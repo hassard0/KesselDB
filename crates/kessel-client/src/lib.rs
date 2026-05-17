@@ -45,6 +45,34 @@ pub struct Client {
     stream: TcpStream,
 }
 
+/// Render an `OpResult` as a concise, human/agent-readable line. Pure and
+/// total — used by the `kessel` CLI and safe to rely on in scripts.
+pub fn format_result(r: &OpResult) -> String {
+    match r {
+        OpResult::Ok => "OK".to_string(),
+        OpResult::TypeCreated(t) => format!("OK  (table created, type_id={t})"),
+        OpResult::Exists => "EXISTS  (row already present)".to_string(),
+        OpResult::NotFound => "NOT FOUND".to_string(),
+        OpResult::Constraint(m) => format!("CONSTRAINT  {m}"),
+        OpResult::SchemaError(m) => format!("ERROR  {m}"),
+        OpResult::Unavailable => {
+            "UNAVAILABLE  (this node is not the active primary — connect with a \
+             cluster address list / ClusterClient)"
+                .to_string()
+        }
+        OpResult::Unauthorized => {
+            "UNAUTHORIZED  (missing or wrong --token)".to_string()
+        }
+        OpResult::Got(b) if b.len() == 16 => {
+            // The common scalar reply (aggregate result is a 16-byte i128).
+            format!("= {}  ({} bytes)", i128::from_le_bytes(b[..16].try_into().unwrap()), b.len())
+        }
+        OpResult::Got(b) => {
+            format!("GOT  {} bytes  (use `DESCRIBE <table>` to decode rows)", b.len())
+        }
+    }
+}
+
 /// Auth handshake tag (mirrors `kesseldb_server::AUTH_TAG`).
 pub const AUTH_TAG: u8 = 0xFC;
 
@@ -208,5 +236,36 @@ impl ClusterClient {
         Err(last_err.unwrap_or_else(|| {
             io::Error::new(io::ErrorKind::TimedOut, "no primary reachable")
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_result_is_readable_for_every_variant() {
+        assert_eq!(format_result(&OpResult::Ok), "OK");
+        assert!(format_result(&OpResult::TypeCreated(3)).contains("type_id=3"));
+        assert!(format_result(&OpResult::Exists).starts_with("EXISTS"));
+        assert_eq!(format_result(&OpResult::NotFound), "NOT FOUND");
+        assert!(format_result(&OpResult::Constraint("UNIQUE x".into()))
+            .contains("UNIQUE x"));
+        assert!(format_result(&OpResult::SchemaError("bad".into())).contains("bad"));
+        assert!(format_result(&OpResult::Unavailable).contains("primary"));
+        assert!(format_result(&OpResult::Unauthorized).contains("token"));
+        // scalar reply (aggregate = 16-byte i128)
+        assert!(format_result(&OpResult::Got(1049i128.to_le_bytes().to_vec()))
+            .contains("= 1049"));
+        // opaque rows
+        assert!(format_result(&OpResult::Got(vec![0u8; 40])).contains("40 bytes"));
+        // never panics, always non-empty
+        for r in [
+            OpResult::Ok,
+            OpResult::Got(vec![]),
+            OpResult::Got(vec![1, 2, 3]),
+        ] {
+            assert!(!format_result(&r).is_empty());
+        }
     }
 }

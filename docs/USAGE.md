@@ -5,6 +5,7 @@ KesselDB. Every feature described here is covered by the test suite.
 
 - [1. Install & build](#1-install--build)
 - [2. Run a server](#2-run-a-server)
+- [2b. The `kessel` command-line client](#2b-the-kessel-command-line-client)
 - [3. The client library](#3-the-client-library)
 - [4. SQL reference](#4-sql-reference)
 - [5. The data model](#5-the-data-model)
@@ -58,8 +59,34 @@ process and it recovers from the WAL automatically (crash‑safe, torn‑tail
 handled).
 
 For authentication, quotas, or a multi‑node cluster you compose the
-`kesseldb-server` **library** API (a thin all‑in‑one CLI is a planned
-convenience) — see §7 and §8.
+`kesseldb-server` **library** API — see §7 and §8.
+
+## 2b. The `kessel` command-line client
+
+Query KesselDB without writing any code — the fastest path for humans,
+scripts, ops, and agents.
+
+```bash
+# one-shot (exit 0 = success, 1 = statement/connection error, 2 = bad usage)
+cargo run -q -p kessel-client --bin kessel -- "CREATE TABLE t (v U64 NOT NULL)"
+cargo run -q -p kessel-client --bin kessel -- "INSERT INTO t ID 1 (v) VALUES (42)"
+cargo run -q -p kessel-client --bin kessel -- "SELECT SUM(v) FROM t"   # => = 42
+
+# pipe a .sql file (lines starting with # or -- are comments; blanks ignored)
+cat schema.sql | cargo run -q -p kessel-client --bin kessel
+
+# interactive shell (TTY): a `kessel>` prompt; `quit` / `exit` / `\q` to leave
+cargo run -q -p kessel-client --bin kessel
+
+# remote / authenticated
+kessel --addr 10.0.0.1:7878 --token s3cret "SELECT * FROM t ID 1"
+```
+
+`kessel [--addr HOST:PORT] [--token TOKEN] ["SQL"]` — default address
+`127.0.0.1:7878`. With no SQL argument it reads statements from stdin (one
+per line). The **exit code is reliable**, so an agent or script can branch
+on success without parsing output. (After `cargo build --release` the
+binary is `target/release/kessel`.)
 
 ## 3. The client library
 

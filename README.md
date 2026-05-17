@@ -6,7 +6,7 @@
 
 *"It's the database that made the Kessel Run in 12 parsecs."*
 
-`145 tests green` · `0 external dependencies` · `Rust 1.95+` · single‑binary
+`146 tests green` · `0 external dependencies` · `Rust 1.95+` · single‑binary
 
 </div>
 
@@ -64,7 +64,22 @@ cargo build --release
 cargo run --release --bin kesseldb -- 127.0.0.1:7878 ./data
 ```
 
-### Talk to it from Rust
+### Query it in one command — no code required
+
+```bash
+kessel "CREATE TABLE acct (owner U32 NOT NULL, bal I64 NOT NULL)"
+kessel "INSERT INTO acct ID 1 (owner, bal) VALUES (100, 50)"
+kessel "SELECT SUM(bal) FROM acct WHERE owner = 100"     # => = 50
+
+echo "SELECT * FROM acct ID 1" | kessel                  # pipe a .sql file
+kessel                                                   # interactive shell
+```
+
+The `kessel` CLI (`cargo run -p kessel-client --bin kessel -- …`, or
+`target/release/kessel` after a release build) is one-shot, pipe, and
+interactive, with reliable exit codes — ideal for scripts, ops, and agents.
+
+### Or from Rust
 
 ```rust
 use kessel_client::Client;
@@ -138,14 +153,15 @@ Honest boundaries (documented, not hidden):
 - **Non‑gating roadmap** (tracked, not blocking): balance‑guard helpers,
   cross‑shard transactions, destructive `ALTER/DROP`, overflow GC.
 
-Every claim in this repository is backed by the test suite (`145 tests`); the
+Every claim in this repository is backed by the test suite (`146 tests`); the
 docs call out exactly what is proven versus roadmap.
 
 ## Documentation
 
 | Doc | Contents |
 |---|---|
-| [`docs/USAGE.md`](docs/USAGE.md) | Install, run, client API, **SQL reference**, clustering, auth, backup & monitoring |
+| [`AGENTS.md`](AGENTS.md) | Machine-first operating guide — build/test/run/CLI, wire protocol, repo map, working rules (read this first if you're an agent) |
+| [`docs/USAGE.md`](docs/USAGE.md) | Install, run, **CLI**, client API, **SQL reference**, clustering, auth, backup & monitoring |
 | [`docs/STATUS.md`](docs/STATUS.md) | Production‑readiness gate, per‑slice status, performance log |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Storage, replication, sharding, caching internals |
 | [`docs/superpowers/specs/`](docs/superpowers/specs/) | One design spec per sub‑project |
@@ -154,7 +170,7 @@ docs call out exactly what is proven versus roadmap.
 
 ```bash
 cargo build                 # all crates, zero external deps
-cargo test --workspace      # 145 tests (incl. seeded partition/fault simulation)
+cargo test --workspace      # 146 tests (incl. seeded partition/fault simulation)
 cargo run -p kessel-bench --release -- --help   # benchmarks
 ```
 

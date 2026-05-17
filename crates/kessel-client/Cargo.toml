@@ -9,3 +9,7 @@ kessel-proto = { path = "../kessel-proto" }
 
 [lib]
 path = "src/lib.rs"
+
+[[bin]]
+name = "kessel"
+path = "src/bin/kessel.rs"

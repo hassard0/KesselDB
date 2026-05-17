@@ -70,6 +70,12 @@ impl ReadCache {
         self.map.remove(key);
     }
 
+    /// Drop every entry (used when a transaction aborts — any entries it
+    /// wrote referenced uncommitted overlay values).
+    pub fn clear(&mut self) {
+        self.map.clear();
+    }
+
     pub fn len(&self) -> usize {
         self.map.len()
     }

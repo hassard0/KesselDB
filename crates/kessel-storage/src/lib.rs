@@ -298,6 +298,11 @@ pub struct Storage<V: Vfs> {
     /// When false, `commit` appends to the WAL without fsync; the caller
     /// must call `sync()` to make the group durable (TB-style group commit).
     autosync: bool,
+    /// Active transaction overlay (Sub-project 9). While `Some`, writes are
+    /// buffered here (NOT in WAL/memtable) and reads see it first, so a
+    /// transaction is all-or-nothing: `commit_txn` flushes it atomically,
+    /// `abort_txn` discards it leaving zero trace.
+    txn: Option<BTreeMap<Key, (u64, Option<Vec<u8>>)>>,
 }
 
 impl<V: Vfs> Storage<V> {
@@ -322,7 +327,46 @@ impl<V: Vfs> Storage<V> {
             manifest,
             wal,
             autosync: true,
+            txn: None,
         })
+    }
+
+    /// Begin an atomic transaction: subsequent put/delete buffer in an
+    /// overlay until `commit_txn` (atomic flush) or `abort_txn` (discard).
+    pub fn begin_txn(&mut self) {
+        self.txn = Some(BTreeMap::new());
+    }
+
+    /// Atomically flush the transaction overlay: append every buffered entry
+    /// to the WAL, ONE fsync, then make them visible. Crash-consistent (WAL
+    /// replay rebuilds the memtable; a torn tail loses the whole batch).
+    pub fn commit_txn(&mut self) -> io::Result<()> {
+        let ov = match self.txn.take() {
+            Some(o) => o,
+            None => return Ok(()),
+        };
+        for (k, (n, v)) in &ov {
+            self.wal.append(&Entry {
+                op_number: *n,
+                key: *k,
+                value: v.clone(),
+            })?;
+        }
+        self.wal.sync()?;
+        for (k, (_, v)) in ov {
+            self.memtable.insert(k, v);
+        }
+        Ok(())
+    }
+
+    /// Discard the transaction overlay. Nothing reached the WAL/memtable, so
+    /// there is literally nothing to undo.
+    pub fn abort_txn(&mut self) {
+        self.txn = None;
+    }
+
+    pub fn in_txn(&self) -> bool {
+        self.txn.is_some()
     }
 
     /// Group-commit control. `false` => `commit` skips the per-op fsync;
@@ -353,6 +397,10 @@ impl<V: Vfs> Storage<V> {
     }
 
     fn commit(&mut self, e: Entry) -> io::Result<()> {
+        if let Some(ov) = self.txn.as_mut() {
+            ov.insert(e.key, (e.op_number, e.value)); // buffered, not durable
+            return Ok(());
+        }
         self.wal.append(&e)?;
         if self.autosync {
             self.wal.sync()?;
@@ -362,6 +410,11 @@ impl<V: Vfs> Storage<V> {
     }
 
     pub fn get(&self, key: &Key) -> Option<Vec<u8>> {
+        if let Some(ov) = &self.txn {
+            if let Some((_, v)) = ov.get(key) {
+                return v.clone(); // read-your-writes within the txn
+            }
+        }
         if let Some(v) = self.memtable.get(key) {
             return v.clone();
         }
@@ -617,6 +670,34 @@ mod tests {
         };
         assert_eq!(build(&[]), build(&[3, 10, 20]));
         assert_eq!(build(&[3, 10, 20]), build(&[0, 1, 2, 29]));
+    }
+
+    #[test]
+    fn txn_is_atomic_commit_and_abort() {
+        let vfs = MemVfs::new();
+        let mut s = Storage::open(vfs.clone()).unwrap();
+        s.put(1, k(1), b"base".to_vec()).unwrap();
+
+        // aborted txn leaves zero trace
+        s.begin_txn();
+        s.put(2, k(2), b"x".to_vec()).unwrap();
+        s.delete(3, k(1)).unwrap();
+        assert_eq!(s.get(&k(2)), Some(b"x".to_vec()), "read-your-writes in txn");
+        assert_eq!(s.get(&k(1)), None, "tombstone visible in txn");
+        s.abort_txn();
+        assert_eq!(s.get(&k(1)), Some(b"base".to_vec()), "abort rolled back");
+        assert_eq!(s.get(&k(2)), None, "abort discarded insert");
+
+        // committed txn is atomic + durable across reopen
+        s.begin_txn();
+        s.put(4, k(2), b"y".to_vec()).unwrap();
+        s.put(5, k(3), b"z".to_vec()).unwrap();
+        s.commit_txn().unwrap();
+        s.flush().unwrap();
+        let s2 = Storage::open(vfs).unwrap();
+        assert_eq!(s2.get(&k(2)), Some(b"y".to_vec()));
+        assert_eq!(s2.get(&k(3)), Some(b"z".to_vec()));
+        assert_eq!(s2.get(&k(1)), Some(b"base".to_vec()));
     }
 
     #[test]

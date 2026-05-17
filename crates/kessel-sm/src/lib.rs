@@ -1083,6 +1083,51 @@ impl<V: Vfs> StateMachine<V> {
                 }
                 self.persist_catalog(op_number)
             }
+
+            Op::Txn { ops } => {
+                // Only data ops (and reads) may participate; schema/DDL and
+                // nested txns are rejected up-front so the overlay model
+                // stays correct (the overlay does not cover catalog/scan).
+                for o in &ops {
+                    let ok = matches!(
+                        o,
+                        Op::Create { .. }
+                            | Op::Update { .. }
+                            | Op::Delete { .. }
+                            | Op::GetById { .. }
+                            | Op::GetBlob { .. }
+                            | Op::FindBy { .. }
+                            | Op::Query { .. }
+                    );
+                    if !ok {
+                        return OpResult::SchemaError(
+                            "Txn: only data ops allowed (no DDL / nested txn)".into(),
+                        );
+                    }
+                }
+                self.storage.begin_txn();
+                for (i, o) in ops.into_iter().enumerate() {
+                    let r = self.apply(op_number + i as u64, o);
+                    let failed = matches!(
+                        r,
+                        OpResult::Exists
+                            | OpResult::NotFound
+                            | OpResult::SchemaError(_)
+                            | OpResult::Constraint(_)
+                    );
+                    if failed {
+                        self.storage.abort_txn();
+                        if let Some(c) = self.cache.as_mut() {
+                            c.clear(); // purge any overlay-derived entries
+                        }
+                        return r; // whole batch rolled back
+                    }
+                }
+                match self.storage.commit_txn() {
+                    Ok(()) => OpResult::Ok,
+                    Err(e) => OpResult::SchemaError(format!("txn commit: {e}")),
+                }
+            }
         }
     }
 
@@ -1681,6 +1726,86 @@ mod tests {
         assert_eq!(before, after, "Query must not mutate state");
         assert_eq!(ids_a, ids_b, "Query must be deterministic");
         assert!(!ids_a.is_empty());
+    }
+
+    // ---- Sub-project 9: atomic multi-op transactions ----
+
+    #[test]
+    fn txn_commits_all_or_nothing() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: indexed_type_def() });
+        // successful txn: two creates both land
+        let r = sm.apply(2, Op::Txn {
+            ops: vec![
+                Op::Create { type_id: 1, id: ObjectId::from_u128(1), record: rec_bytes(10, 1) },
+                Op::Create { type_id: 1, id: ObjectId::from_u128(2), record: rec_bytes(20, 2) },
+            ],
+        });
+        assert_eq!(r, OpResult::Ok);
+        assert!(matches!(sm.apply(3, Op::GetById { type_id: 1, id: ObjectId::from_u128(1) }), OpResult::Got(_)));
+        assert!(matches!(sm.apply(4, Op::GetById { type_id: 1, id: ObjectId::from_u128(2) }), OpResult::Got(_)));
+    }
+
+    #[test]
+    fn txn_rolls_back_on_midbatch_failure() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: indexed_type_def() });
+        sm.apply(2, Op::AddUnique { type_id: 1, field_id: 1 });
+        // txn: create A(owner=5) OK, then create B(owner=5) -> UNIQUE fail.
+        // Whole txn must roll back: A must NOT exist afterwards.
+        let r = sm.apply(3, Op::Txn {
+            ops: vec![
+                Op::Create { type_id: 1, id: ObjectId::from_u128(1), record: rec_bytes(5, 1) },
+                Op::Create { type_id: 1, id: ObjectId::from_u128(2), record: rec_bytes(5, 2) },
+            ],
+        });
+        assert!(matches!(r, OpResult::Constraint(_)), "got {r:?}");
+        assert_eq!(
+            sm.apply(4, Op::GetById { type_id: 1, id: ObjectId::from_u128(1) }),
+            OpResult::NotFound,
+            "first op rolled back"
+        );
+        // index must also be clean (no phantom from rolled-back op)
+        assert_eq!(
+            ids_of(sm.apply(5, Op::FindBy { type_id: 1, field_id: 1, value: 5u32.to_le_bytes().to_vec() })),
+            Vec::<u128>::new()
+        );
+        // a subsequent good single create still works
+        assert_eq!(sm.apply(6, Op::Create { type_id: 1, id: ObjectId::from_u128(9), record: rec_bytes(5, 9) }), OpResult::Ok);
+    }
+
+    #[test]
+    fn txn_rejects_ddl_and_nested() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: indexed_type_def() });
+        assert!(matches!(
+            sm.apply(2, Op::Txn { ops: vec![Op::CreateType { def: indexed_type_def() }] }),
+            OpResult::SchemaError(_)
+        ));
+        // type/data untouched by the rejected txn
+        assert_eq!(sm.apply(3, Op::Create { type_id: 1, id: ObjectId::from_u128(1), record: rec_bytes(1, 1) }), OpResult::Ok);
+    }
+
+    #[test]
+    fn txn_is_deterministic() {
+        let build = || {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            sm.apply(1, Op::CreateType { def: indexed_type_def() });
+            sm.apply(2, Op::AddUnique { type_id: 1, field_id: 1 });
+            let mut rng = Rng::new(0xDEFA17);
+            for op in 3..400u64 {
+                let a = ObjectId::from_u128(rng.below(30) as u128);
+                let b = ObjectId::from_u128(rng.below(30) as u128);
+                let _ = sm.apply(op, Op::Txn {
+                    ops: vec![
+                        Op::Create { type_id: 1, id: a, record: rec_bytes(rng.below(20) as u32, op as u32) },
+                        Op::Create { type_id: 1, id: b, record: rec_bytes(rng.below(20) as u32, op as u32) },
+                    ],
+                });
+            }
+            sm.digest()
+        };
+        assert_eq!(build(), build(), "atomic txn pipeline must be deterministic");
     }
 
     // ---- Sub-project 8: deterministic mutating triggers ----

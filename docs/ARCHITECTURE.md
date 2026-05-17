@@ -109,6 +109,18 @@ logic and reaches the same accept/reject. `Op::AddCheck` validates the
 program structurally and against all existing rows before enabling. The same
 VM is the substrate for SP8 deterministic triggers.
 
+## Atomic transactions (Sub-project 9)
+
+`Storage` has a transaction overlay: `begin_txn` buffers writes in-memory
+(reads see them — read-your-writes), `commit_txn` flushes the whole batch to
+the WAL with a single fsync then makes it visible, `abort_txn` drops the
+overlay (nothing reached WAL/memtable ⇒ nothing to undo). `Op::Txn` runs its
+inner data ops through the normal `apply` path so constraints/indexes/
+triggers/overflow all compose and roll back together; the read cache is
+cleared on abort. A transaction is one replicated op, so the serial state
+machine makes it serializable and replica-identical. DDL/nested txns are
+rejected (the overlay does not cover the catalog or range scans).
+
 ## Storage layout
 
 LSM key = `type_id(4B) ‖ primary_id(16B)`, value = codec-encoded fixed-width record with a

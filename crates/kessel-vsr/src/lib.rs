@@ -839,6 +839,41 @@ pub mod sim {
     }
 
     #[test]
+    fn atomic_txn_replicates_and_converges() {
+        // A Txn is one replicated op: every replica must commit-or-rollback
+        // identically (some of these collide on UNIQUE and must roll back
+        // uniformly on all 3 nodes).
+        let mut c = Cluster::new(3, 31, 0);
+        let row = |owner: u32| {
+            let mut b = vec![0u8; 32];
+            b[14..18].copy_from_slice(&owner.to_le_bytes());
+            b
+        };
+        let mut reqs = vec![
+            (1u128, 1u64, Op::CreateType {
+                def: encode_type_def("r", &[
+                    Field { field_id: 0, name: "owner".into(), kind: FieldKind::U32, nullable: false },
+                    Field { field_id: 0, name: "v".into(), kind: FieldKind::U32, nullable: false },
+                ]),
+            }),
+            (1, 2, Op::AddUnique { type_id: 1, field_id: 1 }),
+        ];
+        for i in 0..20u64 {
+            // half the txns have an internal UNIQUE collision -> full rollback
+            let (o1, o2) = if i % 2 == 0 { (i as u32, 100 + i as u32) } else { (i as u32, i as u32) };
+            reqs.push((1, i + 3, Op::Txn {
+                ops: vec![
+                    Op::Create { type_id: 1, id: ObjectId::from_u128(2 * i as u128), record: row(o1) },
+                    Op::Create { type_id: 1, id: ObjectId::from_u128(2 * i as u128 + 1), record: row(o2) },
+                ],
+            }));
+        }
+        assert_ne!(c.run(&reqs, 12000), usize::MAX);
+        let d = c.live_digests();
+        assert!(d.iter().all(|v| *v == d[0]), "txn outcome diverged: {d:?}");
+    }
+
+    #[test]
     fn converges_under_message_loss() {
         let mut c = Cluster::new(3, 9, 25); // drop 25% of messages
         let mut reqs = vec![(3u128, 1u64, def())];

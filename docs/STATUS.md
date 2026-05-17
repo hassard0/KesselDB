@@ -16,6 +16,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP6 — foreign keys** | **done** | `Op::AddForeignKey` (validates existing data); ref-exists enforced on create/update (codec-scoped); replicated convergence; no ON DELETE cascade (documented) |
 | **SP7 — expression VM + CHECK** | **done** | zero-dep deterministic gas-bounded stack VM (`kessel-expr`); `Op::AddCheck` (structural + existing-data validation); enforced on create/update; replicated convergence |
 | **SP8 — deterministic triggers** | **done** | same VM + `SET_FIELD`/`REJECT`; `Op::AddTrigger`; mutate/reject before constraints; order-independent; replicated convergence |
+| **SP9 — atomic transactions** | **done** | storage overlay (begin/commit/abort); `Op::Txn` all-or-nothing incl. index+cache rollback; one replicated op; VSR convergence |
 
 ## M3 VSR — done vs. hardening backlog (honest)
 
@@ -111,13 +112,21 @@ Order-independent (LoadField reads original record). 3-node VSR convergence
 tested. Spec: `docs/superpowers/specs/2026-05-17-kesseldb-subproject8-triggers.md`.
 **Honest limits:** BEFORE-only, single-row, branch-free ISA, no cascading.
 
+## Sub-project 9 — atomic transactions (done)
+
+`Op::Txn` = all-or-nothing batch on a storage overlay (begin/commit/abort);
+rollback covers data, indexes, and the read cache. Replicated as one op ⇒
+identical commit/rollback on every replica (VSR test with colliding txns).
+Data-ops only (no DDL/nested); serial state machine ⇒ serializable by
+construction. Spec: `docs/superpowers/specs/2026-05-17-kesseldb-subproject9-txn.md`.
+
 ## What this is NOT (yet)
 
 Still out of scope (each a later spec): ON DELETE/UPDATE referential actions,
 OR/NOT queries, order-preserving range index, balance-guard constraint,
-destructive ALTER/DROP, overflow GC, index-write throughput optimization,
-M3 hardening backlog (partition matrix, disk-fault-in-VC, seed-corpus sweep,
-socket transport, membership), client SDKs.
+cross-shard atomicity, destructive ALTER/DROP, overflow GC, index-write
+throughput optimization, M3 hardening backlog (partition matrix,
+disk-fault-in-VC, seed-corpus sweep, socket transport, membership), client SDKs.
 
 ## Performance log
 

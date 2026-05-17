@@ -67,6 +67,9 @@ pub enum Op {
     /// Add a before-write trigger (Sub-project 8): a compiled kessel-expr
     /// program run on each Create/Update; may mutate the record or reject it.
     AddTrigger { type_id: TypeId, program: Vec<u8> },
+    /// Atomic transaction (Sub-project 9): apply every inner op all-or-
+    /// nothing. Any failure rolls the whole batch back. Replicated as one op.
+    Txn { ops: Vec<Op> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,6 +103,7 @@ impl Op {
             Op::AddForeignKey { .. } => 12,
             Op::AddCheck { .. } => 13,
             Op::AddTrigger { .. } => 14,
+            Op::Txn { .. } => 15,
         }
     }
 
@@ -158,6 +162,12 @@ impl Op {
                 codec::put_u32(&mut b, *type_id);
                 codec::put_bytes(&mut b, program);
             }
+            Op::Txn { ops } => {
+                codec::put_u32(&mut b, ops.len() as u32);
+                for o in ops {
+                    codec::put_bytes(&mut b, &o.encode()); // length-prefixed
+                }
+            }
         }
         b
     }
@@ -196,6 +206,19 @@ impl Op {
             },
             13 => Op::AddCheck { type_id: c.u32()?, program: c.bytes()? },
             14 => Op::AddTrigger { type_id: c.u32()?, program: c.bytes()? },
+            15 => {
+                let n = c.u32()? as usize;
+                let mut ops = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let inner = c.bytes()?;
+                    let o = Op::decode(&inner)?;
+                    if matches!(o, Op::Txn { .. }) {
+                        return None; // no nested transactions
+                    }
+                    ops.push(o);
+                }
+                Op::Txn { ops }
+            }
             _ => return None,
         };
         Some(op)
@@ -345,6 +368,12 @@ mod tests {
             Op::AddForeignKey { type_id: 4, field_id: 1, ref_type_id: 2 },
             Op::AddCheck { type_id: 4, program: vec![0, 1, 2, 3] },
             Op::AddTrigger { type_id: 4, program: vec![5, 6] },
+            Op::Txn {
+                ops: vec![
+                    Op::Create { type_id: 1, id, record: vec![1, 2] },
+                    Op::Delete { type_id: 1, id },
+                ],
+            },
         ];
         for op in ops {
             let enc = op.encode();

@@ -639,6 +639,46 @@ impl<V: Vfs> StateMachine<V> {
     /// Pushes every object that must be deleted (root + CASCADE descendants)
     /// into `out`; returns `Err` if a RESTRICT edge still has children or the
     /// budget is exceeded. Pure read over committed state ⇒ deterministic.
+    /// For every object being deleted, find children (not themselves being
+    /// deleted) whose FK with `on_delete = SET NULL (3)` references it.
+    /// Returns `(child_type, child_id, field_idx, offset, width)`, deduped.
+    fn collect_set_null(
+        &self,
+        closure: &[(u32, [u8; 16])],
+    ) -> Vec<(u32, [u8; 16], usize, usize, usize)> {
+        let in_closure: std::collections::HashSet<(u32, [u8; 16])> =
+            closure.iter().copied().collect();
+        let mut seen: std::collections::HashSet<(u32, [u8; 16], usize)> =
+            std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for (dt, did) in closure {
+            for ct in &self.catalog.types {
+                let layout = ct.compute_layout();
+                for (fid, rt, od) in &ct.fks {
+                    if *rt != *dt || *od != 3 {
+                        continue;
+                    }
+                    let fi = match ct.fields.iter().position(|f| f.field_id == *fid) {
+                        Some(i) => i,
+                        None => continue,
+                    };
+                    let w = ct.fields[fi].kind.width() as usize;
+                    let off = layout.offsets[fi];
+                    let val = Self::norm(did, w);
+                    for cid in self.idx_lookup(ct.type_id, *fid, &val) {
+                        if in_closure.contains(&(ct.type_id, cid)) {
+                            continue;
+                        }
+                        if seen.insert((ct.type_id, cid, fi)) {
+                            out.push((ct.type_id, cid, fi, off, w));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
     fn cascade_collect(
         &self,
         target_type: u32,
@@ -667,17 +707,23 @@ impl<V: Vfs> StateMachine<V> {
                 let w = ct.fields[fi].kind.width() as usize;
                 let val = Self::norm(&target_id, w);
                 let child_ids = self.idx_lookup(ct.type_id, *fid, &val);
-                if *od == 1 {
-                    if !child_ids.is_empty() {
-                        return Err(format!(
-                            "ON DELETE RESTRICT: type {} field {} still references type {}",
-                            ct.type_id, fid, target_type
-                        ));
+                match *od {
+                    1 => {
+                        if !child_ids.is_empty() {
+                            return Err(format!(
+                                "ON DELETE RESTRICT: type {} field {} still references type {}",
+                                ct.type_id, fid, target_type
+                            ));
+                        }
                     }
-                } else {
-                    for cid in child_ids {
-                        self.cascade_collect(ct.type_id, cid, out, visited, budget)?;
+                    2 => {
+                        for cid in child_ids {
+                            self.cascade_collect(ct.type_id, cid, out, visited, budget)?;
+                        }
                     }
+                    // 3 = SET NULL: handled separately (a mutation, not a
+                    // delete) by `collect_set_null`; skip here.
+                    _ => {}
                 }
             }
         }
@@ -900,10 +946,43 @@ impl<V: Vfs> StateMachine<V> {
                 {
                     return OpResult::Constraint(e);
                 }
-                // Atomic: if not already inside a Txn, wrap the multi-delete.
+                // ON DELETE SET NULL targets: children (not themselves being
+                // deleted) whose FK references something in the closure.
+                let set_null = self.collect_set_null(&closure);
+                // Atomic: if not already inside a Txn, wrap the whole effect.
                 let own_txn = !self.storage.in_txn();
                 if own_txn {
                     self.storage.begin_txn();
+                }
+                for (ct, cid, fi, off, w) in &set_null {
+                    let k = make_key(*ct, cid);
+                    let old = match self.storage.get(&k) {
+                        Some(r) => r,
+                        None => continue,
+                    };
+                    let mut new = old.clone();
+                    for b in new.get_mut(*off..*off + *w).into_iter().flatten() {
+                        *b = 0;
+                    }
+                    // Set the codec null bit when the record is codec-shaped.
+                    if let Some(t) = self.catalog.get(*ct) {
+                        if Self::is_codec_record(t, &new) {
+                            let bit = kessel_catalog::SCHEMA_VER_BYTES + 2 + fi / 8;
+                            if bit < new.len() {
+                                new[bit] |= 1 << (fi % 8);
+                            }
+                        }
+                    }
+                    if let Err(e) = self.storage.put(op_number, k, new.clone()) {
+                        if own_txn {
+                            self.storage.abort_txn();
+                        }
+                        return OpResult::SchemaError(format!("set-null store: {e}"));
+                    }
+                    if let Some(c) = self.cache.as_mut() {
+                        c.invalidate(&k);
+                    }
+                    self.idx_maintain(op_number, *ct, *cid, Some(&old), Some(&new));
                 }
                 for (t, oid) in &closure {
                     let k = make_key(*t, oid);
@@ -1172,8 +1251,8 @@ impl<V: Vfs> StateMachine<V> {
             }
 
             Op::AddForeignKey { type_id, field_id, ref_type_id, on_delete } => {
-                if on_delete > 2 {
-                    return OpResult::SchemaError("on_delete must be 0|1|2".into());
+                if on_delete > 3 {
+                    return OpResult::SchemaError("on_delete must be 0|1|2|3".into());
                 }
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
@@ -2358,6 +2437,68 @@ mod tests {
             sm.digest()
         };
         assert_eq!(build(), build(), "ON DELETE cascade must be deterministic");
+    }
+
+    // ---- Sub-project 19: ON DELETE SET NULL ----
+
+    #[test]
+    fn on_delete_set_null_nulls_referencing_fk() {
+        use kessel_codec::{decode, encode, Value};
+        let (mut sm, cot) = pc_setup(); // parent type1 (a U64), child type2 (pref U128)
+        sm.apply(3, Op::Create { type_id: 1, id: ObjectId::from_u128(5), record: vec![1] });
+        assert_eq!(
+            sm.apply(4, Op::AddForeignKey { type_id: 2, field_id: 1, ref_type_id: 1, on_delete: 3 }),
+            OpResult::Ok
+        );
+        // child 50 references parent 5 (codec record so the null bit is real)
+        sm.apply(5, Op::Create {
+            type_id: 2,
+            id: ObjectId::from_u128(50),
+            record: encode(&cot, &[Value::Uint(5)]).unwrap(),
+        });
+        // sanity: child currently references 5
+        assert_eq!(
+            ids_of(sm.apply(6, Op::FindBy { type_id: 2, field_id: 1, value: 5u128.to_le_bytes().to_vec() })),
+            vec![50]
+        );
+        // delete the parent -> child's FK is SET NULL, child still exists
+        assert_eq!(sm.apply(7, Op::Delete { type_id: 1, id: ObjectId::from_u128(5) }), OpResult::Ok);
+        match sm.apply(8, Op::GetById { type_id: 2, id: ObjectId::from_u128(50) }) {
+            OpResult::Got(rec) => {
+                let vals = decode(&cot, &rec).unwrap();
+                assert_eq!(vals[0], Value::Null, "FK field is now NULL");
+            }
+            o => panic!("child should still exist, got {o:?}"),
+        }
+        // and it no longer indexes under parent 5
+        assert_eq!(
+            ids_of(sm.apply(9, Op::FindBy { type_id: 2, field_id: 1, value: 5u128.to_le_bytes().to_vec() })),
+            Vec::<u128>::new()
+        );
+    }
+
+    #[test]
+    fn on_delete_set_null_is_deterministic() {
+        use kessel_codec::{encode, Value};
+        let build = || {
+            let (mut sm, cot) = pc_setup();
+            sm.apply(3, Op::AddForeignKey { type_id: 2, field_id: 1, ref_type_id: 1, on_delete: 3 });
+            for p in 0..8u128 {
+                sm.apply(10 + p as u64, Op::Create { type_id: 1, id: ObjectId::from_u128(p), record: vec![1] });
+            }
+            for ch in 0..30u128 {
+                sm.apply(100 + ch as u64, Op::Create {
+                    type_id: 2,
+                    id: ObjectId::from_u128(1000 + ch),
+                    record: encode(&cot, &[Value::Uint(ch % 8)]).unwrap(),
+                });
+            }
+            for p in (0..8u128).step_by(2) {
+                sm.apply(500 + p as u64, Op::Delete { type_id: 1, id: ObjectId::from_u128(p) });
+            }
+            sm.digest()
+        };
+        assert_eq!(build(), build(), "ON DELETE SET NULL must be deterministic");
     }
 
     // ---- Sub-project 7: CHECK via deterministic expression VM ----

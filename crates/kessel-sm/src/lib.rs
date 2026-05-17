@@ -1544,6 +1544,57 @@ impl<V: Vfs> StateMachine<V> {
                 OpResult::Got(result.to_le_bytes().to_vec())
             }
 
+            Op::SelectSorted { type_id, program, sort_field, desc, offset, limit } => {
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                let layout = ot.compute_layout();
+                let (soff, sw, skind) = match ot.fields.iter().position(|f| f.field_id == sort_field) {
+                    Some(i) => (
+                        layout.offsets[i],
+                        ot.fields[i].kind.width() as usize,
+                        ot.fields[i].kind,
+                    ),
+                    None => return OpResult::SchemaError(format!("no sort field {sort_field}")),
+                };
+                let lo = make_key(type_id, &[0u8; 16]);
+                let hi = make_key(type_id, &[0xFFu8; 16]);
+                // Buffer matches with their sort-key bytes + object id
+                // (tiebreak by id => total deterministic order).
+                let mut rows: Vec<(Vec<u8>, [u8; 16], Vec<u8>)> = Vec::new();
+                for (k, rec) in self.storage.scan_range(&lo, &hi) {
+                    match kessel_expr::eval(&program, &ot, &rec) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(e) => {
+                            return OpResult::SchemaError(format!("sort program: {e:?}"))
+                        }
+                    }
+                    let sk = rec.get(soff..soff + sw).map(|b| b.to_vec()).unwrap_or_default();
+                    let mut oid = [0u8; 16];
+                    oid.copy_from_slice(&k[4..20]);
+                    rows.push((sk, oid, rec));
+                }
+                rows.sort_by(|a, b| {
+                    Self::cmp_field(skind, &a.0, &b.0).then(a.1.cmp(&b.1))
+                });
+                if desc {
+                    rows.reverse();
+                }
+                let mut out = Vec::new();
+                let mut emitted = 0u32;
+                for (_, _, rec) in rows.into_iter().skip(offset as usize) {
+                    if limit != 0 && emitted >= limit {
+                        break;
+                    }
+                    out.extend_from_slice(&(rec.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&rec);
+                    emitted += 1;
+                }
+                OpResult::Got(out)
+            }
+
             Op::GroupAggregate { type_id, program, group_field, kind, agg_field } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
@@ -1734,6 +1785,7 @@ impl<V: Vfs> StateMachine<V> {
                             | Op::Aggregate { .. }
                             | Op::SelectFields { .. }
                             | Op::GroupAggregate { .. }
+                            | Op::SelectSorted { .. }
                     );
                     if !ok {
                         return OpResult::SchemaError(
@@ -3252,6 +3304,86 @@ mod tests {
         let (b, _, _) = build();
         assert_eq!(before, after, "GroupAggregate must not mutate state");
         assert_eq!(a, b, "GroupAggregate must be deterministic");
+    }
+
+    // ---- Sub-project 23: ORDER BY + OFFSET/LIMIT ----
+
+    #[test]
+    fn select_sorted_orders_and_paginates() {
+        use kessel_expr::Program;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: q_type_def() }); // owner f1, kind f2, v(u32) f3
+        // insert in scrambled v order
+        let vs = [50u32, 10, 90, 30, 70, 20, 80, 40, 60, 0];
+        for (i, v) in vs.iter().enumerate() {
+            sm.apply(2 + i as u64, Op::Create {
+                type_id: 1, id: ObjectId::from_u128(i as u128), record: qrec(1, 0, *v),
+            });
+        }
+        let read_v = |b: &[u8]| -> Vec<u32> {
+            let mut p = 0;
+            let mut out = Vec::new();
+            let (o0, _) = q_v_off();
+            while p + 4 <= b.len() {
+                let l = u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize;
+                p += 4;
+                let rec = &b[p..p + l];
+                out.push(u32::from_le_bytes(rec[o0..o0 + 4].try_into().unwrap()));
+                p += l;
+            }
+            out
+        };
+        let all = Program::new().push_int(1).bytes();
+        // ascending by v, all
+        match sm.apply(20, Op::SelectSorted { type_id: 1, program: all.clone(), sort_field: 3, desc: false, offset: 0, limit: 0 }) {
+            OpResult::Got(b) => assert_eq!(read_v(&b), vec![0,10,20,30,40,50,60,70,80,90]),
+            o => panic!("{o:?}"),
+        }
+        // descending, offset 2 limit 3 -> skip 90,80 -> [70,60,50]
+        match sm.apply(21, Op::SelectSorted { type_id: 1, program: all, sort_field: 3, desc: true, offset: 2, limit: 3 }) {
+            OpResult::Got(b) => assert_eq!(read_v(&b), vec![70, 60, 50]),
+            o => panic!("{o:?}"),
+        }
+    }
+
+    fn q_v_off() -> (usize, usize) {
+        // offset of field 3 (v) in the q_type layout
+        let ot = ObjectType {
+            type_id: 1, name: "q".into(), schema_ver: 1,
+            fields: vec![
+                Field { field_id: 1, name: "owner".into(), kind: FieldKind::U32, nullable: false },
+                Field { field_id: 2, name: "kind".into(), kind: FieldKind::U16, nullable: false },
+                Field { field_id: 3, name: "v".into(), kind: FieldKind::U32, nullable: false },
+            ],
+            indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![],
+        };
+        let l = ot.compute_layout();
+        (l.offsets[2], 4)
+    }
+
+    #[test]
+    fn select_sorted_is_deterministic() {
+        use kessel_expr::Program;
+        let build = || {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            sm.apply(1, Op::CreateType { def: q_type_def() });
+            for i in 0..30u64 {
+                sm.apply(2 + i, Op::Create {
+                    type_id: 1, id: ObjectId::from_u128(i as u128),
+                    record: qrec(0, 0, (i * 7 % 11) as u32),
+                });
+            }
+            let d0 = sm.digest();
+            let r = match sm.apply(99, Op::SelectSorted {
+                type_id: 1, program: Program::new().push_int(1).bytes(),
+                sort_field: 3, desc: false, offset: 1, limit: 10,
+            }) { OpResult::Got(b) => b, o => panic!("{o:?}") };
+            (r, d0, sm.digest())
+        };
+        let (a, before, after) = build();
+        let (b, _, _) = build();
+        assert_eq!(before, after);
+        assert_eq!(a, b, "SelectSorted must be deterministic");
     }
 
     // ---- Sub-project 6: foreign keys ----

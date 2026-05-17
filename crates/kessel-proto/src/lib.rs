@@ -104,6 +104,18 @@ pub enum Op {
         kind: u8,
         agg_field: u16,
     },
+    /// Sorted/paginated query (Sub-project 23): rows matching `program`,
+    /// ordered by `sort_field` (`desc` for descending; ties broken by
+    /// object id for determinism), then `offset` skipped and at most
+    /// `limit` returned (0 = unlimited). Result = `[u32 rowlen][record]*`.
+    SelectSorted {
+        type_id: TypeId,
+        program: Vec<u8>,
+        sort_field: u16,
+        desc: bool,
+        offset: u32,
+        limit: u32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,6 +199,7 @@ impl Op {
             Op::Aggregate { .. } => 20,
             Op::SelectFields { .. } => 21,
             Op::GroupAggregate { .. } => 22,
+            Op::SelectSorted { .. } => 23,
         }
     }
 
@@ -293,6 +306,14 @@ impl Op {
                 b.push(*kind);
                 b.extend_from_slice(&agg_field.to_le_bytes());
             }
+            Op::SelectSorted { type_id, program, sort_field, desc, offset, limit } => {
+                codec::put_u32(&mut b, *type_id);
+                codec::put_bytes(&mut b, program);
+                b.extend_from_slice(&sort_field.to_le_bytes());
+                b.push(*desc as u8);
+                codec::put_u32(&mut b, *offset);
+                codec::put_u32(&mut b, *limit);
+            }
         }
         b
     }
@@ -380,6 +401,14 @@ impl Op {
                 group_field: c.u16()?,
                 kind: c.u8()?,
                 agg_field: c.u16()?,
+            },
+            23 => Op::SelectSorted {
+                type_id: c.u32()?,
+                program: c.bytes()?,
+                sort_field: c.u16()?,
+                desc: c.u8()? != 0,
+                offset: c.u32()?,
+                limit: c.u32()?,
             },
             _ => return None,
         };
@@ -564,6 +593,7 @@ mod tests {
             Op::Aggregate { type_id: 4, program: vec![1], kind: 1, field_id: 3 },
             Op::SelectFields { type_id: 4, program: vec![1], fields: vec![1, 3], limit: 5 },
             Op::GroupAggregate { type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3 },
+            Op::SelectSorted { type_id: 4, program: vec![1], sort_field: 3, desc: true, offset: 2, limit: 5 },
         ];
         for op in ops {
             let enc = op.encode();

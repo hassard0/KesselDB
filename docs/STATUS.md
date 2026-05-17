@@ -30,6 +30,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP20 — aggregates** | **done** | `Op::Aggregate` COUNT/SUM/MIN/MAX over a VM-filtered set; i128 result; read-only, deterministic, txn-allowed |
 | **SP21 — projection** | **done** | `Op::SelectFields` returns only chosen fields per filtered row; read-only, deterministic, txn-allowed |
 | **SP22 — GROUP BY** | **done** | `Op::GroupAggregate` COUNT/SUM/MIN/MAX per group key (BTreeMap → ascending-order deterministic output); read-only, txn-allowed |
+| **SP23 — ORDER BY + paging** | **done** | `Op::SelectSorted` sort by field (cmp_field, id tiebreak), desc, OFFSET/LIMIT; read-only, deterministic, txn-allowed |
 
 ## M3 VSR — done vs. hardening backlog (honest)
 

@@ -70,6 +70,10 @@ pub enum Op {
     /// Atomic transaction (Sub-project 9): apply every inner op all-or-
     /// nothing. Any failure rolls the whole batch back. Replicated as one op.
     Txn { ops: Vec<Op> },
+    /// Boolean query (Sub-project 14): returns concatenated 16-byte object
+    /// ids of rows for which the kessel-expr `program` evaluates true.
+    /// Arbitrary AND/OR/NOT — a filtered scan, read-only & deterministic.
+    QueryExpr { type_id: TypeId, program: Vec<u8> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -146,6 +150,7 @@ impl Op {
             Op::AddCheck { .. } => 13,
             Op::AddTrigger { .. } => 14,
             Op::Txn { .. } => 15,
+            Op::QueryExpr { .. } => 16,
         }
     }
 
@@ -211,6 +216,10 @@ impl Op {
                     codec::put_bytes(&mut b, &o.encode()); // length-prefixed
                 }
             }
+            Op::QueryExpr { type_id, program } => {
+                codec::put_u32(&mut b, *type_id);
+                codec::put_bytes(&mut b, program);
+            }
         }
         b
     }
@@ -263,6 +272,7 @@ impl Op {
                 }
                 Op::Txn { ops }
             }
+            16 => Op::QueryExpr { type_id: c.u32()?, program: c.bytes()? },
             _ => return None,
         };
         Some(op)
@@ -439,6 +449,7 @@ mod tests {
                     Op::Delete { type_id: 1, id },
                 ],
             },
+            Op::QueryExpr { type_id: 4, program: vec![0, 9, 9] },
         ];
         for op in ops {
             let enc = op.encode();

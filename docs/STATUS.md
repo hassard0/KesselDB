@@ -21,6 +21,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP11 — ON DELETE RESTRICT/CASCADE** | **done** | FK `on_delete`; auto-index for reverse lookup; recursive cascade closure (visited+budget); atomic via txn wrap; VSR convergence |
 | **SP12 — VSR partition hardening** | **partial (honest)** | partition fault model + request-relay + VC-retry; determinism-under-partition & bounded post-heal convergence proven; **seed 7 = documented open VC-liveness repro** |
 | **SP13 — VSR view-change hardening** | **partial (honest)** | max-view-seen convergence (no escalation chase) + introspection; precise seed-7 diagnosis (view-change storm → first op lost → SchemaError-converged empty DB); root cause = VSR uncommitted-log reconciliation, still open |
+| **SP14 — OR/NOT boolean queries** | **done** | `Op::QueryExpr` reuses the deterministic expr VM as a row filter (arbitrary AND/OR/NOT); read-only, deterministic, txn-allowed; non-breaking (SP5 indexed fast path intact) |
 
 ## M3 VSR — done vs. hardening backlog (honest)
 
@@ -159,8 +160,9 @@ partitions. Concrete repro kept in-code + spec. Spec:
 ## What this is NOT (yet)
 
 Still out of scope (each a later spec): **full VSR view-change liveness
-under arbitrary partition (SP12 open repro: seed 7)**, SET NULL/SET DEFAULT
-& ON UPDATE actions, OR/NOT queries, order-preserving range index,
+under arbitrary partition (SP12/13 open repro: seed 7)**, index-accelerated
+boolean-query planning, SET NULL/SET DEFAULT & ON UPDATE actions,
+order-preserving range index,
 balance-guard constraint, cross-shard atomicity, multi-node VSR over sockets,
 destructive ALTER/DROP, overflow GC, index-write throughput optimization,
 disk-fault-during-view-change, membership reconfiguration, auth/TLS,

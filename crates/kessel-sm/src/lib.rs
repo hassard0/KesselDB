@@ -1179,6 +1179,37 @@ impl<V: Vfs> StateMachine<V> {
                 self.persist_catalog(op_number)
             }
 
+            Op::QueryExpr { type_id, program } => {
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                // Arbitrary boolean filter via the deterministic VM. Filtered
+                // scan over the type's contiguous key range; read-only.
+                let lo = make_key(type_id, &[0u8; 16]);
+                let hi = make_key(type_id, &[0xFFu8; 16]);
+                let mut matched: Vec<[u8; 16]> = Vec::new();
+                for (k, rec) in self.storage.scan_range(&lo, &hi) {
+                    match kessel_expr::eval(&program, &ot, &rec) {
+                        Ok(true) => {
+                            let mut id = [0u8; 16];
+                            id.copy_from_slice(&k[4..20]);
+                            matched.push(id);
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            return OpResult::SchemaError(format!("query program: {e:?}"))
+                        }
+                    }
+                }
+                matched.sort_unstable();
+                let mut out = Vec::with_capacity(matched.len() * 16);
+                for id in matched {
+                    out.extend_from_slice(&id);
+                }
+                OpResult::Got(out)
+            }
+
             Op::Txn { ops } => {
                 // Only data ops (and reads) may participate; schema/DDL and
                 // nested txns are rejected up-front so the overlay model
@@ -1193,6 +1224,7 @@ impl<V: Vfs> StateMachine<V> {
                             | Op::GetBlob { .. }
                             | Op::FindBy { .. }
                             | Op::Query { .. }
+                            | Op::QueryExpr { .. }
                     );
                     if !ok {
                         return OpResult::SchemaError(
@@ -2187,6 +2219,81 @@ mod tests {
             sm.digest()
         };
         assert_eq!(build(), build(), "CHECK VM must be deterministic");
+    }
+
+    // ---- Sub-project 14: OR/NOT boolean queries via the expr VM ----
+
+    #[test]
+    fn query_expr_or_not_and_combined() {
+        use kessel_expr::Program;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: q_type_def() }); // owner u32 f1, kind u16 f2, v u32 f3
+        // rows: (owner, kind, v)
+        let rows = [(100, 1, 5), (200, 2, 6), (300, 9, 7), (100, 9, 8), (400, 1, 99)];
+        for (i, (o, k, v)) in rows.iter().enumerate() {
+            sm.apply(10 + i as u64, Op::Create {
+                type_id: 1,
+                id: ObjectId::from_u128(i as u128),
+                record: qrec(*o, *k, *v),
+            });
+        }
+        // OR: owner==100 OR owner==200  -> rows 0,1,3
+        let p_or = Program::new()
+            .load(1).push_int(100).eq()
+            .load(1).push_int(200).eq()
+            .or()
+            .bytes();
+        let mut g = qids(sm.apply(20, Op::QueryExpr { type_id: 1, program: p_or }));
+        g.sort();
+        assert_eq!(g, vec![0, 1, 3]);
+        // NOT: NOT(kind==9)  -> rows 0,1,4
+        let p_not = Program::new().load(2).push_int(9).eq().not().bytes();
+        let mut g = qids(sm.apply(21, Op::QueryExpr { type_id: 1, program: p_not }));
+        g.sort();
+        assert_eq!(g, vec![0, 1, 4]);
+        // combined: (owner==100 AND v>=8) OR kind==2  -> row 3 (100,_,8), row 1 (kind 2)
+        let p_c = Program::new()
+            .load(1).push_int(100).eq()
+            .load(3).push_int(8).ge()
+            .and()
+            .load(2).push_int(2).eq()
+            .or()
+            .bytes();
+        let mut g = qids(sm.apply(22, Op::QueryExpr { type_id: 1, program: p_c }));
+        g.sort();
+        assert_eq!(g, vec![1, 3]);
+        // empty result is well-formed
+        let p_none = Program::new().load(1).push_int(99999).eq().bytes();
+        assert_eq!(qids(sm.apply(23, Op::QueryExpr { type_id: 1, program: p_none })), Vec::<u128>::new());
+    }
+
+    #[test]
+    fn query_expr_is_readonly_and_deterministic() {
+        use kessel_expr::Program;
+        let build = || {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            sm.apply(1, Op::CreateType { def: q_type_def() });
+            for i in 0..40u64 {
+                sm.apply(2 + i, Op::Create {
+                    type_id: 1,
+                    id: ObjectId::from_u128(i as u128),
+                    record: qrec((i % 5) as u32, 0, i as u32),
+                });
+            }
+            let d0 = sm.digest();
+            let p = Program::new()
+                .load(1).push_int(2).eq()
+                .load(1).push_int(4).eq()
+                .or()
+                .bytes();
+            let r = qids(sm.apply(99, Op::QueryExpr { type_id: 1, program: p }));
+            (r, d0, sm.digest())
+        };
+        let (ids_a, before, after) = build();
+        let (ids_b, _, _) = build();
+        assert_eq!(before, after, "QueryExpr must not mutate state");
+        assert_eq!(ids_a, ids_b, "QueryExpr must be deterministic");
+        assert!(!ids_a.is_empty());
     }
 
     // ---- Sub-project 6: foreign keys ----

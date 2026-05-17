@@ -437,21 +437,29 @@ impl<V: Vfs> Replica<V> {
         if self.status != Status::Normal {
             return; // mid view change; client retransmits
         }
-        if !self.is_primary() {
-            // A backup relays the request to the current primary instead of
-            // silently dropping it, so a client reaching ANY connected node
-            // makes progress (materially improves liveness under partition).
-            let p = self.primary_of(self.view);
-            if p != self.idx {
-                out.msgs.push((p, Msg::Request { client, req, op }));
-            }
-            return;
-        }
+        // Any node — primary OR backup — that already holds the committed
+        // result for this request answers a retransmission directly from
+        // the replicated client table (`apply_through` populates it on
+        // every replica). This makes exactly-once retries *failover-safe*:
+        // a client that retries against a surviving node after the primary
+        // it originally talked to is gone still gets its original reply,
+        // with no re-execution.
         if let Some((last, res)) = self.client_table.get(&client) {
             if req <= *last {
                 out.replies.push((client, *last, res.clone()));
                 return;
             }
+        }
+        if !self.is_primary() {
+            // Otherwise a backup relays the request to the current primary
+            // instead of silently dropping it, so a client reaching ANY
+            // connected node makes progress (improves liveness under
+            // partition).
+            let p = self.primary_of(self.view);
+            if p != self.idx {
+                out.msgs.push((p, Msg::Request { client, req, op }));
+            }
+            return;
         }
         let op_number = self.op_number() + 1;
         self.log.push(LogEntry { op_number, client, req, op: op.clone() });

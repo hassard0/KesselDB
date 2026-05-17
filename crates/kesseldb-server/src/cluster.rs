@@ -108,6 +108,12 @@ impl Session {
         self.submit_with_req(op, req)
     }
 
+    /// This session's stable VSR client id (so a failover client can retry
+    /// the same `(client, req)` against another node via `Node::submit_as`).
+    pub fn client_id(&self) -> ClientId {
+        self.client
+    }
+
     /// Submit `op` under an explicit request number. Re-using a number that
     /// already committed is a *retry*: the replica returns the cached reply
     /// and does not execute the op again (exactly-once).
@@ -148,6 +154,23 @@ impl Node {
     pub fn apply_raw(&self, frame: Vec<u8>) -> OpResult {
         let (rtx, rrx) = sync_channel(1);
         if self.tx.send(Ev::ClientRaw { frame, reply: rtx }).is_err() {
+            return OpResult::SchemaError("engine stopped".into());
+        }
+        rrx.recv()
+            .unwrap_or_else(|_| OpResult::SchemaError("engine dropped reply".into()))
+    }
+
+    /// Submit `op` under an explicit `(client, req)` to *this* node. This is
+    /// what a failover-aware client uses to retry against a surviving node:
+    /// any node holding the committed result answers from its replicated
+    /// client table; otherwise a backup relays to the primary.
+    pub fn submit_as(&self, client: ClientId, req: u64, op: Op) -> OpResult {
+        let (rtx, rrx) = sync_channel(1);
+        if self
+            .tx
+            .send(Ev::Client { client, req, op, reply: rtx })
+            .is_err()
+        {
             return OpResult::SchemaError("engine stopped".into());
         }
         rrx.recv()
@@ -759,6 +782,77 @@ mod tests {
             wait_converged(&nodes, 1),
             "nodes did not converge after session ops"
         );
+        for d in &dirs {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn failover_retry_against_follower_returns_cached_reply() {
+        let n = 3;
+        let listeners: Vec<TcpListener> = (0..n)
+            .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let addrs: Vec<SocketAddr> =
+            listeners.iter().map(|l| l.local_addr().unwrap()).collect();
+        let mut nodes = Vec::new();
+        let mut dirs = Vec::new();
+        for (i, l) in listeners.into_iter().enumerate() {
+            let dir = std::env::temp_dir()
+                .join(format!("kesseldb-fail-{}-{i}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            dirs.push(dir.clone());
+            nodes.push(spawn_node(i, l, addrs.clone(), dir).unwrap());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+
+        assert_eq!(
+            nodes[0].submit(Op::CreateType {
+                def: encode_type_def(
+                    "t",
+                    &[Field {
+                        field_id: 0,
+                        name: "v".into(),
+                        kind: FieldKind::U64,
+                        nullable: false,
+                    }],
+                ),
+            }),
+            OpResult::TypeCreated(1)
+        );
+
+        // Client talks to the primary under a stable session.
+        let s = nodes[0].session();
+        let cid = s.client_id();
+        let id = ObjectId::from_u128(7);
+        assert_eq!(
+            s.submit_with_req(Op::Create { type_id: 1, id, record: vec![1] }, 1),
+            OpResult::Ok
+        );
+        // Wait until every node (incl. the follower) has applied it.
+        assert!(wait_converged(&nodes, 1), "did not converge before failover");
+        let follower_digest = nodes[1].probe().0;
+
+        // Primary "fails": the client reconnects to a FOLLOWER and retries
+        // the exact same (client, req=1). The follower answers from its
+        // replicated client table — original reply, no re-execution.
+        assert_eq!(
+            nodes[1].submit_as(cid, 1, Op::Create { type_id: 1, id, record: vec![1] }),
+            OpResult::Ok,
+            "follower must serve the cached reply for a committed (client,req)"
+        );
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            nodes[1].probe().0,
+            follower_digest,
+            "follower re-applied a retried request — not exactly-once on failover"
+        );
+        // Sanity: a fresh client creating the same id collides (exists once).
+        assert_eq!(
+            nodes[0].submit(Op::Create { type_id: 1, id, record: vec![9] }),
+            OpResult::Exists
+        );
+
         for d in &dirs {
             let _ = std::fs::remove_dir_all(d);
         }

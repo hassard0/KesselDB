@@ -48,6 +48,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP38 — VSR over real TCP sockets** | **done** | `kessel_vsr::wire` Msg codec (all 9 variants, roundtrip-tested) + `kesseldb_server::cluster` (single engine owns `Replica<DirVfs>`, per-peer socket transport); 3-node real-TCP test converges to identical digest; **129 green** |
 | **SP39 — SQL over the cluster** | **done** | `Replica::catalog()` + `Ev::ClientRaw` continuation engine (UPDATE = 2-round RMW over consensus, non-blocking) + `serve_clients`; real `Client::sql()` full CRUD against a 3-node TCP cluster, followers match primary digest; **130 green** |
 | **SP40 — client sessions (exactly-once)** | **done** | `Node::session()`/`Session` = stable ClientId + monotonic req; retried `(client,req)` returns the cached reply, op does not re-apply (digest-stable proof on 3-node cluster); **131 green** |
+| **SP41 — failover-safe retries** | **done (server side)** | cached-reply check moved ahead of the backup relay → *any* node serves a committed `(client,req)` from its replicated client table; `submit_as`/`client_id`; follower-retry test digest-stable; **132 green** |
 
 ## Production-readiness gate (precise, not vague)
 
@@ -65,7 +66,7 @@ hand-waving:
 | **Multi-node replication over real sockets** | ✅ **SP38 done** — 3-node TCP cluster, digests converge over the wire |
 | **Full SQL over the cluster (incl. UPDATE RMW)** | ✅ **SP39 done** — `Client::sql()` full CRUD, linearized through consensus |
 | Exactly-once client retries | ✅ **SP40 done** — stable sessions; duplicate `(client,req)` deduped, digest-stable |
-| Failover client-reply re-routing (reconnect to new primary) | ⚠️ open — substrate (replicated client table + sessions) in place |
+| Failover-safe retries (any node serves committed result) | ✅ **SP41 done** — server side; client auto-discovery of new primary is the only remainder |
 | Index point-read perf (post-SP25 tradeoff) | ⚠️ documented enhancement |
 | Auth / TLS / quotas / backpressure | ❌ not started |
 | Operational tooling (backup, metrics, admin) | ❌ not started |
@@ -73,9 +74,9 @@ hand-waving:
 The honest verdict: a **complete & functionally-correct** database, **VSR
 safety** hardened, now running as a **real multi-node TCP cluster** (SP38).
 The remaining gates are concrete and named: adversarial-partition liveness
-(seed 7), failover client-reply routing (client reconnect/retry to the new
-primary), then auth/TLS/quotas and ops tooling. No vague "research-grade"
-hedging — each item is a
+(seed 7), client-side new-primary auto-discovery (server-side failover-safe
+retry already done, SP41), then auth/TLS/quotas and ops tooling. No vague
+"research-grade" hedging — each item is a
 specific, scoped slice.
 
 ## M3 VSR — done vs. hardening backlog (honest)

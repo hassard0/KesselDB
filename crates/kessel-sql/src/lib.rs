@@ -68,7 +68,7 @@ fn lex(s: &str) -> Result<Vec<Tok>, SqlError> {
             out.push(Tok::Ident(s[start..i].to_string()));
         } else {
             match c {
-                '(' | ')' | ',' | ';' => {
+                '(' | ')' | ',' | ';' | '.' => {
                     out.push(Tok::Punct(c));
                     i += 1;
                 }
@@ -598,6 +598,55 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
     p.expect_kw("FROM")?;
     let tname = p.ident()?;
     let ot = p.type_named(&tname)?.clone();
+    // Inner equi-join: `SELECT * FROM a JOIN b ON a.x = b.y [LIMIT n]`.
+    if p.kw("JOIN") {
+        let rname = p.ident()?;
+        let rt = p.type_named(&rname)?.clone();
+        p.expect_kw("ON")?;
+        let a1 = p.ident()?;
+        p.punct('.')?;
+        let c1 = p.ident()?;
+        if !matches!(p.next(), Some(Tok::Cmp("="))) {
+            return Err("JOIN ON needs `=`".into());
+        }
+        let a2 = p.ident()?;
+        p.punct('.')?;
+        let c2 = p.ident()?;
+        // a1/a2 must name the two tables (either order)
+        let (lf_tbl, lf_col, rf_tbl, rf_col) = if a1 == tname && a2 == rname {
+            (&ot, c1, &rt, c2)
+        } else if a1 == rname && a2 == tname {
+            (&ot, c2, &rt, c1)
+        } else {
+            return Err("JOIN ON columns must reference the joined tables".into());
+        };
+        let lfid = lf_tbl
+            .fields
+            .iter()
+            .find(|f| f.name == lf_col)
+            .ok_or_else(|| format!("unknown column `{lf_col}`"))?
+            .field_id;
+        let rfid = rf_tbl
+            .fields
+            .iter()
+            .find(|f| f.name == rf_col)
+            .ok_or_else(|| format!("unknown column `{rf_col}`"))?
+            .field_id;
+        let mut limit = 0u32;
+        if p.kw("LIMIT") {
+            match p.next() {
+                Some(Tok::Int(n)) => limit = n as u32,
+                _ => return Err("LIMIT needs int".into()),
+            }
+        }
+        return Ok(Op::Join {
+            left_type: ot.type_id,
+            right_type: rt.type_id,
+            left_field: lfid,
+            right_field: rfid,
+            limit,
+        });
+    }
     // Primary-key fast path: `SELECT ... FROM t ID <n>` -> O(1) GetById
     // (returns the whole record; projection/WHERE not applied to a
     // single-row id fetch — documented).
@@ -995,6 +1044,54 @@ mod tests {
             o => panic!("{o:?}"),
         }
         assert!(compile("DESC nope", sm.catalog()).is_err());
+    }
+
+    #[test]
+    fn inner_equi_join() {
+        use kessel_proto::Op;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE usr (uid U32 NOT NULL)");
+        run(&mut sm, 2, "CREATE TABLE ord (owner U32 NOT NULL, amt U32 NOT NULL)");
+        // users 1,2,3 ; orders: owner 1 x2, owner 2 x1, owner 9 (no match)
+        run(&mut sm, 3, "INSERT INTO usr ID 1 (uid) VALUES (1)");
+        run(&mut sm, 4, "INSERT INTO usr ID 2 (uid) VALUES (2)");
+        run(&mut sm, 5, "INSERT INTO usr ID 3 (uid) VALUES (3)");
+        run(&mut sm, 6, "INSERT INTO ord ID 10 (owner, amt) VALUES (1, 100)");
+        run(&mut sm, 7, "INSERT INTO ord ID 11 (owner, amt) VALUES (1, 200)");
+        run(&mut sm, 8, "INSERT INTO ord ID 12 (owner, amt) VALUES (2, 50)");
+        run(&mut sm, 9, "INSERT INTO ord ID 13 (owner, amt) VALUES (9, 7)");
+
+        // compiles to Op::Join
+        let cat = sm.catalog().clone();
+        match compile("SELECT * FROM usr JOIN ord ON usr.uid = ord.owner", &cat).unwrap() {
+            Op::Join { left_field, right_field, .. } => {
+                assert_eq!((left_field, right_field), (1, 1));
+            }
+            o => panic!("expected Join, got {o:?}"),
+        }
+        // execute: 3 joined rows (uid1×2 orders + uid2×1)
+        match run(&mut sm, 20, "SELECT * FROM usr JOIN ord ON usr.uid = ord.owner") {
+            OpResult::Got(b) => {
+                let mut p = 0;
+                let mut rows = 0;
+                while p + 4 <= b.len() {
+                    let ll = u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize;
+                    p += 4 + ll;
+                    let rl = u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize;
+                    p += 4 + rl;
+                    rows += 1;
+                }
+                assert_eq!(rows, 3);
+            }
+            o => panic!("{o:?}"),
+        }
+        // ON columns may be written in either table order
+        assert!(matches!(
+            compile("SELECT * FROM usr JOIN ord ON ord.owner = usr.uid", &cat).unwrap(),
+            Op::Join { .. }
+        ));
+        // bad ON columns rejected
+        assert!(compile("SELECT * FROM usr JOIN ord ON usr.uid = usr.uid", &cat).is_err());
     }
 
     #[test]

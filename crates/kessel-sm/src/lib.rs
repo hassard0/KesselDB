@@ -1009,6 +1009,70 @@ impl<V: Vfs> StateMachine<V> {
                 None => OpResult::NotFound,
             },
 
+            Op::Join { left_type, right_type, left_field, right_field, limit } => {
+                let lt = match self.catalog.get(left_type) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {left_type}")),
+                };
+                let rt = match self.catalog.get(right_type) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {right_type}")),
+                };
+                let pos = |ot: &kessel_catalog::ObjectType, fid: u16| {
+                    ot.fields.iter().position(|f| f.field_id == fid).map(|i| {
+                        (ot.compute_layout().offsets[i], ot.fields[i].kind.width() as usize)
+                    })
+                };
+                let (loff, lw) = match pos(&lt, left_field) {
+                    Some(p) => p,
+                    None => return OpResult::SchemaError("no left join field".into()),
+                };
+                let (roff, rw) = match pos(&rt, right_field) {
+                    Some(p) => p,
+                    None => return OpResult::SchemaError("no right join field".into()),
+                };
+                if lw != rw {
+                    return OpResult::SchemaError(
+                        "join fields must have equal width".into(),
+                    );
+                }
+                // Build the right side keyed by the join value (scan order =>
+                // deterministic per-key ordering).
+                let mut map: std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>> =
+                    std::collections::HashMap::new();
+                let rlo = make_key(right_type, &[0u8; 16]);
+                let rhi = make_key(right_type, &[0xFFu8; 16]);
+                for (_, rr) in self.storage.scan_range(&rlo, &rhi) {
+                    if let Some(k) = rr.get(roff..roff + rw) {
+                        map.entry(k.to_vec()).or_default().push(rr);
+                    }
+                }
+                // Probe with the left side in key order.
+                let llo = make_key(left_type, &[0u8; 16]);
+                let lhi = make_key(left_type, &[0xFFu8; 16]);
+                let mut out = Vec::new();
+                let mut n = 0u32;
+                'outer: for (_, lr) in self.storage.scan_range(&llo, &lhi) {
+                    let k = match lr.get(loff..loff + lw) {
+                        Some(k) => k,
+                        None => continue,
+                    };
+                    if let Some(rs) = map.get(k) {
+                        for rr in rs {
+                            if limit != 0 && n >= limit {
+                                break 'outer;
+                            }
+                            out.extend_from_slice(&(lr.len() as u32).to_le_bytes());
+                            out.extend_from_slice(&lr);
+                            out.extend_from_slice(&(rr.len() as u32).to_le_bytes());
+                            out.extend_from_slice(rr);
+                            n += 1;
+                        }
+                    }
+                }
+                OpResult::Got(out)
+            }
+
             Op::GetBlob { handle } => match self.storage.get(&handle_key(handle)) {
                 Some(b) => OpResult::Got(b),
                 None => OpResult::NotFound,
@@ -1933,6 +1997,7 @@ impl<V: Vfs> StateMachine<V> {
                             | Op::Delete { .. }
                             | Op::GetById { .. }
                             | Op::Describe { .. }
+                            | Op::Join { .. }
                             | Op::GetBlob { .. }
                             | Op::FindBy { .. }
                             | Op::Query { .. }

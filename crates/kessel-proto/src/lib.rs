@@ -119,6 +119,18 @@ pub enum Op {
     /// Schema introspection (Sub-project 34): returns the table's serialized
     /// `(name, fields)` definition so a client can decode `SELECT` rows.
     Describe { type_id: TypeId },
+    /// Inner equi-join (Sub-project 36): rows where
+    /// `left.left_field == right.right_field` (raw fixed-width bytes).
+    /// Returns up to `limit` joined rows as
+    /// `[u32 total][u32 left_len][left rec][right rec]*`, deterministic
+    /// (left key order, then right scan order). Read-only.
+    Join {
+        left_type: TypeId,
+        right_type: TypeId,
+        left_field: u16,
+        right_field: u16,
+        limit: u32,
+    },
     /// Add a composite (multi-field) equality index (Sub-project 27);
     /// backfills existing rows.
     AddCompositeIndex { type_id: TypeId, fields: Vec<u16> },
@@ -220,6 +232,7 @@ impl Op {
             Op::Select { .. } => 19,
             Op::QueryRows { .. } => 26,
             Op::Describe { .. } => 27,
+            Op::Join { .. } => 28,
             Op::Aggregate { .. } => 20,
             Op::SelectFields { .. } => 21,
             Op::GroupAggregate { .. } => 22,
@@ -311,6 +324,13 @@ impl Op {
                 codec::put_u32(&mut b, *limit);
             }
             Op::Describe { type_id } => codec::put_u32(&mut b, *type_id),
+            Op::Join { left_type, right_type, left_field, right_field, limit } => {
+                codec::put_u32(&mut b, *left_type);
+                codec::put_u32(&mut b, *right_type);
+                b.extend_from_slice(&left_field.to_le_bytes());
+                b.extend_from_slice(&right_field.to_le_bytes());
+                codec::put_u32(&mut b, *limit);
+            }
             Op::QueryRows { type_id, eq_preds, program, limit } => {
                 codec::put_u32(&mut b, *type_id);
                 codec::put_u32(&mut b, eq_preds.len() as u32);
@@ -435,6 +455,13 @@ impl Op {
                 limit: c.u32()?,
             },
             27 => Op::Describe { type_id: c.u32()? },
+            28 => Op::Join {
+                left_type: c.u32()?,
+                right_type: c.u32()?,
+                left_field: c.u16()?,
+                right_field: c.u16()?,
+                limit: c.u32()?,
+            },
             26 => {
                 let type_id = c.u32()?;
                 let n = c.u32()? as usize;
@@ -685,6 +712,7 @@ mod tests {
             Op::Select { type_id: 4, program: vec![1, 2], limit: 10 },
             Op::QueryRows { type_id: 4, eq_preds: vec![(1, vec![9, 9])], program: vec![1], limit: 5 },
             Op::Describe { type_id: 4 },
+            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9 },
             Op::Aggregate { type_id: 4, program: vec![1], kind: 1, field_id: 3 },
             Op::SelectFields { type_id: 4, program: vec![1], fields: vec![1, 3], limit: 5 },
             Op::GroupAggregate { type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3 },

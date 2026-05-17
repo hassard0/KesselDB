@@ -43,6 +43,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP33 — SQL CREATE INDEX DDL** | **done** | `CREATE [UNIQUE\|RANGE] INDEX ON t(c)` → CreateIndex/AddUnique/AddOrderedIndex; `CREATE INDEX ON t(a,b)` → AddCompositeIndex. Full index workflow now pure-SQL end-to-end |
 | **SP34 — DESCRIBE** | **done** | `Op::Describe`/SQL `DESCRIBE\|DESC t` returns serialized `(name,fields)`; clients decode `SELECT` rows from the wire schema (closes the results-unusable-without-schema gap) |
 | **SP35 — AVG aggregate** | **done** | aggregate kind 4 = AVG (integer sum/count, empty→0) in Aggregate + GroupAggregate; SQL `AVG(col)`. Standard set COUNT/SUM/MIN/MAX/AVG complete |
+| **SP36 — inner equi-JOIN** | **done** | `Op::Join` deterministic hash-join over two scans; SQL `SELECT * FROM a JOIN b ON a.x=b.y [LIMIT]` (lexer `.`, bidirectional ON); leftrec++rightrec length-prefixed |
 
 ## M3 VSR — done vs. hardening backlog (honest)
 

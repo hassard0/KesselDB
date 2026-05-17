@@ -306,6 +306,13 @@ impl<V: Vfs> Replica<V> {
     pub fn catalog(&self) -> &kessel_catalog::Catalog {
         self.sm.catalog()
     }
+    /// True only when this replica is the primary of its current view AND
+    /// in `Normal` status — i.e. it can actually drive a fresh request to
+    /// commit. A cluster front uses this to redirect clients off a backup
+    /// or a mid-view-change node instead of letting them hang.
+    pub fn is_active_primary(&self) -> bool {
+        self.is_primary() && self.status == Status::Normal
+    }
     /// Introspection for diagnostics: (view, is_primary, status, commit,
     /// op_number, max_view_seen).
     pub fn probe(&self) -> (u64, bool, &'static str, u64, u64, u64) {

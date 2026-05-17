@@ -362,7 +362,8 @@ pub fn spawn_node(
         };
 
         // Submit one op through consensus under a fresh internal client id,
-        // with `cont` to fire when it commits.
+        // with `cont` to fire when it commits. Returns the driven `Out` and
+        // the `(client, req)` key, so the caller can redirect if stranded.
         let submit_internal = |replica: &mut Replica<DirVfs>,
                                pending: &mut HashMap<(ClientId, u64), Cont>,
                                iseq: &mut u128,
@@ -371,7 +372,27 @@ pub fn spawn_node(
             *iseq += 1;
             let c = *iseq;
             pending.insert((c, 1), cont);
-            replica.handle(self_idx, Msg::Request { client: c, req: 1, op })
+            let out = replica.handle(self_idx, Msg::Request { client: c, req: 1, op });
+            (out, (c, 1u64))
+        };
+
+        // If a request is still pending and this node is NOT the active
+        // primary, it will never be answered here (a backup only relays;
+        // the reply lands on the primary). Tell the client to try another
+        // node — exactly-once (SP40/41) makes the cross-node retry safe.
+        let redirect = |replica: &Replica<DirVfs>,
+                        pending: &mut HashMap<(ClientId, u64), Cont>,
+                        key: (ClientId, u64)| {
+            if replica.is_active_primary() {
+                return; // primary: the reply arrives async on commit
+            }
+            if let Some(cont) = pending.remove(&key) {
+                let s = match cont {
+                    Cont::Reply(s) => s,
+                    Cont::Update { reply, .. } => reply,
+                };
+                let _ = s.send(OpResult::Unavailable);
+            }
         };
 
         while let Ok(ev) = erx.recv() {
@@ -381,6 +402,7 @@ pub fn spawn_node(
                     let out =
                         replica.handle(self_idx, Msg::Request { client, req, op });
                     process(&mut replica, &mut pending, &mut iseq, out);
+                    redirect(&replica, &mut pending, (client, req));
                 }
                 Ev::ClientRaw { frame, reply } => {
                     if frame.first() == Some(&0xFE) {
@@ -394,7 +416,7 @@ pub fn spawn_node(
                         };
                         match kessel_sql::compile_stmt(sql, replica.catalog()) {
                             Ok(Stmt::Op(o)) => {
-                                let out = submit_internal(
+                                let (out, key) = submit_internal(
                                     &mut replica,
                                     &mut pending,
                                     &mut iseq,
@@ -407,10 +429,11 @@ pub fn spawn_node(
                                     &mut iseq,
                                     out,
                                 );
+                                redirect(&replica, &mut pending, key);
                             }
                             Ok(Stmt::Update { type_id, id, sets }) => {
                                 // RMW: linearized GetById, then patched Update.
-                                let out = submit_internal(
+                                let (out, key) = submit_internal(
                                     &mut replica,
                                     &mut pending,
                                     &mut iseq,
@@ -426,6 +449,7 @@ pub fn spawn_node(
                                     &mut iseq,
                                     out,
                                 );
+                                redirect(&replica, &mut pending, key);
                             }
                             Err(e) => {
                                 let _ = reply
@@ -435,7 +459,7 @@ pub fn spawn_node(
                     } else {
                         match Op::decode(&frame) {
                             Some(o) => {
-                                let out = submit_internal(
+                                let (out, key) = submit_internal(
                                     &mut replica,
                                     &mut pending,
                                     &mut iseq,
@@ -448,6 +472,7 @@ pub fn spawn_node(
                                     &mut iseq,
                                     out,
                                 );
+                                redirect(&replica, &mut pending, key);
                             }
                             None => {
                                 let _ = reply.send(OpResult::SchemaError(
@@ -493,7 +518,13 @@ fn handle_client_conn(mut s: TcpStream, node: Arc<Node>) {
             Ok(r) => r,
             Err(_) => break,
         };
-        let res = node.apply_raw(req);
+        // A `0xFD` session frame carries a stable (client, req) so a
+        // cross-node failover retry is exactly-once; route it through the
+        // dedup-aware path. Anything else keeps the legacy behaviour.
+        let res = match kessel_client::parse_session_frame(&req) {
+            Some((client, rq, op)) => node.submit_as(client, rq, op),
+            None => node.apply_raw(req),
+        };
         if write_frame(&mut s, &res.encode()).is_err() {
             break;
         }
@@ -851,6 +882,122 @@ mod tests {
         assert_eq!(
             nodes[0].submit(Op::Create { type_id: 1, id, record: vec![9] }),
             OpResult::Exists
+        );
+
+        for d in &dirs {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    fn poll_converged(nodes: &[Arc<Node>], want_commit: u64) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(10) {
+            let p: Vec<_> = nodes.iter().map(|nd| nd.probe()).collect();
+            let d0 = p[0].0;
+            if p.iter().all(|x| x.0 == d0 && x.2 >= want_commit) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn cluster_client_finds_primary_and_is_exactly_once() {
+        use kessel_client::{session_frame, ClusterClient};
+
+        let n = 3;
+        let peer_ls: Vec<TcpListener> = (0..n)
+            .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let addrs: Vec<SocketAddr> =
+            peer_ls.iter().map(|l| l.local_addr().unwrap()).collect();
+
+        let mut dirs = Vec::new();
+        let mut client_addrs = Vec::new();
+        let mut arc_nodes: Vec<Arc<Node>> = Vec::new();
+        for (i, l) in peer_ls.into_iter().enumerate() {
+            let dir = std::env::temp_dir()
+                .join(format!("kesseldb-cc-{}-{i}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            dirs.push(dir.clone());
+            let node = Arc::new(spawn_node(i, l, addrs.clone(), dir).unwrap());
+            let cl = TcpListener::bind("127.0.0.1:0").unwrap();
+            client_addrs.push(cl.local_addr().unwrap().to_string());
+            let nn = node.clone();
+            std::thread::spawn(move || serve_clients(cl, nn));
+            arc_nodes.push(node);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Address list with the PRIMARY (node 0) LAST, so the client must
+        // rotate past two followers (which answer Unavailable) to find it.
+        let ordered = vec![
+            client_addrs[1].clone(),
+            client_addrs[2].clone(),
+            client_addrs[0].clone(),
+        ];
+        let mut c = ClusterClient::new(ordered);
+
+        assert_eq!(
+            c.call(&Op::CreateType {
+                def: encode_type_def(
+                    "t",
+                    &[Field {
+                        field_id: 0,
+                        name: "v".into(),
+                        kind: FieldKind::U64,
+                        nullable: false,
+                    }],
+                ),
+            })
+            .unwrap(),
+            OpResult::TypeCreated(1),
+            "ClusterClient must rotate past followers and reach the primary"
+        );
+        let id = ObjectId::from_u128(5);
+        // req 2 — keep this the LATEST request: a VSR client has one
+        // outstanding request at a time and only ever retries its latest,
+        // so the client table (which keeps the last (req,result)) dedupes
+        // exactly that case.
+        assert_eq!(
+            c.call(&Op::Create { type_id: 1, id, record: vec![3] }).unwrap(),
+            OpResult::Ok
+        );
+
+        // Exactly-once across the wire: replay the *identical* committed
+        // session frame straight to a follower's client port; it must
+        // return the cached reply and NOT re-apply (digest stable).
+        assert!(
+            poll_converged(&arc_nodes, 2),
+            "cluster did not converge before the replay check"
+        );
+        let foll_digest = arc_nodes[1].probe().0;
+        // req 1 = CreateType, req 2 = the Create above. Replay req 2.
+        let frame = session_frame(
+            c.client_id(),
+            2,
+            &Op::Create { type_id: 1, id, record: vec![3] },
+        );
+        let mut raw = TcpStream::connect(&client_addrs[1]).unwrap();
+        write_frame(&mut raw, &frame).unwrap();
+        let resp = read_frame(&mut raw).unwrap();
+        assert_eq!(
+            OpResult::decode(&resp),
+            Some(OpResult::Ok),
+            "follower must serve the cached reply for a replayed session frame"
+        );
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            arc_nodes[1].probe().0,
+            foll_digest,
+            "replayed session frame re-applied — not exactly-once"
+        );
+
+        // Client still works for a fresh request after all the rotation.
+        assert_eq!(
+            c.call(&Op::GetById { type_id: 1, id }).unwrap(),
+            OpResult::Got(vec![3])
         );
 
         for d in &dirs {

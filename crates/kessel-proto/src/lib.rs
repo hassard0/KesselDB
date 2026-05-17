@@ -163,6 +163,11 @@ pub enum OpResult {
     /// A built-in constraint (NOT NULL / UNIQUE) rejected the write
     /// (Sub-project 4). Deterministic — counts as a committed op result.
     Constraint(String),
+    /// This node cannot serve the request right now (not the active
+    /// primary, or mid view-change) and held no cached result for it.
+    /// NOT a committed result — a transport-level "try another node"
+    /// signal so a cluster client rotates to the primary (Sub-project 42).
+    Unavailable,
 }
 
 impl OpResult {
@@ -188,6 +193,7 @@ impl OpResult {
                 b.push(6);
                 codec::put_bytes(&mut b, s.as_bytes());
             }
+            OpResult::Unavailable => b.push(7),
         }
         b
     }
@@ -202,6 +208,7 @@ impl OpResult {
             4 => OpResult::TypeCreated(c.u32()?),
             5 => OpResult::SchemaError(String::from_utf8_lossy(&c.bytes()?).into_owned()),
             6 => OpResult::Constraint(String::from_utf8_lossy(&c.bytes()?).into_owned()),
+            7 => OpResult::Unavailable,
             _ => return None,
         })
     }
@@ -739,6 +746,7 @@ mod tests {
             OpResult::TypeCreated(77),
             OpResult::SchemaError("nope".into()),
             OpResult::Constraint("UNIQUE x".into()),
+            OpResult::Unavailable,
         ] {
             assert_eq!(OpResult::decode(&r.encode()), Some(r));
         }

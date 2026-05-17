@@ -12,9 +12,9 @@ kessel-vsr = { path = "../kessel-vsr" }
 kessel-sql = { path = "../kessel-sql" }
 kessel-codec = { path = "../kessel-codec" }
 kessel-catalog = { path = "../kessel-catalog" }
+kessel-client = { path = "../kessel-client" }
 
 [dev-dependencies]
-kessel-client = { path = "../kessel-client" }
 kessel-expr = { path = "../kessel-expr" }
 
 [lib]

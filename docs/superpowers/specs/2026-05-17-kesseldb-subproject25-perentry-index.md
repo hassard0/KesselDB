@@ -40,14 +40,33 @@ claimed as a pure win.
 
 Unlike SP17 (fixed nothing, regressed reads), SP25 **fixes the actual
 flagged debt** and replaces a fundamentally non-scalable design (bucket RMW,
-quadratic under skew) with the correct one. The read regression is an
-*implementation* artifact of `scan_range`, not the data model, and is a
-clean, well-scoped follow-up:
+quadratic under skew) with the correct one real databases use.
 
-> **Documented follow-up (next perf SP):** a lightweight prefix-key iterator
-> (`Storage::scan_prefix`) that streams keys in `[lo,hi]` without building a
-> `BTreeMap` or cloning values, restoring O(matching) point/index reads while
-> keeping the O(1) write win.
+## CORRECTION (honest — superseding the optimistic note above)
 
-115 tests green; eq-index writes ~2.5× faster; read-path optimization
-explicitly queued.
+SP26 added the lightweight `Storage::scan_prefix` (keys-only, memtable
+fast-path, no merged-BTreeMap/value-clones) and pointed `idx_lookup` at it.
+It helped only marginally. The earlier claim that the FindBy regression was
+"just an implementation artifact of `scan_range`" was **over-optimistic and
+is hereby corrected**: it is a genuine **architectural read/write tradeoff**.
+
+- The old bucket design served point reads in ~1.2M ops/s *because* a value's
+  ids were one blob fetched in a single `get` — the very thing that made its
+  **writes pathological and non-scalable** (read-modify-write, quadratic
+  under value skew).
+- The per-entry design makes **writes O(1) and scalable** (the flagged #1
+  debt, genuinely fixed) at the cost of point-value reads being an
+  **O(matching) prefix scan** instead of a single get — slower per call but
+  scalable and not skew-quadratic.
+
+This is the correct tradeoff for a write-optimized, TigerBeetle-class engine.
+The old 1.2M FindBy number was an artifact of a non-scalable write design and
+is **not** the right baseline. Legitimate *further* read speedups (a
+per-prefix block index / bloom filter on the index keyspace; routing FindBy
+through the existing M4 read cache) are real future perf work — but framed
+honestly as enhancements, not as "restoring" a number that depended on a
+broken write path.
+
+115 tests green; eq-index writes materially faster and scalable; the read
+characteristic is a documented, understood, deliberate tradeoff — not hidden,
+not over-claimed.

@@ -474,7 +474,7 @@ impl<V: Vfs> StateMachine<V> {
         let mut hi = prefix.clone();
         hi.extend_from_slice(&[0xFFu8; 16]);
         let mut ids = Vec::new();
-        for (k, _) in self.storage.scan_range(&lo, &hi) {
+        for k in self.storage.scan_prefix(&lo, &hi) {
             if k.len() == prefix.len() + 16 && k.starts_with(&prefix) {
                 let mut id = [0u8; 16];
                 id.copy_from_slice(&k[prefix.len()..]);

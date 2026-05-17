@@ -539,6 +539,43 @@ impl<V: Vfs> Storage<V> {
             .collect()
     }
 
+    /// Keys present in `[lo, hi]` (live, tombstone-aware), nothing else.
+    /// Lightweight: avoids the merged-BTreeMap + value clones of
+    /// `scan_range`. Fast path when there are no SSTables and no active txn
+    /// (the common case for index prefix scans) — a direct memtable walk.
+    pub fn scan_prefix(&self, lo: &Key, hi: &Key) -> Vec<Key> {
+        if self.sstables.is_empty() && self.txn.is_none() {
+            return self
+                .memtable
+                .range(lo.clone()..=hi.clone())
+                .filter(|(_, v)| v.is_some())
+                .map(|(k, _)| k.clone())
+                .collect();
+        }
+        let mut present: BTreeMap<Key, bool> = BTreeMap::new();
+        for sst in &self.sstables {
+            let s = sst.entries.partition_point(|(k, _)| k < lo);
+            for (k, v) in &sst.entries[s..] {
+                if k > hi {
+                    break;
+                }
+                present.insert(k.clone(), v.is_some());
+            }
+        }
+        for (k, v) in self.memtable.range(lo.clone()..=hi.clone()) {
+            present.insert(k.clone(), v.is_some());
+        }
+        if let Some(ov) = &self.txn {
+            for (k, (_, v)) in ov.range(lo.clone()..=hi.clone()) {
+                present.insert(k.clone(), v.is_some());
+            }
+        }
+        present
+            .into_iter()
+            .filter_map(|(k, alive)| alive.then_some(k))
+            .collect()
+    }
+
     /// Order-independent CRC digest of the entire live keyspace.
     pub fn digest(&self) -> u32 {
         let mut acc: u32 = 0xFFFF_FFFF;

@@ -205,6 +205,122 @@ fn run_replicated(n: usize) {
     );
 }
 
+/// SP16: how much do the flexibility layers cost vs a plain create?
+/// In-memory (MemVfs) so this isolates CPU overhead, not fsync. Honest
+/// relative numbers feeding the "Postgres flexibility at TB speed" thesis.
+fn run_flex(n: usize) {
+    use kessel_expr::Program;
+    let tdef = || {
+        encode_type_def("t", &[
+            Field { field_id: 0, name: "owner".into(), kind: FieldKind::U32, nullable: false },
+            Field { field_id: 0, name: "score".into(), kind: FieldKind::I32, nullable: false },
+        ])
+    };
+    let rec = |owner: u32, score: i32| {
+        // record_size for two 4B fields = next_pow2(14+8)=32
+        let mut b = vec![0u8; 32];
+        b[14..18].copy_from_slice(&owner.to_le_bytes());
+        b[18..22].copy_from_slice(&score.to_le_bytes());
+        b
+    };
+    let time = |label: &str, n: usize, f: &mut dyn FnMut()| {
+        let t = Instant::now();
+        f();
+        let s = t.elapsed().as_secs_f64();
+        println!("  {label:<28} {:>10.0} ops/s", n as f64 / s);
+    };
+
+    println!("[flex] in-memory; relative CPU cost of the flexibility layers");
+
+    // baseline: plain create, no indexes/constraints
+    {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: tdef() });
+        let mut op = 2u64;
+        time("plain CREATE", n, &mut || {
+            for i in 0..n {
+                sm.apply(op, Op::Create { type_id: 1, id: ObjectId::from_u128(i as u128), record: rec(i as u32, i as i32) });
+                op += 1;
+            }
+        });
+    }
+    // + equality index
+    {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: tdef() });
+        sm.apply(2, Op::CreateIndex { type_id: 1, field_id: 1 });
+        let mut op = 3u64;
+        time("CREATE +eq-index", n, &mut || {
+            for i in 0..n {
+                sm.apply(op, Op::Create { type_id: 1, id: ObjectId::from_u128(i as u128), record: rec((i % 1000) as u32, i as i32) });
+                op += 1;
+            }
+        });
+        let mut op2 = op;
+        time("FindBy (indexed eq)", n, &mut || {
+            for i in 0..n {
+                sm.apply(op2, Op::FindBy { type_id: 1, field_id: 1, value: ((i % 1000) as u32).to_le_bytes().to_vec() });
+                op2 += 1;
+            }
+        });
+    }
+    // + ordered index, then range/scan reads
+    {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: tdef() });
+        sm.apply(2, Op::AddOrderedIndex { type_id: 1, field_id: 2 });
+        let mut op = 3u64;
+        time("CREATE +ordered-index", n, &mut || {
+            for i in 0..n {
+                sm.apply(op, Op::Create { type_id: 1, id: ObjectId::from_u128(i as u128), record: rec(i as u32, (i % 5000) as i32) });
+                op += 1;
+            }
+        });
+        let mut op2 = op;
+        time("FindRange (1% window)", n, &mut || {
+            for _ in 0..n {
+                sm.apply(op2, Op::FindRange { type_id: 1, field_id: 2, lo: 0i32.to_le_bytes().to_vec(), hi: 50i32.to_le_bytes().to_vec() });
+                op2 += 1;
+            }
+        });
+        let prog = Program::new().load(2).push_int(2500).ge().bytes();
+        let mut op3 = op2;
+        let m = (n / 20).max(1); // QueryExpr is a full scan; fewer iters
+        time("QueryExpr (full scan)", m, &mut || {
+            for _ in 0..m {
+                sm.apply(op3, Op::QueryExpr { type_id: 1, program: prog.clone() });
+                op3 += 1;
+            }
+        });
+    }
+    // + CHECK constraint
+    {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: tdef() });
+        sm.apply(2, Op::AddCheck { type_id: 1, program: Program::new().load(2).push_int(0).ge().bytes() });
+        let mut op = 3u64;
+        time("CREATE +CHECK", n, &mut || {
+            for i in 0..n {
+                sm.apply(op, Op::Create { type_id: 1, id: ObjectId::from_u128(i as u128), record: rec(i as u32, (i % 1000) as i32) });
+                op += 1;
+            }
+        });
+    }
+    // + trigger (derived field)
+    {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: tdef() });
+        sm.apply(2, Op::AddTrigger { type_id: 1, program: Program::new().load(1).push_int(2).mul().set_field(2).bytes() });
+        let mut op = 3u64;
+        time("CREATE +trigger", n, &mut || {
+            for i in 0..n {
+                sm.apply(op, Op::Create { type_id: 1, id: ObjectId::from_u128(i as u128), record: rec(i as u32, 0) });
+                op += 1;
+            }
+        });
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(200_000);
@@ -213,6 +329,7 @@ fn main() {
 
     println!("KesselDB M2 single-node benchmark — N={n}, vfs={vfs}, batch={batch} (localhost)");
     match vfs {
+        "flex" => run_flex(n),
         "repl" => run_replicated(n),
         "file" => {
             let dir = std::env::temp_dir().join(format!("kesseldb-bench-{}", std::process::id()));

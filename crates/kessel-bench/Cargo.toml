@@ -11,6 +11,7 @@ kessel-catalog = { path = "../kessel-catalog" }
 kessel-codec = { path = "../kessel-codec" }
 kessel-sm = { path = "../kessel-sm" }
 kessel-vsr = { path = "../kessel-vsr" }
+kessel-expr = { path = "../kessel-expr" }
 
 [[bin]]
 name = "kessel-bench"

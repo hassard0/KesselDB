@@ -133,6 +133,9 @@ pub struct ObjectType {
     /// CHECK constraints (Sub-project 7): compiled kessel-expr programs that
     /// must evaluate true for every written row.
     pub checks: Vec<Vec<u8>>,
+    /// Before-write triggers (Sub-project 8): kessel-expr programs run in
+    /// order on each Create/Update; may mutate the record or reject it.
+    pub triggers: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -287,6 +290,11 @@ impl Catalog {
                 b.extend_from_slice(&(prog.len() as u32).to_le_bytes());
                 b.extend_from_slice(prog);
             }
+            b.extend_from_slice(&(t.triggers.len() as u16).to_le_bytes());
+            for prog in &t.triggers {
+                b.extend_from_slice(&(prog.len() as u32).to_le_bytes());
+                b.extend_from_slice(prog);
+            }
         }
         b
     }
@@ -341,6 +349,15 @@ impl Catalog {
                 checks.push(b.get(p..p + cl)?.to_vec());
                 p += cl;
             }
+            let nt = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
+            p += 2;
+            let mut triggers = Vec::with_capacity(nt);
+            for _ in 0..nt {
+                let tl = u32::from_le_bytes(b.get(p..p + 4)?.try_into().ok()?) as usize;
+                p += 4;
+                triggers.push(b.get(p..p + tl)?.to_vec());
+                p += tl;
+            }
             types.push(ObjectType {
                 type_id,
                 name,
@@ -350,6 +367,7 @@ impl Catalog {
                 unique,
                 fks,
                 checks,
+                triggers,
             });
         }
         Some(Catalog {
@@ -374,7 +392,7 @@ mod tests {
 
     #[test]
     fn layout_is_pure_and_deterministic() {
-        let t = ObjectType { type_id: 1, name: "transfer".into(), schema_ver: 1, fields: sample_fields(), indexes: vec![], unique: vec![], fks: vec![], checks: vec![] };
+        let t = ObjectType { type_id: 1, name: "transfer".into(), schema_ver: 1, fields: sample_fields(), indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![] };
         let a = t.compute_layout();
         let b = t.compute_layout();
         assert_eq!(a, b);
@@ -388,7 +406,7 @@ mod tests {
 
     #[test]
     fn appending_nullable_field_keeps_existing_offsets() {
-        let mut t = ObjectType { type_id: 1, name: "t".into(), schema_ver: 1, fields: sample_fields(), indexes: vec![], unique: vec![], fks: vec![], checks: vec![] };
+        let mut t = ObjectType { type_id: 1, name: "t".into(), schema_ver: 1, fields: sample_fields(), indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![] };
         let before = t.compute_layout();
         t.fields.push(Field { field_id: 5, name: "memo".into(), kind: FieldKind::Char(32), nullable: true });
         t.schema_ver += 1;
@@ -410,8 +428,8 @@ mod tests {
     fn catalog_roundtrip() {
         let mut c = Catalog::default();
         c.next_type_id = 3;
-        c.types.push(ObjectType { type_id: 1, name: "a".into(), schema_ver: 2, fields: sample_fields(), indexes: vec![3], unique: vec![3], fks: vec![(3, 9)], checks: vec![vec![1, 2, 3]] });
-        c.types.push(ObjectType { type_id: 2, name: "b".into(), schema_ver: 1, fields: vec![], indexes: vec![], unique: vec![], fks: vec![], checks: vec![] });
+        c.types.push(ObjectType { type_id: 1, name: "a".into(), schema_ver: 2, fields: sample_fields(), indexes: vec![3], unique: vec![3], fks: vec![(3, 9)], checks: vec![vec![1, 2, 3]], triggers: vec![vec![7, 7]] });
+        c.types.push(ObjectType { type_id: 2, name: "b".into(), schema_ver: 1, fields: vec![], indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![] });
         let enc = c.encode();
         let dec = Catalog::decode(&enc).unwrap();
         assert_eq!(dec.next_type_id, 3);
@@ -422,6 +440,7 @@ mod tests {
         assert_eq!(dec.types[0].unique, vec![3], "unique survives roundtrip");
         assert_eq!(dec.types[0].fks, vec![(3, 9)], "fks survive roundtrip");
         assert_eq!(dec.types[0].checks, vec![vec![1u8, 2, 3]], "checks survive roundtrip");
+        assert_eq!(dec.types[0].triggers, vec![vec![7u8, 7]], "triggers survive roundtrip");
         assert_eq!(dec.types[1].indexes, Vec::<u16>::new());
         assert_eq!(dec.types[1].unique, Vec::<u16>::new());
         assert_eq!(dec.types[1].fks, Vec::<(u16, u32)>::new());

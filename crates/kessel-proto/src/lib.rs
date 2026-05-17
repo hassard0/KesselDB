@@ -64,6 +64,9 @@ pub enum Op {
     /// Add a CHECK constraint (Sub-project 7): a compiled kessel-expr program
     /// that must evaluate true for every written row. Validates current data.
     AddCheck { type_id: TypeId, program: Vec<u8> },
+    /// Add a before-write trigger (Sub-project 8): a compiled kessel-expr
+    /// program run on each Create/Update; may mutate the record or reject it.
+    AddTrigger { type_id: TypeId, program: Vec<u8> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,6 +99,7 @@ impl Op {
             Op::Query { .. } => 11,
             Op::AddForeignKey { .. } => 12,
             Op::AddCheck { .. } => 13,
+            Op::AddTrigger { .. } => 14,
         }
     }
 
@@ -150,6 +154,10 @@ impl Op {
                 codec::put_u32(&mut b, *type_id);
                 codec::put_bytes(&mut b, program);
             }
+            Op::AddTrigger { type_id, program } => {
+                codec::put_u32(&mut b, *type_id);
+                codec::put_bytes(&mut b, program);
+            }
         }
         b
     }
@@ -187,6 +195,7 @@ impl Op {
                 ref_type_id: c.u32()?,
             },
             13 => Op::AddCheck { type_id: c.u32()?, program: c.bytes()? },
+            14 => Op::AddTrigger { type_id: c.u32()?, program: c.bytes()? },
             _ => return None,
         };
         Some(op)
@@ -335,6 +344,7 @@ mod tests {
             },
             Op::AddForeignKey { type_id: 4, field_id: 1, ref_type_id: 2 },
             Op::AddCheck { type_id: 4, program: vec![0, 1, 2, 3] },
+            Op::AddTrigger { type_id: 4, program: vec![5, 6] },
         ];
         for op in ops {
             let enc = op.encode();

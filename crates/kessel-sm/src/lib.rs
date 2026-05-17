@@ -499,6 +499,26 @@ impl<V: Vfs> StateMachine<V> {
         Ok(())
     }
 
+    /// Run every before-write trigger of `type_id` in order. Each may mutate
+    /// the record or reject the write. Deterministic (pure gas-bounded VM).
+    fn run_triggers(&self, type_id: u32, mut rec: Vec<u8>) -> Result<Vec<u8>, String> {
+        let ot = match self.catalog.get(type_id) {
+            Some(t) => t,
+            None => return Ok(rec),
+        };
+        if ot.triggers.is_empty() {
+            return Ok(rec);
+        }
+        for (n, prog) in ot.triggers.iter().enumerate() {
+            match kessel_expr::eval_trigger(prog, ot, &rec) {
+                Ok(Some(next)) => rec = next,
+                Ok(None) => return Err(format!("trigger #{n} rejected the write")),
+                Err(e) => return Err(format!("trigger #{n} error: {e:?}")),
+            }
+        }
+        Ok(rec)
+    }
+
     /// Run every CHECK program of `type_id` against `rec`. A program that
     /// returns false OR errors (div-by-zero, bad program, out-of-gas) rejects
     /// the write. Deterministic: the VM is pure and gas-bounded.
@@ -550,6 +570,7 @@ impl<V: Vfs> StateMachine<V> {
                     unique: Vec::new(),
                     fks: Vec::new(),
                     checks: Vec::new(),
+                    triggers: Vec::new(),
                 });
                 self.catalog.next_type_id += 1;
                 match self.persist_catalog(op_number) {
@@ -602,6 +623,10 @@ impl<V: Vfs> StateMachine<V> {
                     .get(type_id)
                     .map(|t| !t.indexes.is_empty())
                     .unwrap_or(false);
+                let record = match self.run_triggers(type_id, record) {
+                    Ok(r) => r,
+                    Err(e) => return OpResult::Constraint(e),
+                };
                 if let Some(t) = self.catalog.get(type_id) {
                     if let Err(e) = Self::check_not_null(t, &record) {
                         return OpResult::Constraint(e);
@@ -650,6 +675,10 @@ impl<V: Vfs> StateMachine<V> {
                     .get(type_id)
                     .map(|t| !t.indexes.is_empty())
                     .unwrap_or(false);
+                let record = match self.run_triggers(type_id, record) {
+                    Ok(r) => r,
+                    Err(e) => return OpResult::Constraint(e),
+                };
                 if let Some(t) = self.catalog.get(type_id) {
                     if let Err(e) = Self::check_not_null(t, &record) {
                         return OpResult::Constraint(e);
@@ -1032,6 +1061,28 @@ impl<V: Vfs> StateMachine<V> {
                 }
                 self.persist_catalog(op_number)
             }
+
+            Op::AddTrigger { type_id, program } => {
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                // Structural validation against a zero record.
+                let zero = vec![0u8; ot.compute_layout().record_size];
+                if let Err(e) = kessel_expr::eval_trigger(&program, &ot, &zero) {
+                    if matches!(
+                        e,
+                        kessel_expr::ExprError::BadProgram
+                            | kessel_expr::ExprError::StackUnderflow
+                    ) {
+                        return OpResult::SchemaError(format!("bad trigger program: {e:?}"));
+                    }
+                }
+                if let Some(t) = self.catalog.get_mut(type_id) {
+                    t.triggers.push(program);
+                }
+                self.persist_catalog(op_number)
+            }
         }
     }
 
@@ -1233,6 +1284,7 @@ mod tests {
             unique: vec![],
             fks: vec![],
             checks: vec![],
+            triggers: vec![],
         };
         vec![0u8; t.compute_layout().record_size]
     }
@@ -1319,6 +1371,7 @@ mod tests {
             unique: vec![],
             fks: vec![],
             checks: vec![],
+            triggers: vec![],
         };
         let mut b = vec![0u8; t.compute_layout().record_size];
         let o0 = t.compute_layout().offsets[0];
@@ -1502,6 +1555,7 @@ mod tests {
             unique: vec![],
             fks: vec![],
             checks: vec![],
+            triggers: vec![],
         }
         .compute_layout()
     }
@@ -1629,6 +1683,100 @@ mod tests {
         assert!(!ids_a.is_empty());
     }
 
+    // ---- Sub-project 8: deterministic mutating triggers ----
+
+    #[test]
+    fn trigger_derives_field_on_write() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: chk_type() }); // fields age(I32) f1, bal(I64) f2
+        // trigger: bal := age * 10
+        let prog = kessel_expr::Program::new()
+            .load(1).push_int(10).mul().set_field(2)
+            .bytes();
+        assert_eq!(sm.apply(2, Op::AddTrigger { type_id: 1, program: prog }), OpResult::Ok);
+        assert_eq!(
+            sm.apply(3, Op::Create { type_id: 1, id: ObjectId::from_u128(1), record: chk_rec(7, 0) }),
+            OpResult::Ok
+        );
+        // read back: bal must have been set to 70 by the trigger
+        match sm.apply(4, Op::GetById { type_id: 1, id: ObjectId::from_u128(1) }) {
+            OpResult::Got(r) => {
+                let l = q_like_layout();
+                let bal = i64::from_le_bytes(r[l.1..l.1 + 8].try_into().unwrap());
+                assert_eq!(bal, 70, "trigger derived bal = age*10");
+            }
+            o => panic!("unexpected {o:?}"),
+        }
+        // update also re-derives
+        sm.apply(5, Op::Update { type_id: 1, id: ObjectId::from_u128(1), record: chk_rec(3, 999) });
+        match sm.apply(6, Op::GetById { type_id: 1, id: ObjectId::from_u128(1) }) {
+            OpResult::Got(r) => {
+                let l = q_like_layout();
+                let bal = i64::from_le_bytes(r[l.1..l.1 + 8].try_into().unwrap());
+                assert_eq!(bal, 30, "trigger re-derived on update (ignored client 999)");
+            }
+            o => panic!("unexpected {o:?}"),
+        }
+    }
+
+    // offsets of (age, bal) for the chk_type layout
+    fn q_like_layout() -> (usize, usize) {
+        let ot = ObjectType {
+            type_id: 1, name: "acct".into(), schema_ver: 1,
+            fields: vec![
+                Field { field_id: 1, name: "age".into(), kind: FieldKind::I32, nullable: false },
+                Field { field_id: 2, name: "bal".into(), kind: FieldKind::I64, nullable: false },
+            ],
+            indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![],
+        };
+        let l = ot.compute_layout();
+        (l.offsets[0], l.offsets[1])
+    }
+
+    #[test]
+    fn trigger_can_reject_write() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: chk_type() });
+        let prog = kessel_expr::Program::new().reject().bytes();
+        assert_eq!(sm.apply(2, Op::AddTrigger { type_id: 1, program: prog }), OpResult::Ok);
+        assert!(matches!(
+            sm.apply(3, Op::Create { type_id: 1, id: ObjectId::from_u128(1), record: chk_rec(1, 1) }),
+            OpResult::Constraint(_)
+        ));
+        // malformed trigger -> SchemaError not panic
+        assert!(matches!(
+            sm.apply(4, Op::AddTrigger { type_id: 1, program: vec![3] }),
+            OpResult::SchemaError(_)
+        ));
+    }
+
+    #[test]
+    fn trigger_then_check_compose_deterministically() {
+        let build = || {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            sm.apply(1, Op::CreateType { def: chk_type() });
+            // trigger: bal := age * 2 ; CHECK: bal >= 0  (rejects negative age)
+            sm.apply(2, Op::AddTrigger {
+                type_id: 1,
+                program: kessel_expr::Program::new().load(1).push_int(2).mul().set_field(2).bytes(),
+            });
+            sm.apply(3, Op::AddCheck {
+                type_id: 1,
+                program: kessel_expr::Program::new().load(2).push_int(0).ge().bytes(),
+            });
+            for i in 0..40i64 {
+                let age = (i as i32) - 15;
+                sm.apply(4 + i as u64, Op::Create {
+                    type_id: 1,
+                    id: ObjectId::from_u128(i as u128),
+                    record: chk_rec(age, 7777),
+                });
+            }
+            sm.digest()
+        };
+        assert_eq!(build(), build(), "trigger+check pipeline must be deterministic");
+    }
+
     // ---- Sub-project 7: CHECK via deterministic expression VM ----
 
     fn chk_type() -> Vec<u8> {
@@ -1644,7 +1792,7 @@ mod tests {
                 Field { field_id: 1, name: "age".into(), kind: FieldKind::I32, nullable: false },
                 Field { field_id: 2, name: "bal".into(), kind: FieldKind::I64, nullable: false },
             ],
-            indexes: vec![], unique: vec![], fks: vec![], checks: vec![],
+            indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![],
         };
         let l = ot.compute_layout();
         let mut b = vec![0u8; l.record_size];

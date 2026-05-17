@@ -171,6 +171,7 @@ mod tests {
             unique: vec![],
             fks: vec![],
             checks: vec![],
+            triggers: vec![],
         }
     }
 

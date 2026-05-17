@@ -15,6 +15,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP5 — query planner** | **done** | `Op::Query` AND-of-(Eq/Ge/Le); multi-index intersection + filtered `scan_range` fallback; per-kind numeric compare; read-only & deterministic |
 | **SP6 — foreign keys** | **done** | `Op::AddForeignKey` (validates existing data); ref-exists enforced on create/update (codec-scoped); replicated convergence; no ON DELETE cascade (documented) |
 | **SP7 — expression VM + CHECK** | **done** | zero-dep deterministic gas-bounded stack VM (`kessel-expr`); `Op::AddCheck` (structural + existing-data validation); enforced on create/update; replicated convergence |
+| **SP8 — deterministic triggers** | **done** | same VM + `SET_FIELD`/`REJECT`; `Op::AddTrigger`; mutate/reject before constraints; order-independent; replicated convergence |
 
 ## M3 VSR — done vs. hardening backlog (honest)
 
@@ -101,13 +102,22 @@ false or any VM error. 3-node VSR convergence tested. Spec:
 replicated state machine. **Honest limits:** predicate-only (no mutation —
 that's SP8 triggers, same VM); single-row; no aggregates; u128-high-bit edge.
 
+## Sub-project 8 — deterministic mutating triggers (done)
+
+Same `kessel-expr` VM + `SET_FIELD`/`REJECT`. `ObjectType.triggers` +
+`Op::AddTrigger`. Before-write triggers run in order, may mutate (derived/
+generated columns) or reject; output then flows through all constraints.
+Order-independent (LoadField reads original record). 3-node VSR convergence
+tested. Spec: `docs/superpowers/specs/2026-05-17-kesseldb-subproject8-triggers.md`.
+**Honest limits:** BEFORE-only, single-row, branch-free ISA, no cascading.
+
 ## What this is NOT (yet)
 
-Still out of scope (each a later spec): deterministic triggers (mutating, SP8),
-ON DELETE/UPDATE referential actions, OR/NOT queries, order-preserving range
-index, balance-guard constraint, destructive ALTER/DROP, overflow GC,
-index-write throughput optimization, M3 hardening backlog (partition matrix,
-disk-fault-in-VC, seed-corpus sweep, socket transport, membership), client SDKs.
+Still out of scope (each a later spec): ON DELETE/UPDATE referential actions,
+OR/NOT queries, order-preserving range index, balance-guard constraint,
+destructive ALTER/DROP, overflow GC, index-write throughput optimization,
+M3 hardening backlog (partition matrix, disk-fault-in-VC, seed-corpus sweep,
+socket transport, membership), client SDKs.
 
 ## Performance log
 

@@ -806,6 +806,39 @@ pub mod sim {
     }
 
     #[test]
+    fn trigger_replicates_and_converges() {
+        // A mutating trigger (derived field) must produce byte-identical
+        // rows on every replica.
+        let mut c = Cluster::new(3, 29, 0);
+        // trigger: y := x * 3
+        let prog = Program::new().load(1).push_int(3).mul().set_field(2).bytes();
+        let row = |x: i32| {
+            let mut b = vec![0u8; 32]; // I32 x @14, I64 y @18
+            b[14..18].copy_from_slice(&x.to_le_bytes());
+            b
+        };
+        let mut reqs = vec![
+            (1u128, 1u64, Op::CreateType {
+                def: encode_type_def("a", &[
+                    Field { field_id: 0, name: "x".into(), kind: FieldKind::I32, nullable: false },
+                    Field { field_id: 0, name: "y".into(), kind: FieldKind::I64, nullable: false },
+                ]),
+            }),
+            (1, 2, Op::AddTrigger { type_id: 1, program: prog }),
+        ];
+        for i in 0..30i64 {
+            reqs.push((1, i as u64 + 3, Op::Create {
+                type_id: 1,
+                id: ObjectId::from_u128(i as u128),
+                record: row(i as i32),
+            }));
+        }
+        assert_ne!(c.run(&reqs, 12000), usize::MAX);
+        let d = c.live_digests();
+        assert!(d.iter().all(|v| *v == d[0]), "trigger output diverged: {d:?}");
+    }
+
+    #[test]
     fn converges_under_message_loss() {
         let mut c = Cluster::new(3, 9, 25); // drop 25% of messages
         let mut reqs = vec![(3u128, 1u64, def())];

@@ -50,6 +50,8 @@ const AND: u8 = 14;
 const OR: u8 = 15;
 const NOT: u8 = 16;
 const PUSH_BYTES: u8 = 17;
+const SET_FIELD: u8 = 18; // trigger-only: pop value, write into working record
+const REJECT: u8 = 19; // trigger-only: abort the write
 
 /// Fluent program builder (test/host convenience). Emits the wire bytecode.
 #[derive(Default)]
@@ -100,6 +102,17 @@ impl Program {
     pub fn and(self) -> Self { self.op(AND) }
     pub fn or(self) -> Self { self.op(OR) }
     pub fn not(self) -> Self { self.op(NOT) }
+    /// Trigger op: pop the top value and store it into `field_id` of the
+    /// working record (numeric → LE width, bytes → fixed width).
+    pub fn set_field(mut self, field_id: u16) -> Self {
+        self.code.push(SET_FIELD);
+        self.code.extend_from_slice(&field_id.to_le_bytes());
+        self
+    }
+    /// Trigger op: abort the write (row rejected).
+    pub fn reject(self) -> Self {
+        self.op(REJECT)
+    }
     pub fn bytes(self) -> Vec<u8> {
         self.code
     }
@@ -186,9 +199,77 @@ fn truthy(v: &Value) -> bool {
     matches!(v, Value::Int(n) if *n != 0)
 }
 
+/// Write `val` into `work` at `field_id` (numeric → LE width, bytes → fixed
+/// width, Null → zeroed + null bit if codec-shaped). Used by triggers.
+fn write_field(ot: &ObjectType, work: &mut [u8], field_id: u16, val: &Value) {
+    use kessel_catalog::SCHEMA_VER_BYTES;
+    let i = match ot.fields.iter().position(|f| f.field_id == field_id) {
+        Some(i) => i,
+        None => return,
+    };
+    let layout = ot.compute_layout();
+    let off = layout.offsets[i];
+    let w = ot.fields[i].kind.width() as usize;
+    if off + w > work.len() {
+        return;
+    }
+    let codec_shaped = work.len() == layout.record_size
+        && u16::from_le_bytes(work[SCHEMA_VER_BYTES..SCHEMA_VER_BYTES + 2].try_into().unwrap())
+            as usize
+            == ot.fields.len();
+    let clear_null = |w_: &mut [u8]| {
+        if codec_shaped {
+            w_[SCHEMA_VER_BYTES + 2 + i / 8] &= !(1 << (i % 8));
+        }
+    };
+    match val {
+        Value::Int(n) => {
+            let le = n.to_le_bytes();
+            work[off..off + w].copy_from_slice(&le[..w.min(16)]);
+            if w > 16 {
+                for b in work[off + 16..off + w].iter_mut() {
+                    *b = if *n < 0 { 0xFF } else { 0 };
+                }
+            }
+            clear_null(work);
+        }
+        Value::Bytes(b) => {
+            let n = b.len().min(w);
+            work[off..off + n].copy_from_slice(&b[..n]);
+            for x in work[off + n..off + w].iter_mut() {
+                *x = 0;
+            }
+            clear_null(work);
+        }
+        Value::Null => {
+            for x in work[off..off + w].iter_mut() {
+                *x = 0;
+            }
+            if codec_shaped {
+                work[SCHEMA_VER_BYTES + 2 + i / 8] |= 1 << (i % 8);
+            }
+        }
+    }
+}
+
+/// Outcome of running a program: whether a trigger rejected, and the final
+/// stack top (for predicate `eval`).
+struct RunEnd {
+    rejected: bool,
+    top: Option<Value>,
+}
+
 /// Evaluate `code` against `rec` of `ot`. Returns the boolean verdict
 /// (top-of-stack must be a non-zero Int to pass).
-pub fn eval(code: &[u8], ot: &ObjectType, rec: &[u8]) -> Result<bool, ExprError> {
+/// Core interpreter. `LoadField`/`IsNull` read the ORIGINAL `rec` (so
+/// trigger output is order-independent and deterministic); `SET_FIELD`
+/// mutates `work`. `REJECT` stops with `rejected=true`.
+fn run(
+    code: &[u8],
+    ot: &ObjectType,
+    rec: &[u8],
+    work: &mut [u8],
+) -> Result<RunEnd, ExprError> {
     let mut st: Vec<Value> = Vec::new();
     let mut pc = 0usize;
     let mut gas = 0u32;
@@ -306,12 +387,50 @@ pub fn eval(code: &[u8], ot: &ObjectType, rec: &[u8]) -> Result<bool, ExprError>
                 let a = pop!();
                 st.push(Value::Int((!truthy(&a)) as i128));
             }
+            SET_FIELD => {
+                let fid = u16::from_le_bytes(
+                    code.get(pc..pc + 2).ok_or(ExprError::BadProgram)?.try_into().unwrap(),
+                );
+                pc += 2;
+                let v = pop!();
+                write_field(ot, work, fid, &v);
+            }
+            REJECT => {
+                return Ok(RunEnd { rejected: true, top: None });
+            }
             _ => return Err(ExprError::BadProgram),
         }
     }
-    match st.last() {
-        Some(v) => Ok(truthy(v)),
+    Ok(RunEnd {
+        rejected: false,
+        top: st.last().cloned(),
+    })
+}
+
+/// Evaluate a predicate program (CHECK). True iff top-of-stack is a
+/// non-zero Int.
+pub fn eval(code: &[u8], ot: &ObjectType, rec: &[u8]) -> Result<bool, ExprError> {
+    let mut work = rec.to_vec(); // unused by predicate ops
+    let end = run(code, ot, rec, &mut work)?;
+    match end.top {
+        Some(v) => Ok(truthy(&v)),
         None => Err(ExprError::EmptyResult),
+    }
+}
+
+/// Run a trigger program. `Ok(None)` = the row is rejected; `Ok(Some(rec'))`
+/// = the (possibly mutated) record to continue writing. Deterministic.
+pub fn eval_trigger(
+    code: &[u8],
+    ot: &ObjectType,
+    rec: &[u8],
+) -> Result<Option<Vec<u8>>, ExprError> {
+    let mut work = rec.to_vec();
+    let end = run(code, ot, rec, &mut work)?;
+    if end.rejected {
+        Ok(None)
+    } else {
+        Ok(Some(work))
     }
 }
 
@@ -333,6 +452,7 @@ mod tests {
             unique: vec![],
             fks: vec![],
             checks: vec![],
+            triggers: vec![],
         }
     }
     fn rec(age: i32, bal: i64) -> Vec<u8> {
@@ -389,6 +509,30 @@ mod tests {
         assert_eq!(eval(&[EQ], &ot(), &rec(0, 0)), Err(ExprError::StackUnderflow));
         assert_eq!(eval(&[], &ot(), &rec(0, 0)), Err(ExprError::EmptyResult));
         assert_eq!(eval(&[250], &ot(), &rec(0, 0)), Err(ExprError::BadProgram));
+    }
+
+    #[test]
+    fn trigger_sets_derived_field() {
+        // trigger: bal := age * 10
+        let p = Program::new().load(1).push_int(10).mul().set_field(2).bytes();
+        let out = eval_trigger(&p, &ot(), &rec(7, 0)).unwrap().unwrap();
+        // read field 2 (bal, I64) back from the mutated record
+        let l = ot().compute_layout();
+        let bal = i64::from_le_bytes(out[l.offsets[1]..l.offsets[1] + 8].try_into().unwrap());
+        assert_eq!(bal, 70);
+    }
+
+    #[test]
+    fn trigger_can_reject() {
+        let p = Program::new().reject().bytes();
+        assert_eq!(eval_trigger(&p, &ot(), &rec(1, 1)), Ok(None));
+        // conditional reject is up to the host (run program, then a guard
+        // CHECK) — the VM stays branch-free; here we just prove REJECT works.
+        let q = Program::new().load(1).push_int(5).set_field(1).bytes();
+        let out = eval_trigger(&q, &ot(), &rec(9, 0)).unwrap().unwrap();
+        let l = ot().compute_layout();
+        let age = i32::from_le_bytes(out[l.offsets[0]..l.offsets[0] + 4].try_into().unwrap());
+        assert_eq!(age, 5, "set_field overwrote age");
     }
 
     #[test]

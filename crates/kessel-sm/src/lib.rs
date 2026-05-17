@@ -21,6 +21,9 @@ fn catalog_key() -> Key {
 pub struct StateMachine<V: Vfs> {
     catalog: Catalog,
     storage: Storage<V>,
+    /// Optional read cache. NEVER consulted to compute committed state or the
+    /// digest — only to short-circuit `GetById`. Off => zero core-path effect.
+    cache: Option<kessel_cache::ReadCache>,
 }
 
 impl<V: Vfs> StateMachine<V> {
@@ -34,7 +37,21 @@ impl<V: Vfs> StateMachine<V> {
         if catalog.next_type_id == 0 {
             catalog.next_type_id = 1; // 0 reserved for the catalog itself
         }
-        Ok(StateMachine { catalog, storage })
+        Ok(StateMachine {
+            catalog,
+            storage,
+            cache: None,
+        })
+    }
+
+    /// Enable a bounded read cache (M4). Purely a `GetById` accelerator.
+    pub fn with_cache(mut self, capacity: usize) -> Self {
+        self.cache = Some(kessel_cache::ReadCache::new(capacity));
+        self
+    }
+
+    pub fn cache_hit_rate(&self) -> Option<f64> {
+        self.cache.as_ref().map(|c| c.hit_rate())
     }
 
     pub fn catalog(&self) -> &Catalog {
@@ -121,8 +138,14 @@ impl<V: Vfs> StateMachine<V> {
                 if self.storage.get(&key).is_some() {
                     return OpResult::Exists;
                 }
+                let cached = self.cache.as_mut().map(|_| record.clone());
                 match self.storage.put(op_number, key, record) {
-                    Ok(()) => OpResult::Ok,
+                    Ok(()) => {
+                        if let (Some(c), Some(v)) = (self.cache.as_mut(), cached) {
+                            c.insert(key, v);
+                        }
+                        OpResult::Ok
+                    }
                     Err(e) => OpResult::SchemaError(format!("store: {e}")),
                 }
             }
@@ -135,8 +158,17 @@ impl<V: Vfs> StateMachine<V> {
                 if self.storage.get(&key).is_none() {
                     return OpResult::NotFound;
                 }
+                let cached = self.cache.as_mut().map(|_| record.clone());
                 match self.storage.put(op_number, key, record) {
-                    Ok(()) => OpResult::Ok,
+                    Ok(()) => {
+                        if let Some(c) = self.cache.as_mut() {
+                            match cached {
+                                Some(v) => c.insert(key, v),
+                                None => c.invalidate(&key),
+                            }
+                        }
+                        OpResult::Ok
+                    }
                     Err(e) => OpResult::SchemaError(format!("store: {e}")),
                 }
             }
@@ -147,15 +179,30 @@ impl<V: Vfs> StateMachine<V> {
                     return OpResult::NotFound;
                 }
                 match self.storage.delete(op_number, key) {
-                    Ok(()) => OpResult::Ok,
+                    Ok(()) => {
+                        if let Some(c) = self.cache.as_mut() {
+                            c.invalidate(&key); // never serve a deleted row
+                        }
+                        OpResult::Ok
+                    }
                     Err(e) => OpResult::SchemaError(format!("store: {e}")),
                 }
             }
 
             Op::GetById { type_id, id } => {
                 let key = make_key(type_id, &id.0);
+                if let Some(c) = self.cache.as_mut() {
+                    if let Some(v) = c.get(&key) {
+                        return OpResult::Got(v);
+                    }
+                }
                 match self.storage.get(&key) {
-                    Some(b) => OpResult::Got(b),
+                    Some(b) => {
+                        if let Some(c) = self.cache.as_mut() {
+                            c.insert(key, b.clone());
+                        }
+                        OpResult::Got(b)
+                    }
                     None => OpResult::NotFound,
                 }
             }
@@ -304,6 +351,37 @@ mod tests {
             sm.apply(999, Op::GetById { type_id: 1, id: ObjectId::from_u128(73) }),
             OpResult::Got(vec![73])
         );
+    }
+
+    #[test]
+    fn cache_on_equals_cache_off() {
+        // The read cache must be observationally invisible: identical op
+        // results and identical state digest with cache on vs off.
+        let run = |cache: bool| {
+            let mut sm = if cache {
+                StateMachine::open(MemVfs::new()).unwrap().with_cache(256)
+            } else {
+                StateMachine::open(MemVfs::new()).unwrap()
+            };
+            sm.apply(1, Op::CreateType { def: transfer_def() });
+            let mut rng = Rng::new(0xBEEF);
+            let mut results = Vec::new();
+            for op in 2..3000u64 {
+                let id = ObjectId::from_u128(rng.below(40) as u128);
+                let o = match rng.below(5) {
+                    0 => Op::Create { type_id: 1, id, record: vec![(op & 0xFF) as u8; 4] },
+                    1 => Op::Update { type_id: 1, id, record: vec![0x77; 2] },
+                    2 => Op::Delete { type_id: 1, id },
+                    _ => Op::GetById { type_id: 1, id },
+                };
+                results.push(sm.apply(op, o));
+            }
+            (results, sm.digest())
+        };
+        let (r_off, d_off) = run(false);
+        let (r_on, d_on) = run(true);
+        assert_eq!(r_off, r_on, "cache changed observable op results");
+        assert_eq!(d_off, d_on, "cache changed the state digest");
     }
 
     /// Linearizability vs. an in-memory reference model under a random op

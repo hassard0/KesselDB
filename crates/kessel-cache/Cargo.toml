@@ -1,0 +1,11 @@
+[package]
+name = "kessel-cache"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+kessel-storage = { path = "../kessel-storage" }
+
+[lib]
+path = "src/lib.rs"

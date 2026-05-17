@@ -1,15 +1,12 @@
 [package]
-name = "kessel-sm"
+name = "kessel-shard"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 
 [dependencies]
 kessel-proto = { path = "../kessel-proto" }
-kessel-io = { path = "../kessel-io" }
 kessel-storage = { path = "../kessel-storage" }
-kessel-catalog = { path = "../kessel-catalog" }
-kessel-cache = { path = "../kessel-cache" }
 
 [lib]
 path = "src/lib.rs"

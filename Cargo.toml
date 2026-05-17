@@ -7,6 +7,8 @@ members = [
     "crates/kessel-catalog",
     "crates/kessel-codec",
     "crates/kessel-sm",
+    "crates/kessel-cache",
+    "crates/kessel-shard",
     "crates/kessel-vsr",
     "crates/kessel-bench",
     "crates/kessel-sim",

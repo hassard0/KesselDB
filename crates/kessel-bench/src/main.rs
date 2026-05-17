@@ -173,6 +173,38 @@ fn run<V: Vfs>(tag: &str, vfs: V, n: usize, batch: usize) {
     report("generalized CREATE", n, t.elapsed().as_secs_f64(), lat);
 }
 
+/// 3-node replicated throughput via the deterministic VSR cluster (in-process
+/// bus — measures protocol/commit overhead, NOT network; see scaling notes).
+fn run_replicated(n: usize) {
+    use kessel_vsr::sim::Cluster;
+    let mut c = Cluster::new(3, 1, 0);
+    let mut reqs: Vec<(u128, u64, Op)> = vec![(1u128, 1u64, Op::CreateType {
+        def: encode_type_def(
+            "t",
+            &[Field { field_id: 0, name: "v".into(), kind: FieldKind::U64, nullable: false }],
+        ),
+    })];
+    for i in 0..n as u64 {
+        reqs.push((1, i + 2, Op::Create {
+            type_id: 1,
+            id: ObjectId::from_u128(i as u128),
+            record: (i as u64).to_le_bytes().to_vec(),
+        }));
+    }
+    let t = Instant::now();
+    let steps = c.run(&reqs, n * 50 + 5000);
+    let secs = t.elapsed().as_secs_f64();
+    let d = c.live_digests();
+    let converged = d.iter().all(|x| *x == d[0]);
+    println!(
+        "  3-node REPL CREATE     {:>10.0} ops/s | {} steps | {} replicas converged={}",
+        n as f64 / secs,
+        steps,
+        c.replica_count(),
+        converged
+    );
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(200_000);
@@ -181,6 +213,7 @@ fn main() {
 
     println!("KesselDB M2 single-node benchmark — N={n}, vfs={vfs}, batch={batch} (localhost)");
     match vfs {
+        "repl" => run_replicated(n),
         "file" => {
             let dir = std::env::temp_dir().join(format!("kesseldb-bench-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);

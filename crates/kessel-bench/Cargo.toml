@@ -10,6 +10,7 @@ kessel-io = { path = "../kessel-io" }
 kessel-catalog = { path = "../kessel-catalog" }
 kessel-codec = { path = "../kessel-codec" }
 kessel-sm = { path = "../kessel-sm" }
+kessel-vsr = { path = "../kessel-vsr" }
 
 [[bin]]
 name = "kessel-bench"

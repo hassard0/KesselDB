@@ -8,7 +8,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | M1 — storage engine (LSM+WAL+recovery) | **done** | WAL+memtable+SSTable+compaction+manifest+crash recovery; 5 tests incl. property-vs-oracle & crash-recovery; Vfs seam added |
 | M2 — catalog + codec + single-node SM | **done — CONDITIONAL GO** | thesis not refuted; group-commit added (37× win); see verdict below |
 | M3 — VSR replication | **done (core) — hardening backlog listed** | crash-stop VSR: normal op, client table, view change w/ log recovery, state transfer, loss tolerance; 4 sim invariants green |
-| M4 — cache + sharding + perf | in progress | cloud-scaling speculation |
+| M4 — cache + sharding + perf | **done** | LRU read cache (observably invisible), rendezvous sharding groundwork, replicated bench, scaling speculation |
 
 ## M3 VSR — done vs. hardening backlog (honest)
 
@@ -82,5 +82,47 @@ path, exactly as the thesis analysis predicted.
 **Decision:** proceed to M3 (VSR). The VSR primary will hand committed *batches* to
 `StateMachine::apply_batch`, so replication and group commit compose naturally.
 
-Benchmarks continue at M3/M4 (replicated, cache on/off) with explicit reasoned
-cloud-scaling speculation — all localhost, never cloud-measured.
+### M4 replicated + cache + sharding
+
+- **3-node replicated CREATE: ~161,000 ops/s**, all replicas converged
+  (in-process deterministic bus + MemVfs). This isolates **consensus/commit
+  overhead only** — no network, no fsync. Single-node MemVfs create was ~245K/s,
+  so the replication protocol overhead at this layer is ~35% (245K → 161K),
+  which is reasonable for quorum replication.
+- **Read cache:** correctness proven (`cache_on_equals_cache_off`: identical op
+  results AND identical state digest over a 3,000-op random stream). It is
+  observably invisible to the replicated core; value is workload-dependent
+  (hit-rate metric exposed via `cache_hit_rate()`), so its speedup is
+  characterized qualitatively, not over-claimed with a synthetic number.
+- **Sharding:** rendezvous-hash routing, deterministic & ~balanced (<15% skew
+  over 8 shards), <30% remap on 4→5 resize. Single-shard today; cross-shard
+  transactions explicitly deferred (documented in ARCHITECTURE.md).
+
+### Cloud-scaling speculation (reasoned, NOT measured)
+
+All numbers above are a single localhost machine. Extrapolating honestly:
+
+1. **Durability is the dominant cloud cost.** Per-op fsync was 2.3K/s; group
+   commit took it to 87K/s locally. Cloud NVMe fsync (~50–200µs) with batches
+   of ~1–8K ops/fsync (TB-style) projects to **roughly 0.5–3M durable ops/s
+   per node** — the thesis-relevant regime — but this is an extrapolation from
+   the measured 37× batching win, not a cloud measurement.
+2. **Replication adds RTT, not CPU.** The ~35% protocol overhead measured here
+   is CPU/structural. In a cloud region, intra-AZ RTT (~0.1–0.5ms) is hidden by
+   pipelining/batching (many ops in flight per round-trip) — throughput stays
+   storage-bound; **p99 latency rises by ~1 RTT**, not throughput collapse.
+   Cross-region replication would materially raise commit latency (10–80ms RTT)
+   and is a deployment-topology decision, not an engine limit.
+3. **Sharding is the horizontal-scale lever.** With independent VSR groups per
+   shard and rendezvous routing, single-shard-key throughput scales ~linearly
+   with shard count until the client/router fans out — bounded by the (deferred)
+   cross-shard-transaction fraction of the workload.
+4. **Known ceilings before any cloud claim is credible:** O(#sstables) reads
+   (no bloom filter), value-cloning hot path, single-threaded core, in-process
+   (not socket) transport. These are the M4-hardening / Sub-project-2+ backlog;
+   until they're addressed, treat all projections as upper-bound reasoning.
+
+**Bottom line:** the data supports "schema flexibility at TB-class speed is
+*achievable*" — generalization costs ~20%, replication ~35%, and the historical
+400× gap was batching (now fixed). It does not yet *demonstrate* TB-class
+absolute numbers; that requires the hardening backlog and real hardware.

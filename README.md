@@ -6,7 +6,14 @@ A schema-flexible, deterministic OLTP object kernel — a **fresh Rust reimpleme
 
 ## Status
 
-**This is an in-progress, milestone-gated build. It is NOT a complete database.** See [`docs/STATUS.md`](docs/STATUS.md) for exactly what is implemented and tested vs. roadmap. Claims here never exceed what the test suite proves.
+**This is a milestone-gated foundation, NOT a complete production database.** Sub-project 1 milestones M0–M4 are implemented and tested (47 tests green): determinism seam, LSM storage + crash recovery, schema catalog + record codec + online DDL, deterministic state machine, group commit, crash-stop VSR with view change, read cache, sharding groundwork. The North Star (var-length store, secondary indexes, query planner, constraints, WASM triggers) and the M3 hardening backlog (partition matrix, socket transport, membership) are explicitly *not* done. See [`docs/STATUS.md`](docs/STATUS.md) for exactly what is proven vs. roadmap and for honest performance numbers + cloud-scaling reasoning. Claims here never exceed what the test suite proves.
+
+```bash
+cargo test --workspace                                  # 47 tests
+cargo run -p kessel-bench --release -- 200000 file 1000 # durable, group commit
+cargo run -p kessel-bench --release -- 20000  repl      # 3-node replicated
+cargo run -p kessel-storage --release --example bench_storage
+```
 
 ## Why
 

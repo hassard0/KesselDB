@@ -443,16 +443,15 @@ impl<V: Vfs> Replica<V> {
     }
 }
 
-#[cfg(test)]
-mod tests {
+/// Deterministic in-process replicated cluster driver with seeded fault
+/// injection. Public so benchmarks and tests can both drive a real cluster.
+pub mod sim {
     use super::*;
-    use kessel_catalog::encode_type_def;
     use kessel_io::MemVfs;
-    use kessel_proto::{ObjectId, Rng};
+    use kessel_proto::Rng;
     use std::collections::VecDeque;
 
-    /// Deterministic in-process cluster driver with seeded fault injection.
-    struct Cluster {
+    pub struct Cluster {
         rs: Vec<Replica<MemVfs>>,
         inbox: Vec<VecDeque<(usize, Msg)>>,
         replies: HashMap<(ClientId, u64), OpResult>,
@@ -461,7 +460,7 @@ mod tests {
     }
 
     impl Cluster {
-        fn new(n: usize, seed: u64, drop_pct: u64) -> Self {
+        pub fn new(n: usize, seed: u64, drop_pct: u64) -> Self {
             let rs = (0..n)
                 .map(|i| Replica::new(i, n, StateMachine::open(MemVfs::new()).unwrap()))
                 .collect();
@@ -491,7 +490,7 @@ mod tests {
         }
 
         /// Run until every (client,req) in `reqs` has a reply, or `max` steps.
-        fn run(&mut self, reqs: &[(ClientId, u64, Op)], max: usize) -> usize {
+        pub fn run(&mut self, reqs: &[(ClientId, u64, Op)], max: usize) -> usize {
             let n = self.rs.len();
             for step in 0..max {
                 // clients (re)send to a rotating target until acked
@@ -518,10 +517,22 @@ mod tests {
             usize::MAX
         }
 
-        fn live_digests(&self) -> Vec<u32> {
+        pub fn live_digests(&self) -> Vec<u32> {
             self.rs.iter().filter(|r| !r.crashed).map(|r| r.digest()).collect()
         }
+
+        pub fn replica_count(&self) -> usize {
+            self.rs.len()
+        }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::Cluster;
+        use kessel_catalog::encode_type_def;
+        use kessel_io::MemVfs;
+        use kessel_proto::{ObjectId, Op};
+        use kessel_sm::StateMachine;
 
     fn def() -> Op {
         Op::CreateType { def: encode_type_def("t", &[]) }
@@ -611,4 +622,5 @@ mod tests {
         let d = c.live_digests();
         assert!(d.iter().all(|x| *x == d[0]), "diverged under loss: {d:?}");
     }
-}
+    } // mod tests
+} // pub mod sim

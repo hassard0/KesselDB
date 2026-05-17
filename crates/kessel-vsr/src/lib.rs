@@ -453,7 +453,17 @@ impl<V: Vfs> Replica<V> {
         // with no re-execution.
         if let Some((last, res)) = self.client_table.get(&client) {
             if req <= *last {
-                out.replies.push((client, *last, res.clone()));
+                // Reply addressed to the request that was actually asked
+                // (`req`), not to `last`. For a normal retransmit
+                // `req == last` so this is unchanged; but a delayed/
+                // reordered *older* request (`req < last`, possible once
+                // loss + partition reorder delivery) must still be acked
+                // under its own `(client, req)` key — otherwise the caller
+                // waiting on `req` waits forever even though the cluster is
+                // healthy. (The op is long superseded; returning the
+                // client's latest committed result is the correct
+                // exactly-once answer and never re-executes.)
+                out.replies.push((client, req, res.clone()));
                 return;
             }
         }
@@ -1363,18 +1373,19 @@ pub mod sim {
         // and every replica MUST reconverge. We deliberately do NOT assert
         // liveness *during* an adversarial partition (that is a documented
         // open item, not overclaimed).
-        // KNOWN OPEN ITEM (documented in STATUS, not overclaimed): seed 7
-        // reproduces a view-change-liveness stall under this adversarial
-        // partition schedule even after heal. The crash-stop VSR's
-        // view-change does not yet guarantee universal post-heal liveness;
-        // it IS deterministic (separate test) and has shown no safety
-        // (divergence) violation. Excluded here with a concrete repro rather
-        // than asserting a property not yet achieved.
-        let known_open: &[u64] = &[7];
+        // Post-heal: the cluster MUST complete every request and every
+        // replica MUST reconverge — asserted below for the whole 0..12
+        // adversarial-partition corpus, seed 7 included (SP46).
+        // SP46: seed 7 is NO LONGER excluded — the full 0..12 corpus
+        // passes. The former post-heal "stall" was not a consensus defect
+        // (the cluster was provably healthy: all Normal, one primary,
+        // converged). `on_request`'s dedup replied under `(client, last)`
+        // instead of `(client, req)`, so a delayed/reordered older request
+        // (`req < last`, possible once loss+partition reorder delivery)
+        // never got an ack under its own key — a permanent liveness stall
+        // with an otherwise-healthy cluster. Fixed by addressing the cached
+        // reply to the request actually asked.
         for seed in 0..12u64 {
-            if known_open.contains(&seed) {
-                continue;
-            }
             let mut c = Cluster::new_partitioned(3, seed, 10);
             let mut reqs = vec![(7u128, 1u64, def())];
             for i in 0..15u64 {

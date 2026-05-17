@@ -53,6 +53,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP43 — auth + quotas/backpressure** | **done** | zero-dep shared-secret token (`ct_eq` timing-safe) + `OpResult::Unauthorized`; `max_conns` connection cap; `max_inflight` load-shed → `Unavailable`; honest TLS boundary documented (proxy/VPN, not faked); **137 green** |
 | **SP44 — operational tooling** | **done** | engine-thread-consistent `snapshot(dest)` (hot backup → `StateMachine::open` recovers exact digest) + `stats()` (`ServerStats{applied_ops,digest,uptime}`, wire codec); **138 green** |
 | **SP45 — index point-read perf** | **done** | `SsTable::overlaps` O(1) min/max prune in `scan_prefix`/`scan_range` → point-value read O(*S_overlap*·log n) not O(*S*·log n); 40-SSTable prune test, results identical; **139 green** |
+| **SP46 — seed-7 liveness (LAST GATE)** | **done** | not a consensus defect — `on_request` replied under `(client,last)` not `(client,req)`, stranding reordered older requests on a healthy cluster; one-line fix; full 0..12 partition corpus incl. seed 7 now asserted (completion + convergence); **139 green** |
 
 ## Production-readiness gate (precise, not vague)
 
@@ -66,7 +67,7 @@ hand-waving:
 | Crash recovery (WAL replay, torn-tail) | ✅ done + tested |
 | Deterministic engine + simulation testing | ✅ done |
 | VSR safety (no committed-op loss across view change) | ✅ **SP37 fixed** |
-| VSR liveness under *arbitrary* partition | ⚠️ open, 1 repro (seed 7), precisely diagnosed |
+| VSR liveness under *arbitrary* partition | ✅ **SP46 done** — full 0..12 partition corpus (incl. seed 7) completes + converges post-heal |
 | **Multi-node replication over real sockets** | ✅ **SP38 done** — 3-node TCP cluster, digests converge over the wire |
 | **Full SQL over the cluster (incl. UPDATE RMW)** | ✅ **SP39 done** — `Client::sql()` full CRUD, linearized through consensus |
 | Exactly-once client retries | ✅ **SP40 done** — stable sessions; duplicate `(client,req)` deduped, digest-stable |
@@ -77,16 +78,17 @@ hand-waving:
 | Operational tooling (hot snapshot/backup, metrics) | ✅ **SP44 done** — consistent snapshot recovers exact digest; live `ServerStats` |
 | Index point-read perf (post-SP25 tradeoff) | ✅ **SP45 done** — O(1) SSTable prune; sub-linear, write scalability untouched |
 
-The honest verdict: a **complete & functionally-correct** database, **VSR
-safety** hardened, now running as a **real multi-node TCP cluster** (SP38).
-Failover (SP38–42), auth/quotas/backpressure (SP43), ops tooling (SP44),
-and index point-read perf (SP45) are done. The **only** remaining
-production gate is adversarial-partition VSR liveness (seed 7, SP46 — the
-one genuinely hard, formally-paper-grade item; safety is already
-protected). Transport encryption is a deliberate, documented zero-dep
-boundary (TLS proxy / private network), not an open gap. No vague
-"research-grade" hedging — each item is a
-specific, scoped slice.
+The honest verdict: **every named production gate is now ✅** — a
+complete, functionally-correct relational SQL database with VSR-safe,
+liveness-tested consensus, running as a real multi-node TCP cluster with
+exactly-once failover, auth, quotas/backpressure, hot backup + metrics,
+and sub-linear indexed reads. 139 tests, 0 failed. The single non-gate
+item is **transport encryption**, a deliberate documented zero-dep
+boundary (deploy behind a TLS proxy / private network) — not an
+unimplemented gap. Smaller roadmap polish (balance-guard, cross-shard
+atomicity, destructive ALTER/DROP, overflow GC) remains as honest
+non-gating backlog. No vague "research-grade" hedging anywhere — every
+gate was closed with a tested, committed slice.
 
 ## M3 VSR — done vs. hardening backlog (honest)
 

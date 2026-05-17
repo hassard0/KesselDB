@@ -321,6 +321,55 @@ fn run_flex(n: usize) {
     }
 }
 
+/// SP47: quantify the prepared-statement cache. Measures repeated SQL
+/// compilation cost vs. a cached compiled-statement clone (the exact work
+/// the engine cache removes from the single-threaded hot path).
+fn run_sqlcache(n: usize) {
+    use std::collections::HashMap;
+    let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+    sm.apply(
+        1,
+        Op::CreateType {
+            def: encode_type_def(
+                "acct",
+                &[
+                    Field { field_id: 0, name: "owner".into(), kind: FieldKind::U32, nullable: false },
+                    Field { field_id: 1, name: "bal".into(), kind: FieldKind::I64, nullable: false },
+                ],
+            ),
+        },
+    );
+    let q = "SELECT SUM(bal) FROM acct WHERE owner = 100";
+    let cat = sm.catalog();
+
+    // Cold: recompile every request (today's cost without the cache).
+    let t0 = Instant::now();
+    for _ in 0..n {
+        let _ = kessel_sql::compile_stmt(q, cat).unwrap();
+    }
+    let cold = t0.elapsed();
+
+    // Warm: compile once, then serve from the cache (clone) — what the
+    // engine now does for a repeated statement.
+    let mut cache: HashMap<String, kessel_sql::Stmt> = HashMap::new();
+    let t1 = Instant::now();
+    for _ in 0..n {
+        if let Some(s) = cache.get(q) {
+            std::hint::black_box(s.clone());
+        } else {
+            let s = kessel_sql::compile_stmt(q, cat).unwrap();
+            cache.insert(q.to_string(), s);
+        }
+    }
+    let warm = t1.elapsed();
+
+    let cps = n as f64 / cold.as_secs_f64();
+    let wps = n as f64 / warm.as_secs_f64();
+    println!("SQL compile (cold)  : {cps:>12.0} stmt/s  ({cold:?} for {n})");
+    println!("SQL compile (cached): {wps:>12.0} stmt/s  ({warm:?} for {n})");
+    println!("speedup             : {:>11.1}x", wps / cps);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(200_000);
@@ -330,6 +379,7 @@ fn main() {
     println!("KesselDB M2 single-node benchmark — N={n}, vfs={vfs}, batch={batch} (localhost)");
     match vfs {
         "flex" => run_flex(n),
+        "sqlcache" => run_sqlcache(n),
         "repl" => run_replicated(n),
         "file" => {
             let dir = std::env::temp_dir().join(format!("kesseldb-bench-{}", std::process::id()));

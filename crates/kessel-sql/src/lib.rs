@@ -193,7 +193,9 @@ fn kind_of(name: &str, arg: Option<i128>) -> Result<FieldKind, SqlError> {
 
 /// A compiled statement. Most map to a single `Op`; `UPDATE` needs a
 /// server-side read-modify-write (the engine reads the current row, applies
-/// the SET list, re-encodes) so it is its own variant.
+/// the SET list, re-encodes) so it is its own variant. `Clone` so a
+/// compiled statement can be cached and replayed (SP47).
+#[derive(Clone)]
 pub enum Stmt {
     Op(Op),
     Update {

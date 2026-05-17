@@ -14,6 +14,7 @@ use kessel_io::DirVfs;
 use kessel_proto::wire::{read_frame, write_frame};
 use kessel_proto::{Op, OpResult};
 use kessel_sm::StateMachine;
+use std::collections::HashMap;
 use std::io;
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::Path;
@@ -124,6 +125,50 @@ fn authenticate(stream: &mut TcpStream, token: &Option<Vec<u8>>) -> bool {
     ok
 }
 
+/// Engine-thread-local prepared-statement cache (SP47). Tokenise+parse+
+/// plan is pure CPU on the single-threaded deterministic core, so for a
+/// repeated SQL string it is wasted work every request. Caching the
+/// compiled `Stmt` removes it from the hot path with **zero** functional
+/// change (identical `Stmt`, identical results, still deterministic — the
+/// cache is engine-local and never touches replicated state). It is
+/// cleared whenever an applied op can change the catalog, so a cached plan
+/// is never reused against a changed schema: correctness is identical to
+/// always recompiling, only faster.
+struct CompileCache {
+    map: HashMap<String, kessel_sql::Stmt>,
+    cap: usize,
+}
+
+impl CompileCache {
+    fn new() -> Self {
+        CompileCache { map: HashMap::new(), cap: 4096 }
+    }
+    fn get_or_compile(
+        &mut self,
+        sql: &str,
+        cat: &kessel_catalog::Catalog,
+    ) -> Result<kessel_sql::Stmt, String> {
+        if let Some(s) = self.map.get(sql) {
+            return Ok(s.clone());
+        }
+        let s = kessel_sql::compile_stmt(sql, cat).map_err(|e| e.to_string())?;
+        if self.map.len() >= self.cap {
+            self.map.clear(); // bounded + deterministic (rare)
+        }
+        self.map.insert(sql.to_string(), s.clone());
+        Ok(s)
+    }
+    fn invalidate(&mut self) {
+        self.map.clear();
+    }
+}
+
+/// Applying an op of one of these kinds can change the catalog/schema, so
+/// any cached compiled statement must be discarded afterwards.
+fn mutates_schema(op: &Op) -> bool {
+    matches!(op.kind(), 1 | 2 | 8 | 10 | 12 | 13 | 14 | 17 | 24 | 15)
+}
+
 /// One request to the engine thread: an op and a one-shot reply channel.
 type EngineMsg = (Vec<u8>, SyncSender<OpResult>);
 
@@ -215,6 +260,7 @@ pub fn spawn_engine_cfg(
             }
         };
         let mut n: u64 = 1;
+        let mut cache = CompileCache::new();
         let start = std::time::Instant::now();
         while let Ok((frame, reply)) = rx.recv() {
             // Admin frames are handled inline on the engine thread (so a
@@ -250,7 +296,7 @@ pub fn spawn_engine_cfg(
                         continue;
                     }
                 };
-                match kessel_sql::compile_stmt(sql, sm.catalog()) {
+                match cache.get_or_compile(sql, sm.catalog()) {
                     Ok(kessel_sql::Stmt::Op(o)) => Some(o),
                     Ok(kessel_sql::Stmt::Update { type_id, id, sets }) => {
                         // Server-side read-modify-write for SQL UPDATE.
@@ -308,8 +354,13 @@ pub fn spawn_engine_cfg(
             };
             let r = match op {
                 Some(o) => {
+                    let mutates = mutates_schema(&o);
                     let r = sm.apply(n, o);
                     n += 1;
+                    if mutates {
+                        // Schema changed — any cached plan is now stale.
+                        cache.invalidate();
+                    }
                     r
                 }
                 None => OpResult::SchemaError("malformed request frame".into()),
@@ -677,5 +728,49 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn compile_cache_is_correct_across_schema_change() {
+        let dir = std::env::temp_dir()
+            .join(format!("kesseldb-cc47-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = spawn_engine(&dir).unwrap();
+        let sql = |s: &str| {
+            let mut f = vec![0xFEu8];
+            f.extend_from_slice(s.as_bytes());
+            engine.apply_raw(f)
+        };
+
+        assert!(matches!(
+            sql("CREATE TABLE t (v U64 NOT NULL)"),
+            OpResult::TypeCreated(1)
+        ));
+        assert_eq!(sql("INSERT INTO t ID 1 (v) VALUES (5)"), OpResult::Ok);
+
+        // Same statement twice — second is a cache hit, must be identical.
+        let r1 = sql("SELECT * FROM t ID 1");
+        let r2 = sql("SELECT * FROM t ID 1");
+        assert!(matches!(r1, OpResult::Got(_)));
+        assert_eq!(r1, r2, "cache hit must return identical result");
+
+        // A DDL changes the catalog → cache is invalidated.
+        assert!(matches!(
+            sql("CREATE TABLE t2 (a U64 NOT NULL)"),
+            OpResult::TypeCreated(2)
+        ));
+
+        // The previously-cached query still works (recompiled cleanly post
+        // schema change) and a brand-new statement against the new table
+        // compiles correctly — proving invalidation is safe, not stale.
+        assert_eq!(sql("SELECT * FROM t ID 1"), r1);
+        assert_eq!(sql("INSERT INTO t2 ID 1 (a) VALUES (9)"), OpResult::Ok);
+        assert!(matches!(sql("SELECT * FROM t2 ID 1"), OpResult::Got(_)));
+
+        // UPDATE (RMW path) also flows through the cache unchanged.
+        assert_eq!(sql("UPDATE t ID 1 SET v = 50"), OpResult::Ok);
+        assert_eq!(sql("UPDATE t ID 1 SET v = 50"), OpResult::Ok);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

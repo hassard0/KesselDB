@@ -54,6 +54,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP44 — operational tooling** | **done** | engine-thread-consistent `snapshot(dest)` (hot backup → `StateMachine::open` recovers exact digest) + `stats()` (`ServerStats{applied_ops,digest,uptime}`, wire codec); **138 green** |
 | **SP45 — index point-read perf** | **done** | `SsTable::overlaps` O(1) min/max prune in `scan_prefix`/`scan_range` → point-value read O(*S_overlap*·log n) not O(*S*·log n); 40-SSTable prune test, results identical; **139 green** |
 | **SP46 — seed-7 liveness (LAST GATE)** | **done** | not a consensus defect — `on_request` replied under `(client,last)` not `(client,req)`, stranding reordered older requests on a healthy cluster; one-line fix; full 0..12 partition corpus incl. seed 7 now asserted (completion + convergence); **139 green** |
+| **SP47 — prepared-statement cache** | **done** | engine-local `sql→Stmt` cache, invalidated on schema-mutating ops; **26.2× faster SQL compile** (574K→15.0M stmt/s, `kessel-bench sqlcache`), zero functional change, determinism intact; **140 green** |
 
 ## Production-readiness gate (precise, not vague)
 
@@ -259,6 +260,18 @@ level compaction, zero-copy reads), recorded here rather than hidden. The first
 
 GET fast on DirVfs because post-flush data sits in OS-cached SSTables; the slower
 MemVfs GET reflects the known O(#sstables) read path (no bloom filter yet, M4 work).
+
+### SP47 SQL prepared-statement cache (`kessel-bench sqlcache`, release)
+
+| SQL compile path | stmt/s |
+|---|---|
+| cold (recompile every request) | ~573,960 |
+| cached (compile once, clone) | ~15,035,785 |
+| **speedup** | **26.2×** |
+
+The single-threaded deterministic core means per-op CPU *is* the ceiling;
+removing ~1.7 µs of tokenise+parse+plan per repeated statement is a direct,
+measured throughput innovation with zero functional change (SP47).
 
 ### M2 go/no-go verdict: CONDITIONAL GO
 

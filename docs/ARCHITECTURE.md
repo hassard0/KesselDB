@@ -51,6 +51,18 @@ assigned by the VSR primary and replicated, so every replica computes the
 same handle and stores identical bytes. Reads use `GetBlob { handle }`.
 Orphaned-blob GC (after an overflow-field `Update`) is deferred and documented.
 
+## Equality secondary indexes (Sub-project 3)
+
+`ObjectType.indexes` lists indexed `field_id`s (replicated catalog). Index
+entries live in a reserved storage type-slot `0xFFFE0000 | (user_type&0xFFFF)`,
+key id = `field_id ++ value_digest8 ++ pad`, entry value = digest-collision-
+safe buckets (per full value, a sorted set of object ids). Keys/bytes are
+content-derived and id sets sorted, so replicas build a byte-identical index
+keyspace (digest-covered). `CreateIndex` backfills via `Storage::scan_range`
+over the type's contiguous key range; Create/Update/Delete maintain indexes.
+Equality only; range scans + a multi-index intersection planner are a later
+spec.
+
 ## Storage layout
 
 LSM key = `type_id(4B) ‖ primary_id(16B)`, value = codec-encoded fixed-width record with a

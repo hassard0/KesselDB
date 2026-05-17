@@ -140,6 +140,160 @@ impl<V: Vfs> StateMachine<V> {
         Ok(fixed)
     }
 
+    // ---- equality secondary index (Sub-project 3) ----
+    //
+    // Index keyspace: storage type-slot = IDX_TYPE_BASE | (user_type & 0xFFFF).
+    // Key id16 = field_id(2) ++ value_digest8 ++ [0;6]. The entry value holds
+    // digest-collision-safe buckets: per distinct full value, a sorted set of
+    // 16-byte object ids. All index keys/bytes are content-derived, so two
+    // replicas applying the same ops build a byte-identical index keyspace
+    // (covered by the state digest). Index maintenance is read-modify-write
+    // (correct; throughput optimization is future perf work, documented).
+
+    fn idx_value_digest(v: &[u8]) -> [u8; 8] {
+        let a = kessel_proto::codec::crc32c(v) as u64;
+        let mut salted = Vec::with_capacity(v.len() + 1);
+        salted.push(0xA5);
+        salted.extend_from_slice(v);
+        let b = kessel_proto::codec::crc32c(&salted) as u64;
+        ((a << 32) | b).to_le_bytes()
+    }
+
+    fn idx_key(user_type: u32, field_id: u16, v: &[u8]) -> Key {
+        let mut id = [0u8; 16];
+        id[..2].copy_from_slice(&field_id.to_le_bytes());
+        id[2..10].copy_from_slice(&Self::idx_value_digest(v));
+        make_key(0xFFFE_0000 | (user_type & 0xFFFF), &id)
+    }
+
+    /// buckets := [u16 n] then n × ( [u32 vlen][value] [u32 m] m×[16 id] )
+    fn idx_decode(buf: &[u8]) -> Vec<(Vec<u8>, Vec<[u8; 16]>)> {
+        let mut out = Vec::new();
+        if buf.len() < 2 {
+            return out;
+        }
+        let n = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+        let mut p = 2;
+        for _ in 0..n {
+            if p + 4 > buf.len() {
+                break;
+            }
+            let vl = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap()) as usize;
+            p += 4;
+            let val = buf[p..p + vl].to_vec();
+            p += vl;
+            let m = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap()) as usize;
+            p += 4;
+            let mut ids = Vec::with_capacity(m);
+            for _ in 0..m {
+                let mut id = [0u8; 16];
+                id.copy_from_slice(&buf[p..p + 16]);
+                ids.push(id);
+                p += 16;
+            }
+            out.push((val, ids));
+        }
+        out
+    }
+
+    fn idx_encode(buckets: &[(Vec<u8>, Vec<[u8; 16]>)]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&(buckets.len() as u16).to_le_bytes());
+        for (val, ids) in buckets {
+            b.extend_from_slice(&(val.len() as u32).to_le_bytes());
+            b.extend_from_slice(val);
+            b.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+            for id in ids {
+                b.extend_from_slice(id);
+            }
+        }
+        b
+    }
+
+    fn idx_add(&mut self, op_number: u64, ut: u32, fid: u16, v: &[u8], obj: [u8; 16]) {
+        let key = Self::idx_key(ut, fid, v);
+        let mut buckets = self
+            .storage
+            .get(&key)
+            .map(|b| Self::idx_decode(&b))
+            .unwrap_or_default();
+        match buckets.iter_mut().find(|(val, _)| val == v) {
+            Some((_, ids)) => {
+                if let Err(i) = ids.binary_search(&obj) {
+                    ids.insert(i, obj); // sorted set => deterministic bytes
+                }
+            }
+            None => {
+                buckets.push((v.to_vec(), vec![obj]));
+                buckets.sort_by(|a, b| a.0.cmp(&b.0));
+            }
+        }
+        let _ = self.storage.put(op_number, key, Self::idx_encode(&buckets));
+    }
+
+    fn idx_remove(&mut self, op_number: u64, ut: u32, fid: u16, v: &[u8], obj: [u8; 16]) {
+        let key = Self::idx_key(ut, fid, v);
+        let mut buckets = match self.storage.get(&key) {
+            Some(b) => Self::idx_decode(&b),
+            None => return,
+        };
+        if let Some((_, ids)) = buckets.iter_mut().find(|(val, _)| val == v) {
+            if let Ok(i) = ids.binary_search(&obj) {
+                ids.remove(i);
+            }
+        }
+        buckets.retain(|(_, ids)| !ids.is_empty());
+        if buckets.is_empty() {
+            let _ = self.storage.delete(op_number, key);
+        } else {
+            let _ = self.storage.put(op_number, key, Self::idx_encode(&buckets));
+        }
+    }
+
+    /// (offset,width) of an indexed field; None if absent or OverflowRef.
+    fn idx_field_pos(ot: &kessel_catalog::ObjectType, fid: u16) -> Option<(usize, usize)> {
+        let i = ot.fields.iter().position(|f| f.field_id == fid)?;
+        if matches!(ot.fields[i].kind, kessel_catalog::FieldKind::OverflowRef) {
+            return None;
+        }
+        let layout = ot.compute_layout();
+        Some((layout.offsets[i], ot.fields[i].kind.width() as usize))
+    }
+
+    /// Maintain every index of `type_id` for one row mutation.
+    fn idx_maintain(
+        &mut self,
+        op_number: u64,
+        type_id: u32,
+        obj: [u8; 16],
+        old: Option<&[u8]>,
+        new: Option<&[u8]>,
+    ) {
+        let ot = match self.catalog.get(type_id) {
+            Some(t) => t.clone(),
+            None => return,
+        };
+        for fid in ot.indexes.clone() {
+            let (off, w) = match Self::idx_field_pos(&ot, fid) {
+                Some(p) => p,
+                None => continue,
+            };
+            let ov = old.and_then(|r| r.get(off..off + w));
+            let nv = new.and_then(|r| r.get(off..off + w));
+            if ov == nv {
+                continue;
+            }
+            if let Some(o) = ov {
+                let o = o.to_vec();
+                self.idx_remove(op_number, type_id, fid, &o, obj);
+            }
+            if let Some(n) = nv {
+                let n = n.to_vec();
+                self.idx_add(op_number, type_id, fid, &n, obj);
+            }
+        }
+    }
+
     /// Apply one committed op. Deterministic.
     pub fn apply(&mut self, op_number: u64, op: Op) -> OpResult {
         match op {
@@ -169,6 +323,7 @@ impl<V: Vfs> StateMachine<V> {
                     name,
                     schema_ver: 1,
                     fields,
+                    indexes: Vec::new(),
                 });
                 self.catalog.next_type_id += 1;
                 match self.persist_catalog(op_number) {
@@ -216,11 +371,20 @@ impl<V: Vfs> StateMachine<V> {
                     Ok(r) => r,
                     Err(e) => return e,
                 };
+                let need_idx = self
+                    .catalog
+                    .get(type_id)
+                    .map(|t| !t.indexes.is_empty())
+                    .unwrap_or(false);
+                let rec_idx = if need_idx { Some(record.clone()) } else { None };
                 let cached = self.cache.as_mut().map(|_| record.clone());
                 match self.storage.put(op_number, key, record) {
                     Ok(()) => {
                         if let (Some(c), Some(v)) = (self.cache.as_mut(), cached) {
                             c.insert(key, v);
+                        }
+                        if let Some(r) = rec_idx {
+                            self.idx_maintain(op_number, type_id, id.0, None, Some(&r));
                         }
                         OpResult::Ok
                     }
@@ -233,13 +397,20 @@ impl<V: Vfs> StateMachine<V> {
                     return OpResult::SchemaError(format!("no type {type_id}"));
                 }
                 let key = make_key(type_id, &id.0);
-                if self.storage.get(&key).is_none() {
+                let old = self.storage.get(&key);
+                if old.is_none() {
                     return OpResult::NotFound;
                 }
                 let record = match self.materialize_overflow(op_number, type_id, record) {
                     Ok(r) => r,
                     Err(e) => return e,
                 };
+                let need_idx = self
+                    .catalog
+                    .get(type_id)
+                    .map(|t| !t.indexes.is_empty())
+                    .unwrap_or(false);
+                let rec_idx = if need_idx { Some(record.clone()) } else { None };
                 let cached = self.cache.as_mut().map(|_| record.clone());
                 match self.storage.put(op_number, key, record) {
                     Ok(()) => {
@@ -249,6 +420,15 @@ impl<V: Vfs> StateMachine<V> {
                                 None => c.invalidate(&key),
                             }
                         }
+                        if let Some(r) = rec_idx {
+                            self.idx_maintain(
+                                op_number,
+                                type_id,
+                                id.0,
+                                old.as_deref(),
+                                Some(&r),
+                            );
+                        }
                         OpResult::Ok
                     }
                     Err(e) => OpResult::SchemaError(format!("store: {e}")),
@@ -257,7 +437,8 @@ impl<V: Vfs> StateMachine<V> {
 
             Op::Delete { type_id, id } => {
                 let key = make_key(type_id, &id.0);
-                if self.storage.get(&key).is_none() {
+                let old = self.storage.get(&key);
+                if old.is_none() {
                     return OpResult::NotFound;
                 }
                 match self.storage.delete(op_number, key) {
@@ -265,6 +446,7 @@ impl<V: Vfs> StateMachine<V> {
                         if let Some(c) = self.cache.as_mut() {
                             c.invalidate(&key); // never serve a deleted row
                         }
+                        self.idx_maintain(op_number, type_id, id.0, old.as_deref(), None);
                         OpResult::Ok
                     }
                     Err(e) => OpResult::SchemaError(format!("store: {e}")),
@@ -293,6 +475,73 @@ impl<V: Vfs> StateMachine<V> {
                 Some(b) => OpResult::Got(b),
                 None => OpResult::NotFound,
             },
+
+            Op::CreateIndex { type_id, field_id } => {
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                if ot.fields.iter().all(|f| f.field_id != field_id) {
+                    return OpResult::SchemaError(format!("no field {field_id}"));
+                }
+                if Self::idx_field_pos(&ot, field_id).is_none() {
+                    return OpResult::SchemaError("cannot index an OverflowRef field".into());
+                }
+                if ot.indexes.contains(&field_id) {
+                    return OpResult::Ok; // idempotent
+                }
+                if let Some(t) = self.catalog.get_mut(type_id) {
+                    t.indexes.push(field_id);
+                }
+                if let OpResult::SchemaError(e) = self.persist_catalog(op_number) {
+                    return OpResult::SchemaError(e);
+                }
+                // Deterministic backfill of existing rows.
+                let lo = make_key(type_id, &[0u8; 16]);
+                let hi = make_key(type_id, &[0xFFu8; 16]);
+                let rows = self.storage.scan_range(&lo, &hi);
+                let (off, w) = Self::idx_field_pos(&ot, field_id).unwrap();
+                for (k, rec) in rows {
+                    if let Some(v) = rec.get(off..off + w) {
+                        let mut obj = [0u8; 16];
+                        obj.copy_from_slice(&k[4..20]);
+                        let v = v.to_vec();
+                        self.idx_add(op_number, type_id, field_id, &v, obj);
+                    }
+                }
+                OpResult::Ok
+            }
+
+            Op::FindBy { type_id, field_id, value } => {
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                let (_, w) = match Self::idx_field_pos(&ot, field_id) {
+                    Some(p) => p,
+                    None => return OpResult::SchemaError("field not indexable".into()),
+                };
+                if !ot.indexes.contains(&field_id) {
+                    return OpResult::SchemaError("field is not indexed".into());
+                }
+                // Normalize query value to the field's fixed width.
+                let mut v = value;
+                v.resize(w, 0);
+                let key = Self::idx_key(type_id, field_id, &v);
+                let ids = match self.storage.get(&key) {
+                    Some(b) => Self::idx_decode(&b)
+                        .into_iter()
+                        .find(|(val, _)| *val == v)
+                        .map(|(_, ids)| ids)
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                let mut out = Vec::with_capacity(ids.len() * 16);
+                for id in ids {
+                    out.extend_from_slice(&id);
+                }
+                OpResult::Got(out)
+            }
         }
     }
 
@@ -490,6 +739,7 @@ mod tests {
                 Field { field_id: 1, name: "body".into(), kind: FieldKind::OverflowRef, nullable: false },
                 Field { field_id: 2, name: "n".into(), kind: FieldKind::U64, nullable: false },
             ],
+            indexes: vec![],
         };
         vec![0u8; t.compute_layout().record_size]
     }
@@ -549,6 +799,108 @@ mod tests {
         assert_eq!(sm.apply(4, Op::GetBlob { handle: h_new }), OpResult::Got(b"new".to_vec()));
         // Old blob is ORPHANED but still resolvable (no GC yet — documented).
         assert_eq!(sm.apply(5, Op::GetBlob { handle: h_old }), OpResult::Got(b"old".to_vec()));
+    }
+
+    // ---- Sub-project 3: equality secondary index ----
+
+    fn indexed_type_def() -> Vec<u8> {
+        // field 1 = u32 "owner" (indexable), field 2 = u32 "v"
+        encode_type_def(
+            "rec",
+            &[
+                Field { field_id: 0, name: "owner".into(), kind: FieldKind::U32, nullable: false },
+                Field { field_id: 0, name: "v".into(), kind: FieldKind::U32, nullable: false },
+            ],
+        )
+    }
+    fn rec_bytes(owner: u32, v: u32) -> Vec<u8> {
+        let t = ObjectType {
+            type_id: 1,
+            name: "rec".into(),
+            schema_ver: 1,
+            fields: vec![
+                Field { field_id: 1, name: "owner".into(), kind: FieldKind::U32, nullable: false },
+                Field { field_id: 2, name: "v".into(), kind: FieldKind::U32, nullable: false },
+            ],
+            indexes: vec![],
+        };
+        let mut b = vec![0u8; t.compute_layout().record_size];
+        let o0 = t.compute_layout().offsets[0];
+        let o1 = t.compute_layout().offsets[1];
+        b[o0..o0 + 4].copy_from_slice(&owner.to_le_bytes());
+        b[o1..o1 + 4].copy_from_slice(&v.to_le_bytes());
+        b
+    }
+    fn ids_of(r: OpResult) -> Vec<u128> {
+        match r {
+            OpResult::Got(b) => b
+                .chunks(16)
+                .map(|c| u128::from_le_bytes(c.try_into().unwrap()))
+                .collect::<Vec<_>>(),
+            o => panic!("expected Got, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn equality_index_find_by_after_create_and_backfill() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: indexed_type_def() });
+        // rows BEFORE index exists -> exercises deterministic backfill
+        for i in 0..6u128 {
+            let owner = if i < 4 { 100 } else { 200 };
+            sm.apply(2 + i as u64, Op::Create {
+                type_id: 1,
+                id: ObjectId::from_u128(i),
+                record: rec_bytes(owner, i as u32),
+            });
+        }
+        assert_eq!(sm.apply(20, Op::CreateIndex { type_id: 1, field_id: 1 }), OpResult::Ok);
+        assert_eq!(sm.apply(21, Op::CreateIndex { type_id: 1, field_id: 1 }), OpResult::Ok); // idempotent
+
+        let mut got = ids_of(sm.apply(22, Op::FindBy { type_id: 1, field_id: 1, value: 100u32.to_le_bytes().to_vec() }));
+        got.sort();
+        assert_eq!(got, vec![0, 1, 2, 3]);
+        let mut g2 = ids_of(sm.apply(23, Op::FindBy { type_id: 1, field_id: 1, value: 200u32.to_le_bytes().to_vec() }));
+        g2.sort();
+        assert_eq!(g2, vec![4, 5]);
+        assert_eq!(ids_of(sm.apply(24, Op::FindBy { type_id: 1, field_id: 1, value: 999u32.to_le_bytes().to_vec() })), Vec::<u128>::new());
+    }
+
+    #[test]
+    fn index_maintained_on_update_and_delete() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: indexed_type_def() });
+        sm.apply(2, Op::CreateIndex { type_id: 1, field_id: 1 });
+        let id = ObjectId::from_u128(42);
+        sm.apply(3, Op::Create { type_id: 1, id, record: rec_bytes(7, 1) });
+        assert_eq!(ids_of(sm.apply(4, Op::FindBy { type_id: 1, field_id: 1, value: 7u32.to_le_bytes().to_vec() })), vec![42]);
+        // update moves it from owner=7 bucket to owner=9 bucket
+        sm.apply(5, Op::Update { type_id: 1, id, record: rec_bytes(9, 1) });
+        assert_eq!(ids_of(sm.apply(6, Op::FindBy { type_id: 1, field_id: 1, value: 7u32.to_le_bytes().to_vec() })), Vec::<u128>::new());
+        assert_eq!(ids_of(sm.apply(7, Op::FindBy { type_id: 1, field_id: 1, value: 9u32.to_le_bytes().to_vec() })), vec![42]);
+        // delete removes it entirely
+        sm.apply(8, Op::Delete { type_id: 1, id });
+        assert_eq!(ids_of(sm.apply(9, Op::FindBy { type_id: 1, field_id: 1, value: 9u32.to_le_bytes().to_vec() })), Vec::<u128>::new());
+    }
+
+    #[test]
+    fn index_is_deterministic_across_instances() {
+        let build = || {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            sm.apply(1, Op::CreateType { def: indexed_type_def() });
+            sm.apply(2, Op::CreateIndex { type_id: 1, field_id: 1 });
+            let mut rng = Rng::new(0xF00D);
+            for op in 3..600u64 {
+                let id = ObjectId::from_u128(rng.below(60) as u128);
+                match rng.below(4) {
+                    0 => { sm.apply(op, Op::Delete { type_id: 1, id }); }
+                    1 => { sm.apply(op, Op::Update { type_id: 1, id, record: rec_bytes((rng.below(5)) as u32, op as u32) }); }
+                    _ => { sm.apply(op, Op::Create { type_id: 1, id, record: rec_bytes((rng.below(5)) as u32, op as u32) }); }
+                }
+            }
+            sm.digest()
+        };
+        assert_eq!(build(), build(), "index broke replica determinism");
     }
 
     /// Linearizability vs. an in-memory reference model under a random op

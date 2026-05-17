@@ -10,6 +10,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | M3 — VSR replication | **done (core) — hardening backlog listed** | crash-stop VSR: normal op, client table, view change w/ log recovery, state transfer, loss tolerance; 4 sim invariants green |
 | M4 — cache + sharding + perf | **done** | LRU read cache (observably invisible), rendezvous sharding groundwork, replicated bench, scaling speculation |
 | **SP2 — variable-length overflow store** | **done** | replication-correct overflow blobs via op-derived deterministic handles; `GetBlob`; replicated-convergence test; GC deferred (documented) |
+| **SP3 — equality secondary indexes** | **done** | `CreateIndex`/`FindBy`, deterministic backfill + maintenance, `Storage::scan_range`, replicated convergence; range scans & multi-index planner deferred |
 
 ## M3 VSR — done vs. hardening backlog (honest)
 
@@ -45,11 +46,23 @@ while the core record stays fixed-width. Spec:
   (still resolvable; documented and asserted by `update_orphans_old_blob…`).
   Orphan compaction is a later spec.
 
+## Sub-project 3 — equality secondary indexes (done)
+
+`CreateIndex(type_id, field_id)` + `FindBy(type_id, field_id, value)`.
+Replication-correct (content-derived keys, sorted id sets, digest-covered),
+deterministic backfill of pre-existing rows, maintained on Create/Update/
+Delete. Added `Storage::scan_range`. Spec:
+`docs/superpowers/specs/2026-05-17-kesseldb-subproject3-indexes.md`.
+**Honest limits:** equality only (no range / multi-index planner — next
+spec); read-modify-write per index op (correct, not yet throughput-optimized);
+`OverflowRef` fields not indexable.
+
 ## What this is NOT (yet)
 
-Still out of scope (each a later spec): secondary indexes, filtered scans,
-multi-index planner, built-in constraints, WASM triggers, destructive
-ALTER/DROP, overflow GC, cluster membership reconfiguration, client SDKs.
+Still out of scope (each a later spec): range scans, multi-index intersection
+planner, built-in constraints (NOT NULL/UNIQUE/FK/CHECK), WASM triggers,
+destructive ALTER/DROP, overflow GC, index-write throughput optimization,
+cluster membership reconfiguration, client SDKs.
 
 ## Performance log
 

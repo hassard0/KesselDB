@@ -445,6 +445,29 @@ impl<V: Vfs> Storage<V> {
             .collect()
     }
 
+    /// Sorted live entries whose key is in `[lo, hi]` (inclusive). Merges
+    /// memtable over SSTables, tombstones dropped. Backs index lookups and
+    /// type-range backfill. O(matching + #sstables·log n).
+    pub fn scan_range(&self, lo: &Key, hi: &Key) -> Vec<(Key, Vec<u8>)> {
+        let mut merged: BTreeMap<Key, Option<Vec<u8>>> = BTreeMap::new();
+        for sst in &self.sstables {
+            let s = sst.entries.partition_point(|(k, _)| k < lo);
+            for (k, v) in &sst.entries[s..] {
+                if k > hi {
+                    break;
+                }
+                merged.insert(*k, v.clone());
+            }
+        }
+        for (k, v) in self.memtable.range(*lo..=*hi) {
+            merged.insert(*k, v.clone());
+        }
+        merged
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|val| (k, val)))
+            .collect()
+    }
+
     /// Order-independent CRC digest of the entire live keyspace.
     pub fn digest(&self) -> u32 {
         let mut acc: u32 = 0xFFFF_FFFF;
@@ -556,6 +579,25 @@ mod tests {
         for n in 0..40u128 {
             assert_eq!(s.get(&k(n)), oracle.get(&k(n)).cloned(), "key {n}");
         }
+    }
+
+    #[test]
+    fn scan_range_is_sorted_correct_across_levels() {
+        let mut s = Storage::open(MemVfs::new()).unwrap();
+        for n in 0..20u128 {
+            s.put(n as u64, k(n), vec![n as u8]).unwrap();
+            if n == 9 {
+                s.flush().unwrap(); // 0..=9 in sstable, 10..=19 in memtable
+            }
+        }
+        s.delete(99, k(5)).unwrap();
+        let got = s.scan_range(&k(3), &k(12));
+        let keys: Vec<u128> = got
+            .iter()
+            .map(|(kk, _)| u128::from_le_bytes(kk[4..].try_into().unwrap()))
+            .collect();
+        assert_eq!(keys, vec![3, 4, 6, 7, 8, 9, 10, 11, 12], "range, sorted, 5 tombstoned");
+        assert!(got.windows(2).all(|w| w[0].0 < w[1].0));
     }
 
     #[test]

@@ -167,6 +167,7 @@ mod tests {
             name: "t".into(),
             schema_ver: ver,
             fields,
+            indexes: vec![],
         }
     }
 

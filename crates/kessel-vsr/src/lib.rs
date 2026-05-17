@@ -635,6 +635,49 @@ pub mod sim {
     }
 
     #[test]
+    fn secondary_index_replicates_and_converges() {
+        // CreateIndex + index maintenance must be deterministic through VSR:
+        // every replica's index keyspace (covered by digest) must match.
+        let mut c = Cluster::new(3, 13, 0);
+        let def = Op::CreateType {
+            def: encode_type_def(
+                "rec",
+                &[
+                    Field { field_id: 0, name: "owner".into(), kind: FieldKind::U32, nullable: false },
+                    Field { field_id: 0, name: "v".into(), kind: FieldKind::U32, nullable: false },
+                ],
+            ),
+        };
+        let row = |owner: u32| {
+            // record_size for two U32 = next_pow2(14+8)=32
+            let mut b = vec![0u8; 32];
+            b[14..18].copy_from_slice(&owner.to_le_bytes());
+            b
+        };
+        let mut reqs = vec![
+            (1u128, 1u64, def),
+            (1, 2, Op::CreateIndex { type_id: 1, field_id: 1 }),
+        ];
+        for i in 0..40u64 {
+            reqs.push((1, i + 3, Op::Create {
+                type_id: 1,
+                id: ObjectId::from_u128(i as u128),
+                record: row((i % 4) as u32),
+            }));
+        }
+        for i in 0..15u64 {
+            reqs.push((1, i + 100, Op::Update {
+                type_id: 1,
+                id: ObjectId::from_u128(i as u128),
+                record: row(9),
+            }));
+        }
+        assert_ne!(c.run(&reqs, 12000), usize::MAX, "indexed ops must commit");
+        let d = c.live_digests();
+        assert!(d.iter().all(|x| *x == d[0]), "index diverged: {d:?}");
+    }
+
+    #[test]
     fn converges_under_message_loss() {
         let mut c = Cluster::new(3, 9, 25); // drop 25% of messages
         let mut reqs = vec![(3u128, 1u64, def())];

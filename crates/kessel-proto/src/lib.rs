@@ -35,6 +35,12 @@ pub enum Op {
     /// Read a variable-length overflow blob by its deterministic handle
     /// (Sub-project 2). Write side rides inside `Create`/`Update` records.
     GetBlob { handle: u64 },
+    /// Declare an equality secondary index on a field; backfills existing
+    /// rows deterministically (Sub-project 3).
+    CreateIndex { type_id: TypeId, field_id: u16 },
+    /// Equality lookup: returns concatenated 16-byte object ids of every row
+    /// whose indexed field equals `value` (Sub-project 3).
+    FindBy { type_id: TypeId, field_id: u16, value: Vec<u8> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,6 +64,8 @@ impl Op {
             Op::Delete { .. } => 5,
             Op::GetById { .. } => 6,
             Op::GetBlob { .. } => 7,
+            Op::CreateIndex { .. } => 8,
+            Op::FindBy { .. } => 9,
         }
     }
 
@@ -81,6 +89,15 @@ impl Op {
                 b.extend_from_slice(&id.0);
             }
             Op::GetBlob { handle } => codec::put_u64(&mut b, *handle),
+            Op::CreateIndex { type_id, field_id } => {
+                codec::put_u32(&mut b, *type_id);
+                b.extend_from_slice(&field_id.to_le_bytes());
+            }
+            Op::FindBy { type_id, field_id, value } => {
+                codec::put_u32(&mut b, *type_id);
+                b.extend_from_slice(&field_id.to_le_bytes());
+                codec::put_bytes(&mut b, value);
+            }
         }
         b
     }
@@ -96,6 +113,8 @@ impl Op {
             5 => Op::Delete { type_id: c.u32()?, id: c.object_id()? },
             6 => Op::GetById { type_id: c.u32()?, id: c.object_id()? },
             7 => Op::GetBlob { handle: c.u64()? },
+            8 => Op::CreateIndex { type_id: c.u32()?, field_id: c.u16()? },
+            9 => Op::FindBy { type_id: c.u32()?, field_id: c.u16()?, value: c.bytes()? },
             _ => return None,
         };
         Some(op)
@@ -133,6 +152,11 @@ pub mod codec {
             let v = *self.buf.get(self.pos)?;
             self.pos += 1;
             Some(v)
+        }
+        pub fn u16(&mut self) -> Option<u16> {
+            let s = self.buf.get(self.pos..self.pos + 2)?;
+            self.pos += 2;
+            Some(u16::from_le_bytes(s.try_into().ok()?))
         }
         pub fn u32(&mut self) -> Option<u32> {
             let s = self.buf.get(self.pos..self.pos + 4)?;
@@ -227,6 +251,8 @@ mod tests {
             Op::Delete { type_id: 4, id },
             Op::GetById { type_id: 4, id },
             Op::GetBlob { handle: 0xABCD_1234_5678 },
+            Op::CreateIndex { type_id: 4, field_id: 2 },
+            Op::FindBy { type_id: 4, field_id: 2, value: vec![1, 2, 3, 4] },
         ];
         for op in ops {
             let enc = op.encode();

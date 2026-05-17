@@ -265,6 +265,51 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
         return Err("UPDATE requires server-side execution (compile_stmt)".into());
     }
     if p.kw("CREATE") {
+        // CREATE [UNIQUE|RANGE] INDEX ON t (cols) — DDL for indexes.
+        let unique = p.kw("UNIQUE");
+        let range = p.kw("RANGE");
+        if unique || range || {
+            // lookahead: `INDEX` (without consuming if it's TABLE)
+            matches!(p.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("INDEX"))
+        } {
+            p.expect_kw("INDEX")?;
+            p.expect_kw("ON")?;
+            let tname = p.ident()?;
+            let ot = p.type_named(&tname)?.clone();
+            p.punct('(')?;
+            let mut cols = Vec::new();
+            loop {
+                let c = p.ident()?;
+                let f = ot
+                    .fields
+                    .iter()
+                    .find(|f| f.name == c)
+                    .ok_or_else(|| format!("unknown column `{c}`"))?;
+                cols.push(f.field_id);
+                match p.next() {
+                    Some(Tok::Punct(',')) => continue,
+                    Some(Tok::Punct(')')) => break,
+                    _ => return Err("expected `,` or `)`".into()),
+                }
+            }
+            if cols.len() > 1 {
+                if unique || range {
+                    return Err("UNIQUE/RANGE index must be single-column".into());
+                }
+                return Ok(Op::AddCompositeIndex {
+                    type_id: ot.type_id,
+                    fields: cols,
+                });
+            }
+            let fid = cols[0];
+            return Ok(if unique {
+                Op::AddUnique { type_id: ot.type_id, field_id: fid }
+            } else if range {
+                Op::AddOrderedIndex { type_id: ot.type_id, field_id: fid }
+            } else {
+                Op::CreateIndex { type_id: ot.type_id, field_id: fid }
+            });
+        }
         p.expect_kw("TABLE")?;
         let name = p.ident()?;
         p.punct('(')?;
@@ -857,6 +902,60 @@ mod tests {
         // multi-eq AND, and the fallback Select must agree with QueryRows
         let q = run(&mut sm, 21, "SELECT * FROM rec WHERE owner = 200 AND v = 7");
         assert!(matches!(&q, OpResult::Got(b) if b.len() > 0));
+    }
+
+    #[test]
+    fn create_index_ddl_all_forms() {
+        use kessel_proto::Op;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (a U32 NOT NULL, b U32 NOT NULL, c I64 NOT NULL)");
+        let cat = sm.catalog().clone();
+        assert!(matches!(
+            compile("CREATE INDEX ON t (a)", &cat).unwrap(),
+            Op::CreateIndex { field_id: 1, .. }
+        ));
+        assert!(matches!(
+            compile("CREATE UNIQUE INDEX ON t (b)", &cat).unwrap(),
+            Op::AddUnique { field_id: 2, .. }
+        ));
+        assert!(matches!(
+            compile("CREATE RANGE INDEX ON t (c)", &cat).unwrap(),
+            Op::AddOrderedIndex { field_id: 3, .. }
+        ));
+        match compile("CREATE INDEX ON t (a, b)", &cat).unwrap() {
+            Op::AddCompositeIndex { fields, .. } => assert_eq!(fields, vec![1, 2]),
+            o => panic!("{o:?}"),
+        }
+        assert!(compile("CREATE UNIQUE INDEX ON t (a, b)", &cat).is_err());
+        // CREATE TABLE still works (not mistaken for an index)
+        assert!(matches!(
+            compile("CREATE TABLE z (x U8 NOT NULL)", &Catalog::default()).unwrap(),
+            Op::CreateType { .. }
+        ));
+
+        // end-to-end: pure-SQL index then index-accelerated query
+        assert_eq!(run(&mut sm, 2, "CREATE INDEX ON t (a)"), OpResult::Ok);
+        for i in 0..6u64 {
+            run(&mut sm, 3 + i, &format!("INSERT INTO t ID {i} (a, b, c) VALUES ({}, {i}, {i})", if i < 3 { 7 } else { 8 }));
+        }
+        let cat2 = sm.catalog().clone();
+        assert!(matches!(
+            compile("SELECT * FROM t WHERE a = 7", &cat2).unwrap(),
+            Op::QueryRows { .. }
+        ));
+        match run(&mut sm, 20, "SELECT * FROM t WHERE a = 7") {
+            OpResult::Got(b) => {
+                let mut p = 0;
+                let mut n = 0;
+                while p + 4 <= b.len() {
+                    let l = u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize;
+                    p += 4 + l;
+                    n += 1;
+                }
+                assert_eq!(n, 3);
+            }
+            o => panic!("{o:?}"),
+        }
     }
 
     #[test]

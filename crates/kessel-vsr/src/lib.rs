@@ -62,6 +62,10 @@ pub struct Replica<V: Vfs> {
     /// Consecutive view-change retry timeouts (drives VC liveness: resend,
     /// then escalate to the next view).
     vc_retries: u64,
+    /// Highest view number observed in ANY inbound message. Escalation
+    /// targets `max_view_seen + 1` so split replicas converge on one view
+    /// instead of chasing each other's `self.view + 1` forever.
+    max_view_seen: u64,
     pub crashed: bool,
 }
 
@@ -89,6 +93,7 @@ impl<V: Vfs> Replica<V> {
             dvc: HashMap::new(),
             ticks_idle: 0,
             vc_retries: 0,
+            max_view_seen: 0,
             crashed: false,
         }
     }
@@ -110,6 +115,21 @@ impl<V: Vfs> Replica<V> {
     }
     pub fn digest(&self) -> u32 {
         self.sm.digest()
+    }
+    /// Introspection for diagnostics: (view, is_primary, status, commit,
+    /// op_number, max_view_seen).
+    pub fn probe(&self) -> (u64, bool, &'static str, u64, u64, u64) {
+        (
+            self.view,
+            self.is_primary(),
+            match self.status {
+                Status::Normal => "Normal",
+                Status::ViewChange => "ViewChange",
+            },
+            self.commit,
+            self.op_number(),
+            self.max_view_seen,
+        )
     }
 
     /// Apply newly-committed entries (commit+1 ..= target) in order, exactly
@@ -139,6 +159,20 @@ impl<V: Vfs> Replica<V> {
         let mut out = Out::default();
         if self.crashed {
             return out;
+        }
+        let mv = match &msg {
+            Msg::Prepare { view, .. }
+            | Msg::PrepareOk { view, .. }
+            | Msg::Commit { view, .. }
+            | Msg::StartViewChange { view, .. }
+            | Msg::DoViewChange { view, .. }
+            | Msg::StartView { view, .. }
+            | Msg::GetState { view, .. }
+            | Msg::NewState { view, .. } => *view,
+            Msg::Request { .. } => 0,
+        };
+        if mv > self.max_view_seen {
+            self.max_view_seen = mv;
         }
         match msg {
             Msg::Request { client, req, op } => self.on_request(client, req, op, &mut out),
@@ -321,7 +355,11 @@ impl<V: Vfs> Replica<V> {
     // ---- view change ----
 
     fn start_view_change(&mut self, out: &mut Out) {
-        self.view += 1;
+        // Jump to one past the highest view ANYONE has reached, so split
+        // replicas rendezvous on a single view instead of each doing
+        // `self.view + 1` and chasing forever.
+        self.view = self.view.max(self.max_view_seen) + 1;
+        self.max_view_seen = self.max_view_seen.max(self.view);
         self.status = Status::ViewChange;
         self.svc_votes.entry(self.view).or_default().insert(self.idx);
         let v = self.view;
@@ -464,9 +502,13 @@ impl<V: Vfs> Replica<V> {
             if self.ticks_idle >= PRIMARY_TIMEOUT_TICKS {
                 self.ticks_idle = 0;
                 self.vc_retries += 1;
-                if self.vc_retries >= 3 {
+                // Staggered by replica index so they don't all escalate in
+                // lockstep (which would re-bump max_view_seen and restart the
+                // chase). Resend SVC several times first; convergence on the
+                // current max view should win before escalation fires.
+                if self.vc_retries >= 4 + self.idx as u64 {
                     self.vc_retries = 0;
-                    self.start_view_change(&mut out); // escalate to view+1
+                    self.start_view_change(&mut out); // -> max_view_seen + 1
                 } else {
                     let v = self.view;
                     self.svc_votes.entry(v).or_default().insert(self.idx);
@@ -598,6 +640,14 @@ pub mod sim {
 
         pub fn replica_count(&self) -> usize {
             self.rs.len()
+        }
+
+        pub fn probe(&self) -> Vec<(usize, (u64, bool, &'static str, u64, u64, u64))> {
+            self.rs.iter().map(|r| (r.idx, r.probe())).collect()
+        }
+
+        pub fn acked(&self) -> usize {
+            self.replies.len()
         }
 
         /// Permanently heal the network (SP12): no more partitions. Models

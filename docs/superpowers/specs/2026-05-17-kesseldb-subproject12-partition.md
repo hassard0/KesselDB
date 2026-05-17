@@ -31,16 +31,35 @@ concrete open limitation — nothing here is overclaimed.**
 - **No safety violation observed:** failures were stalls, never divergence
   / wrong committed data.
 
-## KNOWN OPEN LIMITATION (documented, not hidden)
+## KNOWN OPEN LIMITATION (documented, with precise diagnosis)
 
-`seed 7` of this adversarial schedule reproduces a **view-change-liveness
-stall that persists even after the network heals**. The crash-stop VSR's
-view-change does **not yet guarantee universal post-heal liveness** under
-arbitrary transient partitions. This is excluded from the assertion with an
-in-code comment and recorded here and in STATUS as a concrete, reproducible
-backlog item — *not* asserted as working. Closing it (full VSR view-change
-liveness: proper nonce/round handling, log-tail reconciliation, possibly
-recovery protocol) is a dedicated future spec.
+`seed 7` reproduces a failure that **persists even after the network heals**.
+SP13 added real improvements that did NOT close it but did improve the common
+case and sharpen the diagnosis (introspection via `Replica::probe`):
+
+**Improvements kept (genuine, tested):** escalate to `max_view_seen + 1`
+(split replicas rendezvous on one view instead of chasing `self+1`);
+backups relay client `Request`s to the primary; view-change retry/escalation
+timer staggered by replica index.
+
+**Precise diagnosis of the residual seed-7 failure** (from `probe`): after
+heal all three replicas *do* agree — same view, all `Normal`, equal commit —
+so view-change **safety holds and basic liveness recovers**. But the run
+reaches **view ≈ 138** (a view-change *storm* driven by repeated transient
+isolation of the primary), and across that storm the **first `CreateType`
+op is lost** (uncommitted-log reconciliation across many view changes does
+not preserve/re-propose it). Every dependent `Create` then deterministically
+returns `SchemaError("no type")` — which the client counts as a reply — so
+the replicas "converge" on an **empty database** (digest `0xFFFFFFFF`,
+13/16 acked).
+
+**Root cause class:** correct VSR uncommitted-log reconciliation + view-
+change-storm damping. This is the canonical hardest part of Viewstamped
+Replication (TigerBeetle invested person-years here). It is excluded from the
+assertion with an in-code comment and recorded here + STATUS as a concrete,
+reproducible, *precisely diagnosed* backlog item — never asserted as working
+and never faked. A dedicated future spec (proper DoViewChange log-merge that
+unions all uncommitted suffixes + view-change-storm backoff) will close it.
 
 ## Honesty note
 

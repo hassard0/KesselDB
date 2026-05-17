@@ -20,6 +20,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP10 — runnable TCP server + client** | **done** | `OpResult` wire codec; `kesseldb` binary (real fsync), `kessel-client`; single owning engine thread; end-to-end socket test |
 | **SP11 — ON DELETE RESTRICT/CASCADE** | **done** | FK `on_delete`; auto-index for reverse lookup; recursive cascade closure (visited+budget); atomic via txn wrap; VSR convergence |
 | **SP12 — VSR partition hardening** | **partial (honest)** | partition fault model + request-relay + VC-retry; determinism-under-partition & bounded post-heal convergence proven; **seed 7 = documented open VC-liveness repro** |
+| **SP13 — VSR view-change hardening** | **partial (honest)** | max-view-seen convergence (no escalation chase) + introspection; precise seed-7 diagnosis (view-change storm → first op lost → SchemaError-converged empty DB); root cause = VSR uncommitted-log reconciliation, still open |
 
 ## M3 VSR — done vs. hardening backlog (honest)
 

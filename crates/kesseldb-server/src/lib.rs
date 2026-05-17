@@ -18,7 +18,7 @@ use std::path::Path;
 use std::sync::mpsc::{channel, sync_channel, Sender, SyncSender};
 
 /// One request to the engine thread: an op and a one-shot reply channel.
-type EngineMsg = (Op, SyncSender<OpResult>);
+type EngineMsg = (Vec<u8>, SyncSender<OpResult>);
 
 /// Handle used by connection threads to submit ops to the single engine.
 #[derive(Clone)]
@@ -27,13 +27,20 @@ pub struct EngineHandle {
 }
 
 impl EngineHandle {
-    pub fn apply(&self, op: Op) -> OpResult {
+    /// Submit a raw request frame. `[0xFE] ++ utf8 SQL` is compiled against
+    /// the live catalog on the engine thread; otherwise it is an
+    /// `Op::encode()` frame. (SQL must compile on the engine thread because
+    /// it needs the catalog, which lives with the non-`Send` StateMachine.)
+    pub fn apply_raw(&self, frame: Vec<u8>) -> OpResult {
         let (rtx, rrx) = sync_channel(1);
-        if self.tx.send((op, rtx)).is_err() {
+        if self.tx.send((frame, rtx)).is_err() {
             return OpResult::SchemaError("engine stopped".into());
         }
         rrx.recv()
             .unwrap_or_else(|_| OpResult::SchemaError("engine dropped reply".into()))
+    }
+    pub fn apply(&self, op: Op) -> OpResult {
+        self.apply_raw(op.encode())
     }
 }
 
@@ -56,9 +63,32 @@ pub fn spawn_engine(data_dir: impl AsRef<Path>) -> io::Result<EngineHandle> {
             }
         };
         let mut n: u64 = 1;
-        while let Ok((op, reply)) = rx.recv() {
-            let r = sm.apply(n, op);
-            n += 1;
+        while let Ok((frame, reply)) = rx.recv() {
+            let op = if frame.first() == Some(&0xFE) {
+                match std::str::from_utf8(&frame[1..]) {
+                    Ok(sql) => match kessel_sql::compile(sql, sm.catalog()) {
+                        Ok(o) => Some(o),
+                        Err(e) => {
+                            let _ = reply.send(OpResult::SchemaError(format!("sql: {e}")));
+                            continue;
+                        }
+                    },
+                    Err(_) => {
+                        let _ = reply.send(OpResult::SchemaError("sql: not utf8".into()));
+                        continue;
+                    }
+                }
+            } else {
+                Op::decode(&frame)
+            };
+            let r = match op {
+                Some(o) => {
+                    let r = sm.apply(n, o);
+                    n += 1;
+                    r
+                }
+                None => OpResult::SchemaError("malformed request frame".into()),
+            };
             let _ = reply.send(r);
         }
     });
@@ -75,10 +105,7 @@ fn handle_conn(mut stream: TcpStream, engine: EngineHandle) {
             Ok(r) => r,
             Err(_) => break,
         };
-        let result = match Op::decode(&req) {
-            Some(op) => engine.apply(op),
-            None => OpResult::SchemaError("malformed request frame".into()),
-        };
+        let result = engine.apply_raw(req);
         if write_frame(&mut stream, &result.encode()).is_err() {
             break;
         }
@@ -172,6 +199,42 @@ mod tests {
             }
             o => panic!("unexpected {o:?}"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sql_over_tcp() {
+        let dir = std::env::temp_dir().join(format!("kesseldb-sql-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = spawn_engine(&dir).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || serve(listener, engine));
+
+        let mut c = Client::connect(addr).unwrap();
+        assert!(matches!(
+            c.sql("CREATE TABLE acct (owner U32 NOT NULL, bal I64 NOT NULL)").unwrap(),
+            OpResult::TypeCreated(1)
+        ));
+        assert_eq!(
+            c.sql("INSERT INTO acct ID 1 (owner, bal) VALUES (100, 50)").unwrap(),
+            OpResult::Ok
+        );
+        assert_eq!(
+            c.sql("INSERT INTO acct ID 2 (owner, bal) VALUES (100, 999)").unwrap(),
+            OpResult::Ok
+        );
+        match c.sql("SELECT SUM(bal) FROM acct WHERE owner = 100").unwrap() {
+            OpResult::Got(b) => {
+                assert_eq!(i128::from_le_bytes(b.try_into().unwrap()), 1049)
+            }
+            o => panic!("unexpected {o:?}"),
+        }
+        // a bad statement returns a clean error over the wire, no crash
+        assert!(matches!(
+            c.sql("SELECT FROM nope").unwrap(),
+            OpResult::SchemaError(_)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

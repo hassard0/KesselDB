@@ -29,4 +29,16 @@ impl Client {
         OpResult::decode(&resp)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad OpResult frame"))
     }
+
+    /// Send a SQL statement (compiled server-side against the live catalog).
+    /// Wire form: `[0xFE] ++ utf8`.
+    pub fn sql(&mut self, sql: &str) -> io::Result<OpResult> {
+        let mut frame = Vec::with_capacity(sql.len() + 1);
+        frame.push(0xFE);
+        frame.extend_from_slice(sql.as_bytes());
+        write_frame(&mut self.stream, &frame)?;
+        let resp = read_frame(&mut self.stream)?;
+        OpResult::decode(&resp)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad OpResult frame"))
+    }
 }

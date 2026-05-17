@@ -36,6 +36,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP26 — lightweight scan_prefix** | **done** | keys-only memtable-fast-path scan for index reads; helped marginally; FindBy/write gap is an architectural tradeoff (corrected the earlier over-optimistic SP25 note honestly) |
 | **SP27 — composite indexes** | **done** | multi-field equality index via SP25 per-entry design (synthetic fid + concatenated values); `AddCompositeIndex`/`FindByComposite`; maintained C/U/D; VSR convergence |
 | **SP28 — SQL text layer** | **done** | `kessel-sql`: tokenizer + recursive-descent; CREATE/INSERT/SELECT(WHERE→expr VM, GROUP BY, ORDER BY, LIMIT/OFFSET, COUNT/SUM/MIN/MAX)/DELETE → existing Ops; e2e through StateMachine |
+| **SP29 — SQL over TCP** | **done** | engine compiles `0xFE`-marked frames vs live catalog; `Client::sql()`; usable networked SQL DB; e2e SQL-over-socket test |
 
 ## M3 VSR — done vs. hardening backlog (honest)
 

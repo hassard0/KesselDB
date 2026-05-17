@@ -23,6 +23,57 @@ use std::sync::Arc;
 
 /// First-frame auth handshake tag: `[0xFC] ++ token`.
 pub const AUTH_TAG: u8 = 0xFC;
+/// Admin: request server stats. Frame = `[0xFB]`; reply `Got(stats)`.
+pub const STATS_TAG: u8 = 0xFB;
+/// Admin: take a consistent on-disk snapshot. Frame =
+/// `[0xFA] ++ utf8 dest_dir`; reply `Ok` / `SchemaError`.
+pub const SNAPSHOT_TAG: u8 = 0xFA;
+
+/// Operational status of a running node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerStats {
+    /// Engine sequence number — monotone count of applied ops.
+    pub applied_ops: u64,
+    /// Deterministic state digest (matches `Replica::digest`).
+    pub digest: u32,
+    /// Seconds since this engine started.
+    pub uptime_secs: u64,
+}
+
+impl ServerStats {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(20);
+        b.extend_from_slice(&self.applied_ops.to_le_bytes());
+        b.extend_from_slice(&self.digest.to_le_bytes());
+        b.extend_from_slice(&self.uptime_secs.to_le_bytes());
+        b
+    }
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() < 20 {
+            return None;
+        }
+        Some(ServerStats {
+            applied_ops: u64::from_le_bytes(b[0..8].try_into().ok()?),
+            digest: u32::from_le_bytes(b[8..12].try_into().ok()?),
+            uptime_secs: u64::from_le_bytes(b[12..20].try_into().ok()?),
+        })
+    }
+}
+
+/// Copy every file in a flat data dir to `dest` (created if missing). The
+/// caller (engine thread) guarantees no concurrent writes, so the copy is
+/// a crash-consistent image — `StateMachine::open(dest)` recovers it.
+fn copy_dir_flat(src: &Path, dest: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for e in std::fs::read_dir(src)? {
+        let e = e?;
+        let p = e.path();
+        if p.is_file() {
+            std::fs::copy(&p, dest.join(e.file_name()))?;
+        }
+    }
+    Ok(())
+}
 
 /// Server policy: optional shared-secret token, plus quota / backpressure
 /// caps. Defaults are open + generous so existing embeddings are unchanged.
@@ -112,6 +163,28 @@ impl EngineHandle {
     pub fn apply(&self, op: Op) -> OpResult {
         self.apply_raw(op.encode())
     }
+
+    /// Current operational stats (ops applied, state digest, uptime).
+    pub fn stats(&self) -> ServerStats {
+        match self.apply_raw(vec![STATS_TAG]) {
+            OpResult::Got(b) => ServerStats::decode(&b)
+                .unwrap_or(ServerStats { applied_ops: 0, digest: 0, uptime_secs: 0 }),
+            _ => ServerStats { applied_ops: 0, digest: 0, uptime_secs: 0 },
+        }
+    }
+
+    /// Take a consistent on-disk snapshot/backup into `dest`. The engine
+    /// flushes, then copies its data dir while no apply is in flight, so
+    /// `StateMachine::open(dest)` recovers an identical state.
+    pub fn snapshot(&self, dest: impl AsRef<Path>) -> io::Result<()> {
+        let mut f = vec![SNAPSHOT_TAG];
+        f.extend_from_slice(dest.as_ref().to_string_lossy().as_bytes());
+        match self.apply_raw(f) {
+            OpResult::Ok => Ok(()),
+            OpResult::SchemaError(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
+            _ => Err(io::Error::new(io::ErrorKind::Other, "snapshot failed")),
+        }
+    }
 }
 
 /// Spawn the owning engine thread with the default config.
@@ -142,7 +215,33 @@ pub fn spawn_engine_cfg(
             }
         };
         let mut n: u64 = 1;
+        let start = std::time::Instant::now();
         while let Ok((frame, reply)) = rx.recv() {
+            // Admin frames are handled inline on the engine thread (so a
+            // snapshot sees no concurrent apply, and stats are exact).
+            match frame.first() {
+                Some(&STATS_TAG) => {
+                    let st = ServerStats {
+                        applied_ops: n - 1,
+                        digest: sm.digest(),
+                        uptime_secs: start.elapsed().as_secs(),
+                    };
+                    let _ = reply.send(OpResult::Got(st.encode()));
+                    continue;
+                }
+                Some(&SNAPSHOT_TAG) => {
+                    let dest = String::from_utf8_lossy(&frame[1..]).into_owned();
+                    let r = sm
+                        .flush()
+                        .and_then(|_| copy_dir_flat(&dir, Path::new(&dest)));
+                    let _ = reply.send(match r {
+                        Ok(()) => OpResult::Ok,
+                        Err(e) => OpResult::SchemaError(format!("snapshot: {e}")),
+                    });
+                    continue;
+                }
+                _ => {}
+            }
             let op = if frame.first() == Some(&0xFE) {
                 let sql = match std::str::from_utf8(&frame[1..]) {
                     Ok(s) => s,
@@ -518,5 +617,65 @@ mod tests {
         let r = c2.call(&Op::GetById { type_id: 1, id: ObjectId::from_u128(1) });
         assert!(r.is_err(), "connection past the cap must not be served");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stats_and_snapshot_are_consistent_and_recoverable() {
+        let dir =
+            std::env::temp_dir().join(format!("kesseldb-snap-{}", std::process::id()));
+        let dest = std::env::temp_dir()
+            .join(format!("kesseldb-snap-dest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dest);
+        let engine = spawn_engine(&dir).unwrap();
+
+        let before = engine.stats();
+        assert_eq!(before.applied_ops, 0);
+
+        assert_eq!(
+            engine.apply(Op::CreateType {
+                def: encode_type_def(
+                    "t",
+                    &[Field {
+                        field_id: 0,
+                        name: "v".into(),
+                        kind: FieldKind::U64,
+                        nullable: false,
+                    }],
+                ),
+            }),
+            OpResult::TypeCreated(1)
+        );
+        let id = ObjectId::from_u128(99);
+        assert_eq!(
+            engine.apply(Op::Create { type_id: 1, id, record: vec![5, 0, 0, 0, 0, 0, 0, 0] }),
+            OpResult::Ok
+        );
+
+        let after = engine.stats();
+        assert!(
+            after.applied_ops >= 2 && after.applied_ops > before.applied_ops,
+            "stats must track applied ops"
+        );
+
+        // Consistent online snapshot, then recover it independently.
+        engine.snapshot(&dest).unwrap();
+        let live_digest = after.digest;
+        let recovered =
+            StateMachine::open(DirVfs::new(&dest).unwrap()).unwrap();
+        assert_eq!(
+            recovered.digest(),
+            live_digest,
+            "snapshot must recover to the exact live state digest"
+        );
+        // The row is readable from the recovered copy.
+        let mut rec = recovered;
+        assert_eq!(
+            rec.apply(1, Op::GetById { type_id: 1, id }),
+            OpResult::Got(vec![5, 0, 0, 0, 0, 0, 0, 0])
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dest);
     }
 }

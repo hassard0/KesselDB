@@ -51,6 +51,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP41 — failover-safe retries** | **done (server side)** | cached-reply check moved ahead of the backup relay → *any* node serves a committed `(client,req)` from its replicated client table; `submit_as`/`client_id`; follower-retry test digest-stable; **132 green** |
 | **SP42 — client-side failover discovery** | **done** | `OpResult::Unavailable` redirect + `is_active_primary` + `0xFD` session frame + `ClusterClient` (rotates address list, retries same `(client,req)`); client finds primary past 2 followers, replay exactly-once over the wire; **133 green** |
 | **SP43 — auth + quotas/backpressure** | **done** | zero-dep shared-secret token (`ct_eq` timing-safe) + `OpResult::Unauthorized`; `max_conns` connection cap; `max_inflight` load-shed → `Unavailable`; honest TLS boundary documented (proxy/VPN, not faked); **137 green** |
+| **SP44 — operational tooling** | **done** | engine-thread-consistent `snapshot(dest)` (hot backup → `StateMachine::open` recovers exact digest) + `stats()` (`ServerStats{applied_ops,digest,uptime}`, wire codec); **138 green** |
 
 ## Production-readiness gate (precise, not vague)
 
@@ -70,17 +71,17 @@ hand-waving:
 | Exactly-once client retries | ✅ **SP40 done** — stable sessions; duplicate `(client,req)` deduped, digest-stable |
 | Failover-safe retries (server: any node serves committed result) | ✅ **SP41 done** |
 | Client-side new-primary auto-discovery (exactly-once) | ✅ **SP42 done** — `ClusterClient` rotates + retries same `(client,req)` |
-| Index point-read perf (post-SP25 tradeoff) | ⚠️ documented enhancement |
 | Auth (shared-secret, timing-safe) + quotas + backpressure | ✅ **SP43 done** |
 | Transport encryption (TLS) | ⛔ deliberate zero-dep boundary — deploy behind TLS proxy / private net (documented, not faked) |
-| Operational tooling (backup, metrics, admin) | ⚠️ SP44 next |
+| Operational tooling (hot snapshot/backup, metrics) | ✅ **SP44 done** — consistent snapshot recovers exact digest; live `ServerStats` |
+| Index point-read perf (post-SP25 tradeoff) | ⚠️ SP45 next |
 
 The honest verdict: a **complete & functionally-correct** database, **VSR
 safety** hardened, now running as a **real multi-node TCP cluster** (SP38).
-Failover (SP38–42) and auth/quotas/backpressure (SP43) are done. Remaining
-gates, concrete and named: ops tooling (SP44 next), index point-read perf
-(SP45), and adversarial-partition liveness (seed 7, SP46 — the one
-genuinely hard item). Transport encryption is a deliberate, documented
+Failover (SP38–42), auth/quotas/backpressure (SP43), and ops tooling
+(SP44) are done. Remaining gates, concrete and named: index point-read
+perf (SP45 next), and adversarial-partition liveness (seed 7, SP46 — the
+one genuinely hard item). Transport encryption is a deliberate, documented
 zero-dep boundary (TLS proxy / private network), not an open gap. No vague
 "research-grade" hedging — each item is a
 specific, scoped slice.

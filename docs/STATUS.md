@@ -25,6 +25,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP15 — order-preserving range index** | **done** | `Op::AddOrderedIndex`+`FindRange`; sign-correct 8B order keys; sub-linear range scan; maintained on C/U/D; replicated/deterministic; fixed need_idx gate bug |
 | **SP16 — flexibility-cost benchmark** | **done** | `kessel-bench flex`: plain CREATE ~893K/s; eq-index ~6.5× (top perf debt), ordered ~2.9×, CHECK/trigger ~3×, FindBy 1.2M/s; honest analysis recorded |
 | **SP17 — eq-index sharding** | **reverted (honest negative result)** | built+tested but didn't improve the measured debt & regressed FindBy ~2×; reverted not shipped; real fix = per-(value,object) index keys (needs wider storage key) — documented future spec |
+| **SP18 — Select (rows + LIMIT)** | **done** | `Op::Select` returns filtered whole rows (VM filter) up to LIMIT; read-only, deterministic, txn-allowed; end-to-end over the TCP server |
 
 ## M3 VSR — done vs. hardening backlog (honest)
 

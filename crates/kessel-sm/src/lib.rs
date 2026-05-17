@@ -1327,6 +1327,37 @@ impl<V: Vfs> StateMachine<V> {
                 OpResult::Got(out)
             }
 
+            Op::Select { type_id, program, limit } => {
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                // Filtered scan returning up to `limit` rows as
+                // length-prefixed record blobs (sorted by key for
+                // deterministic output). Read-only.
+                let lo = make_key(type_id, &[0u8; 16]);
+                let hi = make_key(type_id, &[0xFFu8; 16]);
+                let mut out = Vec::new();
+                let mut n = 0u32;
+                for (_, rec) in self.storage.scan_range(&lo, &hi) {
+                    if limit != 0 && n >= limit {
+                        break;
+                    }
+                    match kessel_expr::eval(&program, &ot, &rec) {
+                        Ok(true) => {
+                            out.extend_from_slice(&(rec.len() as u32).to_le_bytes());
+                            out.extend_from_slice(&rec);
+                            n += 1;
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            return OpResult::SchemaError(format!("select program: {e:?}"))
+                        }
+                    }
+                }
+                OpResult::Got(out)
+            }
+
             Op::AddOrderedIndex { type_id, field_id } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
@@ -1429,6 +1460,7 @@ impl<V: Vfs> StateMachine<V> {
                             | Op::Query { .. }
                             | Op::QueryExpr { .. }
                             | Op::FindRange { .. }
+                            | Op::Select { .. }
                     );
                     if !ok {
                         return OpResult::SchemaError(
@@ -2609,6 +2641,76 @@ mod tests {
             sm.digest()
         };
         assert_eq!(build(), build(), "range index must be deterministic");
+    }
+
+    // ---- Sub-project 18: Select (rows + filter + LIMIT) ----
+
+    fn sel_rows(r: OpResult) -> Vec<Vec<u8>> {
+        match r {
+            OpResult::Got(b) => {
+                let mut out = Vec::new();
+                let mut p = 0;
+                while p + 4 <= b.len() {
+                    let l = u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize;
+                    p += 4;
+                    out.push(b[p..p + l].to_vec());
+                    p += l;
+                }
+                out
+            }
+            o => panic!("expected Got, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn select_returns_filtered_rows_with_limit() {
+        use kessel_expr::Program;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: q_type_def() }); // owner u32 f1, kind u16 f2, v u32 f3
+        for i in 0..20u64 {
+            sm.apply(2 + i, Op::Create {
+                type_id: 1,
+                id: ObjectId::from_u128(i as u128),
+                record: qrec(if i < 8 { 100 } else { 200 }, 0, i as u32),
+            });
+        }
+        // filter owner==100 -> 8 rows; unlimited
+        let prog = Program::new().load(1).push_int(100).eq().bytes();
+        let rows = sel_rows(sm.apply(30, Op::Select { type_id: 1, program: prog.clone(), limit: 0 }));
+        assert_eq!(rows.len(), 8);
+        // each returned blob is a full fixed record
+        let rsz = qrec(0, 0, 0).len();
+        assert!(rows.iter().all(|r| r.len() == rsz));
+        // LIMIT 3 caps it
+        let rows = sel_rows(sm.apply(31, Op::Select { type_id: 1, program: prog, limit: 3 }));
+        assert_eq!(rows.len(), 3);
+        // filter matching nothing -> empty
+        let none = Program::new().load(1).push_int(99999).eq().bytes();
+        assert_eq!(sel_rows(sm.apply(32, Op::Select { type_id: 1, program: none, limit: 0 })).len(), 0);
+    }
+
+    #[test]
+    fn select_is_readonly_and_deterministic() {
+        use kessel_expr::Program;
+        let build = || {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            sm.apply(1, Op::CreateType { def: q_type_def() });
+            for i in 0..30u64 {
+                sm.apply(2 + i, Op::Create {
+                    type_id: 1, id: ObjectId::from_u128(i as u128),
+                    record: qrec((i % 4) as u32, 0, i as u32),
+                });
+            }
+            let d0 = sm.digest();
+            let prog = Program::new().load(1).push_int(2).lt().bytes(); // owner<2
+            let rows = sel_rows(sm.apply(99, Op::Select { type_id: 1, program: prog, limit: 0 }));
+            (rows, d0, sm.digest())
+        };
+        let (a, before, after) = build();
+        let (b, _, _) = build();
+        assert_eq!(before, after, "Select must not mutate state");
+        assert_eq!(a, b, "Select must be deterministic");
+        assert!(!a.is_empty());
     }
 
     // ---- Sub-project 6: foreign keys ----

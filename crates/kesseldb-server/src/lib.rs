@@ -153,6 +153,25 @@ mod tests {
             .unwrap(),
             OpResult::Ok
         );
+        // Select over the wire returns actual rows (limit 10).
+        let prog = kessel_expr::Program::new().push_int(1).bytes(); // always true
+        match c
+            .call(&Op::Select { type_id: 1, program: prog, limit: 10 })
+            .unwrap()
+        {
+            OpResult::Got(b) => {
+                // at least the 3 rows created above, as length-prefixed blobs
+                let mut p = 0;
+                let mut rows = 0;
+                while p + 4 <= b.len() {
+                    let l = u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize;
+                    p += 4 + l;
+                    rows += 1;
+                }
+                assert!(rows >= 3, "Select returned {rows} rows over the wire");
+            }
+            o => panic!("unexpected {o:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

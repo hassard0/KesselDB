@@ -80,6 +80,10 @@ pub enum Op {
     /// Sub-linear inclusive range scan over an order-indexed field: returns
     /// concatenated 16-byte ids of rows with `lo <= field <= hi`.
     FindRange { type_id: TypeId, field_id: u16, lo: Vec<u8>, hi: Vec<u8> },
+    /// Filtered row query (Sub-project 18): scan, keep rows where the
+    /// kessel-expr `program` is true, return up to `limit` rows as
+    /// length-prefixed record blobs. Read-only & deterministic.
+    Select { type_id: TypeId, program: Vec<u8>, limit: u32 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -159,6 +163,7 @@ impl Op {
             Op::QueryExpr { .. } => 16,
             Op::AddOrderedIndex { .. } => 17,
             Op::FindRange { .. } => 18,
+            Op::Select { .. } => 19,
         }
     }
 
@@ -238,6 +243,11 @@ impl Op {
                 codec::put_bytes(&mut b, lo);
                 codec::put_bytes(&mut b, hi);
             }
+            Op::Select { type_id, program, limit } => {
+                codec::put_u32(&mut b, *type_id);
+                codec::put_bytes(&mut b, program);
+                codec::put_u32(&mut b, *limit);
+            }
         }
         b
     }
@@ -297,6 +307,11 @@ impl Op {
                 field_id: c.u16()?,
                 lo: c.bytes()?,
                 hi: c.bytes()?,
+            },
+            19 => Op::Select {
+                type_id: c.u32()?,
+                program: c.bytes()?,
+                limit: c.u32()?,
             },
             _ => return None,
         };
@@ -477,6 +492,7 @@ mod tests {
             Op::QueryExpr { type_id: 4, program: vec![0, 9, 9] },
             Op::AddOrderedIndex { type_id: 4, field_id: 2 },
             Op::FindRange { type_id: 4, field_id: 2, lo: vec![0], hi: vec![255, 255] },
+            Op::Select { type_id: 4, program: vec![1, 2], limit: 10 },
         ];
         for op in ops {
             let enc = op.encode();

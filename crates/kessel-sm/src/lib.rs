@@ -1437,6 +1437,70 @@ impl<V: Vfs> StateMachine<V> {
                 OpResult::Got(out)
             }
 
+            Op::Aggregate { type_id, program, kind, field_id } => {
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                // COUNT needs no field; SUM/MIN/MAX need a numeric ≤8B field.
+                let fpos = if kind == 0 {
+                    None
+                } else {
+                    match Self::ord_field_pos(&ot, field_id) {
+                        Some((off, w, fk)) => Some((off, w, fk)),
+                        None => {
+                            return OpResult::SchemaError(
+                                "Aggregate field must be numeric ≤8B".into(),
+                            )
+                        }
+                    }
+                };
+                let decode_i128 = |raw: &[u8], w: usize, signed: bool| -> i128 {
+                    let mut le = [0u8; 16];
+                    le[..w.min(16)].copy_from_slice(&raw[..w.min(16)]);
+                    if signed && w < 16 && raw[w - 1] & 0x80 != 0 {
+                        for b in le.iter_mut().skip(w) {
+                            *b = 0xFF;
+                        }
+                    }
+                    i128::from_le_bytes(le)
+                };
+                let lo = make_key(type_id, &[0u8; 16]);
+                let hi = make_key(type_id, &[0xFFu8; 16]);
+                let mut count: i128 = 0;
+                let mut sum: i128 = 0;
+                let mut mn: Option<i128> = None;
+                let mut mx: Option<i128> = None;
+                for (_, rec) in self.storage.scan_range(&lo, &hi) {
+                    match kessel_expr::eval(&program, &ot, &rec) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(e) => {
+                            return OpResult::SchemaError(format!("agg program: {e:?}"))
+                        }
+                    }
+                    count += 1;
+                    if let Some((off, w, fk)) = fpos {
+                        if let Some(raw) = rec.get(off..off + w) {
+                            use kessel_catalog::FieldKind::*;
+                            let signed = matches!(fk, I8 | I16 | I32 | I64 | Fixed { .. });
+                            let v = decode_i128(raw, w, signed);
+                            sum = sum.wrapping_add(v);
+                            mn = Some(mn.map_or(v, |m| m.min(v)));
+                            mx = Some(mx.map_or(v, |m| m.max(v)));
+                        }
+                    }
+                }
+                let result: i128 = match kind {
+                    0 => count,
+                    1 => sum,
+                    2 => mn.unwrap_or(0),
+                    3 => mx.unwrap_or(0),
+                    _ => return OpResult::SchemaError("agg kind must be 0|1|2|3".into()),
+                };
+                OpResult::Got(result.to_le_bytes().to_vec())
+            }
+
             Op::AddOrderedIndex { type_id, field_id } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
@@ -1540,6 +1604,7 @@ impl<V: Vfs> StateMachine<V> {
                             | Op::QueryExpr { .. }
                             | Op::FindRange { .. }
                             | Op::Select { .. }
+                            | Op::Aggregate { .. }
                     );
                     if !ok {
                         return OpResult::SchemaError(
@@ -2852,6 +2917,69 @@ mod tests {
         assert_eq!(before, after, "Select must not mutate state");
         assert_eq!(a, b, "Select must be deterministic");
         assert!(!a.is_empty());
+    }
+
+    // ---- Sub-project 20: aggregates ----
+
+    #[test]
+    fn aggregate_count_sum_min_max() {
+        use kessel_expr::Program;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: q_type_def() }); // owner u32 f1, kind u16 f2, v u32 f3
+        // rows: owner, v   (v in field 3)
+        let data = [(1u32, 10i64), (1, 20), (1, 5), (2, 100), (2, 7)];
+        for (i, (o, v)) in data.iter().enumerate() {
+            sm.apply(2 + i as u64, Op::Create {
+                type_id: 1,
+                id: ObjectId::from_u128(i as u128),
+                record: qrec(*o, 0, *v as u32),
+            });
+        }
+        let agg = |sm: &mut StateMachine<MemVfs>, op, k, prog: Vec<u8>| -> i128 {
+            match sm.apply(op, Op::Aggregate { type_id: 1, program: prog, kind: k, field_id: 3 }) {
+                OpResult::Got(b) => i128::from_le_bytes(b.try_into().unwrap()),
+                o => panic!("expected Got, got {o:?}"),
+            }
+        };
+        let all = Program::new().push_int(1).bytes(); // always true
+        let owner1 = Program::new().load(1).push_int(1).eq().bytes();
+        assert_eq!(agg(&mut sm, 20, 0, all.clone()), 5, "COUNT all");
+        assert_eq!(agg(&mut sm, 21, 0, owner1.clone()), 3, "COUNT owner=1");
+        assert_eq!(agg(&mut sm, 22, 1, owner1.clone()), 35, "SUM v owner=1 (10+20+5)");
+        assert_eq!(agg(&mut sm, 23, 2, owner1.clone()), 5, "MIN v owner=1");
+        assert_eq!(agg(&mut sm, 24, 3, owner1), 20, "MAX v owner=1");
+        assert_eq!(agg(&mut sm, 25, 1, all), 142, "SUM v all (10+20+5+100+7)");
+        // no match -> COUNT 0, SUM 0
+        let none = Program::new().load(1).push_int(999).eq().bytes();
+        assert_eq!(agg(&mut sm, 26, 0, none.clone()), 0);
+        assert_eq!(agg(&mut sm, 27, 1, none), 0);
+    }
+
+    #[test]
+    fn aggregate_is_readonly_and_deterministic() {
+        use kessel_expr::Program;
+        let build = || {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            sm.apply(1, Op::CreateType { def: q_type_def() });
+            for i in 0..40u64 {
+                sm.apply(2 + i, Op::Create {
+                    type_id: 1, id: ObjectId::from_u128(i as u128),
+                    record: qrec((i % 4) as u32, 0, i as u32),
+                });
+            }
+            let d0 = sm.digest();
+            let prog = Program::new().push_int(1).bytes();
+            let s = match sm.apply(99, Op::Aggregate { type_id: 1, program: prog, kind: 1, field_id: 3 }) {
+                OpResult::Got(b) => i128::from_le_bytes(b.try_into().unwrap()),
+                o => panic!("{o:?}"),
+            };
+            (s, d0, sm.digest())
+        };
+        let (a, before, after) = build();
+        let (b, _, _) = build();
+        assert_eq!(before, after, "Aggregate must not mutate state");
+        assert_eq!(a, b, "Aggregate must be deterministic");
+        assert_eq!(a, (0..40).sum::<i128>(), "SUM 0..40");
     }
 
     // ---- Sub-project 6: foreign keys ----

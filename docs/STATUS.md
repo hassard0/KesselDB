@@ -27,6 +27,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP17 — eq-index sharding** | **reverted (honest negative result)** | built+tested but didn't improve the measured debt & regressed FindBy ~2×; reverted not shipped; real fix = per-(value,object) index keys (needs wider storage key) — documented future spec |
 | **SP18 — Select (rows + LIMIT)** | **done** | `Op::Select` returns filtered whole rows (VM filter) up to LIMIT; read-only, deterministic, txn-allowed; end-to-end over the TCP server |
 | **SP19 — ON DELETE SET NULL** | **done** | action 3; nulls referencing FK fields (codec null bit) atomically with cascade; index maintenance; deterministic; VSR convergence. Referential-action set complete |
+| **SP20 — aggregates** | **done** | `Op::Aggregate` COUNT/SUM/MIN/MAX over a VM-filtered set; i128 result; read-only, deterministic, txn-allowed |
 
 ## M3 VSR — done vs. hardening backlog (honest)
 

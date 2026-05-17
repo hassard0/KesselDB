@@ -84,6 +84,10 @@ pub enum Op {
     /// kessel-expr `program` is true, return up to `limit` rows as
     /// length-prefixed record blobs. Read-only & deterministic.
     Select { type_id: TypeId, program: Vec<u8>, limit: u32 },
+    /// Aggregate (Sub-project 20) over rows matching `program`:
+    /// `kind` 0=COUNT, 1=SUM, 2=MIN, 3=MAX of `field_id` (numeric).
+    /// Result returned as a 16-byte little-endian i128 in `Got`.
+    Aggregate { type_id: TypeId, program: Vec<u8>, kind: u8, field_id: u16 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -164,6 +168,7 @@ impl Op {
             Op::AddOrderedIndex { .. } => 17,
             Op::FindRange { .. } => 18,
             Op::Select { .. } => 19,
+            Op::Aggregate { .. } => 20,
         }
     }
 
@@ -248,6 +253,12 @@ impl Op {
                 codec::put_bytes(&mut b, program);
                 codec::put_u32(&mut b, *limit);
             }
+            Op::Aggregate { type_id, program, kind, field_id } => {
+                codec::put_u32(&mut b, *type_id);
+                codec::put_bytes(&mut b, program);
+                b.push(*kind);
+                b.extend_from_slice(&field_id.to_le_bytes());
+            }
         }
         b
     }
@@ -312,6 +323,12 @@ impl Op {
                 type_id: c.u32()?,
                 program: c.bytes()?,
                 limit: c.u32()?,
+            },
+            20 => Op::Aggregate {
+                type_id: c.u32()?,
+                program: c.bytes()?,
+                kind: c.u8()?,
+                field_id: c.u16()?,
             },
             _ => return None,
         };
@@ -493,6 +510,7 @@ mod tests {
             Op::AddOrderedIndex { type_id: 4, field_id: 2 },
             Op::FindRange { type_id: 4, field_id: 2, lo: vec![0], hi: vec![255, 255] },
             Op::Select { type_id: 4, program: vec![1, 2], limit: 10 },
+            Op::Aggregate { type_id: 4, program: vec![1], kind: 1, field_id: 3 },
         ];
         for op in ops {
             let enc = op.encode();

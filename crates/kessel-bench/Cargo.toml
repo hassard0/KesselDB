@@ -1,0 +1,16 @@
+[package]
+name = "kessel-bench"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+kessel-proto = { path = "../kessel-proto" }
+kessel-io = { path = "../kessel-io" }
+kessel-catalog = { path = "../kessel-catalog" }
+kessel-codec = { path = "../kessel-codec" }
+kessel-sm = { path = "../kessel-sm" }
+
+[[bin]]
+name = "kessel-bench"
+path = "src/main.rs"

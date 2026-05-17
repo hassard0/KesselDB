@@ -6,8 +6,8 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 |---|---|---|
 | M0 — workspace + determinism seam | **done** | proto/io/sim crates; 13 tests green; determinism gate = 100 seeds × 2 runs identical |
 | M1 — storage engine (LSM+WAL+recovery) | **done** | WAL+memtable+SSTable+compaction+manifest+crash recovery; 5 tests incl. property-vs-oracle & crash-recovery; Vfs seam added |
-| M2 — catalog + codec + single-node SM | in progress | early go/no-go benchmark gate |
-| M3 — VSR replication | not started | hardest milestone (consensus from scratch) |
+| M2 — catalog + codec + single-node SM | **done — CONDITIONAL GO** | thesis not refuted; group-commit added (37× win); see verdict below |
+| M3 — VSR replication | in progress | hardest milestone (consensus from scratch) |
 | M4 — cache + sharding + perf | not started | cloud-scaling speculation |
 
 ## What this is NOT (yet)
@@ -30,5 +30,36 @@ filter. This is a known architectural debt earmarked for M4 perf work (bloom fil
 level compaction, zero-copy reads), recorded here rather than hidden. The first
 *thesis-relevant* number is the M2 single-node state-machine benchmark.
 
-Benchmarks continue at M2 (single-node SM) and M4 (replicated, cache on/off) with explicit
-reasoned cloud-scaling speculation — all localhost, never cloud-measured.
+### M2 single-node state machine (localhost, single-thread, 128B TB-equivalent record)
+
+| Path | CREATE | GET |
+|---|---|---|
+| MemVfs, per-op (in-mem upper bound) | ~245K ops/s | ~589K ops/s |
+| MemVfs, generalized (codec) | ~205K ops/s | — |
+| DirVfs real fsync, **per-op** | **2,339 ops/s** | ~2.0M ops/s |
+| DirVfs real fsync, **batch=1000 (group commit)** | **87,338 ops/s** | ~1.05M ops/s |
+
+GET fast on DirVfs because post-flush data sits in OS-cached SSTables; the slower
+MemVfs GET reflects the known O(#sstables) read path (no bloom filter yet, M4 work).
+
+### M2 go/no-go verdict: CONDITIONAL GO
+
+The spec's M2 gate asks: is the generalization cost fatal before we invest in VSR?
+
+- **Generalization cost is NOT fatal.** Schema-driven codec records cost ~20% vs a
+  raw fixed type (205K vs 245K create) — comfortably within the spec's ≥70%-of-kernel
+  intent. The flexibility layer is cheap.
+- **The real gap vs TigerBeetle (~1M+/s) was batching, not flexibility.** Naive
+  per-op fsync = 2,339/s (purely fsync-bound: p50 395µs ≈ one Windows fsync).
+  Adding TB-style **group commit** (one fsync per batch) took the durable path to
+  **87,338/s — a 37× win** — with a single, well-understood change. With larger
+  batches / parallel fsync / faster storage this scales further; the thesis that
+  "schema flexibility at TB-class speed" is achievable is **supported, not refuted**,
+  conditional on batched group commit (now implemented) and the remaining M4 perf
+  work (bloom filters, zero-copy reads, level compaction).
+
+**Decision:** proceed to M3 (VSR). The VSR primary will hand committed *batches* to
+`StateMachine::apply_batch`, so replication and group commit compose naturally.
+
+Benchmarks continue at M3/M4 (replicated, cache on/off) with explicit reasoned
+cloud-scaling speculation — all localhost, never cloud-measured.

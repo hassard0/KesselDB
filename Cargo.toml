@@ -4,6 +4,10 @@ members = [
     "crates/kessel-proto",
     "crates/kessel-io",
     "crates/kessel-storage",
+    "crates/kessel-catalog",
+    "crates/kessel-codec",
+    "crates/kessel-sm",
+    "crates/kessel-bench",
     "crates/kessel-sim",
 ]
 

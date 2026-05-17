@@ -295,6 +295,9 @@ pub struct Storage<V: Vfs> {
     sstables: Vec<SsTable>,
     manifest: Manifest,
     wal: Wal,
+    /// When false, `commit` appends to the WAL without fsync; the caller
+    /// must call `sync()` to make the group durable (TB-style group commit).
+    autosync: bool,
 }
 
 impl<V: Vfs> Storage<V> {
@@ -318,7 +321,19 @@ impl<V: Vfs> Storage<V> {
             sstables,
             manifest,
             wal,
+            autosync: true,
         })
+    }
+
+    /// Group-commit control. `false` => `commit` skips the per-op fsync;
+    /// durability is reached only on the next `sync()`. This is the single
+    /// biggest throughput lever (matches TigerBeetle's batched-fsync design).
+    pub fn set_autosync(&mut self, on: bool) {
+        self.autosync = on;
+    }
+
+    pub fn sync(&mut self) -> io::Result<()> {
+        self.wal.sync()
     }
 
     pub fn put(&mut self, op_number: u64, key: Key, value: Vec<u8>) -> io::Result<()> {
@@ -339,7 +354,9 @@ impl<V: Vfs> Storage<V> {
 
     fn commit(&mut self, e: Entry) -> io::Result<()> {
         self.wal.append(&e)?;
-        self.wal.sync()?;
+        if self.autosync {
+            self.wal.sync()?;
+        }
         self.memtable.insert(e.key, e.value);
         Ok(())
     }

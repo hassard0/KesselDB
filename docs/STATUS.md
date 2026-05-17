@@ -12,6 +12,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP2 — variable-length overflow store** | **done** | replication-correct overflow blobs via op-derived deterministic handles; `GetBlob`; replicated-convergence test; GC deferred (documented) |
 | **SP3 — equality secondary indexes** | **done** | `CreateIndex`/`FindBy`, deterministic backfill + maintenance, `Storage::scan_range`, replicated convergence; range scans & multi-index planner deferred |
 | **SP4 — UNIQUE + NOT NULL constraints** | **done** | `OpResult::Constraint`, `Op::AddUnique` (validates existing data), enforced on create/update, replicated convergence; FK/CHECK/balance/WASM deferred |
+| **SP5 — query planner** | **done** | `Op::Query` AND-of-(Eq/Ge/Le); multi-index intersection + filtered `scan_range` fallback; per-kind numeric compare; read-only & deterministic |
 
 ## M3 VSR — done vs. hardening backlog (honest)
 
@@ -68,13 +69,22 @@ Spec: `docs/superpowers/specs/2026-05-17-kesseldb-subproject4-constraints.md`.
 deferred); NOT NULL enforced for codec records only; UNIQUE uses the SP3
 read-modify-write path.
 
+## Sub-project 5 — query planner (done)
+
+`Op::Query` = AND of Eq/Ge/Le predicates. Planner intersects indexed-equality
+id sets then post-filters; otherwise a filtered `scan_range`. Per-kind numeric
+comparison (correct range on LE integers). Read-only, deterministic (digest
+unchanged). Spec: `docs/superpowers/specs/2026-05-17-kesseldb-subproject5-query.md`.
+**Honest limits:** AND-only (no OR/NOT), no order-preserving range index
+(range = scan/post-filter), no cost-based intersection ordering.
+
 ## What this is NOT (yet)
 
-Still out of scope (each a later spec): range scans, multi-index intersection
-planner, FK-ref / CHECK / balance-guard constraints, deterministic WASM
-trigger sandbox, destructive ALTER/DROP, overflow GC, index-write throughput
-optimization, M3 hardening backlog, cluster membership reconfiguration,
-real socket transport, client SDKs.
+Still out of scope (each a later spec): OR/NOT queries, order-preserving range
+index, FK-ref / CHECK / balance-guard constraints, deterministic WASM trigger
+sandbox, destructive ALTER/DROP, overflow GC, index-write throughput
+optimization, M3 hardening backlog (partition matrix, disk-fault-in-VC,
+seed-corpus sweep, socket transport, membership), client SDKs.
 
 ## Performance log
 

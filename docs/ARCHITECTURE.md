@@ -76,6 +76,18 @@ half-applying), then records the constraint in the replicated catalog. All
 deterministic; convergence is digest-covered and VSR-tested. FK-ref, CHECK,
 balance-guard, and the WASM trigger sandbox are later specs.
 
+## Query planner (Sub-project 5)
+
+`Op::Query` takes a conjunction of `Pred{field_id, op∈{Eq,Ge,Le}, value}`.
+The planner fetches and **intersects** the SP3 id-sets of all indexed
+equality predicates; if any exist it verifies every predicate on just those
+candidate rows, else it does a filtered `scan_range` over the type's key
+range. `cmp_field` compares per kind (numeric for ints/bool/timestamp,
+sign-extended for signed/Fixed, lexicographic for byte kinds) so range
+predicates are correct on little-endian integer storage. `Query` is
+read-only and a pure function of committed state, so it is not logged and is
+trivially identical across replicas.
+
 ## Storage layout
 
 LSM key = `type_id(4B) ‖ primary_id(16B)`, value = codec-encoded fixed-width record with a

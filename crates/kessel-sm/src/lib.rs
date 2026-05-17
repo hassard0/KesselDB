@@ -382,6 +382,64 @@ impl<V: Vfs> StateMachine<V> {
         Ok(())
     }
 
+    // ---- query planner (Sub-project 5) ----
+
+    /// Width-normalize `v` to exactly `w` bytes (zero-pad / truncate).
+    fn norm(v: &[u8], w: usize) -> Vec<u8> {
+        let mut o = vec![0u8; w];
+        let n = v.len().min(w);
+        o[..n].copy_from_slice(&v[..n]);
+        o
+    }
+
+    /// Compare two width-`w` field encodings per kind (numeric where it
+    /// matters; lexicographic for byte kinds).
+    fn cmp_field(
+        kind: kessel_catalog::FieldKind,
+        a: &[u8],
+        b: &[u8],
+    ) -> std::cmp::Ordering {
+        use kessel_catalog::FieldKind::*;
+        let w = kind.width() as usize;
+        let a = Self::norm(a, w);
+        let b = Self::norm(b, w);
+        let load_u = |x: &[u8]| {
+            let mut le = [0u8; 16];
+            le[..w.min(16)].copy_from_slice(&x[..w.min(16)]);
+            u128::from_le_bytes(le)
+        };
+        let load_i = |x: &[u8]| {
+            let mut le = [0u8; 16];
+            le[..w.min(16)].copy_from_slice(&x[..w.min(16)]);
+            if w < 16 && x[w - 1] & 0x80 != 0 {
+                for byte in le.iter_mut().skip(w) {
+                    *byte = 0xFF;
+                }
+            }
+            i128::from_le_bytes(le)
+        };
+        match kind {
+            U8 | U16 | U32 | U64 | U128 | Bool | Timestamp => load_u(&a).cmp(&load_u(&b)),
+            I8 | I16 | I32 | I64 | I128 | Fixed { .. } => load_i(&a).cmp(&load_i(&b)),
+            Char(_) | Bytes(_) | Ref | OverflowRef => a.cmp(&b),
+        }
+    }
+
+    /// Sorted object-id set for an indexed field value (equality).
+    fn idx_lookup(&self, ut: u32, fid: u16, v: &[u8]) -> Vec<[u8; 16]> {
+        let key = Self::idx_key(ut, fid, v);
+        self.storage
+            .get(&key)
+            .map(|b| {
+                Self::idx_decode(&b)
+                    .into_iter()
+                    .find(|(val, _)| val == v)
+                    .map(|(_, ids)| ids)
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
+    }
+
     /// Apply one committed op. Deterministic.
     pub fn apply(&mut self, op_number: u64, op: Op) -> OpResult {
         match op {
@@ -701,6 +759,106 @@ impl<V: Vfs> StateMachine<V> {
                 }
                 self.persist_catalog(op_number)
             }
+
+            Op::Query { type_id, preds } => {
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                let layout = ot.compute_layout();
+                // Resolve every predicate against the schema.
+                struct P {
+                    off: usize,
+                    w: usize,
+                    kind: kessel_catalog::FieldKind,
+                    fid: u16,
+                    op: u8,
+                    val: Vec<u8>,
+                    indexed: bool,
+                }
+                let mut plan: Vec<P> = Vec::with_capacity(preds.len());
+                for pr in &preds {
+                    let i = match ot.fields.iter().position(|f| f.field_id == pr.field_id) {
+                        Some(i) => i,
+                        None => {
+                            return OpResult::SchemaError(format!("no field {}", pr.field_id))
+                        }
+                    };
+                    if pr.op > 2 {
+                        return OpResult::SchemaError("bad predicate op".into());
+                    }
+                    let w = ot.fields[i].kind.width() as usize;
+                    plan.push(P {
+                        off: layout.offsets[i],
+                        w,
+                        kind: ot.fields[i].kind,
+                        fid: pr.field_id,
+                        op: pr.op,
+                        val: Self::norm(&pr.value, w),
+                        indexed: ot.indexes.contains(&pr.field_id)
+                            && Self::idx_field_pos(&ot, pr.field_id).is_some(),
+                    });
+                }
+
+                let row_ok = |rec: &[u8], p: &P| -> bool {
+                    match rec.get(p.off..p.off + p.w) {
+                        Some(fv) => {
+                            let c = Self::cmp_field(p.kind, fv, &p.val);
+                            match p.op {
+                                0 => c == std::cmp::Ordering::Equal,
+                                1 => c != std::cmp::Ordering::Less, // >=
+                                _ => c != std::cmp::Ordering::Greater, // <=
+                            }
+                        }
+                        None => false,
+                    }
+                };
+
+                // Planner: intersect indexed-equality predicates' id sets.
+                let mut cand: Option<Vec<[u8; 16]>> = None;
+                for p in plan.iter().filter(|p| p.op == 0 && p.indexed) {
+                    let ids = self.idx_lookup(type_id, p.fid, &p.val);
+                    cand = Some(match cand {
+                        None => ids,
+                        Some(prev) => {
+                            let s: std::collections::BTreeSet<_> = ids.into_iter().collect();
+                            prev.into_iter().filter(|i| s.contains(i)).collect()
+                        }
+                    });
+                }
+
+                let mut matched: Vec<[u8; 16]> = Vec::new();
+                match cand {
+                    Some(ids) => {
+                        // Index-driven: verify ALL predicates on each candidate.
+                        for id in ids {
+                            if let Some(rec) = self.storage.get(&make_key(type_id, &id)) {
+                                if plan.iter().all(|p| row_ok(&rec, p)) {
+                                    matched.push(id);
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        // Filtered scan over the type's contiguous key range.
+                        let lo = make_key(type_id, &[0u8; 16]);
+                        let hi = make_key(type_id, &[0xFFu8; 16]);
+                        for (k, rec) in self.storage.scan_range(&lo, &hi) {
+                            if plan.iter().all(|p| row_ok(&rec, p)) {
+                                let mut id = [0u8; 16];
+                                id.copy_from_slice(&k[4..20]);
+                                matched.push(id);
+                            }
+                        }
+                    }
+                }
+                matched.sort_unstable();
+                let mut out = Vec::with_capacity(matched.len() * 16);
+                for id in matched {
+                    out.extend_from_slice(&id);
+                }
+                OpResult::Got(out)
+            }
         }
     }
 
@@ -733,7 +891,7 @@ impl<V: Vfs> StateMachine<V> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kessel_catalog::{encode_field, encode_type_def, Field, FieldKind, ObjectType};
+    use kessel_catalog::{encode_field, encode_type_def, Field, FieldKind, Layout, ObjectType};
     use kessel_io::MemVfs;
     use kessel_proto::{ObjectId, Rng};
     use std::collections::HashMap;
@@ -1139,6 +1297,157 @@ mod tests {
             sm.apply(7, Op::Create { type_id: 1, id: ObjectId::from_u128(3), record: rec_bytes(5, 3) }),
             OpResult::Constraint(_)
         ));
+    }
+
+    // ---- Sub-project 5: query planner ----
+
+    fn q_type_def() -> Vec<u8> {
+        encode_type_def(
+            "q",
+            &[
+                Field { field_id: 0, name: "owner".into(), kind: FieldKind::U32, nullable: false },
+                Field { field_id: 0, name: "kind".into(), kind: FieldKind::U16, nullable: false },
+                Field { field_id: 0, name: "v".into(), kind: FieldKind::U32, nullable: false },
+            ],
+        )
+    }
+    fn q_layout() -> Layout {
+        ObjectType {
+            type_id: 1,
+            name: "q".into(),
+            schema_ver: 1,
+            fields: vec![
+                Field { field_id: 1, name: "owner".into(), kind: FieldKind::U32, nullable: false },
+                Field { field_id: 2, name: "kind".into(), kind: FieldKind::U16, nullable: false },
+                Field { field_id: 3, name: "v".into(), kind: FieldKind::U32, nullable: false },
+            ],
+            indexes: vec![],
+            unique: vec![],
+        }
+        .compute_layout()
+    }
+    fn qrec(owner: u32, kind: u16, v: u32) -> Vec<u8> {
+        let l = q_layout();
+        let mut b = vec![0u8; l.record_size];
+        b[l.offsets[0]..l.offsets[0] + 4].copy_from_slice(&owner.to_le_bytes());
+        b[l.offsets[1]..l.offsets[1] + 2].copy_from_slice(&kind.to_le_bytes());
+        b[l.offsets[2]..l.offsets[2] + 4].copy_from_slice(&v.to_le_bytes());
+        b
+    }
+    fn qids(r: OpResult) -> Vec<u128> {
+        match r {
+            OpResult::Got(b) => b.chunks(16).map(|c| u128::from_le_bytes(c.try_into().unwrap())).collect(),
+            o => panic!("expected Got, got {o:?}"),
+        }
+    }
+    fn pred(field_id: u16, op: u8, value: Vec<u8>) -> kessel_proto::Pred {
+        kessel_proto::Pred { field_id, op, value }
+    }
+
+    #[test]
+    fn query_multi_index_intersection() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: q_type_def() });
+        sm.apply(2, Op::CreateIndex { type_id: 1, field_id: 1 }); // owner
+        sm.apply(3, Op::CreateIndex { type_id: 1, field_id: 2 }); // kind
+        // rows: (owner, kind)
+        let rows = [(100, 2), (100, 9), (100, 2), (200, 2), (100, 2)];
+        for (i, (o, k)) in rows.iter().enumerate() {
+            sm.apply(10 + i as u64, Op::Create {
+                type_id: 1,
+                id: ObjectId::from_u128(i as u128),
+                record: qrec(*o, *k, i as u32),
+            });
+        }
+        // owner=100 AND kind=2  -> ids 0, 2, 4
+        let mut got = qids(sm.apply(20, Op::Query {
+            type_id: 1,
+            preds: vec![
+                pred(1, 0, 100u32.to_le_bytes().to_vec()),
+                pred(2, 0, 2u16.to_le_bytes().to_vec()),
+            ],
+        }));
+        got.sort();
+        assert_eq!(got, vec![0, 2, 4]);
+    }
+
+    #[test]
+    fn query_range_filtered_scan_no_index() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: q_type_def() });
+        for i in 0..20u64 {
+            sm.apply(2 + i, Op::Create {
+                type_id: 1,
+                id: ObjectId::from_u128(i as u128),
+                record: qrec(1, 0, i as u32),
+            });
+        }
+        // 5 <= v <= 9  (no index on v -> filtered scan, numeric LE compare)
+        let mut got = qids(sm.apply(40, Op::Query {
+            type_id: 1,
+            preds: vec![
+                pred(3, 1, 5u32.to_le_bytes().to_vec()), // >= 5
+                pred(3, 2, 9u32.to_le_bytes().to_vec()), // <= 9
+            ],
+        }));
+        got.sort();
+        assert_eq!(got, vec![5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn query_indexed_eq_plus_unindexed_range() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: q_type_def() });
+        sm.apply(2, Op::CreateIndex { type_id: 1, field_id: 1 }); // owner indexed
+        for i in 0..30u64 {
+            sm.apply(3 + i, Op::Create {
+                type_id: 1,
+                id: ObjectId::from_u128(i as u128),
+                record: qrec(if i % 2 == 0 { 7 } else { 8 }, 0, i as u32),
+            });
+        }
+        // owner=7 (indexed) AND v >= 20  -> even i in [20,29] => 20,22,24,26,28
+        let mut got = qids(sm.apply(50, Op::Query {
+            type_id: 1,
+            preds: vec![
+                pred(1, 0, 7u32.to_le_bytes().to_vec()),
+                pred(3, 1, 20u32.to_le_bytes().to_vec()),
+            ],
+        }));
+        got.sort();
+        assert_eq!(got, vec![20, 22, 24, 26, 28]);
+        // empty result is well-formed
+        assert_eq!(qids(sm.apply(51, Op::Query {
+            type_id: 1,
+            preds: vec![pred(1, 0, 999u32.to_le_bytes().to_vec())],
+        })), Vec::<u128>::new());
+    }
+
+    #[test]
+    fn query_is_readonly_and_deterministic() {
+        let build = || {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            sm.apply(1, Op::CreateType { def: q_type_def() });
+            sm.apply(2, Op::CreateIndex { type_id: 1, field_id: 1 });
+            for i in 0..40u64 {
+                sm.apply(3 + i, Op::Create {
+                    type_id: 1,
+                    id: ObjectId::from_u128(i as u128),
+                    record: qrec((i % 3) as u32, 0, i as u32),
+                });
+            }
+            let d0 = sm.digest();
+            let q = sm.apply(99, Op::Query {
+                type_id: 1,
+                preds: vec![pred(1, 0, 1u32.to_le_bytes().to_vec())],
+            });
+            (qids(q), d0, sm.digest())
+        };
+        let (ids_a, before, after) = build();
+        let (ids_b, _, _) = build();
+        assert_eq!(before, after, "Query must not mutate state");
+        assert_eq!(ids_a, ids_b, "Query must be deterministic");
+        assert!(!ids_a.is_empty());
     }
 
     /// Linearizability vs. an in-memory reference model under a random op

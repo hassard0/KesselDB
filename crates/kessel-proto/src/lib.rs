@@ -21,6 +21,15 @@ impl ObjectId {
     }
 }
 
+/// One query predicate (Sub-project 5). `op`: 0 = Eq, 1 = Ge (>=),
+/// 2 = Le (<=). `value` is the field value (width-normalized by the engine).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pred {
+    pub field_id: u16,
+    pub op: u8,
+    pub value: Vec<u8>,
+}
+
 /// Operations applied by the deterministic state machine. Payloads are opaque
 /// bytes here so `kessel-proto` stays schema-agnostic; `kessel-catalog` /
 /// `kessel-codec` give them meaning.
@@ -44,6 +53,10 @@ pub enum Op {
     /// Add a UNIQUE constraint on a field (Sub-project 4): ensures/creates an
     /// index, validates current data, then enforces on future writes.
     AddUnique { type_id: TypeId, field_id: u16 },
+    /// Conjunctive query (Sub-project 5): returns concatenated 16-byte object
+    /// ids of rows matching ALL predicates. The planner intersects indexed
+    /// equality predicates and filter-scans the rest.
+    Query { type_id: TypeId, preds: Vec<Pred> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,6 +86,7 @@ impl Op {
             Op::CreateIndex { .. } => 8,
             Op::FindBy { .. } => 9,
             Op::AddUnique { .. } => 10,
+            Op::Query { .. } => 11,
         }
     }
 
@@ -109,6 +123,15 @@ impl Op {
                 codec::put_u32(&mut b, *type_id);
                 b.extend_from_slice(&field_id.to_le_bytes());
             }
+            Op::Query { type_id, preds } => {
+                codec::put_u32(&mut b, *type_id);
+                codec::put_u32(&mut b, preds.len() as u32);
+                for p in preds {
+                    b.extend_from_slice(&p.field_id.to_le_bytes());
+                    b.push(p.op);
+                    codec::put_bytes(&mut b, &p.value);
+                }
+            }
         }
         b
     }
@@ -127,6 +150,19 @@ impl Op {
             8 => Op::CreateIndex { type_id: c.u32()?, field_id: c.u16()? },
             9 => Op::FindBy { type_id: c.u32()?, field_id: c.u16()?, value: c.bytes()? },
             10 => Op::AddUnique { type_id: c.u32()?, field_id: c.u16()? },
+            11 => {
+                let type_id = c.u32()?;
+                let n = c.u32()? as usize;
+                let mut preds = Vec::with_capacity(n);
+                for _ in 0..n {
+                    preds.push(Pred {
+                        field_id: c.u16()?,
+                        op: c.u8()?,
+                        value: c.bytes()?,
+                    });
+                }
+                Op::Query { type_id, preds }
+            }
             _ => return None,
         };
         Some(op)
@@ -266,6 +302,13 @@ mod tests {
             Op::CreateIndex { type_id: 4, field_id: 2 },
             Op::FindBy { type_id: 4, field_id: 2, value: vec![1, 2, 3, 4] },
             Op::AddUnique { type_id: 4, field_id: 2 },
+            Op::Query {
+                type_id: 4,
+                preds: vec![
+                    Pred { field_id: 1, op: 0, value: vec![9, 9] },
+                    Pred { field_id: 2, op: 1, value: vec![] },
+                ],
+            },
         ];
         for op in ops {
             let enc = op.encode();

@@ -19,6 +19,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP9 — atomic transactions** | **done** | storage overlay (begin/commit/abort); `Op::Txn` all-or-nothing incl. index+cache rollback; one replicated op; VSR convergence |
 | **SP10 — runnable TCP server + client** | **done** | `OpResult` wire codec; `kesseldb` binary (real fsync), `kessel-client`; single owning engine thread; end-to-end socket test |
 | **SP11 — ON DELETE RESTRICT/CASCADE** | **done** | FK `on_delete`; auto-index for reverse lookup; recursive cascade closure (visited+budget); atomic via txn wrap; VSR convergence |
+| **SP12 — VSR partition hardening** | **partial (honest)** | partition fault model + request-relay + VC-retry; determinism-under-partition & bounded post-heal convergence proven; **seed 7 = documented open VC-liveness repro** |
 
 ## M3 VSR — done vs. hardening backlog (honest)
 
@@ -142,14 +143,27 @@ wrap). Replicated/deterministic (VSR test). Spec:
 `docs/superpowers/specs/2026-05-17-kesseldb-subproject11-ondelete.md`.
 **Honest limit:** no SET NULL/SET DEFAULT/ON UPDATE; budget-bounded cascade.
 
+## Sub-project 12 — VSR partition hardening (partial, honest)
+
+Added a deterministic transient-single-node partition fault model, a
+backup→primary request relay (real liveness fix), and a view-change retry/
+escalation timer. **Proven:** determinism under partition+loss; bounded
+post-heal convergence for the corpus; no safety/divergence violation.
+**Documented open limitation (not overclaimed):** `seed 7` reproduces a
+view-change-liveness stall that persists after heal — the crash-stop VSR
+does not yet guarantee universal post-heal liveness under arbitrary
+partitions. Concrete repro kept in-code + spec. Spec:
+`docs/superpowers/specs/2026-05-17-kesseldb-subproject12-partition.md`.
+
 ## What this is NOT (yet)
 
-Still out of scope (each a later spec): SET NULL/SET DEFAULT & ON UPDATE
-actions, OR/NOT queries, order-preserving range index, balance-guard
-constraint, cross-shard atomicity, multi-node VSR over sockets, destructive
-ALTER/DROP, overflow GC, index-write throughput optimization, M3 hardening
-backlog (partition matrix, disk-fault-in-VC, seed-corpus sweep, membership),
-auth/TLS, client SDKs beyond Rust.
+Still out of scope (each a later spec): **full VSR view-change liveness
+under arbitrary partition (SP12 open repro: seed 7)**, SET NULL/SET DEFAULT
+& ON UPDATE actions, OR/NOT queries, order-preserving range index,
+balance-guard constraint, cross-shard atomicity, multi-node VSR over sockets,
+destructive ALTER/DROP, overflow GC, index-write throughput optimization,
+disk-fault-during-view-change, membership reconfiguration, auth/TLS,
+client SDKs beyond Rust.
 
 ## Performance log
 

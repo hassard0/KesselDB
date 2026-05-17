@@ -370,6 +370,44 @@ fn run_sqlcache(n: usize) {
     println!("speedup             : {:>11.1}x", wps / cps);
 }
 
+/// SP48: per-SSTable bloom filter. A point `get` of an absent key still
+/// visits every SSTable (the read path is a flat newest-first scan, so it
+/// stays O(#sstables) until leveled compaction — the named next step), but
+/// each visit is now an O(1) bloom reject (a handful of bit tests) instead
+/// of a binary search over the segment's sorted keys. This measures the
+/// resulting absent-key throughput at 1 vs 64 segments — an honest
+/// constant-factor number, NOT an O(1) claim.
+fn run_bloomget(n: usize) {
+    use kessel_storage::{make_key, Storage};
+    let bench = |segments: usize| -> f64 {
+        let mut s = Storage::open(MemVfs::new()).unwrap();
+        let mut op = 0u64;
+        for seg in 0..segments {
+            for j in 0..200u128 {
+                op += 1;
+                let id = ((seg as u128) << 32) | j;
+                s.put(op, make_key(0, &id.to_le_bytes()), vec![1]).unwrap();
+            }
+            s.flush().unwrap();
+        }
+        // All-miss workload (the bloom's job): keys never inserted.
+        let t = Instant::now();
+        for i in 0..n as u128 {
+            let miss = make_key(0, &(0xDEAD_0000u128 + i).to_le_bytes());
+            std::hint::black_box(s.get(&miss));
+        }
+        n as f64 / t.elapsed().as_secs_f64()
+    };
+    let one = bench(1);
+    let many = bench(64);
+    println!("absent-key GET, 1  segment : {one:>12.0} ops/s");
+    println!("absent-key GET, 64 segments: {many:>12.0} ops/s");
+    println!(
+        "per-segment miss cost      : ~{:.0} ns  (bloom bit-tests, not a binary search)",
+        (1.0 / many - 1.0 / one) * 1e9 / 63.0
+    );
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(200_000);
@@ -380,6 +418,7 @@ fn main() {
     match vfs {
         "flex" => run_flex(n),
         "sqlcache" => run_sqlcache(n),
+        "bloomget" => run_bloomget(n),
         "repl" => run_replicated(n),
         "file" => {
             let dir = std::env::temp_dir().join(format!("kesseldb-bench-{}", std::process::id()));

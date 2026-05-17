@@ -13,6 +13,7 @@ kessel-sm = { path = "../kessel-sm" }
 kessel-vsr = { path = "../kessel-vsr" }
 kessel-expr = { path = "../kessel-expr" }
 kessel-sql = { path = "../kessel-sql" }
+kessel-storage = { path = "../kessel-storage" }
 
 [[bin]]
 name = "kessel-bench"

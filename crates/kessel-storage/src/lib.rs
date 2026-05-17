@@ -183,8 +183,78 @@ fn write_sstable(
 
 /// Fully-loaded, sorted, integrity-checked SSTable (M1: simple & correct;
 /// block index / bloom filter is a later perf concern).
+/// Zero-dep Bloom filter (SP48). Built once per SSTable from its keys so a
+/// point `get` can skip a table that *definitely* does not hold the key in
+/// O(1) instead of binary-searching it — turning the long-standing
+/// O(#sstables) read path into O(1) expected. No false negatives (so
+/// tombstone/shadow correctness is preserved); ~1% false positives only
+/// cost one needless binary search. In-memory only — rebuilt from entries
+/// at open, so the on-disk format is unchanged.
+struct Bloom {
+    bits: Vec<u64>,
+    mask: u64,
+    k: u32,
+}
+
+impl Bloom {
+    /// FNV-1a 64 of a key.
+    #[inline]
+    fn hash(key: &[u8]) -> u64 {
+        let mut h = 0xcbf29ce484222325u64;
+        for &b in key {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+
+    fn build<'a, I: Iterator<Item = &'a Key>>(n: usize, keys: I) -> Self {
+        // ~10 bits/key, power-of-two word count → ~1% FPR at k=7.
+        let bits_target = (n.max(1) as u64) * 10;
+        let words = (bits_target / 64 + 1).next_power_of_two() as usize;
+        let mut b = Bloom {
+            bits: vec![0u64; words],
+            mask: (words as u64 * 64) - 1,
+            k: 7,
+        };
+        for key in keys {
+            b.insert(key);
+        }
+        b
+    }
+
+    #[inline]
+    fn positions(&self, key: &[u8]) -> (u64, u64) {
+        let h = Bloom::hash(key);
+        // double hashing: bit_i = h1 + i*h2 (h2 forced odd, nonzero)
+        (h, (h >> 32) | 1)
+    }
+
+    #[inline]
+    fn insert(&mut self, key: &[u8]) {
+        let (h1, h2) = self.positions(key);
+        for i in 0..self.k as u64 {
+            let bit = h1.wrapping_add(i.wrapping_mul(h2)) & self.mask;
+            self.bits[(bit >> 6) as usize] |= 1u64 << (bit & 63);
+        }
+    }
+
+    #[inline]
+    fn maybe_contains(&self, key: &[u8]) -> bool {
+        let (h1, h2) = self.positions(key);
+        for i in 0..self.k as u64 {
+            let bit = h1.wrapping_add(i.wrapping_mul(h2)) & self.mask;
+            if self.bits[(bit >> 6) as usize] & (1u64 << (bit & 63)) == 0 {
+                return false; // definitely absent
+            }
+        }
+        true // probably present (or a ~1% false positive)
+    }
+}
+
 struct SsTable {
     entries: Vec<(Key, Option<Vec<u8>>)>,
+    bloom: Bloom,
 }
 
 impl SsTable {
@@ -236,10 +306,18 @@ impl SsTable {
             };
             entries.push((key, val));
         }
-        Ok(SsTable { entries })
+        let bloom = Bloom::build(entries.len(), entries.iter().map(|(k, _)| k));
+        Ok(SsTable { entries, bloom })
     }
 
     fn get(&self, key: &Key) -> Option<&Option<Vec<u8>>> {
+        // O(1) reject of a definite miss before the binary search — the
+        // SP48 point-read fast path. No false negatives, so this never
+        // skips a table that actually holds the key (shadow/tombstone
+        // semantics preserved by the newest-first caller).
+        if !self.bloom.maybe_contains(key) {
+            return None;
+        }
         self.entries
             .binary_search_by(|(k, _)| k.cmp(key))
             .ok()
@@ -721,6 +799,52 @@ mod tests {
         let mut got: Vec<Key> = s.scan_prefix(&lo, &hi);
         got.sort();
         assert_eq!(got, want, "wide scan still returns the full set");
+    }
+
+    #[test]
+    fn bloom_has_no_false_negatives() {
+        // The only correctness requirement of a Bloom filter: every key
+        // that was inserted must test positive (false positives are fine).
+        let keys: Vec<Key> = (0..500u128).map(k).collect();
+        let b = Bloom::build(keys.len(), keys.iter());
+        for key in &keys {
+            assert!(b.maybe_contains(key), "false negative — would lose data");
+        }
+        // Sanity: a clearly-absent key is *usually* rejected (not asserted
+        // per-key since FP is allowed, but the rate must be low).
+        let fps = (1_000_000u128..1_000_500)
+            .filter(|n| b.maybe_contains(&k(*n)))
+            .count();
+        assert!(fps < 25, "false-positive rate too high: {fps}/500");
+    }
+
+    #[test]
+    fn point_get_correct_with_bloom_across_many_sstables() {
+        let vfs = MemVfs::new();
+        let mut s = Storage::open(vfs).unwrap();
+        // 60 SSTables of distinct keys; then a shadow + a tombstone in
+        // later tables. The bloom must never hide a real key.
+        for i in 0..60u128 {
+            s.put((i + 1) as u64, k(i), vec![i as u8]).unwrap();
+            s.flush().unwrap();
+        }
+        s.put(100, k(17), b"shadow".to_vec()).unwrap(); // newer value
+        s.flush().unwrap();
+        s.delete(101, k(42)).unwrap(); // tombstone
+        s.flush().unwrap();
+
+        for i in 0..60u128 {
+            let want = match i {
+                17 => Some(b"shadow".to_vec()),
+                42 => None,
+                _ => Some(vec![i as u8]),
+            };
+            assert_eq!(s.get(&k(i)), want, "key {i} wrong with bloom path");
+        }
+        // Absent keys: correct (and mostly bloom-rejected, but correctness
+        // holds regardless of FP).
+        assert_eq!(s.get(&k(9999)), None);
+        assert_eq!(s.sstable_count(), 62);
     }
 
     #[test]

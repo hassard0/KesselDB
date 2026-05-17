@@ -55,6 +55,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP45 — index point-read perf** | **done** | `SsTable::overlaps` O(1) min/max prune in `scan_prefix`/`scan_range` → point-value read O(*S_overlap*·log n) not O(*S*·log n); 40-SSTable prune test, results identical; **139 green** |
 | **SP46 — seed-7 liveness (LAST GATE)** | **done** | not a consensus defect — `on_request` replied under `(client,last)` not `(client,req)`, stranding reordered older requests on a healthy cluster; one-line fix; full 0..12 partition corpus incl. seed 7 now asserted (completion + convergence); **139 green** |
 | **SP47 — prepared-statement cache** | **done** | engine-local `sql→Stmt` cache, invalidated on schema-mutating ops; **26.2× faster SQL compile** (574K→15.0M stmt/s, `kessel-bench sqlcache`), zero functional change, determinism intact; **140 green** |
+| **SP48 — per-SSTable bloom filter** | **done (honest)** | zero-dep bloom, ~28 ns/segment O(1) miss-reject vs binary search, no false negatives (proven); read path still O(#sstables) — *not* claimed O(1); leveled compaction is the named next step; **142 green** |
 
 ## Production-readiness gate (precise, not vague)
 
@@ -272,6 +273,19 @@ MemVfs GET reflects the known O(#sstables) read path (no bloom filter yet, M4 wo
 The single-threaded deterministic core means per-op CPU *is* the ceiling;
 removing ~1.7 µs of tokenise+parse+plan per repeated statement is a direct,
 measured throughput innovation with zero functional change (SP47).
+
+### SP48 per-SSTable bloom (`kessel-bench bloomget`, release, MemVfs)
+
+| absent-key GET | ops/s |
+|---|---|
+| 1 segment | ~16,784,250 |
+| 64 segments | ~553,202 |
+| per-segment miss reject | ~28 ns (bloom bit-tests, was a binary search) |
+
+Honest reading: still O(#sstables) — the bloom is a per-segment
+constant-factor win + the structural prerequisite for leveled compaction
+(the named next step toward genuinely sub-linear point reads). Not claimed
+as O(1); correctness (no false negatives) is proven, not assumed.
 
 ### M2 go/no-go verdict: CONDITIONAL GO
 

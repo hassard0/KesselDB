@@ -63,6 +63,11 @@ impl Program {
     pub fn new() -> Self {
         Self::default()
     }
+    /// Wrap already-emitted bytecode (used by compilers that splice
+    /// sub-programs, e.g. kessel-sql's WHERE).
+    pub fn from_raw(code: Vec<u8>) -> Self {
+        Program { code }
+    }
     pub fn push_int(mut self, v: i128) -> Self {
         self.code.push(PUSH_INT);
         self.code.extend_from_slice(&v.to_le_bytes());

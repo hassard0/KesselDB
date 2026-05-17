@@ -1,0 +1,18 @@
+[package]
+name = "kessel-sql"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+kessel-proto = { path = "../kessel-proto" }
+kessel-catalog = { path = "../kessel-catalog" }
+kessel-codec = { path = "../kessel-codec" }
+kessel-expr = { path = "../kessel-expr" }
+
+[dev-dependencies]
+kessel-io = { path = "../kessel-io" }
+kessel-sm = { path = "../kessel-sm" }
+
+[lib]
+path = "src/lib.rs"

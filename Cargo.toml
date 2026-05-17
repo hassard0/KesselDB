@@ -6,6 +6,7 @@ members = [
     "crates/kessel-storage",
     "crates/kessel-catalog",
     "crates/kessel-codec",
+    "crates/kessel-expr",
     "crates/kessel-sm",
     "crates/kessel-cache",
     "crates/kessel-shard",

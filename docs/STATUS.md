@@ -14,6 +14,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP4 — UNIQUE + NOT NULL constraints** | **done** | `OpResult::Constraint`, `Op::AddUnique` (validates existing data), enforced on create/update, replicated convergence; FK/CHECK/balance/WASM deferred |
 | **SP5 — query planner** | **done** | `Op::Query` AND-of-(Eq/Ge/Le); multi-index intersection + filtered `scan_range` fallback; per-kind numeric compare; read-only & deterministic |
 | **SP6 — foreign keys** | **done** | `Op::AddForeignKey` (validates existing data); ref-exists enforced on create/update (codec-scoped); replicated convergence; no ON DELETE cascade (documented) |
+| **SP7 — expression VM + CHECK** | **done** | zero-dep deterministic gas-bounded stack VM (`kessel-expr`); `Op::AddCheck` (structural + existing-data validation); enforced on create/update; replicated convergence |
 
 ## M3 VSR — done vs. hardening backlog (honest)
 
@@ -89,14 +90,24 @@ scoped, NULL skipped), deterministic + VSR-convergence tested. Spec:
 a parent neither cascades nor is blocked (FK checked only on child write);
 single-field FK only.
 
+## Sub-project 7 — deterministic expression VM + CHECK (done)
+
+`kessel-expr`: zero-dependency, pure, gas-bounded, terminating stack
+bytecode VM. `ObjectType.checks` + `Op::AddCheck` (validates structure +
+all existing rows before enabling). Enforced on create/update; rejects on
+false or any VM error. 3-node VSR convergence tested. Spec:
+`docs/superpowers/specs/2026-05-17-kesseldb-subproject7-check-vm.md`.
+**This is the revolutionary core** — user logic, deterministic, inside the
+replicated state machine. **Honest limits:** predicate-only (no mutation —
+that's SP8 triggers, same VM); single-row; no aggregates; u128-high-bit edge.
+
 ## What this is NOT (yet)
 
-Still out of scope (each a later spec): ON DELETE/UPDATE referential actions,
-OR/NOT queries, order-preserving range index, CHECK / balance-guard
-constraints, deterministic WASM trigger sandbox, destructive ALTER/DROP,
-overflow GC, index-write throughput optimization, M3 hardening backlog
-(partition matrix, disk-fault-in-VC, seed-corpus sweep, socket transport,
-membership), client SDKs.
+Still out of scope (each a later spec): deterministic triggers (mutating, SP8),
+ON DELETE/UPDATE referential actions, OR/NOT queries, order-preserving range
+index, balance-guard constraint, destructive ALTER/DROP, overflow GC,
+index-write throughput optimization, M3 hardening backlog (partition matrix,
+disk-fault-in-VC, seed-corpus sweep, socket transport, membership), client SDKs.
 
 ## Performance log
 

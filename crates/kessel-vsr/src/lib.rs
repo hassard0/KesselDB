@@ -534,6 +534,7 @@ pub mod sim {
         use kessel_io::MemVfs;
         use kessel_proto::{ObjectId, Op};
         use kessel_sm::{encode_overflow_record, StateMachine};
+        use kessel_expr::Program;
 
     fn def() -> Op {
         Op::CreateType { def: encode_type_def("t", &[]) }
@@ -769,6 +770,39 @@ pub mod sim {
         assert_ne!(c.run(&reqs, 14000), usize::MAX);
         let d = c.live_digests();
         assert!(d.iter().all(|x| *x == d[0]), "FK state diverged: {d:?}");
+    }
+
+    #[test]
+    fn check_constraint_replicates_and_converges() {
+        // The deterministic expression VM must accept/reject identically on
+        // every replica (its purity is the whole point).
+        let mut c = Cluster::new(3, 23, 0);
+        let prog = Program::new().load(1).push_int(0).ge().bytes(); // field1 >= 0
+        let row = |x: i32| {
+            let mut b = vec![0u8; 32]; // I32 + I64 -> record_size 32
+            b[14..18].copy_from_slice(&x.to_le_bytes());
+            b
+        };
+        let mut reqs = vec![
+            (1u128, 1u64, Op::CreateType {
+                def: encode_type_def("a", &[
+                    Field { field_id: 0, name: "x".into(), kind: FieldKind::I32, nullable: false },
+                    Field { field_id: 0, name: "y".into(), kind: FieldKind::I64, nullable: false },
+                ]),
+            }),
+            (1, 2, Op::AddCheck { type_id: 1, program: prog }),
+        ];
+        for i in 0..30i64 {
+            let x = (i as i32) - 15; // ~half negative -> rejected uniformly
+            reqs.push((1, i as u64 + 3, Op::Create {
+                type_id: 1,
+                id: ObjectId::from_u128(i as u128),
+                record: row(x),
+            }));
+        }
+        assert_ne!(c.run(&reqs, 12000), usize::MAX);
+        let d = c.live_digests();
+        assert!(d.iter().all(|v| *v == d[0]), "CHECK VM diverged: {d:?}");
     }
 
     #[test]

@@ -499,6 +499,24 @@ impl<V: Vfs> StateMachine<V> {
         Ok(())
     }
 
+    /// Run every CHECK program of `type_id` against `rec`. A program that
+    /// returns false OR errors (div-by-zero, bad program, out-of-gas) rejects
+    /// the write. Deterministic: the VM is pure and gas-bounded.
+    fn check_checks(&self, type_id: u32, rec: &[u8]) -> Result<(), String> {
+        let ot = match self.catalog.get(type_id) {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        for (n, prog) in ot.checks.iter().enumerate() {
+            match kessel_expr::eval(prog, ot, rec) {
+                Ok(true) => {}
+                Ok(false) => return Err(format!("CHECK #{n} failed")),
+                Err(e) => return Err(format!("CHECK #{n} error: {e:?}")),
+            }
+        }
+        Ok(())
+    }
+
     /// Apply one committed op. Deterministic.
     pub fn apply(&mut self, op_number: u64, op: Op) -> OpResult {
         match op {
@@ -531,6 +549,7 @@ impl<V: Vfs> StateMachine<V> {
                     indexes: Vec::new(),
                     unique: Vec::new(),
                     fks: Vec::new(),
+                    checks: Vec::new(),
                 });
                 self.catalog.next_type_id += 1;
                 match self.persist_catalog(op_number) {
@@ -594,6 +613,9 @@ impl<V: Vfs> StateMachine<V> {
                 if let Err(e) = self.check_fk(type_id, &record) {
                     return OpResult::Constraint(e);
                 }
+                if let Err(e) = self.check_checks(type_id, &record) {
+                    return OpResult::Constraint(e);
+                }
                 let rec_idx = if need_idx { Some(record.clone()) } else { None };
                 let cached = self.cache.as_mut().map(|_| record.clone());
                 match self.storage.put(op_number, key, record) {
@@ -637,6 +659,9 @@ impl<V: Vfs> StateMachine<V> {
                     return OpResult::Constraint(e);
                 }
                 if let Err(e) = self.check_fk(type_id, &record) {
+                    return OpResult::Constraint(e);
+                }
+                if let Err(e) = self.check_checks(type_id, &record) {
                     return OpResult::Constraint(e);
                 }
                 let rec_idx = if need_idx { Some(record.clone()) } else { None };
@@ -970,6 +995,43 @@ impl<V: Vfs> StateMachine<V> {
                 }
                 self.persist_catalog(op_number)
             }
+
+            Op::AddCheck { type_id, program } => {
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                // Structural validation against a zero record (catches a
+                // malformed program even when the type has no rows yet).
+                let zero = vec![0u8; ot.compute_layout().record_size];
+                if let Err(e) = kessel_expr::eval(&program, &ot, &zero) {
+                    if matches!(
+                        e,
+                        kessel_expr::ExprError::BadProgram
+                            | kessel_expr::ExprError::StackUnderflow
+                            | kessel_expr::ExprError::EmptyResult
+                    ) {
+                        return OpResult::SchemaError(format!("bad CHECK program: {e:?}"));
+                    }
+                }
+                // Validate every existing row satisfies the new CHECK.
+                let lo = make_key(type_id, &[0u8; 16]);
+                let hi = make_key(type_id, &[0xFFu8; 16]);
+                for (_, rec) in self.storage.scan_range(&lo, &hi) {
+                    match kessel_expr::eval(&program, &ot, &rec) {
+                        Ok(true) => {}
+                        _ => {
+                            return OpResult::Constraint(
+                                "AddCheck: existing row violates CHECK".into(),
+                            )
+                        }
+                    }
+                }
+                if let Some(t) = self.catalog.get_mut(type_id) {
+                    t.checks.push(program);
+                }
+                self.persist_catalog(op_number)
+            }
         }
     }
 
@@ -1170,6 +1232,7 @@ mod tests {
             indexes: vec![],
             unique: vec![],
             fks: vec![],
+            checks: vec![],
         };
         vec![0u8; t.compute_layout().record_size]
     }
@@ -1255,6 +1318,7 @@ mod tests {
             indexes: vec![],
             unique: vec![],
             fks: vec![],
+            checks: vec![],
         };
         let mut b = vec![0u8; t.compute_layout().record_size];
         let o0 = t.compute_layout().offsets[0];
@@ -1437,6 +1501,7 @@ mod tests {
             indexes: vec![],
             unique: vec![],
             fks: vec![],
+            checks: vec![],
         }
         .compute_layout()
     }
@@ -1562,6 +1627,106 @@ mod tests {
         assert_eq!(before, after, "Query must not mutate state");
         assert_eq!(ids_a, ids_b, "Query must be deterministic");
         assert!(!ids_a.is_empty());
+    }
+
+    // ---- Sub-project 7: CHECK via deterministic expression VM ----
+
+    fn chk_type() -> Vec<u8> {
+        encode_type_def("acct", &[
+            Field { field_id: 0, name: "age".into(), kind: FieldKind::I32, nullable: false },
+            Field { field_id: 0, name: "bal".into(), kind: FieldKind::I64, nullable: false },
+        ])
+    }
+    fn chk_rec(age: i32, bal: i64) -> Vec<u8> {
+        let ot = ObjectType {
+            type_id: 1, name: "acct".into(), schema_ver: 1,
+            fields: vec![
+                Field { field_id: 1, name: "age".into(), kind: FieldKind::I32, nullable: false },
+                Field { field_id: 2, name: "bal".into(), kind: FieldKind::I64, nullable: false },
+            ],
+            indexes: vec![], unique: vec![], fks: vec![], checks: vec![],
+        };
+        let l = ot.compute_layout();
+        let mut b = vec![0u8; l.record_size];
+        b[l.offsets[0]..l.offsets[0] + 4].copy_from_slice(&age.to_le_bytes());
+        b[l.offsets[1]..l.offsets[1] + 8].copy_from_slice(&bal.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn check_constraint_enforced_via_vm() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: chk_type() });
+        // CHECK: age >= 18 AND bal >= 0
+        let prog = kessel_expr::Program::new()
+            .load(1).push_int(18).ge()
+            .load(2).push_int(0).ge()
+            .and()
+            .bytes();
+        assert_eq!(sm.apply(2, Op::AddCheck { type_id: 1, program: prog }), OpResult::Ok);
+        assert_eq!(
+            sm.apply(3, Op::Create { type_id: 1, id: ObjectId::from_u128(1), record: chk_rec(25, 100) }),
+            OpResult::Ok
+        );
+        assert!(matches!(
+            sm.apply(4, Op::Create { type_id: 1, id: ObjectId::from_u128(2), record: chk_rec(16, 100) }),
+            OpResult::Constraint(_)
+        ));
+        assert!(matches!(
+            sm.apply(5, Op::Create { type_id: 1, id: ObjectId::from_u128(3), record: chk_rec(30, -5) }),
+            OpResult::Constraint(_)
+        ));
+        // update violating CHECK is rejected too
+        assert!(matches!(
+            sm.apply(6, Op::Update { type_id: 1, id: ObjectId::from_u128(1), record: chk_rec(25, -1) }),
+            OpResult::Constraint(_)
+        ));
+    }
+
+    #[test]
+    fn add_check_validates_existing_and_rejects_bad_program() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: chk_type() });
+        sm.apply(2, Op::Create { type_id: 1, id: ObjectId::from_u128(1), record: chk_rec(40, 0) });
+        sm.apply(3, Op::Create { type_id: 1, id: ObjectId::from_u128(2), record: chk_rec(10, 0) });
+        let prog = kessel_expr::Program::new().load(1).push_int(18).ge().bytes();
+        // existing row age=10 violates -> AddCheck refused
+        assert!(matches!(
+            sm.apply(4, Op::AddCheck { type_id: 1, program: prog.clone() }),
+            OpResult::Constraint(_)
+        ));
+        // malformed program -> SchemaError, not a panic
+        assert!(matches!(
+            sm.apply(5, Op::AddCheck { type_id: 1, program: vec![3] }),
+            OpResult::SchemaError(_)
+        ));
+        // fix the row, then AddCheck succeeds and enforces
+        sm.apply(6, Op::Update { type_id: 1, id: ObjectId::from_u128(2), record: chk_rec(22, 0) });
+        assert_eq!(sm.apply(7, Op::AddCheck { type_id: 1, program: prog }), OpResult::Ok);
+        assert!(matches!(
+            sm.apply(8, Op::Create { type_id: 1, id: ObjectId::from_u128(9), record: chk_rec(5, 0) }),
+            OpResult::Constraint(_)
+        ));
+    }
+
+    #[test]
+    fn check_is_deterministic() {
+        let build = || {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            sm.apply(1, Op::CreateType { def: chk_type() });
+            let prog = kessel_expr::Program::new().load(1).push_int(0).gt().bytes();
+            sm.apply(2, Op::AddCheck { type_id: 1, program: prog });
+            for i in 0..50u64 {
+                let age = (i as i32) - 10; // some negative -> rejected uniformly
+                sm.apply(3 + i, Op::Create {
+                    type_id: 1,
+                    id: ObjectId::from_u128(i as u128),
+                    record: chk_rec(age, 0),
+                });
+            }
+            sm.digest()
+        };
+        assert_eq!(build(), build(), "CHECK VM must be deterministic");
     }
 
     // ---- Sub-project 6: foreign keys ----

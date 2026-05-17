@@ -10,6 +10,7 @@ kessel-io = { path = "../kessel-io" }
 kessel-storage = { path = "../kessel-storage" }
 kessel-catalog = { path = "../kessel-catalog" }
 kessel-cache = { path = "../kessel-cache" }
+kessel-expr = { path = "../kessel-expr" }
 
 [dev-dependencies]
 kessel-codec = { path = "../kessel-codec" }

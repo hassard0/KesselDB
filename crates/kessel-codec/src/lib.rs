@@ -170,6 +170,7 @@ mod tests {
             indexes: vec![],
             unique: vec![],
             fks: vec![],
+            checks: vec![],
         }
     }
 

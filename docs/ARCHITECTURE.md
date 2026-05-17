@@ -98,6 +98,17 @@ deterministic/replication-safe. Codec-record scoped; NULL skipped.
 any dangling reference. No referential actions (`ON DELETE`/`ON UPDATE`) —
 documented limitation.
 
+## Deterministic expression VM + CHECK (Sub-project 7)
+
+`kessel-expr` is a zero-dependency stack bytecode VM that is **pure,
+gas-bounded, and terminating** (no backward jumps). It is the mechanism that
+lets KesselDB carry Postgres-style programmable constraints while staying a
+deterministic replicated state machine: a CHECK program is part of the
+replicated catalog (`ObjectType.checks`), so every replica runs byte-identical
+logic and reaches the same accept/reject. `Op::AddCheck` validates the
+program structurally and against all existing rows before enabling. The same
+VM is the substrate for SP8 deterministic triggers.
+
 ## Storage layout
 
 LSM key = `type_id(4B) ‖ primary_id(16B)`, value = codec-encoded fixed-width record with a

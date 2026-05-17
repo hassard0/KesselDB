@@ -61,6 +61,9 @@ pub enum Op {
     /// (padded to 16 bytes) must be an existing object id of
     /// `ref_type_id`. Validates current data before enabling.
     AddForeignKey { type_id: TypeId, field_id: u16, ref_type_id: TypeId },
+    /// Add a CHECK constraint (Sub-project 7): a compiled kessel-expr program
+    /// that must evaluate true for every written row. Validates current data.
+    AddCheck { type_id: TypeId, program: Vec<u8> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,6 +95,7 @@ impl Op {
             Op::AddUnique { .. } => 10,
             Op::Query { .. } => 11,
             Op::AddForeignKey { .. } => 12,
+            Op::AddCheck { .. } => 13,
         }
     }
 
@@ -142,6 +146,10 @@ impl Op {
                 b.extend_from_slice(&field_id.to_le_bytes());
                 codec::put_u32(&mut b, *ref_type_id);
             }
+            Op::AddCheck { type_id, program } => {
+                codec::put_u32(&mut b, *type_id);
+                codec::put_bytes(&mut b, program);
+            }
         }
         b
     }
@@ -178,6 +186,7 @@ impl Op {
                 field_id: c.u16()?,
                 ref_type_id: c.u32()?,
             },
+            13 => Op::AddCheck { type_id: c.u32()?, program: c.bytes()? },
             _ => return None,
         };
         Some(op)
@@ -325,6 +334,7 @@ mod tests {
                 ],
             },
             Op::AddForeignKey { type_id: 4, field_id: 1, ref_type_id: 2 },
+            Op::AddCheck { type_id: 4, program: vec![0, 1, 2, 3] },
         ];
         for op in ops {
             let enc = op.encode();

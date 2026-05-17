@@ -1,0 +1,11 @@
+[package]
+name = "kessel-expr"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+kessel-catalog = { path = "../kessel-catalog" }
+
+[lib]
+path = "src/lib.rs"

@@ -11,6 +11,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | M4 — cache + sharding + perf | **done** | LRU read cache (observably invisible), rendezvous sharding groundwork, replicated bench, scaling speculation |
 | **SP2 — variable-length overflow store** | **done** | replication-correct overflow blobs via op-derived deterministic handles; `GetBlob`; replicated-convergence test; GC deferred (documented) |
 | **SP3 — equality secondary indexes** | **done** | `CreateIndex`/`FindBy`, deterministic backfill + maintenance, `Storage::scan_range`, replicated convergence; range scans & multi-index planner deferred |
+| **SP4 — UNIQUE + NOT NULL constraints** | **done** | `OpResult::Constraint`, `Op::AddUnique` (validates existing data), enforced on create/update, replicated convergence; FK/CHECK/balance/WASM deferred |
 
 ## M3 VSR — done vs. hardening backlog (honest)
 
@@ -57,12 +58,23 @@ Delete. Added `Storage::scan_range`. Spec:
 spec); read-modify-write per index op (correct, not yet throughput-optimized);
 `OverflowRef` fields not indexable.
 
+## Sub-project 4 — UNIQUE + NOT NULL constraints (done)
+
+`OpResult::Constraint`, NOT NULL from `Field.nullable` (codec-record scoped),
+UNIQUE via the SP3 index (`ObjectType.unique`), `Op::AddUnique` that validates
+existing data before enabling. Deterministic + replicated-convergence tested.
+Spec: `docs/superpowers/specs/2026-05-17-kesseldb-subproject4-constraints.md`.
+**Honest limits:** only NOT NULL + UNIQUE (FK/CHECK/balance-guard/WASM
+deferred); NOT NULL enforced for codec records only; UNIQUE uses the SP3
+read-modify-write path.
+
 ## What this is NOT (yet)
 
 Still out of scope (each a later spec): range scans, multi-index intersection
-planner, built-in constraints (NOT NULL/UNIQUE/FK/CHECK), WASM triggers,
-destructive ALTER/DROP, overflow GC, index-write throughput optimization,
-cluster membership reconfiguration, client SDKs.
+planner, FK-ref / CHECK / balance-guard constraints, deterministic WASM
+trigger sandbox, destructive ALTER/DROP, overflow GC, index-write throughput
+optimization, M3 hardening backlog, cluster membership reconfiguration,
+real socket transport, client SDKs.
 
 ## Performance log
 

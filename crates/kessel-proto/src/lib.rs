@@ -41,6 +41,9 @@ pub enum Op {
     /// Equality lookup: returns concatenated 16-byte object ids of every row
     /// whose indexed field equals `value` (Sub-project 3).
     FindBy { type_id: TypeId, field_id: u16, value: Vec<u8> },
+    /// Add a UNIQUE constraint on a field (Sub-project 4): ensures/creates an
+    /// index, validates current data, then enforces on future writes.
+    AddUnique { type_id: TypeId, field_id: u16 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,6 +54,9 @@ pub enum OpResult {
     NotFound,
     TypeCreated(TypeId),
     SchemaError(String),
+    /// A built-in constraint (NOT NULL / UNIQUE) rejected the write
+    /// (Sub-project 4). Deterministic — counts as a committed op result.
+    Constraint(String),
 }
 
 impl Op {
@@ -66,6 +72,7 @@ impl Op {
             Op::GetBlob { .. } => 7,
             Op::CreateIndex { .. } => 8,
             Op::FindBy { .. } => 9,
+            Op::AddUnique { .. } => 10,
         }
     }
 
@@ -98,6 +105,10 @@ impl Op {
                 b.extend_from_slice(&field_id.to_le_bytes());
                 codec::put_bytes(&mut b, value);
             }
+            Op::AddUnique { type_id, field_id } => {
+                codec::put_u32(&mut b, *type_id);
+                b.extend_from_slice(&field_id.to_le_bytes());
+            }
         }
         b
     }
@@ -115,6 +126,7 @@ impl Op {
             7 => Op::GetBlob { handle: c.u64()? },
             8 => Op::CreateIndex { type_id: c.u32()?, field_id: c.u16()? },
             9 => Op::FindBy { type_id: c.u32()?, field_id: c.u16()?, value: c.bytes()? },
+            10 => Op::AddUnique { type_id: c.u32()?, field_id: c.u16()? },
             _ => return None,
         };
         Some(op)
@@ -253,6 +265,7 @@ mod tests {
             Op::GetBlob { handle: 0xABCD_1234_5678 },
             Op::CreateIndex { type_id: 4, field_id: 2 },
             Op::FindBy { type_id: 4, field_id: 2, value: vec![1, 2, 3, 4] },
+            Op::AddUnique { type_id: 4, field_id: 2 },
         ];
         for op in ops {
             let enc = op.encode();

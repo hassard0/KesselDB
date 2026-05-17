@@ -63,6 +63,19 @@ over the type's contiguous key range; Create/Update/Delete maintain indexes.
 Equality only; range scans + a multi-index intersection planner are a later
 spec.
 
+## Built-in constraints (Sub-project 4)
+
+`OpResult::Constraint` is a deterministic op result. NOT NULL derives from
+`Field.nullable` and is checked against the codec null-bitmap, but only for
+well-formed codec records (`len == record_size` and `field_count == #fields`)
+— raw/opaque writers opt out by construction. UNIQUE (`ObjectType.unique`,
+always ⊆ `indexes`) consults the SP3 equality-index bucket on every
+Create/Update, excluding self. `Op::AddUnique` builds the backing index if
+needed, validates that current data has no duplicate (rejecting without
+half-applying), then records the constraint in the replicated catalog. All
+deterministic; convergence is digest-covered and VSR-tested. FK-ref, CHECK,
+balance-guard, and the WASM trigger sandbox are later specs.
+
 ## Storage layout
 
 LSM key = `type_id(4B) ‖ primary_id(16B)`, value = codec-encoded fixed-width record with a

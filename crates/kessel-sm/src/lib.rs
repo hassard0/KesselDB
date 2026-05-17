@@ -294,6 +294,94 @@ impl<V: Vfs> StateMachine<V> {
         }
     }
 
+    // ---- built-in constraints (Sub-project 4) ----
+
+    /// Field `i` is NULL if absent (beyond the record's stored field_count)
+    /// or its null-bitmap bit is set. Reads only the codec header constants
+    /// (no full codec dependency).
+    fn field_is_null(rec: &[u8], i: usize) -> bool {
+        use kessel_catalog::{NULL_BITMAP_BYTES, SCHEMA_VER_BYTES};
+        if rec.len() < kessel_catalog::HEADER_BYTES {
+            return true;
+        }
+        let fc = u16::from_le_bytes(
+            rec[SCHEMA_VER_BYTES..SCHEMA_VER_BYTES + 2].try_into().unwrap(),
+        ) as usize;
+        if i >= fc {
+            return true;
+        }
+        let bm = &rec[SCHEMA_VER_BYTES + 2..SCHEMA_VER_BYTES + 2 + NULL_BITMAP_BYTES];
+        bm.get(i / 8).map(|b| b & (1 << (i % 8)) != 0).unwrap_or(true)
+    }
+
+    /// NOT NULL is enforced only for well-formed codec records — those whose
+    /// length is exactly the type's computed `record_size`. Opaque/raw byte
+    /// writes (any other length) carry no codec null information and are not
+    /// constrained: a deliberate, documented kernel scoping (constraints ride
+    /// the codec contract; raw byte writers opt out).
+    fn check_not_null(ot: &kessel_catalog::ObjectType, rec: &[u8]) -> Result<(), String> {
+        use kessel_catalog::SCHEMA_VER_BYTES;
+        // Codec contract: exact record_size AND field_count == #fields. Any
+        // other shape is an opaque/raw write and opts out of NOT NULL.
+        if rec.len() != ot.compute_layout().record_size {
+            return Ok(());
+        }
+        let fc = u16::from_le_bytes(
+            rec[SCHEMA_VER_BYTES..SCHEMA_VER_BYTES + 2].try_into().unwrap(),
+        ) as usize;
+        if fc != ot.fields.len() {
+            return Ok(());
+        }
+        for (i, f) in ot.fields.iter().enumerate() {
+            if !f.nullable && Self::field_is_null(rec, i) {
+                return Err(format!("NOT NULL violated on field '{}'", f.name));
+            }
+        }
+        Ok(())
+    }
+
+    /// True if some OTHER object already holds `v` for this unique field.
+    fn unique_conflict(&self, ut: u32, fid: u16, v: &[u8], self_obj: [u8; 16]) -> bool {
+        let key = Self::idx_key(ut, fid, v);
+        match self.storage.get(&key) {
+            Some(b) => Self::idx_decode(&b)
+                .into_iter()
+                .find(|(val, _)| val == v)
+                .map(|(_, ids)| ids.iter().any(|id| *id != self_obj))
+                .unwrap_or(false),
+            None => false,
+        }
+    }
+
+    /// Enforce all UNIQUE constraints of `type_id` for one row write.
+    fn check_unique(
+        &self,
+        type_id: u32,
+        rec: &[u8],
+        self_obj: [u8; 16],
+    ) -> Result<(), String> {
+        let ot = match self.catalog.get(type_id) {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        for fid in &ot.unique {
+            if let Some((off, w)) = Self::idx_field_pos(ot, *fid) {
+                if let Some(v) = rec.get(off..off + w) {
+                    if self.unique_conflict(type_id, *fid, v, self_obj) {
+                        let name = ot
+                            .fields
+                            .iter()
+                            .find(|f| f.field_id == *fid)
+                            .map(|f| f.name.as_str())
+                            .unwrap_or("?");
+                        return Err(format!("UNIQUE violated on field '{name}'"));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Apply one committed op. Deterministic.
     pub fn apply(&mut self, op_number: u64, op: Op) -> OpResult {
         match op {
@@ -324,6 +412,7 @@ impl<V: Vfs> StateMachine<V> {
                     schema_ver: 1,
                     fields,
                     indexes: Vec::new(),
+                    unique: Vec::new(),
                 });
                 self.catalog.next_type_id += 1;
                 match self.persist_catalog(op_number) {
@@ -376,6 +465,14 @@ impl<V: Vfs> StateMachine<V> {
                     .get(type_id)
                     .map(|t| !t.indexes.is_empty())
                     .unwrap_or(false);
+                if let Some(t) = self.catalog.get(type_id) {
+                    if let Err(e) = Self::check_not_null(t, &record) {
+                        return OpResult::Constraint(e);
+                    }
+                }
+                if let Err(e) = self.check_unique(type_id, &record, id.0) {
+                    return OpResult::Constraint(e);
+                }
                 let rec_idx = if need_idx { Some(record.clone()) } else { None };
                 let cached = self.cache.as_mut().map(|_| record.clone());
                 match self.storage.put(op_number, key, record) {
@@ -410,6 +507,14 @@ impl<V: Vfs> StateMachine<V> {
                     .get(type_id)
                     .map(|t| !t.indexes.is_empty())
                     .unwrap_or(false);
+                if let Some(t) = self.catalog.get(type_id) {
+                    if let Err(e) = Self::check_not_null(t, &record) {
+                        return OpResult::Constraint(e);
+                    }
+                }
+                if let Err(e) = self.check_unique(type_id, &record, id.0) {
+                    return OpResult::Constraint(e);
+                }
                 let rec_idx = if need_idx { Some(record.clone()) } else { None };
                 let cached = self.cache.as_mut().map(|_| record.clone());
                 match self.storage.put(op_number, key, record) {
@@ -541,6 +646,60 @@ impl<V: Vfs> StateMachine<V> {
                     out.extend_from_slice(&id);
                 }
                 OpResult::Got(out)
+            }
+
+            Op::AddUnique { type_id, field_id } => {
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                let (off, w) = match Self::idx_field_pos(&ot, field_id) {
+                    Some(p) => p,
+                    None => return OpResult::SchemaError("field not indexable".into()),
+                };
+                if ot.unique.contains(&field_id) {
+                    return OpResult::Ok; // idempotent
+                }
+                // Ensure the backing index exists (build it if needed).
+                if !ot.indexes.contains(&field_id) {
+                    if let Some(t) = self.catalog.get_mut(type_id) {
+                        t.indexes.push(field_id);
+                    }
+                    if let OpResult::SchemaError(e) = self.persist_catalog(op_number) {
+                        return OpResult::SchemaError(e);
+                    }
+                    let lo = make_key(type_id, &[0u8; 16]);
+                    let hi = make_key(type_id, &[0xFFu8; 16]);
+                    for (k, rec) in self.storage.scan_range(&lo, &hi) {
+                        if let Some(v) = rec.get(off..off + w) {
+                            let mut obj = [0u8; 16];
+                            obj.copy_from_slice(&k[4..20]);
+                            let v = v.to_vec();
+                            self.idx_add(op_number, type_id, field_id, &v, obj);
+                        }
+                    }
+                }
+                // Validate current data has no duplicate for this field.
+                let idxtype = 0xFFFE_0000 | (type_id & 0xFFFF);
+                let mut lo = [0u8; 16];
+                lo[..2].copy_from_slice(&field_id.to_le_bytes());
+                let mut hi = lo;
+                hi[2..].copy_from_slice(&[0xFFu8; 14]);
+                let lo = make_key(idxtype, &lo);
+                let hi = make_key(idxtype, &hi);
+                for (_, entry) in self.storage.scan_range(&lo, &hi) {
+                    for (_, ids) in Self::idx_decode(&entry) {
+                        if ids.len() > 1 {
+                            return OpResult::Constraint(
+                                "AddUnique: existing duplicate values".into(),
+                            );
+                        }
+                    }
+                }
+                if let Some(t) = self.catalog.get_mut(type_id) {
+                    t.unique.push(field_id);
+                }
+                self.persist_catalog(op_number)
             }
         }
     }
@@ -740,6 +899,7 @@ mod tests {
                 Field { field_id: 2, name: "n".into(), kind: FieldKind::U64, nullable: false },
             ],
             indexes: vec![],
+            unique: vec![],
         };
         vec![0u8; t.compute_layout().record_size]
     }
@@ -823,6 +983,7 @@ mod tests {
                 Field { field_id: 2, name: "v".into(), kind: FieldKind::U32, nullable: false },
             ],
             indexes: vec![],
+            unique: vec![],
         };
         let mut b = vec![0u8; t.compute_layout().record_size];
         let o0 = t.compute_layout().offsets[0];
@@ -901,6 +1062,83 @@ mod tests {
             sm.digest()
         };
         assert_eq!(build(), build(), "index broke replica determinism");
+    }
+
+    // ---- Sub-project 4: UNIQUE + NOT NULL constraints ----
+
+    #[test]
+    fn not_null_enforced_for_codec_records() {
+        use kessel_codec::{encode, Value};
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        // type: a = U32 NOT NULL, b = U32 nullable
+        sm.apply(1, Op::CreateType {
+            def: encode_type_def(
+                "r",
+                &[
+                    Field { field_id: 0, name: "a".into(), kind: FieldKind::U32, nullable: false },
+                    Field { field_id: 0, name: "b".into(), kind: FieldKind::U32, nullable: true },
+                ],
+            ),
+        });
+        let ot = sm.catalog().get(1).unwrap().clone();
+        let id = ObjectId::from_u128(1);
+        // Valid codec record (both set). a set, b NULL is also valid (b is
+        // nullable). codec itself refuses Null in a non-nullable field, so to
+        // exercise the SM-level NOT NULL guard we hand-set field 0's null bit.
+        let good = encode(&ot, &[Value::Uint(7), Value::Null]).unwrap();
+        assert_eq!(sm.apply(3, Op::Create { type_id: 1, id, record: good.clone() }), OpResult::Ok);
+        let mut bad = good.clone();
+        // null bitmap starts after schema_ver(4)+field_count(2) = byte 6;
+        // set bit 0 => field 0 ('a', NOT NULL) is null.
+        bad[6] |= 1;
+        assert!(matches!(
+            sm.apply(4, Op::Create { type_id: 1, id: ObjectId::from_u128(2), record: bad }),
+            OpResult::Constraint(_)
+        ));
+    }
+
+    #[test]
+    fn unique_rejects_duplicate_on_create_and_update() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: indexed_type_def() });
+        assert_eq!(sm.apply(2, Op::AddUnique { type_id: 1, field_id: 1 }), OpResult::Ok);
+        assert_eq!(sm.apply(3, Op::AddUnique { type_id: 1, field_id: 1 }), OpResult::Ok); // idempotent
+        sm.apply(4, Op::Create { type_id: 1, id: ObjectId::from_u128(1), record: rec_bytes(100, 1) });
+        // second row with same owner=100 -> UNIQUE violation
+        assert!(matches!(
+            sm.apply(5, Op::Create { type_id: 1, id: ObjectId::from_u128(2), record: rec_bytes(100, 2) }),
+            OpResult::Constraint(_)
+        ));
+        // different value is fine
+        assert_eq!(sm.apply(6, Op::Create { type_id: 1, id: ObjectId::from_u128(2), record: rec_bytes(101, 2) }), OpResult::Ok);
+        // updating row 2 to collide with row 1's value -> rejected
+        assert!(matches!(
+            sm.apply(7, Op::Update { type_id: 1, id: ObjectId::from_u128(2), record: rec_bytes(100, 9) }),
+            OpResult::Constraint(_)
+        ));
+        // updating a row to its own same value is fine (self excluded)
+        assert_eq!(sm.apply(8, Op::Update { type_id: 1, id: ObjectId::from_u128(1), record: rec_bytes(100, 42) }), OpResult::Ok);
+    }
+
+    #[test]
+    fn add_unique_validates_existing_data() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: indexed_type_def() });
+        sm.apply(2, Op::Create { type_id: 1, id: ObjectId::from_u128(1), record: rec_bytes(5, 1) });
+        sm.apply(3, Op::Create { type_id: 1, id: ObjectId::from_u128(2), record: rec_bytes(5, 2) });
+        // existing dup on field 1 -> AddUnique must refuse
+        assert!(matches!(
+            sm.apply(4, Op::AddUnique { type_id: 1, field_id: 1 }),
+            OpResult::Constraint(_)
+        ));
+        // fix the dup, then it succeeds
+        sm.apply(5, Op::Update { type_id: 1, id: ObjectId::from_u128(2), record: rec_bytes(6, 2) });
+        assert_eq!(sm.apply(6, Op::AddUnique { type_id: 1, field_id: 1 }), OpResult::Ok);
+        // and is now enforced
+        assert!(matches!(
+            sm.apply(7, Op::Create { type_id: 1, id: ObjectId::from_u128(3), record: rec_bytes(5, 3) }),
+            OpResult::Constraint(_)
+        ));
     }
 
     /// Linearizability vs. an in-memory reference model under a random op

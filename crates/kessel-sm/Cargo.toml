@@ -11,5 +11,8 @@ kessel-storage = { path = "../kessel-storage" }
 kessel-catalog = { path = "../kessel-catalog" }
 kessel-cache = { path = "../kessel-cache" }
 
+[dev-dependencies]
+kessel-codec = { path = "../kessel-codec" }
+
 [lib]
 path = "src/lib.rs"

@@ -123,6 +123,9 @@ pub struct ObjectType {
     pub fields: Vec<Field>,
     /// `field_id`s with an equality secondary index (Sub-project 3).
     pub indexes: Vec<u16>,
+    /// `field_id`s with a UNIQUE constraint (Sub-project 4). Always a subset
+    /// of `indexes` (UNIQUE implies an index).
+    pub unique: Vec<u16>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -263,6 +266,10 @@ impl Catalog {
             for fid in &t.indexes {
                 b.extend_from_slice(&fid.to_le_bytes());
             }
+            b.extend_from_slice(&(t.unique.len() as u16).to_le_bytes());
+            for fid in &t.unique {
+                b.extend_from_slice(&fid.to_le_bytes());
+            }
         }
         b
     }
@@ -291,12 +298,20 @@ impl Catalog {
                 indexes.push(u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?));
                 p += 2;
             }
+            let nu = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
+            p += 2;
+            let mut unique = Vec::with_capacity(nu);
+            for _ in 0..nu {
+                unique.push(u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?));
+                p += 2;
+            }
             types.push(ObjectType {
                 type_id,
                 name,
                 schema_ver,
                 fields,
                 indexes,
+                unique,
             });
         }
         Some(Catalog {
@@ -321,7 +336,7 @@ mod tests {
 
     #[test]
     fn layout_is_pure_and_deterministic() {
-        let t = ObjectType { type_id: 1, name: "transfer".into(), schema_ver: 1, fields: sample_fields(), indexes: vec![] };
+        let t = ObjectType { type_id: 1, name: "transfer".into(), schema_ver: 1, fields: sample_fields(), indexes: vec![], unique: vec![] };
         let a = t.compute_layout();
         let b = t.compute_layout();
         assert_eq!(a, b);
@@ -335,7 +350,7 @@ mod tests {
 
     #[test]
     fn appending_nullable_field_keeps_existing_offsets() {
-        let mut t = ObjectType { type_id: 1, name: "t".into(), schema_ver: 1, fields: sample_fields(), indexes: vec![] };
+        let mut t = ObjectType { type_id: 1, name: "t".into(), schema_ver: 1, fields: sample_fields(), indexes: vec![], unique: vec![] };
         let before = t.compute_layout();
         t.fields.push(Field { field_id: 5, name: "memo".into(), kind: FieldKind::Char(32), nullable: true });
         t.schema_ver += 1;
@@ -357,8 +372,8 @@ mod tests {
     fn catalog_roundtrip() {
         let mut c = Catalog::default();
         c.next_type_id = 3;
-        c.types.push(ObjectType { type_id: 1, name: "a".into(), schema_ver: 2, fields: sample_fields(), indexes: vec![3] });
-        c.types.push(ObjectType { type_id: 2, name: "b".into(), schema_ver: 1, fields: vec![], indexes: vec![] });
+        c.types.push(ObjectType { type_id: 1, name: "a".into(), schema_ver: 2, fields: sample_fields(), indexes: vec![3], unique: vec![3] });
+        c.types.push(ObjectType { type_id: 2, name: "b".into(), schema_ver: 1, fields: vec![], indexes: vec![], unique: vec![] });
         let enc = c.encode();
         let dec = Catalog::decode(&enc).unwrap();
         assert_eq!(dec.next_type_id, 3);
@@ -366,7 +381,9 @@ mod tests {
         assert_eq!(dec.types[0].name, "a");
         assert_eq!(dec.types[0].fields, sample_fields());
         assert_eq!(dec.types[0].indexes, vec![3], "indexes survive roundtrip");
+        assert_eq!(dec.types[0].unique, vec![3], "unique survives roundtrip");
         assert_eq!(dec.types[1].indexes, Vec::<u16>::new());
+        assert_eq!(dec.types[1].unique, Vec::<u16>::new());
         assert_eq!(Catalog::decode(&[]).unwrap().types.len(), 0);
     }
 }

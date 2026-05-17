@@ -168,6 +168,7 @@ mod tests {
             schema_ver: ver,
             fields,
             indexes: vec![],
+            unique: vec![],
         }
     }
 

@@ -85,6 +85,48 @@ pub enum OpResult {
     Constraint(String),
 }
 
+impl OpResult {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut b = Vec::new();
+        match self {
+            OpResult::Ok => b.push(0),
+            OpResult::Got(v) => {
+                b.push(1);
+                codec::put_bytes(&mut b, v);
+            }
+            OpResult::Exists => b.push(2),
+            OpResult::NotFound => b.push(3),
+            OpResult::TypeCreated(t) => {
+                b.push(4);
+                codec::put_u32(&mut b, *t);
+            }
+            OpResult::SchemaError(s) => {
+                b.push(5);
+                codec::put_bytes(&mut b, s.as_bytes());
+            }
+            OpResult::Constraint(s) => {
+                b.push(6);
+                codec::put_bytes(&mut b, s.as_bytes());
+            }
+        }
+        b
+    }
+
+    pub fn decode(buf: &[u8]) -> Option<OpResult> {
+        let mut c = codec::Cursor::new(buf);
+        Some(match c.u8()? {
+            0 => OpResult::Ok,
+            1 => OpResult::Got(c.bytes()?),
+            2 => OpResult::Exists,
+            3 => OpResult::NotFound,
+            4 => OpResult::TypeCreated(c.u32()?),
+            5 => OpResult::SchemaError(String::from_utf8_lossy(&c.bytes()?).into_owned()),
+            6 => OpResult::Constraint(String::from_utf8_lossy(&c.bytes()?).into_owned()),
+            _ => return None,
+        })
+    }
+}
+
 impl Op {
     /// Discriminant tag used in WAL frames and the wire protocol.
     pub fn kind(&self) -> u8 {
@@ -306,6 +348,27 @@ pub mod codec {
     }
 }
 
+/// Length-prefixed framing shared by the TCP server and client:
+/// `[u32 little-endian length][payload]`.
+pub mod wire {
+    use std::io::{self, Read, Write};
+
+    pub fn write_frame(w: &mut impl Write, payload: &[u8]) -> io::Result<()> {
+        w.write_all(&(payload.len() as u32).to_le_bytes())?;
+        w.write_all(payload)?;
+        w.flush()
+    }
+
+    pub fn read_frame(r: &mut impl Read) -> io::Result<Vec<u8>> {
+        let mut len = [0u8; 4];
+        r.read_exact(&mut len)?;
+        let n = u32::from_le_bytes(len) as usize;
+        let mut buf = vec![0u8; n];
+        r.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+}
+
 /// Deterministic splitmix64 PRNG. Used by tests and the simulator so a single
 /// `u64` seed reproduces an entire run bit-for-bit.
 #[derive(Clone)]
@@ -381,6 +444,24 @@ mod tests {
             assert_eq!(op, dec);
             assert_eq!(op.kind(), enc[0]);
         }
+    }
+
+    #[test]
+    fn opresult_roundtrip_all_variants() {
+        for r in [
+            OpResult::Ok,
+            OpResult::Got(vec![1, 2, 3, 250]),
+            OpResult::Got(vec![]),
+            OpResult::Exists,
+            OpResult::NotFound,
+            OpResult::TypeCreated(77),
+            OpResult::SchemaError("nope".into()),
+            OpResult::Constraint("UNIQUE x".into()),
+        ] {
+            assert_eq!(OpResult::decode(&r.encode()), Some(r));
+        }
+        assert_eq!(OpResult::decode(&[9]), None);
+        assert_eq!(OpResult::decode(&[]), None);
     }
 
     #[test]

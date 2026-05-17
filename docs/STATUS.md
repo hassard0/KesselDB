@@ -17,6 +17,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP7 — expression VM + CHECK** | **done** | zero-dep deterministic gas-bounded stack VM (`kessel-expr`); `Op::AddCheck` (structural + existing-data validation); enforced on create/update; replicated convergence |
 | **SP8 — deterministic triggers** | **done** | same VM + `SET_FIELD`/`REJECT`; `Op::AddTrigger`; mutate/reject before constraints; order-independent; replicated convergence |
 | **SP9 — atomic transactions** | **done** | storage overlay (begin/commit/abort); `Op::Txn` all-or-nothing incl. index+cache rollback; one replicated op; VSR convergence |
+| **SP10 — runnable TCP server + client** | **done** | `OpResult` wire codec; `kesseldb` binary (real fsync), `kessel-client`; single owning engine thread; end-to-end socket test |
 
 ## M3 VSR — done vs. hardening backlog (honest)
 
@@ -120,13 +121,24 @@ identical commit/rollback on every replica (VSR test with colliding txns).
 Data-ops only (no DDL/nested); serial state machine ⇒ serializable by
 construction. Spec: `docs/superpowers/specs/2026-05-17-kesseldb-subproject9-txn.md`.
 
+## Sub-project 10 — runnable server + client (done)
+
+`kesseldb` binary (TCP, real fsync, `127.0.0.1:7878` default) + `kessel-client`
++ `OpResult` wire codec. Single owning engine thread (deterministic core never
+moves; connection threads talk to it via a channel). End-to-end socket test
+incl. an atomic `Op::Txn` over the wire. KesselDB is now actually runnable.
+Spec: `docs/superpowers/specs/2026-05-17-kesseldb-subproject10-server.md`.
+**Honest limit:** single-node only (multi-node VSR-over-sockets still
+deferred); no auth/TLS/back-pressure.
+
 ## What this is NOT (yet)
 
 Still out of scope (each a later spec): ON DELETE/UPDATE referential actions,
 OR/NOT queries, order-preserving range index, balance-guard constraint,
-cross-shard atomicity, destructive ALTER/DROP, overflow GC, index-write
-throughput optimization, M3 hardening backlog (partition matrix,
-disk-fault-in-VC, seed-corpus sweep, socket transport, membership), client SDKs.
+cross-shard atomicity, multi-node VSR over sockets, destructive ALTER/DROP,
+overflow GC, index-write throughput optimization, M3 hardening backlog
+(partition matrix, disk-fault-in-VC, seed-corpus sweep, membership),
+auth/TLS, client SDKs beyond Rust.
 
 ## Performance log
 

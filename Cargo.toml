@@ -12,6 +12,8 @@ members = [
     "crates/kessel-shard",
     "crates/kessel-vsr",
     "crates/kessel-bench",
+    "crates/kesseldb-server",
+    "crates/kessel-client",
     "crates/kessel-sim",
 ]
 

@@ -1,0 +1,11 @@
+[package]
+name = "kessel-client"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+kessel-proto = { path = "../kessel-proto" }
+
+[lib]
+path = "src/lib.rs"

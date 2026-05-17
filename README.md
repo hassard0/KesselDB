@@ -6,13 +6,13 @@ A schema-flexible, deterministic OLTP object kernel — a **fresh Rust reimpleme
 
 ## Status
 
-**This is a milestone-gated foundation, NOT a complete production database.** Implemented and tested (**89 tests green**): SP1 M0–M4 (determinism seam, LSM storage + crash recovery, schema catalog + record codec + online DDL, deterministic state machine, group commit, crash-stop VSR with view change, read cache, sharding groundwork), **SP2** variable-length overflow store, **SP3** equality secondary indexes, **SP4** UNIQUE + NOT NULL constraints, **SP5** query planner (AND of Eq/range, multi-index intersection + filtered scan), **SP6** foreign keys, **SP7** deterministic expression VM + CHECK, **SP8** deterministic mutating triggers / generated columns (same zero-dep pure gas-bounded VM), **SP9** atomic all-or-nothing transactions (`Op::Txn`, data+index+cache rollback, one replicated op) — all replication-correct/deterministic and tested (**89 tests**). Still *not* done (each a later spec): ON DELETE/UPDATE actions, OR/NOT & order-preserving range index, balance-guard, cross-shard atomicity, destructive ALTER/DROP, overflow GC, M3 hardening (partition matrix, socket transport, membership). See [`docs/STATUS.md`](docs/STATUS.md) for exactly what is proven vs. roadmap and honest perf + cloud-scaling reasoning. Claims here never exceed what the test suite proves.
+**This is a milestone-gated foundation, NOT a complete production database.** Implemented and tested (**91 tests green**): SP1 M0–M4 (determinism seam, LSM storage + crash recovery, schema catalog + record codec + online DDL, deterministic state machine, group commit, crash-stop VSR with view change, read cache, sharding groundwork), **SP2** variable-length overflow store, **SP3** equality secondary indexes, **SP4** UNIQUE + NOT NULL constraints, **SP5** query planner (AND of Eq/range, multi-index intersection + filtered scan), **SP6** foreign keys, **SP7** deterministic expression VM + CHECK, **SP8** deterministic mutating triggers / generated columns (same zero-dep pure gas-bounded VM), **SP9** atomic all-or-nothing transactions (`Op::Txn`), **SP10** a runnable `kesseldb` TCP server + `kessel-client` (real fsync, end-to-end tested) — all replication-correct/deterministic and tested (**91 tests**). Still *not* done (each a later spec): ON DELETE/UPDATE actions, OR/NOT & order-preserving range index, balance-guard, cross-shard atomicity, multi-node VSR over sockets, destructive ALTER/DROP, overflow GC, M3 hardening, auth/TLS. See [`docs/STATUS.md`](docs/STATUS.md) for exactly what is proven vs. roadmap and honest perf + cloud-scaling reasoning. Claims here never exceed what the test suite proves.
 
 ```bash
-cargo test --workspace                                  # 47 tests
+cargo test --workspace                                  # 91 tests
+cargo run --release --bin kesseldb -- 127.0.0.1:7878 ./data   # run the server
 cargo run -p kessel-bench --release -- 200000 file 1000 # durable, group commit
 cargo run -p kessel-bench --release -- 20000  repl      # 3-node replicated
-cargo run -p kessel-storage --release --example bench_storage
 ```
 
 ## Why

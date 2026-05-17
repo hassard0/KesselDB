@@ -1,0 +1,21 @@
+[package]
+name = "kesseldb-server"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+kessel-proto = { path = "../kessel-proto" }
+kessel-io = { path = "../kessel-io" }
+kessel-sm = { path = "../kessel-sm" }
+
+[dev-dependencies]
+kessel-client = { path = "../kessel-client" }
+kessel-catalog = { path = "../kessel-catalog" }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "kesseldb"
+path = "src/main.rs"

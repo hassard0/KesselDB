@@ -1487,6 +1487,85 @@ impl<V: Vfs> StateMachine<V> {
                 OpResult::Got(out)
             }
 
+            Op::QueryRows { type_id, eq_preds, program, limit } => {
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                // Planner: intersect indexed equality predicates to narrow
+                // candidates; the full `program` still verifies every row so
+                // the result is identical to Select (index only accelerates).
+                let mut cand: Option<std::collections::BTreeSet<[u8; 16]>> = None;
+                for (fid, val) in &eq_preds {
+                    let fi = match ot.fields.iter().position(|f| f.field_id == *fid) {
+                        Some(i) => i,
+                        None => continue,
+                    };
+                    if !ot.indexes.contains(fid) {
+                        continue;
+                    }
+                    let w = ot.fields[fi].kind.width() as usize;
+                    let mut v = val.clone();
+                    v.resize(w, 0);
+                    let ids: std::collections::BTreeSet<[u8; 16]> =
+                        self.idx_lookup(type_id, *fid, &v).into_iter().collect();
+                    cand = Some(match cand {
+                        None => ids,
+                        Some(prev) => prev.intersection(&ids).copied().collect(),
+                    });
+                }
+                let mut out = Vec::new();
+                let mut n = 0u32;
+                let mut emit = |rec: &[u8], n: &mut u32, out: &mut Vec<u8>| {
+                    out.extend_from_slice(&(rec.len() as u32).to_le_bytes());
+                    out.extend_from_slice(rec);
+                    *n += 1;
+                };
+                match cand {
+                    Some(ids) => {
+                        // index-driven: fetch only candidates (sorted set =>
+                        // deterministic order), verify the full predicate.
+                        for id in ids {
+                            if limit != 0 && n >= limit {
+                                break;
+                            }
+                            let rec = match self.storage.get(&make_key(type_id, &id)) {
+                                Some(r) => r,
+                                None => continue,
+                            };
+                            match kessel_expr::eval(&program, &ot, &rec) {
+                                Ok(true) => emit(&rec, &mut n, &mut out),
+                                Ok(false) => {}
+                                Err(e) => {
+                                    return OpResult::SchemaError(format!(
+                                        "query program: {e:?}"
+                                    ))
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        let lo = make_key(type_id, &[0u8; 16]);
+                        let hi = make_key(type_id, &[0xFFu8; 16]);
+                        for (_, rec) in self.storage.scan_range(&lo, &hi) {
+                            if limit != 0 && n >= limit {
+                                break;
+                            }
+                            match kessel_expr::eval(&program, &ot, &rec) {
+                                Ok(true) => emit(&rec, &mut n, &mut out),
+                                Ok(false) => {}
+                                Err(e) => {
+                                    return OpResult::SchemaError(format!(
+                                        "query program: {e:?}"
+                                    ))
+                                }
+                            }
+                        }
+                    }
+                }
+                OpResult::Got(out)
+            }
+
             Op::SelectFields { type_id, program, fields, limit } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
@@ -1833,6 +1912,7 @@ impl<V: Vfs> StateMachine<V> {
                             | Op::FindRange { .. }
                             | Op::FindByComposite { .. }
                             | Op::Select { .. }
+                            | Op::QueryRows { .. }
                             | Op::Aggregate { .. }
                             | Op::SelectFields { .. }
                             | Op::GroupAggregate { .. }

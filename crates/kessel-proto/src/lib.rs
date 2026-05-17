@@ -84,6 +84,18 @@ pub enum Op {
     /// kessel-expr `program` is true, return up to `limit` rows as
     /// length-prefixed record blobs. Read-only & deterministic.
     Select { type_id: TypeId, program: Vec<u8>, limit: u32 },
+    /// Index-accelerated row query (Sub-project 32): `eq_preds` are
+    /// `(field_id, value)` equality predicates; any on an indexed field are
+    /// intersected via the index to narrow candidates (else a full scan).
+    /// `program` (the full WHERE) then verifies every candidate, so the
+    /// result is identical to `Select` — the index only accelerates.
+    /// Returns up to `limit` rows as `[u32 len][record]*`.
+    QueryRows {
+        type_id: TypeId,
+        eq_preds: Vec<(u16, Vec<u8>)>,
+        program: Vec<u8>,
+        limit: u32,
+    },
     /// Aggregate (Sub-project 20) over rows matching `program`:
     /// `kind` 0=COUNT, 1=SUM, 2=MIN, 3=MAX of `field_id` (numeric).
     /// Result returned as a 16-byte little-endian i128 in `Got`.
@@ -203,6 +215,7 @@ impl Op {
             Op::AddOrderedIndex { .. } => 17,
             Op::FindRange { .. } => 18,
             Op::Select { .. } => 19,
+            Op::QueryRows { .. } => 26,
             Op::Aggregate { .. } => 20,
             Op::SelectFields { .. } => 21,
             Op::GroupAggregate { .. } => 22,
@@ -290,6 +303,16 @@ impl Op {
             }
             Op::Select { type_id, program, limit } => {
                 codec::put_u32(&mut b, *type_id);
+                codec::put_bytes(&mut b, program);
+                codec::put_u32(&mut b, *limit);
+            }
+            Op::QueryRows { type_id, eq_preds, program, limit } => {
+                codec::put_u32(&mut b, *type_id);
+                codec::put_u32(&mut b, eq_preds.len() as u32);
+                for (f, v) in eq_preds {
+                    b.extend_from_slice(&f.to_le_bytes());
+                    codec::put_bytes(&mut b, v);
+                }
                 codec::put_bytes(&mut b, program);
                 codec::put_u32(&mut b, *limit);
             }
@@ -406,6 +429,20 @@ impl Op {
                 program: c.bytes()?,
                 limit: c.u32()?,
             },
+            26 => {
+                let type_id = c.u32()?;
+                let n = c.u32()? as usize;
+                let mut eq_preds = Vec::with_capacity(n);
+                for _ in 0..n {
+                    eq_preds.push((c.u16()?, c.bytes()?));
+                }
+                Op::QueryRows {
+                    type_id,
+                    eq_preds,
+                    program: c.bytes()?,
+                    limit: c.u32()?,
+                }
+            }
             20 => Op::Aggregate {
                 type_id: c.u32()?,
                 program: c.bytes()?,
@@ -640,6 +677,7 @@ mod tests {
             Op::AddOrderedIndex { type_id: 4, field_id: 2 },
             Op::FindRange { type_id: 4, field_id: 2, lo: vec![0], hi: vec![255, 255] },
             Op::Select { type_id: 4, program: vec![1, 2], limit: 10 },
+            Op::QueryRows { type_id: 4, eq_preds: vec![(1, vec![9, 9])], program: vec![1], limit: 5 },
             Op::Aggregate { type_id: 4, program: vec![1], kind: 1, field_id: 3 },
             Op::SelectFields { type_id: 4, program: vec![1], fields: vec![1, 3], limit: 5 },
             Op::GroupAggregate { type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3 },

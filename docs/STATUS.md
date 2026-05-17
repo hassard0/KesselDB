@@ -39,6 +39,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP29 — SQL over TCP** | **done** | engine compiles `0xFE`-marked frames vs live catalog; `Client::sql()`; usable networked SQL DB; e2e SQL-over-socket test |
 | **SP30 — SQL UPDATE** | **done** | `Stmt`/`compile_stmt`; `UPDATE t ID n SET …` via server-side GetById→decode→set→encode→Op::Update; full SQL CRUD; e2e |
 | **SP31 — SQL SELECT by ID** | **done** | `SELECT … FROM t ID <n>` → O(1) `GetById` primary-key fast path; e2e over TCP |
+| **SP32 — index-accelerated queries** | **done** | `Op::QueryRows` (index-narrowed candidates + VM-verified, identical to Select); SQL `SELECT * … WHERE c=v [AND…]` → sub-linear; clean fallback for non-restricted grammar |
 
 ## M3 VSR — done vs. hardening backlog (honest)
 

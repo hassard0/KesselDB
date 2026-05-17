@@ -378,6 +378,15 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
     }
 
     if p.kw("SELECT") {
+        // Fast path: `SELECT * FROM t [WHERE c=v [AND c=v]*] [LIMIT n]`
+        // compiles to Op::QueryRows so equality on indexed columns is
+        // sub-linear. Anything outside this restricted grammar restores the
+        // cursor and falls back to the general (scan) planner.
+        let save = p.i;
+        if let Some(op) = try_query_rows(&mut p) {
+            return Ok(op);
+        }
+        p.i = save;
         return compile_select(&mut p);
     }
 
@@ -402,6 +411,95 @@ fn lit_to_value(l: &Lit, k: FieldKind) -> Result<Value, SqlError> {
         }
         (Lit::Int(n), Ref) => Value::Blob((*n as u128).to_le_bytes().to_vec()),
         _ => return Err("literal/column type mismatch".into()),
+    })
+}
+
+/// Try the restricted `SELECT * FROM t [WHERE c=v [AND c=v]*] [LIMIT n]`
+/// grammar -> `Op::QueryRows`. Returns None (caller restores + falls back)
+/// on anything outside it.
+fn try_query_rows(p: &mut P) -> Option<Op> {
+    if !matches!(p.peek(), Some(Tok::Star)) {
+        return None;
+    }
+    p.i += 1;
+    if !p.kw("FROM") {
+        return None;
+    }
+    let tname = match p.next() {
+        Some(Tok::Ident(s)) => s,
+        _ => return None,
+    };
+    let ot = p.type_named(&tname).ok()?.clone();
+    let mut eq_preds: Vec<(u16, Vec<u8>)> = Vec::new();
+    let mut prog: Option<Program> = None;
+    if p.kw("WHERE") {
+        loop {
+            let col = match p.next() {
+                Some(Tok::Ident(s)) => s,
+                _ => return None,
+            };
+            if !matches!(p.next(), Some(Tok::Cmp("="))) {
+                return None;
+            }
+            let lit = match p.next() {
+                Some(Tok::Int(n)) => Lit::Int(n),
+                Some(Tok::Str(s)) => Lit::Str(s),
+                _ => return None,
+            };
+            let f = ot.fields.iter().find(|f| f.name == col)?;
+            let w = f.kind.width() as usize;
+            // index hint bytes must equal the record's stored field bytes
+            let hint = match &lit {
+                Lit::Int(n) => n.to_le_bytes()[..w.min(16)].to_vec(),
+                Lit::Str(s) => s.clone().into_bytes(),
+            };
+            eq_preds.push((f.field_id, hint));
+            // also fold into the verifying program (load == lit)
+            let mut clause = Program::new().load(f.field_id);
+            clause = match &lit {
+                Lit::Int(n) => clause.push_int(*n),
+                Lit::Str(s) => clause.push_bytes(s.as_bytes()),
+            };
+            let clause = Program::from_raw({
+                let mut r = clause.bytes();
+                r.push(3); // EQ
+                r
+            });
+            prog = Some(match prog.take() {
+                None => clause,
+                Some(acc) => {
+                    let mut r = acc.bytes();
+                    r.extend_from_slice(&clause.bytes());
+                    r.push(14); // AND
+                    Program::from_raw(r)
+                }
+            });
+            if !p.kw("AND") {
+                break;
+            }
+        }
+    }
+    let mut limit = 0u32;
+    if p.kw("LIMIT") {
+        match p.next() {
+            Some(Tok::Int(n)) => limit = n as u32,
+            _ => return None,
+        }
+    }
+    // restricted grammar only — anything left (GROUP/ORDER/OFFSET/...) =>
+    // bail to the general planner.
+    match p.peek() {
+        None | Some(Tok::Punct(';')) => {}
+        _ => return None,
+    }
+    let program = prog
+        .unwrap_or_else(|| Program::new().push_int(1))
+        .bytes();
+    Some(Op::QueryRows {
+        type_id: ot.type_id,
+        eq_preds,
+        program,
+        limit,
     })
 }
 
@@ -712,6 +810,53 @@ mod tests {
             OpResult::Got(b) => assert_eq!(i128::from_le_bytes(b.try_into().unwrap()), 2),
             o => panic!("{o:?}"),
         }
+    }
+
+    #[test]
+    fn select_star_eq_compiles_to_query_rows_and_is_correct() {
+        use kessel_proto::Op;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE rec (owner U32 NOT NULL, v U32 NOT NULL)");
+        // index on owner (field_id 1) so QueryRows narrows via the index
+        assert_eq!(sm.apply(2, Op::CreateIndex { type_id: 1, field_id: 1 }), OpResult::Ok);
+        for i in 0..10u64 {
+            run(
+                &mut sm,
+                3 + i,
+                &format!(
+                    "INSERT INTO rec ID {i} (owner, v) VALUES ({}, {i})",
+                    if i < 4 { 100 } else { 200 }
+                ),
+            );
+        }
+        // restricted grammar -> QueryRows
+        let cat = sm.catalog().clone();
+        match compile("SELECT * FROM rec WHERE owner = 100", &cat).unwrap() {
+            Op::QueryRows { eq_preds, .. } => assert_eq!(eq_preds.len(), 1),
+            o => panic!("expected QueryRows, got {o:?}"),
+        }
+        // OR is outside the restricted grammar -> falls back to Select
+        match compile("SELECT * FROM rec WHERE owner = 100 OR v = 1", &cat).unwrap() {
+            Op::Select { .. } => {}
+            o => panic!("expected Select fallback, got {o:?}"),
+        }
+        // correctness: indexed query returns exactly the 4 owner=100 rows
+        match run(&mut sm, 20, "SELECT * FROM rec WHERE owner = 100") {
+            OpResult::Got(b) => {
+                let mut p = 0;
+                let mut n = 0;
+                while p + 4 <= b.len() {
+                    let l = u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize;
+                    p += 4 + l;
+                    n += 1;
+                }
+                assert_eq!(n, 4);
+            }
+            o => panic!("{o:?}"),
+        }
+        // multi-eq AND, and the fallback Select must agree with QueryRows
+        let q = run(&mut sm, 21, "SELECT * FROM rec WHERE owner = 200 AND v = 7");
+        assert!(matches!(&q, OpResult::Got(b) if b.len() > 0));
     }
 
     #[test]

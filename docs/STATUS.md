@@ -52,6 +52,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP42 — client-side failover discovery** | **done** | `OpResult::Unavailable` redirect + `is_active_primary` + `0xFD` session frame + `ClusterClient` (rotates address list, retries same `(client,req)`); client finds primary past 2 followers, replay exactly-once over the wire; **133 green** |
 | **SP43 — auth + quotas/backpressure** | **done** | zero-dep shared-secret token (`ct_eq` timing-safe) + `OpResult::Unauthorized`; `max_conns` connection cap; `max_inflight` load-shed → `Unavailable`; honest TLS boundary documented (proxy/VPN, not faked); **137 green** |
 | **SP44 — operational tooling** | **done** | engine-thread-consistent `snapshot(dest)` (hot backup → `StateMachine::open` recovers exact digest) + `stats()` (`ServerStats{applied_ops,digest,uptime}`, wire codec); **138 green** |
+| **SP45 — index point-read perf** | **done** | `SsTable::overlaps` O(1) min/max prune in `scan_prefix`/`scan_range` → point-value read O(*S_overlap*·log n) not O(*S*·log n); 40-SSTable prune test, results identical; **139 green** |
 
 ## Production-readiness gate (precise, not vague)
 
@@ -74,15 +75,16 @@ hand-waving:
 | Auth (shared-secret, timing-safe) + quotas + backpressure | ✅ **SP43 done** |
 | Transport encryption (TLS) | ⛔ deliberate zero-dep boundary — deploy behind TLS proxy / private net (documented, not faked) |
 | Operational tooling (hot snapshot/backup, metrics) | ✅ **SP44 done** — consistent snapshot recovers exact digest; live `ServerStats` |
-| Index point-read perf (post-SP25 tradeoff) | ⚠️ SP45 next |
+| Index point-read perf (post-SP25 tradeoff) | ✅ **SP45 done** — O(1) SSTable prune; sub-linear, write scalability untouched |
 
 The honest verdict: a **complete & functionally-correct** database, **VSR
 safety** hardened, now running as a **real multi-node TCP cluster** (SP38).
-Failover (SP38–42), auth/quotas/backpressure (SP43), and ops tooling
-(SP44) are done. Remaining gates, concrete and named: index point-read
-perf (SP45 next), and adversarial-partition liveness (seed 7, SP46 — the
-one genuinely hard item). Transport encryption is a deliberate, documented
-zero-dep boundary (TLS proxy / private network), not an open gap. No vague
+Failover (SP38–42), auth/quotas/backpressure (SP43), ops tooling (SP44),
+and index point-read perf (SP45) are done. The **only** remaining
+production gate is adversarial-partition VSR liveness (seed 7, SP46 — the
+one genuinely hard, formally-paper-grade item; safety is already
+protected). Transport encryption is a deliberate, documented zero-dep
+boundary (TLS proxy / private network), not an open gap. No vague
 "research-grade" hedging — each item is a
 specific, scoped slice.
 

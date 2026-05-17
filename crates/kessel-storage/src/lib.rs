@@ -188,6 +188,21 @@ struct SsTable {
 }
 
 impl SsTable {
+    /// Cheap O(1) pruning: does this table's `[min,max]` key span intersect
+    /// the query range `[lo,hi]`? `entries` is sorted, so the bounds are the
+    /// first/last keys. Lets a prefix/range scan skip whole SSTables that
+    /// cannot contribute — the SP45 point-read win in a large LSM (turns
+    /// O(#sstables · log n) into O(#overlapping · log n)).
+    #[inline]
+    fn overlaps(&self, lo: &Key, hi: &Key) -> bool {
+        match (self.entries.first(), self.entries.last()) {
+            (Some((min, _)), Some((max, _))) => min <= hi && max >= lo,
+            _ => false, // empty table contributes nothing
+        }
+    }
+}
+
+impl SsTable {
     fn open(vfs: &dyn Vfs, name: &str) -> io::Result<Self> {
         let disk = vfs.open(name)?;
         let len = disk.len() as usize;
@@ -513,6 +528,9 @@ impl<V: Vfs> Storage<V> {
     pub fn scan_range(&self, lo: &Key, hi: &Key) -> Vec<(Key, Vec<u8>)> {
         let mut merged: BTreeMap<Key, Option<Vec<u8>>> = BTreeMap::new();
         for sst in &self.sstables {
+            if !sst.overlaps(lo, hi) {
+                continue;
+            }
             let s = sst.entries.partition_point(|(k, _)| k < lo);
             for (k, v) in &sst.entries[s..] {
                 if k > hi {
@@ -554,6 +572,9 @@ impl<V: Vfs> Storage<V> {
         }
         let mut present: BTreeMap<Key, bool> = BTreeMap::new();
         for sst in &self.sstables {
+            if !sst.overlaps(lo, hi) {
+                continue;
+            }
             let s = sst.entries.partition_point(|(k, _)| k < lo);
             for (k, v) in &sst.entries[s..] {
                 if k > hi {
@@ -659,6 +680,47 @@ mod tests {
         assert_eq!(s.sstable_count(), 1);
         assert_eq!(s.get(&k(1)), Some(b"a2".to_vec()));
         assert_eq!(s.get(&k(2)), None);
+    }
+
+    #[test]
+    fn scan_prunes_disjoint_sstables_without_changing_results() {
+        let vfs = MemVfs::new();
+        let mut s = Storage::open(vfs).unwrap();
+        // 40 SSTables, each holding one distinct key — a many-segment LSM.
+        let m = 40u128;
+        for i in 0..m {
+            s.put((i + 1) as u64, k(i * 1000), vec![i as u8]).unwrap();
+            s.flush().unwrap();
+        }
+        assert_eq!(s.sstable_count() as u128, m);
+
+        // A single-key point scan must return exactly that key — the
+        // overlap-skip means 39 of 40 SSTables are pruned in O(1) each,
+        // but the result is unchanged.
+        let target = k(17 * 1000);
+        assert_eq!(
+            s.scan_prefix(&target, &target),
+            vec![target.clone()],
+            "point scan over a many-SSTable LSM must be exact"
+        );
+        assert_eq!(
+            s.scan_range(&target, &target),
+            vec![(target.clone(), vec![17u8])],
+        );
+        // A miss is still a clean empty (all SSTables pruned).
+        let absent = k(999_999);
+        assert!(s.scan_prefix(&absent, &absent).is_empty());
+
+        // Oracle: scanning the full [min,max] key span (Keys order
+        // lexicographically over the encoded bytes) must still return every
+        // key — pruning skips disjoint tables but drops nothing in range.
+        let mut want: Vec<Key> = (0..m).map(|i| k(i * 1000)).collect();
+        want.sort();
+        let lo = want.first().unwrap().clone();
+        let hi = want.last().unwrap().clone();
+        let mut got: Vec<Key> = s.scan_prefix(&lo, &hi);
+        got.sort();
+        assert_eq!(got, want, "wide scan still returns the full set");
     }
 
     #[test]

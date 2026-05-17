@@ -169,6 +169,7 @@ mod tests {
             fields,
             indexes: vec![],
             unique: vec![],
+            fks: vec![],
         }
     }
 

@@ -440,6 +440,65 @@ impl<V: Vfs> StateMachine<V> {
             .unwrap_or_default()
     }
 
+    /// True if `rec` follows the codec contract (exact size + field_count).
+    /// FK / NOT NULL enforcement is scoped to such records (raw writers opt
+    /// out by construction — documented).
+    fn is_codec_record(ot: &kessel_catalog::ObjectType, rec: &[u8]) -> bool {
+        use kessel_catalog::SCHEMA_VER_BYTES;
+        if rec.len() != ot.compute_layout().record_size {
+            return false;
+        }
+        let fc = u16::from_le_bytes(
+            rec[SCHEMA_VER_BYTES..SCHEMA_VER_BYTES + 2].try_into().unwrap(),
+        ) as usize;
+        fc == ot.fields.len()
+    }
+
+    /// Enforce all foreign keys of `type_id` for one row write. The field
+    /// value, padded to 16 bytes, must be an existing object id of the
+    /// referenced type. Codec-record scoped; NULL fk fields are skipped
+    /// (SQL-like). Read-only check against committed state ⇒ deterministic.
+    fn check_fk(&self, type_id: u32, rec: &[u8]) -> Result<(), String> {
+        let ot = match self.catalog.get(type_id) {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        if ot.fks.is_empty() || !Self::is_codec_record(ot, rec) {
+            return Ok(());
+        }
+        let layout = ot.compute_layout();
+        for (fid, rt) in &ot.fks {
+            let i = match ot.fields.iter().position(|f| f.field_id == *fid) {
+                Some(i) => i,
+                None => continue,
+            };
+            if Self::field_is_null(rec, i) {
+                continue; // NULL foreign key allowed
+            }
+            let off = layout.offsets[i];
+            let w = ot.fields[i].kind.width() as usize;
+            let fv = match rec.get(off..off + w) {
+                Some(v) => v,
+                None => continue,
+            };
+            let mut id16 = [0u8; 16];
+            let n = fv.len().min(16);
+            id16[..n].copy_from_slice(&fv[..n]);
+            if self.storage.get(&make_key(*rt, &id16)).is_none() {
+                let name = ot
+                    .fields
+                    .iter()
+                    .find(|f| f.field_id == *fid)
+                    .map(|f| f.name.as_str())
+                    .unwrap_or("?");
+                return Err(format!(
+                    "FOREIGN KEY violated on field '{name}' -> type {rt}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Apply one committed op. Deterministic.
     pub fn apply(&mut self, op_number: u64, op: Op) -> OpResult {
         match op {
@@ -471,6 +530,7 @@ impl<V: Vfs> StateMachine<V> {
                     fields,
                     indexes: Vec::new(),
                     unique: Vec::new(),
+                    fks: Vec::new(),
                 });
                 self.catalog.next_type_id += 1;
                 match self.persist_catalog(op_number) {
@@ -531,6 +591,9 @@ impl<V: Vfs> StateMachine<V> {
                 if let Err(e) = self.check_unique(type_id, &record, id.0) {
                     return OpResult::Constraint(e);
                 }
+                if let Err(e) = self.check_fk(type_id, &record) {
+                    return OpResult::Constraint(e);
+                }
                 let rec_idx = if need_idx { Some(record.clone()) } else { None };
                 let cached = self.cache.as_mut().map(|_| record.clone());
                 match self.storage.put(op_number, key, record) {
@@ -571,6 +634,9 @@ impl<V: Vfs> StateMachine<V> {
                     }
                 }
                 if let Err(e) = self.check_unique(type_id, &record, id.0) {
+                    return OpResult::Constraint(e);
+                }
+                if let Err(e) = self.check_fk(type_id, &record) {
                     return OpResult::Constraint(e);
                 }
                 let rec_idx = if need_idx { Some(record.clone()) } else { None };
@@ -859,6 +925,51 @@ impl<V: Vfs> StateMachine<V> {
                 }
                 OpResult::Got(out)
             }
+
+            Op::AddForeignKey { type_id, field_id, ref_type_id } => {
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                if self.catalog.get(ref_type_id).is_none() {
+                    return OpResult::SchemaError(format!("no ref type {ref_type_id}"));
+                }
+                let i = match ot.fields.iter().position(|f| f.field_id == field_id) {
+                    Some(i) => i,
+                    None => return OpResult::SchemaError(format!("no field {field_id}")),
+                };
+                if matches!(ot.fields[i].kind, kessel_catalog::FieldKind::OverflowRef) {
+                    return OpResult::SchemaError("cannot FK an OverflowRef field".into());
+                }
+                if ot.fks.contains(&(field_id, ref_type_id)) {
+                    return OpResult::Ok; // idempotent
+                }
+                // Validate existing rows (same scope as enforcement).
+                let layout = ot.compute_layout();
+                let off = layout.offsets[i];
+                let w = ot.fields[i].kind.width() as usize;
+                let lo = make_key(type_id, &[0u8; 16]);
+                let hi = make_key(type_id, &[0xFFu8; 16]);
+                for (_, rec) in self.storage.scan_range(&lo, &hi) {
+                    if !Self::is_codec_record(&ot, &rec) || Self::field_is_null(&rec, i) {
+                        continue;
+                    }
+                    if let Some(fv) = rec.get(off..off + w) {
+                        let mut id16 = [0u8; 16];
+                        let n = fv.len().min(16);
+                        id16[..n].copy_from_slice(&fv[..n]);
+                        if self.storage.get(&make_key(ref_type_id, &id16)).is_none() {
+                            return OpResult::Constraint(
+                                "AddForeignKey: existing dangling reference".into(),
+                            );
+                        }
+                    }
+                }
+                if let Some(t) = self.catalog.get_mut(type_id) {
+                    t.fks.push((field_id, ref_type_id));
+                }
+                self.persist_catalog(op_number)
+            }
         }
     }
 
@@ -1058,6 +1169,7 @@ mod tests {
             ],
             indexes: vec![],
             unique: vec![],
+            fks: vec![],
         };
         vec![0u8; t.compute_layout().record_size]
     }
@@ -1142,6 +1254,7 @@ mod tests {
             ],
             indexes: vec![],
             unique: vec![],
+            fks: vec![],
         };
         let mut b = vec![0u8; t.compute_layout().record_size];
         let o0 = t.compute_layout().offsets[0];
@@ -1323,6 +1436,7 @@ mod tests {
             ],
             indexes: vec![],
             unique: vec![],
+            fks: vec![],
         }
         .compute_layout()
     }
@@ -1448,6 +1562,90 @@ mod tests {
         assert_eq!(before, after, "Query must not mutate state");
         assert_eq!(ids_a, ids_b, "Query must be deterministic");
         assert!(!ids_a.is_empty());
+    }
+
+    // ---- Sub-project 6: foreign keys ----
+
+    #[test]
+    fn foreign_key_enforced_and_validates_existing() {
+        use kessel_codec::{encode, Value};
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        // parent type 1, child type 2 with pref(U128) -> parent, v(U32)
+        sm.apply(1, Op::CreateType {
+            def: encode_type_def("parent", &[
+                Field { field_id: 0, name: "a".into(), kind: FieldKind::U64, nullable: false },
+            ]),
+        });
+        sm.apply(2, Op::CreateType {
+            def: encode_type_def("child", &[
+                Field { field_id: 0, name: "pref".into(), kind: FieldKind::U128, nullable: false },
+                Field { field_id: 0, name: "v".into(), kind: FieldKind::U32, nullable: false },
+            ]),
+        });
+        let child_ot = sm.catalog().get(2).unwrap().clone();
+        let child = |p: u128, v: u32| encode(&child_ot, &[Value::Uint(p), Value::Uint(v as u128)]).unwrap();
+
+        // parent id=5 exists
+        sm.apply(3, Op::Create { type_id: 1, id: ObjectId::from_u128(5), record: vec![1] });
+
+        // Add FK: pref -> type 1 (no children yet -> validates clean)
+        assert_eq!(
+            sm.apply(4, Op::AddForeignKey { type_id: 2, field_id: 1, ref_type_id: 1 }),
+            OpResult::Ok
+        );
+        assert_eq!(
+            sm.apply(5, Op::AddForeignKey { type_id: 2, field_id: 1, ref_type_id: 1 }),
+            OpResult::Ok,
+            "idempotent"
+        );
+        // child referencing existing parent 5 -> Ok
+        assert_eq!(
+            sm.apply(6, Op::Create { type_id: 2, id: ObjectId::from_u128(1), record: child(5, 1) }),
+            OpResult::Ok
+        );
+        // child referencing missing parent 999 -> Constraint
+        assert!(matches!(
+            sm.apply(7, Op::Create { type_id: 2, id: ObjectId::from_u128(2), record: child(999, 1) }),
+            OpResult::Constraint(_)
+        ));
+        // update child to dangling ref -> Constraint
+        assert!(matches!(
+            sm.apply(8, Op::Update { type_id: 2, id: ObjectId::from_u128(1), record: child(404, 2) }),
+            OpResult::Constraint(_)
+        ));
+    }
+
+    #[test]
+    fn add_foreign_key_rejects_existing_dangling() {
+        use kessel_codec::{encode, Value};
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType {
+            def: encode_type_def("parent", &[
+                Field { field_id: 0, name: "a".into(), kind: FieldKind::U64, nullable: false },
+            ]),
+        });
+        sm.apply(2, Op::CreateType {
+            def: encode_type_def("child", &[
+                Field { field_id: 0, name: "pref".into(), kind: FieldKind::U128, nullable: false },
+            ]),
+        });
+        let cot = sm.catalog().get(2).unwrap().clone();
+        sm.apply(3, Op::Create { type_id: 1, id: ObjectId::from_u128(5), record: vec![1] });
+        // child references parent 5 (exists) and 7 (does NOT) before FK added
+        sm.apply(4, Op::Create { type_id: 2, id: ObjectId::from_u128(1), record: encode(&cot, &[Value::Uint(5)]).unwrap() });
+        sm.apply(5, Op::Create { type_id: 2, id: ObjectId::from_u128(2), record: encode(&cot, &[Value::Uint(7)]).unwrap() });
+        // AddForeignKey must refuse (id=2 is dangling) and NOT enable
+        assert!(matches!(
+            sm.apply(6, Op::AddForeignKey { type_id: 2, field_id: 1, ref_type_id: 1 }),
+            OpResult::Constraint(_)
+        ));
+        // fix the dangling row, then it succeeds and is enforced
+        sm.apply(7, Op::Update { type_id: 2, id: ObjectId::from_u128(2), record: encode(&cot, &[Value::Uint(5)]).unwrap() });
+        assert_eq!(sm.apply(8, Op::AddForeignKey { type_id: 2, field_id: 1, ref_type_id: 1 }), OpResult::Ok);
+        assert!(matches!(
+            sm.apply(9, Op::Create { type_id: 2, id: ObjectId::from_u128(3), record: encode(&cot, &[Value::Uint(123)]).unwrap() }),
+            OpResult::Constraint(_)
+        ));
     }
 
     /// Linearizability vs. an in-memory reference model under a random op

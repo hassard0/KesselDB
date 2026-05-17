@@ -88,6 +88,16 @@ predicates are correct on little-endian integer storage. `Query` is
 read-only and a pure function of committed state, so it is not logged and is
 trivially identical across replicas.
 
+## Foreign keys (Sub-project 6)
+
+`ObjectType.fks` = `(field_id, ref_type_id)` pairs. On Create/Update (after
+UNIQUE) each FK field's value, padded to a 16-byte id, must resolve via
+`storage.get(make_key(ref_type, id))`. Read-only against committed state ⇒
+deterministic/replication-safe. Codec-record scoped; NULL skipped.
+`AddForeignKey` validates all existing rows and refuses (without enabling) on
+any dangling reference. No referential actions (`ON DELETE`/`ON UPDATE`) —
+documented limitation.
+
 ## Storage layout
 
 LSM key = `type_id(4B) ‖ primary_id(16B)`, value = codec-encoded fixed-width record with a

@@ -530,6 +530,7 @@ pub mod sim {
     mod tests {
         use super::Cluster;
         use kessel_catalog::{encode_type_def, Field, FieldKind};
+        use kessel_codec::{encode, Value};
         use kessel_io::MemVfs;
         use kessel_proto::{ObjectId, Op};
         use kessel_sm::{encode_overflow_record, StateMachine};
@@ -719,6 +720,55 @@ pub mod sim {
         assert_ne!(c.run(&reqs, 12000), usize::MAX);
         let d = c.live_digests();
         assert!(d.iter().all(|x| *x == d[0]), "constraint state diverged: {d:?}");
+    }
+
+    #[test]
+    fn foreign_key_replicates_and_converges() {
+        // FK validation/rejection must be deterministic through VSR.
+        let mut c = Cluster::new(3, 19, 0);
+        let mut reqs = vec![
+            (1u128, 1u64, Op::CreateType {
+                def: encode_type_def("p", &[
+                    Field { field_id: 0, name: "a".into(), kind: FieldKind::U64, nullable: false },
+                ]),
+            }),
+            (1, 2, Op::CreateType {
+                def: encode_type_def("c", &[
+                    Field { field_id: 0, name: "pref".into(), kind: FieldKind::U128, nullable: false },
+                ]),
+            }),
+        ];
+        // 20 parents id 0..20
+        for i in 0..20u64 {
+            reqs.push((1, i + 3, Op::Create {
+                type_id: 1,
+                id: ObjectId::from_u128(i as u128),
+                record: vec![1],
+            }));
+        }
+        reqs.push((1, 100, Op::AddForeignKey { type_id: 2, field_id: 1, ref_type_id: 1 }));
+        // children: half valid (ref existing parent), half dangling (ref 9999)
+        // need a codec record for the FK field -> use codec encode at build
+        let cot = {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            sm.apply(1, Op::CreateType {
+                def: encode_type_def("c", &[
+                    Field { field_id: 0, name: "pref".into(), kind: FieldKind::U128, nullable: false },
+                ]),
+            });
+            sm.catalog().get(1).unwrap().clone()
+        };
+        for i in 0..20u64 {
+            let pref = if i % 2 == 0 { i as u128 } else { 9999 };
+            reqs.push((1, 200 + i, Op::Create {
+                type_id: 2,
+                id: ObjectId::from_u128(1000 + i as u128),
+                record: encode(&cot, &[Value::Uint(pref)]).unwrap(),
+            }));
+        }
+        assert_ne!(c.run(&reqs, 14000), usize::MAX);
+        let d = c.live_digests();
+        assert!(d.iter().all(|x| *x == d[0]), "FK state diverged: {d:?}");
     }
 
     #[test]

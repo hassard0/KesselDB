@@ -57,6 +57,10 @@ pub enum Op {
     /// ids of rows matching ALL predicates. The planner intersects indexed
     /// equality predicates and filter-scans the rest.
     Query { type_id: TypeId, preds: Vec<Pred> },
+    /// Add a foreign-key constraint (Sub-project 6): `field_id`'s value
+    /// (padded to 16 bytes) must be an existing object id of
+    /// `ref_type_id`. Validates current data before enabling.
+    AddForeignKey { type_id: TypeId, field_id: u16, ref_type_id: TypeId },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,6 +91,7 @@ impl Op {
             Op::FindBy { .. } => 9,
             Op::AddUnique { .. } => 10,
             Op::Query { .. } => 11,
+            Op::AddForeignKey { .. } => 12,
         }
     }
 
@@ -132,6 +137,11 @@ impl Op {
                     codec::put_bytes(&mut b, &p.value);
                 }
             }
+            Op::AddForeignKey { type_id, field_id, ref_type_id } => {
+                codec::put_u32(&mut b, *type_id);
+                b.extend_from_slice(&field_id.to_le_bytes());
+                codec::put_u32(&mut b, *ref_type_id);
+            }
         }
         b
     }
@@ -163,6 +173,11 @@ impl Op {
                 }
                 Op::Query { type_id, preds }
             }
+            12 => Op::AddForeignKey {
+                type_id: c.u32()?,
+                field_id: c.u16()?,
+                ref_type_id: c.u32()?,
+            },
             _ => return None,
         };
         Some(op)
@@ -309,6 +324,7 @@ mod tests {
                     Pred { field_id: 2, op: 1, value: vec![] },
                 ],
             },
+            Op::AddForeignKey { type_id: 4, field_id: 1, ref_type_id: 2 },
         ];
         for op in ops {
             let enc = op.encode();

@@ -11,6 +11,7 @@ kessel-sm = { path = "../kessel-sm" }
 
 [dev-dependencies]
 kessel-catalog = { path = "../kessel-catalog" }
+kessel-codec = { path = "../kessel-codec" }
 
 [lib]
 path = "src/lib.rs"

@@ -13,6 +13,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP3 — equality secondary indexes** | **done** | `CreateIndex`/`FindBy`, deterministic backfill + maintenance, `Storage::scan_range`, replicated convergence; range scans & multi-index planner deferred |
 | **SP4 — UNIQUE + NOT NULL constraints** | **done** | `OpResult::Constraint`, `Op::AddUnique` (validates existing data), enforced on create/update, replicated convergence; FK/CHECK/balance/WASM deferred |
 | **SP5 — query planner** | **done** | `Op::Query` AND-of-(Eq/Ge/Le); multi-index intersection + filtered `scan_range` fallback; per-kind numeric compare; read-only & deterministic |
+| **SP6 — foreign keys** | **done** | `Op::AddForeignKey` (validates existing data); ref-exists enforced on create/update (codec-scoped); replicated convergence; no ON DELETE cascade (documented) |
 
 ## M3 VSR — done vs. hardening backlog (honest)
 
@@ -78,13 +79,24 @@ unchanged). Spec: `docs/superpowers/specs/2026-05-17-kesseldb-subproject5-query.
 **Honest limits:** AND-only (no OR/NOT), no order-preserving range index
 (range = scan/post-filter), no cost-based intersection ordering.
 
+## Sub-project 6 — foreign keys (done)
+
+`ObjectType.fks`, `Op::AddForeignKey` (validates existing rows before
+enabling, idempotent), ref-exists enforced on Create/Update (codec-record
+scoped, NULL skipped), deterministic + VSR-convergence tested. Spec:
+`docs/superpowers/specs/2026-05-17-kesseldb-subproject6-fk.md`.
+**Honest limit:** no `ON DELETE`/`ON UPDATE` referential actions — deleting
+a parent neither cascades nor is blocked (FK checked only on child write);
+single-field FK only.
+
 ## What this is NOT (yet)
 
-Still out of scope (each a later spec): OR/NOT queries, order-preserving range
-index, FK-ref / CHECK / balance-guard constraints, deterministic WASM trigger
-sandbox, destructive ALTER/DROP, overflow GC, index-write throughput
-optimization, M3 hardening backlog (partition matrix, disk-fault-in-VC,
-seed-corpus sweep, socket transport, membership), client SDKs.
+Still out of scope (each a later spec): ON DELETE/UPDATE referential actions,
+OR/NOT queries, order-preserving range index, CHECK / balance-guard
+constraints, deterministic WASM trigger sandbox, destructive ALTER/DROP,
+overflow GC, index-write throughput optimization, M3 hardening backlog
+(partition matrix, disk-fault-in-VC, seed-corpus sweep, socket transport,
+membership), client SDKs.
 
 ## Performance log
 

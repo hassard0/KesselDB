@@ -126,6 +126,10 @@ pub struct ObjectType {
     /// `field_id`s with a UNIQUE constraint (Sub-project 4). Always a subset
     /// of `indexes` (UNIQUE implies an index).
     pub unique: Vec<u16>,
+    /// Foreign keys (Sub-project 6): `(field_id, referenced_type_id)`. The
+    /// field value (padded to 16 bytes) must be an existing object id of the
+    /// referenced type at write time.
+    pub fks: Vec<(u16, u32)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -270,6 +274,11 @@ impl Catalog {
             for fid in &t.unique {
                 b.extend_from_slice(&fid.to_le_bytes());
             }
+            b.extend_from_slice(&(t.fks.len() as u16).to_le_bytes());
+            for (fid, rt) in &t.fks {
+                b.extend_from_slice(&fid.to_le_bytes());
+                b.extend_from_slice(&rt.to_le_bytes());
+            }
         }
         b
     }
@@ -305,6 +314,16 @@ impl Catalog {
                 unique.push(u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?));
                 p += 2;
             }
+            let nf = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
+            p += 2;
+            let mut fks = Vec::with_capacity(nf);
+            for _ in 0..nf {
+                let fid = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?);
+                p += 2;
+                let rt = u32::from_le_bytes(b.get(p..p + 4)?.try_into().ok()?);
+                p += 4;
+                fks.push((fid, rt));
+            }
             types.push(ObjectType {
                 type_id,
                 name,
@@ -312,6 +331,7 @@ impl Catalog {
                 fields,
                 indexes,
                 unique,
+                fks,
             });
         }
         Some(Catalog {
@@ -336,7 +356,7 @@ mod tests {
 
     #[test]
     fn layout_is_pure_and_deterministic() {
-        let t = ObjectType { type_id: 1, name: "transfer".into(), schema_ver: 1, fields: sample_fields(), indexes: vec![], unique: vec![] };
+        let t = ObjectType { type_id: 1, name: "transfer".into(), schema_ver: 1, fields: sample_fields(), indexes: vec![], unique: vec![], fks: vec![] };
         let a = t.compute_layout();
         let b = t.compute_layout();
         assert_eq!(a, b);
@@ -350,7 +370,7 @@ mod tests {
 
     #[test]
     fn appending_nullable_field_keeps_existing_offsets() {
-        let mut t = ObjectType { type_id: 1, name: "t".into(), schema_ver: 1, fields: sample_fields(), indexes: vec![], unique: vec![] };
+        let mut t = ObjectType { type_id: 1, name: "t".into(), schema_ver: 1, fields: sample_fields(), indexes: vec![], unique: vec![], fks: vec![] };
         let before = t.compute_layout();
         t.fields.push(Field { field_id: 5, name: "memo".into(), kind: FieldKind::Char(32), nullable: true });
         t.schema_ver += 1;
@@ -372,8 +392,8 @@ mod tests {
     fn catalog_roundtrip() {
         let mut c = Catalog::default();
         c.next_type_id = 3;
-        c.types.push(ObjectType { type_id: 1, name: "a".into(), schema_ver: 2, fields: sample_fields(), indexes: vec![3], unique: vec![3] });
-        c.types.push(ObjectType { type_id: 2, name: "b".into(), schema_ver: 1, fields: vec![], indexes: vec![], unique: vec![] });
+        c.types.push(ObjectType { type_id: 1, name: "a".into(), schema_ver: 2, fields: sample_fields(), indexes: vec![3], unique: vec![3], fks: vec![(3, 9)] });
+        c.types.push(ObjectType { type_id: 2, name: "b".into(), schema_ver: 1, fields: vec![], indexes: vec![], unique: vec![], fks: vec![] });
         let enc = c.encode();
         let dec = Catalog::decode(&enc).unwrap();
         assert_eq!(dec.next_type_id, 3);
@@ -382,8 +402,10 @@ mod tests {
         assert_eq!(dec.types[0].fields, sample_fields());
         assert_eq!(dec.types[0].indexes, vec![3], "indexes survive roundtrip");
         assert_eq!(dec.types[0].unique, vec![3], "unique survives roundtrip");
+        assert_eq!(dec.types[0].fks, vec![(3, 9)], "fks survive roundtrip");
         assert_eq!(dec.types[1].indexes, Vec::<u16>::new());
         assert_eq!(dec.types[1].unique, Vec::<u16>::new());
+        assert_eq!(dec.types[1].fks, Vec::<(u16, u32)>::new());
         assert_eq!(Catalog::decode(&[]).unwrap().types.len(), 0);
     }
 }

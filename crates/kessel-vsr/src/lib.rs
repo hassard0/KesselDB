@@ -1211,6 +1211,41 @@ pub mod sim {
     }
 
     #[test]
+    fn composite_index_replicates_and_converges() {
+        let mut c = Cluster::new(3, 47, 0);
+        let row = |o: u32, k: u32| {
+            let mut b = vec![0u8; 32]; // owner u32 @14, kind u32 @18
+            b[14..18].copy_from_slice(&o.to_le_bytes());
+            b[18..22].copy_from_slice(&k.to_le_bytes());
+            b
+        };
+        let mut reqs = vec![
+            (1u128, 1u64, Op::CreateType {
+                def: encode_type_def("r", &[
+                    Field { field_id: 0, name: "owner".into(), kind: FieldKind::U32, nullable: false },
+                    Field { field_id: 0, name: "kind".into(), kind: FieldKind::U32, nullable: false },
+                ]),
+            }),
+            (1, 2, Op::AddCompositeIndex { type_id: 1, fields: vec![1, 2] }),
+        ];
+        for i in 0..40u64 {
+            reqs.push((1, i + 3, Op::Create {
+                type_id: 1, id: ObjectId::from_u128(i as u128),
+                record: row((i % 5) as u32, (i % 3) as u32),
+            }));
+        }
+        for i in 0..15u64 {
+            reqs.push((1, i + 100, Op::Update {
+                type_id: 1, id: ObjectId::from_u128(i as u128),
+                record: row(9, 9),
+            }));
+        }
+        assert_ne!(c.run(&reqs, 14000), usize::MAX);
+        let d = c.live_digests();
+        assert!(d.iter().all(|v| *v == d[0]), "composite index diverged: {d:?}");
+    }
+
+    #[test]
     fn converges_under_message_loss() {
         let mut c = Cluster::new(3, 9, 25); // drop 25% of messages
         let mut reqs = vec![(3u128, 1u64, def())];

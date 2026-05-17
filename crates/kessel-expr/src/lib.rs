@@ -454,6 +454,7 @@ mod tests {
             checks: vec![],
             triggers: vec![],
             ordered: vec![],
+            composite: vec![],
         }
     }
     fn rec(age: i32, bal: i64) -> Vec<u8> {

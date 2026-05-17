@@ -139,6 +139,9 @@ pub struct ObjectType {
     /// `field_id`s with an order-preserving range index (Sub-project 15),
     /// enabling sub-linear `FindRange`.
     pub ordered: Vec<u16>,
+    /// Composite (multi-field) equality indexes (Sub-project 27): each entry
+    /// is the ordered list of `field_id`s forming one composite index.
+    pub composite: Vec<Vec<u16>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -303,6 +306,13 @@ impl Catalog {
             for fid in &t.ordered {
                 b.extend_from_slice(&fid.to_le_bytes());
             }
+            b.extend_from_slice(&(t.composite.len() as u16).to_le_bytes());
+            for ci in &t.composite {
+                b.extend_from_slice(&(ci.len() as u16).to_le_bytes());
+                for fid in ci {
+                    b.extend_from_slice(&fid.to_le_bytes());
+                }
+            }
         }
         b
     }
@@ -375,6 +385,19 @@ impl Catalog {
                 ordered.push(u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?));
                 p += 2;
             }
+            let ncomp = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
+            p += 2;
+            let mut composite = Vec::with_capacity(ncomp);
+            for _ in 0..ncomp {
+                let nf = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
+                p += 2;
+                let mut ci = Vec::with_capacity(nf);
+                for _ in 0..nf {
+                    ci.push(u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?));
+                    p += 2;
+                }
+                composite.push(ci);
+            }
             types.push(ObjectType {
                 type_id,
                 name,
@@ -386,6 +409,7 @@ impl Catalog {
                 checks,
                 triggers,
                 ordered,
+                composite,
             });
         }
         Some(Catalog {
@@ -410,7 +434,7 @@ mod tests {
 
     #[test]
     fn layout_is_pure_and_deterministic() {
-        let t = ObjectType { type_id: 1, name: "transfer".into(), schema_ver: 1, fields: sample_fields(), indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![] };
+        let t = ObjectType { type_id: 1, name: "transfer".into(), schema_ver: 1, fields: sample_fields(), indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![] };
         let a = t.compute_layout();
         let b = t.compute_layout();
         assert_eq!(a, b);
@@ -424,7 +448,7 @@ mod tests {
 
     #[test]
     fn appending_nullable_field_keeps_existing_offsets() {
-        let mut t = ObjectType { type_id: 1, name: "t".into(), schema_ver: 1, fields: sample_fields(), indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![] };
+        let mut t = ObjectType { type_id: 1, name: "t".into(), schema_ver: 1, fields: sample_fields(), indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![] };
         let before = t.compute_layout();
         t.fields.push(Field { field_id: 5, name: "memo".into(), kind: FieldKind::Char(32), nullable: true });
         t.schema_ver += 1;
@@ -446,8 +470,8 @@ mod tests {
     fn catalog_roundtrip() {
         let mut c = Catalog::default();
         c.next_type_id = 3;
-        c.types.push(ObjectType { type_id: 1, name: "a".into(), schema_ver: 2, fields: sample_fields(), indexes: vec![3], unique: vec![3], fks: vec![(3, 9, 2)], checks: vec![vec![1, 2, 3]], triggers: vec![vec![7, 7]], ordered: vec![2] });
-        c.types.push(ObjectType { type_id: 2, name: "b".into(), schema_ver: 1, fields: vec![], indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![] });
+        c.types.push(ObjectType { type_id: 1, name: "a".into(), schema_ver: 2, fields: sample_fields(), indexes: vec![3], unique: vec![3], fks: vec![(3, 9, 2)], checks: vec![vec![1, 2, 3]], triggers: vec![vec![7, 7]], ordered: vec![2], composite: vec![vec![1, 2]] });
+        c.types.push(ObjectType { type_id: 2, name: "b".into(), schema_ver: 1, fields: vec![], indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![] });
         let enc = c.encode();
         let dec = Catalog::decode(&enc).unwrap();
         assert_eq!(dec.next_type_id, 3);
@@ -460,6 +484,7 @@ mod tests {
         assert_eq!(dec.types[0].checks, vec![vec![1u8, 2, 3]], "checks survive roundtrip");
         assert_eq!(dec.types[0].triggers, vec![vec![7u8, 7]], "triggers survive roundtrip");
         assert_eq!(dec.types[0].ordered, vec![2], "ordered survives roundtrip");
+        assert_eq!(dec.types[0].composite, vec![vec![1u16, 2]], "composite survives roundtrip");
         assert_eq!(dec.types[1].indexes, Vec::<u16>::new());
         assert_eq!(dec.types[1].unique, Vec::<u16>::new());
         assert_eq!(dec.types[1].fks, Vec::<(u16, u32, u8)>::new());

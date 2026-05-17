@@ -173,6 +173,7 @@ mod tests {
             checks: vec![],
             triggers: vec![],
             ordered: vec![],
+            composite: vec![],
         }
     }
 

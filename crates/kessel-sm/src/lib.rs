@@ -181,6 +181,30 @@ impl<V: Vfs> StateMachine<V> {
         let _ = self.storage.delete(op_number, key); // O(1), no RMW
     }
 
+    /// Synthetic field-id for composite index number `n` (real field_ids are
+    /// small; 0xC000+ is reserved for composites).
+    fn composite_fid(n: usize) -> u16 {
+        0xC000 | (n as u16 & 0x3FFF)
+    }
+
+    /// Concatenate the member fields' bytes from `rec` (in `flist` order).
+    /// None if any member is missing/short.
+    fn composite_concat(
+        ot: &kessel_catalog::ObjectType,
+        flist: &[u16],
+        rec: &[u8],
+    ) -> Option<Vec<u8>> {
+        let layout = ot.compute_layout();
+        let mut out = Vec::new();
+        for fid in flist {
+            let i = ot.fields.iter().position(|f| f.field_id == *fid)?;
+            let off = layout.offsets[i];
+            let w = ot.fields[i].kind.width() as usize;
+            out.extend_from_slice(rec.get(off..off + w)?);
+        }
+        Some(out)
+    }
+
     /// (offset,width) of an indexed field; None if absent or OverflowRef.
     fn idx_field_pos(ot: &kessel_catalog::ObjectType, fid: u16) -> Option<(usize, usize)> {
         let i = ot.fields.iter().position(|f| f.field_id == fid)?;
@@ -239,6 +263,21 @@ impl<V: Vfs> StateMachine<V> {
             }
             if let Some(n) = nv.and_then(|b| Self::order_key(kind, b)) {
                 self.oidx_add(op_number, type_id, fid, n, obj);
+            }
+        }
+        // SP27: composite (multi-field) equality indexes.
+        for (ci_no, flist) in ot.composite.clone().iter().enumerate() {
+            let oc = old.and_then(|r| Self::composite_concat(&ot, flist, r));
+            let nc = new.and_then(|r| Self::composite_concat(&ot, flist, r));
+            if oc == nc {
+                continue;
+            }
+            let cfid = Self::composite_fid(ci_no);
+            if let Some(o) = &oc {
+                self.idx_remove(op_number, type_id, cfid, o, obj);
+            }
+            if let Some(n) = &nc {
+                self.idx_add(op_number, type_id, cfid, n, obj);
             }
         }
     }
@@ -713,6 +752,7 @@ impl<V: Vfs> StateMachine<V> {
                     checks: Vec::new(),
                     triggers: Vec::new(),
                     ordered: Vec::new(),
+                    composite: Vec::new(),
                 });
                 self.catalog.next_type_id += 1;
                 match self.persist_catalog(op_number) {
@@ -763,7 +803,11 @@ impl<V: Vfs> StateMachine<V> {
                 let need_idx = self
                     .catalog
                     .get(type_id)
-                    .map(|t| !t.indexes.is_empty() || !t.ordered.is_empty())
+                    .map(|t| {
+                        !t.indexes.is_empty()
+                            || !t.ordered.is_empty()
+                            || !t.composite.is_empty()
+                    })
                     .unwrap_or(false);
                 let record = match self.run_triggers(type_id, record) {
                     Ok(r) => r,
@@ -815,7 +859,11 @@ impl<V: Vfs> StateMachine<V> {
                 let need_idx = self
                     .catalog
                     .get(type_id)
-                    .map(|t| !t.indexes.is_empty() || !t.ordered.is_empty())
+                    .map(|t| {
+                        !t.indexes.is_empty()
+                            || !t.ordered.is_empty()
+                            || !t.composite.is_empty()
+                    })
                     .unwrap_or(false);
                 let record = match self.run_triggers(type_id, record) {
                     Ok(r) => r,
@@ -1011,6 +1059,87 @@ impl<V: Vfs> StateMachine<V> {
                 let mut v = value;
                 v.resize(w, 0);
                 let ids = self.idx_lookup(type_id, field_id, &v);
+                let mut out = Vec::with_capacity(ids.len() * 16);
+                for id in ids {
+                    out.extend_from_slice(&id);
+                }
+                OpResult::Got(out)
+            }
+
+            Op::AddCompositeIndex { type_id, fields } => {
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                if fields.is_empty() {
+                    return OpResult::SchemaError("composite index needs ≥1 field".into());
+                }
+                for fid in &fields {
+                    match ot.fields.iter().position(|f| f.field_id == *fid) {
+                        Some(i) if !matches!(
+                            ot.fields[i].kind,
+                            kessel_catalog::FieldKind::OverflowRef
+                        ) => {}
+                        Some(_) => {
+                            return OpResult::SchemaError(
+                                "cannot composite-index an OverflowRef field".into(),
+                            )
+                        }
+                        None => return OpResult::SchemaError(format!("no field {fid}")),
+                    }
+                }
+                if ot.composite.iter().any(|c| *c == fields) {
+                    return OpResult::Ok; // idempotent
+                }
+                let ci_no = ot.composite.len();
+                if let Some(t) = self.catalog.get_mut(type_id) {
+                    t.composite.push(fields.clone());
+                }
+                if let OpResult::SchemaError(e) = self.persist_catalog(op_number) {
+                    return OpResult::SchemaError(e);
+                }
+                let cfid = Self::composite_fid(ci_no);
+                let lo = make_key(type_id, &[0u8; 16]);
+                let hi = make_key(type_id, &[0xFFu8; 16]);
+                for (k, rec) in self.storage.scan_range(&lo, &hi) {
+                    if let Some(c) = Self::composite_concat(&ot, &fields, &rec) {
+                        let mut obj = [0u8; 16];
+                        obj.copy_from_slice(&k[4..20]);
+                        self.idx_add(op_number, type_id, cfid, &c, obj);
+                    }
+                }
+                OpResult::Ok
+            }
+
+            Op::FindByComposite { type_id, fields, values } => {
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                let ci_no = match ot.composite.iter().position(|c| *c == fields) {
+                    Some(n) => n,
+                    None => {
+                        return OpResult::SchemaError("no such composite index".into())
+                    }
+                };
+                if values.len() != fields.len() {
+                    return OpResult::SchemaError("values/fields arity mismatch".into());
+                }
+                // Normalize each value to its field width, concatenated.
+                let layout = ot.compute_layout();
+                let mut concat = Vec::new();
+                for (fid, val) in fields.iter().zip(&values) {
+                    let i = match ot.fields.iter().position(|f| f.field_id == *fid) {
+                        Some(i) => i,
+                        None => return OpResult::SchemaError(format!("no field {fid}")),
+                    };
+                    let w = ot.fields[i].kind.width() as usize;
+                    let _ = layout.offsets[i];
+                    let mut v = val.clone();
+                    v.resize(w, 0);
+                    concat.extend_from_slice(&v);
+                }
+                let ids = self.idx_lookup(type_id, Self::composite_fid(ci_no), &concat);
                 let mut out = Vec::with_capacity(ids.len() * 16);
                 for id in ids {
                     out.extend_from_slice(&id);
@@ -1702,6 +1831,7 @@ impl<V: Vfs> StateMachine<V> {
                             | Op::Query { .. }
                             | Op::QueryExpr { .. }
                             | Op::FindRange { .. }
+                            | Op::FindByComposite { .. }
                             | Op::Select { .. }
                             | Op::Aggregate { .. }
                             | Op::SelectFields { .. }
@@ -1940,6 +2070,7 @@ mod tests {
             checks: vec![],
             triggers: vec![],
             ordered: vec![],
+            composite: vec![],
         };
         vec![0u8; t.compute_layout().record_size]
     }
@@ -2028,6 +2159,7 @@ mod tests {
             checks: vec![],
             triggers: vec![],
             ordered: vec![],
+            composite: vec![],
         };
         let mut b = vec![0u8; t.compute_layout().record_size];
         let o0 = t.compute_layout().offsets[0];
@@ -2213,6 +2345,7 @@ mod tests {
             checks: vec![],
             triggers: vec![],
             ordered: vec![],
+            composite: vec![],
         }
         .compute_layout()
     }
@@ -2464,7 +2597,7 @@ mod tests {
                 Field { field_id: 1, name: "age".into(), kind: FieldKind::I32, nullable: false },
                 Field { field_id: 2, name: "bal".into(), kind: FieldKind::I64, nullable: false },
             ],
-            indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![],
+            indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![],
         };
         let l = ot.compute_layout();
         (l.offsets[0], l.offsets[1])
@@ -2683,7 +2816,7 @@ mod tests {
                 Field { field_id: 1, name: "age".into(), kind: FieldKind::I32, nullable: false },
                 Field { field_id: 2, name: "bal".into(), kind: FieldKind::I64, nullable: false },
             ],
-            indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![],
+            indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![],
         };
         let l = ot.compute_layout();
         let mut b = vec![0u8; l.record_size];
@@ -2858,7 +2991,7 @@ mod tests {
                 Field { field_id: 1, name: "score".into(), kind: FieldKind::I32, nullable: false },
                 Field { field_id: 2, name: "big".into(), kind: FieldKind::U64, nullable: false },
             ],
-            indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![],
+            indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![],
         };
         let l = ot.compute_layout();
         (l.offsets[0], l.offsets[1])
@@ -2869,7 +3002,7 @@ mod tests {
             let ot = ObjectType { type_id:1,name:"rng".into(),schema_ver:1,fields:vec![
                 Field{field_id:1,name:"score".into(),kind:FieldKind::I32,nullable:false},
                 Field{field_id:2,name:"big".into(),kind:FieldKind::U64,nullable:false}],
-                indexes:vec![],unique:vec![],fks:vec![],checks:vec![],triggers:vec![],ordered:vec![] };
+                indexes:vec![],unique:vec![],fks:vec![],checks:vec![],triggers:vec![],ordered:vec![],composite:vec![] };
             ot.compute_layout().record_size
         }];
         b[o0..o0 + 4].copy_from_slice(&score.to_le_bytes());
@@ -3276,7 +3409,7 @@ mod tests {
                 Field { field_id: 2, name: "kind".into(), kind: FieldKind::U16, nullable: false },
                 Field { field_id: 3, name: "v".into(), kind: FieldKind::U32, nullable: false },
             ],
-            indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![],
+            indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![],
         };
         let l = ot.compute_layout();
         (l.offsets[2], 4)
@@ -3305,6 +3438,69 @@ mod tests {
         let (b, _, _) = build();
         assert_eq!(before, after);
         assert_eq!(a, b, "SelectSorted must be deterministic");
+    }
+
+    // ---- Sub-project 27: composite (multi-field) indexes ----
+
+    #[test]
+    fn composite_index_find_and_maintenance() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: q_type_def() }); // owner u32 f1, kind u16 f2, v u32 f3
+        // rows (owner, kind)
+        let rows = [(100u32, 1u16), (100, 2), (100, 1), (200, 1), (100, 2)];
+        for (i, (o, k)) in rows.iter().enumerate() {
+            sm.apply(2 + i as u64, Op::Create {
+                type_id: 1, id: ObjectId::from_u128(i as u128), record: qrec(*o, *k, i as u32),
+            });
+        }
+        // composite index on (owner, kind) — backfill
+        assert_eq!(sm.apply(20, Op::AddCompositeIndex { type_id: 1, fields: vec![1, 2] }), OpResult::Ok);
+        assert_eq!(sm.apply(21, Op::AddCompositeIndex { type_id: 1, fields: vec![1, 2] }), OpResult::Ok); // idempotent
+        // (owner=100, kind=1) -> ids 0,2
+        let q = |sm: &mut StateMachine<MemVfs>, op, o: u32, k: u16| -> Vec<u128> {
+            ids_of(sm.apply(op, Op::FindByComposite {
+                type_id: 1, fields: vec![1, 2],
+                values: vec![o.to_le_bytes().to_vec(), k.to_le_bytes().to_vec()],
+            }))
+        };
+        let mut g = q(&mut sm, 22, 100, 1); g.sort();
+        assert_eq!(g, vec![0, 2]);
+        let mut g = q(&mut sm, 23, 100, 2); g.sort();
+        assert_eq!(g, vec![1, 4]);
+        assert_eq!(q(&mut sm, 24, 999, 9), Vec::<u128>::new());
+        // update row 0 -> (100,2): leaves (100,1), joins (100,2)
+        sm.apply(25, Op::Update { type_id: 1, id: ObjectId::from_u128(0), record: qrec(100, 2, 0) });
+        assert_eq!(q(&mut sm, 26, 100, 1), vec![2]);
+        let mut g = q(&mut sm, 27, 100, 2); g.sort();
+        assert_eq!(g, vec![0, 1, 4]);
+        // delete row 4 -> drops from (100,2)
+        sm.apply(28, Op::Delete { type_id: 1, id: ObjectId::from_u128(4) });
+        let mut g = q(&mut sm, 29, 100, 2); g.sort();
+        assert_eq!(g, vec![0, 1]);
+    }
+
+    #[test]
+    fn composite_index_is_deterministic() {
+        let build = || {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            sm.apply(1, Op::CreateType { def: q_type_def() });
+            sm.apply(2, Op::AddCompositeIndex { type_id: 1, fields: vec![1, 2] });
+            let mut rng = Rng::new(0xC0FFEE);
+            for op in 3..400u64 {
+                let id = ObjectId::from_u128(rng.below(40) as u128);
+                match rng.below(4) {
+                    0 => { sm.apply(op, Op::Delete { type_id: 1, id }); }
+                    _ => {
+                        sm.apply(op, Op::Create {
+                            type_id: 1, id,
+                            record: qrec((rng.below(5)) as u32, (rng.below(3)) as u16, op as u32),
+                        });
+                    }
+                }
+            }
+            sm.digest()
+        };
+        assert_eq!(build(), build(), "composite index must be deterministic");
     }
 
     // ---- Sub-project 6: foreign keys ----

@@ -104,6 +104,13 @@ pub enum Op {
         kind: u8,
         agg_field: u16,
     },
+    /// Add a composite (multi-field) equality index (Sub-project 27);
+    /// backfills existing rows.
+    AddCompositeIndex { type_id: TypeId, fields: Vec<u16> },
+    /// Equality lookup on a composite index: `fields` identifies the index,
+    /// `values` are the per-field query values (in the same order).
+    /// Returns concatenated 16-byte object ids.
+    FindByComposite { type_id: TypeId, fields: Vec<u16>, values: Vec<Vec<u8>> },
     /// Sorted/paginated query (Sub-project 23): rows matching `program`,
     /// ordered by `sort_field` (`desc` for descending; ties broken by
     /// object id for determinism), then `offset` skipped and at most
@@ -200,6 +207,8 @@ impl Op {
             Op::SelectFields { .. } => 21,
             Op::GroupAggregate { .. } => 22,
             Op::SelectSorted { .. } => 23,
+            Op::AddCompositeIndex { .. } => 24,
+            Op::FindByComposite { .. } => 25,
         }
     }
 
@@ -306,6 +315,24 @@ impl Op {
                 b.push(*kind);
                 b.extend_from_slice(&agg_field.to_le_bytes());
             }
+            Op::AddCompositeIndex { type_id, fields } => {
+                codec::put_u32(&mut b, *type_id);
+                codec::put_u32(&mut b, fields.len() as u32);
+                for f in fields {
+                    b.extend_from_slice(&f.to_le_bytes());
+                }
+            }
+            Op::FindByComposite { type_id, fields, values } => {
+                codec::put_u32(&mut b, *type_id);
+                codec::put_u32(&mut b, fields.len() as u32);
+                for f in fields {
+                    b.extend_from_slice(&f.to_le_bytes());
+                }
+                codec::put_u32(&mut b, values.len() as u32);
+                for v in values {
+                    codec::put_bytes(&mut b, v);
+                }
+            }
             Op::SelectSorted { type_id, program, sort_field, desc, offset, limit } => {
                 codec::put_u32(&mut b, *type_id);
                 codec::put_bytes(&mut b, program);
@@ -402,6 +429,29 @@ impl Op {
                 kind: c.u8()?,
                 agg_field: c.u16()?,
             },
+            24 => {
+                let type_id = c.u32()?;
+                let nf = c.u32()? as usize;
+                let mut fields = Vec::with_capacity(nf);
+                for _ in 0..nf {
+                    fields.push(c.u16()?);
+                }
+                Op::AddCompositeIndex { type_id, fields }
+            }
+            25 => {
+                let type_id = c.u32()?;
+                let nf = c.u32()? as usize;
+                let mut fields = Vec::with_capacity(nf);
+                for _ in 0..nf {
+                    fields.push(c.u16()?);
+                }
+                let nv = c.u32()? as usize;
+                let mut values = Vec::with_capacity(nv);
+                for _ in 0..nv {
+                    values.push(c.bytes()?);
+                }
+                Op::FindByComposite { type_id, fields, values }
+            }
             23 => Op::SelectSorted {
                 type_id: c.u32()?,
                 program: c.bytes()?,
@@ -594,6 +644,8 @@ mod tests {
             Op::SelectFields { type_id: 4, program: vec![1], fields: vec![1, 3], limit: 5 },
             Op::GroupAggregate { type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3 },
             Op::SelectSorted { type_id: 4, program: vec![1], sort_field: 3, desc: true, offset: 2, limit: 5 },
+            Op::AddCompositeIndex { type_id: 4, fields: vec![1, 3] },
+            Op::FindByComposite { type_id: 4, fields: vec![1, 3], values: vec![vec![9], vec![8, 8]] },
         ];
         for op in ops {
             let enc = op.encode();

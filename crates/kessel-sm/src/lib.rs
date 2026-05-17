@@ -8,7 +8,9 @@
 
 #![forbid(unsafe_code)]
 
-use kessel_catalog::{decode_field, decode_type_def, Catalog, Field, ObjectType};
+use kessel_catalog::{
+    decode_field, decode_type_def, encode_type_def, Catalog, Field, ObjectType,
+};
 use kessel_io::Vfs;
 use kessel_proto::{Op, OpResult};
 use kessel_storage::{make_key, Key, Storage};
@@ -1002,6 +1004,11 @@ impl<V: Vfs> StateMachine<V> {
                 }
             }
 
+            Op::Describe { type_id } => match self.catalog.get(type_id) {
+                Some(t) => OpResult::Got(encode_type_def(&t.name, &t.fields)),
+                None => OpResult::NotFound,
+            },
+
             Op::GetBlob { handle } => match self.storage.get(&handle_key(handle)) {
                 Some(b) => OpResult::Got(b),
                 None => OpResult::NotFound,
@@ -1905,6 +1912,7 @@ impl<V: Vfs> StateMachine<V> {
                             | Op::Update { .. }
                             | Op::Delete { .. }
                             | Op::GetById { .. }
+                            | Op::Describe { .. }
                             | Op::GetBlob { .. }
                             | Op::FindBy { .. }
                             | Op::Query { .. }

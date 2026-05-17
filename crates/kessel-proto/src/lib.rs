@@ -116,6 +116,9 @@ pub enum Op {
         kind: u8,
         agg_field: u16,
     },
+    /// Schema introspection (Sub-project 34): returns the table's serialized
+    /// `(name, fields)` definition so a client can decode `SELECT` rows.
+    Describe { type_id: TypeId },
     /// Add a composite (multi-field) equality index (Sub-project 27);
     /// backfills existing rows.
     AddCompositeIndex { type_id: TypeId, fields: Vec<u16> },
@@ -216,6 +219,7 @@ impl Op {
             Op::FindRange { .. } => 18,
             Op::Select { .. } => 19,
             Op::QueryRows { .. } => 26,
+            Op::Describe { .. } => 27,
             Op::Aggregate { .. } => 20,
             Op::SelectFields { .. } => 21,
             Op::GroupAggregate { .. } => 22,
@@ -306,6 +310,7 @@ impl Op {
                 codec::put_bytes(&mut b, program);
                 codec::put_u32(&mut b, *limit);
             }
+            Op::Describe { type_id } => codec::put_u32(&mut b, *type_id),
             Op::QueryRows { type_id, eq_preds, program, limit } => {
                 codec::put_u32(&mut b, *type_id);
                 codec::put_u32(&mut b, eq_preds.len() as u32);
@@ -429,6 +434,7 @@ impl Op {
                 program: c.bytes()?,
                 limit: c.u32()?,
             },
+            27 => Op::Describe { type_id: c.u32()? },
             26 => {
                 let type_id = c.u32()?;
                 let n = c.u32()? as usize;
@@ -678,6 +684,7 @@ mod tests {
             Op::FindRange { type_id: 4, field_id: 2, lo: vec![0], hi: vec![255, 255] },
             Op::Select { type_id: 4, program: vec![1, 2], limit: 10 },
             Op::QueryRows { type_id: 4, eq_preds: vec![(1, vec![9, 9])], program: vec![1], limit: 5 },
+            Op::Describe { type_id: 4 },
             Op::Aggregate { type_id: 4, program: vec![1], kind: 1, field_id: 3 },
             Op::SelectFields { type_id: 4, program: vec![1], fields: vec![1, 3], limit: 5 },
             Op::GroupAggregate { type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3 },

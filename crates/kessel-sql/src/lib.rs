@@ -264,6 +264,12 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
     if p.kw("UPDATE") {
         return Err("UPDATE requires server-side execution (compile_stmt)".into());
     }
+    if p.kw("DESCRIBE") || p.kw("DESC") {
+        let tname = p.ident()?;
+        let ot = p.type_named(&tname)?;
+        return Ok(Op::Describe { type_id: ot.type_id });
+    }
+
     if p.kw("CREATE") {
         // CREATE [UNIQUE|RANGE] INDEX ON t (cols) — DDL for indexes.
         let unique = p.kw("UNIQUE");
@@ -956,6 +962,38 @@ mod tests {
             }
             o => panic!("{o:?}"),
         }
+    }
+
+    #[test]
+    fn describe_lets_client_decode_rows() {
+        use kessel_catalog::decode_type_def;
+        use kessel_codec::{decode, Value};
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE acct (owner U32 NOT NULL, bal I64 NOT NULL)");
+        run(&mut sm, 2, "INSERT INTO acct ID 1 (owner, bal) VALUES (100, -7)");
+        // DESCRIBE -> serialized (name, fields); a client rebuilds the type
+        let def = match run(&mut sm, 3, "DESCRIBE acct") {
+            OpResult::Got(b) => b,
+            o => panic!("{o:?}"),
+        };
+        let (name, fields) = decode_type_def(&def).unwrap();
+        assert_eq!(name, "acct");
+        assert_eq!(fields.len(), 2);
+        let ot = kessel_catalog::ObjectType {
+            type_id: 1, name, schema_ver: 1, fields,
+            indexes: vec![], unique: vec![], fks: vec![], checks: vec![],
+            triggers: vec![], ordered: vec![], composite: vec![],
+        };
+        // fetch the row and decode it using ONLY the described schema
+        match run(&mut sm, 4, "SELECT * FROM acct ID 1") {
+            OpResult::Got(rec) => {
+                let vals = decode(&ot, &rec).unwrap();
+                assert_eq!(vals[0], Value::Uint(100));
+                assert_eq!(vals[1], Value::Int(-7));
+            }
+            o => panic!("{o:?}"),
+        }
+        assert!(compile("DESC nope", sm.catalog()).is_err());
     }
 
     #[test]

@@ -41,6 +41,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP31 — SQL SELECT by ID** | **done** | `SELECT … FROM t ID <n>` → O(1) `GetById` primary-key fast path; e2e over TCP |
 | **SP32 — index-accelerated queries** | **done** | `Op::QueryRows` (index-narrowed candidates + VM-verified, identical to Select); SQL `SELECT * … WHERE c=v [AND…]` → sub-linear; clean fallback for non-restricted grammar |
 | **SP33 — SQL CREATE INDEX DDL** | **done** | `CREATE [UNIQUE\|RANGE] INDEX ON t(c)` → CreateIndex/AddUnique/AddOrderedIndex; `CREATE INDEX ON t(a,b)` → AddCompositeIndex. Full index workflow now pure-SQL end-to-end |
+| **SP34 — DESCRIBE** | **done** | `Op::Describe`/SQL `DESCRIBE\|DESC t` returns serialized `(name,fields)`; clients decode `SELECT` rows from the wire schema (closes the results-unusable-without-schema gap) |
 
 ## M3 VSR — done vs. hardening backlog (honest)
 

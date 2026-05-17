@@ -65,16 +65,63 @@ pub fn spawn_engine(data_dir: impl AsRef<Path>) -> io::Result<EngineHandle> {
         let mut n: u64 = 1;
         while let Ok((frame, reply)) = rx.recv() {
             let op = if frame.first() == Some(&0xFE) {
-                match std::str::from_utf8(&frame[1..]) {
-                    Ok(sql) => match kessel_sql::compile(sql, sm.catalog()) {
-                        Ok(o) => Some(o),
-                        Err(e) => {
-                            let _ = reply.send(OpResult::SchemaError(format!("sql: {e}")));
-                            continue;
-                        }
-                    },
+                let sql = match std::str::from_utf8(&frame[1..]) {
+                    Ok(s) => s,
                     Err(_) => {
                         let _ = reply.send(OpResult::SchemaError("sql: not utf8".into()));
+                        continue;
+                    }
+                };
+                match kessel_sql::compile_stmt(sql, sm.catalog()) {
+                    Ok(kessel_sql::Stmt::Op(o)) => Some(o),
+                    Ok(kessel_sql::Stmt::Update { type_id, id, sets }) => {
+                        // Server-side read-modify-write for SQL UPDATE.
+                        let oid = kessel_proto::ObjectId::from_u128(id);
+                        let cur = sm.apply(n, Op::GetById { type_id, id: oid });
+                        n += 1;
+                        let rec = match cur {
+                            OpResult::Got(r) => r,
+                            other => {
+                                let _ = reply.send(other); // NotFound etc.
+                                continue;
+                            }
+                        };
+                        let ot = match sm.catalog().get(type_id) {
+                            Some(t) => t.clone(),
+                            None => {
+                                let _ = reply
+                                    .send(OpResult::SchemaError("update: no type".into()));
+                                continue;
+                            }
+                        };
+                        let mut vals = match kessel_codec::decode(&ot, &rec) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let _ = reply.send(OpResult::SchemaError(format!(
+                                    "update decode: {e:?}"
+                                )));
+                                continue;
+                            }
+                        };
+                        for (fid, v) in sets {
+                            if let Some(i) =
+                                ot.fields.iter().position(|f| f.field_id == fid)
+                            {
+                                vals[i] = v;
+                            }
+                        }
+                        match kessel_codec::encode(&ot, &vals) {
+                            Ok(record) => Some(Op::Update { type_id, id: oid, record }),
+                            Err(e) => {
+                                let _ = reply.send(OpResult::SchemaError(format!(
+                                    "update encode: {e:?}"
+                                )));
+                                continue;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = reply.send(OpResult::SchemaError(format!("sql: {e}")));
                         continue;
                     }
                 }
@@ -230,6 +277,22 @@ mod tests {
             }
             o => panic!("unexpected {o:?}"),
         }
+        // UPDATE (server-side read-modify-write): bal 50 -> 500
+        assert_eq!(
+            c.sql("UPDATE acct ID 1 SET bal = 500").unwrap(),
+            OpResult::Ok
+        );
+        match c.sql("SELECT SUM(bal) FROM acct WHERE owner = 100").unwrap() {
+            OpResult::Got(b) => {
+                assert_eq!(i128::from_le_bytes(b.try_into().unwrap()), 1499)
+            }
+            o => panic!("unexpected {o:?}"),
+        }
+        // UPDATE of a missing row -> NotFound over the wire
+        assert_eq!(
+            c.sql("UPDATE acct ID 999 SET bal = 1").unwrap(),
+            OpResult::NotFound
+        );
         // a bad statement returns a clean error over the wire, no crash
         assert!(matches!(
             c.sql("SELECT FROM nope").unwrap(),

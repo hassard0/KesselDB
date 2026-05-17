@@ -191,14 +191,79 @@ fn kind_of(name: &str, arg: Option<i128>) -> Result<FieldKind, SqlError> {
     })
 }
 
+/// A compiled statement. Most map to a single `Op`; `UPDATE` needs a
+/// server-side read-modify-write (the engine reads the current row, applies
+/// the SET list, re-encodes) so it is its own variant.
+pub enum Stmt {
+    Op(Op),
+    Update {
+        type_id: u32,
+        id: u128,
+        sets: Vec<(u16, Value)>,
+    },
+}
+
+/// Compile one SQL statement, including `UPDATE`.
+pub fn compile_stmt(sql: &str, cat: &Catalog) -> Result<Stmt, SqlError> {
+    {
+        let mut p = P { t: lex(sql)?, i: 0, cat };
+        if p.kw("UPDATE") {
+            let tname = p.ident()?;
+            p.expect_kw("ID")?;
+            let id = match p.next() {
+                Some(Tok::Int(n)) => n as u128,
+                _ => return Err("UPDATE needs `ID <int>`".into()),
+            };
+            p.expect_kw("SET")?;
+            let ot = p.type_named(&tname)?.clone();
+            let mut sets = Vec::new();
+            loop {
+                let col = p.ident()?;
+                match p.next() {
+                    Some(Tok::Cmp("=")) => {}
+                    _ => return Err("expected `=`".into()),
+                }
+                let lit = match p.next() {
+                    Some(Tok::Int(n)) => Lit::Int(n),
+                    Some(Tok::Str(s)) => Lit::Str(s),
+                    _ => return Err("expected value".into()),
+                };
+                let f = ot
+                    .fields
+                    .iter()
+                    .find(|f| f.name == col)
+                    .ok_or_else(|| format!("unknown column `{col}`"))?;
+                sets.push((f.field_id, lit_to_value(&lit, f.kind)?));
+                match p.peek() {
+                    Some(Tok::Punct(',')) => {
+                        p.i += 1;
+                        continue;
+                    }
+                    _ => break,
+                }
+            }
+            return Ok(Stmt::Update {
+                type_id: ot.type_id,
+                id,
+                sets,
+            });
+        }
+    }
+    Ok(Stmt::Op(compile(sql, cat)?))
+}
+
 /// Compile one SQL statement to an `Op`. `cat` is needed for everything
-/// except `CREATE TABLE`.
+/// except `CREATE TABLE`. `UPDATE` is rejected here (use `compile_stmt` +
+/// a server that can read-modify-write).
 pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
     let mut p = P {
         t: lex(sql)?,
         i: 0,
         cat,
     };
+    if p.kw("UPDATE") {
+        return Err("UPDATE requires server-side execution (compile_stmt)".into());
+    }
     if p.kw("CREATE") {
         p.expect_kw("TABLE")?;
         let name = p.ident()?;

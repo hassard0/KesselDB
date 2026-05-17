@@ -86,6 +86,43 @@ fn build_update(
 pub struct Node {
     tx: Sender<Ev>,
     client_seq: Arc<AtomicU64>,
+    session_seq: Arc<AtomicU64>,
+}
+
+/// A stable client session: one VSR `ClientId` plus a monotonic request
+/// counter. This is what makes retries **exactly-once** — re-submitting the
+/// same `(client, req)` (e.g. a client that timed out and retried) is
+/// deduped by the replica's client table and returns the *cached* result
+/// without re-applying. Without a stable id (as bare `submit` uses) every
+/// call is a new client and a retry would double-apply.
+pub struct Session {
+    tx: Sender<Ev>,
+    client: ClientId,
+    req: AtomicU64,
+}
+
+impl Session {
+    /// Submit `op` under the next request number; blocks for the result.
+    pub fn submit(&self, op: Op) -> OpResult {
+        let req = self.req.fetch_add(1, Ordering::Relaxed) + 1;
+        self.submit_with_req(op, req)
+    }
+
+    /// Submit `op` under an explicit request number. Re-using a number that
+    /// already committed is a *retry*: the replica returns the cached reply
+    /// and does not execute the op again (exactly-once).
+    pub fn submit_with_req(&self, op: Op, req: u64) -> OpResult {
+        let (rtx, rrx) = sync_channel(1);
+        if self
+            .tx
+            .send(Ev::Client { client: self.client, req, op, reply: rtx })
+            .is_err()
+        {
+            return OpResult::SchemaError("engine stopped".into());
+        }
+        rrx.recv()
+            .unwrap_or_else(|_| OpResult::SchemaError("engine dropped reply".into()))
+    }
 }
 
 impl Node {
@@ -115,6 +152,18 @@ impl Node {
         }
         rrx.recv()
             .unwrap_or_else(|_| OpResult::SchemaError("engine dropped reply".into()))
+    }
+
+    /// Open a stable client session (exactly-once retries). The session's
+    /// `ClientId` is tagged into a range disjoint from bare `submit`
+    /// (small) and internal SQL ops (`1<<100+`).
+    pub fn session(&self) -> Session {
+        let ord = self.session_seq.fetch_add(1, Ordering::Relaxed) as u128;
+        Session {
+            tx: self.tx.clone(),
+            client: (1u128 << 64) | ord,
+            req: AtomicU64::new(0),
+        }
     }
 
     /// `(state digest, op_number, commit)` — for replication assertions.
@@ -405,7 +454,11 @@ pub fn spawn_node(
     });
 
     match ready_rx.recv() {
-        Ok(Ok(())) => Ok(Node { tx: etx, client_seq: Arc::new(AtomicU64::new(1)) }),
+        Ok(Ok(())) => Ok(Node {
+            tx: etx,
+            client_seq: Arc::new(AtomicU64::new(1)),
+            session_seq: Arc::new(AtomicU64::new(0)),
+        }),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(io::Error::new(io::ErrorKind::Other, "engine failed to start")),
     }
@@ -623,6 +676,89 @@ mod tests {
             );
         }
 
+        for d in &dirs {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn session_retry_is_exactly_once() {
+        let n = 3;
+        let listeners: Vec<TcpListener> = (0..n)
+            .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let addrs: Vec<SocketAddr> =
+            listeners.iter().map(|l| l.local_addr().unwrap()).collect();
+        let mut nodes = Vec::new();
+        let mut dirs = Vec::new();
+        for (i, l) in listeners.into_iter().enumerate() {
+            let dir = std::env::temp_dir()
+                .join(format!("kesseldb-sess-{}-{i}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            dirs.push(dir.clone());
+            nodes.push(spawn_node(i, l, addrs.clone(), dir).unwrap());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        let primary = &nodes[0];
+
+        // Setup schema via the bare path (irrelevant to the dedup proof).
+        assert_eq!(
+            primary.submit(Op::CreateType {
+                def: encode_type_def(
+                    "t",
+                    &[Field {
+                        field_id: 0,
+                        name: "v".into(),
+                        kind: FieldKind::U64,
+                        nullable: false,
+                    }],
+                ),
+            }),
+            OpResult::TypeCreated(1)
+        );
+
+        let s = primary.session();
+        let id = ObjectId::from_u128(7);
+        // req 1: create the row -> Ok.
+        assert_eq!(
+            s.submit_with_req(Op::Create { type_id: 1, id, record: vec![1] }, 1),
+            OpResult::Ok
+        );
+        std::thread::sleep(Duration::from_millis(60));
+        let digest_after_create = primary.probe().0;
+
+        // RETRY of the *same* (client, req=1): a client that lost the reply
+        // and resent. Must return the CACHED result (Ok) and NOT re-apply.
+        assert_eq!(
+            s.submit_with_req(Op::Create { type_id: 1, id, record: vec![1] }, 1),
+            OpResult::Ok,
+            "retried (client,req) must return the cached reply, not re-execute"
+        );
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            primary.probe().0,
+            digest_after_create,
+            "state digest changed on a duplicate request — op applied twice"
+        );
+
+        // Proof the row really exists exactly once: a *different* client
+        // creating the same id now collides.
+        assert_eq!(
+            primary.submit(Op::Create { type_id: 1, id, record: vec![9] }),
+            OpResult::Exists
+        );
+
+        // A genuinely new request number on the same session still works.
+        let id2 = ObjectId::from_u128(8);
+        assert_eq!(
+            s.submit_with_req(Op::Create { type_id: 1, id: id2, record: vec![2] }, 2),
+            OpResult::Ok
+        );
+
+        assert!(
+            wait_converged(&nodes, 1),
+            "nodes did not converge after session ops"
+        );
         for d in &dirs {
             let _ = std::fs::remove_dir_all(d);
         }

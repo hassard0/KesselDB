@@ -47,6 +47,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP37 — VSR view-change safety** | **done (safety) / liveness open** | fixed real committed-op-loss bug (stale log could win DoViewChange); `Normal`/`normal_view` only via authoritative install; 127 green; seed-7 *liveness* under adversarial partition still open (precisely diagnosed) |
 | **SP38 — VSR over real TCP sockets** | **done** | `kessel_vsr::wire` Msg codec (all 9 variants, roundtrip-tested) + `kesseldb_server::cluster` (single engine owns `Replica<DirVfs>`, per-peer socket transport); 3-node real-TCP test converges to identical digest; **129 green** |
 | **SP39 — SQL over the cluster** | **done** | `Replica::catalog()` + `Ev::ClientRaw` continuation engine (UPDATE = 2-round RMW over consensus, non-blocking) + `serve_clients`; real `Client::sql()` full CRUD against a 3-node TCP cluster, followers match primary digest; **130 green** |
+| **SP40 — client sessions (exactly-once)** | **done** | `Node::session()`/`Session` = stable ClientId + monotonic req; retried `(client,req)` returns the cached reply, op does not re-apply (digest-stable proof on 3-node cluster); **131 green** |
 
 ## Production-readiness gate (precise, not vague)
 
@@ -63,6 +64,8 @@ hand-waving:
 | VSR liveness under *arbitrary* partition | ⚠️ open, 1 repro (seed 7), precisely diagnosed |
 | **Multi-node replication over real sockets** | ✅ **SP38 done** — 3-node TCP cluster, digests converge over the wire |
 | **Full SQL over the cluster (incl. UPDATE RMW)** | ✅ **SP39 done** — `Client::sql()` full CRUD, linearized through consensus |
+| Exactly-once client retries | ✅ **SP40 done** — stable sessions; duplicate `(client,req)` deduped, digest-stable |
+| Failover client-reply re-routing (reconnect to new primary) | ⚠️ open — substrate (replicated client table + sessions) in place |
 | Index point-read perf (post-SP25 tradeoff) | ⚠️ documented enhancement |
 | Auth / TLS / quotas / backpressure | ❌ not started |
 | Operational tooling (backup, metrics, admin) | ❌ not started |

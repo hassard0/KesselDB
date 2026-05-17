@@ -38,6 +38,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP28 — SQL text layer** | **done** | `kessel-sql`: tokenizer + recursive-descent; CREATE/INSERT/SELECT(WHERE→expr VM, GROUP BY, ORDER BY, LIMIT/OFFSET, COUNT/SUM/MIN/MAX)/DELETE → existing Ops; e2e through StateMachine |
 | **SP29 — SQL over TCP** | **done** | engine compiles `0xFE`-marked frames vs live catalog; `Client::sql()`; usable networked SQL DB; e2e SQL-over-socket test |
 | **SP30 — SQL UPDATE** | **done** | `Stmt`/`compile_stmt`; `UPDATE t ID n SET …` via server-side GetById→decode→set→encode→Op::Update; full SQL CRUD; e2e |
+| **SP31 — SQL SELECT by ID** | **done** | `SELECT … FROM t ID <n>` → O(1) `GetById` primary-key fast path; e2e over TCP |
 
 ## M3 VSR — done vs. hardening backlog (honest)
 

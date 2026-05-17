@@ -293,6 +293,12 @@ mod tests {
             c.sql("UPDATE acct ID 999 SET bal = 1").unwrap(),
             OpResult::NotFound
         );
+        // SELECT ... ID <n> -> O(1) GetById, whole record back
+        match c.sql("SELECT * FROM acct ID 2").unwrap() {
+            OpResult::Got(rec) => assert!(!rec.is_empty()),
+            o => panic!("unexpected {o:?}"),
+        }
+        assert_eq!(c.sql("SELECT * FROM acct ID 12345").unwrap(), OpResult::NotFound);
         // a bad statement returns a clean error over the wire, no crash
         assert!(matches!(
             c.sql("SELECT FROM nope").unwrap(),

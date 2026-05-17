@@ -448,6 +448,19 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
     p.expect_kw("FROM")?;
     let tname = p.ident()?;
     let ot = p.type_named(&tname)?.clone();
+    // Primary-key fast path: `SELECT ... FROM t ID <n>` -> O(1) GetById
+    // (returns the whole record; projection/WHERE not applied to a
+    // single-row id fetch — documented).
+    if p.kw("ID") {
+        let id = match p.next() {
+            Some(Tok::Int(n)) => n as u128,
+            _ => return Err("SELECT ... ID needs `<int>`".into()),
+        };
+        return Ok(Op::GetById {
+            type_id: ot.type_id,
+            id: ObjectId::from_u128(id),
+        });
+    }
     let fid = |n: &str| -> Result<u16, SqlError> {
         ot.fields
             .iter()

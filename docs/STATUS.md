@@ -18,6 +18,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP8 — deterministic triggers** | **done** | same VM + `SET_FIELD`/`REJECT`; `Op::AddTrigger`; mutate/reject before constraints; order-independent; replicated convergence |
 | **SP9 — atomic transactions** | **done** | storage overlay (begin/commit/abort); `Op::Txn` all-or-nothing incl. index+cache rollback; one replicated op; VSR convergence |
 | **SP10 — runnable TCP server + client** | **done** | `OpResult` wire codec; `kesseldb` binary (real fsync), `kessel-client`; single owning engine thread; end-to-end socket test |
+| **SP11 — ON DELETE RESTRICT/CASCADE** | **done** | FK `on_delete`; auto-index for reverse lookup; recursive cascade closure (visited+budget); atomic via txn wrap; VSR convergence |
 
 ## M3 VSR — done vs. hardening backlog (honest)
 
@@ -131,13 +132,23 @@ Spec: `docs/superpowers/specs/2026-05-17-kesseldb-subproject10-server.md`.
 **Honest limit:** single-node only (multi-node VSR-over-sockets still
 deferred); no auth/TLS/back-pressure.
 
+## Sub-project 11 — ON DELETE RESTRICT/CASCADE (done)
+
+FK `on_delete` (NoAction/Restrict/Cascade). Action≠0 auto-indexes the FK
+field for reverse lookup. Parent delete computes the cascade closure
+(visited set + budget, handles diamonds/cycles), RESTRICT aborts with zero
+effect, CASCADE recursively deletes; the whole multi-delete is atomic (txn
+wrap). Replicated/deterministic (VSR test). Spec:
+`docs/superpowers/specs/2026-05-17-kesseldb-subproject11-ondelete.md`.
+**Honest limit:** no SET NULL/SET DEFAULT/ON UPDATE; budget-bounded cascade.
+
 ## What this is NOT (yet)
 
-Still out of scope (each a later spec): ON DELETE/UPDATE referential actions,
-OR/NOT queries, order-preserving range index, balance-guard constraint,
-cross-shard atomicity, multi-node VSR over sockets, destructive ALTER/DROP,
-overflow GC, index-write throughput optimization, M3 hardening backlog
-(partition matrix, disk-fault-in-VC, seed-corpus sweep, membership),
+Still out of scope (each a later spec): SET NULL/SET DEFAULT & ON UPDATE
+actions, OR/NOT queries, order-preserving range index, balance-guard
+constraint, cross-shard atomicity, multi-node VSR over sockets, destructive
+ALTER/DROP, overflow GC, index-write throughput optimization, M3 hardening
+backlog (partition matrix, disk-fault-in-VC, seed-corpus sweep, membership),
 auth/TLS, client SDKs beyond Rust.
 
 ## Performance log

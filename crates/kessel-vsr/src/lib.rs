@@ -747,7 +747,7 @@ pub mod sim {
                 record: vec![1],
             }));
         }
-        reqs.push((1, 100, Op::AddForeignKey { type_id: 2, field_id: 1, ref_type_id: 1 }));
+        reqs.push((1, 100, Op::AddForeignKey { type_id: 2, field_id: 1, ref_type_id: 1, on_delete: 0 }));
         // children: half valid (ref existing parent), half dangling (ref 9999)
         // need a codec record for the FK field -> use codec encode at build
         let cot = {
@@ -871,6 +871,49 @@ pub mod sim {
         assert_ne!(c.run(&reqs, 12000), usize::MAX);
         let d = c.live_digests();
         assert!(d.iter().all(|v| *v == d[0]), "txn outcome diverged: {d:?}");
+    }
+
+    #[test]
+    fn on_delete_cascade_replicates_and_converges() {
+        let mut c = Cluster::new(3, 37, 0);
+        let cot = {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            sm.apply(1, Op::CreateType {
+                def: encode_type_def("child", &[
+                    Field { field_id: 0, name: "pref".into(), kind: FieldKind::U128, nullable: false },
+                ]),
+            });
+            sm.catalog().get(1).unwrap().clone()
+        };
+        let mut reqs = vec![
+            (1u128, 1u64, Op::CreateType {
+                def: encode_type_def("parent", &[
+                    Field { field_id: 0, name: "a".into(), kind: FieldKind::U64, nullable: false },
+                ]),
+            }),
+            (1, 2, Op::CreateType {
+                def: encode_type_def("child", &[
+                    Field { field_id: 0, name: "pref".into(), kind: FieldKind::U128, nullable: false },
+                ]),
+            }),
+            (1, 3, Op::AddForeignKey { type_id: 2, field_id: 1, ref_type_id: 1, on_delete: 2 }),
+        ];
+        for p in 0..10u128 {
+            reqs.push((1, 10 + p as u64, Op::Create { type_id: 1, id: ObjectId::from_u128(p), record: vec![1] }));
+        }
+        for ch in 0..40u128 {
+            reqs.push((1, 100 + ch as u64, Op::Create {
+                type_id: 2,
+                id: ObjectId::from_u128(1000 + ch),
+                record: encode(&cot, &[Value::Uint(ch % 10)]).unwrap(),
+            }));
+        }
+        for p in (0..10u128).step_by(2) {
+            reqs.push((1, 500 + p as u64, Op::Delete { type_id: 1, id: ObjectId::from_u128(p) }));
+        }
+        assert_ne!(c.run(&reqs, 16000), usize::MAX);
+        let d = c.live_digests();
+        assert!(d.iter().all(|v| *v == d[0]), "cascade diverged: {d:?}");
     }
 
     #[test]

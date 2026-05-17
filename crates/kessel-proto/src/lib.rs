@@ -60,7 +60,7 @@ pub enum Op {
     /// Add a foreign-key constraint (Sub-project 6): `field_id`'s value
     /// (padded to 16 bytes) must be an existing object id of
     /// `ref_type_id`. Validates current data before enabling.
-    AddForeignKey { type_id: TypeId, field_id: u16, ref_type_id: TypeId },
+    AddForeignKey { type_id: TypeId, field_id: u16, ref_type_id: TypeId, on_delete: u8 },
     /// Add a CHECK constraint (Sub-project 7): a compiled kessel-expr program
     /// that must evaluate true for every written row. Validates current data.
     AddCheck { type_id: TypeId, program: Vec<u8> },
@@ -191,10 +191,11 @@ impl Op {
                     codec::put_bytes(&mut b, &p.value);
                 }
             }
-            Op::AddForeignKey { type_id, field_id, ref_type_id } => {
+            Op::AddForeignKey { type_id, field_id, ref_type_id, on_delete } => {
                 codec::put_u32(&mut b, *type_id);
                 b.extend_from_slice(&field_id.to_le_bytes());
                 codec::put_u32(&mut b, *ref_type_id);
+                b.push(*on_delete);
             }
             Op::AddCheck { type_id, program } => {
                 codec::put_u32(&mut b, *type_id);
@@ -245,6 +246,7 @@ impl Op {
                 type_id: c.u32()?,
                 field_id: c.u16()?,
                 ref_type_id: c.u32()?,
+                on_delete: c.u8()?,
             },
             13 => Op::AddCheck { type_id: c.u32()?, program: c.bytes()? },
             14 => Op::AddTrigger { type_id: c.u32()?, program: c.bytes()? },
@@ -428,7 +430,7 @@ mod tests {
                     Pred { field_id: 2, op: 1, value: vec![] },
                 ],
             },
-            Op::AddForeignKey { type_id: 4, field_id: 1, ref_type_id: 2 },
+            Op::AddForeignKey { type_id: 4, field_id: 1, ref_type_id: 2, on_delete: 2 },
             Op::AddCheck { type_id: 4, program: vec![0, 1, 2, 3] },
             Op::AddTrigger { type_id: 4, program: vec![5, 6] },
             Op::Txn {

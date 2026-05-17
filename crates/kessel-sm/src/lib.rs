@@ -467,7 +467,7 @@ impl<V: Vfs> StateMachine<V> {
             return Ok(());
         }
         let layout = ot.compute_layout();
-        for (fid, rt) in &ot.fks {
+        for (fid, rt, _od) in &ot.fks {
             let i = match ot.fields.iter().position(|f| f.field_id == *fid) {
                 Some(i) => i,
                 None => continue,
@@ -517,6 +517,55 @@ impl<V: Vfs> StateMachine<V> {
             }
         }
         Ok(rec)
+    }
+
+    /// DFS the ON DELETE closure rooted at `(target_type, target_id)`.
+    /// Pushes every object that must be deleted (root + CASCADE descendants)
+    /// into `out`; returns `Err` if a RESTRICT edge still has children or the
+    /// budget is exceeded. Pure read over committed state ⇒ deterministic.
+    fn cascade_collect(
+        &self,
+        target_type: u32,
+        target_id: [u8; 16],
+        out: &mut Vec<(u32, [u8; 16])>,
+        visited: &mut std::collections::HashSet<(u32, [u8; 16])>,
+        budget: &mut u32,
+    ) -> Result<(), String> {
+        if !visited.insert((target_type, target_id)) {
+            return Ok(()); // already scheduled (handles diamonds/cycles)
+        }
+        if *budget == 0 {
+            return Err("ON DELETE cascade budget exceeded".into());
+        }
+        *budget -= 1;
+        out.push((target_type, target_id));
+        for ct in &self.catalog.types {
+            for (fid, rt, od) in &ct.fks {
+                if *rt != target_type || *od == 0 {
+                    continue;
+                }
+                let fi = match ct.fields.iter().position(|f| f.field_id == *fid) {
+                    Some(i) => i,
+                    None => continue,
+                };
+                let w = ct.fields[fi].kind.width() as usize;
+                let val = Self::norm(&target_id, w);
+                let child_ids = self.idx_lookup(ct.type_id, *fid, &val);
+                if *od == 1 {
+                    if !child_ids.is_empty() {
+                        return Err(format!(
+                            "ON DELETE RESTRICT: type {} field {} still references type {}",
+                            ct.type_id, fid, target_type
+                        ));
+                    }
+                } else {
+                    for cid in child_ids {
+                        self.cascade_collect(ct.type_id, cid, out, visited, budget)?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Run every CHECK program of `type_id` against `rec`. A program that
@@ -720,20 +769,45 @@ impl<V: Vfs> StateMachine<V> {
 
             Op::Delete { type_id, id } => {
                 let key = make_key(type_id, &id.0);
-                let old = self.storage.get(&key);
-                if old.is_none() {
+                if self.storage.get(&key).is_none() {
                     return OpResult::NotFound;
                 }
-                match self.storage.delete(op_number, key) {
-                    Ok(()) => {
-                        if let Some(c) = self.cache.as_mut() {
-                            c.invalidate(&key); // never serve a deleted row
-                        }
-                        self.idx_maintain(op_number, type_id, id.0, old.as_deref(), None);
-                        OpResult::Ok
-                    }
-                    Err(e) => OpResult::SchemaError(format!("store: {e}")),
+                // Compute the full ON DELETE closure (root + cascade
+                // descendants); RESTRICT anywhere aborts with zero effect.
+                let mut closure: Vec<(u32, [u8; 16])> = Vec::new();
+                let mut visited: std::collections::HashSet<(u32, [u8; 16])> =
+                    std::collections::HashSet::new();
+                let mut budget: u32 = 200_000;
+                if let Err(e) =
+                    self.cascade_collect(type_id, id.0, &mut closure, &mut visited, &mut budget)
+                {
+                    return OpResult::Constraint(e);
                 }
+                // Atomic: if not already inside a Txn, wrap the multi-delete.
+                let own_txn = !self.storage.in_txn();
+                if own_txn {
+                    self.storage.begin_txn();
+                }
+                for (t, oid) in &closure {
+                    let k = make_key(*t, oid);
+                    let oldr = self.storage.get(&k);
+                    if let Err(e) = self.storage.delete(op_number, k) {
+                        if own_txn {
+                            self.storage.abort_txn();
+                        }
+                        return OpResult::SchemaError(format!("store: {e}"));
+                    }
+                    if let Some(c) = self.cache.as_mut() {
+                        c.invalidate(&k);
+                    }
+                    self.idx_maintain(op_number, *t, *oid, oldr.as_deref(), None);
+                }
+                if own_txn {
+                    if let Err(e) = self.storage.commit_txn() {
+                        return OpResult::SchemaError(format!("txn commit: {e}"));
+                    }
+                }
+                OpResult::Ok
             }
 
             Op::GetById { type_id, id } => {
@@ -980,7 +1054,10 @@ impl<V: Vfs> StateMachine<V> {
                 OpResult::Got(out)
             }
 
-            Op::AddForeignKey { type_id, field_id, ref_type_id } => {
+            Op::AddForeignKey { type_id, field_id, ref_type_id, on_delete } => {
+                if on_delete > 2 {
+                    return OpResult::SchemaError("on_delete must be 0|1|2".into());
+                }
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
                     None => return OpResult::SchemaError(format!("no type {type_id}")),
@@ -995,15 +1072,15 @@ impl<V: Vfs> StateMachine<V> {
                 if matches!(ot.fields[i].kind, kessel_catalog::FieldKind::OverflowRef) {
                     return OpResult::SchemaError("cannot FK an OverflowRef field".into());
                 }
-                if ot.fks.contains(&(field_id, ref_type_id)) {
+                if ot.fks.iter().any(|(f, r, _)| *f == field_id && *r == ref_type_id) {
                     return OpResult::Ok; // idempotent
                 }
-                // Validate existing rows (same scope as enforcement).
                 let layout = ot.compute_layout();
                 let off = layout.offsets[i];
                 let w = ot.fields[i].kind.width() as usize;
                 let lo = make_key(type_id, &[0u8; 16]);
                 let hi = make_key(type_id, &[0xFFu8; 16]);
+                // Validate existing rows (same scope as enforcement).
                 for (_, rec) in self.storage.scan_range(&lo, &hi) {
                     if !Self::is_codec_record(&ot, &rec) || Self::field_is_null(&rec, i) {
                         continue;
@@ -1019,8 +1096,26 @@ impl<V: Vfs> StateMachine<V> {
                         }
                     }
                 }
+                // RESTRICT/CASCADE need a reverse lookup -> ensure an index
+                // on the FK field (build + backfill if absent).
+                if on_delete != 0 && !ot.indexes.contains(&field_id) {
+                    if let Some(t) = self.catalog.get_mut(type_id) {
+                        t.indexes.push(field_id);
+                    }
+                    if let OpResult::SchemaError(e) = self.persist_catalog(op_number) {
+                        return OpResult::SchemaError(e);
+                    }
+                    for (k, rec) in self.storage.scan_range(&lo, &hi) {
+                        if let Some(v) = rec.get(off..off + w) {
+                            let mut obj = [0u8; 16];
+                            obj.copy_from_slice(&k[4..20]);
+                            let v = v.to_vec();
+                            self.idx_add(op_number, type_id, field_id, &v, obj);
+                        }
+                    }
+                }
                 if let Some(t) = self.catalog.get_mut(type_id) {
-                    t.fks.push((field_id, ref_type_id));
+                    t.fks.push((field_id, ref_type_id, on_delete));
                 }
                 self.persist_catalog(op_number)
             }
@@ -1902,6 +1997,98 @@ mod tests {
         assert_eq!(build(), build(), "trigger+check pipeline must be deterministic");
     }
 
+    // ---- Sub-project 11: ON DELETE RESTRICT / CASCADE ----
+
+    fn pc_setup() -> (StateMachine<MemVfs>, kessel_catalog::ObjectType) {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType {
+            def: encode_type_def("parent", &[
+                Field { field_id: 0, name: "a".into(), kind: FieldKind::U64, nullable: false },
+            ]),
+        });
+        sm.apply(2, Op::CreateType {
+            def: encode_type_def("child", &[
+                Field { field_id: 0, name: "pref".into(), kind: FieldKind::U128, nullable: false },
+            ]),
+        });
+        let cot = sm.catalog().get(2).unwrap().clone();
+        (sm, cot)
+    }
+
+    #[test]
+    fn on_delete_restrict_blocks_parent_delete() {
+        use kessel_codec::{encode, Value};
+        let (mut sm, cot) = pc_setup();
+        sm.apply(3, Op::Create { type_id: 1, id: ObjectId::from_u128(5), record: vec![1] });
+        assert_eq!(
+            sm.apply(4, Op::AddForeignKey { type_id: 2, field_id: 1, ref_type_id: 1, on_delete: 1 }),
+            OpResult::Ok
+        );
+        sm.apply(5, Op::Create { type_id: 2, id: ObjectId::from_u128(50), record: encode(&cot, &[Value::Uint(5)]).unwrap() });
+        // RESTRICT: parent delete refused while a child references it
+        assert!(matches!(
+            sm.apply(6, Op::Delete { type_id: 1, id: ObjectId::from_u128(5) }),
+            OpResult::Constraint(_)
+        ));
+        assert!(matches!(sm.apply(7, Op::GetById { type_id: 1, id: ObjectId::from_u128(5) }), OpResult::Got(_)), "parent untouched");
+        // remove child, then parent delete succeeds
+        sm.apply(8, Op::Delete { type_id: 2, id: ObjectId::from_u128(50) });
+        assert_eq!(sm.apply(9, Op::Delete { type_id: 1, id: ObjectId::from_u128(5) }), OpResult::Ok);
+    }
+
+    #[test]
+    fn on_delete_cascade_removes_children_recursively() {
+        use kessel_codec::{encode, Value};
+        let (mut sm, cot) = pc_setup();
+        // grandchild type 3: gref(U128) -> child(type 2), CASCADE
+        sm.apply(3, Op::CreateType {
+            def: encode_type_def("gc", &[
+                Field { field_id: 0, name: "gref".into(), kind: FieldKind::U128, nullable: false },
+            ]),
+        });
+        let got = sm.catalog().get(3).unwrap().clone();
+        sm.apply(4, Op::Create { type_id: 1, id: ObjectId::from_u128(7), record: vec![1] });
+        sm.apply(5, Op::AddForeignKey { type_id: 2, field_id: 1, ref_type_id: 1, on_delete: 2 });
+        sm.apply(6, Op::AddForeignKey { type_id: 3, field_id: 1, ref_type_id: 2, on_delete: 2 });
+        // children 50,51 -> parent 7 ; grandchild 500 -> child 50
+        sm.apply(7, Op::Create { type_id: 2, id: ObjectId::from_u128(50), record: encode(&cot, &[Value::Uint(7)]).unwrap() });
+        sm.apply(8, Op::Create { type_id: 2, id: ObjectId::from_u128(51), record: encode(&cot, &[Value::Uint(7)]).unwrap() });
+        sm.apply(9, Op::Create { type_id: 3, id: ObjectId::from_u128(500), record: encode(&got, &[Value::Uint(50)]).unwrap() });
+        // delete the parent -> cascades through child -> grandchild
+        assert_eq!(sm.apply(10, Op::Delete { type_id: 1, id: ObjectId::from_u128(7) }), OpResult::Ok);
+        assert_eq!(sm.apply(11, Op::GetById { type_id: 1, id: ObjectId::from_u128(7) }), OpResult::NotFound);
+        assert_eq!(sm.apply(12, Op::GetById { type_id: 2, id: ObjectId::from_u128(50) }), OpResult::NotFound);
+        assert_eq!(sm.apply(13, Op::GetById { type_id: 2, id: ObjectId::from_u128(51) }), OpResult::NotFound);
+        assert_eq!(sm.apply(14, Op::GetById { type_id: 3, id: ObjectId::from_u128(500) }), OpResult::NotFound);
+    }
+
+    #[test]
+    fn on_delete_is_deterministic() {
+        use kessel_codec::{encode, Value};
+        let build = || {
+            let (mut sm, cot) = pc_setup();
+            sm.apply(3, Op::AddForeignKey { type_id: 2, field_id: 1, ref_type_id: 1, on_delete: 2 });
+            for p in 0..10u128 {
+                sm.apply(10 + p as u64, Op::Create { type_id: 1, id: ObjectId::from_u128(p), record: vec![1] });
+            }
+            for ch in 0..40u128 {
+                let parent = ch % 10;
+                sm.apply(100 + ch as u64, Op::Create {
+                    type_id: 2,
+                    id: ObjectId::from_u128(1000 + ch),
+                    record: encode(&cot, &[Value::Uint(parent)]).unwrap(),
+                });
+            }
+            for p in 0..10u128 {
+                if p % 2 == 0 {
+                    sm.apply(500 + p as u64, Op::Delete { type_id: 1, id: ObjectId::from_u128(p) });
+                }
+            }
+            sm.digest()
+        };
+        assert_eq!(build(), build(), "ON DELETE cascade must be deterministic");
+    }
+
     // ---- Sub-project 7: CHECK via deterministic expression VM ----
 
     fn chk_type() -> Vec<u8> {
@@ -2028,11 +2215,11 @@ mod tests {
 
         // Add FK: pref -> type 1 (no children yet -> validates clean)
         assert_eq!(
-            sm.apply(4, Op::AddForeignKey { type_id: 2, field_id: 1, ref_type_id: 1 }),
+            sm.apply(4, Op::AddForeignKey { type_id: 2, field_id: 1, ref_type_id: 1, on_delete: 0 }),
             OpResult::Ok
         );
         assert_eq!(
-            sm.apply(5, Op::AddForeignKey { type_id: 2, field_id: 1, ref_type_id: 1 }),
+            sm.apply(5, Op::AddForeignKey { type_id: 2, field_id: 1, ref_type_id: 1, on_delete: 0 }),
             OpResult::Ok,
             "idempotent"
         );
@@ -2074,12 +2261,12 @@ mod tests {
         sm.apply(5, Op::Create { type_id: 2, id: ObjectId::from_u128(2), record: encode(&cot, &[Value::Uint(7)]).unwrap() });
         // AddForeignKey must refuse (id=2 is dangling) and NOT enable
         assert!(matches!(
-            sm.apply(6, Op::AddForeignKey { type_id: 2, field_id: 1, ref_type_id: 1 }),
+            sm.apply(6, Op::AddForeignKey { type_id: 2, field_id: 1, ref_type_id: 1, on_delete: 0 }),
             OpResult::Constraint(_)
         ));
         // fix the dangling row, then it succeeds and is enforced
         sm.apply(7, Op::Update { type_id: 2, id: ObjectId::from_u128(2), record: encode(&cot, &[Value::Uint(5)]).unwrap() });
-        assert_eq!(sm.apply(8, Op::AddForeignKey { type_id: 2, field_id: 1, ref_type_id: 1 }), OpResult::Ok);
+        assert_eq!(sm.apply(8, Op::AddForeignKey { type_id: 2, field_id: 1, ref_type_id: 1, on_delete: 0 }), OpResult::Ok);
         assert!(matches!(
             sm.apply(9, Op::Create { type_id: 2, id: ObjectId::from_u128(3), record: encode(&cot, &[Value::Uint(123)]).unwrap() }),
             OpResult::Constraint(_)

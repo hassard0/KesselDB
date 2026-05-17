@@ -1043,6 +1043,60 @@ impl<V: Vfs> StateMachine<V> {
                 None => OpResult::NotFound,
             },
 
+            Op::DropType { type_id } => {
+                if self.catalog.get(type_id).is_none() {
+                    return OpResult::NotFound;
+                }
+                // Referential integrity: refuse to drop a table another
+                // table still points at via a foreign key (no effect).
+                if let Some(t) = self.catalog.types.iter().find(|t| {
+                    t.type_id != type_id
+                        && t.fks.iter().any(|(_, rt, _)| *rt == type_id)
+                }) {
+                    return OpResult::Constraint(format!(
+                        "DROP TABLE: type {type_id} is referenced by a foreign \
+                         key from \"{}\"",
+                        t.name
+                    ));
+                }
+                let own_txn = !self.storage.in_txn();
+                if own_txn {
+                    self.storage.begin_txn();
+                }
+                // Remove every row together with its index entries (the
+                // type is still in the catalog so `idx_maintain` resolves
+                // the schema; we drop it afterwards).
+                let lo = make_key(type_id, &[0u8; 16]);
+                let hi = make_key(type_id, &[0xFFu8; 16]);
+                for (k, rec) in self.storage.scan_range(&lo, &hi) {
+                    let mut obj = [0u8; 16];
+                    if k.len() >= 20 {
+                        obj.copy_from_slice(&k[4..20]);
+                    }
+                    self.idx_maintain(op_number, type_id, obj, Some(&rec), None);
+                    if let Err(e) = self.storage.delete(op_number, k) {
+                        if own_txn {
+                            self.storage.abort_txn();
+                        }
+                        return OpResult::SchemaError(format!("drop: {e}"));
+                    }
+                }
+                self.catalog.types.retain(|t| t.type_id != type_id);
+                let pc = self.persist_catalog(op_number);
+                if !matches!(pc, OpResult::Ok) {
+                    if own_txn {
+                        self.storage.abort_txn();
+                    }
+                    return pc;
+                }
+                if own_txn {
+                    if let Err(e) = self.storage.commit_txn() {
+                        return OpResult::SchemaError(format!("drop commit: {e}"));
+                    }
+                }
+                OpResult::Ok
+            }
+
             Op::Join { left_type, right_type, left_field, right_field, limit } => {
                 let lt = match self.catalog.get(left_type) {
                     Some(t) => t.clone(),
@@ -2200,6 +2254,59 @@ mod tests {
             OpResult::NotFound,
             "read after delete must not return a cached value"
         );
+    }
+
+    #[test]
+    fn drop_table_removes_rows_and_type_and_guards_fks() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        assert_eq!(
+            sm.apply(1, Op::CreateType { def: encode_type_def("acct", &[]) }),
+            OpResult::TypeCreated(1)
+        );
+        let id1 = ObjectId::from_u128(1);
+        let id2 = ObjectId::from_u128(2);
+        sm.apply(2, Op::Create { type_id: 1, id: id1, record: vec![1] });
+        sm.apply(3, Op::Create { type_id: 1, id: id2, record: vec![2] });
+        assert_eq!(sm.apply(4, Op::GetById { type_id: 1, id: id1 }), OpResult::Got(vec![1]));
+
+        // Drop it. The type is gone from the catalog and Describe fails;
+        // (a query against the dropped type now errors at the type check,
+        // which is the externally-observable "table is gone").
+        assert_eq!(sm.apply(5, Op::DropType { type_id: 1 }), OpResult::Ok);
+        assert_eq!(sm.apply(8, Op::Describe { type_id: 1 }), OpResult::NotFound);
+        assert!(sm.catalog().get(1).is_none(), "type must be gone from catalog");
+        // Dropping a non-existent type is a clean NotFound (idempotent-ish).
+        assert_eq!(sm.apply(9, Op::DropType { type_id: 99 }), OpResult::NotFound);
+        // The name is free again (catalog entry truly removed).
+        assert!(matches!(
+            sm.apply(10, Op::CreateType { def: encode_type_def("acct", &[]) }),
+            OpResult::TypeCreated(_)
+        ));
+
+        // Foreign-key guard: cannot drop a table another table references.
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: encode_type_def("parent", &[]) });
+        let child = encode_type_def(
+            "child",
+            &[Field { field_id: 0, name: "p".into(), kind: FieldKind::Ref, nullable: false }],
+        );
+        sm.apply(2, Op::CreateType { def: child });
+        assert_eq!(
+            sm.apply(
+                3,
+                Op::AddForeignKey { type_id: 2, field_id: 1, ref_type_id: 1, on_delete: 0 }
+            ),
+            OpResult::Ok
+        );
+        // parent is referenced → refused, parent still present.
+        assert!(matches!(
+            sm.apply(4, Op::DropType { type_id: 1 }),
+            OpResult::Constraint(_)
+        ));
+        assert!(sm.catalog().get(1).is_some(), "refused drop must not remove the type");
+        // Drop the child first, then the parent succeeds.
+        assert_eq!(sm.apply(5, Op::DropType { type_id: 2 }), OpResult::Ok);
+        assert_eq!(sm.apply(6, Op::DropType { type_id: 1 }), OpResult::Ok);
     }
 
     #[test]

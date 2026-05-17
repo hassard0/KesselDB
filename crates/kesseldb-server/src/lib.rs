@@ -166,7 +166,7 @@ impl CompileCache {
 /// Applying an op of one of these kinds can change the catalog/schema, so
 /// any cached compiled statement must be discarded afterwards.
 fn mutates_schema(op: &Op) -> bool {
-    matches!(op.kind(), 1 | 2 | 8 | 10 | 12 | 13 | 14 | 17 | 24 | 15)
+    matches!(op.kind(), 1 | 2 | 8 | 10 | 12 | 13 | 14 | 17 | 24 | 15 | 29)
 }
 
 /// One request to the engine thread: an op and a one-shot reply channel.

@@ -156,6 +156,8 @@ tested):
 
 ```sql
 CREATE TABLE <t> (<col> <TYPE> [NOT NULL], ...)
+DROP TABLE <t>                              -- removes rows, indexes & the type
+                                            -- (refused if an FK still points at it)
 CREATE INDEX        ON <t> (<col>)          -- equality index
 CREATE UNIQUE INDEX ON <t> (<col>)          -- unique constraint + index
 CREATE RANGE  INDEX ON <t> (<col>)          -- order‑preserving (range scans)

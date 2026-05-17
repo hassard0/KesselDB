@@ -6,7 +6,7 @@
 
 *"It's the database that made the Kessel Run in 12 parsecs."*
 
-`148 tests green` · `0 external dependencies` · `Rust 1.95+` · single‑binary
+`150 tests green` · `0 external dependencies` · `Rust 1.95+` · single‑binary
 
 </div>
 
@@ -30,9 +30,9 @@ feature, not an aspiration.
 
 ## Highlights
 
-- **Real SQL** — `CREATE TABLE`, `INSERT`, `SELECT` (filters, `JOIN`, `GROUP BY`,
-  `ORDER BY`, `LIMIT/OFFSET`), `UPDATE`, `DELETE`, `COUNT/SUM/MIN/MAX/AVG`,
-  `CREATE [UNIQUE|RANGE] INDEX`, `DESCRIBE`.
+- **Real SQL** — `CREATE TABLE`, `DROP TABLE`, `INSERT`, `SELECT` (filters,
+  `JOIN`, `GROUP BY`, `ORDER BY`, `LIMIT/OFFSET`), `UPDATE`, `DELETE`,
+  `COUNT/SUM/MIN/MAX/AVG`, `CREATE [UNIQUE|RANGE] INDEX`, `DESCRIBE`.
 - **Constraints & logic** — `NOT NULL`, `UNIQUE`, foreign keys with
   `ON DELETE RESTRICT/CASCADE/SET NULL`, `CHECK`, and deterministic triggers
   (a gas‑bounded zero‑dep expression VM).
@@ -152,9 +152,9 @@ Honest boundaries (documented, not hidden):
   proxy or on a private/encrypted network; the wire is plaintext but
   token‑authenticated with a timing‑safe comparison.
 - **Non‑gating roadmap** (tracked, not blocking): balance‑guard helpers,
-  cross‑shard transactions, destructive `ALTER/DROP`, overflow GC.
+  cross‑shard transactions, destructive `ALTER TABLE` & `DROP INDEX` (`DROP TABLE` done, SP54), overflow GC.
 
-Every claim in this repository is backed by the test suite (`148 tests`); the
+Every claim in this repository is backed by the test suite (`150 tests`); the
 docs call out exactly what is proven versus roadmap.
 
 ## Documentation
@@ -171,7 +171,7 @@ docs call out exactly what is proven versus roadmap.
 
 ```bash
 cargo build                 # all crates, zero external deps
-cargo test --workspace      # 148 tests (incl. seeded partition/fault simulation)
+cargo test --workspace      # 150 tests (incl. seeded partition/fault simulation)
 cargo run -p kessel-bench --release -- --help   # benchmarks
 ```
 

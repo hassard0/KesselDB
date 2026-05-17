@@ -61,6 +61,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP51 — cluster compile cache** | **done** | deterministic `catalog_epoch` (bumped in `persist_catalog`, digest-invisible) + epoch-keyed cluster SQL cache; SP47's compile win now on the replicated path, DDL-safe; full determinism/VSR corpus green; **145 green** |
 | **SP52 — `kessel` CLI + DX** | **done** | zero-dep `kessel` CLI (one-shot/pipe/shell, reliable exit codes) + `format_result` (tested) + `AGENTS.md` + USAGE/README CLI docs; query the DB with no code; **146 green** |
 | **SP53 — typed row rendering** | **done** | `select_star_table` (real lexer) + `ObjectType::from_def` + `render_rows` (both wire shapes, aligned table); CLI prints real columns for `SELECT *`; projections/joins fall back honestly; **148 green** |
+| **SP54 — `DROP TABLE`** | **done** | `Op::DropType` (kind 29) — removes rows + index entries + catalog type, atomic, FK-referential-guard; SQL `DROP TABLE <t>`; determinism/VSR corpus green; **150 green** |
 
 ## Production-readiness gate (precise, not vague)
 

@@ -305,6 +305,13 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
         let ot = p.type_named(&tname)?;
         return Ok(Op::Describe { type_id: ot.type_id });
     }
+    if p.kw("DROP") {
+        // DROP TABLE <name> — destructive DDL (Sub-project 54).
+        p.expect_kw("TABLE")?;
+        let tname = p.ident()?;
+        let ot = p.type_named(&tname)?;
+        return Ok(Op::DropType { type_id: ot.type_id });
+    }
 
     if p.kw("CREATE") {
         // CREATE [UNIQUE|RANGE] INDEX ON t (cols) — DDL for indexes.
@@ -918,6 +925,28 @@ mod tests {
     fn run(sm: &mut StateMachine<MemVfs>, op: u64, sql: &str) -> OpResult {
         let o = compile(sql, sm.catalog()).expect("compile");
         sm.apply(op, o)
+    }
+
+    #[test]
+    fn drop_table_sql() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        assert!(matches!(
+            run(&mut sm, 1, "CREATE TABLE acct (owner U32 NOT NULL, bal I64 NOT NULL)"),
+            OpResult::TypeCreated(1)
+        ));
+        assert_eq!(
+            run(&mut sm, 2, "INSERT INTO acct ID 1 (owner, bal) VALUES (100, 50)"),
+            OpResult::Ok
+        );
+        assert_eq!(run(&mut sm, 3, "DROP TABLE acct"), OpResult::Ok);
+        // The table (and its row) are gone; compiling against it now fails.
+        assert!(compile("SELECT * FROM acct ID 1", sm.catalog()).is_err());
+        assert!(compile("DROP TABLE acct", sm.catalog()).is_err()); // unknown name
+        // Re-create with the freed name.
+        assert!(matches!(
+            run(&mut sm, 4, "CREATE TABLE acct (owner U32 NOT NULL)"),
+            OpResult::TypeCreated(_)
+        ));
     }
 
     #[test]

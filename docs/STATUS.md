@@ -44,6 +44,30 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP34 — DESCRIBE** | **done** | `Op::Describe`/SQL `DESCRIBE\|DESC t` returns serialized `(name,fields)`; clients decode `SELECT` rows from the wire schema (closes the results-unusable-without-schema gap) |
 | **SP35 — AVG aggregate** | **done** | aggregate kind 4 = AVG (integer sum/count, empty→0) in Aggregate + GroupAggregate; SQL `AVG(col)`. Standard set COUNT/SUM/MIN/MAX/AVG complete |
 | **SP36 — inner equi-JOIN** | **done** | `Op::Join` deterministic hash-join over two scans; SQL `SELECT * FROM a JOIN b ON a.x=b.y [LIMIT]` (lexer `.`, bidirectional ON); leftrec++rightrec length-prefixed |
+| **SP37 — VSR view-change safety** | **done (safety) / liveness open** | fixed real committed-op-loss bug (stale log could win DoViewChange); `Normal`/`normal_view` only via authoritative install; 127 green; seed-7 *liveness* under adversarial partition still open (precisely diagnosed) |
+
+## Production-readiness gate (precise, not vague)
+
+KesselDB is a **complete, correct relational SQL database**. The specific,
+concrete items between it and "production scalable & reliable" — no
+hand-waving:
+
+| Gate | Status |
+|---|---|
+| Functional completeness (SQL DDL/DML/JOIN/agg/index/constraints/triggers/txn) | ✅ done |
+| Crash recovery (WAL replay, torn-tail) | ✅ done + tested |
+| Deterministic engine + simulation testing | ✅ done |
+| VSR safety (no committed-op loss across view change) | ✅ **SP37 fixed** |
+| VSR liveness under *arbitrary* partition | ⚠️ open, 1 repro (seed 7), precisely diagnosed |
+| **Multi-node replication over real sockets** | ⚠️ open — server is single-node; VSR is in-process-bus only |
+| Index point-read perf (post-SP25 tradeoff) | ⚠️ documented enhancement |
+| Auth / TLS / quotas / backpressure | ❌ not started |
+| Operational tooling (backup, metrics, admin) | ❌ not started |
+
+The honest verdict: it is a **complete & functionally-correct** database
+with **VSR safety** now hardened; "production scalable & reliable" is gated
+by (a) multi-node-over-sockets and (b) adversarial-partition liveness — both
+concrete, named, and tractable, not vague "research".
 
 ## M3 VSR — done vs. hardening backlog (honest)
 

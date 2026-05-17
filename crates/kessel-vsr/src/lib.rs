@@ -194,7 +194,12 @@ impl<V: Vfs> Replica<V> {
                 self.on_start_view(view, log, commit, &mut out)
             }
             Msg::GetState { view, after, replica } => {
-                if view == self.view && self.op_number() > after {
+                // Only an authoritative (Normal, same-view) replica may
+                // answer — its log is the truth for that view.
+                if view == self.view
+                    && self.status == Status::Normal
+                    && self.op_number() >= after
+                {
                     let suffix = self.log[after as usize..].to_vec();
                     out.msgs.push((
                         replica,
@@ -204,11 +209,22 @@ impl<V: Vfs> Replica<V> {
             }
             Msg::NewState { view, suffix, commit } => {
                 if view == self.view {
-                    for e in suffix {
-                        if e.op_number == self.op_number() + 1 {
-                            self.log.push(e);
+                    if self.status != Status::Normal {
+                        // Authoritative recovery (we asked from 0): adopt the
+                        // primary's log wholesale, THEN become Normal — only
+                        // now is normal_view legitimately this view.
+                        self.log = suffix;
+                        self.status = Status::Normal;
+                        self.normal_view = view;
+                    } else {
+                        // In-Normal gap fill: append contiguous tail.
+                        for e in suffix {
+                            if e.op_number == self.op_number() + 1 {
+                                self.log.push(e);
+                            }
                         }
                     }
+                    self.ticks_idle = 0;
                     self.apply_through(commit, &mut out);
                     if !self.is_primary() {
                         out.msgs.push((
@@ -276,10 +292,22 @@ impl<V: Vfs> Replica<V> {
             return;
         }
         if view > self.view {
-            // Behind: adopt the view, recover the log via state transfer.
+            // A higher view exists. Adopt the NUMBER, but do NOT claim
+            // Normal/normal_view with our (stale) log — that would let a
+            // divergent log win a future DoViewChange and drop committed
+            // ops. Go to ViewChange and solicit the authoritative log.
             self.view = view;
-            self.status = Status::Normal;
-            self.normal_view = view;
+            self.status = Status::ViewChange;
+            self.ticks_idle = 0;
+            out.msgs.push((
+                self.primary_of(view),
+                Msg::GetState { view, after: 0, replica: self.idx },
+            ));
+            return;
+        }
+        if self.status != Status::Normal {
+            // Still recovering this view; wait for StartView/NewState.
+            return;
         }
         self.ticks_idle = 0;
         if op_number == self.op_number() + 1 {
@@ -339,8 +367,16 @@ impl<V: Vfs> Replica<V> {
         }
         if view > self.view {
             self.view = view;
-            self.status = Status::Normal;
-            self.normal_view = view;
+            self.status = Status::ViewChange;
+            self.ticks_idle = 0;
+            out.msgs.push((
+                self.primary_of(view),
+                Msg::GetState { view, after: 0, replica: self.idx },
+            ));
+            return;
+        }
+        if self.status != Status::Normal {
+            return; // recovering this view; await StartView/NewState
         }
         self.ticks_idle = 0;
         if commit > self.op_number() {

@@ -24,6 +24,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP14 — OR/NOT boolean queries** | **done** | `Op::QueryExpr` reuses the deterministic expr VM as a row filter (arbitrary AND/OR/NOT); read-only, deterministic, txn-allowed; non-breaking (SP5 indexed fast path intact) |
 | **SP15 — order-preserving range index** | **done** | `Op::AddOrderedIndex`+`FindRange`; sign-correct 8B order keys; sub-linear range scan; maintained on C/U/D; replicated/deterministic; fixed need_idx gate bug |
 | **SP16 — flexibility-cost benchmark** | **done** | `kessel-bench flex`: plain CREATE ~893K/s; eq-index ~6.5× (top perf debt), ordered ~2.9×, CHECK/trigger ~3×, FindBy 1.2M/s; honest analysis recorded |
+| **SP17 — eq-index sharding** | **reverted (honest negative result)** | built+tested but didn't improve the measured debt & regressed FindBy ~2×; reverted not shipped; real fix = per-(value,object) index keys (needs wider storage key) — documented future spec |
 
 ## M3 VSR — done vs. hardening backlog (honest)
 
@@ -246,6 +247,11 @@ TB-class; every Postgres-flexibility layer has a measured, bounded,
 improvable cost; equality-index write maintenance is the prioritized
 optimization. Detail + analysis:
 `docs/superpowers/specs/2026-05-17-kesseldb-subproject16-flexbench.md`.
+**SP17** attempted to fix this (shard + bitmap) but did not improve the
+measured debt and regressed point reads ~2×, so it was **reverted** — honest
+negative result (`…-subproject17-index-sharding-REVERTED.md`). The correct
+fix (one index entry per (value,object) LSM key, no read-modify-write) needs
+a wider storage key and is the prioritized future spec.
 
 ### Cloud-scaling speculation (reasoned, NOT measured)
 

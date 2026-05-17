@@ -1,0 +1,16 @@
+[package]
+name = "kessel-vsr"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+kessel-proto = { path = "../kessel-proto" }
+kessel-io = { path = "../kessel-io" }
+kessel-sm = { path = "../kessel-sm" }
+
+[dev-dependencies]
+kessel-catalog = { path = "../kessel-catalog" }
+
+[lib]
+path = "src/lib.rs"

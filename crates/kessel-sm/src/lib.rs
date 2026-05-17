@@ -176,6 +176,12 @@ impl<V: Vfs> StateMachine<V> {
         Ok(out)
     }
 
+    /// Deterministic digest of the whole replicated state (data + catalog).
+    /// Two replicas that have applied the same committed prefix MUST match.
+    pub fn digest(&self) -> u32 {
+        self.storage.digest()
+    }
+
     /// Flush the underlying storage memtable (used at checkpoints/benchmarks).
     pub fn flush(&mut self) -> std::io::Result<()> {
         self.storage.flush()

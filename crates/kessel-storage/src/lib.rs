@@ -425,6 +425,40 @@ impl<V: Vfs> Storage<V> {
     pub fn sstable_count(&self) -> usize {
         self.sstables.len()
     }
+
+    /// Merged live view (oldest SSTable -> newest -> memtable, latest wins,
+    /// tombstones dropped). Sorted by key. Used for digests / convergence
+    /// checks; O(total) — not a hot path.
+    pub fn scan_all(&self) -> Vec<(Key, Vec<u8>)> {
+        let mut merged: BTreeMap<Key, Option<Vec<u8>>> = BTreeMap::new();
+        for sst in &self.sstables {
+            for (k, v) in &sst.entries {
+                merged.insert(*k, v.clone());
+            }
+        }
+        for (k, v) in &self.memtable {
+            merged.insert(*k, v.clone());
+        }
+        merged
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|val| (k, val)))
+            .collect()
+    }
+
+    /// Order-independent CRC digest of the entire live keyspace.
+    pub fn digest(&self) -> u32 {
+        let mut acc: u32 = 0xFFFF_FFFF;
+        for (k, v) in self.scan_all() {
+            let mut rec = Vec::with_capacity(28 + v.len());
+            rec.extend_from_slice(&k);
+            rec.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            rec.extend_from_slice(&v);
+            // commutative-ish fold (XOR of per-record CRCs) so insertion
+            // order of the scan never matters.
+            acc ^= crc32c(&rec);
+        }
+        acc
+    }
 }
 
 #[cfg(test)]
@@ -522,6 +556,25 @@ mod tests {
         for n in 0..40u128 {
             assert_eq!(s.get(&k(n)), oracle.get(&k(n)).cloned(), "key {n}");
         }
+    }
+
+    #[test]
+    fn digest_is_path_independent() {
+        // Same logical state must hash identically whether data sits in the
+        // memtable or has been flushed/compacted into SSTables.
+        let build = |flush_at: &[u64]| {
+            let mut s = Storage::open(MemVfs::new()).unwrap();
+            for op in 0..30u64 {
+                s.put(op, k(op as u128), vec![op as u8; 3]).unwrap();
+                if flush_at.contains(&op) {
+                    s.flush().unwrap();
+                }
+            }
+            s.delete(99, k(5)).unwrap();
+            s.digest()
+        };
+        assert_eq!(build(&[]), build(&[3, 10, 20]));
+        assert_eq!(build(&[3, 10, 20]), build(&[0, 1, 2, 29]));
     }
 
     #[test]

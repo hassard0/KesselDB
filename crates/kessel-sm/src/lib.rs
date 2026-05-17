@@ -855,7 +855,7 @@ impl<V: Vfs> StateMachine<V> {
                 }
                 let rec_idx = if need_idx { Some(record.clone()) } else { None };
                 let cached = self.cache.as_mut().map(|_| record.clone());
-                match self.storage.put(op_number, key, record) {
+                match self.storage.put(op_number, key.clone(), record) {
                     Ok(()) => {
                         if let (Some(c), Some(v)) = (self.cache.as_mut(), cached) {
                             c.insert(key, v);
@@ -907,7 +907,7 @@ impl<V: Vfs> StateMachine<V> {
                 }
                 let rec_idx = if need_idx { Some(record.clone()) } else { None };
                 let cached = self.cache.as_mut().map(|_| record.clone());
-                match self.storage.put(op_number, key, record) {
+                match self.storage.put(op_number, key.clone(), record) {
                     Ok(()) => {
                         if let Some(c) = self.cache.as_mut() {
                             match cached {
@@ -973,7 +973,7 @@ impl<V: Vfs> StateMachine<V> {
                             }
                         }
                     }
-                    if let Err(e) = self.storage.put(op_number, k, new.clone()) {
+                    if let Err(e) = self.storage.put(op_number, k.clone(), new.clone()) {
                         if own_txn {
                             self.storage.abort_txn();
                         }
@@ -987,7 +987,7 @@ impl<V: Vfs> StateMachine<V> {
                 for (t, oid) in &closure {
                     let k = make_key(*t, oid);
                     let oldr = self.storage.get(&k);
-                    if let Err(e) = self.storage.delete(op_number, k) {
+                    if let Err(e) = self.storage.delete(op_number, k.clone()) {
                         if own_txn {
                             self.storage.abort_txn();
                         }

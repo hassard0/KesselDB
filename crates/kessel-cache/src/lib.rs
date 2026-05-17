@@ -53,11 +53,12 @@ impl ReadCache {
         let t = self.tick();
         if !self.map.contains_key(&key) && self.map.len() >= self.cap {
             // Evict least-recently-used. Deterministic tiebreak: smallest key.
-            if let Some((&victim, _)) = self
+            let victim = self
                 .map
                 .iter()
                 .min_by(|a, b| a.1 .1.cmp(&b.1 .1).then(a.0.cmp(b.0)))
-            {
+                .map(|(k, _)| k.clone());
+            if let Some(victim) = victim {
                 self.map.remove(&victim);
             }
         }

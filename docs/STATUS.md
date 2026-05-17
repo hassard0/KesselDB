@@ -31,6 +31,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP21 — projection** | **done** | `Op::SelectFields` returns only chosen fields per filtered row; read-only, deterministic, txn-allowed |
 | **SP22 — GROUP BY** | **done** | `Op::GroupAggregate` COUNT/SUM/MIN/MAX per group key (BTreeMap → ascending-order deterministic output); read-only, txn-allowed |
 | **SP23 — ORDER BY + paging** | **done** | `Op::SelectSorted` sort by field (cmp_field, id tiebreak), desc, OFFSET/LIMIT; read-only, deterministic, txn-allowed |
+| **SP24 — variable-length Key** | **done** | storage `Key` [u8;20]→Vec<u8>; WAL/SSTable length-prefix keys; semantics unchanged; 115 green. Enabler for the real eq-index fix |
 
 ## M3 VSR — done vs. hardening backlog (honest)
 

@@ -16,13 +16,16 @@ use kessel_proto::codec::crc32c;
 use std::collections::BTreeMap;
 use std::io;
 
-/// `type_id (4, LE) ++ object_id (16)` — a type's rows form a contiguous range.
-pub type Key = [u8; 20];
+/// Variable-length, lexicographically-ordered key (SP24). Data rows still
+/// use `type_id (4, LE) ++ object_id (16)` = 20 bytes (a type's rows remain
+/// a contiguous range), but the key type is now `Vec<u8>` so indexes can use
+/// per-(value,object) keys without a read-modify-write bucket.
+pub type Key = Vec<u8>;
 
 pub fn make_key(type_id: u32, object_id: &[u8; 16]) -> Key {
-    let mut k = [0u8; 20];
-    k[..4].copy_from_slice(&type_id.to_le_bytes());
-    k[4..].copy_from_slice(object_id);
+    let mut k = Vec::with_capacity(20);
+    k.extend_from_slice(&type_id.to_le_bytes());
+    k.extend_from_slice(object_id);
     k
 }
 
@@ -46,6 +49,7 @@ pub struct Entry {
 fn encode_entry(e: &Entry) -> Vec<u8> {
     let mut p = Vec::new();
     p.extend_from_slice(&e.op_number.to_le_bytes());
+    p.extend_from_slice(&(e.key.len() as u16).to_le_bytes());
     p.extend_from_slice(&e.key);
     match &e.value {
         Some(v) => {
@@ -59,16 +63,19 @@ fn encode_entry(e: &Entry) -> Vec<u8> {
 }
 
 fn decode_entry(p: &[u8]) -> Option<Entry> {
-    if p.len() < 8 + 20 + 1 {
+    if p.len() < 8 + 2 + 1 {
         return None;
     }
     let op_number = u64::from_le_bytes(p[0..8].try_into().ok()?);
-    let mut key = [0u8; 20];
-    key.copy_from_slice(&p[8..28]);
-    let value = match p[28] {
+    let kl = u16::from_le_bytes(p[8..10].try_into().ok()?) as usize;
+    let key = p.get(10..10 + kl)?.to_vec();
+    let mut q = 10 + kl;
+    let value = match *p.get(q)? {
         0 => {
-            let vl = u32::from_le_bytes(p[29..33].try_into().ok()?) as usize;
-            Some(p.get(33..33 + vl)?.to_vec())
+            q += 1;
+            let vl = u32::from_le_bytes(p.get(q..q + 4)?.try_into().ok()?) as usize;
+            q += 4;
+            Some(p.get(q..q + vl)?.to_vec())
         }
         1 => None,
         _ => return None,
@@ -154,6 +161,7 @@ fn write_sstable(
     buf.extend_from_slice(&SST_MAGIC.to_le_bytes());
     buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     for (k, v) in entries {
+        buf.extend_from_slice(&(k.len() as u16).to_le_bytes());
         buf.extend_from_slice(k);
         match v {
             Some(val) => {
@@ -196,9 +204,10 @@ impl SsTable {
         let mut entries = Vec::with_capacity(count);
         let mut p = 8usize;
         for _ in 0..count {
-            let mut key = [0u8; 20];
-            key.copy_from_slice(&buf[p..p + 20]);
-            p += 20;
+            let kl = u16::from_le_bytes(buf[p..p + 2].try_into().unwrap()) as usize;
+            p += 2;
+            let key = buf[p..p + kl].to_vec();
+            p += kl;
             let tag = buf[p];
             p += 1;
             let val = if tag == 0 {
@@ -348,7 +357,7 @@ impl<V: Vfs> Storage<V> {
         for (k, (n, v)) in &ov {
             self.wal.append(&Entry {
                 op_number: *n,
-                key: *k,
+                key: k.clone(),
                 value: v.clone(),
             })?;
         }
@@ -454,7 +463,7 @@ impl<V: Vfs> Storage<V> {
         let mut merged: BTreeMap<Key, Option<Vec<u8>>> = BTreeMap::new();
         for sst in &self.sstables {
             for (k, v) in &sst.entries {
-                merged.insert(*k, v.clone()); // later (newer) wins
+                merged.insert(k.clone(), v.clone()); // later (newer) wins
             }
         }
         merged.retain(|_, v| v.is_some()); // base level: drop tombstones
@@ -486,11 +495,11 @@ impl<V: Vfs> Storage<V> {
         let mut merged: BTreeMap<Key, Option<Vec<u8>>> = BTreeMap::new();
         for sst in &self.sstables {
             for (k, v) in &sst.entries {
-                merged.insert(*k, v.clone());
+                merged.insert(k.clone(), v.clone());
             }
         }
         for (k, v) in &self.memtable {
-            merged.insert(*k, v.clone());
+            merged.insert(k.clone(), v.clone());
         }
         merged
             .into_iter()
@@ -509,11 +518,11 @@ impl<V: Vfs> Storage<V> {
                 if k > hi {
                     break;
                 }
-                merged.insert(*k, v.clone());
+                merged.insert(k.clone(), v.clone());
             }
         }
-        for (k, v) in self.memtable.range(*lo..=*hi) {
-            merged.insert(*k, v.clone());
+        for (k, v) in self.memtable.range(lo.clone()..=hi.clone()) {
+            merged.insert(k.clone(), v.clone());
         }
         merged
             .into_iter()
@@ -615,11 +624,11 @@ mod tests {
         for op in 0..2000u64 {
             let key = k(rng.below(40) as u128);
             if rng.below(4) == 0 {
-                s.delete(op, key).unwrap();
+                s.delete(op, key.clone()).unwrap();
                 oracle.remove(&key);
             } else {
                 let val = vec![(op & 0xFF) as u8; 1 + rng.below(8) as usize];
-                s.put(op, key, val.clone()).unwrap();
+                s.put(op, key.clone(), val.clone()).unwrap();
                 oracle.insert(key, val);
             }
             if rng.below(50) == 0 {

@@ -1132,6 +1132,42 @@ pub mod sim {
     }
 
     #[test]
+    fn ordered_index_replicates_and_converges() {
+        let mut c = Cluster::new(3, 41, 0);
+        let row = |score: i32| {
+            let mut b = vec![0u8; 32]; // I32 @14, U64 @18
+            b[14..18].copy_from_slice(&score.to_le_bytes());
+            b
+        };
+        let mut reqs = vec![
+            (1u128, 1u64, Op::CreateType {
+                def: encode_type_def("rng", &[
+                    Field { field_id: 0, name: "score".into(), kind: FieldKind::I32, nullable: false },
+                    Field { field_id: 0, name: "big".into(), kind: FieldKind::U64, nullable: false },
+                ]),
+            }),
+            (1, 2, Op::AddOrderedIndex { type_id: 1, field_id: 1 }),
+        ];
+        for i in 0..40i64 {
+            reqs.push((1, i as u64 + 3, Op::Create {
+                type_id: 1,
+                id: ObjectId::from_u128(i as u128),
+                record: row((i as i32) - 20),
+            }));
+        }
+        for i in 0..15i64 {
+            reqs.push((1, i as u64 + 100, Op::Update {
+                type_id: 1,
+                id: ObjectId::from_u128(i as u128),
+                record: row((i as i32) * 3 - 50),
+            }));
+        }
+        assert_ne!(c.run(&reqs, 14000), usize::MAX);
+        let d = c.live_digests();
+        assert!(d.iter().all(|v| *v == d[0]), "ordered index diverged: {d:?}");
+    }
+
+    #[test]
     fn converges_under_message_loss() {
         let mut c = Cluster::new(3, 9, 25); // drop 25% of messages
         let mut reqs = vec![(3u128, 1u64, def())];

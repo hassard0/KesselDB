@@ -292,6 +292,122 @@ impl<V: Vfs> StateMachine<V> {
                 self.idx_add(op_number, type_id, fid, &n, obj);
             }
         }
+        // SP15: order-preserving range indexes.
+        for fid in ot.ordered.clone() {
+            let (off, w, kind) = match Self::ord_field_pos(&ot, fid) {
+                Some(p) => p,
+                None => continue,
+            };
+            let ov = old.and_then(|r| r.get(off..off + w));
+            let nv = new.and_then(|r| r.get(off..off + w));
+            if ov == nv {
+                continue;
+            }
+            if let Some(o) = ov.and_then(|b| Self::order_key(kind, b)) {
+                self.oidx_remove(op_number, type_id, fid, o, obj);
+            }
+            if let Some(n) = nv.and_then(|b| Self::order_key(kind, b)) {
+                self.oidx_add(op_number, type_id, fid, n, obj);
+            }
+        }
+    }
+
+    // ---- SP15: order-preserving range index ----
+
+    /// (offset, width, kind) if the field supports an ordered index
+    /// (fixed-width numeric/bool/timestamp ≤ 8 bytes). None otherwise.
+    fn ord_field_pos(
+        ot: &kessel_catalog::ObjectType,
+        fid: u16,
+    ) -> Option<(usize, usize, kessel_catalog::FieldKind)> {
+        use kessel_catalog::FieldKind::*;
+        let i = ot.fields.iter().position(|f| f.field_id == fid)?;
+        let kind = ot.fields[i].kind;
+        let ok = matches!(
+            kind,
+            U8 | U16 | U32 | U64 | I8 | I16 | I32 | I64 | Bool | Timestamp | Fixed { .. }
+        );
+        if !ok {
+            return None;
+        }
+        let layout = ot.compute_layout();
+        Some((layout.offsets[i], ot.fields[i].kind.width() as usize, kind))
+    }
+
+    /// Order-preserving 8-byte big-endian encoding: unsigned as-is,
+    /// signed/Fixed with the sign bit flipped so lexicographic byte order
+    /// equals numeric order.
+    fn order_key(kind: kessel_catalog::FieldKind, raw: &[u8]) -> Option<[u8; 8]> {
+        use kessel_catalog::FieldKind::*;
+        let w = kind.width() as usize;
+        if w > 8 || raw.len() < w {
+            return None;
+        }
+        let signed = matches!(kind, I8 | I16 | I32 | I64 | Fixed { .. });
+        let mut le = [0u8; 8];
+        le[..w].copy_from_slice(&raw[..w]);
+        if signed && w < 8 && raw[w - 1] & 0x80 != 0 {
+            for b in le.iter_mut().skip(w) {
+                *b = 0xFF;
+            }
+        }
+        let mut v = u64::from_le_bytes(le);
+        if signed {
+            v ^= 0x8000_0000_0000_0000;
+        }
+        Some(v.to_be_bytes())
+    }
+
+    fn oidx_key(ut: u32, fid: u16, ok: [u8; 8]) -> Key {
+        let mut id = [0u8; 16];
+        id[..2].copy_from_slice(&fid.to_le_bytes());
+        id[2..10].copy_from_slice(&ok);
+        make_key(0xFFFD_0000 | (ut & 0xFFFF), &id)
+    }
+
+    fn oidx_add(&mut self, op: u64, ut: u32, fid: u16, ok: [u8; 8], obj: [u8; 16]) {
+        let key = Self::oidx_key(ut, fid, ok);
+        let mut ids: Vec<[u8; 16]> = self
+            .storage
+            .get(&key)
+            .map(|b| b.chunks(16).filter(|c| c.len() == 16).map(|c| {
+                let mut a = [0u8; 16];
+                a.copy_from_slice(c);
+                a
+            }).collect())
+            .unwrap_or_default();
+        if let Err(i) = ids.binary_search(&obj) {
+            ids.insert(i, obj);
+        }
+        let mut out = Vec::with_capacity(ids.len() * 16);
+        for x in &ids {
+            out.extend_from_slice(x);
+        }
+        let _ = self.storage.put(op, key, out);
+    }
+
+    fn oidx_remove(&mut self, op: u64, ut: u32, fid: u16, ok: [u8; 8], obj: [u8; 16]) {
+        let key = Self::oidx_key(ut, fid, ok);
+        let mut ids: Vec<[u8; 16]> = match self.storage.get(&key) {
+            Some(b) => b.chunks(16).filter(|c| c.len() == 16).map(|c| {
+                let mut a = [0u8; 16];
+                a.copy_from_slice(c);
+                a
+            }).collect(),
+            None => return,
+        };
+        if let Ok(i) = ids.binary_search(&obj) {
+            ids.remove(i);
+        }
+        if ids.is_empty() {
+            let _ = self.storage.delete(op, key);
+        } else {
+            let mut out = Vec::with_capacity(ids.len() * 16);
+            for x in &ids {
+                out.extend_from_slice(x);
+            }
+            let _ = self.storage.put(op, key, out);
+        }
     }
 
     // ---- built-in constraints (Sub-project 4) ----
@@ -620,6 +736,7 @@ impl<V: Vfs> StateMachine<V> {
                     fks: Vec::new(),
                     checks: Vec::new(),
                     triggers: Vec::new(),
+                    ordered: Vec::new(),
                 });
                 self.catalog.next_type_id += 1;
                 match self.persist_catalog(op_number) {
@@ -670,7 +787,7 @@ impl<V: Vfs> StateMachine<V> {
                 let need_idx = self
                     .catalog
                     .get(type_id)
-                    .map(|t| !t.indexes.is_empty())
+                    .map(|t| !t.indexes.is_empty() || !t.ordered.is_empty())
                     .unwrap_or(false);
                 let record = match self.run_triggers(type_id, record) {
                     Ok(r) => r,
@@ -722,7 +839,7 @@ impl<V: Vfs> StateMachine<V> {
                 let need_idx = self
                     .catalog
                     .get(type_id)
-                    .map(|t| !t.indexes.is_empty())
+                    .map(|t| !t.indexes.is_empty() || !t.ordered.is_empty())
                     .unwrap_or(false);
                 let record = match self.run_triggers(type_id, record) {
                     Ok(r) => r,
@@ -1210,6 +1327,92 @@ impl<V: Vfs> StateMachine<V> {
                 OpResult::Got(out)
             }
 
+            Op::AddOrderedIndex { type_id, field_id } => {
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                let (off, w, kind) = match Self::ord_field_pos(&ot, field_id) {
+                    Some(p) => p,
+                    None => {
+                        return OpResult::SchemaError(
+                            "field kind not supported for ordered index (need fixed-width <=8B numeric/bool/ts)".into(),
+                        )
+                    }
+                };
+                if ot.ordered.contains(&field_id) {
+                    return OpResult::Ok; // idempotent
+                }
+                if let Some(t) = self.catalog.get_mut(type_id) {
+                    t.ordered.push(field_id);
+                }
+                if let OpResult::SchemaError(e) = self.persist_catalog(op_number) {
+                    return OpResult::SchemaError(e);
+                }
+                let lo = make_key(type_id, &[0u8; 16]);
+                let hi = make_key(type_id, &[0xFFu8; 16]);
+                for (k, rec) in self.storage.scan_range(&lo, &hi) {
+                    if let Some(ok) = rec.get(off..off + w).and_then(|b| Self::order_key(kind, b)) {
+                        let mut obj = [0u8; 16];
+                        obj.copy_from_slice(&k[4..20]);
+                        self.oidx_add(op_number, type_id, field_id, ok, obj);
+                    }
+                }
+                OpResult::Ok
+            }
+
+            Op::FindRange { type_id, field_id, lo, hi } => {
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                if !ot.ordered.contains(&field_id) {
+                    return OpResult::SchemaError("field is not range-indexed".into());
+                }
+                let (_, w, kind) = match Self::ord_field_pos(&ot, field_id) {
+                    Some(p) => p,
+                    None => return OpResult::SchemaError("field not range-indexable".into()),
+                };
+                let lo_ok = match Self::order_key(kind, &Self::norm(&lo, w)) {
+                    Some(k) => k,
+                    None => return OpResult::SchemaError("bad range lo".into()),
+                };
+                let hi_ok = match Self::order_key(kind, &Self::norm(&hi, w)) {
+                    Some(k) => k,
+                    None => return OpResult::SchemaError("bad range hi".into()),
+                };
+                // Sub-linear: scan only the [lo_ok, hi_ok] slice of the
+                // order-index keyspace (entries are physically sorted by the
+                // order key in the LSM).
+                let idxt = 0xFFFD_0000 | (type_id & 0xFFFF);
+                let mut klo = [0u8; 16];
+                klo[..2].copy_from_slice(&field_id.to_le_bytes());
+                klo[2..10].copy_from_slice(&lo_ok);
+                let mut khi = [0u8; 16];
+                khi[..2].copy_from_slice(&field_id.to_le_bytes());
+                khi[2..10].copy_from_slice(&hi_ok);
+                khi[10..].copy_from_slice(&[0xFFu8; 6]);
+                let klo = make_key(idxt, &klo);
+                let khi = make_key(idxt, &khi);
+                let mut ids: Vec<[u8; 16]> = Vec::new();
+                for (_, entry) in self.storage.scan_range(&klo, &khi) {
+                    for c in entry.chunks(16) {
+                        if c.len() == 16 {
+                            let mut a = [0u8; 16];
+                            a.copy_from_slice(c);
+                            ids.push(a);
+                        }
+                    }
+                }
+                ids.sort_unstable();
+                ids.dedup();
+                let mut out = Vec::with_capacity(ids.len() * 16);
+                for id in ids {
+                    out.extend_from_slice(&id);
+                }
+                OpResult::Got(out)
+            }
+
             Op::Txn { ops } => {
                 // Only data ops (and reads) may participate; schema/DDL and
                 // nested txns are rejected up-front so the overlay model
@@ -1225,6 +1428,7 @@ impl<V: Vfs> StateMachine<V> {
                             | Op::FindBy { .. }
                             | Op::Query { .. }
                             | Op::QueryExpr { .. }
+                            | Op::FindRange { .. }
                     );
                     if !ok {
                         return OpResult::SchemaError(
@@ -1457,6 +1661,7 @@ mod tests {
             fks: vec![],
             checks: vec![],
             triggers: vec![],
+            ordered: vec![],
         };
         vec![0u8; t.compute_layout().record_size]
     }
@@ -1544,6 +1749,7 @@ mod tests {
             fks: vec![],
             checks: vec![],
             triggers: vec![],
+            ordered: vec![],
         };
         let mut b = vec![0u8; t.compute_layout().record_size];
         let o0 = t.compute_layout().offsets[0];
@@ -1728,6 +1934,7 @@ mod tests {
             fks: vec![],
             checks: vec![],
             triggers: vec![],
+            ordered: vec![],
         }
         .compute_layout()
     }
@@ -1979,7 +2186,7 @@ mod tests {
                 Field { field_id: 1, name: "age".into(), kind: FieldKind::I32, nullable: false },
                 Field { field_id: 2, name: "bal".into(), kind: FieldKind::I64, nullable: false },
             ],
-            indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![],
+            indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![],
         };
         let l = ot.compute_layout();
         (l.offsets[0], l.offsets[1])
@@ -2136,7 +2343,7 @@ mod tests {
                 Field { field_id: 1, name: "age".into(), kind: FieldKind::I32, nullable: false },
                 Field { field_id: 2, name: "bal".into(), kind: FieldKind::I64, nullable: false },
             ],
-            indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![],
+            indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![],
         };
         let l = ot.compute_layout();
         let mut b = vec![0u8; l.record_size];
@@ -2294,6 +2501,114 @@ mod tests {
         assert_eq!(before, after, "QueryExpr must not mutate state");
         assert_eq!(ids_a, ids_b, "QueryExpr must be deterministic");
         assert!(!ids_a.is_empty());
+    }
+
+    // ---- Sub-project 15: order-preserving range index ----
+
+    fn rng_type() -> Vec<u8> {
+        encode_type_def("rng", &[
+            Field { field_id: 0, name: "score".into(), kind: FieldKind::I32, nullable: false },
+            Field { field_id: 0, name: "big".into(), kind: FieldKind::U64, nullable: false },
+        ])
+    }
+    fn rng_off() -> (usize, usize) {
+        let ot = ObjectType {
+            type_id: 1, name: "rng".into(), schema_ver: 1,
+            fields: vec![
+                Field { field_id: 1, name: "score".into(), kind: FieldKind::I32, nullable: false },
+                Field { field_id: 2, name: "big".into(), kind: FieldKind::U64, nullable: false },
+            ],
+            indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![],
+        };
+        let l = ot.compute_layout();
+        (l.offsets[0], l.offsets[1])
+    }
+    fn rrec(score: i32, big: u64) -> Vec<u8> {
+        let (o0, o1) = rng_off();
+        let mut b = vec![0u8; {
+            let ot = ObjectType { type_id:1,name:"rng".into(),schema_ver:1,fields:vec![
+                Field{field_id:1,name:"score".into(),kind:FieldKind::I32,nullable:false},
+                Field{field_id:2,name:"big".into(),kind:FieldKind::U64,nullable:false}],
+                indexes:vec![],unique:vec![],fks:vec![],checks:vec![],triggers:vec![],ordered:vec![] };
+            ot.compute_layout().record_size
+        }];
+        b[o0..o0 + 4].copy_from_slice(&score.to_le_bytes());
+        b[o1..o1 + 8].copy_from_slice(&big.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn range_index_signed_ordering_and_maintenance() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: rng_type() });
+        // rows id=i with score s
+        let scores = [(-5i32), -1, 0, 3, 10];
+        for (i, s) in scores.iter().enumerate() {
+            sm.apply(2 + i as u64, Op::Create {
+                type_id: 1, id: ObjectId::from_u128(i as u128), record: rrec(*s, 0),
+            });
+        }
+        assert_eq!(sm.apply(10, Op::AddOrderedIndex { type_id: 1, field_id: 1 }), OpResult::Ok);
+        assert_eq!(sm.apply(11, Op::AddOrderedIndex { type_id: 1, field_id: 1 }), OpResult::Ok); // idempotent
+        // range [-2, 5] across the sign boundary -> scores -1(id1),0(id2),3(id3)
+        let mut g = ids_of(sm.apply(12, Op::FindRange {
+            type_id: 1, field_id: 1,
+            lo: (-2i32).to_le_bytes().to_vec(), hi: 5i32.to_le_bytes().to_vec(),
+        }));
+        g.sort();
+        assert_eq!(g, vec![1, 2, 3]);
+        // full negative range
+        let mut g = ids_of(sm.apply(13, Op::FindRange {
+            type_id: 1, field_id: 1,
+            lo: (-100i32).to_le_bytes().to_vec(), hi: (-1i32).to_le_bytes().to_vec(),
+        }));
+        g.sort();
+        assert_eq!(g, vec![0, 1]); // -5, -1
+        // update id0 score -5 -> 7, then it leaves the negative range and
+        // enters [6,8]
+        sm.apply(14, Op::Update { type_id: 1, id: ObjectId::from_u128(0), record: rrec(7, 0) });
+        assert_eq!(ids_of(sm.apply(15, Op::FindRange {
+            type_id: 1, field_id: 1,
+            lo: (-100i32).to_le_bytes().to_vec(), hi: (-1i32).to_le_bytes().to_vec(),
+        })), vec![1]); // only -1 (id1) left negative
+        assert_eq!(ids_of(sm.apply(16, Op::FindRange {
+            type_id: 1, field_id: 1,
+            lo: 6i32.to_le_bytes().to_vec(), hi: 8i32.to_le_bytes().to_vec(),
+        })), vec![0]);
+        // delete id3 (score 3) removes it from range
+        sm.apply(17, Op::Delete { type_id: 1, id: ObjectId::from_u128(3) });
+        assert_eq!(ids_of(sm.apply(18, Op::FindRange {
+            type_id: 1, field_id: 1,
+            lo: 2i32.to_le_bytes().to_vec(), hi: 4i32.to_le_bytes().to_vec(),
+        })), Vec::<u128>::new());
+        // unsupported field kind (u128/char) rejected
+        assert!(matches!(
+            sm.apply(19, Op::AddOrderedIndex { type_id: 1, field_id: 99 }),
+            OpResult::SchemaError(_)
+        ));
+    }
+
+    #[test]
+    fn range_index_is_deterministic() {
+        let build = || {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            sm.apply(1, Op::CreateType { def: rng_type() });
+            sm.apply(2, Op::AddOrderedIndex { type_id: 1, field_id: 1 });
+            let mut rng = Rng::new(0x5AFE);
+            for op in 3..400u64 {
+                let id = ObjectId::from_u128(rng.below(40) as u128);
+                match rng.below(4) {
+                    0 => { sm.apply(op, Op::Delete { type_id: 1, id }); }
+                    _ => {
+                        let s = (rng.below(200) as i32) - 100;
+                        sm.apply(op, Op::Create { type_id: 1, id, record: rrec(s, op) });
+                        sm.apply(op + 100000, Op::Update { type_id: 1, id, record: rrec(s / 2, op) });
+                    }
+                }
+            }
+            sm.digest()
+        };
+        assert_eq!(build(), build(), "range index must be deterministic");
     }
 
     // ---- Sub-project 6: foreign keys ----

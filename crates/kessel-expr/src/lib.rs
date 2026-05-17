@@ -453,6 +453,7 @@ mod tests {
             fks: vec![],
             checks: vec![],
             triggers: vec![],
+            ordered: vec![],
         }
     }
     fn rec(age: i32, bal: i64) -> Vec<u8> {

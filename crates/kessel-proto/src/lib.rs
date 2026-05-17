@@ -74,6 +74,12 @@ pub enum Op {
     /// ids of rows for which the kessel-expr `program` evaluates true.
     /// Arbitrary AND/OR/NOT — a filtered scan, read-only & deterministic.
     QueryExpr { type_id: TypeId, program: Vec<u8> },
+    /// Add an order-preserving range index on a field (Sub-project 15);
+    /// backfills existing rows. Enables sub-linear `FindRange`.
+    AddOrderedIndex { type_id: TypeId, field_id: u16 },
+    /// Sub-linear inclusive range scan over an order-indexed field: returns
+    /// concatenated 16-byte ids of rows with `lo <= field <= hi`.
+    FindRange { type_id: TypeId, field_id: u16, lo: Vec<u8>, hi: Vec<u8> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -151,6 +157,8 @@ impl Op {
             Op::AddTrigger { .. } => 14,
             Op::Txn { .. } => 15,
             Op::QueryExpr { .. } => 16,
+            Op::AddOrderedIndex { .. } => 17,
+            Op::FindRange { .. } => 18,
         }
     }
 
@@ -220,6 +228,16 @@ impl Op {
                 codec::put_u32(&mut b, *type_id);
                 codec::put_bytes(&mut b, program);
             }
+            Op::AddOrderedIndex { type_id, field_id } => {
+                codec::put_u32(&mut b, *type_id);
+                b.extend_from_slice(&field_id.to_le_bytes());
+            }
+            Op::FindRange { type_id, field_id, lo, hi } => {
+                codec::put_u32(&mut b, *type_id);
+                b.extend_from_slice(&field_id.to_le_bytes());
+                codec::put_bytes(&mut b, lo);
+                codec::put_bytes(&mut b, hi);
+            }
         }
         b
     }
@@ -273,6 +291,13 @@ impl Op {
                 Op::Txn { ops }
             }
             16 => Op::QueryExpr { type_id: c.u32()?, program: c.bytes()? },
+            17 => Op::AddOrderedIndex { type_id: c.u32()?, field_id: c.u16()? },
+            18 => Op::FindRange {
+                type_id: c.u32()?,
+                field_id: c.u16()?,
+                lo: c.bytes()?,
+                hi: c.bytes()?,
+            },
             _ => return None,
         };
         Some(op)
@@ -450,6 +475,8 @@ mod tests {
                 ],
             },
             Op::QueryExpr { type_id: 4, program: vec![0, 9, 9] },
+            Op::AddOrderedIndex { type_id: 4, field_id: 2 },
+            Op::FindRange { type_id: 4, field_id: 2, lo: vec![0], hi: vec![255, 255] },
         ];
         for op in ops {
             let enc = op.encode();

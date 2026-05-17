@@ -172,6 +172,7 @@ mod tests {
             fks: vec![],
             checks: vec![],
             triggers: vec![],
+            ordered: vec![],
         }
     }
 

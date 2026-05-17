@@ -168,6 +168,9 @@ pub enum OpResult {
     /// NOT a committed result — a transport-level "try another node"
     /// signal so a cluster client rotates to the primary (Sub-project 42).
     Unavailable,
+    /// Connection-level auth failed (missing/incorrect shared-secret
+    /// token). Transport-level, not a committed result (Sub-project 43).
+    Unauthorized,
 }
 
 impl OpResult {
@@ -194,6 +197,7 @@ impl OpResult {
                 codec::put_bytes(&mut b, s.as_bytes());
             }
             OpResult::Unavailable => b.push(7),
+            OpResult::Unauthorized => b.push(8),
         }
         b
     }
@@ -209,6 +213,7 @@ impl OpResult {
             5 => OpResult::SchemaError(String::from_utf8_lossy(&c.bytes()?).into_owned()),
             6 => OpResult::Constraint(String::from_utf8_lossy(&c.bytes()?).into_owned()),
             7 => OpResult::Unavailable,
+            8 => OpResult::Unauthorized,
             _ => return None,
         })
     }
@@ -747,6 +752,7 @@ mod tests {
             OpResult::SchemaError("nope".into()),
             OpResult::Constraint("UNIQUE x".into()),
             OpResult::Unavailable,
+            OpResult::Unauthorized,
         ] {
             assert_eq!(OpResult::decode(&r.encode()), Some(r));
         }

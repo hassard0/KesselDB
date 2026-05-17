@@ -45,11 +45,39 @@ pub struct Client {
     stream: TcpStream,
 }
 
+/// Auth handshake tag (mirrors `kesseldb_server::AUTH_TAG`).
+pub const AUTH_TAG: u8 = 0xFC;
+
+/// Send `[0xFC] ++ token` and require an `Ok` reply. Used by both client
+/// kinds when a server token is configured.
+fn do_auth(stream: &mut TcpStream, token: &[u8]) -> io::Result<()> {
+    let mut f = Vec::with_capacity(token.len() + 1);
+    f.push(AUTH_TAG);
+    f.extend_from_slice(token);
+    write_frame(stream, &f)?;
+    let resp = read_frame(stream)?;
+    match OpResult::decode(&resp) {
+        Some(OpResult::Ok) => Ok(()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "kesseldb: unauthorized (bad token)",
+        )),
+    }
+}
+
 impl Client {
     pub fn connect(addr: impl ToSocketAddrs) -> io::Result<Self> {
         Ok(Client {
             stream: TcpStream::connect(addr)?,
         })
+    }
+
+    /// Connect and authenticate with a shared-secret token (the server's
+    /// `ServerConfig.token`). Fails with `PermissionDenied` if rejected.
+    pub fn connect_authed(addr: impl ToSocketAddrs, token: &[u8]) -> io::Result<Self> {
+        let mut stream = TcpStream::connect(addr)?;
+        do_auth(&mut stream, token)?;
+        Ok(Client { stream })
     }
 
     /// Send one op, block for its result.
@@ -85,6 +113,7 @@ pub struct ClusterClient {
     stream: Option<TcpStream>,
     client: ClientId,
     req: u64,
+    token: Option<Vec<u8>>,
 }
 
 impl ClusterClient {
@@ -112,7 +141,14 @@ impl ClusterClient {
             stream: None,
             client: nanos ^ (salt << 80) ^ tid,
             req: 0,
+            token: None,
         }
+    }
+
+    /// Authenticate every (re)connection with this shared-secret token.
+    pub fn with_token(mut self, token: Vec<u8>) -> Self {
+        self.token = Some(token);
+        self
     }
 
     /// This client's stable session id (for tests / failover tooling).
@@ -128,7 +164,11 @@ impl ClusterClient {
     fn conn(&mut self) -> io::Result<&mut TcpStream> {
         if self.stream.is_none() {
             let a = &self.addrs[self.idx % self.addrs.len()];
-            self.stream = Some(TcpStream::connect(a)?);
+            let mut s = TcpStream::connect(a)?;
+            if let Some(tok) = &self.token {
+                do_auth(&mut s, tok)?;
+            }
+            self.stream = Some(s);
         }
         Ok(self.stream.as_mut().unwrap())
     }

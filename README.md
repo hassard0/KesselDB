@@ -1,44 +1,173 @@
+<div align="center">
+
 # KesselDB
 
-> *"It's the database that made the Kessel Run in 12 parsecs."*
+**A deterministic, replicated SQL database with PostgreSQL-style flexibility on a TigerBeetle-style core.**
 
-A schema-flexible, deterministic OLTP object kernel — a **fresh Rust reimplementation that ports TigerBeetle's engineering designs** (determinism seam, LSM storage, WAL, Viewstamped Replication, simulation-driven testing) toward PostgreSQL-grade schema flexibility.
+*"It's the database that made the Kessel Run in 12 parsecs."*
 
-## Status
+`143 tests green` · `0 external dependencies` · `Rust 1.95+` · single‑binary
 
-**A complete, functionally-correct relational SQL database on a VSR-safe, liveness-tested, real-multi-node consensus core. Every named production-readiness gate is now ✅ (see `docs/STATUS.md`): VSR safety + adversarial-partition liveness, multi-node-over-sockets, full SQL over the cluster, exactly-once + failover (server & client), auth/quotas/backpressure, hot backup + metrics, sub-linear indexed reads. The one non-gate item — transport encryption — is a deliberate, documented zero-dep boundary (deploy behind a TLS proxy / private network), not an unimplemented gap.** Implemented and tested (**143 tests green**): SP1 M0–M4 (determinism seam, LSM storage + crash recovery, schema catalog + record codec + online DDL, deterministic state machine, group commit, crash-stop VSR with view change, read cache, sharding groundwork), **SP2** variable-length overflow store, **SP3** equality secondary indexes, **SP4** UNIQUE + NOT NULL constraints, **SP5** query planner (AND of Eq/range, multi-index intersection + filtered scan), **SP6** foreign keys, **SP7** deterministic expression VM + CHECK, **SP8** deterministic mutating triggers / generated columns (same zero-dep pure gas-bounded VM), **SP9** atomic all-or-nothing transactions (`Op::Txn`), **SP10** a runnable `kesseldb` TCP server + `kessel-client`, **SP11** ON DELETE RESTRICT/CASCADE (recursive, atomic), **SP12/13** VSR partition hardening (partition fault model, request-relay, max-view convergence; determinism & post-heal convergence proven — the one repro left open here was later root-caused and fixed in SP46), **SP14** arbitrary OR/NOT boolean queries, **SP15** order-preserving range index (`AddOrderedIndex`/`FindRange`, sub-linear), **SP16** flexibility-cost benchmark, **SP18** `Select` (filtered whole-row queries + LIMIT, end-to-end over the server), **SP19** `ON DELETE SET NULL` (referential-action set complete), **SP20** aggregates (COUNT/SUM/MIN/MAX), **SP21** projection (`SelectFields`), **SP22** `GROUP BY` aggregation, **SP23** `ORDER BY` + OFFSET/LIMIT, **SP24** variable-length storage key, **SP25/26** per-(value,object) equality index + lightweight `scan_prefix` (O(1) scalable writes — the SP16 #1 perf debt fixed ~6.5×→~2.6×; honest deliberate tradeoff: point-value reads are now an O(matching) scan, not a single bucket get), **SP27** composite (multi-field) indexes, **SP28** a **SQL text layer** (`kessel-sql`: CREATE/INSERT/SELECT…WHERE/GROUP BY/ORDER BY/LIMIT/aggregates/DELETE), **SP29** **SQL over TCP** (`Client::sql("…")`), **SP30** SQL `UPDATE` (full CRUD over the network), **SP31** `SELECT … ID <n>` O(1) primary-key fetch, **SP32** index-accelerated SQL queries (`SELECT * … WHERE c=v [AND…]` sub-linear, VM-verified), **SP33** SQL `CREATE [UNIQUE|RANGE] INDEX` DDL, **SP34** `DESCRIBE` (clients decode `SELECT` rows from the wire schema), **SP35** `AVG` (standard aggregate set complete), **SP36** inner equi-**JOIN** (`SELECT * FROM a JOIN b ON a.x=b.y`), **SP37** VSR view-change **safety hardening** (fixed a real committed-op-loss bug: a stale log could win `DoViewChange`; `Normal`/`normal_view` now set only via authoritative log install), **SP38** **VSR over real TCP sockets** — `kessel_vsr::wire` Msg codec + `kesseldb_server::cluster`; a **3-node cluster replicates over real sockets** and converges to an identical state digest, **SP39** **full SQL over the cluster** — `Client::sql()` full CRUD (incl. `UPDATE` as a 2-round read-modify-write linearized through consensus) against a 3-node TCP cluster, followers match the primary digest, **SP40** **client sessions / exactly-once retries** — `Node::session()`: a retried `(client, req)` returns the cached reply without re-applying (digest-stable, proven on the 3-node cluster), **SP41** **failover-safe retries** — *any* node serves a committed `(client, req)` from its replicated client table, **SP42** **client-side failover discovery** — `ClusterClient` rotates the node list and retries the same `(client, req)` on `OpResult::Unavailable` until it reaches the primary, exactly-once over the wire (`0xFD` session frame), **SP43** **auth + quotas/backpressure** — zero-dep timing-safe shared-secret token (`connect_authed`), connection cap, in-flight load-shedding; transport encryption is a deliberately documented zero-dep boundary (deploy behind a TLS proxy / private network), not a faked feature, **SP44** **operational tooling** — engine-thread-consistent hot `snapshot(dest)` (recovers to the exact live state digest) + live `stats()` (`ServerStats{applied_ops,digest,uptime}`), **SP45** **index point-read perf** — O(1) `SsTable::overlaps` min/max pruning in `scan_prefix`/`scan_range` makes equality point-value reads sub-linear with write scalability untouched, **SP46** **adversarial-partition liveness** — the former seed-7 post-heal stall was diagnosed (cluster provably healthy) to a reply-routing key bug (`on_request` replied under `(client,last)` not `(client,req)`, stranding reordered older requests); one-line fix, the full 0..12 partition corpus incl. seed 7 now asserts completion + convergence, **SP47** **prepared-statement cache** — engine-local `sql→Stmt` cache invalidated on schema-mutating ops: **26.2× faster SQL compile** (574K→15M stmt/s) on the single-threaded hot path with zero functional change and determinism intact, **SP48** **per-SSTable bloom filter** — zero-dep, no false negatives (proven), rejects an absent-key segment in ~28 ns of bit-tests instead of a binary search (honest constant-factor win; read path still O(#sstables) at the raw primitive), **SP49** **bounded-segment compaction** — the product caps segment fan-out at 8 via deterministic auto-compaction, so point reads are ≤8 bloom-probed segments *independent of total data size* (bounded fast reads; digest/determinism unchanged, full VSR corpus green) — tested (**143 tests**). See `docs/STATUS.md` "Production-readiness gate" for the precise, named list of what gates production (no vague hedging): EVERY named gate is now ✅ — functional completeness, crash recovery, VSR safety + adversarial-partition liveness, multi-node-over-sockets, full SQL over the cluster, failover (server+client, exactly-once), auth/quotas/backpressure, ops tooling, index point-read perf; TLS is the one deliberate documented zero-dep boundary (deploy behind a proxy/private net), not an open gap. (SP17 eq-index sharding was attempted, measured, and honestly reverted — see STATUS.) Honest non-gating roadmap polish (each a later spec): balance-guard, cross-shard atomicity, destructive ALTER/DROP, overflow GC. See [`docs/STATUS.md`](docs/STATUS.md) for exactly what is proven vs. roadmap and honest perf + cloud-scaling reasoning. Claims here never exceed what the test suite proves.
+</div>
+
+---
+
+## What is KesselDB?
+
+KesselDB is a from‑scratch Rust database that takes the engineering ideas behind
+[TigerBeetle](https://github.com/tigerbeetle/tigerbeetle) — a deterministic state
+machine, an LSM storage engine, a write‑ahead log, Viewstamped Replication, and
+simulation‑driven testing — and lifts them to a **general, schema‑flexible SQL
+database** instead of a single hard‑coded domain.
+
+You get runtime‑defined tables and online DDL, real SQL (joins, aggregates,
+indexes, constraints, triggers, transactions), and a replicated multi‑node
+cluster with exactly‑once client semantics — while the core stays a single
+deterministic state machine that can be replayed bit‑for‑bit from a seed.
+
+It is written in **pure Rust with zero external dependencies** — determinism is a
+feature, not an aspiration.
+
+## Highlights
+
+- **Real SQL** — `CREATE TABLE`, `INSERT`, `SELECT` (filters, `JOIN`, `GROUP BY`,
+  `ORDER BY`, `LIMIT/OFFSET`), `UPDATE`, `DELETE`, `COUNT/SUM/MIN/MAX/AVG`,
+  `CREATE [UNIQUE|RANGE] INDEX`, `DESCRIBE`.
+- **Constraints & logic** — `NOT NULL`, `UNIQUE`, foreign keys with
+  `ON DELETE RESTRICT/CASCADE/SET NULL`, `CHECK`, and deterministic triggers
+  (a gas‑bounded zero‑dep expression VM).
+- **Atomic transactions** — all‑or‑nothing multi‑op transactions, replicated as a
+  single operation.
+- **Replicated & highly available** — Viewstamped Replication over real TCP
+  sockets; safety‑hardened (no committed‑op loss across view change) and
+  liveness‑tested under an adversarial partition corpus.
+- **Exactly‑once clients with automatic failover** — stable client sessions; a
+  `ClusterClient` finds the primary, retries safely, and never double‑applies.
+- **Crash‑safe** — WAL replay with torn‑tail handling; tested.
+- **Operable** — hot consistent snapshots/backup, live metrics, shared‑secret
+  auth, connection quotas and backpressure.
+- **Fast where it counts** — prepared‑statement cache (≈26× faster SQL compile),
+  per‑SSTable bloom filters, bounded‑segment compaction for data‑size‑independent
+  point reads.
+- **Deterministic & verifiable** — the whole engine is a seedable state machine;
+  the test suite includes a seeded partition/fault simulation corpus.
+
+## Quick start
+
+### Build & run a server
 
 ```bash
-cargo test --workspace                                  # 143 tests
-cargo run --release --bin kesseldb -- 127.0.0.1:7878 ./data   # SQL server
-# then: Client::connect(addr)?.sql("CREATE TABLE t (a U64 NOT NULL)")?;
-cargo run -p kessel-bench --release -- 200000 file 1000 # durable, group commit
-cargo run -p kessel-bench --release -- 20000  repl      # 3-node replicated
-cargo run -p kessel-bench --release -- 100000 flex      # flexibility-cost
-cargo run -p kessel-bench --release -- 200000 sqlcache  # SP47 prepared-stmt cache (26x)
-cargo run -p kessel-bench --release -- 300000 bloomget  # SP48 per-SSTable bloom
+git clone https://github.com/hassard0/KesselDB && cd KesselDB
+cargo build --release
+
+# start a node:  kesseldb [LISTEN_ADDR] [DATA_DIR]
+cargo run --release --bin kesseldb -- 127.0.0.1:7878 ./data
 ```
 
-## Why
+### Talk to it from Rust
 
-TigerBeetle is fast *because* it is inflexible (hardcoded schema, single domain, immutable records, static allocation). PostgreSQL is flexible but general-purpose. KesselDB picks a deliberate point on that tradeoff curve: **runtime-defined object types and online DDL, kept deterministic and replicated, on a TB-style storage + consensus core.**
+```rust
+use kessel_client::Client;
 
-## Design
+let mut db = Client::connect("127.0.0.1:7878")?;
 
-- [`docs/superpowers/specs/2026-05-17-kesseldb-design.md`](docs/superpowers/specs/2026-05-17-kesseldb-design.md) — full design spec (Sub-project 1)
-- [`docs/superpowers/plans/2026-05-17-kesseldb-subproject1.md`](docs/superpowers/plans/2026-05-17-kesseldb-subproject1.md) — implementation plan
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — architecture, replication, sharding, caching
+db.sql("CREATE TABLE acct (owner U32 NOT NULL, bal I64 NOT NULL)")?;
+db.sql("INSERT INTO acct ID 1 (owner, bal) VALUES (100, 50)")?;
+db.sql("INSERT INTO acct ID 2 (owner, bal) VALUES (100, 999)")?;
 
-## Build
+let total = db.sql("SELECT SUM(bal) FROM acct WHERE owner = 100")?; // => 1049
+db.sql("UPDATE acct ID 1 SET bal = 500")?;
+let row   = db.sql("SELECT * FROM acct ID 2")?;
+```
+
+That's the whole loop: connect, run SQL, get results — over a single TCP socket,
+no drivers, no dependencies.
+
+→ Full instructions, SQL reference, cluster setup, auth and operations are in
+**[`docs/USAGE.md`](docs/USAGE.md)**.
+
+## Running a cluster
+
+A replicated cluster is composed with the `kesseldb-server` library
+(`spawn_node` + `serve_clients`); clients use `ClusterClient`, which discovers
+the primary and fails over automatically with exactly‑once semantics:
+
+```rust
+use kessel_client::ClusterClient;
+
+let mut db = ClusterClient::new(vec![
+    "10.0.0.1:7878".into(),
+    "10.0.0.2:7878".into(),
+    "10.0.0.3:7878".into(),
+]);
+db.call(&op)?; // routed to the primary; retried safely on failover
+```
+
+See [`docs/USAGE.md`](docs/USAGE.md) → *Running a cluster*.
+
+## Performance (localhost, single thread, honest)
+
+| Path | Result |
+|---|---|
+| State‑machine create (in‑mem, 128B record) | ~245K ops/s |
+| Durable create, group commit (batch 1000) | ~87K ops/s |
+| SQL compile, prepared‑statement cache | **574K → 15.0M stmt/s (26.2×)** |
+| Point read | ≤8 bloom‑probed segments (~28 ns/segment), bounded by design |
+| 3‑node replicated | ~161K ops/s |
+
+Numbers are reproducible (`cargo run -p kessel-bench --release -- --help`) and
+every figure in the docs is backed by a benchmark or a test. See
+[`docs/STATUS.md`](docs/STATUS.md) for the full performance log and the precise
+production‑readiness gate.
+
+## Project status & maturity
+
+KesselDB is a **complete, functionally‑correct relational SQL database** on a
+VSR‑safe, liveness‑tested, real multi‑node consensus core. Every named
+production‑readiness gate is met (functional completeness, crash recovery, VSR
+safety + adversarial‑partition liveness, multi‑node over sockets, full SQL over
+the cluster, exactly‑once + failover, auth/quotas/backpressure, hot
+backup + metrics). See the gate table in [`docs/STATUS.md`](docs/STATUS.md).
+
+Honest boundaries (documented, not hidden):
+
+- **Transport encryption (TLS)** is intentionally *not* in‑process — hand‑rolled
+  crypto would violate the zero‑dependency design. Deploy behind a TLS‑terminating
+  proxy or on a private/encrypted network; the wire is plaintext but
+  token‑authenticated with a timing‑safe comparison.
+- **Non‑gating roadmap** (tracked, not blocking): balance‑guard helpers,
+  cross‑shard transactions, destructive `ALTER/DROP`, overflow GC.
+
+Every claim in this repository is backed by the test suite (`143 tests`); the
+docs call out exactly what is proven versus roadmap.
+
+## Documentation
+
+| Doc | Contents |
+|---|---|
+| [`docs/USAGE.md`](docs/USAGE.md) | Install, run, client API, **SQL reference**, clustering, auth, backup & monitoring |
+| [`docs/STATUS.md`](docs/STATUS.md) | Production‑readiness gate, per‑slice status, performance log |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Storage, replication, sharding, caching internals |
+| [`docs/superpowers/specs/`](docs/superpowers/specs/) | One design spec per sub‑project |
+
+## Building & testing
 
 ```bash
-cargo build
-cargo test            # all crates
-cargo run -p kessel-bench -- --help
+cargo build                 # all crates, zero external deps
+cargo test --workspace      # 143 tests (incl. seeded partition/fault simulation)
+cargo run -p kessel-bench --release -- --help   # benchmarks
 ```
 
-Requires Rust stable (1.95+).
+Requires Rust stable 1.95+. No system libraries, no native build steps.
+
+## Contributing
+
+Issues and PRs welcome. The project rule is simple and strict: **every change is
+test‑driven, the full suite stays green, and documentation/claims never exceed
+what the tests prove.** Each unit of work ships as one reviewed slice with its
+own spec under `docs/superpowers/specs/`.
 
 ## License
 
-Unlicensed / private. © 2026.
+Unlicensed / private. © 2026. (Re‑licensing for public open‑source release is
+tracked separately.)

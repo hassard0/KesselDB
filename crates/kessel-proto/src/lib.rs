@@ -88,6 +88,10 @@ pub enum Op {
     /// `kind` 0=COUNT, 1=SUM, 2=MIN, 3=MAX of `field_id` (numeric).
     /// Result returned as a 16-byte little-endian i128 in `Got`.
     Aggregate { type_id: TypeId, program: Vec<u8>, kind: u8, field_id: u16 },
+    /// Projection (Sub-project 21): like `Select` but each returned row is
+    /// only the concatenated bytes of `fields` (in order), not the whole
+    /// record. Result = `[u32 rowlen][row]*`. Read-only & deterministic.
+    SelectFields { type_id: TypeId, program: Vec<u8>, fields: Vec<u16>, limit: u32 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -169,6 +173,7 @@ impl Op {
             Op::FindRange { .. } => 18,
             Op::Select { .. } => 19,
             Op::Aggregate { .. } => 20,
+            Op::SelectFields { .. } => 21,
         }
     }
 
@@ -259,6 +264,15 @@ impl Op {
                 b.push(*kind);
                 b.extend_from_slice(&field_id.to_le_bytes());
             }
+            Op::SelectFields { type_id, program, fields, limit } => {
+                codec::put_u32(&mut b, *type_id);
+                codec::put_bytes(&mut b, program);
+                codec::put_u32(&mut b, fields.len() as u32);
+                for f in fields {
+                    b.extend_from_slice(&f.to_le_bytes());
+                }
+                codec::put_u32(&mut b, *limit);
+            }
         }
         b
     }
@@ -330,6 +344,16 @@ impl Op {
                 kind: c.u8()?,
                 field_id: c.u16()?,
             },
+            21 => {
+                let type_id = c.u32()?;
+                let program = c.bytes()?;
+                let nf = c.u32()? as usize;
+                let mut fields = Vec::with_capacity(nf);
+                for _ in 0..nf {
+                    fields.push(c.u16()?);
+                }
+                Op::SelectFields { type_id, program, fields, limit: c.u32()? }
+            }
             _ => return None,
         };
         Some(op)
@@ -511,6 +535,7 @@ mod tests {
             Op::FindRange { type_id: 4, field_id: 2, lo: vec![0], hi: vec![255, 255] },
             Op::Select { type_id: 4, program: vec![1, 2], limit: 10 },
             Op::Aggregate { type_id: 4, program: vec![1], kind: 1, field_id: 3 },
+            Op::SelectFields { type_id: 4, program: vec![1], fields: vec![1, 3], limit: 5 },
         ];
         for op in ops {
             let enc = op.encode();

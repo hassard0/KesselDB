@@ -28,6 +28,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP18 — Select (rows + LIMIT)** | **done** | `Op::Select` returns filtered whole rows (VM filter) up to LIMIT; read-only, deterministic, txn-allowed; end-to-end over the TCP server |
 | **SP19 — ON DELETE SET NULL** | **done** | action 3; nulls referencing FK fields (codec null bit) atomically with cascade; index maintenance; deterministic; VSR convergence. Referential-action set complete |
 | **SP20 — aggregates** | **done** | `Op::Aggregate` COUNT/SUM/MIN/MAX over a VM-filtered set; i128 result; read-only, deterministic, txn-allowed |
+| **SP21 — projection** | **done** | `Op::SelectFields` returns only chosen fields per filtered row; read-only, deterministic, txn-allowed |
 
 ## M3 VSR — done vs. hardening backlog (honest)
 

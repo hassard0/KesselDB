@@ -1437,6 +1437,49 @@ impl<V: Vfs> StateMachine<V> {
                 OpResult::Got(out)
             }
 
+            Op::SelectFields { type_id, program, fields, limit } => {
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                let layout = ot.compute_layout();
+                // Resolve projected fields to (offset,width); reject unknown.
+                let mut cols: Vec<(usize, usize)> = Vec::with_capacity(fields.len());
+                for fid in &fields {
+                    match ot.fields.iter().position(|f| f.field_id == *fid) {
+                        Some(i) => cols.push((layout.offsets[i], ot.fields[i].kind.width() as usize)),
+                        None => return OpResult::SchemaError(format!("no field {fid}")),
+                    }
+                }
+                let lo = make_key(type_id, &[0u8; 16]);
+                let hi = make_key(type_id, &[0xFFu8; 16]);
+                let mut out = Vec::new();
+                let mut n = 0u32;
+                for (_, rec) in self.storage.scan_range(&lo, &hi) {
+                    if limit != 0 && n >= limit {
+                        break;
+                    }
+                    match kessel_expr::eval(&program, &ot, &rec) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(e) => {
+                            return OpResult::SchemaError(format!("project program: {e:?}"))
+                        }
+                    }
+                    let mut row = Vec::new();
+                    for (off, w) in &cols {
+                        match rec.get(*off..*off + *w) {
+                            Some(b) => row.extend_from_slice(b),
+                            None => row.extend(std::iter::repeat(0u8).take(*w)),
+                        }
+                    }
+                    out.extend_from_slice(&(row.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&row);
+                    n += 1;
+                }
+                OpResult::Got(out)
+            }
+
             Op::Aggregate { type_id, program, kind, field_id } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
@@ -1605,6 +1648,7 @@ impl<V: Vfs> StateMachine<V> {
                             | Op::FindRange { .. }
                             | Op::Select { .. }
                             | Op::Aggregate { .. }
+                            | Op::SelectFields { .. }
                     );
                     if !ok {
                         return OpResult::SchemaError(
@@ -2980,6 +3024,74 @@ mod tests {
         assert_eq!(before, after, "Aggregate must not mutate state");
         assert_eq!(a, b, "Aggregate must be deterministic");
         assert_eq!(a, (0..40).sum::<i128>(), "SUM 0..40");
+    }
+
+    // ---- Sub-project 21: projection (SelectFields) ----
+
+    #[test]
+    fn select_fields_projects_chosen_columns() {
+        use kessel_expr::Program;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: q_type_def() }); // owner u32 f1, kind u16 f2, v u32 f3
+        for i in 0..10u64 {
+            sm.apply(2 + i, Op::Create {
+                type_id: 1,
+                id: ObjectId::from_u128(i as u128),
+                record: qrec(100 + i as u32, 7, 1000 + i as u32),
+            });
+        }
+        // project [owner(f1,4B), v(f3,4B)] for all rows -> rows of 8 bytes
+        let prog = Program::new().push_int(1).bytes();
+        match sm.apply(20, Op::SelectFields { type_id: 1, program: prog, fields: vec![1, 3], limit: 0 }) {
+            OpResult::Got(b) => {
+                let mut p = 0;
+                let mut rows = Vec::new();
+                while p + 4 <= b.len() {
+                    let l = u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize;
+                    p += 4;
+                    rows.push(b[p..p + l].to_vec());
+                    p += l;
+                }
+                assert_eq!(rows.len(), 10);
+                assert!(rows.iter().all(|r| r.len() == 8), "owner(4)+v(4)");
+                // row 0: owner=100, v=1000
+                assert_eq!(u32::from_le_bytes(rows[0][0..4].try_into().unwrap()), 100);
+                assert_eq!(u32::from_le_bytes(rows[0][4..8].try_into().unwrap()), 1000);
+            }
+            o => panic!("{o:?}"),
+        }
+        // unknown field rejected
+        assert!(matches!(
+            sm.apply(21, Op::SelectFields { type_id: 1, program: Program::new().push_int(1).bytes(), fields: vec![999], limit: 0 }),
+            OpResult::SchemaError(_)
+        ));
+    }
+
+    #[test]
+    fn select_fields_is_readonly_and_deterministic() {
+        use kessel_expr::Program;
+        let build = || {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            sm.apply(1, Op::CreateType { def: q_type_def() });
+            for i in 0..30u64 {
+                sm.apply(2 + i, Op::Create {
+                    type_id: 1, id: ObjectId::from_u128(i as u128),
+                    record: qrec((i % 3) as u32, 0, i as u32),
+                });
+            }
+            let d0 = sm.digest();
+            let prog = Program::new().load(1).push_int(1).eq().bytes();
+            let r = match sm.apply(99, Op::SelectFields { type_id: 1, program: prog, fields: vec![3], limit: 0 }) {
+                OpResult::Got(b) => b,
+                o => panic!("{o:?}"),
+            };
+            (r, d0, sm.digest())
+        };
+        let (a, before, after) = build();
+        let (b, _, _) = build();
+        assert_eq!(before, after, "SelectFields must not mutate state");
+        assert_eq!(a, b, "SelectFields must be deterministic");
+        assert!(!a.is_empty());
     }
 
     // ---- Sub-project 6: foreign keys ----

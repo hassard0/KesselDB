@@ -524,6 +524,15 @@ impl<V: Vfs> Storage<V> {
         for (k, v) in self.memtable.range(lo.clone()..=hi.clone()) {
             merged.insert(k.clone(), v.clone());
         }
+        // Overlay-aware (SP25): an in-flight transaction's buffered writes
+        // must be visible to range scans too — index lookups, FK reverse
+        // lookups and cascade now prefix-scan, so read-your-writes has to
+        // hold for scans, not just point gets.
+        if let Some(ov) = &self.txn {
+            for (k, (_, v)) in ov.range(lo.clone()..=hi.clone()) {
+                merged.insert(k.clone(), v.clone());
+            }
+        }
         merged
             .into_iter()
             .filter_map(|(k, v)| v.map(|val| (k, val)))

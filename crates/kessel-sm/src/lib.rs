@@ -150,104 +150,35 @@ impl<V: Vfs> StateMachine<V> {
     // (covered by the state digest). Index maintenance is read-modify-write
     // (correct; throughput optimization is future perf work, documented).
 
-    fn idx_value_digest(v: &[u8]) -> [u8; 8] {
-        let a = kessel_proto::codec::crc32c(v) as u64;
-        let mut salted = Vec::with_capacity(v.len() + 1);
-        salted.push(0xA5);
-        salted.extend_from_slice(v);
-        let b = kessel_proto::codec::crc32c(&salted) as u64;
-        ((a << 32) | b).to_le_bytes()
+    // SP25: ONE LSM entry per (value, object) — no read-modify-write.
+    // Variable-length key = ns(4 LE) ++ field_id(2 LE) ++ value(w) ++
+    // object_id(16). Lexicographic order groups all entries for a given
+    // (type,field,value) contiguously, so add = 1 put, remove = 1 delete,
+    // lookup = a prefix scan. Empty value bytes (the entry payload carries
+    // nothing; the object id lives in the key).
+
+    fn idx_prefix(ut: u32, fid: u16, v: &[u8]) -> Vec<u8> {
+        let mut p = Vec::with_capacity(6 + v.len());
+        p.extend_from_slice(&(0xFFFE_0000 | (ut & 0xFFFF)).to_le_bytes());
+        p.extend_from_slice(&fid.to_le_bytes());
+        p.extend_from_slice(v);
+        p
     }
 
-    fn idx_key(user_type: u32, field_id: u16, v: &[u8]) -> Key {
-        let mut id = [0u8; 16];
-        id[..2].copy_from_slice(&field_id.to_le_bytes());
-        id[2..10].copy_from_slice(&Self::idx_value_digest(v));
-        make_key(0xFFFE_0000 | (user_type & 0xFFFF), &id)
-    }
-
-    /// buckets := [u16 n] then n × ( [u32 vlen][value] [u32 m] m×[16 id] )
-    fn idx_decode(buf: &[u8]) -> Vec<(Vec<u8>, Vec<[u8; 16]>)> {
-        let mut out = Vec::new();
-        if buf.len() < 2 {
-            return out;
-        }
-        let n = u16::from_le_bytes([buf[0], buf[1]]) as usize;
-        let mut p = 2;
-        for _ in 0..n {
-            if p + 4 > buf.len() {
-                break;
-            }
-            let vl = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap()) as usize;
-            p += 4;
-            let val = buf[p..p + vl].to_vec();
-            p += vl;
-            let m = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap()) as usize;
-            p += 4;
-            let mut ids = Vec::with_capacity(m);
-            for _ in 0..m {
-                let mut id = [0u8; 16];
-                id.copy_from_slice(&buf[p..p + 16]);
-                ids.push(id);
-                p += 16;
-            }
-            out.push((val, ids));
-        }
-        out
-    }
-
-    fn idx_encode(buckets: &[(Vec<u8>, Vec<[u8; 16]>)]) -> Vec<u8> {
-        let mut b = Vec::new();
-        b.extend_from_slice(&(buckets.len() as u16).to_le_bytes());
-        for (val, ids) in buckets {
-            b.extend_from_slice(&(val.len() as u32).to_le_bytes());
-            b.extend_from_slice(val);
-            b.extend_from_slice(&(ids.len() as u32).to_le_bytes());
-            for id in ids {
-                b.extend_from_slice(id);
-            }
-        }
-        b
+    fn idx_entry_key(ut: u32, fid: u16, v: &[u8], obj: &[u8; 16]) -> Key {
+        let mut k = Self::idx_prefix(ut, fid, v);
+        k.extend_from_slice(obj);
+        k
     }
 
     fn idx_add(&mut self, op_number: u64, ut: u32, fid: u16, v: &[u8], obj: [u8; 16]) {
-        let key = Self::idx_key(ut, fid, v);
-        let mut buckets = self
-            .storage
-            .get(&key)
-            .map(|b| Self::idx_decode(&b))
-            .unwrap_or_default();
-        match buckets.iter_mut().find(|(val, _)| val == v) {
-            Some((_, ids)) => {
-                if let Err(i) = ids.binary_search(&obj) {
-                    ids.insert(i, obj); // sorted set => deterministic bytes
-                }
-            }
-            None => {
-                buckets.push((v.to_vec(), vec![obj]));
-                buckets.sort_by(|a, b| a.0.cmp(&b.0));
-            }
-        }
-        let _ = self.storage.put(op_number, key, Self::idx_encode(&buckets));
+        let key = Self::idx_entry_key(ut, fid, v, &obj);
+        let _ = self.storage.put(op_number, key, Vec::new()); // O(1), no RMW
     }
 
     fn idx_remove(&mut self, op_number: u64, ut: u32, fid: u16, v: &[u8], obj: [u8; 16]) {
-        let key = Self::idx_key(ut, fid, v);
-        let mut buckets = match self.storage.get(&key) {
-            Some(b) => Self::idx_decode(&b),
-            None => return,
-        };
-        if let Some((_, ids)) = buckets.iter_mut().find(|(val, _)| val == v) {
-            if let Ok(i) = ids.binary_search(&obj) {
-                ids.remove(i);
-            }
-        }
-        buckets.retain(|(_, ids)| !ids.is_empty());
-        if buckets.is_empty() {
-            let _ = self.storage.delete(op_number, key);
-        } else {
-            let _ = self.storage.put(op_number, key, Self::idx_encode(&buckets));
-        }
+        let key = Self::idx_entry_key(ut, fid, v, &obj);
+        let _ = self.storage.delete(op_number, key); // O(1), no RMW
     }
 
     /// (offset,width) of an indexed field; None if absent or OverflowRef.
@@ -458,15 +389,7 @@ impl<V: Vfs> StateMachine<V> {
 
     /// True if some OTHER object already holds `v` for this unique field.
     fn unique_conflict(&self, ut: u32, fid: u16, v: &[u8], self_obj: [u8; 16]) -> bool {
-        let key = Self::idx_key(ut, fid, v);
-        match self.storage.get(&key) {
-            Some(b) => Self::idx_decode(&b)
-                .into_iter()
-                .find(|(val, _)| val == v)
-                .map(|(_, ids)| ids.iter().any(|id| *id != self_obj))
-                .unwrap_or(false),
-            None => false,
-        }
+        self.idx_lookup(ut, fid, v).iter().any(|id| *id != self_obj)
     }
 
     /// Enforce all UNIQUE constraints of `type_id` for one row write.
@@ -543,17 +466,24 @@ impl<V: Vfs> StateMachine<V> {
 
     /// Sorted object-id set for an indexed field value (equality).
     fn idx_lookup(&self, ut: u32, fid: u16, v: &[u8]) -> Vec<[u8; 16]> {
-        let key = Self::idx_key(ut, fid, v);
-        self.storage
-            .get(&key)
-            .map(|b| {
-                Self::idx_decode(&b)
-                    .into_iter()
-                    .find(|(val, _)| val == v)
-                    .map(|(_, ids)| ids)
-                    .unwrap_or_default()
-            })
-            .unwrap_or_default()
+        // Prefix scan over all (ns,field,value,*) entries: sub-linear in the
+        // matching set, no fan-out, no read-modify-write.
+        let prefix = Self::idx_prefix(ut, fid, v);
+        let mut lo = prefix.clone();
+        lo.extend_from_slice(&[0u8; 16]);
+        let mut hi = prefix.clone();
+        hi.extend_from_slice(&[0xFFu8; 16]);
+        let mut ids = Vec::new();
+        for (k, _) in self.storage.scan_range(&lo, &hi) {
+            if k.len() == prefix.len() + 16 && k.starts_with(&prefix) {
+                let mut id = [0u8; 16];
+                id.copy_from_slice(&k[prefix.len()..]);
+                ids.push(id);
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids
     }
 
     /// True if `rec` follows the codec contract (exact size + field_count).
@@ -1080,15 +1010,7 @@ impl<V: Vfs> StateMachine<V> {
                 // Normalize query value to the field's fixed width.
                 let mut v = value;
                 v.resize(w, 0);
-                let key = Self::idx_key(type_id, field_id, &v);
-                let ids = match self.storage.get(&key) {
-                    Some(b) => Self::idx_decode(&b)
-                        .into_iter()
-                        .find(|(val, _)| *val == v)
-                        .map(|(_, ids)| ids)
-                        .unwrap_or_default(),
-                    None => Vec::new(),
-                };
+                let ids = self.idx_lookup(type_id, field_id, &v);
                 let mut out = Vec::with_capacity(ids.len() * 16);
                 for id in ids {
                     out.extend_from_slice(&id);
@@ -1127,17 +1049,16 @@ impl<V: Vfs> StateMachine<V> {
                         }
                     }
                 }
-                // Validate current data has no duplicate for this field.
-                let idxtype = 0xFFFE_0000 | (type_id & 0xFFFF);
-                let mut lo = [0u8; 16];
-                lo[..2].copy_from_slice(&field_id.to_le_bytes());
-                let mut hi = lo;
-                hi[2..].copy_from_slice(&[0xFFu8; 14]);
-                let lo = make_key(idxtype, &lo);
-                let hi = make_key(idxtype, &hi);
-                for (_, entry) in self.storage.scan_range(&lo, &hi) {
-                    for (_, ids) in Self::idx_decode(&entry) {
-                        if ids.len() > 1 {
+                // Validate current data has no duplicate value for this
+                // field, directly over the data rows (representation-
+                // independent and correct).
+                let dlo = make_key(type_id, &[0u8; 16]);
+                let dhi = make_key(type_id, &[0xFFu8; 16]);
+                let mut seen: std::collections::HashSet<Vec<u8>> =
+                    std::collections::HashSet::new();
+                for (_, rec) in self.storage.scan_range(&dlo, &dhi) {
+                    if let Some(v) = rec.get(off..off + w) {
+                        if !seen.insert(v.to_vec()) {
                             return OpResult::Constraint(
                                 "AddUnique: existing duplicate values".into(),
                             );

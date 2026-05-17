@@ -32,6 +32,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP22 — GROUP BY** | **done** | `Op::GroupAggregate` COUNT/SUM/MIN/MAX per group key (BTreeMap → ascending-order deterministic output); read-only, txn-allowed |
 | **SP23 — ORDER BY + paging** | **done** | `Op::SelectSorted` sort by field (cmp_field, id tiebreak), desc, OFFSET/LIMIT; read-only, deterministic, txn-allowed |
 | **SP24 — variable-length Key** | **done** | storage `Key` [u8;20]→Vec<u8>; WAL/SSTable length-prefix keys; semantics unchanged; 115 green. Enabler for the real eq-index fix |
+| **SP25 — per-entry equality index** | **done (honest mixed)** | one LSM entry/(value,object): writes O(1) — eq-index debt ~6.5×→~2.6× ✅; FindBy regressed ~40× ⚠️ (scan_range heavyweight); overlay-aware scan_range (correctness+); read-path opt = documented next SP |
 
 ## M3 VSR — done vs. hardening backlog (honest)
 
@@ -253,11 +254,13 @@ TB-class; every Postgres-flexibility layer has a measured, bounded,
 improvable cost; equality-index write maintenance is the prioritized
 optimization. Detail + analysis:
 `docs/superpowers/specs/2026-05-17-kesseldb-subproject16-flexbench.md`.
-**SP17** attempted to fix this (shard + bitmap) but did not improve the
-measured debt and regressed point reads ~2×, so it was **reverted** — honest
-negative result (`…-subproject17-index-sharding-REVERTED.md`). The correct
-fix (one index entry per (value,object) LSM key, no read-modify-write) needs
-a wider storage key and is the prioritized future spec.
+**SP17** attempted shard+bitmap — reverted (didn't fix it). **SP24** widened
+the storage key (Vec<u8>); **SP25** then implemented the correct fix — one
+LSM entry per (value,object): eq-index **writes ~6.5×→~2.6×** (the flagged
+debt, fixed). Honest tradeoff: FindBy point reads regressed ~40× because
+`idx_lookup` now uses the heavyweight `scan_range`; a lightweight
+`scan_prefix` iterator is the documented next perf SP. See
+`…-subproject25-perentry-index.md`.
 
 ### Cloud-scaling speculation (reasoned, NOT measured)
 

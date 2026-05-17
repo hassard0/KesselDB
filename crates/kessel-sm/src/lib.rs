@@ -53,6 +53,9 @@ pub struct StateMachine<V: Vfs> {
     /// Optional read cache. NEVER consulted to compute committed state or the
     /// digest — only to short-circuit `GetById`. Off => zero core-path effect.
     cache: Option<kessel_cache::ReadCache>,
+    /// Engine-local schema epoch (SP51). Not part of the digest; bumped by
+    /// `persist_catalog` on every catalog change.
+    catalog_epoch: u64,
 }
 
 impl<V: Vfs> StateMachine<V> {
@@ -80,6 +83,7 @@ impl<V: Vfs> StateMachine<V> {
             // short-circuits hot `GetById`s. `with_cache` overrides the
             // capacity; cache-off remains available for the raw primitive.
             cache: Some(kessel_cache::ReadCache::new(DEFAULT_READ_CACHE)),
+            catalog_epoch: 0,
         })
     }
 
@@ -100,9 +104,25 @@ impl<V: Vfs> StateMachine<V> {
     fn persist_catalog(&mut self, op_number: u64) -> OpResult {
         let bytes = self.catalog.encode();
         match self.storage.put(op_number, catalog_key(), bytes) {
-            Ok(()) => OpResult::Ok,
+            Ok(()) => {
+                // SP51: every catalog mutation flows through here, so this
+                // is the one place to bump the schema epoch. It is engine-
+                // local metadata (NOT part of the digest / replicated
+                // state) but is deterministic — same op stream ⇒ same
+                // epoch — so a compiled-statement cache keyed by it is
+                // never served against a changed schema.
+                self.catalog_epoch += 1;
+                OpResult::Ok
+            }
             Err(e) => OpResult::SchemaError(format!("catalog persist: {e}")),
         }
+    }
+
+    /// Monotonic counter bumped on every catalog (schema) change. A SQL
+    /// compile cache keyed by `(sql, catalog_epoch)` stays correct across
+    /// online DDL without recompiling on the hot path (SP51).
+    pub fn catalog_epoch(&self) -> u64 {
+        self.catalog_epoch
     }
 
     /// Split an optional overflow trailer off `record`, persist each blob

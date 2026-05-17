@@ -299,6 +299,12 @@ pub fn spawn_node(
         // Internal consensus ops (SQL compile / UPDATE RMW) use a client-id
         // range disjoint from external `Node::submit` ids (which start at 1).
         let mut iseq: u128 = 1u128 << 100;
+        // SP51: engine-thread-local prepared-statement cache for the
+        // cluster SQL path, keyed by `(sql, catalog_epoch)`. The epoch is
+        // bumped on every committed catalog change, so a cached plan is
+        // never reused against a changed schema (no explicit invalidation
+        // needed — a stale-epoch entry is simply recompiled).
+        let mut sqlcache: HashMap<String, (u64, Stmt)> = HashMap::new();
 
         // Drive an `Out` to completion: ship peer msgs, route replies, and
         // chase `Update` continuations (each spawns a follow-up replicated
@@ -414,7 +420,20 @@ pub fn spawn_node(
                                 continue;
                             }
                         };
-                        match kessel_sql::compile_stmt(sql, replica.catalog()) {
+                        let epoch = replica.catalog_epoch();
+                        let compiled = match sqlcache.get(sql) {
+                            Some((e, s)) if *e == epoch => Ok(s.clone()),
+                            _ => kessel_sql::compile_stmt(sql, replica.catalog())
+                                .map(|s| {
+                                    if sqlcache.len() >= 4096 {
+                                        sqlcache.clear(); // bounded, deterministic
+                                    }
+                                    sqlcache
+                                        .insert(sql.to_string(), (epoch, s.clone()));
+                                    s
+                                }),
+                        };
+                        match compiled {
                             Ok(Stmt::Op(o)) => {
                                 let (out, key) = submit_internal(
                                     &mut replica,
@@ -999,6 +1018,75 @@ mod tests {
             c.call(&Op::GetById { type_id: 1, id }).unwrap(),
             OpResult::Got(vec![3])
         );
+
+        for d in &dirs {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn cluster_sql_cache_correct_across_ddl() {
+        use kessel_client::Client;
+
+        let n = 3;
+        let listeners: Vec<TcpListener> = (0..n)
+            .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let addrs: Vec<SocketAddr> =
+            listeners.iter().map(|l| l.local_addr().unwrap()).collect();
+        let mut dirs = Vec::new();
+        let mut listeners = listeners.into_iter();
+        let dir0 = std::env::temp_dir()
+            .join(format!("kesseldb-sqlc51-{}-0", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir0);
+        dirs.push(dir0.clone());
+        let node0 = Arc::new(
+            spawn_node(0, listeners.next().unwrap(), addrs.clone(), dir0).unwrap(),
+        );
+        for i in 1..n {
+            let dir = std::env::temp_dir()
+                .join(format!("kesseldb-sqlc51-{}-{i}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            dirs.push(dir.clone());
+            spawn_node(i, listeners.next().unwrap(), addrs.clone(), dir).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        let cl = TcpListener::bind("127.0.0.1:0").unwrap();
+        let caddr = cl.local_addr().unwrap();
+        {
+            let n0 = node0.clone();
+            std::thread::spawn(move || serve_clients(cl, n0));
+        }
+
+        let mut c = Client::connect(caddr).unwrap();
+        assert!(matches!(
+            c.sql("CREATE TABLE a (v U64 NOT NULL)").unwrap(),
+            OpResult::TypeCreated(1)
+        ));
+        assert_eq!(c.sql("INSERT INTO a ID 1 (v) VALUES (7)").unwrap(), OpResult::Ok);
+
+        // Compile + cache, then a cache hit at the same epoch — identical.
+        let r1 = c.sql("SELECT * FROM a ID 1").unwrap();
+        let r2 = c.sql("SELECT * FROM a ID 1").unwrap();
+        assert!(matches!(r1, OpResult::Got(_)));
+        assert_eq!(r1, r2, "cluster cache hit must be identical");
+
+        // A DDL changes the catalog → epoch bumps → cached plans for the
+        // *new* statements are recompiled against the new schema, and the
+        // old one is still correct (not a stale-epoch entry).
+        assert!(matches!(
+            c.sql("CREATE TABLE b (w U64 NOT NULL)").unwrap(),
+            OpResult::TypeCreated(2)
+        ));
+        assert_eq!(c.sql("SELECT * FROM a ID 1").unwrap(), r1, "post-DDL still correct");
+        assert_eq!(c.sql("INSERT INTO b ID 1 (w) VALUES (9)").unwrap(), OpResult::Ok);
+        assert!(matches!(
+            c.sql("SELECT * FROM b ID 1").unwrap(),
+            OpResult::Got(_)
+        ));
+        // RMW path through the cluster cache still works.
+        assert_eq!(c.sql("UPDATE a ID 1 SET v = 50").unwrap(), OpResult::Ok);
+        assert_eq!(c.sql("UPDATE a ID 1 SET v = 50").unwrap(), OpResult::Ok);
 
         for d in &dirs {
             let _ = std::fs::remove_dir_all(d);

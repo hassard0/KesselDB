@@ -306,6 +306,12 @@ impl<V: Vfs> Replica<V> {
     pub fn catalog(&self) -> &kessel_catalog::Catalog {
         self.sm.catalog()
     }
+    /// Schema epoch of the wrapped state machine — bumped on every catalog
+    /// change. A cluster SQL compile cache keys on this so a cached plan is
+    /// never reused against a changed schema (SP51).
+    pub fn catalog_epoch(&self) -> u64 {
+        self.sm.catalog_epoch()
+    }
     /// True only when this replica is the primary of its current view AND
     /// in `Normal` status — i.e. it can actually drive a fresh request to
     /// commit. A cluster front uses this to redirect clients off a backup

@@ -58,6 +58,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP48 — per-SSTable bloom filter** | **done (honest)** | zero-dep bloom, ~28 ns/segment O(1) miss-reject vs binary search, no false negatives (proven); read path still O(#sstables) — *not* claimed O(1); leveled compaction is the named next step; **142 green** |
 | **SP49 — bounded-segment compaction** | **done** | opt-in `set_compact_threshold` (SM uses 8); flush auto-compacts so point-read fan-out is ≤k *independent of data size* (with SP48 bloom = bounded fast reads); deterministic, digest unchanged (full VSR/determinism corpus green); **143 green** |
 | **SP50 — read cache on by default** | **done** | `StateMachine::open` enables the (already-wired, digest-invisible, write-invalidated) LRU read cache (`DEFAULT_READ_CACHE=8192`); hot `GetById` served from memory; full determinism/VSR corpus green ⇒ zero observable/replicated change; **144 green** |
+| **SP51 — cluster compile cache** | **done** | deterministic `catalog_epoch` (bumped in `persist_catalog`, digest-invisible) + epoch-keyed cluster SQL cache; SP47's compile win now on the replicated path, DDL-safe; full determinism/VSR corpus green; **145 green** |
 
 ## Production-readiness gate (precise, not vague)
 

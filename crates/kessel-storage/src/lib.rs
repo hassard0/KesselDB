@@ -405,6 +405,11 @@ pub struct Storage<V: Vfs> {
     /// transaction is all-or-nothing: `commit_txn` flushes it atomically,
     /// `abort_txn` discards it leaving zero trace.
     txn: Option<BTreeMap<Key, (u64, Option<Vec<u8>>)>>,
+    /// SP49: if > 0, `flush` auto-`compact`s once the live segment count
+    /// reaches this, so the point-read fan-out stays bounded (≈ O(1) in
+    /// total data instead of O(#flushes)). 0 = off (raw primitive
+    /// behaviour, unchanged — every existing storage test relies on it).
+    compact_threshold: usize,
 }
 
 impl<V: Vfs> Storage<V> {
@@ -430,7 +435,16 @@ impl<V: Vfs> Storage<V> {
             wal,
             autosync: true,
             txn: None,
+            compact_threshold: 0,
         })
+    }
+
+    /// Enable bounded-segment auto-compaction (SP49): once `flush` produces
+    /// a `k`-th live segment it compacts back to one, keeping point-read
+    /// fan-out ≤ `k`. Deterministic (driven only by the op/flush stream),
+    /// so replicas stay identical. `0` disables it (the default).
+    pub fn set_compact_threshold(&mut self, k: usize) {
+        self.compact_threshold = k;
     }
 
     /// Begin an atomic transaction: subsequent put/delete buffer in an
@@ -545,6 +559,13 @@ impl<V: Vfs> Storage<V> {
         self.vfs.remove(WAL_NAME)?;
         self.wal = Wal::open(&self.vfs)?;
         self.memtable.clear();
+        // SP49: keep read fan-out bounded. Deterministic — same op/flush
+        // stream ⇒ same compaction points ⇒ identical state on every
+        // replica (compaction preserves live keys, drops shadowed/
+        // tombstoned, so the digest is unchanged).
+        if self.compact_threshold > 0 && self.sstables.len() >= self.compact_threshold {
+            self.compact()?;
+        }
         Ok(())
     }
 
@@ -845,6 +866,44 @@ mod tests {
         // holds regardless of FP).
         assert_eq!(s.get(&k(9999)), None);
         assert_eq!(s.sstable_count(), 62);
+    }
+
+    #[test]
+    fn bounded_compaction_caps_segments_and_stays_correct() {
+        let vfs = MemVfs::new();
+        let mut s = Storage::open(vfs).unwrap();
+        s.set_compact_threshold(4);
+        let mut op = 0u64;
+        // 30 flushes worth of distinct keys — without bounding this would
+        // be 30 segments; with threshold 4 it must stay ≤ 4.
+        for i in 0..30u128 {
+            op += 1;
+            s.put(op, k(i), vec![i as u8]).unwrap();
+            s.flush().unwrap();
+            assert!(
+                s.sstable_count() <= 4,
+                "segment count {} exceeded the cap after flush {i}",
+                s.sstable_count()
+            );
+        }
+        // Shadow + tombstone after the cap is active.
+        op += 1;
+        s.put(op, k(10), b"new".to_vec()).unwrap();
+        s.flush().unwrap();
+        op += 1;
+        s.delete(op, k(20)).unwrap();
+        s.flush().unwrap();
+        assert!(s.sstable_count() <= 4);
+
+        for i in 0..30u128 {
+            let want = match i {
+                10 => Some(b"new".to_vec()),
+                20 => None,
+                _ => Some(vec![i as u8]),
+            };
+            assert_eq!(s.get(&k(i)), want, "key {i} wrong after bounded compaction");
+        }
+        assert_eq!(s.get(&k(9999)), None);
     }
 
     #[test]

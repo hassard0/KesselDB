@@ -56,6 +56,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP46 — seed-7 liveness (LAST GATE)** | **done** | not a consensus defect — `on_request` replied under `(client,last)` not `(client,req)`, stranding reordered older requests on a healthy cluster; one-line fix; full 0..12 partition corpus incl. seed 7 now asserted (completion + convergence); **139 green** |
 | **SP47 — prepared-statement cache** | **done** | engine-local `sql→Stmt` cache, invalidated on schema-mutating ops; **26.2× faster SQL compile** (574K→15.0M stmt/s, `kessel-bench sqlcache`), zero functional change, determinism intact; **140 green** |
 | **SP48 — per-SSTable bloom filter** | **done (honest)** | zero-dep bloom, ~28 ns/segment O(1) miss-reject vs binary search, no false negatives (proven); read path still O(#sstables) — *not* claimed O(1); leveled compaction is the named next step; **142 green** |
+| **SP49 — bounded-segment compaction** | **done** | opt-in `set_compact_threshold` (SM uses 8); flush auto-compacts so point-read fan-out is ≤k *independent of data size* (with SP48 bloom = bounded fast reads); deterministic, digest unchanged (full VSR/determinism corpus green); **143 green** |
 
 ## Production-readiness gate (precise, not vague)
 
@@ -286,6 +287,17 @@ Honest reading: still O(#sstables) — the bloom is a per-segment
 constant-factor win + the structural prerequisite for leveled compaction
 (the named next step toward genuinely sub-linear point reads). Not claimed
 as O(1); correctness (no false negatives) is proven, not assumed.
+
+### SP49 bounded-segment compaction
+
+The product (`StateMachine`) now caps segment fan-out at **8** via
+auto-compaction on flush. Point reads are therefore ≤ 8 bloom-probed
+segments (~28 ns each) **regardless of total data size** — bounded,
+data-size-independent reads (O(k) constant, not O(#flushes)). Verified by
+`bounded_compaction_caps_segments_and_stays_correct` (segment count
+asserted ≤ cap after every flush) and the entire determinism/VSR corpus
+staying green with auto-compaction live. Trade: write path now includes
+amortised compaction — the deliberate, bounded LSM read/write trade.
 
 ### M2 go/no-go verdict: CONDITIONAL GO
 

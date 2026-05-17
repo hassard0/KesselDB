@@ -53,7 +53,11 @@ pub struct StateMachine<V: Vfs> {
 
 impl<V: Vfs> StateMachine<V> {
     pub fn open(vfs: V) -> std::io::Result<Self> {
-        let storage = Storage::open(vfs)?;
+        let mut storage = Storage::open(vfs)?;
+        // SP49: bound point-read fan-out for the product (raw `Storage`
+        // stays unbounded by default for the primitive tests). 8 segments
+        // keeps reads ≈O(1) in total data while amortising write cost.
+        storage.set_compact_threshold(8);
         let catalog = storage
             .get(&catalog_key())
             .and_then(|b| Catalog::decode(&b))

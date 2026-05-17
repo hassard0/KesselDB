@@ -8,6 +8,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cluster;
+
 use kessel_io::DirVfs;
 use kessel_proto::wire::{read_frame, write_frame};
 use kessel_proto::{Op, OpResult};

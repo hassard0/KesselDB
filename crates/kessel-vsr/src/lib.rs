@@ -44,6 +44,191 @@ enum Status {
     ViewChange,
 }
 
+/// Self-contained `Msg` wire codec — zero deps, length-prefixed, so VSR can
+/// run over real TCP sockets, not just the in-process sim bus. Format:
+/// `[tag:u8] ++ fields`. Ints little-endian; `replica:usize` is `u32`;
+/// `Op` is `[len:u32] ++ Op::encode()`; `Vec<LogEntry>` is `[count:u32] ++
+/// entries`, each `[op_number:u64][client:u128][req:u64][op]`.
+pub mod wire {
+    use super::{LogEntry, Msg};
+    use kessel_proto::Op;
+
+    fn pu32(o: &mut Vec<u8>, v: u32) {
+        o.extend_from_slice(&v.to_le_bytes());
+    }
+    fn pu64(o: &mut Vec<u8>, v: u64) {
+        o.extend_from_slice(&v.to_le_bytes());
+    }
+    fn pu128(o: &mut Vec<u8>, v: u128) {
+        o.extend_from_slice(&v.to_le_bytes());
+    }
+    fn pop(o: &mut Vec<u8>, op: &Op) {
+        let b = op.encode();
+        pu32(o, b.len() as u32);
+        o.extend_from_slice(&b);
+    }
+    fn plog(o: &mut Vec<u8>, log: &[LogEntry]) {
+        pu32(o, log.len() as u32);
+        for e in log {
+            pu64(o, e.op_number);
+            pu128(o, e.client);
+            pu64(o, e.req);
+            pop(o, &e.op);
+        }
+    }
+
+    /// A cursor over a byte slice; every reader returns `Option` so a
+    /// truncated/garbage frame decodes to `None` instead of panicking.
+    struct R<'a> {
+        b: &'a [u8],
+        p: usize,
+    }
+    impl<'a> R<'a> {
+        fn u32(&mut self) -> Option<u32> {
+            let e = self.p + 4;
+            let v = u32::from_le_bytes(self.b.get(self.p..e)?.try_into().ok()?);
+            self.p = e;
+            Some(v)
+        }
+        fn u64(&mut self) -> Option<u64> {
+            let e = self.p + 8;
+            let v = u64::from_le_bytes(self.b.get(self.p..e)?.try_into().ok()?);
+            self.p = e;
+            Some(v)
+        }
+        fn u128(&mut self) -> Option<u128> {
+            let e = self.p + 16;
+            let v = u128::from_le_bytes(self.b.get(self.p..e)?.try_into().ok()?);
+            self.p = e;
+            Some(v)
+        }
+        fn op(&mut self) -> Option<Op> {
+            let n = self.u32()? as usize;
+            let e = self.p + n;
+            let o = Op::decode(self.b.get(self.p..e)?)?;
+            self.p = e;
+            Some(o)
+        }
+        fn log(&mut self) -> Option<Vec<LogEntry>> {
+            let n = self.u32()? as usize;
+            let mut v = Vec::with_capacity(n.min(4096));
+            for _ in 0..n {
+                v.push(LogEntry {
+                    op_number: self.u64()?,
+                    client: self.u128()?,
+                    req: self.u64()?,
+                    op: self.op()?,
+                });
+            }
+            Some(v)
+        }
+    }
+
+    /// Serialize a `Msg` to a self-describing frame body.
+    pub fn encode(m: &Msg) -> Vec<u8> {
+        let mut o = Vec::new();
+        match m {
+            Msg::Request { client, req, op } => {
+                o.push(1);
+                pu128(&mut o, *client);
+                pu64(&mut o, *req);
+                pop(&mut o, op);
+            }
+            Msg::Prepare { view, op_number, client, req, op, commit } => {
+                o.push(2);
+                pu64(&mut o, *view);
+                pu64(&mut o, *op_number);
+                pu128(&mut o, *client);
+                pu64(&mut o, *req);
+                pu64(&mut o, *commit);
+                pop(&mut o, op);
+            }
+            Msg::PrepareOk { view, op_number, replica } => {
+                o.push(3);
+                pu64(&mut o, *view);
+                pu64(&mut o, *op_number);
+                pu32(&mut o, *replica as u32);
+            }
+            Msg::Commit { view, commit } => {
+                o.push(4);
+                pu64(&mut o, *view);
+                pu64(&mut o, *commit);
+            }
+            Msg::StartViewChange { view, replica } => {
+                o.push(5);
+                pu64(&mut o, *view);
+                pu32(&mut o, *replica as u32);
+            }
+            Msg::DoViewChange { view, log, commit, normal_view, replica } => {
+                o.push(6);
+                pu64(&mut o, *view);
+                pu64(&mut o, *commit);
+                pu64(&mut o, *normal_view);
+                pu32(&mut o, *replica as u32);
+                plog(&mut o, log);
+            }
+            Msg::StartView { view, log, commit } => {
+                o.push(7);
+                pu64(&mut o, *view);
+                pu64(&mut o, *commit);
+                plog(&mut o, log);
+            }
+            Msg::GetState { view, after, replica } => {
+                o.push(8);
+                pu64(&mut o, *view);
+                pu64(&mut o, *after);
+                pu32(&mut o, *replica as u32);
+            }
+            Msg::NewState { view, suffix, commit } => {
+                o.push(9);
+                pu64(&mut o, *view);
+                pu64(&mut o, *commit);
+                plog(&mut o, suffix);
+            }
+        }
+        o
+    }
+
+    /// Parse a frame body back into a `Msg`; `None` on any malformation.
+    pub fn decode(b: &[u8]) -> Option<Msg> {
+        let tag = *b.first()?;
+        let mut r = R { b, p: 1 };
+        Some(match tag {
+            1 => Msg::Request { client: r.u128()?, req: r.u64()?, op: r.op()? },
+            2 => Msg::Prepare {
+                view: r.u64()?,
+                op_number: r.u64()?,
+                client: r.u128()?,
+                req: r.u64()?,
+                commit: r.u64()?,
+                op: r.op()?,
+            },
+            3 => Msg::PrepareOk {
+                view: r.u64()?,
+                op_number: r.u64()?,
+                replica: r.u32()? as usize,
+            },
+            4 => Msg::Commit { view: r.u64()?, commit: r.u64()? },
+            5 => Msg::StartViewChange { view: r.u64()?, replica: r.u32()? as usize },
+            6 => Msg::DoViewChange {
+                view: r.u64()?,
+                commit: r.u64()?,
+                normal_view: r.u64()?,
+                replica: r.u32()? as usize,
+                log: r.log()?,
+            },
+            7 => Msg::StartView { view: r.u64()?, commit: r.u64()?, log: r.log()? },
+            8 => Msg::GetState {
+                view: r.u64()?,
+                after: r.u64()?,
+                replica: r.u32()? as usize,
+            },
+            9 => Msg::NewState { view: r.u64()?, commit: r.u64()?, suffix: r.log()? },
+            _ => return None,
+        })
+    }
+}
+
 /// One replica: a `StateMachine` wrapped in the VSR protocol.
 pub struct Replica<V: Vfs> {
     pub idx: usize,
@@ -725,6 +910,53 @@ pub mod sim {
 
     fn def() -> Op {
         Op::CreateType { def: encode_type_def("t", &[]) }
+    }
+
+    #[test]
+    fn msg_wire_roundtrips_every_variant() {
+        use crate::wire::{decode, encode};
+        use crate::{LogEntry, Msg};
+        let op = Op::Create {
+            type_id: 3,
+            id: ObjectId::from_u128(0xCAFE),
+            record: vec![1, 2, 3, 4, 5],
+        };
+        let le = |n: u64| LogEntry { op_number: n, client: 77, req: n + 1, op: op.clone() };
+        let log = vec![le(1), le(2), le(3)];
+        let msgs = vec![
+            Msg::Request { client: 9, req: 4, op: op.clone() },
+            Msg::Prepare {
+                view: 5,
+                op_number: 6,
+                client: 9,
+                req: 4,
+                op: op.clone(),
+                commit: 2,
+            },
+            Msg::PrepareOk { view: 5, op_number: 6, replica: 2 },
+            Msg::Commit { view: 5, commit: 6 },
+            Msg::StartViewChange { view: 8, replica: 1 },
+            Msg::DoViewChange {
+                view: 8,
+                log: log.clone(),
+                commit: 2,
+                normal_view: 7,
+                replica: 0,
+            },
+            Msg::StartView { view: 8, log: log.clone(), commit: 3 },
+            Msg::GetState { view: 8, after: 1, replica: 2 },
+            Msg::NewState { view: 8, suffix: log.clone(), commit: 3 },
+        ];
+        for m in &msgs {
+            let bytes = encode(m);
+            let back = decode(&bytes).expect("decodes");
+            // structural equality via re-encode (Msg has no PartialEq)
+            assert_eq!(encode(&back), bytes, "roundtrip mismatch for a variant");
+        }
+        // truncated / garbage frames decode to None, never panic
+        assert!(decode(&[]).is_none());
+        assert!(decode(&[2, 0, 0]).is_none());
+        assert!(decode(&[255]).is_none());
     }
 
     #[test]

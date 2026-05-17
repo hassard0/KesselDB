@@ -8,6 +8,7 @@ license.workspace = true
 kessel-proto = { path = "../kessel-proto" }
 kessel-io = { path = "../kessel-io" }
 kessel-sm = { path = "../kessel-sm" }
+kessel-vsr = { path = "../kessel-vsr" }
 kessel-sql = { path = "../kessel-sql" }
 kessel-codec = { path = "../kessel-codec" }
 

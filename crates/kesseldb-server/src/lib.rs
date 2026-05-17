@@ -29,6 +29,12 @@ pub const STATS_TAG: u8 = 0xFB;
 /// Admin: take a consistent on-disk snapshot. Frame =
 /// `[0xFA] ++ utf8 dest_dir`; reply `Ok` / `SchemaError`.
 pub const SNAPSHOT_TAG: u8 = 0xFA;
+/// SQL transaction commit. Frame = `[0xF9][u32 n]` then `n ×
+/// ([u32 len][utf8 SQL])`. The engine compiles every statement and
+/// applies them as one atomic `Op::Txn` (all-or-nothing). Built by the
+/// connection handler from statements buffered between `BEGIN` and
+/// `COMMIT`; the client never builds it directly.
+pub const TXN_TAG: u8 = 0xF9;
 
 /// Operational status of a running node.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -286,6 +292,64 @@ pub fn spawn_engine_cfg(
                     });
                     continue;
                 }
+                Some(&TXN_TAG) => {
+                    // Compile every buffered statement, then apply them as
+                    // ONE atomic Op::Txn. Any compile failure (or a
+                    // statement that needs server-side RMW) aborts the
+                    // whole transaction with zero effect.
+                    let body = &frame[1..];
+                    let r = (|| -> Result<Vec<Op>, String> {
+                        let n0 = u32::from_le_bytes(
+                            body.get(0..4)
+                                .ok_or("txn: short")?
+                                .try_into()
+                                .unwrap(),
+                        ) as usize;
+                        let mut p = 4usize;
+                        let mut ops = Vec::with_capacity(n0);
+                        for _ in 0..n0 {
+                            let l = u32::from_le_bytes(
+                                body.get(p..p + 4)
+                                    .ok_or("txn: short")?
+                                    .try_into()
+                                    .unwrap(),
+                            ) as usize;
+                            p += 4;
+                            let s = std::str::from_utf8(
+                                body.get(p..p + l).ok_or("txn: short")?,
+                            )
+                            .map_err(|_| "txn: not utf8".to_string())?;
+                            p += l;
+                            match cache.get_or_compile(s, sm.catalog()) {
+                                Ok(kessel_sql::Stmt::Op(o)) => ops.push(o),
+                                Ok(kessel_sql::Stmt::Update { .. }) => {
+                                    return Err(
+                                        "UPDATE inside a transaction is not \
+                                         yet supported"
+                                            .into(),
+                                    )
+                                }
+                                Err(e) => return Err(format!("sql: {e}")),
+                            }
+                        }
+                        Ok(ops)
+                    })();
+                    match r {
+                        Ok(ops) => {
+                            let mutates = ops.iter().any(mutates_schema);
+                            let res = sm.apply(n, Op::Txn { ops });
+                            n += 1;
+                            if mutates {
+                                cache.invalidate();
+                            }
+                            let _ = reply.send(res);
+                        }
+                        Err(e) => {
+                            let _ = reply.send(OpResult::SchemaError(e));
+                        }
+                    }
+                    continue;
+                }
                 _ => {}
             }
             let op = if frame.first() == Some(&0xFE) {
@@ -383,12 +447,57 @@ fn handle_conn(mut stream: TcpStream, engine: EngineHandle, token: Option<Vec<u8
     if !authenticate(&mut stream, &token) {
         return; // rejected; Unauthorized already written
     }
+    // Per-connection SQL transaction state. `BEGIN` starts buffering SQL
+    // statements; `COMMIT` ships the buffer as one atomic `Op::Txn`;
+    // `ROLLBACK` discards it. Buffering is local to the connection, so
+    // other connections are unaffected and the engine never blocks.
+    let mut txn: Option<Vec<String>> = None;
     loop {
         let req = match read_frame(&mut stream) {
             Ok(r) => r,
             Err(_) => break,
         };
-        let result = engine.apply_raw(req);
+        let result = if req.first() == Some(&0xFE) {
+            // SQL frame — intercept transaction-control keywords.
+            let sql = std::str::from_utf8(&req[1..]).unwrap_or("").trim();
+            let kw = sql.trim_end_matches(';').trim();
+            if kw.eq_ignore_ascii_case("BEGIN")
+                || kw.eq_ignore_ascii_case("START TRANSACTION")
+            {
+                txn = Some(Vec::new());
+                OpResult::Ok
+            } else if kw.eq_ignore_ascii_case("ROLLBACK") {
+                let was = txn.take().is_some();
+                if was {
+                    OpResult::Ok
+                } else {
+                    OpResult::SchemaError("ROLLBACK without BEGIN".into())
+                }
+            } else if kw.eq_ignore_ascii_case("COMMIT") {
+                match txn.take() {
+                    None => OpResult::SchemaError("COMMIT without BEGIN".into()),
+                    Some(stmts) => {
+                        // Build the atomic txn-batch frame and apply it.
+                        let mut f = vec![TXN_TAG];
+                        f.extend_from_slice(&(stmts.len() as u32).to_le_bytes());
+                        for s in &stmts {
+                            f.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                            f.extend_from_slice(s.as_bytes());
+                        }
+                        engine.apply_raw(f)
+                    }
+                }
+            } else if let Some(buf) = txn.as_mut() {
+                // Inside a transaction: buffer the statement (deferred).
+                buf.push(sql.to_string());
+                OpResult::Ok
+            } else {
+                engine.apply_raw(req)
+            }
+        } else {
+            // Non-SQL frames don't participate in SQL transactions.
+            engine.apply_raw(req)
+        };
         if write_frame(&mut stream, &result.encode()).is_err() {
             break;
         }
@@ -770,6 +879,85 @@ mod tests {
         // UPDATE (RMW path) also flows through the cache unchanged.
         assert_eq!(sql("UPDATE t ID 1 SET v = 50"), OpResult::Ok);
         assert_eq!(sql("UPDATE t ID 1 SET v = 50"), OpResult::Ok);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sql_transactions_are_atomic() {
+        let dir =
+            std::env::temp_dir().join(format!("kesseldb-tx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = spawn_engine(&dir).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || serve(listener, engine));
+        let mut c = Client::connect(addr).unwrap();
+        let present = |c: &mut Client, id: u32| {
+            matches!(
+                c.sql(&format!("SELECT * FROM t ID {id}")).unwrap(),
+                OpResult::Got(_)
+            )
+        };
+
+        assert!(matches!(
+            c.sql("CREATE TABLE t (v U64 NOT NULL)").unwrap(),
+            OpResult::TypeCreated(1)
+        ));
+
+        // Committed transaction — both rows land atomically.
+        assert_eq!(c.sql("BEGIN").unwrap(), OpResult::Ok);
+        assert_eq!(
+            c.sql("INSERT INTO t ID 1 (v) VALUES (1)").unwrap(),
+            OpResult::Ok
+        ); // buffered
+        assert_eq!(
+            c.sql("INSERT INTO t ID 2 (v) VALUES (2)").unwrap(),
+            OpResult::Ok
+        );
+        assert_eq!(c.sql("COMMIT").unwrap(), OpResult::Ok);
+        assert!(present(&mut c, 1) && present(&mut c, 2), "committed rows visible");
+
+        // ROLLBACK discards everything buffered.
+        assert_eq!(c.sql("BEGIN").unwrap(), OpResult::Ok);
+        assert_eq!(
+            c.sql("INSERT INTO t ID 3 (v) VALUES (3)").unwrap(),
+            OpResult::Ok
+        );
+        assert_eq!(c.sql("ROLLBACK").unwrap(), OpResult::Ok);
+        assert!(!present(&mut c, 3), "rolled-back row must not exist");
+
+        // COMMIT/ROLLBACK without BEGIN are clean errors.
+        assert!(matches!(
+            c.sql("COMMIT").unwrap(),
+            OpResult::SchemaError(_)
+        ));
+        assert!(matches!(
+            c.sql("ROLLBACK").unwrap(),
+            OpResult::SchemaError(_)
+        ));
+
+        // Atomicity: a failing statement aborts the WHOLE transaction.
+        assert_eq!(c.sql("BEGIN").unwrap(), OpResult::Ok);
+        assert_eq!(
+            c.sql("INSERT INTO t ID 4 (v) VALUES (4)").unwrap(),
+            OpResult::Ok
+        );
+        // duplicate id 1 — fails inside the atomic Op::Txn
+        assert_eq!(
+            c.sql("INSERT INTO t ID 1 (v) VALUES (9)").unwrap(),
+            OpResult::Ok
+        ); // buffered; failure surfaces at COMMIT
+        let commit = c.sql("COMMIT").unwrap();
+        assert_ne!(commit, OpResult::Ok, "txn with a dup must not commit Ok");
+        assert!(!present(&mut c, 4), "failed txn must roll back id 4 too");
+
+        // Connection still usable after an aborted txn.
+        assert_eq!(
+            c.sql("INSERT INTO t ID 5 (v) VALUES (5)").unwrap(),
+            OpResult::Ok
+        );
+        assert!(present(&mut c, 5));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

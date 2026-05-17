@@ -215,7 +215,31 @@ digest on every replica.
 
 ## 6. Transactions
 
-Atomic, all‑or‑nothing, replicated as a single operation. At the op level:
+**SQL** (single-node server) — `BEGIN` buffers subsequent statements;
+`COMMIT` applies them as one atomic unit; `ROLLBACK` discards them:
+
+```sql
+BEGIN;
+INSERT INTO acct ID 1 (owner, bal) VALUES (100, 50);
+INSERT INTO acct ID 2 (owner, bal) VALUES (100, 999);
+COMMIT;          -- both rows land atomically; any failure aborts ALL
+```
+
+```bash
+printf 'BEGIN\nINSERT INTO acct ID 9 (owner,bal) VALUES (1,1)\nCOMMIT\n' | kessel
+```
+
+A failing statement (e.g. a duplicate id) makes `COMMIT` fail and rolls
+back every statement in the transaction; the connection stays usable.
+`COMMIT`/`ROLLBACK` without `BEGIN` is a clean error. **Boundaries:**
+`UPDATE` inside a transaction is rejected (it needs server-side
+read-modify-write — named follow-up); `SELECT` inside a transaction is
+buffered, not executed mid-transaction; transactions are per-connection
+and currently single-node (the cluster front doesn't yet intercept the
+keywords — use op-level `Op::Txn` there).
+
+**Op level** (works everywhere, incl. the cluster) — atomic,
+all‑or‑nothing, replicated as a single operation:
 
 ```rust
 use kessel_proto::Op;

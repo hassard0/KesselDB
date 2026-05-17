@@ -43,6 +43,10 @@ pub fn encode_overflow_record(fixed: &[u8], entries: &[(u16, Vec<u8>)]) -> Vec<u
     b
 }
 
+/// Default read-cache capacity (entries) for `StateMachine::open` (SP50).
+/// Bounded LRU; digest-invisible; `with_cache` overrides it.
+const DEFAULT_READ_CACHE: usize = 8192;
+
 pub struct StateMachine<V: Vfs> {
     catalog: Catalog,
     storage: Storage<V>,
@@ -69,7 +73,13 @@ impl<V: Vfs> StateMachine<V> {
         Ok(StateMachine {
             catalog,
             storage,
-            cache: None,
+            // SP50: the product runs with the read cache ON by default.
+            // It is digest-invisible (never consulted for committed state)
+            // and is deterministically invalidated on every write, so this
+            // changes nothing observable or replicated — it only
+            // short-circuits hot `GetById`s. `with_cache` overrides the
+            // capacity; cache-off remains available for the raw primitive.
+            cache: Some(kessel_cache::ReadCache::new(DEFAULT_READ_CACHE)),
         })
     }
 
@@ -2125,6 +2135,51 @@ mod tests {
             sm.apply(11, Op::Create { type_id: 42, id, record: vec![] }),
             OpResult::SchemaError(_)
         ));
+    }
+
+    #[test]
+    fn read_cache_on_by_default_and_correct_under_mutation() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        // Cache is enabled by default (SP50) — not None.
+        assert!(sm.cache_hit_rate().is_some(), "read cache should be on by default");
+
+        sm.apply(1, Op::CreateType { def: transfer_def() });
+        let id = ObjectId::from_u128(7);
+        assert_eq!(
+            sm.apply(2, Op::Create { type_id: 1, id, record: vec![1, 2, 3] }),
+            OpResult::Ok
+        );
+
+        // Repeated point reads hit the cache.
+        for op in 3..8 {
+            assert_eq!(
+                sm.apply(op, Op::GetById { type_id: 1, id }),
+                OpResult::Got(vec![1, 2, 3])
+            );
+        }
+        assert!(
+            sm.cache_hit_rate().unwrap() > 0.0,
+            "repeated GetById must register cache hits"
+        );
+
+        // A write must invalidate the cached entry (correctness, not stale).
+        assert_eq!(
+            sm.apply(8, Op::Update { type_id: 1, id, record: vec![4, 5] }),
+            OpResult::Ok
+        );
+        assert_eq!(
+            sm.apply(9, Op::GetById { type_id: 1, id }),
+            OpResult::Got(vec![4, 5]),
+            "read after write must see the new value, not a stale cache entry"
+        );
+
+        // Delete also invalidates.
+        assert_eq!(sm.apply(10, Op::Delete { type_id: 1, id }), OpResult::Ok);
+        assert_eq!(
+            sm.apply(11, Op::GetById { type_id: 1, id }),
+            OpResult::NotFound,
+            "read after delete must not return a cached value"
+        );
     }
 
     #[test]

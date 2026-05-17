@@ -6,7 +6,7 @@
 
 *"It's the database that made the Kessel Run in 12 parsecs."*
 
-`143 tests green` · `0 external dependencies` · `Rust 1.95+` · single‑binary
+`144 tests green` · `0 external dependencies` · `Rust 1.95+` · single‑binary
 
 </div>
 
@@ -48,7 +48,7 @@ feature, not an aspiration.
   auth, connection quotas and backpressure.
 - **Fast where it counts** — prepared‑statement cache (≈26× faster SQL compile),
   per‑SSTable bloom filters, bounded‑segment compaction for data‑size‑independent
-  point reads.
+  point reads, and an in‑memory read cache for hot keys (all on by default).
 - **Deterministic & verifiable** — the whole engine is a seedable state machine;
   the test suite includes a seeded partition/fault simulation corpus.
 
@@ -138,7 +138,7 @@ Honest boundaries (documented, not hidden):
 - **Non‑gating roadmap** (tracked, not blocking): balance‑guard helpers,
   cross‑shard transactions, destructive `ALTER/DROP`, overflow GC.
 
-Every claim in this repository is backed by the test suite (`143 tests`); the
+Every claim in this repository is backed by the test suite (`144 tests`); the
 docs call out exactly what is proven versus roadmap.
 
 ## Documentation
@@ -154,7 +154,7 @@ docs call out exactly what is proven versus roadmap.
 
 ```bash
 cargo build                 # all crates, zero external deps
-cargo test --workspace      # 143 tests (incl. seeded partition/fault simulation)
+cargo test --workspace      # 144 tests (incl. seeded partition/fault simulation)
 cargo run -p kessel-bench --release -- --help   # benchmarks
 ```
 

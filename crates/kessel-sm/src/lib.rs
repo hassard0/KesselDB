@@ -1675,7 +1675,18 @@ impl<V: Vfs> StateMachine<V> {
                     1 => sum,
                     2 => mn.unwrap_or(0),
                     3 => mx.unwrap_or(0),
-                    _ => return OpResult::SchemaError("agg kind must be 0|1|2|3".into()),
+                    4 => {
+                        if count == 0 {
+                            0
+                        } else {
+                            sum / count // integer AVG (floor toward zero)
+                        }
+                    }
+                    _ => {
+                        return OpResult::SchemaError(
+                            "agg kind must be 0|1|2|3|4".into(),
+                        )
+                    }
                 };
                 OpResult::Got(result.to_le_bytes().to_vec())
             }
@@ -1804,8 +1815,17 @@ impl<V: Vfs> StateMachine<V> {
                         1 => sum,
                         2 => mn.unwrap_or(0),
                         3 => mx.unwrap_or(0),
+                        4 => {
+                            if cnt == 0 {
+                                0
+                            } else {
+                                sum / cnt
+                            }
+                        }
                         _ => {
-                            return OpResult::SchemaError("agg kind must be 0|1|2|3".into())
+                            return OpResult::SchemaError(
+                                "agg kind must be 0|1|2|3|4".into(),
+                            )
                         }
                     };
                     out.extend_from_slice(&(k.len() as u32).to_le_bytes());
@@ -3276,6 +3296,33 @@ mod tests {
         let none = Program::new().load(1).push_int(999).eq().bytes();
         assert_eq!(agg(&mut sm, 26, 0, none.clone()), 0);
         assert_eq!(agg(&mut sm, 27, 1, none), 0);
+    }
+
+    #[test]
+    fn aggregate_avg_integer() {
+        use kessel_expr::Program;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: q_type_def() });
+        for (i, v) in [10u32, 20, 5, 100, 7].iter().enumerate() {
+            sm.apply(2 + i as u64, Op::Create {
+                type_id: 1, id: ObjectId::from_u128(i as u128),
+                record: qrec(if i < 3 { 1 } else { 2 }, 0, *v),
+            });
+        }
+        let avg = |sm: &mut StateMachine<MemVfs>, op, prog: Vec<u8>| -> i128 {
+            match sm.apply(op, Op::Aggregate { type_id: 1, program: prog, kind: 4, field_id: 3 }) {
+                OpResult::Got(b) => i128::from_le_bytes(b.try_into().unwrap()),
+                o => panic!("{o:?}"),
+            }
+        };
+        let owner1 = Program::new().load(1).push_int(1).eq().bytes();
+        // owner=1: v {10,20,5} -> 35/3 = 11 (integer floor)
+        assert_eq!(avg(&mut sm, 20, owner1), 11);
+        // all: 142/5 = 28
+        assert_eq!(avg(&mut sm, 21, Program::new().push_int(1).bytes()), 28);
+        // empty -> 0 (no div-by-zero)
+        let none = Program::new().load(1).push_int(999).eq().bytes();
+        assert_eq!(avg(&mut sm, 22, none), 0);
     }
 
     #[test]

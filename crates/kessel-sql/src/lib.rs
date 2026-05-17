@@ -566,7 +566,7 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
         Proj::Star
     } else if let Some(Tok::Ident(w)) = p.peek().cloned() {
         let up = w.to_ascii_uppercase();
-        if matches!(up.as_str(), "COUNT" | "SUM" | "MIN" | "MAX") {
+        if matches!(up.as_str(), "COUNT" | "SUM" | "MIN" | "MAX" | "AVG") {
             p.i += 1;
             p.punct('(')?;
             let f = if matches!(p.peek(), Some(Tok::Star)) {
@@ -580,7 +580,8 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
                 "COUNT" => 0,
                 "SUM" => 1,
                 "MIN" => 2,
-                _ => 3,
+                "MAX" => 3,
+                _ => 4, // AVG
             };
             Proj::Agg(k, f)
         } else {

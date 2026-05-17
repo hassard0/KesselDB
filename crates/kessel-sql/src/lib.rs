@@ -205,6 +205,40 @@ pub enum Stmt {
     },
 }
 
+/// If `sql` is a whole-row, single-table select
+/// (`SELECT * FROM <table> ...`, i.e. no projection list and no `JOIN`),
+/// return the source table name so a client can `DESCRIBE` it and decode
+/// the returned rows. `None` for projections, joins, aggregates or
+/// non-selects (the caller then leaves the bytes opaque). Uses the real
+/// lexer — no string heuristics.
+pub fn select_star_table(sql: &str) -> Option<String> {
+    let toks = lex(sql).ok()?;
+    let mut it = toks.iter();
+    match it.next()? {
+        Tok::Ident(k) if k.eq_ignore_ascii_case("SELECT") => {}
+        _ => return None,
+    }
+    match it.next()? {
+        Tok::Star => {}
+        _ => return None, // projection list ⇒ not a whole-row select
+    }
+    match it.next()? {
+        Tok::Ident(k) if k.eq_ignore_ascii_case("FROM") => {}
+        _ => return None,
+    }
+    let table = match it.next()? {
+        Tok::Ident(t) => t.clone(),
+        _ => return None,
+    };
+    // A JOIN produces composite rows (different wire shape) — bail out.
+    if let Some(Tok::Ident(k)) = it.next() {
+        if k.eq_ignore_ascii_case("JOIN") {
+            return None;
+        }
+    }
+    Some(table)
+}
+
 /// Compile one SQL statement, including `UPDATE`.
 pub fn compile_stmt(sql: &str, cat: &Catalog) -> Result<Stmt, SqlError> {
     {
@@ -856,6 +890,30 @@ mod tests {
     use kessel_io::MemVfs;
     use kessel_proto::OpResult;
     use kessel_sm::StateMachine;
+
+    #[test]
+    fn select_star_table_only_matches_whole_row_single_table() {
+        assert_eq!(select_star_table("SELECT * FROM acct"), Some("acct".into()));
+        assert_eq!(
+            select_star_table("select * from acct where owner = 1"),
+            Some("acct".into())
+        );
+        assert_eq!(
+            select_star_table("SELECT * FROM acct ID 7"),
+            Some("acct".into())
+        );
+        assert_eq!(
+            select_star_table("SELECT * FROM t ORDER BY v LIMIT 5"),
+            Some("t".into())
+        );
+        // Not whole-row / not single-table / not select:
+        assert_eq!(select_star_table("SELECT owner, bal FROM acct"), None);
+        assert_eq!(select_star_table("SELECT COUNT(*) FROM acct"), None);
+        assert_eq!(select_star_table("SELECT * FROM a JOIN b ON a.x = b.y"), None);
+        assert_eq!(select_star_table("DESCRIBE acct"), None);
+        assert_eq!(select_star_table("INSERT INTO t ID 1 (v) VALUES (1)"), None);
+        assert_eq!(select_star_table("garbage ;;"), None);
+    }
 
     fn run(sm: &mut StateMachine<MemVfs>, op: u64, sql: &str) -> OpResult {
         let o = compile(sql, sm.catalog()).expect("compile");

@@ -6,6 +6,9 @@ license.workspace = true
 
 [dependencies]
 kessel-proto = { path = "../kessel-proto" }
+kessel-sql = { path = "../kessel-sql" }
+kessel-catalog = { path = "../kessel-catalog" }
+kessel-codec = { path = "../kessel-codec" }
 
 [lib]
 path = "src/lib.rs"

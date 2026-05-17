@@ -73,6 +73,103 @@ pub fn format_result(r: &OpResult) -> String {
     }
 }
 
+fn format_value(v: &kessel_codec::Value) -> String {
+    use kessel_codec::Value::*;
+    match v {
+        Null => "NULL".to_string(),
+        Uint(u) => u.to_string(),
+        Int(i) => i.to_string(),
+        Blob(b) => {
+            let t: &[u8] = {
+                // trim fixed-width Char zero padding for display
+                let end = b.iter().rposition(|&x| x != 0).map_or(0, |i| i + 1);
+                &b[..end]
+            };
+            if t.iter().all(|&c| (0x20..=0x7e).contains(&c)) {
+                String::from_utf8_lossy(t).into_owned()
+            } else {
+                let mut s = String::from("0x");
+                for x in t {
+                    s.push_str(&format!("{x:02x}"));
+                }
+                s
+            }
+        }
+    }
+}
+
+/// Decode `SELECT *` row bytes (`[u32 len][record]*`) against a wire type
+/// definition (`DESCRIBE` output) and render an aligned text table.
+/// `None` if the schema or row stream is malformed — the caller then
+/// falls back to [`format_result`]. Pure and total.
+pub fn render_rows(typedef: &[u8], rows: &[u8]) -> Option<String> {
+    let (name, fields) = kessel_catalog::decode_type_def(typedef)?;
+    let ot = kessel_catalog::ObjectType::from_def(name, fields);
+    let headers: Vec<String> = ot.fields.iter().map(|f| f.name.clone()).collect();
+    if headers.is_empty() {
+        return None;
+    }
+    // Two wire shapes: a filtered `SELECT *` returns `[u32 len][rec]*`;
+    // the `SELECT * ... ID <n>` O(1) fast path returns a single bare
+    // record. Try the length-prefixed form first (must consume exactly);
+    // otherwise treat the whole blob as one record.
+    let parse_lp = || -> Option<Vec<Vec<String>>> {
+        let mut t = Vec::new();
+        let mut p = 0usize;
+        while p + 4 <= rows.len() {
+            let len = u32::from_le_bytes(rows[p..p + 4].try_into().ok()?) as usize;
+            p += 4;
+            let rec = rows.get(p..p + len)?;
+            p += len;
+            let vals = kessel_codec::decode(&ot, rec).ok()?;
+            t.push(vals.iter().map(format_value).collect());
+        }
+        (p == rows.len()).then_some(t)
+    };
+    let table: Vec<Vec<String>> = if let Some(t) = parse_lp() {
+        t
+    } else if !rows.is_empty() {
+        // single bare record (primary-key fast path)
+        let vals = kessel_codec::decode(&ot, rows).ok()?;
+        vec![vals.iter().map(format_value).collect()]
+    } else {
+        Vec::new()
+    };
+    // Column widths.
+    let mut w: Vec<usize> = headers.iter().map(|h| h.len()).collect();
+    for row in &table {
+        for (i, cell) in row.iter().enumerate() {
+            if i < w.len() {
+                w[i] = w[i].max(cell.len());
+            }
+        }
+    }
+    let pad = |s: &str, n: usize| format!("{s:<n$}");
+    let mut out = String::new();
+    out.push_str(
+        &headers
+            .iter()
+            .enumerate()
+            .map(|(i, h)| pad(h, w[i]))
+            .collect::<Vec<_>>()
+            .join(" | "),
+    );
+    out.push('\n');
+    out.push_str(&w.iter().map(|n| "-".repeat(*n)).collect::<Vec<_>>().join("-+-"));
+    for row in &table {
+        out.push('\n');
+        out.push_str(
+            &row.iter()
+                .enumerate()
+                .map(|(i, c)| pad(c, *w.get(i).unwrap_or(&0)))
+                .collect::<Vec<_>>()
+                .join(" | "),
+        );
+    }
+    out.push_str(&format!("\n({} row{})", table.len(), if table.len() == 1 { "" } else { "s" }));
+    Some(out)
+}
+
 /// Auth handshake tag (mirrors `kesseldb_server::AUTH_TAG`).
 pub const AUTH_TAG: u8 = 0xFC;
 
@@ -267,5 +364,50 @@ mod tests {
         ] {
             assert!(!format_result(&r).is_empty());
         }
+    }
+
+    #[test]
+    fn render_rows_decodes_and_aligns() {
+        use kessel_catalog::{encode_type_def, Field, FieldKind};
+        let fields = vec![
+            Field { field_id: 1, name: "owner".into(), kind: FieldKind::U32, nullable: false },
+            Field { field_id: 2, name: "bal".into(), kind: FieldKind::I64, nullable: false },
+        ];
+        let typedef = encode_type_def("acct", &fields);
+        let ot = kessel_catalog::ObjectType::from_def("acct".into(), fields);
+
+        let mut rows = Vec::new();
+        for (o, b) in [(100u128, 50i128), (7, -3)] {
+            let rec = kessel_codec::encode(
+                &ot,
+                &[kessel_codec::Value::Uint(o), kessel_codec::Value::Int(b)],
+            )
+            .unwrap();
+            rows.extend_from_slice(&(rec.len() as u32).to_le_bytes());
+            rows.extend_from_slice(&rec);
+        }
+
+        let out = render_rows(&typedef, &rows).expect("decodes");
+        assert!(out.contains("owner"), "header: {out}");
+        assert!(out.contains("bal"));
+        assert!(out.contains("100"));
+        assert!(out.contains("-3"), "signed value: {out}");
+        assert!(out.contains("(2 rows)"), "row count: {out}");
+
+        // Malformed → None (CLI then falls back to opaque bytes).
+        assert!(render_rows(&typedef, &[0xFF, 0xFF, 0xFF, 0xFF, 1]).is_none());
+        assert!(render_rows(b"not a typedef", &rows).is_none());
+        // Zero rows still renders a header + "(0 rows)".
+        let empty = render_rows(&typedef, &[]).expect("header only");
+        assert!(empty.contains("owner") && empty.contains("(0 rows)"));
+
+        // Single BARE record (the `SELECT * ... ID <n>` fast path shape).
+        let one = kessel_codec::encode(
+            &ot,
+            &[kessel_codec::Value::Uint(42), kessel_codec::Value::Int(9)],
+        )
+        .unwrap();
+        let r = render_rows(&typedef, &one).expect("single record decodes");
+        assert!(r.contains("42") && r.contains("(1 row)"), "single: {r}");
     }
 }

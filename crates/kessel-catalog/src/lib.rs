@@ -160,6 +160,26 @@ fn next_pow2(n: usize) -> usize {
 }
 
 impl ObjectType {
+    /// Build a minimal `ObjectType` from a decoded type definition
+    /// (`decode_type_def`). Enough for `kessel_codec::decode` (which only
+    /// needs `fields`/`compute_layout`); index/constraint metadata is left
+    /// empty. Used by clients to decode `SELECT` rows from the wire schema.
+    pub fn from_def(name: String, fields: Vec<Field>) -> Self {
+        ObjectType {
+            type_id: 0,
+            name,
+            schema_ver: 1,
+            fields,
+            indexes: vec![],
+            unique: vec![],
+            fks: vec![],
+            checks: vec![],
+            triggers: vec![],
+            ordered: vec![],
+            composite: vec![],
+        }
+    }
+
     /// Pure layout computation. Offsets of existing fields are invariant under
     /// appending new fields (fixed header + fixed null bitmap).
     pub fn compute_layout(&self) -> Layout {

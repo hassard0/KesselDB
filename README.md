@@ -6,7 +6,7 @@
 
 *"It's the database that made the Kessel Run in 12 parsecs."*
 
-`146 tests green` · `0 external dependencies` · `Rust 1.95+` · single‑binary
+`148 tests green` · `0 external dependencies` · `Rust 1.95+` · single‑binary
 
 </div>
 
@@ -70,6 +70,7 @@ cargo run --release --bin kesseldb -- 127.0.0.1:7878 ./data
 kessel "CREATE TABLE acct (owner U32 NOT NULL, bal I64 NOT NULL)"
 kessel "INSERT INTO acct ID 1 (owner, bal) VALUES (100, 50)"
 kessel "SELECT SUM(bal) FROM acct WHERE owner = 100"     # => = 50
+kessel "SELECT * FROM acct"                              # prints an aligned table
 
 echo "SELECT * FROM acct ID 1" | kessel                  # pipe a .sql file
 kessel                                                   # interactive shell
@@ -153,7 +154,7 @@ Honest boundaries (documented, not hidden):
 - **Non‑gating roadmap** (tracked, not blocking): balance‑guard helpers,
   cross‑shard transactions, destructive `ALTER/DROP`, overflow GC.
 
-Every claim in this repository is backed by the test suite (`146 tests`); the
+Every claim in this repository is backed by the test suite (`148 tests`); the
 docs call out exactly what is proven versus roadmap.
 
 ## Documentation
@@ -170,7 +171,7 @@ docs call out exactly what is proven versus roadmap.
 
 ```bash
 cargo build                 # all crates, zero external deps
-cargo test --workspace      # 146 tests (incl. seeded partition/fault simulation)
+cargo test --workspace      # 148 tests (incl. seeded partition/fault simulation)
 cargo run -p kessel-bench --release -- --help   # benchmarks
 ```
 

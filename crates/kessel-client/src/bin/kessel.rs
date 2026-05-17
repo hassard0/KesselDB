@@ -20,7 +20,7 @@
 //! Lines beginning with `#` or `--` are treated as comments; `quit`,
 //! `exit` or `\q` end an interactive session. Zero external dependencies.
 
-use kessel_client::{format_result, Client};
+use kessel_client::{format_result, render_rows, Client};
 use kessel_proto::OpResult;
 use std::io::{BufRead, IsTerminal, Write};
 
@@ -125,6 +125,23 @@ fn main() {
 /// a reliable signal without parsing text.
 fn run_one(client: &mut Client, sql: &str) -> i32 {
     match client.sql(sql) {
+        Ok(OpResult::Got(b)) => {
+            // Whole-row single-table SELECT → decode & print real columns
+            // (best-DX path). Falls back cleanly if it isn't one or the
+            // schema/rows don't decode.
+            if let Some(t) = kessel_sql::select_star_table(sql) {
+                if let Ok(OpResult::Got(def)) =
+                    client.sql(&format!("DESCRIBE {t}"))
+                {
+                    if let Some(table) = render_rows(&def, &b) {
+                        println!("{table}");
+                        return 0;
+                    }
+                }
+            }
+            println!("{}", format_result(&OpResult::Got(b)));
+            0
+        }
         Ok(r) => {
             println!("{}", format_result(&r));
             match r {

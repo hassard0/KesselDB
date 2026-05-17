@@ -72,6 +72,15 @@ cargo run -q -p kessel-client --bin kessel -- "CREATE TABLE t (v U64 NOT NULL)"
 cargo run -q -p kessel-client --bin kessel -- "INSERT INTO t ID 1 (v) VALUES (42)"
 cargo run -q -p kessel-client --bin kessel -- "SELECT SUM(v) FROM t"   # => = 42
 
+# a whole-row SELECT prints a real aligned table (no DESCRIBE needed):
+#   owner | bal
+#   ------+----
+#   100   | 50
+#   (1 row)
+kessel "SELECT * FROM t ID 1"
+kessel "SELECT * FROM t WHERE owner = 100"
+# (projections `SELECT c1,c2` and JOINs print opaque bytes — see USAGE §4)
+
 # pipe a .sql file (lines starting with # or -- are comments; blanks ignored)
 cat schema.sql | cargo run -q -p kessel-client --bin kessel
 

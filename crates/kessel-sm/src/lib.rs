@@ -1544,6 +1544,90 @@ impl<V: Vfs> StateMachine<V> {
                 OpResult::Got(result.to_le_bytes().to_vec())
             }
 
+            Op::GroupAggregate { type_id, program, group_field, kind, agg_field } => {
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                let layout = ot.compute_layout();
+                let gpos = match ot.fields.iter().position(|f| f.field_id == group_field) {
+                    Some(i) => (layout.offsets[i], ot.fields[i].kind.width() as usize),
+                    None => return OpResult::SchemaError(format!("no group field {group_field}")),
+                };
+                let apos = if kind == 0 {
+                    None
+                } else {
+                    match Self::ord_field_pos(&ot, agg_field) {
+                        Some(p) => Some(p),
+                        None => {
+                            return OpResult::SchemaError(
+                                "GroupAggregate agg field must be numeric ≤8B".into(),
+                            )
+                        }
+                    }
+                };
+                let dec = |raw: &[u8], w: usize, signed: bool| -> i128 {
+                    let mut le = [0u8; 16];
+                    le[..w.min(16)].copy_from_slice(&raw[..w.min(16)]);
+                    if signed && w < 16 && raw[w - 1] & 0x80 != 0 {
+                        for b in le.iter_mut().skip(w) {
+                            *b = 0xFF;
+                        }
+                    }
+                    i128::from_le_bytes(le)
+                };
+                // BTreeMap => groups emitted in ascending key order
+                // (deterministic). Per group: (count, sum, min, max).
+                let mut groups: std::collections::BTreeMap<
+                    Vec<u8>,
+                    (i128, i128, Option<i128>, Option<i128>),
+                > = std::collections::BTreeMap::new();
+                let lo = make_key(type_id, &[0u8; 16]);
+                let hi = make_key(type_id, &[0xFFu8; 16]);
+                for (_, rec) in self.storage.scan_range(&lo, &hi) {
+                    match kessel_expr::eval(&program, &ot, &rec) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(e) => {
+                            return OpResult::SchemaError(format!("group program: {e:?}"))
+                        }
+                    }
+                    let gkey = match rec.get(gpos.0..gpos.0 + gpos.1) {
+                        Some(b) => b.to_vec(),
+                        None => continue,
+                    };
+                    let e = groups.entry(gkey).or_insert((0, 0, None, None));
+                    e.0 += 1;
+                    if let Some((off, w, fk)) = apos {
+                        if let Some(raw) = rec.get(off..off + w) {
+                            use kessel_catalog::FieldKind::*;
+                            let signed = matches!(fk, I8 | I16 | I32 | I64 | Fixed { .. });
+                            let v = dec(raw, w, signed);
+                            e.1 = e.1.wrapping_add(v);
+                            e.2 = Some(e.2.map_or(v, |m| m.min(v)));
+                            e.3 = Some(e.3.map_or(v, |m| m.max(v)));
+                        }
+                    }
+                }
+                let mut out = Vec::new();
+                out.extend_from_slice(&(groups.len() as u32).to_le_bytes());
+                for (k, (cnt, sum, mn, mx)) in groups {
+                    let res: i128 = match kind {
+                        0 => cnt,
+                        1 => sum,
+                        2 => mn.unwrap_or(0),
+                        3 => mx.unwrap_or(0),
+                        _ => {
+                            return OpResult::SchemaError("agg kind must be 0|1|2|3".into())
+                        }
+                    };
+                    out.extend_from_slice(&(k.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&k);
+                    out.extend_from_slice(&res.to_le_bytes());
+                }
+                OpResult::Got(out)
+            }
+
             Op::AddOrderedIndex { type_id, field_id } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
@@ -1649,6 +1733,7 @@ impl<V: Vfs> StateMachine<V> {
                             | Op::Select { .. }
                             | Op::Aggregate { .. }
                             | Op::SelectFields { .. }
+                            | Op::GroupAggregate { .. }
                     );
                     if !ok {
                         return OpResult::SchemaError(
@@ -3092,6 +3177,81 @@ mod tests {
         assert_eq!(before, after, "SelectFields must not mutate state");
         assert_eq!(a, b, "SelectFields must be deterministic");
         assert!(!a.is_empty());
+    }
+
+    // ---- Sub-project 22: GROUP BY aggregation ----
+
+    #[test]
+    fn group_aggregate_sum_and_count_per_group() {
+        use kessel_expr::Program;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: q_type_def() }); // owner u32 f1, kind u16 f2, v u32 f3
+        // (owner, v): owner is group key (4 bytes), v aggregated
+        let data = [(1u32, 10u32), (1, 20), (2, 5), (2, 7), (2, 8), (3, 100)];
+        for (i, (o, v)) in data.iter().enumerate() {
+            sm.apply(2 + i as u64, Op::Create {
+                type_id: 1, id: ObjectId::from_u128(i as u128), record: qrec(*o, 0, *v),
+            });
+        }
+        let parse = |b: Vec<u8>| -> Vec<(u32, i128)> {
+            let n = u32::from_le_bytes(b[0..4].try_into().unwrap()) as usize;
+            let mut p = 4;
+            let mut g = Vec::new();
+            for _ in 0..n {
+                let kl = u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize;
+                p += 4;
+                let key = u32::from_le_bytes(b[p..p + 4].try_into().unwrap());
+                p += kl;
+                let val = i128::from_le_bytes(b[p..p + 16].try_into().unwrap());
+                p += 16;
+                g.push((key, val));
+            }
+            g
+        };
+        let all = Program::new().push_int(1).bytes();
+        // SUM(v) GROUP BY owner -> {1:30, 2:20, 3:100} ascending key order
+        match sm.apply(20, Op::GroupAggregate { type_id: 1, program: all.clone(), group_field: 1, kind: 1, agg_field: 3 }) {
+            OpResult::Got(b) => assert_eq!(parse(b), vec![(1, 30), (2, 20), (3, 100)]),
+            o => panic!("{o:?}"),
+        }
+        // COUNT GROUP BY owner -> {1:2, 2:3, 3:1}
+        match sm.apply(21, Op::GroupAggregate { type_id: 1, program: all.clone(), group_field: 1, kind: 0, agg_field: 0 }) {
+            OpResult::Got(b) => assert_eq!(parse(b), vec![(1, 2), (2, 3), (3, 1)]),
+            o => panic!("{o:?}"),
+        }
+        // MAX(v) GROUP BY owner -> {1:20, 2:8, 3:100}
+        match sm.apply(22, Op::GroupAggregate { type_id: 1, program: all, group_field: 1, kind: 3, agg_field: 3 }) {
+            OpResult::Got(b) => assert_eq!(parse(b), vec![(1, 20), (2, 8), (3, 100)]),
+            o => panic!("{o:?}"),
+        }
+    }
+
+    #[test]
+    fn group_aggregate_is_readonly_and_deterministic() {
+        use kessel_expr::Program;
+        let build = || {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            sm.apply(1, Op::CreateType { def: q_type_def() });
+            for i in 0..40u64 {
+                sm.apply(2 + i, Op::Create {
+                    type_id: 1, id: ObjectId::from_u128(i as u128),
+                    record: qrec((i % 5) as u32, 0, i as u32),
+                });
+            }
+            let d0 = sm.digest();
+            let r = match sm.apply(99, Op::GroupAggregate {
+                type_id: 1, program: Program::new().push_int(1).bytes(),
+                group_field: 1, kind: 1, agg_field: 3,
+            }) {
+                OpResult::Got(b) => b,
+                o => panic!("{o:?}"),
+            };
+            (r, d0, sm.digest())
+        };
+        let (a, before, after) = build();
+        let (b, _, _) = build();
+        assert_eq!(before, after, "GroupAggregate must not mutate state");
+        assert_eq!(a, b, "GroupAggregate must be deterministic");
     }
 
     // ---- Sub-project 6: foreign keys ----

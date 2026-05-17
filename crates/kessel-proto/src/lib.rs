@@ -92,6 +92,18 @@ pub enum Op {
     /// only the concatenated bytes of `fields` (in order), not the whole
     /// record. Result = `[u32 rowlen][row]*`. Read-only & deterministic.
     SelectFields { type_id: TypeId, program: Vec<u8>, fields: Vec<u16>, limit: u32 },
+    /// GROUP BY aggregate (Sub-project 22): over rows matching `program`,
+    /// group by `group_field`'s value and compute `kind` (0 COUNT / 1 SUM /
+    /// 2 MIN / 3 MAX) of `agg_field` per group. Result =
+    /// `[u32 ngroups]` then per group `[u32 keylen][key][16B i128 LE]`,
+    /// groups in ascending key order (deterministic). Read-only.
+    GroupAggregate {
+        type_id: TypeId,
+        program: Vec<u8>,
+        group_field: u16,
+        kind: u8,
+        agg_field: u16,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -174,6 +186,7 @@ impl Op {
             Op::Select { .. } => 19,
             Op::Aggregate { .. } => 20,
             Op::SelectFields { .. } => 21,
+            Op::GroupAggregate { .. } => 22,
         }
     }
 
@@ -273,6 +286,13 @@ impl Op {
                 }
                 codec::put_u32(&mut b, *limit);
             }
+            Op::GroupAggregate { type_id, program, group_field, kind, agg_field } => {
+                codec::put_u32(&mut b, *type_id);
+                codec::put_bytes(&mut b, program);
+                b.extend_from_slice(&group_field.to_le_bytes());
+                b.push(*kind);
+                b.extend_from_slice(&agg_field.to_le_bytes());
+            }
         }
         b
     }
@@ -354,6 +374,13 @@ impl Op {
                 }
                 Op::SelectFields { type_id, program, fields, limit: c.u32()? }
             }
+            22 => Op::GroupAggregate {
+                type_id: c.u32()?,
+                program: c.bytes()?,
+                group_field: c.u16()?,
+                kind: c.u8()?,
+                agg_field: c.u16()?,
+            },
             _ => return None,
         };
         Some(op)
@@ -536,6 +563,7 @@ mod tests {
             Op::Select { type_id: 4, program: vec![1, 2], limit: 10 },
             Op::Aggregate { type_id: 4, program: vec![1], kind: 1, field_id: 3 },
             Op::SelectFields { type_id: 4, program: vec![1], fields: vec![1, 3], limit: 5 },
+            Op::GroupAggregate { type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3 },
         ];
         for op in ops {
             let enc = op.encode();

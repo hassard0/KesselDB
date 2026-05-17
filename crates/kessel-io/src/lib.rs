@@ -248,6 +248,142 @@ impl Net for SimNetHandle {
     }
 }
 
+// ----------------------------------------------------------------------------
+// Vfs: a namespace of named durable blobs (so the storage engine can have
+// WAL + manifest + many SSTables while ALL I/O still flows through the seam).
+// ----------------------------------------------------------------------------
+
+pub trait Vfs {
+    fn open(&self, name: &str) -> io::Result<Box<dyn Disk>>;
+    fn exists(&self, name: &str) -> bool;
+    fn remove(&self, name: &str) -> io::Result<()>;
+    fn list(&self) -> Vec<String>;
+}
+
+/// Real directory-backed VFS (production).
+pub struct DirVfs {
+    root: std::path::PathBuf,
+}
+
+impl DirVfs {
+    pub fn new(root: impl AsRef<Path>) -> io::Result<Self> {
+        std::fs::create_dir_all(root.as_ref())?;
+        Ok(DirVfs {
+            root: root.as_ref().to_path_buf(),
+        })
+    }
+}
+
+impl Vfs for DirVfs {
+    fn open(&self, name: &str) -> io::Result<Box<dyn Disk>> {
+        Ok(Box::new(FileDisk::open(self.root.join(name))?))
+    }
+    fn exists(&self, name: &str) -> bool {
+        self.root.join(name).exists()
+    }
+    fn remove(&self, name: &str) -> io::Result<()> {
+        let p = self.root.join(name);
+        if p.exists() {
+            std::fs::remove_file(p)?;
+        }
+        Ok(())
+    }
+    fn list(&self) -> Vec<String> {
+        std::fs::read_dir(&self.root)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Clone, Default)]
+struct MemBlob {
+    /// All bytes ever written.
+    data: Rc<RefCell<Vec<u8>>>,
+    /// Length known durable as of the last `sync` (torn-tail model).
+    synced_len: Rc<RefCell<u64>>,
+}
+
+/// Deterministic in-memory VFS (simulator). Models crash by discarding any
+/// bytes written after the last `sync` on each blob (the common "unsynced
+/// tail is not durable" failure — enough for a meaningful recovery test).
+#[derive(Clone, Default)]
+pub struct MemVfs {
+    blobs: Rc<RefCell<std::collections::BTreeMap<String, MemBlob>>>,
+}
+
+impl MemVfs {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Simulate a crash: every blob loses anything past its last sync point.
+    pub fn crash(&self) {
+        for blob in self.blobs.borrow().values() {
+            let keep = *blob.synced_len.borrow() as usize;
+            blob.data.borrow_mut().truncate(keep);
+        }
+    }
+}
+
+struct MemVfsDisk {
+    blob: MemBlob,
+}
+
+impl Vfs for MemVfs {
+    fn open(&self, name: &str) -> io::Result<Box<dyn Disk>> {
+        let blob = self
+            .blobs
+            .borrow_mut()
+            .entry(name.to_string())
+            .or_default()
+            .clone();
+        Ok(Box::new(MemVfsDisk { blob }))
+    }
+    fn exists(&self, name: &str) -> bool {
+        self.blobs.borrow().contains_key(name)
+    }
+    fn remove(&self, name: &str) -> io::Result<()> {
+        self.blobs.borrow_mut().remove(name);
+        Ok(())
+    }
+    fn list(&self) -> Vec<String> {
+        self.blobs.borrow().keys().cloned().collect()
+    }
+}
+
+impl Disk for MemVfsDisk {
+    fn write_at(&mut self, off: u64, buf: &[u8]) -> io::Result<()> {
+        let mut d = self.blob.data.borrow_mut();
+        let end = off as usize + buf.len();
+        if end > d.len() {
+            d.resize(end, 0);
+        }
+        d[off as usize..end].copy_from_slice(buf);
+        Ok(())
+    }
+    fn read_at(&self, off: u64, buf: &mut [u8]) -> io::Result<usize> {
+        let d = self.blob.data.borrow();
+        let off = off as usize;
+        if off >= d.len() {
+            return Ok(0);
+        }
+        let n = buf.len().min(d.len() - off);
+        buf[..n].copy_from_slice(&d[off..off + n]);
+        Ok(n)
+    }
+    fn sync(&mut self) -> io::Result<()> {
+        let len = self.blob.data.borrow().len() as u64;
+        *self.blob.synced_len.borrow_mut() = len;
+        Ok(())
+    }
+    fn len(&self) -> u64 {
+        self.blob.data.borrow().len() as u64
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,5 +444,38 @@ mod tests {
             v
         };
         assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn memvfs_persists_across_reopen() {
+        let vfs = MemVfs::new();
+        {
+            let mut d = vfs.open("wal").unwrap();
+            d.write_at(0, b"durable").unwrap();
+            d.sync().unwrap();
+        }
+        let d2 = vfs.open("wal").unwrap();
+        let mut buf = [0u8; 7];
+        d2.read_at(0, &mut buf).unwrap();
+        assert_eq!(&buf, b"durable");
+        assert!(vfs.exists("wal"));
+        assert_eq!(vfs.list(), vec!["wal".to_string()]);
+    }
+
+    #[test]
+    fn memvfs_crash_discards_unsynced_tail() {
+        let vfs = MemVfs::new();
+        {
+            let mut d = vfs.open("seg").unwrap();
+            d.write_at(0, b"keep").unwrap();
+            d.sync().unwrap();
+            d.write_at(4, b"LOSTLOST").unwrap(); // never synced
+        }
+        vfs.crash();
+        let d = vfs.open("seg").unwrap();
+        assert_eq!(d.len(), 4, "unsynced tail must be gone after crash");
+        let mut buf = [0u8; 4];
+        d.read_at(0, &mut buf).unwrap();
+        assert_eq!(&buf, b"keep");
     }
 }

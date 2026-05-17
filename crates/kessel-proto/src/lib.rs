@@ -32,6 +32,9 @@ pub enum Op {
     Update { type_id: TypeId, id: ObjectId, record: Vec<u8> },
     Delete { type_id: TypeId, id: ObjectId },
     GetById { type_id: TypeId, id: ObjectId },
+    /// Read a variable-length overflow blob by its deterministic handle
+    /// (Sub-project 2). Write side rides inside `Create`/`Update` records.
+    GetBlob { handle: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,6 +57,7 @@ impl Op {
             Op::Update { .. } => 4,
             Op::Delete { .. } => 5,
             Op::GetById { .. } => 6,
+            Op::GetBlob { .. } => 7,
         }
     }
 
@@ -76,6 +80,7 @@ impl Op {
                 codec::put_u32(&mut b, *type_id);
                 b.extend_from_slice(&id.0);
             }
+            Op::GetBlob { handle } => codec::put_u64(&mut b, *handle),
         }
         b
     }
@@ -90,6 +95,7 @@ impl Op {
             4 => Op::Update { type_id: c.u32()?, id: c.object_id()?, record: c.bytes()? },
             5 => Op::Delete { type_id: c.u32()?, id: c.object_id()? },
             6 => Op::GetById { type_id: c.u32()?, id: c.object_id()? },
+            7 => Op::GetBlob { handle: c.u64()? },
             _ => return None,
         };
         Some(op)
@@ -220,6 +226,7 @@ mod tests {
             Op::Update { type_id: 4, id, record: vec![] },
             Op::Delete { type_id: 4, id },
             Op::GetById { type_id: 4, id },
+            Op::GetBlob { handle: 0xABCD_1234_5678 },
         ];
         for op in ops {
             let enc = op.encode();

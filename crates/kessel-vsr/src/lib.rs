@@ -529,10 +529,10 @@ pub mod sim {
     #[cfg(test)]
     mod tests {
         use super::Cluster;
-        use kessel_catalog::encode_type_def;
+        use kessel_catalog::{encode_type_def, Field, FieldKind};
         use kessel_io::MemVfs;
         use kessel_proto::{ObjectId, Op};
-        use kessel_sm::StateMachine;
+        use kessel_sm::{encode_overflow_record, StateMachine};
 
     fn def() -> Op {
         Op::CreateType { def: encode_type_def("t", &[]) }
@@ -605,6 +605,33 @@ pub mod sim {
         let d = c.live_digests(); // replicas 1 and 2
         assert_eq!(d.len(), 2);
         assert_eq!(d[0], d[1], "surviving replicas must converge after failover");
+    }
+
+    #[test]
+    fn overflow_replicates_and_converges() {
+        // Variable-length blobs ride inside Create records; the deterministic
+        // op-derived handle must make every replica's overflow keyspace
+        // identical (digest includes it).
+        let mut c = Cluster::new(3, 11, 0);
+        let def = Op::CreateType {
+            def: encode_type_def(
+                "doc",
+                &[Field { field_id: 0, name: "body".into(), kind: FieldKind::OverflowRef, nullable: false }],
+            ),
+        };
+        let fixed = vec![0u8; 32]; // OverflowRef-only type: record_size = 32
+        let mut reqs = vec![(1u128, 1u64, def)];
+        for i in 0..40u64 {
+            let rec = encode_overflow_record(&fixed, &[(0, vec![i as u8; 500 + i as usize])]);
+            reqs.push((
+                1,
+                i + 2,
+                Op::Create { type_id: 1, id: ObjectId::from_u128(i as u128), record: rec },
+            ));
+        }
+        assert_ne!(c.run(&reqs, 8000), usize::MAX, "overflow ops must commit");
+        let d = c.live_digests();
+        assert!(d.iter().all(|x| *x == d[0]), "overflow diverged: {d:?}");
     }
 
     #[test]

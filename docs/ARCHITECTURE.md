@@ -39,6 +39,18 @@ Update/Delete (write path stays the source of truth and stays deterministic — 
 side index off the committed state, never consulted during `apply`). Feature-flagged so the
 deterministic core path is unaffected when off.
 
+## Variable-length overflow store (Sub-project 2)
+
+`OverflowRef` fields hold arbitrary-length bytes without breaking the
+fixed-width record. The blob travels inside the replicated `Create`/`Update`
+record as a trailer; the state machine splits it out, writes it to a reserved
+LSM keyspace (`type_id = 0xFFFF_FFFF`) under a **deterministic op-derived
+handle** `(op_number << 20) | field_idx`, and patches the 8-byte handle into
+the record's `OverflowRef` slot. Determinism holds because `op_number` is
+assigned by the VSR primary and replicated, so every replica computes the
+same handle and stores identical bytes. Reads use `GetBlob { handle }`.
+Orphaned-blob GC (after an overflow-field `Update`) is deferred and documented.
+
 ## Storage layout
 
 LSM key = `type_id(4B) ‖ primary_id(16B)`, value = codec-encoded fixed-width record with a

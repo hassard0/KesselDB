@@ -18,6 +18,29 @@ fn catalog_key() -> Key {
     make_key(0, &[0u8; 16])
 }
 
+/// Reserved keyspace for variable-length overflow blobs (Sub-project 2).
+const OVERFLOW_TYPE: u32 = 0xFFFF_FFFF;
+
+fn handle_key(handle: u64) -> Key {
+    let mut id = [0u8; 16];
+    id[..8].copy_from_slice(&handle.to_le_bytes());
+    make_key(OVERFLOW_TYPE, &id)
+}
+
+/// Build a `Create`/`Update` record with an overflow trailer:
+/// `[fixed][u16 n]( [u16 field_idx][u32 len][bytes] )*`. `fixed` must be the
+/// codec-encoded fixed-width record (handles will be patched in by the SM).
+pub fn encode_overflow_record(fixed: &[u8], entries: &[(u16, Vec<u8>)]) -> Vec<u8> {
+    let mut b = fixed.to_vec();
+    b.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    for (idx, bytes) in entries {
+        b.extend_from_slice(&idx.to_le_bytes());
+        b.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        b.extend_from_slice(bytes);
+    }
+    b
+}
+
 pub struct StateMachine<V: Vfs> {
     catalog: Catalog,
     storage: Storage<V>,
@@ -64,6 +87,57 @@ impl<V: Vfs> StateMachine<V> {
             Ok(()) => OpResult::Ok,
             Err(e) => OpResult::SchemaError(format!("catalog persist: {e}")),
         }
+    }
+
+    /// Split an optional overflow trailer off `record`, persist each blob
+    /// under a deterministic op-derived handle, and patch the handle into the
+    /// fixed record's `OverflowRef` slot. Returns the now-truly-fixed record.
+    /// Deterministic: handle = (op_number << 20) | field_idx — identical on
+    /// every replica because `op_number` is replicated.
+    fn materialize_overflow(
+        &mut self,
+        op_number: u64,
+        type_id: u32,
+        record: Vec<u8>,
+    ) -> Result<Vec<u8>, OpResult> {
+        let layout = match self.catalog.get(type_id) {
+            Some(t) => t.compute_layout(),
+            None => return Err(OpResult::SchemaError(format!("no type {type_id}"))),
+        };
+        let fixed_size = layout.record_size;
+        if record.len() <= fixed_size {
+            return Ok(record); // no trailer (back-compatible with SP1 records)
+        }
+        let mut fixed = record[..fixed_size].to_vec();
+        let tr = &record[fixed_size..];
+        if tr.len() < 2 {
+            return Err(OpResult::SchemaError("bad overflow trailer".into()));
+        }
+        let n = u16::from_le_bytes([tr[0], tr[1]]) as usize;
+        let mut p = 2usize;
+        for _ in 0..n {
+            if p + 6 > tr.len() {
+                return Err(OpResult::SchemaError("truncated overflow entry".into()));
+            }
+            let field_idx = u16::from_le_bytes([tr[p], tr[p + 1]]) as usize;
+            let len = u32::from_le_bytes([tr[p + 2], tr[p + 3], tr[p + 4], tr[p + 5]]) as usize;
+            p += 6;
+            if p + len > tr.len() {
+                return Err(OpResult::SchemaError("overflow blob overruns".into()));
+            }
+            let blob = tr[p..p + len].to_vec();
+            p += len;
+            let off = match layout.offsets.get(field_idx) {
+                Some(&o) if o + 8 <= fixed_size => o,
+                _ => return Err(OpResult::SchemaError("bad overflow field_idx".into())),
+            };
+            let handle: u64 = (op_number << 20) | (field_idx as u64);
+            if let Err(e) = self.storage.put(op_number, handle_key(handle), blob) {
+                return Err(OpResult::SchemaError(format!("overflow store: {e}")));
+            }
+            fixed[off..off + 8].copy_from_slice(&handle.to_le_bytes());
+        }
+        Ok(fixed)
     }
 
     /// Apply one committed op. Deterministic.
@@ -138,6 +212,10 @@ impl<V: Vfs> StateMachine<V> {
                 if self.storage.get(&key).is_some() {
                     return OpResult::Exists;
                 }
+                let record = match self.materialize_overflow(op_number, type_id, record) {
+                    Ok(r) => r,
+                    Err(e) => return e,
+                };
                 let cached = self.cache.as_mut().map(|_| record.clone());
                 match self.storage.put(op_number, key, record) {
                     Ok(()) => {
@@ -158,6 +236,10 @@ impl<V: Vfs> StateMachine<V> {
                 if self.storage.get(&key).is_none() {
                     return OpResult::NotFound;
                 }
+                let record = match self.materialize_overflow(op_number, type_id, record) {
+                    Ok(r) => r,
+                    Err(e) => return e,
+                };
                 let cached = self.cache.as_mut().map(|_| record.clone());
                 match self.storage.put(op_number, key, record) {
                     Ok(()) => {
@@ -206,6 +288,11 @@ impl<V: Vfs> StateMachine<V> {
                     None => OpResult::NotFound,
                 }
             }
+
+            Op::GetBlob { handle } => match self.storage.get(&handle_key(handle)) {
+                Some(b) => OpResult::Got(b),
+                None => OpResult::NotFound,
+            },
         }
     }
 
@@ -238,7 +325,7 @@ impl<V: Vfs> StateMachine<V> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kessel_catalog::{encode_field, encode_type_def, FieldKind};
+    use kessel_catalog::{encode_field, encode_type_def, Field, FieldKind, ObjectType};
     use kessel_io::MemVfs;
     use kessel_proto::{ObjectId, Rng};
     use std::collections::HashMap;
@@ -382,6 +469,86 @@ mod tests {
         let (r_on, d_on) = run(true);
         assert_eq!(r_off, r_on, "cache changed observable op results");
         assert_eq!(d_off, d_on, "cache changed the state digest");
+    }
+
+    fn overflow_type_def() -> Vec<u8> {
+        encode_type_def(
+            "blobby",
+            &[
+                Field { field_id: 0, name: "body".into(), kind: FieldKind::OverflowRef, nullable: false },
+                Field { field_id: 0, name: "n".into(), kind: FieldKind::U64, nullable: false },
+            ],
+        )
+    }
+
+    fn fixed_zeros() -> Vec<u8> {
+        let t = ObjectType {
+            type_id: 1,
+            name: "blobby".into(),
+            schema_ver: 1,
+            fields: vec![
+                Field { field_id: 1, name: "body".into(), kind: FieldKind::OverflowRef, nullable: false },
+                Field { field_id: 2, name: "n".into(), kind: FieldKind::U64, nullable: false },
+            ],
+        };
+        vec![0u8; t.compute_layout().record_size]
+    }
+
+    #[test]
+    fn overflow_roundtrip_large_blob() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: overflow_type_def() });
+        let blob = vec![0x5Au8; 100 * 1024]; // 100 KB
+        let rec = super::encode_overflow_record(&fixed_zeros(), &[(0, blob.clone())]);
+        let id = ObjectId::from_u128(1);
+        assert_eq!(sm.apply(2, Op::Create { type_id: 1, id, record: rec }), OpResult::Ok);
+
+        // GetById returns the FIXED record with a non-zero handle patched in.
+        let handle = (2u64 << 20) | 0;
+        match sm.apply(3, Op::GetById { type_id: 1, id }) {
+            OpResult::Got(fixed) => {
+                assert_eq!(fixed.len(), fixed_zeros().len(), "record stays fixed-width");
+                let h = u64::from_le_bytes(fixed[14..22].try_into().unwrap());
+                assert_eq!(h, handle, "OverflowRef slot holds the handle");
+            }
+            o => panic!("unexpected {o:?}"),
+        }
+        assert_eq!(sm.apply(4, Op::GetBlob { handle }), OpResult::Got(blob));
+        assert_eq!(sm.apply(5, Op::GetBlob { handle: 999 }), OpResult::NotFound);
+    }
+
+    #[test]
+    fn overflow_handles_are_deterministic_across_replicas() {
+        let build = || {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            sm.apply(1, Op::CreateType { def: overflow_type_def() });
+            for i in 0..50u64 {
+                let rec = super::encode_overflow_record(
+                    &fixed_zeros(),
+                    &[(0, format!("payload-{i}").into_bytes())],
+                );
+                sm.apply(2 + i, Op::Create { type_id: 1, id: ObjectId::from_u128(i as u128), record: rec });
+            }
+            sm.digest()
+        };
+        assert_eq!(build(), build(), "overflow must not break determinism");
+    }
+
+    #[test]
+    fn update_orphans_old_blob_no_gc_documented() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: overflow_type_def() });
+        let id = ObjectId::from_u128(7);
+        let r1 = super::encode_overflow_record(&fixed_zeros(), &[(0, b"old".to_vec())]);
+        sm.apply(2, Op::Create { type_id: 1, id, record: r1 });
+        let h_old = (2u64 << 20) | 0;
+        let r2 = super::encode_overflow_record(&fixed_zeros(), &[(0, b"new".to_vec())]);
+        sm.apply(3, Op::Update { type_id: 1, id, record: r2 });
+        let h_new = (3u64 << 20) | 0;
+        // New value readable; the record points at the new handle.
+        assert_eq!(sm.apply(4, Op::GetBlob { handle: h_new }), OpResult::Got(b"new".to_vec()));
+        // Old blob is ORPHANED but still resolvable (no GC yet — documented).
+        assert_eq!(sm.apply(5, Op::GetBlob { handle: h_old }), OpResult::Got(b"old".to_vec()));
     }
 
     /// Linearizability vs. an in-memory reference model under a random op

@@ -9,6 +9,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | M2 — catalog + codec + single-node SM | **done — CONDITIONAL GO** | thesis not refuted; group-commit added (37× win); see verdict below |
 | M3 — VSR replication | **done (core) — hardening backlog listed** | crash-stop VSR: normal op, client table, view change w/ log recovery, state transfer, loss tolerance; 4 sim invariants green |
 | M4 — cache + sharding + perf | **done** | LRU read cache (observably invisible), rendezvous sharding groundwork, replicated bench, scaling speculation |
+| **SP2 — variable-length overflow store** | **done** | replication-correct overflow blobs via op-derived deterministic handles; `GetBlob`; replicated-convergence test; GC deferred (documented) |
 
 ## M3 VSR — done vs. hardening backlog (honest)
 
@@ -26,11 +27,29 @@ in-process deterministic bus only), cluster membership reconfiguration. These
 are tracked for M3-hardening / later specs; the protocol is transport-agnostic
 so the socket swap is mechanical.
 
+## Sub-project 2 — variable-length overflow store (done)
+
+Object types can have `OverflowRef` fields carrying arbitrary-length bytes
+while the core record stays fixed-width. Spec:
+`docs/superpowers/specs/2026-05-17-kesseldb-subproject2-overflow.md`.
+
+- Write side rides inside `Create`/`Update` records as a trailer
+  (`[fixed][u16 n]( [u16 field_idx][u32 len][bytes] )*`), so it's part of the
+  replicated op — every replica writes identical bytes.
+- Handle = `(op_number << 20) | field_idx` — deterministic, no counter/RNG,
+  identical across replicas (proven: replicated-convergence test + a
+  two-instance digest-equality test).
+- Read via `Op::GetBlob { handle }`. Overflow lives in a reserved LSM
+  keyspace, so it inherits crash recovery, the digest, and replication.
+- **Honest limitation:** no overflow GC — an `Update` orphans the old blob
+  (still resolvable; documented and asserted by `update_orphans_old_blob…`).
+  Orphan compaction is a later spec.
+
 ## What this is NOT (yet)
 
-Out of scope for Sub-project 1 (each a later spec): variable-length overflow store, secondary
-indexes, filtered scans, multi-index planner, built-in constraints, WASM triggers, destructive
-ALTER/DROP, cluster membership reconfiguration, client SDKs.
+Still out of scope (each a later spec): secondary indexes, filtered scans,
+multi-index planner, built-in constraints, WASM triggers, destructive
+ALTER/DROP, overflow GC, cluster membership reconfiguration, client SDKs.
 
 ## Performance log
 

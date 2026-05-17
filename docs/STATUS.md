@@ -46,6 +46,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP36 — inner equi-JOIN** | **done** | `Op::Join` deterministic hash-join over two scans; SQL `SELECT * FROM a JOIN b ON a.x=b.y [LIMIT]` (lexer `.`, bidirectional ON); leftrec++rightrec length-prefixed |
 | **SP37 — VSR view-change safety** | **done (safety) / liveness open** | fixed real committed-op-loss bug (stale log could win DoViewChange); `Normal`/`normal_view` only via authoritative install; 127 green; seed-7 *liveness* under adversarial partition still open (precisely diagnosed) |
 | **SP38 — VSR over real TCP sockets** | **done** | `kessel_vsr::wire` Msg codec (all 9 variants, roundtrip-tested) + `kesseldb_server::cluster` (single engine owns `Replica<DirVfs>`, per-peer socket transport); 3-node real-TCP test converges to identical digest; **129 green** |
+| **SP39 — SQL over the cluster** | **done** | `Replica::catalog()` + `Ev::ClientRaw` continuation engine (UPDATE = 2-round RMW over consensus, non-blocking) + `serve_clients`; real `Client::sql()` full CRUD against a 3-node TCP cluster, followers match primary digest; **130 green** |
 
 ## Production-readiness gate (precise, not vague)
 
@@ -61,6 +62,7 @@ hand-waving:
 | VSR safety (no committed-op loss across view change) | ✅ **SP37 fixed** |
 | VSR liveness under *arbitrary* partition | ⚠️ open, 1 repro (seed 7), precisely diagnosed |
 | **Multi-node replication over real sockets** | ✅ **SP38 done** — 3-node TCP cluster, digests converge over the wire |
+| **Full SQL over the cluster (incl. UPDATE RMW)** | ✅ **SP39 done** — `Client::sql()` full CRUD, linearized through consensus |
 | Index point-read perf (post-SP25 tradeoff) | ⚠️ documented enhancement |
 | Auth / TLS / quotas / backpressure | ❌ not started |
 | Operational tooling (backup, metrics, admin) | ❌ not started |
@@ -68,8 +70,9 @@ hand-waving:
 The honest verdict: a **complete & functionally-correct** database, **VSR
 safety** hardened, now running as a **real multi-node TCP cluster** (SP38).
 The remaining gates are concrete and named: adversarial-partition liveness
-(seed 7), SQL-over-cluster + failover client-reply routing, then auth/TLS/
-quotas and ops tooling. No vague "research-grade" hedging — each item is a
+(seed 7), failover client-reply routing (client reconnect/retry to the new
+primary), then auth/TLS/quotas and ops tooling. No vague "research-grade"
+hedging — each item is a
 specific, scoped slice.
 
 ## M3 VSR — done vs. hardening backlog (honest)

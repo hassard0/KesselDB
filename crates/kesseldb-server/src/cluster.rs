@@ -11,10 +11,12 @@
 //! primary, so a client connects to the primary. SQL-over-cluster and
 //! cross-node client-reply routing on failover are honest follow-ups.
 
+use kessel_codec::Value;
 use kessel_io::DirVfs;
 use kessel_proto::wire::{read_frame, write_frame};
-use kessel_proto::{ClientId, Op, OpResult};
+use kessel_proto::{ClientId, ObjectId, Op, OpResult};
 use kessel_sm::StateMachine;
+use kessel_sql::Stmt;
 use kessel_vsr::{wire, Msg, Replica};
 use std::collections::HashMap;
 use std::io;
@@ -30,9 +32,53 @@ const TICK_MS: u64 = 12;
 
 enum Ev {
     Client { client: ClientId, req: u64, op: Op, reply: SyncSender<OpResult> },
+    /// A raw client frame (`Op::encode()` or `[0xFE] ++ SQL`). SQL must be
+    /// compiled on the engine thread because it needs the live catalog,
+    /// which is owned by the non-`Send` `Replica`.
+    ClientRaw { frame: Vec<u8>, reply: SyncSender<OpResult> },
     Peer { from: usize, msg: Msg },
     Tick,
     Probe(SyncSender<(u32, u64, u64)>),
+}
+
+/// What to do when a linearized op's result comes back.
+enum Cont {
+    /// Forward the result straight to the waiting caller.
+    Reply(SyncSender<OpResult>),
+    /// SQL `UPDATE` read-modify-write: the just-returned `GetById` record is
+    /// patched with `sets`, then re-submitted as a single replicated
+    /// `Op::Update`, whose result goes to `reply`.
+    Update {
+        type_id: u32,
+        id: u128,
+        sets: Vec<(u16, Value)>,
+        reply: SyncSender<OpResult>,
+    },
+}
+
+/// Patch `rec` (a decoded record) with `sets` and re-encode it into an
+/// `Op::Update`. Pure; runs on the engine thread against the live catalog.
+fn build_update(
+    cat: &kessel_catalog::Catalog,
+    type_id: u32,
+    id: u128,
+    rec: &[u8],
+    sets: &[(u16, Value)],
+) -> Result<Op, String> {
+    let ot = cat
+        .get(type_id)
+        .ok_or_else(|| "update: no type".to_string())?
+        .clone();
+    let mut vals =
+        kessel_codec::decode(&ot, rec).map_err(|e| format!("update decode: {e:?}"))?;
+    for (fid, v) in sets {
+        if let Some(i) = ot.fields.iter().position(|f| f.field_id == *fid) {
+            vals[i] = v.clone();
+        }
+    }
+    let record =
+        kessel_codec::encode(&ot, &vals).map_err(|e| format!("update encode: {e:?}"))?;
+    Ok(Op::Update { type_id, id: ObjectId::from_u128(id), record })
 }
 
 /// A running node. Holds the engine channel; `submit` linearizes an op
@@ -53,6 +99,18 @@ impl Node {
             .send(Ev::Client { client, req: 1, op, reply: rtx })
             .is_err()
         {
+            return OpResult::SchemaError("engine stopped".into());
+        }
+        rrx.recv()
+            .unwrap_or_else(|_| OpResult::SchemaError("engine dropped reply".into()))
+    }
+
+    /// Submit a raw client frame (`Op::encode()` or `[0xFE] ++ SQL`) and
+    /// block for the committed result. This is the cluster equivalent of
+    /// the single-node `EngineHandle::apply_raw` — full SQL over consensus.
+    pub fn apply_raw(&self, frame: Vec<u8>) -> OpResult {
+        let (rtx, rrx) = sync_channel(1);
+        if self.tx.send(Ev::ClientRaw { frame, reply: rtx }).is_err() {
             return OpResult::SchemaError("engine stopped".into());
         }
         rrx.recv()
@@ -164,13 +222,21 @@ pub fn spawn_node(
             }
         };
         let mut replica: Replica<DirVfs> = Replica::new(self_idx, n, sm);
-        // (client, req) -> waiting caller, for routing the committed reply.
-        let mut pending: HashMap<(ClientId, u64), SyncSender<OpResult>> = HashMap::new();
+        // (client, req) -> continuation for routing the committed result.
+        let mut pending: HashMap<(ClientId, u64), Cont> = HashMap::new();
+        // Internal consensus ops (SQL compile / UPDATE RMW) use a client-id
+        // range disjoint from external `Node::submit` ids (which start at 1).
+        let mut iseq: u128 = 1u128 << 100;
 
-        let dispatch =
-            |replica: &mut Replica<DirVfs>,
-             pending: &mut HashMap<(ClientId, u64), SyncSender<OpResult>>,
-             out: kessel_vsr::Out| {
+        // Drive an `Out` to completion: ship peer msgs, route replies, and
+        // chase `Update` continuations (each spawns a follow-up replicated
+        // op) until the work queue drains. Sole mutator of `replica`.
+        let process = |replica: &mut Replica<DirVfs>,
+                        pending: &mut HashMap<(ClientId, u64), Cont>,
+                        iseq: &mut u128,
+                        first: kessel_vsr::Out| {
+            let mut queue = vec![first];
+            while let Some(out) = queue.pop() {
                 for (to, msg) in out.msgs {
                     if to == self_idx {
                         continue;
@@ -180,28 +246,152 @@ pub fn spawn_node(
                     }
                 }
                 for (client, req, res) in out.replies {
-                    if let Some(s) = pending.remove(&(client, req)) {
-                        let _ = s.send(res);
+                    let Some(cont) = pending.remove(&(client, req)) else {
+                        continue;
+                    };
+                    match cont {
+                        Cont::Reply(s) => {
+                            let _ = s.send(res);
+                        }
+                        Cont::Update { type_id, id, sets, reply } => match res {
+                            OpResult::Got(rec) => {
+                                match build_update(
+                                    replica.catalog(),
+                                    type_id,
+                                    id,
+                                    &rec,
+                                    &sets,
+                                ) {
+                                    Ok(op) => {
+                                        *iseq += 1;
+                                        let c = *iseq;
+                                        pending
+                                            .insert((c, 1), Cont::Reply(reply));
+                                        let o2 = replica.handle(
+                                            self_idx,
+                                            Msg::Request { client: c, req: 1, op },
+                                        );
+                                        queue.push(o2);
+                                    }
+                                    Err(e) => {
+                                        let _ = reply
+                                            .send(OpResult::SchemaError(e));
+                                    }
+                                }
+                            }
+                            other => {
+                                // NotFound etc. — RMW target absent.
+                                let _ = reply.send(other);
+                            }
+                        },
                     }
                 }
-                let _ = replica;
-            };
+            }
+        };
+
+        // Submit one op through consensus under a fresh internal client id,
+        // with `cont` to fire when it commits.
+        let submit_internal = |replica: &mut Replica<DirVfs>,
+                               pending: &mut HashMap<(ClientId, u64), Cont>,
+                               iseq: &mut u128,
+                               op: Op,
+                               cont: Cont| {
+            *iseq += 1;
+            let c = *iseq;
+            pending.insert((c, 1), cont);
+            replica.handle(self_idx, Msg::Request { client: c, req: 1, op })
+        };
 
         while let Ok(ev) = erx.recv() {
             match ev {
                 Ev::Client { client, req, op, reply } => {
-                    pending.insert((client, req), reply);
+                    pending.insert((client, req), Cont::Reply(reply));
                     let out =
                         replica.handle(self_idx, Msg::Request { client, req, op });
-                    dispatch(&mut replica, &mut pending, out);
+                    process(&mut replica, &mut pending, &mut iseq, out);
+                }
+                Ev::ClientRaw { frame, reply } => {
+                    if frame.first() == Some(&0xFE) {
+                        let sql = match std::str::from_utf8(&frame[1..]) {
+                            Ok(s) => s,
+                            Err(_) => {
+                                let _ = reply
+                                    .send(OpResult::SchemaError("sql: not utf8".into()));
+                                continue;
+                            }
+                        };
+                        match kessel_sql::compile_stmt(sql, replica.catalog()) {
+                            Ok(Stmt::Op(o)) => {
+                                let out = submit_internal(
+                                    &mut replica,
+                                    &mut pending,
+                                    &mut iseq,
+                                    o,
+                                    Cont::Reply(reply),
+                                );
+                                process(
+                                    &mut replica,
+                                    &mut pending,
+                                    &mut iseq,
+                                    out,
+                                );
+                            }
+                            Ok(Stmt::Update { type_id, id, sets }) => {
+                                // RMW: linearized GetById, then patched Update.
+                                let out = submit_internal(
+                                    &mut replica,
+                                    &mut pending,
+                                    &mut iseq,
+                                    Op::GetById {
+                                        type_id,
+                                        id: ObjectId::from_u128(id),
+                                    },
+                                    Cont::Update { type_id, id, sets, reply },
+                                );
+                                process(
+                                    &mut replica,
+                                    &mut pending,
+                                    &mut iseq,
+                                    out,
+                                );
+                            }
+                            Err(e) => {
+                                let _ = reply
+                                    .send(OpResult::SchemaError(format!("sql: {e}")));
+                            }
+                        }
+                    } else {
+                        match Op::decode(&frame) {
+                            Some(o) => {
+                                let out = submit_internal(
+                                    &mut replica,
+                                    &mut pending,
+                                    &mut iseq,
+                                    o,
+                                    Cont::Reply(reply),
+                                );
+                                process(
+                                    &mut replica,
+                                    &mut pending,
+                                    &mut iseq,
+                                    out,
+                                );
+                            }
+                            None => {
+                                let _ = reply.send(OpResult::SchemaError(
+                                    "malformed request frame".into(),
+                                ));
+                            }
+                        }
+                    }
                 }
                 Ev::Peer { from, msg } => {
                     let out = replica.handle(from, msg);
-                    dispatch(&mut replica, &mut pending, out);
+                    process(&mut replica, &mut pending, &mut iseq, out);
                 }
                 Ev::Tick => {
                     let out = replica.tick();
-                    dispatch(&mut replica, &mut pending, out);
+                    process(&mut replica, &mut pending, &mut iseq, out);
                 }
                 Ev::Probe(ptx) => {
                     let _ = ptx.send((
@@ -218,6 +408,30 @@ pub fn spawn_node(
         Ok(Ok(())) => Ok(Node { tx: etx, client_seq: Arc::new(AtomicU64::new(1)) }),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(io::Error::new(io::ErrorKind::Other, "engine failed to start")),
+    }
+}
+
+fn handle_client_conn(mut s: TcpStream, node: Arc<Node>) {
+    loop {
+        let req = match read_frame(&mut s) {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        let res = node.apply_raw(req);
+        if write_frame(&mut s, &res.encode()).is_err() {
+            break;
+        }
+    }
+}
+
+/// Serve the ordinary client protocol (`kessel-client`, incl. `sql()`) for
+/// this cluster node, one thread per connection. Connect clients to the
+/// primary: replies are emitted there (failover client-reply routing is a
+/// documented follow-up).
+pub fn serve_clients(listener: TcpListener, node: Arc<Node>) {
+    for stream in listener.incoming().flatten() {
+        let n = node.clone();
+        std::thread::spawn(move || handle_client_conn(stream, n));
     }
 }
 
@@ -307,6 +521,108 @@ mod tests {
             "nodes did not converge over real TCP: {:?}",
             nodes.iter().map(|n| n.probe()).collect::<Vec<_>>()
         );
+        for d in &dirs {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn sql_over_cluster_full_crud_and_rmw() {
+        use kessel_client::Client;
+
+        let n = 3;
+        let listeners: Vec<TcpListener> = (0..n)
+            .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let addrs: Vec<SocketAddr> =
+            listeners.iter().map(|l| l.local_addr().unwrap()).collect();
+
+        let mut dirs = Vec::new();
+        let mut listeners = listeners.into_iter();
+        // node 0 = primary (view 0); keep it separate as an Arc so the
+        // client front can share it without moving it out of a Vec.
+        let dir0 = std::env::temp_dir()
+            .join(format!("kesseldb-sqlcluster-{}-0", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir0);
+        dirs.push(dir0.clone());
+        let node0 = Arc::new(
+            spawn_node(0, listeners.next().unwrap(), addrs.clone(), dir0).unwrap(),
+        );
+        let mut followers = Vec::new();
+        for i in 1..n {
+            let dir = std::env::temp_dir()
+                .join(format!("kesseldb-sqlcluster-{}-{i}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            dirs.push(dir.clone());
+            followers.push(
+                spawn_node(i, listeners.next().unwrap(), addrs.clone(), dir).unwrap(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Expose the primary's client protocol on a real TCP port.
+        let cl = TcpListener::bind("127.0.0.1:0").unwrap();
+        let caddr = cl.local_addr().unwrap();
+        {
+            let n0 = node0.clone();
+            std::thread::spawn(move || serve_clients(cl, n0));
+        }
+
+        let mut c = Client::connect(caddr).unwrap();
+        assert!(matches!(
+            c.sql("CREATE TABLE acct (owner U32 NOT NULL, bal I64 NOT NULL)")
+                .unwrap(),
+            OpResult::TypeCreated(1)
+        ));
+        assert_eq!(
+            c.sql("INSERT INTO acct ID 1 (owner, bal) VALUES (100, 50)")
+                .unwrap(),
+            OpResult::Ok
+        );
+        assert_eq!(
+            c.sql("INSERT INTO acct ID 2 (owner, bal) VALUES (100, 999)")
+                .unwrap(),
+            OpResult::Ok
+        );
+        match c.sql("SELECT SUM(bal) FROM acct WHERE owner = 100").unwrap() {
+            OpResult::Got(b) => {
+                assert_eq!(i128::from_le_bytes(b.try_into().unwrap()), 1049)
+            }
+            o => panic!("unexpected {o:?}"),
+        }
+        // SQL UPDATE = read-modify-write across consensus (two replicated
+        // rounds: linearized GetById, then the patched Update).
+        assert_eq!(c.sql("UPDATE acct ID 1 SET bal = 500").unwrap(), OpResult::Ok);
+        match c.sql("SELECT SUM(bal) FROM acct WHERE owner = 100").unwrap() {
+            OpResult::Got(b) => {
+                assert_eq!(i128::from_le_bytes(b.try_into().unwrap()), 1499)
+            }
+            o => panic!("unexpected {o:?}"),
+        }
+        assert_eq!(
+            c.sql("UPDATE acct ID 999 SET bal = 1").unwrap(),
+            OpResult::NotFound
+        );
+        match c.sql("SELECT * FROM acct ID 2").unwrap() {
+            OpResult::Got(rec) => assert!(!rec.is_empty()),
+            o => panic!("unexpected {o:?}"),
+        }
+
+        // All three nodes converged to one digest over the wire.
+        let probe0 = node0.probe();
+        assert!(
+            wait_converged(&followers, probe0.2),
+            "followers did not converge after SQL-over-cluster"
+        );
+        for (k, f) in followers.iter().enumerate() {
+            assert_eq!(
+                probe0.0,
+                f.probe().0,
+                "primary/follower {} digests diverged",
+                k + 1
+            );
+        }
+
         for d in &dirs {
             let _ = std::fs::remove_dir_all(d);
         }

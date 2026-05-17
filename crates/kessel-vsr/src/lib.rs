@@ -301,6 +301,11 @@ impl<V: Vfs> Replica<V> {
     pub fn digest(&self) -> u32 {
         self.sm.digest()
     }
+    /// Read-only catalog view, for compiling SQL against the live schema on
+    /// the engine thread (the catalog is owned by the wrapped StateMachine).
+    pub fn catalog(&self) -> &kessel_catalog::Catalog {
+        self.sm.catalog()
+    }
     /// Introspection for diagnostics: (view, is_primary, status, commit,
     /// op_number, max_view_seen).
     pub fn probe(&self) -> (u64, bool, &'static str, u64, u64, u64) {

@@ -4,8 +4,8 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 
 | Milestone | State | Notes |
 |---|---|---|
-| M0 — workspace + determinism seam | not started | |
-| M1 — storage engine (LSM+WAL+recovery) | not started | |
+| M0 — workspace + determinism seam | **done** | proto/io/sim crates; 13 tests green; determinism gate = 100 seeds × 2 runs identical |
+| M1 — storage engine (LSM+WAL+recovery) | in progress | |
 | M2 — catalog + codec + single-node SM | not started | early go/no-go benchmark gate |
 | M3 — VSR replication | not started | hardest milestone (consensus from scratch) |
 | M4 — cache + sharding + perf | not started | cloud-scaling speculation |

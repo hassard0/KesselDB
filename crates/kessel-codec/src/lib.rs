@@ -94,6 +94,40 @@ pub fn encode(ot: &ObjectType, values: &[Value]) -> Result<Vec<u8>, CodecError> 
 
 /// Decode a record into values parallel to the CURRENT `ot.fields`. Fields
 /// beyond the record's stored `field_count` (older schema) decode as NULL.
+/// Decode one field's *raw fixed-width* bytes (exactly `kind.width()`
+/// bytes, no header/bitmap) into a `Value`. This is the per-field core of
+/// `decode`, exposed so clients can decode projection / column-oriented
+/// results that are bare concatenated field bytes (Sub-project 59).
+pub fn value_from_raw(kind: FieldKind, raw: &[u8]) -> Value {
+    let w = raw.len();
+    match kind {
+        FieldKind::I8
+        | FieldKind::I16
+        | FieldKind::I32
+        | FieldKind::I64
+        | FieldKind::I128
+        | FieldKind::Fixed { .. } => {
+            let mut le = [0u8; 16];
+            le[..w].copy_from_slice(raw);
+            if w > 0 && w < 16 && raw[w - 1] & 0x80 != 0 {
+                for b in le.iter_mut().skip(w) {
+                    *b = 0xFF; // sign-extend
+                }
+            }
+            Value::Int(i128::from_le_bytes(le))
+        }
+        FieldKind::Char(_)
+        | FieldKind::Bytes(_)
+        | FieldKind::Ref
+        | FieldKind::OverflowRef => Value::Blob(raw.to_vec()),
+        _ => {
+            let mut le = [0u8; 16];
+            le[..w.min(16)].copy_from_slice(&raw[..w.min(16)]);
+            Value::Uint(u128::from_le_bytes(le))
+        }
+    }
+}
+
 pub fn decode(ot: &ObjectType, rec: &[u8]) -> Result<Vec<Value>, CodecError> {
     if rec.len() < HEADER_BYTES {
         return Err(CodecError::ShortRecord);
@@ -118,34 +152,7 @@ pub fn decode(ot: &ObjectType, rec: &[u8]) -> Result<Vec<Value>, CodecError> {
             return Err(CodecError::ShortRecord);
         }
         let raw = &rec[off..off + w];
-        let v = match field.kind {
-            FieldKind::I8
-            | FieldKind::I16
-            | FieldKind::I32
-            | FieldKind::I64
-            | FieldKind::I128
-            | FieldKind::Fixed { .. } => {
-                let mut le = [0u8; 16];
-                le[..w].copy_from_slice(raw);
-                // sign-extend
-                if w < 16 && raw[w - 1] & 0x80 != 0 {
-                    for b in le.iter_mut().skip(w) {
-                        *b = 0xFF;
-                    }
-                }
-                Value::Int(i128::from_le_bytes(le))
-            }
-            FieldKind::Char(_)
-            | FieldKind::Bytes(_)
-            | FieldKind::Ref
-            | FieldKind::OverflowRef => Value::Blob(raw.to_vec()),
-            _ => {
-                let mut le = [0u8; 16];
-                le[..w].copy_from_slice(raw);
-                Value::Uint(u128::from_le_bytes(le))
-            }
-        };
-        out.push(v);
+        out.push(value_from_raw(field.kind, raw));
     }
     Ok(out)
 }

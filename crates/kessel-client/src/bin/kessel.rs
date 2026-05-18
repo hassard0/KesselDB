@@ -138,6 +138,18 @@ fn run_one(client: &mut Client, sql: &str) -> i32 {
                         return 0;
                     }
                 }
+            } else if let Some((t, cols)) = kessel_sql::select_columns(sql) {
+                // Projection: decode the column-oriented result.
+                if let Ok(OpResult::Got(def)) =
+                    client.sql(&format!("DESCRIBE {t}"))
+                {
+                    if let Some(table) =
+                        kessel_client::render_projection(&def, &cols, &b)
+                    {
+                        println!("{table}");
+                        return 0;
+                    }
+                }
             }
             println!("{}", format_result(&OpResult::Got(b)));
             0

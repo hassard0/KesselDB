@@ -6,7 +6,7 @@
 
 *"It's the database that made the Kessel Run in 12 parsecs."*
 
-`154 tests green` · `0 external dependencies` · `Rust 1.95+` · single‑binary
+`156 tests green` · `0 external dependencies` · `Rust 1.95+` · single‑binary
 
 </div>
 
@@ -158,7 +158,7 @@ Honest boundaries (documented, not hidden):
 - **Non‑gating roadmap** (tracked, not blocking): balance‑guard helpers,
   cross‑shard transactions, destructive `ALTER TABLE` & `DROP INDEX` (`DROP TABLE` done, SP54), overflow GC.
 
-Every claim in this repository is backed by the test suite (`154 tests`); the
+Every claim in this repository is backed by the test suite (`156 tests`); the
 docs call out exactly what is proven versus roadmap.
 
 ## Documentation
@@ -175,7 +175,7 @@ docs call out exactly what is proven versus roadmap.
 
 ```bash
 cargo build                 # all crates, zero external deps
-cargo test --workspace      # 154 tests (incl. seeded partition/fault simulation)
+cargo test --workspace      # 156 tests (incl. seeded partition/fault simulation)
 cargo run -p kessel-bench --release -- --help   # benchmarks
 ```
 

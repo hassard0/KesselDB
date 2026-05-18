@@ -79,7 +79,7 @@ cargo run -q -p kessel-client --bin kessel -- "SELECT SUM(v) FROM t"   # => = 42
 #   (1 row)
 kessel "SELECT * FROM t ID 1"
 kessel "SELECT * FROM t WHERE owner = 100"
-# (projections `SELECT c1,c2` and JOINs print opaque bytes — see USAGE §4)
+kessel "SELECT owner, bal FROM acct"      # projections render too (JOINs: opaque, see §4)
 
 # pipe a .sql file (lines starting with # or -- are comments; blanks ignored)
 cat schema.sql | cargo run -q -p kessel-client --bin kessel

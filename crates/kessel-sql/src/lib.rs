@@ -239,6 +239,48 @@ pub fn select_star_table(sql: &str) -> Option<String> {
     Some(table)
 }
 
+/// If `sql` is a plain projection `SELECT c1, c2, ... FROM <table> ...`
+/// (explicit column list, single table, no `*`, no aggregate function
+/// call, no `JOIN`), return `(table, [c1, c2, ...])` so a client can
+/// `DESCRIBE` the table and decode the projected (column-oriented) result.
+/// `None` otherwise (caller leaves the bytes opaque). Uses the real lexer.
+pub fn select_columns(sql: &str) -> Option<(String, Vec<String>)> {
+    let toks = lex(sql).ok()?;
+    let mut it = toks.iter().peekable();
+    match it.next()? {
+        Tok::Ident(k) if k.eq_ignore_ascii_case("SELECT") => {}
+        _ => return None,
+    }
+    let mut cols = Vec::new();
+    loop {
+        match it.next()? {
+            Tok::Ident(c) if !c.eq_ignore_ascii_case("FROM") => {
+                // `FUNC(` ⇒ aggregate/expr — not a plain column list.
+                if matches!(it.peek(), Some(Tok::Punct('('))) {
+                    return None;
+                }
+                cols.push(c.clone());
+            }
+            _ => return None, // `*`, `FROM` with no cols, etc.
+        }
+        match it.next()? {
+            Tok::Punct(',') => continue,
+            Tok::Ident(k) if k.eq_ignore_ascii_case("FROM") => break,
+            _ => return None,
+        }
+    }
+    let table = match it.next()? {
+        Tok::Ident(t) => t.clone(),
+        _ => return None,
+    };
+    if let Some(Tok::Ident(k)) = it.next() {
+        if k.eq_ignore_ascii_case("JOIN") {
+            return None; // composite rows — different wire shape
+        }
+    }
+    Some((table, cols))
+}
+
 /// Compile one SQL statement, including `UPDATE`.
 pub fn compile_stmt(sql: &str, cat: &Catalog) -> Result<Stmt, SqlError> {
     {
@@ -1121,6 +1163,24 @@ mod tests {
             OpResult::Got(b) => assert_eq!(i128::from_le_bytes(b.try_into().unwrap()), 2),
             o => panic!("{o:?}"),
         }
+    }
+
+    #[test]
+    fn select_columns_only_matches_plain_projection() {
+        assert_eq!(
+            select_columns("SELECT owner, bal FROM acct"),
+            Some(("acct".into(), vec!["owner".into(), "bal".into()]))
+        );
+        assert_eq!(
+            select_columns("select a FROM t WHERE a = 1"),
+            Some(("t".into(), vec!["a".into()]))
+        );
+        // Not plain projections:
+        assert_eq!(select_columns("SELECT * FROM acct"), None);
+        assert_eq!(select_columns("SELECT COUNT(*) FROM acct"), None);
+        assert_eq!(select_columns("SELECT a, b FROM x JOIN y ON x.a = y.b"), None);
+        assert_eq!(select_columns("DESCRIBE acct"), None);
+        assert_eq!(select_columns("INSERT INTO t (id) VALUES (1)"), None);
     }
 
     #[test]

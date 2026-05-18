@@ -135,9 +135,14 @@ pub fn render_rows(typedef: &[u8], rows: &[u8]) -> Option<String> {
     } else {
         Vec::new()
     };
-    // Column widths.
+    Some(render_table(&headers, &table))
+}
+
+/// Format a header + string-cell rows as an aligned ASCII table with an
+/// `(N row[s])` footer. Shared by whole-row and projection rendering.
+fn render_table(headers: &[String], table: &[Vec<String>]) -> String {
     let mut w: Vec<usize> = headers.iter().map(|h| h.len()).collect();
-    for row in &table {
+    for row in table {
         for (i, cell) in row.iter().enumerate() {
             if i < w.len() {
                 w[i] = w[i].max(cell.len());
@@ -156,7 +161,7 @@ pub fn render_rows(typedef: &[u8], rows: &[u8]) -> Option<String> {
     );
     out.push('\n');
     out.push_str(&w.iter().map(|n| "-".repeat(*n)).collect::<Vec<_>>().join("-+-"));
-    for row in &table {
+    for row in table {
         out.push('\n');
         out.push_str(
             &row.iter()
@@ -166,8 +171,56 @@ pub fn render_rows(typedef: &[u8], rows: &[u8]) -> Option<String> {
                 .join(" | "),
         );
     }
-    out.push_str(&format!("\n({} row{})", table.len(), if table.len() == 1 { "" } else { "s" }));
-    Some(out)
+    out.push_str(&format!(
+        "\n({} row{})",
+        table.len(),
+        if table.len() == 1 { "" } else { "s" }
+    ));
+    out
+}
+
+/// Decode a projection result (`SELECT c1, c2 …`) — `[u32 rowlen][row]*`
+/// where each row is the projected columns' bare fixed-width bytes in
+/// `cols` order — against the table's wire schema (`DESCRIBE` output) and
+/// render an aligned table. `None` on any mismatch (caller falls back).
+pub fn render_projection(
+    typedef: &[u8],
+    cols: &[String],
+    rows: &[u8],
+) -> Option<String> {
+    let (name, fields) = kessel_catalog::decode_type_def(typedef)?;
+    let ot = kessel_catalog::ObjectType::from_def(name, fields);
+    // Resolve each requested column to its kind+width (unknown ⇒ None).
+    let mut spec: Vec<(kessel_catalog::FieldKind, usize)> =
+        Vec::with_capacity(cols.len());
+    for c in cols {
+        let f = ot.fields.iter().find(|f| f.name.eq_ignore_ascii_case(c))?;
+        spec.push((f.kind, f.kind.width() as usize));
+    }
+    let rowlen: usize = spec.iter().map(|(_, w)| *w).sum();
+    let mut table: Vec<Vec<String>> = Vec::new();
+    let mut p = 0usize;
+    while p + 4 <= rows.len() {
+        let len = u32::from_le_bytes(rows[p..p + 4].try_into().ok()?) as usize;
+        p += 4;
+        let body = rows.get(p..p + len)?;
+        p += len;
+        if len != rowlen {
+            return None; // shape doesn't match the projection
+        }
+        let mut off = 0usize;
+        let mut cells = Vec::with_capacity(spec.len());
+        for (kind, w) in &spec {
+            let raw = body.get(off..off + *w)?;
+            off += *w;
+            cells.push(format_value(&kessel_codec::value_from_raw(*kind, raw)));
+        }
+        table.push(cells);
+    }
+    if p != rows.len() {
+        return None;
+    }
+    Some(render_table(cols, &table))
 }
 
 /// Auth handshake tag (mirrors `kesseldb_server::AUTH_TAG`).
@@ -364,6 +417,39 @@ mod tests {
         ] {
             assert!(!format_result(&r).is_empty());
         }
+    }
+
+    #[test]
+    fn render_projection_decodes_column_oriented_rows() {
+        use kessel_catalog::{encode_type_def, Field, FieldKind};
+        let fields = vec![
+            Field { field_id: 1, name: "owner".into(), kind: FieldKind::U32, nullable: false },
+            Field { field_id: 2, name: "bal".into(), kind: FieldKind::I64, nullable: false },
+            Field { field_id: 3, name: "tag".into(), kind: FieldKind::U16, nullable: false },
+        ];
+        let typedef = encode_type_def("acct", &fields);
+        // Projection `SELECT owner, bal` ⇒ each row = u32 LE ++ i64 LE,
+        // length-prefixed.
+        let mut rows = Vec::new();
+        for (o, b) in [(100u32, 50i64), (7, -3)] {
+            let mut row = o.to_le_bytes().to_vec();
+            row.extend_from_slice(&b.to_le_bytes());
+            rows.extend_from_slice(&(row.len() as u32).to_le_bytes());
+            rows.extend_from_slice(&row);
+        }
+        let cols = vec!["owner".to_string(), "bal".to_string()];
+        let out = render_projection(&typedef, &cols, &rows).expect("decodes");
+        assert!(out.contains("owner") && out.contains("bal"));
+        assert!(out.contains("100") && out.contains("-3"), "{out}");
+        assert!(out.contains("(2 rows)"), "{out}");
+
+        // Unknown projected column ⇒ None (CLI falls back to bytes).
+        assert!(render_projection(&typedef, &["nope".into()], &rows).is_none());
+        // Wrong row shape ⇒ None.
+        assert!(
+            render_projection(&typedef, &["owner".into()], &rows).is_none(),
+            "rowlen mismatch must reject"
+        );
     }
 
     #[test]

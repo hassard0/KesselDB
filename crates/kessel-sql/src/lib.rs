@@ -657,54 +657,55 @@ fn try_query_rows(p: &mut P) -> Option<Op> {
     };
     let ot = p.type_named(&tname).ok()?.clone();
     let mut eq_preds: Vec<(u16, Vec<u8>)> = Vec::new();
-    let mut prog: Option<Program> = None;
-    if p.kw("WHERE") {
-        loop {
-            let col = match p.next() {
-                Some(Tok::Ident(s)) => s,
-                _ => return None,
-            };
-            if !matches!(p.next(), Some(Tok::Cmp("="))) {
-                return None;
-            }
-            let lit = match p.next() {
-                Some(Tok::Int(n)) => Lit::Int(n),
-                Some(Tok::Str(s)) => Lit::Str(s),
-                _ => return None,
-            };
-            let f = ot.fields.iter().find(|f| f.name == col)?;
-            let w = f.kind.width() as usize;
-            // index hint bytes must equal the record's stored field bytes
-            let hint = match &lit {
-                Lit::Int(n) => n.to_le_bytes()[..w.min(16)].to_vec(),
-                Lit::Str(s) => s.clone().into_bytes(),
-            };
-            eq_preds.push((f.field_id, hint));
-            // also fold into the verifying program (load == lit)
-            let mut clause = Program::new().load(f.field_id);
-            clause = match &lit {
-                Lit::Int(n) => clause.push_int(*n),
-                Lit::Str(s) => clause.push_bytes(s.as_bytes()),
-            };
-            let clause = Program::from_raw({
-                let mut r = clause.bytes();
-                r.push(3); // EQ
-                r
-            });
-            prog = Some(match prog.take() {
-                None => clause,
-                Some(acc) => {
-                    let mut r = acc.bytes();
-                    r.extend_from_slice(&clause.bytes());
-                    r.push(14); // AND
-                    Program::from_raw(r)
+    // SP62: the FULL `WHERE` is compiled to the verifying program (every
+    // predicate kind: =, range, IN/BETWEEN/LIKE/IS NULL, AND/OR/NOT). The
+    // engine re-verifies every candidate with it, so the result is
+    // *always* identical to a scan regardless of the candidate set —
+    // index hints can only speed it up, never change the answer.
+    let program: Vec<u8> = if p.kw("WHERE") {
+        let ws = p.i;
+        let prog = compile_where(p, &ot).ok()?;
+        let span: &[Tok] = &p.t[ws..p.i];
+        // A `col = literal` hint is only SAFE if it is a *mandatory*
+        // conjunct — i.e. the WHERE has NO top-level OR/NOT/parentheses,
+        // so every comparison must hold. Otherwise emit no hints (the
+        // program-only path == a verified full scan: still correct).
+        let unsafe_for_hints = span.iter().any(|t| {
+            matches!(t, Tok::Punct('('))
+                || matches!(t, Tok::Ident(k)
+                    if k.eq_ignore_ascii_case("OR")
+                    || k.eq_ignore_ascii_case("NOT"))
+        });
+        if !unsafe_for_hints {
+            let mut i = 0;
+            while i + 2 < span.len() {
+                if let (Tok::Ident(c), Tok::Cmp("="), lit) =
+                    (&span[i], &span[i + 1], &span[i + 2])
+                {
+                    if let Some(f) = ot.fields.iter().find(|f| &f.name == c) {
+                        if ot.indexes.contains(&f.field_id) {
+                            let w = f.kind.width() as usize;
+                            let hint = match lit {
+                                Tok::Int(n) => {
+                                    n.to_le_bytes()[..w.min(16)].to_vec()
+                                }
+                                Tok::Str(s) => s.clone().into_bytes(),
+                                _ => {
+                                    i += 1;
+                                    continue;
+                                }
+                            };
+                            eq_preds.push((f.field_id, hint));
+                        }
+                    }
                 }
-            });
-            if !p.kw("AND") {
-                break;
+                i += 1;
             }
         }
-    }
+        prog
+    } else {
+        Program::new().push_int(1).bytes() // no WHERE ⇒ always true
+    };
     let mut limit = 0u32;
     if p.kw("LIMIT") {
         match p.next() {
@@ -718,9 +719,6 @@ fn try_query_rows(p: &mut P) -> Option<Op> {
         None | Some(Tok::Punct(';')) => {}
         _ => return None,
     }
-    let program = prog
-        .unwrap_or_else(|| Program::new().push_int(1))
-        .bytes();
     Some(Op::QueryRows {
         type_id: ot.type_id,
         eq_preds,
@@ -1145,6 +1143,107 @@ mod tests {
         sm.apply(op, o)
     }
 
+    /// SP62 oracle: for randomized data + randomized WHEREs (mixing
+    /// equality on an INDEXED column with range / OR / mixed predicates),
+    /// the planned `SELECT *` result must EXACTLY equal an independent
+    /// brute-force filter. This guards that index-narrowing can never
+    /// drop a matching row — the only way the planner could be unsafe.
+    #[test]
+    fn planner_equivalence_oracle() {
+        use kessel_proto::Rng;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (k U32 NOT NULL, v I64 NOT NULL)");
+        run(&mut sm, 2, "CREATE INDEX ON t (k)"); // k is indexed; v is not
+        let ot = sm.catalog().get(1).unwrap().clone();
+
+        let mut rng = Rng::new(0xA5A5_1234);
+        let mut model: Vec<(u128, u64, i64)> = Vec::new(); // (id,k,v)
+        for id in 1..=120u128 {
+            let k = (rng.below(8)) as u64; // small domain ⇒ many dup keys
+            let v = (rng.below(40) as i64) - 20; // -20..19
+            run(
+                &mut sm,
+                100 + id as u64,
+                &format!("INSERT INTO t (id, k, v) VALUES ({id}, {k}, {v})"),
+            );
+            model.push((id, k, v));
+        }
+
+        // Decode a `SELECT *` result into the multiset of (k, v).
+        let decode_kv = |res: OpResult| -> Vec<(u64, i64)> {
+            let b = match res {
+                OpResult::Got(b) => b,
+                o => panic!("unexpected {o:?}"),
+            };
+            let mut out = Vec::new();
+            let mut p = 0;
+            while p + 4 <= b.len() {
+                let l =
+                    u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize;
+                p += 4;
+                let vals = kessel_codec::decode(&ot, &b[p..p + l]).unwrap();
+                p += l;
+                let k = match vals[0] {
+                    Value::Uint(u) => u as u64,
+                    _ => panic!(),
+                };
+                let v = match vals[1] {
+                    Value::Int(i) => i as i64,
+                    _ => panic!(),
+                };
+                out.push((k, v));
+            }
+            out
+        };
+
+        let mut op = 1000u64;
+        for _ in 0..60 {
+            let kk = rng.below(8);
+            let mm = (rng.below(40) as i64) - 20;
+            // a representative mix; each is a top-level AND chain, an OR,
+            // or a non-equality — all must round-trip exactly.
+            let queries: Vec<(String, Box<dyn Fn(u64, i64) -> bool>)> = vec![
+                (
+                    format!("k = {kk}"),
+                    Box::new(move |k, _v| k == kk),
+                ),
+                (
+                    format!("k = {kk} AND v > {mm}"),
+                    Box::new(move |k, v| k == kk && v > mm),
+                ),
+                (
+                    format!("k = {kk} AND v <= {mm} AND v >= {}", mm - 5),
+                    Box::new(move |k, v| k == kk && v <= mm && v >= mm - 5),
+                ),
+                (
+                    format!("k = {kk} OR v = {mm}"),
+                    Box::new(move |k, v| k == kk || v == mm),
+                ),
+                (
+                    format!("v > {mm} AND k = {kk}"),
+                    Box::new(move |k, v| v > mm && k == kk),
+                ),
+                (
+                    format!("NOT (k = {kk})"),
+                    Box::new(move |k, _v| !(k == kk)),
+                ),
+            ];
+            for (w, pred) in queries {
+                op += 1;
+                let mut got =
+                    decode_kv(run(&mut sm, op, &format!("SELECT * FROM t WHERE {w}")));
+                got.sort();
+                let mut want: Vec<(u64, i64)> = model
+                    .iter()
+                    .filter(|(_, k, v)| pred(*k, *v))
+                    .map(|(_, k, v)| (*k, *v))
+                    .collect();
+                want.sort();
+                assert_eq!(got, want, "WHERE {w}: planner result != brute force");
+            }
+        }
+    }
+
     #[test]
     fn drop_table_sql() {
         let mut sm = StateMachine::open(MemVfs::new()).unwrap();
@@ -1506,10 +1605,16 @@ mod tests {
             Op::QueryRows { eq_preds, .. } => assert_eq!(eq_preds.len(), 1),
             o => panic!("expected QueryRows, got {o:?}"),
         }
-        // OR is outside the restricted grammar -> falls back to Select
+        // SP62: an OR query still plans to QueryRows (full verifying
+        // program), but with NO equality hints — `owner = 100` is not a
+        // mandatory conjunct under OR, so using it to narrow candidates
+        // would be unsound. Empty `eq_preds` == a verified full scan:
+        // correct, just not index-accelerated (proven by the oracle).
         match compile("SELECT * FROM rec WHERE owner = 100 OR v = 1", &cat).unwrap() {
-            Op::Select { .. } => {}
-            o => panic!("expected Select fallback, got {o:?}"),
+            Op::QueryRows { eq_preds, .. } => {
+                assert!(eq_preds.is_empty(), "no hints allowed under OR")
+            }
+            o => panic!("expected QueryRows (no hints) for OR, got {o:?}"),
         }
         // correctness: indexed query returns exactly the 4 owner=100 rows
         match run(&mut sm, 20, "SELECT * FROM rec WHERE owner = 100") {

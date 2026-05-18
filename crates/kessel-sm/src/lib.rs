@@ -1761,13 +1761,17 @@ impl<V: Vfs> StateMachine<V> {
                         found = true;
                     }
                     if ot.ordered.contains(&fid) {
+                        // Numeric 0xFFFD entries (prefix = tag(4)++fid(2)).
                         let idxt = 0xFFFD_0000 | (type_id & 0xFFFF);
                         let mut id = [0u8; 16];
                         id[..2].copy_from_slice(&fid.to_le_bytes());
                         let pre = make_key(idxt, &id);
-                        // prefix = tag(4) ++ fid(2); the rest is the
-                        // order key + padding we want to wildcard.
                         drop_prefix(self, pre[..6].to_vec());
+                        // SP90: CHAR/BYTES 0xFFFC entries, if any.
+                        let mut vpre =
+                            (0xFFFC_0000 | (type_id & 0xFFFF)).to_le_bytes().to_vec();
+                        vpre.extend_from_slice(&fid.to_le_bytes());
+                        drop_prefix(self, vpre);
                         found = true;
                     }
                     if found {
@@ -1881,6 +1885,11 @@ impl<V: Vfs> StateMachine<V> {
                     let mut id = [0u8; 16];
                     id[..2].copy_from_slice(&field_id.to_le_bytes());
                     prefixes.push(make_key(idxt, &id)[..6].to_vec());
+                    // SP90: CHAR/BYTES 0xFFFC ordered-index entries.
+                    let mut vpre =
+                        (0xFFFC_0000 | (type_id & 0xFFFF)).to_le_bytes().to_vec();
+                    vpre.extend_from_slice(&field_id.to_le_bytes());
+                    prefixes.push(vpre);
                 }
                 for (ci, members) in ot.composite.iter().enumerate() {
                     if members.contains(&field_id) {
@@ -2712,43 +2721,81 @@ impl<V: Vfs> StateMachine<V> {
                     if !ot.ordered.contains(&fid) {
                         continue;
                     }
-                    let (_, w, kind) = match Self::ord_field_pos(&ot, fid) {
-                        Some(p) => p,
-                        None => continue,
-                    };
-                    let mut lo_ok = [0u8; 8];
-                    let mut hi_ok = [0xFFu8; 8];
-                    let mut usable = false;
-                    for (f, rop, val) in &range_preds {
-                        if *f != fid {
+                    // Build the order-index [klo, khi] bounds for this
+                    // field's range hints — numeric (0xFFFD, 8-byte
+                    // sign-flipped) or CHAR/BYTES (0xFFFC, raw width-w
+                    // bytes, SP90). The bound is taken inclusively; `>`
+                    // / `<` strictness is enforced by `program`, so the
+                    // slice is a SUPERSET (the SP62/63/70 invariant).
+                    let (klo, khi) = if let Some((_, w, kind)) =
+                        Self::ord_field_pos(&ot, fid)
+                    {
+                        let mut lo_ok = [0u8; 8];
+                        let mut hi_ok = [0xFFu8; 8];
+                        let mut usable = false;
+                        for (f, rop, val) in &range_preds {
+                            if *f != fid {
+                                continue;
+                            }
+                            let vk = match Self::order_key(
+                                kind,
+                                &Self::norm(val, w),
+                            ) {
+                                Some(k) => k,
+                                None => continue,
+                            };
+                            match *rop {
+                                0 | 1 if vk > lo_ok => lo_ok = vk,
+                                2 | 3 if vk < hi_ok => hi_ok = vk,
+                                0..=3 => {}
+                                _ => continue,
+                            }
+                            usable = true;
+                        }
+                        if !usable {
                             continue;
                         }
-                        let vk = match Self::order_key(kind, &Self::norm(val, w))
-                        {
-                            Some(k) => k,
-                            None => continue,
-                        };
-                        match *rop {
-                            0 | 1 if vk > lo_ok => lo_ok = vk, // > / >=
-                            2 | 3 if vk < hi_ok => hi_ok = vk, // < / <=
-                            0..=3 => {}
-                            _ => continue,
+                        let idxt = 0xFFFD_0000 | (type_id & 0xFFFF);
+                        let mut a = [0u8; 16];
+                        a[..2].copy_from_slice(&fid.to_le_bytes());
+                        a[2..10].copy_from_slice(&lo_ok);
+                        let mut b = [0u8; 16];
+                        b[..2].copy_from_slice(&fid.to_le_bytes());
+                        b[2..10].copy_from_slice(&hi_ok);
+                        b[10..].copy_from_slice(&[0xFFu8; 6]);
+                        (make_key(idxt, &a), make_key(idxt, &b))
+                    } else if let Some((_, w, _)) =
+                        Self::vord_field_pos(&ot, fid)
+                    {
+                        // CHAR/BYTES: raw width-w bytes are
+                        // memcmp-ordered; combine hints into one tight
+                        // [lo, hi] (lexicographic Vec<u8> = byte order).
+                        let mut lo_v = vec![0u8; w];
+                        let mut hi_v = vec![0xFFu8; w];
+                        let mut usable = false;
+                        for (f, rop, val) in &range_preds {
+                            if *f != fid {
+                                continue;
+                            }
+                            let vk = Self::norm(val, w);
+                            match *rop {
+                                0 | 1 if vk > lo_v => lo_v = vk,
+                                2 | 3 if vk < hi_v => hi_v = vk,
+                                0..=3 => {}
+                                _ => continue,
+                            }
+                            usable = true;
                         }
-                        usable = true;
-                    }
-                    if !usable {
+                        if !usable {
+                            continue;
+                        }
+                        (
+                            Self::voidx_key(type_id, fid, &lo_v),
+                            Self::voidx_key(type_id, fid, &hi_v),
+                        )
+                    } else {
                         continue;
-                    }
-                    let idxt = 0xFFFD_0000 | (type_id & 0xFFFF);
-                    let mut klo = [0u8; 16];
-                    klo[..2].copy_from_slice(&fid.to_le_bytes());
-                    klo[2..10].copy_from_slice(&lo_ok);
-                    let mut khi = [0u8; 16];
-                    khi[..2].copy_from_slice(&fid.to_le_bytes());
-                    khi[2..10].copy_from_slice(&hi_ok);
-                    khi[10..].copy_from_slice(&[0xFFu8; 6]);
-                    let klo = make_key(idxt, &klo);
-                    let khi = make_key(idxt, &khi);
+                    };
                     let mut ids: std::collections::BTreeSet<[u8; 16]> =
                         std::collections::BTreeSet::new();
                     for (_, entry) in self.storage.scan_range(&klo, &khi) {

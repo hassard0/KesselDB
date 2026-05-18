@@ -986,6 +986,37 @@ fn try_query_rows(p: &mut P) -> Option<Op> {
                         }
                     }
                 }
+                // SP90: `col {> >= < <=} 'str'` on an order-indexed
+                // CHAR/BYTES column — the value bytes are the string
+                // itself (the engine width-normalises lexicographically).
+                if let (Tok::Ident(c), Tok::Cmp(cmp), Tok::Str(s)) =
+                    (&span[i], &span[i + 1], &span[i + 2])
+                {
+                    let rop = match *cmp {
+                        ">" => Some(0u8),
+                        ">=" => Some(1u8),
+                        "<" => Some(2u8),
+                        "<=" => Some(3u8),
+                        _ => None,
+                    };
+                    if let (Some(rop), Some(f)) =
+                        (rop, ot.fields.iter().find(|f| &f.name == c))
+                    {
+                        if ot.ordered.contains(&f.field_id)
+                            && matches!(
+                                f.kind,
+                                kessel_catalog::FieldKind::Char(_)
+                                    | kessel_catalog::FieldKind::Bytes(_)
+                            )
+                        {
+                            range_preds.push((
+                                f.field_id,
+                                rop,
+                                s.clone().into_bytes(),
+                            ));
+                        }
+                    }
+                }
                 i += 1;
             }
         }
@@ -1429,6 +1460,143 @@ mod tests {
     fn run(sm: &mut StateMachine<MemVfs>, op: u64, sql: &str) -> OpResult {
         let o = compile(sql, sm.catalog()).expect("compile");
         sm.apply(op, o)
+    }
+
+    /// SP90: a range-indexed CHAR column makes `SELECT * … WHERE s …`
+    /// index-narrowed (the SP87 0xFFFC ordered index is wired into the
+    /// SP70 planner), and — the real SP62/63/70 superset-verify
+    /// invariant — the index-narrowed answer is *byte-identical* to the
+    /// same WHERE run as a pure Seq Scan over the same rows. We prove
+    /// this against an unindexed twin table, so the oracle makes no
+    /// assumption about CHAR comparison semantics (fixed-width padded
+    /// LHS vs raw literal): whatever the engine's WHERE means, the index
+    /// path must mean exactly the same thing. EXPLAIN confirms the
+    /// accelerator is engaged.
+    #[test]
+    fn string_range_planner_narrows_and_equals_scan() {
+        use kessel_proto::Rng;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        // `t` has the range index; `u` is the identical unindexed twin
+        // that defines ground truth via a full Seq Scan.
+        run(&mut sm, 1, "CREATE TABLE t (s CHAR(8) NOT NULL, n U32 NOT NULL)");
+        run(&mut sm, 2, "CREATE TABLE u (s CHAR(8) NOT NULL, n U32 NOT NULL)");
+        run(&mut sm, 3, "CREATE RANGE INDEX ON t (s)");
+        let ot = sm.catalog().get(1).unwrap().clone();
+        let mut rng = Rng::new(0x57_9A);
+        for id in 1..=140u32 {
+            let len = rng.below(5) as usize;
+            let mut s = String::new();
+            for _ in 0..len {
+                s.push((b'a' + rng.below(6) as u8) as char);
+            }
+            run(
+                &mut sm,
+                10 + id as u64,
+                &format!("INSERT INTO t (id, s, n) VALUES ({id}, '{s}', {id})"),
+            );
+            run(
+                &mut sm,
+                10_000 + id as u64,
+                &format!("INSERT INTO u (id, s, n) VALUES ({id}, '{s}', {id})"),
+            );
+        }
+        // The planner must emit a string range predicate on `s` (not a
+        // bare Seq Scan): proves the SP87 0xFFFC ordered index is wired
+        // into SP70 narrowing for CHAR columns.
+        let rsel = "SELECT * FROM t WHERE s >= 'b' AND s <= 'd'";
+        match compile(rsel, sm.catalog()).expect("compile range select") {
+            Op::QueryRows { range_preds, eq_preds, .. } => {
+                assert!(eq_preds.is_empty(), "no eq preds expected");
+                let sfid = ot
+                    .fields
+                    .iter()
+                    .find(|f| f.name == "s")
+                    .unwrap()
+                    .field_id;
+                assert!(
+                    range_preds.iter().any(|(f, _, _)| *f == sfid),
+                    "string RANGE INDEX must surface a range pred on `s`, \
+                     got {range_preds:?}"
+                );
+            }
+            o => panic!("expected QueryRows, got {o:?}"),
+        }
+        // EXPLAIN (planner-only, via compile_stmt) confirms the human plan
+        // names the range accelerator.
+        match compile_stmt(&format!("EXPLAIN {rsel}"), sm.catalog())
+            .expect("compile EXPLAIN")
+        {
+            Stmt::Explain(plan) => assert!(
+                plan.contains("range") || plan.contains("Range"),
+                "EXPLAIN should show range narrowing for a string \
+                 RANGE INDEX, got: {plan}"
+            ),
+            _ => panic!("EXPLAIN did not compile to Stmt::Explain"),
+        }
+        let decode_n = |res: OpResult| -> Vec<u32> {
+            let b = match res {
+                OpResult::Got(b) => b,
+                o => panic!("unexpected {o:?}"),
+            };
+            let mut out = Vec::new();
+            let mut p = 0;
+            while p + 4 <= b.len() {
+                let l =
+                    u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize;
+                p += 4;
+                let v = kessel_codec::decode(&ot, &b[p..p + l]).unwrap();
+                p += l;
+                if let kessel_codec::Value::Uint(u) = v[1] {
+                    out.push(u as u32);
+                }
+            }
+            out.sort_unstable();
+            out
+        };
+        // Sanity: the twin `u` really is unindexed (a Seq Scan), so the
+        // equality below is index-vs-fullscan, not index-vs-index.
+        match compile(
+            "SELECT * FROM u WHERE s >= 'b' AND s <= 'd'",
+            sm.catalog(),
+        )
+        .expect("compile twin select")
+        {
+            Op::QueryRows { range_preds, eq_preds, .. } => assert!(
+                range_preds.is_empty() && eq_preds.is_empty(),
+                "twin `u` must be a pure Seq Scan, got {range_preds:?}"
+            ),
+            o => panic!("expected QueryRows, got {o:?}"),
+        }
+        let mut op = 1000u64;
+        let mut both = |sm: &mut StateMachine<MemVfs>, op: &mut u64, w: &str| {
+            *op += 1;
+            let a = decode_n(run(sm, *op, &format!("SELECT * FROM t WHERE {w}")));
+            *op += 1;
+            let b = decode_n(run(sm, *op, &format!("SELECT * FROM u WHERE {w}")));
+            (a, b)
+        };
+        for _ in 0..30 {
+            let mk = |rng: &mut Rng| {
+                let len = rng.below(4) as usize;
+                let mut s = String::new();
+                for _ in 0..len {
+                    s.push((b'a' + rng.below(6) as u8) as char);
+                }
+                s
+            };
+            let (a, b) = (mk(&mut rng), mk(&mut rng));
+            let w = format!("s >= '{a}' AND s <= '{b}'");
+            let (idx, scan) = both(&mut sm, &mut op, &w);
+            assert_eq!(
+                idx, scan,
+                "index-narrowed != Seq Scan for `WHERE {w}`"
+            );
+        }
+        // Single open bounds also narrow + match the full scan exactly.
+        for w in ["s > 'm'", "s >= 'c'", "s < 'e'", "s <= 'bb'"] {
+            let (idx, scan) = both(&mut sm, &mut op, w);
+            assert_eq!(idx, scan, "index-narrowed != Seq Scan for `WHERE {w}`");
+        }
     }
 
     /// SP86: a column `DEFAULT` is applied to omitted INSERT columns

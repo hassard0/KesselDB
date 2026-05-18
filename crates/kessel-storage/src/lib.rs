@@ -625,6 +625,14 @@ impl<V: Vfs> Storage<V> {
     /// memtable over SSTables, tombstones dropped. Backs index lookups and
     /// type-range backfill. O(matching + #sstables·log n).
     pub fn scan_range(&self, lo: &Key, hi: &Key) -> Vec<(Key, Vec<u8>)> {
+        // An inverted inclusive range `[lo, hi]` with `lo > hi` contains
+        // nothing — and `BTreeMap::range(lo..=hi)` *panics* on it. A
+        // caller can legitimately produce one (e.g. a planner narrowing
+        // `WHERE s >= 'd' AND s <= 'b'` into inverted index bounds), so
+        // treat it as the empty scan rather than letting it abort.
+        if lo > hi {
+            return Vec::new();
+        }
         let mut merged: BTreeMap<Key, Option<Vec<u8>>> = BTreeMap::new();
         for sst in &self.sstables {
             if !sst.overlaps(lo, hi) {
@@ -661,6 +669,9 @@ impl<V: Vfs> Storage<V> {
     /// `scan_range`. Fast path when there are no SSTables and no active txn
     /// (the common case for index prefix scans) — a direct memtable walk.
     pub fn scan_prefix(&self, lo: &Key, hi: &Key) -> Vec<Key> {
+        if lo > hi {
+            return Vec::new(); // empty inverted range; see `scan_range`.
+        }
         if self.sstables.is_empty() && self.txn.is_none() {
             return self
                 .memtable

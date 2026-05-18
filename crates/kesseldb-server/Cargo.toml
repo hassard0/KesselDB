@@ -13,6 +13,7 @@ kessel-sql = { path = "../kessel-sql" }
 kessel-codec = { path = "../kessel-codec" }
 kessel-catalog = { path = "../kessel-catalog" }
 kessel-client = { path = "../kessel-client" }
+kessel-shard = { path = "../kessel-shard" }
 
 # Opt-in TLS termination. OFF by default so the standard build stays
 # zero-dependency (`cargo build` pulls nothing extra). Enable with

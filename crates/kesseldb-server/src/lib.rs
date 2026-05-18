@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cluster;
+pub mod router;
 
 use kessel_io::DirVfs;
 use kessel_proto::wire::{read_frame, write_frame};

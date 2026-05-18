@@ -155,13 +155,26 @@ impl Program {
 
 fn is_codec_record(ot: &ObjectType, rec: &[u8]) -> bool {
     use kessel_catalog::SCHEMA_VER_BYTES;
-    if rec.len() != ot.compute_layout().record_size {
+    if rec.len() < SCHEMA_VER_BYTES + 2 {
         return false;
     }
     let fc = u16::from_le_bytes(
         rec[SCHEMA_VER_BYTES..SCHEMA_VER_BYTES + 2].try_into().unwrap(),
     ) as usize;
-    fc == ot.fields.len()
+    if fc == 0 || fc > ot.fields.len() {
+        return false;
+    }
+    // A codec record stores `fc` fields; after `ALTER … ADD COLUMN` an
+    // older row has `fc < fields.len()` and the *smaller* record size of
+    // the schema it was written under. Recognise it by matching that
+    // truncated-schema record size (offsets of existing fields are
+    // invariant under appends), so fields ≥ fc up-project to NULL exactly
+    // like `kessel_codec::decode`. Deterministic: pure of (record, schema).
+    let prefix = kessel_catalog::ObjectType::from_def(
+        ot.name.clone(),
+        ot.fields[..fc].to_vec(),
+    );
+    rec.len() == prefix.compute_layout().record_size
 }
 
 fn field_is_null(ot: &ObjectType, rec: &[u8], i: usize) -> bool {

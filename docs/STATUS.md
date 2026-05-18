@@ -68,6 +68,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP58 — multi-row `INSERT`** | **done** | Postgres-shaped `INSERT INTO t (id,..) VALUES (..),(..)` → one atomic `Op::Txn` (one round-trip, one consensus op); legacy `ID <n>` kept; dup-in-batch rejects all; **154 green** |
 | **SP59 — typed projection rendering** | **done** | `value_from_raw` (public, behaviour-preserving `decode` refactor) + `select_columns` + `render_projection`; CLI prints real columns for `SELECT c1,c2` too; JOIN still opaque (honest); **156 green** |
 | **SP60 — `LIKE`** | **done** | deterministic expr-VM `LIKE` opcode (20) + `like_match` (`%`/`_`, no recursion); SQL `col [NOT] LIKE 'pat'`, composes; CHAR-padding trimmed; **158 green** |
+| **SP61 — `ALTER TABLE ADD COLUMN`** | **done** | SQL for online `Op::AlterTypeAddField` (no lock/rewrite, old rows up-project NULL); also **fixed a real bug**: expr VM `is_codec_record` mis-saw added columns as present (IS NULL/CHECK/triggers wrong post-ALTER) — now schema-truncation-precise; **159 green** |
 
 ## Production-readiness gate (precise, not vague)
 

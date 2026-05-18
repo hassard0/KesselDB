@@ -156,6 +156,7 @@ tested):
 
 ```sql
 CREATE TABLE <t> (<col> <TYPE> [NOT NULL], ...)
+ALTER TABLE <t> ADD [COLUMN] <c> <TYPE> [NOT NULL]  -- online, no lock; old rows: NULL
 DROP TABLE <t>                              -- removes rows, indexes & the type
                                             -- (refused if an FK still points at it)
 CREATE INDEX        ON <t> (<col>)          -- equality index

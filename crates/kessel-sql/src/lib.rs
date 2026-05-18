@@ -6,7 +6,9 @@
 
 #![forbid(unsafe_code)]
 
-use kessel_catalog::{encode_type_def, Catalog, Field, FieldKind, ObjectType};
+use kessel_catalog::{
+    encode_field, encode_type_def, Catalog, Field, FieldKind, ObjectType,
+};
 use kessel_codec::{encode, Value};
 use kessel_expr::Program;
 use kessel_proto::{ObjectId, Op};
@@ -353,6 +355,45 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
         let tname = p.ident()?;
         let ot = p.type_named(&tname)?;
         return Ok(Op::DropType { type_id: ot.type_id });
+    }
+
+    if p.kw("ALTER") {
+        // ALTER TABLE <t> ADD [COLUMN] <name> <type>[(n)] [NOT NULL]
+        // — online schema evolution (no table lock). The engine assigns
+        // the new field id and enforces the online-DDL rule that an added
+        // column must be nullable; a `NOT NULL` add surfaces as a clean
+        // SchemaError at apply.
+        p.expect_kw("TABLE")?;
+        let tname = p.ident()?;
+        let ot = p.type_named(&tname)?.clone();
+        p.expect_kw("ADD")?;
+        let _ = p.kw("COLUMN"); // optional noise word
+        let cname = p.ident()?;
+        let tyname = p.ident()?;
+        let mut arg = None;
+        if matches!(p.peek(), Some(Tok::Punct('('))) {
+            p.punct('(')?;
+            match p.next() {
+                Some(Tok::Int(n)) => arg = Some(n),
+                _ => return Err("expected size".into()),
+            }
+            p.punct(')')?;
+        }
+        let mut nullable = true;
+        if p.kw("NOT") {
+            p.expect_kw("NULL")?;
+            nullable = false;
+        }
+        let field = Field {
+            field_id: 0,
+            name: cname,
+            kind: kind_of(&tyname, arg)?,
+            nullable,
+        };
+        return Ok(Op::AlterTypeAddField {
+            type_id: ot.type_id,
+            field: encode_field(&field),
+        });
     }
 
     if p.kw("CREATE") {
@@ -1252,6 +1293,47 @@ mod tests {
             sm.catalog()
         )
         .is_err());
+    }
+
+    #[test]
+    fn alter_table_add_column() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        assert!(matches!(
+            run(&mut sm, 1, "CREATE TABLE t (a U64 NOT NULL)"),
+            OpResult::TypeCreated(1)
+        ));
+        assert_eq!(run(&mut sm, 2, "INSERT INTO t (id, a) VALUES (1, 10)"), OpResult::Ok);
+
+        // Online ADD COLUMN (must be nullable) — no lock, existing rows
+        // up-project the new column as NULL.
+        assert_eq!(run(&mut sm, 3, "ALTER TABLE t ADD COLUMN note I64"), OpResult::Ok);
+        assert_eq!(
+            run(&mut sm, 4, "ALTER TABLE t ADD tag U16"), // COLUMN optional
+            OpResult::Ok
+        );
+        // New schema is visible: insert using the new columns.
+        assert_eq!(
+            run(&mut sm, 5, "INSERT INTO t (id, a, note, tag) VALUES (2, 20, 7, 9)"),
+            OpResult::Ok
+        );
+        let cnt = |sm: &mut StateMachine<MemVfs>, op, q: &str| -> i128 {
+            match run(sm, op, q) {
+                OpResult::Got(b) => i128::from_le_bytes(b.try_into().unwrap()),
+                o => panic!("{q}: {o:?}"),
+            }
+        };
+        assert_eq!(cnt(&mut sm, 6, "SELECT COUNT(*) FROM t"), 2);
+        // The old row reads back with note = NULL (up-projected).
+        assert_eq!(cnt(&mut sm, 7, "SELECT COUNT(*) FROM t WHERE note IS NULL"), 1);
+        assert_eq!(cnt(&mut sm, 8, "SELECT COUNT(*) FROM t WHERE note = 7"), 1);
+
+        // The online-DDL rule: a NOT NULL add is rejected by the engine.
+        assert!(matches!(
+            run(&mut sm, 9, "ALTER TABLE t ADD COLUMN bad U32 NOT NULL"),
+            OpResult::SchemaError(_)
+        ));
+        // Unknown table -> compile error.
+        assert!(compile("ALTER TABLE nope ADD COLUMN x U8", sm.catalog()).is_err());
     }
 
     #[test]

@@ -643,6 +643,9 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
             p.expect_kw("SOURCE")?;
             let name = p.ident()?;
             p.punct('(')?;
+            if matches!(p.peek(), Some(Tok::Punct(')'))) {
+                return Err("EXTERNAL SOURCE must declare at least one column".into());
+            }
             let mut fields = Vec::new();
             let mut mapping: Vec<(u16, String)> = Vec::new();
             let mut next_fid: u16 = 1;
@@ -702,7 +705,7 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
                 .position(|f| f.name == key_name)
                 .map(|i| (i as u16) + 1)
                 .ok_or_else(|| {
-                    SqlError::from("KEY is not a declared column")
+                    format!("KEY `{key_name}` is not a declared column")
                 })?;
             let (mut auth_kind, mut auth_a, mut auth_b) =
                 (0u8, String::new(), String::new());
@@ -1635,6 +1638,12 @@ mod tests {
             }
             o => panic!("got {o:?}"),
         }
+        // FIX 1: KEY naming a non-declared column names it in the error.
+        let e = compile("CREATE EXTERNAL SOURCE k (a U32 NOT NULL FROM 'a') FROM 'http://h' FORMAT JSON KEY zzz", &cat).unwrap_err();
+        assert!(e.contains("zzz"), "KEY error must name the column, got: {e}");
+        // FIX 2: empty column list is a clear error.
+        let e2 = compile("CREATE EXTERNAL SOURCE e () FROM 'http://h' FORMAT JSON KEY a", &cat).unwrap_err();
+        assert!(e2.to_lowercase().contains("at least one column"), "empty col list error, got: {e2}");
     }
 
     #[test]

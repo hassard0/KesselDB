@@ -1202,6 +1202,172 @@ impl<V: Vfs> StateMachine<V> {
                 self.persist_catalog(op_number)
             }
 
+            Op::RenameField { type_id, field_id, name } => {
+                // SP75: catalog-only. Indexes are keyed by field id, so
+                // data and index entries are untouched.
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t,
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                if !ot.fields.iter().any(|f| f.field_id == field_id) {
+                    return OpResult::SchemaError(format!("no field {field_id}"));
+                }
+                if ot.fields.iter().any(|f| f.name == name && f.field_id != field_id) {
+                    return OpResult::Constraint(format!(
+                        "RENAME COLUMN: name \"{name}\" already in use"
+                    ));
+                }
+                if let Some(t) = self.catalog.get_mut(type_id) {
+                    if let Some(f) =
+                        t.fields.iter_mut().find(|f| f.field_id == field_id)
+                    {
+                        f.name = name;
+                    }
+                }
+                self.persist_catalog(op_number)
+            }
+
+            Op::DropField { type_id, field_id } => {
+                // SP75: physically remove a column — re-encode every row
+                // without it and shrink the schema, so nothing
+                // downstream needs a "dropped" special case. Conservative
+                // guards keep it correct rather than clever.
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                let fi = match ot.fields.iter().position(|f| f.field_id == field_id)
+                {
+                    Some(i) => i,
+                    None => return OpResult::SchemaError(format!("no field {field_id}")),
+                };
+                if ot.fields.len() == 1 {
+                    return OpResult::SchemaError(
+                        "DROP COLUMN: a table must keep at least one column \
+                         (use DROP TABLE)"
+                            .into(),
+                    );
+                }
+                if matches!(
+                    ot.fields[fi].kind,
+                    kessel_catalog::FieldKind::OverflowRef
+                ) {
+                    return OpResult::SchemaError(
+                        "DROP COLUMN: overflow columns are not supported".into(),
+                    );
+                }
+                if ot.fks.iter().any(|(f, _, _)| *f == field_id) {
+                    return OpResult::Constraint(
+                        "DROP COLUMN: column backs a foreign key".into(),
+                    );
+                }
+                if !ot.checks.is_empty() || !ot.triggers.is_empty() {
+                    return OpResult::SchemaError(
+                        "DROP COLUMN: not supported on a table with CHECK \
+                         constraints or triggers (their programs are \
+                         position-encoded)"
+                            .into(),
+                    );
+                }
+                let own_txn = !self.storage.in_txn();
+                if own_txn {
+                    self.storage.begin_txn();
+                }
+                // Drop the column's own index entries + catalog membership
+                // (surviving fields' index entries are keyed by
+                // (field_id,value) and their values do not change, so they
+                // stay valid — no rebuild needed).
+                let mut prefixes: Vec<Vec<u8>> = Vec::new();
+                if ot.indexes.contains(&field_id) {
+                    prefixes.push(Self::idx_prefix(type_id, field_id, &[]));
+                }
+                if ot.ordered.contains(&field_id) {
+                    let idxt = 0xFFFD_0000 | (type_id & 0xFFFF);
+                    let mut id = [0u8; 16];
+                    id[..2].copy_from_slice(&field_id.to_le_bytes());
+                    prefixes.push(make_key(idxt, &id)[..6].to_vec());
+                }
+                for (ci, members) in ot.composite.iter().enumerate() {
+                    if members.contains(&field_id) {
+                        prefixes.push(Self::idx_prefix(
+                            type_id,
+                            Self::composite_fid(ci),
+                            &[],
+                        ));
+                    }
+                }
+                for pre in prefixes {
+                    let mut hi = pre.clone();
+                    hi.extend_from_slice(&[0xFFu8; 64]);
+                    for (k, _) in self.storage.scan_range(&pre, &hi) {
+                        let _ = self.storage.delete(op_number, k);
+                    }
+                }
+                // Shrunk schema used to re-encode every row.
+                let mut new_ot = ot.clone();
+                new_ot.fields.remove(fi);
+                let lo = make_key(type_id, &[0u8; 16]);
+                let hi = make_key(type_id, &[0xFFu8; 16]);
+                for (k, rec) in self.storage.scan_range(&lo, &hi) {
+                    let mut vals = match kessel_codec::decode(&ot, &rec) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            if own_txn {
+                                self.storage.abort_txn();
+                            }
+                            return OpResult::SchemaError(format!(
+                                "DROP COLUMN decode: {e:?}"
+                            ));
+                        }
+                    };
+                    vals.remove(fi);
+                    let nr = match kessel_codec::encode(&new_ot, &vals) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            if own_txn {
+                                self.storage.abort_txn();
+                            }
+                            return OpResult::SchemaError(format!(
+                                "DROP COLUMN encode: {e:?}"
+                            ));
+                        }
+                    };
+                    if let Err(e) = self.storage.put(op_number, k, nr) {
+                        if own_txn {
+                            self.storage.abort_txn();
+                        }
+                        return OpResult::SchemaError(format!("DROP COLUMN: {e}"));
+                    }
+                }
+                if let Some(t) = self.catalog.get_mut(type_id) {
+                    t.fields.remove(fi);
+                    t.indexes.retain(|f| *f != field_id);
+                    t.unique.retain(|f| *f != field_id);
+                    t.ordered.retain(|f| *f != field_id);
+                    for c in t.composite.iter_mut() {
+                        if c.contains(&field_id) {
+                            c.clear();
+                        }
+                    }
+                    t.schema_ver += 1;
+                }
+                let pc = self.persist_catalog(op_number);
+                if !matches!(pc, OpResult::Ok) {
+                    if own_txn {
+                        self.storage.abort_txn();
+                    }
+                    return pc;
+                }
+                if own_txn {
+                    if let Err(e) = self.storage.commit_txn() {
+                        return OpResult::SchemaError(format!(
+                            "DROP COLUMN commit: {e}"
+                        ));
+                    }
+                }
+                OpResult::Ok
+            }
+
             Op::Join { left_type, right_type, left_field, right_field, limit } => {
                 let lt = match self.catalog.get(left_type) {
                     Some(t) => t.clone(),

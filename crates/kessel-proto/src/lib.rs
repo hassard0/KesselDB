@@ -137,6 +137,14 @@ pub enum Op {
     /// results are unchanged (the planner falls back to a verified
     /// scan), only un-accelerated. `NotFound` if no such index.
     DropIndex { type_id: TypeId, fields: Vec<u16> },
+    /// Destructive ALTER (SP75): physically remove a column. Every row
+    /// is re-encoded without it, the schema shrinks, and the column's
+    /// own indexes (and any composite that referenced it) are dropped —
+    /// so nothing downstream needs a "dropped" special case.
+    DropField { type_id: TypeId, field_id: u16 },
+    /// ALTER … RENAME COLUMN (SP75): catalog-only; indexes are keyed by
+    /// field id so data and indexes are untouched.
+    RenameField { type_id: TypeId, field_id: u16, name: String },
     /// Inner equi-join (Sub-project 36): rows where
     /// `left.left_field == right.right_field` (raw fixed-width bytes).
     /// Returns up to `limit` joined rows as
@@ -264,6 +272,8 @@ impl Op {
             Op::Describe { .. } => 27,
             Op::DropType { .. } => 29,
             Op::DropIndex { .. } => 30,
+            Op::DropField { .. } => 31,
+            Op::RenameField { .. } => 32,
             Op::Join { .. } => 28,
             Op::Aggregate { .. } => 20,
             Op::SelectFields { .. } => 21,
@@ -357,6 +367,15 @@ impl Op {
             }
             Op::Describe { type_id } | Op::DropType { type_id } => {
                 codec::put_u32(&mut b, *type_id)
+            }
+            Op::DropField { type_id, field_id } => {
+                codec::put_u32(&mut b, *type_id);
+                b.extend_from_slice(&field_id.to_le_bytes());
+            }
+            Op::RenameField { type_id, field_id, name } => {
+                codec::put_u32(&mut b, *type_id);
+                b.extend_from_slice(&field_id.to_le_bytes());
+                codec::put_bytes(&mut b, name.as_bytes());
             }
             Op::Join { left_type, right_type, left_field, right_field, limit } => {
                 codec::put_u32(&mut b, *left_type);
@@ -510,6 +529,12 @@ impl Op {
                 }
                 Op::DropIndex { type_id, fields }
             }
+            31 => Op::DropField { type_id: c.u32()?, field_id: c.u16()? },
+            32 => Op::RenameField {
+                type_id: c.u32()?,
+                field_id: c.u16()?,
+                name: String::from_utf8_lossy(&c.bytes()?).into_owned(),
+            },
             28 => Op::Join {
                 left_type: c.u32()?,
                 right_type: c.u32()?,
@@ -786,6 +811,8 @@ mod tests {
             Op::AddCompositeIndex { type_id: 4, fields: vec![1, 3] },
             Op::DropIndex { type_id: 4, fields: vec![1] },
             Op::DropIndex { type_id: 4, fields: vec![1, 3] },
+            Op::DropField { type_id: 4, field_id: 2 },
+            Op::RenameField { type_id: 4, field_id: 2, name: "renamed".into() },
             Op::FindByComposite { type_id: 4, fields: vec![1, 3], values: vec![vec![9], vec![8, 8]] },
         ];
         for op in ops {

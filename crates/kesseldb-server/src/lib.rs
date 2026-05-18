@@ -193,7 +193,10 @@ impl CompileCache {
 /// Applying an op of one of these kinds can change the catalog/schema, so
 /// any cached compiled statement must be discarded afterwards.
 fn mutates_schema(op: &Op) -> bool {
-    matches!(op.kind(), 1 | 2 | 8 | 10 | 12 | 13 | 14 | 17 | 24 | 15 | 29 | 30)
+    matches!(
+        op.kind(),
+        1 | 2 | 8 | 10 | 12 | 13 | 14 | 17 | 24 | 15 | 29 | 30 | 31 | 32
+    )
 }
 
 /// Apply exactly ONE request frame (`[0xFE] ++ SQL`, or a bare

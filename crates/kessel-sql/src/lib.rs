@@ -395,6 +395,14 @@ fn plan_string(stmt: &Stmt, cat: &Catalog) -> String {
                 tname(*type_id),
                 cols(*type_id, fields)
             ),
+            Op::DropField { type_id, field_id } => format!(
+                "Drop Column {} ({}) — re-encode rows",
+                tname(*type_id),
+                cols(*type_id, &[*field_id])
+            ),
+            Op::RenameField { type_id, .. } => {
+                format!("Rename Column on {} (catalog only)", tname(*type_id))
+            }
             Op::AlterTypeAddField { type_id, .. } => {
                 format!("Alter {} Add Column (online, no lock)", tname(*type_id))
             }
@@ -531,6 +539,37 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
         p.expect_kw("TABLE")?;
         let tname = p.ident()?;
         let ot = p.type_named(&tname)?.clone();
+        // SP75: destructive ALTER — DROP / RENAME COLUMN.
+        if p.kw("DROP") {
+            let _ = p.kw("COLUMN"); // optional noise word
+            let c = p.ident()?;
+            let f = ot
+                .fields
+                .iter()
+                .find(|f| f.name == c)
+                .ok_or_else(|| format!("unknown column `{c}`"))?;
+            return Ok(Op::DropField {
+                type_id: ot.type_id,
+                field_id: f.field_id,
+            });
+        }
+        if p.kw("RENAME") {
+            let _ = p.kw("COLUMN");
+            let c = p.ident()?;
+            let f = ot
+                .fields
+                .iter()
+                .find(|f| f.name == c)
+                .ok_or_else(|| format!("unknown column `{c}`"))?
+                .field_id;
+            p.expect_kw("TO")?;
+            let newname = p.ident()?;
+            return Ok(Op::RenameField {
+                type_id: ot.type_id,
+                field_id: f,
+                name: newname,
+            });
+        }
         p.expect_kw("ADD")?;
         let _ = p.kw("COLUMN"); // optional noise word
         let cname = p.ident()?;
@@ -1627,6 +1666,120 @@ mod tests {
             run(&mut b, *op, ["DROP INDEX ON t (k)", "DROP INDEX ON t (v)", "DROP INDEX ON t (k, v)"][i]);
         }
         assert_eq!(a.digest(), b.digest(), "DROP INDEX must be deterministic");
+    }
+
+    /// SP75: ALTER TABLE DROP COLUMN physically removes the column
+    /// (re-encodes rows, shrinks schema, drops its indexes) with
+    /// surviving data intact and nothing downstream special-cased;
+    /// RENAME COLUMN is catalog-only; both deterministic; guards hold.
+    #[test]
+    fn alter_drop_and_rename_column() {
+        let cols = |sm: &StateMachine<MemVfs>| -> Vec<String> {
+            let ot = sm.catalog().get(1).unwrap();
+            ot.fields.iter().map(|f| f.name.clone()).collect()
+        };
+        let scalar = |sm: &mut StateMachine<MemVfs>, op, q: &str| -> i128 {
+            match run(sm, op, q) {
+                OpResult::Got(b) => i128::from_le_bytes(b.try_into().unwrap()),
+                o => panic!("{o:?}"),
+            }
+        };
+        let build = || {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            run(&mut sm, 1, "CREATE TABLE t (a U32 NOT NULL, b I64 NOT NULL, c U32 NOT NULL)");
+            run(&mut sm, 2, "CREATE INDEX ON t (a)");
+            run(&mut sm, 3, "CREATE RANGE INDEX ON t (b)");
+            run(&mut sm, 4, "CREATE INDEX ON t (a, c)"); // composite incl. c
+            for i in 0..30u64 {
+                run(
+                    &mut sm,
+                    10 + i,
+                    &format!(
+                        "INSERT INTO t (id, a, b, c) VALUES ({i}, {}, {}, {})",
+                        i % 4,
+                        i as i64 - 10,
+                        i * 100
+                    ),
+                );
+            }
+            sm
+        };
+        let mut sm = build();
+        let sum_a_before = scalar(&mut sm, 100, "SELECT SUM(a) FROM t");
+        let by_b_before = scalar(
+            &mut sm,
+            101,
+            "SELECT COUNT(*) FROM t WHERE b >= -5 AND b <= 5",
+        );
+
+        // RENAME b -> bal: catalog-only, indexes keyed by field id.
+        assert_eq!(
+            run(&mut sm, 200, "ALTER TABLE t RENAME COLUMN b TO bal"),
+            OpResult::Ok
+        );
+        assert_eq!(cols(&sm), ["a", "bal", "c"]);
+        assert!(compile("SELECT * FROM t WHERE b = 1", sm.catalog()).is_err());
+        // Range index still works under the new name (same field id).
+        assert_eq!(
+            scalar(&mut sm, 201, "SELECT COUNT(*) FROM t WHERE bal >= -5 AND bal <= 5"),
+            by_b_before
+        );
+
+        // DROP COLUMN c: physically removed, schema shrinks, surviving
+        // data intact, composite (a,c) emptied, c's lookups gone.
+        assert_eq!(
+            run(&mut sm, 210, "ALTER TABLE t DROP COLUMN c"),
+            OpResult::Ok
+        );
+        assert_eq!(cols(&sm), ["a", "bal"]);
+        assert_eq!(
+            scalar(&mut sm, 211, "SELECT SUM(a) FROM t"),
+            sum_a_before,
+            "surviving column data must be intact after re-encode"
+        );
+        assert_eq!(
+            scalar(&mut sm, 212, "SELECT COUNT(*) FROM t WHERE bal >= -5 AND bal <= 5"),
+            by_b_before,
+            "untouched index stays correct after DROP COLUMN"
+        );
+        assert!(compile("SELECT * FROM t WHERE c = 1", sm.catalog()).is_err());
+        {
+            let ot = sm.catalog().get(1).unwrap();
+            assert!(ot.composite.iter().all(|x| x.is_empty()), "composite with c emptied");
+            assert!(ot.fields.iter().all(|f| f.name != "c"));
+        }
+        // Re-add a column then it's usable (schema truly mutable).
+        assert_eq!(
+            run(&mut sm, 220, "ALTER TABLE t ADD COLUMN note U32"),
+            OpResult::Ok
+        );
+        assert_eq!(cols(&sm), ["a", "bal", "note"]);
+
+        // Guards. Unknown column is rejected at compile (names are
+        // resolved in the parser).
+        assert!(compile("ALTER TABLE t DROP COLUMN nope", sm.catalog()).is_err());
+        // A table must keep at least one column (use DROP TABLE instead).
+        let mut g = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut g, 1, "CREATE TABLE one (x U32 NOT NULL)");
+        assert!(
+            matches!(
+                run(&mut g, 2, "ALTER TABLE one DROP COLUMN x"),
+                OpResult::SchemaError(_)
+            ),
+            "dropping the last column must be refused"
+        );
+
+        // Determinism: identical histories ⇒ identical digest.
+        let mut a = build();
+        let mut b = build();
+        for (op, q) in [
+            (200u64, "ALTER TABLE t RENAME COLUMN b TO bal"),
+            (210, "ALTER TABLE t DROP COLUMN c"),
+        ] {
+            run(&mut a, op, q);
+            run(&mut b, op, q);
+        }
+        assert_eq!(a.digest(), b.digest(), "destructive ALTER must be deterministic");
     }
 
     #[test]

@@ -1625,5 +1625,214 @@ pub mod sim {
         let d = c.live_digests();
         assert!(d.iter().all(|x| *x == d[0]), "diverged under loss: {d:?}");
     }
+
+    // ---- SP95 (#74): multi-node disk-fault-DURING-view-change ----
+    //
+    // A self-contained cluster over `FaultVfs<MemVfs>` (the public
+    // `Cluster` stays `MemVfs`-typed; no API churn). It can crash a
+    // replica, then *reopen its StateMachine from the faulted disk*
+    // and rejoin it with a fresh VSR layer — the SP94 cursor makes
+    // re-feeding its durable prefix idempotent, so it converges with
+    // the quorum instead of double-applying.
+    mod fault {
+        use crate::{Msg, Replica};
+        use kessel_io::{FaultKind, FaultVfs, MemVfs};
+        use kessel_proto::{Op, OpResult};
+        use kessel_sm::StateMachine;
+        use std::collections::{HashMap, VecDeque};
+
+        type Cid = u128;
+
+        struct FCluster {
+            rs: Vec<Replica<FaultVfs<MemVfs>>>,
+            vfs: Vec<FaultVfs<MemVfs>>,
+            inbox: Vec<VecDeque<(usize, Msg)>>,
+            replies: HashMap<(Cid, u64), OpResult>,
+            n: usize,
+        }
+
+        impl FCluster {
+            fn new(n: usize) -> Self {
+                let vfs: Vec<_> =
+                    (0..n).map(|_| FaultVfs::new(MemVfs::new())).collect();
+                let rs = (0..n)
+                    .map(|i| {
+                        Replica::new(
+                            i,
+                            n,
+                            StateMachine::open(vfs[i].clone()).unwrap(),
+                        )
+                    })
+                    .collect();
+                FCluster {
+                    rs,
+                    vfs,
+                    inbox: (0..n).map(|_| VecDeque::new()).collect(),
+                    replies: HashMap::new(),
+                    n,
+                }
+            }
+
+            fn route(&mut self, from: usize, out: crate::Out) {
+                for (to, m) in out.msgs {
+                    if to < self.n && !self.rs[to].crashed {
+                        self.inbox[to].push_back((from, m));
+                    }
+                }
+                for (c, r, res) in out.replies {
+                    self.replies.entry((c, r)).or_insert(res);
+                }
+            }
+
+            fn step(&mut self, reqs: &[(Cid, u64, Op)], step: usize) {
+                for (c, r, op) in reqs {
+                    if !self.replies.contains_key(&(*c, *r)) {
+                        let t = ((*c as usize) + step / 3) % self.n;
+                        if !self.rs[t].crashed {
+                            self.inbox[t].push_back((
+                                usize::MAX,
+                                Msg::Request { client: *c, req: *r, op: op.clone() },
+                            ));
+                        }
+                    }
+                }
+                for i in 0..self.n {
+                    if self.rs[i].crashed {
+                        self.inbox[i].clear();
+                        continue;
+                    }
+                    while let Some((from, m)) = self.inbox[i].pop_front() {
+                        let out = self.rs[i].handle(from, m);
+                        self.route(i, out);
+                    }
+                }
+                for i in 0..self.n {
+                    if self.rs[i].crashed {
+                        continue;
+                    }
+                    let out = self.rs[i].tick();
+                    self.route(i, out);
+                }
+            }
+
+            fn run(&mut self, reqs: &[(Cid, u64, Op)], max: usize) -> bool {
+                for s in 0..max {
+                    self.step(reqs, s);
+                    if reqs.iter().all(|(c, r, _)| self.replies.contains_key(&(*c, *r)))
+                    {
+                        return true;
+                    }
+                }
+                false
+            }
+
+            fn quiesce(&mut self, steps: usize) {
+                for s in 0..steps {
+                    self.step(&[], s);
+                }
+            }
+
+            /// Crash replica `i`, then recover it *from its own
+            /// (fault-damaged) disk*: drop the unsynced tail, reopen
+            /// the StateMachine, and rejoin with a fresh VSR layer.
+            fn crash_recover(&mut self, i: usize) {
+                // The fault modelled the crash that already happened;
+                // recovery I/O itself is clean.
+                self.vfs[i].plan().borrow_mut().kind = None;
+                self.vfs[i].inner().crash(); // lose the unsynced tail
+                let sm = StateMachine::open(self.vfs[i].clone()).unwrap();
+                self.rs[i] = Replica::new(i, self.n, sm);
+                self.inbox[i].clear(); // in-flight msgs lost on crash
+            }
+
+            fn live_digests(&self) -> Vec<(usize, u32)> {
+                self.rs
+                    .iter()
+                    .filter(|r| !r.crashed)
+                    .map(|r| (r.idx, r.digest()))
+                    .collect()
+            }
+        }
+
+        fn create(id: u128, b: u8) -> Op {
+            Op::Create { type_id: 1, id: kessel_proto::ObjectId::from_u128(id), record: vec![b] }
+        }
+        fn def() -> Op {
+            Op::CreateType {
+                def: kessel_catalog::encode_type_def("t", &[]),
+            }
+        }
+
+        /// A torn WAL write injected on the **new primary while it is
+        /// driving the post-failover view change** must not lose any
+        /// client-acked op: the faulted node, recovered from its
+        /// damaged disk and rejoined with a blank VSR layer, catches
+        /// up from the surviving quorum and converges to the *same*
+        /// digest — and the whole run is deterministic.
+        fn scenario() -> (Vec<(usize, u32)>, usize, bool) {
+            let mut c = FCluster::new(3);
+            // Warm up: type + rows, all acked & quorum-durable.
+            let mut reqs = vec![(1u128, 1u64, def())];
+            for i in 0..6u64 {
+                reqs.push((1, i + 2, create(i as u128, i as u8)));
+            }
+            assert!(c.run(&reqs, 4000), "warmup must commit");
+            let warm_acked = c.replies.len();
+
+            // Kill the primary (replica 0, view 0) → forces a view
+            // change onto replica 1.
+            c.rs[0].crashed = true;
+
+            // Arm a torn WAL write on replica 1: it tears the 4th WAL
+            // write replica 1 makes *as it applies the recovered log
+            // during/after the view change*.
+            c.vfs[1].arm("wal", 4, FaultKind::Torn);
+
+            let mut more = Vec::new();
+            for i in 0..24u64 {
+                more.push((2u128, i + 1, create(100 + i as u128, i as u8)));
+            }
+            assert!(
+                c.run(&more, 16000),
+                "must make progress after failover despite the disk fault"
+            );
+            let total_acked = c.replies.len();
+            let fired = c.vfs[1].fired();
+
+            // Recover replica 1 from its damaged disk; replica 0 stays
+            // down. Live quorum = {1 (recovered), 2}.
+            c.crash_recover(1);
+            c.quiesce(40_000); // catch-up + reconverge
+
+            (c.live_digests(), total_acked - warm_acked, fired)
+        }
+
+        #[test]
+        fn disk_fault_during_view_change_preserves_committed_and_converges() {
+            let (digs, post_failover_acked, fired) = scenario();
+            assert!(fired, "the torn-write fault must actually have fired");
+            // Replicas 1 (recovered) and 2 are live and MUST agree.
+            assert_eq!(digs.len(), 2, "two live replicas expected: {digs:?}");
+            assert_eq!(
+                digs[0].1, digs[1].1,
+                "recovered replica diverged from the surviving quorum: {digs:?}"
+            );
+            // The post-failover ops were all acked (no committed op
+            // lost, no hang) — quorum carried them while a node was
+            // disk-faulted.
+            assert_eq!(
+                post_failover_acked, 24,
+                "every post-failover client op must stay acked"
+            );
+            // Deterministic: the whole fault+recovery run reconverges
+            // to the identical digest.
+            let (digs2, acked2, _) = scenario();
+            assert_eq!(
+                digs2[0].1, digs[0].1,
+                "fault/recovery convergence must be deterministic"
+            );
+            assert_eq!(acked2, 24);
+        }
+    }
     } // mod tests
 } // pub mod sim

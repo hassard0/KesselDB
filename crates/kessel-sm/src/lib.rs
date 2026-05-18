@@ -386,7 +386,7 @@ impl<V: Vfs> StateMachine<V> {
         // SP87: variable-length (CHAR/BYTES) ordered indexes — the
         // numeric loop above skipped these (ord_field_pos → None).
         for fid in ot.ordered.clone() {
-            let (off, w, _k) = match Self::vord_field_pos(&ot, fid) {
+            let (off, w, k) = match Self::vord_field_pos(&ot, fid) {
                 Some(p) => p,
                 None => continue,
             };
@@ -396,11 +396,11 @@ impl<V: Vfs> StateMachine<V> {
                 continue;
             }
             if let Some(o) = ov {
-                let o = o.to_vec();
+                let o = Self::vorder_key(k, o, w);
                 self.voidx_remove(op_number, type_id, fid, &o, obj);
             }
             if let Some(n) = nv {
-                let n = n.to_vec();
+                let n = Self::vorder_key(k, n, w);
                 self.voidx_add(op_number, type_id, fid, &n, obj);
             }
         }
@@ -495,11 +495,55 @@ impl<V: Vfs> StateMachine<V> {
         use kessel_catalog::FieldKind::*;
         let i = ot.fields.iter().position(|f| f.field_id == fid)?;
         let kind = ot.fields[i].kind;
-        if !matches!(kind, Char(_) | Bytes(_)) {
+        // CHAR/BYTES are memcmp-ordered as stored; U128/I128 (SP91)
+        // exceed the 8-byte numeric path and ride the same 0xFFFC
+        // keyspace via an order-preserving 16-byte transform
+        // (`vorder_key`).
+        if !matches!(kind, Char(_) | Bytes(_) | U128 | I128) {
             return None;
         }
         let layout = ot.compute_layout();
         Some((layout.offsets[i], kind.width() as usize, kind))
+    }
+
+    /// The order-preserving variable-length key for the `0xFFFC`
+    /// keyspace. CHAR/BYTES: the raw width-`w` bytes, unchanged (so
+    /// every pre-SP91 string index is byte-identical — zero migration
+    /// / digest risk). U128: 16-byte big-endian (memcmp == numeric).
+    /// I128 (SP91): 16-byte big-endian with the sign bit flipped so
+    /// negatives sort below positives. `raw` is the field's stored
+    /// little-endian bytes (or a `norm`-padded bound).
+    fn vorder_key(
+        kind: kessel_catalog::FieldKind,
+        raw: &[u8],
+        w: usize,
+    ) -> Vec<u8> {
+        use kessel_catalog::FieldKind::*;
+        match kind {
+            U128 | I128 => {
+                let mut le = [0u8; 16];
+                let n = raw.len().min(16);
+                le[..n].copy_from_slice(&raw[..n]);
+                // sign-extend a short negative I128 bound (codec-stored
+                // fields are always full width; SQL/Op bounds may be
+                // minimal) — mirrors the codec's load path.
+                if matches!(kind, I128)
+                    && n > 0
+                    && n < 16
+                    && raw[n - 1] & 0x80 != 0
+                {
+                    for b in le.iter_mut().skip(n) {
+                        *b = 0xFF;
+                    }
+                }
+                let mut v = u128::from_le_bytes(le);
+                if matches!(kind, I128) {
+                    v ^= 1u128 << 127;
+                }
+                v.to_be_bytes().to_vec()
+            }
+            _ => Self::norm(raw, w),
+        }
     }
 
     fn voidx_key(ut: u32, fid: u16, ok: &[u8]) -> Key {
@@ -2764,12 +2808,15 @@ impl<V: Vfs> StateMachine<V> {
                         b[2..10].copy_from_slice(&hi_ok);
                         b[10..].copy_from_slice(&[0xFFu8; 6]);
                         (make_key(idxt, &a), make_key(idxt, &b))
-                    } else if let Some((_, w, _)) =
+                    } else if let Some((_, w, k)) =
                         Self::vord_field_pos(&ot, fid)
                     {
-                        // CHAR/BYTES: raw width-w bytes are
+                        // CHAR/BYTES raw bytes — and U128/I128 via the
+                        // SP91 order-preserving transform — are
                         // memcmp-ordered; combine hints into one tight
-                        // [lo, hi] (lexicographic Vec<u8> = byte order).
+                        // [lo, hi]. The `[0; w]`..`[0xFF; w]` defaults
+                        // are full-range in the *transformed* space too
+                        // (sign-flip maps all of i128 onto it).
                         let mut lo_v = vec![0u8; w];
                         let mut hi_v = vec![0xFFu8; w];
                         let mut usable = false;
@@ -2777,7 +2824,7 @@ impl<V: Vfs> StateMachine<V> {
                             if *f != fid {
                                 continue;
                             }
-                            let vk = Self::norm(val, w);
+                            let vk = Self::vorder_key(k, val, w);
                             match *rop {
                                 0 | 1 if vk > lo_v => lo_v = vk,
                                 2 | 3 if vk < hi_v => hi_v = vk,
@@ -3183,7 +3230,8 @@ impl<V: Vfs> StateMachine<V> {
                 if num.is_none() && var.is_none() {
                     return OpResult::SchemaError(
                         "field kind not supported for ordered index (need \
-                         fixed-width ≤8B numeric/bool/ts, or CHAR/BYTES)"
+                         fixed-width ≤8B numeric/bool/ts, U128/I128, or \
+                         CHAR/BYTES)"
                             .into(),
                     );
                 }
@@ -3208,9 +3256,9 @@ impl<V: Vfs> StateMachine<V> {
                         {
                             self.oidx_add(op_number, type_id, field_id, ok, obj);
                         }
-                    } else if let Some((off, w, _)) = var {
+                    } else if let Some((off, w, k)) = var {
                         if let Some(b) = rec.get(off..off + w) {
-                            let b = b.to_vec();
+                            let b = Self::vorder_key(k, b, w);
                             self.voidx_add(op_number, type_id, field_id, &b, obj);
                         }
                     }
@@ -3251,16 +3299,25 @@ impl<V: Vfs> StateMachine<V> {
                     b[2..10].copy_from_slice(&hi_ok);
                     b[10..].copy_from_slice(&[0xFFu8; 6]);
                     (make_key(idxt, &a), make_key(idxt, &b))
-                } else if let Some((_, w, _)) =
+                } else if let Some((_, w, k)) =
                     Self::vord_field_pos(&ot, field_id)
                 {
-                    // CHAR/BYTES: the order key is the raw width-`w`
-                    // bytes (memcmp order); bucket keys are exactly
-                    // tag++fid++ok, so the inclusive [lo,hi] scan needs
-                    // no padding slot (unlike the numeric layout).
+                    // CHAR/BYTES: order key = raw width-`w` bytes
+                    // (memcmp order). U128/I128 (SP91): order-preserving
+                    // 16-byte BE / sign-flipped key. Bucket keys are
+                    // exactly tag++fid++ok, so the inclusive [lo,hi]
+                    // scan needs no padding slot.
                     (
-                        Self::voidx_key(type_id, field_id, &Self::norm(&lo, w)),
-                        Self::voidx_key(type_id, field_id, &Self::norm(&hi, w)),
+                        Self::voidx_key(
+                            type_id,
+                            field_id,
+                            &Self::vorder_key(k, &lo, w),
+                        ),
+                        Self::voidx_key(
+                            type_id,
+                            field_id,
+                            &Self::vorder_key(k, &hi, w),
+                        ),
                     )
                 } else {
                     return OpResult::SchemaError(
@@ -4413,6 +4470,178 @@ mod tests {
         let (a, _) = build();
         let (b2, _) = build();
         assert_eq!(a.digest(), b2.digest(), "string range index must be deterministic");
+    }
+
+    /// SP91 oracle: a `RANGE INDEX` on a 16-byte `U128` / `I128`
+    /// column makes `Op::FindRange` return EXACTLY the numeric-range
+    /// rows (== an independent brute-force filter) — *including
+    /// negative I128 values, which must sort below the positives* —
+    /// stays correct under UPDATE/DELETE, and is deterministic. These
+    /// exceed the 8-byte numeric `0xFFFD` path; SP91 routes them
+    /// through the SP87 `0xFFFC` variable-length keyspace with an
+    /// order-preserving 16-byte big-endian (sign-flipped for I128) key.
+    #[test]
+    fn u128_i128_range_index_equals_brute_force_and_is_maintained() {
+        use kessel_codec::{encode, Value};
+        use kessel_proto::Rng;
+
+        // ---- U128 ----
+        let udef = encode_type_def(
+            "u",
+            &[
+                Field { field_id: 0, name: "v".into(), kind: FieldKind::U128, nullable: false },
+                Field { field_id: 0, name: "n".into(), kind: FieldKind::U32, nullable: false },
+            ],
+        );
+        let ubuild = || {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            sm.apply(1, Op::CreateType { def: udef.clone() });
+            let cot = sm.catalog().get(1).unwrap().clone();
+            let mut rng = Rng::new(0x91_A1);
+            let mut model: Vec<(u128, u128)> = Vec::new();
+            for id in 1..=120u128 {
+                // wide values spanning the whole u128 range.
+                let v = (rng.below(u64::MAX) as u128) << 64
+                    | rng.below(u64::MAX) as u128;
+                let rec = encode(
+                    &cot,
+                    &[Value::Uint(v), Value::Uint(id)],
+                )
+                .unwrap();
+                sm.apply(
+                    10 + id as u64,
+                    Op::Create { type_id: 1, id: ObjectId::from_u128(id), record: rec },
+                );
+                model.push((id, v));
+            }
+            sm.apply(900, Op::AddOrderedIndex { type_id: 1, field_id: 1 });
+            (sm, model)
+        };
+        let (mut sm, mut model) = ubuild();
+        let mut rng = Rng::new(0x77_22);
+        let mut op = 2000u64;
+        for _ in 0..40 {
+            let mut mk = |r: &mut Rng| {
+                (r.below(u64::MAX) as u128) << 64 | r.below(u64::MAX) as u128
+            };
+            let (mut lo, mut hi) = (mk(&mut rng), mk(&mut rng));
+            if hi < lo {
+                std::mem::swap(&mut lo, &mut hi);
+            }
+            op += 1;
+            let mut got = ids_of(sm.apply(
+                op,
+                Op::FindRange {
+                    type_id: 1,
+                    field_id: 1,
+                    lo: lo.to_le_bytes().to_vec(),
+                    hi: hi.to_le_bytes().to_vec(),
+                },
+            ));
+            got.sort_unstable();
+            let mut want: Vec<u128> = model
+                .iter()
+                .filter(|(_, v)| *v >= lo && *v <= hi)
+                .map(|(id, _)| *id)
+                .collect();
+            want.sort_unstable();
+            assert_eq!(got, want, "U128 FindRange({lo}..={hi}) != brute force");
+        }
+        // UPDATE maintenance: move row 1 to u128::MAX.
+        let cot = sm.catalog().get(1).unwrap().clone();
+        let z = encode(&cot, &[Value::Uint(u128::MAX), Value::Uint(1)]).unwrap();
+        sm.apply(5000, Op::Update { type_id: 1, id: ObjectId::from_u128(1), record: z });
+        model.iter_mut().find(|(id, _)| *id == 1).unwrap().1 = u128::MAX;
+        assert!(
+            ids_of(sm.apply(5001, Op::FindRange {
+                type_id: 1,
+                field_id: 1,
+                lo: (u128::MAX - 1).to_le_bytes().to_vec(),
+                hi: u128::MAX.to_le_bytes().to_vec(),
+            }))
+            .contains(&1),
+            "UPDATE re-indexed the U128 row under its new value"
+        );
+        // DELETE maintenance.
+        sm.apply(5002, Op::Delete { type_id: 1, id: ObjectId::from_u128(1) });
+        assert!(
+            !ids_of(sm.apply(5003, Op::FindRange {
+                type_id: 1,
+                field_id: 1,
+                lo: (u128::MAX - 1).to_le_bytes().to_vec(),
+                hi: u128::MAX.to_le_bytes().to_vec(),
+            }))
+            .contains(&1),
+            "DELETE removed the U128 row from the index"
+        );
+        let (a, _) = ubuild();
+        let (b, _) = ubuild();
+        assert_eq!(a.digest(), b.digest(), "U128 range index must be deterministic");
+
+        // ---- I128 (signed: negatives must sort below positives) ----
+        let idef = encode_type_def(
+            "i",
+            &[
+                Field { field_id: 0, name: "v".into(), kind: FieldKind::I128, nullable: false },
+                Field { field_id: 0, name: "n".into(), kind: FieldKind::U32, nullable: false },
+            ],
+        );
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: idef.clone() });
+        let cot = sm.catalog().get(1).unwrap().clone();
+        let mut rng = Rng::new(0x5151);
+        let mut model: Vec<(u128, i128)> = Vec::new();
+        for id in 1..=120u128 {
+            let mag = (rng.below(u64::MAX) as i128) << 32 | rng.below(u64::MAX) as i128;
+            let v = if rng.below(2) == 0 { -mag } else { mag };
+            let rec = encode(&cot, &[Value::Int(v), Value::Uint(id)]).unwrap();
+            sm.apply(
+                10 + id as u64,
+                Op::Create { type_id: 1, id: ObjectId::from_u128(id), record: rec },
+            );
+            model.push((id, v));
+        }
+        sm.apply(900, Op::AddOrderedIndex { type_id: 1, field_id: 1 });
+        let mut op = 3000u64;
+        for _ in 0..40 {
+            let mut mk = |r: &mut Rng| {
+                let mag = (r.below(u64::MAX) as i128) << 32 | r.below(u64::MAX) as i128;
+                if r.below(2) == 0 { -mag } else { mag }
+            };
+            let (mut lo, mut hi) = (mk(&mut rng), mk(&mut rng));
+            if hi < lo {
+                std::mem::swap(&mut lo, &mut hi);
+            }
+            op += 1;
+            let mut got = ids_of(sm.apply(
+                op,
+                Op::FindRange {
+                    type_id: 1,
+                    field_id: 1,
+                    lo: lo.to_le_bytes().to_vec(),
+                    hi: hi.to_le_bytes().to_vec(),
+                },
+            ));
+            got.sort_unstable();
+            let mut want: Vec<u128> = model
+                .iter()
+                .filter(|(_, v)| *v >= lo && *v <= hi)
+                .map(|(id, _)| *id)
+                .collect();
+            want.sort_unstable();
+            assert_eq!(got, want, "I128 FindRange({lo}..={hi}) != brute force");
+        }
+        // Spanning bound that straddles zero must include both signs.
+        let mut got = ids_of(sm.apply(9000, Op::FindRange {
+            type_id: 1,
+            field_id: 1,
+            lo: i128::MIN.to_le_bytes().to_vec(),
+            hi: i128::MAX.to_le_bytes().to_vec(),
+        }));
+        got.sort_unstable();
+        let mut all: Vec<u128> = model.iter().map(|(id, _)| *id).collect();
+        all.sort_unstable();
+        assert_eq!(got, all, "I128 full-range must return every row");
     }
 
     fn rng_below(r: &mut kessel_proto::Rng, n: u64) -> u64 {

@@ -1599,6 +1599,125 @@ mod tests {
         }
     }
 
+    /// SP91: a `RANGE INDEX` on a `U128` / `I128` column makes
+    /// `SELECT … WHERE v …` index-narrowed through the SP70 planner,
+    /// byte-identical to the same `WHERE` over an unindexed twin —
+    /// including I128 ranges that straddle zero (negatives sort
+    /// below positives).
+    #[test]
+    fn u128_i128_range_planner_narrows_and_equals_scan() {
+        use kessel_proto::Rng;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (v U128 NOT NULL, n U32 NOT NULL)");
+        run(&mut sm, 2, "CREATE TABLE u (v U128 NOT NULL, n U32 NOT NULL)");
+        run(&mut sm, 3, "CREATE RANGE INDEX ON t (v)");
+        run(&mut sm, 4, "CREATE TABLE ti (v I128 NOT NULL, n U32 NOT NULL)");
+        run(&mut sm, 5, "CREATE TABLE ui (v I128 NOT NULL, n U32 NOT NULL)");
+        run(&mut sm, 6, "CREATE RANGE INDEX ON ti (v)");
+        let ot = sm.catalog().get(1).unwrap().clone();
+        let oti = sm.catalog().get(4).unwrap().clone();
+        let mut rng = Rng::new(0x91_5C);
+        // U128 values up to i128::MAX (SQL integer literals are i128).
+        let mut uvals = Vec::new();
+        let mut ivals = Vec::new();
+        for id in 1..=120u32 {
+            let uv = (rng.below(u64::MAX) as u128) << 60
+                | rng.below(u64::MAX) as u128;
+            let mag =
+                (rng.below(u64::MAX) as i128) << 20 | rng.below(u64::MAX) as i128;
+            let iv = if rng.below(2) == 0 { -mag } else { mag };
+            run(&mut sm, 100 + id as u64,
+                &format!("INSERT INTO t (id, v, n) VALUES ({id}, {uv}, {id})"));
+            run(&mut sm, 1_000 + id as u64,
+                &format!("INSERT INTO u (id, v, n) VALUES ({id}, {uv}, {id})"));
+            run(&mut sm, 2_000 + id as u64,
+                &format!("INSERT INTO ti (id, v, n) VALUES ({id}, {iv}, {id})"));
+            run(&mut sm, 3_000 + id as u64,
+                &format!("INSERT INTO ui (id, v, n) VALUES ({id}, {iv}, {id})"));
+            uvals.push(uv);
+            ivals.push(iv);
+        }
+        // Planner must emit a range pred on the 16-byte column.
+        match compile("SELECT * FROM t WHERE v >= 5 AND v <= 9", sm.catalog())
+            .expect("compile")
+        {
+            Op::QueryRows { range_preds, .. } => assert!(
+                !range_preds.is_empty(),
+                "U128 RANGE INDEX must surface a range pred"
+            ),
+            o => panic!("expected QueryRows, got {o:?}"),
+        }
+        let decode_n = |res: OpResult, t: &kessel_catalog::ObjectType| -> Vec<u32> {
+            let b = match res {
+                OpResult::Got(b) => b,
+                o => panic!("unexpected {o:?}"),
+            };
+            let mut out = Vec::new();
+            let mut p = 0;
+            while p + 4 <= b.len() {
+                let l =
+                    u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize;
+                p += 4;
+                let v = kessel_codec::decode(t, &b[p..p + l]).unwrap();
+                p += l;
+                if let kessel_codec::Value::Uint(u) = v[1] {
+                    out.push(u as u32);
+                }
+            }
+            out.sort_unstable();
+            out
+        };
+        let mut op = 5000u64;
+        for _ in 0..30 {
+            let mut pick = |r: &mut Rng, v: &[u128]| v[r.below(v.len() as u64) as usize];
+            let (mut a, mut b) = (pick(&mut rng, &uvals), pick(&mut rng, &uvals));
+            if b < a {
+                std::mem::swap(&mut a, &mut b);
+            }
+            op += 1;
+            let idx = decode_n(
+                run(&mut sm, op, &format!("SELECT * FROM t WHERE v >= {a} AND v <= {b}")),
+                &ot,
+            );
+            op += 1;
+            let scan = decode_n(
+                run(&mut sm, op, &format!("SELECT * FROM u WHERE v >= {a} AND v <= {b}")),
+                &ot,
+            );
+            assert_eq!(idx, scan, "U128 index-narrowed != Seq Scan [{a},{b}]");
+
+            let mut pi = |r: &mut Rng| ivals[r.below(ivals.len() as u64) as usize];
+            let (mut c, mut d) = (pi(&mut rng), pi(&mut rng));
+            if d < c {
+                std::mem::swap(&mut c, &mut d);
+            }
+            op += 1;
+            let iidx = decode_n(
+                run(&mut sm, op, &format!("SELECT * FROM ti WHERE v >= {c} AND v <= {d}")),
+                &oti,
+            );
+            op += 1;
+            let iscan = decode_n(
+                run(&mut sm, op, &format!("SELECT * FROM ui WHERE v >= {c} AND v <= {d}")),
+                &oti,
+            );
+            assert_eq!(iidx, iscan, "I128 index-narrowed != Seq Scan [{c},{d}]");
+        }
+        // An I128 window straddling zero must include both signs and
+        // still match the full scan exactly.
+        op += 1;
+        let zi = decode_n(
+            run(&mut sm, op, "SELECT * FROM ti WHERE v >= -1000000 AND v <= 1000000"),
+            &oti,
+        );
+        op += 1;
+        let zs = decode_n(
+            run(&mut sm, op, "SELECT * FROM ui WHERE v >= -1000000 AND v <= 1000000"),
+            &oti,
+        );
+        assert_eq!(zi, zs, "I128 zero-straddling window != Seq Scan");
+    }
+
     /// SP86: a column `DEFAULT` is applied to omitted INSERT columns
     /// (including a `NOT NULL` column that has a default), an explicit
     /// value overrides it, a `NOT NULL` column with no default still

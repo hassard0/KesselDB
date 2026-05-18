@@ -53,6 +53,8 @@ const PUSH_BYTES: u8 = 17;
 const SET_FIELD: u8 = 18; // trigger-only: pop value, write into working record
 const REJECT: u8 = 19; // trigger-only: abort the write
 const LIKE: u8 = 20; // pop pattern(Bytes) + value(Bytes) -> Int 0/1 (SQL LIKE)
+const SHA256: u8 = 21; // pop value(Bytes) -> Bytes (32-byte digest)
+const HMAC256: u8 = 22; // pop key(Bytes), value(Bytes) -> Bytes (HMAC-SHA256)
 
 /// Deterministic SQL `LIKE` matcher: `%` = any (incl. empty) byte run,
 /// `_` = exactly one byte. Iterative with the classic single backtrack
@@ -124,6 +126,8 @@ impl Program {
     }
     pub fn eq(self) -> Self { self.op(EQ) }
     pub fn ne(self) -> Self { self.op(NE) }
+    pub fn sha256(self) -> Self { self.op(SHA256) }
+    pub fn hmac256(self) -> Self { self.op(HMAC256) }
     pub fn like(self) -> Self { self.op(LIKE) }
     pub fn lt(self) -> Self { self.op(LT) }
     pub fn le(self) -> Self { self.op(LE) }
@@ -418,6 +422,35 @@ fn run(
                 };
                 st.push(Value::Int(r as i128));
             }
+            SHA256 => {
+                // Hash the top value's bytes; Int is hashed via its
+                // 16-byte LE form so the result is deterministic and
+                // type-stable across replicas.
+                let v = pop!();
+                let bytes = match v {
+                    Value::Bytes(b) => b,
+                    Value::Int(n) => n.to_le_bytes().to_vec(),
+                    Value::Null => Vec::new(),
+                };
+                st.push(Value::Bytes(kessel_crypto::sha256(&bytes).to_vec()));
+            }
+            HMAC256 => {
+                let key = pop!();
+                let msg = pop!();
+                let kb = match key {
+                    Value::Bytes(b) => b,
+                    Value::Int(n) => n.to_le_bytes().to_vec(),
+                    Value::Null => Vec::new(),
+                };
+                let mb = match msg {
+                    Value::Bytes(b) => b,
+                    Value::Int(n) => n.to_le_bytes().to_vec(),
+                    Value::Null => Vec::new(),
+                };
+                st.push(Value::Bytes(
+                    kessel_crypto::hmac_sha256(&kb, &mb).to_vec(),
+                ));
+            }
             LT => ord!(|o| o == std::cmp::Ordering::Less),
             LE => ord!(|o| o != std::cmp::Ordering::Greater),
             GT => ord!(|o| o == std::cmp::Ordering::Greater),
@@ -546,6 +579,40 @@ mod tests {
         b[l.offsets[0]..l.offsets[0] + 4].copy_from_slice(&age.to_le_bytes());
         b[l.offsets[1]..l.offsets[1] + 8].copy_from_slice(&bal.to_le_bytes());
         b
+    }
+
+    #[test]
+    fn sha256_and_hmac_opcodes_are_correct_and_deterministic() {
+        let ot = ot();
+        let rec: Vec<u8> = vec![];
+        // sha256("abc") equals the known digest -> predicate true.
+        let want = kessel_crypto::sha256(b"abc");
+        let p = Program::new()
+            .push_bytes(b"abc")
+            .sha256()
+            .push_bytes(&want)
+            .eq()
+            .bytes();
+        assert_eq!(eval(&p, &ot, &rec), Ok(true));
+        // wrong expected -> false (no panic, deterministic)
+        let p2 = Program::new()
+            .push_bytes(b"abc")
+            .sha256()
+            .push_bytes(b"not-the-digest")
+            .eq()
+            .bytes();
+        assert_eq!(eval(&p2, &ot, &rec), Ok(false));
+        // HMAC-SHA256(key="Jefe", msg="what do ya want for nothing?")
+        let hwant =
+            kessel_crypto::hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        let p3 = Program::new()
+            .push_bytes(b"what do ya want for nothing?")
+            .push_bytes(b"Jefe")
+            .hmac256()
+            .push_bytes(&hwant)
+            .eq()
+            .bytes();
+        assert_eq!(eval(&p3, &ot, &rec), Ok(true));
     }
 
     #[test]

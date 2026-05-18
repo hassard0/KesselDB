@@ -6,7 +6,7 @@
 
 *"It's the database that made the Kessel Run in 12 parsecs."*
 
-`161 tests green` · `0 external dependencies` · `Rust 1.95+` · single‑binary
+`165 tests green` · `0 external dependencies` · `Rust 1.95+` · single‑binary
 
 </div>
 
@@ -36,7 +36,8 @@ feature, not an aspiration.
   `COUNT/SUM/MIN/MAX/AVG`, `CREATE [UNIQUE|RANGE] INDEX`, `DESCRIBE`, `EXPLAIN`.
 - **Constraints & logic** — `NOT NULL`, `UNIQUE`, foreign keys with
   `ON DELETE RESTRICT/CASCADE/SET NULL`, `CHECK`, and deterministic triggers
-  (a gas‑bounded zero‑dep expression VM).
+  (a gas‑bounded zero‑dep expression VM) — incl. zero‑dep, test‑vector‑verified
+  **SHA‑256 / HMAC‑SHA256** usable in `CHECK`/triggers (pgcrypto‑subset).
 - **Atomic transactions** — SQL `BEGIN`/`COMMIT`/`ROLLBACK` (and op‑level
   `Op::Txn`): all‑or‑nothing, replicated as a single operation. Multi‑row
   `INSERT … VALUES (…),(…)` is one atomic op in **one round‑trip** — a
@@ -160,7 +161,7 @@ Honest boundaries (documented, not hidden):
 - **Non‑gating roadmap** (tracked, not blocking): balance‑guard helpers,
   cross‑shard transactions, destructive `ALTER TABLE` & `DROP INDEX` (`DROP TABLE` done, SP54), overflow GC.
 
-Every claim in this repository is backed by the test suite (`161 tests`); the
+Every claim in this repository is backed by the test suite (`165 tests`); the
 docs call out exactly what is proven versus roadmap.
 
 ## Documentation
@@ -177,7 +178,7 @@ docs call out exactly what is proven versus roadmap.
 
 ```bash
 cargo build                 # all crates, zero external deps
-cargo test --workspace      # 161 tests (incl. seeded partition/fault simulation)
+cargo test --workspace      # 165 tests (incl. seeded partition/fault simulation)
 cargo run -p kessel-bench --release -- --help   # benchmarks
 ```
 

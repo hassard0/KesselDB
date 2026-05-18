@@ -1,12 +1,10 @@
 [package]
-name = "kessel-expr"
+name = "kessel-crypto"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 
 [dependencies]
-kessel-catalog = { path = "../kessel-catalog" }
-kessel-crypto = { path = "../kessel-crypto" }
 
 [lib]
 path = "src/lib.rs"

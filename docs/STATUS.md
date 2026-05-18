@@ -72,6 +72,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP62 — planner index-accelerates mixed WHEREs** | **done** | `SELECT * WHERE idx=K AND other>M …` now index-narrowed (was full scan) via mandatory-AND equality hints + full-program verify; **randomized oracle** (360 queries: index path == brute-force scan) guards correctness; OR/NOT → no hints (safe); **160 green** |
 | **SP63 — composite-index narrowing** | **done** | multi-col equality covered only by a composite index now narrowed via `FindByComposite` inside `Op::QueryRows` — **no protocol/replicated-op change**; oracle strengthened (+composite cases, ~480 queries); determinism untouched; **160 green** |
 | **SP64 — SQL `EXPLAIN`** | **done** | `EXPLAIN <stmt>` returns the real plan text (composite/index/seq scan, PK lookup, joins, DDL) without executing; CLI prints it; pure planner-layer, zero engine/determinism risk; **161 green** |
+| **SP65 — `kessel-crypto` (pgcrypto subset)** | **done** | zero-dep SHA-256 + HMAC-SHA256, NIST/RFC-4231 vector-verified; deterministic expr-VM `SHA256`/`HMAC256` opcodes (usable in CHECK/triggers); honest scope = hashing/HMAC only; **165 green** |
 
 ## Production-readiness gate (precise, not vague)
 

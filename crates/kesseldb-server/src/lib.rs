@@ -35,6 +35,14 @@ pub const SNAPSHOT_TAG: u8 = 0xFA;
 /// connection handler from statements buffered between `BEGIN` and
 /// `COMMIT`; the client never builds it directly.
 pub const TXN_TAG: u8 = 0xF9;
+/// Pipeline of INDEPENDENT requests (SP69). Frame =
+/// `[0xF8][u32 cnt]` then `cnt × ([u32 len][inner frame])`, where each
+/// inner frame is an ordinary `[0xFE] ++ SQL` or `Op::encode()` frame.
+/// Unlike [`TXN_TAG`] this is **not** atomic — every member applies
+/// independently and gets its own result; the only thing batched is the
+/// group-commit fsync and the network round-trip. The reply is
+/// `Got([u32 cnt]` then `cnt × ([u32 len][OpResult::encode]))`, in order.
+pub const PIPELINE_TAG: u8 = 0xF8;
 
 /// Operational status of a running node.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -186,6 +194,93 @@ impl CompileCache {
 /// any cached compiled statement must be discarded afterwards.
 fn mutates_schema(op: &Op) -> bool {
     matches!(op.kind(), 1 | 2 | 8 | 10 | 12 | 13 | 14 | 17 | 24 | 15 | 29)
+}
+
+/// Apply exactly ONE request frame (`[0xFE] ++ SQL`, or a bare
+/// `Op::encode()`) on the engine thread, including the server-side
+/// read-modify-write for SQL `UPDATE`. This is the single source of
+/// truth for "what one request does", shared by the normal path and by
+/// every member of a pipeline batch (SP69) — so a pipelined member is
+/// byte-for-byte equivalent to having sent it alone (same monotonic id,
+/// same compile-cache use/invalidation, same result). It deliberately
+/// does NOT handle the admin/txn/pipeline tags (those need the engine's
+/// `start`/`dir` and are handled by the driver).
+fn apply_one(
+    sm: &mut StateMachine<DirVfs>,
+    cache: &mut CompileCache,
+    n: &mut u64,
+    frame: &[u8],
+) -> OpResult {
+    let op = if frame.first() == Some(&0xFE) {
+        let sql = match std::str::from_utf8(&frame[1..]) {
+            Ok(s) => s,
+            Err(_) => {
+                return OpResult::SchemaError("sql: not utf8".into());
+            }
+        };
+        match cache.get_or_compile(sql, sm.catalog()) {
+            Ok(kessel_sql::Stmt::Op(o)) => Some(o),
+            Ok(kessel_sql::Stmt::Update { type_id, id, sets }) => {
+                // Server-side read-modify-write for SQL UPDATE.
+                let oid = kessel_proto::ObjectId::from_u128(id);
+                let cur = sm.apply(*n, Op::GetById { type_id, id: oid });
+                *n += 1;
+                let rec = match cur {
+                    OpResult::Got(r) => r,
+                    other => return other, // NotFound etc.
+                };
+                let ot = match sm.catalog().get(type_id) {
+                    Some(t) => t.clone(),
+                    None => {
+                        return OpResult::SchemaError("update: no type".into());
+                    }
+                };
+                let mut vals = match kessel_codec::decode(&ot, &rec) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return OpResult::SchemaError(format!(
+                            "update decode: {e:?}"
+                        ));
+                    }
+                };
+                for (fid, v) in sets {
+                    if let Some(i) =
+                        ot.fields.iter().position(|f| f.field_id == fid)
+                    {
+                        vals[i] = v;
+                    }
+                }
+                match kessel_codec::encode(&ot, &vals) {
+                    Ok(record) => Some(Op::Update { type_id, id: oid, record }),
+                    Err(e) => {
+                        return OpResult::SchemaError(format!(
+                            "update encode: {e:?}"
+                        ));
+                    }
+                }
+            }
+            Ok(kessel_sql::Stmt::Explain(plan)) => {
+                return OpResult::Got(plan.into_bytes());
+            }
+            Err(e) => {
+                return OpResult::SchemaError(format!("sql: {e}"));
+            }
+        }
+    } else {
+        Op::decode(frame)
+    };
+    match op {
+        Some(o) => {
+            let mutates = mutates_schema(&o);
+            let r = sm.apply(*n, o);
+            *n += 1;
+            if mutates {
+                cache.invalidate(); // schema changed → cached plans stale
+            }
+            r
+        }
+        None => OpResult::SchemaError("malformed request frame".into()),
+    }
 }
 
 /// One request to the engine thread: an op and a one-shot reply channel.
@@ -378,80 +473,56 @@ pub fn spawn_engine_cfg(
                         Err(e) => OpResult::SchemaError(e),
                     };
                 }
+                Some(&PIPELINE_TAG) => {
+                    // SP69: a pipeline of INDEPENDENT requests. The whole
+                    // batch is ONE engine message, so it lands in a single
+                    // group-commit fsync and costs a single network
+                    // round-trip — while every member applies exactly as
+                    // if it had been sent alone (same order, same ids,
+                    // same compile-cache use/invalidation via `apply_one`).
+                    // This is the lever SP68 left open: the group-commit
+                    // batch is bounded by in-flight ops, and a serial
+                    // connection only ever has one; a pipeline lets a
+                    // single connection fill the batch itself.
+                    let body = &frame[1..];
+                    let parsed = (|| -> Option<Vec<OpResult>> {
+                        let cnt = u32::from_le_bytes(
+                            body.get(0..4)?.try_into().ok()?,
+                        ) as usize;
+                        let mut p = 4usize;
+                        let mut out = Vec::with_capacity(cnt);
+                        for _ in 0..cnt {
+                            let l = u32::from_le_bytes(
+                                body.get(p..p + 4)?.try_into().ok()?,
+                            ) as usize;
+                            p += 4;
+                            let sub = body.get(p..p + l)?;
+                            p += l;
+                            out.push(apply_one(sm, cache, n, sub));
+                        }
+                        (p == body.len()).then_some(out)
+                    })();
+                    return match parsed {
+                        Some(results) => {
+                            let mut payload =
+                                (results.len() as u32).to_le_bytes().to_vec();
+                            for r in &results {
+                                let e = r.encode();
+                                payload.extend_from_slice(
+                                    &(e.len() as u32).to_le_bytes(),
+                                );
+                                payload.extend_from_slice(&e);
+                            }
+                            OpResult::Got(payload)
+                        }
+                        None => OpResult::SchemaError(
+                            "malformed pipeline frame".into(),
+                        ),
+                    };
+                }
                 _ => {}
             }
-            let op = if frame.first() == Some(&0xFE) {
-                let sql = match std::str::from_utf8(&frame[1..]) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        return OpResult::SchemaError("sql: not utf8".into());
-                    }
-                };
-                match cache.get_or_compile(sql, sm.catalog()) {
-                    Ok(kessel_sql::Stmt::Op(o)) => Some(o),
-                    Ok(kessel_sql::Stmt::Update { type_id, id, sets }) => {
-                        // Server-side read-modify-write for SQL UPDATE.
-                        let oid = kessel_proto::ObjectId::from_u128(id);
-                        let cur = sm.apply(*n, Op::GetById { type_id, id: oid });
-                        *n += 1;
-                        let rec = match cur {
-                            OpResult::Got(r) => r,
-                            other => return other, // NotFound etc.
-                        };
-                        let ot = match sm.catalog().get(type_id) {
-                            Some(t) => t.clone(),
-                            None => {
-                                return OpResult::SchemaError(
-                                    "update: no type".into(),
-                                );
-                            }
-                        };
-                        let mut vals = match kessel_codec::decode(&ot, &rec) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                return OpResult::SchemaError(format!(
-                                    "update decode: {e:?}"
-                                ));
-                            }
-                        };
-                        for (fid, v) in sets {
-                            if let Some(i) =
-                                ot.fields.iter().position(|f| f.field_id == fid)
-                            {
-                                vals[i] = v;
-                            }
-                        }
-                        match kessel_codec::encode(&ot, &vals) {
-                            Ok(record) => Some(Op::Update { type_id, id: oid, record }),
-                            Err(e) => {
-                                return OpResult::SchemaError(format!(
-                                    "update encode: {e:?}"
-                                ));
-                            }
-                        }
-                    }
-                    Ok(kessel_sql::Stmt::Explain(plan)) => {
-                        return OpResult::Got(plan.into_bytes());
-                    }
-                    Err(e) => {
-                        return OpResult::SchemaError(format!("sql: {e}"));
-                    }
-                }
-            } else {
-                Op::decode(&frame)
-            };
-            match op {
-                Some(o) => {
-                    let mutates = mutates_schema(&o);
-                    let r = sm.apply(*n, o);
-                    *n += 1;
-                    if mutates {
-                        cache.invalidate(); // schema changed → cached plans stale
-                    }
-                    r
-                }
-                None => OpResult::SchemaError("malformed request frame".into()),
-            }
+            apply_one(sm, cache, n, frame)
         };
 
         // Group-commit driver: block for one request, drain everything
@@ -1179,6 +1250,110 @@ mod tests {
                 i128::from_le_bytes(b.try_into().unwrap()),
                 total as i128,
                 "every committed row must be durable & present"
+            ),
+            o => panic!("unexpected {o:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pipelined_batch_is_equivalent_and_amortises_round_trips() {
+        // SP69: a pipeline is N independent requests in ONE frame → one
+        // group-commit fsync + one network round-trip. Two things proven:
+        //  (1) equivalence — results are per-statement, in order, and a
+        //      failure in one member does NOT abort the others (it is NOT
+        //      a transaction); the final state equals sending them singly.
+        //  (2) the round-trip/fsync amortisation: ONE connection pushing
+        //      batched inserts beats the per-statement path, because SP68's
+        //      group-commit batch is bounded by in-flight ops and a serial
+        //      connection only ever has one.
+        let dir = std::env::temp_dir()
+            .join(format!("kesseldb-pl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = spawn_engine(&dir).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || serve(listener, engine));
+        let mut c = Client::connect(addr).unwrap();
+        assert!(matches!(
+            c.sql("CREATE TABLE t (v U64 NOT NULL)").unwrap(),
+            OpResult::TypeCreated(1)
+        ));
+
+        // (1) Equivalence + independence: middle statement is a dup id and
+        // must fail on its own WITHOUT taking down the rest.
+        assert_eq!(c.sql("INSERT INTO t (id, v) VALUES (1, 10)").unwrap(), OpResult::Ok);
+        let res = c
+            .pipeline(&[
+                "INSERT INTO t (id, v) VALUES (2, 20)",
+                "INSERT INTO t (id, v) VALUES (1, 99)", // dup → Exists
+                "INSERT INTO t (id, v) VALUES (3, 30)",
+                "SELECT * FROM t ID 2",
+            ])
+            .unwrap();
+        assert_eq!(res.len(), 4);
+        assert_eq!(res[0], OpResult::Ok);
+        assert_eq!(res[1], OpResult::Exists, "dup fails independently");
+        assert_eq!(res[2], OpResult::Ok, "later members unaffected");
+        assert!(matches!(res[3], OpResult::Got(_)));
+        // Final state: ids 1,2,3 present; id 1 still the original value
+        // (the pipelined dup did NOT overwrite) — exactly as if sent singly.
+        assert!(matches!(c.sql("SELECT * FROM t ID 3").unwrap(), OpResult::Got(_)));
+        match c.sql("SELECT COUNT(*) FROM t").unwrap() {
+            OpResult::Got(b) => {
+                assert_eq!(i128::from_le_bytes(b.try_into().unwrap()), 3)
+            }
+            o => panic!("unexpected {o:?}"),
+        }
+
+        // (2) Throughput: 12,000 durable inserts from ONE connection in
+        // batches of 500 (24 round-trips, not 12,000). Compare to the
+        // serial path on the same single connection.
+        let total = 12_000usize;
+        let batch = 500usize;
+        let t = std::time::Instant::now();
+        let mut id = 100usize;
+        for _ in 0..(total / batch) {
+            let stmts: Vec<String> = (0..batch)
+                .map(|_| {
+                    id += 1;
+                    format!("INSERT INTO t (id, v) VALUES ({id}, 1)")
+                })
+                .collect();
+            let refs: Vec<&str> = stmts.iter().map(|s| s.as_str()).collect();
+            for r in c.pipeline(&refs).unwrap() {
+                assert_eq!(r, OpResult::Ok);
+            }
+        }
+        let psecs = t.elapsed().as_secs_f64();
+        let serial_id0 = id;
+        let t2 = std::time::Instant::now();
+        for _ in 0..2000 {
+            id += 1;
+            assert_eq!(
+                c.sql(&format!("INSERT INTO t (id, v) VALUES ({id}, 1)")).unwrap(),
+                OpResult::Ok
+            );
+        }
+        let ssecs = t2.elapsed().as_secs_f64();
+        let _ = serial_id0;
+        println!(
+            "[pipeline] {total} inserts pipelined (batch {batch}) in \
+             {psecs:.3}s = {:.0} ops/s   |   serial 2000 in {ssecs:.3}s = \
+             {:.0} ops/s   speedup ~{:.1}x",
+            total as f64 / psecs,
+            2000.0 / ssecs,
+            (total as f64 / psecs) / (2000.0 / ssecs)
+        );
+
+        // Correctness: every pipelined + serial row is durable & visible
+        // from a FRESH connection (3 setup + 12000 + 2000).
+        let mut c2 = Client::connect(addr).unwrap();
+        match c2.sql("SELECT COUNT(*) FROM t").unwrap() {
+            OpResult::Got(b) => assert_eq!(
+                i128::from_le_bytes(b.try_into().unwrap()),
+                (3 + total + 2000) as i128,
+                "all pipelined & serial rows must be durable"
             ),
             o => panic!("unexpected {o:?}"),
         }

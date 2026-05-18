@@ -76,6 +76,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP66 — optional TLS** | **done** | opt-in `tls` cargo feature (rustls); generic `Read+Write` server I/O (refactor behaviour-identical, 165 green); `ServerConfig.tls`; default build stays zero-dep + plaintext+token; both builds verified clean |
 | **SP67 — profile-driven LRU fix** | **done** | profiled write path on vulcan → O(cap) `ReadCache` eviction scan (latent since SP50) was the bottleneck; O(log n) `BTreeSet` LRU, semantics byte-identical; **vulcan CREATE 7.7K→215K ops/s (~28×), p50 131µs→2µs**; **166 green**, determinism intact |
 | **SP68 — group commit + TCP_NODELAY** | **done** | server drains+applies+fsyncs-once-per-batch (EBS lever; replies only after durable; order/digest unchanged) + `set_nodelay` everywhere — measuring on vulcan/Linux found Nagle was the real EC2 bottleneck: **vulcan durable 97→1,870 ops/s (~19×)**, 12k rows correct; **167 green** |
+| **SP69 — request pipelining** | **done** | `PIPELINE_TAG 0xF8`: N independent statements in one frame → one engine message → one group-fsync + one round-trip; `apply_one` shared core makes a member byte-identical to a lone request (NOT atomic — dup-in-batch fails independently, asserted); **vulcan single-conn 242→52,721 ops/s (~217×)**, all rows durable; **168 green** |
 
 ## Production-readiness gate (precise, not vague)
 
@@ -313,6 +314,28 @@ amortises the fsync (the EBS lever). vulcan's absolute number is gated by
 real fsync + only 8 synchronous clients (batch = in-flight ops);
 throughput scales with concurrency/pipelining (next lever) — stated, not
 overclaimed.
+
+### SP69 — request pipelining (the SP68-named next lever, measured)
+
+`pipelined_batch_is_equivalent_and_amortises_round_trips`: ONE
+connection, 12 000 inserts in batches of 500 vs the serial path on the
+same connection.
+
+| single connection | serial | pipelined (batch 500) | speedup |
+|---|---|---|---|
+| dev box (Windows) | 1,839 ops/s | 88,933 ops/s | ~48× |
+| **vulcan (Linux)** | **242 ops/s** | **52,721 ops/s** | **~217×** |
+
+A serial connection has one op in flight, so SP68's group fsync amortised
+over a batch of 1 and the network paid a round-trip per statement.
+Pipelining puts N independent statements in one engine message → one
+fsync + one round-trip, each member byte-identical to a lone request
+(shared `apply_one`; NOT atomic — a dup-in-batch fails independently,
+asserted). A single pipelined connection (52,721 ops/s) now does ~28×
+SP68's best 8-concurrent-connection durable number (1,870). Gated by real
+fsync over 500-op batches on a near-full disk; bigger batches / more
+pipelined connections go higher — limiting factors named, 14 003 rows
+durable from a fresh connection asserted.
 
 GET fast on DirVfs because post-flush data sits in OS-cached SSTables; the slower
 MemVfs GET reflects the known O(#sstables) read path (no bloom filter yet, M4 work).

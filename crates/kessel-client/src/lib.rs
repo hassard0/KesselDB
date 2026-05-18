@@ -226,6 +226,9 @@ pub fn render_projection(
 /// Auth handshake tag (mirrors `kesseldb_server::AUTH_TAG`).
 pub const AUTH_TAG: u8 = 0xFC;
 
+/// Pipeline tag (mirrors `kesseldb_server::PIPELINE_TAG`).
+pub const PIPELINE_TAG: u8 = 0xF8;
+
 /// Send `[0xFC] ++ token` and require an `Ok` reply. Used by both client
 /// kinds when a server token is configured.
 fn do_auth(stream: &mut TcpStream, token: &[u8]) -> io::Result<()> {
@@ -279,6 +282,52 @@ impl Client {
         let resp = read_frame(&mut self.stream)?;
         OpResult::decode(&resp)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad OpResult frame"))
+    }
+
+    /// Pipeline a batch of SQL statements in ONE round-trip. Each runs
+    /// independently (this is **not** a transaction — for atomicity use
+    /// `BEGIN`/`COMMIT`); the win is that the whole batch costs a single
+    /// network round-trip and lands in one server group-commit fsync.
+    /// Returns one `OpResult` per statement, in order. A pipelined
+    /// statement behaves exactly as if sent alone via [`Client::sql`].
+    pub fn pipeline(&mut self, stmts: &[&str]) -> io::Result<Vec<OpResult>> {
+        let mut frame = vec![PIPELINE_TAG];
+        frame.extend_from_slice(&(stmts.len() as u32).to_le_bytes());
+        for s in stmts {
+            // each member is an ordinary `[0xFE] ++ SQL` inner frame
+            let mut inner = Vec::with_capacity(s.len() + 1);
+            inner.push(0xFE);
+            inner.extend_from_slice(s.as_bytes());
+            frame.extend_from_slice(&(inner.len() as u32).to_le_bytes());
+            frame.extend_from_slice(&inner);
+        }
+        write_frame(&mut self.stream, &frame)?;
+        let resp = read_frame(&mut self.stream)?;
+        let bad =
+            || io::Error::new(io::ErrorKind::InvalidData, "bad pipeline reply");
+        match OpResult::decode(&resp).ok_or_else(bad)? {
+            OpResult::Got(b) => {
+                let cnt = u32::from_le_bytes(
+                    b.get(0..4).ok_or_else(bad)?.try_into().unwrap(),
+                ) as usize;
+                let mut p = 4usize;
+                let mut out = Vec::with_capacity(cnt);
+                for _ in 0..cnt {
+                    let l = u32::from_le_bytes(
+                        b.get(p..p + 4).ok_or_else(bad)?.try_into().unwrap(),
+                    ) as usize;
+                    p += 4;
+                    let r = b.get(p..p + l).ok_or_else(bad)?;
+                    p += l;
+                    out.push(OpResult::decode(r).ok_or_else(bad)?);
+                }
+                Ok(out)
+            }
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("pipeline: unexpected reply {other:?}"),
+            )),
+        }
     }
 }
 

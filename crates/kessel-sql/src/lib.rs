@@ -843,6 +843,27 @@ fn splice(a: Program, b: Program, op: &str) -> Program {
 fn cmp_expr(p: &mut P, ot: &ObjectType) -> Result<Program, SqlError> {
     let negate = p.kw("NOT");
     let lb = term(p, ot)?.bytes(); // lhs program bytes (reused per disjunct)
+    // `col IS NULL` / `col IS NOT NULL` — uses the expr-VM IS_NULL opcode
+    // (2) on the column's field id; `IS NOT NULL` wraps it in NOT (16).
+    if p.kw("IS") {
+        let is_not = p.kw("NOT");
+        if !p.kw("NULL") {
+            return Err("expected NULL after IS [NOT]".into());
+        }
+        // lb must be a bare column load: [LOAD_FIELD=1][field_id:2 LE].
+        if lb.len() != 3 || lb[0] != 1 {
+            return Err("IS NULL requires a column".into());
+        }
+        let mut raw = vec![2u8]; // IS_NULL
+        raw.extend_from_slice(&lb[1..3]); // field_id
+        if is_not {
+            raw.push(16); // NOT  -> IS NOT NULL
+        }
+        if negate {
+            raw.push(16); // outer prefix NOT
+        }
+        return Ok(Program::from_raw(raw));
+    }
     // Optional post-column NOT for `col NOT IN (..)` / `col NOT BETWEEN ..`.
     let post_not = p.kw("NOT");
     let prog = if p.kw("IN") {
@@ -1051,6 +1072,51 @@ mod tests {
             OpResult::Got(b) => assert_eq!(i128::from_le_bytes(b.try_into().unwrap()), 2),
             o => panic!("{o:?}"),
         }
+    }
+
+    #[test]
+    fn is_null_predicate() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        assert!(matches!(
+            run(&mut sm, 1, "CREATE TABLE t (a U64 NOT NULL, note I64)"),
+            OpResult::TypeCreated(1)
+        ));
+        // row 1: `note` omitted -> NULL.  row 2: note = 7.
+        assert_eq!(run(&mut sm, 2, "INSERT INTO t ID 1 (a) VALUES (10)"), OpResult::Ok);
+        assert_eq!(
+            run(&mut sm, 3, "INSERT INTO t ID 2 (a, note) VALUES (20, 7)"),
+            OpResult::Ok
+        );
+        let cnt = |sm: &mut StateMachine<MemVfs>, op, q: &str| -> i128 {
+            match run(sm, op, q) {
+                OpResult::Got(b) => i128::from_le_bytes(b.try_into().unwrap()),
+                o => panic!("{q}: {o:?}"),
+            }
+        };
+        assert_eq!(cnt(&mut sm, 4, "SELECT COUNT(*) FROM t WHERE note IS NULL"), 1);
+        assert_eq!(
+            cnt(&mut sm, 5, "SELECT COUNT(*) FROM t WHERE note IS NOT NULL"),
+            1
+        );
+        // composes with other predicates
+        assert_eq!(
+            cnt(
+                &mut sm,
+                6,
+                "SELECT COUNT(*) FROM t WHERE a >= 0 AND note IS NULL"
+            ),
+            1
+        );
+        assert_eq!(
+            cnt(
+                &mut sm,
+                7,
+                "SELECT COUNT(*) FROM t WHERE note IS NULL OR note IS NOT NULL"
+            ),
+            2
+        );
+        // a non-column LHS is a clean error, not a panic
+        assert!(compile("SELECT * FROM t WHERE 5 IS NULL", sm.catalog()).is_err());
     }
 
     #[test]

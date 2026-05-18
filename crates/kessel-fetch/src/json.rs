@@ -329,7 +329,11 @@ pub(crate) fn opt_string_at(
         Json::Str(s) if s.is_empty() => None,
         Json::Str(s) => Some(s.clone()),
         Json::Num(n) => Some(n.clone()),
-        _ => None,
+        // A boolean is never a valid pagination cursor/next-URL; treat
+        // it as "stop" (do NOT fabricate "true"/"false" as a token —
+        // that would forge a bogus next page). Array/Object likewise.
+        Json::Bool(_) => None,
+        Json::Array(_) | Json::Object(_) => None,
     })
 }
 
@@ -404,6 +408,9 @@ mod tests {
         assert!(matches!(rows_at(body, &cols, Some("p")), Err(FetchError::Parse(_))));
         // path with a missing key => Parse error
         assert!(matches!(rows_at(body, &cols, Some("data.nope")), Err(FetchError::Parse(_))));
+        // empty array at the ROWS path => Ok(vec![]) (the "last page" signal)
+        let empty = br#"{"data":{"items":[]}}"#;
+        assert_eq!(rows_at(empty, &cols, Some("data.items")).unwrap(), Vec::<Vec<Cell>>::new());
     }
 
     #[test]
@@ -420,5 +427,8 @@ mod tests {
         // a non-scalar (array/object) at the path => None (stop, not error)
         let o = br#"{"c":[1,2]}"#;
         assert_eq!(opt_string_at(o, "c").unwrap(), None);
+        // a boolean at the cursor path => None (stop, not a token)
+        let bl = br#"{"c":true}"#;
+        assert_eq!(opt_string_at(bl, "c").unwrap(), None);
     }
 }

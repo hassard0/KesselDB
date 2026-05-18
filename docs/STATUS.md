@@ -77,6 +77,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP67 — profile-driven LRU fix** | **done** | profiled write path on vulcan → O(cap) `ReadCache` eviction scan (latent since SP50) was the bottleneck; O(log n) `BTreeSet` LRU, semantics byte-identical; **vulcan CREATE 7.7K→215K ops/s (~28×), p50 131µs→2µs**; **166 green**, determinism intact |
 | **SP68 — group commit + TCP_NODELAY** | **done** | server drains+applies+fsyncs-once-per-batch (EBS lever; replies only after durable; order/digest unchanged) + `set_nodelay` everywhere — measuring on vulcan/Linux found Nagle was the real EC2 bottleneck: **vulcan durable 97→1,870 ops/s (~19×)**, 12k rows correct; **167 green** |
 | **SP69 — request pipelining** | **done** | `PIPELINE_TAG 0xF8`: N independent statements in one frame → one engine message → one group-fsync + one round-trip; `apply_one` shared core makes a member byte-identical to a lone request (NOT atomic — dup-in-batch fails independently, asserted); **vulcan single-conn 242→52,721 ops/s (~217×)**, all rows durable; **168 green** |
+| **SP70 — range-index narrowing** | **done** | planner emits half-range hints on order-indexed cols; engine combines all hints on a field into one tight order-index interval; `Op::QueryRows.range_preds` appended wire-compatibly (old frame ⇒ empty ⇒ unchanged); SP62/63 superset-verify invariant preserved, oracle strengthened (pure-range + band + mixed, ~660 queries); **vulcan band 35,007→313 µs (~112×)**; **169 green**, determinism/seed-7 intact |
 
 ## Production-readiness gate (precise, not vague)
 
@@ -336,6 +337,29 @@ SP68's best 8-concurrent-connection durable number (1,870). Gated by real
 fsync over 500-op batches on a near-full disk; bigger batches / more
 pipelined connections go higher — limiting factors named, 14 003 rows
 durable from a fresh connection asserted.
+
+### SP70 — range-index narrowing (last open perf item, oracle-proven)
+
+`range_index_is_sublinear_and_correct`: 40 000 rows, a narrow band
+(~0.2% of domain, 81 matched), result asserted identical to the full
+scan.
+
+| band query | full scan | range-index | speed-up |
+|---|---|---|---|
+| dev box (Windows) | 54,186 µs | 251 µs | ~216× |
+| **vulcan (Linux)** | **35,007 µs** | **313 µs** | **~112×** |
+
+Planner emits half-range hints on order-indexed columns (same
+mandatory-conjunct safety gate as eq hints); the engine combines all
+hints on one field into a single tight order-index interval (a band is
+one slice, not two huge half-open scans intersected — that detail was
+the difference between ~2× and ~112×). The slice is taken inclusively so
+it is a superset; `program` still verifies every candidate ⇒ result
+identical to a scan. `Op::QueryRows.range_preds` is appended
+wire-compatibly (an older frame decodes to empty and behaves exactly as
+before). `planner_equivalence_oracle` strengthened with a RANGE index +
+pure-range/band queries (~660 randomized, planner == brute force).
+Determinism / VSR partition corpus (incl. seed 7) unchanged.
 
 GET fast on DirVfs because post-flush data sits in OS-cached SSTables; the slower
 MemVfs GET reflects the known O(#sstables) read path (no bloom filter yet, M4 work).

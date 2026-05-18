@@ -87,14 +87,20 @@ pub enum Op {
     /// Index-accelerated row query (Sub-project 32): `eq_preds` are
     /// `(field_id, value)` equality predicates; any on an indexed field are
     /// intersected via the index to narrow candidates (else a full scan).
-    /// `program` (the full WHERE) then verifies every candidate, so the
-    /// result is identical to `Select` — the index only accelerates.
+    /// `range_preds` (SP70) are `(field_id, op, value)` half-range hints
+    /// (`op` 0=`>` 1=`>=` 2=`<` 3=`<=`) on order-indexed fields, narrowed
+    /// via the order index. `program` (the full WHERE) then verifies every
+    /// candidate, so the result is identical to `Select` regardless of the
+    /// candidate set — the indexes only accelerate. `range_preds` is
+    /// encoded *after* `limit` so an older frame (no range hints) decodes
+    /// to an empty list and behaves exactly as before (wire-compatible).
     /// Returns up to `limit` rows as `[u32 len][record]*`.
     QueryRows {
         type_id: TypeId,
         eq_preds: Vec<(u16, Vec<u8>)>,
         program: Vec<u8>,
         limit: u32,
+        range_preds: Vec<(u16, u8, Vec<u8>)>,
     },
     /// Aggregate (Sub-project 20) over rows matching `program`:
     /// `kind` 0=COUNT, 1=SUM, 2=MIN, 3=MAX of `field_id` (numeric).
@@ -351,7 +357,7 @@ impl Op {
                 b.extend_from_slice(&right_field.to_le_bytes());
                 codec::put_u32(&mut b, *limit);
             }
-            Op::QueryRows { type_id, eq_preds, program, limit } => {
+            Op::QueryRows { type_id, eq_preds, program, limit, range_preds } => {
                 codec::put_u32(&mut b, *type_id);
                 codec::put_u32(&mut b, eq_preds.len() as u32);
                 for (f, v) in eq_preds {
@@ -360,6 +366,16 @@ impl Op {
                 }
                 codec::put_bytes(&mut b, program);
                 codec::put_u32(&mut b, *limit);
+                // SP70: range hints appended last so an older (no-range)
+                // frame is still a valid prefix that decodes to empty.
+                if !range_preds.is_empty() {
+                    codec::put_u32(&mut b, range_preds.len() as u32);
+                    for (f, o, v) in range_preds {
+                        b.extend_from_slice(&f.to_le_bytes());
+                        b.push(*o);
+                        codec::put_bytes(&mut b, v);
+                    }
+                }
             }
             Op::Aggregate { type_id, program, kind, field_id } => {
                 codec::put_u32(&mut b, *type_id);
@@ -490,12 +506,21 @@ impl Op {
                 for _ in 0..n {
                     eq_preds.push((c.u16()?, c.bytes()?));
                 }
-                Op::QueryRows {
-                    type_id,
-                    eq_preds,
-                    program: c.bytes()?,
-                    limit: c.u32()?,
-                }
+                let program = c.bytes()?;
+                let limit = c.u32()?;
+                // SP70: optional trailing range hints. Absent (older
+                // frame) ⇒ empty ⇒ identical behaviour to before.
+                let range_preds = if c.remaining() > 0 {
+                    let m = c.u32()? as usize;
+                    let mut rp = Vec::with_capacity(m);
+                    for _ in 0..m {
+                        rp.push((c.u16()?, c.u8()?, c.bytes()?));
+                    }
+                    rp
+                } else {
+                    Vec::new()
+                };
+                Op::QueryRows { type_id, eq_preds, program, limit, range_preds }
             }
             20 => Op::Aggregate {
                 type_id: c.u32()?,
@@ -731,7 +756,8 @@ mod tests {
             Op::AddOrderedIndex { type_id: 4, field_id: 2 },
             Op::FindRange { type_id: 4, field_id: 2, lo: vec![0], hi: vec![255, 255] },
             Op::Select { type_id: 4, program: vec![1, 2], limit: 10 },
-            Op::QueryRows { type_id: 4, eq_preds: vec![(1, vec![9, 9])], program: vec![1], limit: 5 },
+            Op::QueryRows { type_id: 4, eq_preds: vec![(1, vec![9, 9])], program: vec![1], limit: 5, range_preds: vec![] },
+            Op::QueryRows { type_id: 4, eq_preds: vec![], program: vec![1], limit: 0, range_preds: vec![(2, 1, vec![7, 0]), (2, 3, vec![9, 0])] },
             Op::Describe { type_id: 4 },
             Op::DropType { type_id: 4 },
             Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9 },

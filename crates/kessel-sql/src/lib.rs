@@ -315,13 +315,30 @@ fn plan_string(stmt: &Stmt, cat: &Catalog) -> String {
             tname(*type_id)
         ),
         Stmt::Op(op) => match op {
-            Op::QueryRows { type_id, eq_preds, .. } => {
+            Op::QueryRows { type_id, eq_preds, range_preds, .. } => {
                 if eq_preds.is_empty() {
+                    if !range_preds.is_empty() {
+                        let rf: Vec<u16> =
+                            range_preds.iter().map(|(f, _, _)| *f).collect();
+                        return format!(
+                            "Range Index Scan on {} on [{}] → verify full \
+                             WHERE",
+                            tname(*type_id),
+                            cols(*type_id, &rf)
+                        );
+                    }
                     return format!(
                         "Seq Scan on {} → filter (no usable index)",
                         tname(*type_id)
                     );
                 }
+                let range_note = if range_preds.is_empty() {
+                    String::new()
+                } else {
+                    let rf: Vec<u16> =
+                        range_preds.iter().map(|(f, _, _)| *f).collect();
+                    format!(" + range on [{}]", cols(*type_id, &rf))
+                };
                 let fids: Vec<u16> = eq_preds.iter().map(|(f, _)| *f).collect();
                 let fset: std::collections::BTreeSet<u16> =
                     fids.iter().copied().collect();
@@ -334,15 +351,18 @@ fn plan_string(stmt: &Stmt, cat: &Catalog) -> String {
                 });
                 if let Some(c) = composite {
                     format!(
-                        "Composite Index Scan on {} using ({}) → verify",
+                        "Composite Index Scan on {} using ({}){} → verify",
                         tname(*type_id),
-                        cols(*type_id, c)
+                        cols(*type_id, c),
+                        range_note
                     )
                 } else {
                     format!(
-                        "Index Scan on {} narrowed by [{}] → verify full WHERE",
+                        "Index Scan on {} narrowed by [{}]{} → verify full \
+                         WHERE",
                         tname(*type_id),
-                        cols(*type_id, &fids)
+                        cols(*type_id, &fids),
+                        range_note
                     )
                 }
             }
@@ -772,6 +792,11 @@ fn try_query_rows(p: &mut P) -> Option<Op> {
     };
     let ot = p.type_named(&tname).ok()?.clone();
     let mut eq_preds: Vec<(u16, Vec<u8>)> = Vec::new();
+    // SP70: half-range hints on order-indexed columns. Same safety gate
+    // as eq hints (mandatory conjunct only); the engine narrows via the
+    // order index and the full program still verifies every candidate,
+    // so the result is identical to a scan — only faster.
+    let mut range_preds: Vec<(u16, u8, Vec<u8>)> = Vec::new();
     // SP62: the FULL `WHERE` is compiled to the verifying program (every
     // predicate kind: =, range, IN/BETWEEN/LIKE/IS NULL, AND/OR/NOT). The
     // engine re-verifies every candidate with it, so the result is
@@ -822,6 +847,30 @@ fn try_query_rows(p: &mut P) -> Option<Op> {
                         }
                     }
                 }
+                // SP70: `col {> >= < <=} int` on an order-indexed column.
+                if let (Tok::Ident(c), Tok::Cmp(cmp), Tok::Int(n)) =
+                    (&span[i], &span[i + 1], &span[i + 2])
+                {
+                    let rop = match *cmp {
+                        ">" => Some(0u8),
+                        ">=" => Some(1u8),
+                        "<" => Some(2u8),
+                        "<=" => Some(3u8),
+                        _ => None,
+                    };
+                    if let (Some(rop), Some(f)) =
+                        (rop, ot.fields.iter().find(|f| &f.name == c))
+                    {
+                        if ot.ordered.contains(&f.field_id) {
+                            let w = f.kind.width() as usize;
+                            range_preds.push((
+                                f.field_id,
+                                rop,
+                                n.to_le_bytes()[..w.min(16)].to_vec(),
+                            ));
+                        }
+                    }
+                }
                 i += 1;
             }
         }
@@ -847,6 +896,7 @@ fn try_query_rows(p: &mut P) -> Option<Op> {
         eq_preds,
         program,
         limit,
+        range_preds,
     })
 }
 
@@ -1266,6 +1316,67 @@ mod tests {
         sm.apply(op, o)
     }
 
+    /// SP70: a selective range query must be sub-linear with a RANGE
+    /// index — i.e. materially faster than the full-scan + verify path,
+    /// while returning the *identical* rows (correctness is the oracle's
+    /// job; this asserts the speed-up is real and the answers match).
+    #[test]
+    fn range_index_is_sublinear_and_correct() {
+        let n = 40_000u128;
+        // Same dataset twice: one table WITHOUT a range index (forced
+        // full scan + program verify) and one WITH it (order-index
+        // narrowed). Identical rows + a large speed-up.
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE a (v I64 NOT NULL)");
+        run(&mut sm, 2, "CREATE TABLE b (v I64 NOT NULL)");
+        run(&mut sm, 3, "CREATE RANGE INDEX ON b (v)");
+        let mut o = 100u64;
+        for id in 1..=n {
+            let v = (id as i64 * 2654435761) % 1_000_000; // scattered
+            o += 1;
+            run(&mut sm, o, &format!("INSERT INTO a (id, v) VALUES ({id}, {v})"));
+            o += 1;
+            run(&mut sm, o, &format!("INSERT INTO b (id, v) VALUES ({id}, {v})"));
+        }
+        let count = |res: &OpResult| -> usize {
+            let b = match res {
+                OpResult::Got(b) => b,
+                x => panic!("unexpected {x:?}"),
+            };
+            let (mut p, mut c) = (0usize, 0usize);
+            while p + 4 <= b.len() {
+                let l = u32::from_le_bytes(b[p..p + 4].try_into().unwrap())
+                    as usize;
+                p += 4 + l;
+                c += 1;
+            }
+            c
+        };
+        // A narrow window (≈0.2% of the domain).
+        let q = "WHERE v >= 100000 AND v <= 102000";
+        let t0 = std::time::Instant::now();
+        o += 1;
+        let scan = run(&mut sm, o, &format!("SELECT * FROM a {q}"));
+        let scan_us = t0.elapsed().as_micros();
+        let t1 = std::time::Instant::now();
+        o += 1;
+        let idx = run(&mut sm, o, &format!("SELECT * FROM b {q}"));
+        let idx_us = t1.elapsed().as_micros();
+        let (cs, ci) = (count(&scan), count(&idx));
+        assert_eq!(cs, ci, "range-index result must equal the full scan");
+        assert!(cs > 0 && cs < n as usize, "sanity: a real subset matched");
+        println!(
+            "[range-index] {n} rows, {cs} matched: full-scan {scan_us}µs vs \
+             range-index {idx_us}µs  (~{:.0}x)",
+            scan_us as f64 / idx_us.max(1) as f64
+        );
+        assert!(
+            idx_us * 3 < scan_us,
+            "range index must be materially sub-linear (got idx={idx_us}µs \
+             scan={scan_us}µs)"
+        );
+    }
+
     /// SP62 oracle: for randomized data + randomized WHEREs (mixing
     /// equality on an INDEXED column with range / OR / mixed predicates),
     /// the planned `SELECT *` result must EXACTLY equal an independent
@@ -1278,6 +1389,7 @@ mod tests {
         run(&mut sm, 1, "CREATE TABLE t (k U32 NOT NULL, v I64 NOT NULL)");
         run(&mut sm, 2, "CREATE INDEX ON t (k)"); // single-col index on k
         run(&mut sm, 3, "CREATE INDEX ON t (k, v)"); // composite (k, v) — SP63
+        run(&mut sm, 4, "CREATE RANGE INDEX ON t (v)"); // SP70 order index
         let ot = sm.catalog().get(1).unwrap().clone();
 
         let mut rng = Rng::new(0xA5A5_1234);
@@ -1356,6 +1468,19 @@ mod tests {
                 (
                     format!("v > {mm} AND k = {kk}"),
                     Box::new(move |k, v| v > mm && k == kk),
+                ),
+                (
+                    // SP70: pure range, NO equality — exercises the
+                    // range-only narrowing path (cand starts from the
+                    // order index, not an eq index).
+                    format!("v >= {mm}"),
+                    Box::new(move |_k, v| v >= mm),
+                ),
+                (
+                    // SP70: a band (two half-range hints on one ordered
+                    // column intersect to the interval).
+                    format!("v >= {} AND v <= {}", mm - 5, mm + 5),
+                    Box::new(move |_k, v| v >= mm - 5 && v <= mm + 5),
                 ),
                 (
                     format!("NOT (k = {kk})"),

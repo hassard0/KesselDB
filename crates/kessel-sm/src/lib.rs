@@ -1646,7 +1646,7 @@ impl<V: Vfs> StateMachine<V> {
                 OpResult::Got(out)
             }
 
-            Op::QueryRows { type_id, eq_preds, program, limit } => {
+            Op::QueryRows { type_id, eq_preds, program, limit, range_preds } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
                     None => return OpResult::SchemaError(format!("no type {type_id}")),
@@ -1724,6 +1724,76 @@ impl<V: Vfs> StateMachine<V> {
                             });
                         }
                     }
+                }
+                // SP70: range narrowing via the order index. All hints on
+                // ONE field are combined into a single tight interval
+                // [max of lower bounds, min of upper bounds] and scanned
+                // once — so `v >= a AND v <= b` is one narrow slice, not
+                // two huge half-open scans. The slice is taken inclusively
+                // (`>`/`<` strictness is enforced by `program`), so it is
+                // a SUPERSET of matches: intersecting it in only narrows,
+                // and the full program still verifies every candidate ⇒
+                // result identical to a scan (the SP62/63 invariant).
+                let rfields: std::collections::BTreeSet<u16> =
+                    range_preds.iter().map(|(f, _, _)| *f).collect();
+                for fid in rfields {
+                    if !ot.ordered.contains(&fid) {
+                        continue;
+                    }
+                    let (_, w, kind) = match Self::ord_field_pos(&ot, fid) {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    let mut lo_ok = [0u8; 8];
+                    let mut hi_ok = [0xFFu8; 8];
+                    let mut usable = false;
+                    for (f, rop, val) in &range_preds {
+                        if *f != fid {
+                            continue;
+                        }
+                        let vk = match Self::order_key(kind, &Self::norm(val, w))
+                        {
+                            Some(k) => k,
+                            None => continue,
+                        };
+                        match *rop {
+                            0 | 1 if vk > lo_ok => lo_ok = vk, // > / >=
+                            2 | 3 if vk < hi_ok => hi_ok = vk, // < / <=
+                            0..=3 => {}
+                            _ => continue,
+                        }
+                        usable = true;
+                    }
+                    if !usable {
+                        continue;
+                    }
+                    let idxt = 0xFFFD_0000 | (type_id & 0xFFFF);
+                    let mut klo = [0u8; 16];
+                    klo[..2].copy_from_slice(&fid.to_le_bytes());
+                    klo[2..10].copy_from_slice(&lo_ok);
+                    let mut khi = [0u8; 16];
+                    khi[..2].copy_from_slice(&fid.to_le_bytes());
+                    khi[2..10].copy_from_slice(&hi_ok);
+                    khi[10..].copy_from_slice(&[0xFFu8; 6]);
+                    let klo = make_key(idxt, &klo);
+                    let khi = make_key(idxt, &khi);
+                    let mut ids: std::collections::BTreeSet<[u8; 16]> =
+                        std::collections::BTreeSet::new();
+                    for (_, entry) in self.storage.scan_range(&klo, &khi) {
+                        for ch in entry.chunks(16) {
+                            if ch.len() == 16 {
+                                let mut a = [0u8; 16];
+                                a.copy_from_slice(ch);
+                                ids.insert(a);
+                            }
+                        }
+                    }
+                    cand = Some(match cand {
+                        None => ids,
+                        Some(prev) => {
+                            prev.intersection(&ids).copied().collect()
+                        }
+                    });
                 }
                 let mut out = Vec::new();
                 let mut n = 0u32;

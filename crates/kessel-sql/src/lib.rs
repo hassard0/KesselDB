@@ -746,6 +746,8 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
                 auth_a,
                 auth_b,
                 mapping,
+                rows_path: None,
+                pagination: None,
             });
         }
         // CREATE [UNIQUE|RANGE] INDEX ON t (cols) — DDL for indexes.

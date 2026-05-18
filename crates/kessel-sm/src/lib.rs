@@ -3530,6 +3530,7 @@ impl<V: Vfs> StateMachine<V> {
                 auth_a,
                 auth_b,
                 mapping,
+                ..
             } => {
                 if self.catalog.types.iter().any(|t| t.name == name) {
                     return OpResult::SchemaError(format!(
@@ -3711,6 +3712,7 @@ mod tests {
             format: 0, key_field_id: 1, auth_kind: 1,
             auth_a: "TOK_ENV".into(), auth_b: String::new(),
             mapping: vec![(1, "id".into()), (2, "nm".into())],
+            rows_path: None, pagination: None,
         });
         assert_eq!(r, OpResult::Ok, "create should return Ok");
         let cat = sm.catalog();
@@ -3744,6 +3746,7 @@ mod tests {
             format: 0, key_field_id: 1, auth_kind: 99,
             auth_a: String::new(), auth_b: String::new(),
             mapping: vec![(1, "x".into())],
+            rows_path: None, pagination: None,
         });
         assert!(matches!(br, OpResult::SchemaError(_)), "bad auth_kind => SchemaError, got {br:?}");
         let cat = sm.catalog();
@@ -3770,6 +3773,7 @@ mod tests {
                 format: 0, key_field_id: 1, auth_kind: 0,
                 auth_a: String::new(), auth_b: String::new(),
                 mapping: vec![(1, "pid".into())],
+                rows_path: None, pagination: None,
             }),
             OpResult::Ok
         );

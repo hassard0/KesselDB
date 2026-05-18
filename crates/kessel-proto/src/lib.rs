@@ -161,6 +161,13 @@ pub enum Op {
         auth_a: String,
         auth_b: String,
         mapping: Vec<(u16, String)>,
+        /// JSON path to the rows array (external-sources pagination
+        /// follow-on; `None` = slice-1 default / whole body).
+        rows_path: Option<String>,
+        /// Pagination recipe carrier `(tag, a, b)`: tag 1 =
+        /// NextUrlJson(a=json path), 2 = NextLink (a,b empty), 3 =
+        /// CursorJson{a=path, b=param}. `None` = slice-1 default.
+        pagination: Option<(u8, String, String)>,
     },
     /// Drop a declared external source (external-sources feature).
     DropExternalSource { name: String },
@@ -509,6 +516,7 @@ impl Op {
             Op::CreateExternalSource {
                 name, type_def, url, format, key_field_id,
                 auth_kind, auth_a, auth_b, mapping,
+                rows_path, pagination,
             } => {
                 codec::put_bytes(&mut b, name.as_bytes());
                 codec::put_bytes(&mut b, type_def);
@@ -522,6 +530,22 @@ impl Op {
                 for (fid, src) in mapping {
                     b.extend_from_slice(&fid.to_le_bytes());
                     codec::put_bytes(&mut b, src.as_bytes());
+                }
+                // Additive (pagination follow-on): a None/None op appends
+                // two trailing zero tag bytes; an OLD slice-1 frame has
+                // neither and the tolerant decode treats its absence as
+                // None/None (see decode arm).
+                match rows_path {
+                    None => b.push(0),
+                    Some(s) => { b.push(1); codec::put_bytes(&mut b, s.as_bytes()); }
+                }
+                match pagination {
+                    None => b.push(0),
+                    Some((tag, a, c)) => {
+                        b.push(*tag);
+                        codec::put_bytes(&mut b, a.as_bytes());
+                        codec::put_bytes(&mut b, c.as_bytes());
+                    }
                 }
             }
             Op::DropExternalSource { name }
@@ -768,9 +792,30 @@ impl Op {
                     let src = String::from_utf8_lossy(&c.bytes()?).into_owned();
                     mapping.push((fid, src));
                 }
+                // Tolerant back-compat decode (WAL-replay critical): an OLD
+                // slice-1 frame ends right after `mapping`, so the cursor is
+                // exhausted here and `c.u8()` returns `None` -> slice-1
+                // default of None/None (NOT a decode failure). Cursor readers
+                // return Option<T>, so `None` distinguishes "no trailing
+                // bytes" (slice-1) from a present tag byte.
+                let rows_path = match c.u8() {
+                    None | Some(0) => None,
+                    Some(1) => Some(String::from_utf8_lossy(&c.bytes()?).into_owned()),
+                    Some(_) => None, // unknown tag => treat as None (forward-tolerant)
+                };
+                let pagination = match c.u8() {
+                    None | Some(0) => None,
+                    Some(t @ (1 | 2 | 3)) => {
+                        let a = String::from_utf8_lossy(&c.bytes()?).into_owned();
+                        let cc = String::from_utf8_lossy(&c.bytes()?).into_owned();
+                        Some((t, a, cc))
+                    }
+                    Some(_) => None,
+                };
                 Op::CreateExternalSource {
                     name, type_def, url, format, key_field_id,
                     auth_kind, auth_a, auth_b, mapping,
+                    rows_path, pagination,
                 }
             }
             42 => Op::DropExternalSource {
@@ -1102,6 +1147,7 @@ mod tests {
                 format: 0, key_field_id: 2, auth_kind: 1,
                 auth_a: "TOKEN_ENV".into(), auth_b: String::new(),
                 mapping: vec![(1,"id".into()), (2,"k".into())],
+                rows_path: None, pagination: None,
             },
             Op::DropExternalSource { name: "feed".into() },
             Op::RefreshExternalSource { name: "feed".into() },
@@ -1110,6 +1156,66 @@ mod tests {
             assert_eq!(back, op, "round-trip mismatch");
             assert_eq!(op.kind(), op.encode()[0], "kind/byte mismatch");
             assert!(op.is_mutating());
+        }
+    }
+
+    #[test]
+    fn create_external_source_pagination_wire_round_trip() {
+        for op in [
+            Op::CreateExternalSource{
+                name:"f".into(), type_def:vec![1], url:"u".into(), format:2,
+                key_field_id:1, auth_kind:0, auth_a:String::new(), auth_b:String::new(),
+                mapping:vec![(1,"id".into())],
+                rows_path: Some("d.items".into()),
+                pagination: Some((3, "m.c".into(), "cursor".into())),
+            },
+            Op::CreateExternalSource{
+                name:"g".into(), type_def:vec![], url:"u2".into(), format:0,
+                key_field_id:2, auth_kind:1, auth_a:"E".into(), auth_b:String::new(),
+                mapping:vec![], rows_path:None,
+                pagination: Some((2, String::new(), String::new())),
+            },
+            Op::CreateExternalSource{
+                name:"h".into(), type_def:vec![9], url:"u3".into(), format:1,
+                key_field_id:1, auth_kind:0, auth_a:String::new(), auth_b:String::new(),
+                mapping:vec![(1,"a".into())], rows_path:None, pagination:None,
+            },
+        ] {
+            let back = Op::decode(&op.encode()).expect("decode");
+            assert_eq!(back, op);
+            assert_eq!(op.kind(), op.encode()[0]);
+            assert!(op.is_mutating());
+        }
+    }
+
+    #[test]
+    fn decodes_pre_pagination_create_external_source_frame() {
+        // kind 41 + slice-1 fields ONLY, no trailing rows/pagination bytes
+        // (exactly what the shipped slice-1 binary persisted to the WAL).
+        let mut b = vec![41u8];
+        let put = |b:&mut Vec<u8>, s:&[u8]| {
+            b.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            b.extend_from_slice(s);
+        };
+        put(&mut b, b"f");              // name
+        put(&mut b, &[1]);             // type_def
+        put(&mut b, b"u");              // url
+        b.push(0);                      // format
+        b.extend_from_slice(&1u16.to_le_bytes()); // key_field_id
+        b.push(0);                      // auth_kind
+        put(&mut b, b"");               // auth_a
+        put(&mut b, b"");               // auth_b
+        b.extend_from_slice(&1u32.to_le_bytes()); // mapping len = 1
+        b.extend_from_slice(&1u16.to_le_bytes()); put(&mut b, b"id"); // (fid,src)
+        let op = Op::decode(&b).expect("slice-1 frame must still decode");
+        match op {
+            Op::CreateExternalSource{ rows_path, pagination, name, mapping, .. } => {
+                assert_eq!(name, "f");
+                assert_eq!(mapping, vec![(1u16,"id".to_string())]);
+                assert_eq!(rows_path, None);
+                assert_eq!(pagination, None);
+            }
+            _ => panic!("wrong variant"),
         }
     }
 

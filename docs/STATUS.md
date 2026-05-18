@@ -299,7 +299,11 @@ or `U128`/`I128` columns — a deliberate non-goal (`MIN`/`MAX` over
 all of these is delivered, SP93; `SUM`/`AVG` stay numeric-≤8B and
 return an honest `SchemaError` otherwise),
 cross-shard scatter-gather *reads* / SQL-text routing (distinct from
-cross-shard *transactions*, which are delivered), async per-shard
+cross-shard *transactions*, which are delivered — now **scoped**:
+SP96 assessment slices this into SP-A scan-fanout → SP-B aggregate
+combine → SP-C sorted k-way merge → SP-D group merge → SP-E SQL-text
+routing; cross-shard `Join` and a cross-shard consistent snapshot
+are explicit documented non-goals), async per-shard
 pull-drive (efficiency, not correctness), index-write throughput
 optimization,
 disk-fault-during-view-change, membership reconfiguration, transport

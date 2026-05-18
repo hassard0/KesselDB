@@ -176,6 +176,38 @@ impl<V: Vfs> StateMachine<V> {
         Ok(fixed)
     }
 
+    /// SP76: the overflow-blob handles a record references — the 8-byte
+    /// handle stored at each `OverflowRef` field slot (0 = none). Used
+    /// to reclaim blobs when the referencing row is updated or deleted.
+    fn overflow_handles(&self, type_id: u32, rec: &[u8]) -> Vec<u64> {
+        let ot = match self.catalog.get(type_id) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+        let layout = ot.compute_layout();
+        let mut hs = Vec::new();
+        for (i, f) in ot.fields.iter().enumerate() {
+            if matches!(f.kind, kessel_catalog::FieldKind::OverflowRef) {
+                if let Some(b) = rec.get(layout.offsets[i]..layout.offsets[i] + 8)
+                {
+                    let h = u64::from_le_bytes(b.try_into().unwrap());
+                    if h != 0 {
+                        hs.push(h);
+                    }
+                }
+            }
+        }
+        hs
+    }
+
+    /// Delete the given overflow blobs (deterministic: handles are
+    /// op-number-derived, so every replica frees the same keys).
+    fn reclaim_overflow(&mut self, op: u64, freed: &[u64]) {
+        for &h in freed {
+            let _ = self.storage.delete(op, handle_key(h));
+        }
+    }
+
     // ---- equality secondary index (Sub-project 3) ----
     //
     // Index keyspace: storage type-slot = IDX_TYPE_BASE | (user_type & 0xFFFF).
@@ -958,6 +990,15 @@ impl<V: Vfs> StateMachine<V> {
                 if let Err(e) = self.check_checks(type_id, &record) {
                     return OpResult::Constraint(e);
                 }
+                // SP76: blobs the OLD record referenced but the NEW one
+                // no longer does are now unreachable — reclaim them.
+                let old_h = old
+                    .as_deref()
+                    .map(|r| self.overflow_handles(type_id, r))
+                    .unwrap_or_default();
+                let new_h = self.overflow_handles(type_id, &record);
+                let freed: Vec<u64> =
+                    old_h.into_iter().filter(|h| !new_h.contains(h)).collect();
                 let rec_idx = if need_idx { Some(record.clone()) } else { None };
                 let cached = self.cache.as_mut().map(|_| record.clone());
                 match self.storage.put(op_number, key.clone(), record) {
@@ -977,6 +1018,7 @@ impl<V: Vfs> StateMachine<V> {
                                 Some(&r),
                             );
                         }
+                        self.reclaim_overflow(op_number, &freed);
                         OpResult::Ok
                     }
                     Err(e) => OpResult::SchemaError(format!("store: {e}")),
@@ -1040,6 +1082,13 @@ impl<V: Vfs> StateMachine<V> {
                 for (t, oid) in &closure {
                     let k = make_key(*t, oid);
                     let oldr = self.storage.get(&k);
+                    // SP76: the deleted row's overflow blobs become
+                    // unreachable — reclaim them (same op, atomic in the
+                    // delete's own txn; handles are deterministic).
+                    let freed = oldr
+                        .as_deref()
+                        .map(|r| self.overflow_handles(*t, r))
+                        .unwrap_or_default();
                     if let Err(e) = self.storage.delete(op_number, k.clone()) {
                         if own_txn {
                             self.storage.abort_txn();
@@ -1050,6 +1099,7 @@ impl<V: Vfs> StateMachine<V> {
                         c.invalidate(&k);
                     }
                     self.idx_maintain(op_number, *t, *oid, oldr.as_deref(), None);
+                    self.reclaim_overflow(op_number, &freed);
                 }
                 if own_txn {
                     if let Err(e) = self.storage.commit_txn() {
@@ -2985,20 +3035,44 @@ mod tests {
     }
 
     #[test]
-    fn update_orphans_old_blob_no_gc_documented() {
-        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
-        sm.apply(1, Op::CreateType { def: overflow_type_def() });
-        let id = ObjectId::from_u128(7);
-        let r1 = super::encode_overflow_record(&fixed_zeros(), &[(0, b"old".to_vec())]);
-        sm.apply(2, Op::Create { type_id: 1, id, record: r1 });
+    fn overflow_blobs_are_reclaimed_on_update_and_delete() {
+        // SP76: an UPDATE that replaces an overflow value frees the old
+        // blob; a DELETE frees the row's blobs. Deterministic — handles
+        // are op-number-derived, so every replica reclaims the same keys.
+        let build = || {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            sm.apply(1, Op::CreateType { def: overflow_type_def() });
+            let id = ObjectId::from_u128(7);
+            let r1 = super::encode_overflow_record(&fixed_zeros(), &[(0, b"old".to_vec())]);
+            sm.apply(2, Op::Create { type_id: 1, id, record: r1 });
+            let r2 = super::encode_overflow_record(&fixed_zeros(), &[(0, b"new".to_vec())]);
+            sm.apply(3, Op::Update { type_id: 1, id, record: r2 });
+            sm
+        };
+        let mut sm = build();
         let h_old = (2u64 << 20) | 0;
-        let r2 = super::encode_overflow_record(&fixed_zeros(), &[(0, b"new".to_vec())]);
-        sm.apply(3, Op::Update { type_id: 1, id, record: r2 });
         let h_new = (3u64 << 20) | 0;
-        // New value readable; the record points at the new handle.
-        assert_eq!(sm.apply(4, Op::GetBlob { handle: h_new }), OpResult::Got(b"new".to_vec()));
-        // Old blob is ORPHANED but still resolvable (no GC yet — documented).
-        assert_eq!(sm.apply(5, Op::GetBlob { handle: h_old }), OpResult::Got(b"old".to_vec()));
+        // New value readable; OLD blob reclaimed (was the documented leak).
+        assert_eq!(
+            sm.apply(4, Op::GetBlob { handle: h_new }),
+            OpResult::Got(b"new".to_vec())
+        );
+        assert_eq!(
+            sm.apply(5, Op::GetBlob { handle: h_old }),
+            OpResult::NotFound,
+            "UPDATE must reclaim the superseded blob"
+        );
+        // DELETE reclaims the row's current blob too.
+        sm.apply(6, Op::Delete { type_id: 1, id: ObjectId::from_u128(7) });
+        assert_eq!(
+            sm.apply(7, Op::GetBlob { handle: h_new }),
+            OpResult::NotFound,
+            "DELETE must reclaim the row's blob"
+        );
+        // Deterministic across identical histories.
+        let a = build();
+        let b = build();
+        assert_eq!(a.digest(), b.digest(), "overflow GC must be deterministic");
     }
 
     // ---- Sub-project 3: equality secondary index ----

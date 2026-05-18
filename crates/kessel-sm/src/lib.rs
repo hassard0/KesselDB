@@ -29,6 +29,21 @@ fn handle_key(handle: u64) -> Key {
     make_key(OVERFLOW_TYPE, &id)
 }
 
+/// Reserved keyspace for the global cross-shard sequencer (SP79).
+/// Object id 0 = the next-sequence counter; ids ≥ 1 = descriptor log
+/// entries keyed by **big-endian** seq so a range scan is in order.
+const SEQ_TYPE: u32 = 0xFFFF_FFF0;
+
+fn seq_counter_key() -> Key {
+    make_key(SEQ_TYPE, &[0u8; 16])
+}
+
+fn seq_entry_key(seq: u64) -> Key {
+    let mut id = [0u8; 16];
+    id[8..16].copy_from_slice(&seq.to_be_bytes()); // big-endian ⇒ sorted
+    make_key(SEQ_TYPE, &id)
+}
+
 /// Build a `Create`/`Update` record with an overflow trailer:
 /// `[fixed][u16 n]( [u16 field_idx][u32 len][bytes] )*`. `fixed` must be the
 /// codec-encoded fixed-width record (handles will be patched in by the SM).
@@ -827,6 +842,53 @@ impl<V: Vfs> StateMachine<V> {
     /// Apply one committed op. Deterministic.
     pub fn apply(&mut self, op_number: u64, op: Op) -> OpResult {
         match op {
+            Op::SeqAppend { payload } => {
+                // SP79: atomic assign-next + store, ONE replicated op.
+                // Counter advances strictly by VSR-replicated op order,
+                // so every replica of the sequencer group assigns the
+                // identical gap-free seq and converges bit-for-bit.
+                let cur = self
+                    .storage
+                    .get(&seq_counter_key())
+                    .and_then(|b| b.get(..8).map(|s| {
+                        u64::from_le_bytes(s.try_into().unwrap())
+                    }))
+                    .unwrap_or(0);
+                let s = cur + 1;
+                if let Err(e) =
+                    self.storage.put(op_number, seq_entry_key(s), payload)
+                {
+                    return OpResult::SchemaError(format!("seq store: {e}"));
+                }
+                if let Err(e) = self.storage.put(
+                    op_number,
+                    seq_counter_key(),
+                    s.to_le_bytes().to_vec(),
+                ) {
+                    return OpResult::SchemaError(format!("seq counter: {e}"));
+                }
+                OpResult::Got(s.to_le_bytes().to_vec())
+            }
+            Op::SeqRead { from, limit } => {
+                let lo = seq_entry_key(from.max(1));
+                let hi = seq_entry_key(u64::MAX);
+                let mut out = Vec::new();
+                let mut n = 0u32;
+                for (k, v) in self.storage.scan_range(&lo, &hi) {
+                    if limit != 0 && n >= limit {
+                        break;
+                    }
+                    let seq = k
+                        .get(12..20)
+                        .map(|b| u64::from_be_bytes(b.try_into().unwrap()))
+                        .unwrap_or(0);
+                    out.extend_from_slice(&seq.to_le_bytes());
+                    out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&v);
+                    n += 1;
+                }
+                OpResult::Got(out)
+            }
             Op::CreateType { def } => {
                 let (name, raw_fields) = match decode_type_def(&def) {
                     Some(x) => x,
@@ -3067,6 +3129,77 @@ mod tests {
             sm.digest()
         };
         assert_eq!(build(), build(), "overflow must not break determinism");
+    }
+
+    /// SP79 (cross-shard slice 2): the global sequencer assigns a
+    /// gap-free, monotonic, 1-based total order in ONE op each; the
+    /// ordered log reads back exactly (with from/limit); and an
+    /// identical op stream yields an identical digest (so every replica
+    /// of the sequencer VSR group converges bit-for-bit).
+    #[test]
+    fn sequencer_is_gap_free_monotonic_and_deterministic() {
+        let build = || {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            let mut seqs = Vec::new();
+            for (i, p) in
+                [b"a".to_vec(), b"bb".to_vec(), b"ccc".to_vec()].iter().enumerate()
+            {
+                match sm.apply(10 + i as u64, Op::SeqAppend { payload: p.clone() }) {
+                    OpResult::Got(b) => {
+                        seqs.push(u64::from_le_bytes(b.try_into().unwrap()))
+                    }
+                    o => panic!("unexpected {o:?}"),
+                }
+            }
+            (sm, seqs)
+        };
+        let (mut sm, seqs) = build();
+        assert_eq!(seqs, vec![1, 2, 3], "gap-free, monotonic, 1-based");
+
+        // Full ordered log from 1.
+        let parse = |b: Vec<u8>| -> Vec<(u64, Vec<u8>)> {
+            let mut out = Vec::new();
+            let mut p = 0;
+            while p + 12 <= b.len() {
+                let s = u64::from_le_bytes(b[p..p + 8].try_into().unwrap());
+                let l = u32::from_le_bytes(b[p + 8..p + 12].try_into().unwrap())
+                    as usize;
+                p += 12;
+                out.push((s, b[p..p + l].to_vec()));
+                p += l;
+            }
+            out
+        };
+        match sm.apply(100, Op::SeqRead { from: 1, limit: 0 }) {
+            OpResult::Got(b) => assert_eq!(
+                parse(b),
+                vec![
+                    (1, b"a".to_vec()),
+                    (2, b"bb".to_vec()),
+                    (3, b"ccc".to_vec())
+                ]
+            ),
+            o => panic!("unexpected {o:?}"),
+        }
+        // from/limit window.
+        match sm.apply(101, Op::SeqRead { from: 2, limit: 1 }) {
+            OpResult::Got(b) => {
+                assert_eq!(parse(b), vec![(2, b"bb".to_vec())])
+            }
+            o => panic!("unexpected {o:?}"),
+        }
+        // Reading past the end is empty, not an error.
+        assert_eq!(
+            sm.apply(102, Op::SeqRead { from: 99, limit: 0 }),
+            OpResult::Got(vec![])
+        );
+
+        // Deterministic: identical op stream ⇒ identical digest ⇒ every
+        // replica of the sequencer group converges.
+        let (a, sa) = build();
+        let (b2, sb) = build();
+        assert_eq!(sa, sb);
+        assert_eq!(a.digest(), b2.digest(), "sequencer must be deterministic");
     }
 
     #[test]

@@ -150,6 +150,17 @@ pub enum Op {
     /// (reusing that proven enforcement on every write, incl. inside a
     /// transaction) — the helper is the ergonomic, validated surface.
     AddBalanceGuard { type_id: TypeId, field_id: u16 },
+    /// Global sequencer (SP79, cross-shard slice 2): atomically assign
+    /// the next gap-free sequence number and store `payload` (a
+    /// cross-shard transaction descriptor) under it, in ONE replicated
+    /// op. Reply `Got(seq u64 LE)`. The sequencer is an ordinary VSR
+    /// group, so this total order is linearizable and failover-safe;
+    /// the counter lives in a reserved keyspace so it is part of the
+    /// replicated digest and WAL-recovered.
+    SeqAppend { payload: Vec<u8> },
+    /// Read the ordered descriptor log from `from` (inclusive), up to
+    /// `limit` entries (0 = all). Reply `Got([u64 seq][u32 len][payload])*`.
+    SeqRead { from: u64, limit: u32 },
     /// Inner equi-join (Sub-project 36): rows where
     /// `left.left_field == right.right_field` (raw fixed-width bytes).
     /// Returns up to `limit` joined rows as
@@ -280,6 +291,8 @@ impl Op {
             Op::DropField { .. } => 31,
             Op::RenameField { .. } => 32,
             Op::AddBalanceGuard { .. } => 33,
+            Op::SeqAppend { .. } => 34,
+            Op::SeqRead { .. } => 35,
             Op::Join { .. } => 28,
             Op::Aggregate { .. } => 20,
             Op::SelectFields { .. } => 21,
@@ -369,6 +382,11 @@ impl Op {
             Op::Select { type_id, program, limit } => {
                 codec::put_u32(&mut b, *type_id);
                 codec::put_bytes(&mut b, program);
+                codec::put_u32(&mut b, *limit);
+            }
+            Op::SeqAppend { payload } => codec::put_bytes(&mut b, payload),
+            Op::SeqRead { from, limit } => {
+                b.extend_from_slice(&from.to_le_bytes());
                 codec::put_u32(&mut b, *limit);
             }
             Op::Describe { type_id } | Op::DropType { type_id } => {
@@ -538,6 +556,8 @@ impl Op {
             }
             31 => Op::DropField { type_id: c.u32()?, field_id: c.u16()? },
             33 => Op::AddBalanceGuard { type_id: c.u32()?, field_id: c.u16()? },
+            34 => Op::SeqAppend { payload: c.bytes()? },
+            35 => Op::SeqRead { from: c.u64()?, limit: c.u32()? },
             32 => Op::RenameField {
                 type_id: c.u32()?,
                 field_id: c.u16()?,
@@ -822,6 +842,8 @@ mod tests {
             Op::DropField { type_id: 4, field_id: 2 },
             Op::RenameField { type_id: 4, field_id: 2, name: "renamed".into() },
             Op::AddBalanceGuard { type_id: 4, field_id: 2 },
+            Op::SeqAppend { payload: vec![1, 2, 3, 9] },
+            Op::SeqRead { from: 7, limit: 0 },
             Op::FindByComposite { type_id: 4, fields: vec![1, 3], values: vec![vec![9], vec![8, 8]] },
         ];
         for op in ops {

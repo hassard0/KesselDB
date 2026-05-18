@@ -65,6 +65,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP55 — SQL `BEGIN/COMMIT/ROLLBACK`** | **done** | per-connection statement buffer → `TXN_TAG` batch → one atomic `Op::Txn`; rollback/abort all-or-nothing; `UPDATE`-in-txn rejected honestly; single-node; **151 green** |
 | **SP56 — `IN` / `BETWEEN`** | **done** | parser desugaring into existing OR/AND/NOT expr opcodes (`IN`/`NOT IN`/`BETWEEN`/`NOT BETWEEN`, composable); zero engine/determinism change; **152 green** |
 | **SP57 — `IS NULL` / `IS NOT NULL`** | **done** | wired SQL to the pre-existing expr `IS_NULL` opcode; bare-column guard; composes with AND/OR/NOT; zero engine change; **153 green** |
+| **SP58 — multi-row `INSERT`** | **done** | Postgres-shaped `INSERT INTO t (id,..) VALUES (..),(..)` → one atomic `Op::Txn` (one round-trip, one consensus op); legacy `ID <n>` kept; dup-in-batch rejects all; **154 green** |
 
 ## Production-readiness gate (precise, not vague)
 

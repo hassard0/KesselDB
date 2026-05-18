@@ -6,7 +6,7 @@
 
 *"It's the database that made the Kessel Run in 12 parsecs."*
 
-`153 tests green` · `0 external dependencies` · `Rust 1.95+` · single‑binary
+`154 tests green` · `0 external dependencies` · `Rust 1.95+` · single‑binary
 
 </div>
 
@@ -38,7 +38,10 @@ feature, not an aspiration.
   `ON DELETE RESTRICT/CASCADE/SET NULL`, `CHECK`, and deterministic triggers
   (a gas‑bounded zero‑dep expression VM).
 - **Atomic transactions** — SQL `BEGIN`/`COMMIT`/`ROLLBACK` (and op‑level
-  `Op::Txn`): all‑or‑nothing, replicated as a single operation.
+  `Op::Txn`): all‑or‑nothing, replicated as a single operation. Multi‑row
+  `INSERT … VALUES (…),(…)` is one atomic op in **one round‑trip** — a
+  naive client pays N round‑trips and N consensus decisions; KesselDB pays
+  one.
 - **Replicated & highly available** — Viewstamped Replication over real TCP
   sockets; safety‑hardened (no committed‑op loss across view change) and
   liveness‑tested under an adversarial partition corpus.
@@ -155,7 +158,7 @@ Honest boundaries (documented, not hidden):
 - **Non‑gating roadmap** (tracked, not blocking): balance‑guard helpers,
   cross‑shard transactions, destructive `ALTER TABLE` & `DROP INDEX` (`DROP TABLE` done, SP54), overflow GC.
 
-Every claim in this repository is backed by the test suite (`153 tests`); the
+Every claim in this repository is backed by the test suite (`154 tests`); the
 docs call out exactly what is proven versus roadmap.
 
 ## Documentation
@@ -172,7 +175,7 @@ docs call out exactly what is proven versus roadmap.
 
 ```bash
 cargo build                 # all crates, zero external deps
-cargo test --workspace      # 153 tests (incl. seeded partition/fault simulation)
+cargo test --workspace      # 154 tests (incl. seeded partition/fault simulation)
 cargo run -p kessel-bench --release -- --help   # benchmarks
 ```
 

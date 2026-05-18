@@ -400,11 +400,22 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
     if p.kw("INSERT") {
         p.expect_kw("INTO")?;
         let tname = p.ident()?;
-        p.expect_kw("ID")?;
-        let id = match p.next() {
-            Some(Tok::Int(n)) => n as u128,
-            _ => return Err("INSERT needs `ID <int>`".into()),
+
+        // Two forms:
+        //  (legacy)  INSERT INTO t ID <n> (cols) VALUES (v..)
+        //  (general) INSERT INTO t (id, cols) VALUES (v..)[, (v..)]*
+        // The general form treats a pseudo-column `id` as the 128-bit row
+        // id and supports multi-row inserts, which compile to one atomic
+        // Op::Txn — one replicated round-trip for the whole batch.
+        let legacy_id: Option<u128> = if p.kw("ID") {
+            match p.next() {
+                Some(Tok::Int(n)) => Some(n as u128),
+                _ => return Err("INSERT needs `ID <int>`".into()),
+            }
+        } else {
+            None
         };
+
         let ot = p.type_named(&tname)?.clone();
         p.punct('(')?;
         let mut cols = Vec::new();
@@ -416,43 +427,81 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
                 _ => return Err("expected `,` or `)`".into()),
             }
         }
+        let id_pos = cols.iter().position(|c| c.eq_ignore_ascii_case("id"));
+        if legacy_id.is_none() && id_pos.is_none() {
+            return Err(
+                "INSERT needs a row id: either `ID <n>` or an `id` column".into(),
+            );
+        }
+
         p.expect_kw("VALUES")?;
-        p.punct('(')?;
-        let mut raw = Vec::new();
+        // One or more parenthesised value tuples.
+        let mut ops: Vec<Op> = Vec::new();
         loop {
-            match p.next() {
-                Some(Tok::Int(n)) => raw.push(Lit::Int(n)),
-                Some(Tok::Str(s)) => raw.push(Lit::Str(s)),
-                _ => return Err("expected value".into()),
+            p.punct('(')?;
+            let mut raw = Vec::new();
+            loop {
+                match p.next() {
+                    Some(Tok::Int(n)) => raw.push(Lit::Int(n)),
+                    Some(Tok::Str(s)) => raw.push(Lit::Str(s)),
+                    _ => return Err("expected value".into()),
+                }
+                match p.next() {
+                    Some(Tok::Punct(',')) => continue,
+                    Some(Tok::Punct(')')) => break,
+                    _ => return Err("expected `,` or `)`".into()),
+                }
             }
-            match p.next() {
-                Some(Tok::Punct(',')) => continue,
-                Some(Tok::Punct(')')) => break,
-                _ => return Err("expected `,` or `)`".into()),
+            if cols.len() != raw.len() {
+                return Err("column/value count mismatch".into());
             }
-        }
-        if cols.len() != raw.len() {
-            return Err("column/value count mismatch".into());
-        }
-        // Build values in schema order; unlisted nullable fields => Null.
-        let mut values = Vec::with_capacity(ot.fields.len());
-        for f in &ot.fields {
-            match cols.iter().position(|c| *c == f.name) {
-                Some(idx) => values.push(lit_to_value(&raw[idx], f.kind)?),
-                None => {
-                    if f.nullable {
-                        values.push(Value::Null);
-                    } else {
-                        return Err(format!("missing NOT NULL column `{}`", f.name));
+            // Resolve the row id for this tuple.
+            let id = match (legacy_id, id_pos) {
+                (Some(n), _) => n,
+                (None, Some(ip)) => match &raw[ip] {
+                    Lit::Int(n) => *n as u128,
+                    _ => return Err("`id` must be an integer".into()),
+                },
+                _ => unreachable!(),
+            };
+            // Build field values in schema order (the `id` pseudo-column is
+            // not a field; unlisted nullable fields => Null).
+            let mut values = Vec::with_capacity(ot.fields.len());
+            for f in &ot.fields {
+                match cols.iter().position(|c| *c == f.name) {
+                    Some(idx) => values.push(lit_to_value(&raw[idx], f.kind)?),
+                    None => {
+                        if f.nullable {
+                            values.push(Value::Null);
+                        } else {
+                            return Err(format!(
+                                "missing NOT NULL column `{}`",
+                                f.name
+                            ));
+                        }
                     }
                 }
             }
+            let record =
+                encode(&ot, &values).map_err(|e| format!("encode: {e:?}"))?;
+            ops.push(Op::Create {
+                type_id: ot.type_id,
+                id: ObjectId::from_u128(id),
+                record,
+            });
+            match p.peek() {
+                Some(Tok::Punct(',')) => {
+                    p.i += 1;
+                    continue;
+                }
+                _ => break,
+            }
         }
-        let record = encode(&ot, &values).map_err(|e| format!("encode: {e:?}"))?;
-        return Ok(Op::Create {
-            type_id: ot.type_id,
-            id: ObjectId::from_u128(id),
-            record,
+        return Ok(if ops.len() == 1 {
+            ops.pop().unwrap()
+        } else {
+            // Multi-row: all rows land atomically in one replicated op.
+            Op::Txn { ops }
         });
     }
 
@@ -1072,6 +1121,63 @@ mod tests {
             OpResult::Got(b) => assert_eq!(i128::from_le_bytes(b.try_into().unwrap()), 2),
             o => panic!("{o:?}"),
         }
+    }
+
+    #[test]
+    fn multi_row_insert_is_atomic() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        assert!(matches!(
+            run(&mut sm, 1, "CREATE TABLE acct (owner U32 NOT NULL, bal I64 NOT NULL)"),
+            OpResult::TypeCreated(1)
+        ));
+        // legacy single-row form still works (back-compat)
+        assert_eq!(
+            run(&mut sm, 2, "INSERT INTO acct ID 1 (owner, bal) VALUES (100, 50)"),
+            OpResult::Ok
+        );
+        // new id-column single-row form
+        assert_eq!(
+            run(&mut sm, 3, "INSERT INTO acct (id, owner, bal) VALUES (2, 100, 60)"),
+            OpResult::Ok
+        );
+        // multi-row: one statement, all rows land atomically
+        assert_eq!(
+            run(
+                &mut sm,
+                4,
+                "INSERT INTO acct (id, owner, bal) VALUES (3, 7, 1), (4, 7, 2), (5, 7, 3)"
+            ),
+            OpResult::Ok
+        );
+        let cnt = |sm: &mut StateMachine<MemVfs>, op, q: &str| -> i128 {
+            match run(sm, op, q) {
+                OpResult::Got(b) => i128::from_le_bytes(b.try_into().unwrap()),
+                o => panic!("{q}: {o:?}"),
+            }
+        };
+        assert_eq!(cnt(&mut sm, 5, "SELECT COUNT(*) FROM acct"), 5);
+        assert_eq!(cnt(&mut sm, 6, "SELECT COUNT(*) FROM acct WHERE owner = 7"), 3);
+
+        // Atomicity: a duplicate id inside the batch rejects the WHOLE
+        // statement — none of its rows are inserted.
+        let r = run(
+            &mut sm,
+            7,
+            "INSERT INTO acct (id, owner, bal) VALUES (9, 1, 1), (3, 1, 1)",
+        ); // id 3 already exists
+        assert_ne!(r, OpResult::Ok, "batch with a dup id must not commit");
+        assert_eq!(
+            cnt(&mut sm, 8, "SELECT COUNT(*) FROM acct"),
+            5,
+            "failed batch must insert nothing (id 9 rolled back too)"
+        );
+
+        // Missing row id is a clean error.
+        assert!(compile(
+            "INSERT INTO acct (owner, bal) VALUES (1, 2)",
+            sm.catalog()
+        )
+        .is_err());
     }
 
     #[test]

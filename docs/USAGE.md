@@ -170,7 +170,9 @@ Column types: `U8 U16 U32 U64`, `I8 I16 I32 I64`, `BYTES`, `BOOL`.
 ### DML
 
 ```sql
-INSERT INTO <t> ID <n> (<cols>) VALUES (<vals>)
+INSERT INTO <t> ID <n> (<cols>) VALUES (<vals>)            -- legacy single-row
+INSERT INTO <t> (id, <cols>) VALUES (<v>)[, (<v>)]*       -- Postgres-shaped;
+                                                          -- multi-row = 1 atomic op
 UPDATE <t> ID <n> SET <col> = <val> [, ...]      -- server‑side read‑modify‑write
 DELETE FROM <t> WHERE <col> = <val>
 ```

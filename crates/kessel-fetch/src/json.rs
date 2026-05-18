@@ -264,7 +264,6 @@ impl<'a> P<'a> {
 /// Navigate `rows_path` (if any) to a JSON array, then extract `cols`
 /// from each element (same scalar dotted-path rule as `extract`).
 /// `None` rows_path == today's top-level-array behavior.
-#[allow(dead_code)] // used by fetch_rows_paginated in the next task
 pub(crate) fn rows_at(
     body: &[u8],
     cols: &[ColumnMap],
@@ -306,7 +305,6 @@ pub(crate) fn rows_at(
 /// Read the scalar at `path`. `None` if absent / JSON null / empty
 /// string (the pagination "stop" signals) or if the node is a
 /// non-scalar (array/object). Numbers render as their source text.
-#[allow(dead_code)] // used by fetch_rows_paginated in the next task
 pub(crate) fn opt_string_at(
     body: &[u8],
     path: &str,

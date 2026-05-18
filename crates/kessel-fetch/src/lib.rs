@@ -130,12 +130,10 @@ pub fn fetch_rows_paginated(
         }
         let next: Option<String> = match pagination {
             Pagination::NextUrlJson(p) => json::opt_string_at(&body, p)?,
-            Pagination::CursorJson { path, param } => {
-                match json::opt_string_at(&body, path)? {
-                    None => None,
-                    Some(tok) => Some(set_query_param(base_url, param, &tok)),
-                }
-            }
+            Pagination::CursorJson { path, param } => json::opt_string_at(
+                &body, path,
+            )?
+            .map(|tok| set_query_param(base_url, param, &tok)),
             Pagination::NextLink => link_next(&headers),
         };
         match next {
@@ -149,6 +147,9 @@ pub fn fetch_rows_paginated(
 /// Replace/append `?param=value` on `base` (slice-1: opaque
 /// API-supplied ASCII tokens; no percent-encoding).
 fn set_query_param(base: &str, param: &str, value: &str) -> String {
+    // Slice-1: a data endpoint fragment is not meaningful; strip it so
+    // the appended query can never land after a `#`.
+    let base = base.split_once('#').map_or(base, |(b, _)| b);
     let (path, query) = match base.split_once('?') {
         Some((p, q)) => (p, q),
         None => (base, ""),
@@ -164,6 +165,18 @@ fn set_query_param(base: &str, param: &str, value: &str) -> String {
     format!("{path}?{}", parts.join("&"))
 }
 
+/// True if a Link entry's `rel=` param contains the `next` token
+/// (RFC 8288 allows space-separated rel tokens, e.g. `rel="first next"`).
+fn rel_has_next(part: &str) -> bool {
+    part.split(';').skip(1).any(|p| {
+        let p = p.trim();
+        let Some(v) = p.strip_prefix("rel=") else { return false };
+        v.trim_matches('"')
+            .split_ascii_whitespace()
+            .any(|t| t.eq_ignore_ascii_case("next"))
+    })
+}
+
 /// Find the `rel="next"` target across ALL `Link` response headers
 /// (RFC 8288). A server may send multiple `Link` headers OR one
 /// header with comma-separated entries — handle both. The first
@@ -175,7 +188,7 @@ fn link_next(headers: &[(String, String)]) -> Option<String> {
         }
         for part in v.split(',') {
             let p = part.trim();
-            if p.contains("rel=\"next\"") || p.contains("rel=next") {
+            if rel_has_next(p) {
                 let s = p.find('<')?;
                 let e = p[s + 1..].find('>')? + s + 1;
                 return Some(p[s + 1..e].to_string());
@@ -210,4 +223,38 @@ pub fn fetch_rows(
         out.push(row);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod ptests {
+    use super::*;
+
+    #[test]
+    fn set_query_param_handles_fragment_and_replace() {
+        assert_eq!(set_query_param("http://h/p", "c", "T"), "http://h/p?c=T");
+        assert_eq!(set_query_param("http://h/p#frag", "c", "T"), "http://h/p?c=T");
+        assert_eq!(set_query_param("http://h/p?c=OLD&x=1", "c", "T"), "http://h/p?x=1&c=T");
+        assert_eq!(set_query_param("http://h/p?x=1#f", "c", "T"), "http://h/p?x=1&c=T");
+        // prefix-name must not be false-dropped
+        assert_eq!(set_query_param("http://h/p?cx=1", "c", "T"), "http://h/p?cx=1&c=T");
+    }
+
+    #[test]
+    fn link_next_matches_rel_token_set() {
+        let h = |v: &str| vec![("Link".to_string(), v.to_string())];
+        assert_eq!(link_next(&h(r#"<http://x/2>; rel="next""#)), Some("http://x/2".into()));
+        assert_eq!(link_next(&h(r#"<http://x/2>; rel=next"#)), Some("http://x/2".into()));
+        // space-separated rel token set (RFC 8288) — was previously missed
+        assert_eq!(link_next(&h(r#"<http://x/2>; rel="first next""#)), Some("http://x/2".into()));
+        // rel="nextpage" must NOT match `next`
+        assert_eq!(link_next(&h(r#"<http://x/2>; rel="nextpage""#)), None);
+        // multiple Link headers: pick the one with rel next
+        let multi = vec![
+            ("Link".to_string(), r#"<http://x/prev>; rel="prev""#.to_string()),
+            ("link".to_string(), r#"<http://x/2>; rel="next""#.to_string()),
+        ];
+        assert_eq!(link_next(&multi), Some("http://x/2".into()));
+        // no link header => None
+        assert_eq!(link_next(&[("X".into(), "y".into())]), None);
+    }
 }

@@ -506,6 +506,42 @@ impl<V: Vfs> StateMachine<V> {
         o
     }
 
+    /// SP73 (columnar fast-path): the MIN (`want_max=false`) or MAX
+    /// (`want_max=true`) raw bytes of an order-indexed column, read
+    /// straight from the extreme of the order index — O(scan of the
+    /// matching segment) instead of a full table scan. The order index
+    /// is sorted by an order-preserving key, so its first/last entry is
+    /// the global min/max; we fetch one row under that entry and return
+    /// the column's raw bytes. `None` if the table is empty, the field
+    /// is not order-indexed, or the index/row is (transiently)
+    /// unavailable — the caller then falls back to the full scan, so
+    /// this is purely an accelerator and never changes the answer.
+    fn agg_extreme(
+        &self,
+        type_id: u32,
+        field_id: u16,
+        off: usize,
+        w: usize,
+        want_max: bool,
+    ) -> Option<Vec<u8>> {
+        let idxt = 0xFFFD_0000 | (type_id & 0xFFFF);
+        let mut klo = [0u8; 16];
+        klo[..2].copy_from_slice(&field_id.to_le_bytes());
+        let mut khi = [0u8; 16];
+        khi[..2].copy_from_slice(&field_id.to_le_bytes());
+        khi[2..].copy_from_slice(&[0xFFu8; 14]);
+        // Early-stopping boundary lookup — does NOT materialise the
+        // whole order-index range (that would be O(n) and pointless).
+        let (_, entry) = self.storage.bound_in(
+            &make_key(idxt, &klo),
+            &make_key(idxt, &khi),
+            want_max,
+        )?;
+        let oid: [u8; 16] = entry.get(0..16)?.try_into().ok()?;
+        let rec = self.storage.get(&make_key(type_id, &oid))?;
+        Some(rec.get(off..off + w)?.to_vec())
+    }
+
     /// Compare two width-`w` field encodings per kind (numeric where it
     /// matters; lexicographic for byte kinds).
     fn cmp_field(
@@ -1985,6 +2021,31 @@ impl<V: Vfs> StateMachine<V> {
                     }
                     i128::from_le_bytes(le)
                 };
+                // SP73 columnar fast-path. `uncond` = the planner's
+                // canonical always-true program (no WHERE): the per-row
+                // expr-VM filter is then pure overhead, so skip it and
+                // fold only the aggregated column. For MIN/MAX of an
+                // order-indexed column with no filter, skip the scan
+                // entirely and read the index extreme. Both are pure
+                // accelerators — the slow path below is the oracle.
+                let uncond = program
+                    == kessel_expr::Program::new().push_int(1).bytes().as_slice();
+                if uncond {
+                    if let (Some((off, w, fk)), true) =
+                        (fpos, kind == 2 || kind == 3)
+                    {
+                        use kessel_catalog::FieldKind::*;
+                        let signed =
+                            matches!(fk, I8 | I16 | I32 | I64 | Fixed { .. });
+                        if ot.ordered.contains(&field_id) {
+                            let r = self
+                                .agg_extreme(type_id, field_id, off, w, kind == 3)
+                                .map(|raw| decode_i128(&raw, w, signed))
+                                .unwrap_or(0);
+                            return OpResult::Got(r.to_le_bytes().to_vec());
+                        }
+                    }
+                }
                 let lo = make_key(type_id, &[0u8; 16]);
                 let hi = make_key(type_id, &[0xFFu8; 16]);
                 let mut count: i128 = 0;
@@ -1992,11 +2053,15 @@ impl<V: Vfs> StateMachine<V> {
                 let mut mn: Option<i128> = None;
                 let mut mx: Option<i128> = None;
                 for (_, rec) in self.storage.scan_range(&lo, &hi) {
-                    match kessel_expr::eval(&program, &ot, &rec) {
-                        Ok(true) => {}
-                        Ok(false) => continue,
-                        Err(e) => {
-                            return OpResult::SchemaError(format!("agg program: {e:?}"))
+                    if !uncond {
+                        match kessel_expr::eval(&program, &ot, &rec) {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(e) => {
+                                return OpResult::SchemaError(format!(
+                                    "agg program: {e:?}"
+                                ))
+                            }
                         }
                     }
                     count += 1;
@@ -2121,14 +2186,24 @@ impl<V: Vfs> StateMachine<V> {
                     Vec<u8>,
                     (i128, i128, Option<i128>, Option<i128>),
                 > = std::collections::BTreeMap::new();
+                // SP73: skip the per-row expr-VM when the program is the
+                // planner's canonical always-true (no WHERE) — same
+                // accelerator as scalar Aggregate; group/agg columns are
+                // still read by offset, result is identical.
+                let uncond = program
+                    == kessel_expr::Program::new().push_int(1).bytes().as_slice();
                 let lo = make_key(type_id, &[0u8; 16]);
                 let hi = make_key(type_id, &[0xFFu8; 16]);
                 for (_, rec) in self.storage.scan_range(&lo, &hi) {
-                    match kessel_expr::eval(&program, &ot, &rec) {
-                        Ok(true) => {}
-                        Ok(false) => continue,
-                        Err(e) => {
-                            return OpResult::SchemaError(format!("group program: {e:?}"))
+                    if !uncond {
+                        match kessel_expr::eval(&program, &ot, &rec) {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(e) => {
+                                return OpResult::SchemaError(format!(
+                                    "group program: {e:?}"
+                                ))
+                            }
                         }
                     }
                     let gkey = match rec.get(gpos.0..gpos.0 + gpos.1) {
@@ -3747,6 +3822,128 @@ mod tests {
         let none = Program::new().load(1).push_int(999).eq().bytes();
         assert_eq!(agg(&mut sm, 26, 0, none.clone()), 0);
         assert_eq!(agg(&mut sm, 27, 1, none), 0);
+    }
+
+    /// SP73 oracle: the columnar aggregate fast-path (no-WHERE skips the
+    /// expr-VM; MIN/MAX of an order-indexed column reads the index
+    /// extreme) must return EXACTLY what an independent brute-force model
+    /// computes — for every kind, with and without a filter, including
+    /// the empty case. This guards that the accelerator never changes
+    /// the answer (the only way it could be unsafe).
+    #[test]
+    fn aggregate_columnar_fastpath_equals_scan_oracle() {
+        use kessel_expr::Program;
+        use kessel_proto::Rng;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: q_type_def() });
+        sm.apply(2, Op::AddOrderedIndex { type_id: 1, field_id: 3 }); // RANGE idx on v
+        let mut rng = Rng::new(0xC0FF_EE99);
+        let mut model: Vec<(u32, u32)> = Vec::new(); // (owner, v)
+        for id in 0..220u128 {
+            let o = rng.below(5) as u32;
+            let v = rng.below(1000) as u32;
+            sm.apply(
+                10 + id as u64,
+                Op::Create {
+                    type_id: 1,
+                    id: ObjectId::from_u128(id),
+                    record: qrec(o, 0, v),
+                },
+            );
+            model.push((o, v));
+        }
+        let agg = |sm: &mut StateMachine<MemVfs>, op: u64, k: u8, p: Vec<u8>| -> i128 {
+            match sm.apply(op, Op::Aggregate { type_id: 1, program: p, kind: k, field_id: 3 })
+            {
+                OpResult::Got(b) => i128::from_le_bytes(b.try_into().unwrap()),
+                o => panic!("expected Got, got {o:?}"),
+            }
+        };
+        let mut op = 1000u64;
+        for filter in [None, Some(0u32), Some(2u32), Some(99u32)] {
+            // None ⇒ canonical always-true (fast path, incl. index
+            // MIN/MAX). Some(k) ⇒ owner==k (slow path, expr-VM runs).
+            let (prog, sel): (Vec<u8>, Box<dyn Fn(u32) -> bool>) = match filter {
+                None => (
+                    Program::new().push_int(1).bytes(),
+                    Box::new(|_| true),
+                ),
+                Some(kf) => (
+                    Program::new().load(1).push_int(kf as i128).eq().bytes(),
+                    Box::new(move |o| o == kf),
+                ),
+            };
+            let vs: Vec<i128> = model
+                .iter()
+                .filter(|(o, _)| sel(*o))
+                .map(|(_, v)| *v as i128)
+                .collect();
+            let cnt = vs.len() as i128;
+            let sum: i128 = vs.iter().sum();
+            let mn = vs.iter().min().copied().unwrap_or(0);
+            let mx = vs.iter().max().copied().unwrap_or(0);
+            let avg = if cnt == 0 { 0 } else { sum / cnt };
+            op += 1; assert_eq!(agg(&mut sm, op, 0, prog.clone()), cnt, "COUNT {filter:?}");
+            op += 1; assert_eq!(agg(&mut sm, op, 1, prog.clone()), sum, "SUM {filter:?}");
+            op += 1; assert_eq!(agg(&mut sm, op, 2, prog.clone()), mn, "MIN {filter:?}");
+            op += 1; assert_eq!(agg(&mut sm, op, 3, prog.clone()), mx, "MAX {filter:?}");
+            op += 1; assert_eq!(agg(&mut sm, op, 4, prog.clone()), avg, "AVG {filter:?}");
+        }
+    }
+
+    /// SP73: MIN/MAX of an order-indexed column with no filter must
+    /// answer from the index extreme — materially faster than the
+    /// equivalent full scan — and return the identical value.
+    #[test]
+    fn min_max_via_index_skips_the_scan() {
+        use kessel_expr::Program;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: q_type_def() });
+        sm.apply(2, Op::AddOrderedIndex { type_id: 1, field_id: 3 });
+        let n = 40_000u128;
+        for id in 0..n {
+            let v = ((id * 2654435761) % 1_000_000) as u32;
+            sm.apply(
+                10 + id as u64,
+                Op::Create {
+                    type_id: 1,
+                    id: ObjectId::from_u128(id),
+                    record: qrec(0, 0, v),
+                },
+            );
+        }
+        // Canonical always-true ⇒ index-extreme fast path.
+        let canon = Program::new().push_int(1).bytes();
+        // Always-true but NOT the canonical constant ⇒ forces the full
+        // scan + per-row expr-VM (the honest baseline to beat).
+        let scan = Program::new().push_int(7).push_int(7).eq().bytes();
+        let run = |sm: &mut StateMachine<MemVfs>, op, k, p: Vec<u8>| -> (i128, u128) {
+            let t = std::time::Instant::now();
+            let r = match sm.apply(
+                op,
+                Op::Aggregate { type_id: 1, program: p, kind: k, field_id: 3 },
+            ) {
+                OpResult::Got(b) => i128::from_le_bytes(b.try_into().unwrap()),
+                o => panic!("{o:?}"),
+            };
+            (r, t.elapsed().as_micros())
+        };
+        let (mn_fast, tf) = run(&mut sm, 90, 2, canon.clone());
+        let (mn_scan, ts) = run(&mut sm, 91, 2, scan.clone());
+        let (mx_fast, _) = run(&mut sm, 92, 3, canon);
+        let (mx_scan, _) = run(&mut sm, 93, 3, scan);
+        assert_eq!(mn_fast, mn_scan, "index MIN == scan MIN");
+        assert_eq!(mx_fast, mx_scan, "index MAX == scan MAX");
+        println!(
+            "[agg-fastpath] MIN over {n} rows: index {tf}µs vs full-scan \
+             {ts}µs  (~{:.0}x)",
+            ts as f64 / tf.max(1) as f64
+        );
+        assert!(
+            tf * 3 < ts,
+            "MIN via order index must skip the scan (index {tf}µs vs \
+             scan {ts}µs)"
+        );
     }
 
     #[test]

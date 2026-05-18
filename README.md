@@ -6,7 +6,7 @@
 
 *"It's the database that made the Kessel Run in 12 parsecs."*
 
-`172 tests green` · `0 external dependencies` · `Rust 1.95+` · single‑binary
+`174 tests green` · `0 external dependencies` · `Rust 1.95+` · single‑binary
 
 </div>
 
@@ -53,7 +53,10 @@ feature, not an aspiration.
   auth, connection quotas and backpressure.
 - **Fast where it counts** — prepared‑statement cache (≈26× faster SQL compile),
   per‑SSTable bloom filters, bounded‑segment compaction for data‑size‑independent
-  point reads, and an in‑memory read cache for hot keys (all on by default).
+  point reads, range/band index narrowing, a columnar fast‑path that answers
+  `MIN`/`MAX` from the index extreme without scanning, and an in‑memory read
+  cache for hot keys — all on by default, each proven equivalent to a full
+  scan by a randomized oracle.
 - **Deterministic & verifiable** — the whole engine is a seedable state machine;
   the test suite includes a seeded partition/fault simulation corpus.
 
@@ -130,25 +133,33 @@ db.call(&op)?; // routed to the primary; retried safely on failover
 
 See [`docs/USAGE.md`](docs/USAGE.md) → *Running a cluster*.
 
-## Performance (single thread, honest — measured on a 16-core Xeon)
+## Performance
+
+Single deterministic writer, default zero‑dependency build. Measured on
+a 16‑core x86‑64 Linux reference server (numbers move with hardware; the
+*relationships* hold across platforms — see
+**[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)** for the scaling model
+and cloud projections).
 
 | Path | Result |
 |---|---|
-| State‑machine create (in‑mem, 128B record) | ~215K ops/s @ p50 2µs (vulcan 16-core; SP67) |
-| Durable create, group commit (batch 1000) | ~87K ops/s |
-| Concurrent durable (8 clients, vulcan/Linux) | **97 → 1,870 ops/s (~19×)** — server group commit + TCP_NODELAY (SP68) |
-| Pipelined batch (1 conn, vulcan/Linux) | **242 → 52,721 ops/s (~217×)** — N independent stmts/round-trip (SP69) |
-| SQL compile, prepared‑statement cache | **574K → 15.0M stmt/s (26.2×)** |
-| Mixed `WHERE idx=K AND …` | index-narrowed, not full scan (SP62; oracle-verified) |
-| Multi-col `WHERE a=1 AND b=2` (composite idx) | composite-index-narrowed (SP63; oracle-verified) |
-| Range/band `WHERE v BETWEEN a AND b` (range idx) | **35,007 → 313 µs (~112×)** order-index narrowed (SP70; oracle-verified) |
+| State‑machine create (in‑mem, 128 B) | ~215 K ops/s @ p50 ~2 µs |
+| Durable create, group commit (~1 K batch) | ~87 K ops/s (local NVMe) |
+| Concurrent durable, 8 clients | **~1,870 ops/s** — group commit + `TCP_NODELAY` (conservative; rises with concurrency) |
+| Pipelined batch, 1 connection | **~52,700 ops/s** — N statements per round‑trip |
+| SQL compile, prepared‑statement cache | **~574 K → ~15 M stmt/s** (cold → cached) |
+| Equality / composite `WHERE` | index‑narrowed, not full scan (equivalence‑oracle verified) |
+| Range/band `WHERE v BETWEEN a AND b` (range index) | **~35 ms → ~0.31 ms (~112×)**, oracle‑verified |
+| `MIN`/`MAX` on a range‑indexed column | **~23 ms → ~5 µs (~4,600×)** — columnar fast‑path, answered from the index extreme (no scan), oracle‑verified |
 | Point read | ≤8 bloom‑probed segments (~28 ns/segment), bounded by design |
-| 3‑node replicated | ~161K ops/s |
+| 3‑node replicated | ~161 K ops/s |
 
-Numbers are reproducible (`cargo run -p kessel-bench --release -- --help`) and
-every figure in the docs is backed by a benchmark or a test. See
-[`docs/STATUS.md`](docs/STATUS.md) for the full performance log and the precise
-production‑readiness gate.
+Every figure is reproducible from the test suite / `kessel-bench`, and
+each query accelerator is guarded by a randomized equivalence oracle
+(the accelerated result is proven identical to a brute‑force scan). Full
+methodology, the single‑core/fsync/RTT scaling model, and
+order‑of‑magnitude projections for common cloud instance + storage
+configurations are in **[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)**.
 
 ## Project status & maturity
 
@@ -167,9 +178,9 @@ Honest boundaries (documented, not hidden):
   with a timing‑safe comparison (deploy behind a TLS proxy / private
   network). Hand‑rolling TLS would be irresponsible, hence the feature.
 - **Non‑gating roadmap** (tracked, not blocking): balance‑guard helpers,
-  cross‑shard transactions, destructive `ALTER TABLE` & `DROP INDEX` (`DROP TABLE` done, SP54), overflow GC.
+  cross‑shard transactions, destructive `ALTER TABLE` & `DROP INDEX` (`DROP TABLE` is supported), overflow GC.
 
-Every claim in this repository is backed by the test suite (`172 tests`); the
+Every claim in this repository is backed by the test suite (`174 tests`); the
 docs call out exactly what is proven versus roadmap.
 
 ## Documentation
@@ -178,6 +189,7 @@ docs call out exactly what is proven versus roadmap.
 |---|---|
 | [`AGENTS.md`](AGENTS.md) | Machine-first operating guide — build/test/run/CLI, wire protocol, repo map, working rules (read this first if you're an agent) |
 | [`docs/USAGE.md`](docs/USAGE.md) | Install, run, **CLI**, client API, **SQL reference**, clustering, auth, backup & monitoring |
+| [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) | Methodology, measured numbers, scaling model, cloud projections |
 | [`docs/STATUS.md`](docs/STATUS.md) | Production‑readiness gate, per‑slice status, performance log |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Storage, replication, sharding, caching internals |
 | [`docs/superpowers/specs/`](docs/superpowers/specs/) | One design spec per sub‑project |
@@ -186,7 +198,7 @@ docs call out exactly what is proven versus roadmap.
 
 ```bash
 cargo build                 # all crates, zero external deps
-cargo test --workspace      # 172 tests (incl. seeded partition/fault simulation)
+cargo test --workspace      # 174 tests (incl. seeded partition/fault simulation)
 cargo run -p kessel-bench --release -- --help   # benchmarks
 ```
 

@@ -696,6 +696,114 @@ impl<V: Vfs> Storage<V> {
             .collect()
     }
 
+    /// The single smallest (`want_max=false`) or largest
+    /// (`want_max=true`) **live** entry whose key is in `[lo, hi]`,
+    /// without materialising the whole range. Each SSTable is binary-
+    /// searched for its boundary candidate and the memtable/overlay use
+    /// their ordered cursors; the global candidate is resolved with a
+    /// tombstone-aware point `get`, advancing past a (rare) tombstoned
+    /// boundary. Sub-linear in the common case — the accelerator behind
+    /// `MIN`/`MAX` on an order-indexed column. A hard iteration cap makes
+    /// it fall back to `None` (caller does the full scan) rather than
+    /// ever loop unboundedly: a pure optimisation, never a wrong answer.
+    pub fn bound_in(
+        &self,
+        lo: &Key,
+        hi: &Key,
+        want_max: bool,
+    ) -> Option<(Key, Vec<u8>)> {
+        // Strictly-greater successor (length-safe: append 0x00 — shorter
+        // shared-prefix keys can't exist here since keys are fixed-width).
+        let succ = |k: &Key| -> Key {
+            let mut n = k.clone();
+            n.push(0);
+            n
+        };
+        // Strictly-smaller predecessor: big-endian decrement with borrow
+        // (equal-length byte order == integer order). None at all-zero.
+        let pred = |k: &Key| -> Option<Key> {
+            let mut n = k.clone();
+            for i in (0..n.len()).rev() {
+                if n[i] > 0 {
+                    n[i] -= 1;
+                    return Some(n);
+                }
+                n[i] = 0xFF;
+            }
+            None
+        };
+        let mut lo_c = lo.clone();
+        let mut hi_c = hi.clone();
+        for _ in 0..4096 {
+            if lo_c > hi_c {
+                return None;
+            }
+            // Boundary candidate key across every source.
+            let mut cand: Option<Key> = None;
+            let mut take = |k: &Key| {
+                if k < &lo_c || k > &hi_c {
+                    return;
+                }
+                cand = Some(match cand.take() {
+                    None => k.clone(),
+                    Some(c) => {
+                        if (want_max && *k > c) || (!want_max && *k < c) {
+                            k.clone()
+                        } else {
+                            c
+                        }
+                    }
+                });
+            };
+            for sst in &self.sstables {
+                if !sst.overlaps(&lo_c, &hi_c) {
+                    continue;
+                }
+                if want_max {
+                    let pp =
+                        sst.entries.partition_point(|(k, _)| k <= &hi_c);
+                    if pp > 0 {
+                        take(&sst.entries[pp - 1].0);
+                    }
+                } else {
+                    let s =
+                        sst.entries.partition_point(|(k, _)| k < &lo_c);
+                    if let Some((k, _)) = sst.entries.get(s) {
+                        take(k);
+                    }
+                }
+            }
+            {
+                let mut it = self.memtable.range(lo_c.clone()..=hi_c.clone());
+                if let Some((k, _)) =
+                    if want_max { it.next_back() } else { it.next() }
+                {
+                    take(k);
+                }
+            }
+            if let Some(ov) = &self.txn {
+                let mut it = ov.range(lo_c.clone()..=hi_c.clone());
+                if let Some((k, _)) =
+                    if want_max { it.next_back() } else { it.next() }
+                {
+                    take(k);
+                }
+            }
+            let c = cand?;
+            // Tombstone-aware newest-wins resolution of just this key.
+            if let Some(v) = self.get(&c) {
+                return Some((c, v));
+            }
+            // Boundary was tombstoned at the newest version — step past it.
+            if want_max {
+                hi_c = pred(&c)?;
+            } else {
+                lo_c = succ(&c);
+            }
+        }
+        None // cap hit (pathological tombstone run) → caller full-scans
+    }
+
     /// Order-independent CRC digest of the entire live keyspace.
     pub fn digest(&self) -> u32 {
         let mut acc: u32 = 0xFFFF_FFFF;

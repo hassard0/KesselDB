@@ -74,12 +74,13 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP64 — SQL `EXPLAIN`** | **done** | `EXPLAIN <stmt>` returns the real plan text (composite/index/seq scan, PK lookup, joins, DDL) without executing; CLI prints it; pure planner-layer, zero engine/determinism risk; **161 green** |
 | **SP65 — `kessel-crypto` (pgcrypto subset)** | **done** | zero-dep SHA-256 + HMAC-SHA256, NIST/RFC-4231 vector-verified; deterministic expr-VM `SHA256`/`HMAC256` opcodes (usable in CHECK/triggers); honest scope = hashing/HMAC only; **165 green** |
 | **SP66 — optional TLS** | **done** | opt-in `tls` cargo feature (rustls); generic `Read+Write` server I/O (refactor behaviour-identical, 165 green); `ServerConfig.tls`; default build stays zero-dep + plaintext+token; both builds verified clean |
-| **SP67 — profile-driven LRU fix** | **done** | profiled write path on vulcan → O(cap) `ReadCache` eviction scan (latent since SP50) was the bottleneck; O(log n) `BTreeSet` LRU, semantics byte-identical; **vulcan CREATE 7.7K→215K ops/s (~28×), p50 131µs→2µs**; **166 green**, determinism intact |
-| **SP68 — group commit + TCP_NODELAY** | **done** | server drains+applies+fsyncs-once-per-batch (EBS lever; replies only after durable; order/digest unchanged) + `set_nodelay` everywhere — measuring on vulcan/Linux found Nagle was the real EC2 bottleneck: **vulcan durable 97→1,870 ops/s (~19×)**, 12k rows correct; **167 green** |
-| **SP69 — request pipelining** | **done** | `PIPELINE_TAG 0xF8`: N independent statements in one frame → one engine message → one group-fsync + one round-trip; `apply_one` shared core makes a member byte-identical to a lone request (NOT atomic — dup-in-batch fails independently, asserted); **vulcan single-conn 242→52,721 ops/s (~217×)**, all rows durable; **168 green** |
-| **SP70 — range-index narrowing** | **done** | planner emits half-range hints on order-indexed cols; engine combines all hints on a field into one tight order-index interval; `Op::QueryRows.range_preds` appended wire-compatibly (old frame ⇒ empty ⇒ unchanged); SP62/63 superset-verify invariant preserved, oracle strengthened (pure-range + band + mixed, ~660 queries); **vulcan band 35,007→313 µs (~112×)**; **169 green**, determinism/seed-7 intact |
+| **SP67 — profile-driven LRU fix** | **done** | profiled write path on the Linux reference server → O(cap) `ReadCache` eviction scan (latent since SP50) was the bottleneck; O(log n) `BTreeSet` LRU, semantics byte-identical; **the Linux reference server CREATE 7.7K→215K ops/s (~28×), p50 131µs→2µs**; **166 green**, determinism intact |
+| **SP68 — group commit + TCP_NODELAY** | **done** | server drains+applies+fsyncs-once-per-batch (EBS lever; replies only after durable; order/digest unchanged) + `set_nodelay` everywhere — measuring on the Linux reference server found Nagle was the real EC2 bottleneck: **the Linux reference server durable 97→1,870 ops/s (~19×)**, 12k rows correct; **167 green** |
+| **SP69 — request pipelining** | **done** | `PIPELINE_TAG 0xF8`: N independent statements in one frame → one engine message → one group-fsync + one round-trip; `apply_one` shared core makes a member byte-identical to a lone request (NOT atomic — dup-in-batch fails independently, asserted); **the Linux reference server single-conn 242→52,721 ops/s (~217×)**, all rows durable; **168 green** |
+| **SP70 — range-index narrowing** | **done** | planner emits half-range hints on order-indexed cols; engine combines all hints on a field into one tight order-index interval; `Op::QueryRows.range_preds` appended wire-compatibly (old frame ⇒ empty ⇒ unchanged); SP62/63 superset-verify invariant preserved, oracle strengthened (pure-range + band + mixed, ~660 queries); **the Linux reference server band 35,007→313 µs (~112×)**; **169 green**, determinism/seed-7 intact |
 | **SP71 — CLI & output delight** | **done** | `--json` mode (stable per-statement object: status/value/rows, RFC-8259 escaped), readable `DESCRIBE`/`\d` schema table (was "GOT N bytes"), shell `\?`/`\d`/`\timing`/`\q` + friendly errors — all pure/unit-tested in `kessel-client`, no new server op (client-only; determinism untouched); **171 green** |
 | **SP72 — self-describing typed result** | **done** | `Op::Join` emits `[KTR1][deflen][typedef][recs]` (combined `<t>.<col>` schema, records re-encoded not raw-concat — header/bitmap correctness verified e2e); client `render_typed_result[_json]` reuses the tested `render_rows` → JOINs render as tables/JSON (was opaque); read-op only, determinism/seed-7 intact; **172 green** |
+| **SP73 — columnar aggregate fast-path (Tier 0)** | **done** | no-WHERE skips the per-row expr-VM; `MIN`/`MAX` on an order-indexed column answered from the index extreme via new early-stopping `Storage::bound_in` (no full scan); randomized equivalence oracle proves fast-path == brute-force (all kinds, filtered/empty); **`MIN` 40 K rows ~23 ms → ~5 µs (~4,600×)** on the Linux reference server; read-op only, determinism/seed-7 intact; **174 green** |
 
 ## Production-readiness gate (precise, not vague)
 
@@ -283,7 +284,7 @@ level compaction, zero-copy reads), recorded here rather than hidden. The first
 | DirVfs real fsync, **per-op** | **2,339 ops/s** | ~2.0M ops/s |
 | DirVfs real fsync, **batch=1000 (group commit)** | **87,338 ops/s** | ~1.05M ops/s |
 
-### SP67 — write-path profile fix (measured on vulcan, 16-core Xeon E5-2667 v4)
+### SP67 — write-path profile fix (measured on the Linux reference server, 16-core Xeon E5-2667 v4)
 
 A profile-driven fix to the O(cap) `ReadCache` LRU eviction scan (latent
 since SP50 enabled the cache by default):
@@ -299,21 +300,21 @@ This restores throughput a prior slice had silently regressed; surfaced
 by profiling (perf was locked down on the host), fixed with a byte-
 identical-semantics O(log n) LRU, determinism corpus green.
 
-### SP68 — group commit + TCP_NODELAY (measured on vulcan/Linux)
+### SP68 — group commit + TCP_NODELAY (measured on the Linux reference server)
 
 `group_commit_concurrent_durable_throughput` (8 concurrent clients,
 12 000 durable inserts, all asserted present):
 
-| vulcan | before | after |
+| the Linux reference server | before | after |
 |---|---|---|
 | time | 123.1 s | **6.4 s** |
 | durable throughput | 97 ops/s | **1,870 ops/s (~19×)** |
 
 The dominant cost on Linux was **Nagle + delayed-ACK** (no
 `TCP_NODELAY`), *not* fsync — exposed only by measuring on the
-representative Linux target (the Windows dev box did 10.6K/s and masked
+representative Linux target (the Windows reference laptop did 10.6K/s and masked
 it). Fixed with `set_nodelay(true)` on every socket; server group commit
-amortises the fsync (the EBS lever). vulcan's absolute number is gated by
+amortises the fsync (the EBS lever). the Linux reference server's absolute number is gated by
 real fsync + only 8 synchronous clients (batch = in-flight ops);
 throughput scales with concurrency/pipelining (next lever) — stated, not
 overclaimed.
@@ -326,8 +327,8 @@ same connection.
 
 | single connection | serial | pipelined (batch 500) | speedup |
 |---|---|---|---|
-| dev box (Windows) | 1,839 ops/s | 88,933 ops/s | ~48× |
-| **vulcan (Linux)** | **242 ops/s** | **52,721 ops/s** | **~217×** |
+| reference laptop (Windows) | 1,839 ops/s | 88,933 ops/s | ~48× |
+| **the Linux reference server (Linux)** | **242 ops/s** | **52,721 ops/s** | **~217×** |
 
 A serial connection has one op in flight, so SP68's group fsync amortised
 over a batch of 1 and the network paid a round-trip per statement.
@@ -348,8 +349,8 @@ scan.
 
 | band query | full scan | range-index | speed-up |
 |---|---|---|---|
-| dev box (Windows) | 54,186 µs | 251 µs | ~216× |
-| **vulcan (Linux)** | **35,007 µs** | **313 µs** | **~112×** |
+| reference laptop (Windows) | 54,186 µs | 251 µs | ~216× |
+| **the Linux reference server (Linux)** | **35,007 µs** | **313 µs** | **~112×** |
 
 Planner emits half-range hints on order-indexed columns (same
 mandatory-conjunct safety gate as eq hints); the engine combines all

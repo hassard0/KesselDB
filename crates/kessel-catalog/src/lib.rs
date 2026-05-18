@@ -460,6 +460,13 @@ impl Catalog {
         // ignore trailing bytes; ours parses defensively (short read ⇒
         // empty, never an error) — same philosophy as the SP86 defaults
         // trailer.
+        // INVARIANT (load-bearing for the v2 sentinel below): the
+        // external trailer is written ONLY when non-empty. v1 thus
+        // never emits `[u32 0]`, which is exactly what lets a leading
+        // 0 unambiguously mean "v2 trailer" in decode. Do NOT make
+        // this unconditional or write a 0-count here — it would both
+        // break the byte-identical-when-empty replicated digest and
+        // collide with the sentinel.
         if !self.external.is_empty() {
             // v2 trailer. v1 (slice-1) started with `[u32 n]` where n>=1
             // (the block is only written when non-empty, so v1 NEVER emits

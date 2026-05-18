@@ -12,6 +12,7 @@ KesselDB. Every feature described here is covered by the test suite.
 - [6. Transactions](#6-transactions)
 - [7. Running a cluster](#7-running-a-cluster)
 - [7b. Sharded deployment & cross-shard transactions](#7b-sharded-deployment--cross-shard-transactions)
+- [7c. External sources (JSON/CSV over HTTP)](#7c-external-sources-jsoncsv-over-http)
 - [8. Authentication, quotas & backpressure](#8-authentication-quotas--backpressure)
 - [9. Backup & monitoring](#9-backup--monitoring)
 - [10. Wire protocol](#10-wire-protocol)
@@ -373,6 +374,107 @@ idempotently after a router restart). This is deterministic
 (Calvin‑style), not blocking 2PC. Cross‑shard transactions are
 point‑op batches (`Create`/`Update`/`Delete`); routing cross‑shard
 *scatter‑gather reads*/SQL text is a separate later concern.
+
+## 7c. External sources (JSON/CSV over HTTP)
+
+An **external source** is a named table whose rows are populated by
+fetching a remote JSON or CSV endpoint and materializing the result
+into a normal KesselDB type. Once materialized, the rows are queried
+with ordinary SQL — indexes, aggregates, joins, and constraints all
+apply.
+
+> **Requires the `external-sources` cargo feature.**
+> Build and run the server with `--features external-sources`:
+>
+> ```bash
+> cargo build --release --features external-sources
+> cargo run --release --bin kesseldb --features external-sources -- 127.0.0.1:7878 ./data
+> ```
+
+### Register a source
+
+```sql
+CREATE EXTERNAL SOURCE prices (
+    ticker  CHAR(8)   NOT NULL FROM 'symbol',
+    price   I64       NOT NULL FROM 'quote.last',
+    volume  U64       NOT NULL FROM 'vol'
+) FROM 'http://data.example.com/quotes.json'
+  FORMAT JSON
+  KEY ticker
+  AUTH BEARER ENV 'PRICES_API_TOKEN'
+```
+
+- `FROM '<path>'` after a column name is the **JSON dotted path** to
+  the value in each array element (`FORMAT JSON`) or the **CSV header
+  name** (`FORMAT CSV`).
+- `FROM '<url>'` after the column list is the HTTP endpoint.
+- `FORMAT JSON` — expects a top-level JSON array of objects.
+  `FORMAT CSV` — expects RFC 4180 with a header row.
+- `KEY <col>` — the column whose value is the stable row identity.
+  The same upstream key always maps to the same row; `REFRESH` upserts
+  (create-if-absent / update-if-changed) without duplicating rows.
+- `AUTH BEARER ENV 'VAR'` — send `Authorization: Bearer $VAR` where
+  `$VAR` is read from the server's environment. No auth: omit the
+  clause. Custom header: `AUTH HEADER 'X-Api-Key' ENV 'VAR'`.
+
+### Populate / refresh
+
+```sql
+REFRESH prices
+```
+
+`REFRESH` fetches the URL once, parses and type-checks every row, and
+submits a single atomic upsert batch through the replicated log. If
+any row fails type coercion the entire refresh is rejected and the
+prior data is unchanged. Re-`REFRESH` with the same upstream data is
+idempotent (same rows → same ids → same state, digest unchanged).
+
+### Query
+
+```sql
+SELECT * FROM prices WHERE ticker = 'AAPL'
+SELECT ticker, price FROM prices ORDER BY price DESC LIMIT 10
+SELECT COUNT(*) FROM prices WHERE volume > 1000000
+```
+
+`prices` is an ordinary KesselDB table — all SQL, indexes, aggregates,
+and joins work normally.
+
+### Remove a source
+
+```sql
+DROP EXTERNAL SOURCE prices
+```
+
+Removes both the materialized rows and the registered source
+definition.
+
+### Security — secret handling
+
+Only the env-var **name** (`'PRICES_API_TOKEN'`) is stored in the
+catalog and replicated. The actual secret value is read from the
+router's process environment at `REFRESH` time and never appears in
+any operation, WAL entry, or log line.
+
+Export the secret in the environment of the server process before
+starting it:
+
+```bash
+export PRICES_API_TOKEN=sk-...
+cargo run --release --bin kesseldb --features external-sources -- 127.0.0.1:7878 ./data
+```
+
+### Honest boundaries
+
+- **Snapshot since last REFRESH.** A source reflects only its last
+  successful `REFRESH`; queries read the materialized snapshot, never
+  live upstream. Re-run `REFRESH` whenever you need fresh data.
+- **HTTP only — no TLS.** The fetch client speaks plain HTTP/1.1.
+  For HTTPS upstreams, put a TLS-terminating reverse proxy (nginx,
+  Caddy, etc.) in front of your data endpoint and point the source URL
+  at the proxy.
+- **Upsert only.** Rows deleted from the upstream source are NOT
+  automatically removed; only creates and updates are applied.
 
 ## 8. Authentication, quotas & backpressure
 

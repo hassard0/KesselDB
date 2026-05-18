@@ -6,7 +6,7 @@
 
 *"It's the database that made the Kessel Run in 12 parsecs."*
 
-`174 tests green` · `0 external dependencies` · `Rust 1.95+` · single‑binary
+`222 tests green` · `0 external dependencies` · `Rust 1.95+` · single‑binary
 
 </div>
 
@@ -57,6 +57,10 @@ feature, not an aspiration.
   `MIN`/`MAX` from the index extreme without scanning, and an in‑memory read
   cache for hot keys — all on by default, each proven equivalent to a full
   scan by a randomized oracle.
+- **External sources** — register a JSON or CSV-over-HTTP endpoint as a table
+  (`CREATE EXTERNAL SOURCE … FORMAT JSON|CSV`), populate it with `REFRESH`,
+  and query with ordinary SQL (`--features external-sources`, default off; the
+  deterministic kernel is unaffected when off).
 - **Deterministic & verifiable** — the whole engine is a seedable state machine;
   the test suite includes a seeded partition/fault simulation corpus.
 
@@ -205,7 +209,7 @@ Honest boundaries (documented, not hidden):
   `Delete`); cross‑shard scatter‑gather *reads*/SQL text routing is a
   separate, later concern from cross‑shard *transactions*.
 
-Every claim in this repository is backed by the test suite (`174 tests`); the
+Every claim in this repository is backed by the test suite (`222 tests`); the
 docs call out exactly what is proven versus roadmap.
 
 ## Documentation
@@ -219,12 +223,13 @@ docs call out exactly what is proven versus roadmap.
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Storage, replication, sharding, caching internals |
 | [`clients/python/kesseldb.py`](clients/python/kesseldb.py) | Dependency‑free Python reference client (stdlib‑only, single file) |
 | [`docs/superpowers/specs/`](docs/superpowers/specs/) | One design spec per sub‑project |
+| [`docs/USAGE.md` → §7c](docs/USAGE.md#7c-external-sources-jsoncsv-over-http) | External sources — register & `REFRESH` JSON/CSV-over-HTTP into a table |
 
 ## Building & testing
 
 ```bash
 cargo build                 # all crates, zero external deps
-cargo test --workspace      # 174 tests (incl. seeded partition/fault simulation)
+cargo test --workspace      # 222 tests (incl. seeded partition/fault simulation)
 cargo run -p kessel-bench --release -- --help   # benchmarks
 ```
 

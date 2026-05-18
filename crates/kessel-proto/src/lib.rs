@@ -167,6 +167,21 @@ pub enum Op {
     /// advance), tracking a cursor in a reserved keyspace. The ordered
     /// sequencer log is the commit point — no 2PC, no locks.
     XshardApply { seq: u64, ops: Vec<Op> },
+    /// Exactly-once sequencer append (SP81): if `key` was seen before,
+    /// return its already-assigned seq (no new entry); else assign +
+    /// store + remember `key`. The key→seq map lives in the digest, so
+    /// a client/router retry is exactly-once and crash-safe.
+    SeqAppendOnce { key: Vec<u8>, payload: Vec<u8> },
+    /// Phase 1 of deterministic cross-shard commit (SP81): dry-run this
+    /// shard's slice against committed state, persist a verdict for
+    /// `seq` (idempotent), apply NOTHING. Reply `Got([1])`=would-commit
+    /// / `Got([0])`=would-abort. The verdict is a pure function of
+    /// durable state, so every router re-derives the same decision.
+    XshardDecide { seq: u64, ops: Vec<Op> },
+    /// Phase 2 (SP81): if `commit`, apply the slice atomically and
+    /// advance the cursor; else just advance (deterministic skip).
+    /// Cursor-idempotent and strictly in seq order, like `XshardApply`.
+    XshardCommit { seq: u64, ops: Vec<Op>, commit: bool },
     /// Inner equi-join (Sub-project 36): rows where
     /// `left.left_field == right.right_field` (raw fixed-width bytes).
     /// Returns up to `limit` joined rows as
@@ -300,6 +315,9 @@ impl Op {
             Op::SeqAppend { .. } => 34,
             Op::SeqRead { .. } => 35,
             Op::XshardApply { .. } => 36,
+            Op::SeqAppendOnce { .. } => 37,
+            Op::XshardDecide { .. } => 38,
+            Op::XshardCommit { .. } => 39,
             Op::Join { .. } => 28,
             Op::Aggregate { .. } => 20,
             Op::SelectFields { .. } => 21,
@@ -396,12 +414,25 @@ impl Op {
                 b.extend_from_slice(&from.to_le_bytes());
                 codec::put_u32(&mut b, *limit);
             }
-            Op::XshardApply { seq, ops } => {
+            Op::XshardApply { seq, ops }
+            | Op::XshardDecide { seq, ops } => {
                 b.extend_from_slice(&seq.to_le_bytes());
                 codec::put_u32(&mut b, ops.len() as u32);
                 for o in ops {
                     codec::put_bytes(&mut b, &o.encode());
                 }
+            }
+            Op::XshardCommit { seq, ops, commit } => {
+                b.extend_from_slice(&seq.to_le_bytes());
+                b.push(*commit as u8);
+                codec::put_u32(&mut b, ops.len() as u32);
+                for o in ops {
+                    codec::put_bytes(&mut b, &o.encode());
+                }
+            }
+            Op::SeqAppendOnce { key, payload } => {
+                codec::put_bytes(&mut b, key);
+                codec::put_bytes(&mut b, payload);
             }
             Op::Describe { type_id } | Op::DropType { type_id } => {
                 codec::put_u32(&mut b, *type_id)
@@ -585,6 +616,37 @@ impl Op {
                     ops.push(o);
                 }
                 Op::XshardApply { seq, ops }
+            }
+            37 => Op::SeqAppendOnce {
+                key: c.bytes()?,
+                payload: c.bytes()?,
+            },
+            38 => {
+                let seq = c.u64()?;
+                let n = c.u32()? as usize;
+                let mut ops = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let o = Op::decode(&c.bytes()?)?;
+                    if matches!(o, Op::Txn { .. } | Op::XshardApply { .. }) {
+                        return None;
+                    }
+                    ops.push(o);
+                }
+                Op::XshardDecide { seq, ops }
+            }
+            39 => {
+                let seq = c.u64()?;
+                let commit = c.u8()? != 0;
+                let n = c.u32()? as usize;
+                let mut ops = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let o = Op::decode(&c.bytes()?)?;
+                    if matches!(o, Op::Txn { .. } | Op::XshardApply { .. }) {
+                        return None;
+                    }
+                    ops.push(o);
+                }
+                Op::XshardCommit { seq, ops, commit }
             }
             32 => Op::RenameField {
                 type_id: c.u32()?,
@@ -875,6 +937,16 @@ mod tests {
             Op::XshardApply {
                 seq: 5,
                 ops: vec![Op::Delete { type_id: 1, id: ObjectId::from_u128(9) }],
+            },
+            Op::SeqAppendOnce { key: vec![7, 7], payload: vec![1, 2, 3] },
+            Op::XshardDecide {
+                seq: 6,
+                ops: vec![Op::Delete { type_id: 1, id: ObjectId::from_u128(2) }],
+            },
+            Op::XshardCommit {
+                seq: 6,
+                ops: vec![Op::Delete { type_id: 1, id: ObjectId::from_u128(2) }],
+                commit: true,
             },
             Op::FindByComposite { type_id: 4, fields: vec![1, 3], values: vec![vec![9], vec![8, 8]] },
         ];

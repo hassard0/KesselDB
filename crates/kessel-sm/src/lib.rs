@@ -52,6 +52,33 @@ fn xshard_cursor_key() -> Key {
     make_key(XSHARD_TYPE, &[0u8; 16])
 }
 
+/// Reserved keyspaces (SP81): the sequencer dedup map (exactly-once
+/// append) and the per-seq cross-shard verdict store (deterministic
+/// abort agreement). Both are in the digest, so a router restart
+/// re-derives identical decisions from durable state — no coordinator.
+const SEQ_DEDUP_TYPE: u32 = 0xFFFF_FFF2;
+const XVOTE_TYPE: u32 = 0xFFFF_FFF3;
+
+/// 128-bit FNV-1a — a wide, deterministic id for an arbitrary dedup key.
+fn fnv16(b: &[u8]) -> [u8; 16] {
+    let mut h: u128 = 0x6c62272e07bb014262b821756295c58d;
+    for &x in b {
+        h ^= x as u128;
+        h = h.wrapping_mul(0x0000000001000000000000000000013B);
+    }
+    h.to_le_bytes()
+}
+
+fn seq_dedup_key(k: &[u8]) -> Key {
+    make_key(SEQ_DEDUP_TYPE, &fnv16(k))
+}
+
+fn xvote_key(seq: u64) -> Key {
+    let mut id = [0u8; 16];
+    id[8..16].copy_from_slice(&seq.to_be_bytes());
+    make_key(XVOTE_TYPE, &id)
+}
+
 /// Build a `Create`/`Update` record with an overflow trailer:
 /// `[fixed][u16 n]( [u16 field_idx][u32 len][bytes] )*`. `fixed` must be the
 /// codec-encoded fixed-width record (handles will be patched in by the SM).
@@ -985,6 +1012,167 @@ impl<V: Vfs> StateMachine<V> {
                     OpResult::Ok
                 }
             }
+            Op::SeqAppendOnce { key, payload } => {
+                // SP81: exactly-once append. The map verifies the FULL
+                // key, so a 128-bit-hash collision can only ever cause a
+                // (astronomically unlikely) MISSED dedup, never a FALSE
+                // one — correctness-safe.
+                let dk = seq_dedup_key(&key);
+                if let Some(v) = self.storage.get(&dk) {
+                    if v.len() >= 8 && v.get(8..) == Some(key.as_slice()) {
+                        return OpResult::Got(v[..8].to_vec());
+                    }
+                }
+                let cur = self
+                    .storage
+                    .get(&seq_counter_key())
+                    .and_then(|b| b.get(..8).map(|s| {
+                        u64::from_le_bytes(s.try_into().unwrap())
+                    }))
+                    .unwrap_or(0);
+                let s = cur + 1;
+                if let Err(e) =
+                    self.storage.put(op_number, seq_entry_key(s), payload)
+                {
+                    return OpResult::SchemaError(format!("seq store: {e}"));
+                }
+                let _ = self.storage.put(
+                    op_number,
+                    seq_counter_key(),
+                    s.to_le_bytes().to_vec(),
+                );
+                let mut rec = s.to_le_bytes().to_vec();
+                rec.extend_from_slice(&key);
+                let _ = self.storage.put(op_number, dk, rec);
+                OpResult::Got(s.to_le_bytes().to_vec())
+            }
+
+            Op::XshardDecide { seq, ops } => {
+                // SP81 phase 1: persist a STABLE verdict for `seq` (a
+                // pure function of committed state at decide time), and
+                // apply NOTHING. Idempotent — a re-decide returns the
+                // recorded verdict even if state later changed, so every
+                // router re-derives the same global decision.
+                let vk = xvote_key(seq);
+                if let Some(v) = self.storage.get(&vk) {
+                    return OpResult::Got(v);
+                }
+                for o in &ops {
+                    if !matches!(
+                        o,
+                        Op::Create { .. } | Op::Update { .. } | Op::Delete { .. }
+                    ) {
+                        return OpResult::SchemaError(
+                            "xshard decide: only Create/Update/Delete".into(),
+                        );
+                    }
+                }
+                let own = !self.storage.in_txn();
+                if own {
+                    self.storage.begin_txn();
+                }
+                let mut pass = true;
+                for (i, o) in ops.into_iter().enumerate() {
+                    let r = self.apply(op_number + i as u64, o);
+                    if matches!(
+                        r,
+                        OpResult::Exists
+                            | OpResult::NotFound
+                            | OpResult::SchemaError(_)
+                            | OpResult::Constraint(_)
+                    ) {
+                        pass = false;
+                        break;
+                    }
+                }
+                if own {
+                    self.storage.abort_txn(); // dry-run: never apply
+                    if let Some(c) = self.cache.as_mut() {
+                        c.clear();
+                    }
+                }
+                let verdict = vec![pass as u8];
+                let _ = self.storage.put(op_number, vk, verdict.clone());
+                OpResult::Got(verdict)
+            }
+
+            Op::XshardCommit { seq, ops, commit } => {
+                // SP81 phase 2: same in-order/idempotent cursor as
+                // XshardApply, but gated by the deterministic global
+                // decision. `commit=false` ⇒ deterministic atomic SKIP
+                // (advance the cursor, apply nothing) so all shards stay
+                // lockstep and the txn is all-or-none.
+                let c = self
+                    .storage
+                    .get(&xshard_cursor_key())
+                    .and_then(|b| b.get(..8).map(|s| {
+                        u64::from_le_bytes(s.try_into().unwrap())
+                    }))
+                    .unwrap_or(0);
+                if seq <= c {
+                    return OpResult::Ok;
+                }
+                if seq != c + 1 {
+                    return OpResult::SchemaError(format!(
+                        "xshard out of order: have {c}, got {seq}"
+                    ));
+                }
+                for o in &ops {
+                    if !matches!(
+                        o,
+                        Op::Create { .. } | Op::Update { .. } | Op::Delete { .. }
+                    ) {
+                        return OpResult::SchemaError(
+                            "xshard commit: only Create/Update/Delete".into(),
+                        );
+                    }
+                }
+                let own = !self.storage.in_txn();
+                if own {
+                    self.storage.begin_txn();
+                }
+                if commit {
+                    for (i, o) in ops.into_iter().enumerate() {
+                        let r = self.apply(op_number + i as u64, o);
+                        if matches!(
+                            r,
+                            OpResult::Exists
+                                | OpResult::NotFound
+                                | OpResult::SchemaError(_)
+                                | OpResult::Constraint(_)
+                        ) {
+                            if own {
+                                self.storage.abort_txn();
+                                if let Some(cc) = self.cache.as_mut() {
+                                    cc.clear();
+                                }
+                            }
+                            return r;
+                        }
+                    }
+                }
+                if let Err(e) = self.storage.put(
+                    op_number,
+                    xshard_cursor_key(),
+                    seq.to_le_bytes().to_vec(),
+                ) {
+                    if own {
+                        self.storage.abort_txn();
+                    }
+                    return OpResult::SchemaError(format!("xshard cursor: {e}"));
+                }
+                if own {
+                    match self.storage.commit_txn() {
+                        Ok(()) => OpResult::Ok,
+                        Err(e) => {
+                            OpResult::SchemaError(format!("xshard commit: {e}"))
+                        }
+                    }
+                } else {
+                    OpResult::Ok
+                }
+            }
+
             Op::CreateType { def } => {
                 let (name, raw_fields) = match decode_type_def(&def) {
                     Some(x) => x,
@@ -3380,6 +3568,102 @@ mod tests {
         drive(&mut a);
         drive(&mut b2);
         assert_eq!(a.digest(), b2.digest(), "xshard apply must be deterministic");
+    }
+
+    /// SP81 (cross-shard slice 4): exactly-once append; decide is a
+    /// stable, side-effect-free verdict; commit is gated, atomic, and
+    /// cursor-idempotent — the primitives the deterministic abort
+    /// agreement and recovery are built on.
+    #[test]
+    fn xshard_two_phase_and_exactly_once_primitives() {
+        let mk = |v: u128| Op::Create {
+            type_id: 1,
+            id: ObjectId::from_u128(v),
+            record: vec![v as u8, 0, 0, 0, 0, 0, 0, 0],
+        };
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: q_type_def() });
+        let present = |sm: &mut StateMachine<MemVfs>, op, v: u128| {
+            matches!(
+                sm.apply(op, Op::GetById { type_id: 1, id: ObjectId::from_u128(v) }),
+                OpResult::Got(_)
+            )
+        };
+        let seq_of = |r: OpResult| match r {
+            OpResult::Got(b) => u64::from_le_bytes(b.try_into().unwrap()),
+            o => panic!("{o:?}"),
+        };
+
+        // Exactly-once append: same key ⇒ same seq (no new entry);
+        // different key ⇒ next seq.
+        let s1 = seq_of(sm.apply(
+            10,
+            Op::SeqAppendOnce { key: b"tx-1".to_vec(), payload: vec![9] },
+        ));
+        let s1b = seq_of(sm.apply(
+            11,
+            Op::SeqAppendOnce { key: b"tx-1".to_vec(), payload: vec![7] },
+        ));
+        assert_eq!(s1, s1b, "retry must return the same seq");
+        let s2 = seq_of(sm.apply(
+            12,
+            Op::SeqAppendOnce { key: b"tx-2".to_vec(), payload: vec![1] },
+        ));
+        assert_eq!(s2, s1 + 1, "a new key gets the next seq");
+
+        // Decide: a slice that WOULD succeed ⇒ verdict 1, applies
+        // nothing; stable across re-decide; a slice that WOULD fail
+        // (dup) ⇒ verdict 0.
+        sm.apply(20, Op::XshardApply { seq: 1, ops: vec![mk(5)] }); // cursor=1, id5 exists
+        assert_eq!(
+            sm.apply(21, Op::XshardDecide { seq: 2, ops: vec![mk(6)] }),
+            OpResult::Got(vec![1])
+        );
+        assert!(!present(&mut sm, 22, 6), "decide must not apply");
+        // Re-decide is stable even though we now (separately) create 6.
+        sm.apply(23, Op::XshardApply { seq: 2, ops: vec![mk(6)] }); // cursor=2
+        assert_eq!(
+            sm.apply(24, Op::XshardDecide { seq: 2, ops: vec![mk(6)] }),
+            OpResult::Got(vec![1]),
+            "verdict for a seq is stable once recorded"
+        );
+        // A would-fail slice (dup id 5) ⇒ verdict 0.
+        assert_eq!(
+            sm.apply(25, Op::XshardDecide { seq: 3, ops: vec![mk(5)] }),
+            OpResult::Got(vec![0])
+        );
+
+        // Commit gating: commit=false ⇒ skip (advance cursor, apply
+        // nothing); commit=true ⇒ apply; idempotent re-drive.
+        assert_eq!(
+            sm.apply(26, Op::XshardCommit { seq: 3, ops: vec![mk(7)], commit: false }),
+            OpResult::Ok
+        );
+        assert!(!present(&mut sm, 27, 7), "commit=false must skip atomically");
+        assert_eq!(
+            sm.apply(28, Op::XshardCommit { seq: 4, ops: vec![mk(8)], commit: true }),
+            OpResult::Ok
+        );
+        assert!(present(&mut sm, 29, 8));
+        assert_eq!(
+            sm.apply(30, Op::XshardCommit { seq: 4, ops: vec![mk(99)], commit: true }),
+            OpResult::Ok,
+            "re-drive past cursor is an idempotent no-op"
+        );
+        assert!(!present(&mut sm, 31, 99));
+
+        // Deterministic.
+        let drive = |s: &mut StateMachine<MemVfs>| {
+            s.apply(40, Op::CreateType { def: q_type_def() });
+            s.apply(41, Op::SeqAppendOnce { key: b"k".to_vec(), payload: vec![1] });
+            s.apply(42, Op::XshardDecide { seq: 1, ops: vec![mk(3)] });
+            s.apply(43, Op::XshardCommit { seq: 1, ops: vec![mk(3)], commit: true });
+        };
+        let mut a = StateMachine::open(MemVfs::new()).unwrap();
+        let mut b2 = StateMachine::open(MemVfs::new()).unwrap();
+        drive(&mut a);
+        drive(&mut b2);
+        assert_eq!(a.digest(), b2.digest(), "two-phase must be deterministic");
     }
 
     #[test]

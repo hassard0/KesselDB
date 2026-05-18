@@ -44,7 +44,6 @@ fn parse_records(s: &str) -> Result<Vec<Vec<String>>, FetchError> {
     let mut field = String::new();
     let mut i = 0;
     let mut in_q = false;
-    let mut any = false;
     while i < b.len() {
         let c = b[i];
         if in_q {
@@ -65,26 +64,27 @@ fn parse_records(s: &str) -> Result<Vec<Vec<String>>, FetchError> {
         match c {
             b'"' => {
                 in_q = true;
-                any = true;
                 i += 1;
             }
             b',' => {
                 rec.push(std::mem::take(&mut field));
-                any = true;
                 i += 1;
             }
             b'\r' => {
-                i += 1;
+                if i + 1 >= b.len() || b[i + 1] != b'\n' {
+                    return Err(FetchError::Parse(
+                        "bare CR in CSV (expected CRLF)".into(),
+                    ));
+                }
+                i += 1; // the \n is consumed on the next iteration
             }
             b'\n' => {
                 rec.push(std::mem::take(&mut field));
                 recs.push(std::mem::take(&mut rec));
-                any = false;
                 i += 1;
             }
             _ => {
                 field.push(c as char);
-                any = true;
                 i += 1;
             }
         }
@@ -92,7 +92,7 @@ fn parse_records(s: &str) -> Result<Vec<Vec<String>>, FetchError> {
     if in_q {
         return Err(FetchError::Parse("unterminated CSV quote".into()));
     }
-    if any || !field.is_empty() {
+    if !rec.is_empty() || !field.is_empty() {
         rec.push(field);
         recs.push(rec);
     }
@@ -137,5 +137,16 @@ mod tests {
             extract(body, &[cm("x", "zzz")]),
             Err(FetchError::Parse(_))
         ));
+    }
+
+    #[test]
+    fn final_record_without_trailing_newline() {
+        let body = b"a,b\n1,2";
+        let cols = vec![cm("a", "a"), cm("b", "b")];
+        let rows = extract(body, &cols).unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![Cell::Text("1".into()), Cell::Text("2".into())]]
+        );
     }
 }

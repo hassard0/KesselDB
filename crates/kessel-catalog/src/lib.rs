@@ -221,6 +221,17 @@ fn get_str(b: &[u8], p: &mut usize) -> Option<String> {
     Some(s)
 }
 
+/// Like [`get_str`] but with a `u32` LE length prefix — the framing
+/// used by the Catalog-level external-recipe trailer (URLs / sources
+/// can exceed 64 KiB, and it matches that trailer's encode side).
+fn get_str32(b: &[u8], p: &mut usize) -> Option<String> {
+    let n = u32::from_le_bytes(b.get(*p..*p + 4)?.try_into().ok()?) as usize;
+    *p += 4;
+    let s = String::from_utf8_lossy(b.get(*p..*p + n)?).into_owned();
+    *p += n;
+    Some(s)
+}
+
 pub fn encode_field(f: &Field) -> Vec<u8> {
     let mut b = Vec::new();
     b.extend_from_slice(&f.field_id.to_le_bytes());
@@ -336,11 +347,34 @@ pub fn decode_type_defaults(b: &[u8]) -> Vec<(u16, Vec<u8>)> {
     parse().unwrap_or_default()
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExternalAuth {
+    None,
+    /// Bearer token read from this env var name at fetch time.
+    BearerEnv(String),
+    /// Arbitrary header `header` whose value is read from env `env`.
+    HeaderEnv { header: String, env: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExternalRecipe {
+    pub type_id: u32,
+    pub url: String,
+    /// 0 = JSON, 1 = CSV.
+    pub format: u8,
+    /// field_id whose value derives the deterministic ObjectId.
+    pub key_field_id: u16,
+    pub auth: ExternalAuth,
+    /// (field_id, source) — JSON dotted path or CSV header name.
+    pub mapping: Vec<(u16, String)>,
+}
+
 /// The whole catalog, persisted by the state machine as object type 0.
 #[derive(Clone, Debug, Default)]
 pub struct Catalog {
     pub types: Vec<ObjectType>,
     pub next_type_id: u32,
+    pub external: Vec<ExternalRecipe>,
 }
 
 impl Catalog {
@@ -398,6 +432,44 @@ impl Catalog {
                 b.extend_from_slice(&(ci.len() as u16).to_le_bytes());
                 for fid in ci {
                     b.extend_from_slice(&fid.to_le_bytes());
+                }
+            }
+        }
+        // Backward-compatible Catalog-level external-recipe trailer. When
+        // there are no recipes we append NOTHING, so an empty catalog
+        // encodes byte-identically to before this change (preserving
+        // existing replicated digests / the seed-7 corpus). Old decoders
+        // ignore trailing bytes; ours parses defensively (short read ⇒
+        // empty, never an error) — same philosophy as the SP86 defaults
+        // trailer.
+        if !self.external.is_empty() {
+            b.extend_from_slice(&(self.external.len() as u32).to_le_bytes());
+            for r in &self.external {
+                b.extend_from_slice(&r.type_id.to_le_bytes());
+                b.push(r.format);
+                b.extend_from_slice(&r.key_field_id.to_le_bytes());
+                b.extend_from_slice(&(r.url.len() as u32).to_le_bytes());
+                b.extend_from_slice(r.url.as_bytes());
+                match &r.auth {
+                    ExternalAuth::None => b.push(0),
+                    ExternalAuth::BearerEnv(env) => {
+                        b.push(1);
+                        b.extend_from_slice(&(env.len() as u32).to_le_bytes());
+                        b.extend_from_slice(env.as_bytes());
+                    }
+                    ExternalAuth::HeaderEnv { header, env } => {
+                        b.push(2);
+                        b.extend_from_slice(&(header.len() as u32).to_le_bytes());
+                        b.extend_from_slice(header.as_bytes());
+                        b.extend_from_slice(&(env.len() as u32).to_le_bytes());
+                        b.extend_from_slice(env.as_bytes());
+                    }
+                }
+                b.extend_from_slice(&(r.mapping.len() as u32).to_le_bytes());
+                for (fid, src) in &r.mapping {
+                    b.extend_from_slice(&fid.to_le_bytes());
+                    b.extend_from_slice(&(src.len() as u32).to_le_bytes());
+                    b.extend_from_slice(src.as_bytes());
                 }
             }
         }
@@ -502,9 +574,68 @@ impl Catalog {
                 defaults,
             });
         }
+        // Optional Catalog-level external-recipe trailer. `p` is exactly
+        // where the existing decode finished consuming. Old blobs (and
+        // empty-recipe catalogs) simply end here, so "no leftover bytes"
+        // ⇒ empty list. Any short/invalid read ⇒ empty list, NEVER an
+        // error (mirrors `decode_type_defaults`); recipes are an
+        // accelerator, never load-bearing for replicated state.
+        let external = (|| -> Option<Vec<ExternalRecipe>> {
+            if p >= b.len() {
+                return Some(Vec::new());
+            }
+            let n = u32::from_le_bytes(b.get(p..p + 4)?.try_into().ok()?) as usize;
+            p += 4;
+            let mut out = Vec::with_capacity(n);
+            for _ in 0..n {
+                let type_id =
+                    u32::from_le_bytes(b.get(p..p + 4)?.try_into().ok()?);
+                p += 4;
+                let format = *b.get(p)?;
+                p += 1;
+                let key_field_id =
+                    u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?);
+                p += 2;
+                let url = get_str32(b, &mut p)?;
+                let tag = *b.get(p)?;
+                p += 1;
+                let auth = match tag {
+                    0 => ExternalAuth::None,
+                    1 => ExternalAuth::BearerEnv(get_str32(b, &mut p)?),
+                    2 => {
+                        let header = get_str32(b, &mut p)?;
+                        let env = get_str32(b, &mut p)?;
+                        ExternalAuth::HeaderEnv { header, env }
+                    }
+                    _ => return None,
+                };
+                let ml =
+                    u32::from_le_bytes(b.get(p..p + 4)?.try_into().ok()?) as usize;
+                p += 4;
+                let mut mapping = Vec::with_capacity(ml);
+                for _ in 0..ml {
+                    let fid =
+                        u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?);
+                    p += 2;
+                    let src = get_str32(b, &mut p)?;
+                    mapping.push((fid, src));
+                }
+                out.push(ExternalRecipe {
+                    type_id,
+                    url,
+                    format,
+                    key_field_id,
+                    auth,
+                    mapping,
+                });
+            }
+            Some(out)
+        })()
+        .unwrap_or_default();
         Some(Catalog {
             types,
             next_type_id,
+            external,
         })
     }
 }
@@ -579,5 +710,32 @@ mod tests {
         assert_eq!(dec.types[1].unique, Vec::<u16>::new());
         assert_eq!(dec.types[1].fks, Vec::<(u16, u32, u8)>::new());
         assert_eq!(Catalog::decode(&[]).unwrap().types.len(), 0);
+    }
+
+    #[test]
+    fn catalog_external_recipe_round_trips_and_is_backward_compatible() {
+        let mut c = Catalog::default();
+        c.types.push(ObjectType {
+            type_id: 1, name: "ext".into(), schema_ver: 1,
+            fields: sample_fields(), indexes: vec![], unique: vec![],
+            fks: vec![], checks: vec![], triggers: vec![], ordered: vec![],
+            composite: vec![], defaults: vec![],
+        });
+        c.external.push(ExternalRecipe {
+            type_id: 1, url: "http://x/y".into(), format: 0, key_field_id: 1,
+            auth: ExternalAuth::BearerEnv("TOK".into()),
+            mapping: vec![(1, "id".into()), (2, "u.name".into())],
+        });
+        let back = Catalog::decode(&c.encode()).unwrap();
+        assert_eq!(back.external.len(), 1);
+        assert_eq!(back.external[0].url, "http://x/y");
+        assert_eq!(back.external[0].auth, ExternalAuth::BearerEnv("TOK".into()));
+        assert_eq!(back.external[0].mapping[1], (2, "u.name".to_string()));
+        // A catalog with NO external recipes must encode byte-identically
+        // to before this change and decode to an empty list.
+        let mut plain = Catalog::default();
+        plain.types.push(c.types[0].clone());
+        let enc_plain = plain.encode();
+        assert!(Catalog::decode(&enc_plain).unwrap().external.is_empty());
     }
 }

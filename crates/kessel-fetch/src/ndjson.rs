@@ -2,7 +2,6 @@
 use crate::json::{path_get, parse, Cell};
 use crate::{ColumnMap, FetchError};
 
-#[allow(dead_code)] // wired into fetch_rows via Format::Ndjson in the next task
 pub fn extract(
     body: &[u8],
     cols: &[ColumnMap],

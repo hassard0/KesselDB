@@ -105,13 +105,17 @@ fn truncated_chunked_body_is_typed_error_not_panic() {
 #[test]
 fn ndjson_over_http_round_trips() {
     let (port, h) = serve_once("{\"id\":3}\n{\"id\":4}\n", None);
-    let cols = vec![ColumnMap {
-        name: "id".into(), kind: FieldKind::U32, source: "id".into(),
-    }];
+    let cols = vec![
+        ColumnMap { name: "id".into(), kind: FieldKind::U32, source: "id".into() },
+    ];
     let rows = fetch_rows(
         &format!("http://127.0.0.1:{port}/d"),
-        &Auth::None, Format::Ndjson, &cols, DEFAULT_MAX_BODY,
-    ).unwrap();
+        &Auth::None,
+        Format::Ndjson,
+        &cols,
+        DEFAULT_MAX_BODY,
+    )
+    .unwrap();
     assert_eq!(rows, vec![vec![vec![3,0,0,0]], vec![vec![4,0,0,0]]]);
     let _ = h.join();
 }

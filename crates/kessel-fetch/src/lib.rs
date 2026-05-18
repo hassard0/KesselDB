@@ -39,7 +39,7 @@ impl std::fmt::Display for FetchError {
 pub struct ColumnMap {
     pub name: String,
     pub kind: FieldKind,
-    /// JSON dotted path (FORMAT JSON) or CSV header name (FORMAT CSV).
+    /// JSON dotted path (FORMAT JSON / FORMAT NDJSON) or CSV header name (FORMAT CSV).
     pub source: String,
 }
 

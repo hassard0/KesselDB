@@ -6,10 +6,10 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::thread;
 
-fn serve_once(body: &'static str, expect_auth: Option<&'static str>) -> u16 {
+fn serve_once(body: &'static str, expect_auth: Option<&'static str>) -> (u16, thread::JoinHandle<()>) {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
-    thread::spawn(move || {
+    let handle = thread::spawn(move || {
         let (mut s, _) = l.accept().unwrap();
         let mut buf = [0u8; 2048];
         let n = s.read(&mut buf).unwrap();
@@ -24,12 +24,12 @@ fn serve_once(body: &'static str, expect_auth: Option<&'static str>) -> u16 {
         );
         s.write_all(resp.as_bytes()).unwrap();
     });
-    port
+    (port, handle)
 }
 
 #[test]
 fn json_over_http_with_bearer_round_trips() {
-    let port = serve_once(
+    let (port, handle) = serve_once(
         r#"[{"id":7,"name":"zed"}]"#,
         Some("Authorization: Bearer T0K"),
     );
@@ -48,11 +48,12 @@ fn json_over_http_with_bearer_round_trips() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0], vec![7, 0, 0, 0]);
     assert_eq!(rows[0][1], b"zed\0\0\0\0\0".to_vec());
+    handle.join().expect("stub server thread panicked");
 }
 
 #[test]
 fn body_too_large_is_typed_error() {
-    let port = serve_once(r#"[{"id":1}]"#, None);
+    let (port, handle) = serve_once(r#"[{"id":1}]"#, None);
     let cols = vec![ColumnMap {
         name: "id".into(),
         kind: FieldKind::U32,
@@ -67,4 +68,36 @@ fn body_too_large_is_typed_error() {
     )
     .unwrap_err();
     assert!(matches!(e, kessel_fetch::FetchError::TooLarge(4)));
+    let _ = handle.join();
+}
+
+#[test]
+fn truncated_chunked_body_is_typed_error_not_panic() {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let h = std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        let mut b = [0u8; 1024];
+        let _ = std::io::Read::read(&mut s, &mut b);
+        // chunked, declares 5 bytes, sends "hello" but NO trailing CRLF then closes
+        let _ = std::io::Write::write_all(
+            &mut s,
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello",
+        );
+    });
+    let cols = vec![kessel_fetch::ColumnMap {
+        name: "id".into(),
+        kind: kessel_catalog::FieldKind::U32,
+        source: "id".into(),
+    }];
+    let e = kessel_fetch::fetch_rows(
+        &format!("http://127.0.0.1:{port}/d"),
+        &kessel_fetch::Auth::None,
+        kessel_fetch::Format::Json,
+        &cols,
+        kessel_fetch::DEFAULT_MAX_BODY,
+    )
+    .unwrap_err();
+    assert!(matches!(e, kessel_fetch::FetchError::Http(_)), "expected Http err, got {e:?}");
+    let _ = h.join();
 }

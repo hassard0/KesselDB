@@ -7,6 +7,11 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
+/// Max response-header bytes tolerated before the `\r\n\r\n` separator
+/// (in addition to `max_body`) — bounds buffering on a server that
+/// streams a huge body without ever sending the header terminator.
+const MAX_HEADER_SLACK: u64 = 64 * 1024;
+
 pub fn get(url: &str, auth: &Auth, max_body: u64) -> Result<Vec<u8>, FetchError> {
     let rest = url
         .strip_prefix("http://")
@@ -27,6 +32,12 @@ pub fn get(url: &str, auth: &Auth, max_body: u64) -> Result<Vec<u8>, FetchError>
         ),
         None => (hostport, 80u16),
     };
+    if host.starts_with('[') {
+        return Err(FetchError::Http(
+            "IPv6 literal addresses are not supported in slice 1; \
+             use a hostname or a TLS/proxy sidecar".into(),
+        ));
+    }
     let mut req = format!(
         "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\
          User-Agent: kessel-fetch/0\r\n"
@@ -57,7 +68,7 @@ pub fn get(url: &str, auth: &Auth, max_body: u64) -> Result<Vec<u8>, FetchError>
             break;
         }
         raw.extend_from_slice(&chunk[..n]);
-        if raw.len() as u64 > max_body + 65_536 {
+        if raw.len() as u64 > max_body + MAX_HEADER_SLACK {
             return Err(FetchError::TooLarge(max_body));
         }
     }
@@ -102,17 +113,18 @@ fn dechunk(mut b: &[u8]) -> Result<Vec<u8>, FetchError> {
             .windows(2)
             .position(|w| w == b"\r\n")
             .ok_or_else(|| FetchError::Http("bad chunk".into()))?;
-        let size = usize::from_str_radix(
-            std::str::from_utf8(&b[..nl]).unwrap_or("").trim(),
-            16,
-        )
-        .map_err(|_| FetchError::Http("bad chunk size".into()))?;
+        let size_line = std::str::from_utf8(&b[..nl]).unwrap_or("");
+        let size_hex = size_line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_hex, 16)
+            .map_err(|_| FetchError::Http("bad chunk size".into()))?;
         b = &b[nl + 2..];
         if size == 0 {
             return Ok(out);
         }
-        if b.len() < size {
-            return Err(FetchError::Http("truncated chunk".into()));
+        if b.len() < size + 2 {
+            return Err(FetchError::Http(
+                "truncated chunk (missing trailing CRLF)".into(),
+            ));
         }
         out.extend_from_slice(&b[..size]);
         b = &b[size + 2..];

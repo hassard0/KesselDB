@@ -781,10 +781,10 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
                     return Err("FORMAT JSON with a body cursor (PAGE NEXT JSON / PAGE CURSOR JSON) requires ROWS '<path>'".into());
                 }
                 if format == 1 {
-                    return Err("FORMAT CSV cannot use a body cursor; use PAGE NEXT LINK".into());
+                    return Err("FORMAT CSV cannot use a body cursor; use PAGE NEXT LINK or omit PAGE".into());
                 }
                 if format == 2 {
-                    return Err("FORMAT NDJSON cannot use a body cursor; use PAGE NEXT LINK".into());
+                    return Err("FORMAT NDJSON cannot use a body cursor (no envelope object); use PAGE NEXT LINK or omit PAGE".into());
                 }
             }
             let type_def = encode_type_def(&name, &fields);

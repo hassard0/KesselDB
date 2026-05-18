@@ -2,6 +2,7 @@
 use crate::json::{path_get, parse, Cell};
 use crate::{ColumnMap, FetchError};
 
+#[allow(dead_code)] // wired into fetch_rows via Format::Ndjson in the next task
 pub fn extract(
     body: &[u8],
     cols: &[ColumnMap],
@@ -63,5 +64,32 @@ mod tests {
             extract(body, &[cm("id", "id")]).unwrap(),
             vec![vec![Cell::Text("7".into())]]
         );
+    }
+
+    #[test]
+    fn whitespace_only_line_skipped() {
+        let body = b"{\"id\":1}\n   \n{\"id\":2}";
+        let rows = extract(body, &[cm("id", "id")]).unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn non_utf8_body_is_parse_error() {
+        let body = b"\xff\xfe{\"id\":1}";
+        assert!(matches!(
+            extract(body, &[cm("id", "id")]),
+            Err(FetchError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn error_includes_line_number() {
+        let body = b"{\"id\":1}\n{bad}\n{\"id\":3}";
+        let err = extract(body, &[cm("id", "id")]).unwrap_err();
+        let msg = match err {
+            FetchError::Parse(s) => s,
+            _ => panic!("wrong variant"),
+        };
+        assert!(msg.contains("line 2"), "got: {msg}");
     }
 }

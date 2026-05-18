@@ -502,7 +502,20 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
         let ot = p.type_named(&tname)?;
         return Ok(Op::Describe { type_id: ot.type_id });
     }
+    // REFRESH <name> — trigger a pull of an external source (SP91).
+    if p.kw("REFRESH") {
+        let name = p.ident()?;
+        return Ok(Op::RefreshExternalSource { name });
+    }
     if p.kw("DROP") {
+        // DROP EXTERNAL SOURCE <name> — destructive DDL (SP91). Checked
+        // first; only consumes when `EXTERNAL` matches so DROP INDEX /
+        // DROP TABLE still parse.
+        if p.kw("EXTERNAL") {
+            p.expect_kw("SOURCE")?;
+            let name = p.ident()?;
+            return Ok(Op::DropExternalSource { name });
+        }
         // DROP INDEX ON <t> (cols) — destructive DDL (SP74). Drops the
         // index(es) on exactly those columns; queries still work
         // (verified scan fallback), just un-accelerated.
@@ -621,6 +634,117 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
     }
 
     if p.kw("CREATE") {
+        // CREATE EXTERNAL SOURCE name (col TYPE[(n)] [NOT NULL] FROM 'src',
+        // ...) FROM 'url' FORMAT JSON|CSV KEY col
+        // [AUTH BEARER ENV 'E' | AUTH HEADER 'H' ENV 'E'] — SP91.
+        // Checked before the index/table forms; only consumes when
+        // `EXTERNAL` matches.
+        if p.kw("EXTERNAL") {
+            p.expect_kw("SOURCE")?;
+            let name = p.ident()?;
+            p.punct('(')?;
+            let mut fields = Vec::new();
+            let mut mapping: Vec<(u16, String)> = Vec::new();
+            let mut next_fid: u16 = 1;
+            loop {
+                let cname = p.ident()?;
+                let tyname = p.ident()?;
+                let mut arg = None;
+                if matches!(p.peek(), Some(Tok::Punct('('))) {
+                    p.punct('(')?;
+                    match p.next() {
+                        Some(Tok::Int(n)) => arg = Some(n),
+                        _ => return Err("expected size".into()),
+                    }
+                    p.punct(')')?;
+                }
+                let mut nullable = true;
+                if p.kw("NOT") {
+                    p.expect_kw("NULL")?;
+                    nullable = false;
+                }
+                p.expect_kw("FROM")?;
+                let src = match p.next() {
+                    Some(Tok::Str(s)) => s,
+                    _ => return Err("expected 'source' string".into()),
+                };
+                fields.push(Field {
+                    field_id: 0,
+                    name: cname,
+                    kind: kind_of(&tyname, arg)?,
+                    nullable,
+                });
+                mapping.push((next_fid, src));
+                next_fid += 1;
+                match p.next() {
+                    Some(Tok::Punct(',')) => continue,
+                    Some(Tok::Punct(')')) => break,
+                    _ => return Err("expected `,` or `)`".into()),
+                }
+            }
+            p.expect_kw("FROM")?;
+            let url = match p.next() {
+                Some(Tok::Str(s)) => s,
+                _ => return Err("expected 'url' string".into()),
+            };
+            p.expect_kw("FORMAT")?;
+            let format = if p.kw("JSON") {
+                0u8
+            } else if p.kw("CSV") {
+                1u8
+            } else {
+                return Err("FORMAT must be JSON or CSV".into());
+            };
+            p.expect_kw("KEY")?;
+            let key_name = p.ident()?;
+            let key_field_id = fields
+                .iter()
+                .position(|f| f.name == key_name)
+                .map(|i| (i as u16) + 1)
+                .ok_or_else(|| {
+                    SqlError::from("KEY is not a declared column")
+                })?;
+            let (mut auth_kind, mut auth_a, mut auth_b) =
+                (0u8, String::new(), String::new());
+            if p.kw("AUTH") {
+                if p.kw("BEARER") {
+                    p.expect_kw("ENV")?;
+                    auth_kind = 1;
+                    auth_a = match p.next() {
+                        Some(Tok::Str(s)) => s,
+                        _ => return Err("expected 'ENV_NAME'".into()),
+                    };
+                } else if p.kw("HEADER") {
+                    auth_kind = 2;
+                    auth_a = match p.next() {
+                        Some(Tok::Str(s)) => s,
+                        _ => return Err("expected 'Header-Name'".into()),
+                    };
+                    p.expect_kw("ENV")?;
+                    auth_b = match p.next() {
+                        Some(Tok::Str(s)) => s,
+                        _ => return Err("expected 'ENV_NAME'".into()),
+                    };
+                } else {
+                    return Err(
+                        "AUTH must be BEARER ENV '..' or HEADER '..' ENV '..'"
+                            .into(),
+                    );
+                }
+            }
+            let type_def = encode_type_def(&name, &fields);
+            return Ok(Op::CreateExternalSource {
+                name,
+                type_def,
+                url,
+                format,
+                key_field_id,
+                auth_kind,
+                auth_a,
+                auth_b,
+                mapping,
+            });
+        }
         // CREATE [UNIQUE|RANGE] INDEX ON t (cols) — DDL for indexes.
         let unique = p.kw("UNIQUE");
         let range = p.kw("RANGE");
@@ -1432,6 +1556,86 @@ mod tests {
     use kessel_io::MemVfs;
     use kessel_proto::OpResult;
     use kessel_sm::StateMachine;
+
+    #[test]
+    fn parse_create_external_source() {
+        let cat = Catalog::default();
+        let sql = "CREATE EXTERNAL SOURCE feed (\
+            id U64 NOT NULL FROM 'id', \
+            nm CHAR(8) NOT NULL FROM 'u.name') \
+            FROM 'http://h/p' FORMAT JSON KEY id \
+            AUTH BEARER ENV 'TOK_ENV'";
+        match compile(sql, &cat).expect("compile") {
+            Op::CreateExternalSource {
+                name,
+                url,
+                format,
+                key_field_id,
+                auth_kind,
+                auth_a,
+                mapping,
+                ..
+            } => {
+                assert_eq!(name, "feed");
+                assert_eq!(url, "http://h/p");
+                assert_eq!(format, 0);
+                assert_eq!(auth_kind, 1);
+                assert_eq!(auth_a, "TOK_ENV");
+                assert_eq!(key_field_id, 1);
+                assert_eq!(
+                    mapping,
+                    vec![(1, "id".to_string()), (2, "u.name".to_string())]
+                );
+            }
+            o => panic!("got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_refresh_and_drop_external_source() {
+        let cat = Catalog::default();
+        assert!(matches!(
+            compile("REFRESH feed", &cat).unwrap(),
+            Op::RefreshExternalSource { name } if name == "feed"
+        ));
+        assert!(matches!(
+            compile("DROP EXTERNAL SOURCE feed", &cat).unwrap(),
+            Op::DropExternalSource { name } if name == "feed"
+        ));
+        match compile(
+            "CREATE EXTERNAL SOURCE c (a U32 NOT NULL FROM 'a') FROM 'http://h' FORMAT CSV KEY a",
+            &cat,
+        )
+        .unwrap()
+        {
+            Op::CreateExternalSource {
+                format, auth_kind, ..
+            } => {
+                assert_eq!(format, 1);
+                assert_eq!(auth_kind, 0);
+            }
+            o => panic!("got {o:?}"),
+        }
+        // HEADER auth variant
+        match compile(
+            "CREATE EXTERNAL SOURCE h (a U32 NOT NULL FROM 'a') FROM 'http://h' FORMAT JSON KEY a AUTH HEADER 'X-Key' ENV 'KENV'",
+            &cat,
+        )
+        .unwrap()
+        {
+            Op::CreateExternalSource {
+                auth_kind,
+                auth_a,
+                auth_b,
+                ..
+            } => {
+                assert_eq!(auth_kind, 2);
+                assert_eq!(auth_a, "X-Key");
+                assert_eq!(auth_b, "KENV");
+            }
+            o => panic!("got {o:?}"),
+        }
+    }
 
     #[test]
     fn select_star_table_only_matches_whole_row_single_table() {

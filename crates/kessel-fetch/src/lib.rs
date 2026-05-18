@@ -8,7 +8,7 @@
 mod coerce;
 mod csv;
 mod http;
-mod json;
+pub(crate) mod json;
 
 use kessel_catalog::FieldKind;
 

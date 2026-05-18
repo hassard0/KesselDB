@@ -122,8 +122,6 @@ fn ndjson_over_http_round_trips() {
 
 #[test]
 fn get_resp_exposes_link_header() {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
     let h = std::thread::spawn(move || {

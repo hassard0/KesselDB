@@ -100,9 +100,9 @@ pub(crate) fn get_resp(
         if let Some(colon) = l.find(':') {
             let name = l[..colon].trim().to_string();
             let value = l[colon + 1..].trim().to_string();
-            // Keep existing chunked detection working by deriving it from collected headers.
-            let ll = l.to_ascii_lowercase();
-            if ll.starts_with("transfer-encoding:") && ll.contains("chunked") {
+            if name.eq_ignore_ascii_case("transfer-encoding")
+                && value.to_ascii_lowercase().contains("chunked")
+            {
                 chunked = true;
             }
             headers.push((name, value));

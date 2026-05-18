@@ -75,11 +75,12 @@ fn path_get(v: &Json, path: &str) -> Result<Cell, FetchError> {
 
 struct P<'a> {
     b: &'a [u8],
+    s: &'a str,
     i: usize,
 }
 
 fn parse(s: &str) -> Result<Json, FetchError> {
-    let mut p = P { b: s.as_bytes(), i: 0 };
+    let mut p = P { b: s.as_bytes(), s, i: 0 };
     p.ws();
     let v = p.value()?;
     p.ws();
@@ -135,10 +136,13 @@ impl<'a> P<'a> {
             return Err(FetchError::Parse("expected value".into()));
         }
         Ok(Json::Num(
-            std::str::from_utf8(&self.b[start..self.i]).unwrap().to_string(),
+            std::str::from_utf8(&self.b[start..self.i])
+                .map_err(|_| FetchError::Parse("invalid number bytes".into()))?
+                .to_string(),
         ))
     }
     fn string(&mut self) -> Result<String, FetchError> {
+        // Slice-1 limitation: lone/paired UTF-16 surrogate escapes (\uD800-\uDFFF) are replaced with U+FFFD; astral pairs are not recombined.
         self.i += 1; // opening quote
         let mut s = String::new();
         loop {
@@ -184,7 +188,17 @@ impl<'a> P<'a> {
                         }
                     }
                 }
-                _ => s.push(c as char),
+                _ => {
+                    self.i -= 1; // undo the byte() advance
+                    let ch = self.s[self.i..]
+                        .chars()
+                        .next()
+                        .ok_or_else(|| {
+                            FetchError::Parse("invalid UTF-8 in string".into())
+                        })?;
+                    self.i += ch.len_utf8();
+                    s.push(ch);
+                }
             }
         }
     }
@@ -295,5 +309,13 @@ mod tests {
             rows,
             vec![vec![Cell::Text("a\"b\n".into()), Cell::Text("-12.5".into())]]
         );
+    }
+
+    #[test]
+    fn preserves_multibyte_utf8_in_strings() {
+        let body = "[{\"s\":\"caf\u{00e9} \u{65e5}\u{672c} \u{1f600}\"}]".as_bytes();
+        let cols = vec![cm("s", "s")];
+        let rows = extract(body, &cols).unwrap();
+        assert_eq!(rows, vec![vec![Cell::Text("caf\u{00e9} \u{65e5}\u{672c} \u{1f600}".into())]]);
     }
 }

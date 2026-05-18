@@ -779,6 +779,31 @@ impl<V: Vfs> StateMachine<V> {
         Some(rec.get(off..off + w)?.to_vec())
     }
 
+    /// #73: the same index-extreme accelerator for the SP87/SP91
+    /// `0xFFFC` keyspace (CHAR/BYTES + U128/I128). Its order key is
+    /// order-preserving (`vorder_key`), so the first / last bucket is
+    /// the global MIN / MAX; we fetch one row under it and return the
+    /// column's raw width-`w` bytes. `None` ⇒ empty / not indexed /
+    /// transiently unavailable ⇒ caller falls back to the full scan,
+    /// so this never changes the answer.
+    fn agg_extreme_var(
+        &self,
+        type_id: u32,
+        field_id: u16,
+        off: usize,
+        w: usize,
+        want_max: bool,
+    ) -> Option<Vec<u8>> {
+        // `tag++fid` (no ok) is shorter than — hence < — every real
+        // `tag++fid++ok` bucket; `tag++fid++[0xFF; w]` is ≥ all of them.
+        let lo = Self::voidx_key(type_id, field_id, &[]);
+        let hi = Self::voidx_key(type_id, field_id, &vec![0xFFu8; w]);
+        let (_, entry) = self.storage.bound_in(&lo, &hi, want_max)?;
+        let oid: [u8; 16] = entry.get(0..16)?.try_into().ok()?;
+        let rec = self.storage.get(&make_key(type_id, &oid))?;
+        Some(rec.get(off..off + w)?.to_vec())
+    }
+
     /// Compare two width-`w` field encodings per kind (numeric where it
     /// matters; lexicographic for byte kinds).
     fn cmp_field(
@@ -2961,6 +2986,77 @@ impl<V: Vfs> StateMachine<V> {
                     Some(t) => t.clone(),
                     None => return OpResult::SchemaError(format!("no type {type_id}")),
                 };
+                // #73: MIN/MAX over a CHAR/BYTES/U128/I128 column (the
+                // SP87/SP91 `0xFFFC` keyspace). Self-contained early
+                // return; the numeric ≤8B path below is unchanged.
+                // SUM/AVG stay numeric-only (handled by the path below).
+                if (kind == 2 || kind == 3)
+                    && Self::ord_field_pos(&ot, field_id).is_none()
+                {
+                    let (off, w, fk) = match Self::vord_field_pos(&ot, field_id)
+                    {
+                        Some(p) => p,
+                        None => {
+                            return OpResult::SchemaError(
+                                "Aggregate MIN/MAX field must be numeric \
+                                 ≤8B, CHAR/BYTES, or U128/I128"
+                                    .into(),
+                            )
+                        }
+                    };
+                    let uncond = program
+                        == kessel_expr::Program::new()
+                            .push_int(1)
+                            .bytes()
+                            .as_slice();
+                    // Fast path: no filter + an ordered index ⇒ read
+                    // the index extreme (never changes the answer).
+                    if uncond && ot.ordered.contains(&field_id) {
+                        return match self.agg_extreme_var(
+                            type_id,
+                            field_id,
+                            off,
+                            w,
+                            kind == 3,
+                        ) {
+                            Some(raw) => OpResult::Got(raw),
+                            None => OpResult::Got(Vec::new()), // empty
+                        };
+                    }
+                    // Slow path (the oracle): scan + filter, track the
+                    // extreme raw bytes via the kind-correct comparator.
+                    let lo = make_key(type_id, &[0u8; 16]);
+                    let hi = make_key(type_id, &[0xFFu8; 16]);
+                    let mut best: Option<Vec<u8>> = None;
+                    for (_, rec) in self.storage.scan_range(&lo, &hi) {
+                        if !uncond {
+                            match kessel_expr::eval(&program, &ot, &rec) {
+                                Ok(true) => {}
+                                Ok(false) => continue,
+                                Err(e) => {
+                                    return OpResult::SchemaError(format!(
+                                        "agg program: {e:?}"
+                                    ))
+                                }
+                            }
+                        }
+                        if let Some(raw) = rec.get(off..off + w) {
+                            best = Some(match best {
+                                None => raw.to_vec(),
+                                Some(b) => {
+                                    let ord = Self::cmp_field(fk, raw, &b);
+                                    let take = if kind == 3 {
+                                        ord == std::cmp::Ordering::Greater
+                                    } else {
+                                        ord == std::cmp::Ordering::Less
+                                    };
+                                    if take { raw.to_vec() } else { b }
+                                }
+                            });
+                        }
+                    }
+                    return OpResult::Got(best.unwrap_or_default());
+                }
                 // COUNT needs no field; SUM/MIN/MAX need a numeric ≤8B field.
                 let fpos = if kind == 0 {
                     None
@@ -5716,6 +5812,142 @@ mod tests {
     }
 
     // ---- Sub-project 20: aggregates ----
+
+    /// #73 oracle: `MIN`/`MAX` over a `CHAR` / `U128` / `I128`
+    /// column (the SP87/SP91 `0xFFFC` keyspace) returns EXACTLY the
+    /// brute-force extreme — fast path (no filter + ordered index →
+    /// `agg_extreme_var`) AND slow path (filtered, or no index) AND
+    /// empty — including `U128 > i128::MAX` and negative `I128`, and
+    /// is deterministic. Numeric ≤8B is a separate (unchanged) path.
+    #[test]
+    fn agg_minmax_over_0xfffc_equals_bruteforce() {
+        use kessel_codec::{encode, Value};
+        use kessel_expr::Program;
+        use kessel_proto::Rng;
+
+        let tdef = encode_type_def(
+            "t",
+            &[
+                Field { field_id: 0, name: "owner".into(), kind: FieldKind::U32, nullable: false },
+                Field { field_id: 0, name: "s".into(), kind: FieldKind::Char(8), nullable: false },
+                Field { field_id: 0, name: "u".into(), kind: FieldKind::U128, nullable: false },
+                Field { field_id: 0, name: "i".into(), kind: FieldKind::I128, nullable: false },
+            ],
+        );
+        let build = || {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            sm.apply(1, Op::CreateType { def: tdef.clone() });
+            // Fields are 1-based: owner=1, s=2, u=3, i=4. RANGE INDEX
+            // on s(2) and u(3) → fast path; i(4) has NO index → forces
+            // the slow path even with no filter.
+            sm.apply(2, Op::AddOrderedIndex { type_id: 1, field_id: 2 });
+            sm.apply(3, Op::AddOrderedIndex { type_id: 1, field_id: 3 });
+            let cot = sm.catalog().get(1).unwrap().clone();
+            let mut rng = Rng::new(0x7333_AA);
+            let mut model: Vec<(u32, [u8; 8], u128, i128)> = Vec::new();
+            for id in 1..=160u128 {
+                let owner = rng.below(4) as u32;
+                let len = rng.below(5) as usize;
+                let mut s = [0u8; 8];
+                for c in s.iter_mut().take(len) {
+                    *c = b'a' + rng.below(6) as u8;
+                }
+                // u spans past i128::MAX; i spans negatives.
+                let u = (rng.below(u64::MAX) as u128) << 64
+                    | rng.below(u64::MAX) as u128;
+                let mag =
+                    (rng.below(u64::MAX) as i128) << 20 | rng.below(u64::MAX) as i128;
+                let i = if rng.below(2) == 0 { -mag } else { mag };
+                let rec = encode(
+                    &cot,
+                    &[
+                        Value::Uint(owner as u128),
+                        Value::Blob(s.to_vec()),
+                        Value::Uint(u),
+                        Value::Int(i),
+                    ],
+                )
+                .unwrap();
+                sm.apply(
+                    10 + id as u64,
+                    Op::Create { type_id: 1, id: ObjectId::from_u128(id), record: rec },
+                );
+                model.push((owner, s, u, i));
+            }
+            (sm, model)
+        };
+        let (mut sm, model) = build();
+        let agg = |sm: &mut StateMachine<MemVfs>,
+                   op: u64,
+                   k: u8,
+                   fid: u16,
+                   p: Vec<u8>|
+         -> Vec<u8> {
+            match sm.apply(op, Op::Aggregate { type_id: 1, program: p, kind: k, field_id: fid })
+            {
+                OpResult::Got(b) => b,
+                o => panic!("expected Got, got {o:?}"),
+            }
+        };
+        let all = Program::new().push_int(1).bytes();
+        let mut op = 2000u64;
+        for filter in [None, Some(1u32), Some(99u32)] {
+            let (prog, sel): (Vec<u8>, Box<dyn Fn(u32) -> bool>) = match filter {
+                None => (all.clone(), Box::new(|_| true)),
+                Some(kk) => (
+                    Program::new().load(1).push_int(kk as i128).eq().bytes(),
+                    Box::new(move |o| o == kk),
+                ),
+            };
+            let rows: Vec<&(u32, [u8; 8], u128, i128)> =
+                model.iter().filter(|r| sel(r.0)).collect();
+            // ---- CHAR s (f2) ----
+            op += 1;
+            let got_min = agg(&mut sm, op, 2, 2, prog.clone());
+            op += 1;
+            let got_max = agg(&mut sm, op, 3, 2, prog.clone());
+            if let Some(exp) = rows.iter().map(|r| r.1).min() {
+                assert_eq!(got_min, exp.to_vec(), "MIN(s) f={filter:?}");
+                let exp = rows.iter().map(|r| r.1).max().unwrap();
+                assert_eq!(got_max, exp.to_vec(), "MAX(s) f={filter:?}");
+            } else {
+                assert!(got_min.is_empty() && got_max.is_empty(), "empty MIN/MAX(s)");
+            }
+            // ---- U128 u (f3) ----
+            op += 1;
+            let gmin = agg(&mut sm, op, 2, 3, prog.clone());
+            op += 1;
+            let gmax = agg(&mut sm, op, 3, 3, prog.clone());
+            if let Some(exp) = rows.iter().map(|r| r.2).min() {
+                assert_eq!(gmin, exp.to_le_bytes().to_vec(), "MIN(u) f={filter:?}");
+                let exp = rows.iter().map(|r| r.2).max().unwrap();
+                assert_eq!(gmax, exp.to_le_bytes().to_vec(), "MAX(u) f={filter:?}");
+            } else {
+                assert!(gmin.is_empty() && gmax.is_empty());
+            }
+            // ---- I128 i (f4) — NO index ⇒ slow path even unfiltered ----
+            op += 1;
+            let imin = agg(&mut sm, op, 2, 4, prog.clone());
+            op += 1;
+            let imax = agg(&mut sm, op, 3, 4, prog.clone());
+            if let Some(exp) = rows.iter().map(|r| r.3).min() {
+                assert_eq!(imin, exp.to_le_bytes().to_vec(), "MIN(i) f={filter:?}");
+                let exp = rows.iter().map(|r| r.3).max().unwrap();
+                assert_eq!(imax, exp.to_le_bytes().to_vec(), "MAX(i) f={filter:?}");
+            } else {
+                assert!(imin.is_empty() && imax.is_empty());
+            }
+        }
+        // SUM/AVG over a CHAR column stay an honest SchemaError.
+        assert!(matches!(
+            sm.apply(9001, Op::Aggregate { type_id: 1, program: all.clone(), kind: 1, field_id: 2 }),
+            OpResult::SchemaError(_)
+        ));
+        // Deterministic.
+        let (a, _) = build();
+        let (b, _) = build();
+        assert_eq!(a.digest(), b.digest(), "0xFFFC MIN/MAX path must be deterministic");
+    }
 
     #[test]
     fn aggregate_count_sum_min_max() {

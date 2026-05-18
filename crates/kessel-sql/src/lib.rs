@@ -1718,6 +1718,61 @@ mod tests {
         assert_eq!(zi, zs, "I128 zero-straddling window != Seq Scan");
     }
 
+    /// #73 (SQL surface): `SELECT MIN(s)/MAX(s)` on a CHAR column and
+    /// `MIN(u)/MAX(u)` on a U128 column compile to `Op::Aggregate` and
+    /// return the brute-force extreme bytes — previously these were a
+    /// hard `SchemaError` ("must be numeric ≤8B").
+    #[test]
+    fn sql_min_max_over_string_and_u128() {
+        use kessel_proto::Rng;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (s CHAR(8) NOT NULL, u U128 NOT NULL)");
+        run(&mut sm, 2, "CREATE RANGE INDEX ON t (s)"); // fast path for s
+        let mut rng = Rng::new(0x73_5C);
+        let mut ss: Vec<[u8; 8]> = Vec::new();
+        let mut us: Vec<u128> = Vec::new();
+        for id in 1..=80u32 {
+            let len = rng.below(5) as usize;
+            let mut s = [0u8; 8];
+            for c in s.iter_mut().take(len) {
+                *c = b'a' + rng.below(6) as u8;
+            }
+            let txt: String = s.iter().take(len).map(|&c| c as char).collect();
+            let u = (rng.below(u64::MAX) as u128) << 60
+                | rng.below(u64::MAX) as u128;
+            run(&mut sm, 10 + id as u64,
+                &format!("INSERT INTO t (id, s, u) VALUES ({id}, '{txt}', {u})"));
+            ss.push(s);
+            us.push(u);
+        }
+        let scalar = |sm: &mut StateMachine<MemVfs>, op: u64, q: &str| -> Vec<u8> {
+            match run(sm, op, q) {
+                OpResult::Got(b) => b,
+                o => panic!("expected Got for `{q}`, got {o:?}"),
+            }
+        };
+        assert_eq!(
+            scalar(&mut sm, 900, "SELECT MIN(s) FROM t"),
+            ss.iter().min().unwrap().to_vec(),
+            "SQL MIN(s)"
+        );
+        assert_eq!(
+            scalar(&mut sm, 901, "SELECT MAX(s) FROM t"),
+            ss.iter().max().unwrap().to_vec(),
+            "SQL MAX(s)"
+        );
+        assert_eq!(
+            scalar(&mut sm, 902, "SELECT MIN(u) FROM t"),
+            us.iter().min().unwrap().to_le_bytes().to_vec(),
+            "SQL MIN(u)"
+        );
+        assert_eq!(
+            scalar(&mut sm, 903, "SELECT MAX(u) FROM t"),
+            us.iter().max().unwrap().to_le_bytes().to_vec(),
+            "SQL MAX(u)"
+        );
+    }
+
     /// SP86: a column `DEFAULT` is applied to omitted INSERT columns
     /// (including a `NOT NULL` column that has a default), an explicit
     /// value overrides it, a `NOT NULL` column with no default still

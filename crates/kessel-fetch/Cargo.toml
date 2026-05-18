@@ -1,0 +1,10 @@
+[package]
+name = "kessel-fetch"
+edition = "2021"
+version = "0.0.1"
+license = "UNLICENSED"
+
+[dependencies]
+kessel-catalog = { path = "../kessel-catalog" }
+
+[dev-dependencies]

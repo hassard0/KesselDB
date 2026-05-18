@@ -213,6 +213,13 @@ fn put_str(b: &mut Vec<u8>, s: &str) {
     b.extend_from_slice(&(s.len() as u16).to_le_bytes());
     b.extend_from_slice(s.as_bytes());
 }
+/// Like [`put_str`] but with a `u32` LE length prefix — the symmetric
+/// writer for [`get_str32`], used by the Catalog-level external-recipe
+/// trailer (URLs / sources can exceed 64 KiB).
+fn put_str32(b: &mut Vec<u8>, s: &str) {
+    b.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    b.extend_from_slice(s.as_bytes());
+}
 fn get_str(b: &[u8], p: &mut usize) -> Option<String> {
     let n = u16::from_le_bytes(b.get(*p..*p + 2)?.try_into().ok()?) as usize;
     *p += 2;
@@ -448,28 +455,23 @@ impl Catalog {
                 b.extend_from_slice(&r.type_id.to_le_bytes());
                 b.push(r.format);
                 b.extend_from_slice(&r.key_field_id.to_le_bytes());
-                b.extend_from_slice(&(r.url.len() as u32).to_le_bytes());
-                b.extend_from_slice(r.url.as_bytes());
+                put_str32(&mut b, &r.url);
                 match &r.auth {
                     ExternalAuth::None => b.push(0),
                     ExternalAuth::BearerEnv(env) => {
                         b.push(1);
-                        b.extend_from_slice(&(env.len() as u32).to_le_bytes());
-                        b.extend_from_slice(env.as_bytes());
+                        put_str32(&mut b, env);
                     }
                     ExternalAuth::HeaderEnv { header, env } => {
                         b.push(2);
-                        b.extend_from_slice(&(header.len() as u32).to_le_bytes());
-                        b.extend_from_slice(header.as_bytes());
-                        b.extend_from_slice(&(env.len() as u32).to_le_bytes());
-                        b.extend_from_slice(env.as_bytes());
+                        put_str32(&mut b, header);
+                        put_str32(&mut b, env);
                     }
                 }
                 b.extend_from_slice(&(r.mapping.len() as u32).to_le_bytes());
                 for (fid, src) in &r.mapping {
                     b.extend_from_slice(&fid.to_le_bytes());
-                    b.extend_from_slice(&(src.len() as u32).to_le_bytes());
-                    b.extend_from_slice(src.as_bytes());
+                    put_str32(&mut b, src);
                 }
             }
         }
@@ -607,6 +609,12 @@ impl Catalog {
                         let env = get_str32(b, &mut p)?;
                         ExternalAuth::HeaderEnv { header, env }
                     }
+                    // Unknown auth tag: this build predates the variant.
+                    // We drop the WHOLE recipe trailer (-> empty list),
+                    // matching the decode_type_defaults "accelerator, not
+                    // load-bearing" philosophy. Assumes uniform-version
+                    // clusters; a rolling upgrade introducing a new tag
+                    // must gate the new variant behind a catalog epoch.
                     _ => return None,
                 };
                 let ml =
@@ -726,11 +734,30 @@ mod tests {
             auth: ExternalAuth::BearerEnv("TOK".into()),
             mapping: vec![(1, "id".into()), (2, "u.name".into())],
         });
+        c.external.push(ExternalRecipe {
+            type_id: 2, url: "http://h/k".into(), format: 0, key_field_id: 1,
+            auth: ExternalAuth::HeaderEnv {
+                header: "X-Api-Key".into(),
+                env: "API_ENV".into(),
+            },
+            mapping: vec![(1, "hid".into())],
+        });
+        c.external.push(ExternalRecipe {
+            type_id: 3, url: "http://n/o".into(), format: 0, key_field_id: 1,
+            auth: ExternalAuth::None,
+            mapping: vec![(1, "nid".into())],
+        });
         let back = Catalog::decode(&c.encode()).unwrap();
-        assert_eq!(back.external.len(), 1);
+        assert_eq!(back.external.len(), 3);
         assert_eq!(back.external[0].url, "http://x/y");
         assert_eq!(back.external[0].auth, ExternalAuth::BearerEnv("TOK".into()));
         assert_eq!(back.external[0].mapping[1], (2, "u.name".to_string()));
+        assert_eq!(
+            back.external[1].auth,
+            ExternalAuth::HeaderEnv { header: "X-Api-Key".into(), env: "API_ENV".into() }
+        );
+        assert_eq!(back.external[2].auth, ExternalAuth::None);
+        assert_eq!(back.external[2].url, "http://n/o");
         // A catalog with NO external recipes must encode byte-identically
         // to before this change and decode to an empty list.
         let mut plain = Catalog::default();

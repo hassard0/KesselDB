@@ -145,6 +145,28 @@ pub enum Op {
     /// ALTER … RENAME COLUMN (SP75): catalog-only; indexes are keyed by
     /// field id so data and indexes are untouched.
     RenameField { type_id: TypeId, field_id: u16, name: String },
+    /// Declare an external source (external-sources feature): a named
+    /// HTTP-backed virtual table. `type_def` is `encode_type_def(name,
+    /// fields)` for the backing type; `url`/`format` (0 JSON, 1 CSV)
+    /// describe the upstream; `key_field_id` is the dedup key; `auth_*`
+    /// describe optional auth (`auth_kind` 0 None / 1 BearerEnv /
+    /// 2 HeaderEnv); `mapping` is `(field_id, source path)` pairs.
+    CreateExternalSource {
+        name: String,
+        /// `encode_type_def(name, fields)` for the backing type.
+        type_def: Vec<u8>,
+        url: String,
+        format: u8,        // 0 JSON, 1 CSV
+        key_field_id: u16,
+        auth_kind: u8,     // 0 None, 1 BearerEnv, 2 HeaderEnv
+        auth_a: String,    // BearerEnv: env name | HeaderEnv: header
+        auth_b: String,    // HeaderEnv: env name (else "")
+        mapping: Vec<(u16, String)>,
+    },
+    /// Drop a declared external source (external-sources feature).
+    DropExternalSource { name: String },
+    /// Trigger a re-fetch of an external source (external-sources feature).
+    RefreshExternalSource { name: String },
     /// Balance-guard helper (SP77): a named non-negative invariant on a
     /// signed numeric column (`field >= 0`). Implemented as a `CHECK`
     /// (reusing that proven enforcement on every write, incl. inside a
@@ -325,6 +347,9 @@ impl Op {
             Op::XshardDecide { .. } => 38,
             Op::XshardCommit { .. } => 39,
             Op::UpdateSet { .. } => 40,
+            Op::CreateExternalSource { .. } => 41,
+            Op::DropExternalSource { .. } => 42,
+            Op::RefreshExternalSource { .. } => 43,
             Op::Join { .. } => 28,
             Op::Aggregate { .. } => 20,
             Op::SelectFields { .. } => 21,
@@ -342,6 +367,10 @@ impl Op {
     /// side-effect-free, so the SP94 crash-recovery replay guard must
     /// never short-circuit them (they must always return real data).
     pub fn is_mutating(&self) -> bool {
+        // External-source ops (CreateExternalSource / DropExternalSource /
+        // RefreshExternalSource) are deliberately absent from the read-op
+        // list below, so this negative match correctly classifies them as
+        // mutating (they change catalog/committed state).
         !matches!(
             self,
             Op::GetById { .. }
@@ -477,6 +506,28 @@ impl Op {
             Op::SeqAppendOnce { key, payload } => {
                 codec::put_bytes(&mut b, key);
                 codec::put_bytes(&mut b, payload);
+            }
+            Op::CreateExternalSource {
+                name, type_def, url, format, key_field_id,
+                auth_kind, auth_a, auth_b, mapping,
+            } => {
+                codec::put_bytes(&mut b, name.as_bytes());
+                codec::put_bytes(&mut b, type_def);
+                codec::put_bytes(&mut b, url.as_bytes());
+                b.push(*format);
+                b.extend_from_slice(&key_field_id.to_le_bytes());
+                b.push(*auth_kind);
+                codec::put_bytes(&mut b, auth_a.as_bytes());
+                codec::put_bytes(&mut b, auth_b.as_bytes());
+                codec::put_u32(&mut b, mapping.len() as u32);
+                for (fid, src) in mapping {
+                    b.extend_from_slice(&fid.to_le_bytes());
+                    codec::put_bytes(&mut b, src.as_bytes());
+                }
+            }
+            Op::DropExternalSource { name }
+            | Op::RefreshExternalSource { name } => {
+                codec::put_bytes(&mut b, name.as_bytes());
             }
             Op::Describe { type_id } | Op::DropType { type_id } => {
                 codec::put_u32(&mut b, *type_id)
@@ -702,6 +753,33 @@ impl Op {
                 }
                 Op::UpdateSet { type_id, id, sets }
             }
+            41 => {
+                let name = String::from_utf8_lossy(&c.bytes()?).into_owned();
+                let type_def = c.bytes()?;
+                let url = String::from_utf8_lossy(&c.bytes()?).into_owned();
+                let format = c.u8()?;
+                let key_field_id = c.u16()?;
+                let auth_kind = c.u8()?;
+                let auth_a = String::from_utf8_lossy(&c.bytes()?).into_owned();
+                let auth_b = String::from_utf8_lossy(&c.bytes()?).into_owned();
+                let n = c.u32()? as usize;
+                let mut mapping = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let fid = c.u16()?;
+                    let src = String::from_utf8_lossy(&c.bytes()?).into_owned();
+                    mapping.push((fid, src));
+                }
+                Op::CreateExternalSource {
+                    name, type_def, url, format, key_field_id,
+                    auth_kind, auth_a, auth_b, mapping,
+                }
+            }
+            42 => Op::DropExternalSource {
+                name: String::from_utf8_lossy(&c.bytes()?).into_owned(),
+            },
+            43 => Op::RefreshExternalSource {
+                name: String::from_utf8_lossy(&c.bytes()?).into_owned(),
+            },
             32 => Op::RenameField {
                 type_id: c.u32()?,
                 field_id: c.u16()?,
@@ -1014,6 +1092,24 @@ mod tests {
             let dec = Op::decode(&enc).expect("decode");
             assert_eq!(op, dec);
             assert_eq!(op.kind(), enc[0]);
+        }
+    }
+
+    #[test]
+    fn external_source_ops_wire_round_trip() {
+        for op in [
+            Op::CreateExternalSource {
+                name: "feed".into(), type_def: vec![1,2,3], url: "http://h/p".into(),
+                format: 0, key_field_id: 2, auth_kind: 1,
+                auth_a: "TOKEN_ENV".into(), auth_b: String::new(),
+                mapping: vec![(1,"id".into()), (2,"k".into())],
+            },
+            Op::DropExternalSource { name: "feed".into() },
+            Op::RefreshExternalSource { name: "feed".into() },
+        ] {
+            let back = Op::decode(&op.encode()).expect("decode");
+            assert_eq!(back.encode(), op.encode(), "round-trip mismatch");
+            assert!(op.is_mutating());
         }
     }
 

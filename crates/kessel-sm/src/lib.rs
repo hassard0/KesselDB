@@ -3520,6 +3520,12 @@ impl<V: Vfs> StateMachine<V> {
                     Err(e) => OpResult::SchemaError(format!("txn commit: {e}")),
                 }
             }
+            // External-sources feature: wired in a later task.
+            Op::CreateExternalSource { .. }
+            | Op::DropExternalSource { .. }
+            | Op::RefreshExternalSource { .. } => {
+                OpResult::SchemaError("external sources not yet wired".into())
+            }
         }
     }
 

@@ -3585,6 +3585,12 @@ impl<V: Vfs> StateMachine<V> {
                     key_field_id,
                     auth,
                     mapping,
+                    // CreateExternal does not yet carry pagination params;
+                    // recipes created via this op are single-shot until a
+                    // later op extends them. The v2 catalog trailer
+                    // serializes these as the None tags.
+                    rows_path: None,
+                    pagination: None,
                 });
                 // Re-persist (same op_number): an idempotent overwrite of
                 // the single catalog key — unlike a counter this is safe

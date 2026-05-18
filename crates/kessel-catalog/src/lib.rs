@@ -364,6 +364,13 @@ pub enum ExternalAuth {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PaginationRecipe {
+    NextUrlJson(String),
+    NextLink,
+    CursorJson { path: String, param: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExternalRecipe {
     pub type_id: u32,
     pub url: String,
@@ -374,6 +381,10 @@ pub struct ExternalRecipe {
     pub auth: ExternalAuth,
     /// (field_id, source) — JSON dotted path or CSV header name.
     pub mapping: Vec<(u16, String)>,
+    /// JSON dotted path to the row array (None ⇒ top-level array).
+    pub rows_path: Option<String>,
+    /// How to advance to the next page (None ⇒ single-shot fetch).
+    pub pagination: Option<PaginationRecipe>,
 }
 
 /// The whole catalog, persisted by the state machine as object type 0.
@@ -450,6 +461,15 @@ impl Catalog {
         // empty, never an error) — same philosophy as the SP86 defaults
         // trailer.
         if !self.external.is_empty() {
+            // v2 trailer. v1 (slice-1) started with `[u32 n]` where n>=1
+            // (the block is only written when non-empty, so v1 NEVER emits
+            // 0 here). We exploit that: a leading `[u32 0]` sentinel — a
+            // value v1 could never produce — flags a versioned trailer,
+            // followed by `[u8 version]` then `[u32 n]`. A v1-persisted
+            // catalog (no sentinel, n>=1) still decodes correctly via the
+            // back-compat branch in `decode`.
+            b.extend_from_slice(&0u32.to_le_bytes()); // v2 sentinel
+            b.push(2u8); // trailer version
             b.extend_from_slice(&(self.external.len() as u32).to_le_bytes());
             for r in &self.external {
                 b.extend_from_slice(&r.type_id.to_le_bytes());
@@ -472,6 +492,27 @@ impl Catalog {
                 for (fid, src) in &r.mapping {
                     b.extend_from_slice(&fid.to_le_bytes());
                     put_str32(&mut b, src);
+                }
+                // v2-appended trailing fields, per recipe.
+                match &r.rows_path {
+                    None => b.push(0),
+                    Some(path) => {
+                        b.push(1);
+                        put_str32(&mut b, path);
+                    }
+                }
+                match &r.pagination {
+                    None => b.push(0),
+                    Some(PaginationRecipe::NextUrlJson(path)) => {
+                        b.push(1);
+                        put_str32(&mut b, path);
+                    }
+                    Some(PaginationRecipe::NextLink) => b.push(2),
+                    Some(PaginationRecipe::CursorJson { path, param }) => {
+                        b.push(3);
+                        put_str32(&mut b, path);
+                        put_str32(&mut b, param);
+                    }
                 }
             }
         }
@@ -586,8 +627,36 @@ impl Catalog {
             if p >= b.len() {
                 return Some(Vec::new());
             }
-            let n = u32::from_le_bytes(b.get(p..p + 4)?.try_into().ok()?) as usize;
+            // The first u32 disambiguates the trailer version. v1 wrote
+            // `[u32 n]` with n>=1 (only written when non-empty), so it can
+            // never be 0. A leading 0 is therefore the v2 sentinel: read
+            // `[u8 ver][u32 n]`. Otherwise `first` IS the v1 recipe count.
+            let first =
+                u32::from_le_bytes(b.get(p..p + 4)?.try_into().ok()?) as usize;
             p += 4;
+            let (n, is_v2) = if first == 0 {
+                let ver = *b.get(p)?;
+                p += 1;
+                // Unknown trailer version: this build predates it. Drop the
+                // WHOLE trailer (-> empty list), matching the unknown-auth-tag
+                // / decode_type_defaults "accelerator, not load-bearing"
+                // philosophy. Assumes uniform-version clusters; a rolling
+                // upgrade introducing a new version must gate it behind a
+                // catalog epoch.
+                if ver != 2 {
+                    return None;
+                }
+                let n =
+                    u32::from_le_bytes(b.get(p..p + 4)?.try_into().ok()?) as usize;
+                p += 4;
+                (n, true)
+            } else {
+                // v1 (slice-1) trailer: `first` is the recipe count, no
+                // sentinel, no per-recipe rows_path/pagination. This is the
+                // backward-compat path — a slice-1-persisted catalog decodes
+                // unchanged, with the new fields defaulting to None.
+                (first, false)
+            };
             let mut out = Vec::with_capacity(n);
             for _ in 0..n {
                 let type_id =
@@ -628,6 +697,37 @@ impl Catalog {
                     let src = get_str32(b, &mut p)?;
                     mapping.push((fid, src));
                 }
+                let (rows_path, pagination) = if is_v2 {
+                    let rp_tag = *b.get(p)?;
+                    p += 1;
+                    let rows_path = match rp_tag {
+                        0 => None,
+                        1 => Some(get_str32(b, &mut p)?),
+                        // Unknown rows_path tag ⇒ drop the whole trailer
+                        // (-> empty list), same stance as unknown auth tag.
+                        _ => return None,
+                    };
+                    let pg_tag = *b.get(p)?;
+                    p += 1;
+                    let pagination = match pg_tag {
+                        0 => None,
+                        1 => Some(PaginationRecipe::NextUrlJson(
+                            get_str32(b, &mut p)?,
+                        )),
+                        2 => Some(PaginationRecipe::NextLink),
+                        3 => {
+                            let path = get_str32(b, &mut p)?;
+                            let param = get_str32(b, &mut p)?;
+                            Some(PaginationRecipe::CursorJson { path, param })
+                        }
+                        // Unknown pagination tag ⇒ drop the whole trailer
+                        // (-> empty list), same stance as unknown auth tag.
+                        _ => return None,
+                    };
+                    (rows_path, pagination)
+                } else {
+                    (None, None)
+                };
                 out.push(ExternalRecipe {
                     type_id,
                     url,
@@ -635,6 +735,8 @@ impl Catalog {
                     key_field_id,
                     auth,
                     mapping,
+                    rows_path,
+                    pagination,
                 });
             }
             Some(out)
@@ -733,6 +835,7 @@ mod tests {
             type_id: 1, url: "http://x/y".into(), format: 0, key_field_id: 1,
             auth: ExternalAuth::BearerEnv("TOK".into()),
             mapping: vec![(1, "id".into()), (2, "u.name".into())],
+            rows_path: None, pagination: None,
         });
         c.external.push(ExternalRecipe {
             type_id: 2, url: "http://h/k".into(), format: 0, key_field_id: 1,
@@ -741,11 +844,13 @@ mod tests {
                 env: "API_ENV".into(),
             },
             mapping: vec![(1, "hid".into())],
+            rows_path: None, pagination: None,
         });
         c.external.push(ExternalRecipe {
             type_id: 3, url: "http://n/o".into(), format: 0, key_field_id: 1,
             auth: ExternalAuth::None,
             mapping: vec![(1, "nid".into())],
+            rows_path: None, pagination: None,
         });
         let back = Catalog::decode(&c.encode()).unwrap();
         assert_eq!(back.external.len(), 3);
@@ -764,5 +869,101 @@ mod tests {
         plain.types.push(c.types[0].clone());
         let enc_plain = plain.encode();
         assert!(Catalog::decode(&enc_plain).unwrap().external.is_empty());
+    }
+
+    #[test]
+    fn external_recipe_pagination_round_trips_and_v1_back_compat() {
+        let mut c = Catalog::default();
+        c.types.push(ObjectType {
+            type_id: 1, name: "t".into(), schema_ver: 1,
+            fields: sample_fields(), indexes: vec![], unique: vec![],
+            fks: vec![], checks: vec![], triggers: vec![], ordered: vec![],
+            composite: vec![], defaults: vec![],
+        });
+        c.external.push(ExternalRecipe {
+            type_id: 1, url: "http://x".into(), format: 2, key_field_id: 1,
+            auth: ExternalAuth::None, mapping: vec![(1, "id".into())],
+            rows_path: Some("data.items".into()),
+            pagination: Some(PaginationRecipe::CursorJson {
+                path: "m.cur".into(),
+                param: "cursor".into(),
+            }),
+        });
+        let back = Catalog::decode(&c.encode()).unwrap();
+        assert_eq!(back.external.len(), 1);
+        assert_eq!(back.external[0].rows_path.as_deref(), Some("data.items"));
+        assert_eq!(
+            back.external[0].pagination,
+            Some(PaginationRecipe::CursorJson {
+                path: "m.cur".into(),
+                param: "cursor".into()
+            })
+        );
+        assert_eq!(back.external[0].url, "http://x");
+        assert_eq!(back.external[0].format, 2);
+        // also exercise NextUrlJson + NextLink + None pagination, and rows_path None
+        let mut c2 = Catalog::default();
+        c2.types.push(c.types[0].clone());
+        c2.external.push(ExternalRecipe {
+            type_id: 1, url: "u1".into(), format: 0, key_field_id: 1,
+            auth: ExternalAuth::BearerEnv("E".into()), mapping: vec![(1, "a".into())],
+            rows_path: None,
+            pagination: Some(PaginationRecipe::NextUrlJson("p.next".into())),
+        });
+        c2.external.push(ExternalRecipe {
+            type_id: 1, url: "u2".into(), format: 0, key_field_id: 1,
+            auth: ExternalAuth::HeaderEnv { header: "H".into(), env: "V".into() },
+            mapping: vec![(2, "b".into())],
+            rows_path: Some("d".into()),
+            pagination: Some(PaginationRecipe::NextLink),
+        });
+        c2.external.push(ExternalRecipe {
+            type_id: 1, url: "u3".into(), format: 1, key_field_id: 1,
+            auth: ExternalAuth::None, mapping: vec![],
+            rows_path: None, pagination: None,
+        });
+        let b2 = Catalog::decode(&c2.encode()).unwrap();
+        assert_eq!(b2.external.len(), 3);
+        assert_eq!(
+            b2.external[0].pagination,
+            Some(PaginationRecipe::NextUrlJson("p.next".into()))
+        );
+        assert_eq!(b2.external[1].pagination, Some(PaginationRecipe::NextLink));
+        assert_eq!(b2.external[1].rows_path.as_deref(), Some("d"));
+        assert_eq!(b2.external[2].rows_path, None);
+        assert_eq!(b2.external[2].pagination, None);
+        // empty external => zero trailer bytes (digest unchanged)
+        let mut e = Catalog::default();
+        e.types.push(c.types[0].clone());
+        let enc = e.encode();
+        assert!(Catalog::decode(&enc).unwrap().external.is_empty());
+    }
+
+    #[test]
+    fn decodes_a_handwritten_v1_external_trailer() {
+        // A catalog persisted by the SHIPPED slice-1 (v1) binary: header,
+        // 0 types, then a v1 external trailer (NO sentinel, n>=1).
+        let mut blob = Catalog::default().encode(); // header, no external bytes
+        blob.extend_from_slice(&1u32.to_le_bytes()); // v1: n = 1 (>=1)
+        blob.extend_from_slice(&1u32.to_le_bytes()); // type_id
+        blob.push(0u8); // format
+        blob.extend_from_slice(&1u16.to_le_bytes()); // key_field_id
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        blob.push(b'u'); // url str32 "u"
+        blob.push(0u8); // auth None
+        blob.extend_from_slice(&1u32.to_le_bytes()); // mapping len = 1
+        blob.extend_from_slice(&1u16.to_le_bytes()); // fid
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        blob.push(b's'); // src str32 "s"
+        let cat = Catalog::decode(&blob).expect("v1 trailer must still decode");
+        assert_eq!(
+            cat.external.len(),
+            1,
+            "slice-1 recipe must survive a new-binary decode"
+        );
+        assert_eq!(cat.external[0].url, "u");
+        assert_eq!(cat.external[0].mapping, vec![(1u16, "s".to_string())]);
+        assert_eq!(cat.external[0].rows_path, None);
+        assert_eq!(cat.external[0].pagination, None);
     }
 }

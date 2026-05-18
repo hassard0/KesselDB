@@ -101,6 +101,8 @@ REFRESH <name>
 DROP EXTERNAL SOURCE <name>
 ```
 
+No trailing comma after the final column (the parser expects either `,` to continue or `)` to end the column list).
+
 Parser: recursive-descent extension of the existing `compile()` path.
 Validates: column list non-empty (clear error); `KEY` column must be a
 declared column (error names the missing column). Lowers to the three

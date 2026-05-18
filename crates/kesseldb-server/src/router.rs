@@ -940,4 +940,93 @@ mod tests {
             "the aborted txn stays aborted after recovery (stable verdict)"
         );
     }
+
+    /// SP82 (slice 5): many concurrent cross-shard txns over real
+    /// sockets all commit atomically (the `xs` lock serialises the
+    /// global order), every row lands on its owning shard, and a
+    /// post-hoc full recovery re-drive changes nothing.
+    #[test]
+    fn concurrent_cross_shard_txns_are_atomic_over_sockets() {
+        let s0 = spawn_shard("ca");
+        let s1 = spawn_shard("cb");
+        let seq = spawn_shard("cseq");
+        let router = Arc::new(
+            Router::new(vec![s0.clone(), s1.clone()]).with_sequencer(seq),
+        );
+        let rl = TcpListener::bind("127.0.0.1:0").unwrap();
+        let raddr = rl.local_addr().unwrap();
+        {
+            let r = router.clone();
+            std::thread::spawn(move || serve_router(rl, r));
+        }
+        std::thread::sleep(Duration::from_millis(1600));
+
+        Client::connect(raddr)
+            .unwrap()
+            .call(&Op::CreateType {
+                def: encode_type_def(
+                    "t",
+                    &[Field { field_id: 0, name: "v".into(), kind: FieldKind::U64, nullable: false }],
+                ),
+            })
+            .unwrap();
+
+        let m = ShardMap::new(2);
+        let pick = |want: usize, nth: usize| -> u128 {
+            (1u128..50000)
+                .filter(|v| {
+                    m.shard_of(&row_key(1, &ObjectId::from_u128(*v).0)) as usize
+                        == want
+                })
+                .nth(nth)
+                .unwrap()
+        };
+        let n = 8usize;
+        let handles: Vec<_> = (0..n)
+            .map(|t| {
+                let a = pick(0, t);
+                let b = pick(1, t);
+                std::thread::spawn(move || {
+                    let mut c = Client::connect(raddr).unwrap();
+                    let r = c
+                        .call(&Op::Txn {
+                            ops: vec![
+                                Op::Create { type_id: 1, id: ObjectId::from_u128(a), record: vec![1,0,0,0,0,0,0,0] },
+                                Op::Create { type_id: 1, id: ObjectId::from_u128(b), record: vec![2,0,0,0,0,0,0,0] },
+                            ],
+                        })
+                        .unwrap();
+                    assert_eq!(r, OpResult::Ok, "concurrent cross-shard txn {t}");
+                    (a, b)
+                })
+            })
+            .collect();
+        let pairs: Vec<(u128, u128)> =
+            handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let mut d0 = ClusterClient::new(s0);
+        let mut d1 = ClusterClient::new(s1);
+        for (a, b) in &pairs {
+            assert!(matches!(
+                d0.call(&Op::GetById { type_id: 1, id: ObjectId::from_u128(*a) }).unwrap(),
+                OpResult::Got(_)
+            ));
+            assert!(matches!(
+                d1.call(&Op::GetById { type_id: 1, id: ObjectId::from_u128(*b) }).unwrap(),
+                OpResult::Got(_)
+            ));
+        }
+        // A full recovery re-drive after concurrent commits is a no-op.
+        assert!(super::recover(&router).expect("recover") >= n);
+        for (a, b) in &pairs {
+            assert!(matches!(
+                d0.call(&Op::GetById { type_id: 1, id: ObjectId::from_u128(*a) }).unwrap(),
+                OpResult::Got(_)
+            ));
+            assert!(matches!(
+                d1.call(&Op::GetById { type_id: 1, id: ObjectId::from_u128(*b) }).unwrap(),
+                OpResult::Got(_)
+            ));
+        }
+    }
 }

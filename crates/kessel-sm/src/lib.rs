@@ -3666,6 +3666,164 @@ mod tests {
         assert_eq!(a.digest(), b2.digest(), "two-phase must be deterministic");
     }
 
+    /// SP82 (cross-shard slice 5): the deterministic cross-shard
+    /// protocol is atomic and convergent under an ADVERSARIAL drive
+    /// schedule — partial decide, "router crash", duplicate
+    /// SeqAppendOnce retries, repeated full-log recovery, reordering —
+    /// the final per-shard state is identical to a clean run and the
+    /// whole chaotic schedule is itself bit-for-bit deterministic.
+    /// (Per-group partition tolerance is the seed-7 corpus; this proves
+    /// the cross-shard layer composed on top of it.)
+    #[test]
+    fn xshard_protocol_atomic_and_deterministic_under_adversarial_drive() {
+        const K: usize = 3;
+        let mk = |v: u128| Op::Create {
+            type_id: 1,
+            id: ObjectId::from_u128(v),
+            record: vec![v as u8, 0, 0, 0, 0, 0, 0, 0],
+        };
+        // (dedup key, per-shard slices). T2's shard-1 slice dups a row
+        // pre-seeded below ⇒ that whole cross-shard txn must abort
+        // everywhere; T1/T3 must commit everywhere.
+        let txns: Vec<(Vec<u8>, [Vec<Op>; K])> = vec![
+            (b"t1".to_vec(), [vec![mk(10)], vec![mk(11)], vec![]]),
+            (b"t2".to_vec(), [vec![], vec![mk(99)], vec![mk(12)]]), // mk(99) dup ⇒ abort
+            (b"t3".to_vec(), [vec![mk(13)], vec![], vec![mk(14)]]),
+        ];
+
+        // Build K shard SMs (+ pre-seed the dup) and a sequencer SM.
+        let setup = || {
+            let mut shards: Vec<StateMachine<MemVfs>> =
+                (0..K).map(|_| StateMachine::open(MemVfs::new()).unwrap()).collect();
+            for s in shards.iter_mut() {
+                s.apply(1, Op::CreateType { def: q_type_def() });
+            }
+            // Pre-existing row on shard 1 so T2's slice deterministically
+            // fails (Exists) ⇒ deterministic global abort.
+            shards[1].apply(2, mk(99));
+            let seqr = StateMachine::open(MemVfs::new()).unwrap();
+            (shards, seqr, std::cell::Cell::new(100u64))
+        };
+        let assign = |seqr: &mut StateMachine<MemVfs>,
+                      n: &std::cell::Cell<u64>,
+                      key: &[u8]|
+         -> u64 {
+            n.set(n.get() + 1);
+            match seqr.apply(
+                n.get(),
+                Op::SeqAppendOnce { key: key.to_vec(), payload: vec![] },
+            ) {
+                OpResult::Got(b) => u64::from_le_bytes(b.try_into().unwrap()),
+                o => panic!("{o:?}"),
+            }
+        };
+        let drive = |shards: &mut Vec<StateMachine<MemVfs>>,
+                     n: &std::cell::Cell<u64>,
+                     seq: u64,
+                     slices: &[Vec<Op>; K]| {
+            let mut decision = true;
+            for (i, sl) in slices.iter().enumerate() {
+                if sl.is_empty() {
+                    continue;
+                }
+                n.set(n.get() + 1);
+                if let OpResult::Got(v) = shards[i].apply(
+                    n.get(),
+                    Op::XshardDecide { seq, ops: sl.clone() },
+                ) {
+                    if v == vec![0] {
+                        decision = false;
+                    }
+                }
+            }
+            for (i, sl) in slices.iter().enumerate() {
+                n.set(n.get() + 1);
+                shards[i].apply(
+                    n.get(),
+                    Op::XshardCommit { seq, ops: sl.clone(), commit: decision },
+                );
+            }
+        };
+        let digests =
+            |sh: &mut Vec<StateMachine<MemVfs>>| -> Vec<u32> {
+                sh.iter_mut().map(|s| s.digest()).collect()
+            };
+
+        // --- Clean reference run ---
+        let (mut cs, mut cseq, cn) = setup();
+        let mut log: Vec<(u64, [Vec<Op>; K])> = Vec::new();
+        for (k, sl) in &txns {
+            let seq = assign(&mut cseq, &cn, k);
+            log.push((seq, sl.clone()));
+        }
+        for (seq, sl) in &log {
+            drive(&mut cs, &cn, *seq, sl);
+        }
+        let reference = digests(&mut cs);
+        // Sanity: T1/T3 committed (rows present), T2 aborted everywhere.
+        let present = |s: &mut StateMachine<MemVfs>, v: u128| {
+            matches!(
+                s.apply(9_000_000, Op::GetById { type_id: 1, id: ObjectId::from_u128(v) }),
+                OpResult::Got(_)
+            )
+        };
+        assert!(present(&mut cs[0], 10) && present(&mut cs[1], 11), "T1 committed");
+        assert!(present(&mut cs[0], 13) && present(&mut cs[2], 14), "T3 committed");
+        assert!(
+            !present(&mut cs[2], 12),
+            "T2 must abort on shard 2 too (deterministic agreement)"
+        );
+
+        // --- Adversarial run (fresh state) ---
+        let adversarial = || {
+            let (mut s, mut seqr, n) = setup();
+            // Duplicate, out-of-order SeqAppendOnce retries: same key ⇒
+            // same seq, no extra entries.
+            let mut alog: Vec<(u64, [Vec<Op>; K])> = Vec::new();
+            for (k, sl) in &txns {
+                let q1 = assign(&mut seqr, &n, k);
+                let q2 = assign(&mut seqr, &n, k); // retry
+                assert_eq!(q1, q2, "exactly-once seq under retry");
+                alog.push((q1, sl.clone()));
+            }
+            let rec = |s: &mut Vec<StateMachine<MemVfs>>,
+                       n: &std::cell::Cell<u64>| {
+                for (seq, sl) in &alog {
+                    drive(s, n, *seq, sl);
+                }
+            };
+            // Chaos: fully drive T1; partially decide T2 on shard 1
+            // only; then "router crash" → full recovery; recover AGAIN
+            // (idempotent); then a stray duplicate commit of T1.
+            drive(&mut s, &n, alog[0].0, &alog[0].1);
+            n.set(n.get() + 1);
+            let _ = s[1].apply(
+                n.get(),
+                Op::XshardDecide { seq: alog[1].0, ops: alog[1].1[1].clone() },
+            );
+            rec(&mut s, &n); // recover from the durable log
+            rec(&mut s, &n); // again — must be a no-op
+            n.set(n.get() + 1);
+            let _ = s[0].apply(
+                n.get(),
+                Op::XshardCommit { seq: alog[0].0, ops: alog[0].1[0].clone(), commit: true },
+            );
+            rec(&mut s, &n); // and once more
+            digests(&mut s)
+        };
+
+        let a1 = adversarial();
+        let a2 = adversarial();
+        assert_eq!(
+            a1, reference,
+            "adversarial drive must converge to the clean-run state"
+        );
+        assert_eq!(
+            a1, a2,
+            "the whole adversarial schedule is itself deterministic"
+        );
+    }
+
     #[test]
     fn overflow_blobs_are_reclaimed_on_update_and_delete() {
         // SP76: an UPDATE that replaces an overflow value frees the old

@@ -153,14 +153,13 @@ pub enum Op {
     /// 2 HeaderEnv); `mapping` is `(field_id, source path)` pairs.
     CreateExternalSource {
         name: String,
-        /// `encode_type_def(name, fields)` for the backing type.
         type_def: Vec<u8>,
         url: String,
-        format: u8,        // 0 JSON, 1 CSV
+        format: u8,
         key_field_id: u16,
-        auth_kind: u8,     // 0 None, 1 BearerEnv, 2 HeaderEnv
-        auth_a: String,    // BearerEnv: env name | HeaderEnv: header
-        auth_b: String,    // HeaderEnv: env name (else "")
+        auth_kind: u8,
+        auth_a: String,
+        auth_b: String,
         mapping: Vec<(u16, String)>,
     },
     /// Drop a declared external source (external-sources feature).
@@ -1108,7 +1107,8 @@ mod tests {
             Op::RefreshExternalSource { name: "feed".into() },
         ] {
             let back = Op::decode(&op.encode()).expect("decode");
-            assert_eq!(back.encode(), op.encode(), "round-trip mismatch");
+            assert_eq!(back, op, "round-trip mismatch");
+            assert_eq!(op.kind(), op.encode()[0], "kind/byte mismatch");
             assert!(op.is_mutating());
         }
     }

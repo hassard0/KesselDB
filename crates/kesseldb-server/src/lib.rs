@@ -195,7 +195,7 @@ impl CompileCache {
 fn mutates_schema(op: &Op) -> bool {
     matches!(
         op.kind(),
-        1 | 2 | 8 | 10 | 12 | 13 | 14 | 17 | 24 | 15 | 29 | 30 | 31 | 32
+        1 | 2 | 8 | 10 | 12 | 13 | 14 | 17 | 24 | 15 | 29 | 30 | 31 | 32 | 33
     )
 }
 

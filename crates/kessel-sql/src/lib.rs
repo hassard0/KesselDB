@@ -403,6 +403,11 @@ fn plan_string(stmt: &Stmt, cat: &Catalog) -> String {
             Op::RenameField { type_id, .. } => {
                 format!("Rename Column on {} (catalog only)", tname(*type_id))
             }
+            Op::AddBalanceGuard { type_id, field_id } => format!(
+                "Add Balance Guard on {} ({} >= 0)",
+                tname(*type_id),
+                cols(*type_id, &[*field_id])
+            ),
             Op::AlterTypeAddField { type_id, .. } => {
                 format!("Alter {} Add Column (online, no lock)", tname(*type_id))
             }
@@ -571,6 +576,21 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
             });
         }
         p.expect_kw("ADD")?;
+        // SP77: ALTER TABLE t ADD BALANCE GUARD [ON] <col>
+        if p.kw("BALANCE") {
+            p.expect_kw("GUARD")?;
+            let _ = p.kw("ON"); // optional noise word
+            let c = p.ident()?;
+            let f = ot
+                .fields
+                .iter()
+                .find(|f| f.name == c)
+                .ok_or_else(|| format!("unknown column `{c}`"))?;
+            return Ok(Op::AddBalanceGuard {
+                type_id: ot.type_id,
+                field_id: f.field_id,
+            });
+        }
         let _ = p.kw("COLUMN"); // optional noise word
         let cname = p.ident()?;
         let tyname = p.ident()?;
@@ -1780,6 +1800,110 @@ mod tests {
             run(&mut b, op, q);
         }
         assert_eq!(a.digest(), b.digest(), "destructive ALTER must be deterministic");
+    }
+
+    /// SP77: a balance guard is a named `col >= 0` invariant enforced
+    /// on every write (incl. inside a transaction), validates existing
+    /// rows when added, requires a signed numeric column, and is
+    /// deterministic.
+    #[test]
+    fn balance_guard_enforces_non_negative() {
+        let build = || {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            run(&mut sm, 1, "CREATE TABLE acct (bal I64 NOT NULL)");
+            run(&mut sm, 2, "INSERT INTO acct (id, bal) VALUES (1, 100)");
+            run(&mut sm, 3, "ALTER TABLE acct ADD BALANCE GUARD bal");
+            sm
+        };
+        let mut sm = build();
+        let ot = sm.catalog().get(1).unwrap().clone();
+        let bal_rec = |v: i128| {
+            kessel_codec::encode(&ot, &[kessel_codec::Value::Int(v)]).unwrap()
+        };
+        let upd = |s: &mut StateMachine<MemVfs>, op: u64, v: i128| {
+            s.apply(
+                op,
+                kessel_proto::Op::Update {
+                    type_id: 1,
+                    id: kessel_proto::ObjectId::from_u128(1),
+                    record: bal_rec(v),
+                },
+            )
+        };
+        // Within the guard: fine (INSERT via SQL, UPDATE via engine —
+        // SQL UPDATE is a server-side RMW, out of the compile path).
+        assert_eq!(
+            run(&mut sm, 10, "INSERT INTO acct (id, bal) VALUES (2, 0)"),
+            OpResult::Ok
+        );
+        assert_eq!(upd(&mut sm, 11, 5), OpResult::Ok);
+        // Negative INSERT and UPDATE are rejected (no effect).
+        assert!(matches!(
+            run(&mut sm, 12, "INSERT INTO acct (id, bal) VALUES (3, -1)"),
+            OpResult::Constraint(_)
+        ));
+        assert!(matches!(upd(&mut sm, 13, -7), OpResult::Constraint(_)));
+        // The rejected update had no effect (row 1 still bal = 5).
+        assert_eq!(
+            sm.apply(
+                14,
+                kessel_proto::Op::GetById {
+                    type_id: 1,
+                    id: kessel_proto::ObjectId::from_u128(1)
+                }
+            ),
+            OpResult::Got(bal_rec(5))
+        );
+
+        // Adding the guard when a current row already violates it fails
+        // (and the guard is not installed).
+        let mut bad = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut bad, 1, "CREATE TABLE a (bal I64 NOT NULL)");
+        run(&mut bad, 2, "INSERT INTO a (id, bal) VALUES (1, -3)");
+        assert!(matches!(
+            run(&mut bad, 3, "ALTER TABLE a ADD BALANCE GUARD bal"),
+            OpResult::Constraint(_)
+        ));
+        assert_eq!(
+            run(&mut bad, 4, "INSERT INTO a (id, bal) VALUES (2, -9)"),
+            OpResult::Ok,
+            "guard must NOT have been installed after the failed add"
+        );
+
+        // Signed-column requirement: a guard on an unsigned column is
+        // refused (it would be vacuously true).
+        let mut u = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut u, 1, "CREATE TABLE w (n U32 NOT NULL)");
+        assert!(matches!(
+            run(&mut u, 2, "ALTER TABLE w ADD BALANCE GUARD n"),
+            OpResult::SchemaError(_)
+        ));
+
+        // Enforced atomically inside a transaction: one negative member
+        // rolls the whole batch back (Op::Txn is the engine-level form;
+        // BEGIN/COMMIT are a server-connection concern).
+        let mut t = build();
+        let ins = |s: &mut StateMachine<MemVfs>, q: &str| {
+            compile(q, s.catalog()).expect("compile")
+        };
+        let o1 = ins(&mut t, "INSERT INTO acct (id, bal) VALUES (50, 10)");
+        let o2 = ins(&mut t, "INSERT INTO acct (id, bal) VALUES (51, -2)");
+        assert_ne!(
+            t.apply(20, kessel_proto::Op::Txn { ops: vec![o1, o2] }),
+            OpResult::Ok
+        );
+        assert!(
+            matches!(
+                run(&mut t, 24, "SELECT * FROM acct ID 50"),
+                OpResult::NotFound
+            ),
+            "a balance-guard violation must roll back the whole txn"
+        );
+
+        // Deterministic.
+        let a = build();
+        let b = build();
+        assert_eq!(a.digest(), b.digest(), "balance guard must be deterministic");
     }
 
     #[test]

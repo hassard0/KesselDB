@@ -145,6 +145,11 @@ pub enum Op {
     /// ALTER … RENAME COLUMN (SP75): catalog-only; indexes are keyed by
     /// field id so data and indexes are untouched.
     RenameField { type_id: TypeId, field_id: u16, name: String },
+    /// Balance-guard helper (SP77): a named non-negative invariant on a
+    /// signed numeric column (`field >= 0`). Implemented as a `CHECK`
+    /// (reusing that proven enforcement on every write, incl. inside a
+    /// transaction) — the helper is the ergonomic, validated surface.
+    AddBalanceGuard { type_id: TypeId, field_id: u16 },
     /// Inner equi-join (Sub-project 36): rows where
     /// `left.left_field == right.right_field` (raw fixed-width bytes).
     /// Returns up to `limit` joined rows as
@@ -274,6 +279,7 @@ impl Op {
             Op::DropIndex { .. } => 30,
             Op::DropField { .. } => 31,
             Op::RenameField { .. } => 32,
+            Op::AddBalanceGuard { .. } => 33,
             Op::Join { .. } => 28,
             Op::Aggregate { .. } => 20,
             Op::SelectFields { .. } => 21,
@@ -368,7 +374,8 @@ impl Op {
             Op::Describe { type_id } | Op::DropType { type_id } => {
                 codec::put_u32(&mut b, *type_id)
             }
-            Op::DropField { type_id, field_id } => {
+            Op::DropField { type_id, field_id }
+            | Op::AddBalanceGuard { type_id, field_id } => {
                 codec::put_u32(&mut b, *type_id);
                 b.extend_from_slice(&field_id.to_le_bytes());
             }
@@ -530,6 +537,7 @@ impl Op {
                 Op::DropIndex { type_id, fields }
             }
             31 => Op::DropField { type_id: c.u32()?, field_id: c.u16()? },
+            33 => Op::AddBalanceGuard { type_id: c.u32()?, field_id: c.u16()? },
             32 => Op::RenameField {
                 type_id: c.u32()?,
                 field_id: c.u16()?,
@@ -813,6 +821,7 @@ mod tests {
             Op::DropIndex { type_id: 4, fields: vec![1, 3] },
             Op::DropField { type_id: 4, field_id: 2 },
             Op::RenameField { type_id: 4, field_id: 2, name: "renamed".into() },
+            Op::AddBalanceGuard { type_id: 4, field_id: 2 },
             Op::FindByComposite { type_id: 4, fields: vec![1, 3], values: vec![vec![9], vec![8, 8]] },
         ];
         for op in ops {

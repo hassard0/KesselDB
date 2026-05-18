@@ -177,8 +177,14 @@ Honest boundaries (documented, not hidden):
   zero‑dependency. Without it the wire is plaintext but token‑authenticated
   with a timing‑safe comparison (deploy behind a TLS proxy / private
   network). Hand‑rolling TLS would be irresponsible, hence the feature.
-- **Non‑gating roadmap** (tracked, not blocking): balance‑guard helpers,
-  cross‑shard transactions, destructive `ALTER TABLE` & `DROP INDEX` (`DROP TABLE` is supported), overflow GC.
+- **Cross‑shard transactions** are a documented single‑shard boundary.
+  A single shard gives serializable atomic transactions. The router
+  uses rendezvous hashing so a multi‑shard deployment is per‑shard
+  atomic; a deterministic cross‑shard 2‑phase commit is intentionally
+  *not* implemented (faking distributed atomicity would be worse than
+  documenting its absence). Balance‑guard helpers, destructive
+  `ALTER TABLE` (`DROP`/`RENAME COLUMN`), `DROP INDEX`, `DROP TABLE`,
+  and overflow‑blob GC are all implemented.
 
 Every claim in this repository is backed by the test suite (`174 tests`); the
 docs call out exactly what is proven versus roadmap.

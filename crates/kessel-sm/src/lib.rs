@@ -1418,6 +1418,41 @@ impl<V: Vfs> StateMachine<V> {
                 OpResult::Ok
             }
 
+            Op::AddBalanceGuard { type_id, field_id } => {
+                // SP77: a named non-negative invariant. It IS a CHECK
+                // (`field >= 0`); we validate the column is signed
+                // numeric (so "negative" is meaningful — a guard on an
+                // unsigned column would be vacuous, almost always a
+                // mistake) and then reuse the proven AddCheck path
+                // (existing-row validation, persistence, per-write
+                // enforcement incl. inside Txn). No new catalog format.
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t,
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                let fk = match ot.fields.iter().find(|f| f.field_id == field_id) {
+                    Some(f) => f.kind,
+                    None => return OpResult::SchemaError(format!("no field {field_id}")),
+                };
+                use kessel_catalog::FieldKind::*;
+                if !matches!(fk, I8 | I16 | I32 | I64 | I128 | Fixed { .. }) {
+                    return OpResult::SchemaError(
+                        "balance guard requires a signed numeric column \
+                         (a guard on an unsigned column is always true)"
+                            .into(),
+                    );
+                }
+                let program = kessel_expr::Program::new()
+                    .load(field_id)
+                    .push_int(0)
+                    .ge()
+                    .bytes();
+                // Delegate: identical effect to ADD CHECK (col >= 0),
+                // including rejecting the add if a current row is
+                // already negative.
+                self.apply(op_number, Op::AddCheck { type_id, program })
+            }
+
             Op::Join { left_type, right_type, left_field, right_field, limit } => {
                 let lt = match self.catalog.get(left_type) {
                     Some(t) => t.clone(),

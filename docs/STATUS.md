@@ -140,12 +140,12 @@ recovery. Tests: linearizable-vs-reference (single-client total order),
 same-seed determinism, primary-crash → view-change → progress + survivor
 convergence, convergence under 25% message loss.
 
-**Explicit hardening backlog (NOT yet done — listed, not hidden):**
-asymmetric network-partition matrix, disk corruption *during* a view change,
-large randomized seed-corpus sweep (CI), real socket transport (currently
-in-process deterministic bus only), cluster membership reconfiguration. These
-are tracked for M3-hardening / later specs; the protocol is transport-agnostic
-so the socket swap is mechanical.
+**Explicit hardening backlog (listed, not hidden):** disk corruption
+*during* a view change, large randomized seed-corpus sweep (CI),
+cluster membership reconfiguration — still open. **Since closed:** the
+asymmetric/adversarial partition matrix incl. seed 7 (SP46), and real
+socket transport — VSR now runs over real TCP (SP38) and a full
+multi-shard deployment runs over sockets (SP78–83).
 
 ## Sub-project 2 — variable-length overflow store (done)
 
@@ -161,9 +161,12 @@ while the core record stays fixed-width. Spec:
   two-instance digest-equality test).
 - Read via `Op::GetBlob { handle }`. Overflow lives in a reserved LSM
   keyspace, so it inherits crash recovery, the digest, and replication.
-- **Honest limitation:** no overflow GC — an `Update` orphans the old blob
-  (still resolvable; documented and asserted by `update_orphans_old_blob…`).
-  Orphan compaction is a later spec.
+- ~~**Honest limitation:** no overflow GC — an `Update` orphans the old
+  blob; orphan compaction is a later spec.~~ **Closed (SP76):** overflow
+  GC is implemented — `Update` frees `old−new` handles and `Delete`
+  frees the row's blobs, precisely at the mutating op, deterministic and
+  replication-safe. The old "no GC, documented" test was replaced with
+  reclamation + determinism assertions.
 
 ## Sub-project 3 — equality secondary indexes (done)
 
@@ -259,10 +262,11 @@ Added a deterministic transient-single-node partition fault model, a
 backup→primary request relay (real liveness fix), and a view-change retry/
 escalation timer. **Proven:** determinism under partition+loss; bounded
 post-heal convergence for the corpus; no safety/divergence violation.
-**Documented open limitation (not overclaimed):** `seed 7` reproduces a
-view-change-liveness stall that persists after heal — the crash-stop VSR
-does not yet guarantee universal post-heal liveness under arbitrary
-partitions. Concrete repro kept in-code + spec. Spec:
+~~**Documented open limitation:** `seed 7` reproduces a
+view-change-liveness stall that persists after heal.~~ **Closed
+(SP46):** seed 7 was a reply-routing key mismatch, not a consensus
+liveness defect — fixed; the full partition corpus (incl. seed 7) is
+green and asserted in CI. Concrete history kept in-code + spec. Spec:
 `docs/superpowers/specs/2026-05-17-kesseldb-subproject12-partition.md`.
 
 ## What this is NOT (yet)
@@ -501,12 +505,14 @@ All numbers above are a single localhost machine. Extrapolating honestly:
    and is a deployment-topology decision, not an engine limit.
 3. **Sharding is the horizontal-scale lever.** With independent VSR groups per
    shard and rendezvous routing, single-shard-key throughput scales ~linearly
-   with shard count until the client/router fans out — bounded by the (deferred)
-   cross-shard-transaction fraction of the workload.
-4. **Known ceilings before any cloud claim is credible:** O(#sstables) reads
-   (no bloom filter), value-cloning hot path, single-threaded core, in-process
-   (not socket) transport. These are the M4-hardening / Sub-project-2+ backlog;
-   until they're addressed, treat all projections as upper-bound reasoning.
+   with shard count; the cross-shard-transaction fraction is the bound (now
+   implemented — deterministic, the deliberate serialized slow path).
+4. **Known ceilings (this was the M2 verdict; most since closed):**
+   ~~O(#sstables) reads (no bloom filter)~~ — bloom + bounded compaction
+   (SP48/49); value-cloning hot path; single-threaded core (by design);
+   ~~in-process (not socket) transport~~ — real TCP (SP38). Remaining
+   genuine ceilings are the single-writer core and per-op value cloning;
+   treat absolute projections as upper-bound reasoning regardless.
 
 **Bottom line:** the data supports "schema flexibility at TB-class speed is
 *achievable*" — generalization costs ~20%, replication ~35%, and the historical

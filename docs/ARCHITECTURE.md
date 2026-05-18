@@ -85,7 +85,10 @@ handle** `(op_number << 20) | field_idx`, and patches the 8-byte handle into
 the record's `OverflowRef` slot. Determinism holds because `op_number` is
 assigned by the VSR primary and replicated, so every replica computes the
 same handle and stores identical bytes. Reads use `GetBlob { handle }`.
-Orphaned-blob GC (after an overflow-field `Update`) is deferred and documented.
+Orphaned-blob GC is implemented: an overflow-field `Update` frees the
+superseded blob and a `Delete` frees the row's blobs, precisely at the
+mutating op (deterministic, replication-safe — handles are
+op-number-derived).
 
 ## Equality secondary indexes (Sub-project 3)
 

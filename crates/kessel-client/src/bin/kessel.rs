@@ -25,7 +25,8 @@
 
 use kessel_client::{
     format_result, format_result_json, render_projection, render_rows,
-    render_rows_json, render_schema, render_schema_json, Client,
+    render_rows_json, render_schema, render_schema_json,
+    render_typed_result, render_typed_result_json, Client,
 };
 use kessel_proto::OpResult;
 use std::io::{BufRead, IsTerminal, Write};
@@ -258,6 +259,11 @@ fn print_got_text(client: &mut Client, sql: &str, b: Vec<u8>, explain: bool) {
             return;
         }
     }
+    // Self-describing typed result (JOINs, …) — renders generically.
+    if let Some(s) = render_typed_result(&b) {
+        println!("{s}");
+        return;
+    }
     if let Some(t) = kessel_sql::select_star_table(sql) {
         if let Ok(OpResult::Got(def)) = client.sql(&format!("DESCRIBE {t}")) {
             if let Some(table) = render_rows(&def, &b) {
@@ -290,6 +296,10 @@ fn print_got_json(client: &mut Client, sql: &str, b: &[u8], explain: bool) {
             println!("{s}");
             return;
         }
+    }
+    if let Some(rows) = render_typed_result_json(b) {
+        println!(r#"{{"status":"ok","rows":{rows}}}"#);
+        return;
     }
     if let Some(t) = kessel_sql::select_star_table(sql) {
         if let Ok(OpResult::Got(def)) = client.sql(&format!("DESCRIBE {t}")) {

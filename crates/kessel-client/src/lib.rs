@@ -185,6 +185,38 @@ fn kind_name(k: &kessel_catalog::FieldKind) -> String {
     }
 }
 
+/// Magic prefix of a self-describing typed result (SP72): the server
+/// embeds the result's own column schema so the client renders any
+/// shape — JOINs today, more later — with no `DESCRIBE` round-trip.
+pub const TYPED_RESULT_MAGIC: &[u8; 4] = b"KTR1";
+
+/// If `b` is a typed result (`[KTR1][u32 deflen][type def][rows…]`),
+/// split it into the embedded type def and the length-prefixed row
+/// bytes. `None` if it isn't one — the caller falls back. Pure.
+fn split_typed_result(b: &[u8]) -> Option<(&[u8], &[u8])> {
+    if b.len() < 8 || &b[..4] != TYPED_RESULT_MAGIC {
+        return None;
+    }
+    let dl = u32::from_le_bytes(b[4..8].try_into().ok()?) as usize;
+    let def = b.get(8..8 + dl)?;
+    let rows = b.get(8 + dl..)?;
+    Some((def, rows))
+}
+
+/// Render a self-describing typed result as an aligned table — reuses
+/// the exact same decoder as whole-row `SELECT *`, so a JOIN renders
+/// identically to a plain table. `None` if `b` is not a typed result.
+pub fn render_typed_result(b: &[u8]) -> Option<String> {
+    let (def, rows) = split_typed_result(b)?;
+    render_rows(def, rows)
+}
+
+/// The JSON form of [`render_typed_result`] — `[{col:val,…},…]`.
+pub fn render_typed_result_json(b: &[u8]) -> Option<String> {
+    let (def, rows) = split_typed_result(b)?;
+    render_rows_json(def, rows)
+}
+
 /// Decode a `DESCRIBE` typedef into a readable schema table
 /// (`column | type | null`). `None` if it isn't a valid typedef — the
 /// caller falls back to the byte summary. Pure and total.
@@ -713,6 +745,50 @@ mod tests {
         );
         // Zero rows is a valid empty array, not None.
         assert_eq!(render_rows_json(&typedef, &[]).as_deref(), Some("[]"));
+    }
+
+    #[test]
+    fn typed_result_renders_generically_text_and_json() {
+        use kessel_catalog::{encode_type_def, Field, FieldKind};
+        // A synthetic JOIN result: combined schema usr.uid + ord.amt.
+        let combined = vec![
+            Field { field_id: 0, name: "usr.uid".into(), kind: FieldKind::U32, nullable: false },
+            Field { field_id: 1, name: "ord.amt".into(), kind: FieldKind::U32, nullable: false },
+        ];
+        let cot = kessel_catalog::ObjectType::from_def(
+            "usr+ord".into(),
+            combined.clone(),
+        );
+        let typedef = encode_type_def("usr+ord", &combined);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(TYPED_RESULT_MAGIC);
+        payload.extend_from_slice(&(typedef.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&typedef);
+        for (u, a) in [(1u128, 100u128), (1, 200), (2, 50)] {
+            let rec = kessel_codec::encode(
+                &cot,
+                &[kessel_codec::Value::Uint(u), kessel_codec::Value::Uint(a)],
+            )
+            .unwrap();
+            payload.extend_from_slice(&(rec.len() as u32).to_le_bytes());
+            payload.extend_from_slice(&rec);
+        }
+
+        let t = render_typed_result(&payload).expect("typed text");
+        assert!(t.contains("usr.uid") && t.contains("ord.amt"), "{t}");
+        assert!(t.contains("100") && t.contains("200") && t.contains("50"));
+        assert!(t.contains("(3 rows)"), "{t}");
+
+        let j = render_typed_result_json(&payload).expect("typed json");
+        assert_eq!(
+            j,
+            r#"[{"usr.uid":1,"ord.amt":100},{"usr.uid":1,"ord.amt":200},{"usr.uid":2,"ord.amt":50}]"#
+        );
+
+        // Not a typed result ⇒ None (caller falls back), never panics.
+        assert!(render_typed_result(b"KTR").is_none());
+        assert!(render_typed_result(&[1, 2, 3, 4, 5, 6, 7, 8]).is_none());
+        assert!(render_typed_result_json(b"").is_none());
     }
 
     #[test]

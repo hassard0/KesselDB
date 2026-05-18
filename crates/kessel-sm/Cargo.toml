@@ -11,8 +11,8 @@ kessel-storage = { path = "../kessel-storage" }
 kessel-catalog = { path = "../kessel-catalog" }
 kessel-cache = { path = "../kessel-cache" }
 kessel-expr = { path = "../kessel-expr" }
-
-[dev-dependencies]
+# Internal workspace crate (zero external deps). Used by Op::Join to
+# build a self-describing typed result (SP72).
 kessel-codec = { path = "../kessel-codec" }
 
 [lib]

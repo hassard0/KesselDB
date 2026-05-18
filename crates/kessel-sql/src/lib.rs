@@ -2039,18 +2039,37 @@ mod tests {
             }
             o => panic!("expected Join, got {o:?}"),
         }
-        // execute: 3 joined rows (uid1×2 orders + uid2×1)
+        // execute: SP72 self-describing typed result. The payload is
+        // [b"KTR1"][u32 deflen][type def][ [u32 reclen][rec] ]*, and a
+        // joined record decodes against the embedded combined schema
+        // (left cols `usr.*` then right cols `ord.*`). 3 rows expected
+        // (uid1×2 orders + uid2×1).
         match run(&mut sm, 20, "SELECT * FROM usr JOIN ord ON usr.uid = ord.owner") {
             OpResult::Got(b) => {
-                let mut p = 0;
+                assert_eq!(&b[..4], b"KTR1", "typed-result magic");
+                let dl = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
+                let (jname, jfields) =
+                    kessel_catalog::decode_type_def(&b[8..8 + dl]).unwrap();
+                let jot = kessel_catalog::ObjectType::from_def(jname, jfields);
+                let names: Vec<&str> =
+                    jot.fields.iter().map(|f| f.name.as_str()).collect();
+                assert_eq!(names, ["usr.uid", "ord.owner", "ord.amt"]);
+                let mut p = 8 + dl;
                 let mut rows = 0;
                 while p + 4 <= b.len() {
-                    let ll = u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize;
-                    p += 4 + ll;
-                    let rl = u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize;
-                    p += 4 + rl;
+                    let rl = u32::from_le_bytes(
+                        b[p..p + 4].try_into().unwrap(),
+                    ) as usize;
+                    p += 4;
+                    // Each record decodes cleanly against the combined
+                    // type — i.e. the result is genuinely self-describing.
+                    let vals =
+                        kessel_codec::decode(&jot, &b[p..p + rl]).unwrap();
+                    assert_eq!(vals.len(), 3);
+                    p += rl;
                     rows += 1;
                 }
+                assert_eq!(p, b.len(), "consumed exactly");
                 assert_eq!(rows, 3);
             }
             o => panic!("{o:?}"),

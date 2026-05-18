@@ -1135,10 +1135,51 @@ impl<V: Vfs> StateMachine<V> {
                         map.entry(k.to_vec()).or_default().push(rr);
                     }
                 }
-                // Probe with the left side in key order.
+                // SP72 — typed (self-describing) result. The joined output
+                // carries its own column schema so the client decodes it
+                // generically (no DESCRIBE, no per-shape special-casing).
+                // The schema is a synthetic type def: every left column as
+                // `<lt>.<col>` then every right column as `<rt>.<col>`,
+                // same kinds/order. A joined row is exactly the left record
+                // bytes followed by the right record bytes — which, because
+                // record layout is sequential by field, is precisely a
+                // valid record of that combined type. Payload:
+                //   [b"KTR1"][u32 deflen][type def][ [u32 reclen][rec] ]*
+                let mut combined: Vec<kessel_catalog::Field> =
+                    Vec::with_capacity(lt.fields.len() + rt.fields.len());
+                let mut fid: u16 = 0;
+                for (src, f) in lt
+                    .fields
+                    .iter()
+                    .map(|f| (&lt.name, f))
+                    .chain(rt.fields.iter().map(|f| (&rt.name, f)))
+                {
+                    combined.push(kessel_catalog::Field {
+                        field_id: fid,
+                        name: format!("{src}.{}", f.name),
+                        kind: f.kind,
+                        nullable: f.nullable,
+                    });
+                    fid += 1;
+                }
+                let jname = format!("{}+{}", lt.name, rt.name);
+                let typedef =
+                    kessel_catalog::encode_type_def(&jname, &combined);
+                let cot = kessel_catalog::ObjectType::from_def(
+                    jname,
+                    combined.clone(),
+                );
+                let mut out = Vec::with_capacity(64 + typedef.len());
+                out.extend_from_slice(b"KTR1");
+                out.extend_from_slice(&(typedef.len() as u32).to_le_bytes());
+                out.extend_from_slice(&typedef);
+                // Probe with the left side in key order. A joined row is
+                // built by DECODING each side against its own type and
+                // re-ENCODING the concatenated values against the combined
+                // type — raw byte concat would be wrong, since every record
+                // carries its own header + null bitmap.
                 let llo = make_key(left_type, &[0u8; 16]);
                 let lhi = make_key(left_type, &[0xFFu8; 16]);
-                let mut out = Vec::new();
                 let mut n = 0u32;
                 'outer: for (_, lr) in self.storage.scan_range(&llo, &lhi) {
                     let k = match lr.get(loff..loff + lw) {
@@ -1146,14 +1187,40 @@ impl<V: Vfs> StateMachine<V> {
                         None => continue,
                     };
                     if let Some(rs) = map.get(k) {
+                        let lv = match kessel_codec::decode(&lt, &lr) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                return OpResult::SchemaError(format!(
+                                    "join decode left: {e:?}"
+                                ))
+                            }
+                        };
                         for rr in rs {
                             if limit != 0 && n >= limit {
                                 break 'outer;
                             }
-                            out.extend_from_slice(&(lr.len() as u32).to_le_bytes());
-                            out.extend_from_slice(&lr);
-                            out.extend_from_slice(&(rr.len() as u32).to_le_bytes());
-                            out.extend_from_slice(rr);
+                            let rv = match kessel_codec::decode(&rt, rr) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    return OpResult::SchemaError(format!(
+                                        "join decode right: {e:?}"
+                                    ))
+                                }
+                            };
+                            let mut row = lv.clone();
+                            row.extend(rv);
+                            let rec = match kessel_codec::encode(&cot, &row) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    return OpResult::SchemaError(format!(
+                                        "join encode: {e:?}"
+                                    ))
+                                }
+                            };
+                            out.extend_from_slice(
+                                &(rec.len() as u32).to_le_bytes(),
+                            );
+                            out.extend_from_slice(&rec);
                             n += 1;
                         }
                     }

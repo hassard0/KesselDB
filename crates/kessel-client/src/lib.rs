@@ -73,6 +73,198 @@ pub fn format_result(r: &OpResult) -> String {
     }
 }
 
+/// Minimal RFC-8259 string escaper (zero-dep). Used by the `--json`
+/// output mode so agents/scripts get machine-parseable results.
+fn json_str(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 2);
+    o.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                o.push_str(&format!("\\u{:04x}", c as u32))
+            }
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+    o
+}
+
+/// A `kessel_codec::Value` as a JSON scalar (numbers bare, blobs as
+/// trimmed text or `0x…` hex strings, NULL as `null`).
+fn json_value(v: &kessel_codec::Value) -> String {
+    use kessel_codec::Value::*;
+    match v {
+        Null => "null".to_string(),
+        Uint(u) => u.to_string(),
+        Int(i) => i.to_string(),
+        Blob(_) => json_str(&format_value(v)),
+    }
+}
+
+/// Render `SELECT *` rows as a JSON array of objects keyed by column
+/// name (`[{"col":val,…},…]`), decoded against the `DESCRIBE` typedef.
+/// `None` on a schema/row mismatch — the caller then falls back. Pure.
+pub fn render_rows_json(typedef: &[u8], rows: &[u8]) -> Option<String> {
+    let (name, fields) = kessel_catalog::decode_type_def(typedef)?;
+    let ot = kessel_catalog::ObjectType::from_def(name, fields);
+    let names: Vec<String> =
+        ot.fields.iter().map(|f| f.name.clone()).collect();
+    if names.is_empty() {
+        return None;
+    }
+    let decode_one = |rec: &[u8]| -> Option<String> {
+        let vals = kessel_codec::decode(&ot, rec).ok()?;
+        let mut obj = String::from("{");
+        for (i, v) in vals.iter().enumerate() {
+            if i > 0 {
+                obj.push(',');
+            }
+            obj.push_str(&json_str(&names[i]));
+            obj.push(':');
+            obj.push_str(&json_value(v));
+        }
+        obj.push('}');
+        Some(obj)
+    };
+    let mut items: Vec<String> = Vec::new();
+    let mut p = 0usize;
+    let mut consumed_lp = true;
+    while p + 4 <= rows.len() {
+        let len =
+            u32::from_le_bytes(rows[p..p + 4].try_into().ok()?) as usize;
+        p += 4;
+        let rec = rows.get(p..p + len)?;
+        p += len;
+        match decode_one(rec) {
+            Some(o) => items.push(o),
+            None => {
+                consumed_lp = false;
+                break;
+            }
+        }
+    }
+    if !consumed_lp || p != rows.len() {
+        // single bare record (primary-key fast path) or not length-prefixed
+        if rows.is_empty() {
+            return Some("[]".to_string());
+        }
+        let o = decode_one(rows)?;
+        return Some(format!("[{o}]"));
+    }
+    Some(format!("[{}]", items.join(",")))
+}
+
+/// A `FieldKind` as a short, friendly SQL-ish type name for `DESCRIBE`
+/// / `\d` output.
+fn kind_name(k: &kessel_catalog::FieldKind) -> String {
+    use kessel_catalog::FieldKind::*;
+    match k {
+        U8 => "U8".into(),
+        U16 => "U16".into(),
+        U32 => "U32".into(),
+        U64 => "U64".into(),
+        U128 => "U128".into(),
+        I8 => "I8".into(),
+        I16 => "I16".into(),
+        I32 => "I32".into(),
+        I64 => "I64".into(),
+        I128 => "I128".into(),
+        Bool => "BOOL".into(),
+        Fixed { scale } => format!("FIXED(scale={scale})"),
+        Char(n) => format!("CHAR({n})"),
+        Bytes(n) => format!("BYTES({n})"),
+        Timestamp => "TIMESTAMP".into(),
+        Ref => "REF".into(),
+        OverflowRef => "OVERFLOWREF".into(),
+    }
+}
+
+/// Decode a `DESCRIBE` typedef into a readable schema table
+/// (`column | type | null`). `None` if it isn't a valid typedef — the
+/// caller falls back to the byte summary. Pure and total.
+pub fn render_schema(typedef: &[u8]) -> Option<String> {
+    let (name, fields) = kessel_catalog::decode_type_def(typedef)?;
+    let headers = vec![
+        "column".to_string(),
+        "type".to_string(),
+        "null".to_string(),
+    ];
+    let table: Vec<Vec<String>> = fields
+        .iter()
+        .map(|f| {
+            vec![
+                f.name.clone(),
+                kind_name(&f.kind),
+                if f.nullable { "YES".into() } else { "NO".into() },
+            ]
+        })
+        .collect();
+    Some(format!("table {name}\n{}", render_table(&headers, &table)))
+}
+
+/// `DESCRIBE` typedef as JSON: `{"table":"…","columns":[{"name","type",
+/// "nullable"},…]}`. `None` if not a typedef. Pure.
+pub fn render_schema_json(typedef: &[u8]) -> Option<String> {
+    let (name, fields) = kessel_catalog::decode_type_def(typedef)?;
+    let cols: Vec<String> = fields
+        .iter()
+        .map(|f| {
+            format!(
+                r#"{{"name":{},"type":{},"nullable":{}}}"#,
+                json_str(&f.name),
+                json_str(&kind_name(&f.kind)),
+                f.nullable
+            )
+        })
+        .collect();
+    Some(format!(
+        r#"{{"status":"ok","table":{},"columns":[{}]}}"#,
+        json_str(&name),
+        cols.join(",")
+    ))
+}
+
+/// An `OpResult` as a single JSON object — the stable machine contract
+/// for `kessel --json`. Scalar/typed-row rendering is layered on top by
+/// the CLI; this is the total fallback and the non-row cases. Pure.
+pub fn format_result_json(r: &OpResult) -> String {
+    match r {
+        OpResult::Ok => r#"{"status":"ok"}"#.to_string(),
+        OpResult::TypeCreated(t) => {
+            format!(r#"{{"status":"ok","type_id":{t}}}"#)
+        }
+        OpResult::Exists => r#"{"status":"exists"}"#.to_string(),
+        OpResult::NotFound => r#"{"status":"not_found"}"#.to_string(),
+        OpResult::Constraint(m) => {
+            format!(r#"{{"status":"constraint","message":{}}}"#, json_str(m))
+        }
+        OpResult::SchemaError(m) => {
+            format!(r#"{{"status":"error","message":{}}}"#, json_str(m))
+        }
+        OpResult::Unavailable => {
+            r#"{"status":"unavailable"}"#.to_string()
+        }
+        OpResult::Unauthorized => {
+            r#"{"status":"unauthorized"}"#.to_string()
+        }
+        OpResult::Got(b) if b.len() == 16 => {
+            format!(
+                r#"{{"status":"ok","value":{}}}"#,
+                i128::from_le_bytes(b[..16].try_into().unwrap())
+            )
+        }
+        OpResult::Got(b) => {
+            format!(r#"{{"status":"ok","bytes":{}}}"#, b.len())
+        }
+    }
+}
+
 fn format_value(v: &kessel_codec::Value) -> String {
     use kessel_codec::Value::*;
     match v {
@@ -470,6 +662,79 @@ mod tests {
         ] {
             assert!(!format_result(&r).is_empty());
         }
+    }
+
+    #[test]
+    fn json_output_is_well_formed_and_total() {
+        // Every non-row variant maps to a stable JSON object.
+        assert_eq!(format_result_json(&OpResult::Ok), r#"{"status":"ok"}"#);
+        assert_eq!(
+            format_result_json(&OpResult::TypeCreated(3)),
+            r#"{"status":"ok","type_id":3}"#
+        );
+        assert_eq!(
+            format_result_json(&OpResult::NotFound),
+            r#"{"status":"not_found"}"#
+        );
+        assert_eq!(
+            format_result_json(&OpResult::Got(1049i128.to_le_bytes().to_vec())),
+            r#"{"status":"ok","value":1049}"#
+        );
+        // Error messages are JSON-escaped, never raw.
+        let j = format_result_json(&OpResult::SchemaError(
+            "bad \"quote\"\n".into(),
+        ));
+        assert!(j.contains(r#"\"quote\""#) && j.contains(r#"\n"#), "{j}");
+        assert!(!j.contains('\n'), "control chars must be escaped: {j}");
+
+        // Typed rows → JSON array of objects keyed by column name.
+        use kessel_catalog::{encode_type_def, Field, FieldKind};
+        let fields = vec![
+            Field { field_id: 1, name: "owner".into(), kind: FieldKind::U32, nullable: false },
+            Field { field_id: 2, name: "bal".into(), kind: FieldKind::I64, nullable: false },
+        ];
+        let typedef = encode_type_def("acct", &fields);
+        let ot = kessel_catalog::ObjectType::from_def("acct".into(), fields);
+        let mut rows = Vec::new();
+        for (o, b) in [(100u128, 50i128), (7, -3)] {
+            let rec = kessel_codec::encode(
+                &ot,
+                &[kessel_codec::Value::Uint(o), kessel_codec::Value::Int(b)],
+            )
+            .unwrap();
+            rows.extend_from_slice(&(rec.len() as u32).to_le_bytes());
+            rows.extend_from_slice(&rec);
+        }
+        let j = render_rows_json(&typedef, &rows).expect("json rows");
+        assert_eq!(
+            j,
+            r#"[{"owner":100,"bal":50},{"owner":7,"bal":-3}]"#,
+            "compact, ordered, machine-parseable: {j}"
+        );
+        // Zero rows is a valid empty array, not None.
+        assert_eq!(render_rows_json(&typedef, &[]).as_deref(), Some("[]"));
+    }
+
+    #[test]
+    fn schema_rendering_is_readable_and_json() {
+        use kessel_catalog::{encode_type_def, Field, FieldKind};
+        let typedef = encode_type_def(
+            "acct",
+            &[
+                Field { field_id: 1, name: "owner".into(), kind: FieldKind::U32, nullable: false },
+                Field { field_id: 2, name: "note".into(), kind: FieldKind::Char(16), nullable: true },
+            ],
+        );
+        let t = render_schema(&typedef).expect("schema text");
+        assert!(t.contains("table acct"), "{t}");
+        assert!(t.contains("owner") && t.contains("U32") && t.contains("NO"));
+        assert!(t.contains("note") && t.contains("CHAR(16)") && t.contains("YES"));
+        let j = render_schema_json(&typedef).expect("schema json");
+        assert_eq!(
+            j,
+            r#"{"status":"ok","table":"acct","columns":[{"name":"owner","type":"U32","nullable":false},{"name":"note","type":"CHAR(16)","nullable":true}]}"#
+        );
+        assert!(render_schema(b"not a typedef").is_none());
     }
 
     #[test]

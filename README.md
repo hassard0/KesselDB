@@ -6,7 +6,7 @@
 
 *"It's the database that made the Kessel Run in 12 parsecs."*
 
-`169 tests green` · `0 external dependencies` · `Rust 1.95+` · single‑binary
+`171 tests green` · `0 external dependencies` · `Rust 1.95+` · single‑binary
 
 </div>
 
@@ -75,15 +75,19 @@ cargo run --release --bin kesseldb -- 127.0.0.1:7878 ./data
 kessel "CREATE TABLE acct (owner U32 NOT NULL, bal I64 NOT NULL)"
 kessel "INSERT INTO acct ID 1 (owner, bal) VALUES (100, 50)"
 kessel "SELECT SUM(bal) FROM acct WHERE owner = 100"     # => = 50
-kessel "SELECT * FROM acct"                              # prints an aligned table
+kessel "SELECT * FROM acct"                              # aligned table
+kessel "DESCRIBE acct"                                   # readable schema
+kessel --json "SELECT * FROM acct"                       # {"status":"ok","rows":[…]}
 
 echo "SELECT * FROM acct ID 1" | kessel                  # pipe a .sql file
-kessel                                                   # interactive shell
+kessel                                                   # interactive shell (\? for commands)
 ```
 
 The `kessel` CLI (`cargo run -p kessel-client --bin kessel -- …`, or
 `target/release/kessel` after a release build) is one-shot, pipe, and
-interactive, with reliable exit codes — ideal for scripts, ops, and agents.
+interactive, with reliable exit codes and a `--json` mode — ideal for
+scripts, ops, and agents. In the shell, `\?` lists commands, `\d <table>`
+describes a table, `\timing` toggles query timing.
 
 ### Or from Rust
 
@@ -165,7 +169,7 @@ Honest boundaries (documented, not hidden):
 - **Non‑gating roadmap** (tracked, not blocking): balance‑guard helpers,
   cross‑shard transactions, destructive `ALTER TABLE` & `DROP INDEX` (`DROP TABLE` done, SP54), overflow GC.
 
-Every claim in this repository is backed by the test suite (`169 tests`); the
+Every claim in this repository is backed by the test suite (`171 tests`); the
 docs call out exactly what is proven versus roadmap.
 
 ## Documentation
@@ -182,7 +186,7 @@ docs call out exactly what is proven versus roadmap.
 
 ```bash
 cargo build                 # all crates, zero external deps
-cargo test --workspace      # 169 tests (incl. seeded partition/fault simulation)
+cargo test --workspace      # 171 tests (incl. seeded partition/fault simulation)
 cargo run -p kessel-bench --release -- --help   # benchmarks
 ```
 

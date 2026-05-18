@@ -84,18 +84,38 @@ kessel "SELECT owner, bal FROM acct"      # projections render too (JOINs: opaqu
 # pipe a .sql file (lines starting with # or -- are comments; blanks ignored)
 cat schema.sql | cargo run -q -p kessel-client --bin kessel
 
-# interactive shell (TTY): a `kessel>` prompt; `quit` / `exit` / `\q` to leave
+# machine-readable: one JSON object per statement (ideal for agents)
+kessel --json "SELECT * FROM t"
+#   {"status":"ok","rows":[{"v":42}]}
+kessel --json "SELECT SUM(v) FROM t"      # {"status":"ok","value":42}
+kessel --json "DESCRIBE t"                # {"status":"ok","table":"t","columns":[…]}
+kessel --json "SELECT * FROM nope"        # {"status":"error","message":"…"}  (exit 1)
+
+# DESCRIBE / \d render a readable schema (text mode):
+#   table t
+#   column | type | null
+#   -------+------+-----
+#   v      | U64  | NO
+kessel "DESCRIBE t"
+
+# interactive shell (TTY): a `kessel>` prompt
 cargo run -q -p kessel-client --bin kessel
+#   \?  \h  \help      list shell commands
+#   \d <table>         describe a table
+#   \timing            toggle per-statement timing
+#   \q  quit  exit     leave
 
 # remote / authenticated
 kessel --addr 10.0.0.1:7878 --token s3cret "SELECT * FROM t ID 1"
 ```
 
-`kessel [--addr HOST:PORT] [--token TOKEN] ["SQL"]` — default address
-`127.0.0.1:7878`. With no SQL argument it reads statements from stdin (one
-per line). The **exit code is reliable**, so an agent or script can branch
-on success without parsing output. (After `cargo build --release` the
-binary is `target/release/kessel`.)
+`kessel [--addr HOST:PORT] [--token TOKEN] [--json] ["SQL"]` — default
+address `127.0.0.1:7878`. With no SQL argument it reads statements from
+stdin (one per line). The **exit code is reliable** (0 ok, 1
+statement/connection error, 2 bad usage) and `--json` emits one stable
+object per statement, so an agent or script can branch on success
+without parsing prose. (After `cargo build --release` the binary is
+`target/release/kessel`.)
 
 ## 3. The client library
 

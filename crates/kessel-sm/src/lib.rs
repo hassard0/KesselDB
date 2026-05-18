@@ -2207,6 +2207,17 @@ impl<V: Vfs> StateMachine<V> {
     pub fn flush(&mut self) -> std::io::Result<()> {
         self.storage.flush()
     }
+
+    /// Durability control for server-side group commit (SP68): turn off
+    /// the per-op WAL fsync, then `sync()` once per drained request batch.
+    /// Pure durability *timing* — ordering/state/digest are unchanged.
+    pub fn set_autosync(&mut self, on: bool) {
+        self.storage.set_autosync(on);
+    }
+    /// fsync the WAL now (one call durably commits the whole batch).
+    pub fn sync(&mut self) -> std::io::Result<()> {
+        self.storage.sync()
+    }
 }
 
 #[cfg(test)]

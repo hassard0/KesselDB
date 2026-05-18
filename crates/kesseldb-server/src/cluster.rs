@@ -226,6 +226,7 @@ pub fn spawn_node(
             while let Ok(bytes) = wrx.recv() {
                 if sock.is_none() {
                     if let Ok(mut s) = TcpStream::connect(paddr) {
+                        let _ = s.set_nodelay(true); // low-latency consensus
                         // Announce who we are so the peer tags inbound.
                         if write_frame(&mut s, &me.to_le_bytes()).is_ok() {
                             sock = Some(s);
@@ -249,6 +250,7 @@ pub fn spawn_node(
                 let etx = etx.clone();
                 std::thread::spawn(move || {
                     let mut s = stream;
+                    let _ = s.set_nodelay(true); // low-latency consensus
                     let hello = match read_frame(&mut s) {
                         Ok(h) if h.len() == 4 => h,
                         _ => return,
@@ -561,6 +563,7 @@ fn handle_client_conn(mut s: TcpStream, node: Arc<Node>) {
 /// documented follow-up).
 pub fn serve_clients(listener: TcpListener, node: Arc<Node>) {
     for stream in listener.incoming().flatten() {
+        let _ = stream.set_nodelay(true); // no Nagle (see lib.rs serve_cfg)
         let n = node.clone();
         std::thread::spawn(move || handle_client_conn(stream, n));
     }

@@ -245,15 +245,18 @@ fn do_auth(stream: &mut TcpStream, token: &[u8]) -> io::Result<()> {
 
 impl Client {
     pub fn connect(addr: impl ToSocketAddrs) -> io::Result<Self> {
-        Ok(Client {
-            stream: TcpStream::connect(addr)?,
-        })
+        let stream = TcpStream::connect(addr)?;
+        // Disable Nagle: requests are small and synchronous, so Nagle +
+        // delayed-ACK adds ~40 ms latency per round-trip on Linux/EC2.
+        let _ = stream.set_nodelay(true);
+        Ok(Client { stream })
     }
 
     /// Connect and authenticate with a shared-secret token (the server's
     /// `ServerConfig.token`). Fails with `PermissionDenied` if rejected.
     pub fn connect_authed(addr: impl ToSocketAddrs, token: &[u8]) -> io::Result<Self> {
         let mut stream = TcpStream::connect(addr)?;
+        let _ = stream.set_nodelay(true);
         do_auth(&mut stream, token)?;
         Ok(Client { stream })
     }
@@ -343,6 +346,7 @@ impl ClusterClient {
         if self.stream.is_none() {
             let a = &self.addrs[self.idx % self.addrs.len()];
             let mut s = TcpStream::connect(a)?;
+            let _ = s.set_nodelay(true);
             if let Some(tok) = &self.token {
                 do_auth(&mut s, tok)?;
             }

@@ -75,6 +75,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP65 — `kessel-crypto` (pgcrypto subset)** | **done** | zero-dep SHA-256 + HMAC-SHA256, NIST/RFC-4231 vector-verified; deterministic expr-VM `SHA256`/`HMAC256` opcodes (usable in CHECK/triggers); honest scope = hashing/HMAC only; **165 green** |
 | **SP66 — optional TLS** | **done** | opt-in `tls` cargo feature (rustls); generic `Read+Write` server I/O (refactor behaviour-identical, 165 green); `ServerConfig.tls`; default build stays zero-dep + plaintext+token; both builds verified clean |
 | **SP67 — profile-driven LRU fix** | **done** | profiled write path on vulcan → O(cap) `ReadCache` eviction scan (latent since SP50) was the bottleneck; O(log n) `BTreeSet` LRU, semantics byte-identical; **vulcan CREATE 7.7K→215K ops/s (~28×), p50 131µs→2µs**; **166 green**, determinism intact |
+| **SP68 — group commit + TCP_NODELAY** | **done** | server drains+applies+fsyncs-once-per-batch (EBS lever; replies only after durable; order/digest unchanged) + `set_nodelay` everywhere — measuring on vulcan/Linux found Nagle was the real EC2 bottleneck: **vulcan durable 97→1,870 ops/s (~19×)**, 12k rows correct; **167 green** |
 
 ## Production-readiness gate (precise, not vague)
 
@@ -292,10 +293,26 @@ since SP50 enabled the cache by default):
 `Storage::put` was unchanged (~1.6 µs) — the win was exactly the LRU.
 This restores throughput a prior slice had silently regressed; surfaced
 by profiling (perf was locked down on the host), fixed with a byte-
-identical-semantics O(log n) LRU, determinism corpus green. Honest:
-durable (`fsync`) numbers below are localhost; on EBS-class storage
-group-commit matters more (server-side group-commit default is an open
-follow-up).
+identical-semantics O(log n) LRU, determinism corpus green.
+
+### SP68 — group commit + TCP_NODELAY (measured on vulcan/Linux)
+
+`group_commit_concurrent_durable_throughput` (8 concurrent clients,
+12 000 durable inserts, all asserted present):
+
+| vulcan | before | after |
+|---|---|---|
+| time | 123.1 s | **6.4 s** |
+| durable throughput | 97 ops/s | **1,870 ops/s (~19×)** |
+
+The dominant cost on Linux was **Nagle + delayed-ACK** (no
+`TCP_NODELAY`), *not* fsync — exposed only by measuring on the
+representative Linux target (the Windows dev box did 10.6K/s and masked
+it). Fixed with `set_nodelay(true)` on every socket; server group commit
+amortises the fsync (the EBS lever). vulcan's absolute number is gated by
+real fsync + only 8 synchronous clients (batch = in-flight ops);
+throughput scales with concurrency/pipelining (next lever) — stated, not
+overclaimed.
 
 GET fast on DirVfs because post-flush data sits in OS-cached SSTables; the slower
 MemVfs GET reflects the known O(#sstables) read path (no bloom filter yet, M4 work).

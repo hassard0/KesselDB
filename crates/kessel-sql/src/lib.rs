@@ -390,6 +390,11 @@ fn plan_string(stmt: &Stmt, cat: &Catalog) -> String {
             Op::Update { type_id, .. } => format!("Update {}", tname(*type_id)),
             Op::CreateType { .. } => "Create Table (online DDL)".to_string(),
             Op::DropType { type_id } => format!("Drop Table {}", tname(*type_id)),
+            Op::DropIndex { type_id, fields } => format!(
+                "Drop Index on {} ({})",
+                tname(*type_id),
+                cols(*type_id, fields)
+            ),
             Op::AlterTypeAddField { type_id, .. } => {
                 format!("Alter {} Add Column (online, no lock)", tname(*type_id))
             }
@@ -485,6 +490,31 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
         return Ok(Op::Describe { type_id: ot.type_id });
     }
     if p.kw("DROP") {
+        // DROP INDEX ON <t> (cols) — destructive DDL (SP74). Drops the
+        // index(es) on exactly those columns; queries still work
+        // (verified scan fallback), just un-accelerated.
+        if p.kw("INDEX") {
+            p.expect_kw("ON")?;
+            let tname = p.ident()?;
+            let ot = p.type_named(&tname)?.clone();
+            p.punct('(')?;
+            let mut cols = Vec::new();
+            loop {
+                let c = p.ident()?;
+                let f = ot
+                    .fields
+                    .iter()
+                    .find(|f| f.name == c)
+                    .ok_or_else(|| format!("unknown column `{c}`"))?;
+                cols.push(f.field_id);
+                match p.next() {
+                    Some(Tok::Punct(',')) => continue,
+                    Some(Tok::Punct(')')) => break,
+                    _ => return Err("expected `,` or `)`".into()),
+                }
+            }
+            return Ok(Op::DropIndex { type_id: ot.type_id, fields: cols });
+        }
         // DROP TABLE <name> — destructive DDL (Sub-project 54).
         p.expect_kw("TABLE")?;
         let tname = p.ident()?;
@@ -1523,6 +1553,80 @@ mod tests {
             run(&mut sm, 4, "CREATE TABLE acct (owner U32 NOT NULL)"),
             OpResult::TypeCreated(_)
         ));
+    }
+
+    /// SP74: DROP INDEX removes the index(es) and their entries but the
+    /// answer to every query is unchanged (the planner falls back to a
+    /// verified scan); it is idempotent-clean, re-creatable, and
+    /// deterministic across runs.
+    #[test]
+    fn drop_index_keeps_results_and_is_deterministic() {
+        let build = || {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            run(&mut sm, 1, "CREATE TABLE t (k U32 NOT NULL, v I64 NOT NULL)");
+            run(&mut sm, 2, "CREATE INDEX ON t (k)");
+            run(&mut sm, 3, "CREATE RANGE INDEX ON t (v)");
+            run(&mut sm, 4, "CREATE INDEX ON t (k, v)"); // composite
+            for i in 0..40u64 {
+                run(
+                    &mut sm,
+                    10 + i,
+                    &format!(
+                        "INSERT INTO t (id, k, v) VALUES ({i}, {}, {})",
+                        i % 5,
+                        (i as i64) - 20
+                    ),
+                );
+            }
+            sm
+        };
+        let queries = [
+            "SELECT * FROM t WHERE k = 3",
+            "SELECT * FROM t WHERE v >= -5 AND v <= 5",
+            "SELECT * FROM t WHERE k = 2 AND v = -18",
+            "SELECT COUNT(*) FROM t WHERE k = 1",
+        ];
+        let mut sm = build();
+        // Results WITH every index.
+        let before: Vec<OpResult> = queries
+            .iter()
+            .enumerate()
+            .map(|(i, q)| run(&mut sm, 100 + i as u64, q))
+            .collect();
+
+        // Drop all three indexes via SQL.
+        assert_eq!(run(&mut sm, 200, "DROP INDEX ON t (k)"), OpResult::Ok);
+        assert_eq!(run(&mut sm, 201, "DROP INDEX ON t (v)"), OpResult::Ok);
+        assert_eq!(run(&mut sm, 202, "DROP INDEX ON t (k, v)"), OpResult::Ok);
+        // Catalog reflects the drops.
+        {
+            let ot = sm.catalog().get(1).unwrap();
+            assert!(ot.indexes.is_empty() && ot.ordered.is_empty());
+            assert!(ot.composite.iter().all(|c| c.is_empty()));
+        }
+        // Dropping again ⇒ clean NotFound (not a crash, not Ok).
+        assert_eq!(run(&mut sm, 203, "DROP INDEX ON t (k)"), OpResult::NotFound);
+
+        // Same queries, identical answers — only un-accelerated now.
+        let after: Vec<OpResult> = queries
+            .iter()
+            .enumerate()
+            .map(|(i, q)| run(&mut sm, 300 + i as u64, q))
+            .collect();
+        assert_eq!(before, after, "DROP INDEX must not change any result");
+
+        // Re-create one and it still answers correctly.
+        assert_eq!(run(&mut sm, 400, "CREATE INDEX ON t (k)"), OpResult::Ok);
+        assert_eq!(run(&mut sm, 401, queries[0]), before[0]);
+
+        // Deterministic: a second identical history yields the same digest.
+        let mut a = build();
+        let mut b = build();
+        for (i, op) in [200u64, 201, 202].iter().enumerate() {
+            run(&mut a, *op, ["DROP INDEX ON t (k)", "DROP INDEX ON t (v)", "DROP INDEX ON t (k, v)"][i]);
+            run(&mut b, *op, ["DROP INDEX ON t (k)", "DROP INDEX ON t (v)", "DROP INDEX ON t (k, v)"][i]);
+        }
+        assert_eq!(a.digest(), b.digest(), "DROP INDEX must be deterministic");
     }
 
     #[test]

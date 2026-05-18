@@ -130,6 +130,13 @@ pub enum Op {
     /// effect) if another table's foreign key still references it.
     /// Deterministic; replicated as one op.
     DropType { type_id: TypeId },
+    /// Destructive DDL (SP74): drop the secondary index(es) on exactly
+    /// `fields`. One field ⇒ its equality (and UNIQUE) and/or range
+    /// index; multiple ⇒ the composite index with that exact field
+    /// list. Index entries are deleted and the catalog updated; query
+    /// results are unchanged (the planner falls back to a verified
+    /// scan), only un-accelerated. `NotFound` if no such index.
+    DropIndex { type_id: TypeId, fields: Vec<u16> },
     /// Inner equi-join (Sub-project 36): rows where
     /// `left.left_field == right.right_field` (raw fixed-width bytes).
     /// Returns up to `limit` joined rows as
@@ -256,6 +263,7 @@ impl Op {
             Op::QueryRows { .. } => 26,
             Op::Describe { .. } => 27,
             Op::DropType { .. } => 29,
+            Op::DropIndex { .. } => 30,
             Op::Join { .. } => 28,
             Op::Aggregate { .. } => 20,
             Op::SelectFields { .. } => 21,
@@ -399,7 +407,8 @@ impl Op {
                 b.push(*kind);
                 b.extend_from_slice(&agg_field.to_le_bytes());
             }
-            Op::AddCompositeIndex { type_id, fields } => {
+            Op::AddCompositeIndex { type_id, fields }
+            | Op::DropIndex { type_id, fields } => {
                 codec::put_u32(&mut b, *type_id);
                 codec::put_u32(&mut b, fields.len() as u32);
                 for f in fields {
@@ -492,6 +501,15 @@ impl Op {
             },
             27 => Op::Describe { type_id: c.u32()? },
             29 => Op::DropType { type_id: c.u32()? },
+            30 => {
+                let type_id = c.u32()?;
+                let nf = c.u32()? as usize;
+                let mut fields = Vec::with_capacity(nf);
+                for _ in 0..nf {
+                    fields.push(c.u16()?);
+                }
+                Op::DropIndex { type_id, fields }
+            }
             28 => Op::Join {
                 left_type: c.u32()?,
                 right_type: c.u32()?,
@@ -766,6 +784,8 @@ mod tests {
             Op::GroupAggregate { type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3 },
             Op::SelectSorted { type_id: 4, program: vec![1], sort_field: 3, desc: true, offset: 2, limit: 5 },
             Op::AddCompositeIndex { type_id: 4, fields: vec![1, 3] },
+            Op::DropIndex { type_id: 4, fields: vec![1] },
+            Op::DropIndex { type_id: 4, fields: vec![1, 3] },
             Op::FindByComposite { type_id: 4, fields: vec![1, 3], values: vec![vec![9], vec![8, 8]] },
         ];
         for op in ops {

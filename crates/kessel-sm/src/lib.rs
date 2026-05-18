@@ -303,6 +303,9 @@ impl<V: Vfs> StateMachine<V> {
         }
         // SP27: composite (multi-field) equality indexes.
         for (ci_no, flist) in ot.composite.clone().iter().enumerate() {
+            if flist.is_empty() {
+                continue; // SP74: a dropped composite — slot kept, inert
+            }
             let oc = old.and_then(|r| Self::composite_concat(&ot, flist, r));
             let nc = new.and_then(|r| Self::composite_concat(&ot, flist, r));
             if oc == nc {
@@ -1131,6 +1134,72 @@ impl<V: Vfs> StateMachine<V> {
                     }
                 }
                 OpResult::Ok
+            }
+
+            Op::DropIndex { type_id, fields } => {
+                // SP74: drop the secondary index(es) on exactly `fields`
+                // and delete their LSM entries. Query results are
+                // unaffected — the planner falls back to a verified scan
+                // (the QueryRows program-verify invariant guarantees the
+                // same answer), only without acceleration.
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                // Delete every index entry whose key has the raw prefix
+                // `tag` (eq/composite live in the 0xFFFE keyspace,
+                // ordered in 0xFFFD). Keys are a contiguous range, so a
+                // prefix .. prefix++0xFF… scan covers exactly them.
+                let mut drop_prefix = |me: &mut Self, prefix: Vec<u8>| {
+                    let mut hi = prefix.clone();
+                    hi.extend_from_slice(&[0xFFu8; 64]);
+                    for (k, _) in me.storage.scan_range(&prefix, &hi) {
+                        let _ = me.storage.delete(op_number, k);
+                    }
+                };
+                let mut found = false;
+                if fields.len() == 1 {
+                    let fid = fields[0];
+                    if ot.indexes.contains(&fid) {
+                        let pre = Self::idx_prefix(type_id, fid, &[]);
+                        drop_prefix(self, pre);
+                        found = true;
+                    }
+                    if ot.ordered.contains(&fid) {
+                        let idxt = 0xFFFD_0000 | (type_id & 0xFFFF);
+                        let mut id = [0u8; 16];
+                        id[..2].copy_from_slice(&fid.to_le_bytes());
+                        let pre = make_key(idxt, &id);
+                        // prefix = tag(4) ++ fid(2); the rest is the
+                        // order key + padding we want to wildcard.
+                        drop_prefix(self, pre[..6].to_vec());
+                        found = true;
+                    }
+                    if found {
+                        if let Some(t) = self.catalog.get_mut(type_id) {
+                            t.indexes.retain(|f| *f != fid);
+                            t.unique.retain(|f| *f != fid);
+                            t.ordered.retain(|f| *f != fid);
+                        }
+                    }
+                } else if let Some(ci) =
+                    ot.composite.iter().position(|c| *c == fields)
+                {
+                    let cfid = Self::composite_fid(ci);
+                    let pre = Self::idx_prefix(type_id, cfid, &[]);
+                    drop_prefix(self, pre);
+                    // Empty the slot rather than removing it — composite
+                    // entries are keyed by slot index, so removing would
+                    // renumber later composites and orphan their keys.
+                    if let Some(t) = self.catalog.get_mut(type_id) {
+                        t.composite[ci].clear();
+                    }
+                    found = true;
+                }
+                if !found {
+                    return OpResult::NotFound;
+                }
+                self.persist_catalog(op_number)
             }
 
             Op::Join { left_type, right_type, left_field, right_field, limit } => {

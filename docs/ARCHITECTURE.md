@@ -134,8 +134,14 @@ UNIQUE) each FK field's value, padded to a 16-byte id, must resolve via
 `storage.get(make_key(ref_type, id))`. Read-only against committed state ⇒
 deterministic/replication-safe. Codec-record scoped; NULL skipped.
 `AddForeignKey` validates all existing rows and refuses (without enabling) on
-any dangling reference. No referential actions (`ON DELETE`/`ON UPDATE`) —
-documented limitation.
+any dangling reference. `ON DELETE` referential actions are implemented:
+`RESTRICT`, `CASCADE` (budget-bounded transitive closure), and `SET NULL`
+(atomic with the delete). `ON DELETE SET DEFAULT` is not implemented because
+there are no per-column defaults yet (a genuine, separate follow-up).
+`ON UPDATE` actions are **inapplicable by model, not a missing feature**: a
+foreign key references a parent's *object id*, which is immutable (an
+`Update` never changes a row's id), so the SQL `ON UPDATE` trigger — "the
+referenced key changed" — has no condition under which it could ever fire.
 
 ## Deterministic expression VM + CHECK (Sub-project 7)
 

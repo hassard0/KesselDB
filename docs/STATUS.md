@@ -206,9 +206,10 @@ unchanged). Spec: `docs/superpowers/specs/2026-05-17-kesseldb-subproject5-query.
 enabling, idempotent), ref-exists enforced on Create/Update (codec-record
 scoped, NULL skipped), deterministic + VSR-convergence tested. Spec:
 `docs/superpowers/specs/2026-05-17-kesseldb-subproject6-fk.md`.
-**Honest limit:** no `ON DELETE`/`ON UPDATE` referential actions — deleting
-a parent neither cascades nor is blocked (FK checked only on child write);
-single-field FK only.
+~~**Honest limit:** no `ON DELETE`/`ON UPDATE` referential actions.~~
+**Update:** `ON DELETE` `RESTRICT`/`CASCADE` shipped (SP11), `SET NULL`
+(SP19). `ON UPDATE` is inapplicable by model (FKs reference an immutable
+object id — the referenced key can't change). Single-field FK only.
 
 ## Sub-project 7 — deterministic expression VM + CHECK (done)
 
@@ -256,7 +257,9 @@ field for reverse lookup. Parent delete computes the cascade closure
 effect, CASCADE recursively deletes; the whole multi-delete is atomic (txn
 wrap). Replicated/deterministic (VSR test). Spec:
 `docs/superpowers/specs/2026-05-17-kesseldb-subproject11-ondelete.md`.
-**Honest limit:** no SET NULL/SET DEFAULT/ON UPDATE; budget-bounded cascade.
+**Honest limit:** budget-bounded cascade. (`SET NULL` shipped SP19;
+`SET DEFAULT` needs per-column defaults — open follow-up; `ON UPDATE`
+inapplicable by model — FKs reference an immutable object id.)
 
 ## Sub-project 12 — VSR partition hardening (partial, honest)
 
@@ -274,12 +277,19 @@ green and asserted in CI. Concrete history kept in-code + spec. Spec:
 ## What this is NOT (yet)
 
 Still out of scope (each a later spec): wide/byte-string range
-indexes, `SET DEFAULT` & `ON UPDATE` actions, cross-shard
-scatter-gather *reads* / SQL-text routing (distinct from cross-shard
-*transactions*, which are delivered), async per-shard pull-drive
-(efficiency, not correctness), index-write throughput optimization,
+indexes, per-column `DEFAULT` (and hence `ON DELETE SET DEFAULT`),
+cross-shard scatter-gather *reads* / SQL-text routing (distinct from
+cross-shard *transactions*, which are delivered), async per-shard
+pull-drive (efficiency, not correctness), index-write throughput
+optimization,
 disk-fault-during-view-change, membership reconfiguration, transport
 TLS as a non-opt-in default, client SDKs beyond Rust.
+
+**Not applicable by model (not a future spec):** `ON UPDATE`
+referential actions — a foreign key references a parent's *object id*,
+which is immutable (an `Update` never changes a row's id), so the SQL
+`ON UPDATE` trigger ("the referenced key changed") has no condition
+under which it can fire. Documented as a model fact, not deferred work.
 
 (Previously listed here and since delivered with tested, committed
 slices: seed-7 view-change liveness, balance-guard, destructive

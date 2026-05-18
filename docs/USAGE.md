@@ -183,7 +183,7 @@ DELETE FROM <t> WHERE <col> = <val>
 SELECT * FROM <t> ID <n>                         -- O(1) primary‑key fetch
 SELECT * FROM <t> [WHERE <expr>]                 -- =, !=, <, <=, >, >=, AND/OR/NOT,
                                                  --   col IN (a,b,..), col BETWEEN lo AND hi
-                                                 --   col IS NULL / col IS NOT NULL  (NOT IN / NOT BETWEEN too)
+                                                 --   col IS [NOT] NULL, col [NOT] LIKE 'pat%' (NOT IN / NOT BETWEEN too)
 SELECT <c1>, <c2> FROM <t> [WHERE ...]           -- projection
 SELECT COUNT(*) | SUM(c) | MIN(c) | MAX(c) | AVG(c) FROM <t> [WHERE ...]
        [GROUP BY <col>]

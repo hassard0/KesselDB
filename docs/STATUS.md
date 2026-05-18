@@ -67,6 +67,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP57 — `IS NULL` / `IS NOT NULL`** | **done** | wired SQL to the pre-existing expr `IS_NULL` opcode; bare-column guard; composes with AND/OR/NOT; zero engine change; **153 green** |
 | **SP58 — multi-row `INSERT`** | **done** | Postgres-shaped `INSERT INTO t (id,..) VALUES (..),(..)` → one atomic `Op::Txn` (one round-trip, one consensus op); legacy `ID <n>` kept; dup-in-batch rejects all; **154 green** |
 | **SP59 — typed projection rendering** | **done** | `value_from_raw` (public, behaviour-preserving `decode` refactor) + `select_columns` + `render_projection`; CLI prints real columns for `SELECT c1,c2` too; JOIN still opaque (honest); **156 green** |
+| **SP60 — `LIKE`** | **done** | deterministic expr-VM `LIKE` opcode (20) + `like_match` (`%`/`_`, no recursion); SQL `col [NOT] LIKE 'pat'`, composes; CHAR-padding trimmed; **158 green** |
 
 ## Production-readiness gate (precise, not vague)
 

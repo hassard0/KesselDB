@@ -1004,8 +1004,22 @@ fn cmp_expr(p: &mut P, ot: &ObjectType) -> Result<Program, SqlError> {
             prog = Program::from_raw(r);
         }
         prog
+    } else if p.kw("LIKE") {
+        // `col LIKE 'pat'` / `col NOT LIKE 'pat'` — SQL wildcard match
+        // (`%` any run, `_` one char) via the expr-VM LIKE opcode (20).
+        let pat = term(p, ot)?;
+        let mut raw = lb.clone();
+        raw.extend_from_slice(&pat.bytes());
+        raw.push(20); // LIKE
+        let mut prog = Program::from_raw(raw);
+        if post_not {
+            let mut r = prog.bytes();
+            r.push(16); // NOT  -> NOT LIKE
+            prog = Program::from_raw(r);
+        }
+        prog
     } else if post_not {
-        return Err("expected IN or BETWEEN after NOT".into());
+        return Err("expected IN, BETWEEN or LIKE after NOT".into());
     } else if let Some(Tok::Cmp(c)) = p.peek().cloned() {
         p.i += 1;
         let rhs = term(p, ot)?;
@@ -1238,6 +1252,52 @@ mod tests {
             sm.catalog()
         )
         .is_err());
+    }
+
+    #[test]
+    fn like_predicate() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        assert!(matches!(
+            run(&mut sm, 1, "CREATE TABLE u (name CHAR(16) NOT NULL)"),
+            OpResult::TypeCreated(1)
+        ));
+        for (i, n) in ["Alice", "Albert", "Bob", "Alicia"].iter().enumerate() {
+            assert_eq!(
+                run(
+                    &mut sm,
+                    (i + 2) as u64,
+                    &format!("INSERT INTO u (id, name) VALUES ({}, '{n}')", i + 1)
+                ),
+                OpResult::Ok
+            );
+        }
+        let cnt = |sm: &mut StateMachine<MemVfs>, op, q: &str| -> i128 {
+            match run(sm, op, q) {
+                OpResult::Got(b) => i128::from_le_bytes(b.try_into().unwrap()),
+                o => panic!("{q}: {o:?}"),
+            }
+        };
+        assert_eq!(cnt(&mut sm, 10, "SELECT COUNT(*) FROM u WHERE name LIKE 'Al%'"), 3);
+        assert_eq!(
+            cnt(&mut sm, 11, "SELECT COUNT(*) FROM u WHERE name LIKE 'Alic_'"),
+            1 // Alice (Alicia is 6 chars)
+        );
+        assert_eq!(
+            cnt(&mut sm, 12, "SELECT COUNT(*) FROM u WHERE name LIKE '%b%'"),
+            2 // Albert, Bob
+        );
+        assert_eq!(
+            cnt(&mut sm, 13, "SELECT COUNT(*) FROM u WHERE name NOT LIKE 'Al%'"),
+            1 // Bob
+        );
+        assert_eq!(
+            cnt(
+                &mut sm,
+                14,
+                "SELECT COUNT(*) FROM u WHERE name LIKE 'A%' AND name LIKE '%e'"
+            ),
+            1 // Alice
+        );
     }
 
     #[test]

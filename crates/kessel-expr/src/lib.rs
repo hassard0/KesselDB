@@ -52,6 +52,35 @@ const NOT: u8 = 16;
 const PUSH_BYTES: u8 = 17;
 const SET_FIELD: u8 = 18; // trigger-only: pop value, write into working record
 const REJECT: u8 = 19; // trigger-only: abort the write
+const LIKE: u8 = 20; // pop pattern(Bytes) + value(Bytes) -> Int 0/1 (SQL LIKE)
+
+/// Deterministic SQL `LIKE` matcher: `%` = any (incl. empty) byte run,
+/// `_` = exactly one byte. Iterative with the classic single backtrack
+/// point — O(|s|·|p|) worst case, no recursion, no allocation.
+fn like_match(s: &[u8], p: &[u8]) -> bool {
+    let (mut i, mut j) = (0usize, 0usize);
+    let (mut star, mut mark) = (None::<usize>, 0usize);
+    while i < s.len() {
+        if j < p.len() && (p[j] == b'_' || p[j] == s[i]) {
+            i += 1;
+            j += 1;
+        } else if j < p.len() && p[j] == b'%' {
+            star = Some(j);
+            mark = i;
+            j += 1;
+        } else if let Some(sj) = star {
+            j = sj + 1;
+            mark += 1;
+            i = mark;
+        } else {
+            return false;
+        }
+    }
+    while j < p.len() && p[j] == b'%' {
+        j += 1;
+    }
+    j == p.len()
+}
 
 /// Fluent program builder (test/host convenience). Emits the wire bytecode.
 #[derive(Default)]
@@ -95,6 +124,7 @@ impl Program {
     }
     pub fn eq(self) -> Self { self.op(EQ) }
     pub fn ne(self) -> Self { self.op(NE) }
+    pub fn like(self) -> Self { self.op(LIKE) }
     pub fn lt(self) -> Self { self.op(LT) }
     pub fn le(self) -> Self { self.op(LE) }
     pub fn gt(self) -> Self { self.op(GT) }
@@ -361,6 +391,20 @@ fn run(
                 let a = pop!();
                 st.push(Value::Int((a != b) as i128));
             }
+            LIKE => {
+                let pat = pop!();
+                let val = pop!();
+                let r = match (&val, &pat) {
+                    (Value::Bytes(v), Value::Bytes(p)) => {
+                        // Trim trailing NULs so fixed-width Char text
+                        // (zero-padded) matches naturally.
+                        let end = v.iter().rposition(|&c| c != 0).map_or(0, |x| x + 1);
+                        like_match(&v[..end], p)
+                    }
+                    _ => false, // non-text operands => deterministic false
+                };
+                st.push(Value::Int(r as i128));
+            }
             LT => ord!(|o| o == std::cmp::Ordering::Less),
             LE => ord!(|o| o != std::cmp::Ordering::Greater),
             GT => ord!(|o| o == std::cmp::Ordering::Greater),
@@ -443,6 +487,26 @@ pub fn eval_trigger(
 mod tests {
     use super::*;
     use kessel_catalog::Field;
+
+    #[test]
+    fn like_match_semantics() {
+        let m = |s: &str, p: &str| like_match(s.as_bytes(), p.as_bytes());
+        assert!(m("Alice", "Alice")); // literal
+        assert!(!m("Alice", "alice")); // case-sensitive
+        assert!(m("Alice", "A%")); // prefix
+        assert!(m("Alice", "%e")); // suffix
+        assert!(m("Alice", "%lic%")); // contains
+        assert!(m("Alice", "_____")); // 5 single-char
+        assert!(!m("Alice", "____")); // wrong length
+        assert!(m("Alice", "A_ice")); // mixed
+        assert!(m("Alice", "%")); // % matches anything
+        assert!(m("", "%")); // % matches empty
+        assert!(m("", "")); // empty/empty
+        assert!(!m("Alice", "")); // empty pattern, non-empty text
+        assert!(!m("Alice", "Bob%")); // no match
+        assert!(m("aaa", "a%a")); // backtracking
+        assert!(m("abababc", "a%b%c")); // multiple stars
+    }
 
     fn ot() -> ObjectType {
         ObjectType {

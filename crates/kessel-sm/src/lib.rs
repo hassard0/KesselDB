@@ -3520,12 +3520,104 @@ impl<V: Vfs> StateMachine<V> {
                     Err(e) => OpResult::SchemaError(format!("txn commit: {e}")),
                 }
             }
-            // External-sources feature: wired in a later task.
-            Op::CreateExternalSource { .. }
-            | Op::DropExternalSource { .. }
-            | Op::RefreshExternalSource { .. } => {
-                OpResult::SchemaError("external sources not yet wired".into())
+            Op::CreateExternalSource {
+                name,
+                type_def,
+                url,
+                format,
+                key_field_id,
+                auth_kind,
+                auth_a,
+                auth_b,
+                mapping,
+            } => {
+                if self.catalog.types.iter().any(|t| t.name == name) {
+                    return OpResult::SchemaError(format!(
+                        "type `{name}` already exists"
+                    ));
+                }
+                // Create the backing type via the SAME path as
+                // Op::CreateType — re-enter `apply` with the SAME
+                // op_number, mirroring the Op::Txn precedent (its first
+                // inner op is `self.apply(op_number + 0, ..)`). The SP94
+                // guard at the top of `apply` checks `is_mutating() &&
+                // op_number <= high_op()`. In normal operation, when this
+                // outer arm runs, no storage write for `op_number` has
+                // happened yet (this arm does no I/O before this call),
+                // so `high_op() < op_number` and the nested CreateType
+                // passes the guard and persists. On a VSR replay the
+                // OUTER op is caught by the same guard at the top of
+                // `apply` and short-circuits to `Ok` before ever reaching
+                // this code, so the nested CreateType is never reached
+                // twice — no double-apply, exactly like Txn.
+                let created =
+                    self.apply(op_number, Op::CreateType { def: type_def });
+                let tid = match created {
+                    OpResult::TypeCreated(id) => id,
+                    // Surface the schema error (or any other result)
+                    // verbatim — type creation is the gate.
+                    other => return other,
+                };
+                let auth = match auth_kind {
+                    0 => kessel_catalog::ExternalAuth::None,
+                    1 => kessel_catalog::ExternalAuth::BearerEnv(auth_a),
+                    2 => kessel_catalog::ExternalAuth::HeaderEnv {
+                        header: auth_a,
+                        env: auth_b,
+                    },
+                    _ => {
+                        return OpResult::SchemaError(
+                            "invalid auth_kind".into(),
+                        )
+                    }
+                };
+                // Same mechanism CreateType uses: direct mutation of
+                // `self.catalog` followed by `persist_catalog`. The
+                // recipe rides the catalog's backward-compat trailer and
+                // is part of the persisted/replicated catalog.
+                self.catalog.external.push(kessel_catalog::ExternalRecipe {
+                    type_id: tid,
+                    url,
+                    format,
+                    key_field_id,
+                    auth,
+                    mapping,
+                });
+                // Re-persist (same op_number): an idempotent overwrite of
+                // the single catalog key — unlike a counter this is safe
+                // to repeat. This durably commits the recipe alongside
+                // the type the nested CreateType already persisted.
+                match self.persist_catalog(op_number) {
+                    OpResult::SchemaError(e) => OpResult::SchemaError(e),
+                    _ => OpResult::Ok,
+                }
             }
+            Op::DropExternalSource { name } => {
+                let tid = match self
+                    .catalog
+                    .types
+                    .iter()
+                    .find(|t| t.name == name)
+                {
+                    Some(t) => t.type_id,
+                    None => return OpResult::NotFound,
+                };
+                // Remove the recipe FIRST, then drop the backing type.
+                // Op::DropType ends with its own `persist_catalog`
+                // (encoding the WHOLE catalog, recipe trailer included),
+                // so removing the recipe before that call is what makes
+                // the recipe removal durable — no extra persist needed.
+                self.catalog.external.retain(|e| e.type_id != tid);
+                // Same op_number reuse / SP94 reasoning as
+                // CreateExternalSource above (Op::Txn precedent): inert
+                // in normal operation, outer op guarded on replay.
+                self.apply(op_number, Op::DropType { type_id: tid })
+            }
+            Op::RefreshExternalSource { .. } => OpResult::SchemaError(
+                "REFRESH is a router-side operation, never applied at the \
+                 state machine"
+                    .into(),
+            ),
         }
     }
 
@@ -3582,6 +3674,44 @@ mod tests {
                 Field { field_id: 0, name: "amount".into(), kind: FieldKind::U64, nullable: false },
             ],
         )
+    }
+
+    #[test]
+    fn create_and_drop_external_source_manages_type_and_recipe() {
+        use kessel_catalog::ExternalAuth;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        let td = kessel_catalog::encode_type_def(
+            "feed",
+            &[
+                Field { field_id: 0, name: "id".into(), kind: FieldKind::U64, nullable: false },
+                Field { field_id: 0, name: "nm".into(), kind: FieldKind::Char(8), nullable: false },
+            ],
+        );
+        let r = sm.apply(1, Op::CreateExternalSource {
+            name: "feed".into(), type_def: td, url: "http://h/p".into(),
+            format: 0, key_field_id: 1, auth_kind: 1,
+            auth_a: "TOK_ENV".into(), auth_b: String::new(),
+            mapping: vec![(1, "id".into()), (2, "nm".into())],
+        });
+        assert!(matches!(r, OpResult::Ok | OpResult::TypeCreated(_)), "got {r:?}");
+        let cat = sm.catalog();
+        let t = cat.types.iter().find(|t| t.name == "feed").expect("type made");
+        let rec = cat.external.iter().find(|e| e.type_id == t.type_id).expect("recipe");
+        assert_eq!(rec.url, "http://h/p");
+        assert_eq!(rec.auth, ExternalAuth::BearerEnv("TOK_ENV".into()));
+        assert_eq!(rec.key_field_id, 1);
+        // Refresh must NEVER be applied at the SM (router-only).
+        assert!(matches!(
+            sm.apply(2, Op::RefreshExternalSource { name: "feed".into() }),
+            OpResult::SchemaError(_)
+        ));
+        // Drop removes BOTH recipe and backing type.
+        assert_eq!(sm.apply(3, Op::DropExternalSource { name: "feed".into() }), OpResult::Ok);
+        let cat = sm.catalog();
+        assert!(cat.types.iter().all(|t| t.name != "feed"));
+        assert!(cat.external.is_empty());
+        // Dropping a non-existent source => NotFound.
+        assert_eq!(sm.apply(4, Op::DropExternalSource { name: "ghost".into() }), OpResult::NotFound);
     }
 
     /// SP94 (unblocks #74): after a crash+reopen, the state machine

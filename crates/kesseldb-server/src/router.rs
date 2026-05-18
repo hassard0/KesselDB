@@ -449,6 +449,295 @@ impl<'a> Conn<'a> {
     }
 }
 
+/// Router-side `REFRESH <name>` (EXT slice 1, behind the
+/// `external-sources` feature). The fetch happens **once, here**; only
+/// the captured rows re-enter the replicated log, as one atomic
+/// `Op::Txn` of upserts driven through the EXISTING `forward` path
+/// (so single-shard / cross-shard routing AND the exactly-once `dedup`
+/// key are reused unchanged). A failed/partial fetch, or any codec/id
+/// error before the Txn is submitted, mutates NOTHING.
+#[cfg(feature = "external-sources")]
+impl<'a> Conn<'a> {
+    fn do_refresh(&mut self, op: &Op, dedup: Vec<u8>) -> OpResult {
+        use kessel_catalog::{Catalog, ExternalAuth};
+        use kessel_fetch::{
+            fetch_rows, Auth, ColumnMap, Format, DEFAULT_MAX_BODY,
+        };
+
+        // 1. Resolve the source name.
+        let name = match op {
+            Op::RefreshExternalSource { name } => name.clone(),
+            _ => {
+                return OpResult::SchemaError(
+                    "do_refresh: not a RefreshExternalSource op".into(),
+                )
+            }
+        };
+
+        // 2. Read the FULL catalog. The state machine persists the whole
+        //    `Catalog` (incl. the `external` recipe trailer) under the
+        //    single well-known storage key `make_key(0, [0;16])`
+        //    (kessel_sm::catalog_key). `Op::GetById` is a generic,
+        //    side-effect-free storage read with no type-existence guard,
+        //    so reading type_id 0 / id 0 returns exactly that encoded
+        //    blob. The catalog is identical on every shard (DDL is
+        //    broadcast), so — like `Op::Describe` (`Route::One(0)`) — we
+        //    answer from shard 0.
+        let cat_blob = match self.client(0).call(&Op::GetById {
+            type_id: 0,
+            id: kessel_proto::ObjectId([0u8; 16]),
+        }) {
+            Ok(OpResult::Got(b)) => b,
+            Ok(OpResult::NotFound) => {
+                return OpResult::SchemaError(
+                    "REFRESH: catalog is empty".into(),
+                )
+            }
+            Ok(o) => {
+                return OpResult::SchemaError(format!(
+                    "REFRESH: unexpected catalog read result {o:?}"
+                ))
+            }
+            Err(e) => {
+                return OpResult::SchemaError(format!(
+                    "REFRESH: catalog read failed: {e}"
+                ))
+            }
+        };
+        let cat = match Catalog::decode(&cat_blob) {
+            Some(c) => c,
+            None => {
+                return OpResult::SchemaError(
+                    "REFRESH: catalog decode failed".into(),
+                )
+            }
+        };
+        let ot = match cat.types.iter().find(|t| t.name == name) {
+            Some(t) => t.clone(),
+            None => return OpResult::NotFound,
+        };
+        let recipe = match cat
+            .external
+            .iter()
+            .find(|e| e.type_id == ot.type_id)
+        {
+            Some(r) => r.clone(),
+            None => {
+                return OpResult::SchemaError(format!(
+                    "REFRESH `{name}`: not an external source"
+                ))
+            }
+        };
+
+        // 3. Resolve auth from THIS process's env (a value, never put in
+        //    an op or a log line; the recipe only persisted a reference).
+        let auth = match &recipe.auth {
+            ExternalAuth::None => Auth::None,
+            ExternalAuth::BearerEnv(var) => match std::env::var(var) {
+                Ok(v) => Auth::Bearer(v),
+                Err(_) => {
+                    return OpResult::SchemaError(format!(
+                        "REFRESH `{name}`: auth env `{var}` not set"
+                    ))
+                }
+            },
+            ExternalAuth::HeaderEnv { header, env } => {
+                match std::env::var(env) {
+                    Ok(v) => Auth::Header {
+                        name: header.clone(),
+                        value: v,
+                    },
+                    Err(_) => {
+                        return OpResult::SchemaError(format!(
+                            "REFRESH `{name}`: auth env `{env}` not set"
+                        ))
+                    }
+                }
+            }
+        };
+
+        // 4. Build the column map (recipe.mapping joined with the type's
+        //    fields by field_id, in mapping order) and fetch.
+        let mut cols: Vec<ColumnMap> = Vec::with_capacity(recipe.mapping.len());
+        // Parallel: the field for each mapped column, same order as the
+        // fetched per-column bytes.
+        let mut col_fields: Vec<&kessel_catalog::Field> =
+            Vec::with_capacity(recipe.mapping.len());
+        for (fid, source) in &recipe.mapping {
+            let field = match ot.fields.iter().find(|f| f.field_id == *fid) {
+                Some(f) => f,
+                None => {
+                    return OpResult::SchemaError(format!(
+                        "REFRESH `{name}`: mapping references unknown \
+                         field_id {fid}"
+                    ))
+                }
+            };
+            cols.push(ColumnMap {
+                name: field.name.clone(),
+                kind: field.kind,
+                source: source.clone(),
+            });
+            col_fields.push(field);
+        }
+        let format = match recipe.format {
+            0 => Format::Json,
+            1 => Format::Csv,
+            n => {
+                return OpResult::SchemaError(format!(
+                    "REFRESH `{name}`: unknown format code {n}"
+                ))
+            }
+        };
+        // The KEY column's INDEX within the fetched per-column vec (which
+        // is in `recipe.mapping` order).
+        let key_idx = match recipe
+            .mapping
+            .iter()
+            .position(|(fid, _)| *fid == recipe.key_field_id)
+        {
+            Some(i) => i,
+            None => {
+                return OpResult::SchemaError(format!(
+                    "REFRESH `{name}`: KEY field_id {} is not mapped",
+                    recipe.key_field_id
+                ))
+            }
+        };
+
+        let rows = match fetch_rows(
+            &recipe.url,
+            &auth,
+            format,
+            &cols,
+            DEFAULT_MAX_BODY,
+        ) {
+            Ok(r) => r,
+            // Fetch/parse/type/auth/too-large — mutate NOTHING.
+            Err(e) => {
+                return OpResult::SchemaError(format!("refresh: {e}"))
+            }
+        };
+
+        // 5. Build the codec record + deterministic ObjectId per row.
+        //    Codec path: `kessel_codec::value_from_raw(kind, raw)` turns
+        //    each column's raw fixed-width LE bytes into a `Value`
+        //    (per FieldKind), then `kessel_codec::encode(&ot, &values)`
+        //    assembles the record — the existing public codec API; no
+        //    helper needed. The columns come back in `recipe.mapping`
+        //    order; `ot.fields` is the canonical field order, so we
+        //    place each mapped value at its field's index.
+        let mut to_create: Vec<(kessel_proto::ObjectId, Vec<u8>)> = Vec::new();
+        let mut to_upsert: Vec<(kessel_proto::ObjectId, Vec<u8>)> = Vec::new();
+        for row in &rows {
+            if row.len() != cols.len() {
+                return OpResult::SchemaError(format!(
+                    "refresh: row arity {} != mapped columns {}",
+                    row.len(),
+                    cols.len()
+                ));
+            }
+            // Deterministic id from the KEY column's raw bytes.
+            let key_raw = &row[key_idx];
+            let mut pre: Vec<u8> = Vec::new();
+            pre.extend_from_slice(b"kessel-ext-id\0");
+            pre.extend_from_slice(&ot.type_id.to_le_bytes());
+            pre.extend_from_slice(key_raw);
+            let digest = kessel_crypto::sha256(&pre);
+            let mut id = [0u8; 16];
+            id.copy_from_slice(&digest[..16]);
+            let oid = kessel_proto::ObjectId(id);
+
+            // Values parallel to `ot.fields`. Mapped fields get the
+            // fetched bytes; any unmapped field is NULL (it must then be
+            // nullable, else `encode` rejects it — correct, surfaced
+            // before any mutation).
+            let mut values: Vec<kessel_codec::Value> =
+                vec![kessel_codec::Value::Null; ot.fields.len()];
+            for (ci, field) in col_fields.iter().enumerate() {
+                let idx = ot
+                    .fields
+                    .iter()
+                    .position(|f| f.field_id == field.field_id)
+                    .expect("mapped field is in the type");
+                values[idx] =
+                    kessel_codec::value_from_raw(field.kind, &row[ci]);
+            }
+            let record = match kessel_codec::encode(&ot, &values) {
+                Ok(r) => r,
+                Err(e) => {
+                    return OpResult::SchemaError(format!(
+                        "refresh: record encode failed: {e:?}"
+                    ))
+                }
+            };
+
+            // 6. Create-vs-Update via a side-effect-free point existence
+            //    check through the EXISTING route path.
+            let exists = match self.forward(
+                &Op::GetById {
+                    type_id: ot.type_id,
+                    id: oid,
+                },
+                dedup_probe(&dedup, &id),
+            ) {
+                OpResult::Got(_) => true,
+                OpResult::NotFound => false,
+                other => {
+                    return OpResult::SchemaError(format!(
+                        "refresh: existence probe failed: {other:?}"
+                    ))
+                }
+            };
+            if exists {
+                to_upsert.push((oid, record));
+            } else {
+                to_create.push((oid, record));
+            }
+        }
+
+        // Assemble ONE atomic Op::Txn (creates then updates) and submit
+        // it through the EXISTING replicated path with the SAME `dedup`
+        // (this is exactly why Task 10 threaded `dedup` — exactly-once is
+        // preserved end to end; do NOT drop it).
+        let mut txn_ops: Vec<Op> = Vec::with_capacity(rows.len());
+        for (oid, record) in to_create {
+            txn_ops.push(Op::Create {
+                type_id: ot.type_id,
+                id: oid,
+                record,
+            });
+        }
+        for (oid, record) in to_upsert {
+            txn_ops.push(Op::Update {
+                type_id: ot.type_id,
+                id: oid,
+                record,
+            });
+        }
+        if txn_ops.is_empty() {
+            // Nothing upstream: a successful no-op refresh.
+            return OpResult::Ok;
+        }
+        match self.forward(&Op::Txn { ops: txn_ops }, dedup) {
+            OpResult::Ok => OpResult::Ok,
+            other => other,
+        }
+    }
+}
+
+/// Derive a stable, distinct dedup key for a per-row read probe so it
+/// can never collide with the refresh's write `dedup`. Reads are
+/// side-effect-free, so this only matters for cross-shard read framing.
+#[cfg(feature = "external-sources")]
+fn dedup_probe(base: &[u8], id: &[u8; 16]) -> Vec<u8> {
+    let mut d = Vec::with_capacity(base.len() + 17);
+    d.push(b'p');
+    d.extend_from_slice(base);
+    d.extend_from_slice(id);
+    d
+}
+
 /// Serve the ordinary client protocol in front of K shard groups, one
 /// thread per connection.
 /// Re-drive the entire ordered cross-shard log idempotently (call

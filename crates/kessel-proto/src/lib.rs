@@ -335,6 +335,34 @@ impl Op {
         }
     }
 
+    /// True if applying this op can change committed state (writes,
+    /// DDL, sequencer append, cross-shard apply/decide/commit).
+    /// Reads (`Get*`/`Find*`/`Query*`/`Select*`/`Aggregate*`/
+    /// `Describe`/`SeqRead`/`Join`) return `false` — re-running them is
+    /// side-effect-free, so the SP94 crash-recovery replay guard must
+    /// never short-circuit them (they must always return real data).
+    pub fn is_mutating(&self) -> bool {
+        !matches!(
+            self,
+            Op::GetById { .. }
+                | Op::GetBlob { .. }
+                | Op::FindBy { .. }
+                | Op::Query { .. }
+                | Op::QueryExpr { .. }
+                | Op::FindRange { .. }
+                | Op::Select { .. }
+                | Op::QueryRows { .. }
+                | Op::Describe { .. }
+                | Op::SeqRead { .. }
+                | Op::Join { .. }
+                | Op::Aggregate { .. }
+                | Op::SelectFields { .. }
+                | Op::GroupAggregate { .. }
+                | Op::SelectSorted { .. }
+                | Op::FindByComposite { .. }
+        )
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Vec::new();
         b.push(self.kind());

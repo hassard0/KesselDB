@@ -1483,20 +1483,26 @@ mod tests {
         run(&mut sm, 3, "CREATE RANGE INDEX ON t (s)");
         let ot = sm.catalog().get(1).unwrap().clone();
         let mut rng = Rng::new(0x57_9A);
+        // Monotonic op-numbers (real VSR never decreases them; the
+        // SP94 recovery guard short-circuits a mutating op whose
+        // op-number is ≤ the durable cursor).
+        let mut iop = 3u64;
         for id in 1..=140u32 {
             let len = rng.below(5) as usize;
             let mut s = String::new();
             for _ in 0..len {
                 s.push((b'a' + rng.below(6) as u8) as char);
             }
+            iop += 1;
             run(
                 &mut sm,
-                10 + id as u64,
+                iop,
                 &format!("INSERT INTO t (id, s, n) VALUES ({id}, '{s}', {id})"),
             );
+            iop += 1;
             run(
                 &mut sm,
-                10_000 + id as u64,
+                iop,
                 &format!("INSERT INTO u (id, s, n) VALUES ({id}, '{s}', {id})"),
             );
         }
@@ -1620,19 +1626,26 @@ mod tests {
         // U128 values up to i128::MAX (SQL integer literals are i128).
         let mut uvals = Vec::new();
         let mut ivals = Vec::new();
+        // Monotonic op-numbers (SP94 recovery guard short-circuits a
+        // mutating op whose op-number is ≤ the durable cursor).
+        let mut iop = 6u64;
         for id in 1..=120u32 {
             let uv = (rng.below(u64::MAX) as u128) << 60
                 | rng.below(u64::MAX) as u128;
             let mag =
                 (rng.below(u64::MAX) as i128) << 20 | rng.below(u64::MAX) as i128;
             let iv = if rng.below(2) == 0 { -mag } else { mag };
-            run(&mut sm, 100 + id as u64,
+            iop += 1;
+            run(&mut sm, iop,
                 &format!("INSERT INTO t (id, v, n) VALUES ({id}, {uv}, {id})"));
-            run(&mut sm, 1_000 + id as u64,
+            iop += 1;
+            run(&mut sm, iop,
                 &format!("INSERT INTO u (id, v, n) VALUES ({id}, {uv}, {id})"));
-            run(&mut sm, 2_000 + id as u64,
+            iop += 1;
+            run(&mut sm, iop,
                 &format!("INSERT INTO ti (id, v, n) VALUES ({id}, {iv}, {id})"));
-            run(&mut sm, 3_000 + id as u64,
+            iop += 1;
+            run(&mut sm, iop,
                 &format!("INSERT INTO ui (id, v, n) VALUES ({id}, {iv}, {id})"));
             uvals.push(uv);
             ivals.push(iv);

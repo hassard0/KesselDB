@@ -334,6 +334,13 @@ struct Manifest {
     /// Oldest -> newest. Newer SSTables shadow older ones.
     sstables: Vec<String>,
     next_sst: u64,
+    /// SP94: durable apply-cursor watermark — the highest op-number
+    /// whose effects were folded into an SSTable at flush/compact
+    /// time. `flush` truncates the WAL, so this carries the cursor
+    /// across reopen for already-flushed ops; post-flush ops extend it
+    /// via WAL replay. `0` ⇒ unknown (also what a pre-SP94 manifest
+    /// reads as — backward compatible).
+    high_op: u64,
 }
 
 fn read_manifest(vfs: &dyn Vfs) -> Manifest {
@@ -367,7 +374,15 @@ fn read_manifest(vfs: &dyn Vfs) -> Manifest {
         sstables.push(String::from_utf8_lossy(&buf[p..p + nl]).into_owned());
         p += nl;
     }
-    Manifest { sstables, next_sst }
+    // SP94: optional `high_op` watermark sits between the sstable
+    // list and the trailing CRC. A pre-SP94 manifest has nothing
+    // there (p == len-4) ⇒ `0` (unknown) — backward compatible.
+    let high_op = if len >= p + 4 + 8 {
+        u64::from_le_bytes(buf[p..p + 8].try_into().unwrap())
+    } else {
+        0
+    };
+    Manifest { sstables, next_sst, high_op }
 }
 
 fn write_manifest(vfs: &dyn Vfs, m: &Manifest) -> io::Result<()> {
@@ -379,6 +394,7 @@ fn write_manifest(vfs: &dyn Vfs, m: &Manifest) -> io::Result<()> {
         buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
         buf.extend_from_slice(s.as_bytes());
     }
+    buf.extend_from_slice(&m.high_op.to_le_bytes()); // SP94 watermark
     let crc = crc32c(&buf);
     buf.extend_from_slice(&crc.to_le_bytes());
     let mut disk = vfs.open(MANIFEST_NAME)?;
@@ -410,6 +426,11 @@ pub struct Storage<V: Vfs> {
     /// total data instead of O(#flushes)). 0 = off (raw primitive
     /// behaviour, unchanged — every existing storage test relies on it).
     compact_threshold: usize,
+    /// SP94: the highest op-number ever durably WAL-framed (max over
+    /// replay + every `commit`). `None` ⇒ nothing durable yet. Used by
+    /// the state machine as its replay/recovery apply-cursor; not part
+    /// of the digest (it is derived from the WAL, not stored state).
+    high_op: Option<u64>,
 }
 
 impl<V: Vfs> Storage<V> {
@@ -424,7 +445,12 @@ impl<V: Vfs> Storage<V> {
         }
         let wal = Wal::open(&vfs)?;
         let mut memtable = BTreeMap::new();
+        // SP94: the cursor survives a WAL-truncating flush via the
+        // manifest watermark; post-flush ops extend it from the WAL.
+        let mut high_op: Option<u64> =
+            (manifest.high_op > 0).then_some(manifest.high_op);
         for e in wal.replay() {
+            high_op = Some(high_op.map_or(e.op_number, |h| h.max(e.op_number)));
             memtable.insert(e.key, e.value);
         }
         Ok(Storage {
@@ -436,6 +462,7 @@ impl<V: Vfs> Storage<V> {
             autosync: true,
             txn: None,
             compact_threshold: 0,
+            high_op,
         })
     }
 
@@ -521,8 +548,17 @@ impl<V: Vfs> Storage<V> {
         if self.autosync {
             self.wal.sync()?;
         }
+        let op = e.op_number;
         self.memtable.insert(e.key, e.value);
+        self.high_op = Some(self.high_op.map_or(op, |h| h.max(op)));
         Ok(())
+    }
+
+    /// SP94: the highest op-number ever durably WAL-framed (max over
+    /// recovery replay + every `commit`); `None` ⇒ nothing durable.
+    /// The state machine uses this as its crash-recovery apply-cursor.
+    pub fn high_op(&self) -> Option<u64> {
+        self.high_op
     }
 
     pub fn get(&self, key: &Key) -> Option<Vec<u8>> {
@@ -552,6 +588,9 @@ impl<V: Vfs> Storage<V> {
         let mut next = self.manifest.clone();
         next.sstables.push(name.clone());
         next.next_sst += 1;
+        // SP94: persist the durable apply-cursor — the WAL (which
+        // also carries it) is truncated just below.
+        next.high_op = self.high_op.unwrap_or(next.high_op).max(next.high_op);
         write_manifest(&self.vfs, &next)?; // 2. manifest durable
         self.manifest = next;
         self.sstables.push(SsTable::open(&self.vfs, &name)?);
@@ -587,6 +626,11 @@ impl<V: Vfs> Storage<V> {
         let mut next = Manifest {
             sstables: vec![name.clone()],
             next_sst: self.manifest.next_sst + 1,
+            // SP94: compaction preserves the durable cursor.
+            high_op: self
+                .high_op
+                .unwrap_or(self.manifest.high_op)
+                .max(self.manifest.high_op),
         };
         write_manifest(&self.vfs, &next)?;
         for o in old {

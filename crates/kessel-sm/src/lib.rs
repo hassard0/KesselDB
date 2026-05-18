@@ -1072,7 +1072,32 @@ impl<V: Vfs> StateMachine<V> {
     }
 
     /// Apply one committed op. Deterministic.
+    /// SP94: the crash-recovery apply-cursor — the highest op-number
+    /// whose effects are durably WAL-framed (recovered from the WAL on
+    /// `open`). `None` ⇒ nothing durable yet. A VSR replica uses this
+    /// after a reopen to know which committed ops it already has.
+    pub fn applied(&self) -> Option<u64> {
+        self.storage.high_op()
+    }
+
     pub fn apply(&mut self, op_number: u64, op: Op) -> OpResult {
+        // SP94 replay/recovery guard. When a VSR primary re-feeds the
+        // committed log to a crash-recovered replica, every op at or
+        // below the durable cursor has already taken effect — its
+        // WAL frames were replayed on `open`. Re-running a *mutating*
+        // op (e.g. the non-idempotent `SeqAppend` counter) would
+        // double-apply and diverge from the quorum, so short-circuit
+        // it. Reads are never guarded (side-effect-free, must return
+        // real data). In normal monotonic operation `op_number` is
+        // always strictly greater than the cursor, so this is inert —
+        // it fires only on the recovery replay path.
+        if op.is_mutating() {
+            if let Some(cursor) = self.storage.high_op() {
+                if op_number <= cursor {
+                    return OpResult::Ok;
+                }
+            }
+        }
         match op {
             Op::SeqAppend { payload } => {
                 // SP79: atomic assign-next + store, ONE replicated op.
@@ -3551,6 +3576,62 @@ mod tests {
                 Field { field_id: 0, name: "amount".into(), kind: FieldKind::U64, nullable: false },
             ],
         )
+    }
+
+    /// SP94 (unblocks #74): after a crash+reopen, the state machine
+    /// recovers its durable prefix AND its apply cursor from the WAL,
+    /// and re-feeding that durable prefix (what a VSR primary does to
+    /// catch a recovered replica up) is a **no-op on state** — even
+    /// for a non-idempotent op like `SeqAppend`. Without the cursor
+    /// guard the counter would advance twice and the replica would
+    /// diverge from the quorum.
+    #[test]
+    fn reopen_then_vsr_replay_of_durable_prefix_is_idempotent() {
+        use kessel_codec::{encode, Value};
+        let vfs = MemVfs::new();
+        let rec = |sm: &StateMachine<MemVfs>, d: u128, a: u64| {
+            let cot = sm.catalog().get(1).unwrap().clone();
+            encode(&cot, &[Value::Uint(d), Value::Uint(a as u128)]).unwrap()
+        };
+        let prefix = |sm: &mut StateMachine<MemVfs>| {
+            sm.apply(1, Op::CreateType { def: transfer_def() });
+            let r2 = rec(sm, 10, 100);
+            sm.apply(2, Op::Create { type_id: 1, id: ObjectId::from_u128(1), record: r2 });
+            sm.apply(3, Op::SeqAppend { payload: b"alpha".to_vec() });
+            sm.apply(4, Op::SeqAppend { payload: b"beta".to_vec() });
+            let r5 = rec(sm, 20, 200);
+            sm.apply(5, Op::Create { type_id: 1, id: ObjectId::from_u128(2), record: r5 });
+        };
+        let (d1, applied1);
+        {
+            let mut sm = StateMachine::open(vfs.clone()).unwrap();
+            prefix(&mut sm);
+            sm.flush().unwrap();
+            sm.sync().unwrap();
+            d1 = sm.digest();
+            applied1 = sm.applied();
+        }
+        // Crash-free reopen from the same disk: durable prefix + the
+        // apply cursor are reconstructed from the WAL.
+        let mut sm2 = StateMachine::open(vfs.clone()).unwrap();
+        assert_eq!(sm2.digest(), d1, "reopen recovers the durable prefix");
+        assert_eq!(applied1, Some(5), "cursor = max durable op-number");
+        assert_eq!(sm2.applied(), applied1, "cursor recovered from WAL");
+        // The primary re-feeds the entire committed prefix to the
+        // recovered replica. Every op is at/below the cursor ⇒ each
+        // is a guarded no-op; state must be byte-identical.
+        prefix(&mut sm2);
+        assert_eq!(
+            sm2.digest(),
+            d1,
+            "replaying the durable prefix must not mutate state"
+        );
+        assert_eq!(sm2.applied(), Some(5), "cursor unchanged by replay");
+        // A genuinely new op past the cursor still applies normally.
+        let r = sm2.apply(6, Op::SeqAppend { payload: b"gamma".to_vec() });
+        assert!(matches!(r, OpResult::Got(_)), "fresh op applies, got {r:?}");
+        assert_ne!(sm2.digest(), d1, "a new op past the cursor mutates state");
+        assert_eq!(sm2.applied(), Some(6));
     }
 
     #[test]

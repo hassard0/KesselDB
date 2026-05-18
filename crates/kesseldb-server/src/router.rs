@@ -559,13 +559,19 @@ impl<'a> Conn<'a> {
         // 4. Build the column map (recipe.mapping joined with the type's
         //    fields by field_id, in mapping order) and fetch.
         let mut cols: Vec<ColumnMap> = Vec::with_capacity(recipe.mapping.len());
-        // Parallel: the field for each mapped column, same order as the
-        // fetched per-column bytes.
-        let mut col_fields: Vec<&kessel_catalog::Field> =
+        // Parallel: the field and its index in `ot.fields` for each
+        // mapped column, same order as the fetched per-column bytes.
+        // Capturing the index here avoids a re-scan per row (FIX #3).
+        let mut col_fields: Vec<(&kessel_catalog::Field, usize)> =
             Vec::with_capacity(recipe.mapping.len());
         for (fid, source) in &recipe.mapping {
-            let field = match ot.fields.iter().find(|f| f.field_id == *fid) {
-                Some(f) => f,
+            let (idx, field) = match ot
+                .fields
+                .iter()
+                .enumerate()
+                .find(|(_, f)| f.field_id == *fid)
+            {
+                Some(p) => p,
                 None => {
                     return OpResult::SchemaError(format!(
                         "REFRESH `{name}`: mapping references unknown \
@@ -578,7 +584,7 @@ impl<'a> Conn<'a> {
                 kind: field.kind,
                 source: source.clone(),
             });
-            col_fields.push(field);
+            col_fields.push((field, idx));
         }
         let format = match recipe.format {
             0 => Format::Json,
@@ -654,13 +660,17 @@ impl<'a> Conn<'a> {
             // before any mutation).
             let mut values: Vec<kessel_codec::Value> =
                 vec![kessel_codec::Value::Null; ot.fields.len()];
-            for (ci, field) in col_fields.iter().enumerate() {
-                let idx = ot
-                    .fields
-                    .iter()
-                    .position(|f| f.field_id == field.field_id)
-                    .expect("mapped field is in the type");
-                values[idx] =
+            for (ci, (field, idx)) in col_fields.iter().enumerate() {
+                if row[ci].len() != field.kind.width() as usize {
+                    return OpResult::SchemaError(format!(
+                        "refresh: column `{}` raw width {} != {:?} width {}",
+                        field.name,
+                        row[ci].len(),
+                        field.kind,
+                        field.kind.width()
+                    ));
+                }
+                values[*idx] =
                     kessel_codec::value_from_raw(field.kind, &row[ci]);
             }
             let record = match kessel_codec::encode(&ot, &values) {
@@ -674,6 +684,9 @@ impl<'a> Conn<'a> {
 
             // 6. Create-vs-Update via a side-effect-free point existence
             //    check through the EXISTING route path.
+            // SCALING (EXT slice 1): one point existence read per
+            // row. Fine for modest feeds; a follow-on can batch
+            // this into a single key-set read before the Txn.
             let exists = match self.forward(
                 &Op::GetById {
                     type_id: ot.type_id,

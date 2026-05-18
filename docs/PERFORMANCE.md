@@ -41,6 +41,15 @@ scales, and the projections fall straight out of it:
 4. **Indexed and columnar reads are sub-linear** and CPU/cache-bound,
    so they track single-core performance and are largely independent
    of table size.
+5. **Sharding scales single-shard work horizontally.** Point ops and
+   single-shard transactions go straight to the owning shard group, so
+   aggregate throughput grows ~linearly with shard count. A
+   *cross-shard* transaction additionally pays one sequencer
+   round-trip plus a decide+commit round-trip per participating shard
+   (deterministic, no locks/2PC blocking); the router currently
+   serializes cross-shard commits to drive the global order, so they
+   are the deliberate slow path — keep transactions single-shard where
+   latency-critical.
 
 ## Measured
 

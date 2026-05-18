@@ -25,12 +25,48 @@ view-change on primary timeout; state transfer for lagging replicas; client tabl
 exactly-once retried client batches. Fixed cluster size (3 or 5); membership reconfiguration
 is out of scope for Sub-project 1.
 
-## Sharding (groundwork in M4)
+## Sharding & cross-shard transactions
 
-Deterministic key→shard mapping (hash/rendezvous over `type_id‖primary_id`). Sub-project 1
-ships a single shard with the routing interface in place. Multi-shard introduces cross-shard
-transactions — explicitly deferred; the limitation is documented rather than hidden. Each shard
-would be its own VSR group; a shard router sits in front.
+Deterministic key→shard mapping (rendezvous hashing over the 20-byte
+row key). A deployment runs **K independent VSR shard groups** behind a
+**router**: a request goes to the shard that owns its key; schema/DDL
+is broadcast to every shard (identical catalogs ⇒ deterministic
+per-shard execution); a single-shard transaction stays on that shard's
+own VSR group (serializable, fast path).
+
+**Cross-shard transactions are deterministic (Calvin-style), not 2PC.**
+A cross-shard `Op::Txn` is decomposed into per-shard slices and a
+descriptor is durably **totally ordered** by a dedicated replicated
+**sequencer group** (an ordinary VSR cluster; one append op assigns a
+gap-free seq, the counter lives in the digest). Each shard then
+processes every global seq in order via a deterministic two phases:
+
+- *decide* — dry-run the slice against committed state and persist a
+  **stable** verdict (applies nothing);
+- *commit* — apply the slice iff the **global decision** (the AND of
+  participant verdicts) is commit, else a deterministic atomic skip;
+  the per-shard cursor advances lockstep with the global order.
+
+Because every verdict is a pure function of that group's durable state,
+the global decision is recomputable by **any** router (no coordinator
+whose crash loses the outcome) and no locks are held across shards.
+Properties: atomic (all-or-none across shards), exactly-once under
+client retry (stable `(client,req)` keying with a digest-resident dedup
+map), and recoverable (a full ordered re-drive after a router restart
+is idempotent — verdicts are stable, commits cursor-idempotent).
+
+Correctness is proven by composition: each shard group's partition
+tolerance is the seeded VSR corpus (incl. the historically-hard
+seed 7); the cross-shard layer adds a deterministic adversarial-drive
+test (partial decide, simulated router crash, duplicate retries,
+repeated recovery, reordering ⇒ identical state, itself deterministic)
+plus over-sockets atomicity/exactly-once/recovery/concurrency tests.
+
+Documented boundary: the router serializes cross-shard commits to drive
+the global order (an async per-shard pull-drive is an efficiency
+follow-up, not a correctness change); cross-shard transactions are
+point-op batches, and cross-shard scatter-gather *reads*/SQL routing is
+a separate later concern from cross-shard *transactions*.
 
 ## Caching (M4)
 

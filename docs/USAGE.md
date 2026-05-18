@@ -11,6 +11,7 @@ KesselDB. Every feature described here is covered by the test suite.
 - [5. The data model](#5-the-data-model)
 - [6. Transactions](#6-transactions)
 - [7. Running a cluster](#7-running-a-cluster)
+- [7b. Sharded deployment & cross-shard transactions](#7b-sharded-deployment--cross-shard-transactions)
 - [8. Authentication, quotas & backpressure](#8-authentication-quotas--backpressure)
 - [9. Backup & monitoring](#9-backup--monitoring)
 - [10. Wire protocol](#10-wire-protocol)
@@ -311,6 +312,41 @@ Properties (all tested, including a seeded adversarial partition corpus):
 
 Connect applications with `ClusterClient` (§3). It rotates the address list and
 retries on `Unavailable` until it reaches the primary.
+
+### 7b. Sharded deployment & cross-shard transactions
+
+For horizontal scale, run **K independent shard groups** (each a
+cluster as above) plus one small **sequencer group**, with a
+**router** in front (`kesseldb_server::router`):
+
+```rust
+use kesseldb_server::router::{Router, serve_router, recover};
+
+let router = std::sync::Arc::new(
+    Router::new(vec![
+        vec!["shard0a:7878".into(), "shard0b:7878".into(), "shard0c:7878".into()],
+        vec!["shard1a:7878".into(), "shard1b:7878".into(), "shard1c:7878".into()],
+    ])
+    .with_sequencer(vec!["seqa:7878".into(), "seqb:7878".into(), "seqc:7878".into()]),
+);
+serve_router(listener, router.clone());      // speaks the ordinary client wire
+// after a router restart, finish any in-flight cross-shard txns:
+recover(&router).unwrap();
+```
+
+The router sends each request to the shard that owns its key
+(rendezvous mapping); schema/DDL is broadcast to every shard. A
+single‑shard transaction stays on its shard's own VSR group. A
+**cross‑shard `Op::Txn`** is decomposed into per‑shard slices,
+durably totally‑ordered by the sequencer, then applied by a
+deterministic *decide → commit*: it is **atomic** (a slice that would
+fail aborts the whole transaction on every shard), **exactly‑once**
+under client retry (use session‑framed clients for true exactly‑once),
+and **recoverable** (`recover()` re‑drives the ordered log
+idempotently after a router restart). This is deterministic
+(Calvin‑style), not blocking 2PC. Cross‑shard transactions are
+point‑op batches (`Create`/`Update`/`Delete`); routing cross‑shard
+*scatter‑gather reads*/SQL text is a separate later concern.
 
 ## 8. Authentication, quotas & backpressure
 

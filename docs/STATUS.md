@@ -80,6 +80,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP70 — range-index narrowing** | **done** | planner emits half-range hints on order-indexed cols; engine combines all hints on a field into one tight order-index interval; `Op::QueryRows.range_preds` appended wire-compatibly (old frame ⇒ empty ⇒ unchanged); SP62/63 superset-verify invariant preserved, oracle strengthened (pure-range + band + mixed, ~660 queries); **the Linux reference server band 35,007→313 µs (~112×)**; **169 green**, determinism/seed-7 intact |
 | **SP71 — CLI & output delight** | **done** | `--json` mode (stable per-statement object: status/value/rows, RFC-8259 escaped), readable `DESCRIBE`/`\d` schema table (was "GOT N bytes"), shell `\?`/`\d`/`\timing`/`\q` + friendly errors — all pure/unit-tested in `kessel-client`, no new server op (client-only; determinism untouched); **171 green** |
 | **SP72 — self-describing typed result** | **done** | `Op::Join` emits `[KTR1][deflen][typedef][recs]` (combined `<t>.<col>` schema, records re-encoded not raw-concat — header/bitmap correctness verified e2e); client `render_typed_result[_json]` reuses the tested `render_rows` → JOINs render as tables/JSON (was opaque); read-op only, determinism/seed-7 intact; **172 green** |
+| **SP83 — cross-shard docs (6/6)** | **done** | README/ARCHITECTURE/USAGE/PERFORMANCE/STATUS rewritten from "deferred single-shard boundary" to the delivered deterministic (Calvin-style) cross-shard design (router+sequencer+two-phase, atomic/exactly-once/recoverable, honest boundaries); public docs verified free of internal host names & slice codenames. **Cross-shard transactions complete (6 slices).** |
 | **SP82 — cross-shard adversarial proof (5/6)** | **done** | deterministic adversarial-drive test (3 shard SMs + sequencer): clean run vs chaos (dup/out-of-order SeqAppendOnce retries, partial decide, simulated router crash, repeated recover, stray commit) ⇒ identical per-shard digests AND the chaotic schedule itself bit-for-bit deterministic; + 8-way concurrent cross-shard txns over sockets atomic, recover a no-op. Composes with the per-group seed-7 partition corpus (unchanged) |
 | **SP81 — cross-shard atomicity/exactly-once/recovery (4/6)** | **done** | deterministic two-phase: `XshardDecide` (dry-run, stable persisted verdict, applies nothing) → global AND-decision (pure fn of durable state ⇒ any router re-derives it, no coordinator) → `XshardCommit{commit}` (apply or atomic skip, cursor-idempotent); `SeqAppendOnce` exactly-once (dedup map in digest, full-key verified); `router::recover` re-drives the whole log idempotently. SM test + sockets test (failing slice ⇒ both shards abort; session replay once; recovery stable); seed-7 untouched |
 | **SP80 — deterministic cross-shard execution (3/6)** | **done** | `Op::XshardApply{seq,ops}`: shard processes every global seq in-order/exactly-once (cursor in reserved `0xFFFF_FFF1`, in digest), slice+cursor atomic via Txn overlay, empty=advance; router `commit_cross_shard` decomposes Txn→per-shard slices, `SeqAppend` descriptor (commit point), drives all shards in seq order (serialized). Cross-shard `Op::Txn` now COMMITS atomically over sockets; SM test + 2×3-shard+seq socket test; seed-7 untouched |
@@ -121,10 +122,14 @@ exactly-once failover, auth, quotas/backpressure, hot backup + metrics,
 and sub-linear indexed reads. 139 tests, 0 failed. The single non-gate
 item is **transport encryption**, a deliberate documented zero-dep
 boundary (deploy behind a TLS proxy / private network) — not an
-unimplemented gap. Smaller roadmap polish (balance-guard, cross-shard
-atomicity, destructive ALTER/DROP, overflow GC) remains as honest
-non-gating backlog. No vague "research-grade" hedging anywhere — every
-gate was closed with a tested, committed slice.
+unimplemented gap. The former non-gating roadmap has since been
+delivered: balance-guard, destructive `ALTER`/`DROP` (DROP INDEX,
+DROP/RENAME COLUMN, DROP TABLE), overflow-blob GC, and **deterministic
+(Calvin-style) cross-shard transactions** (router + sequencer +
+two-phase decide/commit; atomic, exactly-once, recoverable;
+adversarial-drive + over-sockets proven). No vague "research-grade"
+hedging anywhere — every gate and roadmap item was closed with a
+tested, committed slice.
 
 ## M3 VSR — done vs. hardening backlog (honest)
 
@@ -262,13 +267,18 @@ partitions. Concrete repro kept in-code + spec. Spec:
 
 ## What this is NOT (yet)
 
-Still out of scope (each a later spec): **full VSR view-change liveness
-under arbitrary partition (SP12/13 open repro: seed 7)**, index-accelerated
-boolean-query planning, wide/byte-string range indexes, SET DEFAULT &
-ON UPDATE actions, balance-guard constraint, cross-shard atomicity, multi-node VSR over sockets,
-destructive ALTER/DROP, overflow GC, index-write throughput optimization,
-disk-fault-during-view-change, membership reconfiguration, auth/TLS,
-client SDKs beyond Rust.
+Still out of scope (each a later spec): wide/byte-string range
+indexes, `SET DEFAULT` & `ON UPDATE` actions, cross-shard
+scatter-gather *reads* / SQL-text routing (distinct from cross-shard
+*transactions*, which are delivered), async per-shard pull-drive
+(efficiency, not correctness), index-write throughput optimization,
+disk-fault-during-view-change, membership reconfiguration, transport
+TLS as a non-opt-in default, client SDKs beyond Rust.
+
+(Previously listed here and since delivered with tested, committed
+slices: seed-7 view-change liveness, balance-guard, destructive
+`ALTER`/`DROP`, overflow GC, multi-node VSR over sockets, and
+deterministic cross-shard transactions.)
 
 ## Performance log
 
@@ -449,8 +459,10 @@ path, exactly as the thesis analysis predicted.
   (hit-rate metric exposed via `cache_hit_rate()`), so its speedup is
   characterized qualitatively, not over-claimed with a synthetic number.
 - **Sharding:** rendezvous-hash routing, deterministic & ~balanced (<15% skew
-  over 8 shards), <30% remap on 4→5 resize. Single-shard today; cross-shard
-  transactions explicitly deferred (documented in ARCHITECTURE.md).
+  over 8 shards), <30% remap on 4→5 resize. K independent VSR shard
+  groups behind a router; **deterministic (Calvin-style) cross-shard
+  transactions** delivered — sequenced, two-phase decide/commit,
+  atomic, exactly-once, recoverable (see ARCHITECTURE.md).
 
 ### SP16 flexibility-cost (N=100k, localhost, in-memory, single-thread)
 

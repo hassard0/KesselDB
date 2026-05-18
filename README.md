@@ -177,14 +177,33 @@ Honest boundaries (documented, not hidden):
   zero‑dependency. Without it the wire is plaintext but token‑authenticated
   with a timing‑safe comparison (deploy behind a TLS proxy / private
   network). Hand‑rolling TLS would be irresponsible, hence the feature.
-- **Cross‑shard transactions** are a documented single‑shard boundary.
-  A single shard gives serializable atomic transactions. The router
-  uses rendezvous hashing so a multi‑shard deployment is per‑shard
-  atomic; a deterministic cross‑shard 2‑phase commit is intentionally
-  *not* implemented (faking distributed atomicity would be worse than
-  documenting its absence). Balance‑guard helpers, destructive
-  `ALTER TABLE` (`DROP`/`RENAME COLUMN`), `DROP INDEX`, `DROP TABLE`,
-  and overflow‑blob GC are all implemented.
+- **Cross‑shard transactions** are implemented, **deterministically**
+  (Calvin‑style), over real sockets — *not* blocking two‑phase commit.
+  A deployment runs K independent VSR shard groups behind a router
+  (rendezvous key→shard mapping). A cross‑shard `Op::Txn` is
+  decomposed into per‑shard slices, durably **totally ordered** by a
+  replicated sequencer group, then each shard applies its slice in that
+  order: a deterministic *decide → commit* in which every shard’s
+  verdict is a pure function of its durable state, so the global AND
+  decision is recomputable by any router with **no coordinator‑failure
+  hole** and no locks held across shards. It is **atomic** (a slice
+  that would fail aborts the transaction on every shard),
+  **exactly‑once** under client retry (stable `(client,req)` keying),
+  and **recoverable** (a full ordered re‑drive after a router restart
+  is idempotent). Single‑shard transactions stay on their shard’s own
+  VSR group (serializable, fast path). Proven by a deterministic
+  adversarial‑drive test composed on the seeded per‑group partition
+  corpus, plus over‑sockets atomicity/abort/exactly‑once/recovery and
+  concurrency tests. Balance‑guard helpers, destructive `ALTER TABLE`
+  (`DROP`/`RENAME COLUMN`), `DROP INDEX`, `DROP TABLE`, and
+  overflow‑blob GC are all implemented.
+
+  *Boundary (documented, not hidden):* the router serializes
+  cross‑shard commits to drive the global order; an async per‑shard
+  pull‑drive is an efficiency follow‑up, not a correctness change.
+  Cross‑shard transactions are point‑op batches (`Create`/`Update`/
+  `Delete`); cross‑shard scatter‑gather *reads*/SQL text routing is a
+  separate, later concern from cross‑shard *transactions*.
 
 Every claim in this repository is backed by the test suite (`174 tests`); the
 docs call out exactly what is proven versus roadmap.

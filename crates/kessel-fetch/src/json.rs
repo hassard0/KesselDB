@@ -261,6 +261,78 @@ impl<'a> P<'a> {
     }
 }
 
+/// Navigate `rows_path` (if any) to a JSON array, then extract `cols`
+/// from each element (same scalar dotted-path rule as `extract`).
+/// `None` rows_path == today's top-level-array behavior.
+#[allow(dead_code)] // used by fetch_rows_paginated in the next task
+pub(crate) fn rows_at(
+    body: &[u8],
+    cols: &[ColumnMap],
+    rows_path: Option<&str>,
+) -> Result<Vec<Vec<Cell>>, FetchError> {
+    let rp = match rows_path {
+        None => return extract(body, cols),
+        Some(p) => p,
+    };
+    let v = parse(std::str::from_utf8(body).map_err(|_| {
+        FetchError::Parse("body is not UTF-8".into())
+    })?)?;
+    let mut cur = &v;
+    for seg in rp.split('.') {
+        match cur {
+            Json::Object(m) => {
+                cur = m.iter().find(|(k, _)| k == seg).map(|(_, x)| x)
+                    .ok_or_else(|| FetchError::Parse(format!(
+                        "ROWS `{rp}`: no key `{seg}`")))?;
+            }
+            _ => return Err(FetchError::Parse(format!(
+                "ROWS `{rp}`: `{seg}` is not an object"))),
+        }
+    }
+    let arr = match cur {
+        Json::Array(a) => a,
+        _ => return Err(FetchError::Parse(format!(
+            "ROWS `{rp}` is not an array"))),
+    };
+    let mut rows = Vec::with_capacity(arr.len());
+    for el in arr {
+        let mut row = Vec::with_capacity(cols.len());
+        for c in cols { row.push(path_get(el, &c.source)?); }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+/// Read the scalar at `path`. `None` if absent / JSON null / empty
+/// string (the pagination "stop" signals) or if the node is a
+/// non-scalar (array/object). Numbers render as their source text.
+#[allow(dead_code)] // used by fetch_rows_paginated in the next task
+pub(crate) fn opt_string_at(
+    body: &[u8],
+    path: &str,
+) -> Result<Option<String>, FetchError> {
+    let v = parse(std::str::from_utf8(body).map_err(|_| {
+        FetchError::Parse("body is not UTF-8".into())
+    })?)?;
+    let mut cur = &v;
+    for seg in path.split('.') {
+        match cur {
+            Json::Object(m) => match m.iter().find(|(k, _)| k == seg) {
+                Some((_, x)) => cur = x,
+                None => return Ok(None), // absent => stop
+            },
+            _ => return Ok(None),
+        }
+    }
+    Ok(match cur {
+        Json::Null => None,
+        Json::Str(s) if s.is_empty() => None,
+        Json::Str(s) => Some(s.clone()),
+        Json::Num(n) => Some(n.clone()),
+        _ => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,5 +389,36 @@ mod tests {
         let cols = vec![cm("s", "s")];
         let rows = extract(body, &cols).unwrap();
         assert_eq!(rows, vec![vec![Cell::Text("caf\u{00e9} \u{65e5}\u{672c} \u{1f600}".into())]]);
+    }
+
+    #[test]
+    fn rows_at_navigates_envelope_then_extracts() {
+        let body = br#"{"data":{"items":[{"id":1},{"id":2}]},"p":{"next":"http://x/2"}}"#;
+        let cols = vec![ColumnMap{name:"id".into(),kind:FieldKind::U64,source:"id".into()}];
+        let rows = rows_at(body, &cols, Some("data.items")).unwrap();
+        assert_eq!(rows, vec![vec![Cell::Text("1".into())], vec![Cell::Text("2".into())]]);
+        // None rows_path == top-level array (delegates to extract())
+        let arr = br#"[{"id":9}]"#;
+        assert_eq!(rows_at(arr, &cols, None).unwrap(), vec![vec![Cell::Text("9".into())]]);
+        // path that is not an array => Parse error
+        assert!(matches!(rows_at(body, &cols, Some("p")), Err(FetchError::Parse(_))));
+        // path with a missing key => Parse error
+        assert!(matches!(rows_at(body, &cols, Some("data.nope")), Err(FetchError::Parse(_))));
+    }
+
+    #[test]
+    fn opt_string_at_reads_cursor_or_none() {
+        let b = br#"{"p":{"next":"http://x/2"},"empty":"","nul":null}"#;
+        assert_eq!(opt_string_at(b, "p.next").unwrap(), Some("http://x/2".to_string()));
+        assert_eq!(opt_string_at(b, "empty").unwrap(), None);   // empty string => stop
+        assert_eq!(opt_string_at(b, "nul").unwrap(), None);     // null => stop
+        assert_eq!(opt_string_at(b, "missing").unwrap(), None); // absent => stop
+        assert_eq!(opt_string_at(b, "p.missing").unwrap(), None); // absent nested => stop
+        // a number cursor renders as its source text
+        let n = br#"{"c":42}"#;
+        assert_eq!(opt_string_at(n, "c").unwrap(), Some("42".to_string()));
+        // a non-scalar (array/object) at the path => None (stop, not error)
+        let o = br#"{"c":[1,2]}"#;
+        assert_eq!(opt_string_at(o, "c").unwrap(), None);
     }
 }

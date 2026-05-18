@@ -43,7 +43,8 @@ enum Route {
     All,
     /// A transaction spanning these shards (sorted, len ≥ 2).
     Cross(Vec<usize>),
-    /// Router-side: fetch external data then submit captured rows.
+    /// Router-side op: handled entirely in the router, not forwarded
+    /// to any shard.
     Refresh,
     /// Not routable by this slice (clear error, never a wrong answer).
     Unsupported(&'static str),
@@ -428,16 +429,19 @@ impl<'a> Conn<'a> {
             Route::Refresh => {
                 #[cfg(feature = "external-sources")]
                 {
-                    self.do_refresh(op)
+                    self.do_refresh(op, dedup)
                 }
                 #[cfg(not(feature = "external-sources"))]
                 {
-                    let _ = op;
-                    OpResult::SchemaError(
-                        "REFRESH requires the server built with \
+                    let _ = dedup;
+                    let what = match op {
+                        Op::RefreshExternalSource { name } => name.as_str(),
+                        _ => "<unknown>",
+                    };
+                    OpResult::SchemaError(format!(
+                        "REFRESH `{what}`: server not built with \
                          --features external-sources"
-                            .into(),
-                    )
+                    ))
                 }
             }
             Route::Unsupported(why) => OpResult::SchemaError(why.into()),
@@ -731,6 +735,22 @@ mod tests {
             r.route(&Op::Select { type_id: 1, program: vec![], limit: 0 }),
             Route::Unsupported(_)
         ));
+        assert_eq!(
+            r.route(&Op::RefreshExternalSource { name: "s".into() }),
+            Route::Refresh
+        );
+        assert_eq!(
+            r.route(&Op::CreateExternalSource {
+                name: "s".into(), type_def: vec![], url: String::new(),
+                format: 0, key_field_id: 1, auth_kind: 0,
+                auth_a: String::new(), auth_b: String::new(), mapping: vec![],
+            }),
+            Route::All
+        );
+        assert_eq!(
+            r.route(&Op::DropExternalSource { name: "s".into() }),
+            Route::All
+        );
     }
 
     /// SP80 (slice 3): with a sequencer configured, a cross-shard

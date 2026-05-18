@@ -47,6 +47,7 @@ pub struct ColumnMap {
 pub enum Format {
     Json,
     Csv,
+    Ndjson,
 }
 
 /// Auth resolved by the caller (router) from its own env — a value,
@@ -74,6 +75,7 @@ pub fn fetch_rows(
     let raw_rows = match format {
         Format::Json => json::extract(&body, cols)?,
         Format::Csv => csv::extract(&body, cols)?,
+        Format::Ndjson => ndjson::extract(&body, cols)?,
     };
     let mut out = Vec::with_capacity(raw_rows.len());
     for r in raw_rows {

@@ -459,7 +459,7 @@ impl<'a> Conn<'a> {
 #[cfg(feature = "external-sources")]
 impl<'a> Conn<'a> {
     fn do_refresh(&mut self, op: &Op, dedup: Vec<u8>) -> OpResult {
-        use kessel_catalog::{Catalog, ExternalAuth};
+        use kessel_catalog::{Catalog, ExternalAuth, PaginationRecipe};
         use kessel_fetch::{
             fetch_rows, fetch_rows_paginated, Auth, ColumnMap, Format,
             Pagination, DEFAULT_MAX_BODY,
@@ -629,13 +629,13 @@ impl<'a> Conn<'a> {
                 ),
                 Some(pr) => {
                     let pg = match pr {
-                        kessel_catalog::PaginationRecipe::NextUrlJson(p) => {
+                        PaginationRecipe::NextUrlJson(p) => {
                             Pagination::NextUrlJson(p.clone())
                         }
-                        kessel_catalog::PaginationRecipe::NextLink => {
+                        PaginationRecipe::NextLink => {
                             Pagination::NextLink
                         }
-                        kessel_catalog::PaginationRecipe::CursorJson {
+                        PaginationRecipe::CursorJson {
                             path,
                             param,
                         } => Pagination::CursorJson {

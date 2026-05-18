@@ -292,7 +292,7 @@ fn select_blob(shard: &mut Client) -> Vec<u8> {
 /// embed the real port into page1's `next` URL *before* the server is
 /// listening. Serves a queue of bodies, one per accepted connection,
 /// and exits once the queue drains (join the handle at test end).
-/// Mirrors `kessel-fetch/tests/paginate_stub.rs`'s `stub_at`.
+/// Adapts (header-stripped, body-only form of) kessel-fetch/tests/paginate_stub.rs's stub_at.
 fn stub_at(port: u16, pages: Vec<String>) -> std::thread::JoinHandle<()> {
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("rebind");
     let queue = Arc::new(Mutex::new(pages));
@@ -425,7 +425,7 @@ fn drain_and_join(h: std::thread::JoinHandle<()>, port: u16) {
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let d2 = done.clone();
     let jh = std::thread::spawn(move || {
-        h.join().ok();
+        h.join().expect("stub thread panicked");
         d2.store(true, std::sync::atomic::Ordering::SeqCst);
     });
     while !done.load(std::sync::atomic::Ordering::SeqCst) {

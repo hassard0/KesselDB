@@ -16,19 +16,35 @@ pub fn to_field_bytes(
             ))
         }
         (Cell::Bool(b), Bool) => return Ok(vec![*b as u8]),
+        // JSON booleans coerce to 0/1 for any numeric column (common
+        // in weakly-typed sources); rejected only by parse if the
+        // declared kind cannot represent 0/1.
         (Cell::Bool(b), _) => (if *b { "1" } else { "0" }).to_string(),
         (Cell::Text(s), _) => s.clone(),
     };
     let int = |signed: bool, w: usize| -> Result<Vec<u8>, FetchError> {
         if signed {
             let n: i128 = txt.parse().map_err(|_| {
-                FetchError::Type(format!("`{txt}` is not an integer"))
+                FetchError::Type(format!("`{txt}` is not a valid {kind:?} value"))
             })?;
+            let max = i128::MAX >> (8 * (16 - w));
+            let min = i128::MIN >> (8 * (16 - w));
+            if n < min || n > max {
+                return Err(FetchError::Type(format!(
+                    "`{txt}` overflows a {w}-byte signed field ({kind:?})"
+                )));
+            }
             Ok(n.to_le_bytes()[..w].to_vec())
         } else {
             let n: u128 = txt.parse().map_err(|_| {
-                FetchError::Type(format!("`{txt}` is not an unsigned integer"))
+                FetchError::Type(format!("`{txt}` is not a valid {kind:?} value"))
             })?;
+            let max = u128::MAX >> (8 * (16 - w));
+            if n > max {
+                return Err(FetchError::Type(format!(
+                    "`{txt}` overflows a {w}-byte unsigned field ({kind:?})"
+                )));
+            }
             Ok(n.to_le_bytes()[..w].to_vec())
         }
     };
@@ -47,9 +63,9 @@ pub fn to_field_bytes(
             if txt == "1" || txt.eq_ignore_ascii_case("true") { 1 } else { 0 },
         ]),
         Timestamp => int(false, 8),
-        Char(w) | Bytes(w) => {
+        Char(n) | Bytes(n) => {
             let raw = txt.as_bytes();
-            let w = *w as usize;
+            let w = *n as usize;
             if raw.len() > w {
                 return Err(FetchError::Type(format!(
                     "value of {} bytes exceeds CHAR/BYTES({w})",
@@ -61,7 +77,8 @@ pub fn to_field_bytes(
             Ok(out)
         }
         other => Err(FetchError::Type(format!(
-            "external column kind {other:?} unsupported in slice 1"
+            "FieldKind::{other:?} cannot be mapped from an external \
+             source (internal-only or unsupported column kind)"
         ))),
     }
 }
@@ -110,5 +127,30 @@ mod tests {
             to_field_bytes(&FieldKind::Char(1), Cell::Text("toolong".into())),
             Err(FetchError::Type(_))
         ));
+    }
+
+    #[test]
+    fn out_of_range_integers_are_rejected() {
+        assert!(matches!(
+            to_field_bytes(&FieldKind::U8, Cell::Text("300".into())),
+            Err(FetchError::Type(_))
+        ));
+        assert!(matches!(
+            to_field_bytes(&FieldKind::I8, Cell::Text("200".into())),
+            Err(FetchError::Type(_))
+        ));
+        assert!(matches!(
+            to_field_bytes(&FieldKind::U16, Cell::Text("70000".into())),
+            Err(FetchError::Type(_))
+        ));
+        // in-range boundary still works
+        assert_eq!(
+            to_field_bytes(&FieldKind::U8, Cell::Text("255".into())).unwrap(),
+            vec![255]
+        );
+        assert_eq!(
+            to_field_bytes(&FieldKind::I8, Cell::Text("-128".into())).unwrap(),
+            vec![0x80]
+        );
     }
 }

@@ -126,6 +126,13 @@ fn main() {
 fn run_one(client: &mut Client, sql: &str) -> i32 {
     match client.sql(sql) {
         Ok(OpResult::Got(b)) => {
+            // EXPLAIN returns plain plan text — print it as text.
+            if sql.trim_start().get(..7).map_or(false, |k| {
+                k.eq_ignore_ascii_case("EXPLAIN")
+            }) {
+                println!("{}", String::from_utf8_lossy(&b));
+                return 0;
+            }
             // Whole-row single-table SELECT → decode & print real columns
             // (best-DX path). Falls back cleanly if it isn't one or the
             // schema/rows don't decode.

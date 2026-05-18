@@ -329,6 +329,13 @@ pub fn spawn_engine_cfg(
                                             .into(),
                                     )
                                 }
+                                Ok(kessel_sql::Stmt::Explain(_)) => {
+                                    return Err(
+                                        "EXPLAIN inside a transaction is not \
+                                         supported"
+                                            .into(),
+                                    )
+                                }
                                 Err(e) => return Err(format!("sql: {e}")),
                             }
                         }
@@ -407,6 +414,11 @@ pub fn spawn_engine_cfg(
                                 continue;
                             }
                         }
+                    }
+                    Ok(kessel_sql::Stmt::Explain(plan)) => {
+                        // EXPLAIN: return the plan text, execute nothing.
+                        let _ = reply.send(OpResult::Got(plan.into_bytes()));
+                        continue;
                     }
                     Err(e) => {
                         let _ = reply.send(OpResult::SchemaError(format!("sql: {e}")));

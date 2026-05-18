@@ -164,6 +164,7 @@ CREATE UNIQUE INDEX ON <t> (<col>)          -- unique constraint + index
 CREATE RANGE  INDEX ON <t> (<col>)          -- order‑preserving (range scans)
 CREATE INDEX        ON <t> (<c1>, <c2>)     -- composite
 DESCRIBE <t>                                -- returns the table definition
+EXPLAIN <stmt>                              -- prints the plan, runs nothing
 ```
 
 Column types: `U8 U16 U32 U64`, `I8 I16 I32 I64`, `BYTES`, `BOOL`.

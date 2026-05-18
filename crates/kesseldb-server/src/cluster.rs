@@ -470,6 +470,11 @@ pub fn spawn_node(
                                 );
                                 redirect(&replica, &mut pending, key);
                             }
+                            Ok(Stmt::Explain(plan)) => {
+                                // EXPLAIN: pure planner text, no consensus.
+                                let _ = reply
+                                    .send(OpResult::Got(plan.into_bytes()));
+                            }
                             Err(e) => {
                                 let _ = reply
                                     .send(OpResult::SchemaError(format!("sql: {e}")));

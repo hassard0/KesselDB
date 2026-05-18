@@ -205,6 +205,10 @@ pub enum Stmt {
         id: u128,
         sets: Vec<(u16, Value)>,
     },
+    /// `EXPLAIN <stmt>` — a precomputed, human-readable query plan. The
+    /// inner statement is *not* executed; the server just returns this
+    /// text. Pure planner output (SP64).
+    Explain(String),
 }
 
 /// If `sql` is a whole-row, single-table select
@@ -283,8 +287,119 @@ pub fn select_columns(sql: &str) -> Option<(String, Vec<String>)> {
     Some((table, cols))
 }
 
+/// Human-readable query plan for `EXPLAIN`. Describes how the compiled
+/// statement will actually run (index-narrowed vs full scan, which
+/// columns / composite index), so users can see the SP62/SP63 planner at
+/// work. Pure; no execution.
+fn plan_string(stmt: &Stmt, cat: &Catalog) -> String {
+    let tname = |tid: u32| {
+        cat.get(tid)
+            .map(|t| t.name.clone())
+            .unwrap_or_else(|| format!("type#{tid}"))
+    };
+    let cols = |tid: u32, fids: &[u16]| -> String {
+        let ot = cat.get(tid);
+        fids.iter()
+            .map(|fid| {
+                ot.and_then(|t| t.fields.iter().find(|f| f.field_id == *fid))
+                    .map(|f| f.name.clone())
+                    .unwrap_or_else(|| format!("f#{fid}"))
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match stmt {
+        Stmt::Explain(_) => "EXPLAIN".to_string(),
+        Stmt::Update { type_id, id, .. } => format!(
+            "Read-Modify-Write on {} (id {id})",
+            tname(*type_id)
+        ),
+        Stmt::Op(op) => match op {
+            Op::QueryRows { type_id, eq_preds, .. } => {
+                if eq_preds.is_empty() {
+                    return format!(
+                        "Seq Scan on {} → filter (no usable index)",
+                        tname(*type_id)
+                    );
+                }
+                let fids: Vec<u16> = eq_preds.iter().map(|(f, _)| *f).collect();
+                let fset: std::collections::BTreeSet<u16> =
+                    fids.iter().copied().collect();
+                let composite = cat.get(*type_id).and_then(|t| {
+                    t.composite.iter().find(|c| {
+                        c.len() == fset.len()
+                            && c.iter().copied().collect::<std::collections::BTreeSet<_>>()
+                                == fset
+                    })
+                });
+                if let Some(c) = composite {
+                    format!(
+                        "Composite Index Scan on {} using ({}) → verify",
+                        tname(*type_id),
+                        cols(*type_id, c)
+                    )
+                } else {
+                    format!(
+                        "Index Scan on {} narrowed by [{}] → verify full WHERE",
+                        tname(*type_id),
+                        cols(*type_id, &fids)
+                    )
+                }
+            }
+            Op::GetById { type_id, .. } => {
+                format!("Primary-Key Lookup on {} (O(1))", tname(*type_id))
+            }
+            Op::Select { type_id, .. } | Op::SelectFields { type_id, .. } => {
+                format!("Seq Scan on {} → filter", tname(*type_id))
+            }
+            Op::SelectSorted { type_id, .. } => {
+                format!("Seq Scan on {} → filter → sort", tname(*type_id))
+            }
+            Op::Aggregate { type_id, .. }
+            | Op::GroupAggregate { type_id, .. } => {
+                format!("Aggregate over Seq Scan on {}", tname(*type_id))
+            }
+            Op::Join { left_type, right_type, .. } => format!(
+                "Hash Join {} ⋈ {}",
+                tname(*left_type),
+                tname(*right_type)
+            ),
+            Op::Txn { ops } => format!("Atomic Txn ({} ops)", ops.len()),
+            Op::Create { type_id, .. } => format!("Insert into {}", tname(*type_id)),
+            Op::Delete { type_id, .. } => format!("Delete from {}", tname(*type_id)),
+            Op::Update { type_id, .. } => format!("Update {}", tname(*type_id)),
+            Op::CreateType { .. } => "Create Table (online DDL)".to_string(),
+            Op::DropType { type_id } => format!("Drop Table {}", tname(*type_id)),
+            Op::AlterTypeAddField { type_id, .. } => {
+                format!("Alter {} Add Column (online, no lock)", tname(*type_id))
+            }
+            Op::CreateIndex { type_id, .. }
+            | Op::AddUnique { type_id, .. }
+            | Op::AddOrderedIndex { type_id, .. }
+            | Op::AddCompositeIndex { type_id, .. } => {
+                format!("Build Index on {} (backfill)", tname(*type_id))
+            }
+            Op::Describe { type_id } => format!("Describe {}", tname(*type_id)),
+            other => format!("{:?}", other.kind()),
+        },
+    }
+}
+
 /// Compile one SQL statement, including `UPDATE`.
 pub fn compile_stmt(sql: &str, cat: &Catalog) -> Result<Stmt, SqlError> {
+    // EXPLAIN <stmt> — compile the inner statement and describe its plan
+    // WITHOUT executing it. Pure planner output.
+    {
+        let t = sql.trim_start();
+        if t.len() >= 8 && t[..7].eq_ignore_ascii_case("EXPLAIN") {
+            let rest = t[7..].trim_start();
+            if rest.is_empty() {
+                return Err("EXPLAIN needs a statement".into());
+            }
+            let inner = compile_stmt(rest, cat)?;
+            return Ok(Stmt::Explain(plan_string(&inner, cat)));
+        }
+    }
     {
         let mut p = P { t: lex(sql)?, i: 0, cat };
         if p.kw("UPDATE") {
@@ -1411,6 +1526,42 @@ mod tests {
             sm.catalog()
         )
         .is_err());
+    }
+
+    #[test]
+    fn explain_shows_the_plan() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (a U32 NOT NULL, b U32 NOT NULL, v I64 NOT NULL)");
+        run(&mut sm, 2, "CREATE INDEX ON t (a)");
+        run(&mut sm, 3, "CREATE INDEX ON t (a, b)"); // composite
+        let cat = sm.catalog().clone();
+        let plan = |q: &str| match compile_stmt(q, &cat).expect("compile") {
+            Stmt::Explain(s) => s,
+            o => panic!("expected Explain, got non-explain ({:?})", std::mem::discriminant(&o)),
+        };
+        // single-column index narrowing
+        let p1 = plan("EXPLAIN SELECT * FROM t WHERE a = 1 AND v > 5");
+        assert!(p1.contains("Index Scan") && p1.contains("t"), "{p1}");
+        // composite index
+        let p2 = plan("EXPLAIN SELECT * FROM t WHERE a = 1 AND b = 2");
+        assert!(p2.to_lowercase().contains("composite"), "{p2}");
+        // OR ⇒ no usable index ⇒ seq scan
+        let p3 = plan("EXPLAIN SELECT * FROM t WHERE a = 1 OR v = 2");
+        assert!(p3.contains("Seq Scan"), "{p3}");
+        // primary-key fast path
+        let p4 = plan("EXPLAIN SELECT * FROM t ID 7");
+        assert!(p4.contains("Primary-Key Lookup"), "{p4}");
+        // DDL / write plans
+        assert!(plan("EXPLAIN CREATE TABLE z (x U8 NOT NULL)").contains("Create Table"));
+        assert!(plan("EXPLAIN INSERT INTO t (id,a,b,v) VALUES (1,1,1,1)")
+            .to_lowercase()
+            .contains("insert"));
+        // case-insensitive keyword; nothing is executed (table z absent)
+        assert!(matches!(
+            compile_stmt("explain SELECT * FROM t WHERE a = 1", &cat),
+            Ok(Stmt::Explain(_))
+        ));
+        assert!(compile_stmt("EXPLAIN", &cat).is_err());
     }
 
     #[test]

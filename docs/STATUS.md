@@ -71,6 +71,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP61 — `ALTER TABLE ADD COLUMN`** | **done** | SQL for online `Op::AlterTypeAddField` (no lock/rewrite, old rows up-project NULL); also **fixed a real bug**: expr VM `is_codec_record` mis-saw added columns as present (IS NULL/CHECK/triggers wrong post-ALTER) — now schema-truncation-precise; **159 green** |
 | **SP62 — planner index-accelerates mixed WHEREs** | **done** | `SELECT * WHERE idx=K AND other>M …` now index-narrowed (was full scan) via mandatory-AND equality hints + full-program verify; **randomized oracle** (360 queries: index path == brute-force scan) guards correctness; OR/NOT → no hints (safe); **160 green** |
 | **SP63 — composite-index narrowing** | **done** | multi-col equality covered only by a composite index now narrowed via `FindByComposite` inside `Op::QueryRows` — **no protocol/replicated-op change**; oracle strengthened (+composite cases, ~480 queries); determinism untouched; **160 green** |
+| **SP64 — SQL `EXPLAIN`** | **done** | `EXPLAIN <stmt>` returns the real plan text (composite/index/seq scan, PK lookup, joins, DDL) without executing; CLI prints it; pure planner-layer, zero engine/determinism risk; **161 green** |
 
 ## Production-readiness gate (precise, not vague)
 

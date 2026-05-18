@@ -7,6 +7,7 @@
 
 mod coerce;
 mod csv;
+mod ndjson;
 mod http;
 pub(crate) mod json;
 

@@ -33,7 +33,7 @@ pub fn extract(
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum Json {
+pub(crate) enum Json {
     Null,
     Bool(bool),
     Num(String),
@@ -42,7 +42,7 @@ enum Json {
     Object(Vec<(String, Json)>),
 }
 
-fn path_get(v: &Json, path: &str) -> Result<Cell, FetchError> {
+pub(crate) fn path_get(v: &Json, path: &str) -> Result<Cell, FetchError> {
     let mut cur = v;
     for seg in path.split('.') {
         match cur {
@@ -79,7 +79,7 @@ struct P<'a> {
     i: usize,
 }
 
-fn parse(s: &str) -> Result<Json, FetchError> {
+pub(crate) fn parse(s: &str) -> Result<Json, FetchError> {
     let mut p = P { b: s.as_bytes(), s, i: 0 };
     p.ws();
     let v = p.value()?;

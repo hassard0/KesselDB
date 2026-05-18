@@ -259,12 +259,22 @@ printf 'BEGIN\nINSERT INTO acct ID 9 (owner,bal) VALUES (1,1)\nCOMMIT\n' | kesse
 
 A failing statement (e.g. a duplicate id) makes `COMMIT` fail and rolls
 back every statement in the transaction; the connection stays usable.
-`COMMIT`/`ROLLBACK` without `BEGIN` is a clean error. **Boundaries:**
-`UPDATE` inside a transaction is rejected (it needs server-side
-read-modify-write — named follow-up); `SELECT` inside a transaction is
-buffered, not executed mid-transaction; transactions are per-connection
-and currently single-node (the cluster front doesn't yet intercept the
-keywords — use op-level `Op::Txn` there).
+`COMMIT`/`ROLLBACK` without `BEGIN` is a clean error. `UPDATE` composes
+inside a transaction (it lowers to the deterministic replicated
+`Op::UpdateSet`), and read-your-writes holds for writes within the
+batch (a later statement sees an earlier one's effect).
+
+**Model boundary (by design, not a TODO):** a KesselDB transaction is
+an *atomic, non-interactive write batch* — serializable by
+construction. A `SELECT`/`DESCRIBE`/`EXPLAIN` *inside* `BEGIN`/`COMMIT`
+is **rejected with a clear error**: returning interactive
+read-your-writes mid-transaction would require holding the single
+engine overlay across client round-trips, serializing the whole engine
+— a deliberate non-goal. Run reads outside the transaction.
+`UPDATE … SET col = NULL` *inside* a transaction is the one
+unsupported write form (clear error; works outside a txn).
+Transactions are per-connection and single-node (the cluster front
+doesn't intercept the keywords — use op-level `Op::Txn` there).
 
 **Op level** (works everywhere, incl. the cluster) — atomic,
 all‑or‑nothing, replicated as a single operation:

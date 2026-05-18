@@ -656,9 +656,36 @@ fn handle_conn<S: std::io::Read + std::io::Write>(
                     }
                 }
             } else if let Some(buf) = txn.as_mut() {
-                // Inside a transaction: buffer the statement (deferred).
-                buf.push(sql.to_string());
-                OpResult::Ok
+                // SP85: KesselDB transactions are atomic, non-interactive
+                // WRITE batches (serializable by construction). A read
+                // mid-transaction would require holding the single
+                // engine overlay across client round-trips, serializing
+                // the whole engine — a deliberate non-goal. Reject reads
+                // clearly instead of silently buffering an Ok whose rows
+                // are then discarded. Read-your-writes still holds for
+                // *mutations* within the batch (a later op sees an
+                // earlier op's writes); run SELECTs outside the txn.
+                let head = kw
+                    .split(|c: char| c.is_whitespace() || c == '(')
+                    .next()
+                    .unwrap_or("");
+                if matches!(
+                    head.to_ascii_uppercase().as_str(),
+                    "SELECT" | "DESCRIBE" | "DESC" | "EXPLAIN"
+                ) {
+                    OpResult::SchemaError(
+                        "reads inside a transaction are not supported — \
+                         KesselDB transactions are atomic write batches; \
+                         run SELECT/DESCRIBE/EXPLAIN outside the \
+                         transaction (read-your-writes still holds for \
+                         writes within the batch)"
+                            .into(),
+                    )
+                } else {
+                    // A write: buffer it for the atomic COMMIT batch.
+                    buf.push(sql.to_string());
+                    OpResult::Ok
+                }
             } else {
                 engine.apply_raw(req)
             }
@@ -1237,6 +1264,67 @@ mod tests {
         );
         assert!(present(&mut c, 5));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SP85: reads mid-transaction are cleanly rejected (KesselDB
+    /// transactions are atomic write batches, not interactive sessions
+    /// — a deliberate model boundary), while read-your-writes still
+    /// holds for *mutations* within the batch (a later write sees an
+    /// earlier write).
+    #[test]
+    fn reads_in_txn_rejected_writes_read_your_writes() {
+        let dir = std::env::temp_dir()
+            .join(format!("kesseldb-rtx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = spawn_engine(&dir).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || serve(listener, engine));
+        let mut c = Client::connect(addr).unwrap();
+        assert!(matches!(
+            c.sql("CREATE TABLE acct (owner U32 NOT NULL, bal I64 NOT NULL)").unwrap(),
+            OpResult::TypeCreated(1)
+        ));
+
+        // A read inside BEGIN/COMMIT is a clear error, not a silent Ok.
+        assert_eq!(c.sql("BEGIN").unwrap(), OpResult::Ok);
+        assert_eq!(
+            c.sql("INSERT INTO acct ID 1 (owner, bal) VALUES (1, 10)").unwrap(),
+            OpResult::Ok
+        );
+        assert!(matches!(
+            c.sql("SELECT * FROM acct ID 1").unwrap(),
+            OpResult::SchemaError(_)
+        ));
+        assert!(matches!(
+            c.sql("DESCRIBE acct").unwrap(),
+            OpResult::SchemaError(_)
+        ));
+        assert_eq!(c.sql("ROLLBACK").unwrap(), OpResult::Ok);
+        // Rolled back: nothing persisted.
+        assert_eq!(
+            c.sql("SELECT * FROM acct ID 1").unwrap(),
+            OpResult::NotFound
+        );
+
+        // Read-your-writes for writes within the atomic batch: the
+        // UPDATE depends on the INSERT made earlier in the SAME txn.
+        assert_eq!(c.sql("BEGIN").unwrap(), OpResult::Ok);
+        assert_eq!(
+            c.sql("INSERT INTO acct ID 2 (owner, bal) VALUES (2, 1)").unwrap(),
+            OpResult::Ok
+        );
+        assert_eq!(c.sql("UPDATE acct ID 2 SET bal = 9").unwrap(), OpResult::Ok);
+        assert_eq!(c.sql("COMMIT").unwrap(), OpResult::Ok);
+        match c.sql("SELECT bal FROM acct WHERE owner = 2").unwrap() {
+            OpResult::Got(b) => assert_eq!(
+                i64::from_le_bytes(b[4..12].try_into().unwrap()),
+                9,
+                "UPDATE saw the in-batch INSERT (read-your-writes)"
+            ),
+            o => panic!("unexpected {o:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

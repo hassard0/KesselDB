@@ -866,6 +866,61 @@ mod tests {
         assert_eq!(replayed[7].op_number, 7);
     }
 
+    /// SP92: the invariant VSR safety rests on. A torn WAL write
+    /// (only half the frame reaches disk) must leave a *clean
+    /// committed prefix*: `Storage::open` recovers every op before
+    /// the torn one and **nothing** at or after it — no partial /
+    /// garbage op ever surfaces. (A recovered replica is then a
+    /// well-defined lagging node the quorum can safely state-transfer
+    /// — the multi-node crash-recover-during-view-change harness that
+    /// builds on this `FaultVfs` is tracked as a separate slice.)
+    #[test]
+    fn wal_torn_write_recovers_clean_committed_prefix() {
+        use kessel_io::{FaultKind, FaultVfs};
+
+        let recover = || -> (Vec<bool>, bool) {
+            let fv = FaultVfs::new(MemVfs::new());
+            {
+                let mut s = Storage::open(fv.clone()).unwrap();
+                // 10 cleanly-committed ops.
+                for i in 1..=10u64 {
+                    s.put(i, k(i as u128), vec![i as u8; 6]).unwrap();
+                }
+                // Arm: the *very next* WAL write tears in half. Robust
+                // to any Wal::open preamble — we count from here.
+                fv.arm("wal", 1, FaultKind::Torn);
+                // op 11's frame is torn; 12..=20 append after it.
+                for i in 11..=20u64 {
+                    s.put(i, k(i as u128), vec![i as u8; 6]).unwrap();
+                }
+                assert!(fv.fired(), "the torn-write fault must have fired");
+            }
+            // Reopen from the SAME disk (disarm so replay/compaction
+            // writes are clean).
+            fv.plan().borrow_mut().kind = None;
+            let s2 = Storage::open(fv.clone()).unwrap();
+            let present: Vec<bool> =
+                (1..=20u64).map(|i| s2.get(&k(i as u128)).is_some()).collect();
+            (present, fv.fired())
+        };
+
+        let (present, fired) = recover();
+        assert!(fired);
+        for i in 0..10 {
+            assert!(present[i], "op {} (before the tear) must survive", i + 1);
+        }
+        for i in 10..20 {
+            assert!(
+                !present[i],
+                "op {} (at/after the tear) must NOT partially survive",
+                i + 1
+            );
+        }
+        // Deterministic: the recovered prefix is identical run-to-run.
+        let (present2, _) = recover();
+        assert_eq!(present, present2, "torn-write recovery must be deterministic");
+    }
+
     #[test]
     fn lsm_get_spans_memtable_and_sstables() {
         let vfs = MemVfs::new();

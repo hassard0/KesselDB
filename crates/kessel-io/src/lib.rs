@@ -384,6 +384,144 @@ impl Disk for MemVfsDisk {
     }
 }
 
+// ----------------------------------------------------------------------------
+// FaultVfs — deterministic disk-fault injection (SP92)
+// ----------------------------------------------------------------------------
+
+/// What a single armed fault does to one `write_at`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FaultKind {
+    /// Persist only the first half of the buffer (a torn write): the
+    /// frame on disk is short, so a length/CRC-checked replay must stop
+    /// cleanly at it and recover the intact prefix.
+    Torn,
+    /// Fail the write with an I/O error (the caller's `?` propagates).
+    Err,
+}
+
+/// Deterministic, externally-controlled fault schedule shared by every
+/// `FaultDisk` a `FaultVfs` hands out. Unarmed (`kind == None`) it is a
+/// pure pass-through, so wrapping any VFS in `FaultVfs` changes nothing
+/// until a test explicitly `arm`s it.
+#[derive(Clone, Default)]
+pub struct FaultPlan {
+    /// Substring matched against the opened file name; only writes to a
+    /// matching file are counted/affected.
+    pub target: String,
+    /// 1-based index of the matching write to hit. `0` = disarmed.
+    pub at_write: u32,
+    pub kind: Option<FaultKind>,
+    /// Matching writes observed so far (deterministic counter).
+    pub writes_seen: u32,
+    /// Set once the fault has actually fired (lets a test assert it did).
+    pub fired: bool,
+}
+
+/// A VFS wrapper that injects one deterministic disk fault. `inner` is
+/// any real VFS (typically `MemVfs`); the plan is shared by clone so a
+/// test holds one handle and every disk the cluster opens obeys it.
+#[derive(Clone)]
+pub struct FaultVfs<V: Vfs> {
+    inner: V,
+    plan: Rc<RefCell<FaultPlan>>,
+}
+
+impl<V: Vfs> FaultVfs<V> {
+    pub fn new(inner: V) -> Self {
+        FaultVfs { inner, plan: Rc::new(RefCell::new(FaultPlan::default())) }
+    }
+    /// Shared plan handle (clone-cheap; same `RefCell` as every disk).
+    pub fn plan(&self) -> Rc<RefCell<FaultPlan>> {
+        Rc::clone(&self.plan)
+    }
+    /// Arm the fault: hit the `nth` (1-based) write to a file whose name
+    /// contains `target`, with `kind`. Resets the counter.
+    pub fn arm(&self, target: &str, nth: u32, kind: FaultKind) {
+        let mut p = self.plan.borrow_mut();
+        p.target = target.to_string();
+        p.at_write = nth;
+        p.kind = Some(kind);
+        p.writes_seen = 0;
+        p.fired = false;
+    }
+    pub fn fired(&self) -> bool {
+        self.plan.borrow().fired
+    }
+    pub fn inner(&self) -> &V {
+        &self.inner
+    }
+}
+
+impl<V: Vfs> Vfs for FaultVfs<V> {
+    fn open(&self, name: &str) -> io::Result<Box<dyn Disk>> {
+        Ok(Box::new(FaultDisk {
+            inner: self.inner.open(name)?,
+            name: name.to_string(),
+            plan: Rc::clone(&self.plan),
+        }))
+    }
+    fn exists(&self, name: &str) -> bool {
+        self.inner.exists(name)
+    }
+    fn remove(&self, name: &str) -> io::Result<()> {
+        self.inner.remove(name)
+    }
+    fn list(&self) -> Vec<String> {
+        self.inner.list()
+    }
+}
+
+struct FaultDisk {
+    inner: Box<dyn Disk>,
+    name: String,
+    plan: Rc<RefCell<FaultPlan>>,
+}
+
+impl Disk for FaultDisk {
+    fn write_at(&mut self, off: u64, buf: &[u8]) -> io::Result<()> {
+        // Decide under the borrow, act after it (don't hold it across
+        // the inner I/O call).
+        let action = {
+            let mut p = self.plan.borrow_mut();
+            if p.kind.is_some()
+                && p.at_write > 0
+                && self.name.contains(&p.target)
+            {
+                p.writes_seen += 1;
+                if p.writes_seen == p.at_write {
+                    p.fired = true;
+                    p.kind
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        match action {
+            Some(FaultKind::Err) => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "injected disk write fault",
+            )),
+            Some(FaultKind::Torn) => {
+                // Persist only the first half — a short/torn frame.
+                let keep = buf.len() / 2;
+                self.inner.write_at(off, &buf[..keep])
+            }
+            None => self.inner.write_at(off, buf),
+        }
+    }
+    fn read_at(&self, off: u64, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read_at(off, buf)
+    }
+    fn sync(&mut self) -> io::Result<()> {
+        self.inner.sync()
+    }
+    fn len(&self) -> u64 {
+        self.inner.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

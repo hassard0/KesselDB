@@ -133,6 +133,7 @@ See [`docs/USAGE.md`](docs/USAGE.md) → *Running a cluster*.
 | Durable create, group commit (batch 1000) | ~87K ops/s |
 | SQL compile, prepared‑statement cache | **574K → 15.0M stmt/s (26.2×)** |
 | Mixed `WHERE idx=K AND …` | index-narrowed, not full scan (SP62; oracle-verified) |
+| Multi-col `WHERE a=1 AND b=2` (composite idx) | composite-index-narrowed (SP63; oracle-verified) |
 | Point read | ≤8 bloom‑probed segments (~28 ns/segment), bounded by design |
 | 3‑node replicated | ~161K ops/s |
 

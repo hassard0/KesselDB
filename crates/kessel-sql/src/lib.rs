@@ -683,7 +683,15 @@ fn try_query_rows(p: &mut P) -> Option<Op> {
                     (&span[i], &span[i + 1], &span[i + 2])
                 {
                     if let Some(f) = ot.fields.iter().find(|f| &f.name == c) {
-                        if ot.indexes.contains(&f.field_id) {
+                        // Hint if the column is single-indexed OR a member
+                        // of a composite index (the engine then picks the
+                        // single or composite lookup). SP62/SP63.
+                        let usable = ot.indexes.contains(&f.field_id)
+                            || ot
+                                .composite
+                                .iter()
+                                .any(|ci| ci.contains(&f.field_id));
+                        if usable {
                             let w = f.kind.width() as usize;
                             let hint = match lit {
                                 Tok::Int(n) => {
@@ -1153,7 +1161,8 @@ mod tests {
         use kessel_proto::Rng;
         let mut sm = StateMachine::open(MemVfs::new()).unwrap();
         run(&mut sm, 1, "CREATE TABLE t (k U32 NOT NULL, v I64 NOT NULL)");
-        run(&mut sm, 2, "CREATE INDEX ON t (k)"); // k is indexed; v is not
+        run(&mut sm, 2, "CREATE INDEX ON t (k)"); // single-col index on k
+        run(&mut sm, 3, "CREATE INDEX ON t (k, v)"); // composite (k, v) — SP63
         let ot = sm.catalog().get(1).unwrap().clone();
 
         let mut rng = Rng::new(0xA5A5_1234);
@@ -1218,6 +1227,16 @@ mod tests {
                 (
                     format!("k = {kk} OR v = {mm}"),
                     Box::new(move |k, v| k == kk || v == mm),
+                ),
+                (
+                    // exact composite (k, v) equality — SP63 path
+                    format!("k = {kk} AND v = {mm}"),
+                    Box::new(move |k, v| k == kk && v == mm),
+                ),
+                (
+                    // composite-covered eq + extra range conjunct
+                    format!("v = {mm} AND k = {kk} AND v >= {}", mm - 1),
+                    Box::new(move |k, v| v == mm && k == kk && v >= mm - 1),
                 ),
                 (
                     format!("v > {mm} AND k = {kk}"),

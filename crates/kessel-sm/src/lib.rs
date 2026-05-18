@@ -1673,6 +1673,58 @@ impl<V: Vfs> StateMachine<V> {
                         Some(prev) => prev.intersection(&ids).copied().collect(),
                     });
                 }
+                // SP63: if the equality predicates EXACTLY cover a
+                // composite index (same field set), narrow via that single
+                // composite lookup too. It is the exact id set for the
+                // full equality tuple (a superset of true matches), so
+                // intersecting it in keeps the result identical (the
+                // program still verifies every candidate) while making
+                // multi-column equality sub-linear even when the
+                // individual columns are not separately indexed.
+                if !eq_preds.is_empty() {
+                    let qfields: std::collections::BTreeSet<u16> =
+                        eq_preds.iter().map(|(f, _)| *f).collect();
+                    let ci = ot.composite.iter().position(|c| {
+                        c.len() == qfields.len()
+                            && c.iter().collect::<std::collections::BTreeSet<_>>()
+                                == qfields.iter().collect()
+                    });
+                    if let Some(ci_no) = ci {
+                        // Build the concat key in the composite index's
+                        // declared field order.
+                        let mut concat = Vec::new();
+                        let mut ok = true;
+                        for fid in &ot.composite[ci_no] {
+                            let (val, fi) = match (
+                                eq_preds.iter().find(|(f, _)| f == fid),
+                                ot.fields.iter().position(|f| f.field_id == *fid),
+                            ) {
+                                (Some((_, v)), Some(i)) => (v, i),
+                                _ => {
+                                    ok = false;
+                                    break;
+                                }
+                            };
+                            let w = ot.fields[fi].kind.width() as usize;
+                            let mut v = val.clone();
+                            v.resize(w, 0);
+                            concat.extend_from_slice(&v);
+                        }
+                        if ok {
+                            let cfid = Self::composite_fid(ci_no);
+                            let ids: std::collections::BTreeSet<[u8; 16]> = self
+                                .idx_lookup(type_id, cfid, &concat)
+                                .into_iter()
+                                .collect();
+                            cand = Some(match cand {
+                                None => ids,
+                                Some(prev) => {
+                                    prev.intersection(&ids).copied().collect()
+                                }
+                            });
+                        }
+                    }
+                }
                 let mut out = Vec::new();
                 let mut n = 0u32;
                 let mut emit = |rec: &[u8], n: &mut u32, out: &mut Vec<u8>| {

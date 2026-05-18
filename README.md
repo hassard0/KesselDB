@@ -217,6 +217,7 @@ docs call out exactly what is proven versus roadmap.
 | [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) | Methodology, measured numbers, scaling model, cloud projections |
 | [`docs/STATUS.md`](docs/STATUS.md) | Production‑readiness gate, per‑slice status, performance log |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Storage, replication, sharding, caching internals |
+| [`clients/python/kesseldb.py`](clients/python/kesseldb.py) | Dependency‑free Python reference client (stdlib‑only, single file) |
 | [`docs/superpowers/specs/`](docs/superpowers/specs/) | One design spec per sub‑project |
 
 ## Building & testing

@@ -80,6 +80,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP70 — range-index narrowing** | **done** | planner emits half-range hints on order-indexed cols; engine combines all hints on a field into one tight order-index interval; `Op::QueryRows.range_preds` appended wire-compatibly (old frame ⇒ empty ⇒ unchanged); SP62/63 superset-verify invariant preserved, oracle strengthened (pure-range + band + mixed, ~660 queries); **the Linux reference server band 35,007→313 µs (~112×)**; **169 green**, determinism/seed-7 intact |
 | **SP71 — CLI & output delight** | **done** | `--json` mode (stable per-statement object: status/value/rows, RFC-8259 escaped), readable `DESCRIBE`/`\d` schema table (was "GOT N bytes"), shell `\?`/`\d`/`\timing`/`\q` + friendly errors — all pure/unit-tested in `kessel-client`, no new server op (client-only; determinism untouched); **171 green** |
 | **SP72 — self-describing typed result** | **done** | `Op::Join` emits `[KTR1][deflen][typedef][recs]` (combined `<t>.<col>` schema, records re-encoded not raw-concat — header/bitmap correctness verified e2e); client `render_typed_result[_json]` reuses the tested `render_rows` → JOINs render as tables/JSON (was opaque); read-op only, determinism/seed-7 intact; **172 green** |
+| **SP89 — dependency-free Python reference SDK** | **done** | `clients/python/kesseldb.py` (stdlib-only single file): framing + SQL + token auth + full OpResult decode + one-shot CLI; Rust integration smoke drives the whole loop through it over sockets (skips cleanly if no python) — green vs Python 3.11; README/USAGE updated |
 | **SP87 — wide / byte-string range indexes** | **done** | separate `0xFFFC` variable-length keyspace for CHAR/BYTES ordered indexes (`vord_field_pos`/`voidx_*`), numeric `0xFFFD` path byte-identical/untouched; `AddOrderedIndex`+`FindRange`+`idx_maintain` branch by kind; SQL `CREATE RANGE INDEX` on a string col works; equivalence oracle (FindRange == brute-force lexicographic, maintained under UPDATE/DELETE, deterministic); seed-7 intact. Boundary: SQL-planner narrowing & MIN/MAX fast-path stay numeric-only (string still correct via verified scan) |
 | **SP88 — large seed-corpus sweep (M3 hardening)** | **done** | `large_seed_corpus_is_deterministic_and_converges`: determinism over seeds 0..120 (run-twice bit-identical) + post-heal convergence over 0..40 (vs focused 0..12), with the established quiesce/state-transfer catch-up. Pure test addition, no engine change. Disk-fault-*during-view-change* honestly restated (needs a corruptible-Vfs VSR harness — scoped follow-up, not faked; storage torn-write/crash recovery + partition/heal already tested) |
 | **SP86 — column DEFAULT + ON DELETE SET DEFAULT** | **done** | `ObjectType.defaults` via a backward-compat trailer in the length-delimited type-def blob (encode/decode_type_def's 77 callers untouched; no on-disk-catalog hazard); SQL `DEFAULT <lit>` + INSERT fills omitted cols (incl NOT-NULL-with-default); FK action 4 SET DEFAULT (degrades to SET NULL w/o a default); SM + SQL + catalog-roundtrip tests; seed-7 intact. (ON UPDATE = model-inapplicable, documented separately) |
@@ -293,7 +294,10 @@ cross-shard *transactions*, which are delivered), async per-shard
 pull-drive (efficiency, not correctness), index-write throughput
 optimization,
 disk-fault-during-view-change, membership reconfiguration, transport
-TLS as a non-opt-in default, client SDKs beyond Rust.
+TLS as a non-opt-in default. (A dependency-free Python reference SDK
+ships in `clients/python/`, SP89; SDKs for further languages are
+straightforward over the documented protocol and welcome but not
+tracked here.)
 
 **Not applicable by model (not a future spec):** `ON UPDATE`
 referential actions — a foreign key references a parent's *object id*,

@@ -124,6 +124,22 @@ without parsing prose. (After `cargo build --release` the binary is
 `kessel-client` is a minimal blocking client. Add it as a path dependency, or
 copy the wire protocol (§10) into any language.
 
+**Python** — a dependency-free, stdlib-only reference client ships at
+[`clients/python/kesseldb.py`](../clients/python/kesseldb.py):
+
+```python
+from kesseldb import connect
+db = connect("127.0.0.1:7878")            # connect(addr, token=b"..") for auth
+db.sql("CREATE TABLE acct (owner U32 NOT NULL, bal I64 NOT NULL)")
+db.sql("INSERT INTO acct ID 1 (owner, bal) VALUES (100, 50)")
+print(db.sql("SELECT SUM(bal) FROM acct WHERE owner = 100").value)  # 50
+db.close()
+```
+
+Or one-shot: `python clients/python/kesseldb.py "SELECT …" [--addr H:P]
+[--token T]` (exit 0 ok / 1 error / 2 usage). It is a faithful, tested
+implementation of §10 — the template for an SDK in any language.
+
 ### Single node
 
 ```rust

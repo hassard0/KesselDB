@@ -1574,4 +1574,74 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// SP89: the dependency-free Python reference SDK round-trips
+    /// against a live server using only the documented wire protocol.
+    /// Skips cleanly (test still passes) if no Python is on PATH, so
+    /// CI stays green everywhere; when Python *is* present this is a
+    /// real cross-language end-to-end check.
+    #[test]
+    fn python_sdk_round_trips_over_the_wire() {
+        use std::process::Command;
+        let py = ["python3", "python"].into_iter().find(|p| {
+            Command::new(p)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        });
+        let Some(py) = py else {
+            eprintln!("skip: no python on PATH (SDK validated vs the \
+                       documented protocol; run manually)");
+            return;
+        };
+        let script = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../clients/python/kesseldb.py"
+        );
+        let dir = std::env::temp_dir()
+            .join(format!("kesseldb-pysdk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = spawn_engine(&dir).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || serve(listener, engine));
+
+        let run = |sql: &str| -> (bool, String) {
+            let out = Command::new(py)
+                .arg(script)
+                .arg(sql)
+                .arg("--addr")
+                .arg(&addr)
+                .output()
+                .expect("run python sdk");
+            (
+                out.status.success(),
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            )
+        };
+        // Whole loop driven *through the Python SDK* over real sockets.
+        assert!(run("CREATE TABLE acct (owner U32 NOT NULL, bal I64 NOT NULL)").0);
+        assert!(run("INSERT INTO acct ID 1 (owner, bal) VALUES (100, 50)").0);
+        assert!(run("INSERT INTO acct ID 2 (owner, bal) VALUES (100, 999)").0);
+        let (ok, sumline) = run("SELECT SUM(bal) FROM acct WHERE owner = 100");
+        assert!(ok, "SUM via Python SDK should succeed");
+        assert_eq!(sumline, "= 1049", "Python SDK decoded the scalar");
+        // A bad statement → exit 1 + an ERROR line (no panic/hang).
+        let bad = Command::new(py)
+            .arg(script)
+            .arg("SELECT FROM nope")
+            .arg("--addr")
+            .arg(&addr)
+            .output()
+            .unwrap();
+        assert!(!bad.status.success(), "bad SQL must exit non-zero");
+        assert!(
+            String::from_utf8_lossy(&bad.stdout).contains("ERROR"),
+            "bad SQL prints an ERROR line"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

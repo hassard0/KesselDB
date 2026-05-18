@@ -63,6 +63,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP53 — typed row rendering** | **done** | `select_star_table` (real lexer) + `ObjectType::from_def` + `render_rows` (both wire shapes, aligned table); CLI prints real columns for `SELECT *`; projections/joins fall back honestly; **148 green** |
 | **SP54 — `DROP TABLE`** | **done** | `Op::DropType` (kind 29) — removes rows + index entries + catalog type, atomic, FK-referential-guard; SQL `DROP TABLE <t>`; determinism/VSR corpus green; **150 green** |
 | **SP55 — SQL `BEGIN/COMMIT/ROLLBACK`** | **done** | per-connection statement buffer → `TXN_TAG` batch → one atomic `Op::Txn`; rollback/abort all-or-nothing; `UPDATE`-in-txn rejected honestly; single-node; **151 green** |
+| **SP56 — `IN` / `BETWEEN`** | **done** | parser desugaring into existing OR/AND/NOT expr opcodes (`IN`/`NOT IN`/`BETWEEN`/`NOT BETWEEN`, composable); zero engine/determinism change; **152 green** |
 
 ## Production-readiness gate (precise, not vague)
 

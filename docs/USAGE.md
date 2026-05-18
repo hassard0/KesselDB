@@ -26,7 +26,7 @@ steps.
 ```bash
 git clone https://github.com/hassard0/KesselDB && cd KesselDB
 cargo build --release        # builds every crate
-cargo test --workspace       # 143 tests, incl. seeded partition simulation
+cargo test --workspace       # full suite, incl. seeded partition simulation
 ```
 
 Requires Rust stable **1.95+**.
@@ -179,7 +179,9 @@ DELETE FROM <t> WHERE <col> = <val>
 
 ```sql
 SELECT * FROM <t> ID <n>                         -- O(1) primary‑key fetch
-SELECT * FROM <t> [WHERE <col> = <v> [AND ...]]  -- index‑accelerated when possible
+SELECT * FROM <t> [WHERE <expr>]                 -- =, !=, <, <=, >, >=, AND/OR/NOT,
+                                                 --   col IN (a,b,..), col BETWEEN lo AND hi
+                                                 --   (NOT IN / NOT BETWEEN too)
 SELECT <c1>, <c2> FROM <t> [WHERE ...]           -- projection
 SELECT COUNT(*) | SUM(c) | MIN(c) | MAX(c) | AVG(c) FROM <t> [WHERE ...]
        [GROUP BY <col>]
@@ -187,7 +189,7 @@ SELECT * FROM <t> [WHERE ...] ORDER BY <col> [DESC] [OFFSET n] [LIMIT n]
 SELECT * FROM <a> JOIN <b> ON <a.x> = <b.y> [LIMIT n]   -- inner equi‑join
 ```
 
-`WHERE` supports `AND`/`OR`/`NOT` and `=`, `>=`, `<=`. `SELECT *` returns
+`WHERE` supports `AND`/`OR`/`NOT`, all of `= != < <= > >=`, and `IN`/`BETWEEN` (incl. `NOT IN`/`NOT BETWEEN`). `SELECT *` returns
 length‑prefixed record blobs; use `DESCRIBE <t>` to decode them against the
 schema (the client decodes the wire schema for you).
 

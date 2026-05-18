@@ -842,11 +842,62 @@ fn splice(a: Program, b: Program, op: &str) -> Program {
 
 fn cmp_expr(p: &mut P, ot: &ObjectType) -> Result<Program, SqlError> {
     let negate = p.kw("NOT");
-    let lhs = term(p, ot)?;
-    let prog = if let Some(Tok::Cmp(c)) = p.peek().cloned() {
+    let lb = term(p, ot)?.bytes(); // lhs program bytes (reused per disjunct)
+    // Optional post-column NOT for `col NOT IN (..)` / `col NOT BETWEEN ..`.
+    let post_not = p.kw("NOT");
+    let prog = if p.kw("IN") {
+        // `col IN (v1, v2, ...)` ≡ `(col=v1) OR (col=v2) OR ...`.
+        p.punct('(')?;
+        let mut acc: Option<Program> = None;
+        loop {
+            let v = term(p, ot)?;
+            let mut raw = lb.clone();
+            raw.extend_from_slice(&v.bytes());
+            raw.push(3); // EQ
+            let eqp = Program::from_raw(raw);
+            acc = Some(match acc {
+                None => eqp,
+                Some(a) => splice(a, eqp, "OR"),
+            });
+            match p.peek() {
+                Some(Tok::Punct(',')) => p.i += 1,
+                _ => break,
+            }
+        }
+        p.punct(')')?;
+        let mut prog = acc.ok_or_else(|| "IN () needs ≥1 value".to_string())?;
+        if post_not {
+            let mut r = prog.bytes();
+            r.push(16); // NOT  -> NOT IN
+            prog = Program::from_raw(r);
+        }
+        prog
+    } else if p.kw("BETWEEN") {
+        // `col BETWEEN lo AND hi` ≡ `(col>=lo) AND (col<=hi)`.
+        let lo = term(p, ot)?;
+        if !p.kw("AND") {
+            return Err("BETWEEN needs `lo AND hi`".into());
+        }
+        let hi = term(p, ot)?;
+        let mut ge = lb.clone();
+        ge.extend_from_slice(&lo.bytes());
+        ge.push(8); // >=
+        let mut le = lb.clone();
+        le.extend_from_slice(&hi.bytes());
+        le.push(6); // <=
+        let mut prog = splice(Program::from_raw(ge), Program::from_raw(le), "AND");
+        if post_not {
+            let mut r = prog.bytes();
+            r.push(16); // NOT  -> NOT BETWEEN
+            prog = Program::from_raw(r);
+        }
+        prog
+    } else if post_not {
+        return Err("expected IN or BETWEEN after NOT".into());
+    } else if let Some(Tok::Cmp(c)) = p.peek().cloned() {
         p.i += 1;
         let rhs = term(p, ot)?;
-        let mut raw = lhs.bytes();
+        let mut raw = lb.clone();
         raw.extend_from_slice(&rhs.bytes());
         raw.push(match c {
             "=" => 3,
@@ -859,7 +910,7 @@ fn cmp_expr(p: &mut P, ot: &ObjectType) -> Result<Program, SqlError> {
         });
         Program::from_raw(raw)
     } else {
-        lhs
+        Program::from_raw(lb)
     };
     if negate {
         let mut raw = prog.bytes();
@@ -1000,6 +1051,62 @@ mod tests {
             OpResult::Got(b) => assert_eq!(i128::from_le_bytes(b.try_into().unwrap()), 2),
             o => panic!("{o:?}"),
         }
+    }
+
+    #[test]
+    fn in_and_between_predicates() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        assert!(matches!(
+            run(&mut sm, 1, "CREATE TABLE acct (owner U32 NOT NULL, bal I64 NOT NULL)"),
+            OpResult::TypeCreated(1)
+        ));
+        for (i, (o, b)) in
+            [(10u32, 5i64), (20, 15), (30, 25), (40, 35)].iter().enumerate()
+        {
+            assert_eq!(
+                run(
+                    &mut sm,
+                    (i + 2) as u64,
+                    &format!("INSERT INTO acct ID {} (owner, bal) VALUES ({o}, {b})", i + 1)
+                ),
+                OpResult::Ok
+            );
+        }
+        let cnt = |sm: &mut StateMachine<MemVfs>, op, q: &str| -> i128 {
+            match run(sm, op, q) {
+                OpResult::Got(b) => i128::from_le_bytes(b.try_into().unwrap()),
+                o => panic!("{q}: {o:?}"),
+            }
+        };
+        // IN — owner in {10,30,99} -> rows 10 and 30
+        assert_eq!(
+            cnt(&mut sm, 20, "SELECT COUNT(*) FROM acct WHERE owner IN (10, 30, 99)"),
+            2
+        );
+        // NOT IN — exclude {10,30} -> 20 and 40
+        assert_eq!(
+            cnt(&mut sm, 21, "SELECT COUNT(*) FROM acct WHERE owner NOT IN (10, 30)"),
+            2
+        );
+        // BETWEEN — bal in [15,35] -> 15,25,35 = 3 rows
+        assert_eq!(
+            cnt(&mut sm, 22, "SELECT COUNT(*) FROM acct WHERE bal BETWEEN 15 AND 35"),
+            3
+        );
+        // NOT BETWEEN — bal outside [15,35] -> just bal=5
+        assert_eq!(
+            cnt(&mut sm, 23, "SELECT COUNT(*) FROM acct WHERE bal NOT BETWEEN 15 AND 35"),
+            1
+        );
+        // composed with AND/OR — still works
+        assert_eq!(
+            cnt(
+                &mut sm,
+                24,
+                "SELECT COUNT(*) FROM acct WHERE owner IN (10, 20) AND bal BETWEEN 0 AND 10"
+            ),
+            1
+        );
     }
 
     #[test]

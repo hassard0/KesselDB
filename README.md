@@ -6,7 +6,7 @@
 
 *"It's the database that made the Kessel Run in 12 parsecs."*
 
-`151 tests green` · `0 external dependencies` · `Rust 1.95+` · single‑binary
+`152 tests green` · `0 external dependencies` · `Rust 1.95+` · single‑binary
 
 </div>
 
@@ -30,8 +30,9 @@ feature, not an aspiration.
 
 ## Highlights
 
-- **Real SQL** — `CREATE TABLE`, `DROP TABLE`, `INSERT`, `SELECT` (filters,
-  `JOIN`, `GROUP BY`, `ORDER BY`, `LIMIT/OFFSET`), `UPDATE`, `DELETE`,
+- **Real SQL** — `CREATE TABLE`, `DROP TABLE`, `INSERT`, `SELECT` (filters
+  incl. `IN` / `BETWEEN` / `AND`/`OR`/`NOT`, `JOIN`, `GROUP BY`,
+  `ORDER BY`, `LIMIT/OFFSET`), `UPDATE`, `DELETE`,
   `COUNT/SUM/MIN/MAX/AVG`, `CREATE [UNIQUE|RANGE] INDEX`, `DESCRIBE`.
 - **Constraints & logic** — `NOT NULL`, `UNIQUE`, foreign keys with
   `ON DELETE RESTRICT/CASCADE/SET NULL`, `CHECK`, and deterministic triggers
@@ -154,7 +155,7 @@ Honest boundaries (documented, not hidden):
 - **Non‑gating roadmap** (tracked, not blocking): balance‑guard helpers,
   cross‑shard transactions, destructive `ALTER TABLE` & `DROP INDEX` (`DROP TABLE` done, SP54), overflow GC.
 
-Every claim in this repository is backed by the test suite (`151 tests`); the
+Every claim in this repository is backed by the test suite (`152 tests`); the
 docs call out exactly what is proven versus roadmap.
 
 ## Documentation
@@ -171,7 +172,7 @@ docs call out exactly what is proven versus roadmap.
 
 ```bash
 cargo build                 # all crates, zero external deps
-cargo test --workspace      # 151 tests (incl. seeded partition/fault simulation)
+cargo test --workspace      # 152 tests (incl. seeded partition/fault simulation)
 cargo run -p kessel-bench --release -- --help   # benchmarks
 ```
 

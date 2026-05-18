@@ -3557,18 +3557,21 @@ impl<V: Vfs> StateMachine<V> {
                 // discipline as auth_kind above: an unknown tag must be
                 // rejected BEFORE the backing type is created so a bad
                 // value cannot orphan a type (slice-1 C1).
+                // Tag semantics per kessel_proto::Op::CreateExternalSource
+                // doc (1=NextUrlJson 2=NextLink 3=CursorJson) — MUST match
+                // kessel_catalog::PaginationRecipe's wire tags.
                 let pagination = match pagination {
                     None => None,
-                    Some((1, a, _)) => {
-                        Some(kessel_catalog::PaginationRecipe::NextUrlJson(a))
+                    Some((1, path, _)) => {
+                        Some(kessel_catalog::PaginationRecipe::NextUrlJson(path))
                     }
                     Some((2, _, _)) => {
                         Some(kessel_catalog::PaginationRecipe::NextLink)
                     }
-                    Some((3, a, b)) => {
+                    Some((3, path, param)) => {
                         Some(kessel_catalog::PaginationRecipe::CursorJson {
-                            path: a,
-                            param: b,
+                            path,
+                            param,
                         })
                     }
                     Some((t, _, _)) => {
@@ -3822,6 +3825,20 @@ mod tests {
         }), OpResult::SchemaError(_)));
         assert!(sm.catalog().types.iter().all(|t| t.name != "feed4"),
             "bad pagination tag must reject BEFORE creating the backing type");
+        // tag 1 NextUrlJson mapping (SM-level coverage)
+        let td5 = kessel_catalog::encode_type_def("feed5",
+            &[Field { field_id: 0, name: "id".into(), kind: FieldKind::U64, nullable: false }]);
+        assert_eq!(sm.apply(9, Op::CreateExternalSource {
+            name: "feed5".into(), type_def: td5, url: "http://h".into(), format: 0,
+            key_field_id: 1, auth_kind: 0, auth_a: String::new(), auth_b: String::new(),
+            mapping: vec![(1, "id".into())], rows_path: Some("data".into()),
+            pagination: Some((1, "p.next".into(), String::new())),
+        }), OpResult::Ok);
+        let cat = sm.catalog();
+        let tid5 = cat.types.iter().find(|t| t.name == "feed5").unwrap().type_id;
+        let r5 = cat.external.iter().find(|e| e.type_id == tid5).unwrap();
+        assert_eq!(r5.pagination, Some(kessel_catalog::PaginationRecipe::NextUrlJson("p.next".into())));
+        assert_eq!(r5.rows_path.as_deref(), Some("data"));
 
         // --- I1 regression: a failed DropType must NOT remove the recipe. ---
         // Fresh isolated SM. `parent` is an external source; `child` is a

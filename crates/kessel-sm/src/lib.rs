@@ -3530,7 +3530,8 @@ impl<V: Vfs> StateMachine<V> {
                 auth_a,
                 auth_b,
                 mapping,
-                ..
+                rows_path,
+                pagination,
             } => {
                 if self.catalog.types.iter().any(|t| t.name == name) {
                     return OpResult::SchemaError(format!(
@@ -3550,6 +3551,30 @@ impl<V: Vfs> StateMachine<V> {
                         return OpResult::SchemaError(
                             "invalid auth_kind".into(),
                         )
+                    }
+                };
+                // Validate the pagination tag with the SAME pre-check
+                // discipline as auth_kind above: an unknown tag must be
+                // rejected BEFORE the backing type is created so a bad
+                // value cannot orphan a type (slice-1 C1).
+                let pagination = match pagination {
+                    None => None,
+                    Some((1, a, _)) => {
+                        Some(kessel_catalog::PaginationRecipe::NextUrlJson(a))
+                    }
+                    Some((2, _, _)) => {
+                        Some(kessel_catalog::PaginationRecipe::NextLink)
+                    }
+                    Some((3, a, b)) => {
+                        Some(kessel_catalog::PaginationRecipe::CursorJson {
+                            path: a,
+                            param: b,
+                        })
+                    }
+                    Some((t, _, _)) => {
+                        return OpResult::SchemaError(format!(
+                            "CreateExternalSource: unknown pagination tag {t}"
+                        ))
                     }
                 };
                 // Type creation is the point of no return; auth is resolved.
@@ -3586,12 +3611,12 @@ impl<V: Vfs> StateMachine<V> {
                     key_field_id,
                     auth,
                     mapping,
-                    // CreateExternal does not yet carry pagination params;
-                    // recipes created via this op are single-shot until a
-                    // later op extends them. The v2 catalog trailer
-                    // serializes these as the None tags.
-                    rows_path: None,
-                    pagination: None,
+                    // rows_path + pagination were validated/mapped above as
+                    // pure pre-checks (a bad pagination tag short-circuits
+                    // before the backing type is created). They ride the
+                    // v2 catalog trailer; absent params serialize as None.
+                    rows_path,
+                    pagination,
                 });
                 // Re-persist (same op_number): an idempotent overwrite of
                 // the single catalog key — unlike a counter this is safe
@@ -3756,6 +3781,47 @@ mod tests {
             // No recipe may reference a (now non-existent) `bad` type.
             cat.types.iter().any(|t| t.type_id == e.type_id && t.name != "bad")
         }), "no recipe references a `bad` backing type (C1)");
+
+        // --- pagination + rows_path persisted into the catalog recipe ---
+        let td2 = kessel_catalog::encode_type_def("feed2",
+            &[Field { field_id: 0, name: "id".into(), kind: FieldKind::U64, nullable: false }]);
+        assert_eq!(sm.apply(6, Op::CreateExternalSource {
+            name: "feed2".into(), type_def: td2, url: "http://h".into(), format: 2,
+            key_field_id: 1, auth_kind: 0, auth_a: String::new(), auth_b: String::new(),
+            mapping: vec![(1, "id".into())],
+            rows_path: Some("d.items".into()),
+            pagination: Some((3, "m.c".into(), "cursor".into())),
+        }), OpResult::Ok);
+        let cat = sm.catalog();
+        let tid2 = cat.types.iter().find(|t| t.name == "feed2").unwrap().type_id;
+        let r = cat.external.iter().find(|e| e.type_id == tid2).unwrap();
+        assert_eq!(r.rows_path.as_deref(), Some("d.items"));
+        assert_eq!(r.pagination, Some(kessel_catalog::PaginationRecipe::CursorJson {
+            path: "m.c".into(), param: "cursor".into() }));
+        // a NextLink + None rows_path source
+        let td3 = kessel_catalog::encode_type_def("feed3",
+            &[Field { field_id: 0, name: "id".into(), kind: FieldKind::U64, nullable: false }]);
+        assert_eq!(sm.apply(7, Op::CreateExternalSource {
+            name: "feed3".into(), type_def: td3, url: "http://h".into(), format: 0,
+            key_field_id: 1, auth_kind: 0, auth_a: String::new(), auth_b: String::new(),
+            mapping: vec![(1, "id".into())], rows_path: None,
+            pagination: Some((2, String::new(), String::new())),
+        }), OpResult::Ok);
+        let cat = sm.catalog();
+        let tid3 = cat.types.iter().find(|t| t.name == "feed3").unwrap().type_id;
+        assert_eq!(cat.external.iter().find(|e| e.type_id == tid3).unwrap().pagination,
+            Some(kessel_catalog::PaginationRecipe::NextLink));
+        // bad pagination tag => SchemaError AND no "feed4" type created (pre-mutation reject)
+        let td4 = kessel_catalog::encode_type_def("feed4",
+            &[Field { field_id: 0, name: "id".into(), kind: FieldKind::U64, nullable: false }]);
+        assert!(matches!(sm.apply(8, Op::CreateExternalSource {
+            name: "feed4".into(), type_def: td4, url: "http://h".into(), format: 0,
+            key_field_id: 1, auth_kind: 0, auth_a: String::new(), auth_b: String::new(),
+            mapping: vec![(1, "id".into())], rows_path: None,
+            pagination: Some((9, String::new(), String::new())),
+        }), OpResult::SchemaError(_)));
+        assert!(sm.catalog().types.iter().all(|t| t.name != "feed4"),
+            "bad pagination tag must reject BEFORE creating the backing type");
 
         // --- I1 regression: a failed DropType must NOT remove the recipe. ---
         // Fresh isolated SM. `parent` is an external source; `child` is a

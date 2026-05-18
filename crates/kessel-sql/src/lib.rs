@@ -746,6 +746,7 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
                 auth_a,
                 auth_b,
                 mapping,
+                // Wired by the pagination SQL grammar task (FORMAT NDJSON / ROWS / PAGE).
                 rows_path: None,
                 pagination: None,
             });

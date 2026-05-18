@@ -167,6 +167,7 @@ pub enum Op {
         /// Pagination recipe carrier `(tag, a, b)`: tag 1 =
         /// NextUrlJson(a=json path), 2 = NextLink (a,b empty), 3 =
         /// CursorJson{a=path, b=param}. `None` = slice-1 default.
+        /// MUST match `kessel_catalog::PaginationRecipe`'s wire tags; adding a variant there requires a new tag here AND a WAL protocol-version bump.
         pagination: Option<(u8, String, String)>,
     },
     /// Drop a declared external source (external-sources feature).
@@ -539,6 +540,7 @@ impl Op {
                     None => b.push(0),
                     Some(s) => { b.push(1); codec::put_bytes(&mut b, s.as_bytes()); }
                 }
+                // Tags MUST match kessel_catalog::PaginationRecipe wire encoding.
                 match pagination {
                     None => b.push(0),
                     Some((tag, a, c)) => {
@@ -801,16 +803,19 @@ impl Op {
                 let rows_path = match c.u8() {
                     None | Some(0) => None,
                     Some(1) => Some(String::from_utf8_lossy(&c.bytes()?).into_owned()),
-                    Some(_) => None, // unknown tag => treat as None (forward-tolerant)
+                    // Unknown PRESENT tag ⇒ cursor position is unknowable;
+                    // fail the decode (matches kessel_catalog's stance).
+                    // An EXHAUSTED cursor (None) stays the slice-1 default.
+                    Some(_) => return None,
                 };
                 let pagination = match c.u8() {
                     None | Some(0) => None,
-                    Some(t @ (1 | 2 | 3)) => {
+                    Some(t @ 1..=3) => {
                         let a = String::from_utf8_lossy(&c.bytes()?).into_owned();
                         let cc = String::from_utf8_lossy(&c.bytes()?).into_owned();
                         Some((t, a, cc))
                     }
-                    Some(_) => None,
+                    Some(_) => return None,
                 };
                 Op::CreateExternalSource {
                     name, type_def, url, format, key_field_id,
@@ -1186,6 +1191,22 @@ mod tests {
             assert_eq!(op.kind(), op.encode()[0]);
             assert!(op.is_mutating());
         }
+
+        // FIX: an unknown PRESENT rows_path tag must fail decode (not
+        // silently corrupt the pagination field).
+        let mut bad = vec![41u8];
+        let put = |b:&mut Vec<u8>, s:&[u8]| { b.extend_from_slice(&(s.len() as u32).to_le_bytes()); b.extend_from_slice(s); };
+        put(&mut bad, b"f");                         // name
+        put(&mut bad, &[1]);                         // type_def
+        put(&mut bad, b"u");                         // url
+        bad.push(0);                                 // format
+        bad.extend_from_slice(&1u16.to_le_bytes());  // key_field_id
+        bad.push(0);                                 // auth_kind
+        put(&mut bad, b"");                          // auth_a
+        put(&mut bad, b"");                          // auth_b
+        bad.extend_from_slice(&0u32.to_le_bytes());  // mapping len = 0
+        bad.push(7);                                 // UNKNOWN rows_path tag
+        assert!(Op::decode(&bad).is_none(), "unknown rows_path tag must fail decode");
     }
 
     #[test]

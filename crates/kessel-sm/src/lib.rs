@@ -3536,6 +3536,22 @@ impl<V: Vfs> StateMachine<V> {
                         "type `{name}` already exists"
                     ));
                 }
+                // Validate auth_kind BEFORE creating the backing type
+                // so a bad value cannot orphan a type in the catalog.
+                let auth = match auth_kind {
+                    0 => kessel_catalog::ExternalAuth::None,
+                    1 => kessel_catalog::ExternalAuth::BearerEnv(auth_a),
+                    2 => kessel_catalog::ExternalAuth::HeaderEnv {
+                        header: auth_a,
+                        env: auth_b,
+                    },
+                    _ => {
+                        return OpResult::SchemaError(
+                            "invalid auth_kind".into(),
+                        )
+                    }
+                };
+                // Type creation is the point of no return; auth is resolved.
                 // Create the backing type via the SAME path as
                 // Op::CreateType — re-enter `apply` with the SAME
                 // op_number, mirroring the Op::Txn precedent (its first
@@ -3558,19 +3574,6 @@ impl<V: Vfs> StateMachine<V> {
                     // verbatim — type creation is the gate.
                     other => return other,
                 };
-                let auth = match auth_kind {
-                    0 => kessel_catalog::ExternalAuth::None,
-                    1 => kessel_catalog::ExternalAuth::BearerEnv(auth_a),
-                    2 => kessel_catalog::ExternalAuth::HeaderEnv {
-                        header: auth_a,
-                        env: auth_b,
-                    },
-                    _ => {
-                        return OpResult::SchemaError(
-                            "invalid auth_kind".into(),
-                        )
-                    }
-                };
                 // Same mechanism CreateType uses: direct mutation of
                 // `self.catalog` followed by `persist_catalog`. The
                 // recipe rides the catalog's backward-compat trailer and
@@ -3587,10 +3590,11 @@ impl<V: Vfs> StateMachine<V> {
                 // the single catalog key — unlike a counter this is safe
                 // to repeat. This durably commits the recipe alongside
                 // the type the nested CreateType already persisted.
-                match self.persist_catalog(op_number) {
-                    OpResult::SchemaError(e) => OpResult::SchemaError(e),
-                    _ => OpResult::Ok,
-                }
+                // `persist_catalog` returns `Ok` on success / `SchemaError`
+                // on failure — return it directly, the dominant idiom for
+                // arms whose last step is the persist (cf. lines ~1468,
+                // ~1895, ~2600).
+                self.persist_catalog(op_number)
             }
             Op::DropExternalSource { name } => {
                 let tid = match self
@@ -3602,16 +3606,25 @@ impl<V: Vfs> StateMachine<V> {
                     Some(t) => t.type_id,
                     None => return OpResult::NotFound,
                 };
-                // Remove the recipe FIRST, then drop the backing type.
-                // Op::DropType ends with its own `persist_catalog`
-                // (encoding the WHOLE catalog, recipe trailer included),
-                // so removing the recipe before that call is what makes
-                // the recipe removal durable — no extra persist needed.
-                self.catalog.external.retain(|e| e.type_id != tid);
+                // DropType may return Constraint (FK-referenced) WITHOUT
+                // mutating the catalog — so don't drop the recipe until
+                // the type drop has actually succeeded, else an unrelated
+                // later persist would make the recipe loss durable while
+                // the type still exists.
+                //
                 // Same op_number reuse / SP94 reasoning as
                 // CreateExternalSource above (Op::Txn precedent): inert
                 // in normal operation, outer op guarded on replay.
-                self.apply(op_number, Op::DropType { type_id: tid })
+                let res = self.apply(op_number, Op::DropType { type_id: tid });
+                if matches!(res, OpResult::Ok) {
+                    self.catalog.external.retain(|e| e.type_id != tid);
+                    // DropType already persisted the type removal; persist
+                    // again (idempotent same-key overwrite) so the recipe
+                    // removal is durable too. `persist_catalog` returns
+                    // `Ok`/`SchemaError` directly — the dominant idiom.
+                    return self.persist_catalog(op_number);
+                }
+                res
             }
             Op::RefreshExternalSource { .. } => OpResult::SchemaError(
                 "REFRESH is a router-side operation, never applied at the \
@@ -3693,7 +3706,7 @@ mod tests {
             auth_a: "TOK_ENV".into(), auth_b: String::new(),
             mapping: vec![(1, "id".into()), (2, "nm".into())],
         });
-        assert!(matches!(r, OpResult::Ok | OpResult::TypeCreated(_)), "got {r:?}");
+        assert_eq!(r, OpResult::Ok, "create should return Ok");
         let cat = sm.catalog();
         let t = cat.types.iter().find(|t| t.name == "feed").expect("type made");
         let rec = cat.external.iter().find(|e| e.type_id == t.type_id).expect("recipe");
@@ -3712,6 +3725,80 @@ mod tests {
         assert!(cat.external.is_empty());
         // Dropping a non-existent source => NotFound.
         assert_eq!(sm.apply(4, Op::DropExternalSource { name: "ghost".into() }), OpResult::NotFound);
+
+        // --- C1 regression: a bad auth_kind must NOT orphan a type. ---
+        // Auth is validated as a pure pre-check BEFORE the backing type
+        // is created, so an invalid auth_kind creates nothing.
+        let bad_td = encode_type_def(
+            "bad",
+            &[Field { field_id: 0, name: "x".into(), kind: FieldKind::U32, nullable: false }],
+        );
+        let br = sm.apply(5, Op::CreateExternalSource {
+            name: "bad".into(), type_def: bad_td, url: "http://h/b".into(),
+            format: 0, key_field_id: 1, auth_kind: 99,
+            auth_a: String::new(), auth_b: String::new(),
+            mapping: vec![(1, "x".into())],
+        });
+        assert!(matches!(br, OpResult::SchemaError(_)), "bad auth_kind => SchemaError, got {br:?}");
+        let cat = sm.catalog();
+        assert!(cat.types.iter().all(|t| t.name != "bad"), "no orphan type `bad` (C1)");
+        let bad_referenced = cat.types.iter().any(|t| t.name == "bad");
+        assert!(!bad_referenced && cat.external.iter().all(|e| {
+            // No recipe may reference a (now non-existent) `bad` type.
+            cat.types.iter().any(|t| t.type_id == e.type_id && t.name != "bad")
+        }), "no recipe references a `bad` backing type (C1)");
+
+        // --- I1 regression: a failed DropType must NOT remove the recipe. ---
+        // Fresh isolated SM. `parent` is an external source; `child` is a
+        // regular type with an FK pointing at `parent`'s backing type, so
+        // Op::DropType on `parent` returns Constraint (FK-referenced) and
+        // mutates nothing — the recipe must survive.
+        let mut sm2 = StateMachine::open(MemVfs::new()).unwrap();
+        let parent_td = encode_type_def(
+            "parent",
+            &[Field { field_id: 0, name: "pid".into(), kind: FieldKind::U64, nullable: false }],
+        );
+        assert_eq!(
+            sm2.apply(1, Op::CreateExternalSource {
+                name: "parent".into(), type_def: parent_td, url: "http://h/p".into(),
+                format: 0, key_field_id: 1, auth_kind: 0,
+                auth_a: String::new(), auth_b: String::new(),
+                mapping: vec![(1, "pid".into())],
+            }),
+            OpResult::Ok
+        );
+        let parent_tid = sm2.catalog().types.iter()
+            .find(|t| t.name == "parent").expect("parent type").type_id;
+        // `child` regular type with a U64 FK column.
+        let child_td = encode_type_def(
+            "child",
+            &[Field { field_id: 0, name: "ref".into(), kind: FieldKind::U64, nullable: false }],
+        );
+        let cc = sm2.apply(2, Op::CreateType { def: child_td });
+        let child_tid = match cc {
+            OpResult::TypeCreated(id) => id,
+            other => panic!("child create => {other:?}"),
+        };
+        // FK: child.field 1 -> parent's backing type (field ids are 1-based
+        // positional, cf. CreateType). on_delete=0 (NoAction); no rows so
+        // no dangling-reference rejection.
+        assert_eq!(
+            sm2.apply(3, Op::AddForeignKey {
+                type_id: child_tid, field_id: 1, ref_type_id: parent_tid, on_delete: 0,
+            }),
+            OpResult::Ok
+        );
+        // Drop the external source whose backing type is FK-referenced.
+        let dr = sm2.apply(4, Op::DropExternalSource { name: "parent".into() });
+        assert!(matches!(dr, OpResult::Constraint(_)),
+            "FK-blocked drop => Constraint, got {dr:?}");
+        let cat2 = sm2.catalog();
+        // Recipe still present (I1: not removed on failed DropType).
+        assert!(cat2.external.iter().any(|e| e.type_id == parent_tid),
+            "parent recipe still present after failed drop (I1)");
+        // Backing type still present too.
+        assert!(cat2.types.iter().any(|t| t.name == "parent"),
+            "parent type still present after failed drop (I1)");
     }
 
     /// SP94 (unblocks #74): after a crash+reopen, the state machine

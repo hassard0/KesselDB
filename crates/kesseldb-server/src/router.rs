@@ -461,7 +461,8 @@ impl<'a> Conn<'a> {
     fn do_refresh(&mut self, op: &Op, dedup: Vec<u8>) -> OpResult {
         use kessel_catalog::{Catalog, ExternalAuth};
         use kessel_fetch::{
-            fetch_rows, Auth, ColumnMap, Format, DEFAULT_MAX_BODY,
+            fetch_rows, fetch_rows_paginated, Auth, ColumnMap, Format,
+            Pagination, DEFAULT_MAX_BODY,
         };
 
         // 1. Resolve the source name.
@@ -589,6 +590,7 @@ impl<'a> Conn<'a> {
         let format = match recipe.format {
             0 => Format::Json,
             1 => Format::Csv,
+            2 => Format::Ndjson,
             n => {
                 return OpResult::SchemaError(format!(
                     "REFRESH `{name}`: unknown format code {n}"
@@ -611,17 +613,53 @@ impl<'a> Conn<'a> {
             }
         };
 
-        let rows = match fetch_rows(
-            &recipe.url,
-            &auth,
-            format,
-            &cols,
-            DEFAULT_MAX_BODY,
-        ) {
-            Ok(r) => r,
-            // Fetch/parse/type/auth/too-large — mutate NOTHING.
-            Err(e) => {
-                return OpResult::SchemaError(format!("refresh: {e}"))
+        // Single fetch step. With no PAGE clause this is exactly the
+        // slice-1 one-shot `fetch_rows`; with a PAGE recipe it walks
+        // pages via `fetch_rows_paginated` (itself all-or-nothing — on
+        // Err nothing below runs, so NOTHING is submitted). Everything
+        // after `rows` (id/codec/Txn/all-or-nothing) is unchanged.
+        let rows = {
+            let res = match &recipe.pagination {
+                None => fetch_rows(
+                    &recipe.url,
+                    &auth,
+                    format,
+                    &cols,
+                    DEFAULT_MAX_BODY,
+                ),
+                Some(pr) => {
+                    let pg = match pr {
+                        kessel_catalog::PaginationRecipe::NextUrlJson(p) => {
+                            Pagination::NextUrlJson(p.clone())
+                        }
+                        kessel_catalog::PaginationRecipe::NextLink => {
+                            Pagination::NextLink
+                        }
+                        kessel_catalog::PaginationRecipe::CursorJson {
+                            path,
+                            param,
+                        } => Pagination::CursorJson {
+                            path: path.clone(),
+                            param: param.clone(),
+                        },
+                    };
+                    fetch_rows_paginated(
+                        &recipe.url,
+                        &auth,
+                        format,
+                        &cols,
+                        recipe.rows_path.as_deref(),
+                        &pg,
+                        DEFAULT_MAX_BODY,
+                    )
+                }
+            };
+            match res {
+                Ok(r) => r,
+                // Fetch/parse/type/auth/too-large/loop — mutate NOTHING.
+                Err(e) => {
+                    return OpResult::SchemaError(format!("refresh: {e}"))
+                }
             }
         };
 

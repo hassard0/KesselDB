@@ -278,3 +278,316 @@ fn select_blob(shard: &mut Client) -> Vec<u8> {
         o => panic!("SELECT * FROM feed: {o:?}"),
     }
 }
+
+// ---------------------------------------------------------------------
+// EXT pagination oracle (Task 10): the router-side `do_refresh` now
+// dispatches to `fetch_rows_paginated` when the recipe carries a PAGE
+// clause. A localhost stub serves a 2-page JSON envelope; the test
+// proves SELECT == union-of-pages, re-REFRESH is byte-identical
+// (deterministic-id upsert dedups), and a self-looping page makes
+// REFRESH error while the prior good rows stay intact (all-or-nothing).
+// ---------------------------------------------------------------------
+
+/// Stub bound to a specific (already-known-free) port so the caller can
+/// embed the real port into page1's `next` URL *before* the server is
+/// listening. Serves a queue of bodies, one per accepted connection,
+/// and exits once the queue drains (join the handle at test end).
+/// Mirrors `kessel-fetch/tests/paginate_stub.rs`'s `stub_at`.
+fn stub_at(port: u16, pages: Vec<String>) -> std::thread::JoinHandle<()> {
+    let listener = TcpListener::bind(("127.0.0.1", port)).expect("rebind");
+    let queue = Arc::new(Mutex::new(pages));
+    std::thread::spawn(move || loop {
+        let remaining = {
+            let q = queue.lock().expect("lock");
+            q.len()
+        };
+        if remaining == 0 {
+            break;
+        }
+        let (mut conn, _) = match listener.accept() {
+            Ok(c) => c,
+            Err(_) => break,
+        };
+        let body = {
+            let mut q = queue.lock().expect("lock");
+            if q.is_empty() {
+                break;
+            }
+            q.remove(0)
+        };
+        // Read the request up to the blank line so the client's write
+        // completes before we reply with `Connection: close`.
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            match conn.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+            body.as_bytes().len(),
+            body
+        );
+        let _ = conn.write_all(resp.as_bytes());
+        let _ = conn.flush();
+    })
+}
+
+/// Independent model: decode `SELECT * FROM <table>` into a sorted SET
+/// of (id u64, name String) pairs. Same wire shape / decode as the
+/// slice-1 `select_set`, parameterized on the table + its type id.
+fn select_set_tbl(
+    shard: &mut Client,
+    table: &str,
+    type_id: u32,
+) -> Vec<(u64, String)> {
+    let typedef = match shard
+        .call(&Op::Describe { type_id })
+        .expect("describe wire")
+    {
+        OpResult::Got(b) => b,
+        o => panic!("describe: {o:?}"),
+    };
+    let (name, fields) = kessel_catalog::decode_type_def(&typedef).unwrap();
+    let ot = ObjectType::from_def(name, fields);
+    let sql = format!("SELECT * FROM {table}");
+    let blob = match shard.sql(&sql).expect("select wire") {
+        OpResult::Got(b) => b,
+        o => panic!("{sql}: {o:?}"),
+    };
+    let mut out = Vec::new();
+    let mut p = 0usize;
+    while p + 4 <= blob.len() {
+        let len =
+            u32::from_le_bytes(blob[p..p + 4].try_into().unwrap()) as usize;
+        p += 4;
+        let rec = &blob[p..p + len];
+        p += len;
+        let vals = kessel_codec::decode(&ot, rec).unwrap();
+        let id = match &vals[0] {
+            kessel_codec::Value::Uint(u) => *u as u64,
+            v => panic!("id not uint: {v:?}"),
+        };
+        let nm = match &vals[1] {
+            kessel_codec::Value::Blob(b) => {
+                let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+                String::from_utf8_lossy(&b[..end]).to_string()
+            }
+            v => panic!("nm not blob: {v:?}"),
+        };
+        out.push((id, nm));
+    }
+    assert_eq!(p, blob.len(), "SELECT blob fully consumed");
+    out.sort();
+    out
+}
+
+/// Find a user type's id by name, polling until the DDL has replicated
+/// to the shard the Router reads (catalog is global; scan a small id
+/// range exactly like the slice-1 test does for `feed`). Polling closes
+/// the create→refresh replication race: `do_refresh` resolves the source
+/// by name from shard 0's catalog, so the name must be visible there
+/// before REFRESH (else `do_refresh` returns `NotFound` having fetched
+/// nothing).
+fn type_id_of(cc: &mut ClusterClient, want: &str) -> u32 {
+    for _ in 0..50 {
+        for t in 1..16u32 {
+            if let OpResult::Got(def) =
+                cc.call(&Op::Describe { type_id: t }).unwrap()
+            {
+                let (n, _) =
+                    kessel_catalog::decode_type_def(&def).unwrap();
+                if n == want {
+                    return t;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("type `{want}` never became visible");
+}
+
+/// Drain a `stub_at` server whose queue may still hold bodies the
+/// client never consumed (e.g. `do_refresh` errored before/while
+/// fetching). Repeatedly opens-and-drops connections — each wakes one
+/// blocked `accept()`, draining one queued body — until the server
+/// thread exits, then joins it. Robust regardless of how many bodies
+/// were left (no fixed connect count to get wrong / deadlock on).
+fn drain_and_join(h: std::thread::JoinHandle<()>, port: u16) {
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let d2 = done.clone();
+    let jh = std::thread::spawn(move || {
+        h.join().ok();
+        d2.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    while !done.load(std::sync::atomic::Ordering::SeqCst) {
+        let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    jh.join().ok();
+}
+
+#[test]
+fn refresh_oracle_paginates_union_idempotent_and_loop_aborts() {
+    // One 3-node shard + Router, exactly the slice-1 bring-up.
+    let shard = spawn_shard("p");
+    let router = Arc::new(Router::new(vec![shard.clone()]));
+    let rl = TcpListener::bind("127.0.0.1:0").unwrap();
+    let raddr = rl.local_addr().unwrap();
+    {
+        let r = router.clone();
+        std::thread::spawn(move || serve_router(rl, r));
+    }
+    std::thread::sleep(Duration::from_millis(1400));
+
+    let mut sc = shard
+        .iter()
+        .find_map(|a| {
+            Client::connect(a.parse::<SocketAddr>().unwrap()).ok()
+        })
+        .expect("connect shard");
+    let mut cc = ClusterClient::new(shard.clone());
+    let mut rc = Client::connect(raddr).expect("connect router");
+
+    // Bind→learn free port→drop→rebuild bodies with the real port→
+    // start the stub on that port (the paginate_stub.rs technique).
+    let probe = TcpListener::bind("127.0.0.1:0").expect("bind probe");
+    let port = probe.local_addr().expect("addr").port();
+    drop(probe);
+
+    // Two-page JSON envelope; page1.next is the absolute URL of page2
+    // on the very same stub (substituting the real bound port).
+    let page1 = format!(
+        r#"{{"items":[{{"id":1,"nm":"a"}}],"pg":{{"next":"http://127.0.0.1:{port}/p2"}}}}"#
+    );
+    let page2 =
+        r#"{"items":[{"id":2,"nm":"b"}],"pg":{"next":null}}"#.to_string();
+
+    let ddl = format!(
+        "CREATE EXTERNAL SOURCE feedp (\
+           id U64 NOT NULL FROM 'id', \
+           nm CHAR(8) NOT NULL FROM 'nm'\
+         ) FROM 'http://127.0.0.1:{port}/p1' FORMAT JSON KEY id \
+         ROWS 'items' PAGE NEXT JSON 'pg.next'"
+    );
+    assert!(
+        matches!(
+            sc.sql(&ddl).expect("ddl wire"),
+            OpResult::Ok | OpResult::TypeCreated(_)
+        ),
+        "CREATE EXTERNAL SOURCE feedp must succeed"
+    );
+    let tid = type_id_of(&mut cc, "feedp");
+
+    // === Assertion 1: REFRESH walks BOTH pages; SELECT == union. ===
+    let h = stub_at(port, vec![page1.clone(), page2.clone()]);
+    assert_eq!(
+        rc.call(&Op::RefreshExternalSource {
+            name: "feedp".into()
+        })
+        .expect("refresh wire"),
+        OpResult::Ok,
+        "paginated REFRESH #1 must succeed"
+    );
+    drain_and_join(h, port);
+    let model = sorted(vec![(1, "a".into()), (2, "b".into())]);
+    assert_eq!(
+        select_set_tbl(&mut sc, "feedp", tid),
+        model,
+        "REFRESH must materialize the UNION of both served pages"
+    );
+    let blob_after_first = match sc
+        .sql("SELECT * FROM feedp")
+        .expect("select wire")
+    {
+        OpResult::Got(b) => b,
+        o => panic!("SELECT * FROM feedp: {o:?}"),
+    };
+
+    // === Assertion 2: identical re-REFRESH is byte-identical. ===
+    // Serve the SAME two pages again; the deterministic-id upsert must
+    // dedup so the materialized blob is byte-for-byte unchanged.
+    let h = stub_at(port, vec![page1.clone(), page2.clone()]);
+    assert_eq!(
+        rc.call(&Op::RefreshExternalSource {
+            name: "feedp".into()
+        })
+        .expect("refresh wire"),
+        OpResult::Ok,
+        "paginated REFRESH #2 (identical pages) must succeed"
+    );
+    drain_and_join(h, port);
+    assert_eq!(
+        select_set_tbl(&mut sc, "feedp", tid),
+        model,
+        "idempotent re-REFRESH leaves the row set unchanged"
+    );
+    let blob_after_second = match sc
+        .sql("SELECT * FROM feedp")
+        .expect("select wire")
+    {
+        OpResult::Got(b) => b,
+        o => panic!("SELECT * FROM feedp: {o:?}"),
+    };
+    assert_eq!(
+        blob_after_first, blob_after_second,
+        "idempotent re-REFRESH must not perturb materialized state"
+    );
+
+    // === Assertion 3: a self-looping page ⇒ error + prior data intact.
+    // Re-use `feedp` (already proven resolvable — no second-DDL
+    // replication race): its source URL is `http://127.0.0.1:{port}/p1`.
+    // Bind a fresh stub on that SAME `port` whose page's `pg.next`
+    // points back at the base URL (a cycle). `fetch_rows_paginated`'s
+    // loop guard fires ⇒ Err ⇒ `do_refresh` returns SchemaError and
+    // submits NOTHING (all-or-nothing), so feedp's previously
+    // materialized rows must be byte-for-byte unchanged.
+    let loop_body = format!(
+        r#"{{"items":[{{"id":9,"nm":"z"}}],"pg":{{"next":"http://127.0.0.1:{port}/p1"}}}}"#
+    );
+    let h = stub_at(
+        port,
+        vec![loop_body.clone(), loop_body.clone(), loop_body],
+    );
+    let r = rc
+        .call(&Op::RefreshExternalSource {
+            name: "feedp".into(),
+        })
+        .expect("refresh wire");
+    // The looped fetch consumes >=1 body then errors; any remaining
+    // queued bodies are drained until the stub thread exits.
+    drain_and_join(h, port);
+    assert!(
+        !matches!(r, OpResult::Ok),
+        "a self-looping page must make REFRESH error, got {r:?}"
+    );
+    assert!(
+        matches!(r, OpResult::SchemaError(_)),
+        "loop ⇒ do_refresh returns SchemaError, got {r:?}"
+    );
+    // feedp untouched: all-or-nothing across the looped fetch.
+    assert_eq!(
+        select_set_tbl(&mut sc, "feedp", tid),
+        model,
+        "loop-source REFRESH must leave feedp's rows intact"
+    );
+    let blob_after_loop = match sc
+        .sql("SELECT * FROM feedp")
+        .expect("select wire")
+    {
+        OpResult::Got(b) => b,
+        o => panic!("SELECT * FROM feedp: {o:?}"),
+    };
+    assert_eq!(
+        blob_after_second, blob_after_loop,
+        "all-or-nothing: prior good rows byte-identical after loop abort"
+    );
+}

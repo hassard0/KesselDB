@@ -142,6 +142,12 @@ pub struct ObjectType {
     /// Composite (multi-field) equality indexes (Sub-project 27): each entry
     /// is the ordered list of `field_id`s forming one composite index.
     pub composite: Vec<Vec<u16>>,
+    /// Per-column defaults (SP86): `(field_id, raw fixed-width bytes)`.
+    /// Applied at INSERT to omitted columns and by `ON DELETE SET
+    /// DEFAULT`. Serialized in a backward-compatible trailer of the
+    /// length-delimited type-def blob (old blobs simply have no
+    /// trailer ⇒ no defaults).
+    pub defaults: Vec<(u16, Vec<u8>)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -177,6 +183,7 @@ impl ObjectType {
             triggers: vec![],
             ordered: vec![],
             composite: vec![],
+            defaults: vec![],
         }
     }
 
@@ -273,6 +280,62 @@ pub fn decode_type_def(b: &[u8]) -> Option<(String, Vec<Field>)> {
     Some((name, fields))
 }
 
+/// Like [`encode_type_def`] but appends a backward-compatible defaults
+/// trailer `[u16 ndef] ndef×([u16 fid][u16 len][bytes])` (only when
+/// non-empty). Old decoders ignore trailing bytes, so a blob written
+/// this way still decodes name+fields identically (SP86).
+pub fn encode_type_def_with_defaults(
+    name: &str,
+    fields: &[Field],
+    defaults: &[(u16, Vec<u8>)],
+) -> Vec<u8> {
+    let mut b = encode_type_def(name, fields);
+    if !defaults.is_empty() {
+        b.extend_from_slice(&(defaults.len() as u16).to_le_bytes());
+        for (fid, raw) in defaults {
+            b.extend_from_slice(&fid.to_le_bytes());
+            b.extend_from_slice(&(raw.len() as u16).to_le_bytes());
+            b.extend_from_slice(raw);
+        }
+    }
+    b
+}
+
+/// Parse the SP86 defaults trailer from a type-def blob (the bytes
+/// after `name` + the `n` length-delimited fields). Empty if there is
+/// no trailer (an old blob, or no defaults) or on any short read —
+/// defaults are a pure accelerator/convenience, never load-bearing.
+pub fn decode_type_defaults(b: &[u8]) -> Vec<(u16, Vec<u8>)> {
+    let parse = || -> Option<Vec<(u16, Vec<u8>)>> {
+        let mut p = 0usize;
+        let _ = get_str(b, &mut p)?; // name
+        let n = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
+        p += 2;
+        for _ in 0..n {
+            let fl =
+                u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
+            p += 2 + fl;
+        }
+        if p >= b.len() {
+            return Some(Vec::new()); // no trailer (old blob / no defaults)
+        }
+        let nd = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
+        p += 2;
+        let mut out = Vec::with_capacity(nd);
+        for _ in 0..nd {
+            let fid = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?);
+            p += 2;
+            let l =
+                u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
+            p += 2;
+            out.push((fid, b.get(p..p + l)?.to_vec()));
+            p += l;
+        }
+        Some(out)
+    };
+    parse().unwrap_or_default()
+}
+
 /// The whole catalog, persisted by the state machine as object type 0.
 #[derive(Clone, Debug, Default)]
 pub struct Catalog {
@@ -295,7 +358,11 @@ impl Catalog {
         for t in &self.types {
             b.extend_from_slice(&t.type_id.to_le_bytes());
             b.extend_from_slice(&t.schema_ver.to_le_bytes());
-            let def = encode_type_def(&t.name, &t.fields);
+            let def = encode_type_def_with_defaults(
+                &t.name,
+                &t.fields,
+                &t.defaults,
+            );
             b.extend_from_slice(&(def.len() as u32).to_le_bytes());
             b.extend_from_slice(&def);
             b.extend_from_slice(&(t.indexes.len() as u16).to_le_bytes());
@@ -352,7 +419,9 @@ impl Catalog {
             p += 4;
             let dl = u32::from_le_bytes(b.get(p..p + 4)?.try_into().ok()?) as usize;
             p += 4;
-            let (name, fields) = decode_type_def(b.get(p..p + dl)?)?;
+            let def_slice = b.get(p..p + dl)?;
+            let (name, fields) = decode_type_def(def_slice)?;
+            let defaults = decode_type_defaults(def_slice);
             p += dl;
             let ni = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
             p += 2;
@@ -430,6 +499,7 @@ impl Catalog {
                 triggers,
                 ordered,
                 composite,
+                defaults,
             });
         }
         Some(Catalog {
@@ -454,7 +524,7 @@ mod tests {
 
     #[test]
     fn layout_is_pure_and_deterministic() {
-        let t = ObjectType { type_id: 1, name: "transfer".into(), schema_ver: 1, fields: sample_fields(), indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![] };
+        let t = ObjectType { type_id: 1, name: "transfer".into(), schema_ver: 1, fields: sample_fields(), indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![], defaults: vec![] };
         let a = t.compute_layout();
         let b = t.compute_layout();
         assert_eq!(a, b);
@@ -468,7 +538,7 @@ mod tests {
 
     #[test]
     fn appending_nullable_field_keeps_existing_offsets() {
-        let mut t = ObjectType { type_id: 1, name: "t".into(), schema_ver: 1, fields: sample_fields(), indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![] };
+        let mut t = ObjectType { type_id: 1, name: "t".into(), schema_ver: 1, fields: sample_fields(), indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![], defaults: vec![] };
         let before = t.compute_layout();
         t.fields.push(Field { field_id: 5, name: "memo".into(), kind: FieldKind::Char(32), nullable: true });
         t.schema_ver += 1;
@@ -490,8 +560,8 @@ mod tests {
     fn catalog_roundtrip() {
         let mut c = Catalog::default();
         c.next_type_id = 3;
-        c.types.push(ObjectType { type_id: 1, name: "a".into(), schema_ver: 2, fields: sample_fields(), indexes: vec![3], unique: vec![3], fks: vec![(3, 9, 2)], checks: vec![vec![1, 2, 3]], triggers: vec![vec![7, 7]], ordered: vec![2], composite: vec![vec![1, 2]] });
-        c.types.push(ObjectType { type_id: 2, name: "b".into(), schema_ver: 1, fields: vec![], indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![] });
+        c.types.push(ObjectType { type_id: 1, name: "a".into(), schema_ver: 2, fields: sample_fields(), indexes: vec![3], unique: vec![3], fks: vec![(3, 9, 2)], checks: vec![vec![1, 2, 3]], triggers: vec![vec![7, 7]], ordered: vec![2], composite: vec![vec![1, 2]], defaults: vec![(1, vec![9, 0, 0, 0])] });
+        c.types.push(ObjectType { type_id: 2, name: "b".into(), schema_ver: 1, fields: vec![], indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![], defaults: vec![] });
         let enc = c.encode();
         let dec = Catalog::decode(&enc).unwrap();
         assert_eq!(dec.next_type_id, 3);

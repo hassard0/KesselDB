@@ -670,6 +670,9 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
         let name = p.ident()?;
         p.punct('(')?;
         let mut fields = Vec::new();
+        // SP86: per-column DEFAULT, keyed by the field id the engine
+        // will assign (positional, 1-based — matches CreateType).
+        let mut defaults: Vec<(u16, Vec<u8>)> = Vec::new();
         loop {
             let cname = p.ident()?;
             let tname = p.ident()?;
@@ -687,10 +690,22 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
                 p.expect_kw("NULL")?;
                 nullable = false;
             }
+            let kind = kind_of(&tname, arg)?;
+            if p.kw("DEFAULT") {
+                let v = match p.next() {
+                    Some(Tok::Int(n)) => lit_to_value(&Lit::Int(n), kind)?,
+                    Some(Tok::Str(s)) => lit_to_value(&Lit::Str(s), kind)?,
+                    _ => return Err("DEFAULT needs a literal".into()),
+                };
+                let raw = kessel_codec::raw_from_value(kind, &v).ok_or(
+                    "DEFAULT NULL is not supported (omit the column instead)",
+                )?;
+                defaults.push(((fields.len() + 1) as u16, raw));
+            }
             fields.push(Field {
                 field_id: 0,
                 name: cname,
-                kind: kind_of(&tname, arg)?,
+                kind,
                 nullable,
             });
             match p.next() {
@@ -700,7 +715,9 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
             }
         }
         return Ok(Op::CreateType {
-            def: encode_type_def(&name, &fields),
+            def: kessel_catalog::encode_type_def_with_defaults(
+                &name, &fields, &defaults,
+            ),
         });
     }
 
@@ -778,11 +795,20 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
                 match cols.iter().position(|c| *c == f.name) {
                     Some(idx) => values.push(lit_to_value(&raw[idx], f.kind)?),
                     None => {
-                        if f.nullable {
+                        // SP86: an omitted column takes its DEFAULT if
+                        // one was declared; else NULL (nullable) or a
+                        // clean error (NOT NULL, no default).
+                        if let Some((_, d)) =
+                            ot.defaults.iter().find(|(fid, _)| *fid == f.field_id)
+                        {
+                            values.push(kessel_codec::value_from_raw(
+                                f.kind, d,
+                            ));
+                        } else if f.nullable {
                             values.push(Value::Null);
                         } else {
                             return Err(format!(
-                                "missing NOT NULL column `{}`",
+                                "missing NOT NULL column `{}` (no default)",
                                 f.name
                             ));
                         }
@@ -1403,6 +1429,77 @@ mod tests {
     fn run(sm: &mut StateMachine<MemVfs>, op: u64, sql: &str) -> OpResult {
         let o = compile(sql, sm.catalog()).expect("compile");
         sm.apply(op, o)
+    }
+
+    /// SP86: a column `DEFAULT` is applied to omitted INSERT columns
+    /// (including a `NOT NULL` column that has a default), an explicit
+    /// value overrides it, a `NOT NULL` column with no default still
+    /// errors, the default survives a catalog round-trip, and it is
+    /// deterministic.
+    #[test]
+    fn column_default_is_applied_and_persists() {
+        let build = || {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            run(
+                &mut sm,
+                1,
+                "CREATE TABLE t (a U32 NOT NULL, b I64 DEFAULT 7, \
+                 c U32 NOT NULL DEFAULT 3)",
+            );
+            sm
+        };
+        let row = |sm: &mut StateMachine<MemVfs>, op, id: u128| -> (u32, i64, u32) {
+            match sm.apply(op, compile(&format!("SELECT * FROM t ID {id}"), sm.catalog()).unwrap())
+            {
+                OpResult::Got(r) => {
+                    let ot = sm.catalog().get(1).unwrap().clone();
+                    let v = kessel_codec::decode(&ot, &r).unwrap();
+                    let a = match v[0] { Value::Uint(u) => u as u32, _ => panic!() };
+                    let b = match v[1] { Value::Int(i) => i as i64, _ => panic!() };
+                    let c = match v[2] { Value::Uint(u) => u as u32, _ => panic!() };
+                    (a, b, c)
+                }
+                o => panic!("unexpected {o:?}"),
+            }
+        };
+        let mut sm = build();
+        // Omit b and c → both take their declared defaults (c is NOT
+        // NULL but has a default, so it's satisfied).
+        assert_eq!(
+            run(&mut sm, 2, "INSERT INTO t (id, a) VALUES (1, 5)"),
+            OpResult::Ok
+        );
+        assert_eq!(row(&mut sm, 3, 1), (5, 7, 3));
+        // Explicit values override the defaults.
+        assert_eq!(
+            run(&mut sm, 4, "INSERT INTO t (id, a, b, c) VALUES (2, 9, -1, 100)"),
+            OpResult::Ok
+        );
+        assert_eq!(row(&mut sm, 5, 2), (9, -1, 100));
+        // A NOT NULL column WITHOUT a default is still required.
+        run(&mut sm, 6, "CREATE TABLE u (x U32 NOT NULL)");
+        assert!(
+            compile("INSERT INTO u (id) VALUES (1)", sm.catalog()).is_err(),
+            "NOT NULL with no default must still be required"
+        );
+        // Default survives a full catalog encode/decode round-trip.
+        let cat2 = kessel_catalog::Catalog::decode(
+            &sm.catalog().encode(),
+        )
+        .unwrap();
+        assert_eq!(
+            cat2.get(1).unwrap().defaults,
+            sm.catalog().get(1).unwrap().defaults,
+            "defaults must persist through the catalog blob"
+        );
+        assert!(
+            !cat2.get(1).unwrap().defaults.is_empty(),
+            "two defaults were declared"
+        );
+        // Deterministic.
+        let a = build();
+        let b2 = build();
+        assert_eq!(a.digest(), b2.digest());
     }
 
     /// SP70: a selective range query must be sub-linear with a RANGE
@@ -2384,6 +2481,7 @@ mod tests {
             type_id: 1, name, schema_ver: 1, fields,
             indexes: vec![], unique: vec![], fks: vec![], checks: vec![],
             triggers: vec![], ordered: vec![], composite: vec![],
+            defaults: vec![],
         };
         // fetch the row and decode it using ONLY the described schema
         match run(&mut sm, 4, "SELECT * FROM acct ID 1") {

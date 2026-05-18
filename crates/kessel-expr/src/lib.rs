@@ -570,6 +570,7 @@ mod tests {
             triggers: vec![],
             ordered: vec![],
             composite: vec![],
+            defaults: vec![],
         }
     }
     fn rec(age: i32, bal: i64) -> Vec<u8> {

@@ -768,10 +768,11 @@ impl<V: Vfs> StateMachine<V> {
     /// For every object being deleted, find children (not themselves being
     /// deleted) whose FK with `on_delete = SET NULL (3)` references it.
     /// Returns `(child_type, child_id, field_idx, offset, width)`, deduped.
+    #[allow(clippy::type_complexity)]
     fn collect_set_null(
         &self,
         closure: &[(u32, [u8; 16])],
-    ) -> Vec<(u32, [u8; 16], usize, usize, usize)> {
+    ) -> Vec<(u32, [u8; 16], usize, usize, usize, Option<Vec<u8>>)> {
         let in_closure: std::collections::HashSet<(u32, [u8; 16])> =
             closure.iter().copied().collect();
         let mut seen: std::collections::HashSet<(u32, [u8; 16], usize)> =
@@ -781,7 +782,8 @@ impl<V: Vfs> StateMachine<V> {
             for ct in &self.catalog.types {
                 let layout = ct.compute_layout();
                 for (fid, rt, od) in &ct.fks {
-                    if *rt != *dt || *od != 3 {
+                    // 3 = SET NULL, 4 = SET DEFAULT (SP86).
+                    if *rt != *dt || (*od != 3 && *od != 4) {
                         continue;
                     }
                     let fi = match ct.fields.iter().position(|f| f.field_id == *fid) {
@@ -790,13 +792,31 @@ impl<V: Vfs> StateMachine<V> {
                     };
                     let w = ct.fields[fi].kind.width() as usize;
                     let off = layout.offsets[fi];
+                    // SET DEFAULT writes the child column's declared
+                    // default (width-normalised); if there is none it
+                    // degrades to SET NULL — documented, deterministic.
+                    let dflt = if *od == 4 {
+                        ct.defaults
+                            .iter()
+                            .find(|(f, _)| f == fid)
+                            .map(|(_, d)| Self::norm(d, w))
+                    } else {
+                        None
+                    };
                     let val = Self::norm(did, w);
                     for cid in self.idx_lookup(ct.type_id, *fid, &val) {
                         if in_closure.contains(&(ct.type_id, cid)) {
                             continue;
                         }
                         if seen.insert((ct.type_id, cid, fi)) {
-                            out.push((ct.type_id, cid, fi, off, w));
+                            out.push((
+                                ct.type_id,
+                                cid,
+                                fi,
+                                off,
+                                w,
+                                dflt.clone(),
+                            ));
                         }
                     }
                 }
@@ -1206,6 +1226,11 @@ impl<V: Vfs> StateMachine<V> {
                     triggers: Vec::new(),
                     ordered: Vec::new(),
                     composite: Vec::new(),
+                    // SP86: per-column defaults ride a backward-compat
+                    // trailer in the type-def blob; the parser keyed
+                    // them by positional (1-based) id, which is exactly
+                    // the field id assigned above.
+                    defaults: kessel_catalog::decode_type_defaults(&def),
                 });
                 self.catalog.next_type_id += 1;
                 match self.persist_catalog(op_number) {
@@ -1449,22 +1474,34 @@ impl<V: Vfs> StateMachine<V> {
                 if own_txn {
                     self.storage.begin_txn();
                 }
-                for (ct, cid, fi, off, w) in &set_null {
+                for (ct, cid, fi, off, w, dflt) in &set_null {
                     let k = make_key(*ct, cid);
                     let old = match self.storage.get(&k) {
                         Some(r) => r,
                         None => continue,
                     };
                     let mut new = old.clone();
-                    for b in new.get_mut(*off..*off + *w).into_iter().flatten() {
-                        *b = 0;
-                    }
-                    // Set the codec null bit when the record is codec-shaped.
-                    if let Some(t) = self.catalog.get(*ct) {
-                        if Self::is_codec_record(t, &new) {
-                            let bit = kessel_catalog::SCHEMA_VER_BYTES + 2 + fi / 8;
-                            if bit < new.len() {
-                                new[bit] |= 1 << (fi % 8);
+                    if let Some(d) = dflt {
+                        // SET DEFAULT: write the default value bytes; it
+                        // is a present value, so do NOT set the null bit.
+                        if let Some(slot) = new.get_mut(*off..*off + *w) {
+                            slot.copy_from_slice(&Self::norm(d, *w));
+                        }
+                    } else {
+                        // SET NULL: zero the field and set the null bit
+                        // (codec-shaped records).
+                        for b in
+                            new.get_mut(*off..*off + *w).into_iter().flatten()
+                        {
+                            *b = 0;
+                        }
+                        if let Some(t) = self.catalog.get(*ct) {
+                            if Self::is_codec_record(t, &new) {
+                                let bit =
+                                    kessel_catalog::SCHEMA_VER_BYTES + 2 + fi / 8;
+                                if bit < new.len() {
+                                    new[bit] |= 1 << (fi % 8);
+                                }
                             }
                         }
                     }
@@ -2283,8 +2320,12 @@ impl<V: Vfs> StateMachine<V> {
             }
 
             Op::AddForeignKey { type_id, field_id, ref_type_id, on_delete } => {
-                if on_delete > 3 {
-                    return OpResult::SchemaError("on_delete must be 0|1|2|3".into());
+                if on_delete > 4 {
+                    return OpResult::SchemaError(
+                        "on_delete must be 0|1|2|3|4 (0=NoAction 1=Restrict \
+                         2=Cascade 3=SetNull 4=SetDefault)"
+                            .into(),
+                    );
                 }
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
@@ -3426,6 +3467,7 @@ mod tests {
             triggers: vec![],
             ordered: vec![],
             composite: vec![],
+            defaults: vec![],
         };
         vec![0u8; t.compute_layout().record_size]
     }
@@ -4064,6 +4106,7 @@ mod tests {
             triggers: vec![],
             ordered: vec![],
             composite: vec![],
+            defaults: vec![],
         };
         let mut b = vec![0u8; t.compute_layout().record_size];
         let o0 = t.compute_layout().offsets[0];
@@ -4250,6 +4293,7 @@ mod tests {
             triggers: vec![],
             ordered: vec![],
             composite: vec![],
+            defaults: vec![],
         }
         .compute_layout()
     }
@@ -4502,6 +4546,7 @@ mod tests {
                 Field { field_id: 2, name: "bal".into(), kind: FieldKind::I64, nullable: false },
             ],
             indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![],
+            defaults: vec![],
         };
         let l = ot.compute_layout();
         (l.offsets[0], l.offsets[1])
@@ -4681,6 +4726,93 @@ mod tests {
         );
     }
 
+    /// SP86: `ON DELETE SET DEFAULT` (action 4) writes the child FK
+    /// column's declared default (a present value, no null bit) when
+    /// the parent is deleted; with no declared default it deterministically
+    /// degrades to SET NULL.
+    #[test]
+    fn on_delete_set_default_writes_column_default() {
+        use kessel_codec::{decode, encode, Value};
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType {
+            def: encode_type_def("parent", &[
+                Field { field_id: 0, name: "a".into(), kind: FieldKind::U64, nullable: false },
+            ]),
+        });
+        // child.pref U128 with a declared DEFAULT of 777.
+        sm.apply(2, Op::CreateType {
+            def: kessel_catalog::encode_type_def_with_defaults(
+                "child",
+                &[Field { field_id: 0, name: "pref".into(), kind: FieldKind::U128, nullable: true }],
+                &[(1u16, 777u128.to_le_bytes().to_vec())],
+            ),
+        });
+        let cot = sm.catalog().get(2).unwrap().clone();
+        assert_eq!(
+            sm.catalog().get(2).unwrap().defaults,
+            vec![(1u16, 777u128.to_le_bytes().to_vec())],
+            "child default loaded from the type-def trailer"
+        );
+        sm.apply(3, Op::Create { type_id: 1, id: ObjectId::from_u128(5), record: vec![1] });
+        assert_eq!(
+            sm.apply(4, Op::AddForeignKey { type_id: 2, field_id: 1, ref_type_id: 1, on_delete: 4 }),
+            OpResult::Ok
+        );
+        sm.apply(5, Op::Create {
+            type_id: 2,
+            id: ObjectId::from_u128(50),
+            record: encode(&cot, &[Value::Uint(5)]).unwrap(),
+        });
+        // Delete the parent → child.pref becomes the DEFAULT (777),
+        // NOT NULL; child still exists and re-indexes under 777.
+        assert_eq!(
+            sm.apply(6, Op::Delete { type_id: 1, id: ObjectId::from_u128(5) }),
+            OpResult::Ok
+        );
+        match sm.apply(7, Op::GetById { type_id: 2, id: ObjectId::from_u128(50) }) {
+            OpResult::Got(rec) => {
+                assert_eq!(
+                    decode(&cot, &rec).unwrap()[0],
+                    Value::Uint(777),
+                    "SET DEFAULT writes the column default, not NULL"
+                );
+            }
+            o => panic!("child should still exist, got {o:?}"),
+        }
+        assert_eq!(
+            ids_of(sm.apply(8, Op::FindBy { type_id: 2, field_id: 1, value: 777u128.to_le_bytes().to_vec() })),
+            vec![50],
+            "child re-indexed under the default value"
+        );
+
+        // No-default child + on_delete=4 ⇒ deterministic SET NULL.
+        sm.apply(10, Op::CreateType {
+            def: encode_type_def("c2", &[
+                Field { field_id: 0, name: "pref".into(), kind: FieldKind::U128, nullable: true },
+            ]),
+        });
+        let c2 = sm.catalog().get(3).unwrap().clone();
+        sm.apply(11, Op::Create { type_id: 1, id: ObjectId::from_u128(6), record: vec![2] });
+        sm.apply(12, Op::AddForeignKey { type_id: 3, field_id: 1, ref_type_id: 1, on_delete: 4 });
+        sm.apply(13, Op::Create {
+            type_id: 3,
+            id: ObjectId::from_u128(60),
+            record: encode(&c2, &[Value::Uint(6)]).unwrap(),
+        });
+        assert_eq!(
+            sm.apply(14, Op::Delete { type_id: 1, id: ObjectId::from_u128(6) }),
+            OpResult::Ok
+        );
+        match sm.apply(15, Op::GetById { type_id: 3, id: ObjectId::from_u128(60) }) {
+            OpResult::Got(rec) => assert_eq!(
+                decode(&c2, &rec).unwrap()[0],
+                Value::Null,
+                "no declared default ⇒ SET DEFAULT degrades to SET NULL"
+            ),
+            o => panic!("child should still exist, got {o:?}"),
+        }
+    }
+
     #[test]
     fn on_delete_set_null_is_deterministic() {
         use kessel_codec::{encode, Value};
@@ -4721,6 +4853,7 @@ mod tests {
                 Field { field_id: 2, name: "bal".into(), kind: FieldKind::I64, nullable: false },
             ],
             indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![],
+            defaults: vec![],
         };
         let l = ot.compute_layout();
         let mut b = vec![0u8; l.record_size];
@@ -4896,6 +5029,7 @@ mod tests {
                 Field { field_id: 2, name: "big".into(), kind: FieldKind::U64, nullable: false },
             ],
             indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![],
+            defaults: vec![],
         };
         let l = ot.compute_layout();
         (l.offsets[0], l.offsets[1])
@@ -4906,7 +5040,7 @@ mod tests {
             let ot = ObjectType { type_id:1,name:"rng".into(),schema_ver:1,fields:vec![
                 Field{field_id:1,name:"score".into(),kind:FieldKind::I32,nullable:false},
                 Field{field_id:2,name:"big".into(),kind:FieldKind::U64,nullable:false}],
-                indexes:vec![],unique:vec![],fks:vec![],checks:vec![],triggers:vec![],ordered:vec![],composite:vec![] };
+                indexes:vec![],unique:vec![],fks:vec![],checks:vec![],triggers:vec![],ordered:vec![],composite:vec![],defaults:vec![] };
             ot.compute_layout().record_size
         }];
         b[o0..o0 + 4].copy_from_slice(&score.to_le_bytes());
@@ -5463,6 +5597,7 @@ mod tests {
                 Field { field_id: 3, name: "v".into(), kind: FieldKind::U32, nullable: false },
             ],
             indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![],
+            defaults: vec![],
         };
         let l = ot.compute_layout();
         (l.offsets[2], 4)

@@ -199,6 +199,7 @@ mod tests {
             triggers: vec![],
             ordered: vec![],
             composite: vec![],
+            defaults: vec![],
         }
     }
 

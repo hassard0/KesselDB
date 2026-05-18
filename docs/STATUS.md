@@ -80,6 +80,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP70 — range-index narrowing** | **done** | planner emits half-range hints on order-indexed cols; engine combines all hints on a field into one tight order-index interval; `Op::QueryRows.range_preds` appended wire-compatibly (old frame ⇒ empty ⇒ unchanged); SP62/63 superset-verify invariant preserved, oracle strengthened (pure-range + band + mixed, ~660 queries); **the Linux reference server band 35,007→313 µs (~112×)**; **169 green**, determinism/seed-7 intact |
 | **SP71 — CLI & output delight** | **done** | `--json` mode (stable per-statement object: status/value/rows, RFC-8259 escaped), readable `DESCRIBE`/`\d` schema table (was "GOT N bytes"), shell `\?`/`\d`/`\timing`/`\q` + friendly errors — all pure/unit-tested in `kessel-client`, no new server op (client-only; determinism untouched); **171 green** |
 | **SP72 — self-describing typed result** | **done** | `Op::Join` emits `[KTR1][deflen][typedef][recs]` (combined `<t>.<col>` schema, records re-encoded not raw-concat — header/bitmap correctness verified e2e); client `render_typed_result[_json]` reuses the tested `render_rows` → JOINs render as tables/JSON (was opaque); read-op only, determinism/seed-7 intact; **172 green** |
+| **SP88 — large seed-corpus sweep (M3 hardening)** | **done** | `large_seed_corpus_is_deterministic_and_converges`: determinism over seeds 0..120 (run-twice bit-identical) + post-heal convergence over 0..40 (vs focused 0..12), with the established quiesce/state-transfer catch-up. Pure test addition, no engine change. Disk-fault-*during-view-change* honestly restated (needs a corruptible-Vfs VSR harness — scoped follow-up, not faked; storage torn-write/crash recovery + partition/heal already tested) |
 | **SP86 — column DEFAULT + ON DELETE SET DEFAULT** | **done** | `ObjectType.defaults` via a backward-compat trailer in the length-delimited type-def blob (encode/decode_type_def's 77 callers untouched; no on-disk-catalog hazard); SQL `DEFAULT <lit>` + INSERT fills omitted cols (incl NOT-NULL-with-default); FK action 4 SET DEFAULT (degrades to SET NULL w/o a default); SM + SQL + catalog-roundtrip tests; seed-7 intact. (ON UPDATE = model-inapplicable, documented separately) |
 | **SP85 — reads in a transaction (reclassified)** | **done** | `scan_range` already overlay-aware (SP25) ⇒ read-your-writes for writes-in-batch works (SP84); interactive mid-txn SELECT is a deliberate non-goal (atomic non-interactive batch — interactive would serialize the engine). Mid-txn SELECT/DESCRIBE/EXPLAIN now a CLEAR ERROR (not silent buffered Ok); USAGE reclassified as by-design boundary; test proves reject + write-read-your-writes; seed-7 intact |
 | **SP84 — UPDATE inside a transaction** | **done** | `Op::UpdateSet` (deterministic replicated RMW: overlay-aware read → splice → re-encode → delegate to proven Op::Update path) composes in `Op::Txn`; `TXN_TAG` builder lowers buffered `Stmt::Update`→`UpdateSet` (`kessel_codec::raw_from_value`); SM + e2e SQL `BEGIN;UPDATE;COMMIT`/`ROLLBACK`/abort tests; seed-7 intact. Boundary: `SET col=NULL` in-txn unsupported (clear error; works outside txn) |
@@ -143,12 +144,16 @@ recovery. Tests: linearizable-vs-reference (single-client total order),
 same-seed determinism, primary-crash → view-change → progress + survivor
 convergence, convergence under 25% message loss.
 
-**Explicit hardening backlog (listed, not hidden):** disk corruption
-*during* a view change, large randomized seed-corpus sweep (CI),
-cluster membership reconfiguration — still open. **Since closed:** the
-asymmetric/adversarial partition matrix incl. seed 7 (SP46), and real
-socket transport — VSR now runs over real TCP (SP38) and a full
-multi-shard deployment runs over sockets (SP78–83).
+**Explicit hardening backlog (listed, not hidden):** byte corruption
+injected *precisely during* a view change (needs a corruptible-Vfs
+VSR harness — scoped follow-up, not faked; storage torn-write/crash
+recovery and partition/heal are already tested), and cluster
+membership reconfiguration — still open. **Since closed:** the
+large randomized seed-corpus sweep (SP88: determinism 0..120 +
+post-heal convergence 0..40), the asymmetric/adversarial partition
+matrix incl. seed 7 (SP46), and real socket transport — VSR now runs
+over real TCP (SP38) and a full multi-shard deployment runs over
+sockets (SP78–83).
 
 ## Sub-project 2 — variable-length overflow store (done)
 

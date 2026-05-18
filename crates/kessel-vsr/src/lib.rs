@@ -1436,6 +1436,66 @@ pub mod sim {
         }
     }
 
+    /// SP88: a *large* randomized seed-corpus sweep (the M3-hardening
+    /// item). Determinism is checked over a wide seed range; post-heal
+    /// convergence over a broader range than the focused `0..12`
+    /// corpus. Pure test addition — exercises the existing
+    /// fault/partition model at scale, no engine change.
+    #[test]
+    fn large_seed_corpus_is_deterministic_and_converges() {
+        // (a) Determinism at scale: many seeds, each run twice, must be
+        // bit-for-bit identical (no hidden nondeterminism across the
+        // adversarial schedule space).
+        for seed in 0..120u64 {
+            let run = |s: u64| {
+                let mut c = Cluster::new_partitioned(3, s, 12);
+                let reqs = vec![
+                    (1u128, 1u64, def()),
+                    (1, 2, Op::Create { type_id: 1, id: ObjectId::from_u128(1), record: vec![9] }),
+                    (3, 1, Op::Create { type_id: 1, id: ObjectId::from_u128(2), record: vec![7] }),
+                ];
+                c.run(&reqs, 3_000);
+                c.live_digests()
+            };
+            assert_eq!(run(seed), run(seed), "seed {seed} non-deterministic");
+        }
+        // (b) Post-heal convergence over a broader corpus (0..40):
+        // under partition progress may stall, but after heal the
+        // cluster MUST finish and every replica MUST reconverge.
+        for seed in 0..40u64 {
+            let mut c = Cluster::new_partitioned(3, seed, 12);
+            let mut reqs = vec![(7u128, 1u64, def())];
+            for i in 0..8u64 {
+                reqs.push((
+                    7,
+                    i + 2,
+                    Op::Create {
+                        type_id: 1,
+                        id: ObjectId::from_u128(i as u128),
+                        record: vec![i as u8],
+                    },
+                ));
+            }
+            let _ = c.run(&reqs, 4_000);
+            c.heal();
+            let after = c.run(&reqs, 30_000);
+            assert_ne!(
+                after,
+                usize::MAX,
+                "seed {seed}: stalled even after heal"
+            );
+            // Let any previously-isolated replica catch up (state
+            // transfer / heartbeats) before checking convergence —
+            // same discipline as the focused corpus test.
+            c.quiesce(8_000);
+            let d = c.live_digests();
+            assert!(
+                d.iter().all(|x| *x == d[0]),
+                "seed {seed}: replicas diverged after heal: {d:?}"
+            );
+        }
+    }
+
     #[test]
     fn ordered_index_replicates_and_converges() {
         let mut c = Cluster::new(3, 41, 0);

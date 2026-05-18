@@ -61,6 +61,13 @@ pub enum Auth {
 
 pub const DEFAULT_MAX_BODY: u64 = 64 * 1024 * 1024;
 
+/// Test-only accessor for `http::get_resp` (the crate-internal function that
+/// exposes response headers). Not part of the stable public API.
+#[doc(hidden)]
+pub fn http_get_resp_for_test(url: &str, max_body: u64) -> (Vec<(String, String)>, Vec<u8>) {
+    http::get_resp(url, &Auth::None, max_body).expect("get_resp")
+}
+
 /// Fetch + parse. Returns one `Vec<(column-index, raw FieldKind bytes)>`
 /// per row, columns in `cols` order. Pure given the bytes the server
 /// returned (the only nondeterminism is the network, owned by `http`).

@@ -12,7 +12,13 @@ use std::time::Duration;
 /// streams a huge body without ever sending the header terminator.
 const MAX_HEADER_SLACK: u64 = 64 * 1024;
 
-pub fn get(url: &str, auth: &Auth, max_body: u64) -> Result<Vec<u8>, FetchError> {
+/// Like `get` but also returns the response headers as `(name, value)` pairs
+/// (names stored as-received; callers compare with `eq_ignore_ascii_case`).
+pub(crate) fn get_resp(
+    url: &str,
+    auth: &Auth,
+    max_body: u64,
+) -> Result<(Vec<(String, String)>, Vec<u8>), FetchError> {
     let rest = url
         .strip_prefix("http://")
         .ok_or_else(|| {
@@ -88,10 +94,18 @@ pub fn get(url: &str, auth: &Auth, max_body: u64) -> Result<Vec<u8>, FetchError>
         return Err(FetchError::Http(format!("HTTP {code}")));
     }
     let mut chunked = false;
+    let mut headers: Vec<(String, String)> = Vec::new();
     for l in lines {
-        let ll = l.to_ascii_lowercase();
-        if ll.starts_with("transfer-encoding:") && ll.contains("chunked") {
-            chunked = true;
+        // Collect every header line as (name, value), split on the first ':'.
+        if let Some(colon) = l.find(':') {
+            let name = l[..colon].trim().to_string();
+            let value = l[colon + 1..].trim().to_string();
+            // Keep existing chunked detection working by deriving it from collected headers.
+            let ll = l.to_ascii_lowercase();
+            if ll.starts_with("transfer-encoding:") && ll.contains("chunked") {
+                chunked = true;
+            }
+            headers.push((name, value));
         }
     }
     let body_raw = &raw[sep + 4..];
@@ -103,7 +117,12 @@ pub fn get(url: &str, auth: &Auth, max_body: u64) -> Result<Vec<u8>, FetchError>
     if body.len() as u64 > max_body {
         return Err(FetchError::TooLarge(max_body));
     }
-    Ok(body)
+    Ok((headers, body))
+}
+
+/// Returns only the response body. Thin wrapper around `get_resp`.
+pub fn get(url: &str, auth: &Auth, max_body: u64) -> Result<Vec<u8>, FetchError> {
+    Ok(get_resp(url, auth, max_body)?.1)
 }
 
 fn dechunk(mut b: &[u8]) -> Result<Vec<u8>, FetchError> {

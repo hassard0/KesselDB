@@ -119,3 +119,27 @@ fn ndjson_over_http_round_trips() {
     assert_eq!(rows, vec![vec![vec![3,0,0,0]], vec![vec![4,0,0,0]]]);
     let _ = h.join();
 }
+
+#[test]
+fn get_resp_exposes_link_header() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let h = std::thread::spawn(move || {
+        let (mut s, _) = l.accept().unwrap();
+        let mut b = [0u8; 512]; let _ = s.read(&mut b);
+        let body = b"[]";
+        let _ = s.write_all(format!(
+            "HTTP/1.1 200 OK\r\nLink: <http://x/p2>; rel=\"next\"\r\nContent-Length: {}\r\n\r\n",
+            body.len()).as_bytes());
+        let _ = s.write_all(body);
+    });
+    let (headers, body) = kessel_fetch::http_get_resp_for_test(
+        &format!("http://127.0.0.1:{port}/d"), kessel_fetch::DEFAULT_MAX_BODY);
+    assert_eq!(body, b"[]");
+    assert!(headers.iter().any(|(k,v)|
+        k.eq_ignore_ascii_case("link") && v.contains("rel=\"next\"")),
+        "headers were {headers:?}");
+    let _ = h.join();
+}

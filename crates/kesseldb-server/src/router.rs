@@ -43,6 +43,8 @@ enum Route {
     All,
     /// A transaction spanning these shards (sorted, len ≥ 2).
     Cross(Vec<usize>),
+    /// Router-side: fetch external data then submit captured rows.
+    Refresh,
     /// Not routable by this slice (clear error, never a wrong answer).
     Unsupported(&'static str),
 }
@@ -147,6 +149,13 @@ impl Router {
             | Op::DropField { .. }
             | Op::RenameField { .. }
             | Op::AddBalanceGuard { .. } => Route::All,
+            // External-source DDL is catalog state: every shard must
+            // apply identical Create/Drop in the same order, exactly
+            // like CreateType above.
+            Op::CreateExternalSource { .. }
+            | Op::DropExternalSource { .. } => Route::All,
+            // REFRESH is router-side: fetch then submit captured rows.
+            Op::RefreshExternalSource { .. } => Route::Refresh,
             // Catalog is identical on every shard — answer from one.
             Op::Describe { .. } => Route::One(0),
             Op::Txn { ops } => {
@@ -414,6 +423,21 @@ impl<'a> Conn<'a> {
                     _ => OpResult::SchemaError(
                         "cross-shard route on a non-Txn op".into(),
                     ),
+                }
+            }
+            Route::Refresh => {
+                #[cfg(feature = "external-sources")]
+                {
+                    self.do_refresh(op)
+                }
+                #[cfg(not(feature = "external-sources"))]
+                {
+                    let _ = op;
+                    OpResult::SchemaError(
+                        "REFRESH requires the server built with \
+                         --features external-sources"
+                            .into(),
+                    )
                 }
             }
             Route::Unsupported(why) => OpResult::SchemaError(why.into()),

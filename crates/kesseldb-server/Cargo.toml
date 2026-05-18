@@ -21,9 +21,14 @@ kessel-shard = { path = "../kessel-shard" }
 rustls = { version = "0.23", optional = true }
 rustls-pemfile = { version = "2", optional = true }
 
+# Opt-in external data sources (REFRESH). OFF by default. Enable with
+# `cargo build --features external-sources`.
+kessel-fetch = { path = "../kessel-fetch", optional = true }
+
 [features]
 default = []
 tls = ["dep:rustls", "dep:rustls-pemfile"]
+external-sources = ["dep:kessel-fetch"]
 
 [dev-dependencies]
 kessel-expr = { path = "../kessel-expr" }

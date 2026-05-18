@@ -14,6 +14,16 @@ kessel-codec = { path = "../kessel-codec" }
 kessel-catalog = { path = "../kessel-catalog" }
 kessel-client = { path = "../kessel-client" }
 
+# Opt-in TLS termination. OFF by default so the standard build stays
+# zero-dependency (`cargo build` pulls nothing extra). Enable with
+# `cargo build --features tls`.
+rustls = { version = "0.23", optional = true }
+rustls-pemfile = { version = "2", optional = true }
+
+[features]
+default = []
+tls = ["dep:rustls", "dep:rustls-pemfile"]
+
 [dev-dependencies]
 kessel-expr = { path = "../kessel-expr" }
 

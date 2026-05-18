@@ -16,7 +16,7 @@ use kessel_proto::{Op, OpResult};
 use kessel_sm::StateMachine;
 use std::collections::HashMap;
 use std::io;
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{TcpListener, ToSocketAddrs};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Sender, SyncSender};
@@ -94,11 +94,21 @@ pub struct ServerConfig {
     /// Max requests in flight to the engine; over this, callers get
     /// `OpResult::Unavailable` (backpressure) instead of unbounded queueing.
     pub max_inflight: usize,
+    /// Optional TLS. `Some((cert_pem, key_pem))` terminates TLS in-process
+    /// using the **opt-in `tls` cargo feature** (rustls). With the feature
+    /// off this field is ignored (the default build stays zero-dependency
+    /// and plaintext+token — deploy behind a TLS proxy / private network).
+    pub tls: Option<(std::path::PathBuf, std::path::PathBuf)>,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        ServerConfig { token: None, max_conns: 1024, max_inflight: 4096 }
+        ServerConfig {
+            token: None,
+            max_conns: 1024,
+            max_inflight: 4096,
+            tls: None,
+        }
     }
 }
 
@@ -119,7 +129,10 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// Run the auth handshake. Open mode → always Ok and *no* frame consumed.
 /// Token mode → read exactly one frame; accept iff it is `[0xFC] ++ token`,
 /// replying `Ok`; otherwise reply `Unauthorized` and reject.
-fn authenticate(stream: &mut TcpStream, token: &Option<Vec<u8>>) -> bool {
+fn authenticate<S: std::io::Read + std::io::Write>(
+    stream: &mut S,
+    token: &Option<Vec<u8>>,
+) -> bool {
     let Some(tok) = token else { return true };
     let frame = match read_frame(stream) {
         Ok(f) => f,
@@ -455,7 +468,11 @@ pub fn spawn_engine_cfg(
     }
 }
 
-fn handle_conn(mut stream: TcpStream, engine: EngineHandle, token: Option<Vec<u8>>) {
+fn handle_conn<S: std::io::Read + std::io::Write>(
+    mut stream: S,
+    engine: EngineHandle,
+    token: Option<Vec<u8>>,
+) {
     if !authenticate(&mut stream, &token) {
         return; // rejected; Unauthorized already written
     }
@@ -526,6 +543,32 @@ pub fn serve(listener: TcpListener, engine: EngineHandle) {
 /// connection past `max_conns` is dropped immediately.
 pub fn serve_cfg(listener: TcpListener, engine: EngineHandle, cfg: ServerConfig) {
     let active = Arc::new(AtomicUsize::new(0));
+
+    // Build the TLS acceptor once (opt-in `tls` feature). If TLS is
+    // requested but the feature is off, refuse to serve silently-insecure
+    // — fail loudly instead.
+    #[cfg(feature = "tls")]
+    let tls_acceptor: Option<std::sync::Arc<rustls::ServerConfig>> =
+        match &cfg.tls {
+            Some((cert, key)) => match tls::server_config(cert, key) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    eprintln!("kesseldb: TLS config error: {e}; refusing to serve");
+                    return;
+                }
+            },
+            None => None,
+        };
+    #[cfg(not(feature = "tls"))]
+    if cfg.tls.is_some() {
+        eprintln!(
+            "kesseldb: ServerConfig.tls set but built without the `tls` \
+             feature — refusing to serve insecure. Rebuild with \
+             `--features tls`."
+        );
+        return;
+    }
+
     for stream in listener.incoming().flatten() {
         if active.load(Ordering::Acquire) >= cfg.max_conns {
             drop(stream); // at capacity — refuse
@@ -535,10 +578,64 @@ pub fn serve_cfg(listener: TcpListener, engine: EngineHandle, cfg: ServerConfig)
         let e = engine.clone();
         let tok = cfg.token.clone();
         let a = active.clone();
+        #[cfg(feature = "tls")]
+        let acc = tls_acceptor.clone();
         std::thread::spawn(move || {
+            #[cfg(feature = "tls")]
+            {
+                if let Some(cfg) = acc {
+                    if let Some(tls_stream) = tls::accept(cfg, stream) {
+                        handle_conn(tls_stream, e, tok);
+                    }
+                } else {
+                    handle_conn(stream, e, tok);
+                }
+            }
+            #[cfg(not(feature = "tls"))]
             handle_conn(stream, e, tok);
             a.fetch_sub(1, Ordering::AcqRel);
         });
+    }
+}
+
+/// Opt-in TLS termination (the `tls` cargo feature; rustls). Kept behind
+/// the feature so the default build stays zero-dependency.
+#[cfg(feature = "tls")]
+mod tls {
+    use std::io;
+    use std::net::TcpStream;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    pub fn server_config(
+        cert_pem: &Path,
+        key_pem: &Path,
+    ) -> io::Result<Arc<rustls::ServerConfig>> {
+        let certs: Vec<_> = rustls_pemfile::certs(&mut io::BufReader::new(
+            std::fs::File::open(cert_pem)?,
+        ))
+        .collect::<Result<_, _>>()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let key = rustls_pemfile::private_key(&mut io::BufReader::new(
+            std::fs::File::open(key_pem)?,
+        ))?
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "no private key in PEM")
+        })?;
+        let cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        Ok(Arc::new(cfg))
+    }
+
+    /// Complete the TLS handshake; return a Read+Write stream or `None`.
+    pub fn accept(
+        cfg: Arc<rustls::ServerConfig>,
+        sock: TcpStream,
+    ) -> Option<rustls::StreamOwned<rustls::ServerConnection, TcpStream>> {
+        let conn = rustls::ServerConnection::new(cfg).ok()?;
+        Some(rustls::StreamOwned::new(conn, sock))
     }
 }
 
@@ -557,6 +654,32 @@ pub fn run_cfg(
     let listener = TcpListener::bind(addr)?;
     serve_cfg(listener, engine, cfg);
     Ok(())
+}
+
+#[cfg(all(test, feature = "tls"))]
+mod tls_tests {
+    use super::*;
+
+    #[test]
+    fn tls_config_rejects_bad_inputs() {
+        // Missing cert/key files → clean error, never a panic.
+        let bad = std::path::Path::new("/no/such/cert.pem");
+        assert!(tls::server_config(bad, bad).is_err());
+        // A real .pem file with no usable key → error, not a key.
+        let dir = std::env::temp_dir()
+            .join(format!("kdb-tls-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let junk = dir.join("junk.pem");
+        std::fs::write(&junk, b"-----BEGIN NOPE-----\nzz\n-----END NOPE-----\n")
+            .unwrap();
+        assert!(tls::server_config(&junk, &junk).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn server_config_default_has_tls_none() {
+        assert!(ServerConfig::default().tls.is_none());
+    }
 }
 
 #[cfg(test)]

@@ -154,10 +154,11 @@ backup + metrics). See the gate table in [`docs/STATUS.md`](docs/STATUS.md).
 
 Honest boundaries (documented, not hidden):
 
-- **Transport encryption (TLS)** is intentionally *not* in‑process — hand‑rolled
-  crypto would violate the zero‑dependency design. Deploy behind a TLS‑terminating
-  proxy or on a private/encrypted network; the wire is plaintext but
-  token‑authenticated with a timing‑safe comparison.
+- **Transport encryption (TLS)** is an **opt‑in cargo feature**
+  (`--features tls`, rustls) so the default build stays strictly
+  zero‑dependency. Without it the wire is plaintext but token‑authenticated
+  with a timing‑safe comparison (deploy behind a TLS proxy / private
+  network). Hand‑rolling TLS would be irresponsible, hence the feature.
 - **Non‑gating roadmap** (tracked, not blocking): balance‑guard helpers,
   cross‑shard transactions, destructive `ALTER TABLE` & `DROP INDEX` (`DROP TABLE` done, SP54), overflow GC.
 

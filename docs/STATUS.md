@@ -73,6 +73,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP63 — composite-index narrowing** | **done** | multi-col equality covered only by a composite index now narrowed via `FindByComposite` inside `Op::QueryRows` — **no protocol/replicated-op change**; oracle strengthened (+composite cases, ~480 queries); determinism untouched; **160 green** |
 | **SP64 — SQL `EXPLAIN`** | **done** | `EXPLAIN <stmt>` returns the real plan text (composite/index/seq scan, PK lookup, joins, DDL) without executing; CLI prints it; pure planner-layer, zero engine/determinism risk; **161 green** |
 | **SP65 — `kessel-crypto` (pgcrypto subset)** | **done** | zero-dep SHA-256 + HMAC-SHA256, NIST/RFC-4231 vector-verified; deterministic expr-VM `SHA256`/`HMAC256` opcodes (usable in CHECK/triggers); honest scope = hashing/HMAC only; **165 green** |
+| **SP66 — optional TLS** | **done** | opt-in `tls` cargo feature (rustls); generic `Read+Write` server I/O (refactor behaviour-identical, 165 green); `ServerConfig.tls`; default build stays zero-dep + plaintext+token; both builds verified clean |
 
 ## Production-readiness gate (precise, not vague)
 
@@ -93,7 +94,7 @@ hand-waving:
 | Failover-safe retries (server: any node serves committed result) | ✅ **SP41 done** |
 | Client-side new-primary auto-discovery (exactly-once) | ✅ **SP42 done** — `ClusterClient` rotates + retries same `(client,req)` |
 | Auth (shared-secret, timing-safe) + quotas + backpressure | ✅ **SP43 done** |
-| Transport encryption (TLS) | ⛔ deliberate zero-dep boundary — deploy behind TLS proxy / private net (documented, not faked) |
+| Transport encryption (TLS) | ✅ **SP66** — opt-in `tls` cargo feature (rustls); default build stays zero-dep + plaintext+token (deploy behind proxy/private net) |
 | Operational tooling (hot snapshot/backup, metrics) | ✅ **SP44 done** — consistent snapshot recovers exact digest; live `ServerStats` |
 | Index point-read perf (post-SP25 tradeoff) | ✅ **SP45 done** — O(1) SSTable prune; sub-linear, write scalability untouched |
 

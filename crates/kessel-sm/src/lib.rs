@@ -44,6 +44,14 @@ fn seq_entry_key(seq: u64) -> Key {
     make_key(SEQ_TYPE, &id)
 }
 
+/// Reserved keyspace for a shard's cross-shard apply cursor (SP80):
+/// the highest global sequence number this shard has processed.
+const XSHARD_TYPE: u32 = 0xFFFF_FFF1;
+
+fn xshard_cursor_key() -> Key {
+    make_key(XSHARD_TYPE, &[0u8; 16])
+}
+
 /// Build a `Create`/`Update` record with an overflow trailer:
 /// `[fixed][u16 n]( [u16 field_idx][u32 len][bytes] )*`. `fixed` must be the
 /// codec-encoded fixed-width record (handles will be patched in by the SM).
@@ -888,6 +896,94 @@ impl<V: Vfs> StateMachine<V> {
                     n += 1;
                 }
                 OpResult::Got(out)
+            }
+            Op::XshardApply { seq, ops } => {
+                // SP80: apply this shard's slice of the cross-shard txn
+                // at global `seq`. Strictly in-order and idempotent: the
+                // shard processes every global seq exactly once (its
+                // slice, or empty to just advance), tracking a cursor in
+                // a reserved keyspace (part of the digest ⇒ every replica
+                // of this shard group advances identically). The ordered
+                // sequencer log is the commit point.
+                let c = self
+                    .storage
+                    .get(&xshard_cursor_key())
+                    .and_then(|b| b.get(..8).map(|s| {
+                        u64::from_le_bytes(s.try_into().unwrap())
+                    }))
+                    .unwrap_or(0);
+                if seq <= c {
+                    return OpResult::Ok; // already applied (safe re-drive)
+                }
+                if seq != c + 1 {
+                    return OpResult::SchemaError(format!(
+                        "xshard out of order: have {c}, got {seq}"
+                    ));
+                }
+                for o in &ops {
+                    let ok = matches!(
+                        o,
+                        Op::Create { .. }
+                            | Op::Update { .. }
+                            | Op::Delete { .. }
+                    );
+                    if !ok {
+                        return OpResult::SchemaError(
+                            "xshard slice: only Create/Update/Delete \
+                             allowed"
+                                .into(),
+                        );
+                    }
+                }
+                let own = !self.storage.in_txn();
+                if own {
+                    self.storage.begin_txn();
+                }
+                for (i, o) in ops.into_iter().enumerate() {
+                    let r = self.apply(op_number + i as u64, o);
+                    // NOTE (slice-3 boundary): a slice op failing here is
+                    // a per-shard abort. Deterministic cross-shard abort
+                    // *agreement* (so all shards abort iff any would) is
+                    // slice 4; this slice's tests use non-conflicting
+                    // slices. We still roll this shard's slice back
+                    // atomically rather than apply it half-way.
+                    if matches!(
+                        r,
+                        OpResult::Exists
+                            | OpResult::NotFound
+                            | OpResult::SchemaError(_)
+                            | OpResult::Constraint(_)
+                    ) {
+                        if own {
+                            self.storage.abort_txn();
+                            if let Some(cc) = self.cache.as_mut() {
+                                cc.clear();
+                            }
+                        }
+                        return r;
+                    }
+                }
+                // Advance the cursor atomically with the slice.
+                if let Err(e) = self.storage.put(
+                    op_number,
+                    xshard_cursor_key(),
+                    seq.to_le_bytes().to_vec(),
+                ) {
+                    if own {
+                        self.storage.abort_txn();
+                    }
+                    return OpResult::SchemaError(format!("xshard cursor: {e}"));
+                }
+                if own {
+                    match self.storage.commit_txn() {
+                        Ok(()) => OpResult::Ok,
+                        Err(e) => {
+                            OpResult::SchemaError(format!("xshard commit: {e}"))
+                        }
+                    }
+                } else {
+                    OpResult::Ok
+                }
             }
             Op::CreateType { def } => {
                 let (name, raw_fields) = match decode_type_def(&def) {
@@ -3200,6 +3296,90 @@ mod tests {
         let (b2, sb) = build();
         assert_eq!(sa, sb);
         assert_eq!(a.digest(), b2.digest(), "sequencer must be deterministic");
+    }
+
+    /// SP80 (cross-shard slice 3): a shard applies cross-shard slices
+    /// strictly in global-seq order, exactly once (idempotent re-drive),
+    /// atomically (a failing slice rolls back and does NOT advance the
+    /// cursor), with empty slices just advancing — and deterministically.
+    #[test]
+    fn xshard_apply_is_in_order_idempotent_and_atomic() {
+        let mk = |v: u128| Op::Create {
+            type_id: 1,
+            id: ObjectId::from_u128(v),
+            record: vec![v as u8, 0, 0, 0, 0, 0, 0, 0],
+        };
+        let build = || {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            sm.apply(1, Op::CreateType { def: q_type_def() });
+            sm
+        };
+        let present = |sm: &mut StateMachine<MemVfs>, op, v: u128| {
+            matches!(
+                sm.apply(op, Op::GetById { type_id: 1, id: ObjectId::from_u128(v) }),
+                OpResult::Got(_)
+            )
+        };
+        let mut sm = build();
+
+        // seq 1 applies.
+        assert_eq!(
+            sm.apply(10, Op::XshardApply { seq: 1, ops: vec![mk(1)] }),
+            OpResult::Ok
+        );
+        assert!(present(&mut sm, 11, 1));
+        // Re-drive of seq 1 is a no-op even with different ops (the
+        // cursor already passed it) — exactly-once.
+        assert_eq!(
+            sm.apply(12, Op::XshardApply { seq: 1, ops: vec![mk(999)] }),
+            OpResult::Ok
+        );
+        assert!(!present(&mut sm, 13, 999), "re-drive must not re-apply");
+        // Out of order is refused (no gaps).
+        assert!(matches!(
+            sm.apply(14, Op::XshardApply { seq: 3, ops: vec![mk(3)] }),
+            OpResult::SchemaError(_)
+        ));
+        assert!(!present(&mut sm, 15, 3));
+        // Empty slice just advances the cursor (non-participant shard).
+        assert_eq!(
+            sm.apply(16, Op::XshardApply { seq: 2, ops: vec![] }),
+            OpResult::Ok
+        );
+        // Now seq 3 with a real op applies.
+        assert_eq!(
+            sm.apply(17, Op::XshardApply { seq: 3, ops: vec![mk(3)] }),
+            OpResult::Ok
+        );
+        assert!(present(&mut sm, 18, 3));
+        // Atomic: a slice whose 2nd op fails rolls back the 1st too and
+        // does NOT advance the cursor.
+        assert!(matches!(
+            sm.apply(
+                19,
+                Op::XshardApply { seq: 4, ops: vec![mk(4), mk(1)] } // mk(1) dup → Exists
+            ),
+            OpResult::Exists | OpResult::Constraint(_) | OpResult::SchemaError(_)
+        ));
+        assert!(!present(&mut sm, 20, 4), "failed slice must roll back");
+        // Cursor unchanged ⇒ seq 4 can still be retried cleanly.
+        assert_eq!(
+            sm.apply(21, Op::XshardApply { seq: 4, ops: vec![mk(4)] }),
+            OpResult::Ok
+        );
+        assert!(present(&mut sm, 22, 4));
+
+        // Deterministic: identical slice stream ⇒ identical digest.
+        let drive = |sm: &mut StateMachine<MemVfs>| {
+            sm.apply(30, Op::XshardApply { seq: 1, ops: vec![mk(7)] });
+            sm.apply(31, Op::XshardApply { seq: 2, ops: vec![] });
+            sm.apply(32, Op::XshardApply { seq: 3, ops: vec![mk(8)] });
+        };
+        let mut a = build();
+        let mut b2 = build();
+        drive(&mut a);
+        drive(&mut b2);
+        assert_eq!(a.digest(), b2.digest(), "xshard apply must be deterministic");
     }
 
     #[test]

@@ -161,6 +161,12 @@ pub enum Op {
     /// Read the ordered descriptor log from `from` (inclusive), up to
     /// `limit` entries (0 = all). Reply `Got([u64 seq][u32 len][payload])*`.
     SeqRead { from: u64, limit: u32 },
+    /// Apply this shard's slice of the cross-shard transaction at global
+    /// `seq` (SP80, slice 3). Idempotent and strictly in-order: a shard
+    /// processes every global seq in order (its slice, or empty to just
+    /// advance), tracking a cursor in a reserved keyspace. The ordered
+    /// sequencer log is the commit point — no 2PC, no locks.
+    XshardApply { seq: u64, ops: Vec<Op> },
     /// Inner equi-join (Sub-project 36): rows where
     /// `left.left_field == right.right_field` (raw fixed-width bytes).
     /// Returns up to `limit` joined rows as
@@ -293,6 +299,7 @@ impl Op {
             Op::AddBalanceGuard { .. } => 33,
             Op::SeqAppend { .. } => 34,
             Op::SeqRead { .. } => 35,
+            Op::XshardApply { .. } => 36,
             Op::Join { .. } => 28,
             Op::Aggregate { .. } => 20,
             Op::SelectFields { .. } => 21,
@@ -388,6 +395,13 @@ impl Op {
             Op::SeqRead { from, limit } => {
                 b.extend_from_slice(&from.to_le_bytes());
                 codec::put_u32(&mut b, *limit);
+            }
+            Op::XshardApply { seq, ops } => {
+                b.extend_from_slice(&seq.to_le_bytes());
+                codec::put_u32(&mut b, ops.len() as u32);
+                for o in ops {
+                    codec::put_bytes(&mut b, &o.encode());
+                }
             }
             Op::Describe { type_id } | Op::DropType { type_id } => {
                 codec::put_u32(&mut b, *type_id)
@@ -558,6 +572,20 @@ impl Op {
             33 => Op::AddBalanceGuard { type_id: c.u32()?, field_id: c.u16()? },
             34 => Op::SeqAppend { payload: c.bytes()? },
             35 => Op::SeqRead { from: c.u64()?, limit: c.u32()? },
+            36 => {
+                let seq = c.u64()?;
+                let n = c.u32()? as usize;
+                let mut ops = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let inner = c.bytes()?;
+                    let o = Op::decode(&inner)?;
+                    if matches!(o, Op::Txn { .. } | Op::XshardApply { .. }) {
+                        return None; // no nested batch ops in a slice
+                    }
+                    ops.push(o);
+                }
+                Op::XshardApply { seq, ops }
+            }
             32 => Op::RenameField {
                 type_id: c.u32()?,
                 field_id: c.u16()?,
@@ -844,6 +872,10 @@ mod tests {
             Op::AddBalanceGuard { type_id: 4, field_id: 2 },
             Op::SeqAppend { payload: vec![1, 2, 3, 9] },
             Op::SeqRead { from: 7, limit: 0 },
+            Op::XshardApply {
+                seq: 5,
+                ops: vec![Op::Delete { type_id: 1, id: ObjectId::from_u128(9) }],
+            },
             Op::FindByComposite { type_id: 4, fields: vec![1, 3], values: vec![vec![9], vec![8, 8]] },
         ];
         for op in ops {

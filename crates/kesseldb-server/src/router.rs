@@ -51,8 +51,17 @@ enum Route {
 /// per-connection shard clients are created lazily by [`serve_router`].
 pub struct Router {
     shard_addrs: Vec<Vec<String>>,
+    /// The global sequencer group's client addresses (SP79). When set,
+    /// a cross-shard `Op::Txn` is sequenced and deterministically
+    /// applied to every shard in seq order (Calvin-style); when empty
+    /// it is cleanly rejected (slice-1 behaviour).
+    seq_addrs: Vec<String>,
     map: ShardMap,
     token: Option<Vec<u8>>,
+    /// Serializes cross-shard commits so global seqs are *driven* to
+    /// every shard strictly in order (each shard's in-order cursor then
+    /// trivially accepts them). Async pull-drive is a later slice.
+    xs: std::sync::Mutex<()>,
 }
 
 /// The 20-byte storage key for a row (`type_id` LE ++ `object_id`),
@@ -70,7 +79,20 @@ impl Router {
     /// (any order; the per-shard `ClusterClient` finds its primary).
     pub fn new(shard_addrs: Vec<Vec<String>>) -> Self {
         let k = shard_addrs.len().max(1) as u32;
-        Router { shard_addrs, map: ShardMap::new(k), token: None }
+        Router {
+            shard_addrs,
+            seq_addrs: Vec::new(),
+            map: ShardMap::new(k),
+            token: None,
+            xs: std::sync::Mutex::new(()),
+        }
+    }
+
+    /// Enable deterministic cross-shard transactions by giving the
+    /// router the sequencer group's client addresses (SP80).
+    pub fn with_sequencer(mut self, seq_addrs: Vec<String>) -> Self {
+        self.seq_addrs = seq_addrs;
+        self
     }
 
     /// Authenticate every shard hop with this shared-secret token.
@@ -152,6 +174,7 @@ impl Router {
 struct Conn<'a> {
     router: &'a Router,
     clients: Vec<Option<ClusterClient>>,
+    seq: Option<ClusterClient>,
 }
 
 impl<'a> Conn<'a> {
@@ -164,6 +187,97 @@ impl<'a> Conn<'a> {
             self.clients[i] = Some(c);
         }
         self.clients[i].as_mut().unwrap()
+    }
+
+    fn seq_client(&mut self) -> &mut ClusterClient {
+        if self.seq.is_none() {
+            let mut c = ClusterClient::new(self.router.seq_addrs.clone());
+            if let Some(t) = &self.router.token {
+                c = c.with_token(t.clone());
+            }
+            self.seq = Some(c);
+        }
+        self.seq.as_mut().unwrap()
+    }
+
+    /// Deterministic (Calvin-style) cross-shard commit. Holding the
+    /// router's `xs` lock so global seqs are driven in order: decompose
+    /// the txn into per-shard slices, durably append the descriptor to
+    /// the sequencer (THE commit point), then drive **every** shard
+    /// through `seq` in order — participants get their slice, others an
+    /// empty advance, so each shard's cursor stays lockstep with the
+    /// global order. Idempotent: a re-drive is a no-op (cursor).
+    fn commit_cross_shard(&mut self, members: Vec<Op>) -> OpResult {
+        let k = self.router.shards();
+        let mut slices: Vec<Vec<Op>> = (0..k).map(|_| Vec::new()).collect();
+        for o in members {
+            match &o {
+                Op::Create { type_id, id, .. }
+                | Op::Update { type_id, id, .. }
+                | Op::Delete { type_id, id } => {
+                    let s = self.router.shard_of(*type_id, &id.0);
+                    slices[s].push(o);
+                }
+                _ => {
+                    return OpResult::SchemaError(
+                        "cross-shard txn members must be Create/Update/\
+                         Delete"
+                            .into(),
+                    )
+                }
+            }
+        }
+        // Descriptor = the durable record of this cross-shard txn (used
+        // for recovery in a later slice): [u32 k] then k×Txn-encoded
+        // slices.
+        let mut desc = (k as u32).to_le_bytes().to_vec();
+        for sl in &slices {
+            let enc = Op::Txn { ops: sl.clone() }.encode();
+            desc.extend_from_slice(&(enc.len() as u32).to_le_bytes());
+            desc.extend_from_slice(&enc);
+        }
+
+        let _guard = self.router.xs.lock().unwrap();
+        // Commit point: durably ordered in the sequencer's replicated
+        // log. After this returns, the txn IS committed.
+        let seq = match self
+            .seq_client()
+            .call(&Op::SeqAppend { payload: desc })
+        {
+            Ok(OpResult::Got(b)) if b.len() == 8 => {
+                u64::from_le_bytes(b.try_into().unwrap())
+            }
+            Ok(o) => {
+                return OpResult::SchemaError(format!(
+                    "sequencer returned unexpected {o:?}"
+                ))
+            }
+            Err(e) => {
+                return OpResult::SchemaError(format!("sequencer: {e}"))
+            }
+        };
+        // Drive every shard through this seq, in order (participants get
+        // their slice; others an empty cursor-advance).
+        for i in 0..k {
+            let ops = std::mem::take(&mut slices[i]);
+            match self
+                .client(i)
+                .call(&Op::XshardApply { seq, ops })
+            {
+                Ok(OpResult::Ok) => {}
+                Ok(o) => {
+                    return OpResult::SchemaError(format!(
+                        "cross-shard apply on shard {i} (seq {seq}): {o:?}"
+                    ))
+                }
+                Err(e) => {
+                    return OpResult::SchemaError(format!(
+                        "cross-shard apply on shard {i}: {e}"
+                    ))
+                }
+            }
+        }
+        OpResult::Ok
     }
 
     fn forward(&mut self, op: &Op) -> OpResult {
@@ -192,11 +306,20 @@ impl<'a> Conn<'a> {
                 }
                 first.unwrap_or(OpResult::Ok)
             }
-            Route::Cross(set) => OpResult::SchemaError(format!(
-                "cross-shard transaction spans shards {set:?}; deterministic \
-                 cross-shard commit lands in a later slice (this slice keeps \
-                 multi-shard correct, not silently wrong)"
-            )),
+            Route::Cross(set) => {
+                if self.router.seq_addrs.is_empty() {
+                    return OpResult::SchemaError(format!(
+                        "cross-shard transaction spans shards {set:?}; no \
+                         sequencer configured (run with_sequencer)"
+                    ));
+                }
+                match op {
+                    Op::Txn { ops } => self.commit_cross_shard(ops.clone()),
+                    _ => OpResult::SchemaError(
+                        "cross-shard route on a non-Txn op".into(),
+                    ),
+                }
+            }
             Route::Unsupported(why) => OpResult::SchemaError(why.into()),
         }
     }
@@ -216,6 +339,7 @@ fn handle(mut s: TcpStream, router: Arc<Router>) {
     let mut conn = Conn {
         router: &router,
         clients: (0..router.shards()).map(|_| None).collect(),
+        seq: None,
     };
     loop {
         let req = match read_frame(&mut s) {
@@ -455,6 +579,112 @@ mod tests {
         assert!(matches!(
             r.route(&Op::Select { type_id: 1, program: vec![], limit: 0 }),
             Route::Unsupported(_)
+        ));
+    }
+
+    /// SP80 (slice 3): with a sequencer configured, a cross-shard
+    /// `Op::Txn` is deterministically committed — durably ordered, then
+    /// applied to every owning shard. Atomic placement verified by
+    /// talking to each shard directly.
+    #[test]
+    fn cross_shard_txn_commits_atomically_via_sequencer() {
+        let s0 = spawn_shard("xa");
+        let s1 = spawn_shard("xb");
+        let seq = spawn_shard("xseq");
+        let router = Arc::new(
+            Router::new(vec![s0.clone(), s1.clone()]).with_sequencer(seq),
+        );
+        let rl = TcpListener::bind("127.0.0.1:0").unwrap();
+        let raddr = rl.local_addr().unwrap();
+        {
+            let r = router.clone();
+            std::thread::spawn(move || serve_router(rl, r));
+        }
+        std::thread::sleep(Duration::from_millis(1600));
+
+        let mut c = Client::connect(raddr).unwrap();
+        assert_eq!(
+            c.call(&Op::CreateType {
+                def: encode_type_def(
+                    "t",
+                    &[Field {
+                        field_id: 0,
+                        name: "v".into(),
+                        kind: FieldKind::U64,
+                        nullable: false,
+                    }],
+                ),
+            })
+            .unwrap(),
+            OpResult::TypeCreated(1)
+        );
+
+        let m = ShardMap::new(2);
+        let pick = |want: usize, skip: &[u128]| -> u128 {
+            (1u128..5000)
+                .find(|v| {
+                    !skip.contains(v)
+                        && m.shard_of(&row_key(1, &ObjectId::from_u128(*v).0))
+                            as usize
+                            == want
+                })
+                .unwrap()
+        };
+        let a1 = pick(0, &[]);
+        let b1 = pick(1, &[]);
+
+        // Cross-shard txn: one row per shard, atomic.
+        assert_eq!(
+            c.call(&Op::Txn {
+                ops: vec![
+                    Op::Create { type_id: 1, id: ObjectId::from_u128(a1), record: vec![1,0,0,0,0,0,0,0] },
+                    Op::Create { type_id: 1, id: ObjectId::from_u128(b1), record: vec![2,0,0,0,0,0,0,0] },
+                ],
+            })
+            .unwrap(),
+            OpResult::Ok
+        );
+
+        // Each row landed on exactly its owning shard.
+        let mut d0 = ClusterClient::new(s0.clone());
+        let mut d1 = ClusterClient::new(s1.clone());
+        assert!(matches!(
+            d0.call(&Op::GetById { type_id: 1, id: ObjectId::from_u128(a1) }).unwrap(),
+            OpResult::Got(_)
+        ));
+        assert!(matches!(
+            d1.call(&Op::GetById { type_id: 1, id: ObjectId::from_u128(b1) }).unwrap(),
+            OpResult::Got(_)
+        ));
+        assert_eq!(
+            d1.call(&Op::GetById { type_id: 1, id: ObjectId::from_u128(a1) }).unwrap(),
+            OpResult::NotFound
+        );
+        assert_eq!(
+            d0.call(&Op::GetById { type_id: 1, id: ObjectId::from_u128(b1) }).unwrap(),
+            OpResult::NotFound
+        );
+
+        // A second cross-shard txn (next global seq) also commits.
+        let a2 = pick(0, &[a1]);
+        let b2 = pick(1, &[b1]);
+        assert_eq!(
+            c.call(&Op::Txn {
+                ops: vec![
+                    Op::Create { type_id: 1, id: ObjectId::from_u128(a2), record: vec![3,0,0,0,0,0,0,0] },
+                    Op::Create { type_id: 1, id: ObjectId::from_u128(b2), record: vec![4,0,0,0,0,0,0,0] },
+                ],
+            })
+            .unwrap(),
+            OpResult::Ok
+        );
+        assert!(matches!(
+            d0.call(&Op::GetById { type_id: 1, id: ObjectId::from_u128(a2) }).unwrap(),
+            OpResult::Got(_)
+        ));
+        assert!(matches!(
+            d1.call(&Op::GetById { type_id: 1, id: ObjectId::from_u128(b2) }).unwrap(),
+            OpResult::Got(_)
         ));
     }
 }

@@ -695,8 +695,10 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
                 0u8
             } else if p.kw("CSV") {
                 1u8
+            } else if p.kw("NDJSON") {
+                2u8
             } else {
-                return Err("FORMAT must be JSON or CSV".into());
+                return Err("FORMAT must be JSON, CSV, or NDJSON".into());
             };
             p.expect_kw("KEY")?;
             let key_name = p.ident()?;
@@ -735,6 +737,56 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
                     );
                 }
             }
+            let mut rows_path: Option<String> = None;
+            if p.kw("ROWS") {
+                rows_path = Some(match p.next() {
+                    Some(Tok::Str(s)) => s,
+                    _ => return Err("expected 'rows-path' string after ROWS".into()),
+                });
+            }
+            let mut pagination: Option<(u8, String, String)> = None;
+            if p.kw("PAGE") {
+                if p.kw("NEXT") {
+                    if p.kw("JSON") {
+                        let path = match p.next() {
+                            Some(Tok::Str(s)) => s,
+                            _ => return Err("expected 'path' string after PAGE NEXT JSON".into()),
+                        };
+                        pagination = Some((1, path, String::new()));
+                    } else if p.kw("LINK") {
+                        pagination = Some((2, String::new(), String::new()));
+                    } else {
+                        return Err("PAGE NEXT must be JSON '<path>' or LINK".into());
+                    }
+                } else if p.kw("CURSOR") {
+                    p.expect_kw("JSON")?;
+                    let path = match p.next() {
+                        Some(Tok::Str(s)) => s,
+                        _ => return Err("expected 'path' string after PAGE CURSOR JSON".into()),
+                    };
+                    p.expect_kw("PARAM")?;
+                    let param = match p.next() {
+                        Some(Tok::Str(s)) => s,
+                        _ => return Err("expected 'param' string after PARAM".into()),
+                    };
+                    pagination = Some((3, path, param));
+                } else {
+                    return Err("PAGE must be NEXT JSON|LINK or CURSOR JSON '<p>' PARAM '<q>'".into());
+                }
+            }
+            // Compatibility matrix (CREATE-time, before building the op):
+            let body_cursor = matches!(pagination, Some((1, _, _)) | Some((3, _, _)));
+            if body_cursor {
+                if format == 0 && rows_path.is_none() {
+                    return Err("FORMAT JSON with a body cursor (PAGE NEXT JSON / PAGE CURSOR JSON) requires ROWS '<path>'".into());
+                }
+                if format == 1 {
+                    return Err("FORMAT CSV cannot use a body cursor; use PAGE NEXT LINK".into());
+                }
+                if format == 2 {
+                    return Err("FORMAT NDJSON cannot use a body cursor; use PAGE NEXT LINK".into());
+                }
+            }
             let type_def = encode_type_def(&name, &fields);
             return Ok(Op::CreateExternalSource {
                 name,
@@ -746,9 +798,8 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
                 auth_a,
                 auth_b,
                 mapping,
-                // Wired by the pagination SQL grammar task (FORMAT NDJSON / ROWS / PAGE).
-                rows_path: None,
-                pagination: None,
+                rows_path,
+                pagination,
             });
         }
         // CREATE [UNIQUE|RANGE] INDEX ON t (cols) — DDL for indexes.
@@ -1595,6 +1646,61 @@ mod tests {
             }
             o => panic!("got {o:?}"),
         }
+    }
+
+    #[test]
+    fn parse_external_source_pagination_forms() {
+        let cat = Catalog::default();
+        match compile("CREATE EXTERNAL SOURCE f (id U64 NOT NULL FROM 'id') \
+            FROM 'http://h' FORMAT JSON KEY id \
+            ROWS 'data.items' PAGE NEXT JSON 'p.next'", &cat).unwrap() {
+            Op::CreateExternalSource{ rows_path, pagination, format, .. } => {
+                assert_eq!(format, 0);
+                assert_eq!(rows_path.as_deref(), Some("data.items"));
+                assert_eq!(pagination, Some((1,"p.next".to_string(),String::new())));
+            } o=>panic!("{o:?}"),
+        }
+        match compile("CREATE EXTERNAL SOURCE g (id U64 NOT NULL FROM 'id') \
+            FROM 'http://h' FORMAT NDJSON KEY id PAGE NEXT LINK", &cat).unwrap() {
+            Op::CreateExternalSource{ format, rows_path, pagination, .. } => {
+                assert_eq!(format, 2); assert_eq!(rows_path, None);
+                assert_eq!(pagination, Some((2,String::new(),String::new())));
+            } o=>panic!("{o:?}"),
+        }
+        match compile("CREATE EXTERNAL SOURCE h (id U64 NOT NULL FROM 'id') \
+            FROM 'http://h' FORMAT JSON KEY id ROWS 'items' \
+            PAGE CURSOR JSON 'm.c' PARAM 'cursor'", &cat).unwrap() {
+            Op::CreateExternalSource{ pagination, .. } =>
+                assert_eq!(pagination, Some((3,"m.c".to_string(),"cursor".to_string()))),
+            o=>panic!("{o:?}"),
+        }
+        // no pagination, NDJSON, no ROWS => still valid (None/None, format 2)
+        match compile("CREATE EXTERNAL SOURCE n (id U64 NOT NULL FROM 'id') \
+            FROM 'http://h' FORMAT NDJSON KEY id", &cat).unwrap() {
+            Op::CreateExternalSource{ format, rows_path, pagination, .. } => {
+                assert_eq!(format,2); assert_eq!(rows_path,None); assert_eq!(pagination,None);
+            } o=>panic!("{o:?}"),
+        }
+    }
+
+    #[test]
+    fn external_source_compat_matrix_rejected() {
+        let cat = Catalog::default();
+        // JSON + body cursor WITHOUT ROWS => error
+        assert!(compile("CREATE EXTERNAL SOURCE a (id U64 NOT NULL FROM 'id') \
+            FROM 'http://h' FORMAT JSON KEY id PAGE NEXT JSON 'p.next'",&cat).is_err());
+        // NDJSON + body cursor => error
+        assert!(compile("CREATE EXTERNAL SOURCE b (id U64 NOT NULL FROM 'id') \
+            FROM 'http://h' FORMAT NDJSON KEY id PAGE NEXT JSON 'p.next'",&cat).is_err());
+        // CSV + body cursor => error
+        assert!(compile("CREATE EXTERNAL SOURCE c (id U64 NOT NULL FROM 'id') \
+            FROM 'http://h' FORMAT CSV KEY id PAGE CURSOR JSON 'm' PARAM 'p'",&cat).is_err());
+        // CSV + LINK => OK
+        assert!(compile("CREATE EXTERNAL SOURCE d (id U64 NOT NULL FROM 'id') \
+            FROM 'http://h' FORMAT CSV KEY id PAGE NEXT LINK",&cat).is_ok());
+        // JSON + body cursor WITH ROWS => OK
+        assert!(compile("CREATE EXTERNAL SOURCE e (id U64 NOT NULL FROM 'id') \
+            FROM 'http://h' FORMAT JSON KEY id ROWS 'd' PAGE NEXT JSON 'p.next'",&cat).is_ok());
     }
 
     #[test]

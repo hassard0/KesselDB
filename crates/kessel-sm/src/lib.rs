@@ -1371,6 +1371,60 @@ impl<V: Vfs> StateMachine<V> {
                 }
             }
 
+            Op::UpdateSet { type_id, id, sets } => {
+                // SP84: deterministic server-side RMW as ONE replicated
+                // op, so SQL UPDATE composes inside Op::Txn (the read is
+                // overlay-aware ⇒ read-your-writes within the batch).
+                // We decode the *current* record (overlay-aware get),
+                // splice the set fields, re-encode, and delegate to the
+                // proven Op::Update path (triggers / NOT NULL / UNIQUE /
+                // FK / CHECK / balance / indexes / overflow GC).
+                let key = make_key(type_id, &id.0);
+                let old = match self.storage.get(&key) {
+                    Some(r) => r,
+                    None => return OpResult::NotFound,
+                };
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => {
+                        return OpResult::SchemaError(format!("no type {type_id}"))
+                    }
+                };
+                let mut vals = match kessel_codec::decode(&ot, &old) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return OpResult::SchemaError(format!(
+                            "updateset decode: {e:?}"
+                        ))
+                    }
+                };
+                for (fid, raw) in &sets {
+                    let i = match ot.fields.iter().position(|f| f.field_id == *fid)
+                    {
+                        Some(i) => i,
+                        None => {
+                            return OpResult::SchemaError(format!(
+                                "updateset: no field {fid}"
+                            ))
+                        }
+                    };
+                    let w = ot.fields[i].kind.width() as usize;
+                    vals[i] = kessel_codec::value_from_raw(
+                        ot.fields[i].kind,
+                        &Self::norm(raw, w),
+                    );
+                }
+                let record = match kessel_codec::encode(&ot, &vals) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return OpResult::SchemaError(format!(
+                            "updateset encode: {e:?}"
+                        ))
+                    }
+                };
+                self.apply(op_number, Op::Update { type_id, id, record })
+            }
+
             Op::Delete { type_id, id } => {
                 let key = make_key(type_id, &id.0);
                 if self.storage.get(&key).is_none() {
@@ -3012,6 +3066,7 @@ impl<V: Vfs> StateMachine<V> {
                         o,
                         Op::Create { .. }
                             | Op::Update { .. }
+                            | Op::UpdateSet { .. }
                             | Op::Delete { .. }
                             | Op::GetById { .. }
                             | Op::Describe { .. }
@@ -3822,6 +3877,122 @@ mod tests {
             a1, a2,
             "the whole adversarial schedule is itself deterministic"
         );
+    }
+
+    /// SP84: `Op::UpdateSet` is a deterministic server-side RMW that
+    /// composes inside `Op::Txn` (read-your-writes via the overlay) and
+    /// reuses the proven Op::Update enforcement path.
+    #[test]
+    fn update_set_rmw_composes_in_txn_and_is_deterministic() {
+        // Codec-encoded record (what a SQL INSERT actually stores —
+        // qrec() is header-less and not representative here).
+        let crec = |sm: &StateMachine<MemVfs>, o: u32, k: u16, v: u32| {
+            let ot = sm.catalog().get(1).unwrap().clone();
+            kessel_codec::encode(
+                &ot,
+                &[
+                    kessel_codec::Value::Uint(o as u128),
+                    kessel_codec::Value::Uint(k as u128),
+                    kessel_codec::Value::Uint(v as u128),
+                ],
+            )
+            .unwrap()
+        };
+        let build = || {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            sm.apply(1, Op::CreateType { def: q_type_def() }); // owner f1,kind f2,v f3
+            let r = crec(&sm, 7, 0, 100);
+            sm.apply(
+                2,
+                Op::Create { type_id: 1, id: ObjectId::from_u128(1), record: r },
+            );
+            sm
+        };
+        let v_of = |sm: &mut StateMachine<MemVfs>, op, id: u128| -> u32 {
+            match sm.apply(op, Op::GetById { type_id: 1, id: ObjectId::from_u128(id) }) {
+                OpResult::Got(r) => {
+                    let ot = sm.catalog().get(1).unwrap().clone();
+                    match kessel_codec::decode(&ot, &r).unwrap()[2] {
+                        kessel_codec::Value::Uint(u) => u as u32,
+                        _ => panic!(),
+                    }
+                }
+                o => panic!("{o:?}"),
+            }
+        };
+        let mut sm = build();
+        // Standalone RMW: set field 3 (v) = 500.
+        assert_eq!(
+            sm.apply(
+                10,
+                Op::UpdateSet {
+                    type_id: 1,
+                    id: ObjectId::from_u128(1),
+                    sets: vec![(3, 500u32.to_le_bytes().to_vec())],
+                },
+            ),
+            OpResult::Ok
+        );
+        assert_eq!(v_of(&mut sm, 11, 1), 500);
+        // Missing row ⇒ NotFound (no effect).
+        assert_eq!(
+            sm.apply(
+                12,
+                Op::UpdateSet {
+                    type_id: 1,
+                    id: ObjectId::from_u128(99),
+                    sets: vec![(3, 1u32.to_le_bytes().to_vec())],
+                },
+            ),
+            OpResult::NotFound
+        );
+        // Composes in a txn: Create id 2 then UpdateSet id 2 in the SAME
+        // batch (read-your-writes via the overlay); atomic.
+        assert_eq!(
+            sm.apply(
+                13,
+                Op::Txn {
+                    ops: vec![
+                        Op::Create { type_id: 1, id: ObjectId::from_u128(2), record: crec(&sm, 1, 0, 10) },
+                        Op::UpdateSet { type_id: 1, id: ObjectId::from_u128(2), sets: vec![(3, 42u32.to_le_bytes().to_vec())] },
+                    ],
+                },
+            ),
+            OpResult::Ok
+        );
+        assert_eq!(v_of(&mut sm, 14, 2), 42, "RMW saw the in-txn create");
+        // A failing member rolls the whole txn back (UpdateSet on a
+        // missing row ⇒ NotFound ⇒ abort; the create must not persist).
+        assert_ne!(
+            sm.apply(
+                15,
+                Op::Txn {
+                    ops: vec![
+                        Op::Create { type_id: 1, id: ObjectId::from_u128(3), record: crec(&sm, 1, 0, 1) },
+                        Op::UpdateSet { type_id: 1, id: ObjectId::from_u128(404), sets: vec![(3, 9u32.to_le_bytes().to_vec())] },
+                    ],
+                },
+            ),
+            OpResult::Ok
+        );
+        assert_eq!(
+            sm.apply(16, Op::GetById { type_id: 1, id: ObjectId::from_u128(3) }),
+            OpResult::NotFound,
+            "failed txn must roll back the create too"
+        );
+        // Deterministic.
+        let drive = |sm: &mut StateMachine<MemVfs>| {
+            sm.apply(20, Op::UpdateSet { type_id: 1, id: ObjectId::from_u128(1), sets: vec![(3, 7u32.to_le_bytes().to_vec())] });
+            sm.apply(21, Op::Txn { ops: vec![
+                Op::Create { type_id: 1, id: ObjectId::from_u128(5), record: crec(sm, 2, 0, 2) },
+                Op::UpdateSet { type_id: 1, id: ObjectId::from_u128(5), sets: vec![(1, 9u32.to_le_bytes().to_vec())] },
+            ]});
+        };
+        let mut a = build();
+        let mut b2 = build();
+        drive(&mut a);
+        drive(&mut b2);
+        assert_eq!(a.digest(), b2.digest(), "UpdateSet must be deterministic");
     }
 
     #[test]

@@ -445,12 +445,57 @@ pub fn spawn_engine_cfg(
                             p += l;
                             match cache.get_or_compile(s, sm.catalog()) {
                                 Ok(kessel_sql::Stmt::Op(o)) => ops.push(o),
-                                Ok(kessel_sql::Stmt::Update { .. }) => {
-                                    return Err(
-                                        "UPDATE inside a transaction is not \
-                                         yet supported"
-                                            .into(),
-                                    )
+                                Ok(kessel_sql::Stmt::Update { type_id, id, sets }) => {
+                                    // SP84: UPDATE composes in a txn as a
+                                    // deterministic replicated RMW op
+                                    // (Op::UpdateSet). Resolve each
+                                    // Value → raw field bytes via the
+                                    // live catalog (engine thread).
+                                    let ot = match sm.catalog().get(type_id) {
+                                        Some(t) => t.clone(),
+                                        None => {
+                                            return Err(format!(
+                                                "update: no type {type_id}"
+                                            ))
+                                        }
+                                    };
+                                    let mut raw_sets =
+                                        Vec::with_capacity(sets.len());
+                                    for (fid, v) in sets {
+                                        let fk = match ot
+                                            .fields
+                                            .iter()
+                                            .find(|f| f.field_id == fid)
+                                        {
+                                            Some(f) => f.kind,
+                                            None => {
+                                                return Err(format!(
+                                                    "update: no field {fid}"
+                                                ))
+                                            }
+                                        };
+                                        match kessel_codec::raw_from_value(
+                                            fk, &v,
+                                        ) {
+                                            Some(r) => raw_sets.push((fid, r)),
+                                            None => {
+                                                return Err(
+                                                    "UPDATE … SET col = NULL \
+                                                     inside a transaction is \
+                                                     not yet supported \
+                                                     (use it outside a txn)"
+                                                        .into(),
+                                                )
+                                            }
+                                        }
+                                    }
+                                    ops.push(Op::UpdateSet {
+                                        type_id,
+                                        id: kessel_proto::ObjectId::from_u128(
+                                            id,
+                                        ),
+                                        sets: raw_sets,
+                                    });
                                 }
                                 Ok(kessel_sql::Stmt::Explain(_)) => {
                                     return Err(
@@ -1192,6 +1237,84 @@ mod tests {
         );
         assert!(present(&mut c, 5));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SP84: SQL `UPDATE` composes inside `BEGIN`/`COMMIT` (it lowers to
+    /// the deterministic replicated `Op::UpdateSet`), commits/rolls back
+    /// atomically, and a failing member aborts the whole batch.
+    #[test]
+    fn sql_update_inside_transaction() {
+        let dir = std::env::temp_dir()
+            .join(format!("kesseldb-utx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = spawn_engine(&dir).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || serve(listener, engine));
+        let mut c = Client::connect(addr).unwrap();
+        let bal = |c: &mut Client, owner: u32| -> i128 {
+            match c
+                .sql(&format!("SELECT bal FROM acct WHERE owner = {owner}"))
+                .unwrap()
+            {
+                OpResult::Got(b) => {
+                    // projection: [u32 rowlen][i64 bal]
+                    i64::from_le_bytes(b[4..12].try_into().unwrap()) as i128
+                }
+                o => panic!("unexpected {o:?}"),
+            }
+        };
+        assert!(matches!(
+            c.sql("CREATE TABLE acct (owner U32 NOT NULL, bal I64 NOT NULL)").unwrap(),
+            OpResult::TypeCreated(1)
+        ));
+        assert_eq!(
+            c.sql("INSERT INTO acct ID 1 (owner, bal) VALUES (1, 50)").unwrap(),
+            OpResult::Ok
+        );
+
+        // Committed txn: UPDATE + INSERT land atomically.
+        assert_eq!(c.sql("BEGIN").unwrap(), OpResult::Ok);
+        assert_eq!(c.sql("UPDATE acct ID 1 SET bal = 500").unwrap(), OpResult::Ok);
+        assert_eq!(
+            c.sql("INSERT INTO acct ID 2 (owner, bal) VALUES (2, 7)").unwrap(),
+            OpResult::Ok
+        );
+        assert_eq!(c.sql("COMMIT").unwrap(), OpResult::Ok);
+        assert_eq!(bal(&mut c, 1), 500, "UPDATE in committed txn applied");
+        assert!(matches!(
+            c.sql("SELECT * FROM acct ID 2").unwrap(),
+            OpResult::Got(_)
+        ));
+
+        // ROLLBACK discards a buffered UPDATE.
+        assert_eq!(c.sql("BEGIN").unwrap(), OpResult::Ok);
+        assert_eq!(c.sql("UPDATE acct ID 1 SET bal = 999").unwrap(), OpResult::Ok);
+        assert_eq!(c.sql("ROLLBACK").unwrap(), OpResult::Ok);
+        assert_eq!(bal(&mut c, 1), 500, "rolled-back UPDATE must not apply");
+
+        // A txn whose UPDATE targets a missing row aborts the WHOLE
+        // batch (the earlier buffered INSERT must not persist).
+        assert_eq!(c.sql("BEGIN").unwrap(), OpResult::Ok);
+        assert_eq!(
+            c.sql("INSERT INTO acct ID 9 (owner, bal) VALUES (9, 1)").unwrap(),
+            OpResult::Ok
+        );
+        assert_eq!(
+            c.sql("UPDATE acct ID 12345 SET bal = 1").unwrap(),
+            OpResult::Ok
+        ); // buffered; the failure surfaces at COMMIT
+        assert_ne!(
+            c.sql("COMMIT").unwrap(),
+            OpResult::Ok,
+            "UPDATE of a missing row must abort the txn"
+        );
+        assert_eq!(
+            c.sql("SELECT * FROM acct ID 9").unwrap(),
+            OpResult::NotFound,
+            "aborted txn must roll back the buffered INSERT too"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

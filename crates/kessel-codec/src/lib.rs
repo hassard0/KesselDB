@@ -98,6 +98,24 @@ pub fn encode(ot: &ObjectType, values: &[Value]) -> Result<Vec<u8>, CodecError> 
 /// bytes, no header/bitmap) into a `Value`. This is the per-field core of
 /// `decode`, exposed so clients can decode projection / column-oriented
 /// results that are bare concatenated field bytes (Sub-project 59).
+/// Inverse of [`value_from_raw`] for a single field: the fixed-width
+/// little-endian bytes of `v` for `kind` (caller width-normalizes).
+/// `Null` → `None` (the caller decides how to represent absence).
+pub fn raw_from_value(kind: FieldKind, v: &Value) -> Option<Vec<u8>> {
+    let w = kind.width() as usize;
+    match v {
+        Value::Null => None,
+        Value::Int(i) => Some(i.to_le_bytes()[..w.min(16)].to_vec()),
+        Value::Uint(u) => Some(u.to_le_bytes()[..w.min(16)].to_vec()),
+        Value::Blob(b) => {
+            let mut o = vec![0u8; w];
+            let n = b.len().min(w);
+            o[..n].copy_from_slice(&b[..n]);
+            Some(o)
+        }
+    }
+}
+
 pub fn value_from_raw(kind: FieldKind, raw: &[u8]) -> Value {
     let w = raw.len();
     match kind {

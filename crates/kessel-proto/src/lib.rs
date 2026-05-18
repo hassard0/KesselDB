@@ -182,6 +182,12 @@ pub enum Op {
     /// advance the cursor; else just advance (deterministic skip).
     /// Cursor-idempotent and strictly in seq order, like `XshardApply`.
     XshardCommit { seq: u64, ops: Vec<Op>, commit: bool },
+    /// Deterministic server-side read-modify-write (SP84): splice each
+    /// `(field_id, raw bytes)` into the row's current record and write
+    /// it back, as ONE replicated op. Unlike the connection-layer SQL
+    /// `UPDATE` RMW this composes inside `Op::Txn` (reads are
+    /// overlay-aware ⇒ read-your-writes). `NotFound` if absent.
+    UpdateSet { type_id: TypeId, id: ObjectId, sets: Vec<(u16, Vec<u8>)> },
     /// Inner equi-join (Sub-project 36): rows where
     /// `left.left_field == right.right_field` (raw fixed-width bytes).
     /// Returns up to `limit` joined rows as
@@ -318,6 +324,7 @@ impl Op {
             Op::SeqAppendOnce { .. } => 37,
             Op::XshardDecide { .. } => 38,
             Op::XshardCommit { .. } => 39,
+            Op::UpdateSet { .. } => 40,
             Op::Join { .. } => 28,
             Op::Aggregate { .. } => 20,
             Op::SelectFields { .. } => 21,
@@ -428,6 +435,15 @@ impl Op {
                 codec::put_u32(&mut b, ops.len() as u32);
                 for o in ops {
                     codec::put_bytes(&mut b, &o.encode());
+                }
+            }
+            Op::UpdateSet { type_id, id, sets } => {
+                codec::put_u32(&mut b, *type_id);
+                b.extend_from_slice(&id.0);
+                codec::put_u32(&mut b, sets.len() as u32);
+                for (f, raw) in sets {
+                    b.extend_from_slice(&f.to_le_bytes());
+                    codec::put_bytes(&mut b, raw);
                 }
             }
             Op::SeqAppendOnce { key, payload } => {
@@ -647,6 +663,16 @@ impl Op {
                     ops.push(o);
                 }
                 Op::XshardCommit { seq, ops, commit }
+            }
+            40 => {
+                let type_id = c.u32()?;
+                let id = c.object_id()?;
+                let n = c.u32()? as usize;
+                let mut sets = Vec::with_capacity(n);
+                for _ in 0..n {
+                    sets.push((c.u16()?, c.bytes()?));
+                }
+                Op::UpdateSet { type_id, id, sets }
             }
             32 => Op::RenameField {
                 type_id: c.u32()?,
@@ -939,6 +965,11 @@ mod tests {
                 ops: vec![Op::Delete { type_id: 1, id: ObjectId::from_u128(9) }],
             },
             Op::SeqAppendOnce { key: vec![7, 7], payload: vec![1, 2, 3] },
+            Op::UpdateSet {
+                type_id: 4,
+                id: ObjectId::from_u128(8),
+                sets: vec![(1, vec![9, 0, 0, 0]), (3, vec![1])],
+            },
             Op::XshardDecide {
                 seq: 6,
                 ops: vec![Op::Delete { type_id: 1, id: ObjectId::from_u128(2) }],

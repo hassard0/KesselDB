@@ -408,6 +408,154 @@ fn run_bloomget(n: usize) {
     );
 }
 
+/// SP67 #6: isolate the write-path phases so we know exactly where the
+/// per-op time goes (perf is locked down on the target host). Pure,
+/// deterministic, dependency-free; reports ns/op per phase.
+fn run_profile(n: usize) {
+    use kessel_catalog::ObjectType;
+    use std::collections::BTreeMap;
+
+    let fields = vec![
+        Field { field_id: 0, name: "debit".into(), kind: FieldKind::U128, nullable: false },
+        Field { field_id: 0, name: "credit".into(), kind: FieldKind::U128, nullable: false },
+        Field { field_id: 0, name: "amount".into(), kind: FieldKind::U128, nullable: false },
+        Field { field_id: 0, name: "pending".into(), kind: FieldKind::U128, nullable: false },
+        Field { field_id: 0, name: "user".into(), kind: FieldKind::U64, nullable: false },
+        Field { field_id: 0, name: "ledger".into(), kind: FieldKind::U32, nullable: false },
+        Field { field_id: 0, name: "code".into(), kind: FieldKind::U16, nullable: false },
+        Field { field_id: 0, name: "flags".into(), kind: FieldKind::U16, nullable: false },
+        Field { field_id: 0, name: "ts".into(), kind: FieldKind::Timestamp, nullable: false },
+    ];
+    let vals = vec![
+        Value::Uint(1), Value::Uint(2), Value::Uint(1000), Value::Uint(0),
+        Value::Uint(42), Value::Uint(7), Value::Uint(100), Value::Uint(0),
+        Value::Uint(1_700_000_000_000_000_000),
+    ];
+    // Build an ObjectType for direct codec timing (field_ids 1..=9).
+    let mut ot_fields = fields.clone();
+    for (i, f) in ot_fields.iter_mut().enumerate() {
+        f.field_id = (i + 1) as u16;
+    }
+    let ot = ObjectType::from_def("transfer".into(), ot_fields);
+    let rec = encode(&ot, &vals).unwrap();
+
+    let bench = |label: &str, reps: usize, mut f: Box<dyn FnMut(usize)>| {
+        let t = Instant::now();
+        for i in 0..reps {
+            f(i);
+        }
+        let ns = t.elapsed().as_nanos() as f64 / reps as f64;
+        println!("  {label:<34} {ns:>9.0} ns/op");
+    };
+
+    println!("[profile] {}-byte record, {} fields", rec.len(), ot.fields.len());
+
+    // 1. the per-op Vec clone the write loop itself does
+    {
+        let r = rec.clone();
+        bench("Vec<u8> record clone", n, Box::new(move |_| {
+            std::hint::black_box(r.clone());
+        }));
+    }
+    // 2. codec encode (Values -> record bytes)
+    {
+        let ot2 = ot.clone();
+        let v2 = vals.clone();
+        bench("codec::encode (9 fields)", n, Box::new(move |_| {
+            std::hint::black_box(encode(&ot2, &v2).unwrap());
+        }));
+    }
+    // 3. codec decode (record bytes -> Values)
+    {
+        let ot3 = ot.clone();
+        let r3 = rec.clone();
+        bench("codec::decode (9 fields)", n, Box::new(move |_| {
+            std::hint::black_box(kessel_codec::decode(&ot3, &r3).unwrap());
+        }));
+    }
+    // 4. sm.apply(Create) — type with NO index (WAL+memtable+codec)
+    {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: encode_type_def("t", &fields) });
+        let mut op = 10u64;
+        let r = rec.clone();
+        bench("sm.apply Create (no index)", n, Box::new(move |i| {
+            sm.apply(op, Op::Create {
+                type_id: 1,
+                id: ObjectId::from_u128(i as u128),
+                record: r.clone(),
+            });
+            op += 1;
+        }));
+    }
+    // 5. sm.apply(Create) — type WITH an eq index on `user` (field 5)
+    {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: encode_type_def("t", &fields) });
+        sm.apply(2, Op::CreateIndex { type_id: 1, field_id: 5 });
+        let mut op = 10u64;
+        let r = rec.clone();
+        bench("sm.apply Create (1 eq index)", n, Box::new(move |i| {
+            sm.apply(op, Op::Create {
+                type_id: 1,
+                id: ObjectId::from_u128(i as u128),
+                record: r.clone(),
+            });
+            op += 1;
+        }));
+    }
+    // 6. sm.apply(GetById) — read path (cache on by default)
+    {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: encode_type_def("t", &fields) });
+        for i in 0..1000u128 {
+            sm.apply(10 + i as u64, Op::Create {
+                type_id: 1,
+                id: ObjectId::from_u128(i),
+                record: rec.clone(),
+            });
+        }
+        let mut op = 5000u64;
+        bench("sm.apply GetById (cached)", n, Box::new(move |i| {
+            std::hint::black_box(sm.apply(op, Op::GetById {
+                type_id: 1,
+                id: ObjectId::from_u128((i % 1000) as u128),
+            }));
+            op += 1;
+        }));
+    }
+    // 7. raw Storage::put (WAL append + autosync + memtable) — isolates
+    //    storage from the StateMachine apply wrapper
+    {
+        let mut st = kessel_storage::Storage::open(MemVfs::new()).unwrap();
+        let r = rec.clone();
+        bench("Storage::put (WAL+sync+memtable)", n, Box::new(move |i| {
+            let k = kessel_storage::make_key(1, &(i as u128).to_le_bytes());
+            st.put(i as u64, k, r.clone()).unwrap();
+        }));
+    }
+    // 8. raw Storage::put with autosync OFF (group-commit model)
+    {
+        let mut st = kessel_storage::Storage::open(MemVfs::new()).unwrap();
+        st.set_autosync(false);
+        let r = rec.clone();
+        bench("Storage::put (autosync OFF)", n, Box::new(move |i| {
+            let k = kessel_storage::make_key(1, &(i as u128).to_le_bytes());
+            st.put(i as u64, k, r.clone()).unwrap();
+        }));
+    }
+    // 9. baseline: raw BTreeMap insert (20B key, 128B val) — lower bound
+    {
+        let mut m: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        let r = rec.clone();
+        bench("baseline BTreeMap insert", n, Box::new(move |i| {
+            let mut k = (i as u128).to_le_bytes().to_vec();
+            k.extend_from_slice(&[0u8; 4]);
+            m.insert(k, r.clone());
+        }));
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(200_000);
@@ -419,6 +567,7 @@ fn main() {
         "flex" => run_flex(n),
         "sqlcache" => run_sqlcache(n),
         "bloomget" => run_bloomget(n),
+        "profile" => run_profile(n),
         "repl" => run_replicated(n),
         "file" => {
             let dir = std::env::temp_dir().join(format!("kesseldb-bench-{}", std::process::id()));

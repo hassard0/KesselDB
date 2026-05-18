@@ -74,6 +74,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 | **SP64 — SQL `EXPLAIN`** | **done** | `EXPLAIN <stmt>` returns the real plan text (composite/index/seq scan, PK lookup, joins, DDL) without executing; CLI prints it; pure planner-layer, zero engine/determinism risk; **161 green** |
 | **SP65 — `kessel-crypto` (pgcrypto subset)** | **done** | zero-dep SHA-256 + HMAC-SHA256, NIST/RFC-4231 vector-verified; deterministic expr-VM `SHA256`/`HMAC256` opcodes (usable in CHECK/triggers); honest scope = hashing/HMAC only; **165 green** |
 | **SP66 — optional TLS** | **done** | opt-in `tls` cargo feature (rustls); generic `Read+Write` server I/O (refactor behaviour-identical, 165 green); `ServerConfig.tls`; default build stays zero-dep + plaintext+token; both builds verified clean |
+| **SP67 — profile-driven LRU fix** | **done** | profiled write path on vulcan → O(cap) `ReadCache` eviction scan (latent since SP50) was the bottleneck; O(log n) `BTreeSet` LRU, semantics byte-identical; **vulcan CREATE 7.7K→215K ops/s (~28×), p50 131µs→2µs**; **166 green**, determinism intact |
 
 ## Production-readiness gate (precise, not vague)
 
@@ -276,6 +277,25 @@ level compaction, zero-copy reads), recorded here rather than hidden. The first
 | MemVfs, generalized (codec) | ~205K ops/s | — |
 | DirVfs real fsync, **per-op** | **2,339 ops/s** | ~2.0M ops/s |
 | DirVfs real fsync, **batch=1000 (group commit)** | **87,338 ops/s** | ~1.05M ops/s |
+
+### SP67 — write-path profile fix (measured on vulcan, 16-core Xeon E5-2667 v4)
+
+A profile-driven fix to the O(cap) `ReadCache` LRU eviction scan (latent
+since SP50 enabled the cache by default):
+
+| `kessel-bench mem` CREATE | before | after |
+|---|---|---|
+| throughput | 7,730 ops/s | **215,740 ops/s** (~28×) |
+| p50 latency | 131 µs | **2 µs** (~65×) |
+| `profile` `sm.apply Create` | 116,738 ns | **2,393 ns** (~49×) |
+
+`Storage::put` was unchanged (~1.6 µs) — the win was exactly the LRU.
+This restores throughput a prior slice had silently regressed; surfaced
+by profiling (perf was locked down on the host), fixed with a byte-
+identical-semantics O(log n) LRU, determinism corpus green. Honest:
+durable (`fsync`) numbers below are localhost; on EBS-class storage
+group-commit matters more (server-side group-commit default is an open
+follow-up).
 
 GET fast on DirVfs because post-flush data sits in OS-cached SSTables; the slower
 MemVfs GET reflects the known O(#sstables) read path (no bloom filter yet, M4 work).

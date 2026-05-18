@@ -383,6 +383,27 @@ impl<V: Vfs> StateMachine<V> {
                 self.oidx_add(op_number, type_id, fid, n, obj);
             }
         }
+        // SP87: variable-length (CHAR/BYTES) ordered indexes — the
+        // numeric loop above skipped these (ord_field_pos → None).
+        for fid in ot.ordered.clone() {
+            let (off, w, _k) = match Self::vord_field_pos(&ot, fid) {
+                Some(p) => p,
+                None => continue,
+            };
+            let ov = old.and_then(|r| r.get(off..off + w));
+            let nv = new.and_then(|r| r.get(off..off + w));
+            if ov == nv {
+                continue;
+            }
+            if let Some(o) = ov {
+                let o = o.to_vec();
+                self.voidx_remove(op_number, type_id, fid, &o, obj);
+            }
+            if let Some(n) = nv {
+                let n = n.to_vec();
+                self.voidx_add(op_number, type_id, fid, &n, obj);
+            }
+        }
         // SP27: composite (multi-field) equality indexes.
         for (ci_no, flist) in ot.composite.clone().iter().enumerate() {
             if flist.is_empty() {
@@ -454,6 +475,93 @@ impl<V: Vfs> StateMachine<V> {
         id[..2].copy_from_slice(&fid.to_le_bytes());
         id[2..10].copy_from_slice(&ok);
         make_key(0xFFFD_0000 | (ut & 0xFFFF), &id)
+    }
+
+    // ---- SP87: variable-length (CHAR/BYTES) ordered index ----
+    //
+    // A SEPARATE keyspace (tag 0xFFFC) so the numeric ≤8B path (0xFFFD)
+    // is byte-identical and untouched (zero migration / digest risk).
+    // CHAR/BYTES are fixed-width and memcmp-ordered as stored
+    // (zero-padded), so the order key is just the raw `w` bytes — no
+    // transform. Key = tag(4) ++ field_id(2) ++ ok(w); a bucket value
+    // is the sorted set of 16-byte object ids, exactly like `oidx`.
+
+    /// (offset, width, kind) if the field is a fixed-width CHAR/BYTES
+    /// column (variable-length ordered-index path). None otherwise.
+    fn vord_field_pos(
+        ot: &kessel_catalog::ObjectType,
+        fid: u16,
+    ) -> Option<(usize, usize, kessel_catalog::FieldKind)> {
+        use kessel_catalog::FieldKind::*;
+        let i = ot.fields.iter().position(|f| f.field_id == fid)?;
+        let kind = ot.fields[i].kind;
+        if !matches!(kind, Char(_) | Bytes(_)) {
+            return None;
+        }
+        let layout = ot.compute_layout();
+        Some((layout.offsets[i], kind.width() as usize, kind))
+    }
+
+    fn voidx_key(ut: u32, fid: u16, ok: &[u8]) -> Key {
+        let mut k = Vec::with_capacity(6 + ok.len());
+        k.extend_from_slice(&(0xFFFC_0000 | (ut & 0xFFFF)).to_le_bytes());
+        k.extend_from_slice(&fid.to_le_bytes());
+        k.extend_from_slice(ok);
+        k
+    }
+
+    fn voidx_add(&mut self, op: u64, ut: u32, fid: u16, ok: &[u8], obj: [u8; 16]) {
+        let key = Self::voidx_key(ut, fid, ok);
+        let mut ids: Vec<[u8; 16]> = self
+            .storage
+            .get(&key)
+            .map(|b| {
+                b.chunks(16)
+                    .filter(|c| c.len() == 16)
+                    .map(|c| {
+                        let mut a = [0u8; 16];
+                        a.copy_from_slice(c);
+                        a
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Err(i) = ids.binary_search(&obj) {
+            ids.insert(i, obj);
+        }
+        let mut out = Vec::with_capacity(ids.len() * 16);
+        for x in &ids {
+            out.extend_from_slice(x);
+        }
+        let _ = self.storage.put(op, key, out);
+    }
+
+    fn voidx_remove(&mut self, op: u64, ut: u32, fid: u16, ok: &[u8], obj: [u8; 16]) {
+        let key = Self::voidx_key(ut, fid, ok);
+        let mut ids: Vec<[u8; 16]> = match self.storage.get(&key) {
+            Some(b) => b
+                .chunks(16)
+                .filter(|c| c.len() == 16)
+                .map(|c| {
+                    let mut a = [0u8; 16];
+                    a.copy_from_slice(c);
+                    a
+                })
+                .collect(),
+            None => return,
+        };
+        if let Ok(i) = ids.binary_search(&obj) {
+            ids.remove(i);
+        }
+        if ids.is_empty() {
+            let _ = self.storage.delete(op, key);
+        } else {
+            let mut out = Vec::with_capacity(ids.len() * 16);
+            for x in &ids {
+                out.extend_from_slice(x);
+            }
+            let _ = self.storage.put(op, key, out);
+        }
     }
 
     fn oidx_add(&mut self, op: u64, ut: u32, fid: u16, ok: [u8; 8], obj: [u8; 16]) {
@@ -3017,14 +3125,21 @@ impl<V: Vfs> StateMachine<V> {
                     Some(t) => t.clone(),
                     None => return OpResult::SchemaError(format!("no type {type_id}")),
                 };
-                let (off, w, kind) = match Self::ord_field_pos(&ot, field_id) {
-                    Some(p) => p,
-                    None => {
-                        return OpResult::SchemaError(
-                            "field kind not supported for ordered index (need fixed-width <=8B numeric/bool/ts)".into(),
-                        )
-                    }
+                // Numeric ≤8B (0xFFFD) or CHAR/BYTES variable-length
+                // (0xFFFC, SP87) — pick the path by field kind.
+                let num = Self::ord_field_pos(&ot, field_id);
+                let var = if num.is_none() {
+                    Self::vord_field_pos(&ot, field_id)
+                } else {
+                    None
                 };
+                if num.is_none() && var.is_none() {
+                    return OpResult::SchemaError(
+                        "field kind not supported for ordered index (need \
+                         fixed-width ≤8B numeric/bool/ts, or CHAR/BYTES)"
+                            .into(),
+                    );
+                }
                 if ot.ordered.contains(&field_id) {
                     return OpResult::Ok; // idempotent
                 }
@@ -3037,10 +3152,20 @@ impl<V: Vfs> StateMachine<V> {
                 let lo = make_key(type_id, &[0u8; 16]);
                 let hi = make_key(type_id, &[0xFFu8; 16]);
                 for (k, rec) in self.storage.scan_range(&lo, &hi) {
-                    if let Some(ok) = rec.get(off..off + w).and_then(|b| Self::order_key(kind, b)) {
-                        let mut obj = [0u8; 16];
-                        obj.copy_from_slice(&k[4..20]);
-                        self.oidx_add(op_number, type_id, field_id, ok, obj);
+                    let mut obj = [0u8; 16];
+                    obj.copy_from_slice(&k[4..20]);
+                    if let Some((off, w, kind)) = num {
+                        if let Some(ok) = rec
+                            .get(off..off + w)
+                            .and_then(|b| Self::order_key(kind, b))
+                        {
+                            self.oidx_add(op_number, type_id, field_id, ok, obj);
+                        }
+                    } else if let Some((off, w, _)) = var {
+                        if let Some(b) = rec.get(off..off + w) {
+                            let b = b.to_vec();
+                            self.voidx_add(op_number, type_id, field_id, &b, obj);
+                        }
                     }
                 }
                 OpResult::Ok
@@ -3054,31 +3179,47 @@ impl<V: Vfs> StateMachine<V> {
                 if !ot.ordered.contains(&field_id) {
                     return OpResult::SchemaError("field is not range-indexed".into());
                 }
-                let (_, w, kind) = match Self::ord_field_pos(&ot, field_id) {
-                    Some(p) => p,
-                    None => return OpResult::SchemaError("field not range-indexable".into()),
+                // Numeric ≤8B (0xFFFD) or CHAR/BYTES (0xFFFC, SP87).
+                let (klo, khi) = if let Some((_, w, kind)) =
+                    Self::ord_field_pos(&ot, field_id)
+                {
+                    let lo_ok = match Self::order_key(kind, &Self::norm(&lo, w)) {
+                        Some(k) => k,
+                        None => {
+                            return OpResult::SchemaError("bad range lo".into())
+                        }
+                    };
+                    let hi_ok = match Self::order_key(kind, &Self::norm(&hi, w)) {
+                        Some(k) => k,
+                        None => {
+                            return OpResult::SchemaError("bad range hi".into())
+                        }
+                    };
+                    let idxt = 0xFFFD_0000 | (type_id & 0xFFFF);
+                    let mut a = [0u8; 16];
+                    a[..2].copy_from_slice(&field_id.to_le_bytes());
+                    a[2..10].copy_from_slice(&lo_ok);
+                    let mut b = [0u8; 16];
+                    b[..2].copy_from_slice(&field_id.to_le_bytes());
+                    b[2..10].copy_from_slice(&hi_ok);
+                    b[10..].copy_from_slice(&[0xFFu8; 6]);
+                    (make_key(idxt, &a), make_key(idxt, &b))
+                } else if let Some((_, w, _)) =
+                    Self::vord_field_pos(&ot, field_id)
+                {
+                    // CHAR/BYTES: the order key is the raw width-`w`
+                    // bytes (memcmp order); bucket keys are exactly
+                    // tag++fid++ok, so the inclusive [lo,hi] scan needs
+                    // no padding slot (unlike the numeric layout).
+                    (
+                        Self::voidx_key(type_id, field_id, &Self::norm(&lo, w)),
+                        Self::voidx_key(type_id, field_id, &Self::norm(&hi, w)),
+                    )
+                } else {
+                    return OpResult::SchemaError(
+                        "field not range-indexable".into(),
+                    );
                 };
-                let lo_ok = match Self::order_key(kind, &Self::norm(&lo, w)) {
-                    Some(k) => k,
-                    None => return OpResult::SchemaError("bad range lo".into()),
-                };
-                let hi_ok = match Self::order_key(kind, &Self::norm(&hi, w)) {
-                    Some(k) => k,
-                    None => return OpResult::SchemaError("bad range hi".into()),
-                };
-                // Sub-linear: scan only the [lo_ok, hi_ok] slice of the
-                // order-index keyspace (entries are physically sorted by the
-                // order key in the LSM).
-                let idxt = 0xFFFD_0000 | (type_id & 0xFFFF);
-                let mut klo = [0u8; 16];
-                klo[..2].copy_from_slice(&field_id.to_le_bytes());
-                klo[2..10].copy_from_slice(&lo_ok);
-                let mut khi = [0u8; 16];
-                khi[..2].copy_from_slice(&field_id.to_le_bytes());
-                khi[2..10].copy_from_slice(&hi_ok);
-                khi[10..].copy_from_slice(&[0xFFu8; 6]);
-                let klo = make_key(idxt, &klo);
-                let khi = make_key(idxt, &khi);
                 let mut ids: Vec<[u8; 16]> = Vec::new();
                 for (_, entry) in self.storage.scan_range(&klo, &khi) {
                     for c in entry.chunks(16) {
@@ -4123,6 +4264,112 @@ mod tests {
                 .collect::<Vec<_>>(),
             o => panic!("expected Got, got {o:?}"),
         }
+    }
+
+    /// SP87 oracle: a `RANGE INDEX` on a `CHAR` column makes
+    /// `Op::FindRange` return EXACTLY the lexicographic-range rows
+    /// (== an independent brute-force filter), stays correct under
+    /// UPDATE/DELETE maintenance, and is deterministic.
+    #[test]
+    fn string_range_index_equals_brute_force_and_is_maintained() {
+        use kessel_codec::{encode, Value};
+        use kessel_proto::Rng;
+        // type: s CHAR(8) (field 1, range-indexed), n U32 (field 2).
+        let tdef = encode_type_def(
+            "t",
+            &[
+                Field { field_id: 0, name: "s".into(), kind: FieldKind::Char(8), nullable: false },
+                Field { field_id: 0, name: "n".into(), kind: FieldKind::U32, nullable: false },
+            ],
+        );
+        let build = || {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            sm.apply(1, Op::CreateType { def: tdef.clone() });
+            let cot = sm.catalog().get(1).unwrap().clone();
+            let mut rng = Rng::new(0x5712_AB);
+            let mut model: Vec<(u128, [u8; 8])> = Vec::new();
+            for id in 1..=120u128 {
+                // short random lowercase strings (0..4 chars), zero-padded.
+                let len = (rng.below(5)) as usize;
+                let mut s = [0u8; 8];
+                for c in s.iter_mut().take(len) {
+                    *c = b'a' + (rng.below(6) as u8); // a..f
+                }
+                let rec = encode(
+                    &cot,
+                    &[Value::Blob(s.to_vec()), Value::Uint(id)],
+                )
+                .unwrap();
+                sm.apply(
+                    10 + id as u64,
+                    Op::Create { type_id: 1, id: ObjectId::from_u128(id), record: rec },
+                );
+                model.push((id, s));
+            }
+            sm.apply(900, Op::AddOrderedIndex { type_id: 1, field_id: 1 });
+            (sm, model)
+        };
+        let (mut sm, mut model) = build();
+        let norm8 = |b: &[u8]| {
+            let mut o = [0u8; 8];
+            let k = b.len().min(8);
+            o[..k].copy_from_slice(&b[..k]);
+            o
+        };
+        let mut op = 2000u64;
+        let mut rng = Rng::new(0x9911);
+        for _ in 0..40 {
+            let mut mk = |rng: &mut kessel_proto::Rng| {
+                let len = rng.below(4) as usize;
+                let mut v = Vec::new();
+                for _ in 0..len {
+                    v.push(b'a' + (rng.below(6) as u8));
+                }
+                v
+            };
+            let (mut lo, mut hi) = (mk(&mut rng), mk(&mut rng));
+            if norm8(&hi) < norm8(&lo) {
+                std::mem::swap(&mut lo, &mut hi);
+            }
+            op += 1;
+            let mut got = ids_of(sm.apply(
+                op,
+                Op::FindRange { type_id: 1, field_id: 1, lo: lo.clone(), hi: hi.clone() },
+            ));
+            got.sort_unstable();
+            let (l8, h8) = (norm8(&lo), norm8(&hi));
+            let mut want: Vec<u128> = model
+                .iter()
+                .filter(|(_, s)| *s >= l8 && *s <= h8)
+                .map(|(id, _)| *id)
+                .collect();
+            want.sort_unstable();
+            assert_eq!(got, want, "FindRange(\"{lo:?}\"..=\"{hi:?}\") != brute force");
+        }
+        // UPDATE maintenance: move row 1's string to "zzzz".
+        let cot = sm.catalog().get(1).unwrap().clone();
+        let z = encode(&cot, &[Value::Blob(b"zzzz".to_vec()), Value::Uint(1)]).unwrap();
+        sm.apply(5000, Op::Update { type_id: 1, id: ObjectId::from_u128(1), record: z });
+        model.iter_mut().find(|(id, _)| *id == 1).unwrap().1 = norm8(b"zzzz");
+        assert_eq!(
+            ids_of(sm.apply(5001, Op::FindRange { type_id: 1, field_id: 1, lo: b"zz".to_vec(), hi: b"zzzzzzzz".to_vec() })),
+            vec![1],
+            "UPDATE re-indexed the row under its new value"
+        );
+        // DELETE maintenance: row 1 leaves the index.
+        sm.apply(5002, Op::Delete { type_id: 1, id: ObjectId::from_u128(1) });
+        assert!(
+            !ids_of(sm.apply(5003, Op::FindRange { type_id: 1, field_id: 1, lo: b"zz".to_vec(), hi: b"zzzzzzzz".to_vec() })).contains(&1),
+            "DELETE removed the row from the index"
+        );
+        // Deterministic.
+        let (a, _) = build();
+        let (b2, _) = build();
+        assert_eq!(a.digest(), b2.digest(), "string range index must be deterministic");
+    }
+
+    fn rng_below(r: &mut kessel_proto::Rng, n: u64) -> u64 {
+        r.below(n)
     }
 
     #[test]

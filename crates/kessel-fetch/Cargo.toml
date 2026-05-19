@@ -15,6 +15,8 @@ kessel-catalog = { path = "../kessel-catalog" }
 rustls = { version = "0.23", optional = true }
 webpki-roots = { version = "1", optional = true }
 rustls-pemfile = { version = "2", optional = true }
+kessel-objstore = { path = "../kessel-objstore", optional = true }
 
 [features]
 tls = ["dep:rustls", "dep:webpki-roots", "dep:rustls-pemfile"]
+object-store = ["tls", "dep:kessel-objstore"]

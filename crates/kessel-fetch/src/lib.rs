@@ -266,6 +266,59 @@ pub fn fetch_rows_https_test(
     rows_from_body(&body, format, cols, None)
 }
 
+/// Fetch a single object over HTTPS using caller-supplied (already
+/// signed) request headers, then decode exactly like `fetch_rows`.
+/// HTTPS-only (object storage is always TLS); reuses the production
+/// rustls transport + `exchange` + `rows_from_body`. Used by the
+/// router's object-store path (`s3://` / `az://`).
+#[cfg(feature = "object-store")]
+pub fn fetch_rows_signed(
+    https_url: &str,
+    headers: &[(String, String)],
+    format: Format,
+    cols: &[ColumnMap],
+    rows_path: Option<&str>,
+    max_body: u64,
+) -> Result<Vec<Vec<Vec<u8>>>, FetchError> {
+    let (scheme, host, port, path) = http::parse_target(https_url)?;
+    if scheme != http::Scheme::Https {
+        return Err(FetchError::Http(
+            "object-store fetch requires https://".into(),
+        ));
+    }
+    let stream = tls::connect_tls(&host, port)?;
+    let req = http::build_request_with_headers(&path, &host, headers);
+    let (_h, body) = http::exchange(stream, &req, max_body)?;
+    rows_from_body(&body, format, cols, rows_path)
+}
+
+/// Test-only companion to `fetch_rows_signed`: same logic but trusts
+/// only the certs in `trust_pem` (the checked-in localhost fixture).
+/// Mirrors `fetch_rows_https_test`; never reachable from production.
+#[cfg(feature = "object-store")]
+#[doc(hidden)]
+pub fn fetch_rows_signed_test(
+    https_url: &str,
+    headers: &[(String, String)],
+    format: Format,
+    cols: &[ColumnMap],
+    rows_path: Option<&str>,
+    max_body: u64,
+    trust_pem: &[u8],
+) -> Result<Vec<Vec<Vec<u8>>>, FetchError> {
+    let (scheme, host, port, path) = http::parse_target(https_url)?;
+    if scheme != http::Scheme::Https {
+        return Err(FetchError::Http(
+            "object-store fetch requires https://".into(),
+        ));
+    }
+    let cfg = tls::test_config_trusting(trust_pem);
+    let stream = tls::connect_tls_with(cfg, &host, port)?;
+    let req = http::build_request_with_headers(&path, &host, headers);
+    let (_h, body) = http::exchange(stream, &req, max_body)?;
+    rows_from_body(&body, format, cols, rows_path)
+}
+
 #[cfg(test)]
 mod ptests {
     use super::*;

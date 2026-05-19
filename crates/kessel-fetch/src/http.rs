@@ -57,24 +57,37 @@ pub(crate) fn parse_target(
     Ok((scheme, host.to_string(), port, path.to_string()))
 }
 
-/// Build the HTTP/1.1 GET request text (Host header value is the bare
-/// host, unchanged from slice 1).
-pub(crate) fn build_request(path: &str, host: &str, auth: &Auth) -> String {
+/// Build an HTTP/1.1 GET with caller-supplied header lines (each
+/// emitted verbatim after the Host/Connection/User-Agent lines).
+pub(crate) fn build_request_with_headers(
+    path: &str,
+    host: &str,
+    extra: &[(String, String)],
+) -> String {
     let mut req = format!(
         "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\
          User-Agent: kessel-fetch/0\r\n"
     );
-    match auth {
-        Auth::None => {}
-        Auth::Bearer(t) => {
-            req.push_str(&format!("Authorization: Bearer {t}\r\n"))
-        }
-        Auth::Header { name, value } => {
-            req.push_str(&format!("{name}: {value}\r\n"))
-        }
+    for (k, v) in extra {
+        req.push_str(&format!("{k}: {v}\r\n"));
     }
     req.push_str("\r\n");
     req
+}
+
+/// Build the HTTP/1.1 GET request text (Host header value is the bare
+/// host, unchanged from slice 1).
+pub(crate) fn build_request(path: &str, host: &str, auth: &Auth) -> String {
+    let extra: Vec<(String, String)> = match auth {
+        Auth::None => Vec::new(),
+        Auth::Bearer(t) => {
+            vec![("Authorization".into(), format!("Bearer {t}"))]
+        }
+        Auth::Header { name, value } => {
+            vec![(name.clone(), value.clone())]
+        }
+    };
+    build_request_with_headers(path, host, &extra)
 }
 
 /// Send `req` over an already-connected stream, read the full

@@ -66,13 +66,11 @@ fn page_payload<'a>(
         meta::Codec::Snappy => {
             Ok(std::borrow::Cow::Owned(snappy::decompress(on_disk, uncomp)?))
         }
-        // T2 stub: Gzip arm added to keep enum exhaustive; T3 flips to
-        // gzip::decompress(on_disk, uncomp).
-        meta::Codec::Gzip => Err(PqError::Unsupported(
-            "compression codec (gzip/zstd/lz4/brotli): OBJ-2c".into(),
+        meta::Codec::Gzip => Ok(std::borrow::Cow::Owned(
+            gzip::decompress(on_disk, uncomp)?
         )),
         meta::Codec::Other(_) => Err(PqError::Unsupported(
-            "compression codec (gzip/zstd/lz4/brotli): OBJ-2c".into(),
+            "compression codec (zstd/lz4/brotli): OBJ-2c".into(),
         )),
     }
 }
@@ -157,12 +155,10 @@ fn read_chunk_values(
     max_def_level: u32,
 ) -> Result<Vec<PqValue>, PqError> {
     match cc.codec {
-        meta::Codec::Uncompressed | meta::Codec::Snappy => {}
-        // T2 stub: Gzip arm added to keep enum exhaustive; T3 flips to
-        // accepted (Gzip will be allowed once page_payload decompresses it).
-        meta::Codec::Gzip | meta::Codec::Other(_) => {
+        meta::Codec::Uncompressed | meta::Codec::Snappy | meta::Codec::Gzip => {}
+        meta::Codec::Other(_) => {
             return Err(PqError::Unsupported(
-                "compression codec (gzip/zstd/lz4/brotli): OBJ-2c".into(),
+                "compression codec (zstd/lz4/brotli): OBJ-2c".into(),
             ))
         }
     }
@@ -605,15 +601,106 @@ mod tests {
         ]);
     }
 
+    /// Build a PLAIN INT64 [7,-2] file gzip-compressed (codec=GZIP=2).
+    /// `gz` is a real RFC-1952 gzip member of the 16 raw PLAIN bytes,
+    /// captured from python at test-build time and pasted (the same
+    /// independent-authority discipline as the inflate KATs). Layout
+    /// mirrors build_snappy_plain_int64_file_inner(None) exactly, changing
+    /// only: f4 codec = zz(2) (GZIP), the page body = gz, and
+    /// compressed_page_size = gz.len() as i64. uncompressed_page_size,
+    /// num_values, encoding, schema, framing all identical.
+    fn build_gzip_plain_int64_file(gz: &[u8]) -> Vec<u8> {
+        let uncomp: i64 = 16;                     // uncompressed = 16 bytes (two i64)
+        let comp = gz.len() as i64;               // compressed = gz.len()
+
+        let mut hdr = Vec::new();
+        hdr.push(0x15); uv(&mut hdr, zz(0));     // f1 type=DATA_PAGE(0)
+        hdr.push(0x15); uv(&mut hdr, zz(uncomp)); // f2 uncompressed_page_size=16
+        hdr.push(0x15); uv(&mut hdr, zz(comp));  // f3 compressed_page_size=gz.len()
+        hdr.push(0x2c);                           // f5 DataPageHeader struct (delta 3->5=2)
+        hdr.push(0x15); uv(&mut hdr, zz(2));     // g1 num_values=2
+        hdr.push(0x15); uv(&mut hdr, zz(0));     // g2 encoding=PLAIN(0)
+        hdr.push(0x00); hdr.push(0x00);          // stop DPH / PH
+
+        let data_page_offset: i64 = 4;
+
+        let mut m = Vec::new();
+        m.push(0x15); uv(&mut m, zz(2));         // f1 version=2
+        m.push(0x19); m.push(0x2c);              // f2 list<SchemaElement> 2
+        m.push(0x48); uv(&mut m, 6); m.extend_from_slice(b"schema");
+        m.push(0x15); uv(&mut m, zz(1));         // schema[0] num_children=1
+        m.push(0x00);
+        m.push(0x15); uv(&mut m, zz(2));         // schema[1] f1 type=INT64
+        m.push(0x25); uv(&mut m, zz(0));         // f3 repetition=REQUIRED
+        m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x00);
+        m.push(0x16); uv(&mut m, zz(2));         // f3 num_rows=2
+        m.push(0x19); m.push(0x1c);              // f4 list<RowGroup> 1
+        m.push(0x19); m.push(0x1c);              // RG f1 list<ColumnChunk> 1
+        m.push(0x3c);                            // ColumnChunk f3 ColumnMetaData
+        m.push(0x15); uv(&mut m, zz(2));         // CMD f1 type=INT64
+        m.push(0x19); m.push(0x15); uv(&mut m, zz(0)); // f2 encodings [PLAIN]
+        m.push(0x19); m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x15); uv(&mut m, zz(2));         // f4 codec=GZIP(2)
+        m.push(0x16); uv(&mut m, zz(2));         // f5 num_values=2
+        m.push(0x46); uv(&mut m, zz(data_page_offset)); // f9 data_page_offset=4
+        m.push(0x00); m.push(0x00);              // stop CMD / ColumnChunk
+        m.push(0x26); uv(&mut m, zz(2));         // RG f3 num_rows=2
+        m.push(0x00); m.push(0x00);              // stop RG / FileMetaData
+
+        let mut f = Vec::new();
+        f.extend_from_slice(b"PAR1");
+        f.extend_from_slice(&hdr);
+        f.extend_from_slice(gz);
+        let mlen = m.len() as u32;
+        f.extend_from_slice(&m);
+        f.extend_from_slice(&mlen.to_le_bytes());
+        f.extend_from_slice(b"PAR1");
+        f
+    }
+
     #[test]
-    fn extract_rejects_gzip_codec_obj2c() {
-        // codec = GZIP(2) in ColumnMetaData (note: 2 is GZIP, not SNAPPY;
-        // SNAPPY is 1 — the original comment was inaccurate).
-        // GZIP still Unsupported (OBJ-2c); this test verifies that gate.
-        let gzip_file = build_parquet_file(0, 2, 0, false);
+    fn extract_decodes_gzip_plain_int64() {
+        // gz = python gzip.compress(struct.pack('<qq', 7, -2))
+        // captured via: python -c "import gzip,struct,sys;
+        //   sys.stdout.buffer.write(gzip.compress(struct.pack('<qq',7,-2)))"
+        // Independent authority (Python stdlib gzip — NOT our code).
+        let gz: &[u8] = &[
+            0x1f,0x8b,0x08,0x00,0xb8,0xa3,0x0c,0x6a,0x02,0xff,
+            0x63,0x67,0x80,0x80,0x7f,0xff,0x21,0x00,0x00,0xcb,
+            0xb3,0x8e,0x99,0x10,0x00,0x00,0x00,
+        ];
+        let f = build_gzip_plain_int64_file(gz);
+        assert_eq!(
+            extract(&f, &["id"]).expect("gzip"),
+            vec![vec![PqValue::I64(7)], vec![PqValue::I64(-2)]],
+        );
+    }
+
+    #[test]
+    fn extract_gzip_uncompressed_snappy_identical() {
+        // Source-format independence: same logical [7,-2] three ways.
+        let gz: &[u8] = &[
+            0x1f,0x8b,0x08,0x00,0xb8,0xa3,0x0c,0x6a,0x02,0xff,
+            0x63,0x67,0x80,0x80,0x7f,0xff,0x21,0x00,0x00,0xcb,
+            0xb3,0x8e,0x99,0x10,0x00,0x00,0x00,
+        ];
+        let g = extract(&build_gzip_plain_int64_file(gz), &["id"]).unwrap();
+        let p = extract(&build_parquet_file(0, 0, 0, false), &["id"]).unwrap();
+        let s = extract(&build_snappy_plain_int64_file(), &["id"]).unwrap();
+        assert_eq!(g, p);
+        assert_eq!(g, s);
+        assert_eq!(g, vec![vec![PqValue::I64(7)], vec![PqValue::I64(-2)]]);
+    }
+
+    #[test]
+    fn extract_rejects_zstd_codec_obj2c() {
+        // Repurposed from extract_rejects_gzip_codec_obj2c: GZIP(2) is now
+        // SUPPORTED; ZSTD(6) is still Unsupported (OBJ-2c follow-on).
+        let f = build_parquet_file(0, 6, 0, false); // codec=ZSTD(6)=Other(6)
         assert!(
-            matches!(extract(&gzip_file, &["id"]), Err(PqError::Unsupported(_))),
-            "gzip codec must be Unsupported (OBJ-2c)"
+            matches!(extract(&f, &["id"]), Err(PqError::Unsupported(_))),
+            "ZSTD codec must be Unsupported (OBJ-2c)"
         );
     }
 

@@ -200,6 +200,32 @@ fn link_next(headers: &[(String, String)]) -> Option<String> {
     None
 }
 
+/// Decode a fetched body into coerced rows. Shared by `fetch_rows`
+/// (single page) and the per-page step of `fetch_rows_paginated`.
+/// `rows_path` is honored for `Format::Json` only (NDJSON/CSV ignore
+/// it, exactly as the existing paginated loop does).
+pub(crate) fn rows_from_body(
+    body: &[u8],
+    format: Format,
+    cols: &[ColumnMap],
+    rows_path: Option<&str>,
+) -> Result<Vec<Vec<Vec<u8>>>, FetchError> {
+    let raw = match format {
+        Format::Json => json::rows_at(body, cols, rows_path)?,
+        Format::Csv => csv::extract(body, cols)?,
+        Format::Ndjson => ndjson::extract(body, cols)?,
+    };
+    let mut out = Vec::with_capacity(raw.len());
+    for r in raw {
+        let mut row = Vec::with_capacity(cols.len());
+        for (i, cell) in r.into_iter().enumerate() {
+            row.push(coerce::to_field_bytes(&cols[i].kind, cell)?);
+        }
+        out.push(row);
+    }
+    Ok(out)
+}
+
 /// Fetch + parse. Returns one `Vec<(column-index, raw FieldKind bytes)>`
 /// per row, columns in `cols` order. Pure given the bytes the server
 /// returned (the only nondeterminism is the network, owned by `http`).
@@ -211,20 +237,30 @@ pub fn fetch_rows(
     max_body: u64,
 ) -> Result<Vec<Vec<Vec<u8>>>, FetchError> {
     let body = http::get(url, auth, max_body)?;
-    let raw_rows = match format {
-        Format::Json => json::extract(&body, cols)?,
-        Format::Csv => csv::extract(&body, cols)?,
-        Format::Ndjson => ndjson::extract(&body, cols)?,
-    };
-    let mut out = Vec::with_capacity(raw_rows.len());
-    for r in raw_rows {
-        let mut row = Vec::with_capacity(cols.len());
-        for (i, cell) in r.into_iter().enumerate() {
-            row.push(coerce::to_field_bytes(&cols[i].kind, cell)?);
-        }
-        out.push(row);
-    }
-    Ok(out)
+    rows_from_body(&body, format, cols, None)
+}
+
+/// Test-only: fetch over HTTPS with a caller-supplied trust config
+/// (the localhost fixture). Reuses the exact production exchange +
+/// decode path; differs from production only in WHICH roots are
+/// trusted. Never reachable from any production caller.
+#[cfg(feature = "tls")]
+#[doc(hidden)]
+pub fn fetch_rows_https_test(
+    url: &str,
+    auth: &Auth,
+    format: Format,
+    cols: &[ColumnMap],
+    max_body: u64,
+    trust_pem: &[u8],
+) -> Result<Vec<Vec<Vec<u8>>>, FetchError> {
+    let (scheme, host, port, path) = http::parse_target(url)?;
+    assert_eq!(scheme, http::Scheme::Https, "test entry is https-only");
+    let cfg = tls::test_config_trusting(trust_pem);
+    let stream = tls::connect_tls_with(cfg, &host, port)?;
+    let req = http::build_request(&path, &host, auth);
+    let (_headers, body) = http::exchange(stream, &req, max_body)?;
+    rows_from_body(&body, format, cols, None)
 }
 
 #[cfg(test)]
@@ -258,5 +294,18 @@ mod ptests {
         assert_eq!(link_next(&multi), Some("http://x/2".into()));
         // no link header => None
         assert_eq!(link_next(&[("X".into(), "y".into())]), None);
+    }
+
+    #[test]
+    fn rows_from_body_decodes_json_like_fetch_rows() {
+        let cols = vec![ColumnMap {
+            name: "id".into(),
+            kind: FieldKind::U32,
+            source: "id".into(),
+        }];
+        let rows =
+            rows_from_body(br#"[{"id":9}]"#, Format::Json, &cols, None)
+                .unwrap();
+        assert_eq!(rows, vec![vec![vec![9, 0, 0, 0]]]);
     }
 }

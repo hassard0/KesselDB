@@ -71,14 +71,81 @@ fn page_payload<'a>(
     }
 }
 
+/// Decode one V1 data-page payload, returning exactly `n` `PqValue`s.
+///
+/// `max_def_level == 0` (REQUIRED): no level bytes — directly decode `n`
+/// values from `payload` by `dp_encoding`. This arm is byte-identical to
+/// the prior per-page inline `match ph.dp_encoding { ... }`.
+///
+/// `max_def_level == 1` (flat OPTIONAL): payload starts with a
+/// 4-byte-u32-LE-length-prefixed RLE/bit-packing-hybrid def-level stream
+/// (bit_width=1), followed by exactly the present-count values.
+fn decode_page(
+    payload: &[u8],
+    dp_encoding: i32,
+    wp: meta::Type,
+    n: usize,
+    max_def_level: u32,
+    dict: &[PqValue],
+) -> Result<Vec<PqValue>, PqError> {
+    if max_def_level == 0 {
+        return match dp_encoding {
+            0 => plain::decode_plain(payload, wp, n),
+            2 | 8 => dict::resolve_dict_indices(payload, dict, n),
+            _ => Err(PqError::Unsupported(
+                "data page encoding (DELTA/BYTE_STREAM_SPLIT): OBJ-2c".into(),
+            )),
+        };
+    }
+    // max_def_level == 1: flat OPTIONAL — def-level prefix + present values.
+    let (defs, consumed) = rle::decode_level_v1(payload, 1, n)?;
+    if defs.len() != n {
+        return Err(PqError::Bad("def-level count != num_values".into()));
+    }
+    for &d in &defs {
+        if d > 1 {
+            return Err(PqError::Bad("definition level exceeds max".into()));
+        }
+    }
+    let present = defs.iter().filter(|&&d| d == 1).count();
+    let body = payload
+        .get(consumed..)
+        .ok_or_else(|| PqError::Bad("def-level consumed past payload".into()))?;
+    let vals = match dp_encoding {
+        0 => plain::decode_plain(body, wp, present)?,
+        2 | 8 => dict::resolve_dict_indices(body, dict, present)?,
+        _ => {
+            return Err(PqError::Unsupported(
+                "data page encoding (DELTA/BYTE_STREAM_SPLIT): OBJ-2c".into(),
+            ))
+        }
+    };
+    if vals.len() != present {
+        return Err(PqError::Bad("value/def-level count mismatch".into()));
+    }
+    let mut out = Vec::with_capacity(n);
+    let mut it = vals.into_iter();
+    for &d in &defs {
+        if d == 1 {
+            out.push(it.next().ok_or_else(|| {
+                PqError::Bad("value/def-level count mismatch".into())
+            })?);
+        } else {
+            out.push(PqValue::Null);
+        }
+    }
+    Ok(out)
+}
+
 /// Read one column chunk's values across all its pages.
-/// Flat REQUIRED, UNCOMPRESSED or SNAPPY, V1. Supports: an optional
-/// leading DICTIONARY_PAGE then zero-or-more DATA_PAGEs; each data
+/// Flat REQUIRED or OPTIONAL, UNCOMPRESSED or SNAPPY, V1. Supports: an
+/// optional leading DICTIONARY_PAGE then zero-or-more DATA_PAGEs; each data
 /// page is PLAIN (dictionary-fallback) or PLAIN_DICTIONARY/RLE_DICTIONARY.
 fn read_chunk_values(
     file: &[u8],
     cc: &meta::ColumnChunk,
     want_ptype: meta::Type,
+    max_def_level: u32,
 ) -> Result<Vec<PqValue>, PqError> {
     match cc.codec {
         meta::Codec::Uncompressed | meta::Codec::Snappy => {}
@@ -162,24 +229,13 @@ fn read_chunk_values(
         let uncomp = usize::try_from(ph.uncompressed_size)
             .map_err(|_| PqError::Bad("page size range".into()))?;
         let payload = page_payload(file, dstart, comp, uncomp, cc.codec)?;
-        let vals = match ph.dp_encoding {
-            0 => plain::decode_plain(&payload, want_ptype, n)?,
-            2 | 8 => {
-                if cc.dictionary_page_offset.is_none() {
-                    return Err(PqError::Bad(
-                        "dictionary-encoded data page without dictionary_page_offset"
-                            .into(),
-                    ));
-                }
-                dict::resolve_dict_indices(&payload, &dict, n)?
-            }
-            _ => {
-                return Err(PqError::Unsupported(
-                    "data page encoding (DELTA/BYTE_STREAM_SPLIT): OBJ-2c"
-                        .into(),
-                ))
-            }
-        };
+        if matches!(ph.dp_encoding, 2 | 8) && cc.dictionary_page_offset.is_none() {
+            return Err(PqError::Bad(
+                "dictionary-encoded data page without dictionary_page_offset"
+                    .into(),
+            ));
+        }
+        let vals = decode_page(&payload, ph.dp_encoding, want_ptype, n, max_def_level, &dict)?;
         if out.len().checked_add(vals.len()).map(|t| t > want_rows).unwrap_or(true) {
             return Err(PqError::Bad(
                 "data page values exceed chunk num_values".into(),
@@ -211,10 +267,12 @@ pub fn extract(
     let md_bytes = footer::metadata_slice(bytes)?;
     let md = meta::FileMetaData::decode(md_bytes)?;
 
-    // Resolve each wanted name to its leaf; enforce REQUIRED + flat.
+    // Resolve each wanted name to its leaf; enforce flat schema + known
+    // repetition + supported physical type.
     // Also collect the schema-declared physical type for each wanted column
     // so the per-row-group loop can verify ColumnMetaData type consistency.
     let mut wanted_ptypes: Vec<meta::Type> = Vec::with_capacity(wanted.len());
+    let mut wanted_max_def_levels: Vec<u32> = Vec::with_capacity(wanted.len());
     for w in wanted {
         let leaf = md
             .leaves
@@ -223,11 +281,19 @@ pub fn extract(
             .ok_or_else(|| {
                 PqError::Bad(format!("column `{w}` not found in Parquet schema"))
             })?;
-        if leaf.repetition != meta::Repetition::Required {
-            return Err(PqError::Unsupported(
-                "OPTIONAL/REPEATED columns: OBJ-2b".into(),
-            ));
+        if !md.flat_schema {
+            return Err(PqError::Unsupported("nested schema: OBJ-2c".into()));
         }
+        let max_def_level: u32 = match leaf.repetition {
+            meta::Repetition::Required => 0,
+            meta::Repetition::Optional => 1,
+            meta::Repetition::Repeated => {
+                return Err(PqError::Unsupported("REPEATED columns: OBJ-2c".into()))
+            }
+            meta::Repetition::Other(_) => {
+                return Err(PqError::Unsupported("unknown repetition: OBJ-2c".into()))
+            }
+        };
         match leaf.ptype {
             meta::Type::Boolean
             | meta::Type::Int32
@@ -242,6 +308,7 @@ pub fn extract(
             }
         }
         wanted_ptypes.push(leaf.ptype);
+        wanted_max_def_levels.push(max_def_level);
     }
 
     // Per wanted column: concatenate its values across all row groups.
@@ -269,7 +336,7 @@ pub fn extract(
                     w
                 )));
             }
-            let vals = read_chunk_values(bytes, cc, wanted_ptypes[ci])?;
+            let vals = read_chunk_values(bytes, cc, wanted_ptypes[ci], wanted_max_def_levels[ci])?;
             cols[ci].extend(vals);
         }
     }
@@ -527,17 +594,6 @@ mod tests {
         assert!(
             matches!(extract(&gzip_file, &["id"]), Err(PqError::Unsupported(_))),
             "gzip codec must be Unsupported (OBJ-2c)"
-        );
-    }
-
-    #[test]
-    fn extract_rejects_optional_repetition() {
-        // repetition = OPTIONAL(1) in SchemaElement
-        // → triggers "OPTIONAL/REPEATED columns" gate (checked at schema level)
-        let optional_file = build_parquet_file(0, 0, 1, false);
-        assert!(
-            matches!(extract(&optional_file, &["id"]), Err(PqError::Unsupported(_))),
-            "optional repetition must be Unsupported"
         );
     }
 
@@ -843,6 +899,317 @@ mod tests {
             .expect("snappy");
         assert_eq!(plain, snap); // source-format independence
         assert_eq!(snap, vec![vec![PqValue::I64(7)], vec![PqValue::I64(-2)]]);
+    }
+
+    // ── OBJ-2b-4 T2: flat OPTIONAL tests ─────────────────────────────────
+
+    /// Flat OPTIONAL INT64 "id" file. `defs` (length = rows, values 0/1)
+    /// + `present_vals` (the non-null i64s, len == #(defs==1)). PLAIN.
+    /// Layout: [PAR1][page_hdr][page_payload][FileMetaData][mlen][PAR1].
+    /// page_payload = [u32 LE deflen][def hybrid][PLAIN i64 present_vals].
+    fn build_opt_plain_i64(defs: &[u8], present_vals: &[i64]) -> Vec<u8> {
+        assert_eq!(
+            present_vals.len(),
+            defs.iter().filter(|&&d| d == 1).count()
+        );
+        let n = defs.len();
+        // def-level hybrid: one bit-packed group of ceil(n/8)*8 (pad 0),
+        // bit_width=1. header = (groups<<1)|1.
+        let groups = ((n + 7) / 8).max(1) as u64;
+        let mut def_hybrid = Vec::new();
+        // varint(header)
+        let mut h = (groups << 1) | 1;
+        loop {
+            let b = (h & 0x7f) as u8;
+            h >>= 7;
+            if h == 0 {
+                def_hybrid.push(b);
+                break;
+            } else {
+                def_hybrid.push(b | 0x80);
+            }
+        }
+        let nbytes = groups as usize; // bit_width 1 → 1 byte/group
+        let mut bits = vec![0u8; nbytes];
+        for (i, &d) in defs.iter().enumerate() {
+            if d == 1 {
+                bits[i / 8] |= 1 << (i % 8);
+            }
+        }
+        def_hybrid.extend_from_slice(&bits);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(def_hybrid.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&def_hybrid);
+        for v in present_vals {
+            payload.extend_from_slice(&v.to_le_bytes());
+        }
+        let psz = payload.len() as i64;
+
+        let mut hdr = Vec::new();
+        hdr.push(0x15); uv(&mut hdr, zz(0));        // f1 type=DATA_PAGE(0)
+        hdr.push(0x15); uv(&mut hdr, zz(psz));      // f2 uncompressed_page_size
+        hdr.push(0x15); uv(&mut hdr, zz(psz));      // f3 compressed_page_size
+        hdr.push(0x2c);                             // f5 DataPageHeader (delta 3->5=2, struct)
+        hdr.push(0x15); uv(&mut hdr, zz(n as i64)); // g1 num_values = rows (incl nulls)
+        hdr.push(0x15); uv(&mut hdr, zz(0));        // g2 encoding=PLAIN(0)
+        hdr.push(0x00); hdr.push(0x00);
+
+        let data_page_offset: i64 = 4;
+        let mut m = Vec::new();
+        m.push(0x15); uv(&mut m, zz(2));            // f1 version=2
+        m.push(0x19); m.push(0x2c);                 // f2 list<SchemaElement> 2
+        m.push(0x48); uv(&mut m, 6); m.extend_from_slice(b"schema");
+        m.push(0x15); uv(&mut m, zz(1));            // root num_children=1
+        m.push(0x00);
+        m.push(0x15); uv(&mut m, zz(2));            // leaf f1 type=INT64
+        m.push(0x25); uv(&mut m, zz(1));            // f3 repetition=OPTIONAL(1)
+        m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x00);
+        m.push(0x16); uv(&mut m, zz(n as i64));     // f3 num_rows = rows
+        m.push(0x19); m.push(0x1c);                 // f4 list<RowGroup> 1
+        m.push(0x19); m.push(0x1c);                 // RG f1 list<ColumnChunk> 1
+        m.push(0x3c);                               // ColumnChunk f3 ColumnMetaData
+        m.push(0x15); uv(&mut m, zz(2));            // CMD f1 type=INT64
+        m.push(0x19); m.push(0x15); uv(&mut m, zz(0)); // f2 enc [PLAIN]
+        m.push(0x19); m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x15); uv(&mut m, zz(0));            // f4 codec=UNCOMPRESSED
+        m.push(0x16); uv(&mut m, zz(n as i64));     // f5 num_values = rows
+        m.push(0x46); uv(&mut m, zz(data_page_offset));
+        m.push(0x00); m.push(0x00);
+        m.push(0x26); uv(&mut m, zz(n as i64));     // RG f3 num_rows = rows
+        m.push(0x00); m.push(0x00);
+
+        let mut f = Vec::new();
+        f.extend_from_slice(b"PAR1");
+        f.extend_from_slice(&hdr);
+        f.extend_from_slice(&payload);
+        let mlen = m.len() as u32;
+        f.extend_from_slice(&m);
+        f.extend_from_slice(&mlen.to_le_bytes());
+        f.extend_from_slice(b"PAR1");
+        f
+    }
+
+    #[test]
+    fn extract_decodes_optional_int64_with_nulls() {
+        // [7, null, -2]: defs [1,0,1], present [7,-2].
+        let f = build_opt_plain_i64(&[1, 0, 1], &[7, -2]);
+        let rows = extract(&f, &["id"]).expect("opt");
+        assert_eq!(rows, vec![
+            vec![PqValue::I64(7)], vec![PqValue::Null], vec![PqValue::I64(-2)],
+        ]);
+    }
+
+    #[test]
+    fn extract_optional_all_null_page() {
+        let f = build_opt_plain_i64(&[0, 0], &[]);
+        assert_eq!(
+            extract(&f, &["id"]).expect("allnull"),
+            vec![vec![PqValue::Null], vec![PqValue::Null]]
+        );
+    }
+
+    #[test]
+    fn extract_optional_all_present_page() {
+        let f = build_opt_plain_i64(&[1, 1], &[7, -2]);
+        assert_eq!(
+            extract(&f, &["id"]).expect("allpresent"),
+            vec![vec![PqValue::I64(7)], vec![PqValue::I64(-2)]]
+        );
+    }
+
+    #[test]
+    fn extract_rejects_repeated_obj2c() {
+        // REPEATED(2) leaf still Unsupported (OBJ-2c).
+        let f = build_parquet_file(0, 0, 2, false); // repetition=REPEATED(2)
+        assert!(
+            matches!(extract(&f, &["id"]), Err(PqError::Unsupported(_))),
+            "REPEATED must be Unsupported (OBJ-2c)"
+        );
+    }
+
+    /// Build a file with a nested (non-flat) schema: root → intermediate group → leaf.
+    /// Schema has 3 SchemaElements: root(nc=1), group(nc=1), leaf.
+    /// The flat_schema gate must reject this with Unsupported("nested schema: OBJ-2c").
+    fn build_nested_schema_file() -> Vec<u8> {
+        // Page: one PLAIN INT64 value (7). data_page_offset=4.
+        let mut page_data = Vec::new();
+        page_data.extend_from_slice(&7i64.to_le_bytes());
+        let data_bytes = page_data.len() as i32; // 8
+
+        let mut hdr = Vec::new();
+        hdr.push(0x15); uv(&mut hdr, zz(0));               // f1 type=DATA_PAGE(0)
+        hdr.push(0x15); uv(&mut hdr, zz(data_bytes as i64)); // f2 uncompressed_page_size
+        hdr.push(0x15); uv(&mut hdr, zz(data_bytes as i64)); // f3 compressed_page_size
+        hdr.push(0x2c);                                    // f5 DataPageHeader struct
+        hdr.push(0x15); uv(&mut hdr, zz(1));               // g1 num_values=1
+        hdr.push(0x15); uv(&mut hdr, zz(0));               // g2 encoding=PLAIN(0)
+        hdr.push(0x00); hdr.push(0x00);
+
+        let data_page_offset: i64 = 4;
+        let mut m = Vec::new();
+        m.push(0x15); uv(&mut m, zz(2));                   // f1 version=2
+        // f2 list<SchemaElement> 3 structs: (3<<4)|12=0x3c
+        m.push(0x19); m.push(0x3c);
+
+        // schema[0] root GROUP: f4 name="schema", f5 num_children=1
+        // NO f1 type (group). Field IDs reset to 0 at struct start.
+        // f4 name: delta=4, binary=8 → (4<<4)|8=0x48
+        m.push(0x48); uv(&mut m, 6); m.extend_from_slice(b"schema");
+        // f5 num_children=1: delta f4→f5=1, i32=5 → (1<<4)|5=0x15; zz(1)=2
+        m.push(0x15); uv(&mut m, zz(1));
+        m.push(0x00); // stop schema[0]
+
+        // schema[1] intermediate GROUP "g": no f1 type, f4 name="g", f5 num_children=1
+        // f4 name: delta=4 → 0x48; len=1
+        m.push(0x48); uv(&mut m, 1); m.extend_from_slice(b"g");
+        // f5 num_children=1: delta f4→f5=1 → 0x15; zz(1)=2
+        m.push(0x15); uv(&mut m, zz(1));
+        m.push(0x00); // stop schema[1]
+
+        // schema[2] leaf "id": f1 type=INT64(2), f3 rep=REQUIRED(0), f4 name="id"
+        m.push(0x15); uv(&mut m, zz(2));                   // f1 type=INT64
+        m.push(0x25); uv(&mut m, zz(0));                   // f3 repetition=REQUIRED
+        m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id"); // f4 name
+        m.push(0x00); // stop schema[2]
+
+        m.push(0x16); uv(&mut m, zz(1));                   // f3 num_rows=1
+        m.push(0x19); m.push(0x1c);                        // f4 list<RowGroup> 1
+        m.push(0x19); m.push(0x1c);                        // RG f1 list<ColumnChunk> 1
+        m.push(0x3c);                                      // ColumnChunk f3 ColumnMetaData
+        m.push(0x15); uv(&mut m, zz(2));                   // CMD f1 type=INT64
+        m.push(0x19); m.push(0x15); uv(&mut m, zz(0));     // f2 encodings [PLAIN]
+        m.push(0x19); m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id"); // f3 path
+        m.push(0x15); uv(&mut m, zz(0));                   // f4 codec=UNCOMPRESSED
+        m.push(0x16); uv(&mut m, zz(1));                   // f5 num_values=1
+        m.push(0x46); uv(&mut m, zz(data_page_offset));    // f9 data_page_offset
+        m.push(0x00); m.push(0x00);                        // stop CMD / ColumnChunk
+        m.push(0x26); uv(&mut m, zz(1));                   // RG f3 num_rows=1
+        m.push(0x00); m.push(0x00);                        // stop RG / FileMetaData
+
+        let mut f = Vec::new();
+        f.extend_from_slice(b"PAR1");
+        f.extend_from_slice(&hdr);
+        f.extend_from_slice(&page_data);
+        let mlen = m.len() as u32;
+        f.extend_from_slice(&m);
+        f.extend_from_slice(&mlen.to_le_bytes());
+        f.extend_from_slice(b"PAR1");
+        f
+    }
+
+    #[test]
+    fn extract_rejects_nested_schema_obj2c() {
+        // A non-flat schema (root → intermediate group → leaf) must be
+        // Unsupported("nested schema: OBJ-2c") regardless of repetition.
+        let f = build_nested_schema_file();
+        assert!(
+            matches!(extract(&f, &["id"]), Err(PqError::Unsupported(_))),
+            "nested schema must be Unsupported (OBJ-2c)"
+        );
+    }
+
+    /// Build an OPTIONAL+dict INT64 file for column "id".
+    /// Logical rows: [7, null, 7]. defs=[1,0,1], dict=[7], present_count=2.
+    /// Dict page: PLAIN [7i64]. Data page: PLAIN_DICTIONARY(2), n=3.
+    /// Data page body after def-level stream = RLE dict indices for 2 present
+    /// values (both index 0 → value 7).
+    /// Dict index body: [0x01 (bit_width=1)][0x03 (1 bit-packed group hdr)]
+    ///   [0x00 (bits: index0=0, index1=0 → both 0)].
+    fn build_opt_dict_int64_file() -> Vec<u8> {
+        // -- Dictionary page --
+        let mut dict_data = Vec::new();
+        dict_data.extend_from_slice(&7i64.to_le_bytes()); // dict[0] = 7
+        let dbytes = dict_data.len() as i64; // 8
+
+        let mut dict_hdr = Vec::new();
+        dict_hdr.push(0x15); uv(&mut dict_hdr, zz(2));      // f1 type=DICTIONARY_PAGE(2)
+        dict_hdr.push(0x15); uv(&mut dict_hdr, zz(dbytes)); // f2 uncompressed_page_size
+        dict_hdr.push(0x15); uv(&mut dict_hdr, zz(dbytes)); // f3 compressed_page_size
+        dict_hdr.push(0x4c);                                // f7 DictionaryPageHeader struct (delta 3->7=4)
+        dict_hdr.push(0x15); uv(&mut dict_hdr, zz(1));      // g1 num_values=1
+        dict_hdr.push(0x15); uv(&mut dict_hdr, zz(2));      // g2 encoding=PLAIN_DICTIONARY(2)
+        dict_hdr.push(0x12);                                // g3 is_sorted=false
+        dict_hdr.push(0x00); dict_hdr.push(0x00);           // stop DPH / PH
+
+        // -- Data page --
+        // n=3 rows (including nulls). defs=[1,0,1].
+        // Def-level stream: 1 bit-packed group of 3 bits, bit_width=1.
+        // groups=1 (ceil(3/8)=1), header = (1<<1)|1 = 3 (varint: 0x03).
+        // bits byte: bit0=def[0]=1, bit1=def[1]=0, bit2=def[2]=1 → 0b00000101=0x05.
+        // def_hybrid = [0x03, 0x05], def_len_prefix = 2 as u32 LE = [0x02,0,0,0].
+        // present_count=2. Dict index body for 2 present values (both index 0):
+        // bit_width=1, 1 bit-packed group: header=(1<<1)|1=3 (varint 0x03),
+        // bits byte: bit0=0(idx0), bit1=0(idx1) → 0x00.
+        // Full dict index body: [0x01 (bit_width byte)][0x03][0x00].
+        let def_len: u32 = 2;
+        let def_hybrid: &[u8] = &[0x03, 0x05]; // varint(3) + bits byte
+        let dict_idx_body: &[u8] = &[0x01, 0x03, 0x00]; // bit_width=1, 1 grp hdr, bits
+
+        let mut data_payload = Vec::new();
+        data_payload.extend_from_slice(&def_len.to_le_bytes()); // [0x02,0,0,0]
+        data_payload.extend_from_slice(def_hybrid);
+        data_payload.extend_from_slice(dict_idx_body);
+        let pbytes = data_payload.len() as i64;
+
+        let mut data_hdr = Vec::new();
+        data_hdr.push(0x15); uv(&mut data_hdr, zz(0));      // f1 type=DATA_PAGE(0)
+        data_hdr.push(0x15); uv(&mut data_hdr, zz(pbytes)); // f2 uncompressed_page_size
+        data_hdr.push(0x15); uv(&mut data_hdr, zz(pbytes)); // f3 compressed_page_size
+        data_hdr.push(0x2c);                                // f5 DataPageHeader struct
+        data_hdr.push(0x15); uv(&mut data_hdr, zz(3));      // g1 num_values=3 (rows incl nulls)
+        data_hdr.push(0x15); uv(&mut data_hdr, zz(2));      // g2 encoding=PLAIN_DICTIONARY(2)
+        data_hdr.push(0x00); data_hdr.push(0x00);           // stop DPH / PH
+
+        let dict_page_offset: i64 = 4;
+        let data_page_offset: i64 = 4 + dict_hdr.len() as i64 + dict_data.len() as i64;
+
+        let mut m = Vec::new();
+        m.push(0x15); uv(&mut m, zz(2));                    // f1 version=2
+        m.push(0x19); m.push(0x2c);                         // f2 list<SchemaElement> 2
+        m.push(0x48); uv(&mut m, 6); m.extend_from_slice(b"schema");
+        m.push(0x15); uv(&mut m, zz(1));                    // root num_children=1
+        m.push(0x00);
+        m.push(0x15); uv(&mut m, zz(2));                    // leaf f1 type=INT64
+        m.push(0x25); uv(&mut m, zz(1));                    // f3 repetition=OPTIONAL(1)
+        m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x00);
+        m.push(0x16); uv(&mut m, zz(3));                    // f3 num_rows=3
+        m.push(0x19); m.push(0x1c);                         // f4 list<RowGroup> 1
+        m.push(0x19); m.push(0x1c);                         // RG f1 list<ColumnChunk> 1
+        m.push(0x3c);                                       // ColumnChunk f3 ColumnMetaData
+        m.push(0x15); uv(&mut m, zz(2));                    // CMD f1 type=INT64
+        m.push(0x19); m.push(0x15); uv(&mut m, zz(2));      // f2 encodings [PLAIN_DICTIONARY(2)]
+        m.push(0x19); m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x15); uv(&mut m, zz(0));                    // f4 codec=UNCOMPRESSED
+        m.push(0x16); uv(&mut m, zz(3));                    // f5 num_values=3
+        m.push(0x46); uv(&mut m, zz(data_page_offset));     // f9 data_page_offset
+        m.push(0x26); uv(&mut m, zz(dict_page_offset));     // f11 dictionary_page_offset
+        m.push(0x00); m.push(0x00);                         // stop CMD / ColumnChunk
+        m.push(0x26); uv(&mut m, zz(3));                    // RG f3 num_rows=3
+        m.push(0x00); m.push(0x00);                         // stop RG / FileMetaData
+
+        let mut f = Vec::new();
+        f.extend_from_slice(b"PAR1");
+        f.extend_from_slice(&dict_hdr);
+        f.extend_from_slice(&dict_data);
+        f.extend_from_slice(&data_hdr);
+        f.extend_from_slice(&data_payload);
+        let mlen = m.len() as u32;
+        f.extend_from_slice(&m);
+        f.extend_from_slice(&mlen.to_le_bytes());
+        f.extend_from_slice(b"PAR1");
+        f
+    }
+
+    #[test]
+    fn extract_decodes_optional_dict_int64_with_nulls() {
+        // [7, null, 7]: defs [1,0,1], dict [7], indices both 0.
+        let f = build_opt_dict_int64_file();
+        let rows = extract(&f, &["id"]).expect("opt-dict");
+        assert_eq!(rows, vec![
+            vec![PqValue::I64(7)], vec![PqValue::Null], vec![PqValue::I64(7)],
+        ]);
     }
 }
 

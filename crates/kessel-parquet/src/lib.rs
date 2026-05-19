@@ -306,8 +306,9 @@ mod tests {
     ///
     /// parquet.thrift PageHeader:
     ///   1: PageType type (i32 enum)
-    ///   3: i32 uncompressed_page_size
-    ///   4: i32 compressed_page_size
+    ///   2: i32 uncompressed_page_size
+    ///   3: i32 compressed_page_size
+    ///   4: optional i32 crc (skipped)
     ///   5: DataPageHeader data_page_header (struct)
     ///
     /// DataPageHeader:
@@ -846,9 +847,9 @@ mod pentest {
 
     /// V1 PLAIN PageHeader with attacker-chosen `num_values` /
     /// `uncompressed_size` (`data_bytes`). Field layout per
-    /// parquet.thrift PageHeader { 1:type, 3:uncompressed_page_size,
-    /// 4:compressed_page_size, 5:DataPageHeader { 1:num_values,
-    /// 2:encoding } }.
+    /// parquet.thrift PageHeader { 1:type, 2:uncompressed_page_size,
+    /// 3:compressed_page_size, 4:crc (skipped),
+    /// 5:DataPageHeader { 1:num_values, 2:encoding } }.
     fn page_header_bytes(num_values: i32, data_bytes: i32) -> Vec<u8> {
         let mut h = Vec::new();
         h.push(0x15); uv(&mut h, zz(0)); // f1 type = DATA_PAGE(0)

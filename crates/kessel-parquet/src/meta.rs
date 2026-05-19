@@ -316,8 +316,9 @@ fn decode_column_meta(
     })
 }
 
-/// V1 DataPageHeader (PageHeader: 1:PageType type, 3:i32
-/// uncompressed_page_size, 5:DataPageHeader data_page_header;
+/// V1 DataPageHeader (PageHeader: 1:PageType type, 2:i32
+/// uncompressed_page_size, 3:i32 compressed_page_size,
+/// 5:DataPageHeader data_page_header;
 /// DataPageHeader: 1:i32 num_values, 2:Encoding encoding).
 /// Field 7: DictionaryPageHeader { 1:i32 num_values, 2:Encoding encoding,
 /// 3:bool is_sorted }.

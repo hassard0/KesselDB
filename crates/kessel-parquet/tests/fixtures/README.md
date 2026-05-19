@@ -165,7 +165,7 @@ Ten fixtures generated and metadata-verified at planning time (pyarrow 24.0.0).
 Regenerate (run from repo root):
 
 ```python
-cd /c/Users/ihass/KesselDB && /c/Users/ihass/AppData/Local/Programs/Python/Python311/python.exe -c "
+cd /c/Users/ihass/KesselDB && python3 -c "
 import pyarrow as pa, pyarrow.parquet as pq
 from decimal import Decimal
 FIX = 'crates/kessel-parquet/tests/fixtures'

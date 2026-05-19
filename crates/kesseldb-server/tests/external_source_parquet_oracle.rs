@@ -381,7 +381,7 @@ static DECIMAL_FLBA_PARQUET_FIXTURE: &[u8] =
 /// bypass is introduced here (SP100/SP101 precedent).
 /// DDL maps the DECIMAL column (source name 'd') to an I128 column named
 /// `id` to satisfy the hardcoded `KEY id` in the helper; the TLS error fires
-/// before any column decode reaches the server.
+/// before any column decode reaches the server. If extended to a trusted-TLS path where decode flows through, the DDL type should be `Text` to match the actual `pq_to_cell(PqValue::Decimal) → Cell::Text` runtime mapping.
 #[test]
 fn refresh_decimal_parquet_from_s3_fails_closed_and_state_intact() {
     run_fail_closed_parquet_e2e(FailClosedCase {

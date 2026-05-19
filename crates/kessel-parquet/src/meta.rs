@@ -108,6 +108,22 @@ pub struct SchemaLeaf {
     pub name: String,
     pub ptype: Type,
     pub repetition: Repetition,
+    /// FLBA width in bytes (parquet.thrift SchemaElement field 2).
+    /// `None` when the SchemaElement omits field 2 (non-FLBA leaves).
+    pub type_length: Option<i32>,
+    /// Raw ConvertedType i32 (parquet.thrift SchemaElement field 6);
+    /// `None` when absent. DECIMAL == 5 is the only value this slice
+    /// acts on; other values are carried verbatim for future slices.
+    pub converted_type: Option<i32>,
+    /// DECIMAL scale (SchemaElement field 7); `None` when absent.
+    pub scale: Option<i32>,
+    /// DECIMAL precision (SchemaElement field 8); `None` when absent.
+    pub precision: Option<i32>,
+    /// LogicalType union arm 5 (DecimalType) parsed from field 10,
+    /// carrying `(scale, precision)`. `None` when no DecimalType arm
+    /// was present. Other LogicalType union arms (Date, Time,
+    /// Timestamp, etc.) are benign-skipped and do not populate this.
+    pub logical_type_decimal: Option<(i32, i32)>,
 }
 
 /// A decoded schema element: either a leaf (physical column) or a group
@@ -230,27 +246,122 @@ fn decode_schema_element(
     let mut name = String::new();
     let mut num_children = 0i32;
     let mut saw_type = false;
+    let mut type_length: Option<i32> = None;
+    let mut converted_type: Option<i32> = None;
+    let mut scale: Option<i32> = None;
+    let mut precision: Option<i32> = None;
+    let mut logical_type_decimal: Option<(i32, i32)> = None;
     while let Some(f) = s.next_field()? {
         match f.id {
             1 => {
                 ptype = Type::from_i32(s.read_i32(&f)?);
                 saw_type = true;
             }
+            2 => type_length = Some(s.read_i32(&f)?),
             3 => repetition = Repetition::from_i32(s.read_i32(&f)?),
             4 => {
                 name = String::from_utf8_lossy(s.read_binary(&f)?)
                     .into_owned()
             }
             5 => num_children = s.read_i32(&f)?,
+            6 => converted_type = Some(s.read_i32(&f)?),
+            7 => scale = Some(s.read_i32(&f)?),
+            8 => precision = Some(s.read_i32(&f)?),
+            10 => {
+                // LogicalType union: a single-arm nested struct.
+                // Per-struct last_id save/reset/restore mirrors the
+                // SP101 PageHeader f5/f7/f8 bracketing so the union's
+                // inner field-ID deltas can't leak into the outer
+                // SchemaElement delta chain.
+                if f.ctype != ctype::STRUCT {
+                    return Err(bad(
+                        "SchemaElement.logicalType: expected struct",
+                    ));
+                }
+                decode_logical_type_union(
+                    s,
+                    &mut logical_type_decimal,
+                )?;
+                s.restore_last_id(f.id);
+            }
             _ => s.skip(f.ctype)?,
         }
     }
     if num_children > 0 || !saw_type {
         // Group element (root or intermediate): has no physical type
-        // or explicitly has num_children > 0.
+        // or explicitly has num_children > 0. Decimal fields are
+        // meaningless on groups; carry only the structural state.
         return Ok(SchemaNode::Group { num_children });
     }
-    Ok(SchemaNode::Leaf(SchemaLeaf { name, ptype, repetition }))
+    // Defense-in-depth agreement check: if BOTH converted_type=DECIMAL
+    // and a LogicalType DecimalType arm are present, their (scale,
+    // precision) must agree. One-sided is fine (writer chose one form);
+    // neither is fine (non-DECIMAL leaf).
+    if converted_type == Some(5) {
+        if let Some((lscale, lprec)) = logical_type_decimal {
+            // Both sides must have scale and precision populated for a
+            // meaningful comparison; if the converted_type-side omitted
+            // them (malformed writer), still treat the disagreement as
+            // a Bad to surface the mismatch.
+            let cscale = scale.unwrap_or(0);
+            let cprec = precision.unwrap_or(0);
+            if lscale != cscale || lprec != cprec {
+                return Err(bad(
+                    "schema DECIMAL: converted_type vs LogicalType \
+                     scale/precision disagree",
+                ));
+            }
+        }
+    }
+    Ok(SchemaNode::Leaf(SchemaLeaf {
+        name,
+        ptype,
+        repetition,
+        type_length,
+        converted_type,
+        scale,
+        precision,
+        logical_type_decimal,
+    }))
+}
+
+/// Decode the LogicalType thrift union. The union is a struct where
+/// at most one arm is set; arm id 5 is DecimalType{1:i32 scale,
+/// 2:i32 precision}. Other arms (Date=4, Time=3, Timestamp=2, etc.)
+/// are benign-skipped — they're future work and must not error out
+/// a schema that includes them. Mirrors the SP101 per-struct
+/// `reset_last_id`/`restore_last_id` bracketing.
+fn decode_logical_type_union(
+    s: &mut StructReader,
+    decimal_out: &mut Option<(i32, i32)>,
+) -> Result<(), PqError> {
+    s.reset_last_id();
+    while let Some(f) = s.next_field()? {
+        match f.id {
+            5 => {
+                if f.ctype != ctype::STRUCT {
+                    return Err(bad(
+                        "LogicalType.DecimalType: expected struct",
+                    ));
+                }
+                let saved = s.save_last_id();
+                s.reset_last_id();
+                let mut d_scale = 0i32;
+                let mut d_prec = 0i32;
+                while let Some(g) = s.next_field()? {
+                    match g.id {
+                        1 => d_scale = s.read_i32(&g)?,
+                        2 => d_prec = s.read_i32(&g)?,
+                        _ => s.skip(g.ctype)?,
+                    }
+                }
+                s.restore_last_id(saved);
+                *decimal_out = Some((d_scale, d_prec));
+            }
+            _ => s.skip(f.ctype)?,
+        }
+    }
+    Ok(())
 }
 
 fn decode_row_group(
@@ -809,6 +920,203 @@ mod tests {
         assert_eq!(ph.page_type, 2);
         assert_eq!(ph.dict_num_values, 2);
         assert_eq!(ph.dict_encoding, 2);
+    }
+
+    /// Wraps a single SchemaElement leaf byte slice in a minimal
+    /// FileMetaData (root Group{nc=1} + the leaf). All bytes are
+    /// hand-derived from parquet.thrift, not produced by the
+    /// decoder under test. Wrapper omits the row_groups list (the
+    /// decode loop simply doesn't see f4 ⇒ row_groups stays empty),
+    /// keeping each KAT focused on the SchemaElement extension.
+    fn wrap_single_leaf(leaf_bytes: &[u8]) -> Vec<u8> {
+        let mut f = Vec::new();
+        // FileMetaData f1 version=1 : (1<<4)|5=0x15, zz(1)=2
+        f.push(0x15); uv(&mut f, zz(1));
+        // FileMetaData f2 list<SchemaElement> 2 elements (root + leaf):
+        //   delta 1->2=1 -> (1<<4)|9=0x19 ; list (2<<4)|12=0x2c
+        f.push(0x19); f.push(0x2c);
+        // schema[0] root group: f4 name="schema", f5 num_children=1.
+        // No f1 type field (groups have no physical type).
+        //   f4 name: (4<<4)|8=0x48 ; len=6 ; "schema"
+        f.push(0x48); uv(&mut f, 6); f.extend_from_slice(b"schema");
+        //   f5 num_children=1: delta 4->5=1 -> (1<<4)|5=0x15 ; zz(1)=2
+        f.push(0x15); uv(&mut f, zz(1));
+        f.push(0x00); // stop schema[0]
+        // schema[1]: append the caller's hand-built leaf.
+        f.extend_from_slice(leaf_bytes);
+        // FileMetaData f3 num_rows=0: delta 2->3=1 -> (1<<4)|6=0x16; zz(0)=0
+        f.push(0x16); uv(&mut f, zz(0));
+        // Omit f4 row_groups (loop tolerates absence).
+        f.push(0x00); // stop FileMetaData
+        f
+    }
+
+    #[test]
+    fn schema_decodes_decimal_via_converted_type() {
+        // INT32 leaf with converted_type=DECIMAL(5), scale=2,
+        // precision=9. NO LogicalType field — proves the
+        // converted_type-only path. parquet.thrift SchemaElement
+        // field IDs: 1:type, 3:repetition_type, 4:name, 6:converted_type
+        // (i32 ConvertedType enum; DECIMAL=5), 7:scale (i32),
+        // 8:precision (i32). compact field header = (delta<<4)|ctype;
+        // i32=5, binary=8; zz(n)=(n<<1)^(n>>63).
+        // Field IDs reset to 0 at struct start.
+        let mut leaf = Vec::new();
+        // f1 type=INT32(1): (1<<4)|5=0x15 ; zz(1)=2
+        leaf.push(0x15); uv(&mut leaf, zz(1));
+        // f3 repetition=REQUIRED(0): delta 1->3=2 -> (2<<4)|5=0x25 ; zz(0)=0
+        leaf.push(0x25); uv(&mut leaf, zz(0));
+        // f4 name="d": delta 3->4=1 -> (1<<4)|8=0x18 ; len=1 ; "d"
+        leaf.push(0x18); uv(&mut leaf, 1); leaf.extend_from_slice(b"d");
+        // f6 converted_type=DECIMAL(5): delta 4->6=2 -> (2<<4)|5=0x25 ; zz(5)=10
+        leaf.push(0x25); uv(&mut leaf, zz(5));
+        // f7 scale=2: delta 6->7=1 -> (1<<4)|5=0x15 ; zz(2)=4
+        leaf.push(0x15); uv(&mut leaf, zz(2));
+        // f8 precision=9: delta 7->8=1 -> (1<<4)|5=0x15 ; zz(9)=18
+        leaf.push(0x15); uv(&mut leaf, zz(9));
+        leaf.push(0x00); // stop SchemaElement
+
+        let bytes = wrap_single_leaf(&leaf);
+        let md = FileMetaData::decode(&bytes).expect("decode");
+        assert_eq!(md.leaves.len(), 1);
+        let lf = &md.leaves[0];
+        assert_eq!(lf.name, "d");
+        assert_eq!(lf.ptype, Type::Int32);
+        assert_eq!(lf.repetition, Repetition::Required);
+        assert_eq!(lf.type_length, None);
+        assert_eq!(lf.converted_type, Some(5));
+        assert_eq!(lf.scale, Some(2));
+        assert_eq!(lf.precision, Some(9));
+        assert_eq!(lf.logical_type_decimal, None);
+    }
+
+    #[test]
+    fn schema_decodes_decimal_via_logical_type_only() {
+        // FIXED_LEN_BYTE_ARRAY(7) leaf, type_length=16, NO
+        // converted_type, only LogicalType field 10 carrying
+        // DecimalType{scale=4, precision=18}. parquet.thrift
+        // SchemaElement: 2:type_length (i32), 10:logicalType (union).
+        // LogicalType union arm 5 = DecimalType{1:i32 scale,
+        // 2:i32 precision}. Each nested struct resets field-ID
+        // deltas to 0. compact header = (delta<<4)|ctype.
+        let mut leaf = Vec::new();
+        // f1 type=FLBA(7): (1<<4)|5=0x15 ; zz(7)=14
+        leaf.push(0x15); uv(&mut leaf, zz(7));
+        // f2 type_length=16: delta 1->2=1 -> (1<<4)|5=0x15 ; zz(16)=32
+        leaf.push(0x15); uv(&mut leaf, zz(16));
+        // f3 repetition=REQUIRED(0): delta 2->3=1 -> (1<<4)|5=0x15 ; zz(0)=0
+        leaf.push(0x15); uv(&mut leaf, zz(0));
+        // f4 name="d": delta 3->4=1 -> (1<<4)|8=0x18 ; len=1 ; "d"
+        leaf.push(0x18); uv(&mut leaf, 1); leaf.extend_from_slice(b"d");
+        // f10 logicalType (struct): delta 4->10=6 -> (6<<4)|12=0x6c
+        leaf.push(0x6c);
+        //   LogicalType union inner (field IDs reset).
+        //   f5 DecimalType (struct): delta 0->5=5 -> (5<<4)|12=0x5c
+        leaf.push(0x5c);
+        //     DecimalType inner (field IDs reset).
+        //     f1 scale=4: (1<<4)|5=0x15 ; zz(4)=8
+        leaf.push(0x15); uv(&mut leaf, zz(4));
+        //     f2 precision=18: delta 1->2=1 -> (1<<4)|5=0x15 ; zz(18)=36
+        leaf.push(0x15); uv(&mut leaf, zz(18));
+        leaf.push(0x00); // stop DecimalType
+        leaf.push(0x00); // stop LogicalType union
+        leaf.push(0x00); // stop SchemaElement
+
+        let bytes = wrap_single_leaf(&leaf);
+        let md = FileMetaData::decode(&bytes).expect("decode");
+        assert_eq!(md.leaves.len(), 1);
+        let lf = &md.leaves[0];
+        assert_eq!(lf.ptype, Type::FixedLenByteArray);
+        assert_eq!(lf.type_length, Some(16));
+        assert_eq!(lf.converted_type, None);
+        assert_eq!(lf.scale, None);
+        assert_eq!(lf.precision, None);
+        assert_eq!(lf.logical_type_decimal, Some((4, 18)));
+    }
+
+    #[test]
+    fn schema_decodes_decimal_via_both_agreement() {
+        // INT32 leaf with BOTH converted_type=DECIMAL(5),
+        // scale=2, precision=9 AND LogicalType DecimalType{2, 9}.
+        // Values agree ⇒ decode Ok, both sides populated.
+        // SchemaElement field IDs 1/3/4/6/7/8/10. Compact field
+        // header = (delta<<4)|ctype. Field IDs reset to 0 at struct
+        // start.
+        let mut leaf = Vec::new();
+        // f1 type=INT32(1): (1<<4)|5=0x15 ; zz(1)=2
+        leaf.push(0x15); uv(&mut leaf, zz(1));
+        // f3 repetition=REQUIRED(0): delta 1->3=2 -> 0x25 ; zz(0)=0
+        leaf.push(0x25); uv(&mut leaf, zz(0));
+        // f4 name="d": delta 3->4=1 -> 0x18 ; len=1 ; "d"
+        leaf.push(0x18); uv(&mut leaf, 1); leaf.extend_from_slice(b"d");
+        // f6 converted_type=DECIMAL(5): delta 4->6=2 -> 0x25 ; zz(5)=10
+        leaf.push(0x25); uv(&mut leaf, zz(5));
+        // f7 scale=2: delta 6->7=1 -> 0x15 ; zz(2)=4
+        leaf.push(0x15); uv(&mut leaf, zz(2));
+        // f8 precision=9: delta 7->8=1 -> 0x15 ; zz(9)=18
+        leaf.push(0x15); uv(&mut leaf, zz(9));
+        // f10 logicalType (struct): delta 8->10=2 -> (2<<4)|12=0x2c
+        leaf.push(0x2c);
+        //   LogicalType union inner. f5 DecimalType struct:
+        //   delta 0->5=5 -> (5<<4)|12=0x5c
+        leaf.push(0x5c);
+        //     DecimalType inner: f1 scale=2 (0x15 ; zz(2)=4),
+        //     f2 precision=9 (0x15 ; zz(9)=18)
+        leaf.push(0x15); uv(&mut leaf, zz(2));
+        leaf.push(0x15); uv(&mut leaf, zz(9));
+        leaf.push(0x00); // stop DecimalType
+        leaf.push(0x00); // stop LogicalType union
+        leaf.push(0x00); // stop SchemaElement
+
+        let bytes = wrap_single_leaf(&leaf);
+        let md = FileMetaData::decode(&bytes).expect("decode");
+        assert_eq!(md.leaves.len(), 1);
+        let lf = &md.leaves[0];
+        assert_eq!(lf.converted_type, Some(5));
+        assert_eq!(lf.scale, Some(2));
+        assert_eq!(lf.precision, Some(9));
+        assert_eq!(lf.logical_type_decimal, Some((2, 9)));
+    }
+
+    #[test]
+    fn schema_rejects_decimal_converted_logical_disagree() {
+        // INT32 leaf with converted_type=DECIMAL(5), scale=2,
+        // precision=9 BUT LogicalType DecimalType{scale=3, precision=9}
+        // (scale disagrees). Defense-in-depth: must return Err(Bad)
+        // with the exact substring "schema DECIMAL: converted_type
+        // vs LogicalType scale/precision disagree". Bounds-safe (no
+        // panic — only the typed Bad). Same byte layout as the
+        // agreement KAT except DecimalType f1 scale=3 instead of 2.
+        let mut leaf = Vec::new();
+        leaf.push(0x15); uv(&mut leaf, zz(1));                      // f1 type=INT32(1)
+        leaf.push(0x25); uv(&mut leaf, zz(0));                      // f3 repetition=REQUIRED
+        leaf.push(0x18); uv(&mut leaf, 1); leaf.extend_from_slice(b"d"); // f4 name="d"
+        leaf.push(0x25); uv(&mut leaf, zz(5));                      // f6 converted_type=DECIMAL(5)
+        leaf.push(0x15); uv(&mut leaf, zz(2));                      // f7 scale=2
+        leaf.push(0x15); uv(&mut leaf, zz(9));                      // f8 precision=9
+        leaf.push(0x2c);                                            // f10 logicalType struct
+        leaf.push(0x5c);                                            //   f5 DecimalType struct
+        leaf.push(0x15); uv(&mut leaf, zz(3));                      //     f1 scale=3 (disagrees!)
+        leaf.push(0x15); uv(&mut leaf, zz(9));                      //     f2 precision=9
+        leaf.push(0x00);                                            //   stop DecimalType
+        leaf.push(0x00);                                            // stop LogicalType union
+        leaf.push(0x00);                                            // stop SchemaElement
+
+        let bytes = wrap_single_leaf(&leaf);
+        let err = FileMetaData::decode(&bytes)
+            .err()
+            .expect("must reject disagreement");
+        if let PqError::Bad(ref msg) = err {
+            assert!(
+                msg.contains(
+                    "schema DECIMAL: converted_type vs LogicalType \
+                     scale/precision disagree",
+                ),
+                "unexpected Bad message: {msg}",
+            );
+        } else {
+            panic!("expected PqError::Bad, got {err:?}");
+        }
     }
 
     #[test]

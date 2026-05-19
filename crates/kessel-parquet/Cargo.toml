@@ -1,0 +1,13 @@
+[package]
+name = "kessel-parquet"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+# Intentionally EMPTY. A minimal Thrift-compact + PLAIN Parquet
+# reader is hand-implemented; this crate adds NO external dependency
+# anywhere (the deterministic-kernel zero-dep invariant).
+
+[lib]
+path = "src/lib.rs"

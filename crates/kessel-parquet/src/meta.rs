@@ -69,20 +69,23 @@ impl Codec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Encoding {
     Plain,
-    /// RLE (id=3 in parquet.thrift). For flat REQUIRED columns this
-    /// encoding appears in the ColumnMetaData encoding list to describe
-    /// the (zero-length) repetition/definition level encoding; it does
-    /// NOT appear as the data page encoding. Allowed in the encoding
-    /// list alongside Plain; the actual data page encoding is checked
-    /// separately via PageHeader.DataPageHeader.encoding.
+    /// RLE (id=3). For flat REQUIRED columns appears in the
+    /// ColumnMetaData encoding list describing the (zero-length)
+    /// level encoding; not the data page encoding.
     Rle,
+    /// PLAIN_DICTIONARY (id=2): dictionary indices, legacy tag.
+    PlainDictionary,
+    /// RLE_DICTIONARY (id=8): dictionary indices, current tag.
+    RleDictionary,
     Other(i32),
 }
 impl Encoding {
     fn from_i32(v: i32) -> Encoding {
         match v {
             0 => Encoding::Plain,
+            2 => Encoding::PlainDictionary,
             3 => Encoding::Rle,
+            8 => Encoding::RleDictionary,
             o => Encoding::Other(o),
         }
     }
@@ -103,6 +106,7 @@ pub struct ColumnChunk {
     pub encodings: Vec<Encoding>,
     pub num_values: i64,
     pub data_page_offset: i64,
+    pub dictionary_page_offset: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -254,6 +258,7 @@ fn decode_column_meta(
     let mut path: Vec<String> = Vec::new();
     let mut num_values = 0i64;
     let mut data_page_offset = 0i64;
+    let mut dictionary_page_offset: Option<i64> = None;
     while let Some(f) = s.next_field()? {
         match f.id {
             1 => ptype = Type::from_i32(s.read_i32(&f)?),
@@ -287,6 +292,7 @@ fn decode_column_meta(
             4 => codec = Codec::from_i32(s.read_i32(&f)?),
             5 => num_values = s.read_i64(&f)?,
             9 => data_page_offset = s.read_i64(&f)?,
+            11 => dictionary_page_offset = Some(s.read_i64(&f)?),
             _ => s.skip(f.ctype)?,
         }
     }
@@ -297,12 +303,15 @@ fn decode_column_meta(
         encodings,
         num_values,
         data_page_offset,
+        dictionary_page_offset,
     })
 }
 
 /// V1 DataPageHeader (PageHeader: 1:PageType type, 3:i32
 /// uncompressed_page_size, 5:DataPageHeader data_page_header;
 /// DataPageHeader: 1:i32 num_values, 2:Encoding encoding).
+/// Field 7: DictionaryPageHeader { 1:i32 num_values, 2:Encoding encoding,
+/// 3:bool is_sorted }.
 #[derive(Clone, Debug)]
 pub struct PageHeader {
     pub page_type: i32,
@@ -310,6 +319,8 @@ pub struct PageHeader {
     pub compressed_size: i32,
     pub dp_num_values: i32,
     pub dp_encoding: i32,
+    pub dict_num_values: i32,
+    pub dict_encoding: i32,
 }
 
 pub fn decode_page_header(
@@ -322,6 +333,8 @@ pub fn decode_page_header(
         compressed_size: 0,
         dp_num_values: 0,
         dp_encoding: -1,
+        dict_num_values: 0,
+        dict_encoding: -1,
     };
     while let Some(f) = s.next_field()? {
         match f.id {
@@ -336,6 +349,20 @@ pub fn decode_page_header(
                     match g.id {
                         1 => ph.dp_num_values = s.read_i32(&g)?,
                         2 => ph.dp_encoding = s.read_i32(&g)?,
+                        _ => s.skip(g.ctype)?,
+                    }
+                }
+                s.restore_last_id(f.id);
+            }
+            7 => {
+                // DictionaryPageHeader { 1:i32 num_values, 2:Encoding encoding,
+                // 3:bool is_sorted }. Same per-struct last_id bracketing as f5.
+                if f.ctype != ctype::STRUCT { return Err(bad("PageHeader.dictionary_page_header: expected struct")); }
+                s.reset_last_id();
+                while let Some(g) = s.next_field()? {
+                    match g.id {
+                        1 => ph.dict_num_values = s.read_i32(&g)?,
+                        2 => ph.dict_encoding = s.read_i32(&g)?,
                         _ => s.skip(g.ctype)?,
                     }
                 }
@@ -453,5 +480,61 @@ mod tests {
         assert_eq!(cc.encodings, vec![Encoding::Plain]);
         assert_eq!(cc.num_values, 2);
         assert_eq!(cc.data_page_offset, 4);
+        assert_eq!(cc.dictionary_page_offset, None);
+    }
+
+    #[test]
+    fn columnmeta_decodes_dictionary_page_offset_field11() {
+        let mut b = Vec::new();
+        b.push(0x15); uv(&mut b, zz(1));                 // f1 version=1
+        b.push(0x19); b.push(0x2c);                      // f2 list<struct> 2
+        b.push(0x48); uv(&mut b, 4); b.extend_from_slice(b"root"); // schema[0] name
+        b.push(0x15); uv(&mut b, zz(1));                 // schema[0] f5 num_children=1
+        b.push(0x00);                                    // stop schema[0]
+        b.push(0x15); uv(&mut b, zz(2));                 // schema[1] f1 type=INT64(2)
+        b.push(0x25); uv(&mut b, zz(0));                 // f3 repetition=REQUIRED
+        b.push(0x18); uv(&mut b, 2); b.extend_from_slice(b"id"); // f4 name
+        b.push(0x00);                                    // stop schema[1]
+        b.push(0x16); uv(&mut b, zz(3));                 // f3 num_rows=3
+        b.push(0x19); b.push(0x1c);                      // f4 list<RowGroup> 1
+        b.push(0x19); b.push(0x1c);                      // RG f1 list<ColumnChunk> 1
+        b.push(0x3c);                                    // ColumnChunk f3 ColumnMetaData
+        b.push(0x15); uv(&mut b, zz(2));                 // CMD f1 type=INT64(2)
+        b.push(0x19); b.push(0x15); uv(&mut b, zz(2));   // f2 encodings [PLAIN_DICTIONARY(2)]
+        b.push(0x19); b.push(0x18); uv(&mut b, 2); b.extend_from_slice(b"id"); // f3 path ["id"]
+        b.push(0x15); uv(&mut b, zz(0));                 // f4 codec=UNCOMPRESSED
+        b.push(0x16); uv(&mut b, zz(3));                 // f5 num_values=3
+        b.push(0x46); uv(&mut b, zz(40));                // f9 data_page_offset=40 (delta 5->9=4, i64=6 -> 0x46)
+        b.push(0x26); uv(&mut b, zz(4));                 // f11 dictionary_page_offset=4 (delta 9->11=2, i64=6 -> 0x26)
+        b.push(0x00);                                    // stop ColumnMetaData
+        b.push(0x00);                                    // stop ColumnChunk
+        b.push(0x26); uv(&mut b, zz(3));                 // RG f3 num_rows=3
+        b.push(0x00);                                    // stop RowGroup
+        b.push(0x00);                                    // stop FileMetaData
+
+        let md = FileMetaData::decode(&b).expect("decode");
+        let cc = &md.row_groups[0].columns[0];
+        assert_eq!(cc.dictionary_page_offset, Some(4));
+        assert_eq!(cc.data_page_offset, 40);
+        assert_eq!(cc.encodings, vec![Encoding::PlainDictionary]);
+    }
+
+    #[test]
+    fn pageheader_decodes_dictionary_page_header_field7() {
+        let mut h = Vec::new();
+        h.push(0x15); uv(&mut h, zz(2));   // f1 type=DICTIONARY_PAGE(2)
+        h.push(0x25); uv(&mut h, zz(16));  // f3 uncompressed_page_size=16 (delta 1->3=2,i32=5 ->0x25)
+        h.push(0x15); uv(&mut h, zz(16));  // f4 compressed_page_size=16 (delta 3->4=1 ->0x15)
+        h.push(0x3c);                      // f7 DictionaryPageHeader struct (delta 4->7=3, struct=12 ->0x3c)
+        h.push(0x15); uv(&mut h, zz(2));   // g1 num_values=2
+        h.push(0x15); uv(&mut h, zz(2));   // g2 encoding=PLAIN_DICTIONARY(2) (delta 1->2=1 ->0x15)
+        h.push(0x12);                      // g3 is_sorted=false (delta 2->3=1, BOOL_FALSE=2 ->0x12)
+        h.push(0x00);                      // stop DictionaryPageHeader
+        h.push(0x00);                      // stop PageHeader
+
+        let (ph, _len) = decode_page_header(&h).expect("decode");
+        assert_eq!(ph.page_type, 2);
+        assert_eq!(ph.dict_num_values, 2);
+        assert_eq!(ph.dict_encoding, 2);
     }
 }

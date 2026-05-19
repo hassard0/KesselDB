@@ -648,6 +648,16 @@ mod tests {
             "DELTA encoding must be Unsupported"
         );
     }
+
+    #[test]
+    fn extract_dict_page_offset_past_eof_is_bad() {
+        let mut f = build_dict_int64_file();
+        f.truncate(8); // footer/dict-page region now unreachable
+        let owned = f.clone();
+        let r = std::panic::catch_unwind(move || extract(&owned, &["id"]));
+        assert!(r.is_ok(), "must not panic");
+        assert!(matches!(r.unwrap(), Err(PqError::Bad(_))));
+    }
 }
 
 // ── Task 12 PENTEST PASS — adversarial lock tests ─────────────────────

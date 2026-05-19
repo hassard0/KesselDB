@@ -106,3 +106,72 @@ mod tests {
         ));
     }
 }
+
+// ── PENTEST PASS — adversarial lock tests ─────────────────────────
+// Dictionary payloads/headers are operator-source-controlled. Each
+// case: no panic / no OOM / no stack-overflow, and a well-formed
+// Result (typed Bad/Unsupported, OR correct Ok for the valid
+// bit_width==0 case which we must NOT over-reject).
+#[cfg(test)]
+mod pentest {
+    use super::*;
+
+    fn d3() -> Vec<PqValue> {
+        vec![
+            PqValue::Bytes(b"x".to_vec()),
+            PqValue::Bytes(b"y".to_vec()),
+            PqValue::Bytes(b"z".to_vec()),
+        ]
+    }
+
+    fn no_panic_bad(payload: &[u8], dict: Vec<PqValue>, n: usize) {
+        let p = payload.to_vec();
+        let r = std::panic::catch_unwind(move || {
+            resolve_dict_indices(&p, &dict, n)
+        });
+        assert!(r.is_ok(), "must NOT panic/OOM-unwind");
+        assert!(
+            matches!(
+                r.unwrap(),
+                Err(PqError::Bad(_)) | Err(PqError::Unsupported(_))
+            ),
+            "hostile input must be a typed error"
+        );
+    }
+
+    #[test]
+    fn empty_payload_bad() {
+        no_panic_bad(&[], d3(), 4);
+    }
+
+    #[test]
+    fn oob_index_bad() {
+        no_panic_bad(&[0x03, 0x08, 0x09], d3(), 4);
+    }
+
+    #[test]
+    fn huge_bit_width_byte_bad() {
+        no_panic_bad(&[200, 0x08, 0x01], d3(), 4);
+    }
+
+    #[test]
+    fn truncated_index_stream_bad() {
+        no_panic_bad(&[0x08, 0x03], d3(), 8);
+    }
+
+    #[test]
+    fn lying_n_vs_short_stream_bad() {
+        no_panic_bad(&[0x01, 0x03, 0x00], d3(), usize::from(u16::MAX));
+    }
+
+    #[test]
+    fn bitwidth0_multi_entry_dict_decodes_to_dict0() {
+        // VALID Parquet: bit_width=0 → all indices 0 → every row is
+        // dict[0], even with a 3-entry dict. MUST decode (Ok), NOT
+        // reject — proves no over-rejection of valid input.
+        let payload = [0x00u8, 0x08];
+        let got = resolve_dict_indices(&payload, &d3(), 4)
+            .expect("bit_width=0 is valid");
+        assert_eq!(got, vec![PqValue::Bytes(b"x".to_vec()); 4]);
+    }
+}

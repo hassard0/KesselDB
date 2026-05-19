@@ -1225,6 +1225,612 @@ mod tests {
     }
 }
 
+// ── OBJ-2b-4 Task 4 PENTEST PASS — OPTIONAL def-level decode + null scatter ──
+//
+// Lock tests for the OPTIONAL (nullable) decode path: def-level stream
+// truncation/lying-length/def>1/count-mismatch/dict-OOB/non-flat-schema,
+// and positive correctness locks (all-null / all-present / mixed scatter).
+// Each hostile case is wrapped in catch_unwind asserting no panic AND a
+// typed Err. The positive locks assert exact Ok rows; a failure there
+// means decode_page/scatter is wrong — never weaken the positive lock.
+#[cfg(test)]
+mod pentest_optional {
+    use super::*;
+
+    // ── inline Thrift compact helpers (mirrors mod tests) ──────────────
+    fn uv(out: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 { out.push(b); break; } else { out.push(b | 0x80); }
+        }
+    }
+    fn zz(v: i64) -> u64 { ((v << 1) ^ (v >> 63)) as u64 }
+
+    // ── re-declared builder: flat OPTIONAL PLAIN INT64 "id" file ───────
+    //
+    // Mirrors `mod tests::build_opt_plain_i64` exactly (not pub there).
+    // `defs` (len = rows, values 0/1) + `present_vals` (non-null i64s).
+    fn build_opt_plain_i64(defs: &[u8], present_vals: &[i64]) -> Vec<u8> {
+        assert_eq!(present_vals.len(), defs.iter().filter(|&&d| d == 1).count());
+        let n = defs.len();
+        let groups = ((n + 7) / 8).max(1) as u64;
+        let mut def_hybrid = Vec::new();
+        let mut h = (groups << 1) | 1;
+        loop {
+            let b = (h & 0x7f) as u8; h >>= 7;
+            if h == 0 { def_hybrid.push(b); break; } else { def_hybrid.push(b | 0x80); }
+        }
+        let nbytes = groups as usize;
+        let mut bits = vec![0u8; nbytes];
+        for (i, &d) in defs.iter().enumerate() {
+            if d == 1 { bits[i / 8] |= 1 << (i % 8); }
+        }
+        def_hybrid.extend_from_slice(&bits);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(def_hybrid.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&def_hybrid);
+        for v in present_vals { payload.extend_from_slice(&v.to_le_bytes()); }
+        let psz = payload.len() as i64;
+        let n_i = n as i64;
+
+        let mut hdr = Vec::new();
+        hdr.push(0x15); uv(&mut hdr, zz(0));
+        hdr.push(0x15); uv(&mut hdr, zz(psz));
+        hdr.push(0x15); uv(&mut hdr, zz(psz));
+        hdr.push(0x2c);
+        hdr.push(0x15); uv(&mut hdr, zz(n_i));
+        hdr.push(0x15); uv(&mut hdr, zz(0));
+        hdr.push(0x00); hdr.push(0x00);
+
+        let mut m = Vec::new();
+        m.push(0x15); uv(&mut m, zz(2));
+        m.push(0x19); m.push(0x2c);
+        m.push(0x48); uv(&mut m, 6); m.extend_from_slice(b"schema");
+        m.push(0x15); uv(&mut m, zz(1));
+        m.push(0x00);
+        m.push(0x15); uv(&mut m, zz(2));       // leaf type=INT64
+        m.push(0x25); uv(&mut m, zz(1));       // f3 repetition=OPTIONAL(1)
+        m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x00);
+        m.push(0x16); uv(&mut m, zz(n_i));     // num_rows
+        m.push(0x19); m.push(0x1c);
+        m.push(0x19); m.push(0x1c);
+        m.push(0x3c);
+        m.push(0x15); uv(&mut m, zz(2));       // CMD type=INT64
+        m.push(0x19); m.push(0x15); uv(&mut m, zz(0)); // enc [PLAIN]
+        m.push(0x19); m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x15); uv(&mut m, zz(0));       // codec=UNCOMPRESSED
+        m.push(0x16); uv(&mut m, zz(n_i));     // num_values
+        m.push(0x46); uv(&mut m, zz(4));       // data_page_offset=4
+        m.push(0x00); m.push(0x00);
+        m.push(0x26); uv(&mut m, zz(n_i));     // RG num_rows
+        m.push(0x00); m.push(0x00);
+
+        let mut f = Vec::new();
+        f.extend_from_slice(b"PAR1");
+        f.extend_from_slice(&hdr);
+        f.extend_from_slice(&payload);
+        let mlen = m.len() as u32;
+        f.extend_from_slice(&m);
+        f.extend_from_slice(&mlen.to_le_bytes());
+        f.extend_from_slice(b"PAR1");
+        f
+    }
+
+    // ── re-declared builder: non-flat schema (root → group → leaf) ─────
+    //
+    // Mirrors `mod tests::build_nested_schema_file` (not pub there).
+    fn build_nested_schema_file() -> Vec<u8> {
+        let mut page_data = Vec::new();
+        page_data.extend_from_slice(&7i64.to_le_bytes());
+        let data_bytes = page_data.len() as i64;
+
+        let mut hdr = Vec::new();
+        hdr.push(0x15); uv(&mut hdr, zz(0));
+        hdr.push(0x15); uv(&mut hdr, zz(data_bytes));
+        hdr.push(0x15); uv(&mut hdr, zz(data_bytes));
+        hdr.push(0x2c);
+        hdr.push(0x15); uv(&mut hdr, zz(1));
+        hdr.push(0x15); uv(&mut hdr, zz(0));
+        hdr.push(0x00); hdr.push(0x00);
+
+        let mut m = Vec::new();
+        m.push(0x15); uv(&mut m, zz(2));
+        m.push(0x19); m.push(0x3c); // 3 SchemaElements
+        // schema[0] root group: f4 name="schema", f5 nc=1
+        m.push(0x48); uv(&mut m, 6); m.extend_from_slice(b"schema");
+        m.push(0x15); uv(&mut m, zz(1));
+        m.push(0x00);
+        // schema[1] intermediate group "g": no f1 type, f4 name="g", f5 nc=1
+        m.push(0x48); uv(&mut m, 1); m.extend_from_slice(b"g");
+        m.push(0x15); uv(&mut m, zz(1));
+        m.push(0x00);
+        // schema[2] leaf "id": f1 INT64, f3 REQUIRED, f4 name
+        m.push(0x15); uv(&mut m, zz(2));
+        m.push(0x25); uv(&mut m, zz(0));
+        m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x00);
+        m.push(0x16); uv(&mut m, zz(1));
+        m.push(0x19); m.push(0x1c);
+        m.push(0x19); m.push(0x1c);
+        m.push(0x3c);
+        m.push(0x15); uv(&mut m, zz(2));
+        m.push(0x19); m.push(0x15); uv(&mut m, zz(0));
+        m.push(0x19); m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x15); uv(&mut m, zz(0));
+        m.push(0x16); uv(&mut m, zz(1));
+        m.push(0x46); uv(&mut m, zz(4));
+        m.push(0x00); m.push(0x00);
+        m.push(0x26); uv(&mut m, zz(1));
+        m.push(0x00); m.push(0x00);
+
+        let mut f = Vec::new();
+        f.extend_from_slice(b"PAR1");
+        f.extend_from_slice(&hdr);
+        f.extend_from_slice(&page_data);
+        let mlen = m.len() as u32;
+        f.extend_from_slice(&m);
+        f.extend_from_slice(&mlen.to_le_bytes());
+        f.extend_from_slice(b"PAR1");
+        f
+    }
+
+    // ── re-declared builder: OPTIONAL+dict INT64 file ──────────────────
+    //
+    // Mirrors `mod tests::build_opt_dict_int64_file` (not pub there).
+    // Logical rows [7, null, 7]: dict=[7], defs=[1,0,1], indices=[0,0].
+    // `oob_index`: if Some(b), overrides the dict-index bits byte so
+    // the present values reference an out-of-range index.
+    fn build_opt_dict_int64_file_with_oob(oob_bits: Option<u8>) -> Vec<u8> {
+        let mut dict_data = Vec::new();
+        dict_data.extend_from_slice(&7i64.to_le_bytes());
+        let dbytes = dict_data.len() as i64;
+
+        let mut dict_hdr = Vec::new();
+        dict_hdr.push(0x15); uv(&mut dict_hdr, zz(2));
+        dict_hdr.push(0x15); uv(&mut dict_hdr, zz(dbytes));
+        dict_hdr.push(0x15); uv(&mut dict_hdr, zz(dbytes));
+        dict_hdr.push(0x4c);
+        dict_hdr.push(0x15); uv(&mut dict_hdr, zz(1));
+        dict_hdr.push(0x15); uv(&mut dict_hdr, zz(2));
+        dict_hdr.push(0x12);
+        dict_hdr.push(0x00); dict_hdr.push(0x00);
+
+        // def-level: defs=[1,0,1], groups=1, bit_width=1.
+        // header varint = (1<<1)|1 = 3 → [0x03]; bits byte: bit0=1,bit1=0,bit2=1 → 0x05.
+        let def_hybrid: &[u8] = &[0x03, 0x05];
+        let def_len: u32 = 2;
+        // dict-index body for 2 present values, both index=0 (normal),
+        // or override bits byte to force OOB index.
+        // bit_width=1, 1 group: header=0x03, bits byte
+        let idx_bits = oob_bits.unwrap_or(0x00); // 0x00=index 0,0; 0xFF=index 1,1 (OOB: dict len=1)
+        let dict_idx_body: Vec<u8> = vec![0x01, 0x03, idx_bits];
+
+        let mut data_payload = Vec::new();
+        data_payload.extend_from_slice(&def_len.to_le_bytes());
+        data_payload.extend_from_slice(def_hybrid);
+        data_payload.extend_from_slice(&dict_idx_body);
+        let pbytes = data_payload.len() as i64;
+
+        let mut data_hdr = Vec::new();
+        data_hdr.push(0x15); uv(&mut data_hdr, zz(0));
+        data_hdr.push(0x15); uv(&mut data_hdr, zz(pbytes));
+        data_hdr.push(0x15); uv(&mut data_hdr, zz(pbytes));
+        data_hdr.push(0x2c);
+        data_hdr.push(0x15); uv(&mut data_hdr, zz(3)); // n=3 rows incl nulls
+        data_hdr.push(0x15); uv(&mut data_hdr, zz(2)); // PLAIN_DICTIONARY(2)
+        data_hdr.push(0x00); data_hdr.push(0x00);
+
+        let dict_page_offset: i64 = 4;
+        let data_page_offset: i64 = 4 + dict_hdr.len() as i64 + dict_data.len() as i64;
+
+        let mut m = Vec::new();
+        m.push(0x15); uv(&mut m, zz(2));
+        m.push(0x19); m.push(0x2c);
+        m.push(0x48); uv(&mut m, 6); m.extend_from_slice(b"schema");
+        m.push(0x15); uv(&mut m, zz(1));
+        m.push(0x00);
+        m.push(0x15); uv(&mut m, zz(2));       // leaf INT64
+        m.push(0x25); uv(&mut m, zz(1));       // OPTIONAL(1)
+        m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x00);
+        m.push(0x16); uv(&mut m, zz(3));
+        m.push(0x19); m.push(0x1c);
+        m.push(0x19); m.push(0x1c);
+        m.push(0x3c);
+        m.push(0x15); uv(&mut m, zz(2));
+        m.push(0x19); m.push(0x15); uv(&mut m, zz(2)); // enc [PLAIN_DICTIONARY]
+        m.push(0x19); m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x15); uv(&mut m, zz(0));
+        m.push(0x16); uv(&mut m, zz(3));
+        m.push(0x46); uv(&mut m, zz(data_page_offset));
+        m.push(0x26); uv(&mut m, zz(dict_page_offset));
+        m.push(0x00); m.push(0x00);
+        m.push(0x26); uv(&mut m, zz(3));
+        m.push(0x00); m.push(0x00);
+
+        let mut f = Vec::new();
+        f.extend_from_slice(b"PAR1");
+        f.extend_from_slice(&dict_hdr);
+        f.extend_from_slice(&dict_data);
+        f.extend_from_slice(&data_hdr);
+        f.extend_from_slice(&data_payload);
+        let mlen = m.len() as u32;
+        f.extend_from_slice(&m);
+        f.extend_from_slice(&mlen.to_le_bytes());
+        f.extend_from_slice(b"PAR1");
+        f
+    }
+
+    // Helper: wrap in catch_unwind, assert no panic + typed Bad.
+    fn assert_no_panic_bad(file: &[u8]) {
+        let owned = file.to_vec();
+        let r = std::panic::catch_unwind(move || extract(&owned, &["id"]));
+        assert!(r.is_ok(), "must NOT panic on hostile input");
+        assert!(
+            matches!(r.unwrap(), Err(PqError::Bad(_))),
+            "hostile input must yield PqError::Bad"
+        );
+    }
+
+    // Helper: no panic + Unsupported.
+    fn assert_no_panic_unsupported(file: &[u8]) {
+        let owned = file.to_vec();
+        let r = std::panic::catch_unwind(move || extract(&owned, &["id"]));
+        assert!(r.is_ok(), "must NOT panic on hostile input");
+        assert!(
+            matches!(r.unwrap(), Err(PqError::Unsupported(_))),
+            "hostile input must yield PqError::Unsupported"
+        );
+    }
+
+    // ── Lock 1: def-level stream truncated ─────────────────────────────
+    //
+    // Take a valid build_opt_plain_i64 file and corrupt the payload by
+    // chopping everything after the 4-byte length prefix. The body the
+    // prefix refers to is empty, so decode_level_v1 → Bad("rle level
+    // body truncated") or the hybrid decoder runs out of input.
+    #[test]
+    fn pentest_opt_def_stream_truncated_is_bad_no_panic() {
+        // Build a valid [7, -2] optional file (defs=[1,1], present=[7,-2]).
+        let good = build_opt_plain_i64(&[1, 1], &[7, -2]);
+        // The page payload starts right after PAR1 (4) + page header.
+        // We'll reconstruct with a corrupted payload: only the 4-byte
+        // length prefix (saying e.g. 5 bytes follow), but with 0 bytes
+        // actually following — the body is absent.
+        //
+        // Easier: build fresh with a hand-crafted payload.
+        // n=2 rows, OPTIONAL. Payload = [0x05,0x00,0x00,0x00] (claims 5
+        // body bytes, but nothing follows). Values section also absent.
+        let corrupt_payload: Vec<u8> = vec![0x05, 0x00, 0x00, 0x00]; // 5 bytes claimed, 0 present
+        let n: i64 = 2;
+        let psz = corrupt_payload.len() as i64;
+
+        let mut hdr = Vec::new();
+        hdr.push(0x15); uv(&mut hdr, zz(0));
+        hdr.push(0x15); uv(&mut hdr, zz(psz));
+        hdr.push(0x15); uv(&mut hdr, zz(psz));
+        hdr.push(0x2c);
+        hdr.push(0x15); uv(&mut hdr, zz(n));
+        hdr.push(0x15); uv(&mut hdr, zz(0));
+        hdr.push(0x00); hdr.push(0x00);
+
+        let mut m = Vec::new();
+        m.push(0x15); uv(&mut m, zz(2));
+        m.push(0x19); m.push(0x2c);
+        m.push(0x48); uv(&mut m, 6); m.extend_from_slice(b"schema");
+        m.push(0x15); uv(&mut m, zz(1)); m.push(0x00);
+        m.push(0x15); uv(&mut m, zz(2));
+        m.push(0x25); uv(&mut m, zz(1)); // OPTIONAL
+        m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x00);
+        m.push(0x16); uv(&mut m, zz(n));
+        m.push(0x19); m.push(0x1c);
+        m.push(0x19); m.push(0x1c);
+        m.push(0x3c);
+        m.push(0x15); uv(&mut m, zz(2));
+        m.push(0x19); m.push(0x15); uv(&mut m, zz(0));
+        m.push(0x19); m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x15); uv(&mut m, zz(0));
+        m.push(0x16); uv(&mut m, zz(n));
+        m.push(0x46); uv(&mut m, zz(4));
+        m.push(0x00); m.push(0x00);
+        m.push(0x26); uv(&mut m, zz(n));
+        m.push(0x00); m.push(0x00);
+
+        let mut f = Vec::new();
+        f.extend_from_slice(b"PAR1");
+        f.extend_from_slice(&hdr);
+        f.extend_from_slice(&corrupt_payload);
+        let mlen = m.len() as u32;
+        f.extend_from_slice(&m);
+        f.extend_from_slice(&mlen.to_le_bytes());
+        f.extend_from_slice(b"PAR1");
+
+        // Also verify the good baseline actually succeeds.
+        assert!(extract(&good, &["id"]).is_ok(), "baseline must succeed");
+        assert_no_panic_bad(&f);
+    }
+
+    // ── Lock 2: lying 4-byte length prefix ─────────────────────────────
+    //
+    // Length prefix says 999 but only a few hybrid bytes follow.
+    // decode_level_v1 → Bad("rle level body truncated").
+    #[test]
+    fn pentest_opt_lying_length_prefix_is_bad_no_panic() {
+        let n: i64 = 2;
+        // payload: prefix claims 999 bytes, body is only 2 bytes.
+        let mut corrupt_payload: Vec<u8> = Vec::new();
+        corrupt_payload.extend_from_slice(&999u32.to_le_bytes()); // lying prefix
+        corrupt_payload.extend_from_slice(&[0x03, 0x03]); // only 2 body bytes
+        let psz = corrupt_payload.len() as i64;
+
+        let mut hdr = Vec::new();
+        hdr.push(0x15); uv(&mut hdr, zz(0));
+        hdr.push(0x15); uv(&mut hdr, zz(psz));
+        hdr.push(0x15); uv(&mut hdr, zz(psz));
+        hdr.push(0x2c);
+        hdr.push(0x15); uv(&mut hdr, zz(n));
+        hdr.push(0x15); uv(&mut hdr, zz(0));
+        hdr.push(0x00); hdr.push(0x00);
+
+        let mut m = Vec::new();
+        m.push(0x15); uv(&mut m, zz(2));
+        m.push(0x19); m.push(0x2c);
+        m.push(0x48); uv(&mut m, 6); m.extend_from_slice(b"schema");
+        m.push(0x15); uv(&mut m, zz(1)); m.push(0x00);
+        m.push(0x15); uv(&mut m, zz(2));
+        m.push(0x25); uv(&mut m, zz(1)); // OPTIONAL
+        m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x00);
+        m.push(0x16); uv(&mut m, zz(n));
+        m.push(0x19); m.push(0x1c);
+        m.push(0x19); m.push(0x1c);
+        m.push(0x3c);
+        m.push(0x15); uv(&mut m, zz(2));
+        m.push(0x19); m.push(0x15); uv(&mut m, zz(0));
+        m.push(0x19); m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x15); uv(&mut m, zz(0));
+        m.push(0x16); uv(&mut m, zz(n));
+        m.push(0x46); uv(&mut m, zz(4));
+        m.push(0x00); m.push(0x00);
+        m.push(0x26); uv(&mut m, zz(n));
+        m.push(0x00); m.push(0x00);
+
+        let mut f = Vec::new();
+        f.extend_from_slice(b"PAR1");
+        f.extend_from_slice(&hdr);
+        f.extend_from_slice(&corrupt_payload);
+        let mlen = m.len() as u32;
+        f.extend_from_slice(&m);
+        f.extend_from_slice(&mlen.to_le_bytes());
+        f.extend_from_slice(b"PAR1");
+
+        assert_no_panic_bad(&f);
+    }
+
+    // ── Lock 3: def-level value > 1 (max_def_level exceeded) ───────────
+    //
+    // An RLE run with bit_width=1 whose repeated-value byte is 0x02.
+    // The RLE grammar reads ceil(bit_width/8)=1 value byte, which CAN
+    // be 0x02 — the high bits are NOT masked by bit_width in the RLE
+    // repeated-value path (only bit-packed groups are bit-width-masked).
+    // So decode_level_v1 returns levels containing 2, and decode_page's
+    // `d > 1` check → Err(Bad("definition level exceeds max")).
+    //
+    // Construction (for n=2 rows):
+    //   RLE header = varint(run_len << 1) = varint(2<<1) = varint(4) = 0x04 (even → RLE)
+    //   value byte = 0x02
+    //   body = [0x04, 0x02]  (len=2)
+    //   4-byte prefix = [0x02, 0x00, 0x00, 0x00]
+    //   full def stream = [0x02,0x00,0x00,0x00, 0x04,0x02]
+    //
+    // Which layer catches it: the RLE decoder returns level=2; decode_page's
+    // `d > 1` check fires → Err(Bad("definition level exceeds max")).
+    #[test]
+    fn pentest_opt_def_level_gt_max_is_bad_no_panic() {
+        let n: i64 = 2;
+        // def stream: RLE run, value=2, run_len=2, bit_width=1.
+        // body = [0x04 (varint run_len<<1 = 4), 0x02 (value byte)]
+        // length prefix = 2 → [0x02,0x00,0x00,0x00]
+        let def_body: &[u8] = &[0x04, 0x02]; // varint(4)=RLE run_len=2, value=2
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(def_body.len() as u32).to_le_bytes());
+        payload.extend_from_slice(def_body);
+        // No value bytes needed (the decode will reject before reaching them).
+        let psz = payload.len() as i64;
+
+        let mut hdr = Vec::new();
+        hdr.push(0x15); uv(&mut hdr, zz(0));
+        hdr.push(0x15); uv(&mut hdr, zz(psz));
+        hdr.push(0x15); uv(&mut hdr, zz(psz));
+        hdr.push(0x2c);
+        hdr.push(0x15); uv(&mut hdr, zz(n));
+        hdr.push(0x15); uv(&mut hdr, zz(0));
+        hdr.push(0x00); hdr.push(0x00);
+
+        let mut m = Vec::new();
+        m.push(0x15); uv(&mut m, zz(2));
+        m.push(0x19); m.push(0x2c);
+        m.push(0x48); uv(&mut m, 6); m.extend_from_slice(b"schema");
+        m.push(0x15); uv(&mut m, zz(1)); m.push(0x00);
+        m.push(0x15); uv(&mut m, zz(2));
+        m.push(0x25); uv(&mut m, zz(1)); // OPTIONAL
+        m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x00);
+        m.push(0x16); uv(&mut m, zz(n));
+        m.push(0x19); m.push(0x1c);
+        m.push(0x19); m.push(0x1c);
+        m.push(0x3c);
+        m.push(0x15); uv(&mut m, zz(2));
+        m.push(0x19); m.push(0x15); uv(&mut m, zz(0));
+        m.push(0x19); m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x15); uv(&mut m, zz(0));
+        m.push(0x16); uv(&mut m, zz(n));
+        m.push(0x46); uv(&mut m, zz(4));
+        m.push(0x00); m.push(0x00);
+        m.push(0x26); uv(&mut m, zz(n));
+        m.push(0x00); m.push(0x00);
+
+        let mut f = Vec::new();
+        f.extend_from_slice(b"PAR1");
+        f.extend_from_slice(&hdr);
+        f.extend_from_slice(&payload);
+        let mlen = m.len() as u32;
+        f.extend_from_slice(&m);
+        f.extend_from_slice(&mlen.to_le_bytes());
+        f.extend_from_slice(b"PAR1");
+
+        let owned = f.clone();
+        let r = std::panic::catch_unwind(move || extract(&owned, &["id"]));
+        assert!(r.is_ok(), "must NOT panic: def>1 case");
+        let result = r.unwrap();
+        assert!(
+            matches!(result, Err(PqError::Bad(_))),
+            "def level > max_def_level must be Err(Bad); got: {result:?}"
+        );
+    }
+
+    // ── Lock 4: value section shorter than present count ────────────────
+    //
+    // defs say 3 rows present (defs=[1,1,1]) but only 2 i64s in the
+    // value section. plain::decode_plain for 3 i64s from 16 bytes →
+    // Bad("PLAIN INT64 truncated") (needs 24, gets 16).
+    #[test]
+    fn pentest_opt_value_section_shorter_than_present_is_bad_no_panic() {
+        // n=3 rows, all defs=1 (3 present), but only 2 i64s in body.
+        let n: i64 = 3;
+        // def stream: 3 present. groups=1, bit_width=1.
+        // header = (1<<1)|1 = 3 → [0x03]; bits byte: bits 0,1,2 all set → 0x07.
+        let def_body: &[u8] = &[0x03, 0x07]; // varint(3), bits=0b00000111
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(def_body.len() as u32).to_le_bytes());
+        payload.extend_from_slice(def_body);
+        // Only 2 i64s (16 bytes) instead of the required 3 (24 bytes).
+        payload.extend_from_slice(&7i64.to_le_bytes());
+        payload.extend_from_slice(&(-2i64).to_le_bytes());
+        let psz = payload.len() as i64;
+
+        let mut hdr = Vec::new();
+        hdr.push(0x15); uv(&mut hdr, zz(0));
+        hdr.push(0x15); uv(&mut hdr, zz(psz));
+        hdr.push(0x15); uv(&mut hdr, zz(psz));
+        hdr.push(0x2c);
+        hdr.push(0x15); uv(&mut hdr, zz(n));
+        hdr.push(0x15); uv(&mut hdr, zz(0));
+        hdr.push(0x00); hdr.push(0x00);
+
+        let mut m = Vec::new();
+        m.push(0x15); uv(&mut m, zz(2));
+        m.push(0x19); m.push(0x2c);
+        m.push(0x48); uv(&mut m, 6); m.extend_from_slice(b"schema");
+        m.push(0x15); uv(&mut m, zz(1)); m.push(0x00);
+        m.push(0x15); uv(&mut m, zz(2));
+        m.push(0x25); uv(&mut m, zz(1)); // OPTIONAL
+        m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x00);
+        m.push(0x16); uv(&mut m, zz(n));
+        m.push(0x19); m.push(0x1c);
+        m.push(0x19); m.push(0x1c);
+        m.push(0x3c);
+        m.push(0x15); uv(&mut m, zz(2));
+        m.push(0x19); m.push(0x15); uv(&mut m, zz(0));
+        m.push(0x19); m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x15); uv(&mut m, zz(0));
+        m.push(0x16); uv(&mut m, zz(n));
+        m.push(0x46); uv(&mut m, zz(4));
+        m.push(0x00); m.push(0x00);
+        m.push(0x26); uv(&mut m, zz(n));
+        m.push(0x00); m.push(0x00);
+
+        let mut f = Vec::new();
+        f.extend_from_slice(b"PAR1");
+        f.extend_from_slice(&hdr);
+        f.extend_from_slice(&payload);
+        let mlen = m.len() as u32;
+        f.extend_from_slice(&m);
+        f.extend_from_slice(&mlen.to_le_bytes());
+        f.extend_from_slice(b"PAR1");
+
+        assert_no_panic_bad(&f);
+    }
+
+    // ── Lock 5: OPTIONAL + dict with out-of-range index ─────────────────
+    //
+    // Dict has 1 entry (index 0 valid). Index bits byte = 0xFF causes
+    // both present-value indices to be 1, which is out-of-range for a
+    // dict of length 1 → Bad from dict::resolve_dict_indices.
+    #[test]
+    fn pentest_opt_dict_oob_index_is_bad_no_panic() {
+        // oob_bits=0xFF: bit-packed indices for 2 present values, both=1
+        // (bit0=1, bit1=1 → index 1), but dict only has entry at index 0.
+        let f = build_opt_dict_int64_file_with_oob(Some(0xFF));
+        assert_no_panic_bad(&f);
+    }
+
+    // ── Lock 6: non-flat schema → Unsupported, no panic ─────────────────
+    //
+    // root → intermediate group → leaf: flat_schema=false → extract →
+    // Err(Unsupported("nested schema: OBJ-2c")), no panic.
+    #[test]
+    fn pentest_opt_non_flat_schema_unsupported_no_panic() {
+        let f = build_nested_schema_file();
+        assert_no_panic_unsupported(&f);
+    }
+
+    // ── Positive correctness locks (MUST be Ok with exact values) ────────
+    //
+    // These assert the decode_page null-scatter is correct. If any fails,
+    // the scatter logic is wrong — report BLOCKED, never weaken the lock.
+
+    #[test]
+    fn pentest_opt_positive_all_null_exact() {
+        // defs=[0,0], present=[] → [[Null],[Null]]
+        let f = build_opt_plain_i64(&[0, 0], &[]);
+        let r = std::panic::catch_unwind(|| extract(&f, &["id"]));
+        assert!(r.is_ok(), "no panic: all-null positive lock");
+        assert_eq!(
+            r.unwrap().expect("all-null must be Ok"),
+            vec![vec![PqValue::Null], vec![PqValue::Null]],
+            "all-null: exact placement required"
+        );
+    }
+
+    #[test]
+    fn pentest_opt_positive_all_present_exact() {
+        // defs=[1,1], present=[7,-2] → [[I64(7)],[I64(-2)]]
+        let f = build_opt_plain_i64(&[1, 1], &[7, -2]);
+        let r = std::panic::catch_unwind(|| extract(&f, &["id"]));
+        assert!(r.is_ok(), "no panic: all-present positive lock");
+        assert_eq!(
+            r.unwrap().expect("all-present must be Ok"),
+            vec![vec![PqValue::I64(7)], vec![PqValue::I64(-2)]],
+            "all-present: exact placement required"
+        );
+    }
+
+    #[test]
+    fn pentest_opt_positive_mixed_scatter_exact() {
+        // defs=[1,0,1,1,0], present=[10,20,30]
+        // Expected: [[I64(10)],[Null],[I64(20)],[I64(30)],[Null]]
+        let f = build_opt_plain_i64(&[1, 0, 1, 1, 0], &[10, 20, 30]);
+        let r = std::panic::catch_unwind(|| extract(&f, &["id"]));
+        assert!(r.is_ok(), "no panic: mixed scatter positive lock");
+        assert_eq!(
+            r.unwrap().expect("mixed scatter must be Ok"),
+            vec![
+                vec![PqValue::I64(10)],
+                vec![PqValue::Null],
+                vec![PqValue::I64(20)],
+                vec![PqValue::I64(30)],
+                vec![PqValue::Null],
+            ],
+            "mixed scatter: exact placement required"
+        );
+    }
+}
+
 // ── Task 12 PENTEST PASS — adversarial lock tests ─────────────────────
 //
 // The Parquet object bytes are operator-declared-source-controlled =

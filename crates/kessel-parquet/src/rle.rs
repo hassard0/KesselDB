@@ -338,3 +338,119 @@ mod tests {
         }
     }
 }
+
+// ── PENTEST PASS — adversarial lock tests ─────────────────────────
+//
+// RLE/bit-packing streams inside a Parquet object are
+// operator-declared-source-controlled = attacker-influenceable. The
+// run-length / group-count are varint header values up to ~2^63.
+// Each case proves: no panic / no OOM / no stack-overflow, and a
+// well-formed Result (Ok of exactly num_values, OR Err(Bad)).
+#[cfg(test)]
+mod pentest {
+    use super::*;
+
+    fn enc_uvarint(out: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(b);
+                break;
+            } else {
+                out.push(b | 0x80);
+            }
+        }
+    }
+
+    fn well_behaved(data: &[u8], bw: u32, nv: usize) {
+        let owned = data.to_vec();
+        let r = std::panic::catch_unwind(move || {
+            decode_hybrid(&owned, bw, nv)
+        });
+        assert!(r.is_ok(), "must NOT panic/OOM-unwind");
+        match r.unwrap() {
+            Ok(v) => assert_eq!(
+                v.len(),
+                nv,
+                "Ok must return exactly num_values"
+            ),
+            Err(PqError::Bad(_)) => {}
+            Err(other) => {
+                panic!("unexpected error variant: {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn rle_header_run_len_max_no_oom() {
+        // RLE header with a near-u64::MAX run length, bit_width=1.
+        // header = run_len<<1; encode the max varint payload.
+        let mut s = Vec::new();
+        enc_uvarint(&mut s, u64::MAX & !1); // even → RLE; huge run_len
+        s.push(0x01); // 1 repeated-value byte (ceil(1/8))
+        // num_values small: must return Ok([1;4]) WITHOUT allocating
+        // run_len elements.
+        well_behaved(&s, 1, 4);
+    }
+
+    #[test]
+    fn bitpacked_groups_max_rejected_before_alloc() {
+        // header = (groups<<1)|1 with groups ≈ u64::MAX/2 → the
+        // groups*8 / groups*bit_width checked_mul overflows → Bad,
+        // BEFORE any unpack/allocation.
+        let mut s = Vec::new();
+        enc_uvarint(&mut s, u64::MAX | 1); // odd → bit-packed
+        well_behaved(&s, 8, 4);
+    }
+
+    #[test]
+    fn truncated_final_bitpacked_group() {
+        // 1 group of 8 @ bit_width=3 needs 3 bytes; supply only 1.
+        let s = [0x03u8, 0x88];
+        well_behaved(&s, 3, 8);
+    }
+
+    #[test]
+    fn truncated_rle_repeated_value() {
+        // RLE run_len=2 bit_width=17 → needs 3 value bytes; supply 1.
+        let s = [0x04u8, 0xA0];
+        well_behaved(&s, 17, 2);
+    }
+
+    #[test]
+    fn bit_width_64_tiny_slice() {
+        // bit_width 64: bit-packed group needs 64 bytes; RLE needs 8.
+        // A 2-byte slice cannot satisfy either → Bad, no panic.
+        well_behaved(&[0x03u8, 0x00], 64, 8);
+        well_behaved(&[0x02u8, 0x00], 64, 1);
+    }
+
+    #[test]
+    fn bit_width_65_rejected() {
+        let r = decode_hybrid(&[0x02u8], 65, 1);
+        assert!(matches!(r, Err(PqError::Bad(_))));
+    }
+
+    #[test]
+    fn empty_slice_num_values_positive() {
+        well_behaved(&[], 3, 4);
+        let r = decode_hybrid(&[], 3, 4);
+        assert!(matches!(r, Err(PqError::Bad(_))));
+    }
+
+    #[test]
+    fn decode_level_v1_oversized_prefix() {
+        // u32 length prefix = 0xFFFF_FFFF but only a few body bytes.
+        let data = [0xFFu8, 0xFF, 0xFF, 0xFF, 0x08, 0x01];
+        let owned = data.to_vec();
+        let r = std::panic::catch_unwind(move || {
+            decode_level_v1(&owned, 1, 4)
+        });
+        assert!(r.is_ok(), "must NOT panic");
+        assert!(matches!(
+            r.unwrap(),
+            Err(PqError::Bad(_))
+        ));
+    }
+}

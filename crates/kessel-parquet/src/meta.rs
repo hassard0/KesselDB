@@ -69,11 +69,22 @@ impl Codec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Encoding {
     Plain,
+    /// RLE (id=3 in parquet.thrift). For flat REQUIRED columns this
+    /// encoding appears in the ColumnMetaData encoding list to describe
+    /// the (zero-length) repetition/definition level encoding; it does
+    /// NOT appear as the data page encoding. Allowed in the encoding
+    /// list alongside Plain; the actual data page encoding is checked
+    /// separately via PageHeader.DataPageHeader.encoding.
+    Rle,
     Other(i32),
 }
 impl Encoding {
     fn from_i32(v: i32) -> Encoding {
-        if v == 0 { Encoding::Plain } else { Encoding::Other(v) }
+        match v {
+            0 => Encoding::Plain,
+            3 => Encoding::Rle,
+            o => Encoding::Other(o),
+        }
     }
 }
 

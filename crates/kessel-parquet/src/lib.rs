@@ -114,9 +114,16 @@ pub fn extract(
                     "compression: OBJ-2b/2c".into(),
                 ));
             }
-            if cc.encodings.iter().any(|e| *e != meta::Encoding::Plain) {
+            // Allow Plain or Rle in the encoding list. For flat REQUIRED
+            // columns, Parquet producers (pyarrow etc.) may list Rle to
+            // describe the definition/repetition level encoding — no actual
+            // level bytes appear in V1 REQUIRED pages. The data page
+            // encoding is enforced separately via ph.dp_encoding == 0.
+            if cc.encodings.iter().any(|e| {
+                !matches!(e, meta::Encoding::Plain | meta::Encoding::Rle)
+            }) {
                 return Err(PqError::Unsupported(
-                    "non-PLAIN encoding (dictionary/RLE/DELTA): OBJ-2b"
+                    "non-PLAIN encoding (dictionary/DELTA/BYTE_STREAM_SPLIT): OBJ-2b"
                         .into(),
                 ));
             }

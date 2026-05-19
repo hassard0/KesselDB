@@ -762,10 +762,12 @@ mod pentest {
     //
     // GZIP_AB with the ISIZE trailer field patched to 100 (LE u32).
     // expected_len=100 (within cap). ISIZE check passes (100==100).
-    // inflate() is called with expected_len=100 but the DEFLATE stream
-    // only produces 2 bytes (b"AB") then emits end-of-block → inflate
-    // returns Err(Bad("deflate length mismatch")). Vec::with_capacity(100)
-    // is a safe alloc (100 bytes); no multi-GB allocation ever occurs.
+    // Vec::with_capacity(100) is a safe 100-byte alloc — no OOM risk.
+    // inflate() runs: the DEFLATE stream legitimately produces 2 bytes
+    // (b"AB") then emits end-of-block; the inflate loop exits normally.
+    // The post-loop guard `out.len()(2) != expected_len(100)` then
+    // returns Bad("deflate length mismatch"). Detection is the
+    // post-loop length check, not a mid-stream abort.
     //
     // Hand-construction: GZIP_AB bytes 18-21 are the ISIZE LE u32.
     // Original ISIZE = 02 00 00 00 (=2). Patched = 64 00 00 00 (=100).
@@ -818,10 +820,11 @@ mod pentest {
 
     // ── lying_fextra ─────────────────────────────────────────────────
     //
-    // FLG bit 2 (FEXTRA) set; XLEN = 0xffff (65535). The pos
-    // arithmetic: 10 + 2 + 65535 = 65547, then the bounds check
-    // `pos > src.len()-8` (10 < 65547) fires →
-    // Bad("gzip: header overruns trailer region").
+    // FLG bit 2 (FEXTRA) set; XLEN = 0xffff (65535).
+    // After reading XLEN the header parser advances pos to
+    // 10 + 2 + 65535 = 65547; the guard
+    // `pos (65547) > src.len().saturating_sub(8) (= 18-8 = 10)`
+    // fires → Bad("gzip: header overruns trailer region").
     // Member is 18 bytes (minimum); last 8 bytes are the "trailer"
     // region — none of it is reachable.
     //
@@ -981,36 +984,31 @@ mod pentest {
     // length/distance back-reference with distance > out.len() (=0).
     // → Bad("deflate: back-reference distance out of range").
     //
-    // Hand-crafted DEFLATE (RFC 1951 fixed Huffman codes):
-    //   Fixed litlen: codes 256-279 are 7-bit, first_code[7]=0.
-    //   Symbol 257 = length 3, canonical code = 0b0000001 (7 bits).
-    //   Decoder reads bits MSB-first (via bit-at-a-time accumulation):
-    //     reads: 0,0,0,0,0,0 (6 zeros) then 1 → code=1 at len=7 → symbol 257.
+    // Hand-crafted DEFLATE (RFC 1951 fixed Huffman, §3.2.6):
     //
-    //   BFINAL=1, BTYPE=01 (fixed): bit0=1, bit1=1(BTYPE[0]), bit2=0(BTYPE[1]).
-    //   Huffman starts reading from bit3.
-    //   7-bit litlen decode for symbol 257:
-    //     reads bits3..bit9 (7 bits): 0,0,0,0,0,0,1 (code=1).
-    //   Fixed dist: 5-bit codes; dist code 0 = canonical code 0 (0b00000).
-    //   5-bit dist decode for code 0: reads bits10..14 = 0,0,0,0,0.
-    //   distance = DIST_BASE[0] + bits(DIST_EXTRA[0]) = 1 + 0 = 1.
-    //   out.len() = 0 → distance(1) > out.len()(0)
+    //   BFINAL=1, BTYPE=01 (fixed Huffman): bit0=1, bit1=1(BTYPE[0]), bit2=0(BTYPE[1]).
+    //   Huffman reads begin at bit3.
+    //
+    //   Litlen decode (7-bit canonical codes, first_code[7]=0):
+    //     The decoder accumulates one bit at a time (MSB-first canonical order).
+    //     bits3..9 = 0,0,0,0,0,0,1 → code=1 at length 7.
+    //     first_code[7]=0, offset=1-0=1, entries[1].symbol=257. ✓
+    //     Symbol 257: length base=3, EXTRA_LEN[0]=0 extra bits → length=3.
+    //
+    //   Dist decode (5-bit codes, first_code[5]=0):
+    //     bits10..14 = 0,0,0,0,0 → code=0 at length 5 → dist_code=0.
+    //     distance = DIST_BASE[0] + bits(DIST_EXTRA[0]) = 1 + 0 = 1.
+    //
+    //   out.len()=0 at this point → distance(1) > out.len()(0)
     //     → Bad("deflate: back-reference distance out of range"). ✓
     //
-    //   Bit layout:
-    //     byte0 = bits0-7: 1,1,0,0,0,0,0,0 → 0x03
-    //       (bit0=BFINAL, bit1=BTYPE[0]=1(fixed), bit2=BTYPE[1]=0,
-    //        bits3-7 = litlen bits0-4 = 0 (MSB side of 7-bit code))
-    //     byte1 = bits8-14 (remaining: litlen bit5=0, bit6=1; dist bits0-4=0):
-    //       bit8=0(litlen b5), bit9=1(litlen b6=1→code=1=sym257), ...wait:
-    //       accumulation: step1=bit3=0(code=0), step2=bit4=0(code=0),
-    //       step3=bit5=0(code=0), step4=bit6=0(code=0), step5=bit7=0(code=0),
-    //       step6=bit8=0(code=0), step7=bit9=1(code=1) → len=7: first_code[7]=0,
-    //       code-first_code=1, offset=1 < count[7]=24 → symbol = entries[1].symbol
-    //       = 257 (the second 7-bit symbol). ✓
-    //     Dist decode from bit10: bits10-14 = 0,0,0,0,0 → code=0 at len=5 → dist_code=0.
-    //     byte0: 0b00000011 = 0x03
-    //     byte1: bit0=0,bit1=1, bits2-6=0 → 0b00000010 = 0x02; rest don't matter.
+    //   Byte layout (LSB-first within each byte, RFC 1951 §3.1.1):
+    //     byte0 = 0x03 = 0b00000011:
+    //       bit0=BFINAL=1, bit1=BTYPE[0]=1(fixed), bit2=BTYPE[1]=0,
+    //       bits3-7=litlen accumulator bits 0-4 (all 0).
+    //     byte1 = 0x02 = 0b00000010:
+    //       bit0=litlen acc bit5=0, bit1=litlen acc bit6=1 → code=1, sym=257;
+    //       bits2-6=dist accumulator bits 0-4 (all 0) → dist_code=0.
     //
     //   Gzip wrapper: ISIZE=3 (= expected_len), CRC=0 (inflate fails, CRC unchecked).
     #[test]

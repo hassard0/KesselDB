@@ -129,10 +129,17 @@ fn refresh_over_https_materializes_rows() {
         .expect("refresh wire");
     // Untrusted self-signed cert ⇒ typed failure surfaced at REFRESH.
     // OpResult has no Err variant; TLS/fetch failures surface as SchemaError.
-    assert!(
-        matches!(res, OpResult::SchemaError(_)),
-        "REFRESH over an untrusted https cert must fail typed as SchemaError, got {res:?}"
-    );
+    match &res {
+        OpResult::SchemaError(msg) => assert!(
+            msg.contains("refresh:"),
+            "REFRESH must fail via the do_refresh fetch path \
+             (message should start `refresh:`), got SchemaError({msg:?})"
+        ),
+        other => panic!(
+            "REFRESH over an untrusted https cert must fail typed \
+             with SchemaError, got {other:?}"
+        ),
+    }
 
     // Atomic abort held: SELECT still works and returns no rows.
     let blob = match sc.sql("SELECT * FROM feed").expect("select wire") {

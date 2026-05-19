@@ -43,3 +43,21 @@ fn dict_flat_fixture_roundtrips() {
         ]
     );
 }
+
+#[test]
+fn snappy_fixtures_roundtrip() {
+    for f in ["snappy_dict.parquet", "snappy_plain.parquet"] {
+        let path = format!(
+            "{}/tests/fixtures/{}", env!("CARGO_MANIFEST_DIR"), f);
+        let bytes = std::fs::read(&path).expect("read fixture");
+        let rows = extract(&bytes, &["id", "s"])
+            .unwrap_or_else(|e| panic!("{f}: {e}"));
+        assert_eq!(rows, vec![
+            vec![PqValue::I64(7),   PqValue::Bytes(b"a".to_vec())],
+            vec![PqValue::I64(7),   PqValue::Bytes(b"a".to_vec())],
+            vec![PqValue::I64(-2),  PqValue::Bytes(b"b".to_vec())],
+            vec![PqValue::I64(7),   PqValue::Bytes(b"c".to_vec())],
+            vec![PqValue::I64(100), PqValue::Bytes(b"a".to_vec())],
+        ], "{f}");
+    }
+}

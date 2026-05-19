@@ -71,3 +71,17 @@ Regenerate:
 Real pyarrow 24.0.0 output: dictionary-encoded, UNCOMPRESSED, V1, flat
 REQUIRED. Expected logical rows:
 id = [7, 7, -2, 7, 100]; s = ["a", "a", "b", "c", "a"].
+
+## snappy_dict.parquet / snappy_plain.parquet (OBJ-2b-3)
+
+Regenerate:
+
+    python -c "import pyarrow as pa, pyarrow.parquet as pq; \
+    sch=pa.schema([pa.field('id',pa.int64(),nullable=False),pa.field('s',pa.large_utf8(),nullable=False)]); \
+    t=pa.table({'id':pa.array([7,7,-2,7,100],type=pa.int64()),'s':pa.array(['a','a','b','c','a'],type=pa.large_utf8())},schema=sch); \
+    pq.write_table(t,'crates/kessel-parquet/tests/fixtures/snappy_dict.parquet',use_dictionary=True,compression='snappy',version='1.0',data_page_version='1.0'); \
+    pq.write_table(t,'crates/kessel-parquet/tests/fixtures/snappy_plain.parquet',use_dictionary=False,compression='snappy',version='1.0',data_page_version='1.0')"
+
+Real pyarrow 24.0.0, SNAPPY-compressed, V1, flat REQUIRED.
+snappy_dict = dictionary-encoded; snappy_plain = PLAIN.
+Expected rows: id=[7,7,-2,7,100]; s=["a","a","b","c","a"].

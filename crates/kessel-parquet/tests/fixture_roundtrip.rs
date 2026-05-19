@@ -100,3 +100,45 @@ fn snappy_fixtures_roundtrip() {
         ], "{f}");
     }
 }
+
+/// OBJ-2c-1: real pyarrow gzip_dict.parquet and gzip_plain.parquet
+/// (REQUIRED + GZIP, dict-encoded and PLAIN respectively). Decisive
+/// non-self-referential proof: production extract() over
+/// metadata-verified-GZIP real pyarrow files.
+#[test]
+fn gzip_fixtures_roundtrip() {
+    for f in ["gzip_dict.parquet", "gzip_plain.parquet"] {
+        let path = format!(
+            "{}/tests/fixtures/{}", env!("CARGO_MANIFEST_DIR"), f);
+        let bytes = std::fs::read(&path).expect("read fixture");
+        let rows = extract(&bytes, &["id", "s"])
+            .unwrap_or_else(|e| panic!("{f}: {e}"));
+        assert_eq!(rows, vec![
+            vec![I64(7),   Bytes(b"a".to_vec())],
+            vec![I64(7),   Bytes(b"a".to_vec())],
+            vec![I64(-2),  Bytes(b"b".to_vec())],
+            vec![I64(7),   Bytes(b"c".to_vec())],
+            vec![I64(100), Bytes(b"a".to_vec())],
+        ], "{f}");
+    }
+}
+
+/// OBJ-2c-1: real pyarrow gzip_nullable.parquet (OPTIONAL + dict + GZIP,
+/// with NULLs). Proves gzip ∘ def-levels ∘ dict composition through the
+/// page_payload seam — decisive non-self-referential proof.
+#[test]
+fn gzip_nullable_fixture_roundtrips() {
+    let path = format!(
+        "{}/tests/fixtures/gzip_nullable.parquet", env!("CARGO_MANIFEST_DIR"));
+    let bytes = std::fs::read(&path).expect("read fixture");
+    let expected = vec![
+        vec![I64(7),   Bytes(b"a".to_vec())],
+        vec![I64(7),   Null],
+        vec![Null,     Bytes(b"b".to_vec())],
+        vec![I64(-2),  Bytes(b"c".to_vec())],
+        vec![I64(100), Bytes(b"a".to_vec())],
+    ];
+    let rows = extract(&bytes, &["id", "s"])
+        .expect("extract gzip_nullable.parquet (OPTIONAL+dict+GZIP)");
+    assert_eq!(rows, expected, "gzip_nullable.parquet (OPTIONAL+dict+GZIP)");
+}

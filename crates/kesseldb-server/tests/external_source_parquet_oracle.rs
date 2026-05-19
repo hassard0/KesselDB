@@ -61,6 +61,9 @@ static SNAPPY_DICT_PARQUET_FIXTURE: &[u8] =
 static NULLABLE_PARQUET_FIXTURE: &[u8] =
     include_bytes!("../../kessel-parquet/tests/fixtures/nullable.parquet");
 
+static GZIP_DICT_PARQUET_FIXTURE: &[u8] =
+    include_bytes!("../../kessel-parquet/tests/fixtures/gzip_dict.parquet");
+
 fn tls_stub_with_fixture(fixture: &'static [u8]) -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
@@ -421,4 +424,82 @@ fn refresh_nullable_parquet_from_s3_fails_closed_and_state_intact() {
         o => panic!("SELECT nfeed: {o:?}"),
     };
     assert!(blob.is_empty(), "no rows must have been materialized for nfeed");
+}
+
+/// Mirrors `refresh_parquet_from_s3_fails_closed_and_state_intact` for the
+/// real pyarrow gzip_dict.parquet fixture (OBJ-2c-1). The same fail-closed
+/// contract applies: the production webpki-roots TLS client does NOT trust
+/// the self-signed localhost cert, so REFRESH returns a typed SchemaError
+/// via the do_refresh → kessel_objstore::sign_get → kessel_fetch path,
+/// and prior (empty) state remains intact. The trusted GZIP-decode happy
+/// path is proven at the kessel-parquet layer by
+/// `fixture_roundtrip::gzip_fixtures_roundtrip`. No fixture-trust bypass
+/// is introduced here (SP100/SP101 precedent).
+#[test]
+fn refresh_gzip_parquet_from_s3_fails_closed_and_state_intact() {
+    std::env::set_var("OBJ_GPQ_KEYID", "AKIAEXAMPLE5");
+    std::env::set_var("OBJ_GPQ_SECRET", "secretexamplekey5");
+
+    let port = tls_stub_with_fixture(GZIP_DICT_PARQUET_FIXTURE);
+    let shard = spawn_shard("gpq");
+    let router = Arc::new(Router::new(vec![shard.clone()]));
+    let rl = TcpListener::bind("127.0.0.1:0").unwrap();
+    let raddr = rl.local_addr().unwrap();
+    {
+        let r = router.clone();
+        std::thread::spawn(move || serve_router(rl, r));
+    }
+    std::thread::sleep(Duration::from_millis(1400));
+
+    let mut sc = shard
+        .iter()
+        .find_map(|a| {
+            Client::connect(a.parse::<SocketAddr>().unwrap()).ok()
+        })
+        .expect("connect shard");
+
+    let ddl = format!(
+        "CREATE EXTERNAL SOURCE gfeed (\
+           id U64 NOT NULL FROM 'id', s CHAR(4) NOT NULL FROM 's'\
+         ) FROM 's3://bucket/gzip.parquet' FORMAT PARQUET KEY id \
+         REGION 'us-east-1' \
+         ENDPOINT 'https://127.0.0.1:{port}' \
+         AUTH OBJSTORE S3 KEYID ENV 'OBJ_GPQ_KEYID' SECRET ENV 'OBJ_GPQ_SECRET'"
+    );
+    assert!(
+        matches!(
+            sc.sql(&ddl).expect("ddl wire"),
+            OpResult::Ok | OpResult::TypeCreated(_)
+        ),
+        "CREATE EXTERNAL SOURCE must succeed (URL is opaque)"
+    );
+
+    let mut rc = Client::connect(raddr).expect("connect router");
+    let res = rc
+        .call(&Op::RefreshExternalSource { name: "gfeed".into() })
+        .expect("refresh wire");
+
+    // Untrusted self-signed cert ⇒ typed SchemaError at REFRESH.
+    // gzip_dict.parquet decode happy-path proven at kessel-parquet layer
+    // (fixture_roundtrip::gzip_fixtures_roundtrip). No fixture-trust
+    // bypass is introduced here (SP100/SP101 precedent).
+    match &res {
+        OpResult::SchemaError(msg) => assert!(
+            msg.contains("refresh:")
+                || msg.contains("sign:")
+                || msg.to_lowercase().contains("tls")
+                || msg.to_lowercase().contains("connect"),
+            "REFRESH must fail via the do_refresh objstore fetch path, got SchemaError({msg:?})"
+        ),
+        other => panic!(
+            "REFRESH over untrusted https objstore must fail typed SchemaError, got {other:?}"
+        ),
+    }
+
+    // Atomic abort held: SELECT still works and returns no rows.
+    let blob = match sc.sql("SELECT * FROM gfeed").expect("select wire") {
+        OpResult::Got(b) => b,
+        o => panic!("SELECT gfeed: {o:?}"),
+    };
+    assert!(blob.is_empty(), "no rows must have been materialized for gfeed");
 }

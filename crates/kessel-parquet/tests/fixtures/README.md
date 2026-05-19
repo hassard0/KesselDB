@@ -99,3 +99,21 @@ Real pyarrow 24.0.0. `nullable.parquet` = VANILLA default (OPTIONAL +
 dictionary + Snappy, with NULLs). `nullable_plain.parquet` = OPTIONAL +
 PLAIN + UNCOMPRESSED, with NULLs. V1, flat schema.
 Expected rows: id=[7,7,null,-2,100]; s=["a",null,"b","c","a"].
+
+## gzip_dict.parquet / gzip_plain.parquet / gzip_nullable.parquet (OBJ-2c-1)
+
+Regenerate:
+
+    python -c "import pyarrow as pa, pyarrow.parquet as pq; \
+    sch=pa.schema([pa.field('id',pa.int64(),nullable=False),pa.field('s',pa.large_utf8(),nullable=False)]); \
+    t=pa.table({'id':pa.array([7,7,-2,7,100],type=pa.int64()),'s':pa.array(['a','a','b','c','a'],type=pa.large_utf8())},schema=sch); \
+    pq.write_table(t,'crates/kessel-parquet/tests/fixtures/gzip_dict.parquet',use_dictionary=True,compression='gzip',version='1.0',data_page_version='1.0'); \
+    pq.write_table(t,'crates/kessel-parquet/tests/fixtures/gzip_plain.parquet',use_dictionary=False,compression='gzip',version='1.0',data_page_version='1.0'); \
+    tn=pa.table({'id':pa.array([7,7,None,-2,100],type=pa.int64()),'s':pa.array(['a',None,'b','c','a'],type=pa.large_utf8())}); \
+    pq.write_table(tn,'crates/kessel-parquet/tests/fixtures/gzip_nullable.parquet',compression='gzip',version='1.0',data_page_version='1.0')"
+
+Real pyarrow 24.0.0, GZIP-compressed, V1. `gzip_dict` = REQUIRED +
+dictionary-encoded. `gzip_plain` = REQUIRED + PLAIN. `gzip_nullable` =
+OPTIONAL (nullable) + dictionary + GZIP, with NULLs.
+Expected rows (dict/plain): id=[7,7,-2,7,100]; s=["a","a","b","c","a"].
+Expected rows (nullable): id=[7,7,null,-2,100]; s=["a",null,"b","c","a"].

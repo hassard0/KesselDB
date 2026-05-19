@@ -261,6 +261,21 @@ impl<'a> P<'a> {
     }
 }
 
+/// Render an f64 to the canonical textual form that `coerce::to_field_bytes`
+/// maps byte-identically to a JSON numeric string of the same value.
+/// Uses Rust's default `{}` Display (shortest round-trip, locale-free,
+/// deterministic). Integral-valued floats print as `"3"` (no `.0`),
+/// which is fine because Parquet physical F64 columns are only ever
+/// mapped to floating-point FieldKinds in the schema — those go through
+/// `coerce`'s `other` arm (rejected) today; the function exists so
+/// `pq_to_cell` is complete and forward-compatible. I64 Parquet integers
+/// render via `i.to_string()` (e.g. `"7"`) which `coerce::to_field_bytes`
+/// accepts for all integer FieldKinds.
+#[cfg_attr(not(feature = "object-store"), allow(dead_code))]
+pub(crate) fn canonical_f64(f: f64) -> String {
+    format!("{f}")
+}
+
 /// Navigate `rows_path` (if any) to a JSON array, then extract `cols`
 /// from each element (same scalar dotted-path rule as `extract`).
 /// `None` rows_path == today's top-level-array behavior.
@@ -409,6 +424,33 @@ mod tests {
         // empty array at the ROWS path => Ok(vec![]) (the "last page" signal)
         let empty = br#"{"data":{"items":[]}}"#;
         assert_eq!(rows_at(empty, &cols, Some("data.items")).unwrap(), Vec::<Vec<Cell>>::new());
+    }
+
+    #[test]
+    fn canonical_f64_form_and_i64_coerce_determinism() {
+        // Pin the textual form: Rust's {} Display is shortest round-trip.
+        assert_eq!(canonical_f64(1.5), "1.5");
+        assert_eq!(canonical_f64(3.0), "3");   // integral float: no trailing ".0"
+        assert_eq!(canonical_f64(-0.5), "-0.5");
+        // Pin: a Parquet I64(7) → Cell::Text("7") → coerce::to_field_bytes
+        // must produce the same LE bytes as 7i64 (same as a JSON "7" numeric token).
+        assert_eq!(
+            crate::coerce::to_field_bytes(
+                &kessel_catalog::FieldKind::I64,
+                Cell::Text("7".into()),
+            )
+            .unwrap(),
+            7i64.to_le_bytes().to_vec()
+        );
+        // Pin: a Parquet I64(-2) → Cell::Text("-2") → coerce → (-2i64).to_le_bytes()
+        assert_eq!(
+            crate::coerce::to_field_bytes(
+                &kessel_catalog::FieldKind::I64,
+                Cell::Text("-2".into()),
+            )
+            .unwrap(),
+            (-2i64).to_le_bytes().to_vec()
+        );
     }
 
     #[test]

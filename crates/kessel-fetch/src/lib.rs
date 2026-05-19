@@ -50,6 +50,7 @@ pub enum Format {
     Json,
     Csv,
     Ndjson,
+    Parquet,
 }
 
 /// Auth resolved by the caller (router) from its own env — a value,
@@ -118,10 +119,16 @@ pub fn fetch_rows_paginated(
         if total > MAX_TOTAL_BODY {
             return Err(FetchError::TooLarge(MAX_TOTAL_BODY));
         }
-        let raw = match format {
+        let raw: Vec<Vec<json::Cell>> = match format {
             Format::Json => json::rows_at(&body, cols, rows_path)?,
             Format::Ndjson => ndjson::extract(&body, cols)?,
             Format::Csv => csv::extract(&body, cols)?,
+            // Parquet is whole-object only; paginated streaming makes no sense.
+            Format::Parquet => {
+                return Err(FetchError::Parse(
+                    "FORMAT PARQUET is single-object only (no pagination)".into(),
+                ))
+            }
         };
         for r in raw {
             let mut row = Vec::with_capacity(cols.len());
@@ -213,10 +220,26 @@ pub(crate) fn rows_from_body(
     cols: &[ColumnMap],
     rows_path: Option<&str>,
 ) -> Result<Vec<Vec<Vec<u8>>>, FetchError> {
-    let raw = match format {
+    let raw: Vec<Vec<json::Cell>> = match format {
         Format::Json => json::rows_at(body, cols, rows_path)?,
         Format::Csv => csv::extract(body, cols)?,
         Format::Ndjson => ndjson::extract(body, cols)?,
+        #[cfg(feature = "object-store")]
+        Format::Parquet => {
+            let names: Vec<&str> =
+                cols.iter().map(|c| c.source.as_str()).collect();
+            let pv = kessel_parquet::extract(body, &names)
+                .map_err(|e| FetchError::Parse(e.to_string()))?;
+            pv.into_iter()
+                .map(|row| row.into_iter().map(pq_to_cell).collect())
+                .collect()
+        }
+        #[cfg(not(feature = "object-store"))]
+        Format::Parquet => {
+            return Err(FetchError::Parse(
+                "FORMAT PARQUET requires the object-store build".into(),
+            ))
+        }
     };
     let mut out = Vec::with_capacity(raw.len());
     for r in raw {
@@ -227,6 +250,36 @@ pub(crate) fn rows_from_body(
         out.push(row);
     }
     Ok(out)
+}
+
+/// Map a `PqValue` to the `json::Cell` representation that `coerce::to_field_bytes`
+/// accepts, byte-identically to the JSON path for the same value.
+#[cfg(feature = "object-store")]
+fn pq_to_cell(v: kessel_parquet::PqValue) -> json::Cell {
+    use kessel_parquet::PqValue::*;
+    match v {
+        Null => json::Cell::Null,
+        Bool(b) => json::Cell::Bool(b),
+        // Integers rendered via to_string() — the same textual form a JSON
+        // numeric token carries, so coerce::to_field_bytes is byte-identical.
+        I64(i) => json::Cell::Text(i.to_string()),
+        F64(f) => json::Cell::Text(json::canonical_f64(f)),
+        Bytes(b) => json::Cell::Text(
+            String::from_utf8_lossy(&b).into_owned(),
+        ),
+    }
+}
+
+/// Test-only accessor for `rows_from_body` (the crate-internal decode+coerce
+/// entry point). Not part of the stable public API.
+#[doc(hidden)]
+pub fn rows_from_body_for_test(
+    body: &[u8],
+    format: Format,
+    cols: &[ColumnMap],
+    rows_path: Option<&str>,
+) -> Result<Vec<Vec<Vec<u8>>>, FetchError> {
+    rows_from_body(body, format, cols, rows_path)
 }
 
 /// Fetch + parse. Returns one `Vec<(column-index, raw FieldKind bytes)>`

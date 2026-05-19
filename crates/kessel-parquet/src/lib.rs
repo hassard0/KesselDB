@@ -347,24 +347,30 @@ fn read_chunk_values(
             .get(off..)
             .ok_or_else(|| PqError::Bad("data page offset past EOF".into()))?;
         let (ph, hlen) = meta::decode_page_header(region)?;
-        // Preserve the V1 path's exact fallible-check ordering: the
-        // `dp_num_values` range check is V1-only and historically ran
-        // FIRST; for `page_type == 3` it is meaningless (V2 uses
-        // `v2_num_values`) so it is computed inside the V1 arm. The
-        // dstart/comp/uncomp bookkeeping is shared and uses the exact
-        // same expressions + error strings the V1 path has always used.
-        let dstart = off
-            .checked_add(hlen)
-            .ok_or_else(|| PqError::Bad("page hdr len ovf".into()))?;
-        let comp = usize::try_from(ph.compressed_size)
-            .map_err(|_| PqError::Bad("page comp size range".into()))?;
-        let uncomp = usize::try_from(ph.uncompressed_size)
-            .map_err(|_| PqError::Bad("page size range".into()))?;
-        let vals = match ph.page_type {
+        // V1 byte-identity is the CRITICAL bar: the `page_type == 0`
+        // arm must reproduce the pre-OBJ-2c-3 fallible-check sequence
+        // token-for-token — `dp_num_values` ("num_values range") FIRST,
+        // then dstart → comp → uncomp, then page_payload, dict-guard,
+        // decode_page. Nothing fallible derived from `ph` is hoisted
+        // before this match (a hoist would let a malformed comp/uncomp
+        // surface ahead of a malformed `dp_num_values`, a V1 observable
+        // change for hostile multi-malformed input). Each arm returns
+        // `(vals, dstart, comp)` so the loop's post-match `off` advance
+        // is derived identically to pre-T3 (`off_next = dstart + comp =
+        // off + hlen + comp`); the V2 arm computes its OWN dstart/comp
+        // independently from `ph`, never sharing V1 bindings.
+        let (vals, dstart, comp) = match ph.page_type {
             0 => {
-                // ── existing V1 path — byte-identical ──
+                // ── existing V1 path — byte-identical (pre-T3 order) ──
                 let n = usize::try_from(ph.dp_num_values)
                     .map_err(|_| PqError::Bad("num_values range".into()))?;
+                let dstart = off
+                    .checked_add(hlen)
+                    .ok_or_else(|| PqError::Bad("page hdr len ovf".into()))?;
+                let comp = usize::try_from(ph.compressed_size)
+                    .map_err(|_| PqError::Bad("page comp size range".into()))?;
+                let uncomp = usize::try_from(ph.uncompressed_size)
+                    .map_err(|_| PqError::Bad("page size range".into()))?;
                 let payload = page_payload(file, dstart, comp, uncomp, cc.codec)?;
                 // decode_page's dict arms (dp_encoding 2|8, both REQUIRED and
                 // OPTIONAL) call dict::resolve_dict_indices, which needs a populated
@@ -379,16 +385,25 @@ fn read_chunk_values(
                             .into(),
                     ));
                 }
-                decode_page(
+                let vals = decode_page(
                     &payload,
                     ph.dp_encoding,
                     want_ptype,
                     n,
                     max_def_level,
                     &dict,
-                )?
+                )?;
+                (vals, dstart, comp)
             }
             3 => {
+                // V2 computes its own region bounds independently from
+                // `ph` — duplicated offset bookkeeping, never the V1
+                // bindings (distinct error strings keep the paths apart).
+                let dstart = off
+                    .checked_add(hlen)
+                    .ok_or_else(|| PqError::Bad("v2 page hdr len ovf".into()))?;
+                let comp = usize::try_from(ph.compressed_size)
+                    .map_err(|_| PqError::Bad("v2 comp size range".into()))?;
                 let v2_region = file
                     .get(
                         dstart
@@ -397,14 +412,15 @@ fn read_chunk_values(
                             })?,
                     )
                     .ok_or_else(|| PqError::Bad("v2 page truncated".into()))?;
-                decode_data_page_v2(
+                let vals = decode_data_page_v2(
                     v2_region,
                     &ph,
                     cc.codec,
                     want_ptype,
                     max_def_level,
                     &dict,
-                )?
+                )?;
+                (vals, dstart, comp)
             }
             _ => {
                 return Err(PqError::Unsupported(
@@ -1742,6 +1758,91 @@ mod tests {
             extract(&f, &["id"]).expect("v2-dict"),
             vec![vec![PqValue::I64(7)], vec![PqValue::Null], vec![PqValue::I64(7)]]
         );
+    }
+
+    // ── OBJ-2c-3 Task 3 review: V1 fallible-check ORDERING lock ───────
+    //
+    // The `match ph.page_type` gate must NOT change any V1 observable,
+    // including for hostile multi-malformed input. Pre-OBJ-2c-3 the V1
+    // `page_type == 0` path ran its fallible checks in this exact order:
+    //   1. n  = usize::try_from(ph.dp_num_values)  → "num_values range"
+    //   2. dstart = off.checked_add(hlen)          → "page hdr len ovf"
+    //   3. comp = usize::try_from(ph.compressed_size) → "page comp size range"
+    //   4. uncomp = usize::try_from(ph.uncompressed_size) → "page size range"
+    //   5. page_payload → dict-guard → decode_page
+    // `dstart` (step 2) is `off (=4) + hlen (small)` and can never
+    // overflow here, so NOTHING fallible sits between the `dp_num_values`
+    // check (1) and the `compressed_size` check (3): a file with BOTH
+    // `dp_num_values < 0` and `compressed_page_size < 0` MUST surface
+    // the `dp_num_values` error ("num_values range") because that check
+    // runs first. An accidental hoist of the comp/uncomp computation
+    // ahead of the `0 =>` arm's `n` check would instead surface "page
+    // comp size range" — exactly the e5fd553 defect this test locks.
+    //
+    // Bytes are hand-derived: a V1 DATA_PAGE PageHeader identical to
+    // `page_header_bytes` except f3 `compressed_page_size` and g1
+    // `dp_num_values` are set to i32 `-1` (zigzag of -1 is 1 → single
+    // byte 0x01; `usize::try_from(-1i32)` fails for BOTH). FileMetaData
+    // still declares chunk num_values=2 so the data-page loop is entered.
+    fn build_v1_dp_num_values_and_comp_both_negative() -> Vec<u8> {
+        // PLAIN page data: 7i64 + (-2)i64 LE (16 bytes) — never reached,
+        // both range checks fire before any payload slicing.
+        let mut page_data = Vec::new();
+        page_data.extend_from_slice(&7i64.to_le_bytes());
+        page_data.extend_from_slice(&(-2i64).to_le_bytes());
+
+        // Hand-built PageHeader: f1 type=DATA_PAGE(0); f2 uncompressed=16
+        // (valid); f3 compressed = -1 (malformed); f5 DataPageHeader{
+        // g1 num_values = -1 (malformed); g2 encoding=PLAIN(0) }.
+        let mut h = Vec::new();
+        h.push(0x15); uv(&mut h, zz(0));  // f1 page_type=DATA_PAGE(0)
+        h.push(0x15); uv(&mut h, zz(16)); // f2 uncompressed_page_size=16 (valid)
+        h.push(0x15); uv(&mut h, zz(-1)); // f3 compressed_page_size=-1 (MALFORMED)
+        h.push(0x2c);                     // f5 DataPageHeader struct (delta 3->5=2)
+        h.push(0x15); uv(&mut h, zz(-1)); // g1 num_values=-1 (MALFORMED)
+        h.push(0x15); uv(&mut h, zz(0));  // g2 encoding=PLAIN(0)
+        h.push(0x00); h.push(0x00);       // stop DPH / stop PH
+
+        let data_page_offset: i64 = 4;
+        // Reuse the canonical one-column INT64 REQUIRED metadata; it
+        // declares chunk num_values=2 so the loop reaches the page.
+        let meta = filemetadata_bytes(0, 0, 0, 2, data_page_offset);
+        let mlen = meta.len() as u32;
+
+        let mut f = Vec::new();
+        f.extend_from_slice(b"PAR1");
+        f.extend_from_slice(&h);
+        f.extend_from_slice(&page_data);
+        f.extend_from_slice(&meta);
+        f.extend_from_slice(&mlen.to_le_bytes());
+        f.extend_from_slice(b"PAR1");
+        f
+    }
+
+    #[test]
+    fn v1_check_order_num_values_before_comp_size_unchanged() {
+        // BOTH dp_num_values and compressed_size are malformed. Pre-T3
+        // (and post-fix) the `dp_num_values` check runs FIRST → the
+        // "num_values range" error wins. Against the e5fd553 hoist the
+        // comp/uncomp checks ran before the `0 =>` arm, so this would
+        // have produced "page comp size range" instead — proving the
+        // defect and that the fix restores exact V1 ordering.
+        let f = build_v1_dp_num_values_and_comp_both_negative();
+        match extract(&f, &["id"]) {
+            Err(PqError::Bad(msg)) => {
+                assert!(
+                    msg.contains("num_values"),
+                    "expected the V1 dp_num_values check to win (pre-T3 \
+                     ordering), got: {msg:?}"
+                );
+                assert!(
+                    !msg.contains("comp size"),
+                    "comp-size error must NOT win — that is the e5fd553 \
+                     hoist defect; got: {msg:?}"
+                );
+            }
+            other => panic!("expected PqError::Bad(num_values…), got {other:?}"),
+        }
     }
 }
 

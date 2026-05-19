@@ -702,3 +702,472 @@ mod tests {
         ));
     }
 }
+
+// ── PENTEST PASS — adversarial lock tests ─────────────────────────────
+//
+// Gzip page bytes are operator/network-source-controlled. Each hostile
+// case is wrapped in catch_unwind asserting no panic/OOM/stack-overflow
+// AND a typed Result (Bad or Unsupported). The positive correctness
+// locks assert exact Ok plaintext — a failure there means the decoder
+// is wrong, NEVER weaken a positive lock.
+//
+// Conventions:
+//  - Valid reference member "GZIP_AB": python gzip.compress(b"AB"),
+//    decompresses to b"AB", expected_len=2.  Used for over_cap,
+//    bomb_bounded (trailer ISIZE patched), isize_mismatch,
+//    crc_mismatch (trailer CRC byte flipped).
+//  - All hostile gzip members are hand-constructed from RFC 1951/1952.
+//  - The four positive inflate locks reuse the Task-1 KAT vectors.
+//  - The gzip ∘ dict ∘ OPTIONAL composition is already proven by the
+//    T4 gzip_nullable roundtrip; the gzip unit pentest covers the
+//    decompress() + inflate() functions specifically.
+#[cfg(test)]
+mod pentest {
+    use super::*;
+
+    // ── Helper ────────────────────────────────────────────────────────
+    //
+    // nb(src, expected_len):
+    //   Wrap decompress(src, expected_len) in catch_unwind.
+    //   Assert: (1) no panic/unwind; (2) result is Err(Bad) or Err(Unsupported).
+    //   Mirrors the snappy.rs mod pentest `nb` shape exactly.
+    fn nb(src: &[u8], expected: usize) {
+        let s = src.to_vec();
+        let r = std::panic::catch_unwind(move || decompress(&s, expected));
+        assert!(r.is_ok(), "must NOT panic/OOM-unwind");
+        assert!(
+            matches!(r.unwrap(),
+                Err(PqError::Bad(_)) | Err(PqError::Unsupported(_))),
+            "hostile input must be a typed error"
+        );
+    }
+
+    // ── over_cap ──────────────────────────────────────────────────────
+    //
+    // A valid gzip member (GZIP_AB) with expected_len = GZIP_MAX_DECOMP+1.
+    // The cap check fires before any alloc → Unsupported. No multi-GB
+    // allocation attempted.
+    #[test]
+    fn over_cap() {
+        // GZIP_AB: python gzip.compress(b"AB") — decompresses to b"AB"
+        // (expected_len=2 in normal use; here we pass an over-cap value).
+        let member: &[u8] = &[
+            0x1f,0x8b,0x08,0x00,0xc5,0x9b,0x0c,0x6a,0x02,0xff,
+            0x73,0x74,0x02,0x00,0x07,0x4c,0x69,0x30,0x02,0x00,0x00,0x00,
+        ];
+        nb(member, GZIP_MAX_DECOMP + 1);
+    }
+
+    // ── bomb_bounded ──────────────────────────────────────────────────
+    //
+    // GZIP_AB with the ISIZE trailer field patched to 100 (LE u32).
+    // expected_len=100 (within cap). ISIZE check passes (100==100).
+    // inflate() is called with expected_len=100 but the DEFLATE stream
+    // only produces 2 bytes (b"AB") then emits end-of-block → inflate
+    // returns Err(Bad("deflate length mismatch")). Vec::with_capacity(100)
+    // is a safe alloc (100 bytes); no multi-GB allocation ever occurs.
+    //
+    // Hand-construction: GZIP_AB bytes 18-21 are the ISIZE LE u32.
+    // Original ISIZE = 02 00 00 00 (=2). Patched = 64 00 00 00 (=100).
+    // CRC bytes 14-17 are left as crc32(b"AB")=0x30694c07; inflate
+    // fails before the CRC check so CRC value is irrelevant to this path.
+    #[test]
+    fn bomb_bounded() {
+        let member: &[u8] = &[
+            0x1f,0x8b,0x08,0x00,0xc5,0x9b,0x0c,0x6a,0x02,0xff,
+            0x73,0x74,0x02,0x00,0x07,0x4c,0x69,0x30,
+            0x64,0x00,0x00,0x00, // ISIZE=100 (patched from 2)
+        ];
+        nb(member, 100);
+    }
+
+    // ── bad_magic ─────────────────────────────────────────────────────
+    //
+    // 18 bytes not starting with 1f 8b → Bad("gzip magic").
+    #[test]
+    fn bad_magic() {
+        let member: &[u8] = &[
+            0x00,0x00,0x08,0x00,0x00,0x00,0x00,0x00,0x00,0xff,
+            0x73,0x74,0x02,0x00,0x07,0x4c,0x69,0x30,
+        ];
+        nb(member, 2);
+    }
+
+    // ── cm_not_deflate ────────────────────────────────────────────────
+    //
+    // A member with src[2]=0x09 (CM != 8 / not DEFLATE).
+    // → Unsupported("gzip method != deflate: OBJ-2c").
+    // Hand-build: valid magic (1f 8b), CM=0x09, rest can be zero
+    // (padded to 18 bytes so the length check passes).
+    #[test]
+    fn cm_not_deflate() {
+        let member: &[u8] = &[
+            0x1f,0x8b,0x09,0x00,0x00,0x00,0x00,0x00,0x00,0xff,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+        ];
+        nb(member, 1);
+    }
+
+    // ── truncated_header ──────────────────────────────────────────────
+    //
+    // Only 2 bytes [1f 8b] — member too short (<18) → Bad.
+    #[test]
+    fn truncated_header() {
+        nb(&[0x1f, 0x8b], 1);
+    }
+
+    // ── lying_fextra ─────────────────────────────────────────────────
+    //
+    // FLG bit 2 (FEXTRA) set; XLEN = 0xffff (65535). The pos
+    // arithmetic: 10 + 2 + 65535 = 65547, then the bounds check
+    // `pos > src.len()-8` (10 < 65547) fires →
+    // Bad("gzip: header overruns trailer region").
+    // Member is 18 bytes (minimum); last 8 bytes are the "trailer"
+    // region — none of it is reachable.
+    //
+    // RFC 1952: FLG bit 2 = FEXTRA; XLEN is LE u16 at pos=10.
+    // Byte layout:
+    //   [0]1f [1]8b [2]08 [3]04(FLG) [4..7]MTIME [8]XFL [9]OS=ff
+    //   [10]ff [11]ff  ← XLEN = 65535 (LE)
+    //   [12..17] padding
+    #[test]
+    fn lying_fextra() {
+        let member: &[u8] = &[
+            0x1f,0x8b,0x08,0x04,0x00,0x00,0x00,0x00,0x00,0xff,
+            0xff,0xff,                          // XLEN = 65535
+            0x00,0x00,0x00,0x00,0x00,0x00,      // padding to 18 bytes
+        ];
+        nb(member, 1);
+    }
+
+    // ── unterminated_fname ────────────────────────────────────────────
+    //
+    // FLG bit 3 (FNAME) set; no NUL byte before the 8-byte trailer
+    // region (positions 10..src.len()-8). The scan immediately hits
+    // the `pos >= src.len()-8` guard → Bad("gzip: FNAME not
+    // NUL-terminated before trailer").
+    //
+    // With 18 bytes: src.len()-8 = 10. FNAME scan starts at pos=10,
+    // immediately 10 >= 10 → Bad.
+    #[test]
+    fn unterminated_fname() {
+        let member: &[u8] = &[
+            0x1f,0x8b,0x08,0x08,0x00,0x00,0x00,0x00,0x00,0xff,
+            0x41,0x42,0x43,0x44,0x45,0x46,0x47,0x48, // "ABCDEFGH", no NUL
+        ];
+        nb(member, 1);
+    }
+
+    // ── truncated_deflate ─────────────────────────────────────────────
+    //
+    // Valid gzip header (1f 8b 08 00 … os=ff, pos=10) but DEFLATE
+    // stream cut to 1 byte [0x73] before the 8-byte trailer.
+    // 0x73 = 0b01110011: bit0=1(BFINAL), bits1-2=01(BTYPE=fixed).
+    // Then the fixed-Huffman litlen decode tries to read 7 bits (for
+    // codes 256-279) starting at bit3. Only bits3..7 (5 bits) are
+    // present in byte 0x73; the next byte is the trailer (treated as
+    // outside deflate). BitReader hits end → Bad("deflate truncated
+    // (bit read)").
+    // ISIZE = 2 (trailer), expected_len = 2 → ISIZE check passes.
+    // CRC = 0 (placeholder; inflate fails first, CRC never checked).
+    //
+    // Byte layout (19 bytes):
+    //   [0..9] standard header, [10] 0x73 (deflate 1 byte),
+    //   [11..14] 00 00 00 00 (CRC placeholder),
+    //   [15..18] 02 00 00 00 (ISIZE=2)
+    #[test]
+    fn truncated_deflate() {
+        let member: &[u8] = &[
+            0x1f,0x8b,0x08,0x00,0x00,0x00,0x00,0x00,0x00,0xff,
+            0x73,                               // 1 deflate byte
+            0x00,0x00,0x00,0x00,                // CRC placeholder
+            0x02,0x00,0x00,0x00,                // ISIZE=2
+        ];
+        nb(member, 2);
+    }
+
+    // ── reserved_btype ───────────────────────────────────────────────
+    //
+    // DEFLATE first byte = 0x07: bit0=1(BFINAL), bits1-2=11(BTYPE=3,
+    // reserved) → Bad("deflate reserved block type") immediately.
+    // The inflate() function never reads further.
+    // ISIZE = 1 (= expected_len), CRC = 0 (inflate fails, CRC unchecked).
+    //
+    // Byte layout (20 bytes):
+    //   [0..9] standard header, [10] 0x07 (reserved btype),
+    //   [11..14] 00 00 00 00 (CRC placeholder),
+    //   [15..18] 01 00 00 00 (ISIZE=1), [19] padding to ≥18
+    // Wait: len = 19 ≥ 18 ✓.
+    #[test]
+    fn reserved_btype() {
+        let member: &[u8] = &[
+            0x1f,0x8b,0x08,0x00,0x00,0x00,0x00,0x00,0x00,0xff,
+            0x07,                               // BFINAL=1,BTYPE=3(reserved)
+            0x00,0x00,0x00,0x00,                // CRC placeholder
+            0x01,0x00,0x00,0x00,                // ISIZE=1
+        ];
+        nb(member, 1);
+    }
+
+    // ── bad_dynamic_huffman ───────────────────────────────────────────
+    //
+    // A dynamic block whose code-length stream overruns HLIT+HDIST=258.
+    // Hand-crafted from RFC 1951:
+    //
+    //   BFINAL=1, BTYPE=10 (dynamic):
+    //     bit0=1, bits1-2=01 (remember bits1=BTYPE[0]=0, bits2=BTYPE[1]=1
+    //     for BTYPE=2). Wait: btype=br.bits(2) reads bit1 then bit2:
+    //     result = bit1|(bit2<<1). For btype=2: bit1=0, bit2=1. So
+    //     byte0 bits: bit0=1(BFINAL), bit1=0(BTYPE[0]), bit2=1(BTYPE[1]).
+    //
+    //   Bit sequence:
+    //     bit0=1  BFINAL
+    //     bit1=0  BTYPE[0]   → BTYPE = (bit1=0)|(bit2<<1=2) = 2 = dynamic
+    //     bit2=1  BTYPE[1]
+    //     bits3-7 = HLIT(5 bits) = 0 → HLIT=257
+    //     bits8-12 = HDIST(5 bits) = 0 → HDIST=1
+    //     bits13-16 = HCLEN(4 bits) = 0 → HCLEN=4
+    //     code-length lengths for [16,17,18,0] (4 entries × 3 bits):
+    //       cl[16]=0 (bits17-19=0,0,0)
+    //       cl[17]=0 (bits20-22=0,0,0)
+    //       cl[18]=1 (bits23-25 = 1,0,0 LSB-first = value 1)
+    //       cl[0]=0  (bits26-28=0,0,0)
+    //     CL Huffman: only symbol 18 has len=1, code=0 (1-bit: bit=0).
+    //     CL decode loop needs to emit 258 lengths total.
+    //       Read bit29=0 → symbol 18 → bits(7) extra: bits30-36=1111111=127
+    //         → emit 11+127=138 zeros. Count=138.
+    //       Read bit37=0 → symbol 18 → bits(7) extra: bits38-44=1111111=127
+    //         → would emit 138 more → total 276 > 258 →
+    //         Bad("deflate dyn: code lengths overrun (18)").
+    //
+    //   Byte layout (bit-packed, LSB-first within each byte):
+    //     byte0 = bits0-7: 1,0,1,0,0,0,0,0 → 0b00000101 = 0x05
+    //       (bit0=BFINAL=1, bit1=BTYPE[0]=0, bit2=BTYPE[1]=1,
+    //        bits3-7=HLIT bits0-4=0)
+    //     byte1 = bits8-15: 0,0,0,0,0,0,0,0 → 0x00
+    //       (bits8-12=HDIST=0, bits13-15=HCLEN bits0-2=0)
+    //     byte2 = bits16-23: 0,0,0,0,0,0,0,1 → 0b10000000 = 0x80
+    //       (bit16=HCLEN bit3=0; bits17-19=cl[16]=0,0,0;
+    //        bits20-22=cl[17]=0,0,0; bit23=cl[18]bit0=1)
+    //     byte3 = bits24-31: 0,0,0,0,0,0,0,1 → 0b11000000... wait:
+    //       bit24=cl[18]bit1=0, bit25=cl[18]bit2=0,
+    //       bits26-28=cl[0]=0,0,0, bit29=CL_code_for_sym18=0,
+    //       bits30-31=extra bits0-1=1,1
+    //       → 0b11000000 = 0xC0
+    //     byte4 = bits32-39: 1,1,1,1,1,0,1,1
+    //       bit32=extra bit2=1, bit33=bit3=1, bit34=bit4=1,
+    //       bit35=bit5=1, bit36=bit6=1 (extra done, 7 bits=1111111),
+    //       bit37=CL_code_for_sym18(2nd)=0,
+    //       bits38-39=extra2 bits0-1=1,1
+    //       → 0b11011111 = 0xDF
+    //     byte5 = bits40-47: 1,1,1,1,1,... (extra2 bits2-6=1,1,1,1,1; rest don't matter)
+    //       → at least 0x1F (low 5 bits=1; guard fires before reading further)
+    //
+    //   Gzip wrapper: ISIZE=10(=expected_len), CRC=0 (inflate fails first).
+    #[test]
+    fn bad_dynamic_huffman() {
+        let member: &[u8] = &[
+            0x1f,0x8b,0x08,0x00,0x00,0x00,0x00,0x00,0x00,0xff, // header
+            0x05,0x00,0x80,0xC0,0xDF,0x1F,                     // deflate: dyn block
+            0x00,0x00,0x00,0x00,                                // CRC placeholder
+            0x0a,0x00,0x00,0x00,                                // ISIZE=10
+        ];
+        nb(member, 10);
+    }
+
+    // ── distance_before_output ────────────────────────────────────────
+    //
+    // A fixed-Huffman stream whose first emitted symbol is a
+    // length/distance back-reference with distance > out.len() (=0).
+    // → Bad("deflate: back-reference distance out of range").
+    //
+    // Hand-crafted DEFLATE (RFC 1951 fixed Huffman codes):
+    //   Fixed litlen: codes 256-279 are 7-bit, first_code[7]=0.
+    //   Symbol 257 = length 3, canonical code = 0b0000001 (7 bits).
+    //   Decoder reads bits MSB-first (via bit-at-a-time accumulation):
+    //     reads: 0,0,0,0,0,0 (6 zeros) then 1 → code=1 at len=7 → symbol 257.
+    //
+    //   BFINAL=1, BTYPE=01 (fixed): bit0=1, bit1=1(BTYPE[0]), bit2=0(BTYPE[1]).
+    //   Huffman starts reading from bit3.
+    //   7-bit litlen decode for symbol 257:
+    //     reads bits3..bit9 (7 bits): 0,0,0,0,0,0,1 (code=1).
+    //   Fixed dist: 5-bit codes; dist code 0 = canonical code 0 (0b00000).
+    //   5-bit dist decode for code 0: reads bits10..14 = 0,0,0,0,0.
+    //   distance = DIST_BASE[0] + bits(DIST_EXTRA[0]) = 1 + 0 = 1.
+    //   out.len() = 0 → distance(1) > out.len()(0)
+    //     → Bad("deflate: back-reference distance out of range"). ✓
+    //
+    //   Bit layout:
+    //     byte0 = bits0-7: 1,1,0,0,0,0,0,0 → 0x03
+    //       (bit0=BFINAL, bit1=BTYPE[0]=1(fixed), bit2=BTYPE[1]=0,
+    //        bits3-7 = litlen bits0-4 = 0 (MSB side of 7-bit code))
+    //     byte1 = bits8-14 (remaining: litlen bit5=0, bit6=1; dist bits0-4=0):
+    //       bit8=0(litlen b5), bit9=1(litlen b6=1→code=1=sym257), ...wait:
+    //       accumulation: step1=bit3=0(code=0), step2=bit4=0(code=0),
+    //       step3=bit5=0(code=0), step4=bit6=0(code=0), step5=bit7=0(code=0),
+    //       step6=bit8=0(code=0), step7=bit9=1(code=1) → len=7: first_code[7]=0,
+    //       code-first_code=1, offset=1 < count[7]=24 → symbol = entries[1].symbol
+    //       = 257 (the second 7-bit symbol). ✓
+    //     Dist decode from bit10: bits10-14 = 0,0,0,0,0 → code=0 at len=5 → dist_code=0.
+    //     byte0: 0b00000011 = 0x03
+    //     byte1: bit0=0,bit1=1, bits2-6=0 → 0b00000010 = 0x02; rest don't matter.
+    //
+    //   Gzip wrapper: ISIZE=3 (= expected_len), CRC=0 (inflate fails, CRC unchecked).
+    #[test]
+    fn distance_before_output() {
+        let member: &[u8] = &[
+            0x1f,0x8b,0x08,0x00,0x00,0x00,0x00,0x00,0x00,0xff, // header
+            0x03,0x02,                                          // deflate: fixed, sym257, dist0
+            0x00,0x00,0x00,0x00,                                // CRC placeholder
+            0x03,0x00,0x00,0x00,                                // ISIZE=3
+        ];
+        nb(member, 3);
+    }
+
+    // ── stored_nlen_mismatch ──────────────────────────────────────────
+    //
+    // STORED block with NLEN != ~LEN.
+    // RFC 1951 §3.2.4: after align, read LEN (LE u16) then NLEN (LE u16).
+    // Require NLEN == !LEN & 0xFFFF.
+    //
+    // BFINAL=1, BTYPE=00 (stored): byte 0x01 (bit0=1=BFINAL, bits1-2=00=BTYPE=0).
+    // After align: LEN=0x0500 (5 LE → bytes 05 00 but wait, LE means byte0=lo=5,
+    // byte1=hi=0, so LEN=5). NLEN=0x0000 (should be !5=0xFFFA): bytes 00 00.
+    // Expected_len=1, ISIZE=1 in trailer. Inflate fails at NLEN check.
+    //
+    // Gzip wrapper (21 bytes):
+    //   [0..9] header, [10] 0x01 (BFINAL+BTYPE=stored), [11..12] 05 00 (LEN=5),
+    //   [13..14] 00 00 (NLEN=0 ≠ 0xFFFA), [15..18] 00 00 00 00 (CRC),
+    //   [19..22] 01 00 00 00 (ISIZE=1)
+    //   Wait that's 23 bytes, ≥ 18 ✓.
+    #[test]
+    fn stored_nlen_mismatch() {
+        let member: &[u8] = &[
+            0x1f,0x8b,0x08,0x00,0x00,0x00,0x00,0x00,0x00,0xff, // header
+            0x01,                                               // BFINAL=1, BTYPE=0 (stored)
+            0x05,0x00,                                          // LEN=5
+            0x00,0x00,                                          // NLEN=0 (should be 0xFFFA)
+            0x00,0x00,0x00,0x00,                                // CRC placeholder
+            0x01,0x00,0x00,0x00,                                // ISIZE=1
+        ];
+        nb(member, 1);
+    }
+
+    // ── isize_mismatch ────────────────────────────────────────────────
+    //
+    // GZIP_AB (ISIZE=2 in trailer) with expected_len=99 → ISIZE(2) ≠ 99
+    // → Bad("gzip isize"). No inflation attempted.
+    #[test]
+    fn isize_mismatch() {
+        let member: &[u8] = &[
+            0x1f,0x8b,0x08,0x00,0xc5,0x9b,0x0c,0x6a,0x02,0xff,
+            0x73,0x74,0x02,0x00,0x07,0x4c,0x69,0x30,0x02,0x00,0x00,0x00,
+        ];
+        nb(member, 99);
+    }
+
+    // ── crc_mismatch ─────────────────────────────────────────────────
+    //
+    // GZIP_AB with the first CRC byte in the trailer flipped
+    // (0x07 → 0x08). inflate() succeeds and produces b"AB".
+    // crc32(b"AB") = 0x30694c07 ≠ stored 0x30694c08 →
+    // Bad("gzip crc mismatch"). This genuinely exercises the CRC
+    // verification path: inflate produces output first, then CRC rejects.
+    //
+    // Trailer original: [07 4c 69 30] CRC | [02 00 00 00] ISIZE.
+    // Patched:          [08 4c 69 30] CRC (first byte 07→08).
+    #[test]
+    fn crc_mismatch() {
+        let member: &[u8] = &[
+            0x1f,0x8b,0x08,0x00,0xc5,0x9b,0x0c,0x6a,0x02,0xff,
+            0x73,0x74,0x02,0x00,
+            0x08,0x4c,0x69,0x30, // CRC first byte flipped 07→08
+            0x02,0x00,0x00,0x00, // ISIZE=2
+        ];
+        // Pass expected_len=2 so ISIZE check passes; then inflate→Ok(b"AB");
+        // then CRC check fires → Bad.
+        nb(member, 2);
+    }
+
+    // ── Positive correctness locks ────────────────────────────────────
+    //
+    // MUST decode Ok with exact plaintext. A failure here means the
+    // decoder has a bug — NEVER weaken these assertions.
+
+    // STORED block: inflate([0x01,0x05,0x00,0xFA,0xFF,'h','e','l','l','o'], 5)
+    // → b"hello" (reuses Task-1 KAT vector; hand-derived from RFC 1951).
+    #[test]
+    fn positive_stored_block() {
+        let deflate = [
+            0x01, 0x05, 0x00, 0xFA, 0xFF,
+            b'h', b'e', b'l', b'l', b'o',
+        ];
+        let r = std::panic::catch_unwind(move || inflate(&deflate, 5));
+        assert!(r.is_ok(), "stored block must not panic");
+        assert_eq!(r.unwrap().unwrap(), b"hello".to_vec(),
+            "stored block must decode to b\"hello\"");
+    }
+
+    // Fixed Huffman: zlib raw DEFLATE of b"hello world" (Task-1 KAT).
+    #[test]
+    fn positive_fixed_huffman() {
+        let deflate: &[u8] = &[
+            0xcb,0x48,0xcd,0xc9,0xc9,0x57,0x28,0xcf,0x2f,0xca,0x49,0x01,0x00,
+        ];
+        let d = deflate.to_vec();
+        let r = std::panic::catch_unwind(move || inflate(&d, 11));
+        assert!(r.is_ok(), "fixed Huffman must not panic");
+        assert_eq!(r.unwrap().unwrap(), b"hello world".to_vec(),
+            "fixed Huffman must decode to b\"hello world\"");
+    }
+
+    // Dynamic Huffman: zlib raw DEFLATE of bytes((i*7+3)%251 for i in range(400))
+    // (Task-1 KAT).
+    #[test]
+    fn positive_dynamic_huffman() {
+        let deflate: &[u8] = &[
+            0x63,0xe6,0x12,0x94,0x90,0x57,0xd3,0x35,0xb1,0x76,0xf2,0x0c,
+            0x08,0x8f,0x4b,0xcd,0x29,0xae,0x6a,0xec,0xe8,0x9f,0x36,0x77,
+            0xc9,0xea,0x4d,0x3b,0x0f,0x1c,0x3f,0x77,0xf5,0xce,0xe3,0x57,
+            0x1f,0x7f,0xb0,0x70,0x0b,0x49,0x2a,0xa8,0xeb,0x99,0xda,0x38,
+            0x7b,0x05,0x46,0xc4,0xa7,0xe5,0x96,0x54,0x37,0x75,0x4e,0x98,
+            0x3e,0x6f,0xe9,0x9a,0xcd,0xbb,0x0e,0x9e,0x38,0x7f,0xed,0xee,
+            0x93,0xd7,0x9f,0x7e,0xb2,0xf2,0x08,0x4b,0x29,0x6a,0xe8,0x9b,
+            0xd9,0xba,0x78,0x07,0x45,0x26,0xa4,0xe7,0x95,0xd6,0x34,0x77,
+            0x4d,0x9c,0x31,0x7f,0xd9,0xda,0x2d,0xbb,0x0f,0x9d,0xbc,0x70,
+            0xfd,0xde,0xd3,0x37,0x9f,0x7f,0xb1,0xf1,0x8a,0x48,0x2b,0x69,
+            0x1a,0x98,0xdb,0xb9,0xfa,0x04,0x47,0x25,0x66,0xe4,0x97,0xd5,
+            0xb6,0x74,0x4f,0x9a,0xb9,0x60,0xf9,0xba,0xad,0x7b,0x0e,0x9f,
+            0xba,0x78,0xe3,0xfe,0xb3,0xb7,0x5f,0x18,0xd8,0xf9,0x44,0x65,
+            0x94,0xb5,0x0c,0x2d,0xec,0xdd,0x7c,0x43,0xa2,0x93,0x32,0x0b,
+            0xca,0xeb,0x5a,0x7b,0x26,0xcf,0x5a,0xb8,0x62,0xfd,0xb6,0xbd,
+            0x47,0x4e,0x5f,0xba,0xf9,0xe0,0xf9,0xbb,0xaf,0x8c,0x1c,0xfc,
+            0x62,0xb2,0x2a,0xda,0x46,0x96,0x0e,0xee,0x7e,0xa1,0x31,0xc9,
+            0x59,0x85,0x15,0xf5,0x6d,0xbd,0x53,0x66,0x2f,0x5a,0xb9,0x61,
+            0xfb,0xbe,0xa3,0x67,0x2e,0xdf,0x7a,0xf8,0xe2,0xfd,0x37,0x26,
+            0x4e,0x01,0x71,0x39,0x55,0x1d,0x63,0x2b,0x47,0x0f,0xff,0xb0,
+            0xd8,0x94,0xec,0xa2,0xca,0x86,0xf6,0xbe,0xa9,0x73,0x16,0xaf,
+            0xda,0xb8,0x63,0xff,0xb1,0xb3,0x57,0x6e,0x3f,0x7a,0xf9,0xe1,
+            0x3b,0xf3,0x60,0xf4,0x3a,0x00,
+        ];
+        let want: Vec<u8> =
+            (0..400u32).map(|i| ((i * 7 + 3) % 251) as u8).collect();
+        let d = deflate.to_vec();
+        let r = std::panic::catch_unwind(move || inflate(&d, 400));
+        assert!(r.is_ok(), "dynamic Huffman must not panic");
+        assert_eq!(r.unwrap().unwrap(), want,
+            "dynamic Huffman must decode to the expected payload");
+    }
+
+    // Overlapping back-reference (RLE): zlib raw DEFLATE of b"a"*8
+    // (Task-1 KAT). Proves byte-wise overlapping copy (distance 1 < length 7).
+    #[test]
+    fn positive_overlapping_backref() {
+        let deflate: &[u8] = &[0x4b, 0x4c, 0x84, 0x00, 0x00];
+        let d = deflate.to_vec();
+        let r = std::panic::catch_unwind(move || inflate(&d, 8));
+        assert!(r.is_ok(), "overlapping backref must not panic");
+        assert_eq!(r.unwrap().unwrap(), vec![b'a'; 8],
+            "overlapping backref must decode to 8 'a' bytes");
+    }
+}

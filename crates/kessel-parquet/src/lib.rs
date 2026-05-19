@@ -611,22 +611,22 @@ mod tests {
         ]);
     }
 
-    /// Build a PLAIN INT64 [7,-2] file gzip-compressed (codec=GZIP=2).
-    /// `gz` is a real RFC-1952 gzip member of the 16 raw PLAIN bytes,
-    /// captured from python at test-build time and pasted (the same
-    /// independent-authority discipline as the inflate KATs). Layout
-    /// mirrors build_snappy_plain_int64_file_inner(None) exactly, changing
-    /// only: f4 codec = zz(2) (GZIP), the page body = gz, and
-    /// compressed_page_size = gz.len() as i64. uncompressed_page_size,
-    /// num_values, encoding, schema, framing all identical.
-    fn build_gzip_plain_int64_file(gz: &[u8]) -> Vec<u8> {
-        let uncomp: i64 = 16;                     // uncompressed = 16 bytes (two i64)
-        let comp = gz.len() as i64;               // compressed = gz.len()
+    /// Inner builder for a PLAIN INT64 [7,-2] gzip-compressed file.
+    /// `comp_override`: `None` → use gz.len() as compressed_page_size
+    /// (correct file, decodes ok); `Some(v)` → use `v` instead (lying
+    /// value, triggers page_payload bounds check).
+    ///
+    /// Analogous to `build_snappy_plain_int64_file_inner(Option)` in SP104:
+    /// single shared body; None path is byte-identical to
+    /// `build_gzip_plain_int64_file(gz)` prior to this refactor.
+    fn build_gzip_plain_int64_file_inner(gz: &[u8], comp_override: Option<i64>) -> Vec<u8> {
+        let uncomp: i64 = 16;
+        let comp = comp_override.unwrap_or(gz.len() as i64);
 
         let mut hdr = Vec::new();
         hdr.push(0x15); uv(&mut hdr, zz(0));     // f1 type=DATA_PAGE(0)
         hdr.push(0x15); uv(&mut hdr, zz(uncomp)); // f2 uncompressed_page_size=16
-        hdr.push(0x15); uv(&mut hdr, zz(comp));  // f3 compressed_page_size=gz.len()
+        hdr.push(0x15); uv(&mut hdr, zz(comp));  // f3 compressed_page_size
         hdr.push(0x2c);                           // f5 DataPageHeader struct (delta 3->5=2)
         hdr.push(0x15); uv(&mut hdr, zz(2));     // g1 num_values=2
         hdr.push(0x15); uv(&mut hdr, zz(0));     // g2 encoding=PLAIN(0)
@@ -669,6 +669,15 @@ mod tests {
         f
     }
 
+    /// Build a PLAIN INT64 [7,-2] file gzip-compressed (codec=GZIP=2).
+    /// Delegates to build_gzip_plain_int64_file_inner(gz, None) — None
+    /// path uses the true on-disk gz length, byte-identical to the prior
+    /// implementation. The normal path stays byte-identical so T3 tests
+    /// remain green.
+    fn build_gzip_plain_int64_file(gz: &[u8]) -> Vec<u8> {
+        build_gzip_plain_int64_file_inner(gz, None)
+    }
+
     #[test]
     fn extract_decodes_gzip_plain_int64() {
         // Independent authority (Python stdlib gzip — NOT our code).
@@ -698,6 +707,35 @@ mod tests {
         assert!(
             matches!(extract(&f, &["id"]), Err(PqError::Unsupported(_))),
             "ZSTD codec must be Unsupported (OBJ-2c)"
+        );
+    }
+
+    /// Genuine lying-compressed-size lock for gzip (folded from deferred
+    /// GZIP-T3 review Minor): the PageHeader f3 compressed_page_size is
+    /// set to 10_000_000 (far larger than the actual gzip on-disk bytes),
+    /// while footer/FileMetaData remain fully parseable (same discipline
+    /// as SP104's extract_snappy_lying_compressed_size_is_bad).
+    ///
+    /// Path: extract() → read_chunk_values → page_payload →
+    /// `file.get(dstart..dstart+10_000_000)` → None →
+    /// Err(Bad("page data truncated")). This exercises the page_payload
+    /// bounds check for the GZIP path (NOT the footer-short path).
+    ///
+    /// build_gzip_plain_int64_file_inner(gz, Some(10_000_000)) sets
+    /// compressed_page_size=10_000_000 while keeping the actual gz body
+    /// at gz.len() bytes and leaving footer/mlen/PAR1 intact.
+    /// build_gzip_plain_int64_file_inner(gz, None) — the normal path —
+    /// is byte-identical to build_gzip_plain_int64_file(gz), so T3
+    /// gzip tests remain green (confirmed by the full suite passing).
+    #[test]
+    fn extract_gzip_lying_compressed_size_is_bad() {
+        let file = build_gzip_plain_int64_file_inner(GZ_7_NEG2, Some(10_000_000));
+        let owned = file.clone();
+        let r = std::panic::catch_unwind(move || extract(&owned, &["id"]));
+        assert!(r.is_ok(), "must not panic");
+        assert!(
+            matches!(r.unwrap(), Err(PqError::Bad(_))),
+            "lying compressed_page_size must yield PqError::Bad (page data truncated)"
         );
     }
 

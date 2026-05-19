@@ -3,10 +3,13 @@
 //! rows. Fixture provenance: pyarrow 24.0.0; see
 //! tests/fixtures/README.md.
 use kessel_parquet::{extract, PqValue};
+use kessel_parquet::PqValue::{Bytes, I64, Null};
 
 const FLAT: &[u8] = include_bytes!("fixtures/flat_required.parquet");
 const MRG: &[u8] = include_bytes!("fixtures/flat_multirg.parquet");
 const DICT: &[u8] = include_bytes!("fixtures/dict_flat.parquet");
+const NULLABLE: &[u8] = include_bytes!("fixtures/nullable.parquet");
+const NULLABLE_PLAIN: &[u8] = include_bytes!("fixtures/nullable_plain.parquet");
 
 #[test]
 fn fixture_flat_required_decodes_expected_rows() {
@@ -42,6 +45,42 @@ fn dict_flat_fixture_roundtrips() {
             vec![PqValue::I64(100), PqValue::Bytes(b"a".to_vec())],
         ]
     );
+}
+
+/// OBJ-2b-4: real pyarrow nullable.parquet (OPTIONAL + dict + Snappy).
+/// This is the decisive non-self-referential proof of the capstone:
+/// extract() reads vanilla pq.write_table(df) output (pyarrow defaults:
+/// OPTIONAL + dictionary + Snappy) with NULLs, zero special flags.
+/// The fixture schema was metadata-verified OPTIONAL and compression SNAPPY.
+#[test]
+fn nullable_parquet_fixture_roundtrips() {
+    let expected = vec![
+        vec![I64(7),   Bytes(b"a".to_vec())],
+        vec![I64(7),   Null],
+        vec![Null,     Bytes(b"b".to_vec())],
+        vec![I64(-2),  Bytes(b"c".to_vec())],
+        vec![I64(100), Bytes(b"a".to_vec())],
+    ];
+    let rows = extract(NULLABLE, &["id", "s"])
+        .expect("extract nullable.parquet (OPTIONAL+dict+Snappy)");
+    assert_eq!(rows, expected, "nullable.parquet (OPTIONAL+dict+Snappy)");
+}
+
+/// OBJ-2b-4: real pyarrow nullable_plain.parquet (OPTIONAL + PLAIN + UNCOMPRESSED).
+/// Same logical table as nullable.parquet; different encoding/compression.
+/// Proves OPTIONAL null-scatter works on both PLAIN and dictionary paths.
+#[test]
+fn nullable_plain_parquet_fixture_roundtrips() {
+    let expected = vec![
+        vec![I64(7),   Bytes(b"a".to_vec())],
+        vec![I64(7),   Null],
+        vec![Null,     Bytes(b"b".to_vec())],
+        vec![I64(-2),  Bytes(b"c".to_vec())],
+        vec![I64(100), Bytes(b"a".to_vec())],
+    ];
+    let rows = extract(NULLABLE_PLAIN, &["id", "s"])
+        .expect("extract nullable_plain.parquet (OPTIONAL+PLAIN+UNCOMPRESSED)");
+    assert_eq!(rows, expected, "nullable_plain.parquet (OPTIONAL+PLAIN+UNCOMPRESSED)");
 }
 
 #[test]

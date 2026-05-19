@@ -85,3 +85,17 @@ Regenerate:
 Real pyarrow 24.0.0, SNAPPY-compressed, V1, flat REQUIRED.
 snappy_dict = dictionary-encoded; snappy_plain = PLAIN.
 Expected rows: id=[7,7,-2,7,100]; s=["a","a","b","c","a"].
+
+## nullable.parquet / nullable_plain.parquet (OBJ-2b-4)
+
+Regenerate:
+
+    python -c "import pyarrow as pa, pyarrow.parquet as pq; \
+    t=pa.table({'id':pa.array([7,7,None,-2,100],type=pa.int64()),'s':pa.array(['a',None,'b','c','a'],type=pa.large_utf8())}); \
+    pq.write_table(t,'crates/kessel-parquet/tests/fixtures/nullable.parquet',version='1.0',data_page_version='1.0'); \
+    pq.write_table(t,'crates/kessel-parquet/tests/fixtures/nullable_plain.parquet',use_dictionary=False,compression=None,version='1.0',data_page_version='1.0')"
+
+Real pyarrow 24.0.0. `nullable.parquet` = VANILLA default (OPTIONAL +
+dictionary + Snappy, with NULLs). `nullable_plain.parquet` = OPTIONAL +
+PLAIN + UNCOMPRESSED, with NULLs. V1, flat schema.
+Expected rows: id=[7,7,null,-2,100]; s=["a",null,"b","c","a"].

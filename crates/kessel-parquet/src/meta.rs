@@ -74,8 +74,11 @@ pub enum Encoding {
     /// level encoding; not the data page encoding.
     Rle,
     /// PLAIN_DICTIONARY (id=2): dictionary indices, legacy tag.
+    /// On-disk index layout is identical to RleDictionary;
+    /// readers MUST treat the two tags the same (do not branch).
     PlainDictionary,
     /// RLE_DICTIONARY (id=8): dictionary indices, current tag.
+    /// Same on-disk index layout as PlainDictionary (see above).
     RleDictionary,
     Other(i32),
 }
@@ -319,6 +322,9 @@ pub struct PageHeader {
     pub compressed_size: i32,
     pub dp_num_values: i32,
     pub dp_encoding: i32,
+    /// DictionaryPageHeader fields. `dict_encoding == -1` and
+    /// `dict_num_values == 0` mean "no dictionary page header was
+    /// present"; only trust these when `page_type == 2` (DICTIONARY_PAGE).
     pub dict_num_values: i32,
     pub dict_encoding: i32,
 }

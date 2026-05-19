@@ -60,6 +60,8 @@ pub enum Codec {
     Uncompressed,
     /// SNAPPY (parquet CompressionCodec id = 1), raw block format.
     Snappy,
+    /// GZIP (parquet CompressionCodec id = 2), RFC 1952 member.
+    Gzip,
     Other(i32),
 }
 impl Codec {
@@ -67,6 +69,7 @@ impl Codec {
         match v {
             0 => Codec::Uncompressed,
             1 => Codec::Snappy,
+            2 => Codec::Gzip,
             o => Codec::Other(o),
         }
     }
@@ -568,6 +571,42 @@ mod tests {
         assert_eq!(cc.dictionary_page_offset, Some(4));
         assert_eq!(cc.data_page_offset, 40);
         assert_eq!(cc.encodings, vec![Encoding::PlainDictionary]);
+    }
+
+    #[test]
+    fn columnmeta_decodes_gzip_codec() {
+        fn build(codec: i64) -> Vec<u8> {
+            let mut b = Vec::new();
+            b.push(0x15); uv(&mut b, zz(1));                 // f1 version=1
+            b.push(0x19); b.push(0x2c);                      // f2 list<struct> 2
+            b.push(0x48); uv(&mut b, 4); b.extend_from_slice(b"root");
+            b.push(0x15); uv(&mut b, zz(1));                 // num_children=1
+            b.push(0x00);
+            b.push(0x15); uv(&mut b, zz(2));                 // leaf type=INT64
+            b.push(0x25); uv(&mut b, zz(0));                 // repetition=REQUIRED
+            b.push(0x18); uv(&mut b, 2); b.extend_from_slice(b"id");
+            b.push(0x00);
+            b.push(0x16); uv(&mut b, zz(1));                 // num_rows=1
+            b.push(0x19); b.push(0x1c);                      // list<RowGroup> 1
+            b.push(0x19); b.push(0x1c);                      // RG list<ColumnChunk> 1
+            b.push(0x3c);                                    // ColumnChunk f3 CMD
+            b.push(0x15); uv(&mut b, zz(2));                 // CMD type=INT64
+            b.push(0x19); b.push(0x15); uv(&mut b, zz(0));   // encodings [PLAIN]
+            b.push(0x19); b.push(0x18); uv(&mut b, 2); b.extend_from_slice(b"id");
+            b.push(0x15); uv(&mut b, zz(codec));             // f4 codec
+            b.push(0x16); uv(&mut b, zz(1));                 // num_values=1
+            b.push(0x46); uv(&mut b, zz(4));                 // data_page_offset=4
+            b.push(0x00); b.push(0x00);
+            b.push(0x26); uv(&mut b, zz(1));                 // RG num_rows=1
+            b.push(0x00); b.push(0x00);
+            b
+        }
+        assert_eq!(
+            FileMetaData::decode(&build(2)).unwrap()
+                .row_groups[0].columns[0].codec, Codec::Gzip);
+        assert_eq!(
+            FileMetaData::decode(&build(6)).unwrap()
+                .row_groups[0].columns[0].codec, Codec::Other(6));
     }
 
     #[test]

@@ -66,6 +66,11 @@ fn page_payload<'a>(
         meta::Codec::Snappy => {
             Ok(std::borrow::Cow::Owned(snappy::decompress(on_disk, uncomp)?))
         }
+        // T2 stub: Gzip arm added to keep enum exhaustive; T3 flips to
+        // gzip::decompress(on_disk, uncomp).
+        meta::Codec::Gzip => Err(PqError::Unsupported(
+            "compression codec (gzip/zstd/lz4/brotli): OBJ-2c".into(),
+        )),
         meta::Codec::Other(_) => Err(PqError::Unsupported(
             "compression codec (gzip/zstd/lz4/brotli): OBJ-2c".into(),
         )),
@@ -153,7 +158,9 @@ fn read_chunk_values(
 ) -> Result<Vec<PqValue>, PqError> {
     match cc.codec {
         meta::Codec::Uncompressed | meta::Codec::Snappy => {}
-        meta::Codec::Other(_) => {
+        // T2 stub: Gzip arm added to keep enum exhaustive; T3 flips to
+        // accepted (Gzip will be allowed once page_payload decompresses it).
+        meta::Codec::Gzip | meta::Codec::Other(_) => {
             return Err(PqError::Unsupported(
                 "compression codec (gzip/zstd/lz4/brotli): OBJ-2c".into(),
             ))

@@ -724,7 +724,7 @@ messages.
 
 - **`FORMAT PARQUET`** is supported for `s3://` / `az://` sources with
   the `--features external-sources-objstore` build (OBJ-2a, §7f below).
-  See §7f for the precise scope (PLAIN/UNCOMPRESSED/flat REQUIRED/V1
+  See §7f for the precise scope (PLAIN/UNCOMPRESSED/GZIP/flat REQUIRED or OPTIONAL/V1
   pages) and the supported-vs-deferred matrix.
 - **Iceberg manifests, prefix/multi-object listing, and STS/SAS/IMDS
   credential providers** are explicit follow-ons (OBJ-3 through OBJ-5)
@@ -763,6 +763,16 @@ messages.
 > INT96/DECIMAL, V2 data pages, and Snappy pages >64 MiB remain
 > Unsupported (→ OBJ-2c).
 
+> **OBJ-2c-1 (SP106):** GZIP-compressed Parquet (pyarrow
+> `compression='gzip'`) is now supported for flat REQUIRED or OPTIONAL
+> columns, PLAIN or dictionary encoding, V1 pages. The pure zero-dep
+> RFC 1952 + RFC 1951 inflater composes with dictionary and
+> OPTIONAL/def-levels via the existing page_payload seam; no other
+> code path changed. Pages decompressed to more than 64 MiB are
+> rejected (typed `Unsupported`). ZSTD/lz4/brotli, INT96/DECIMAL, V2
+> data pages, REPEATED/nested, and GZIP pages >64 MiB remain
+> Unsupported (→ OBJ-2c-2+).
+
 `FORMAT PARQUET` is supported for `s3://` and `az://` sources when the
 server is built with `--features external-sources-objstore`. Plain
 `http://` / `https://` URLs are **rejected** with a clear message if
@@ -799,12 +809,12 @@ CREATE EXTERNAL SOURCE readings (
   `KEY`) are identical to §7e.
 - `REFRESH` and `DROP EXTERNAL SOURCE` work identically to §7e.
 
-### Parquet scope: what is currently supported (OBJ-2a → OBJ-2b-4)
+### Parquet scope: what is currently supported (OBJ-2a → OBJ-2c-1)
 
-| Parquet property | OBJ-2a → OBJ-2b-4 |
+| Parquet property | OBJ-2a → OBJ-2c-1 |
 |---|---|
 | Encoding | `PLAIN` and dictionary (`PLAIN_DICTIONARY`/`RLE_DICTIONARY`); RLE/bit-packing hybrid for dictionary indices |
-| Compression codec | `UNCOMPRESSED` and `SNAPPY` (raw block; pages ≤ 64 MiB decompressed) |
+| Compression codec | `UNCOMPRESSED`, `SNAPPY` (raw block; pages ≤ 64 MiB decompressed), or `GZIP` (RFC 1952; pages ≤ 64 MiB decompressed) |
 | Column repetition | `REQUIRED` or `OPTIONAL` flat columns (nullable; V1 definition levels) |
 | Data page version | V1 (`DATA_PAGE`) only |
 | Row groups | Multi-row-group files are fully supported |
@@ -823,8 +833,8 @@ as every other format):
 - **Non-flat schema (nested / intermediate group nodes)** (non-flat
   schema; intermediate group nodes) — rejected with
   `Unsupported("nested schema: OBJ-2c")`.
-- **Gzip / Zstd / lz4 / brotli compression** — rejected with
-  `Unsupported("compression GZIP/ZSTD: OBJ-2c")`.
+- **Zstd / lz4 / brotli compression** — rejected with
+  `Unsupported("compression codec (zstd/lz4/brotli): OBJ-2c")`. GZIP is now supported (OBJ-2c-1).
 - **Snappy pages above 64 MiB decompressed** — rejected with
   `Unsupported("Snappy decompressed page too large: OBJ-2c")`.
 - **V2 data pages** (`DATA_PAGE_V2`) — rejected with

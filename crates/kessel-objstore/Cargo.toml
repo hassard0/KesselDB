@@ -1,0 +1,14 @@
+[package]
+name = "kessel-objstore"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+# In-tree, zero external deps. Provides sha256 / hmac_sha256 / hex —
+# exactly the AWS SigV4 + Azure Shared-Key primitives, so this crate
+# adds NO new external dependency anywhere.
+kessel-crypto = { path = "../kessel-crypto" }
+
+[lib]
+path = "src/lib.rs"

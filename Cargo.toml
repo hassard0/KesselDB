@@ -18,6 +18,7 @@ members = [
     "crates/kessel-client",
     "crates/kessel-fetch",
     "crates/kessel-sim",
+    "crates/kessel-objstore",
 ]
 
 [workspace.package]

@@ -142,6 +142,7 @@ fn get_resp_exposes_link_header() {
     let _ = h.join();
 }
 
+#[cfg(not(feature = "tls"))]
 #[test]
 fn https_without_tls_feature_is_typed_error_naming_the_feature() {
     // Default build (no `tls`): https:// must be a clean typed error

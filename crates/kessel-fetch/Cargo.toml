@@ -14,11 +14,7 @@ kessel-catalog = { path = "../kessel-catalog" }
 # root set compiled in (deterministic, no OS trust dependency).
 rustls = { version = "0.23", optional = true }
 webpki-roots = { version = "1", optional = true }
+rustls-pemfile = { version = "2", optional = true }
 
 [features]
-tls = ["dep:rustls", "dep:webpki-roots"]
-
-[dev-dependencies]
-# Test-only: parse the checked-in localhost fixture PEM for the TLS
-# stub server and the custom-root client config.
-rustls-pemfile = "2"
+tls = ["dep:rustls", "dep:webpki-roots", "dep:rustls-pemfile"]

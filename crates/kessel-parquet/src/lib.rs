@@ -3449,3 +3449,870 @@ mod pentest_v2 {
         );
     }
 }
+
+// ── SP108 T5 PENTEST PASS — INT96 + DECIMAL + FLBA decode adversarial ─
+//
+// SP108 added three attacker-influenceable decode paths to plain.rs:
+//   1. INT96 (12-byte LE u64 nanos_of_day + u32 julian_day → Timestamp(ns))
+//   2. DECIMAL (logical type carried on INT32/INT64/FLBA/BYTE_ARRAY,
+//      decoded as i128 unscaled + scale)
+//   3. FLBA non-DECIMAL (raw type_length bytes → Bytes)
+//
+// Every byte in every code path above is attacker-controlled. The locks
+// below assert: NO panic, NO OOM, NO hang on hostile inputs (catch_unwind
+// proves no panic; fast typed-Err proves no OOM/hang); and TYPED
+// PqError::Bad/Unsupported with the right SPECIFIC message — locking the
+// exact guard, not merely "some error". Positive locks assert byte-exact
+// Ok(rows) — a positive-lock failure is a decoder bug (BLOCKED, never
+// weaken), a hostile-input panic/OOM/hang is a real vuln (BLOCKED with
+// exact detail).
+//
+// Every corrupt byte is hand-derived from parquet.thrift / the SP108
+// decoder recipes (JULIAN_UNIX_EPOCH=2_440_588, NS_PER_DAY=86_400e9, i128
+// sign-extend), NOT produced by the code under test. The builders take
+// every attacker-controlled field as an explicit parameter; each test
+// injects its hostile value at the format level.
+#[cfg(test)]
+mod pentest_int96_decimal {
+    use super::*;
+
+    // ── inline Thrift compact helpers (mirrors mod tests / pentest_v2) ─
+    fn uv(out: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 { out.push(b); break; } else { out.push(b | 0x80); }
+        }
+    }
+    fn zz(v: i64) -> u64 { ((v << 1) ^ (v >> 63)) as u64 }
+
+    /// Schema-level leaf metadata for one column "d". Every field is
+    /// attacker-controlled so hostile locks can inject DECIMAL on INT96,
+    /// type_length out of range, etc. None disables emission of that
+    /// optional field.
+    struct LeafMeta<'a> {
+        /// Parquet Type enum: 0=BOOL, 1=INT32, 2=INT64, 3=INT96,
+        /// 6=BYTE_ARRAY, 7=FIXED_LEN_BYTE_ARRAY.
+        ptype: i64,
+        /// FixedLenByteArray byte width (None for non-FLBA).
+        type_length: Option<i64>,
+        /// Repetition: 0=REQUIRED, 1=OPTIONAL.
+        rep: i64,
+        /// ConvertedType (5=DECIMAL). None disables.
+        converted_type: Option<i64>,
+        /// SchemaElement.f7 scale.
+        scale: Option<i64>,
+        /// SchemaElement.f8 precision.
+        precision: Option<i64>,
+        /// LogicalType DecimalType{scale,precision}. None disables.
+        /// Used by the converted-vs-logical disagreement lock.
+        logical_decimal: Option<(i64, i64)>,
+        col: &'a [u8],
+    }
+
+    impl<'a> LeafMeta<'a> {
+        fn plain(ptype: i64, col: &'a [u8]) -> Self {
+            Self {
+                ptype,
+                type_length: None,
+                rep: 0,
+                converted_type: None,
+                scale: None,
+                precision: None,
+                logical_decimal: None,
+                col,
+            }
+        }
+    }
+
+    /// Emit the schema leaf SchemaElement struct bytes. Mirrors the
+    /// hand-built leaves in `crate::meta::tests` exactly: each optional
+    /// field tracks the LAST emitted id so the field-delta (compact
+    /// thrift) is computed correctly.
+    fn schema_leaf_bytes(m: &LeafMeta) -> Vec<u8> {
+        let mut leaf = Vec::new();
+        let mut last_id: i64 = 0;
+        // f1 type: always emitted.
+        leaf.push(0x15); uv(&mut leaf, zz(m.ptype));
+        last_id = 1;
+        // f2 type_length (i32).
+        if let Some(n) = m.type_length {
+            let delta = (2 - last_id) as u8;
+            leaf.push((delta << 4) | 5);
+            uv(&mut leaf, zz(n));
+            last_id = 2;
+        }
+        // f3 repetition (i32).
+        let delta = (3 - last_id) as u8;
+        leaf.push((delta << 4) | 5);
+        uv(&mut leaf, zz(m.rep));
+        last_id = 3;
+        // f4 name (binary).
+        let delta = (4 - last_id) as u8;
+        leaf.push((delta << 4) | 8);
+        uv(&mut leaf, m.col.len() as u64);
+        leaf.extend_from_slice(m.col);
+        last_id = 4;
+        // f6 converted_type (i32).
+        if let Some(ct) = m.converted_type {
+            let delta = (6 - last_id) as u8;
+            leaf.push((delta << 4) | 5);
+            uv(&mut leaf, zz(ct));
+            last_id = 6;
+        }
+        // f7 scale (i32).
+        if let Some(s) = m.scale {
+            let delta = (7 - last_id) as u8;
+            leaf.push((delta << 4) | 5);
+            uv(&mut leaf, zz(s));
+            last_id = 7;
+        }
+        // f8 precision (i32).
+        if let Some(p) = m.precision {
+            let delta = (8 - last_id) as u8;
+            leaf.push((delta << 4) | 5);
+            uv(&mut leaf, zz(p));
+            last_id = 8;
+        }
+        // f10 LogicalType union → arm 5 DecimalType{1:scale, 2:precision}.
+        if let Some((ls, lp)) = m.logical_decimal {
+            let delta = (10 - last_id) as u8;
+            leaf.push((delta << 4) | 12); // STRUCT
+            // LogicalType union inner (field IDs reset). f5 DecimalType
+            // struct: delta 0->5=5 -> (5<<4)|12=0x5c
+            leaf.push(0x5c);
+            // DecimalType inner. f1 scale, f2 precision.
+            leaf.push(0x15); uv(&mut leaf, zz(ls));
+            leaf.push(0x15); uv(&mut leaf, zz(lp));
+            leaf.push(0x00); // stop DecimalType
+            leaf.push(0x00); // stop LogicalType union
+        }
+        // last_id is intentionally write-only (no further fields).
+        let _ = last_id;
+        leaf.push(0x00); // stop SchemaElement
+        leaf
+    }
+
+    /// Full FileMetaData for a single-column, single-row-group V1
+    /// PLAIN file. `num_rows` is the chunk + RG + leaf row count.
+    /// `data_page_offset` is the absolute byte offset of the data
+    /// page header (4 if right after PAR1, else after the dict page).
+    /// `encoding` is the chunk encoding written into ColumnMetaData
+    /// (0=PLAIN, 2=PLAIN_DICTIONARY); leaves are otherwise identical.
+    fn filemetadata_bytes(
+        leaf: &LeafMeta,
+        num_rows: i64,
+        encoding: i64,
+        data_page_offset: i64,
+        dict_page_offset: Option<i64>,
+    ) -> Vec<u8> {
+        let leaf_bytes = schema_leaf_bytes(leaf);
+        let mut b = Vec::new();
+        b.push(0x15); uv(&mut b, zz(2));                     // f1 version=2
+        b.push(0x19); b.push(0x2c);                          // f2 list<SchemaElement> 2
+        // schema[0] root group
+        b.push(0x48); uv(&mut b, 6); b.extend_from_slice(b"schema");
+        b.push(0x15); uv(&mut b, zz(1));                     // root num_children=1
+        b.push(0x00);
+        // schema[1] leaf
+        b.extend_from_slice(&leaf_bytes);
+        b.push(0x16); uv(&mut b, zz(num_rows));              // f3 num_rows
+        b.push(0x19); b.push(0x1c);                          // f4 list<RowGroup> 1
+        b.push(0x19); b.push(0x1c);                          // RG f1 list<ColumnChunk> 1
+        b.push(0x3c);                                        // ColumnChunk f3 ColumnMetaData
+        b.push(0x15); uv(&mut b, zz(leaf.ptype));            // CMD f1 type
+        b.push(0x19); b.push(0x15); uv(&mut b, zz(encoding)); // f2 encodings [encoding]
+        b.push(0x19); b.push(0x18); uv(&mut b, leaf.col.len() as u64);
+        b.extend_from_slice(leaf.col);                        // f3 path_in_schema
+        b.push(0x15); uv(&mut b, zz(0));                     // f4 codec=UNCOMPRESSED
+        b.push(0x16); uv(&mut b, zz(num_rows));              // f5 num_values
+        b.push(0x46); uv(&mut b, zz(data_page_offset));      // f9 data_page_offset
+        if let Some(dp) = dict_page_offset {
+            b.push(0x26); uv(&mut b, zz(dp));                // f11 dictionary_page_offset
+        }
+        b.push(0x00); b.push(0x00);                          // stop CMD / ColumnChunk
+        b.push(0x26); uv(&mut b, zz(num_rows));              // RG f3 num_rows
+        b.push(0x00); b.push(0x00);                          // stop RG / FileMetaData
+        b
+    }
+
+    /// V1 PLAIN page header (DATA_PAGE(0), PLAIN(0) encoding).
+    fn plain_v1_page_hdr(num_values: i32, data_bytes: i32) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.push(0x15); uv(&mut h, zz(0));                           // f1 type=DATA_PAGE(0)
+        h.push(0x15); uv(&mut h, zz(data_bytes as i64));           // f2 uncompressed
+        h.push(0x15); uv(&mut h, zz(data_bytes as i64));           // f3 compressed
+        h.push(0x2c);                                              // f5 DPH (delta 3->5=2)
+        h.push(0x15); uv(&mut h, zz(num_values as i64));           // g1 num_values
+        h.push(0x15); uv(&mut h, zz(0));                           // g2 encoding=PLAIN
+        h.push(0x00); h.push(0x00);                                // stop DPH / PH
+        h
+    }
+
+    /// V1 dict-encoded data-page header (DATA_PAGE(0),
+    /// PLAIN_DICTIONARY(2) encoding).
+    fn dict_v1_data_page_hdr(num_values: i32, data_bytes: i32) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.push(0x15); uv(&mut h, zz(0));
+        h.push(0x15); uv(&mut h, zz(data_bytes as i64));
+        h.push(0x15); uv(&mut h, zz(data_bytes as i64));
+        h.push(0x2c);
+        h.push(0x15); uv(&mut h, zz(num_values as i64));
+        h.push(0x15); uv(&mut h, zz(2));                           // g2 encoding=PLAIN_DICTIONARY
+        h.push(0x00); h.push(0x00);
+        h
+    }
+
+    /// Dictionary page header (DICTIONARY_PAGE(2), PLAIN_DICTIONARY(2)).
+    fn dict_page_hdr(num_dict_values: i32, data_bytes: i32) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.push(0x15); uv(&mut h, zz(2));                           // f1 type=DICTIONARY_PAGE(2)
+        h.push(0x15); uv(&mut h, zz(data_bytes as i64));
+        h.push(0x15); uv(&mut h, zz(data_bytes as i64));
+        h.push(0x4c);                                              // f7 DPH (delta 3->7=4)
+        h.push(0x15); uv(&mut h, zz(num_dict_values as i64));      // g1 num_values
+        h.push(0x15); uv(&mut h, zz(2));                           // g2 encoding=PLAIN_DICTIONARY
+        h.push(0x12);                                              // g3 is_sorted=false
+        h.push(0x00); h.push(0x00);
+        h
+    }
+
+    /// Assemble `[PAR1][page_hdr][page_data][meta][mlen_le][PAR1]`.
+    fn assemble_one_page(hdr: &[u8], data: &[u8], meta: &[u8]) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(b"PAR1");
+        f.extend_from_slice(hdr);
+        f.extend_from_slice(data);
+        let mlen = meta.len() as u32;
+        f.extend_from_slice(meta);
+        f.extend_from_slice(&mlen.to_le_bytes());
+        f.extend_from_slice(b"PAR1");
+        f
+    }
+
+    /// Assemble a dict-page file
+    /// `[PAR1][dict_hdr][dict_data][data_hdr][data_payload][meta][mlen_le][PAR1]`.
+    fn assemble_dict_page(
+        dict_hdr: &[u8], dict_data: &[u8],
+        data_hdr: &[u8], data_payload: &[u8],
+        meta: &[u8],
+    ) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(b"PAR1");
+        f.extend_from_slice(dict_hdr);
+        f.extend_from_slice(dict_data);
+        f.extend_from_slice(data_hdr);
+        f.extend_from_slice(data_payload);
+        let mlen = meta.len() as u32;
+        f.extend_from_slice(meta);
+        f.extend_from_slice(&mlen.to_le_bytes());
+        f.extend_from_slice(b"PAR1");
+        f
+    }
+
+    /// 12-byte little-endian INT96 payload from (nanos_of_day,
+    /// julian_day). Independent of the code under test: parquet.thrift
+    /// INT96 = `<u64 nanos_of_day LE><u32 julian_day LE>` (12 bytes).
+    fn int96_le(nod: u64, jd: u32) -> [u8; 12] {
+        let mut out = [0u8; 12];
+        out[..8].copy_from_slice(&nod.to_le_bytes());
+        out[8..].copy_from_slice(&jd.to_le_bytes());
+        out
+    }
+
+    // ── catch_unwind helpers — mirrors `pentest_v2::no_panic_typed_err`
+    // and `pentest_v2::no_panic_err_contains` EXACTLY (column name is
+    // always "d" for this module).
+
+    fn no_panic_typed_err(file: &[u8]) {
+        let owned = file.to_vec();
+        let r = std::panic::catch_unwind(move || extract(&owned, &["d"]));
+        assert!(r.is_ok(), "must NOT panic/OOM-unwind on hostile input");
+        assert!(
+            matches!(
+                r.unwrap(),
+                Err(PqError::Bad(_) | PqError::Unsupported(_))
+            ),
+            "hostile input must yield a typed PqError"
+        );
+    }
+
+    fn no_panic_err_contains(file: &[u8], needle: &str) {
+        let owned = file.to_vec();
+        let needle = needle.to_string();
+        let r = std::panic::catch_unwind(move || extract(&owned, &["d"]));
+        assert!(r.is_ok(), "must NOT panic/OOM-unwind on hostile input");
+        let e = r.unwrap();
+        let msg = match &e {
+            Err(PqError::Bad(m)) | Err(PqError::Unsupported(m)) => m.clone(),
+            other => panic!("expected typed PqError, got {other:?}"),
+        };
+        assert!(
+            msg.contains(&needle),
+            "expected error containing {needle:?}, got {msg:?}"
+        );
+    }
+
+    // ════════════════ HOSTILE LOCKS — INT96 ═══════════════════════════
+
+    // H1: truncated INT96 page — declare num_values=1 (needs 12 bytes),
+    // provide only 11. `decode_plain` `data.get(..12).ok_or("int96
+    // truncated")` fires; NO from_le_bytes panic, NO OOB.
+    #[test]
+    fn int96_truncated_payload_bad() {
+        let payload = vec![0u8; 11]; // one byte short of a single INT96
+        let mut leaf = LeafMeta::plain(3 /*INT96*/, b"d");
+        leaf.rep = 0; // REQUIRED
+        let hdr = plain_v1_page_hdr(1, payload.len() as i32);
+        let meta = filemetadata_bytes(&leaf, 1, 0, 4, None);
+        let f = assemble_one_page(&hdr, &payload, &meta);
+        no_panic_err_contains(&f, "int96 truncated");
+    }
+
+    // H2: INT96 julian_day overflow — jd=u32::MAX. Per plain.rs:
+    //   day_offset = i64::from(u32::MAX) - 2_440_588 = 4_292_526_707
+    //   day_offset * NS_PER_DAY (86_400e9) ≈ 3.7e23, overflows i64::MAX
+    //   (9.2e18) → checked_mul None → Bad("int96 ns overflow").
+    // Hand-derived from JULIAN_UNIX_EPOCH=2_440_588 + NS_PER_DAY recipe,
+    // NOT from the decoder.
+    #[test]
+    fn int96_julian_day_overflow_bad() {
+        let payload = int96_le(0, u32::MAX); // nod=0 (valid), jd huge
+        let leaf = LeafMeta::plain(3 /*INT96*/, b"d");
+        let hdr = plain_v1_page_hdr(1, payload.len() as i32);
+        let meta = filemetadata_bytes(&leaf, 1, 0, 4, None);
+        let f = assemble_one_page(&hdr, &payload, &meta);
+        no_panic_err_contains(&f, "int96 ns overflow");
+    }
+
+    // H3: INT96 nanos_of_day at the exclusive upper bound
+    // (86_400_000_000_000 == 1 day in ns; valid range is `[0,
+    // 86_400e9)`). Hand-derived from parquet.thrift INT96 semantics.
+    #[test]
+    fn int96_nanos_of_day_out_of_range_bad() {
+        let payload = int96_le(86_400_000_000_000, 2_440_588);
+        let leaf = LeafMeta::plain(3 /*INT96*/, b"d");
+        let hdr = plain_v1_page_hdr(1, payload.len() as i32);
+        let meta = filemetadata_bytes(&leaf, 1, 0, 4, None);
+        let f = assemble_one_page(&hdr, &payload, &meta);
+        no_panic_err_contains(&f, "nanos-of-day out of range");
+    }
+
+    // H4: INT96 dict-encoded with index OUT OF RANGE. dict has ONE
+    // INT96 entry (12 bytes PLAIN); data page index stream has one
+    // index of value 5 → dict.get(5) returns None → Bad("dict index
+    // out of range"). Independent: standard parquet dict-page layout.
+    //
+    // Data page payload for OPTIONAL/REQUIRED dict indices when
+    // REQUIRED: `[bit_width][hybrid index stream]`. We use bit_width=3
+    // (fits up to 7), encoded as a single RLE run of length 1 of
+    // value 5: hybrid header varint((1<<1)|0)=0x02, run-value (3-bit
+    // packed into ceil(3/8)=1 byte) = 0x05.
+    #[test]
+    fn int96_dict_index_out_of_range_bad() {
+        // dict page: ONE INT96 = (0, 2_440_588) = epoch midnight.
+        let dict_data = int96_le(0, 2_440_588).to_vec();
+        let dict_hdr = dict_page_hdr(1, dict_data.len() as i32);
+        // data page: bit_width=3, RLE run of 1 of index=5.
+        let data_payload: Vec<u8> = vec![0x03, 0x02, 0x05];
+        let data_hdr = dict_v1_data_page_hdr(1, data_payload.len() as i32);
+        // Layout offsets.
+        let dict_off: i64 = 4;
+        let data_off: i64 = 4 + dict_hdr.len() as i64 + dict_data.len() as i64;
+        let leaf = LeafMeta::plain(3 /*INT96*/, b"d");
+        let meta = filemetadata_bytes(&leaf, 1, 2 /*PLAIN_DICTIONARY*/, data_off, Some(dict_off));
+        let f = assemble_dict_page(&dict_hdr, &dict_data, &data_hdr, &data_payload, &meta);
+        no_panic_err_contains(&f, "dict index out of range");
+    }
+
+    // H5: V2 DATA_PAGE with INT96 + truncated values section. Even
+    // though SP107's V2 path is unchanged, exercise it with an INT96
+    // spec to prove the new physical-type arm composes safely with
+    // V2 — values section is only 11 bytes for num_values=1, so
+    // `decode_plain` INT96 arm hits the `data.get(..12)` bound and
+    // returns Bad. No panic, no OOM.
+    //
+    // V2 PageHeader fields g1 num_values=1, g5 def_len=0 (REQUIRED),
+    // g6 rep_len=0; payload = ONLY the 11-byte truncated values.
+    #[test]
+    fn int96_v2_truncated_values_bad() {
+        let payload: Vec<u8> = vec![0u8; 11];
+        let mut hdr = Vec::new();
+        hdr.push(0x15); uv(&mut hdr, zz(3));                       // f1 type=DATA_PAGE_V2(3)
+        hdr.push(0x15); uv(&mut hdr, zz(payload.len() as i64));    // f2 uncompressed
+        hdr.push(0x15); uv(&mut hdr, zz(payload.len() as i64));    // f3 compressed
+        hdr.push(0x5c);                                            // f8 struct (delta 3->8=5)
+        hdr.push(0x15); uv(&mut hdr, zz(1));                       // g1 num_values=1
+        hdr.push(0x15); uv(&mut hdr, zz(0));                       // g2 num_nulls=0
+        hdr.push(0x15); uv(&mut hdr, zz(1));                       // g3 num_rows=1
+        hdr.push(0x15); uv(&mut hdr, zz(0));                       // g4 encoding=PLAIN
+        hdr.push(0x15); uv(&mut hdr, zz(0));                       // g5 def_len=0
+        hdr.push(0x15); uv(&mut hdr, zz(0));                       // g6 rep_len=0
+        hdr.push(0x12);                                            // g7 is_compressed=false
+        hdr.push(0x00); hdr.push(0x00);
+        let leaf = LeafMeta::plain(3 /*INT96*/, b"d");
+        let meta = filemetadata_bytes(&leaf, 1, 0, 4, None);
+        let f = assemble_one_page(&hdr, &payload, &meta);
+        no_panic_err_contains(&f, "int96 truncated");
+    }
+
+    // ════════════════ HOSTILE LOCKS — DECIMAL metadata ════════════════
+
+    /// Tiny helper: a one-row INT32 + DECIMAL leaf with custom precision
+    /// and scale, just enough to reach build_plain_spec. We use INT32
+    /// here for every metadata-only test because INT32 (4 bytes/value)
+    /// is the smallest physical type that carries DECIMAL.
+    fn int32_decimal_file(precision: Option<i64>, scale: Option<i64>) -> Vec<u8> {
+        let mut leaf = LeafMeta::plain(1 /*INT32*/, b"d");
+        leaf.converted_type = Some(5); // DECIMAL
+        leaf.precision = precision;
+        leaf.scale = scale;
+        // One INT32 value (12345 LE).
+        let payload = 12345i32.to_le_bytes().to_vec();
+        let hdr = plain_v1_page_hdr(1, payload.len() as i32);
+        let meta = filemetadata_bytes(&leaf, 1, 0, 4, None);
+        assemble_one_page(&hdr, &payload, &meta)
+    }
+
+    // H6: DECIMAL precision > 38 (i128 cap) → Unsupported. Hand-derived
+    // bound: i128 max ≈ 1.7e38; precision 39 demands 10^39 > i128.
+    #[test]
+    fn decimal_precision_gt_38_unsupported() {
+        let f = int32_decimal_file(Some(39), Some(0));
+        no_panic_err_contains(&f, "DECIMAL precision");
+        assert!(matches!(
+            extract(&f, &["d"]),
+            Err(PqError::Unsupported(_))
+        ));
+    }
+
+    // H7: DECIMAL precision < 1 (precision=0, the only value < 1 a
+    // valid i32 can represent without going negative). Per
+    // build_plain_spec: precision<1 → Unsupported.
+    #[test]
+    fn decimal_precision_zero_unsupported() {
+        let f = int32_decimal_file(Some(0), Some(0));
+        assert!(matches!(
+            extract(&f, &["d"]),
+            Err(PqError::Unsupported(_))
+        ));
+        no_panic_typed_err(&f);
+    }
+
+    // H8: DECIMAL scale < 0 → Bad. Wire is i32 zz-encoded; scale=-1
+    // round-trips faithfully through Thrift compact.
+    #[test]
+    fn decimal_scale_negative_bad() {
+        let f = int32_decimal_file(Some(5), Some(-1));
+        no_panic_err_contains(&f, "DECIMAL scale -1");
+    }
+
+    // H9: DECIMAL scale > precision → Bad ("scale {s} out of range for
+    // precision {p}").
+    #[test]
+    fn decimal_scale_gt_precision_bad() {
+        let f = int32_decimal_file(Some(5), Some(10));
+        no_panic_err_contains(&f, "out of range for precision");
+    }
+
+    // H10: FLBA DECIMAL type_length=17 (> 16 i128 cap) → Bad. Per
+    // build_plain_spec: `n == 0 || n > 16` → "DECIMAL FLBA width out
+    // of range".
+    #[test]
+    fn decimal_flba_width_17_bad() {
+        let mut leaf = LeafMeta::plain(7 /*FLBA*/, b"d");
+        leaf.type_length = Some(17);
+        leaf.converted_type = Some(5);
+        leaf.precision = Some(20);
+        leaf.scale = Some(2);
+        // page provides 17 bytes (one value) - enough that build_plain_spec
+        // is reached before any per-value decode.
+        let payload = vec![0u8; 17];
+        let hdr = plain_v1_page_hdr(1, payload.len() as i32);
+        let meta = filemetadata_bytes(&leaf, 1, 0, 4, None);
+        let f = assemble_one_page(&hdr, &payload, &meta);
+        no_panic_err_contains(&f, "DECIMAL FLBA width out of range");
+    }
+
+    // H11: FLBA DECIMAL type_length=0 → Bad (zero-width FLBA cannot
+    // sign-extend; build_plain_spec rejects).
+    #[test]
+    fn decimal_flba_width_zero_bad() {
+        let mut leaf = LeafMeta::plain(7 /*FLBA*/, b"d");
+        leaf.type_length = Some(0);
+        leaf.converted_type = Some(5);
+        leaf.precision = Some(5);
+        leaf.scale = Some(2);
+        let payload: Vec<u8> = Vec::new();
+        let hdr = plain_v1_page_hdr(1, 0);
+        let meta = filemetadata_bytes(&leaf, 1, 0, 4, None);
+        let f = assemble_one_page(&hdr, &payload, &meta);
+        no_panic_err_contains(&f, "DECIMAL FLBA width out of range");
+    }
+
+    // H12: DECIMAL precision=15 on INT32 (> 9 i32 max precision) →
+    // Bad. Per parquet spec INT32 can only carry DECIMAL with
+    // precision ≤ 9 (10^9 ≈ 2^30 fits in i32 range).
+    #[test]
+    fn decimal_int32_precision_15_bad() {
+        let f = int32_decimal_file(Some(15), Some(2));
+        no_panic_err_contains(&f, "DECIMAL precision > 9 on INT32");
+    }
+
+    // H13: DECIMAL precision=25 on INT64 (> 18 i64 max precision) →
+    // Bad. Parquet spec: INT64 DECIMAL precision ≤ 18 (10^18 ≈ 2^60
+    // fits in i64 range).
+    #[test]
+    fn decimal_int64_precision_25_bad() {
+        let mut leaf = LeafMeta::plain(2 /*INT64*/, b"d");
+        leaf.converted_type = Some(5);
+        leaf.precision = Some(25);
+        leaf.scale = Some(2);
+        let payload = 1i64.to_le_bytes().to_vec();
+        let hdr = plain_v1_page_hdr(1, payload.len() as i32);
+        let meta = filemetadata_bytes(&leaf, 1, 0, 4, None);
+        let f = assemble_one_page(&hdr, &payload, &meta);
+        no_panic_err_contains(&f, "DECIMAL precision > 18 on INT64");
+    }
+
+    // H14: BYTE_ARRAY DECIMAL per-value u32 LE length-prefix = 17 (>
+    // 16 i128 cap). build_plain_spec is fine — but the per-value
+    // decode in plain.rs fires "BYTE_ARRAY DECIMAL width out of range
+    // (1..=16)" BEFORE any flba_be_to_i128 with > 16 bytes.
+    #[test]
+    fn decimal_byte_array_per_value_length_17_bad() {
+        let mut leaf = LeafMeta::plain(6 /*BYTE_ARRAY*/, b"d");
+        leaf.converted_type = Some(5);
+        leaf.precision = Some(20);
+        leaf.scale = Some(2);
+        // one BYTE_ARRAY value: u32 LE len=17, then 17 dummy bytes.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&17u32.to_le_bytes());
+        payload.extend_from_slice(&[0u8; 17]);
+        let hdr = plain_v1_page_hdr(1, payload.len() as i32);
+        let meta = filemetadata_bytes(&leaf, 1, 0, 4, None);
+        let f = assemble_one_page(&hdr, &payload, &meta);
+        no_panic_err_contains(&f, "BYTE_ARRAY DECIMAL width out of range");
+    }
+
+    // H15: BYTE_ARRAY DECIMAL per-value u32 LE length-prefix = 0.
+    // Zero-length DECIMAL has no sign byte → malformed. Per-value
+    // check rejects as Bad. Independent: parquet spec says DECIMAL
+    // byte-array values must be ≥ 1 byte (at minimum a single sign
+    // byte for the unscaled i128).
+    #[test]
+    fn decimal_byte_array_per_value_length_zero_bad() {
+        let mut leaf = LeafMeta::plain(6 /*BYTE_ARRAY*/, b"d");
+        leaf.converted_type = Some(5);
+        leaf.precision = Some(5);
+        leaf.scale = Some(2);
+        let payload = 0u32.to_le_bytes().to_vec(); // len=0 for one value
+        let hdr = plain_v1_page_hdr(1, payload.len() as i32);
+        let meta = filemetadata_bytes(&leaf, 1, 0, 4, None);
+        let f = assemble_one_page(&hdr, &payload, &meta);
+        no_panic_err_contains(&f, "BYTE_ARRAY DECIMAL width out of range");
+    }
+
+    // H16: converted_type=DECIMAL(scale=2,precision=9) AND LogicalType
+    // DecimalType{scale=3,precision=9} — the two sides DISAGREE.
+    // decode_schema_element's defense-in-depth agreement check fires
+    // at metadata-decode time → Bad with the EXACT substring locked.
+    #[test]
+    fn decimal_converted_vs_logical_disagree_bad() {
+        let mut leaf = LeafMeta::plain(1 /*INT32*/, b"d");
+        leaf.converted_type = Some(5);
+        leaf.scale = Some(2);
+        leaf.precision = Some(9);
+        leaf.logical_decimal = Some((3, 9)); // scale DISAGREES (3 vs 2)
+        let payload = 1i32.to_le_bytes().to_vec();
+        let hdr = plain_v1_page_hdr(1, payload.len() as i32);
+        let meta = filemetadata_bytes(&leaf, 1, 0, 4, None);
+        let f = assemble_one_page(&hdr, &payload, &meta);
+        no_panic_err_contains(
+            &f,
+            "converted_type vs LogicalType",
+        );
+    }
+
+    // H17: DECIMAL on INT96 physical type → Bad. SP108 explicitly
+    // rejects this combination (INT96 has no meaningful unscaled-i128
+    // interpretation). Precision is valid (9) so it reaches the
+    // physical-type branch.
+    #[test]
+    fn decimal_on_int96_bad() {
+        let mut leaf = LeafMeta::plain(3 /*INT96*/, b"d");
+        leaf.converted_type = Some(5);
+        leaf.precision = Some(9);
+        leaf.scale = Some(0);
+        let payload = int96_le(0, 2_440_588).to_vec();
+        let hdr = plain_v1_page_hdr(1, payload.len() as i32);
+        let meta = filemetadata_bytes(&leaf, 1, 0, 4, None);
+        let f = assemble_one_page(&hdr, &payload, &meta);
+        no_panic_err_contains(&f, "DECIMAL on INT96");
+    }
+
+    // ════════════════ HOSTILE LOCKS — FLBA non-DECIMAL ════════════════
+
+    // H18: FLBA non-DECIMAL with type_length=65_537 — above the
+    // 65_536 cap. Per build_plain_spec: `n == 0 || n > 65_536` → Bad.
+    #[test]
+    fn flba_non_decimal_type_length_huge_bad() {
+        let mut leaf = LeafMeta::plain(7 /*FLBA*/, b"d");
+        leaf.type_length = Some(65_537);
+        // We DON'T provide that many bytes — the metadata-level cap
+        // check fires before any per-value read, so this is fine.
+        let payload: Vec<u8> = vec![0u8; 16];
+        let hdr = plain_v1_page_hdr(1, payload.len() as i32);
+        let meta = filemetadata_bytes(&leaf, 1, 0, 4, None);
+        let f = assemble_one_page(&hdr, &payload, &meta);
+        no_panic_err_contains(&f, "FLBA type_length out of range");
+    }
+
+    // H19: FLBA non-DECIMAL truncated — leaf declares type_length=16,
+    // num_values=1 (need=16 bytes), payload only 8. The decode_plain
+    // FLBA arm's `data.get(..need).ok_or("flba truncated")` fires
+    // BEFORE any chunks_exact step, NO from_le_bytes panic.
+    #[test]
+    fn flba_non_decimal_truncated_bad() {
+        let mut leaf = LeafMeta::plain(7 /*FLBA*/, b"d");
+        leaf.type_length = Some(16);
+        let payload = vec![0u8; 8]; // 8 < 16
+        let hdr = plain_v1_page_hdr(1, payload.len() as i32);
+        let meta = filemetadata_bytes(&leaf, 1, 0, 4, None);
+        let f = assemble_one_page(&hdr, &payload, &meta);
+        no_panic_err_contains(&f, "flba truncated");
+    }
+
+    // ════════════════ POSITIVE CORRECTNESS LOCKS ════════════════════
+    //
+    // These assert EXACT Ok(rows). Failure = decoder bug → BLOCKED.
+
+    // P1: INT96 PLAIN REQUIRED — two 12-byte values:
+    //   (nod=0, jd=2_440_588) → ns=0
+    //   (nod=1_500_000_000, jd=2_440_588) → ns=1_500_000_000
+    // Hand-derived from JULIAN_UNIX_EPOCH=2_440_588 + ns conversion
+    // (day_offset=0, day_ns=0, +nod_i64).
+    #[test]
+    fn int96_plain_required_decode_ok() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&int96_le(0, 2_440_588));
+        payload.extend_from_slice(&int96_le(1_500_000_000, 2_440_588));
+        let leaf = LeafMeta::plain(3 /*INT96*/, b"d");
+        let hdr = plain_v1_page_hdr(2, payload.len() as i32);
+        let meta = filemetadata_bytes(&leaf, 2, 0, 4, None);
+        let f = assemble_one_page(&hdr, &payload, &meta);
+        assert_eq!(
+            extract(&f, &["d"]).expect("int96 plain required"),
+            vec![
+                vec![PqValue::Timestamp(0)],
+                vec![PqValue::Timestamp(1_500_000_000)],
+            ]
+        );
+    }
+
+    // P2: INT96 PLAIN OPTIONAL [ts0, null, ts0] — defs=[1,0,1].
+    // Hand-derived V1 OPTIONAL payload: [u32 LE def_len=2][def_hybrid:
+    // header 0x03 (1 group), bits 0x05 (bit0=1, bit1=0, bit2=1)]
+    // [12-byte INT96 (0,2_440_588)][12-byte INT96 (0,2_440_588)].
+    #[test]
+    fn int96_plain_optional_with_null_ok() {
+        let def_hybrid: [u8; 2] = [0x03, 0x05];
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(def_hybrid.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&def_hybrid);
+        payload.extend_from_slice(&int96_le(0, 2_440_588));
+        payload.extend_from_slice(&int96_le(0, 2_440_588));
+        let mut leaf = LeafMeta::plain(3 /*INT96*/, b"d");
+        leaf.rep = 1; // OPTIONAL
+        let hdr = plain_v1_page_hdr(3, payload.len() as i32);
+        let meta = filemetadata_bytes(&leaf, 3, 0, 4, None);
+        let f = assemble_one_page(&hdr, &payload, &meta);
+        assert_eq!(
+            extract(&f, &["d"]).expect("int96 plain optional"),
+            vec![
+                vec![PqValue::Timestamp(0)],
+                vec![PqValue::Null],
+                vec![PqValue::Timestamp(0)],
+            ]
+        );
+    }
+
+    // P3: INT96 dict-encoded — dict=[ts0], indices=[0,0,0] for 3
+    // REQUIRED rows. Hand-derived dict payload: [bit_width=1]
+    // [hybrid header 0x03 (1 bit-packed group of 8)][bits 0x00 (all
+    // indices=0)]. Decoded indices [0,0,0] → all dict[0] → ts0.
+    #[test]
+    fn int96_dict_decode_ok() {
+        let dict_data = int96_le(0, 2_440_588).to_vec();
+        let dict_hdr = dict_page_hdr(1, dict_data.len() as i32);
+        // 3 indices, all 0. bit_width=1, 1 bit-packed group.
+        let data_payload: Vec<u8> = vec![0x01, 0x03, 0x00];
+        let data_hdr = dict_v1_data_page_hdr(3, data_payload.len() as i32);
+        let dict_off: i64 = 4;
+        let data_off: i64 = 4 + dict_hdr.len() as i64 + dict_data.len() as i64;
+        let leaf = LeafMeta::plain(3 /*INT96*/, b"d");
+        let meta = filemetadata_bytes(&leaf, 3, 2 /*PLAIN_DICTIONARY*/, data_off, Some(dict_off));
+        let f = assemble_dict_page(&dict_hdr, &dict_data, &data_hdr, &data_payload, &meta);
+        assert_eq!(
+            extract(&f, &["d"]).expect("int96 dict"),
+            vec![
+                vec![PqValue::Timestamp(0)],
+                vec![PqValue::Timestamp(0)],
+                vec![PqValue::Timestamp(0)],
+            ]
+        );
+    }
+
+    // P4: cross-physical DECIMAL 3-way determinism — INT32, INT64, and
+    // FLBA(16) hand-built files at matched precision=9 (the INT32 cap,
+    // shared with INT64 and FLBA so the SAME precision/scale is legal
+    // on all three), scale=2, unscaled value=12345 → ALL three yield
+    // the IDENTICAL `PqValue::Decimal { unscaled: 12345, scale: 2 }`.
+    // Hand-derived: INT32 LE=12345; INT64 LE=12345; FLBA(16) BE
+    // sign-extended = 14 zero bytes + 0x30, 0x39 (12345 = 0x3039 in 2
+    // BE bytes; full 16 BE = [00,…,00,30,39] from i128::to_be_bytes).
+    //
+    // Non-self-referential: T4's pyarrow fixture pin proves the same
+    // claim via REAL writers (INT32/INT64/FLBA). This T5 lock proves
+    // it via HAND-BUILT bytes (zero pyarrow dependence) — together
+    // the two locks are independent attestations that decode is
+    // source-format-independent.
+    #[test]
+    fn decimal_3way_int32_int64_flba_identical_ok() {
+        let expected = vec![vec![PqValue::Decimal { unscaled: 12345, scale: 2 }]];
+
+        // INT32 file.
+        {
+            let mut leaf = LeafMeta::plain(1 /*INT32*/, b"d");
+            leaf.converted_type = Some(5);
+            leaf.precision = Some(9);
+            leaf.scale = Some(2);
+            let payload = 12345i32.to_le_bytes().to_vec();
+            let hdr = plain_v1_page_hdr(1, payload.len() as i32);
+            let meta = filemetadata_bytes(&leaf, 1, 0, 4, None);
+            let f = assemble_one_page(&hdr, &payload, &meta);
+            assert_eq!(extract(&f, &["d"]).expect("int32 decimal"), expected);
+        }
+
+        // INT64 file.
+        {
+            let mut leaf = LeafMeta::plain(2 /*INT64*/, b"d");
+            leaf.converted_type = Some(5);
+            leaf.precision = Some(9);
+            leaf.scale = Some(2);
+            let payload = 12345i64.to_le_bytes().to_vec();
+            let hdr = plain_v1_page_hdr(1, payload.len() as i32);
+            let meta = filemetadata_bytes(&leaf, 1, 0, 4, None);
+            let f = assemble_one_page(&hdr, &payload, &meta);
+            assert_eq!(extract(&f, &["d"]).expect("int64 decimal"), expected);
+        }
+
+        // FLBA(16) file. 16 BE bytes: positive 12345 sign-extended.
+        {
+            let mut leaf = LeafMeta::plain(7 /*FLBA*/, b"d");
+            leaf.type_length = Some(16);
+            leaf.converted_type = Some(5);
+            leaf.precision = Some(9);
+            leaf.scale = Some(2);
+            let payload = 12345i128.to_be_bytes().to_vec();
+            assert_eq!(payload.len(), 16);
+            let hdr = plain_v1_page_hdr(1, payload.len() as i32);
+            let meta = filemetadata_bytes(&leaf, 1, 0, 4, None);
+            let f = assemble_one_page(&hdr, &payload, &meta);
+            assert_eq!(extract(&f, &["d"]).expect("flba decimal"), expected);
+        }
+    }
+
+    // P5: DECIMAL OPTIONAL with a null in the middle → scatter_nulls
+    // composes correctly with the DECIMAL decode path. INT32 leaf,
+    // OPTIONAL, defs=[1,0,1], two present values [12345, -456].
+    #[test]
+    fn decimal_int32_optional_null_scatter_ok() {
+        let def_hybrid: [u8; 2] = [0x03, 0x05]; // bits 1,0,1
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(def_hybrid.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&def_hybrid);
+        payload.extend_from_slice(&12345i32.to_le_bytes());
+        payload.extend_from_slice(&(-456i32).to_le_bytes());
+        let mut leaf = LeafMeta::plain(1 /*INT32*/, b"d");
+        leaf.rep = 1; // OPTIONAL
+        leaf.converted_type = Some(5);
+        leaf.precision = Some(9);
+        leaf.scale = Some(2);
+        let hdr = plain_v1_page_hdr(3, payload.len() as i32);
+        let meta = filemetadata_bytes(&leaf, 3, 0, 4, None);
+        let f = assemble_one_page(&hdr, &payload, &meta);
+        assert_eq!(
+            extract(&f, &["d"]).expect("int32 decimal optional"),
+            vec![
+                vec![PqValue::Decimal { unscaled: 12345, scale: 2 }],
+                vec![PqValue::Null],
+                vec![PqValue::Decimal { unscaled: -456, scale: 2 }],
+            ]
+        );
+    }
+
+    // P6: FLBA non-DECIMAL, 16-byte UUID-shaped values → PqValue::Bytes.
+    // Two values: all-0xAA and all-0xBB. Independent: parquet FLBA
+    // non-DECIMAL is N raw bytes per value, no length prefix.
+    #[test]
+    fn flba_uuid_required_decode_ok() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0xAA; 16]);
+        payload.extend_from_slice(&[0xBB; 16]);
+        let mut leaf = LeafMeta::plain(7 /*FLBA*/, b"d");
+        leaf.type_length = Some(16);
+        let hdr = plain_v1_page_hdr(2, payload.len() as i32);
+        let meta = filemetadata_bytes(&leaf, 2, 0, 4, None);
+        let f = assemble_one_page(&hdr, &payload, &meta);
+        assert_eq!(
+            extract(&f, &["d"]).expect("flba uuid"),
+            vec![
+                vec![PqValue::Bytes(vec![0xAA; 16])],
+                vec![PqValue::Bytes(vec![0xBB; 16])],
+            ]
+        );
+    }
+
+    // P7: DECIMAL precision=38 boundary — maximum supported precision
+    // on FLBA(16). Unscaled value 12345 fits trivially. Locks that the
+    // build_plain_spec precision == 38 case is INCLUSIVE, not <.
+    #[test]
+    fn decimal_precision_38_boundary_ok() {
+        let mut leaf = LeafMeta::plain(7 /*FLBA*/, b"d");
+        leaf.type_length = Some(16);
+        leaf.converted_type = Some(5);
+        leaf.precision = Some(38);
+        leaf.scale = Some(0);
+        let payload = 12345i128.to_be_bytes().to_vec();
+        let hdr = plain_v1_page_hdr(1, payload.len() as i32);
+        let meta = filemetadata_bytes(&leaf, 1, 0, 4, None);
+        let f = assemble_one_page(&hdr, &payload, &meta);
+        assert_eq!(
+            extract(&f, &["d"]).expect("decimal precision=38 boundary"),
+            vec![vec![PqValue::Decimal { unscaled: 12345, scale: 0 }]]
+        );
+    }
+
+    // P8: DECIMAL FLBA(16) i128::MIN — sign-extend at the MOST negative
+    // boundary. Bytes: 0x80 then 15 × 0x00 → BE i128 = i128::MIN.
+    // Independent of decoder: i128::MIN.to_be_bytes() == [0x80, 0, …, 0].
+    #[test]
+    fn decimal_flba_i128_min_sign_extend_ok() {
+        let mut leaf = LeafMeta::plain(7 /*FLBA*/, b"d");
+        leaf.type_length = Some(16);
+        leaf.converted_type = Some(5);
+        leaf.precision = Some(38);
+        leaf.scale = Some(0);
+        let payload = i128::MIN.to_be_bytes().to_vec();
+        assert_eq!(payload[0], 0x80);
+        assert!(payload[1..].iter().all(|&b| b == 0x00));
+        let hdr = plain_v1_page_hdr(1, payload.len() as i32);
+        let meta = filemetadata_bytes(&leaf, 1, 0, 4, None);
+        let f = assemble_one_page(&hdr, &payload, &meta);
+        assert_eq!(
+            extract(&f, &["d"]).expect("flba i128::MIN"),
+            vec![vec![PqValue::Decimal { unscaled: i128::MIN, scale: 0 }]]
+        );
+    }
+}

@@ -3339,6 +3339,13 @@ mod pentest_v2 {
     //
     // These assert the EXACT decoded rows. A failure here is a decoder
     // bug → BLOCKED, never weaken the expectation.
+    //
+    // Note on positive-lock scope: the V2+INT96 positive lock and the FLBA-dict
+    // positive lock from the original SP108 T5 plan are NOT present here.
+    // V2 page structure is covered by `mod pentest_v2` (generic across physical
+    // types); H5 above proves V2+INT96 compose safely on the hostile path.
+    // FLBA-dict positive coverage is superseded by P7 (precision=38 boundary)
+    // and P8 (i128::MIN sign-extend), which are higher-yield for this surface.
 
     // P1: V2 PLAIN REQUIRED [7,-2] → [[I64(7)],[I64(-2)]].
     #[test]
@@ -3892,11 +3899,11 @@ mod pentest_int96_decimal {
     #[test]
     fn decimal_precision_zero_unsupported() {
         let f = int32_decimal_file(Some(0), Some(0));
+        no_panic_err_contains(&f, "DECIMAL precision");
         assert!(matches!(
             extract(&f, &["d"]),
             Err(PqError::Unsupported(_))
         ));
-        no_panic_typed_err(&f);
     }
 
     // H8: DECIMAL scale < 0 → Bad. Wire is i32 zz-encoded; scale=-1

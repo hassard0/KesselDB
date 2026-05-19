@@ -132,7 +132,7 @@ impl FileMetaData {
                         }
                         s.restore_last_id(saved);
                     }
-                    s.restore_last_id(f.id as i16);
+                    s.restore_last_id(f.id);
                 }
                 3 => num_rows = s.read_i64(&f)?,
                 4 => {
@@ -145,7 +145,7 @@ impl FileMetaData {
                         row_groups.push(decode_row_group(&mut s)?);
                         s.restore_last_id(saved);
                     }
-                    s.restore_last_id(f.id as i16);
+                    s.restore_last_id(f.id);
                 }
                 _ => s.skip(f.ctype)?,
             }
@@ -206,7 +206,7 @@ fn decode_row_group(
                     columns.push(decode_column_chunk(s)?);
                     s.restore_last_id(saved);
                 }
-                s.restore_last_id(f.id as i16);
+                s.restore_last_id(f.id);
             }
             3 => num_rows = s.read_i64(&f)?,
             _ => s.skip(f.ctype)?,
@@ -223,8 +223,9 @@ fn decode_column_chunk(
     while let Some(f) = s.next_field()? {
         match f.id {
             3 => {
+                if f.ctype != ctype::STRUCT { return Err(bad("ColumnChunk.meta_data: expected struct")); }
                 out = Some(decode_column_meta(s)?);
-                s.restore_last_id(f.id as i16);
+                s.restore_last_id(f.id);
             }
             _ => s.skip(f.ctype)?,
         }
@@ -318,6 +319,7 @@ pub fn decode_page_header(
             4 => ph.compressed_size = s.read_i32(&f)?,
             5 => {
                 // nested DataPageHeader struct
+                if f.ctype != ctype::STRUCT { return Err(bad("PageHeader.data_page_header: expected struct")); }
                 s.reset_last_id();
                 while let Some(g) = s.next_field()? {
                     match g.id {
@@ -326,7 +328,7 @@ pub fn decode_page_header(
                         _ => s.skip(g.ctype)?,
                     }
                 }
-                s.restore_last_id(f.id as i16);
+                s.restore_last_id(f.id);
             }
             _ => s.skip(f.ctype)?,
         }

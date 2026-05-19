@@ -209,10 +209,18 @@ impl<'a> StructReader<'a> {
                 }
             }
             ctype::STRUCT => {
+                // A skipped struct has its OWN delta-encoded field-id
+                // sequence (Thrift compact resets last-field-id per
+                // struct). Restore the outer struct's last_id afterward
+                // so the caller's next delta decodes against the correct
+                // base — otherwise a crafted skipped struct can shift the
+                // outer field-id and silently mis-decode a known field.
+                let saved = self.last_id;
                 while let Some(f) = self.next_field()? {
                     let ct = f.ctype;
                     self.skip_depth(ct, depth + 1)?;
                 }
+                self.last_id = saved;
             }
             // MAP (ctype 11) intentionally not implemented: not used by
             // the OBJ-2a Parquet metadata schema subset. Returns a typed
@@ -280,6 +288,36 @@ mod tests {
         let mut s = StructReader::new(&[0x18, 0x05]);
         let f = s.next_field().unwrap().unwrap();
         assert!(s.read_binary(&f).is_err());
+    }
+
+    #[test]
+    fn skip_struct_does_not_corrupt_outer_last_id() {
+        // Outer struct: f1 i32=11, f2 STRUCT{ f50 i32=99 }, f3 i32=33, STOP.
+        // f2's inner field-id 50 must NOT leak into the outer chain;
+        // f3 (delta 1 from f2's id 2) must decode as id 3 -> value 33.
+        let mut b = Vec::new();
+        // f1: (delta1<<4)|I32(5)=0x15 ; zz(11)=22 -> uvarint 0x16
+        b.push(0x15); b.push(0x16);
+        // f2: (delta1<<4)|STRUCT(12)=0x1c
+        b.push(0x1c);
+        //   inner f50: long form (delta 0) -> 0x0|I32(5)=0x05 ; zz(50)=100 -> 0x64 ; value zz(99)=198 -> 0xc6 0x01
+        b.push(0x05); b.push(0x64); b.push(0xc6); b.push(0x01);
+        b.push(0x00); // inner STOP
+        // f3: (delta1<<4)|I32(5)=0x15 ; zz(33)=66 -> 0x42
+        b.push(0x15); b.push(0x42);
+        b.push(0x00); // outer STOP
+        let mut s = StructReader::new(&b);
+        let f1 = s.next_field().unwrap().unwrap();
+        assert_eq!(f1.id, 1);
+        assert_eq!(s.read_i32(&f1).unwrap(), 11);
+        let f2 = s.next_field().unwrap().unwrap();
+        assert_eq!(f2.id, 2);
+        assert_eq!(f2.ctype, ctype::STRUCT);
+        s.skip(f2.ctype).unwrap(); // skip the unknown struct
+        let f3 = s.next_field().unwrap().unwrap();
+        assert_eq!(f3.id, 3, "outer last_id must be restored after skip");
+        assert_eq!(s.read_i32(&f3).unwrap(), 33);
+        assert!(s.next_field().unwrap().is_none());
     }
 
     #[test]

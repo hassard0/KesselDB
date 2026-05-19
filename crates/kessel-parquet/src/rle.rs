@@ -143,6 +143,32 @@ pub fn decode_hybrid(
     Ok(out)
 }
 
+/// V1 definition/repetition level stream: a 4-byte little-endian
+/// `u32` length prefix, then exactly that many bytes of hybrid
+/// `<encoded-data>`. Decodes `num_values` levels of `bit_width` and
+/// returns `(levels, total_consumed)` where `total_consumed` includes
+/// the 4-byte prefix (so the caller can advance to the value section).
+pub fn decode_level_v1(
+    data: &[u8],
+    bit_width: u32,
+    num_values: usize,
+) -> Result<(Vec<u64>, usize), PqError> {
+    let lb = data
+        .get(0..4)
+        .ok_or_else(|| bad("rle level length prefix truncated"))?;
+    // lb is exactly 4 bytes (get(0..4) succeeded) → try_into is
+    // statically infallible; same pattern as plain.rs:87.
+    let len = u32::from_le_bytes(lb.try_into().unwrap()) as usize;
+    let end = 4usize
+        .checked_add(len)
+        .ok_or_else(|| bad("rle level length overflow"))?;
+    let body = data
+        .get(4..end)
+        .ok_or_else(|| bad("rle level body truncated"))?;
+    let levels = decode_hybrid(body, bit_width, num_values)?;
+    Ok((levels, end))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,5 +233,19 @@ mod tests {
         let stream = [0x04u8, 0xA0, 0x86, 0x01];
         let v = decode_hybrid(&stream, 17, 2).expect("decode");
         assert_eq!(v, vec![100_000, 100_000]);
+    }
+
+    // KAT 7 — V1 level stream framing: a 4-byte u32 LE length prefix
+    // followed by exactly `length` hybrid bytes. Body = RLE(value=1,
+    // run_len=4, bw=1): header varint(4<<1)=0x08, value byte 0x01
+    // (ceil(1/8)=1). Body length = 2 → prefix [0x02,0,0,0].
+    // decode_level_v1 returns four 1s and total_consumed = 4 + 2 = 6.
+    #[test]
+    fn kat_decode_level_v1_prefix_and_consumed() {
+        let data = [0x02u8, 0x00, 0x00, 0x00, 0x08, 0x01];
+        let (levels, consumed) =
+            decode_level_v1(&data, 1, 4).expect("decode");
+        assert_eq!(levels, vec![1, 1, 1, 1]);
+        assert_eq!(consumed, 6);
     }
 }

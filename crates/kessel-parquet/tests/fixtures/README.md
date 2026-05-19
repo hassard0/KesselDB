@@ -242,9 +242,11 @@ print('wrote 10 fixtures')
 INT32/INT64 physical type; without it pyarrow defaults to FIXED_LEN_BYTE_ARRAY for DECIMAL.
 `decimal_flba` and `decimal_flba_optional` use precision=30 which forces FLBA by default.
 
-**NOTE:** BYTE_ARRAY DECIMAL is supported by the decoder (hand-KAT pinned in lib.rs#tests) but
-pyarrow 24.0.0 cannot write it; the decode path is non-self-referentially exercised by the
-hand-built KAT in `extract_decimal_cross_physical_type_determinism_pin` only.
+**NOTE:** BYTE_ARRAY DECIMAL is supported by the decoder but pyarrow 24.0.0 cannot write it;
+the decoder's BYTE_ARRAY DECIMAL path is exercised by hand-KATs in `lib.rs#tests`. The
+end-to-end source-format-independence proof across the THREE writable physical types
+(INT32 / INT64 / FLBA) is the `decimal_cross_physical_type_determinism_pin` (see the
+matched-precision fixtures below).
 
 ### Expected logical rows
 
@@ -259,3 +261,61 @@ hand-built KAT in `extract_decimal_cross_physical_type_determinism_pin` only.
   → `Decimal{unscaled:123456,scale:5}`, `Decimal{unscaled:-456789,scale:5}`, `Decimal{unscaled:10000000000,scale:5}`.
 - `decimal_flba_optional`: d=[1.23456, NULL, -4.56789].
 - `flba_uuid`: u=[0x01×16, 0x02×16, 0x03×16] → `Bytes(vec![0x01;16])` etc.
+
+## DECIMAL matched-precision fixtures (SP108 T4 review)
+
+These three fixtures carry the SAME 5 logical decimal values at the SAME
+scale=2 across three different physical encodings, enabling the
+`decimal_cross_physical_type_determinism_pin` end-to-end source-format
+independence assertion through the production `extract()`.
+
+Regenerate (run from repo root):
+
+```python
+import pyarrow as pa, pyarrow.parquet as pq
+from decimal import Decimal
+FIX = "crates/kessel-parquet/tests/fixtures"
+LOGICAL = [Decimal("123.45"), Decimal("-67.89"), Decimal("100000.00"),
+           Decimal("0.00"),   Decimal("-999999.99")]
+
+def write_eq(prec, name, store_int):
+    arr = pa.array(LOGICAL, type=pa.decimal128(prec, 2))
+    t = pa.table({"d": arr})
+    kw = dict(use_dictionary=False, compression=None,
+              version="2.6", data_page_version="1.0")
+    if store_int:
+        kw["store_decimal_as_integer"] = True
+    pq.write_table(t, f"{FIX}/{name}", **kw)
+
+write_eq(9,  "decimal_int32_eq.parquet", True)   # -> INT32
+write_eq(18, "decimal_int64_eq.parquet", True)   # -> INT64
+write_eq(30, "decimal_flba_eq.parquet",  False)  # -> FIXED_LEN_BYTE_ARRAY
+```
+
+### Metadata-verified physical types
+
+| Fixture                  | phys_type              | conv_type | logical_type                       |
+|--------------------------|------------------------|-----------|------------------------------------|
+| decimal_int32_eq         | INT32                  | DECIMAL   | Decimal(precision=9,  scale=2)     |
+| decimal_int64_eq         | INT64                  | DECIMAL   | Decimal(precision=18, scale=2)     |
+| decimal_flba_eq          | FIXED_LEN_BYTE_ARRAY   | DECIMAL   | Decimal(precision=30, scale=2)     |
+
+All three encode the same 5 logical values at scale=2; since the logical
+value is `unscaled / 10^scale` and scale is matched, the unscaled integer is
+identical across the three fixtures (e.g. `123.45` → unscaled `12_345` in all
+three). Decoded `PqValue::Decimal { unscaled, scale }` rows are byte-identical
+across INT32 / INT64 / FLBA — that's the source-format-independence proof.
+
+Expected logical rows (all three fixtures):
+
+```
+123.45        -> Decimal { unscaled:      12_345, scale: 2 }
+-67.89        -> Decimal { unscaled:      -6_789, scale: 2 }
+100_000.00    -> Decimal { unscaled:  10_000_000, scale: 2 }
+0.00          -> Decimal { unscaled:           0, scale: 2 }
+-999_999.99   -> Decimal { unscaled: -99_999_999, scale: 2 }
+```
+
+(`-99_999_999` has |v| < 2^31 = 2_147_483_648, so it fits the INT32 backing
+type at precision=9. The same unscaled integer is rewritten as 8 bytes for
+INT64 and as 13 bytes big-endian two's-complement for FLBA.)

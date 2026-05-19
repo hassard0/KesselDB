@@ -18,6 +18,13 @@ const DEC_I64: &[u8]      = include_bytes!("fixtures/decimal_int64.parquet");
 const DEC_FLBA: &[u8]     = include_bytes!("fixtures/decimal_flba.parquet");
 const DEC_FLBA_OPT: &[u8] = include_bytes!("fixtures/decimal_flba_optional.parquet");
 
+// OBJ-2c-4 (SP108 T4 review): matched-precision DECIMAL fixtures for the
+// 3-way INT32/INT64/FLBA cross-physical-type determinism pin. Same 5
+// logical values, same scale=2; three different physical encodings.
+const DEC_I32_EQ:  &[u8] = include_bytes!("fixtures/decimal_int32_eq.parquet");
+const DEC_I64_EQ:  &[u8] = include_bytes!("fixtures/decimal_int64_eq.parquet");
+const DEC_FLBA_EQ: &[u8] = include_bytes!("fixtures/decimal_flba_eq.parquet");
+
 // ── OBJ-2c-4: FLBA non-DECIMAL fixture ──────────────────────────────────────
 const FLBA_UUID: &[u8] = include_bytes!("fixtures/flba_uuid.parquet");
 
@@ -405,34 +412,73 @@ fn decimal_flba_optional_fixture_roundtrips() {
     ], "decimal_flba_optional.parquet");
 }
 
-/// OBJ-2c-4: DECIMAL 3-way source-independence pin (INT32 / INT64 / FLBA).
+/// OBJ-2c-4: DECIMAL INT32 encoding-independence pin (plain vs dict).
 ///
-/// Three real pyarrow fixtures each carry the SAME logical DECIMAL values
-/// but use different physical backing types:
-///   - decimal_int32: precision=5, scale=2 → INT32 physical (values 1.23, -4.56, 100.00)
-///   - decimal_int32_dict: precision=5, scale=2 → INT32 physical, dict-encoded
-///   - decimal_int64: precision=18, scale=3 → INT64 physical (values 1.234, ...)
-///   - decimal_flba: precision=30, scale=5 → FLBA physical (values 1.23456, ...)
-///
-/// The pin asserts the INT32 plain and INT32 dict paths are mutually identical
-/// (format-independent for the same precision/scale). Each physical type is
-/// separately asserted in its own roundtrip test above; this test pins that
-/// the INT32 plain path == INT32 dict path — the canonical 2-way
-/// format-independence assertion for DECIMAL. The full 4-way cross-physical
-/// determinism (INT32 / INT64 / FLBA / BYTE_ARRAY) is covered by the
-/// hand-KAT `extract_decimal_cross_physical_type_determinism_pin` in
-/// `lib.rs#tests` (SP108 T3, all same precision/scale/value).
-///
-/// Precision/scale choice for the cross-INT32 pin: precision=5, scale=2
-/// (max unscaled = 99999, well within i32 [-2^31..2^31-1]).
+/// Asserts the INT32 PLAIN and INT32 PLAIN_DICTIONARY decode paths produce
+/// identical logical rows for the same precision/scale (precision=5, scale=2).
+/// This pins encoding-only source independence within a single physical type;
+/// cross-physical-type independence is pinned by
+/// `decimal_cross_physical_type_determinism_pin` below.
 #[test]
-fn decimal_int32_plain_vs_dict_source_independence_pin() {
+fn decimal_int32_encoding_independence_pin() {
     let plain = extract(DEC_I32, &["d"])
         .expect("extract decimal_int32 plain");
     let dict = extract(DEC_I32_DICT, &["d"])
         .expect("extract decimal_int32 dict");
     assert_eq!(plain, dict,
         "DECIMAL INT32 plain and dict paths must produce identical logical rows");
+}
+
+/// OBJ-2c-4 (SP108 T4 review): DECIMAL cross-physical-type determinism pin.
+///
+/// The SAME logical DECIMAL values via INT32, INT64, and FLBA physical types
+/// must decode to byte-identical `PqValue::Decimal { unscaled, scale }`. This
+/// is the end-to-end source-format-independence proof that the T4 spec
+/// requires; it is exercised through the production `extract()` entry point
+/// against three pyarrow-written fixtures with metadata-verified differing
+/// physical_type but matched scale=2 and identical logical rows.
+///
+/// Fixtures (all 5 logical values, all scale=2):
+///   - decimal_int32_eq.parquet : pa.decimal128(9,  2) + store_decimal_as_integer → INT32
+///   - decimal_int64_eq.parquet : pa.decimal128(18, 2) + store_decimal_as_integer → INT64
+///   - decimal_flba_eq.parquet  : pa.decimal128(30, 2)                            → FIXED_LEN_BYTE_ARRAY
+///
+/// Logical values (max unscaled |v| = 99_999_999 < 2^31, fits INT32):
+///   123.45        →  Decimal{ unscaled:    12_345,  scale: 2 }
+///   -67.89        →  Decimal{ unscaled:    -6_789,  scale: 2 }
+///   100_000.00    →  Decimal{ unscaled: 10_000_000, scale: 2 }
+///   0.00          →  Decimal{ unscaled:         0,  scale: 2 }
+///   -999_999.99   →  Decimal{ unscaled: -99_999_999, scale: 2 }
+///
+/// pyarrow 24.0.0 cannot write BYTE_ARRAY DECIMAL (plan-acknowledged); the
+/// BYTE_ARRAY decode path is exercised by hand-KATs in `lib.rs#tests`. The
+/// 3-way INT32/INT64/FLBA pin here is what proves source-format independence
+/// end-to-end via production extract().
+#[test]
+fn decimal_cross_physical_type_determinism_pin() {
+    let i32_rows  = extract(DEC_I32_EQ,  &["d"])
+        .expect("extract decimal_int32_eq.parquet (DECIMAL+INT32, matched p=9 s=2)");
+    let i64_rows  = extract(DEC_I64_EQ,  &["d"])
+        .expect("extract decimal_int64_eq.parquet (DECIMAL+INT64, matched p=18 s=2)");
+    let flba_rows = extract(DEC_FLBA_EQ, &["d"])
+        .expect("extract decimal_flba_eq.parquet (DECIMAL+FLBA, matched p=30 s=2)");
+
+    assert_eq!(i32_rows, i64_rows,
+        "INT32 vs INT64 DECIMAL decode mismatch — source-format independence violated");
+    assert_eq!(i64_rows, flba_rows,
+        "INT64 vs FLBA DECIMAL decode mismatch — source-format independence violated");
+
+    // Hand-derived exact expected rows (5 logical values × scale=2).
+    let expected: Vec<Vec<PqValue>> = vec![
+        vec![PqValue::Decimal { unscaled:     12_345, scale: 2 }],
+        vec![PqValue::Decimal { unscaled:     -6_789, scale: 2 }],
+        vec![PqValue::Decimal { unscaled: 10_000_000, scale: 2 }],
+        vec![PqValue::Decimal { unscaled:          0, scale: 2 }],
+        vec![PqValue::Decimal { unscaled: -99_999_999, scale: 2 }],
+    ];
+    assert_eq!(i32_rows,  expected, "INT32 path: exact-value mismatch vs hand-derived expected");
+    assert_eq!(i64_rows,  expected, "INT64 path: exact-value mismatch vs hand-derived expected");
+    assert_eq!(flba_rows, expected, "FLBA path: exact-value mismatch vs hand-derived expected");
 }
 
 /// OBJ-2c-4: real pyarrow flba_uuid.parquet (FIXED_LEN_BYTE_ARRAY(16), no DECIMAL).

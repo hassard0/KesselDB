@@ -34,10 +34,11 @@ or SQL layer is changed.
 
 - **`meta.rs` field-8 `DataPageHeaderV2`** — new Thrift struct decoded
   alongside the existing `DataPageHeader` (field 2 = V1, field 8 = V2).
-  The `PageHeader` enum gains a `DataV2` variant carrying
-  `DataPageHeaderV2` (num_values, num_nulls, num_rows, encoding,
-  definition_levels_byte_length, repetition_levels_byte_length,
-  is_compressed, statistics). `PageType` enum gains `DataPageV2 = 3`.
+  The existing `PageHeader` struct gains 7 flat `v2_*` fields
+  (`v2_num_values`, `v2_num_nulls`, `v2_num_rows`, `v2_encoding`,
+  `v2_def_len`, `v2_rep_len`, `v2_is_compressed`); no new enum variant
+  is added. The page-type discriminant remains the existing `i32
+  page_type` field (bare integer: `0` = DATA_PAGE, `3` = DATA_PAGE_V2).
 
 - **`lib.rs` `decode_data_page_v2`** — new function invoked when
   `page_type == 3`. The V2 layout splits the page payload into three
@@ -57,7 +58,7 @@ or SQL layer is changed.
   tests pass unchanged.
 
 - **`page_type == 3` gate flip** — the `lib.rs` decode dispatch now routes
-  `PageType::DataPageV2` to `decode_data_page_v2` instead of returning
+  `ph.page_type == 3` to `decode_data_page_v2` instead of returning
   `Unsupported("non-V1 data page (V2/index): OBJ-2c")`.
 
 **Supported matrix after OBJ-2c-3:**

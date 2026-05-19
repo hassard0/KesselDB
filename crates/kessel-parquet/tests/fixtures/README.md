@@ -157,3 +157,105 @@ dictionary-encoded. `gzip_plain` = REQUIRED + PLAIN. `gzip_nullable` =
 OPTIONAL (nullable) + dictionary + GZIP, with NULLs.
 Expected rows (dict/plain): id=[7,7,-2,7,100]; s=["a","a","b","c","a"].
 Expected rows (nullable): id=[7,7,null,-2,100]; s=["a",null,"b","c","a"].
+
+## INT96 + DECIMAL (INT32/INT64/FLBA) + FLBA-UUID (OBJ-2c-4)
+
+Ten fixtures generated and metadata-verified at planning time (pyarrow 24.0.0).
+
+Regenerate (run from repo root):
+
+```python
+cd /c/Users/ihass/KesselDB && /c/Users/ihass/AppData/Local/Programs/Python/Python311/python.exe -c "
+import pyarrow as pa, pyarrow.parquet as pq
+from decimal import Decimal
+FIX = 'crates/kessel-parquet/tests/fixtures'
+
+# INT96 fixtures
+schI96 = pa.schema([pa.field('ts', pa.timestamp('ns'), nullable=False)])
+tI96 = pa.table({'ts': pa.array([0, 86_400_000_000_000, -86_400_000_000_000],
+                                 type=pa.timestamp('ns'))}, schema=schI96)
+pq.write_table(tI96, f'{FIX}/int96_plain.parquet',
+               use_deprecated_int96_timestamps=True, use_dictionary=False,
+               compression=None, version='1.0', data_page_version='1.0')
+pq.write_table(tI96, f'{FIX}/int96_dict.parquet',
+               use_deprecated_int96_timestamps=True, use_dictionary=True,
+               compression=None, version='1.0', data_page_version='1.0')
+pq.write_table(tI96, f'{FIX}/int96_v2_snappy.parquet',
+               use_deprecated_int96_timestamps=True, use_dictionary=False,
+               compression='snappy', version='1.0', data_page_version='2.0')
+schI96N = pa.schema([pa.field('ts', pa.timestamp('ns'), nullable=True)])
+tI96N = pa.table({'ts': pa.array([0, None, -86_400_000_000_000], type=pa.timestamp('ns'))},
+                  schema=schI96N)
+pq.write_table(tI96N, f'{FIX}/int96_optional.parquet',
+               use_deprecated_int96_timestamps=True, version='1.0', data_page_version='1.0')
+
+# DECIMAL fixtures
+tDi32 = pa.table({'d': pa.array([Decimal('1.23'), Decimal('-4.56'), Decimal('100.00')],
+                                  type=pa.decimal128(5, 2))})
+pq.write_table(tDi32, f'{FIX}/decimal_int32.parquet',
+               use_dictionary=False, compression=None, version='2.6',
+               data_page_version='1.0', store_decimal_as_integer=True)
+pq.write_table(tDi32, f'{FIX}/decimal_int32_dict.parquet',
+               use_dictionary=True, compression=None, version='2.6',
+               data_page_version='1.0', store_decimal_as_integer=True)
+tDi64 = pa.table({'d': pa.array([Decimal('1.234'), Decimal('-4.567'), Decimal('100000.000')],
+                                  type=pa.decimal128(18, 3))})
+pq.write_table(tDi64, f'{FIX}/decimal_int64.parquet',
+               use_dictionary=False, compression=None, version='2.6',
+               data_page_version='1.0', store_decimal_as_integer=True)
+tDflba = pa.table({'d': pa.array([Decimal('1.23456'), Decimal('-4.56789'),
+                                    Decimal('100000.00000')], type=pa.decimal128(30, 5))})
+pq.write_table(tDflba, f'{FIX}/decimal_flba.parquet',
+               use_dictionary=False, compression=None, version='1.0', data_page_version='1.0')
+schDN = pa.schema([pa.field('d', pa.decimal128(30, 5), nullable=True)])
+tDN = pa.table({'d': pa.array([Decimal('1.23456'), None, Decimal('-4.56789')],
+                                type=pa.decimal128(30, 5))}, schema=schDN)
+pq.write_table(tDN, f'{FIX}/decimal_flba_optional.parquet',
+               version='1.0', data_page_version='1.0')
+
+# FLBA non-DECIMAL UUID-like binary(16)
+schU = pa.schema([pa.field('u', pa.binary(16), nullable=False)])
+tU = pa.table({'u': pa.array([b'\x01'*16, b'\x02'*16, b'\x03'*16],
+                              type=pa.binary(16))}, schema=schU)
+pq.write_table(tU, f'{FIX}/flba_uuid.parquet',
+               use_dictionary=False, compression=None, version='1.0', data_page_version='1.0')
+print('wrote 10 fixtures')
+"
+```
+
+### Metadata-verified physical types (all 10 fixtures)
+
+| Fixture                  | phys_type              | conv_type | logical_type                       | V2-discriminator                             |
+|--------------------------|------------------------|-----------|------------------------------------|----------------------------------------------|
+| int96_plain              | INT96                  | NONE      | None                               | —                                            |
+| int96_dict               | INT96                  | NONE      | None                               | —                                            |
+| int96_v2_snappy          | INT96                  | NONE      | None                               | `b[4]=0x15 b[5]=0x06` (DATA_PAGE_V2)        |
+| int96_optional           | INT96                  | NONE      | None                               | —                                            |
+| decimal_int32            | INT32                  | DECIMAL   | Decimal(precision=5, scale=2)      | —                                            |
+| decimal_int32_dict       | INT32                  | DECIMAL   | Decimal(precision=5, scale=2)      | —                                            |
+| decimal_int64            | INT64                  | DECIMAL   | Decimal(precision=18, scale=3)     | —                                            |
+| decimal_flba             | FIXED_LEN_BYTE_ARRAY   | DECIMAL   | Decimal(precision=30, scale=5)     | —; type_length=13                            |
+| decimal_flba_optional    | FIXED_LEN_BYTE_ARRAY   | DECIMAL   | Decimal(precision=30, scale=5)     | —; type_length=13                            |
+| flba_uuid                | FIXED_LEN_BYTE_ARRAY   | NONE      | None                               | —; type_length=16; no DECIMAL logicalType    |
+
+`store_decimal_as_integer=True` was required for `decimal_int32` and `decimal_int64` to produce
+INT32/INT64 physical type; without it pyarrow defaults to FIXED_LEN_BYTE_ARRAY for DECIMAL.
+`decimal_flba` and `decimal_flba_optional` use precision=30 which forces FLBA by default.
+
+**NOTE:** BYTE_ARRAY DECIMAL is supported by the decoder (hand-KAT pinned in lib.rs#tests) but
+pyarrow 24.0.0 cannot write it; the decode path is non-self-referentially exercised by the
+hand-built KAT in `extract_decimal_cross_physical_type_determinism_pin` only.
+
+### Expected logical rows
+
+- `int96_plain` / `int96_dict` / `int96_v2_snappy`: ts=[0ns, +86400s ns, -86400s ns]
+  → `Timestamp(0)`, `Timestamp(86_400_000_000_000)`, `Timestamp(-86_400_000_000_000)`.
+- `int96_optional`: ts=[0ns, NULL, -86400s ns].
+- `decimal_int32` / `decimal_int32_dict`: d=[1.23, -4.56, 100.00] precision=5 scale=2
+  → `Decimal{unscaled:123,scale:2}`, `Decimal{unscaled:-456,scale:2}`, `Decimal{unscaled:10000,scale:2}`.
+- `decimal_int64`: d=[1.234, -4.567, 100000.000] precision=18 scale=3
+  → `Decimal{unscaled:1234,scale:3}`, `Decimal{unscaled:-4567,scale:3}`, `Decimal{unscaled:100000000,scale:3}`.
+- `decimal_flba`: d=[1.23456, -4.56789, 100000.00000] precision=30 scale=5
+  → `Decimal{unscaled:123456,scale:5}`, `Decimal{unscaled:-456789,scale:5}`, `Decimal{unscaled:10000000000,scale:5}`.
+- `decimal_flba_optional`: d=[1.23456, NULL, -4.56789].
+- `flba_uuid`: u=[0x01×16, 0x02×16, 0x03×16] → `Bytes(vec![0x01;16])` etc.

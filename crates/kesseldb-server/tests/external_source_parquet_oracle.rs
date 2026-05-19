@@ -365,3 +365,34 @@ fn refresh_v2_parquet_from_s3_fails_closed_and_state_intact() {
         s3_path: "v2dict.parquet",
     });
 }
+
+static DECIMAL_FLBA_PARQUET_FIXTURE: &[u8] =
+    include_bytes!("../../kessel-parquet/tests/fixtures/decimal_flba.parquet");
+
+/// Mirrors `refresh_parquet_from_s3_fails_closed_and_state_intact` for the
+/// real pyarrow decimal_flba.parquet fixture (OBJ-2c-4, DECIMAL FLBA,
+/// precision=30 scale=5, type_length=13). The same fail-closed contract
+/// applies: the production webpki-roots TLS client does NOT trust the
+/// self-signed localhost cert, so REFRESH returns a typed SchemaError via
+/// the do_refresh → kessel_objstore::sign_get → kessel_fetch path, and
+/// prior (empty) state remains intact. The trusted DECIMAL-FLBA decode
+/// happy path is proven at the kessel-parquet layer by
+/// `fixture_roundtrip::decimal_flba_fixture_roundtrips`. No fixture-trust
+/// bypass is introduced here (SP100/SP101 precedent).
+/// DDL maps the DECIMAL column (source name 'd') to an I128 column named
+/// `id` to satisfy the hardcoded `KEY id` in the helper; the TLS error fires
+/// before any column decode reaches the server.
+#[test]
+fn refresh_decimal_parquet_from_s3_fails_closed_and_state_intact() {
+    run_fail_closed_parquet_e2e(FailClosedCase {
+        fixture: DECIMAL_FLBA_PARQUET_FIXTURE,
+        tag: "decpq",
+        keyid_env: "OBJ_DEC_KEYID",
+        secret_env: "OBJ_DEC_SECRET",
+        keyid_val: "AKIAEXAMPLE7",
+        secret_val: "secretexamplekey7",
+        source: "decfeed",
+        ddl_cols: "id I128 NOT NULL FROM 'd'",
+        s3_path: "decimal.parquet",
+    });
+}

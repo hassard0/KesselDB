@@ -3,7 +3,23 @@
 //! rows. Fixture provenance: pyarrow 24.0.0; see
 //! tests/fixtures/README.md.
 use kessel_parquet::{extract, PqValue};
-use kessel_parquet::PqValue::{Bytes, I64, Null};
+use kessel_parquet::PqValue::{Bytes, I64, Null, Timestamp};
+
+// ── OBJ-2c-4: INT96 fixtures ─────────────────────────────────────────────────
+const INT96_PLAIN: &[u8]     = include_bytes!("fixtures/int96_plain.parquet");
+const INT96_DICT: &[u8]      = include_bytes!("fixtures/int96_dict.parquet");
+const INT96_V2_SNAPPY: &[u8] = include_bytes!("fixtures/int96_v2_snappy.parquet");
+const INT96_OPTIONAL: &[u8]  = include_bytes!("fixtures/int96_optional.parquet");
+
+// ── OBJ-2c-4: DECIMAL fixtures ────────────────────────────────────────────────
+const DEC_I32: &[u8]      = include_bytes!("fixtures/decimal_int32.parquet");
+const DEC_I32_DICT: &[u8] = include_bytes!("fixtures/decimal_int32_dict.parquet");
+const DEC_I64: &[u8]      = include_bytes!("fixtures/decimal_int64.parquet");
+const DEC_FLBA: &[u8]     = include_bytes!("fixtures/decimal_flba.parquet");
+const DEC_FLBA_OPT: &[u8] = include_bytes!("fixtures/decimal_flba_optional.parquet");
+
+// ── OBJ-2c-4: FLBA non-DECIMAL fixture ──────────────────────────────────────
+const FLBA_UUID: &[u8] = include_bytes!("fixtures/flba_uuid.parquet");
 
 const FLAT: &[u8] = include_bytes!("fixtures/flat_required.parquet");
 const MRG: &[u8] = include_bytes!("fixtures/flat_multirg.parquet");
@@ -234,4 +250,202 @@ fn gzip_nullable_fixture_roundtrips() {
     let rows = extract(&bytes, &["id", "s"])
         .expect("extract gzip_nullable.parquet (OPTIONAL+dict+GZIP)");
     assert_eq!(rows, expected, "gzip_nullable.parquet (OPTIONAL+dict+GZIP)");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// OBJ-2c-4: INT96 + DECIMAL (INT32/INT64/FLBA) + FLBA-UUID roundtrip tests
+// ════════════════════════════════════════════════════════════════════════════
+
+/// OBJ-2c-4: real pyarrow int96_plain.parquet (INT96, PLAIN, UNCOMPRESSED, V1).
+/// Timestamps: 1970-01-01 (0 ns), 1970-01-02 (+86400s), 1969-12-31 (-86400s).
+/// Metadata-verified: phys=INT96, V1 data page. Decisive non-self-referential
+/// proof of the INT96 plain decode path via production extract().
+#[test]
+fn int96_plain_fixture_roundtrips() {
+    let rows = extract(INT96_PLAIN, &["ts"])
+        .expect("extract int96_plain.parquet (INT96+PLAIN+UNCOMPRESSED)");
+    assert_eq!(rows, vec![
+        vec![Timestamp(0)],
+        vec![Timestamp(86_400_000_000_000)],
+        vec![Timestamp(-86_400_000_000_000)],
+    ], "int96_plain.parquet");
+}
+
+/// OBJ-2c-4: real pyarrow int96_dict.parquet (INT96, PLAIN_DICTIONARY, UNCOMPRESSED, V1).
+/// Same logical rows as int96_plain.parquet; proves INT96 dict-encoded path.
+#[test]
+fn int96_dict_fixture_roundtrips() {
+    let rows = extract(INT96_DICT, &["ts"])
+        .expect("extract int96_dict.parquet (INT96+DICT+UNCOMPRESSED)");
+    assert_eq!(rows, vec![
+        vec![Timestamp(0)],
+        vec![Timestamp(86_400_000_000_000)],
+        vec![Timestamp(-86_400_000_000_000)],
+    ], "int96_dict.parquet");
+}
+
+/// OBJ-2c-4: real pyarrow int96_v2_snappy.parquet (INT96, PLAIN, SNAPPY, V2).
+/// Same logical rows; proves INT96 decodes correctly through DataPageHeaderV2
+/// + Snappy. Metadata-verified: V2-discriminator bytes 0x15 0x06 at offset 4.
+#[test]
+fn int96_v2_snappy_fixture_roundtrips() {
+    let rows = extract(INT96_V2_SNAPPY, &["ts"])
+        .expect("extract int96_v2_snappy.parquet (INT96+PLAIN+SNAPPY+V2)");
+    assert_eq!(rows, vec![
+        vec![Timestamp(0)],
+        vec![Timestamp(86_400_000_000_000)],
+        vec![Timestamp(-86_400_000_000_000)],
+    ], "int96_v2_snappy.parquet");
+}
+
+/// OBJ-2c-4: real pyarrow int96_optional.parquet (INT96, OPTIONAL, V1).
+/// Rows: 0 ns / NULL / -86400s ns. Proves INT96 null-scatter in OPTIONAL.
+#[test]
+fn int96_optional_fixture_roundtrips() {
+    let rows = extract(INT96_OPTIONAL, &["ts"])
+        .expect("extract int96_optional.parquet (INT96+OPTIONAL+V1)");
+    assert_eq!(rows, vec![
+        vec![Timestamp(0)],
+        vec![Null],
+        vec![Timestamp(-86_400_000_000_000)],
+    ], "int96_optional.parquet");
+}
+
+/// OBJ-2c-4: INT96 plain-vs-dict-vs-V2 source-independence pin.
+/// Asserts that extract() over int96_plain, int96_dict, and int96_v2_snappy
+/// all produce identical logical rows despite different encodings (PLAIN /
+/// PLAIN_DICTIONARY / DataPageHeaderV2+SNAPPY). The three fixtures carry the
+/// same 3 timestamps: 0 ns, +86400s ns, -86400s ns.
+/// Pins: plain, dict, and V2 INT96 decode paths are source-format-independent.
+#[test]
+fn int96_plain_vs_dict_vs_v2_source_independence_pin() {
+    let plain = extract(INT96_PLAIN, &["ts"])
+        .expect("extract int96_plain");
+    let dict = extract(INT96_DICT, &["ts"])
+        .expect("extract int96_dict");
+    let v2sn = extract(INT96_V2_SNAPPY, &["ts"])
+        .expect("extract int96_v2_snappy");
+    assert_eq!(plain, dict,
+        "INT96 PLAIN and DICT must produce identical logical rows");
+    assert_eq!(plain, v2sn,
+        "INT96 PLAIN and V2+SNAPPY must produce identical logical rows");
+}
+
+/// OBJ-2c-4: real pyarrow decimal_int32.parquet (DECIMAL INT32, precision=5, scale=2).
+/// Values: 1.23, -4.56, 100.00 → unscaled: 123, -456, 10000 / scale=2.
+/// Metadata-verified: phys=INT32, conv=DECIMAL, logical=Decimal(precision=5, scale=2).
+/// Generated with store_decimal_as_integer=True; proves INT32-backed DECIMAL decode.
+#[test]
+fn decimal_int32_fixture_roundtrips() {
+    let rows = extract(DEC_I32, &["d"])
+        .expect("extract decimal_int32.parquet (DECIMAL+INT32)");
+    assert_eq!(rows, vec![
+        vec![PqValue::Decimal { unscaled: 123,    scale: 2 }],
+        vec![PqValue::Decimal { unscaled: -456,   scale: 2 }],
+        vec![PqValue::Decimal { unscaled: 10_000, scale: 2 }],
+    ], "decimal_int32.parquet");
+}
+
+/// OBJ-2c-4: real pyarrow decimal_int32_dict.parquet (DECIMAL INT32, dict-encoded).
+/// Same precision=5, scale=2 values as decimal_int32.parquet.
+/// Proves INT32-backed DECIMAL decodes correctly through the dictionary path.
+#[test]
+fn decimal_int32_dict_fixture_roundtrips() {
+    let rows = extract(DEC_I32_DICT, &["d"])
+        .expect("extract decimal_int32_dict.parquet (DECIMAL+INT32+DICT)");
+    assert_eq!(rows, vec![
+        vec![PqValue::Decimal { unscaled: 123,    scale: 2 }],
+        vec![PqValue::Decimal { unscaled: -456,   scale: 2 }],
+        vec![PqValue::Decimal { unscaled: 10_000, scale: 2 }],
+    ], "decimal_int32_dict.parquet");
+}
+
+/// OBJ-2c-4: real pyarrow decimal_int64.parquet (DECIMAL INT64, precision=18, scale=3).
+/// Values: 1.234, -4.567, 100000.000 → unscaled: 1234, -4567, 100000000 / scale=3.
+/// Metadata-verified: phys=INT64, conv=DECIMAL, logical=Decimal(precision=18, scale=3).
+/// Generated with store_decimal_as_integer=True; proves INT64-backed DECIMAL decode.
+#[test]
+fn decimal_int64_fixture_roundtrips() {
+    let rows = extract(DEC_I64, &["d"])
+        .expect("extract decimal_int64.parquet (DECIMAL+INT64)");
+    assert_eq!(rows, vec![
+        vec![PqValue::Decimal { unscaled: 1_234,       scale: 3 }],
+        vec![PqValue::Decimal { unscaled: -4_567,      scale: 3 }],
+        vec![PqValue::Decimal { unscaled: 100_000_000, scale: 3 }],
+    ], "decimal_int64.parquet");
+}
+
+/// OBJ-2c-4: real pyarrow decimal_flba.parquet (DECIMAL FLBA, precision=30, scale=5,
+/// type_length=13 bytes). Values: 1.23456, -4.56789, 100000.00000 →
+/// unscaled: 123456, -456789, 10000000000 / scale=5.
+/// Metadata-verified: phys=FIXED_LEN_BYTE_ARRAY, conv=DECIMAL,
+/// logical=Decimal(precision=30, scale=5). Proves FLBA-backed DECIMAL decode.
+#[test]
+fn decimal_flba_fixture_roundtrips() {
+    let rows = extract(DEC_FLBA, &["d"])
+        .expect("extract decimal_flba.parquet (DECIMAL+FLBA)");
+    assert_eq!(rows, vec![
+        vec![PqValue::Decimal { unscaled: 123_456,       scale: 5 }],
+        vec![PqValue::Decimal { unscaled: -456_789,      scale: 5 }],
+        vec![PqValue::Decimal { unscaled: 10_000_000_000, scale: 5 }],
+    ], "decimal_flba.parquet");
+}
+
+/// OBJ-2c-4: real pyarrow decimal_flba_optional.parquet (DECIMAL FLBA, OPTIONAL).
+/// Rows: 1.23456 / NULL / -4.56789 → Decimal{123456,5} / Null / Decimal{-456789,5}.
+/// Proves FLBA DECIMAL null-scatter in OPTIONAL.
+#[test]
+fn decimal_flba_optional_fixture_roundtrips() {
+    let rows = extract(DEC_FLBA_OPT, &["d"])
+        .expect("extract decimal_flba_optional.parquet (DECIMAL+FLBA+OPTIONAL)");
+    assert_eq!(rows, vec![
+        vec![PqValue::Decimal { unscaled: 123_456,  scale: 5 }],
+        vec![Null],
+        vec![PqValue::Decimal { unscaled: -456_789, scale: 5 }],
+    ], "decimal_flba_optional.parquet");
+}
+
+/// OBJ-2c-4: DECIMAL 3-way source-independence pin (INT32 / INT64 / FLBA).
+///
+/// Three real pyarrow fixtures each carry the SAME logical DECIMAL values
+/// but use different physical backing types:
+///   - decimal_int32: precision=5, scale=2 → INT32 physical (values 1.23, -4.56, 100.00)
+///   - decimal_int32_dict: precision=5, scale=2 → INT32 physical, dict-encoded
+///   - decimal_int64: precision=18, scale=3 → INT64 physical (values 1.234, ...)
+///   - decimal_flba: precision=30, scale=5 → FLBA physical (values 1.23456, ...)
+///
+/// The pin asserts the INT32 plain and INT32 dict paths are mutually identical
+/// (format-independent for the same precision/scale). Each physical type is
+/// separately asserted in its own roundtrip test above; this test pins that
+/// the INT32 plain path == INT32 dict path — the canonical 2-way
+/// format-independence assertion for DECIMAL. The full 4-way cross-physical
+/// determinism (INT32 / INT64 / FLBA / BYTE_ARRAY) is covered by the
+/// hand-KAT `extract_decimal_cross_physical_type_determinism_pin` in
+/// `lib.rs#tests` (SP108 T3, all same precision/scale/value).
+///
+/// Precision/scale choice for the cross-INT32 pin: precision=5, scale=2
+/// (max unscaled = 99999, well within i32 [-2^31..2^31-1]).
+#[test]
+fn decimal_int32_plain_vs_dict_source_independence_pin() {
+    let plain = extract(DEC_I32, &["d"])
+        .expect("extract decimal_int32 plain");
+    let dict = extract(DEC_I32_DICT, &["d"])
+        .expect("extract decimal_int32 dict");
+    assert_eq!(plain, dict,
+        "DECIMAL INT32 plain and dict paths must produce identical logical rows");
+}
+
+/// OBJ-2c-4: real pyarrow flba_uuid.parquet (FIXED_LEN_BYTE_ARRAY(16), no DECIMAL).
+/// Three rows of 16-byte fixed-size binary: 0x01*16, 0x02*16, 0x03*16.
+/// Metadata-verified: phys=FIXED_LEN_BYTE_ARRAY, type_length=16, no converted/logical type.
+/// Proves non-DECIMAL FLBA decodes as PqValue::Bytes.
+#[test]
+fn flba_uuid_fixture_roundtrips_to_bytes() {
+    let rows = extract(FLBA_UUID, &["u"])
+        .expect("extract flba_uuid.parquet (FLBA+non-DECIMAL)");
+    assert_eq!(rows, vec![
+        vec![Bytes(vec![0x01u8; 16])],
+        vec![Bytes(vec![0x02u8; 16])],
+        vec![Bytes(vec![0x03u8; 16])],
+    ], "flba_uuid.parquet");
 }

@@ -133,6 +133,24 @@ impl Huff {
             }
         }
 
+        // RFC 1951 §3.2.2 Kraft inequality: reject over-subscribed code tables.
+        // An over-subscribed table has more codes than the prefix space allows,
+        // which means two or more symbols share the same code — silent corruption.
+        // left>0 (incomplete) is tolerated: decode() returns Err on any unmatched
+        // pattern; only over-subscription is a build-time reject.
+        // Note: an all-zero lens slice (e.g. an absent distance tree) starts
+        // left=1 and never subtracts anything — stays ≥0, correctly returns Ok.
+        {
+            let mut left: i64 = 1;
+            for bits in 1..=MAX_BITS {
+                left <<= 1;
+                left -= bl_count[bits] as i64;
+                if left < 0 {
+                    return Err(bad("huffman: over-subscribed code"));
+                }
+            }
+        }
+
         let mut next_code = [0u32; MAX_BITS + 1];
         let mut code: u32 = 0;
         for bits in 1..=MAX_BITS {
@@ -157,7 +175,7 @@ impl Huff {
         let mut first_entry = [0usize; MAX_BITS + 1];
         let mut count = [0usize; MAX_BITS + 1];
 
-        // Recompute the canonical first codes per length
+        // recompute first-code-per-length: next_code[] was consumed (mutated) during symbol-code assignment above.
         let mut code2: u32 = 0;
         for bits in 1..=MAX_BITS {
             code2 = (code2 + bl_count[bits - 1]) << 1;
@@ -340,7 +358,7 @@ fn inflate(deflate: &[u8], expected_len: usize) -> Result<Vec<u8>, PqError> {
                             if all_lens.is_empty() {
                                 return Err(bad("deflate dyn: repeat before first symbol"));
                             }
-                            let prev = *all_lens.last().unwrap();
+                            let prev = *all_lens.last().unwrap(); // safe: is_empty() guard above
                             let count = br.bits(2)? + 3;
                             for _ in 0..count {
                                 if all_lens.len() >= total {
@@ -384,6 +402,7 @@ fn inflate(deflate: &[u8], expected_len: usize) -> Result<Vec<u8>, PqError> {
             3 => {
                 return Err(bad("deflate reserved block type"));
             }
+            // bits(2) yields 0..=3; all covered above — this arm is mathematically unreachable.
             _ => unreachable!(),
         }
 

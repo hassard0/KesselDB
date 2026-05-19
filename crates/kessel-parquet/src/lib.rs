@@ -2746,10 +2746,10 @@ mod pentest_v2 {
     /// [rep][def][values] bytes and `phys_*` is what is physically
     /// written into the file's PageHeader f2/f3 size fields. `codec`
     /// is the chunk codec enum (0=UNCOMPRESSED, 1=SNAPPY, 2=GZIP).
-    #[allow(clippy::too_many_arguments)]
     struct V2Spec<'a> {
         optional: bool,    // schema/chunk repetition (max_def_level 1 vs 0)
         rows: i64,         // REAL logical row count → chunk num_values / RG num_rows
+                           // NOTE: rows ≠ hdr_num_values — conflating them was the initial builder defect; rows drives FileMetaData/ColumnChunk truth, hdr_* are attacker-injectable.
         codec: i64,        // chunk codec enum written to ColumnMetaData f4
         hdr_uncompressed: i64, // PageHeader f2 uncompressed_page_size
         hdr_compressed: i64,   // PageHeader f3 compressed_page_size

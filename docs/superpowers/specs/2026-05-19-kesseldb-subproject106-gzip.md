@@ -152,23 +152,35 @@ still round-trip. The existing `gzip_plain` / `gzip_dict` /
   e2e style); REFRESH returns a typed error when the server rejects the
   request; prior materialized data remains intact.
 
-- **Pentest** (18 `catch_unwind` locks — no panic, no OOM, typed errors):
-  - Negative locks: over-cap pre-alloc → `Unsupported`; bomb bounded (ISIZE
-    inconsistent) → `Bad`; bad magic → `Bad`; CM != deflate → `Unsupported`;
-    truncated header (2 bytes) → `Bad`; lying FEXTRA (huge XLEN) → `Bad`;
-    unterminated FNAME (no NUL) → `Bad`; truncated DEFLATE → `Bad`; reserved
-    BTYPE (11) → `Bad`; bad dynamic Huffman (overrun HLIT+HDIST) → `Bad`;
-    distance before output → `Bad`; stored NLEN mismatch → `Bad`; ISIZE
-    mismatch → `Bad`; CRC mismatch → `Bad`.
-  - Positive correctness locks (assert `Ok` exact): STORED block, fixed
+- **Pentest — `gzip.rs` `mod pentest`** (14 hostile + 4 positive inflate
+  locks, 18 total — `catch_unwind` harness; no panic, no OOM, typed errors):
+  - Negative locks (14): over-cap pre-alloc → `Unsupported`; bomb bounded
+    (decompressed length 2 ≠ expected_len 100 → post-inflate length-check
+    `Bad`; allocation bounded at 100 bytes, no OOM) → `Bad`; bad magic →
+    `Bad`; CM != deflate → `Unsupported`; truncated header (2 bytes) →
+    `Bad`; lying FEXTRA (huge XLEN) → `Bad`; unterminated FNAME (no NUL) →
+    `Bad`; truncated DEFLATE → `Bad`; reserved BTYPE (11) → `Bad`; bad
+    dynamic Huffman (overrun HLIT+HDIST) → `Bad`; distance before output →
+    `Bad`; stored NLEN mismatch → `Bad`; ISIZE mismatch → `Bad`; CRC
+    mismatch → `Bad`.
+  - Positive inflate locks (4, assert `Ok` exact): STORED block, fixed
     Huffman, dynamic Huffman, overlapping back-reference (reuse T1 KAT
-    vectors); plus a tiny gzip member of the 16-byte PLAIN int64 payload.
-  - All 22 pentest results are typed `Err(Bad(...))` / `Err(Unsupported(...))`
-    or `Ok(exact_bytes)` — no panic, no stack overflow, no OOM.
-- **Lying-compressed-size page_payload-bounds lock**: a page whose
-  `compressed_page_size` header field lies beyond the file bounds is
-  caught by the existing `page_payload` bounds check before reaching
-  `gzip::decompress` — typed `Bad`, not a panic.
+    vectors).
+  - All 18 gzip.rs pentest results are typed `Err(Bad(...))` /
+    `Err(Unsupported(...))` or `Ok(exact_bytes)` — no panic, no stack
+    overflow, no OOM.
+- **Integration / extract-level locks** (in `lib.rs` `mod tests`, not part
+  of `gzip.rs` `mod pentest`):
+  - **Lying-compressed-size page_payload-bounds lock**
+    (`extract_gzip_lying_compressed_size_is_bad`): a page whose
+    `compressed_page_size` header field lies beyond the file bounds is
+    caught by the existing `page_payload` bounds check before reaching
+    `gzip::decompress` — typed `Bad`, not a panic.
+  - **T3 decode / source-format-independence tests**
+    (`extract_decodes_gzip_plain_int64`, `extract_gzip_uncompressed_snappy_identical`):
+    end-to-end `extract()` correctness — these exercise the full page_payload
+    → decompress → coerce pipeline and are T3 decode tests, not gzip.rs
+    pentest locks.
 
 ---
 

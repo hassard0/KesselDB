@@ -855,19 +855,13 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
                     return Err("S3 (s3://) source requires REGION '<r>' (or an ENDPOINT)".into());
                 }
                 if !is_s3 {
+                    // az://: exactly one of AUTH OBJSTORE AZURE ACCOUNT
+                    // '<a>' XOR ENDPOINT '<url>' (the storage account is
+                    // an identity, not a path component).
                     let has_acct = !acct.is_empty();
-                    match &endpoint {
-                        Some(ep) if has_acct => {
-                            // Allow only if endpoint is the canonical Azure Blob Storage URL for this account
-                            let canonical = format!("https://{}.blob.core.windows.net", acct);
-                            if ep != &canonical {
-                                return Err("az:// requires exactly one of AUTH OBJSTORE AZURE ACCOUNT '<a>' or ENDPOINT '<url>'".into());
-                            }
-                        }
-                        None if !has_acct => {
-                            return Err("az:// requires exactly one of AUTH OBJSTORE AZURE ACCOUNT '<a>' or ENDPOINT '<url>'".into());
-                        }
-                        _ => {}
+                    let has_ep = endpoint.is_some();
+                    if has_acct == has_ep {
+                        return Err("az:// requires exactly one of AUTH OBJSTORE AZURE ACCOUNT '<a>' or ENDPOINT '<url>'".into());
                     }
                 }
                 Some((prov, acct, region.clone().unwrap_or_default(), endpoint.clone().unwrap_or_default()))
@@ -1820,12 +1814,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_external_source_objstore_azure_and_endpoint() {
+    fn parse_external_source_objstore_azure_account_only() {
         let cat = Catalog::default();
         let op = compile(
             "CREATE EXTERNAL SOURCE f (id U64 NOT NULL FROM 'id') \
              FROM 'az://cont/blob.csv' FORMAT CSV KEY id \
-             ENDPOINT 'https://acct.blob.core.windows.net' \
              AUTH OBJSTORE AZURE ACCOUNT 'acct' KEY ENV 'AZ_KEY'",
             &cat,
         ).unwrap();
@@ -1834,7 +1827,27 @@ mod tests {
                 assert_eq!(url, "az://cont/blob.csv");
                 assert_eq!(auth_kind, 3);
                 assert_eq!(auth_a, "AZ_KEY");
-                assert_eq!(objstore, Some((2, "acct".into(), String::new(), "https://acct.blob.core.windows.net".into())));
+                assert_eq!(objstore, Some((2, "acct".into(), String::new(), String::new())));
+            }
+            o => panic!("{o:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_external_source_objstore_azure_endpoint_only() {
+        // The OTHER valid az:// form: ENDPOINT, no ACCOUNT.
+        let cat = Catalog::default();
+        let op = compile(
+            "CREATE EXTERNAL SOURCE g (id U64 NOT NULL FROM 'id') \
+             FROM 'az://cont/blob.csv' FORMAT CSV KEY id \
+             ENDPOINT 'https://acct.blob.core.windows.net' \
+             AUTH OBJSTORE AZURE ACCOUNT '' KEY ENV 'AZ_KEY'",
+            &cat,
+        ).unwrap();
+        match op {
+            Op::CreateExternalSource { auth_kind, objstore, .. } => {
+                assert_eq!(auth_kind, 3);
+                assert_eq!(objstore, Some((2, String::new(), String::new(), "https://acct.blob.core.windows.net".into())));
             }
             o => panic!("{o:?}"),
         }

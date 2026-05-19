@@ -474,3 +474,227 @@ mod tests {
         );
     }
 }
+
+// ── Task 12 PENTEST PASS — adversarial lock tests ─────────────────────
+//
+// The Parquet object bytes are operator-declared-source-controlled =
+// attacker-influenceable. Every test here asserts that `extract` on
+// hostile input returns a typed `Err(PqError::_)` and NEVER panics,
+// stack-overflows, or OOM-aborts the process. Each case is wrapped in
+// `catch_unwind` (proving no panic) AND asserted to be a typed `Err`.
+//
+// The `value_count_overflow_*` / `oversized_byte_array_len_*` cases
+// exercise the deferred `decode_plain` `Vec::with_capacity(count)`
+// pre-reserve: WITHOUT the Task-12 fix `dp_num_values = i32::MAX`
+// makes `Vec::<PqValue>::with_capacity(2_147_483_647)` request tens of
+// GB and abort the process before the per-type bounds check; WITH the
+// fix (`count.min(data.len())`) it returns `PqError::Bad` fast.
+#[cfg(test)]
+mod pentest {
+    use super::*;
+
+    // Spec-faithful compact-thrift primitives (same as the Task-4/6
+    // hand-encoders in `tests` above; re-declared here so this module
+    // is self-contained).
+    fn uv(out: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 { out.push(b); break; } else { out.push(b | 0x80); }
+        }
+    }
+    fn zz(v: i64) -> u64 { ((v << 1) ^ (v >> 63)) as u64 }
+
+    /// V1 PLAIN PageHeader with attacker-chosen `num_values` /
+    /// `uncompressed_size` (`data_bytes`). Field layout per
+    /// parquet.thrift PageHeader { 1:type, 3:uncompressed_page_size,
+    /// 4:compressed_page_size, 5:DataPageHeader { 1:num_values,
+    /// 2:encoding } }.
+    fn page_header_bytes(num_values: i32, data_bytes: i32) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.push(0x15); uv(&mut h, zz(0)); // f1 type = DATA_PAGE(0)
+        h.push(0x25); uv(&mut h, zz(data_bytes as i64)); // f3 uncompressed
+        h.push(0x15); uv(&mut h, zz(data_bytes as i64)); // f4 compressed
+        h.push(0x1c); // f5 DataPageHeader struct
+        h.push(0x15); uv(&mut h, zz(num_values as i64)); // g1 num_values
+        h.push(0x15); uv(&mut h, zz(0)); // g2 encoding = PLAIN(0)
+        h.push(0x00); // stop DataPageHeader
+        h.push(0x00); // stop PageHeader
+        h
+    }
+
+    /// FileMetaData for a one-column one-row-group file. `leaf_ptype`
+    /// is the Type enum written to BOTH the schema leaf and the
+    /// ColumnMetaData (so the Fix-1 schema/chunk guard is satisfied and
+    /// we reach `decode_plain`). `col` is the leaf/path name.
+    fn filemetadata_bytes(
+        leaf_ptype: i64,
+        col: &[u8],
+        data_page_offset: i64,
+    ) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.push(0x15); uv(&mut b, zz(2)); // f1 version=2
+        b.push(0x19); b.push(0x2c); // f2 list<SchemaElement> 2 structs
+        // schema[0] root group
+        b.push(0x48); uv(&mut b, 6); b.extend_from_slice(b"schema");
+        b.push(0x15); uv(&mut b, zz(1)); // f5 num_children=1
+        b.push(0x00);
+        // schema[1] leaf
+        b.push(0x15); uv(&mut b, zz(leaf_ptype)); // f1 type
+        b.push(0x25); uv(&mut b, zz(0)); // f3 repetition=REQUIRED
+        b.push(0x18); uv(&mut b, col.len() as u64);
+        b.extend_from_slice(col); // f4 name
+        b.push(0x00);
+        b.push(0x16); uv(&mut b, zz(2)); // f3 num_rows=2
+        b.push(0x19); b.push(0x1c); // f4 list<RowGroup> 1 struct
+        b.push(0x19); b.push(0x1c); // RowGroup.f1 list<ColumnChunk> 1
+        b.push(0x3c); // ColumnChunk.f3 ColumnMetaData struct
+        b.push(0x15); uv(&mut b, zz(leaf_ptype)); // CMD f1 type
+        b.push(0x19); b.push(0x15); uv(&mut b, zz(0)); // f2 encodings [PLAIN]
+        b.push(0x19); b.push(0x18); uv(&mut b, col.len() as u64);
+        b.extend_from_slice(col); // f3 path_in_schema [col]
+        b.push(0x15); uv(&mut b, zz(0)); // f4 codec=UNCOMPRESSED
+        b.push(0x16); uv(&mut b, zz(2)); // f5 num_values=2
+        b.push(0x46); uv(&mut b, zz(data_page_offset)); // f9 data_page_offset
+        b.push(0x00); // stop ColumnMetaData
+        b.push(0x00); // stop ColumnChunk
+        b.push(0x26); uv(&mut b, zz(2)); // RowGroup.f3 num_rows=2
+        b.push(0x00); // stop RowGroup
+        b.push(0x00); // stop FileMetaData
+        b
+    }
+
+    /// Assemble `[PAR1][page_hdr][page_data][meta][mlen_le][PAR1]`.
+    fn assemble(hdr: &[u8], page_data: &[u8], meta: &[u8]) -> Vec<u8> {
+        let mlen = meta.len() as u32;
+        let mut f = Vec::new();
+        f.extend_from_slice(b"PAR1");
+        f.extend_from_slice(hdr);
+        f.extend_from_slice(page_data);
+        f.extend_from_slice(meta);
+        f.extend_from_slice(&mlen.to_le_bytes());
+        f.extend_from_slice(b"PAR1");
+        f
+    }
+
+    fn no_panic_typed_err(file: &[u8], col: &str) {
+        let owned = file.to_vec();
+        let c = col.to_string();
+        let r = std::panic::catch_unwind(move || extract(&owned, &[c.as_str()]));
+        assert!(r.is_ok(), "must NOT panic/OOM-unwind on hostile input");
+        assert!(
+            matches!(r.unwrap(), Err(PqError::Bad(_) | PqError::Unsupported(_))),
+            "hostile input must yield a typed PqError"
+        );
+    }
+
+    #[test]
+    fn malformed_framing_is_typed_error_never_panic() {
+        let cases: Vec<Vec<u8>> = vec![
+            b"".to_vec(),
+            b"PAR1".to_vec(),
+            b"NOPExxxxxxxxPAR1".to_vec(),
+            // lying metadata_len = 0xffffffff (huge, > file)
+            {
+                let mut v = b"PAR1".to_vec();
+                v.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+                v.extend_from_slice(&u32::MAX.to_le_bytes());
+                v.extend_from_slice(b"PAR1");
+                v
+            },
+            // metadata_len pointing back into the 4-byte header magic
+            {
+                let mut v = b"PAR1".to_vec();
+                v.extend_from_slice(&[0x01]);
+                v.extend_from_slice(&5u32.to_le_bytes());
+                v.extend_from_slice(b"PAR1");
+                v
+            },
+        ];
+        for c in &cases {
+            no_panic_typed_err(c, "id");
+        }
+    }
+
+    #[test]
+    fn value_count_overflow_rejected_no_oom() {
+        // DataPageHeader.num_values = i32::MAX against a 16-byte INT64
+        // PLAIN page. WITHOUT the fix, decode_plain does
+        // Vec::<PqValue>::with_capacity(2_147_483_647) ~= tens of GB →
+        // process OOM-abort BEFORE the `data.get(..need)?` check.
+        // WITH the fix the reservation is bounded by page len and the
+        // per-type bounds check returns PqError::Bad fast.
+        let hdr = page_header_bytes(i32::MAX, 16);
+        let mut page = Vec::new();
+        page.extend_from_slice(&7i64.to_le_bytes());
+        page.extend_from_slice(&(-2i64).to_le_bytes());
+        let meta = filemetadata_bytes(2 /*INT64*/, b"id", 4);
+        let file = assemble(&hdr, &page, &meta);
+        no_panic_typed_err(&file, "id");
+        assert!(
+            matches!(extract(&file, &["id"]), Err(PqError::Bad(_))),
+            "i32::MAX num_values vs tiny page must be PqError::Bad"
+        );
+    }
+
+    #[test]
+    fn oversized_byte_array_len_rejected_no_oom() {
+        // One BYTE_ARRAY column; PLAIN page's first 4-byte length
+        // prefix = 0x7fffffff but only a few payload bytes follow.
+        // decode_plain's `data.get(p..p+len)?` must return Bad — not
+        // attempt a ~2GB `to_vec()` / OOM / panic.
+        let mut page = Vec::new();
+        page.extend_from_slice(&0x7fff_ffffu32.to_le_bytes()); // lying len
+        page.extend_from_slice(b"abcd"); // only 4 payload bytes
+        let data_bytes = page.len() as i32;
+        // num_values=1 (one BYTE_ARRAY element claimed).
+        let hdr = page_header_bytes(1, data_bytes);
+        let meta = filemetadata_bytes(6 /*BYTE_ARRAY*/, b"s", 4);
+        let file = assemble(&hdr, &page, &meta);
+        no_panic_typed_err(&file, "s");
+        assert!(
+            matches!(extract(&file, &["s"]), Err(PqError::Bad(_))),
+            "oversized BYTE_ARRAY len prefix must be PqError::Bad"
+        );
+
+        // And a u32::MAX length prefix variant.
+        let mut page2 = Vec::new();
+        page2.extend_from_slice(&u32::MAX.to_le_bytes());
+        page2.extend_from_slice(b"xy");
+        let hdr2 = page_header_bytes(1, page2.len() as i32);
+        let meta2 = filemetadata_bytes(6, b"s", 4);
+        let file2 = assemble(&hdr2, &page2, &meta2);
+        no_panic_typed_err(&file2, "s");
+        assert!(matches!(
+            extract(&file2, &["s"]),
+            Err(PqError::Bad(_))
+        ));
+    }
+
+    #[test]
+    fn lying_page_size_and_offset_rejected() {
+        // (a) uncompressed_size huge (much larger than the file).
+        let hdr_a = page_header_bytes(2, i32::MAX);
+        let mut page = Vec::new();
+        page.extend_from_slice(&7i64.to_le_bytes());
+        page.extend_from_slice(&(-2i64).to_le_bytes());
+        let meta_a = filemetadata_bytes(2, b"id", 4);
+        let file_a = assemble(&hdr_a, &page, &meta_a);
+        no_panic_typed_err(&file_a, "id");
+        assert!(matches!(
+            extract(&file_a, &["id"]),
+            Err(PqError::Bad(_))
+        ));
+
+        // (b) data_page_offset past EOF: build a valid file, then
+        // rebuild metadata claiming an absurd page offset.
+        let hdr_b = page_header_bytes(2, 16);
+        let meta_b = filemetadata_bytes(2, b"id", 1_000_000);
+        let file_b = assemble(&hdr_b, &page, &meta_b);
+        no_panic_typed_err(&file_b, "id");
+        assert!(matches!(
+            extract(&file_b, &["id"]),
+            Err(PqError::Bad(_))
+        ));
+    }
+}

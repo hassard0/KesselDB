@@ -15,7 +15,19 @@ pub fn decode_plain(
     ptype: Type,
     count: usize,
 ) -> Result<Vec<PqValue>, PqError> {
-    let mut out = Vec::with_capacity(count);
+    // PENTEST HARDENING (Task 12): `count` is the attacker-controlled
+    // `dp_num_values` from the page header (up to i32::MAX). Sizing the
+    // output `Vec` from the raw `count` lets a lying header
+    // (`dp_num_values = i32::MAX`) pre-reserve tens of GB and OOM-abort
+    // the process BEFORE the per-type `data.get(..need)?` bounds check
+    // can reject it. Bound the reservation by what the page bytes can
+    // possibly hold: every PLAIN value consumes >= 1 byte (BOOLEAN is
+    // >= 1 bit, so `data.len()` is still a safe non-OOM upper bound and
+    // never under-reserves harmfully — the real values are still
+    // `push`ed and the per-type `.get(..need)?` still returns
+    // `PqError::Bad` for genuinely short data). This caps the eager
+    // allocation without altering correct-decode behavior.
+    let mut out = Vec::with_capacity(count.min(data.len()));
     match ptype {
         Type::Int32 => {
             let need = count.checked_mul(4).ok_or_else(|| bad("int32 ovf"))?;

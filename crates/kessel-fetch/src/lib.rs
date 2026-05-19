@@ -200,10 +200,13 @@ fn link_next(headers: &[(String, String)]) -> Option<String> {
     None
 }
 
-/// Decode a fetched body into coerced rows. Shared by `fetch_rows`
-/// (single page) and the per-page step of `fetch_rows_paginated`.
-/// `rows_path` is honored for `Format::Json` only (NDJSON/CSV ignore
-/// it, exactly as the existing paginated loop does).
+/// Decode a fetched body into coerced rows. Used by `fetch_rows`.
+/// `fetch_rows_paginated` still has its own inline copy of this
+/// decode+coerce tail; unifying it is a tracked follow-up (it is
+/// behaviorally identical — `json::rows_at`/`csv::extract`/
+/// `ndjson::extract` then the per-cell coerce loop). `rows_path` is
+/// honored for `Format::Json` only (NDJSON/CSV ignore it, exactly as
+/// the paginated loop does).
 pub(crate) fn rows_from_body(
     body: &[u8],
     format: Format,

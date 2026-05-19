@@ -191,12 +191,12 @@ The chosen path:
 - `decode_schema_element` decodes:
   - **field 6 converted_type (i32)** — DECIMAL = 5. Mirror the
     existing field-1/3/4/5 nibble-coded reads.
-  - **field 7 type_length (i32)** — required for FLBA width
+  - **field 2 type_length (i32)** — required for FLBA width
     (`type_length` in parquet.thrift). Recorded even for non-FLBA
     leaves (harmless).
-  - **field 9 scale (i32)** — DECIMAL scale.
-  - **field 10 precision (i32)** — DECIMAL precision.
-  - **field 12 logical_type (LogicalType union)** — newer/broader.
+  - **field 7 scale (i32)** — DECIMAL scale.
+  - **field 8 precision (i32)** — DECIMAL precision.
+  - **field 10 logicalType (LogicalType union)** — newer/broader.
     For this slice we decode only enough to set `logical_decimal=true`
     if the union arm-5 (DecimalType) is present; other arms (UUID
     field 14, TimestampType field 8, etc.) are skipped via
@@ -205,7 +205,11 @@ The chosen path:
     we extract those if the converted_type path didn't already set
     them (some writers set logical_type only). One-source-of-truth
     rule: if BOTH are present, they must agree (Bad on disagreement —
-    defense-in-depth).
+    defense-in-depth). A writer emitting `converted_type=DECIMAL(5)` but
+    omitting SchemaElement fields 7/8 (scale/precision) is malformed per
+    parquet.thrift — the agreement check intentionally rejects it via
+    `unwrap_or(0)` defaulting (strict rejection of the malformed case,
+    not a silent pass).
 
 - `meta::Type::Int96` and `meta::Type::FixedLenByteArray` already exist
   in the `Type` enum (`meta.rs:17/21`) and map physical type values 3

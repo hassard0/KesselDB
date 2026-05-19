@@ -749,6 +749,12 @@ messages.
 > `compression=None` (Snappy → OBJ-2b-3); nullable/OPTIONAL columns
 > still unsupported (→ OBJ-2b-4).
 
+> **OBJ-2b-3 (SP104):** Snappy-compressed Parquet (pyarrow default
+> `compression='snappy'`) is now supported for flat REQUIRED, V1
+> files (dictionary or PLAIN). nullable/OPTIONAL columns still
+> unsupported (→ OBJ-2b-4); gzip/zstd and Snappy pages >64 MiB →
+> OBJ-2c.
+
 `FORMAT PARQUET` is supported for `s3://` and `az://` sources when the
 server is built with `--features external-sources-objstore`. Plain
 `http://` / `https://` URLs are **rejected** with a clear message if

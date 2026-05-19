@@ -106,29 +106,28 @@ fn tls_stub_with_fixture(fixture: &'static [u8]) -> u16 {
     port
 }
 
+#[allow(dead_code)]
 fn tls_stub() -> u16 {
     tls_stub_with_fixture(PARQUET_FIXTURE)
 }
 
-#[test]
-fn refresh_parquet_from_s3_fails_closed_and_state_intact() {
-    // The router's TLS client uses the production webpki-roots config,
-    // which will NOT trust the localhost fixture cert. This e2e therefore
-    // asserts the do_refresh → kessel_objstore::sign_get →
-    // kessel_fetch::fetch_rows_signed path is wired for FORMAT PARQUET
-    // sources and FAILS CLOSED on an untrusted cert, and that the
-    // atomic-abort contract holds: prior (empty) state is intact and
-    // SELECT works after the failed REFRESH.
-    // The trusted happy-path (Parquet bytes decoded to rows) is proven
-    // at the kessel-fetch layer by parquet_decode.rs (Task 8) —
-    // injecting fixture trust here would bypass SP100.
+/// Shared fail-closed e2e: serves `fixture` over a self-signed
+/// localhost TLS stub; the production webpki-roots client must
+/// reject it; REFRESH must return OpResult::SchemaError (refresh/
+/// sign/tls/connect) and the subsequent SELECT must be empty
+/// (atomic-abort, state intact). No router fixture-trust bypass.
+fn run_fail_closed_parquet_e2e(
+    fixture: &'static [u8],
+    tag: &str,
+    keyid_env: &str,
+    secret_env: &str,
+    source: &str,
+) {
+    std::env::set_var(keyid_env, "AKIAEXAMPLE5");
+    std::env::set_var(secret_env, "secretexamplekey5");
 
-    // Credential env vars: distinct names to avoid cross-test collision.
-    std::env::set_var("OBJ_PQ_KEYID", "AKIAEXAMPLE");
-    std::env::set_var("OBJ_PQ_SECRET", "secretexamplekey");
-
-    let port = tls_stub();
-    let shard = spawn_shard("pq");
+    let port = tls_stub_with_fixture(fixture);
+    let shard = spawn_shard(tag);
     let router = Arc::new(Router::new(vec![shard.clone()]));
     let rl = TcpListener::bind("127.0.0.1:0").unwrap();
     let raddr = rl.local_addr().unwrap();
@@ -146,325 +145,12 @@ fn refresh_parquet_from_s3_fails_closed_and_state_intact() {
         .expect("connect shard");
 
     let ddl = format!(
-        "CREATE EXTERNAL SOURCE feed (\
-           id U64 NOT NULL FROM 'id', nm CHAR(16) NOT NULL FROM 'nm'\
-         ) FROM 's3://bucket/data.parquet' FORMAT PARQUET KEY id \
-         REGION 'us-east-1' \
-         ENDPOINT 'https://127.0.0.1:{port}' \
-         AUTH OBJSTORE S3 KEYID ENV 'OBJ_PQ_KEYID' SECRET ENV 'OBJ_PQ_SECRET'"
-    );
-    assert!(
-        matches!(
-            sc.sql(&ddl).expect("ddl wire"),
-            OpResult::Ok | OpResult::TypeCreated(_)
-        ),
-        "CREATE EXTERNAL SOURCE must succeed (URL is opaque)"
-    );
-
-    let mut rc = Client::connect(raddr).expect("connect router");
-    let res = rc
-        .call(&Op::RefreshExternalSource { name: "feed".into() })
-        .expect("refresh wire");
-
-    // Untrusted self-signed cert ⇒ typed failure surfaced at REFRESH.
-    // The TLS handshake fails before any request bytes are sent, so the
-    // stub may receive no data — only the SchemaError matters here.
-    // Error wrapping:
-    //   fetch_rows_signed error  → "refresh: {e}"
-    //   sign_get error           → "REFRESH `feed`: sign: {e}"
-    //   connect/TLS error        → contained in the fetch error ↑
-    match &res {
-        OpResult::SchemaError(msg) => assert!(
-            msg.contains("refresh:")
-                || msg.contains("sign:")
-                || msg.to_lowercase().contains("tls")
-                || msg.to_lowercase().contains("connect"),
-            "REFRESH must fail via the do_refresh objstore fetch path, got SchemaError({msg:?})"
-        ),
-        other => panic!(
-            "REFRESH over untrusted https objstore must fail typed SchemaError, got {other:?}"
-        ),
-    }
-
-    // Atomic abort held: SELECT still works and returns no rows.
-    let blob = match sc.sql("SELECT * FROM feed").expect("select wire") {
-        OpResult::Got(b) => b,
-        o => panic!("SELECT: {o:?}"),
-    };
-    assert!(blob.is_empty(), "no rows must have been materialized");
-}
-
-/// Mirrors `refresh_parquet_from_s3_fails_closed_and_state_intact` for the
-/// real pyarrow use_dictionary fixture (OBJ-2b-2). The same fail-closed
-/// contract applies: the production webpki-roots TLS client does NOT trust
-/// the self-signed localhost cert, so REFRESH returns a typed SchemaError
-/// via the do_refresh → kessel_objstore::sign_get → kessel_fetch path,
-/// and prior (empty) state remains intact. The trusted dict-decode happy
-/// path is proven at the kessel-parquet layer by `fixture_roundtrip.rs`.
-#[test]
-fn refresh_dict_parquet_from_s3_fails_closed_and_state_intact() {
-    std::env::set_var("OBJ_DPQ_KEYID", "AKIAEXAMPLE2");
-    std::env::set_var("OBJ_DPQ_SECRET", "secretexamplekey2");
-
-    let port = tls_stub_with_fixture(DICT_PARQUET_FIXTURE);
-    let shard = spawn_shard("dpq");
-    let router = Arc::new(Router::new(vec![shard.clone()]));
-    let rl = TcpListener::bind("127.0.0.1:0").unwrap();
-    let raddr = rl.local_addr().unwrap();
-    {
-        let r = router.clone();
-        std::thread::spawn(move || serve_router(rl, r));
-    }
-    std::thread::sleep(Duration::from_millis(1400));
-
-    let mut sc = shard
-        .iter()
-        .find_map(|a| {
-            Client::connect(a.parse::<SocketAddr>().unwrap()).ok()
-        })
-        .expect("connect shard");
-
-    let ddl = format!(
-        "CREATE EXTERNAL SOURCE dfeed (\
-           id U64 NOT NULL FROM 'id', s CHAR(4) NOT NULL FROM 's'\
-         ) FROM 's3://bucket/dict.parquet' FORMAT PARQUET KEY id \
-         REGION 'us-east-1' \
-         ENDPOINT 'https://127.0.0.1:{port}' \
-         AUTH OBJSTORE S3 KEYID ENV 'OBJ_DPQ_KEYID' SECRET ENV 'OBJ_DPQ_SECRET'"
-    );
-    assert!(
-        matches!(
-            sc.sql(&ddl).expect("ddl wire"),
-            OpResult::Ok | OpResult::TypeCreated(_)
-        ),
-        "CREATE EXTERNAL SOURCE must succeed (URL is opaque)"
-    );
-
-    let mut rc = Client::connect(raddr).expect("connect router");
-    let res = rc
-        .call(&Op::RefreshExternalSource { name: "dfeed".into() })
-        .expect("refresh wire");
-
-    // Untrusted self-signed cert ⇒ typed SchemaError at REFRESH.
-    // dict_flat.parquet decode happy-path proven at kessel-parquet layer
-    // (fixture_roundtrip::dict_flat_fixture_roundtrips). No fixture-trust
-    // bypass is introduced here (SP100/SP101 precedent).
-    match &res {
-        OpResult::SchemaError(msg) => assert!(
-            msg.contains("refresh:")
-                || msg.contains("sign:")
-                || msg.to_lowercase().contains("tls")
-                || msg.to_lowercase().contains("connect"),
-            "REFRESH must fail via the do_refresh objstore fetch path, got SchemaError({msg:?})"
-        ),
-        other => panic!(
-            "REFRESH over untrusted https objstore must fail typed SchemaError, got {other:?}"
-        ),
-    }
-
-    // Atomic abort held: SELECT still works and returns no rows.
-    let blob = match sc.sql("SELECT * FROM dfeed").expect("select wire") {
-        OpResult::Got(b) => b,
-        o => panic!("SELECT dfeed: {o:?}"),
-    };
-    assert!(blob.is_empty(), "no rows must have been materialized for dfeed");
-}
-
-/// Mirrors `refresh_parquet_from_s3_fails_closed_and_state_intact` for the
-/// real pyarrow Snappy-compressed use_dictionary fixture (OBJ-2b-3). The
-/// same fail-closed contract applies: the production webpki-roots TLS client
-/// does NOT trust the self-signed localhost cert, so REFRESH returns a typed
-/// SchemaError via the do_refresh → kessel_objstore::sign_get →
-/// kessel_fetch path, and prior (empty) state remains intact. The trusted
-/// Snappy-decode happy path is proven at the kessel-parquet layer by
-/// `fixture_roundtrip::snappy_fixtures_roundtrip`. No fixture-trust bypass
-/// is introduced here (SP100/SP101 precedent).
-#[test]
-fn refresh_snappy_parquet_from_s3_fails_closed_and_state_intact() {
-    std::env::set_var("OBJ_SPQ_KEYID", "AKIAEXAMPLE3");
-    std::env::set_var("OBJ_SPQ_SECRET", "secretexamplekey3");
-
-    let port = tls_stub_with_fixture(SNAPPY_DICT_PARQUET_FIXTURE);
-    let shard = spawn_shard("spq");
-    let router = Arc::new(Router::new(vec![shard.clone()]));
-    let rl = TcpListener::bind("127.0.0.1:0").unwrap();
-    let raddr = rl.local_addr().unwrap();
-    {
-        let r = router.clone();
-        std::thread::spawn(move || serve_router(rl, r));
-    }
-    std::thread::sleep(Duration::from_millis(1400));
-
-    let mut sc = shard
-        .iter()
-        .find_map(|a| {
-            Client::connect(a.parse::<SocketAddr>().unwrap()).ok()
-        })
-        .expect("connect shard");
-
-    let ddl = format!(
-        "CREATE EXTERNAL SOURCE sfeed (\
-           id U64 NOT NULL FROM 'id', s CHAR(4) NOT NULL FROM 's'\
-         ) FROM 's3://bucket/snappy.parquet' FORMAT PARQUET KEY id \
-         REGION 'us-east-1' \
-         ENDPOINT 'https://127.0.0.1:{port}' \
-         AUTH OBJSTORE S3 KEYID ENV 'OBJ_SPQ_KEYID' SECRET ENV 'OBJ_SPQ_SECRET'"
-    );
-    assert!(
-        matches!(
-            sc.sql(&ddl).expect("ddl wire"),
-            OpResult::Ok | OpResult::TypeCreated(_)
-        ),
-        "CREATE EXTERNAL SOURCE must succeed (URL is opaque)"
-    );
-
-    let mut rc = Client::connect(raddr).expect("connect router");
-    let res = rc
-        .call(&Op::RefreshExternalSource { name: "sfeed".into() })
-        .expect("refresh wire");
-
-    // Untrusted self-signed cert ⇒ typed SchemaError at REFRESH.
-    // snappy_dict.parquet decode happy-path proven at kessel-parquet layer
-    // (fixture_roundtrip::snappy_fixtures_roundtrip). No fixture-trust
-    // bypass is introduced here (SP100/SP101 precedent).
-    match &res {
-        OpResult::SchemaError(msg) => assert!(
-            msg.contains("refresh:")
-                || msg.contains("sign:")
-                || msg.to_lowercase().contains("tls")
-                || msg.to_lowercase().contains("connect"),
-            "REFRESH must fail via the do_refresh objstore fetch path, got SchemaError({msg:?})"
-        ),
-        other => panic!(
-            "REFRESH over untrusted https objstore must fail typed SchemaError, got {other:?}"
-        ),
-    }
-
-    // Atomic abort held: SELECT still works and returns no rows.
-    let blob = match sc.sql("SELECT * FROM sfeed").expect("select wire") {
-        OpResult::Got(b) => b,
-        o => panic!("SELECT sfeed: {o:?}"),
-    };
-    assert!(blob.is_empty(), "no rows must have been materialized for sfeed");
-}
-
-/// Mirrors `refresh_parquet_from_s3_fails_closed_and_state_intact` for the
-/// real pyarrow nullable.parquet fixture (OBJ-2b-4). The same fail-closed
-/// contract applies: the production webpki-roots TLS client does NOT trust
-/// the self-signed localhost cert, so REFRESH returns a typed SchemaError
-/// via the do_refresh → kessel_objstore::sign_get → kessel_fetch path,
-/// and prior (empty) state remains intact. The trusted nullable-decode happy
-/// path is proven at the kessel-parquet layer by
-/// `fixture_roundtrip::nullable_parquet_fixture_roundtrips`. No
-/// fixture-trust bypass is introduced here (SP100/SP101 precedent).
-#[test]
-fn refresh_nullable_parquet_from_s3_fails_closed_and_state_intact() {
-    std::env::set_var("OBJ_NPQ_KEYID", "AKIAEXAMPLE4");
-    std::env::set_var("OBJ_NPQ_SECRET", "secretexamplekey4");
-
-    let port = tls_stub_with_fixture(NULLABLE_PARQUET_FIXTURE);
-    let shard = spawn_shard("npq");
-    let router = Arc::new(Router::new(vec![shard.clone()]));
-    let rl = TcpListener::bind("127.0.0.1:0").unwrap();
-    let raddr = rl.local_addr().unwrap();
-    {
-        let r = router.clone();
-        std::thread::spawn(move || serve_router(rl, r));
-    }
-    std::thread::sleep(Duration::from_millis(1400));
-
-    let mut sc = shard
-        .iter()
-        .find_map(|a| {
-            Client::connect(a.parse::<SocketAddr>().unwrap()).ok()
-        })
-        .expect("connect shard");
-
-    let ddl = format!(
-        "CREATE EXTERNAL SOURCE nfeed (\
-           id U64 NOT NULL FROM 'id', s CHAR(4) NOT NULL FROM 's'\
-         ) FROM 's3://bucket/nullable.parquet' FORMAT PARQUET KEY id \
-         REGION 'us-east-1' \
-         ENDPOINT 'https://127.0.0.1:{port}' \
-         AUTH OBJSTORE S3 KEYID ENV 'OBJ_NPQ_KEYID' SECRET ENV 'OBJ_NPQ_SECRET'"
-    );
-    assert!(
-        matches!(
-            sc.sql(&ddl).expect("ddl wire"),
-            OpResult::Ok | OpResult::TypeCreated(_)
-        ),
-        "CREATE EXTERNAL SOURCE must succeed (URL is opaque)"
-    );
-
-    let mut rc = Client::connect(raddr).expect("connect router");
-    let res = rc
-        .call(&Op::RefreshExternalSource { name: "nfeed".into() })
-        .expect("refresh wire");
-
-    // Untrusted self-signed cert ⇒ typed SchemaError at REFRESH.
-    // nullable.parquet decode happy-path proven at kessel-parquet layer
-    // (fixture_roundtrip::nullable_parquet_fixture_roundtrips). No
-    // fixture-trust bypass is introduced here (SP100/SP101 precedent).
-    match &res {
-        OpResult::SchemaError(msg) => assert!(
-            msg.contains("refresh:")
-                || msg.contains("sign:")
-                || msg.to_lowercase().contains("tls")
-                || msg.to_lowercase().contains("connect"),
-            "REFRESH must fail via the do_refresh objstore fetch path, got SchemaError({msg:?})"
-        ),
-        other => panic!(
-            "REFRESH over untrusted https objstore must fail typed SchemaError, got {other:?}"
-        ),
-    }
-
-    // Atomic abort held: SELECT still works and returns no rows.
-    let blob = match sc.sql("SELECT * FROM nfeed").expect("select wire") {
-        OpResult::Got(b) => b,
-        o => panic!("SELECT nfeed: {o:?}"),
-    };
-    assert!(blob.is_empty(), "no rows must have been materialized for nfeed");
-}
-
-/// Mirrors `refresh_parquet_from_s3_fails_closed_and_state_intact` for the
-/// real pyarrow gzip_dict.parquet fixture (OBJ-2c-1). The same fail-closed
-/// contract applies: the production webpki-roots TLS client does NOT trust
-/// the self-signed localhost cert, so REFRESH returns a typed SchemaError
-/// via the do_refresh → kessel_objstore::sign_get → kessel_fetch path,
-/// and prior (empty) state remains intact. The trusted GZIP-decode happy
-/// path is proven at the kessel-parquet layer by
-/// `fixture_roundtrip::gzip_fixtures_roundtrip`. No fixture-trust bypass
-/// is introduced here (SP100/SP101 precedent).
-#[test]
-fn refresh_gzip_parquet_from_s3_fails_closed_and_state_intact() {
-    std::env::set_var("OBJ_GPQ_KEYID", "AKIAEXAMPLE5");
-    std::env::set_var("OBJ_GPQ_SECRET", "secretexamplekey5");
-
-    let port = tls_stub_with_fixture(GZIP_DICT_PARQUET_FIXTURE);
-    let shard = spawn_shard("gpq");
-    let router = Arc::new(Router::new(vec![shard.clone()]));
-    let rl = TcpListener::bind("127.0.0.1:0").unwrap();
-    let raddr = rl.local_addr().unwrap();
-    {
-        let r = router.clone();
-        std::thread::spawn(move || serve_router(rl, r));
-    }
-    std::thread::sleep(Duration::from_millis(1400));
-
-    let mut sc = shard
-        .iter()
-        .find_map(|a| {
-            Client::connect(a.parse::<SocketAddr>().unwrap()).ok()
-        })
-        .expect("connect shard");
-
-    let ddl = format!(
-        "CREATE EXTERNAL SOURCE gfeed (\
+        "CREATE EXTERNAL SOURCE {source} (\
            id U64 NOT NULL FROM 'id', s CHAR(4) NOT NULL FROM 's'\
          ) FROM 's3://bucket/gzip.parquet' FORMAT PARQUET KEY id \
          REGION 'us-east-1' \
          ENDPOINT 'https://127.0.0.1:{port}' \
-         AUTH OBJSTORE S3 KEYID ENV 'OBJ_GPQ_KEYID' SECRET ENV 'OBJ_GPQ_SECRET'"
+         AUTH OBJSTORE S3 KEYID ENV '{keyid_env}' SECRET ENV '{secret_env}'"
     );
     assert!(
         matches!(
@@ -476,7 +162,7 @@ fn refresh_gzip_parquet_from_s3_fails_closed_and_state_intact() {
 
     let mut rc = Client::connect(raddr).expect("connect router");
     let res = rc
-        .call(&Op::RefreshExternalSource { name: "gfeed".into() })
+        .call(&Op::RefreshExternalSource { name: source.into() })
         .expect("refresh wire");
 
     // Untrusted self-signed cert ⇒ typed SchemaError at REFRESH.
@@ -497,9 +183,78 @@ fn refresh_gzip_parquet_from_s3_fails_closed_and_state_intact() {
     }
 
     // Atomic abort held: SELECT still works and returns no rows.
-    let blob = match sc.sql("SELECT * FROM gfeed").expect("select wire") {
+    let blob = match sc.sql(&format!("SELECT * FROM {source}")).expect("select wire") {
         OpResult::Got(b) => b,
-        o => panic!("SELECT gfeed: {o:?}"),
+        o => panic!("SELECT {source}: {o:?}"),
     };
-    assert!(blob.is_empty(), "no rows must have been materialized for gfeed");
+    assert!(blob.is_empty(), "no rows must have been materialized for {source}");
+}
+
+#[test]
+fn refresh_parquet_from_s3_fails_closed_and_state_intact() {
+    // The router's TLS client uses the production webpki-roots config,
+    // which will NOT trust the localhost fixture cert. This e2e therefore
+    // asserts the do_refresh → kessel_objstore::sign_get →
+    // kessel_fetch::fetch_rows_signed path is wired for FORMAT PARQUET
+    // sources and FAILS CLOSED on an untrusted cert, and that the
+    // atomic-abort contract holds: prior (empty) state is intact and
+    // SELECT works after the failed REFRESH.
+    // The trusted happy-path (Parquet bytes decoded to rows) is proven
+    // at the kessel-fetch layer by parquet_decode.rs (Task 8) —
+    // injecting fixture trust here would bypass SP100.
+    run_fail_closed_parquet_e2e(PARQUET_FIXTURE, "pq", "OBJ_PQ_KEYID", "OBJ_PQ_SECRET", "feed");
+}
+
+/// Mirrors `refresh_parquet_from_s3_fails_closed_and_state_intact` for the
+/// real pyarrow use_dictionary fixture (OBJ-2b-2). The same fail-closed
+/// contract applies: the production webpki-roots TLS client does NOT trust
+/// the self-signed localhost cert, so REFRESH returns a typed SchemaError
+/// via the do_refresh → kessel_objstore::sign_get → kessel_fetch path,
+/// and prior (empty) state remains intact. The trusted dict-decode happy
+/// path is proven at the kessel-parquet layer by `fixture_roundtrip.rs`.
+#[test]
+fn refresh_dict_parquet_from_s3_fails_closed_and_state_intact() {
+    run_fail_closed_parquet_e2e(DICT_PARQUET_FIXTURE, "dpq", "OBJ_DPQ_KEYID", "OBJ_DPQ_SECRET", "dfeed");
+}
+
+/// Mirrors `refresh_parquet_from_s3_fails_closed_and_state_intact` for the
+/// real pyarrow Snappy-compressed use_dictionary fixture (OBJ-2b-3). The
+/// same fail-closed contract applies: the production webpki-roots TLS client
+/// does NOT trust the self-signed localhost cert, so REFRESH returns a typed
+/// SchemaError via the do_refresh → kessel_objstore::sign_get →
+/// kessel_fetch path, and prior (empty) state remains intact. The trusted
+/// Snappy-decode happy path is proven at the kessel-parquet layer by
+/// `fixture_roundtrip::snappy_fixtures_roundtrip`. No fixture-trust bypass
+/// is introduced here (SP100/SP101 precedent).
+#[test]
+fn refresh_snappy_parquet_from_s3_fails_closed_and_state_intact() {
+    run_fail_closed_parquet_e2e(SNAPPY_DICT_PARQUET_FIXTURE, "spq", "OBJ_SPQ_KEYID", "OBJ_SPQ_SECRET", "sfeed");
+}
+
+/// Mirrors `refresh_parquet_from_s3_fails_closed_and_state_intact` for the
+/// real pyarrow nullable.parquet fixture (OBJ-2b-4). The same fail-closed
+/// contract applies: the production webpki-roots TLS client does NOT trust
+/// the self-signed localhost cert, so REFRESH returns a typed SchemaError
+/// via the do_refresh → kessel_objstore::sign_get → kessel_fetch path,
+/// and prior (empty) state remains intact. The trusted nullable-decode happy
+/// path is proven at the kessel-parquet layer by
+/// `fixture_roundtrip::nullable_parquet_fixture_roundtrips`. No
+/// fixture-trust bypass is introduced here (SP100/SP101 precedent).
+#[test]
+fn refresh_nullable_parquet_from_s3_fails_closed_and_state_intact() {
+    run_fail_closed_parquet_e2e(NULLABLE_PARQUET_FIXTURE, "npq", "OBJ_NPQ_KEYID", "OBJ_NPQ_SECRET", "nfeed");
+}
+
+/// Mirrors `refresh_parquet_from_s3_fails_closed_and_state_intact` for the
+/// real pyarrow gzip_dict.parquet fixture (OBJ-2c-1). The same fail-closed
+/// contract applies: the production webpki-roots TLS client does NOT trust
+/// the self-signed localhost cert, so REFRESH returns a typed SchemaError
+/// via the do_refresh → kessel_objstore::sign_get → kessel_fetch path,
+/// and prior (empty) state remains intact. The trusted GZIP-decode happy
+/// path is proven at the kessel-parquet layer by
+/// `fixture_roundtrip::gzip_fixtures_roundtrip`. No fixture-trust bypass
+/// is introduced here (SP100/SP101 precedent).
+#[test]
+fn refresh_gzip_parquet_from_s3_fails_closed_and_state_intact() {
+    run_fail_closed_parquet_e2e(GZIP_DICT_PARQUET_FIXTURE, "gpq", "OBJ_GPQ_KEYID", "OBJ_GPQ_SECRET", "gfeed");
 }

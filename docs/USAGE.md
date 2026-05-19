@@ -13,6 +13,7 @@ KesselDB. Every feature described here is covered by the test suite.
 - [7. Running a cluster](#7-running-a-cluster)
 - [7b. Sharded deployment & cross-shard transactions](#7b-sharded-deployment--cross-shard-transactions)
 - [7c. External sources (JSON/CSV over HTTP)](#7c-external-sources-jsoncsv-over-http)
+- [7d. Paginated & NDJSON sources](#7d-paginated--ndjson-sources)
 - [8. Authentication, quotas & backpressure](#8-authentication-quotas--backpressure)
 - [9. Backup & monitoring](#9-backup--monitoring)
 - [10. Wire protocol](#10-wire-protocol)
@@ -475,6 +476,110 @@ cargo run --release --bin kesseldb --features external-sources -- 127.0.0.1:7878
   at the proxy.
 - **Upsert only.** Rows deleted from the upstream source are NOT
   automatically removed; only creates and updates are applied.
+
+## 7d. Paginated & NDJSON sources
+
+External sources support two additional capabilities (requires the
+`external-sources` feature, same as §7c):
+
+- **`FORMAT NDJSON`** — one JSON object per line; otherwise identical to
+  `FORMAT JSON`.
+- **Multi-page `PAGE` clause** — a single `REFRESH` walks multiple pages
+  and materializes the union. Three cursor forms are supported.
+
+### NDJSON one-liner
+
+```sql
+CREATE EXTERNAL SOURCE events (
+    id     U64    NOT NULL FROM 'id',
+    kind   BYTES  NOT NULL FROM 'type'
+) FROM 'http://ingest.example.com/events.ndjson'
+  FORMAT NDJSON
+  KEY id
+```
+
+### Paginated JSON with a next-URL in the response body
+
+```sql
+CREATE EXTERNAL SOURCE products (
+    sku    BYTES  NOT NULL FROM 'sku',
+    price  I64    NOT NULL FROM 'price_cents'
+) FROM 'http://catalog.example.com/api/products'
+  FORMAT JSON
+  KEY sku
+  ROWS 'data.items'
+  PAGE NEXT JSON 'paging.next'
+```
+
+`ROWS 'data.items'` — the row array lives at that dotted path inside the
+envelope object (required when `FORMAT JSON` is combined with a
+body-cursor `PAGE` clause).
+
+`PAGE NEXT JSON 'paging.next'` — after each page, extract the absolute
+next-page URL from `paging.next` in the envelope; stop when the field is
+absent, `null`, or an empty string.
+
+### Cursor form — opaque token
+
+```sql
+CREATE EXTERNAL SOURCE orders (
+    order_id  U64   NOT NULL FROM 'id',
+    total     I64   NOT NULL FROM 'total'
+) FROM 'http://shop.example.com/api/orders'
+  FORMAT JSON
+  KEY order_id
+  ROWS 'results'
+  PAGE CURSOR JSON 'meta.cursor' PARAM 'cursor'
+```
+
+`PAGE CURSOR JSON 'meta.cursor' PARAM 'cursor'` — extract the opaque
+token from `meta.cursor` in the envelope; the next request is the
+**original recipe URL** with `?cursor=<token>` appended (replacing any
+pre-existing `cursor` query parameter).
+
+### `PAGE NEXT LINK` — HTTP Link header
+
+```sql
+  PAGE NEXT LINK
+```
+
+Valid with any format (`FORMAT JSON`, `FORMAT NDJSON`, `FORMAT CSV`).
+Uses the `Link: <url>; rel="next"` response header as the next-page URL.
+
+### Compatibility rules (enforced at `CREATE`)
+
+| Format | `PAGE` clause | Rule |
+|---|---|---|
+| `FORMAT JSON` | `PAGE NEXT JSON` or `PAGE CURSOR JSON` | `ROWS '<path>'` **required** |
+| `FORMAT NDJSON` or `FORMAT CSV` | `PAGE NEXT JSON` or `PAGE CURSOR JSON` | **rejected** — no body envelope to read a cursor from; use `PAGE NEXT LINK` or omit `PAGE` |
+| Any format | `PAGE NEXT LINK` | always valid |
+| Any format | absent | single-page fetch (no pagination) |
+
+### Bounded fetch — safety caps
+
+All multi-page fetches are hard-bounded:
+
+- **`MAX_PAGES = 1000`** — a `REFRESH` walks at most 1,000 pages.
+- **`MAX_TOTAL_BODY = 8 × 64 MiB`** — aggregate decompressed response
+  bytes across all pages.
+- Per-page body cap (64 MiB) still applies to each individual response.
+- **Loop detection** — if the extracted next-URL or cursor token exactly
+  equals one already seen in the current walk, `REFRESH` returns an error.
+
+If **any** of these caps is exceeded, or if any page returns an HTTP
+error, parse error, or type-coercion failure, the entire `REFRESH` is
+aborted and **nothing is materialized** — prior data remains intact
+(all-or-nothing, same as a single-page refresh).
+
+### Honest boundaries (same as §7c, unchanged)
+
+- **Snapshot since last `REFRESH`.** A source reflects only its last
+  successful `REFRESH`; queries read the materialized snapshot, never
+  live upstream.
+- **HTTP only — no TLS.** Plain HTTP/1.1. For HTTPS upstreams, use a
+  TLS-terminating reverse proxy and point the source URL at it.
+- **Upsert only.** Rows deleted from the upstream source are not
+  automatically removed.
 
 ## 8. Authentication, quotas & backpressure
 

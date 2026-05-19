@@ -621,6 +621,7 @@ impl<'a> Conn<'a> {
             0 => Format::Json,
             1 => Format::Csv,
             2 => Format::Ndjson,
+            3 => Format::Parquet,
             n => {
                 return OpResult::SchemaError(format!(
                     "REFRESH `{name}`: unknown format code {n}"
@@ -999,6 +1000,7 @@ impl<'a> Conn<'a> {
             0 => Format::Json,
             1 => Format::Csv,
             2 => Format::Ndjson,
+            3 => Format::Parquet,
             n => {
                 return OpResult::SchemaError(format!(
                     "REFRESH `{name}`: unknown format code {n}"

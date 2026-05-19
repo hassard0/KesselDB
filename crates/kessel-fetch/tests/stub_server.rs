@@ -141,3 +141,30 @@ fn get_resp_exposes_link_header() {
         "headers were {headers:?}");
     let _ = h.join();
 }
+
+#[test]
+fn https_without_tls_feature_is_typed_error_naming_the_feature() {
+    // Default build (no `tls`): https:// must be a clean typed error
+    // that names the feature to enable — never a panic, never a
+    // silent plaintext downgrade.
+    let cols = vec![ColumnMap {
+        name: "id".into(),
+        kind: FieldKind::U32,
+        source: "id".into(),
+    }];
+    let e = fetch_rows(
+        "https://example.invalid/d",
+        &Auth::None,
+        Format::Json,
+        &cols,
+        DEFAULT_MAX_BODY,
+    )
+    .unwrap_err();
+    match e {
+        kessel_fetch::FetchError::Http(m) => assert!(
+            m.contains("external-sources-tls"),
+            "message must name the feature, got: {m}"
+        ),
+        other => panic!("expected Http error, got {other:?}"),
+    }
+}

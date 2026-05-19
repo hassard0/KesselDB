@@ -1,7 +1,8 @@
-//! Dependency-free HTTP/1.1 GET. Parses scheme://host[:port]/path,
-//! sends a GET, reads the response, enforces a body cap, returns the
-//! body bytes. HTTPS is intentionally unsupported in slice 1 (use a
-//! TLS-terminating sidecar — see the design doc).
+//! Dependency-free HTTP/1.1 GET with an optional TLS transport.
+//! `http://` is always plaintext; `https://` requires the `tls`
+//! feature (otherwise a typed error). All response handling
+//! (header parse, dechunk, body cap) is one generic path shared by
+//! both transports.
 use crate::{Auth, FetchError};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -12,20 +13,29 @@ use std::time::Duration;
 /// streams a huge body without ever sending the header terminator.
 const MAX_HEADER_SLACK: u64 = 64 * 1024;
 
-/// Like `get` but also returns the response headers as `(name, value)` pairs
-/// (names stored as-received; callers compare with `eq_ignore_ascii_case`).
-pub(crate) fn get_resp(
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Scheme {
+    Http,
+    Https,
+}
+
+/// Parse `scheme://host[:port]/path` into its parts, applying the
+/// scheme's default port. IPv6-literal hosts are rejected (unchanged
+/// from slice 1).
+pub(crate) fn parse_target(
     url: &str,
-    auth: &Auth,
-    max_body: u64,
-) -> Result<(Vec<(String, String)>, Vec<u8>), FetchError> {
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| {
-            FetchError::Http(
-                "only http:// is supported in slice 1 (use a TLS sidecar)".into(),
-            )
-        })?;
+) -> Result<(Scheme, String, u16, String), FetchError> {
+    let (scheme, default_port, rest) = if let Some(r) =
+        url.strip_prefix("http://")
+    {
+        (Scheme::Http, 80u16, r)
+    } else if let Some(r) = url.strip_prefix("https://") {
+        (Scheme::Https, 443u16, r)
+    } else {
+        return Err(FetchError::Http(
+            "only http:// and https:// URLs are supported".into(),
+        ));
+    };
     let (hostport, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
@@ -36,31 +46,46 @@ pub(crate) fn get_resp(
             p.parse::<u16>()
                 .map_err(|_| FetchError::Http("bad port".into()))?,
         ),
-        None => (hostport, 80u16),
+        None => (hostport, default_port),
     };
     if host.starts_with('[') {
         return Err(FetchError::Http(
-            "IPv6 literal addresses are not supported in slice 1; \
-             use a hostname or a TLS/proxy sidecar".into(),
+            "IPv6 literal addresses are not supported; use a hostname"
+                .into(),
         ));
     }
+    Ok((scheme, host.to_string(), port, path.to_string()))
+}
+
+/// Build the HTTP/1.1 GET request text (Host header value is the bare
+/// host, unchanged from slice 1).
+pub(crate) fn build_request(path: &str, host: &str, auth: &Auth) -> String {
     let mut req = format!(
         "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\
          User-Agent: kessel-fetch/0\r\n"
     );
     match auth {
         Auth::None => {}
-        Auth::Bearer(t) => req.push_str(&format!("Authorization: Bearer {t}\r\n")),
+        Auth::Bearer(t) => {
+            req.push_str(&format!("Authorization: Bearer {t}\r\n"))
+        }
         Auth::Header { name, value } => {
             req.push_str(&format!("{name}: {value}\r\n"))
         }
     }
     req.push_str("\r\n");
+    req
+}
 
-    let mut s = TcpStream::connect((host, port))
-        .map_err(|e| FetchError::Http(format!("connect {host}:{port}: {e}")))?;
-    s.set_read_timeout(Some(Duration::from_secs(30))).ok();
-    s.set_write_timeout(Some(Duration::from_secs(30))).ok();
+/// Send `req` over an already-connected stream, read the full
+/// response, enforce the caps, return `(headers, body)`. This is the
+/// single hardened path; both the plaintext and TLS transports flow
+/// through it unchanged.
+pub(crate) fn exchange<S: Read + Write>(
+    mut s: S,
+    req: &str,
+    max_body: u64,
+) -> Result<(Vec<(String, String)>, Vec<u8>), FetchError> {
     s.write_all(req.as_bytes())
         .map_err(|e| FetchError::Http(format!("write: {e}")))?;
 
@@ -89,14 +114,15 @@ pub(crate) fn get_resp(
         .split_whitespace()
         .nth(1)
         .and_then(|c| c.parse::<u16>().ok())
-        .ok_or_else(|| FetchError::Http(format!("bad status line `{status}`")))?;
+        .ok_or_else(|| {
+            FetchError::Http(format!("bad status line `{status}`"))
+        })?;
     if !(200..300).contains(&code) {
         return Err(FetchError::Http(format!("HTTP {code}")));
     }
     let mut chunked = false;
     let mut headers: Vec<(String, String)> = Vec::new();
     for l in lines {
-        // Collect every header line as (name, value), split on the first ':'.
         if let Some(colon) = l.find(':') {
             let name = l[..colon].trim().to_string();
             let value = l[colon + 1..].trim().to_string();
@@ -120,8 +146,65 @@ pub(crate) fn get_resp(
     Ok((headers, body))
 }
 
+/// Connect the right transport for the scheme. `https://` without the
+/// `tls` feature is a typed error that names the feature.
+fn connect(
+    scheme: Scheme,
+    host: &str,
+    port: u16,
+) -> Result<Box<dyn ReadWrite>, FetchError> {
+    match scheme {
+        Scheme::Http => {
+            let s = TcpStream::connect((host, port)).map_err(|e| {
+                FetchError::Http(format!("connect {host}:{port}: {e}"))
+            })?;
+            s.set_read_timeout(Some(Duration::from_secs(30))).ok();
+            s.set_write_timeout(Some(Duration::from_secs(30))).ok();
+            Ok(Box::new(s))
+        }
+        Scheme::Https => {
+            #[cfg(feature = "tls")]
+            {
+                Ok(Box::new(crate::tls::connect_tls(host, port)?))
+            }
+            #[cfg(not(feature = "tls"))]
+            {
+                let _ = (host, port);
+                Err(FetchError::Http(
+                    "https:// requires building with the \
+                     external-sources-tls feature"
+                        .into(),
+                ))
+            }
+        }
+    }
+}
+
+/// Object-safe Read+Write so `connect` can return either transport.
+/// std blanket-impls `Read` and `Write` for `Box<T: Read/Write + ?Sized>`,
+/// which covers `Box<dyn ReadWrite>` because `dyn ReadWrite: Read + Write`.
+pub(crate) trait ReadWrite: Read + Write {}
+impl<T: Read + Write> ReadWrite for T {}
+
+/// Returns response headers + body. Parses the URL, connects the
+/// scheme's transport, and runs the shared exchange.
+pub(crate) fn get_resp(
+    url: &str,
+    auth: &Auth,
+    max_body: u64,
+) -> Result<(Vec<(String, String)>, Vec<u8>), FetchError> {
+    let (scheme, host, port, path) = parse_target(url)?;
+    let stream = connect(scheme, &host, port)?;
+    let req = build_request(&path, &host, auth);
+    exchange(stream, &req, max_body)
+}
+
 /// Returns only the response body. Thin wrapper around `get_resp`.
-pub fn get(url: &str, auth: &Auth, max_body: u64) -> Result<Vec<u8>, FetchError> {
+pub fn get(
+    url: &str,
+    auth: &Auth,
+    max_body: u64,
+) -> Result<Vec<u8>, FetchError> {
     Ok(get_resp(url, auth, max_body)?.1)
 }
 

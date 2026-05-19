@@ -64,6 +64,9 @@ static NULLABLE_PARQUET_FIXTURE: &[u8] =
 static GZIP_DICT_PARQUET_FIXTURE: &[u8] =
     include_bytes!("../../kessel-parquet/tests/fixtures/gzip_dict.parquet");
 
+static V2_DICT_PARQUET_FIXTURE: &[u8] =
+    include_bytes!("../../kessel-parquet/tests/fixtures/v2_dict.parquet");
+
 fn tls_stub_with_fixture(fixture: &'static [u8]) -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
@@ -321,5 +324,29 @@ fn refresh_gzip_parquet_from_s3_fails_closed_and_state_intact() {
         "gfeed",
         "id U64 NOT NULL FROM 'id', s CHAR(4) NOT NULL FROM 's'",
         "gzip.parquet",
+    );
+}
+
+/// Mirrors `refresh_parquet_from_s3_fails_closed_and_state_intact` for the
+/// real pyarrow v2_dict.parquet fixture (OBJ-2c-3, DataPageHeaderV2). The
+/// same fail-closed contract applies: the production webpki-roots TLS client
+/// does NOT trust the self-signed localhost cert, so REFRESH returns a typed
+/// SchemaError via the do_refresh → kessel_objstore::sign_get →
+/// kessel_fetch path, and prior (empty) state remains intact. The trusted
+/// V2-decode happy path is proven at the kessel-parquet layer by
+/// `fixture_roundtrip::v2_dict_fixture_roundtrips`. No fixture-trust bypass
+/// is introduced here (SP100/SP101 precedent).
+#[test]
+fn refresh_v2_parquet_from_s3_fails_closed_and_state_intact() {
+    run_fail_closed_parquet_e2e(
+        V2_DICT_PARQUET_FIXTURE,
+        "v2pq",
+        "OBJ_V2PQ_KEYID",
+        "OBJ_V2PQ_SECRET",
+        "AKIAEXAMPLE6",
+        "secretexamplekey6",
+        "v2feed",
+        "id U64 NOT NULL FROM 'id', s CHAR(4) NOT NULL FROM 's'",
+        "v2dict.parquet",
     );
 }

@@ -101,6 +101,99 @@ fn snappy_fixtures_roundtrip() {
     }
 }
 
+/// OBJ-2c-3: real pyarrow v2_plain / v2_dict / v2_gzip / v2_nullable.
+/// DataPageHeaderV2 fixtures (data_page_version='2.0'). Decisive
+/// non-self-referential proof: production extract() over
+/// metadata-verified-V2 real pyarrow files.
+/// v2_gzip proves V2 per-section GZIP decompression composes;
+/// v2_nullable proves V2 def-level null scatter.
+#[test]
+fn v2_plain_fixture_roundtrips() {
+    let path = format!(
+        "{}/tests/fixtures/v2_plain.parquet", env!("CARGO_MANIFEST_DIR"));
+    let bytes = std::fs::read(&path).expect("read v2_plain.parquet");
+    let rows = extract(&bytes, &["id", "s"])
+        .expect("extract v2_plain.parquet (V2+PLAIN+UNCOMPRESSED)");
+    assert_eq!(rows, vec![
+        vec![I64(7),   Bytes(b"a".to_vec())],
+        vec![I64(7),   Bytes(b"a".to_vec())],
+        vec![I64(-2),  Bytes(b"b".to_vec())],
+        vec![I64(7),   Bytes(b"c".to_vec())],
+        vec![I64(100), Bytes(b"a".to_vec())],
+    ], "v2_plain.parquet");
+}
+
+#[test]
+fn v2_dict_fixture_roundtrips() {
+    let path = format!(
+        "{}/tests/fixtures/v2_dict.parquet", env!("CARGO_MANIFEST_DIR"));
+    let bytes = std::fs::read(&path).expect("read v2_dict.parquet");
+    let rows = extract(&bytes, &["id", "s"])
+        .expect("extract v2_dict.parquet (V2+PLAIN_DICTIONARY+UNCOMPRESSED)");
+    assert_eq!(rows, vec![
+        vec![I64(7),   Bytes(b"a".to_vec())],
+        vec![I64(7),   Bytes(b"a".to_vec())],
+        vec![I64(-2),  Bytes(b"b".to_vec())],
+        vec![I64(7),   Bytes(b"c".to_vec())],
+        vec![I64(100), Bytes(b"a".to_vec())],
+    ], "v2_dict.parquet");
+}
+
+#[test]
+fn v2_gzip_fixture_roundtrips() {
+    let path = format!(
+        "{}/tests/fixtures/v2_gzip.parquet", env!("CARGO_MANIFEST_DIR"));
+    let bytes = std::fs::read(&path).expect("read v2_gzip.parquet");
+    let rows = extract(&bytes, &["id", "s"])
+        .expect("extract v2_gzip.parquet (V2+PLAIN_DICTIONARY+GZIP)");
+    assert_eq!(rows, vec![
+        vec![I64(7),   Bytes(b"a".to_vec())],
+        vec![I64(7),   Bytes(b"a".to_vec())],
+        vec![I64(-2),  Bytes(b"b".to_vec())],
+        vec![I64(7),   Bytes(b"c".to_vec())],
+        vec![I64(100), Bytes(b"a".to_vec())],
+    ], "v2_gzip.parquet");
+}
+
+#[test]
+fn v2_nullable_fixture_roundtrips() {
+    let path = format!(
+        "{}/tests/fixtures/v2_nullable.parquet", env!("CARGO_MANIFEST_DIR"));
+    let bytes = std::fs::read(&path).expect("read v2_nullable.parquet");
+    let rows = extract(&bytes, &["id", "s"])
+        .expect("extract v2_nullable.parquet (V2+OPTIONAL+PLAIN_DICTIONARY+SNAPPY)");
+    assert_eq!(rows, vec![
+        vec![I64(7),   Bytes(b"a".to_vec())],
+        vec![I64(7),   Null],
+        vec![Null,     Bytes(b"b".to_vec())],
+        vec![I64(-2),  Bytes(b"c".to_vec())],
+        vec![I64(100), Bytes(b"a".to_vec())],
+    ], "v2_nullable.parquet");
+}
+
+/// OBJ-2c-3: V2-vs-V1 source-independence pin.
+/// Asserts that extract() over a V2-encoded file (v2_dict, DataPageHeaderV2,
+/// V1 metadata envelope) yields identical logical rows as extract() over the
+/// V1-encoded dict_flat.parquet fixture (DataPageHeader, same schema + data).
+/// Both carry the same 5 logical rows: id=[7,7,-2,7,100], s=["a","a","b","c","a"].
+/// This pins that the V2/V1 decode paths are source-independent: same data in,
+/// same data out, regardless of which Parquet page format produced the file.
+#[test]
+fn v2_dict_vs_v1_dict_source_independence_pin() {
+    let v2_path = format!(
+        "{}/tests/fixtures/v2_dict.parquet", env!("CARGO_MANIFEST_DIR"));
+    let v1_path = format!(
+        "{}/tests/fixtures/dict_flat.parquet", env!("CARGO_MANIFEST_DIR"));
+    let v2_bytes = std::fs::read(&v2_path).expect("read v2_dict.parquet");
+    let v1_bytes = std::fs::read(&v1_path).expect("read dict_flat.parquet");
+    let v2_rows = extract(&v2_bytes, &["id", "s"])
+        .expect("extract v2_dict.parquet");
+    let v1_rows = extract(&v1_bytes, &["id", "s"])
+        .expect("extract dict_flat.parquet");
+    assert_eq!(v2_rows, v1_rows,
+        "V2 dict and V1 dict must produce identical logical rows for the same source data");
+}
+
 /// OBJ-2c-1: real pyarrow gzip_dict.parquet and gzip_plain.parquet
 /// (REQUIRED + GZIP, dict-encoded and PLAIN respectively). Decisive
 /// non-self-referential proof: production extract() over

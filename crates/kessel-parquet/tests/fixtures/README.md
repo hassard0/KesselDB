@@ -100,6 +100,46 @@ dictionary + Snappy, with NULLs). `nullable_plain.parquet` = OPTIONAL +
 PLAIN + UNCOMPRESSED, with NULLs. V1, flat schema.
 Expected rows: id=[7,7,null,-2,100]; s=["a",null,"b","c","a"].
 
+## v2_plain / v2_dict / v2_gzip / v2_nullable .parquet (OBJ-2c-3)
+
+Regenerate:
+
+    python -c "
+    import pyarrow as pa, pyarrow.parquet as pq
+    schR = pa.schema([pa.field('id', pa.int64(), nullable=False),
+                      pa.field('s',  pa.large_utf8(), nullable=False)])
+    tR = pa.table({'id': pa.array([7,7,-2,7,100], type=pa.int64()),
+                   's':  pa.array(['a','a','b','c','a'], type=pa.large_utf8())}, schema=schR)
+    pq.write_table(tR,'crates/kessel-parquet/tests/fixtures/v2_plain.parquet',
+                   use_dictionary=False, compression=None, version='1.0', data_page_version='2.0')
+    pq.write_table(tR,'crates/kessel-parquet/tests/fixtures/v2_dict.parquet',
+                   use_dictionary=True, compression=None, version='1.0', data_page_version='2.0')
+    pq.write_table(tR,'crates/kessel-parquet/tests/fixtures/v2_gzip.parquet',
+                   use_dictionary=True, compression='gzip', version='1.0', data_page_version='2.0')
+    tN = pa.table({'id': pa.array([7,7,None,-2,100], type=pa.int64()),
+                   's':  pa.array(['a',None,'b','c','a'], type=pa.large_utf8())})
+    pq.write_table(tN,'crates/kessel-parquet/tests/fixtures/v2_nullable.parquet',
+                   version='1.0', data_page_version='2.0')
+    "
+
+Real pyarrow 24.0.0, `data_page_version='2.0'`. Data pages are `DataPageHeaderV2`
+(Thrift field-1 zigzag = 6; type byte `0x15 0x06`). Verified at raw-byte level:
+
+- `v2_plain`: no dict page; first page header at offset 4 → `b[4]=0x15 b[5]=0x06` = DATA_PAGE_V2.
+- `v2_nullable`: leading `DICTIONARY_PAGE` (V1-style, `0x15 0x04`) then first data page at
+  `data_page_offset=41` → `b[41]=0x15 b[42]=0x06` = DATA_PAGE_V2.
+- `v2_dict`: leading `DICTIONARY_PAGE` at offset 4; first data page at offset 42 →
+  `b[42]=0x15 b[43]=0x06` = DATA_PAGE_V2.
+- `v2_gzip`: leading `DICTIONARY_PAGE` at offset 4; first data page at offset 48 →
+  `b[48]=0x15 b[49]=0x06` = DATA_PAGE_V2.
+
+Expected rows:
+- `v2_plain` / `v2_dict` / `v2_gzip`: id=[7,7,-2,7,100]; s=["a","a","b","c","a"]. REQUIRED,
+  no nulls. `v2_plain` = PLAIN+UNCOMPRESSED; `v2_dict` = PLAIN_DICTIONARY+UNCOMPRESSED;
+  `v2_gzip` = PLAIN_DICTIONARY+GZIP.
+- `v2_nullable`: id=[7,7,null,-2,100]; s=["a",null,"b","c","a"]. OPTIONAL (nullable),
+  PLAIN_DICTIONARY+SNAPPY. Proves V2 def-level null scatter.
+
 ## gzip_dict.parquet / gzip_plain.parquet / gzip_nullable.parquet (OBJ-2c-1)
 
 Regenerate:

@@ -19,9 +19,9 @@ fn bad(s: &str) -> PqError {
 /// `precision` is in `1..=38` and `scale` is in `0..=precision` (validated
 /// by `build_plain_spec` before any decode).
 #[derive(Clone, Copy, Debug)]
-pub struct DecimalSpec {
-    pub precision: u32,
-    pub scale: u32,
+pub(crate) struct DecimalSpec {
+    pub(crate) precision: u32,
+    pub(crate) scale: u32,
 }
 
 /// Per-leaf decode spec built once at the file-level gate. The hot
@@ -29,42 +29,42 @@ pub struct DecimalSpec {
 /// metadata (FLBA width, precision/scale ranges, physical-vs-logical
 /// agreement) is pre-validated.
 #[derive(Clone, Copy, Debug)]
-pub struct PlainSpec {
-    pub ptype: Type,
+pub(crate) struct PlainSpec {
+    pub(crate) ptype: Type,
     /// Some(n) iff ptype == FixedLenByteArray; n is the byte width
     /// (validated 1..=16 when DECIMAL, 1..=65_536 otherwise).
-    pub flba_len: Option<usize>,
+    pub(crate) flba_len: Option<usize>,
     /// Some iff this leaf carries a DECIMAL logical type.
-    pub decimal: Option<DecimalSpec>,
+    pub(crate) decimal: Option<DecimalSpec>,
 }
 
 impl PlainSpec {
-    /// Non-DECIMAL plain leaf. INT96 + arbitrary-FLBA must use
-    /// `flba` / `Int96`; this constructor is for the 6 OBJ-2a
-    /// physical types (Bool/Int32/Int64/Float/Double/ByteArray)
-    /// + the Int96 marker variant (FLBA must specify a width).
-    pub fn plain(ptype: Type) -> Self {
+    /// Non-DECIMAL plain leaf. Arbitrary-FLBA must use `flba`.
+    /// This constructor is for the 7 plain physical types
+    /// (Bool/Int32/Int64/Float/Double/ByteArray/Int96).
+    /// FLBA must specify a width via `flba` instead.
+    pub(crate) fn plain(ptype: Type) -> Self {
         Self {
             ptype,
             flba_len: None,
             decimal: None,
         }
     }
-    pub fn flba(n: usize) -> Self {
+    pub(crate) fn flba(n: usize) -> Self {
         Self {
             ptype: Type::FixedLenByteArray,
             flba_len: Some(n),
             decimal: None,
         }
     }
-    pub fn flba_decimal(n: usize, precision: u32, scale: u32) -> Self {
+    pub(crate) fn flba_decimal(n: usize, precision: u32, scale: u32) -> Self {
         Self {
             ptype: Type::FixedLenByteArray,
             flba_len: Some(n),
             decimal: Some(DecimalSpec { precision, scale }),
         }
     }
-    pub fn int_decimal(ptype: Type, precision: u32, scale: u32) -> Self {
+    pub(crate) fn int_decimal(ptype: Type, precision: u32, scale: u32) -> Self {
         // ptype must be Int32 or Int64; caller's responsibility.
         Self {
             ptype,
@@ -72,7 +72,7 @@ impl PlainSpec {
             decimal: Some(DecimalSpec { precision, scale }),
         }
     }
-    pub fn byte_array_decimal(precision: u32, scale: u32) -> Self {
+    pub(crate) fn byte_array_decimal(precision: u32, scale: u32) -> Self {
         Self {
             ptype: Type::ByteArray,
             flba_len: None,
@@ -89,7 +89,15 @@ const JULIAN_UNIX_EPOCH: i64 = 2_440_588;
 const NS_PER_DAY: i64 = 86_400 * 1_000_000_000;
 
 /// Sign-extend a big-endian two's-complement byte slice of length `n`
-/// (where `1 <= n <= 16`) into an `i128`. Caller validates `n`.
+/// (where `1 <= n <= 16`) into an `i128`.
+///
+/// Safety contract (triple-gated by callers; `debug_assert` enforces
+/// in tests; unreachable in release if all three gates hold):
+///   1. `build_plain_spec`: rejects FLBA DECIMAL `n == 0 || n > 16`.
+///   2. `decode_plain` FLBA arm: runtime guard `if n > 16 { return Err }`.
+///   3. `decode_plain` BYTE_ARRAY arm: runtime guard
+///      `if len == 0 || len > 16 { return Err }`.
+/// Do NOT remove or weaken any of these without auditing the others.
 fn flba_be_to_i128(bytes: &[u8]) -> i128 {
     debug_assert!(!bytes.is_empty() && bytes.len() <= 16);
     let sign_byte = if bytes[0] & 0x80 != 0 { 0xFFu8 } else { 0x00u8 };
@@ -99,7 +107,7 @@ fn flba_be_to_i128(bytes: &[u8]) -> i128 {
     i128::from_be_bytes(be16)
 }
 
-pub fn decode_plain(
+pub(crate) fn decode_plain(
     data: &[u8],
     spec: PlainSpec,
     count: usize,
@@ -126,8 +134,8 @@ pub fn decode_plain(
         Type::Int32 => {
             let need = count.checked_mul(4).ok_or_else(|| bad("int32 ovf"))?;
             let s = data.get(..need).ok_or_else(|| bad("int32 truncated"))?;
-            if spec.decimal.is_some() {
-                let scale = spec.decimal.unwrap().scale as i32;
+            if let Some(dec) = spec.decimal {
+                let scale = dec.scale as i32;
                 for ch in s.chunks_exact(4) {
                     let v = i32::from_le_bytes(ch.try_into().unwrap()) as i128;
                     out.push(PqValue::Decimal { unscaled: v, scale });
@@ -143,8 +151,8 @@ pub fn decode_plain(
         Type::Int64 => {
             let need = count.checked_mul(8).ok_or_else(|| bad("int64 ovf"))?;
             let s = data.get(..need).ok_or_else(|| bad("int64 truncated"))?;
-            if spec.decimal.is_some() {
-                let scale = spec.decimal.unwrap().scale as i32;
+            if let Some(dec) = spec.decimal {
+                let scale = dec.scale as i32;
                 for ch in s.chunks_exact(8) {
                     let v = i64::from_le_bytes(ch.try_into().unwrap()) as i128;
                     out.push(PqValue::Decimal { unscaled: v, scale });
@@ -194,8 +202,8 @@ pub fn decode_plain(
         }
         Type::ByteArray => {
             let mut p = 0usize;
-            if spec.decimal.is_some() {
-                let scale = spec.decimal.unwrap().scale as i32;
+            if let Some(dec) = spec.decimal {
+                let scale = dec.scale as i32;
                 for _ in 0..count {
                     let lb = data
                         .get(p..p + 4)

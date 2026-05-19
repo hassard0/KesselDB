@@ -2,14 +2,21 @@
 
 **Date:** 2026-05-19  **Status:** done — code + tests committed and passing.
 
-**Builds on:**
-- [Subproject 99 — External Sources TLS](2026-05-18-external-sources-tls-design.md)
-- [Subproject 100 — Object-Store sources](2026-05-19-kesseldb-subproject100-objstore.md)
-- [Subproject 101 — Parquet OBJ-2a](2026-05-19-kesseldb-subproject101-parquet.md)
-- [Subproject 102 — RLE/bit-packing hybrid](2026-05-19-kesseldb-subproject102-rle.md)
+Builds on:
+- Subproject 99 — External Sources TLS:
+  `docs/superpowers/specs/2026-05-18-external-sources-tls-design.md`
+- Subproject 100 — Object-Store sources (OBJ-1):
+  `docs/superpowers/specs/2026-05-19-kesseldb-subproject100-objstore.md`
+- Subproject 101 — Parquet OBJ-2a:
+  `docs/superpowers/specs/2026-05-19-kesseldb-subproject101-parquet.md`
+- Subproject 102 — RLE/bit-packing hybrid (OBJ-2b-1):
+  `docs/superpowers/specs/2026-05-19-kesseldb-subproject102-rle.md`
 
-**Design:** [2026-05-19-parquet-dictionary-design.md](2026-05-19-parquet-dictionary-design.md)
-**Plan:** [../plans/2026-05-19-parquet-dictionary.md](../plans/2026-05-19-parquet-dictionary.md)
+Design document:
+`docs/superpowers/specs/2026-05-19-parquet-dictionary-design.md`
+
+Plan document:
+`docs/superpowers/plans/2026-05-19-parquet-dictionary.md`
 
 ---
 

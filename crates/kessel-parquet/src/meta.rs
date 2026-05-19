@@ -107,6 +107,15 @@ pub struct SchemaLeaf {
     pub repetition: Repetition,
 }
 
+/// A decoded schema element: either a leaf (physical column) or a group
+/// (nested struct node, including the root). Used internally to compute
+/// `FileMetaData::flat_schema`.
+#[derive(Clone, Debug)]
+pub enum SchemaNode {
+    Leaf(SchemaLeaf),
+    Group { num_children: i32 },
+}
+
 #[derive(Clone, Debug)]
 pub struct ColumnChunk {
     pub path: Vec<String>,
@@ -132,6 +141,10 @@ pub struct FileMetaData {
     /// num_children>0 is excluded; only true leaves kept).
     pub leaves: Vec<SchemaLeaf>,
     pub row_groups: Vec<RowGroup>,
+    /// True iff the schema is flat: exactly one root group whose
+    /// `num_children` equals the number of leaf elements, with no
+    /// intermediate group nodes. Required for OBJ-2b OPTIONAL decode.
+    pub flat_schema: bool,
 }
 
 impl FileMetaData {
@@ -141,6 +154,7 @@ impl FileMetaData {
         let mut num_rows = 0i64;
         let mut leaves: Vec<SchemaLeaf> = Vec::new();
         let mut row_groups: Vec<RowGroup> = Vec::new();
+        let mut nodes: Vec<SchemaNode> = Vec::new();
         while let Some(f) = s.next_field()? {
             match f.id {
                 1 => version = s.read_i32(&f)?,
@@ -151,9 +165,11 @@ impl FileMetaData {
                     }
                     let saved = s.save_last_id();
                     for _ in 0..count {
-                        if let Some(le) = decode_schema_element(&mut s)? {
-                            leaves.push(le);
+                        let node = decode_schema_element(&mut s)?;
+                        if let SchemaNode::Leaf(ref le) = node {
+                            leaves.push(le.clone());
                         }
+                        nodes.push(node);
                         s.restore_last_id(saved);
                     }
                     s.restore_last_id(f.id);
@@ -174,16 +190,30 @@ impl FileMetaData {
                 _ => s.skip(f.ctype)?,
             }
         }
-        Ok(FileMetaData { version, num_rows, leaves, row_groups })
+        // flat_schema: true iff the schema is exactly one root group
+        // whose num_children equals the count of leaf elements, with no
+        // intermediate group nodes anywhere else.
+        let flat_schema = !nodes.is_empty()
+            && matches!(nodes[0], SchemaNode::Group { .. })
+            && nodes[1..].iter().all(|n| matches!(n, SchemaNode::Leaf(_)))
+            && (if let SchemaNode::Group { num_children } = nodes[0] {
+                num_children as usize == nodes.len() - 1
+            } else {
+                false
+            });
+        Ok(FileMetaData { version, num_rows, leaves, row_groups, flat_schema })
     }
 }
 
-/// Returns Some(leaf) for a true leaf (num_children == 0), None for
-/// a group element (root / nested) — OBJ-2a only consumes leaves;
-/// nested groups are detected later via repetition checks.
+/// Decodes one SchemaElement struct and returns a `SchemaNode`.
+/// An element with `num_children > 0` or no physical type field is a
+/// `Group`; an element with `num_children == 0` and a physical type is
+/// a `Leaf`. This faithfully reflects parquet.thrift SchemaElement:
+///   {1:Type type (absent for groups), 3:RepetitionType,
+///    4:name (binary), 5:num_children (i32)}.
 fn decode_schema_element(
     s: &mut StructReader,
-) -> Result<Option<SchemaLeaf>, PqError> {
+) -> Result<SchemaNode, PqError> {
     // Each nested struct in Thrift compact resets field-ID deltas to 0.
     s.reset_last_id();
     let mut ptype = Type::Other(-1);
@@ -207,9 +237,11 @@ fn decode_schema_element(
         }
     }
     if num_children > 0 || !saw_type {
-        return Ok(None); // group element, not a leaf
+        // Group element (root or intermediate): has no physical type
+        // or explicitly has num_children > 0.
+        return Ok(SchemaNode::Group { num_children });
     }
-    Ok(Some(SchemaLeaf { name, ptype, repetition }))
+    Ok(SchemaNode::Leaf(SchemaLeaf { name, ptype, repetition }))
 }
 
 fn decode_row_group(
@@ -566,6 +598,108 @@ mod tests {
         assert_eq!(md1.row_groups[0].columns[0].codec, Codec::Snappy);
         let md7 = FileMetaData::decode(&build(7)).expect("other");
         assert_eq!(md7.row_groups[0].columns[0].codec, Codec::Other(7));
+    }
+
+    #[test]
+    fn flat_schema_true_for_root_plus_leaves_false_for_nested_group() {
+        // Builds a minimal FileMetaData whose schema is either flat
+        // (root group + 1 leaf) or nested (root group + intermediate
+        // group + 1 leaf). We verify flat_schema is true/false accordingly.
+        //
+        // Compact-thrift encoding used throughout:
+        //   field header = (field_delta << 4) | ctype
+        //   ctype: i32=5, i64=6, binary=8, struct=12, list=9
+        //   i32/i64 values are zigzag uvariants.
+        //
+        // parquet.thrift SchemaElement field IDs:
+        //   1:Type (i32), 3:RepetitionType (i32), 4:name (binary),
+        //   5:num_children (i32).
+        //   A GROUP element has NO field-1 type and f5 num_children > 0.
+        //
+        // Flat schema bytes:  [Group{nc=1}, Leaf("id")]  → flat_schema=true
+        // Nested schema bytes: [Group{nc=1}, Group{nc=1}, Leaf("id")] → flat_schema=false
+        fn build(nested: bool) -> Vec<u8> {
+            let mut b = Vec::new();
+            // FileMetaData f1 version=1
+            b.push(0x15); uv(&mut b, zz(1));
+            // FileMetaData f2 list<SchemaElement>:
+            //   2 elements (flat) or 3 elements (nested).
+            //   list header byte = (count << 4) | STRUCT_ctype(12)
+            let count: u8 = if nested { 3 } else { 2 };
+            b.push(0x19); b.push((count << 4) | 12);
+
+            // schema[0] root GROUP: f4 name="schema", f5 num_children=1.
+            //   Root always has exactly 1 immediate child
+            //   (the intermediate group in nested, the leaf in flat).
+            //   NO f1 type field (groups have no physical type).
+            //   Field IDs reset to 0 at struct start.
+            //   f4 name: delta=4, binary=8 → (4<<4)|8=0x48
+            b.push(0x48); uv(&mut b, 6); b.extend_from_slice(b"schema");
+            //   f5 num_children: delta f4→f5=1, i32=5 → (1<<4)|5=0x15; zz(1)=2
+            b.push(0x15); uv(&mut b, zz(1));
+            b.push(0x00); // stop schema[0]
+
+            if nested {
+                // schema[1] intermediate GROUP "g": no f1 type, f4 name,
+                //   f5 num_children=1. Minimal (no f3 repetition needed).
+                //   Field IDs reset to 0.
+                //   f4 name: delta=4, binary=8 → 0x48; len=1; "g"
+                b.push(0x48); uv(&mut b, 1); b.extend_from_slice(b"g");
+                //   f5 num_children=1: delta f4→f5=1, i32=5 → 0x15; zz(1)=2
+                b.push(0x15); uv(&mut b, zz(1));
+                b.push(0x00); // stop schema[1] (intermediate group)
+            }
+
+            // schema[last] leaf "id": f1 type=INT64(2), f3 rep=REQUIRED(0),
+            //   f4 name="id". Field IDs reset to 0.
+            //   f1 type=INT64(2): delta=1, i32=5 → (1<<4)|5=0x15; zz(2)=4
+            b.push(0x15); uv(&mut b, zz(2));
+            //   f3 repetition=REQUIRED(0): delta f1→f3=2, i32=5 → (2<<4)|5=0x25; zz(0)=0
+            b.push(0x25); uv(&mut b, zz(0));
+            //   f4 name="id": delta f3→f4=1, binary=8 → (1<<4)|8=0x18; len=2
+            b.push(0x18); uv(&mut b, 2); b.extend_from_slice(b"id");
+            b.push(0x00); // stop leaf
+
+            // f3 num_rows=1 (FileMetaData): delta f2→f3=1, i64=6 → 0x16; zz(1)=2
+            b.push(0x16); uv(&mut b, zz(1));
+            // f4 list<RowGroup> 1: delta f3→f4=1 → 0x19; list (1<<4)|12=0x1c
+            b.push(0x19); b.push(0x1c);
+            //   RowGroup f1 list<ColumnChunk> 1: delta 0→1=1 → 0x19; 0x1c
+            b.push(0x19); b.push(0x1c);
+            //     ColumnChunk f3 ColumnMetaData: delta 0→3=3 → (3<<4)|12=0x3c
+            b.push(0x3c);
+            //     ColumnMetaData f1 type=INT64(2): delta=1, i32=5 → 0x15; zz(2)=4
+            b.push(0x15); uv(&mut b, zz(2));
+            //     f2 encodings [PLAIN(0)]: delta=1, list=9 → 0x19; (1<<4)|i32(5)=0x15; zz(0)
+            b.push(0x19); b.push(0x15); uv(&mut b, zz(0));
+            //     f3 path ["id"]: delta=1, list=9 → 0x19; (1<<4)|binary(8)=0x18; len=2
+            b.push(0x19); b.push(0x18); uv(&mut b, 2); b.extend_from_slice(b"id");
+            //     f4 codec=UNCOMPRESSED(0): delta=1, i32=5 → 0x15; zz(0)=0
+            b.push(0x15); uv(&mut b, zz(0));
+            //     f5 num_values=1: delta=1, i64=6 → 0x16; zz(1)=2
+            b.push(0x16); uv(&mut b, zz(1));
+            //     f9 data_page_offset=4: delta f5→f9=4, i64=6 → (4<<4)|6=0x46; zz(4)=8
+            b.push(0x46); uv(&mut b, zz(4));
+            b.push(0x00); // stop ColumnMetaData
+            b.push(0x00); // stop ColumnChunk
+            //   RowGroup f3 num_rows=1: delta f1→f3=2, i64=6 → (2<<4)|6=0x26; zz(1)=2
+            b.push(0x26); uv(&mut b, zz(1));
+            b.push(0x00); // stop RowGroup
+            b.push(0x00); // stop FileMetaData
+            b
+        }
+
+        // Flat: nodes = [Group{nc=1}, Leaf("id")]
+        //   nodes.len()=2, nodes[0]=Group{nc=1}, nodes[1..] all Leaf,
+        //   nc=1 == len-1=1  ⇒ flat_schema=true.
+        let md_flat = FileMetaData::decode(&build(false)).expect("flat");
+        assert!(md_flat.flat_schema, "root+leaves only ⇒ flat");
+
+        // Nested: nodes = [Group{nc=1}, Group{nc=1}, Leaf("id")]
+        //   nodes[1] is a Group ⇒ nodes[1..].all(Leaf) is false
+        //   ⇒ flat_schema=false.
+        let md_nested = FileMetaData::decode(&build(true)).expect("nested");
+        assert!(!md_nested.flat_schema, "intermediate group ⇒ not flat");
     }
 
     #[test]

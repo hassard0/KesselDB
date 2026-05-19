@@ -1380,8 +1380,8 @@ mod pentest_optional {
     //
     // Mirrors `mod tests::build_opt_dict_int64_file` (not pub there).
     // Logical rows [7, null, 7]: dict=[7], defs=[1,0,1], indices=[0,0].
-    // `oob_index`: if Some(b), overrides the dict-index bits byte so
-    // the present values reference an out-of-range index.
+    // `oob_bits`: None ⇒ 0x00 valid indices (both present values → index 0);
+    // Some(0xFF) ⇒ indices 1,1 OOB for dict len 1 → Bad from resolve_dict_indices.
     fn build_opt_dict_int64_file_with_oob(oob_bits: Option<u8>) -> Vec<u8> {
         let mut dict_data = Vec::new();
         dict_data.extend_from_slice(&7i64.to_le_bytes());
@@ -1553,17 +1553,36 @@ mod pentest_optional {
         assert_no_panic_bad(&f);
     }
 
-    // ── Lock 2: lying 4-byte length prefix ─────────────────────────────
+    // ── Lock 2: def-level 4-byte prefix undercounts the real hybrid body ──
     //
-    // Length prefix says 999 but only a few hybrid bytes follow.
-    // decode_level_v1 → Bad("rle level body truncated").
+    // Distinct path from Lock 1 (prefix-past-EOF → "rle level body truncated"
+    // inside decode_level_v1). Here the prefix is SMALLER than the actual
+    // hybrid bytes present, so decode_level_v1 slices a body that is too
+    // short for decode_hybrid to read a full bit-packed run → Bad("rle
+    // bitpack run truncated") inside decode_hybrid, NOT the same guard as
+    // Lock 1's decode_level_v1 slice check.
+    //
+    // Construction: use build_opt_plain_i64(&[1,0,1], &[7,-2]).
+    // That produces def_hybrid = [0x03, 0x05] (2 bytes: varint header +
+    // 1 bits-byte for n=3). The correct prefix would be 2, but we patch
+    // it to 1 → decode_level_v1 reads body = [0x03] (1 byte only).
+    // decode_hybrid sees header 0x03 (odd → bit-packed, 1 group of 8)
+    // → needs 1*bit_width=1 byte at positions [1..2] inside the 1-byte
+    // body → data.get(1..2) is None → Bad("rle bitpack run truncated").
     #[test]
-    fn pentest_opt_lying_length_prefix_is_bad_no_panic() {
-        let n: i64 = 2;
-        // payload: prefix claims 999 bytes, body is only 2 bytes.
+    fn pentest_opt_def_prefix_undercount_is_bad() {
+        // Build a valid file so we can borrow its structure; then reconstruct
+        // with the patched prefix to guarantee correct metadata layout.
+        let n: i64 = 3;
+        // def_hybrid for defs=[1,0,1], groups=1: header=0x03, bits=0x05 → 2 bytes.
+        // Real prefix = 2. We lie and say 1 → body is only [0x03].
+        let undercount_prefix: u32 = 1; // real body is 2 bytes; we tell the decoder it is 1
+        let real_def_hybrid: &[u8] = &[0x03, 0x05];
         let mut corrupt_payload: Vec<u8> = Vec::new();
-        corrupt_payload.extend_from_slice(&999u32.to_le_bytes()); // lying prefix
-        corrupt_payload.extend_from_slice(&[0x03, 0x03]); // only 2 body bytes
+        corrupt_payload.extend_from_slice(&undercount_prefix.to_le_bytes()); // prefix=1
+        corrupt_payload.extend_from_slice(real_def_hybrid);                  // 2 bytes follow (decoder only sees 1)
+        corrupt_payload.extend_from_slice(&7i64.to_le_bytes());
+        corrupt_payload.extend_from_slice(&(-2i64).to_le_bytes());
         let psz = corrupt_payload.len() as i64;
 
         let mut hdr = Vec::new();
@@ -1683,6 +1702,7 @@ mod pentest_optional {
         f.extend_from_slice(b"PAR1");
 
         let owned = f.clone();
+        // Inlined (not assert_no_panic_bad) to carry the {result:?} diagnostic — def>1 must hit decode_page's d>1 guard, not an earlier reject.
         let r = std::panic::catch_unwind(move || extract(&owned, &["id"]));
         assert!(r.is_ok(), "must NOT panic: def>1 case");
         let result = r.unwrap();

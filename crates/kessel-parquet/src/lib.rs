@@ -542,7 +542,13 @@ mod tests {
     ///   logical rows [7,7,-2]; dictionary [7,-2]; indices [0,0,1].
     /// Layout: [PAR1][dict_hdr][dict_data][data_hdr][data_payload]
     ///         [FileMetaData][mlen u32 LE][PAR1]
-    fn build_dict_int64_file() -> Vec<u8> {
+    ///
+    /// `dict_page_offset_override`: if `None`, the f11 dictionary_page_offset
+    /// is the correct byte offset of the dict page (4). If `Some(v)`, the f11
+    /// field encodes `v` instead — the rest of the file (dict page bytes, data
+    /// page, schema, mlen, PAR1 framing) is byte-identical, so the footer +
+    /// FileMetaData still decode cleanly; only the f11 i64 value changes.
+    fn build_dict_int64_file_with_dict_offset(dict_page_offset_override: Option<i64>) -> Vec<u8> {
         let mut dict_data = Vec::new();
         dict_data.extend_from_slice(&7i64.to_le_bytes());
         dict_data.extend_from_slice(&(-2i64).to_le_bytes());
@@ -570,7 +576,8 @@ mod tests {
         data_hdr.push(0x00);                                  // stop DataPageHeader
         data_hdr.push(0x00);                                  // stop PageHeader
 
-        let dict_page_offset: i64 = 4;
+        let correct_dict_page_offset: i64 = 4;
+        let f11_dict_page_offset = dict_page_offset_override.unwrap_or(correct_dict_page_offset);
         let data_page_offset: i64 =
             4 + dict_hdr.len() as i64 + dict_data.len() as i64;
 
@@ -594,7 +601,7 @@ mod tests {
         m.push(0x15); uv(&mut m, zz(0));                      // f4 codec=UNCOMPRESSED
         m.push(0x16); uv(&mut m, zz(3));                      // f5 num_values=3
         m.push(0x46); uv(&mut m, zz(data_page_offset));       // f9 data_page_offset (delta 5->9=4,i64)
-        m.push(0x26); uv(&mut m, zz(dict_page_offset));       // f11 dictionary_page_offset (delta 9->11=2,i64)
+        m.push(0x26); uv(&mut m, zz(f11_dict_page_offset));   // f11 dictionary_page_offset (delta 9->11=2,i64)
         m.push(0x00);                                         // stop ColumnMetaData
         m.push(0x00);                                         // stop ColumnChunk
         m.push(0x26); uv(&mut m, zz(3));                      // RG f3 num_rows=3
@@ -612,6 +619,12 @@ mod tests {
         f.extend_from_slice(&mlen.to_le_bytes());
         f.extend_from_slice(b"PAR1");
         f
+    }
+
+    /// Convenience wrapper: None path → byte-identical to previous
+    /// `build_dict_int64_file()` so Task-3 tests are unaffected.
+    fn build_dict_int64_file() -> Vec<u8> {
+        build_dict_int64_file_with_dict_offset(None)
     }
 
     #[test]
@@ -650,10 +663,28 @@ mod tests {
     }
 
     #[test]
-    fn extract_dict_page_offset_past_eof_is_bad() {
+    fn extract_truncated_file_is_bad() {
+        // Exercises the footer-short → Bad path: truncating to 8 bytes makes
+        // footer::metadata_slice see file.len()<12 and return Err(Bad).
+        // Honestly exercises: no-panic + typed-Bad on truncated input.
         let mut f = build_dict_int64_file();
         f.truncate(8); // footer/dict-page region now unreachable
         let owned = f.clone();
+        let r = std::panic::catch_unwind(move || extract(&owned, &["id"]));
+        assert!(r.is_ok(), "must not panic");
+        assert!(matches!(r.unwrap(), Err(PqError::Bad(_))));
+    }
+
+    #[test]
+    fn extract_dict_page_offset_past_eof_is_bad() {
+        // Structurally valid footer + FileMetaData, but the f11
+        // dictionary_page_offset points far past EOF → read_chunk_values
+        // dict-page bounds check (`file.get(off..).ok_or_else(|| Bad("dict
+        // page offset past EOF"))`) returns typed Bad, no panic. This
+        // exercises the read_chunk_values dict-page-offset path specifically
+        // (not the footer-short path).
+        let file = build_dict_int64_file_with_dict_offset(Some(10_000_000));
+        let owned = file.clone();
         let r = std::panic::catch_unwind(move || extract(&owned, &["id"]));
         assert!(r.is_ok(), "must not panic");
         assert!(matches!(r.unwrap(), Err(PqError::Bad(_))));

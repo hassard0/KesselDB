@@ -32,6 +32,7 @@ kessel-crypto = { path = "../kessel-crypto", optional = true }
 default = []
 tls = ["dep:rustls", "dep:rustls-pemfile"]
 external-sources = ["dep:kessel-fetch", "dep:kessel-crypto"]
+external-sources-tls = ["external-sources", "kessel-fetch/tls", "dep:rustls", "dep:rustls-pemfile"]
 
 [dev-dependencies]
 kessel-expr = { path = "../kessel-expr" }

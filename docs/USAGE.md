@@ -743,6 +743,12 @@ messages.
 > `FORMAT PARQUET` still requires PLAIN-encoded, UNCOMPRESSED,
 > REQUIRED columns (pyarrow `use_dictionary=False, compression=None`).
 
+> **OBJ-2b-2 (SP103):** dictionary-encoded Parquet (pyarrow default
+> `use_dictionary=True`) is now supported for flat REQUIRED,
+> UNCOMPRESSED, V1 files. Compression still requires
+> `compression=None` (Snappy → OBJ-2b-3); nullable/OPTIONAL columns
+> still unsupported (→ OBJ-2b-4).
+
 `FORMAT PARQUET` is supported for `s3://` and `az://` sources when the
 server is built with `--features external-sources-objstore`. Plain
 `http://` / `https://` URLs are **rejected** with a clear message if

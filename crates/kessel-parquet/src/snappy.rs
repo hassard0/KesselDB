@@ -58,11 +58,10 @@ pub fn decompress(
     if usize::try_from(declared).map(|d| d != expected_len).unwrap_or(true) {
         return Err(bad("snappy preamble length != uncompressed_page_size"));
     }
+    // OOM-safe: expected_len <= SNAPPY_MAX_DECOMP verified above;
+    // never reserve from an attacker-controlled stream count.
     let mut out: Vec<u8> = Vec::with_capacity(expected_len);
-    while pos < src.len() {
-        let tag = *src
-            .get(pos)
-            .ok_or_else(|| bad("snappy tag truncated"))?;
+    while let Some(&tag) = src.get(pos) {
         pos += 1;
         match tag & 0b11 {
             0 => {
@@ -79,15 +78,15 @@ pub fn decompress(
                     }
                     pos = pos
                         .checked_add(extra)
-                        .ok_or_else(|| bad("snappy pos ovf"))?;
+                        .ok_or_else(|| bad("snappy pos overflow"))?;
                     len = v;
                 }
                 len = len
                     .checked_add(1)
-                    .ok_or_else(|| bad("snappy literal len ovf"))?;
+                    .ok_or_else(|| bad("snappy literal len overflow"))?;
                 let end = pos
                     .checked_add(len)
-                    .ok_or_else(|| bad("snappy literal end ovf"))?;
+                    .ok_or_else(|| bad("snappy literal end overflow"))?;
                 let lit = src
                     .get(pos..end)
                     .ok_or_else(|| bad("snappy literal past src"))?;
@@ -121,7 +120,7 @@ pub fn decompress(
                             b.try_into().unwrap(),
                         ) as usize)
                     }
-                    _ => {
+                    _ /* copy, 4-byte offset (tag type 3) */ => {
                         let len = 1 + ((tag >> 2) as usize);
                         let b = src.get(pos..pos + 4).ok_or_else(
                             || bad("snappy copy4 off truncated"),
@@ -239,9 +238,8 @@ mod tests {
             decompress(&[0x0A, 0x24, 0x61, 0x62], 10),
             Err(PqError::Bad(_))
         ));
-        // truncated (empty)
-        assert!(matches!(decompress(&[], 0), Ok(v) if v.is_empty())
-            || matches!(decompress(&[], 0), Err(PqError::Bad(_))));
+        // truncated (empty): varint() on empty src returns Err → Bad
+        assert!(matches!(decompress(&[], 0), Err(PqError::Bad(_))));
     }
 
     // Over-cap expected_len → Unsupported BEFORE allocation.

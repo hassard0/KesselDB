@@ -791,12 +791,12 @@ CREATE EXTERNAL SOURCE readings (
   `KEY`) are identical to §7e.
 - `REFRESH` and `DROP EXTERNAL SOURCE` work identically to §7e.
 
-### OBJ-2a scope: what is supported
+### Parquet scope: what is currently supported (OBJ-2a → OBJ-2b-3)
 
-| Parquet property | OBJ-2a |
+| Parquet property | OBJ-2a → OBJ-2b-3 |
 |---|---|
-| Encoding | `PLAIN` only |
-| Compression codec | `UNCOMPRESSED` only |
+| Encoding | `PLAIN` and dictionary (`PLAIN_DICTIONARY`/`RLE_DICTIONARY`); RLE/bit-packing hybrid for dictionary indices |
+| Compression codec | `UNCOMPRESSED` and `SNAPPY` (raw block; pages ≤ 64 MiB decompressed) |
 | Column repetition | `REQUIRED` flat columns only (no `OPTIONAL`, no `REPEATED`, no nested groups) |
 | Data page version | V1 (`DATA_PAGE`) only |
 | Row groups | Multi-row-group files are fully supported |
@@ -809,15 +809,13 @@ The following trigger a typed `PqError` (surfaced as a `REFRESH`
 failure; prior materialized data is left intact — all-or-nothing, same
 as every other format):
 
-- **Dictionary / RLE-data encoding** — rejected with
-  `Unsupported("<enc> encoding: OBJ-2b")`.
-- **Snappy compression** — rejected with
-  `Unsupported("compression SNAPPY: OBJ-2b")`.
-- **Gzip / Zstd compression** — rejected with
-  `Unsupported("compression GZIP/ZSTD: OBJ-2c")`.
 - **OPTIONAL or REPEATED columns** (definition/repetition levels) —
   rejected with `Unsupported("OPTIONAL/REPEATED/nested columns: OBJ-2b")`.
 - **Nested group columns** — same `Unsupported` as OPTIONAL/REPEATED.
+- **Gzip / Zstd / lz4 / brotli compression** — rejected with
+  `Unsupported("compression GZIP/ZSTD: OBJ-2c")`.
+- **Snappy pages above 64 MiB decompressed** — rejected with
+  `Unsupported("Snappy decompressed page too large: OBJ-2c")`.
 - **V2 data pages** (`DATA_PAGE_V2`) — rejected with
   `Unsupported("Parquet V2 data pages: OBJ-2b")`.
 - **`INT96` / `FIXED_LEN_BYTE_ARRAY` / `DECIMAL`** physical types —

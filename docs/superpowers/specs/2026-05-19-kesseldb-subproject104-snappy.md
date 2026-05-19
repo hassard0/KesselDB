@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-19  **Status:** done — code + tests committed and passing.
 
-**Builds on:**
+Builds on:
 - Subproject 100 — Object-store external sources (OBJ-1):
   `docs/superpowers/specs/2026-05-19-kesseldb-subproject100-objstore.md`
 - Subproject 101 — Parquet OBJ-2a:
@@ -54,8 +54,9 @@ parquet.thrift is **2: uncompressed_page_size, 3: compressed_page_size,
 offset by `uncompressed_size` and never consumed `compressed_size`,
 and the hand-built test page-header encoders were self-consistently
 wrong with the decoder — a self-referential blind spot. OBJ-2b-3's
-advance-by-`compressed_size` surfaced it (real pyarrow files would
-have `compressed_size == 0`). Fixed: decode field 2→uncompressed,
+advance-by-`compressed_size` surfaced it (the decoder would have
+mis-read `compressed_size` as 0 on real pyarrow files (it was decoding
+thrift field 4 = crc, absent ⇒ default 0)). Fixed: decode field 2→uncompressed,
 3→compressed (4 crc skipped); the hand-built test encoders corrected
 to the true field deltas. Validated **non-self-referentially**: the
 real-pyarrow SP101/SP103/SP104 fixtures (written with the true field

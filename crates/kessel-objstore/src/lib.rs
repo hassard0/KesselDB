@@ -23,12 +23,29 @@ pub struct DateTime {
     pub secs_since_epoch: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ObjCreds {
     /// AWS / S3-compatible.
     S3 { key_id: String, secret: String },
     /// Azure Blob Shared Key (`key_b64` is the base64 account key).
     AzureSharedKey { account: String, key_b64: String },
+}
+
+impl std::fmt::Debug for ObjCreds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ObjCreds::S3 { key_id, .. } => f
+                .debug_struct("S3")
+                .field("key_id", key_id)
+                .field("secret", &"[REDACTED]")
+                .finish(),
+            ObjCreds::AzureSharedKey { account, .. } => f
+                .debug_struct("AzureSharedKey")
+                .field("account", account)
+                .field("key_b64", &"[REDACTED]")
+                .finish(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,12 +105,13 @@ pub fn sign_get(
 /// `YYYYMMDD` and `YYYYMMDDTHHMMSSZ` from epoch seconds (UTC,
 /// proleptic Gregorian). Pure — used by both signers and unit-tested
 /// directly so the AWS/Azure known-answer vectors are reproducible.
+#[allow(dead_code)] // consumed by sigv4.rs (Task 2) + azure.rs (Task 3)
 pub(crate) fn ymd_hms(secs: u64) -> (String, String) {
     let days = (secs / 86_400) as i64;
     let sod = (secs % 86_400) as u32;
     let (h, mi, s) = (sod / 3600, (sod % 3600) / 60, sod % 60);
     let z = days + 719_468;
-    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097; // secs is u64 ⇒ z ≥ 719468 > 0; the negative branch is unreachable, kept for Hinnant-algorithm fidelity
     let doe = z - era * 146_097;
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
     let y = yoe + era * 400;
@@ -124,5 +142,21 @@ mod time_tests {
             ymd_hms(0),
             ("19700101".into(), "19700101T000000Z".into())
         );
+    }
+}
+
+#[cfg(test)]
+mod cred_tests {
+    use super::*;
+    #[test]
+    fn objcreds_debug_redacts() {
+        let c = ObjCreds::S3 { key_id: "AKIA".into(), secret: "TOPSECRET".into() };
+        let s = format!("{c:?}");
+        assert!(s.contains("AKIA"));
+        assert!(!s.contains("TOPSECRET"));
+        assert!(s.contains("REDACTED"));
+        let a = ObjCreds::AzureSharedKey { account: "acct".into(), key_b64: "S3CR3TKEY".into() };
+        let s2 = format!("{a:?}");
+        assert!(s2.contains("acct") && !s2.contains("S3CR3TKEY") && s2.contains("REDACTED"));
     }
 }

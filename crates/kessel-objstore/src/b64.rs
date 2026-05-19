@@ -1,5 +1,6 @@
 //! Minimal std-alphabet base64 (encode + decode) — no external dep.
 //! Azure account keys are base64; the signature is base64-encoded.
+#![allow(dead_code)] // encode/decode consumed by azure.rs (Task 3) + sigv4.rs (Task 2)
 
 const ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -30,6 +31,7 @@ pub fn encode(input: &[u8]) -> String {
 }
 
 pub fn decode(s: &str) -> Option<Vec<u8>> {
+    // Strict RFC-4648 mid-string padding rejection is NOT enforced (callers pass encoder-produced base64 only).
     fn val(c: u8) -> Option<u32> {
         match c {
             b'A'..=b'Z' => Some((c - b'A') as u32),

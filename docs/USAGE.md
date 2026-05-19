@@ -887,7 +887,9 @@ pq.write_table(table, "readings.parquet",
 Key options: `use_dictionary=False` (forces PLAIN encoding),
 `compression="none"` (UNCOMPRESSED), `data_page_version="1.0"` (V1
 pages). Multi-row-group files are supported — all row groups are
-iterated in order.
+iterated in order. `data_page_version="2.0"` (DATA_PAGE_V2) is also
+supported as of OBJ-2c-3 (§7f) for the same flat REQUIRED|OPTIONAL ×
+UNCOMPRESSED|Snappy|GZIP × PLAIN|dict matrix.
 
 ### Physical-type-to-KesselDB-column mapping
 

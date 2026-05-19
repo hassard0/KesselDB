@@ -363,6 +363,11 @@ fn decode_column_meta(
 /// DataPageHeader: 1:i32 num_values, 2:Encoding encoding).
 /// Field 7: DictionaryPageHeader { 1:i32 num_values, 2:Encoding encoding,
 /// 3:bool is_sorted }.
+/// Field 8: DataPageHeaderV2 { 1:i32 num_values, 2:i32 num_nulls,
+/// 3:i32 num_rows, 4:Encoding encoding,
+/// 5:i32 definition_levels_byte_length,
+/// 6:i32 repetition_levels_byte_length,
+/// 7:optional bool is_compressed (default true) }.
 #[derive(Clone, Debug)]
 pub struct PageHeader {
     pub page_type: i32,
@@ -375,6 +380,16 @@ pub struct PageHeader {
     /// present"; only trust these when `page_type == 2` (DICTIONARY_PAGE).
     pub dict_num_values: i32,
     pub dict_encoding: i32,
+    // V2 (DataPageHeaderV2, PageHeader field 8). Only meaningful when
+    // page_type == 3 (DATA_PAGE_V2). v2_is_compressed defaults true
+    // (the thrift field is optional, default true).
+    pub v2_num_values: i32,
+    pub v2_num_nulls: i32,
+    pub v2_num_rows: i32,
+    pub v2_encoding: i32,       // default -1
+    pub v2_def_len: i32,
+    pub v2_rep_len: i32,
+    pub v2_is_compressed: bool, // default true
 }
 
 pub fn decode_page_header(
@@ -389,6 +404,13 @@ pub fn decode_page_header(
         dp_encoding: -1,
         dict_num_values: 0,
         dict_encoding: -1,
+        v2_num_values: 0,
+        v2_num_nulls: 0,
+        v2_num_rows: 0,
+        v2_encoding: -1,
+        v2_def_len: 0,
+        v2_rep_len: 0,
+        v2_is_compressed: true,
     };
     while let Some(f) = s.next_field()? {
         match f.id {
@@ -417,6 +439,29 @@ pub fn decode_page_header(
                     match g.id {
                         1 => ph.dict_num_values = s.read_i32(&g)?,
                         2 => ph.dict_encoding = s.read_i32(&g)?,
+                        _ => s.skip(g.ctype)?,
+                    }
+                }
+                s.restore_last_id(f.id);
+            }
+            8 => {
+                // DataPageHeaderV2 { 1:i32 num_values, 2:i32 num_nulls,
+                // 3:i32 num_rows, 4:Encoding encoding,
+                // 5:i32 definition_levels_byte_length,
+                // 6:i32 repetition_levels_byte_length,
+                // 7:optional bool is_compressed (default true) }.
+                // Same per-struct last_id bracketing as field 5 / field 7.
+                if f.ctype != ctype::STRUCT { return Err(bad("PageHeader.data_page_header_v2: expected struct")); }
+                s.reset_last_id();
+                while let Some(g) = s.next_field()? {
+                    match g.id {
+                        1 => ph.v2_num_values = s.read_i32(&g)?,
+                        2 => ph.v2_num_nulls = s.read_i32(&g)?,
+                        3 => ph.v2_num_rows = s.read_i32(&g)?,
+                        4 => ph.v2_encoding = s.read_i32(&g)?,
+                        5 => ph.v2_def_len = s.read_i32(&g)?,
+                        6 => ph.v2_rep_len = s.read_i32(&g)?,
+                        7 => ph.v2_is_compressed = s.read_bool(&g)?,
                         _ => s.skip(g.ctype)?,
                     }
                 }
@@ -764,5 +809,39 @@ mod tests {
         assert_eq!(ph.page_type, 2);
         assert_eq!(ph.dict_num_values, 2);
         assert_eq!(ph.dict_encoding, 2);
+    }
+
+    #[test]
+    fn pageheader_decodes_data_page_header_v2_field8() {
+        // PageHeader { 1:type=DATA_PAGE_V2(3), 2:uncompressed=18,
+        //   3:compressed=18, 8:DataPageHeaderV2{1:num_values=3,
+        //   2:num_nulls=1, 3:num_rows=3, 4:encoding=PLAIN(0),
+        //   5:def_levels_byte_length=2, 6:rep_levels_byte_length=0,
+        //   7:is_compressed=false } }
+        // compact field header = (delta<<4)|ctype; i32-zigzag=5,
+        // struct=12, BOOL_FALSE=2. zz(n)=(n<<1)^(n>>63).
+        let mut h = Vec::new();
+        h.push(0x15); uv(&mut h, zz(3));   // f1 type=DATA_PAGE_V2(3) (delta 0->1=1,i32)
+        h.push(0x15); uv(&mut h, zz(18));  // f2 uncompressed=18 (delta 1->2=1,i32)
+        h.push(0x15); uv(&mut h, zz(18));  // f3 compressed=18 (delta 2->3=1,i32)
+        h.push(0x5c);                      // f8 DataPageHeaderV2 struct (delta 3->8=5 -> (5<<4)|12=0x5c)
+        h.push(0x15); uv(&mut h, zz(3));   // g1 num_values=3 (reset; delta 0->1=1,i32)
+        h.push(0x15); uv(&mut h, zz(1));   // g2 num_nulls=1 (delta 1->2=1,i32)
+        h.push(0x15); uv(&mut h, zz(3));   // g3 num_rows=3 (delta 2->3=1,i32)
+        h.push(0x15); uv(&mut h, zz(0));   // g4 encoding=PLAIN(0) (delta 3->4=1,i32)
+        h.push(0x15); uv(&mut h, zz(2));   // g5 def_levels_byte_length=2 (delta 4->5=1,i32)
+        h.push(0x15); uv(&mut h, zz(0));   // g6 rep_levels_byte_length=0 (delta 5->6=1,i32)
+        h.push(0x12);                      // g7 is_compressed=false (delta 6->7=1, BOOL_FALSE=2 -> 0x12)
+        h.push(0x00);                      // stop DataPageHeaderV2
+        h.push(0x00);                      // stop PageHeader
+
+        let (ph, _len) = decode_page_header(&h).expect("decode");
+        assert_eq!(ph.page_type, 3);
+        assert_eq!(ph.v2_num_values, 3);
+        assert_eq!(ph.v2_num_nulls, 1);
+        assert_eq!(ph.v2_encoding, 0);
+        assert_eq!(ph.v2_def_len, 2);
+        assert_eq!(ph.v2_rep_len, 0);
+        assert_eq!(ph.v2_is_compressed, false);
     }
 }

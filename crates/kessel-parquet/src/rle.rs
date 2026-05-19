@@ -248,4 +248,92 @@ mod tests {
         assert_eq!(levels, vec![1, 1, 1, 1]);
         assert_eq!(consumed, 6);
     }
+
+    // ── Independent grammar-faithful encoders (NOT the decoder under test) ──
+    // Written directly from the parquet-format grammar; entirely separate
+    // code path from decode_hybrid so a round-trip failure indicates a real
+    // decoder bug.
+
+    fn enc_uvarint(out: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(b);
+                break;
+            } else {
+                out.push(b | 0x80);
+            }
+        }
+    }
+
+    /// Encode `vals` as a single bit-packed run (caller pads to a
+    /// multiple of 8). bit_width 1..=32. LSB-of-stream-first.
+    fn enc_bitpacked(vals: &[u64], bit_width: u32) -> Vec<u8> {
+        assert!(vals.len() % 8 == 0 && bit_width >= 1 && bit_width <= 32);
+        let groups = (vals.len() / 8) as u64;
+        let mut out = Vec::new();
+        enc_uvarint(&mut out, (groups << 1) | 1);
+        let nbytes = vals.len() * bit_width as usize / 8;
+        let mut bytes = vec![0u8; nbytes];
+        let mut bitpos = 0usize;
+        for &val in vals {
+            for k in 0..bit_width as usize {
+                let bit = ((val >> k) & 1) as u8;
+                if bit == 1 {
+                    bytes[(bitpos + k) / 8] |= 1 << ((bitpos + k) % 8);
+                }
+            }
+            bitpos += bit_width as usize;
+        }
+        out.extend_from_slice(&bytes);
+        out
+    }
+
+    /// Encode a single RLE run of `value` repeated `run_len` times.
+    fn enc_rle(value: u64, run_len: u64, bit_width: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        enc_uvarint(&mut out, run_len << 1);
+        let vb = ((bit_width as usize) + 7) / 8;
+        for i in 0..vb {
+            out.push(((value >> (8 * i as u32)) & 0xff) as u8);
+        }
+        out
+    }
+
+    #[test]
+    fn roundtrip_bitpacked_all_widths() {
+        // Deterministic LCG (no external rand crate — zero-dep).
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 11
+        };
+        for bw in 1u32..=32 {
+            for &count in &[8usize, 16, 64, 256] {
+                let mask = if bw == 64 { u64::MAX } else { (1u64 << bw) - 1 };
+                let vals: Vec<u64> =
+                    (0..count).map(|_| next() & mask).collect();
+                let stream = enc_bitpacked(&vals, bw);
+                let got = decode_hybrid(&stream, bw, count).expect("decode");
+                assert_eq!(got, vals, "bw={bw} count={count}");
+            }
+        }
+    }
+
+    #[test]
+    fn roundtrip_rle_all_widths() {
+        for bw in 1u32..=32 {
+            let mask = (1u64 << bw) - 1;
+            let value = 0xA5A5_A5A5_A5A5_A5A5u64 & mask;
+            for &run in &[1u64, 7, 100, 1000] {
+                let stream = enc_rle(value, run, bw);
+                let got =
+                    decode_hybrid(&stream, bw, run as usize).expect("decode");
+                assert_eq!(got, vec![value; run as usize], "bw={bw}");
+            }
+        }
+    }
 }

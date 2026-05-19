@@ -184,7 +184,7 @@ real pyarrow fixture files).
 
 | Primitive | Independent authority | Byte vector |
 |---|---|---|
-| Varint (unsigned) | Thrift Compact Protocol spec §3.1: "the standard variable-length integer encoding, MSB first with the low 7 bits of each byte carrying data" — hand-computed for values 0, 1, 127, 128, 16384 | `[0x00]`, `[0x01]`, `[0x7F]`, `[0x80, 0x01]`, `[0x80, 0x80, 0x01]` |
+| Varint (unsigned) | Thrift Compact Protocol spec §3.1: "the standard variable-length integer encoding, MSB first with the low 7 bits of each byte carrying data" (continuation bit in the MSB of each byte; value bits are LSB-first in byte order — i.e. standard LEB128/protobuf varint) — hand-computed for values 0, 1, 127, 128, 16384 | `[0x00]`, `[0x01]`, `[0x7F]`, `[0x80, 0x01]`, `[0x80, 0x80, 0x01]` |
 | Zigzag varint (signed) | Thrift spec §3.1 zigzag mapping `n → (n<<1)^(n>>63)` — hand-computed for 0, -1, 1, -64, 63 | as specified |
 | Field-delta header (type 5 = i32, delta 1) | Thrift spec §3.2: `(delta << 4) | wire_type` — hand-computed | `0x15` |
 | Binary field (type 8) | Thrift spec §3.3 — hand-computed for `b"hello"` | `[0x18, 0x05, b'h', b'e', b'l', b'l', b'o']` |

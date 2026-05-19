@@ -830,6 +830,7 @@ table = pa.table({
     "label":        pa.array([b"A", b"B", b"C"], type=pa.large_binary()),
 })
 pq.write_table(table, "readings.parquet",
+               version='1.0',
                use_dictionary=False,
                compression="none",
                data_page_version="1.0")
@@ -848,7 +849,7 @@ iterated in order.
 | `INT64` | `I64` or `U64` column | Value taken as i64 |
 | `FLOAT` | Any numeric column | Rendered via canonical-f64 formatting |
 | `DOUBLE` | Any numeric column | Rendered via canonical-f64 formatting |
-| `BOOLEAN` | Any column | Rendered as `"true"` or `"false"` |
+| `BOOLEAN` | `Bool` column, or numeric column (as 1/0) | `PqValue::Bool(v) → Cell::Bool(v)` — same as a JSON boolean; coerces to a 1-byte `0x01`/`0x00` for a `Bool` column, or `1`/`0` for a numeric column |
 | `BYTE_ARRAY` | `BYTES` or `CHAR` column | Decoded as UTF-8 (lossy) |
 
 The mapping goes through the same `coerce::to_field_bytes` path the

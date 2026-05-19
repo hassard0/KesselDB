@@ -159,11 +159,11 @@ byte-identical; existing flat REQUIRED files still round-trip).
 ## Honest gate accounting
 
 Default-build total: **348 → 365** (+17) — new meta flat-schema test,
-6 OPTIONAL extract tests (PLAIN + all-null + all-present + OPTIONAL+dict
-+ repeated-reject + nested-reject), 2 nullable fixture roundtrips, 1
-nullable e2e, 1 source-format-independence pin, 9 pentest_optional
-locks; minus 1 intentionally-removed `extract_rejects_optional_repetition`
-test. **NOT a zero-delta** (same corrected stance as SP100–104).
+OPTIONAL extract/fixture/e2e/source-indep/pentest tests, minus 1
+intentionally-removed optional-reject test. **NOT a zero-delta** (same
+corrected stance as SP100–104). (Individual `#[test]` functions contain
+multiple assertions; the +17 is the measured `cargo test --workspace
+--release` delta, the authoritative figure.)
 
 Invariants that hold:
 - Deterministic kernel pulls no new external dependency.

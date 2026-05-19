@@ -820,14 +820,16 @@ as every other format):
 
 - **REPEATED columns / repetition levels** — rejected with
   `Unsupported("REPEATED columns: OBJ-2c")`.
-- **Nested / optional groups** (non-flat schema; intermediate group
-  nodes) — rejected with `Unsupported("nested schema: OBJ-2c")`.
+- **Non-flat schema (nested / intermediate group nodes)** (non-flat
+  schema; intermediate group nodes) — rejected with
+  `Unsupported("nested schema: OBJ-2c")`.
 - **Gzip / Zstd / lz4 / brotli compression** — rejected with
   `Unsupported("compression GZIP/ZSTD: OBJ-2c")`.
 - **Snappy pages above 64 MiB decompressed** — rejected with
   `Unsupported("Snappy decompressed page too large: OBJ-2c")`.
 - **V2 data pages** (`DATA_PAGE_V2`) — rejected with
-  `Unsupported("Parquet V2 data pages: OBJ-2b")`.
+  `Unsupported("non-V1 data page (V2/index): OBJ-2c")`. (Deferral
+  target is OBJ-2c; the typed error already tags OBJ-2c.)
 - **`INT96` / `FIXED_LEN_BYTE_ARRAY` / `DECIMAL`** physical types —
   rejected with `Unsupported("INT96/FIXED_LEN_BYTE_ARRAY: OBJ-2c")`.
 - **A mapped column name absent from the Parquet schema** — rejected
@@ -835,7 +837,7 @@ as every other format):
 
 None of the above are decoded silently or partially. Failure is
 precise, typed, and fail-closed — the error message names the
-OBJ-2b/2c follow-on that will address it.
+OBJ-2c follow-on that will address it.
 
 ### Producing a compatible Parquet file
 

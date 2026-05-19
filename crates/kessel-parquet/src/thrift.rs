@@ -99,6 +99,23 @@ impl<'a> StructReader<'a> {
     pub fn reader_pos(&self) -> usize {
         self.r.pos()
     }
+    /// Reset the delta-ID accumulator to 0. Call this before reading
+    /// each nested struct that is decoded inline via the same
+    /// StructReader (Thrift compact protocol: each struct's field-ID
+    /// deltas are independent of the enclosing struct's counter).
+    pub fn reset_last_id(&mut self) {
+        self.last_id = 0;
+    }
+    /// Save the current last-field-ID so the caller can restore it
+    /// after processing an inline nested struct.
+    pub fn save_last_id(&self) -> i16 {
+        self.last_id
+    }
+    /// Restore the last-field-ID saved before entering an inline
+    /// nested struct (so the outer struct's delta chain resumes).
+    pub fn restore_last_id(&mut self, saved: i16) {
+        self.last_id = saved;
+    }
     /// `Ok(None)` = STOP field (end of struct).
     pub fn next_field(&mut self) -> TResult<Option<Field>> {
         let h = self.r.byte()?;

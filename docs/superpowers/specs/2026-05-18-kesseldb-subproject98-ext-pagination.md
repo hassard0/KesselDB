@@ -90,8 +90,7 @@ digests, and the seed-7 corpus are unaffected.
 
 `Op::CreateExternalSource` gained two optional wire fields (`rows_path`
 and `pagination`) appended after all existing fields. A slice-1-persisted
-WAL frame (without the new fields) decodes with `rows_path = None,
-`pagination = None` — the back-compat path is exercised by a
+WAL frame (without the new fields) decodes with `rows_path = None`, `pagination = None` — the back-compat path is exercised by a
 hand-built-bytes test. All downstream logic (SM, catalog, router) treats
 `None/None` as slice-1 behavior.
 
@@ -246,7 +245,7 @@ pagination = None`.
 - `FORMAT NDJSON` + `PAGE NEXT JSON` → `SchemaError`.
 - `FORMAT CSV` + `PAGE CURSOR JSON` → `SchemaError`.
 
-### `kesseldb-server` — paginated e2e oracle (3 assertions)
+### `kesseldb-server` — paginated e2e oracle (2 oracle tests; the paginated one proves 3 properties)
 
 `paginated_external_source_oracle` (real TCP cluster + stub HTTP server):
 
@@ -269,7 +268,7 @@ FAILED = 0 · TOTAL = 245 · `large_seed_corpus_is_deterministic_and_converges` 
 The feature is compiled in but the router's paginated dispatch path and
 the oracle test (`#![cfg(feature = "external-sources")]`) are excluded
 when the feature flag is off. Feature-ON: `cargo test -p kesseldb-server
---features external-sources` ⇒ 25 lib + 2 oracle tests pass.
+--features external-sources` ⇒ 25 lib tests + 2 oracle tests pass (slice-1 + the paginated oracle; the paginated oracle proves 3 properties: union-of-pages, idempotent re-REFRESH, loop ⇒ error + prior data intact).
 
 The deterministic kernel digest is unchanged: the new `ExternalRecipe`
 fields are not part of any op's determinism domain; existing type-defs

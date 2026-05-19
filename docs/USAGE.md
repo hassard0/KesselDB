@@ -540,6 +540,12 @@ pre-existing `cursor` query parameter).
 ### `PAGE NEXT LINK` — HTTP Link header
 
 ```sql
+CREATE EXTERNAL SOURCE issues (
+    id     U64    NOT NULL FROM 'id',
+    title  BYTES  NOT NULL FROM 'title'
+) FROM 'http://api.example.com/repos/acme/issues'
+  FORMAT JSON
+  KEY id
   PAGE NEXT LINK
 ```
 

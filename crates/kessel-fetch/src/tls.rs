@@ -66,6 +66,7 @@ pub(crate) fn connect_tls(
 /// `pem` (the checked-in localhost fixture). Not reachable from any
 /// production path.
 #[doc(hidden)]
+#[allow(dead_code)] // used by integration tests in Task 6 (tls_stub.rs)
 pub fn test_config_trusting(
     pem: &[u8],
 ) -> Arc<rustls::ClientConfig> {

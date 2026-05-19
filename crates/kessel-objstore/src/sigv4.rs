@@ -268,6 +268,36 @@ mod tests {
     }
 
     #[test]
+    fn key_cannot_inject_headers_or_query() {
+        let r = ObjGetRequest {
+            provider: Provider::S3,
+            bucket_or_container: "b".into(),
+            key: "a\r\nX-Evil: 1/../../etc?z=1#frag".into(),
+            region: Some("us-east-1".into()),
+            endpoint: None,
+            creds: ObjCreds::S3 { key_id: "K".into(), secret: "S".into() },
+        };
+        let s = sign_get_s3(&r, DateTime { secs_since_epoch: 1 }).unwrap();
+        assert!(!s.https_url.contains('\r') && !s.https_url.contains('\n'),
+            "CRLF must be encoded out of the URL");
+        assert!(s.https_url.contains("%0D%0A"), "CRLF percent-encoded");
+        assert!(s.https_url.contains("%3F") && s.https_url.contains("%23"),
+            "? and # percent-encoded so no query/fragment injection");
+        for (k, v) in &s.headers {
+            assert!(!k.contains('\n') && !v.contains('\n'),
+                "no signed header value may contain a newline");
+            assert!(!k.contains('\r') && !v.contains('\r'),
+                "no signed header value may contain a CR");
+        }
+        // Path traversal: `..` segments are percent-safe (encoded '.'?
+        // RFC3986 keeps '.' unreserved, so `..` stays literal — assert
+        // the bucket cannot be escaped: the path still begins with the
+        // signed canonical bucket/key, no scheme/host injection).
+        assert!(s.https_url.starts_with("https://b.s3.us-east-1.amazonaws.com/"),
+            "host/bucket not escapable via key: {}", s.https_url);
+    }
+
+    #[test]
     fn rfc3986_key_encoding_and_path_style() {
         let mk = |key: &str, endpoint: Option<&str>| ObjGetRequest {
             provider: Provider::S3,

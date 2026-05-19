@@ -10,6 +10,7 @@ mod thrift;
 mod footer;
 mod meta;
 mod plain;
+mod rle;
 
 /// One decoded Parquet physical value, format-agnostic. The caller
 /// (`kessel-fetch`) maps this to its own `Cell` so the existing

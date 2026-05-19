@@ -1,0 +1,205 @@
+//! Apache Parquet RLE / bit-packing hybrid decoder.
+//! Authority: parquet-format `Encodings.md`. Zero external deps.
+//! Pure, bounds-checked: never panics / OOMs on hostile bytes.
+#![allow(dead_code)]
+
+use crate::PqError;
+
+fn bad(s: &str) -> PqError {
+    PqError::Bad(s.to_string())
+}
+
+/// Unsigned LEB128 varint at `data[*pos..]`; advances `*pos`.
+/// Rejects > 10 continuation groups (cannot fit u64) as `Bad`.
+fn uvarint(data: &[u8], pos: &mut usize) -> Result<u64, PqError> {
+    let mut result: u64 = 0;
+    let mut shift: u32 = 0;
+    loop {
+        let b = *data
+            .get(*pos)
+            .ok_or_else(|| bad("rle varint truncated"))?;
+        *pos += 1;
+        if shift >= 64 {
+            return Err(bad("rle varint too long"));
+        }
+        result |= ((b & 0x7f) as u64) << shift;
+        if b & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+    }
+    Ok(result)
+}
+
+/// Decode exactly `num_values` from a Parquet RLE/bit-packing-hybrid
+/// stream of fixed `bit_width` (0..=64). Values returned as `u64`;
+/// the caller narrows (dictionary index / definition / repetition
+/// level). Consumes only the bytes the runs require; bit-packed
+/// over-production past `num_values` is discarded. Never panics /
+/// OOM-aborts on hostile input — returns `PqError::Bad`.
+pub fn decode_hybrid(
+    data: &[u8],
+    bit_width: u32,
+    num_values: usize,
+) -> Result<Vec<u64>, PqError> {
+    if bit_width > 64 {
+        return Err(bad("rle bit_width > 64"));
+    }
+    // OOM bound (matches plain.rs:35 stance): `num_values` is the
+    // caller's expected count, itself bounded upstream by the page
+    // header's dp_num_values (SP101 Task-12 capped). We NEVER reserve
+    // from a run-length/group-count read out of the (attacker) header.
+    let mut out: Vec<u64> = Vec::with_capacity(num_values);
+    let val_bytes = ((bit_width as usize) + 7) / 8; // ceil; 0 when bw==0
+    let mut pos = 0usize;
+
+    while out.len() < num_values {
+        let header = uvarint(data, &mut pos)?;
+        if header & 1 == 1 {
+            // ── bit-packed run ──
+            let groups = header >> 1;
+            let total_vals = groups
+                .checked_mul(8)
+                .ok_or_else(|| bad("rle bitpack value count overflow"))?;
+            // bytes = groups * bit_width  (8 values * bit_width bits =
+            // bit_width bytes per group of 8).
+            let nbytes_u64 = groups
+                .checked_mul(bit_width as u64)
+                .ok_or_else(|| bad("rle bitpack byte count overflow"))?;
+            let nbytes = usize::try_from(nbytes_u64)
+                .map_err(|_| bad("rle bitpack byte count range"))?;
+            let end = pos
+                .checked_add(nbytes)
+                .ok_or_else(|| bad("rle bitpack position overflow"))?;
+            let chunk = data
+                .get(pos..end)
+                .ok_or_else(|| bad("rle bitpack run truncated"))?;
+            pos = end;
+            let tv = usize::try_from(total_vals)
+                .map_err(|_| bad("rle bitpack value count range"))?;
+            if bit_width == 0 {
+                for _ in 0..tv {
+                    if out.len() >= num_values {
+                        break;
+                    }
+                    out.push(0);
+                }
+            } else {
+                let bw = bit_width as usize;
+                let mut bitpos = 0usize;
+                for _ in 0..tv {
+                    if out.len() >= num_values {
+                        break;
+                    }
+                    let mut v: u64 = 0;
+                    for k in 0..bw {
+                        let bp = bitpos + k;
+                        let byte = *chunk
+                            .get(bp / 8)
+                            .ok_or_else(|| bad("rle bitpack index"))?;
+                        let bit = (byte >> (bp % 8)) & 1;
+                        v |= (bit as u64) << k;
+                    }
+                    bitpos += bw;
+                    out.push(v);
+                }
+            }
+        } else {
+            // ── RLE run ──
+            let run_len = header >> 1;
+            let value: u64 = if bit_width == 0 {
+                0
+            } else {
+                let end = pos
+                    .checked_add(val_bytes)
+                    .ok_or_else(|| bad("rle value position overflow"))?;
+                let vb = data
+                    .get(pos..end)
+                    .ok_or_else(|| bad("rle repeated value truncated"))?;
+                pos = end;
+                let mut v: u64 = 0;
+                for (i, &b) in vb.iter().enumerate() {
+                    v |= (b as u64) << (8 * i as u32);
+                }
+                v
+            };
+            // Push at most what is still needed: a giant run_len is
+            // legal and simply satisfies num_values (no OOM — we never
+            // allocate run_len).
+            let mut remaining = run_len;
+            while remaining > 0 && out.len() < num_values {
+                out.push(value);
+                remaining -= 1;
+            }
+        }
+    }
+    out.truncate(num_values);
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // KAT 1 — the canonical parquet-format Encodings.md example:
+    // bit_width=3, one bit-packed group of 8 values 0..=7.
+    // header = (number_of_groups_of_8 << 1) | 1 = (1<<1)|1 = 0x03.
+    // LSB-of-stream-first packing of 0,1,2,3,4,5,6,7 (3 bits each):
+    //   byte0 = 0b1000_1000 = 0x88
+    //   byte1 = 0b1100_0110 = 0xC6
+    //   byte2 = 0b1111_1010 = 0xFA
+    #[test]
+    fn kat_bitpacked_0_to_7_width3() {
+        let stream = [0x03u8, 0x88, 0xC6, 0xFA];
+        let v = decode_hybrid(&stream, 3, 8).expect("decode");
+        assert_eq!(v, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    // KAT 2 — RLE run: value 5 repeated 8 times, bit_width=3.
+    // header = varint(run_len << 1) = varint(8<<1) = varint(16) = 0x10.
+    // repeated-value width = ceil(3/8) = 1 byte = 0x05.
+    #[test]
+    fn kat_rle_run_value5_x8_width3() {
+        let stream = [0x10u8, 0x05];
+        let v = decode_hybrid(&stream, 3, 8).expect("decode");
+        assert_eq!(v, vec![5, 5, 5, 5, 5, 5, 5, 5]);
+    }
+
+    // KAT 3 — bit_width == 0: RLE header varint(4<<1)=varint(8)=0x08,
+    // NO value byte; four zeros.
+    #[test]
+    fn kat_bitwidth0_rle_four_zeros() {
+        let stream = [0x08u8];
+        let v = decode_hybrid(&stream, 0, 4).expect("decode");
+        assert_eq!(v, vec![0, 0, 0, 0]);
+    }
+
+    // KAT 4 — mixed: RLE(value=5, run_len=4, bw=3) then the bit-packed
+    // 0..=7 group. RLE header varint(4<<1)=0x08, value 0x05; then
+    // 0x03,0x88,0xC6,0xFA.
+    #[test]
+    fn kat_mixed_rle_then_bitpacked() {
+        let stream = [0x08u8, 0x05, 0x03, 0x88, 0xC6, 0xFA];
+        let v = decode_hybrid(&stream, 3, 12).expect("decode");
+        assert_eq!(v, vec![5, 5, 5, 5, 0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    // KAT 5 — over-production truncation: same stream, ask for 10.
+    // The bit-packed run yields 8 but only 6 are needed → truncate.
+    #[test]
+    fn kat_overproduction_truncates() {
+        let stream = [0x08u8, 0x05, 0x03, 0x88, 0xC6, 0xFA];
+        let v = decode_hybrid(&stream, 3, 10).expect("decode");
+        assert_eq!(v, vec![5, 5, 5, 5, 0, 1, 2, 3, 4, 5]);
+    }
+
+    // KAT 6 — RLE repeated-value wide width: bit_width=17 →
+    // ceil(17/8)=3 bytes little-endian. value = 100000 = 0x01_86A0
+    // → LE bytes [0xA0,0x86,0x01]. run_len=2 → header varint(2<<1)=0x04.
+    #[test]
+    fn kat_rle_wide_value_width17() {
+        let stream = [0x04u8, 0xA0, 0x86, 0x01];
+        let v = decode_hybrid(&stream, 17, 2).expect("decode");
+        assert_eq!(v, vec![100_000, 100_000]);
+    }
+}

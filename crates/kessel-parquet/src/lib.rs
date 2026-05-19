@@ -25,6 +25,16 @@ pub enum PqValue {
     I64(i64),
     F64(f64),
     Bytes(Vec<u8>),
+    /// INT96 → nanoseconds since the Unix epoch (Julian day
+    /// 2_440_588 == 1970-01-01 UTC). i64 to match the catalog's
+    /// `FieldKind::Timestamp` 8-byte storage. Negative for pre-1970
+    /// timestamps; the fetch-boundary coerce currently surfaces the
+    /// nanos as decimal text (the typed `FieldKind::Timestamp`
+    /// mapping is the next SP108 follow-up).
+    Timestamp(i64),
+    /// DECIMAL → unscaled i128 + scale. Logical value =
+    /// `unscaled / 10^scale`. i128 covers Parquet's max precision (38).
+    Decimal { unscaled: i128, scale: i32 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -111,14 +121,14 @@ fn scatter_nulls(
 fn decode_page(
     payload: &[u8],
     dp_encoding: i32,
-    wp: meta::Type,
+    spec: plain::PlainSpec,
     n: usize,
     max_def_level: u32,
     dict: &[PqValue],
 ) -> Result<Vec<PqValue>, PqError> {
     if max_def_level == 0 {
         return match dp_encoding {
-            0 => plain::decode_plain(payload, wp, n),
+            0 => plain::decode_plain(payload, spec, n),
             2 | 8 => dict::resolve_dict_indices(payload, dict, n),
             _ => Err(PqError::Unsupported(
                 "data page encoding (DELTA/BYTE_STREAM_SPLIT): OBJ-2c".into(),
@@ -143,7 +153,7 @@ fn decode_page(
         .get(consumed..)
         .ok_or_else(|| PqError::Bad("def-level consumed past payload".into()))?;
     let vals = match dp_encoding {
-        0 => plain::decode_plain(body, wp, present)?,
+        0 => plain::decode_plain(body, spec, present)?,
         2 | 8 => dict::resolve_dict_indices(body, dict, present)?,
         _ => {
             return Err(PqError::Unsupported(
@@ -169,7 +179,7 @@ fn decode_data_page_v2(
     region: &[u8],
     ph: &meta::PageHeader,
     codec: meta::Codec,
-    want_ptype: meta::Type,
+    spec: plain::PlainSpec,
     max_def_level: u32,
     dict: &[PqValue],
 ) -> Result<Vec<PqValue>, PqError> {
@@ -257,7 +267,7 @@ fn decode_data_page_v2(
         return Err(PqError::Bad("v2 raw values length mismatch".into()));
     }
     let vals = match ph.v2_encoding {
-        0 => plain::decode_plain(&values_raw, want_ptype, present)?,
+        0 => plain::decode_plain(&values_raw, spec, present)?,
         2 | 8 => dict::resolve_dict_indices(&values_raw, dict, present)?,
         _ => {
             return Err(PqError::Unsupported(
@@ -283,7 +293,7 @@ fn decode_data_page_v2(
 fn read_chunk_values(
     file: &[u8],
     cc: &meta::ColumnChunk,
-    want_ptype: meta::Type,
+    spec: plain::PlainSpec,
     max_def_level: u32,
 ) -> Result<Vec<PqValue>, PqError> {
     match cc.codec {
@@ -338,7 +348,7 @@ fn read_chunk_values(
         let uncomp = usize::try_from(ph.uncompressed_size)
             .map_err(|_| PqError::Bad("dict page size range".into()))?;
         let payload = page_payload(file, dstart, comp, uncomp, cc.codec)?;
-        plain::decode_plain(&payload, want_ptype, dn)?
+        plain::decode_plain(&payload, spec, dn)?
     } else {
         Vec::new()
     };
@@ -394,7 +404,7 @@ fn read_chunk_values(
                 let vals = decode_page(
                     &payload,
                     ph.dp_encoding,
-                    want_ptype,
+                    spec,
                     n,
                     max_def_level,
                     &dict,
@@ -422,7 +432,7 @@ fn read_chunk_values(
                     v2_region,
                     &ph,
                     cc.codec,
-                    want_ptype,
+                    spec,
                     max_def_level,
                     &dict,
                 )?;
@@ -455,6 +465,127 @@ fn read_chunk_values(
     Ok(out)
 }
 
+/// Build the per-leaf `PlainSpec` from a schema element. Upfront
+/// validation of DECIMAL precision/scale ranges, FLBA width, and
+/// physical-vs-logical compatibility — so the decode hot loop is
+/// already on validated metadata.
+///
+/// Errors:
+/// - `PqError::Unsupported`: precision outside `1..=38` (i128 cap).
+/// - `PqError::Bad`: malformed/incompatible spec (negative or
+///   excess scale, FLBA width out of range, DECIMAL on FLOAT/DOUBLE,
+///   INT96 + DECIMAL combination, missing FLBA type_length).
+fn build_plain_spec(leaf: &meta::SchemaLeaf) -> Result<plain::PlainSpec, PqError> {
+    use meta::Type::*;
+    // Detect DECIMAL: either ConvertedType=DECIMAL(5) or LogicalType
+    // DecimalType arm (`logical_type_decimal: Some((scale, precision))`).
+    // T2's `decode_schema_element` agreement check guarantees both sides
+    // agree when both are populated; we read whichever has the values.
+    let decimal_meta: Option<(i32, i32)> = if leaf.converted_type == Some(5) {
+        // ConvertedType DECIMAL: scale/precision are SchemaElement
+        // fields 7/8 (default 0 when absent — caught by precision==0
+        // < 1 check below as Unsupported).
+        let scale = leaf.scale.unwrap_or(0);
+        let precision = leaf.precision.unwrap_or(0);
+        Some((scale, precision))
+    } else if let Some((s, p)) = leaf.logical_type_decimal {
+        Some((s, p))
+    } else {
+        None
+    };
+
+    if let Some((scale, precision)) = decimal_meta {
+        // Precision range: parquet spec allows 1..=38 (i128 holds the
+        // unscaled value; > 38 needs arbitrary precision, out of scope).
+        if precision < 1 || precision > 38 {
+            return Err(PqError::Unsupported(format!(
+                "DECIMAL precision {precision} (must be 1..=38): OBJ-2c-4"
+            )));
+        }
+        if scale < 0 || scale > precision {
+            return Err(PqError::Bad(format!(
+                "DECIMAL scale {scale} out of range for precision {precision}"
+            )));
+        }
+        match leaf.ptype {
+            Int32 if precision > 9 => {
+                return Err(PqError::Bad(
+                    "DECIMAL precision > 9 on INT32 physical type".into(),
+                ))
+            }
+            Int64 if precision > 18 => {
+                return Err(PqError::Bad(
+                    "DECIMAL precision > 18 on INT64 physical type".into(),
+                ))
+            }
+            FixedLenByteArray | ByteArray | Int32 | Int64 => {}
+            Int96 => {
+                return Err(PqError::Bad(
+                    "DECIMAL on INT96 physical type: not supported".into(),
+                ))
+            }
+            _ => {
+                return Err(PqError::Bad(
+                    "DECIMAL on incompatible physical type".into(),
+                ))
+            }
+        }
+        // Build the per-physical DECIMAL spec.
+        return match leaf.ptype {
+            FixedLenByteArray => {
+                let n = leaf
+                    .type_length
+                    .ok_or_else(|| {
+                        PqError::Bad(
+                            "FLBA DECIMAL missing type_length".into(),
+                        )
+                    })?;
+                let n = usize::try_from(n).map_err(|_| {
+                    PqError::Bad("FLBA type_length range".into())
+                })?;
+                if n == 0 || n > 16 {
+                    return Err(PqError::Bad(
+                        "DECIMAL FLBA width out of range (1..=16, i128)".into(),
+                    ));
+                }
+                Ok(plain::PlainSpec::flba_decimal(
+                    n,
+                    precision as u32,
+                    scale as u32,
+                ))
+            }
+            Int32 | Int64 => Ok(plain::PlainSpec::int_decimal(
+                leaf.ptype,
+                precision as u32,
+                scale as u32,
+            )),
+            ByteArray => Ok(plain::PlainSpec::byte_array_decimal(
+                precision as u32,
+                scale as u32,
+            )),
+            _ => unreachable!("guarded above"),
+        };
+    }
+
+    // Non-DECIMAL leaves. FLBA must carry a positive type_length.
+    match leaf.ptype {
+        FixedLenByteArray => {
+            let n = leaf
+                .type_length
+                .ok_or_else(|| PqError::Bad("FLBA missing type_length".into()))?;
+            let n = usize::try_from(n)
+                .map_err(|_| PqError::Bad("FLBA type_length range".into()))?;
+            if n == 0 || n > 65_536 {
+                return Err(PqError::Bad(
+                    "FLBA type_length out of range (1..=65_536)".into(),
+                ));
+            }
+            Ok(plain::PlainSpec::flba(n))
+        }
+        _ => Ok(plain::PlainSpec::plain(leaf.ptype)),
+    }
+}
+
 /// Decode the `wanted` leaf columns (in that output order) from a
 /// whole Parquet object. OBJ-2a: flat REQUIRED columns, PLAIN,
 /// UNCOMPRESSED, V1 data pages, all row groups concatenated.
@@ -473,10 +604,13 @@ pub fn extract(
     }
 
     // Resolve each wanted name to its leaf; enforce known repetition +
-    // supported physical type.
+    // supported physical type. Build a per-leaf `PlainSpec` once here
+    // (validating DECIMAL precision/scale/FLBA width upfront) so the
+    // per-row-group hot loop can stay panic-free.
     // Also collect the schema-declared physical type for each wanted column
     // so the per-row-group loop can verify ColumnMetaData type consistency.
     let mut wanted_ptypes: Vec<meta::Type> = Vec::with_capacity(wanted.len());
+    let mut wanted_specs: Vec<plain::PlainSpec> = Vec::with_capacity(wanted.len());
     let mut wanted_max_def_levels: Vec<u32> = Vec::with_capacity(wanted.len());
     for w in wanted {
         let leaf = md
@@ -502,13 +636,17 @@ pub fn extract(
             | meta::Type::Int64
             | meta::Type::Float
             | meta::Type::Double
-            | meta::Type::ByteArray => {}
+            | meta::Type::ByteArray
+            | meta::Type::Int96
+            | meta::Type::FixedLenByteArray => {}
             t => {
                 return Err(PqError::Unsupported(format!(
                     "physical type {t:?}: OBJ-2c"
                 )))
             }
         }
+        let spec = build_plain_spec(leaf)?;
+        wanted_specs.push(spec);
         wanted_ptypes.push(leaf.ptype);
         wanted_max_def_levels.push(max_def_level);
     }
@@ -538,7 +676,7 @@ pub fn extract(
                     w
                 )));
             }
-            let vals = read_chunk_values(bytes, cc, wanted_ptypes[ci], wanted_max_def_levels[ci])?;
+            let vals = read_chunk_values(bytes, cc, wanted_specs[ci], wanted_max_def_levels[ci])?;
             cols[ci].extend(vals);
         }
     }

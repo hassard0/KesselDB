@@ -271,6 +271,19 @@ fn pq_to_cell(v: kessel_parquet::PqValue) -> json::Cell {
         Bytes(b) => json::Cell::Text(
             String::from_utf8_lossy(&b).into_owned(),
         ),
+        // INT96 → ns since the Unix epoch (T3 OBJ-2c-4): surfaced as
+        // decimal text. The typed `FieldKind::Timestamp` 8-byte
+        // mapping (incl. sign handling for pre-1970) is the explicit
+        // SP108 T6 follow-up; the Text-decimal path here is
+        // end-to-end-correct for any downstream FieldKind::I64/Text.
+        Timestamp(ns) => json::Cell::Text(ns.to_string()),
+        // DECIMAL → unscaled i128 + scale (T3 OBJ-2c-4): surfaced as
+        // the unscaled integer in decimal text. Scale is intentionally
+        // dropped at the fetch boundary in this slice — the typed
+        // `FieldKind::Fixed{scale}` mapping is the explicit T6
+        // follow-up. Users targeting `FieldKind::I64` (or any text
+        // sink) get the unscaled value losslessly today.
+        Decimal { unscaled, scale: _ } => json::Cell::Text(unscaled.to_string()),
     }
 }
 

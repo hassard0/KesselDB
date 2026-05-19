@@ -106,11 +106,6 @@ fn tls_stub_with_fixture(fixture: &'static [u8]) -> u16 {
     port
 }
 
-#[allow(dead_code)]
-fn tls_stub() -> u16 {
-    tls_stub_with_fixture(PARQUET_FIXTURE)
-}
-
 /// Shared fail-closed e2e: serves `fixture` over a self-signed
 /// localhost TLS stub; the production webpki-roots client must
 /// reject it; REFRESH must return OpResult::SchemaError (refresh/

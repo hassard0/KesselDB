@@ -4,7 +4,7 @@ use kessel_crypto::{hex, hmac_sha256, sha256};
 const EMPTY_SHA256: &str =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
-fn enc_seg(seg: &str) -> String {
+pub(crate) fn enc_seg(seg: &str) -> String {
     let mut o = String::with_capacity(seg.len());
     for &b in seg.as_bytes() {
         match b {
@@ -16,7 +16,7 @@ fn enc_seg(seg: &str) -> String {
     o
 }
 
-fn canonical_uri(key: &str) -> String {
+pub(crate) fn canonical_uri(key: &str) -> String {
     let mut s = String::from("/");
     let parts: Vec<String> = key.split('/').map(enc_seg).collect();
     s.push_str(&parts.join("/"));

@@ -53,11 +53,15 @@ pub(crate) fn sign_get_azure(
             rest.split('/').next().unwrap_or(rest).to_string()
         }
     };
-    let path = format!(
-        "/{}/{}",
-        req.bucket_or_container,
-        req.key.trim_start_matches('/')
-    );
+    // SECURITY: RFC-3986 percent-encode the operator-controlled container
+    // and blob key (reusing the KAT-proven S3 encoder) so CR/LF/?/#/space
+    // cannot inject into the HTTP request-line/headers (request smuggling)
+    // nor into the signed canonical_resource/StringToSign. `account` is a
+    // restricted identity ([a-z0-9], also used in `host`) — left as-is.
+    let enc_container = crate::sigv4::enc_seg(&req.bucket_or_container);
+    let enc_key_path =
+        crate::sigv4::canonical_uri(req.key.trim_start_matches('/'));
+    let path = format!("/{enc_container}{enc_key_path}");
     let https_url = format!("https://{host}{path}");
 
     let canonical_headers = format!(
@@ -159,6 +163,34 @@ mod tests {
         assert!(h("authorization").unwrap().starts_with("SharedKey devstoreacct:"));
         // Determinism (additional check).
         assert_eq!(sign_get_azure(&req, now).unwrap().headers, s.headers);
+    }
+
+    #[test]
+    fn azure_key_cannot_inject_headers_or_query() {
+        let r = ObjGetRequest {
+            provider: Provider::Azure,
+            bucket_or_container: "c".into(),
+            key: "a\r\nX-Evil: 1/../../etc?z=1#frag".into(),
+            region: None,
+            endpoint: None,
+            creds: ObjCreds::AzureSharedKey {
+                account: "acct".into(),
+                key_b64: b64::encode(&[9u8; 32]),
+            },
+        };
+        let s = sign_get_azure(&r, DateTime { secs_since_epoch: 1 }).unwrap();
+        assert!(!s.https_url.contains('\r') && !s.https_url.contains('\n'),
+            "CRLF must be encoded out of the Azure URL: {}", s.https_url);
+        assert!(s.https_url.contains("%0D%0A"), "CRLF percent-encoded");
+        assert!(s.https_url.contains("%3F") && s.https_url.contains("%23"),
+            "? and # percent-encoded (no query/fragment injection)");
+        for (k, v) in &s.headers {
+            assert!(!k.contains('\r') && !k.contains('\n')
+                 && !v.contains('\r') && !v.contains('\n'),
+                "no signed Azure header may contain CR/LF");
+        }
+        assert!(s.https_url.starts_with("https://acct.blob.core.windows.net/c/"),
+            "host/container not escapable via key: {}", s.https_url);
     }
 
     #[test]

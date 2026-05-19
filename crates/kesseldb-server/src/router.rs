@@ -530,6 +530,27 @@ impl<'a> Conn<'a> {
             }
         };
 
+        // Object-store sources (`s3://` / `az://`) take a separate path
+        // that signs the GET router-side and reuses the SAME post-fetch
+        // tail. Dispatched BEFORE the env-Bearer/Header auth resolution so
+        // an object-store recipe never touches the HTTP-auth code.
+        let is_obj = recipe.url.starts_with("s3://")
+            || recipe.url.starts_with("az://");
+        if is_obj {
+            #[cfg(feature = "external-sources-objstore")]
+            {
+                return self.do_refresh_objstore(&recipe, &ot, &name, dedup);
+            }
+            #[cfg(not(feature = "external-sources-objstore"))]
+            {
+                let _ = &dedup;
+                return OpResult::SchemaError(format!(
+                    "REFRESH `{name}`: object-store sources require the \
+                     external-sources-objstore build feature"
+                ));
+            }
+        }
+
         // 3. Resolve auth from THIS process's env (a value, never put in
         //    an op or a log line; the recipe only persisted a reference).
         let auth = match &recipe.auth {
@@ -554,6 +575,15 @@ impl<'a> Conn<'a> {
                         ))
                     }
                 }
+            }
+            // OBJSTORE creds only make sense on an `s3://` / `az://`
+            // recipe, which is already dispatched above. Reaching here
+            // means a non-object URL was paired with OBJSTORE auth.
+            ExternalAuth::ObjStoreEnv { .. } => {
+                return OpResult::SchemaError(format!(
+                    "REFRESH `{name}`: OBJSTORE credentials require an \
+                     s3:// or az:// source URL"
+                ))
             }
         };
 
@@ -612,6 +642,12 @@ impl<'a> Conn<'a> {
                 ))
             }
         };
+        // `col_fields` / `key_idx` are still built here so the HTTP path's
+        // pre-fetch validation early-returns at the EXACT original point
+        // (byte-identical observable behavior). The post-fetch tail now
+        // recomputes them verbatim inside `materialize_external_rows`
+        // (shared with the object-store path).
+        let _ = (&col_fields, &key_idx);
 
         // Single fetch step. With no PAGE clause this is exactly the
         // slice-1 one-shot `fetch_rows`; with a PAGE recipe it walks
@@ -663,6 +699,69 @@ impl<'a> Conn<'a> {
             }
         };
 
+        // 5–6 + Txn submission: the post-fetch tail is a behavior-neutral
+        // extraction (`materialize_external_rows`); the bytes submitted are
+        // byte-identical to the previous inline tail (proven by the
+        // external_source_oracle / external_source_tls_oracle staying green).
+        self.materialize_external_rows(&recipe, &ot, &name, &cols, rows, dedup)
+    }
+
+    /// The post-fetch tail of `do_refresh`, extracted VERBATIM so the
+    /// object-store path (`do_refresh_objstore`) can reuse it with
+    /// byte-identical submission semantics. `key_idx` / `col_fields` are
+    /// recomputed here from `recipe` + `ot` EXACTLY as the original inline
+    /// step-4 logic did (same order, same error strings) so the captured
+    /// rows produce the SAME deterministic `ObjectId`s, the SAME codec
+    /// records, and the SAME single all-or-nothing `Op::Txn` through the
+    /// existing `forward` path with the SAME `dedup`.
+    fn materialize_external_rows(
+        &mut self,
+        recipe: &kessel_catalog::ExternalRecipe,
+        ot: &kessel_catalog::ObjectType,
+        name: &str,
+        cols: &[kessel_fetch::ColumnMap],
+        rows: Vec<Vec<Vec<u8>>>,
+        dedup: Vec<u8>,
+    ) -> OpResult {
+        // Parallel: the field and its index in `ot.fields` for each
+        // mapped column, same order as the fetched per-column bytes.
+        // Capturing the index here avoids a re-scan per row (FIX #3).
+        // Recomputed verbatim from the original step-4 build.
+        let mut col_fields: Vec<(&kessel_catalog::Field, usize)> =
+            Vec::with_capacity(recipe.mapping.len());
+        for (fid, _source) in &recipe.mapping {
+            let (idx, field) = match ot
+                .fields
+                .iter()
+                .enumerate()
+                .find(|(_, f)| f.field_id == *fid)
+            {
+                Some(p) => p,
+                None => {
+                    return OpResult::SchemaError(format!(
+                        "REFRESH `{name}`: mapping references unknown \
+                         field_id {fid}"
+                    ))
+                }
+            };
+            col_fields.push((field, idx));
+        }
+        // The KEY column's INDEX within the fetched per-column vec (which
+        // is in `recipe.mapping` order).
+        let key_idx = match recipe
+            .mapping
+            .iter()
+            .position(|(fid, _)| *fid == recipe.key_field_id)
+        {
+            Some(i) => i,
+            None => {
+                return OpResult::SchemaError(format!(
+                    "REFRESH `{name}`: KEY field_id {} is not mapped",
+                    recipe.key_field_id
+                ))
+            }
+        };
+
         // 5. Build the codec record + deterministic ObjectId per row.
         //    Codec path: `kessel_codec::value_from_raw(kind, raw)` turns
         //    each column's raw fixed-width LE bytes into a `Value`
@@ -711,7 +810,7 @@ impl<'a> Conn<'a> {
                 values[*idx] =
                     kessel_codec::value_from_raw(field.kind, &row[ci]);
             }
-            let record = match kessel_codec::encode(&ot, &values) {
+            let record = match kessel_codec::encode(ot, &values) {
                 Ok(r) => r,
                 Err(e) => {
                     return OpResult::SchemaError(format!(
@@ -774,6 +873,144 @@ impl<'a> Conn<'a> {
             OpResult::Ok => OpResult::Ok,
             other => other,
         }
+    }
+
+    #[cfg(feature = "external-sources-objstore")]
+    fn do_refresh_objstore(
+        &mut self,
+        recipe: &kessel_catalog::ExternalRecipe,
+        ot: &kessel_catalog::ObjectType,
+        name: &str,
+        dedup: Vec<u8>,
+    ) -> OpResult {
+        use kessel_catalog::ExternalAuth;
+        use kessel_fetch::{ColumnMap, Format};
+        use kessel_objstore::{
+            sign_get, DateTime, ObjCreds, ObjGetRequest, Provider,
+        };
+
+        let (prov, scheme_len) = if recipe.url.starts_with("s3://") {
+            (Provider::S3, 5)
+        } else {
+            (Provider::Azure, 5)
+        };
+        let rest = &recipe.url[scheme_len..];
+        let (b_or_c, key) = match rest.split_once('/') {
+            Some((b, k)) => (b.to_string(), k.to_string()),
+            None => {
+                return OpResult::SchemaError(format!(
+                    "REFRESH `{name}`: object URL must be \
+                     <scheme>://<bucket-or-container>/<key>"
+                ))
+            }
+        };
+
+        let creds = match &recipe.auth {
+            ExternalAuth::ObjStoreEnv { provider, a_env, b_env, account } => {
+                let getenv = |k: &str| std::env::var(k);
+                if *provider == 1 {
+                    let key_id = match getenv(a_env) {
+                        Ok(v) => v,
+                        Err(_) => return OpResult::SchemaError(format!(
+                            "REFRESH `{name}`: env `{a_env}` not set"
+                        )),
+                    };
+                    let secret = match getenv(b_env) {
+                        Ok(v) => v,
+                        Err(_) => return OpResult::SchemaError(format!(
+                            "REFRESH `{name}`: env `{b_env}` not set"
+                        )),
+                    };
+                    ObjCreds::S3 { key_id, secret }
+                } else {
+                    let key_b64 = match getenv(a_env) {
+                        Ok(v) => v,
+                        Err(_) => return OpResult::SchemaError(format!(
+                            "REFRESH `{name}`: env `{a_env}` not set"
+                        )),
+                    };
+                    ObjCreds::AzureSharedKey {
+                        account: account.clone().unwrap_or_default(),
+                        key_b64,
+                    }
+                }
+            }
+            _ => {
+                return OpResult::SchemaError(format!(
+                    "REFRESH `{name}`: object-store source missing \
+                     OBJSTORE credentials"
+                ))
+            }
+        };
+
+        let now = DateTime {
+            secs_since_epoch: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        };
+        let signed = match sign_get(
+            &ObjGetRequest {
+                provider: prov,
+                bucket_or_container: b_or_c,
+                key,
+                region: recipe.region.clone(),
+                endpoint: recipe.endpoint.clone(),
+                creds,
+            },
+            now,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                return OpResult::SchemaError(format!(
+                    "REFRESH `{name}`: sign: {e}"
+                ))
+            }
+        };
+
+        let mut cols: Vec<ColumnMap> =
+            Vec::with_capacity(recipe.mapping.len());
+        for (fid, source) in &recipe.mapping {
+            let field = match ot.fields.iter().find(|f| f.field_id == *fid) {
+                Some(f) => f,
+                None => {
+                    return OpResult::SchemaError(format!(
+                        "REFRESH `{name}`: mapping references unknown \
+                         field_id {fid}"
+                    ))
+                }
+            };
+            cols.push(ColumnMap {
+                name: field.name.clone(),
+                kind: field.kind,
+                source: source.clone(),
+            });
+        }
+        let format = match recipe.format {
+            0 => Format::Json,
+            1 => Format::Csv,
+            2 => Format::Ndjson,
+            n => {
+                return OpResult::SchemaError(format!(
+                    "REFRESH `{name}`: unknown format code {n}"
+                ))
+            }
+        };
+
+        let rows = match kessel_fetch::fetch_rows_signed(
+            &signed.https_url,
+            &signed.headers,
+            format,
+            &cols,
+            recipe.rows_path.as_deref(),
+            kessel_fetch::DEFAULT_MAX_BODY,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                return OpResult::SchemaError(format!("refresh: {e}"))
+            }
+        };
+        self.materialize_external_rows(recipe, ot, name, &cols, rows, dedup)
     }
 }
 

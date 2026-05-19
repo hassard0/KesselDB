@@ -28,11 +28,18 @@ rustls-pemfile = { version = "2", optional = true }
 kessel-fetch = { path = "../kessel-fetch", optional = true }
 kessel-crypto = { path = "../kessel-crypto", optional = true }
 
+# Opt-in object-store external sources (REFRESH from s3://|az://). OFF
+# by default; pulled in only with `--features external-sources-objstore`
+# so the standard and plain external-sources builds stay unchanged. The
+# router signs requests router-side (env-resolved creds, never logged).
+kessel-objstore = { path = "../kessel-objstore", optional = true }
+
 [features]
 default = []
 tls = ["dep:rustls", "dep:rustls-pemfile"]
 external-sources = ["dep:kessel-fetch", "dep:kessel-crypto"]
 external-sources-tls = ["external-sources", "kessel-fetch/tls", "dep:rustls", "dep:rustls-pemfile"]
+external-sources-objstore = ["external-sources", "kessel-fetch/object-store", "dep:kessel-objstore", "dep:rustls", "dep:rustls-pemfile"]
 
 [dev-dependencies]
 kessel-expr = { path = "../kessel-expr" }

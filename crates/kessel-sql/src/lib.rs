@@ -800,6 +800,7 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
                 mapping,
                 rows_path,
                 pagination,
+                objstore: None,
             });
         }
         // CREATE [UNIQUE|RANGE] INDEX ON t (cols) — DDL for indexes.

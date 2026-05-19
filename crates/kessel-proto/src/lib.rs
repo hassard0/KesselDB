@@ -169,6 +169,11 @@ pub enum Op {
         /// CursorJson{a=path, b=param}. `None` = slice-1 default.
         /// MUST match `kessel_catalog::PaginationRecipe`'s wire tags; adding a variant there requires a new tag here AND a WAL protocol-version bump.
         pagination: Option<(u8, String, String)>,
+        /// Object-store extras `(provider, account, region, endpoint)`.
+        /// provider 1=S3 / 2=Azure; strings may be empty. `None` =
+        /// not an object-store source / older frame (tolerant decode —
+        /// absent ⇒ None, never a failure).
+        objstore: Option<(u8, String, String, String)>,
     },
     /// Drop a declared external source (external-sources feature).
     DropExternalSource { name: String },
@@ -517,7 +522,7 @@ impl Op {
             Op::CreateExternalSource {
                 name, type_def, url, format, key_field_id,
                 auth_kind, auth_a, auth_b, mapping,
-                rows_path, pagination,
+                rows_path, pagination, objstore,
             } => {
                 codec::put_bytes(&mut b, name.as_bytes());
                 codec::put_bytes(&mut b, type_def);
@@ -547,6 +552,19 @@ impl Op {
                         b.push(*tag);
                         codec::put_bytes(&mut b, a.as_bytes());
                         codec::put_bytes(&mut b, c.as_bytes());
+                    }
+                }
+                // Additive (OBJ-1): None ⇒ one trailing 0 tag byte; an
+                // OLD frame has neither and the tolerant decode treats
+                // its absence as None.
+                match objstore {
+                    None => b.push(0),
+                    Some((prov, acct, region, endpoint)) => {
+                        b.push(1);
+                        b.push(*prov);
+                        codec::put_bytes(&mut b, acct.as_bytes());
+                        codec::put_bytes(&mut b, region.as_bytes());
+                        codec::put_bytes(&mut b, endpoint.as_bytes());
                     }
                 }
             }
@@ -817,10 +835,24 @@ impl Op {
                     }
                     Some(_) => return None,
                 };
+                let objstore = match c.u8() {
+                    None | Some(0) => None,
+                    Some(1) => {
+                        let prov = c.u8()?;
+                        let acct = String::from_utf8_lossy(&c.bytes()?).into_owned();
+                        let region = String::from_utf8_lossy(&c.bytes()?).into_owned();
+                        let endpoint = String::from_utf8_lossy(&c.bytes()?).into_owned();
+                        Some((prov, acct, region, endpoint))
+                    }
+                    // Unknown PRESENT tag ⇒ fail (matches the rows_path/
+                    // pagination stance; an EXHAUSTED cursor (None) stays
+                    // the slice-1/None default).
+                    Some(_) => return None,
+                };
                 Op::CreateExternalSource {
                     name, type_def, url, format, key_field_id,
                     auth_kind, auth_a, auth_b, mapping,
-                    rows_path, pagination,
+                    rows_path, pagination, objstore,
                 }
             }
             42 => Op::DropExternalSource {
@@ -1152,7 +1184,7 @@ mod tests {
                 format: 0, key_field_id: 2, auth_kind: 1,
                 auth_a: "TOKEN_ENV".into(), auth_b: String::new(),
                 mapping: vec![(1,"id".into()), (2,"k".into())],
-                rows_path: None, pagination: None,
+                rows_path: None, pagination: None, objstore: None,
             },
             Op::DropExternalSource { name: "feed".into() },
             Op::RefreshExternalSource { name: "feed".into() },
@@ -1173,17 +1205,20 @@ mod tests {
                 mapping:vec![(1,"id".into())],
                 rows_path: Some("d.items".into()),
                 pagination: Some((3, "m.c".into(), "cursor".into())),
+                objstore: None,
             },
             Op::CreateExternalSource{
                 name:"g".into(), type_def:vec![], url:"u2".into(), format:0,
                 key_field_id:2, auth_kind:1, auth_a:"E".into(), auth_b:String::new(),
                 mapping:vec![], rows_path:None,
                 pagination: Some((2, String::new(), String::new())),
+                objstore: None,
             },
             Op::CreateExternalSource{
                 name:"h".into(), type_def:vec![9], url:"u3".into(), format:1,
                 key_field_id:1, auth_kind:0, auth_a:String::new(), auth_b:String::new(),
                 mapping:vec![(1,"a".into())], rows_path:None, pagination:None,
+                objstore: None,
             },
         ] {
             let back = Op::decode(&op.encode()).expect("decode");
@@ -1207,6 +1242,46 @@ mod tests {
         bad.extend_from_slice(&0u32.to_le_bytes());  // mapping len = 0
         bad.push(7);                                 // UNKNOWN rows_path tag
         assert!(Op::decode(&bad).is_none(), "unknown rows_path tag must fail decode");
+    }
+
+    #[test]
+    fn create_external_source_objstore_additive_backcompat() {
+        let op = Op::CreateExternalSource {
+            name: "s".into(),
+            type_def: vec![1, 2, 3],
+            url: "s3://b/k.json".into(),
+            format: 0,
+            key_field_id: 1,
+            auth_kind: 3,
+            auth_a: "AWS_ID".into(),
+            auth_b: "AWS_SECRET".into(),
+            mapping: vec![(1, "id".into())],
+            rows_path: None,
+            pagination: None,
+            objstore: Some((1, "acct".into(), "us-east-1".into(), "".into())),
+        };
+        let enc = op.encode();
+        assert_eq!(Op::decode(&enc).unwrap(), op);
+
+        let old = Op::CreateExternalSource {
+            name: "s".into(),
+            type_def: vec![1, 2, 3],
+            url: "http://h".into(),
+            format: 0,
+            key_field_id: 1,
+            auth_kind: 1,
+            auth_a: "TOK".into(),
+            auth_b: String::new(),
+            mapping: vec![(1, "id".into())],
+            rows_path: None,
+            pagination: None,
+            objstore: None,
+        };
+        let mut frame = old.encode();
+        assert_eq!(*frame.last().unwrap(), 0u8, "objstore tag is last");
+        frame.pop();
+        let dec = Op::decode(&frame).expect("old frame decodes");
+        assert_eq!(dec, old);
     }
 
     #[test]

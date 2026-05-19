@@ -3532,6 +3532,7 @@ impl<V: Vfs> StateMachine<V> {
                 mapping,
                 rows_path,
                 pagination,
+                objstore: _,
             } => {
                 if self.catalog.types.iter().any(|t| t.name == name) {
                     return OpResult::SchemaError(format!(
@@ -3742,7 +3743,7 @@ mod tests {
             format: 0, key_field_id: 1, auth_kind: 1,
             auth_a: "TOK_ENV".into(), auth_b: String::new(),
             mapping: vec![(1, "id".into()), (2, "nm".into())],
-            rows_path: None, pagination: None,
+            rows_path: None, pagination: None, objstore: None,
         });
         assert_eq!(r, OpResult::Ok, "create should return Ok");
         let cat = sm.catalog();
@@ -3776,7 +3777,7 @@ mod tests {
             format: 0, key_field_id: 1, auth_kind: 99,
             auth_a: String::new(), auth_b: String::new(),
             mapping: vec![(1, "x".into())],
-            rows_path: None, pagination: None,
+            rows_path: None, pagination: None, objstore: None,
         });
         assert!(matches!(br, OpResult::SchemaError(_)), "bad auth_kind => SchemaError, got {br:?}");
         let cat = sm.catalog();
@@ -3796,6 +3797,7 @@ mod tests {
             mapping: vec![(1, "id".into())],
             rows_path: Some("d.items".into()),
             pagination: Some((3, "m.c".into(), "cursor".into())),
+            objstore: None,
         }), OpResult::Ok);
         let cat = sm.catalog();
         let tid2 = cat.types.iter().find(|t| t.name == "feed2").unwrap().type_id;
@@ -3811,6 +3813,7 @@ mod tests {
             key_field_id: 1, auth_kind: 0, auth_a: String::new(), auth_b: String::new(),
             mapping: vec![(1, "id".into())], rows_path: None,
             pagination: Some((2, String::new(), String::new())),
+            objstore: None,
         }), OpResult::Ok);
         let cat = sm.catalog();
         let tid3 = cat.types.iter().find(|t| t.name == "feed3").unwrap().type_id;
@@ -3824,6 +3827,7 @@ mod tests {
             key_field_id: 1, auth_kind: 0, auth_a: String::new(), auth_b: String::new(),
             mapping: vec![(1, "id".into())], rows_path: None,
             pagination: Some((9, String::new(), String::new())),
+            objstore: None,
         }), OpResult::SchemaError(_)));
         assert!(sm.catalog().types.iter().all(|t| t.name != "feed4"),
             "bad pagination tag must reject BEFORE creating the backing type");
@@ -3835,6 +3839,7 @@ mod tests {
             key_field_id: 1, auth_kind: 0, auth_a: String::new(), auth_b: String::new(),
             mapping: vec![(1, "id".into())], rows_path: Some("data".into()),
             pagination: Some((1, "p.next".into(), String::new())),
+            objstore: None,
         }), OpResult::Ok);
         let cat = sm.catalog();
         let tid5 = cat.types.iter().find(|t| t.name == "feed5").unwrap().type_id;
@@ -3858,7 +3863,7 @@ mod tests {
                 format: 0, key_field_id: 1, auth_kind: 0,
                 auth_a: String::new(), auth_b: String::new(),
                 mapping: vec![(1, "pid".into())],
-                rows_path: None, pagination: None,
+                rows_path: None, pagination: None, objstore: None,
             }),
             OpResult::Ok
         );

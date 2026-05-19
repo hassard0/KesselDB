@@ -1084,7 +1084,7 @@ mod tests {
                 name: "s".into(), type_def: vec![], url: String::new(),
                 format: 0, key_field_id: 1, auth_kind: 0,
                 auth_a: String::new(), auth_b: String::new(), mapping: vec![],
-                rows_path: None, pagination: None,
+                rows_path: None, pagination: None, objstore: None,
             }),
             Route::All
         );

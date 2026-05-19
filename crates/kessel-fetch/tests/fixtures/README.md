@@ -3,7 +3,7 @@
 `localhost.pem` / `localhost.key.pem` — a self-signed, CA-capable
 certificate for `localhost` (SAN `DNS:localhost`) used **only** by the
 `#[cfg(feature = "tls")]` integration tests. It is intentionally given
-a ~730000-day (year ≈3998) validity so the checked-in bytes never
+a ~730000-day (year 4025) validity so the checked-in bytes never
 expire the test suite. No external CA, no `rcgen`/openssl test-time
 dependency.
 
@@ -18,4 +18,6 @@ considered compromised — these are test-only and trust nothing real):
       -addext "keyUsage=critical,digitalSignature,keyCertSign"
 
 This key secures nothing real; it exists so a localhost rustls stub
-can present a chain the test client is configured to trust.
+can present a chain the test client is configured to trust. This
+self-signed, CA:TRUE, localhost-only pattern is for this test fixture
+exclusively and must NOT be used for production or staging certificates.

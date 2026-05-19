@@ -373,6 +373,16 @@ pub fn extract(
 mod tests {
     use super::*;
 
+    // Real python-gzip member of struct.pack('<qq',7,-2) (16 raw bytes).
+    // Regenerate: python -c "import gzip,struct,sys; sys.stdout.buffer.write(gzip.compress(struct.pack('<qq',7,-2)))"
+    // (gzip embeds a wall-clock MTIME in header bytes 4-7; the DEFLATE
+    // body + CRC32/ISIZE trailer are deterministic — only MTIME varies.)
+    const GZ_7_NEG2: &[u8] = &[
+        0x1f,0x8b,0x08,0x00,0xb8,0xa3,0x0c,0x6a,0x02,0xff,
+        0x63,0x67,0x80,0x80,0x7f,0xff,0x21,0x00,0x00,0xcb,
+        0xb3,0x8e,0x99,0x10,0x00,0x00,0x00,
+    ];
+
     // ── helpers (same as Tasks 2–5 hand-encoders) ──────────────────────
     fn uv(out: &mut Vec<u8>, mut v: u64) {
         loop {
@@ -661,16 +671,8 @@ mod tests {
 
     #[test]
     fn extract_decodes_gzip_plain_int64() {
-        // gz = python gzip.compress(struct.pack('<qq', 7, -2))
-        // captured via: python -c "import gzip,struct,sys;
-        //   sys.stdout.buffer.write(gzip.compress(struct.pack('<qq',7,-2)))"
         // Independent authority (Python stdlib gzip — NOT our code).
-        let gz: &[u8] = &[
-            0x1f,0x8b,0x08,0x00,0xb8,0xa3,0x0c,0x6a,0x02,0xff,
-            0x63,0x67,0x80,0x80,0x7f,0xff,0x21,0x00,0x00,0xcb,
-            0xb3,0x8e,0x99,0x10,0x00,0x00,0x00,
-        ];
-        let f = build_gzip_plain_int64_file(gz);
+        let f = build_gzip_plain_int64_file(GZ_7_NEG2);
         assert_eq!(
             extract(&f, &["id"]).expect("gzip"),
             vec![vec![PqValue::I64(7)], vec![PqValue::I64(-2)]],
@@ -680,12 +682,7 @@ mod tests {
     #[test]
     fn extract_gzip_uncompressed_snappy_identical() {
         // Source-format independence: same logical [7,-2] three ways.
-        let gz: &[u8] = &[
-            0x1f,0x8b,0x08,0x00,0xb8,0xa3,0x0c,0x6a,0x02,0xff,
-            0x63,0x67,0x80,0x80,0x7f,0xff,0x21,0x00,0x00,0xcb,
-            0xb3,0x8e,0x99,0x10,0x00,0x00,0x00,
-        ];
-        let g = extract(&build_gzip_plain_int64_file(gz), &["id"]).unwrap();
+        let g = extract(&build_gzip_plain_int64_file(GZ_7_NEG2), &["id"]).unwrap();
         let p = extract(&build_parquet_file(0, 0, 0, false), &["id"]).unwrap();
         let s = extract(&build_snappy_plain_int64_file(), &["id"]).unwrap();
         assert_eq!(g, p);

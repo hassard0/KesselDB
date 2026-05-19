@@ -784,6 +784,25 @@ messages.
 > REPEATED/nested (incl. V2 repetition levels), and pages >64 MiB
 > remain Unsupported (→ OBJ-2c-2/4/5).
 
+> **OBJ-2c-4 (SP108):** INT96 timestamps and DECIMAL logical-type
+> values are now decoded for the existing flat REQUIRED or OPTIONAL ×
+> UNCOMPRESSED|Snappy|GZIP × V1|V2 × PLAIN|dict matrix. `INT96`
+> physical columns decode to `PqValue::Timestamp(i64 ns)` via checked
+> Julian-day arithmetic (nanoseconds since Unix epoch). `DECIMAL`
+> logical-type columns decode to `PqValue::Decimal { unscaled: i128,
+> scale: i32 }` for physical types INT32, INT64, and
+> FixedLenByteArray (BYTE_ARRAY DECIMAL is covered by hand-KATs only;
+> pyarrow 24.0.0 does not write it). FLBA non-DECIMAL columns (e.g.,
+> FLBA-UUID) decode to `PqValue::Bytes`. Today, `pq_to_cell` maps
+> Timestamp → `Cell::Text` (Unix-ns string) and Decimal →
+> `Cell::Text` (unscaled-integer string); mapping via `FieldKind::I64`
+> or `FieldKind::I128` (unscaled) works end-to-end. Coercion to
+> `FieldKind::Timestamp` (for Timestamp) and `FieldKind::Fixed{scale}`
+> (for Decimal) are immediate follow-up items. DECIMAL precision must
+> be 1..=38 (backed by i128); precision > 38 is rejected with
+> `Unsupported`. ZSTD/lz4/brotli, REPEATED/nested (incl. V2
+> rep-levels), and pages >64 MiB remain Unsupported (→ OBJ-2c-2/5).
+
 `FORMAT PARQUET` is supported for `s3://` and `az://` sources when the
 server is built with `--features external-sources-objstore`. Plain
 `http://` / `https://` URLs are **rejected** with a clear message if
@@ -820,9 +839,9 @@ CREATE EXTERNAL SOURCE readings (
   `KEY`) are identical to §7e.
 - `REFRESH` and `DROP EXTERNAL SOURCE` work identically to §7e.
 
-### Parquet scope: what is currently supported (OBJ-2a → OBJ-2c-3)
+### Parquet scope: what is currently supported (OBJ-2a → OBJ-2c-4)
 
-| Parquet property | OBJ-2a → OBJ-2c-3 |
+| Parquet property | OBJ-2a → OBJ-2c-4 |
 |---|---|
 | Encoding | `PLAIN` and dictionary (`PLAIN_DICTIONARY`/`RLE_DICTIONARY`); RLE/bit-packing hybrid for dictionary indices |
 | Compression codec | `UNCOMPRESSED`, `SNAPPY` (raw block; pages ≤ 64 MiB decompressed), or `GZIP` (RFC 1952; pages ≤ 64 MiB decompressed) |
@@ -830,7 +849,9 @@ CREATE EXTERNAL SOURCE readings (
 | Data page version | V1 and V2 (`DATA_PAGE_V2`) |
 | Row groups | Multi-row-group files are fully supported |
 | Column subset | Only the recipe-mapped columns are decoded; unmapped columns are skipped |
-| Physical types | `BOOLEAN`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `BYTE_ARRAY` |
+| Physical types | `BOOLEAN`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `BYTE_ARRAY`, `INT96` (→ Timestamp), `FixedLenByteArray` (raw bytes or DECIMAL) |
+| Logical types | `DECIMAL{precision ≤ 38, scale ≤ precision}` (typed `PqValue::Decimal{ unscaled: i128, scale }`) |
+| Temporal | `INT96` → `PqValue::Timestamp` (Unix nanoseconds; ≥ 1970 end-to-end today via `FieldKind::Timestamp`; any sign via `FieldKind::I64`) |
 | Null values | OPTIONAL def-level 0 rows → `PqValue::Null` (coerced via the same path as JSON `null`) |
 
 ### What is NOT supported (rejected at REFRESH with a precise error)
@@ -851,8 +872,24 @@ as every other format):
   Unsupported pending OBJ-2c-2.
 - **Snappy pages above 64 MiB decompressed** — rejected with
   `Unsupported("Snappy decompressed page too large: OBJ-2c")`.
-- **`INT96` / `FIXED_LEN_BYTE_ARRAY` / `DECIMAL`** physical types —
-  rejected with `Unsupported("INT96/FIXED_LEN_BYTE_ARRAY: OBJ-2c")`.
+- **DECIMAL precision > 38** — rejected with
+  `Unsupported("DECIMAL precision … (must be 1..=38): OBJ-2c-4")`.
+  DECIMAL backed by i128 (≤ 38 digits) is supported; wider types are not.
+- **Pre-1970 INT96 through `FieldKind::Timestamp` coerce** — the decoder
+  produces a correct negative-nanosecond `PqValue::Timestamp`; the
+  `FieldKind::Timestamp` coerce path in `pq_to_cell` is typed
+  `FetchError::Type` at coerce time for negative values. Map to
+  `FieldKind::I64` for any sign (unscaled Unix ns); immediate follow-up:
+  signed-Timestamp FieldKind extension.
+- **DECIMAL → `FieldKind::Fixed` coerce** — `pq_to_cell` Decimal arm is
+  typed `FetchError::Type` at coerce time when the target column is
+  `FieldKind::Fixed` (Fixed is internal-only today); immediate follow-up:
+  `to_field_bytes` Fixed arm. Mapping DECIMAL → `FieldKind::I128`/`I64`
+  (unscaled integer) works today.
+- **BYTE_ARRAY DECIMAL via pyarrow** — hand-KAT-only coverage; pyarrow
+  24.0.0 does not write BYTE_ARRAY DECIMAL (it always chooses INT32, INT64,
+  or FLBA based on precision). The decode arm is implemented and KAT-tested;
+  real-fixture coverage is deferred until a writer that emits it is available.
 - **A mapped column name absent from the Parquet schema** — rejected
   with `Bad("column \`<name>\` not found in Parquet schema")`.
 

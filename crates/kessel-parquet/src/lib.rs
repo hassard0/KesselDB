@@ -75,6 +75,30 @@ fn page_payload<'a>(
     }
 }
 
+/// Scatter `vals` (the decoded *present* values) into `n` output slots
+/// per the def-level vector `defs` (`d==1` → next value, `d==0` → Null).
+/// This is the EXACT OPTIONAL null-scatter logic relocated verbatim out
+/// of `decode_page`'s `max_def_level == 1` arm — shared with the V2 path.
+/// Same count-mismatch `Bad`, same `PqValue::Null` placement.
+fn scatter_nulls(
+    defs: &[u64],
+    vals: Vec<PqValue>,
+    n: usize,
+) -> Result<Vec<PqValue>, PqError> {
+    let mut out = Vec::with_capacity(n);
+    let mut it = vals.into_iter();
+    for &d in defs {
+        if d == 1 {
+            out.push(it.next().ok_or_else(|| {
+                PqError::Bad("value/def-level count mismatch".into())
+            })?);
+        } else {
+            out.push(PqValue::Null);
+        }
+    }
+    Ok(out)
+}
+
 /// Decode one V1 data-page payload, returning exactly `n` `PqValue`s.
 ///
 /// `max_def_level == 0` (REQUIRED): no level bytes — directly decode `n`
@@ -130,18 +154,120 @@ fn decode_page(
     if vals.len() != present {
         return Err(PqError::Bad("value/def-level count mismatch".into()));
     }
-    let mut out = Vec::with_capacity(n);
-    let mut it = vals.into_iter();
-    for &d in &defs {
-        if d == 1 {
-            out.push(it.next().ok_or_else(|| {
-                PqError::Bad("value/def-level count mismatch".into())
-            })?);
-        } else {
-            out.push(PqValue::Null);
+    scatter_nulls(&defs, vals, n)
+}
+
+/// Decode one DATA_PAGE_V2 page (`page_type == 3`).
+///
+/// `region` is the raw on-disk page body `file[dstart..dstart+compressed]`.
+/// V2 layout: `[rep levels (rep_len)][def levels (def_len)][values]`.
+/// Repetition levels (nested/REPEATED) are out of scope ⇒ Unsupported.
+/// Flat OPTIONAL def levels are an RLE/bit-packing hybrid (bit_width=1)
+/// of exactly `def_len` bytes — NOT 4-byte length-prefixed (that's V1).
+/// The values section is independently (de)compressed per `is_compressed`.
+fn decode_data_page_v2(
+    region: &[u8],
+    ph: &meta::PageHeader,
+    codec: meta::Codec,
+    want_ptype: meta::Type,
+    max_def_level: u32,
+    dict: &[PqValue],
+) -> Result<Vec<PqValue>, PqError> {
+    let rep_len = usize::try_from(ph.v2_rep_len)
+        .map_err(|_| PqError::Bad("v2 rep_len range".into()))?;
+    if rep_len > 0 {
+        return Err(PqError::Unsupported(
+            "REPEATED/nested V2 (repetition levels): OBJ-2c-5".into(),
+        ));
+    }
+    let def_len = usize::try_from(ph.v2_def_len)
+        .map_err(|_| PqError::Bad("v2 def_len range".into()))?;
+    let n = usize::try_from(ph.v2_num_values)
+        .map_err(|_| PqError::Bad("v2 num_values range".into()))?;
+    let lvl_end = rep_len
+        .checked_add(def_len)
+        .ok_or_else(|| PqError::Bad("v2 level len ovf".into()))?;
+    if lvl_end > region.len() {
+        return Err(PqError::Bad("v2 levels exceed page".into()));
+    }
+    let def_bytes = region
+        .get(rep_len..lvl_end)
+        .ok_or_else(|| PqError::Bad("v2 def slice".into()))?;
+    let values_section = region
+        .get(lvl_end..)
+        .ok_or_else(|| PqError::Bad("v2 values slice".into()))?;
+    // def-levels
+    let (defs, present): (Option<Vec<u64>>, usize) = if max_def_level == 1 {
+        let d = rle::decode_hybrid(def_bytes, 1, n)?;
+        if d.len() != n {
+            return Err(PqError::Bad("v2 def count".into()));
+        }
+        if d.iter().any(|&x| x > 1) {
+            return Err(PqError::Bad("v2 def-level exceeds max".into()));
+        }
+        let p = d.iter().filter(|&&x| x == 1).count();
+        // defense-in-depth: cross-check vs declared num_nulls
+        let nn = usize::try_from(ph.v2_num_nulls)
+            .map_err(|_| PqError::Bad("v2 num_nulls range".into()))?;
+        if n.checked_sub(nn) != Some(p) {
+            return Err(PqError::Bad(
+                "v2 num_nulls vs def-levels mismatch".into(),
+            ));
+        }
+        (Some(d), p)
+    } else {
+        if def_len != 0 {
+            return Err(PqError::Bad(
+                "v2 def_len non-zero for REQUIRED".into(),
+            ));
+        }
+        (None, n)
+    };
+    // values: target uncompressed length
+    let uncomp = usize::try_from(ph.uncompressed_size)
+        .map_err(|_| PqError::Bad("v2 uncompressed size range".into()))?;
+    let vt = uncomp
+        .checked_sub(lvl_end)
+        .ok_or_else(|| PqError::Bad("v2 values target underflow".into()))?;
+    let values_raw: std::borrow::Cow<[u8]> = match codec {
+        meta::Codec::Uncompressed => std::borrow::Cow::Borrowed(values_section),
+        _ if !ph.v2_is_compressed => std::borrow::Cow::Borrowed(values_section),
+        meta::Codec::Snappy => {
+            std::borrow::Cow::Owned(snappy::decompress(values_section, vt)?)
+        }
+        meta::Codec::Gzip => {
+            std::borrow::Cow::Owned(gzip::decompress(values_section, vt)?)
+        }
+        meta::Codec::Other(_) => {
+            return Err(PqError::Unsupported(
+                "compression codec (zstd/lz4/brotli): OBJ-2c".into(),
+            ))
+        }
+    };
+    // when uncompressed/raw, values_section must be exactly vt
+    if matches!(codec, meta::Codec::Uncompressed) || !ph.v2_is_compressed {
+        if values_section.len() != vt {
+            return Err(PqError::Bad("v2 raw values length mismatch".into()));
         }
     }
-    Ok(out)
+    let vals = match ph.v2_encoding {
+        0 => plain::decode_plain(&values_raw, want_ptype, present)?,
+        2 | 8 => dict::resolve_dict_indices(&values_raw, dict, present)?,
+        _ => {
+            return Err(PqError::Unsupported(
+                "data page encoding (DELTA/BYTE_STREAM_SPLIT): OBJ-2c".into(),
+            ))
+        }
+    };
+    match defs {
+        Some(d) => scatter_nulls(&d, vals, n),
+        None => {
+            if vals.len() != n {
+                return Err(PqError::Bad("v2 value count".into()));
+            }
+            Ok(vals)
+        }
+    }
 }
 
 /// Read one column chunk's values across all its pages.
@@ -221,13 +347,12 @@ fn read_chunk_values(
             .get(off..)
             .ok_or_else(|| PqError::Bad("data page offset past EOF".into()))?;
         let (ph, hlen) = meta::decode_page_header(region)?;
-        if ph.page_type != 0 {
-            return Err(PqError::Unsupported(
-                "non-V1 data page (V2/index): OBJ-2c".into(),
-            ));
-        }
-        let n = usize::try_from(ph.dp_num_values)
-            .map_err(|_| PqError::Bad("num_values range".into()))?;
+        // Preserve the V1 path's exact fallible-check ordering: the
+        // `dp_num_values` range check is V1-only and historically ran
+        // FIRST; for `page_type == 3` it is meaningless (V2 uses
+        // `v2_num_values`) so it is computed inside the V1 arm. The
+        // dstart/comp/uncomp bookkeeping is shared and uses the exact
+        // same expressions + error strings the V1 path has always used.
         let dstart = off
             .checked_add(hlen)
             .ok_or_else(|| PqError::Bad("page hdr len ovf".into()))?;
@@ -235,19 +360,58 @@ fn read_chunk_values(
             .map_err(|_| PqError::Bad("page comp size range".into()))?;
         let uncomp = usize::try_from(ph.uncompressed_size)
             .map_err(|_| PqError::Bad("page size range".into()))?;
-        let payload = page_payload(file, dstart, comp, uncomp, cc.codec)?;
-        // decode_page's dict arms (dp_encoding 2|8, both REQUIRED and
-        // OPTIONAL) call dict::resolve_dict_indices, which needs a populated
-        // `dict`; `dict` is only populated when dictionary_page_offset is
-        // present. Guard here so the failure is a precise typed Bad rather
-        // than an empty-dict OOB inside decode_page.
-        if matches!(ph.dp_encoding, 2 | 8) && cc.dictionary_page_offset.is_none() {
-            return Err(PqError::Bad(
-                "dictionary-encoded data page without dictionary_page_offset"
-                    .into(),
-            ));
-        }
-        let vals = decode_page(&payload, ph.dp_encoding, want_ptype, n, max_def_level, &dict)?;
+        let vals = match ph.page_type {
+            0 => {
+                // ── existing V1 path — byte-identical ──
+                let n = usize::try_from(ph.dp_num_values)
+                    .map_err(|_| PqError::Bad("num_values range".into()))?;
+                let payload = page_payload(file, dstart, comp, uncomp, cc.codec)?;
+                // decode_page's dict arms (dp_encoding 2|8, both REQUIRED and
+                // OPTIONAL) call dict::resolve_dict_indices, which needs a populated
+                // `dict`; `dict` is only populated when dictionary_page_offset is
+                // present. Guard here so the failure is a precise typed Bad rather
+                // than an empty-dict OOB inside decode_page.
+                if matches!(ph.dp_encoding, 2 | 8)
+                    && cc.dictionary_page_offset.is_none()
+                {
+                    return Err(PqError::Bad(
+                        "dictionary-encoded data page without dictionary_page_offset"
+                            .into(),
+                    ));
+                }
+                decode_page(
+                    &payload,
+                    ph.dp_encoding,
+                    want_ptype,
+                    n,
+                    max_def_level,
+                    &dict,
+                )?
+            }
+            3 => {
+                let v2_region = file
+                    .get(
+                        dstart
+                            ..dstart.checked_add(comp).ok_or_else(|| {
+                                PqError::Bad("v2 region ovf".into())
+                            })?,
+                    )
+                    .ok_or_else(|| PqError::Bad("v2 page truncated".into()))?;
+                decode_data_page_v2(
+                    v2_region,
+                    &ph,
+                    cc.codec,
+                    want_ptype,
+                    max_def_level,
+                    &dict,
+                )?
+            }
+            _ => {
+                return Err(PqError::Unsupported(
+                    "non-V1/V2 data page (index): OBJ-2c".into(),
+                ))
+            }
+        };
         if out.len().checked_add(vals.len()).map(|t| t > want_rows).unwrap_or(true) {
             return Err(PqError::Bad(
                 "data page values exceed chunk num_values".into(),
@@ -1352,6 +1516,232 @@ mod tests {
         assert_eq!(rows, vec![
             vec![PqValue::I64(7)], vec![PqValue::Null], vec![PqValue::I64(7)],
         ]);
+    }
+
+    // ── OBJ-2c-3 Task 3: DATA_PAGE_V2 hand-builders + tests ──────────
+    //
+    // The V2 PageHeader byte sequence below is derived independently
+    // from parquet.thrift (it mirrors the meta.rs
+    // `pageheader_decodes_data_page_header_v2_field8` fixture, itself
+    // hand-derived) — NOT produced by the code under test. A failing
+    // KAT means the decode path is wrong.
+
+    /// V2 PLAIN INT64 file. `defs` (rows, 0/1) + `present_vals` (the
+    /// non-null i64s). REQUIRED ⇒ defs all 1 & def_len 0; OPTIONAL ⇒
+    /// def-level RLE-hybrid bytes (NOT 4-byte-prefixed) of length
+    /// def_len. codec=UNCOMPRESSED, is_compressed=false. Layout:
+    /// [PAR1][PageHeaderV2][rep(0)][def(def_len)][values PLAIN]
+    /// [FileMetaData][mlen u32 LE][PAR1].
+    fn build_v2_plain_i64(defs: &[u8], present_vals: &[i64], optional: bool) -> Vec<u8> {
+        assert_eq!(present_vals.len(), defs.iter().filter(|&&d| d == 1).count());
+        let n = defs.len();
+        let nulls = defs.iter().filter(|&&d| d == 0).count();
+        // def-level section: OPTIONAL ⇒ one bit-packed group of 8,
+        // bit_width 1, NOT length-prefixed (V2). header=(1<<1)|1=0x03;
+        // bits byte: bit i set iff defs[i]==1 (i<8). REQUIRED ⇒ empty.
+        let def_section: Vec<u8> = if optional {
+            let mut bits = 0u8;
+            for (i, &d) in defs.iter().enumerate() {
+                if d == 1 && i < 8 {
+                    bits |= 1 << i;
+                }
+            }
+            vec![0x03, bits]
+        } else {
+            Vec::new()
+        };
+        let def_len = def_section.len() as i64;
+        let mut values = Vec::new();
+        for v in present_vals {
+            values.extend_from_slice(&v.to_le_bytes());
+        }
+        // page payload = [rep(0)][def_section][values]; rep section
+        // empty (rep_levels_byte_length=0).
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&def_section);
+        payload.extend_from_slice(&values);
+        let psz = payload.len() as i64; // uncompressed == compressed
+
+        let mut hdr = Vec::new();
+        hdr.push(0x15); uv(&mut hdr, zz(3));            // f1 type=DATA_PAGE_V2(3)
+        hdr.push(0x15); uv(&mut hdr, zz(psz));          // f2 uncompressed
+        hdr.push(0x15); uv(&mut hdr, zz(psz));          // f3 compressed
+        hdr.push(0x5c);                                 // f8 struct (delta 3->8=5)
+        hdr.push(0x15); uv(&mut hdr, zz(n as i64));     // g1 num_values
+        hdr.push(0x15); uv(&mut hdr, zz(nulls as i64)); // g2 num_nulls
+        hdr.push(0x15); uv(&mut hdr, zz(n as i64));     // g3 num_rows
+        hdr.push(0x15); uv(&mut hdr, zz(0));            // g4 encoding=PLAIN
+        hdr.push(0x15); uv(&mut hdr, zz(def_len));      // g5 def_levels_byte_length
+        hdr.push(0x15); uv(&mut hdr, zz(0));            // g6 rep_levels_byte_length
+        hdr.push(0x12);                                 // g7 is_compressed=false
+        hdr.push(0x00); hdr.push(0x00);                 // stop DPHv2 / stop PH
+
+        let data_page_offset: i64 = 4;
+        // FileMetaData mirrors build_opt_plain_i64 exactly, swapping
+        // repetition zz(if optional {1} else {0}).
+        let mut m = Vec::new();
+        m.push(0x15); uv(&mut m, zz(2));                // f1 version=2
+        m.push(0x19); m.push(0x2c);                     // f2 list<SchemaElement> 2
+        m.push(0x48); uv(&mut m, 6); m.extend_from_slice(b"schema");
+        m.push(0x15); uv(&mut m, zz(1));                // root num_children=1
+        m.push(0x00);
+        m.push(0x15); uv(&mut m, zz(2));                // leaf f1 type=INT64
+        m.push(0x25); uv(&mut m, zz(if optional { 1 } else { 0 })); // f3 repetition
+        m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x00);
+        m.push(0x16); uv(&mut m, zz(n as i64));         // f3 num_rows
+        m.push(0x19); m.push(0x1c);                     // f4 list<RowGroup> 1
+        m.push(0x19); m.push(0x1c);                     // RG f1 list<ColumnChunk> 1
+        m.push(0x3c);                                   // ColumnChunk f3 CMD
+        m.push(0x15); uv(&mut m, zz(2));                // CMD f1 type=INT64
+        m.push(0x19); m.push(0x15); uv(&mut m, zz(0));  // f2 enc [PLAIN]
+        m.push(0x19); m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x15); uv(&mut m, zz(0));                // f4 codec=UNCOMPRESSED
+        m.push(0x16); uv(&mut m, zz(n as i64));         // f5 num_values
+        m.push(0x46); uv(&mut m, zz(data_page_offset)); // f9 data_page_offset
+        m.push(0x00); m.push(0x00);                     // stop CMD / ColumnChunk
+        m.push(0x26); uv(&mut m, zz(n as i64));         // RG f3 num_rows
+        m.push(0x00); m.push(0x00);                     // stop RG / FileMetaData
+
+        let mut f = Vec::new();
+        f.extend_from_slice(b"PAR1");
+        f.extend_from_slice(&hdr);
+        f.extend_from_slice(&payload);
+        let mlen = m.len() as u32;
+        f.extend_from_slice(&m);
+        f.extend_from_slice(&mlen.to_le_bytes());
+        f.extend_from_slice(b"PAR1");
+        f
+    }
+
+    #[test]
+    fn extract_decodes_v2_plain_required_int64() {
+        let f = build_v2_plain_i64(&[1, 1], &[7, -2], false);
+        assert_eq!(
+            extract(&f, &["id"]).expect("v2 req"),
+            vec![vec![PqValue::I64(7)], vec![PqValue::I64(-2)]]
+        );
+    }
+
+    #[test]
+    fn extract_decodes_v2_plain_optional_int64_with_nulls() {
+        // [7, null, -2]: defs [1,0,1], present [7,-2]; def_section
+        // = [0x03, 0b00000101=0x05] (NOT 4-byte-prefixed — V2).
+        let f = build_v2_plain_i64(&[1, 0, 1], &[7, -2], true);
+        assert_eq!(
+            extract(&f, &["id"]).expect("v2 opt"),
+            vec![vec![PqValue::I64(7)], vec![PqValue::Null], vec![PqValue::I64(-2)]]
+        );
+    }
+
+    #[test]
+    fn extract_v2_and_v1_plain_identical() {
+        // Source-format independence: same logical [7,-2] V2 vs the
+        // existing V1 build_parquet_file(0,0,0,false).
+        let v2 = extract(&build_v2_plain_i64(&[1, 1], &[7, -2], false), &["id"]).unwrap();
+        let v1 = extract(&build_parquet_file(0, 0, 0, false), &["id"]).unwrap();
+        assert_eq!(v2, v1);
+        assert_eq!(v2, vec![vec![PqValue::I64(7)], vec![PqValue::I64(-2)]]);
+    }
+
+    /// V2 + DICTIONARY: a V1-style DICTIONARY_PAGE (mirrors the SP105
+    /// `build_opt_dict_int64_file` dict page) then a DATA_PAGE_V2 whose
+    /// values section (after the rep(0)/def split) is
+    /// `[bit_width][RLE-hybrid dict indices]`. Logical `[7,null,7]`,
+    /// dict `[7]`, indices both 0 → `[[I64(7)],[Null],[I64(7)]]`.
+    /// def_section `[0x03,0x05]` for [1,0,1]; values section
+    /// `[0x01,0x03,0x00]` per the SP105 opt-dict KAT.
+    fn build_v2_dict_int64_file() -> Vec<u8> {
+        // -- Dictionary page (mirrors build_opt_dict_int64_file) --
+        let mut dict_data = Vec::new();
+        dict_data.extend_from_slice(&7i64.to_le_bytes()); // dict[0] = 7
+        let dbytes = dict_data.len() as i64; // 8
+
+        let mut dict_hdr = Vec::new();
+        dict_hdr.push(0x15); uv(&mut dict_hdr, zz(2));      // f1 type=DICTIONARY_PAGE(2)
+        dict_hdr.push(0x15); uv(&mut dict_hdr, zz(dbytes)); // f2 uncompressed_page_size
+        dict_hdr.push(0x15); uv(&mut dict_hdr, zz(dbytes)); // f3 compressed_page_size
+        dict_hdr.push(0x4c);                                // f7 DictionaryPageHeader struct
+        dict_hdr.push(0x15); uv(&mut dict_hdr, zz(1));      // g1 num_values=1
+        dict_hdr.push(0x15); uv(&mut dict_hdr, zz(2));      // g2 encoding=PLAIN_DICTIONARY(2)
+        dict_hdr.push(0x12);                                // g3 is_sorted=false
+        dict_hdr.push(0x00); dict_hdr.push(0x00);           // stop DPH / PH
+
+        // -- DATA_PAGE_V2: n=3 rows, defs=[1,0,1] → 2 present.
+        // def_section (V2, NOT length-prefixed): [0x03, 0x05].
+        // values section = [bit_width=1][hybrid hdr 0x03][bits 0x00]
+        // → 2 present dict indices both 0.
+        let def_section: &[u8] = &[0x03, 0x05];
+        let values_section: &[u8] = &[0x01, 0x03, 0x00];
+        let def_len = def_section.len() as i64; // 2
+        let mut payload = Vec::new();
+        payload.extend_from_slice(def_section);
+        payload.extend_from_slice(values_section);
+        let psz = payload.len() as i64;
+
+        let mut data_hdr = Vec::new();
+        data_hdr.push(0x15); uv(&mut data_hdr, zz(3));      // f1 type=DATA_PAGE_V2(3)
+        data_hdr.push(0x15); uv(&mut data_hdr, zz(psz));    // f2 uncompressed
+        data_hdr.push(0x15); uv(&mut data_hdr, zz(psz));    // f3 compressed
+        data_hdr.push(0x5c);                                // f8 struct (delta 3->8=5)
+        data_hdr.push(0x15); uv(&mut data_hdr, zz(3));      // g1 num_values=3
+        data_hdr.push(0x15); uv(&mut data_hdr, zz(1));      // g2 num_nulls=1
+        data_hdr.push(0x15); uv(&mut data_hdr, zz(3));      // g3 num_rows=3
+        data_hdr.push(0x15); uv(&mut data_hdr, zz(2));      // g4 encoding=PLAIN_DICTIONARY(2)
+        data_hdr.push(0x15); uv(&mut data_hdr, zz(def_len)); // g5 def_levels_byte_length=2
+        data_hdr.push(0x15); uv(&mut data_hdr, zz(0));      // g6 rep_levels_byte_length=0
+        data_hdr.push(0x12);                                // g7 is_compressed=false
+        data_hdr.push(0x00); data_hdr.push(0x00);           // stop DPHv2 / PH
+
+        let dict_page_offset: i64 = 4;
+        let data_page_offset: i64 = 4 + dict_hdr.len() as i64 + dict_data.len() as i64;
+
+        let mut m = Vec::new();
+        m.push(0x15); uv(&mut m, zz(2));                    // f1 version=2
+        m.push(0x19); m.push(0x2c);                         // f2 list<SchemaElement> 2
+        m.push(0x48); uv(&mut m, 6); m.extend_from_slice(b"schema");
+        m.push(0x15); uv(&mut m, zz(1));                    // root num_children=1
+        m.push(0x00);
+        m.push(0x15); uv(&mut m, zz(2));                    // leaf f1 type=INT64
+        m.push(0x25); uv(&mut m, zz(1));                    // f3 repetition=OPTIONAL(1)
+        m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x00);
+        m.push(0x16); uv(&mut m, zz(3));                    // f3 num_rows=3
+        m.push(0x19); m.push(0x1c);                         // f4 list<RowGroup> 1
+        m.push(0x19); m.push(0x1c);                         // RG f1 list<ColumnChunk> 1
+        m.push(0x3c);                                       // ColumnChunk f3 CMD
+        m.push(0x15); uv(&mut m, zz(2));                    // CMD f1 type=INT64
+        m.push(0x19); m.push(0x15); uv(&mut m, zz(2));      // f2 encodings [PLAIN_DICTIONARY(2)]
+        m.push(0x19); m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x15); uv(&mut m, zz(0));                    // f4 codec=UNCOMPRESSED
+        m.push(0x16); uv(&mut m, zz(3));                    // f5 num_values=3
+        m.push(0x46); uv(&mut m, zz(data_page_offset));     // f9 data_page_offset
+        m.push(0x26); uv(&mut m, zz(dict_page_offset));     // f11 dictionary_page_offset
+        m.push(0x00); m.push(0x00);                         // stop CMD / ColumnChunk
+        m.push(0x26); uv(&mut m, zz(3));                    // RG f3 num_rows=3
+        m.push(0x00); m.push(0x00);                         // stop RG / FileMetaData
+
+        let mut f = Vec::new();
+        f.extend_from_slice(b"PAR1");
+        f.extend_from_slice(&dict_hdr);
+        f.extend_from_slice(&dict_data);
+        f.extend_from_slice(&data_hdr);
+        f.extend_from_slice(&payload);
+        let mlen = m.len() as u32;
+        f.extend_from_slice(&m);
+        f.extend_from_slice(&mlen.to_le_bytes());
+        f.extend_from_slice(b"PAR1");
+        f
+    }
+
+    #[test]
+    fn extract_decodes_v2_dict_int64() {
+        // [7, null, 7]: defs [1,0,1], dict [7], indices both 0.
+        let f = build_v2_dict_int64_file();
+        assert_eq!(
+            extract(&f, &["id"]).expect("v2-dict"),
+            vec![vec![PqValue::I64(7)], vec![PqValue::Null], vec![PqValue::I64(7)]]
+        );
     }
 }
 

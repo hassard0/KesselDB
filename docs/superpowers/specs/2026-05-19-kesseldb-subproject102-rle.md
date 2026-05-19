@@ -1,9 +1,26 @@
-# Subproject 102 — OBJ-2b-1: RLE/bit-packing hybrid decoder
+# KesselDB — Subproject 102: OBJ-2b-1 RLE/bit-packing hybrid decoder
 
-**Date:** 2026-05-19
-**Design:** docs/superpowers/specs/2026-05-19-parquet-rle-hybrid-design.md
-**Plan:** docs/superpowers/plans/2026-05-19-parquet-rle-hybrid.md
-**Builds on:** subproject 97/98/99/100/101
+**Date:** 2026-05-19  **Status:** done — code + tests committed and passing.
+
+Builds on:
+- Subproject 97 — External sources (EXT slice 1):
+  `docs/superpowers/specs/2026-05-18-external-sources-design.md`
+- Subproject 98 — External sources: pagination + NDJSON:
+  `docs/superpowers/specs/2026-05-18-external-sources-pagination-design.md`
+- Subproject 99 — External sources: HTTPS/TLS:
+  `docs/superpowers/specs/2026-05-18-external-sources-tls-design.md`
+- Subproject 100 — Object-store external sources (OBJ-1):
+  `docs/superpowers/specs/2026-05-19-kesseldb-subproject100-objstore.md`
+- Subproject 101 — Parquet object sources (OBJ-2a):
+  `docs/superpowers/specs/2026-05-19-kesseldb-subproject101-parquet.md`
+
+Design document:
+`docs/superpowers/specs/2026-05-19-parquet-rle-hybrid-design.md`
+
+Plan document:
+`docs/superpowers/plans/2026-05-19-parquet-rle-hybrid.md`
+
+---
 
 ## What shipped
 
@@ -24,6 +41,8 @@ and no support-matrix gate changed in this slice** — dictionary,
 Snappy, and OPTIONAL columns are still rejected with the exact same
 typed `Unsupported` errors as OBJ-2a, until OBJ-2b-2/3/4 flip them.
 
+---
+
 ## Verification
 
 - KATs hand-derived from `parquet-format/Encodings.md` (canonical
@@ -36,6 +55,8 @@ typed `Unsupported` errors as OBJ-2a, until OBJ-2b-2/3/4 flip them.
   bit_width=64 tiny slice, bit_width=65, oversized V1 prefix, empty
   slice) — typed `PqError::Bad` or exactly-num_values `Ok`.
 
+---
+
 ## Honest gate accounting
 
 `kessel-parquet` is an existing workspace member; its tests run under
@@ -47,6 +68,8 @@ no new external dependency; `kessel-parquet/Cargo.toml` `[dependencies]`
 stays empty; default `cargo tree -p kesseldb-server` links no
 parquet/objstore/rustls/webpki; `large_seed_corpus_is_deterministic_and_converges`
 green; existing EXT/TLS/OBJ-1 oracles (2/1/1) unchanged.
+
+---
 
 ## Deferred (next OBJ-2b sub-slices)
 

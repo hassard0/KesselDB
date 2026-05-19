@@ -58,11 +58,17 @@ impl Repetition {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Codec {
     Uncompressed,
+    /// SNAPPY (parquet CompressionCodec id = 1), raw block format.
+    Snappy,
     Other(i32),
 }
 impl Codec {
     fn from_i32(v: i32) -> Codec {
-        if v == 0 { Codec::Uncompressed } else { Codec::Other(v) }
+        match v {
+            0 => Codec::Uncompressed,
+            1 => Codec::Snappy,
+            o => Codec::Other(o),
+        }
     }
 }
 
@@ -523,6 +529,42 @@ mod tests {
         assert_eq!(cc.dictionary_page_offset, Some(4));
         assert_eq!(cc.data_page_offset, 40);
         assert_eq!(cc.encodings, vec![Encoding::PlainDictionary]);
+    }
+
+    #[test]
+    fn columnmeta_decodes_snappy_codec() {
+        fn build(codec: i64) -> Vec<u8> {
+            let mut b = Vec::new();
+            b.push(0x15); uv(&mut b, zz(1));                 // f1 version=1
+            b.push(0x19); b.push(0x2c);                      // f2 list<struct> 2
+            b.push(0x48); uv(&mut b, 4); b.extend_from_slice(b"root");
+            b.push(0x15); uv(&mut b, zz(1));                 // num_children=1
+            b.push(0x00);
+            b.push(0x15); uv(&mut b, zz(2));                 // leaf f1 type=INT64
+            b.push(0x25); uv(&mut b, zz(0));                 // f3 repetition=REQUIRED
+            b.push(0x18); uv(&mut b, 2); b.extend_from_slice(b"id");
+            b.push(0x00);
+            b.push(0x16); uv(&mut b, zz(1));                 // f3 num_rows=1
+            b.push(0x19); b.push(0x1c);                      // f4 list<RowGroup> 1
+            b.push(0x19); b.push(0x1c);                      // RG f1 list<ColumnChunk> 1
+            b.push(0x3c);                                    // ColumnChunk f3 ColumnMetaData
+            b.push(0x15); uv(&mut b, zz(2));                 // CMD f1 type=INT64
+            b.push(0x19); b.push(0x15); uv(&mut b, zz(0));   // f2 encodings [PLAIN]
+            b.push(0x19); b.push(0x18); uv(&mut b, 2); b.extend_from_slice(b"id");
+            b.push(0x15); uv(&mut b, zz(codec));             // f4 codec
+            b.push(0x16); uv(&mut b, zz(1));                 // f5 num_values=1
+            b.push(0x46); uv(&mut b, zz(4));                 // f9 data_page_offset=4
+            b.push(0x00);                                    // stop ColumnMetaData
+            b.push(0x00);                                    // stop ColumnChunk
+            b.push(0x26); uv(&mut b, zz(1));                 // RG f3 num_rows=1
+            b.push(0x00);                                    // stop RowGroup
+            b.push(0x00);                                    // stop FileMetaData
+            b
+        }
+        let md1 = FileMetaData::decode(&build(1)).expect("snappy");
+        assert_eq!(md1.row_groups[0].columns[0].codec, Codec::Snappy);
+        let md7 = FileMetaData::decode(&build(7)).expect("other");
+        assert_eq!(md7.row_groups[0].columns[0].codec, Codec::Other(7));
     }
 
     #[test]

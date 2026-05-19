@@ -843,7 +843,13 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
             }
             let objstore: Option<(u8, String, String, String)> = if is_obj {
                 if format == 3 {
-                    return Err("FORMAT PARQUET over object store is OBJ-2 (not yet shipped)".into());
+                    if pagination.is_some() {
+                        return Err("PAGE clauses are not supported with FORMAT PARQUET".into());
+                    }
+                    if rows_path.is_some() {
+                        return Err("ROWS is not applicable to FORMAT PARQUET".into());
+                    }
+                    // PARQUET over object store: accepted (OBJ-2a).
                 }
                 if pagination.is_some() {
                     return Err("PAGE clauses are not supported for object store (s3://|az://) sources".into());
@@ -873,7 +879,7 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
                     return Err("AUTH OBJSTORE is only valid for s3://|az:// sources".into());
                 }
                 if format == 3 {
-                    return Err("FORMAT PARQUET is not supported (OBJ-2)".into());
+                    return Err("FORMAT PARQUET is only supported for object-store (s3://|az://) sources".into());
                 }
                 None
             };
@@ -1860,13 +1866,58 @@ mod tests {
     fn objstore_rejections_at_create() {
         let cat = Catalog::default();
         let bad = |sql: &str| compile(sql, &cat).unwrap_err();
-        assert!(bad("CREATE EXTERNAL SOURCE a (id U64 NOT NULL FROM 'id') FROM 's3://b/k' FORMAT PARQUET KEY id REGION 'r' AUTH OBJSTORE S3 KEYID ENV 'I' SECRET ENV 'S'").contains("PARQUET"));
+        // OBJ-2a: FORMAT PARQUET over s3:// is now ACCEPTED (flipped from OBJ-1 rejection).
+        assert!(compile("CREATE EXTERNAL SOURCE a (id U64 NOT NULL FROM 'id') FROM 's3://b/k' FORMAT PARQUET KEY id REGION 'r' AUTH OBJSTORE S3 KEYID ENV 'I' SECRET ENV 'S'", &cat).is_ok());
         assert!(bad("CREATE EXTERNAL SOURCE a (id U64 NOT NULL FROM 'id') FROM 's3://b/k' FORMAT JSON KEY id REGION 'r' AUTH OBJSTORE S3 KEYID ENV 'I' SECRET ENV 'S' PAGE NEXT LINK").to_lowercase().contains("object store"));
         assert!(bad("CREATE EXTERNAL SOURCE a (id U64 NOT NULL FROM 'id') FROM 's3://b/k' FORMAT JSON KEY id REGION 'r' ENDPOINT 'http://x' AUTH OBJSTORE S3 KEYID ENV 'I' SECRET ENV 'S'").to_lowercase().contains("https"));
         assert!(bad("CREATE EXTERNAL SOURCE a (id U64 NOT NULL FROM 'id') FROM 's3://b/k' FORMAT JSON KEY id").to_lowercase().contains("auth objstore"));
         assert!(bad("CREATE EXTERNAL SOURCE a (id U64 NOT NULL FROM 'id') FROM 's3://b/k' FORMAT JSON KEY id AUTH OBJSTORE S3 KEYID ENV 'I' SECRET ENV 'S'").to_lowercase().contains("region"));
         assert!(bad("CREATE EXTERNAL SOURCE a (id U64 NOT NULL FROM 'id') FROM 'az://c/b' FORMAT JSON KEY id ENDPOINT 'https://h' AUTH OBJSTORE AZURE ACCOUNT 'acct' KEY ENV 'K'").to_lowercase().contains("exactly one"));
         assert!(compile("CREATE EXTERNAL SOURCE ok (id U64 NOT NULL FROM 'id') FROM 'http://h/p' FORMAT JSON KEY id AUTH BEARER ENV 'T'", &cat).is_ok());
+    }
+
+    #[test]
+    fn parquet_accepted_for_object_store() {
+        let cat = Catalog::default();
+        let op = compile(
+            "CREATE EXTERNAL SOURCE p (id U64 NOT NULL FROM 'id') \
+             FROM 's3://b/k.parquet' FORMAT PARQUET KEY id \
+             REGION 'us-east-1' \
+             AUTH OBJSTORE S3 KEYID ENV 'I' SECRET ENV 'S'",
+            &cat,
+        ).unwrap();
+        match op {
+            Op::CreateExternalSource { format, url, .. } => {
+                assert_eq!(format, 3);
+                assert_eq!(url, "s3://b/k.parquet");
+            }
+            o => panic!("{o:?}"),
+        }
+        // az:// too
+        assert!(compile(
+            "CREATE EXTERNAL SOURCE q (id U64 NOT NULL FROM 'id') \
+             FROM 'az://c/b.parquet' FORMAT PARQUET KEY id \
+             AUTH OBJSTORE AZURE ACCOUNT 'a' KEY ENV 'K'", &cat).is_ok());
+    }
+
+    #[test]
+    fn parquet_rejected_off_object_store_or_with_page_rows() {
+        let cat = Catalog::default();
+        let bad = |s: &str| compile(s, &cat).unwrap_err();
+        assert!(bad("CREATE EXTERNAL SOURCE a (id U64 NOT NULL FROM 'id') \
+            FROM 'http://h/x.parquet' FORMAT PARQUET KEY id")
+            .to_lowercase().contains("object-store"));
+        assert!(bad("CREATE EXTERNAL SOURCE a (id U64 NOT NULL FROM 'id') \
+            FROM 'https://h/x.parquet' FORMAT PARQUET KEY id")
+            .to_lowercase().contains("object-store"));
+        assert!(bad("CREATE EXTERNAL SOURCE a (id U64 NOT NULL FROM 'id') \
+            FROM 's3://b/k' FORMAT PARQUET KEY id REGION 'r' \
+            AUTH OBJSTORE S3 KEYID ENV 'I' SECRET ENV 'S' PAGE NEXT LINK")
+            .to_lowercase().contains("page"));
+        assert!(bad("CREATE EXTERNAL SOURCE a (id U64 NOT NULL FROM 'id') \
+            FROM 's3://b/k' FORMAT PARQUET KEY id REGION 'r' \
+            AUTH OBJSTORE S3 KEYID ENV 'I' SECRET ENV 'S' ROWS 'd'")
+            .to_lowercase().contains("rows"));
     }
 
     #[test]

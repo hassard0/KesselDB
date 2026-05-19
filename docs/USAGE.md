@@ -725,7 +725,7 @@ messages.
 - **`FORMAT PARQUET`** is supported for `s3://` / `az://` sources with
   the `--features external-sources-objstore` build (OBJ-2a, §7f below).
   See §7f for the precise scope (PLAIN/UNCOMPRESSED/GZIP/flat REQUIRED or OPTIONAL/V1
-  pages) and the supported-vs-deferred matrix.
+  and V2 pages) and the supported-vs-deferred matrix.
 - **Iceberg manifests, prefix/multi-object listing, and STS/SAS/IMDS
   credential providers** are explicit follow-ons (OBJ-3 through OBJ-5)
   and are **rejected at `CREATE`** with a clear error message.
@@ -773,6 +773,17 @@ messages.
 > data pages, REPEATED/nested, and GZIP pages >64 MiB remain
 > Unsupported (→ OBJ-2c-2+).
 
+> **OBJ-2c-3 (SP107):** `DATA_PAGE_V2` data pages (pyarrow
+> `data_page_version='2.0'`) are now supported for the existing flat
+> REQUIRED or OPTIONAL × UNCOMPRESSED|Snappy|GZIP × PLAIN|dict matrix.
+> The V2 raw-level-split path reads the uncompressed def/rep level
+> bytes directly, then decompresses only the value section; the shared
+> `scatter_nulls` helper keeps the V1 OPTIONAL path byte-identical.
+> OBJ-2c-2 (zstd) was resequenced/deferred to prioritise broader
+> pyarrow compatibility. ZSTD/lz4/brotli, INT96/DECIMAL,
+> REPEATED/nested (incl. V2 repetition levels), and pages >64 MiB
+> remain Unsupported (→ OBJ-2c-2/4/5).
+
 `FORMAT PARQUET` is supported for `s3://` and `az://` sources when the
 server is built with `--features external-sources-objstore`. Plain
 `http://` / `https://` URLs are **rejected** with a clear message if
@@ -809,14 +820,14 @@ CREATE EXTERNAL SOURCE readings (
   `KEY`) are identical to §7e.
 - `REFRESH` and `DROP EXTERNAL SOURCE` work identically to §7e.
 
-### Parquet scope: what is currently supported (OBJ-2a → OBJ-2c-1)
+### Parquet scope: what is currently supported (OBJ-2a → OBJ-2c-3)
 
-| Parquet property | OBJ-2a → OBJ-2c-1 |
+| Parquet property | OBJ-2a → OBJ-2c-3 |
 |---|---|
 | Encoding | `PLAIN` and dictionary (`PLAIN_DICTIONARY`/`RLE_DICTIONARY`); RLE/bit-packing hybrid for dictionary indices |
 | Compression codec | `UNCOMPRESSED`, `SNAPPY` (raw block; pages ≤ 64 MiB decompressed), or `GZIP` (RFC 1952; pages ≤ 64 MiB decompressed) |
-| Column repetition | `REQUIRED` or `OPTIONAL` flat columns (nullable; V1 definition levels) |
-| Data page version | V1 (`DATA_PAGE`) only |
+| Column repetition | `REQUIRED` or `OPTIONAL` flat columns (nullable; V1 and V2 definition levels) |
+| Data page version | V1 and V2 (`DATA_PAGE_V2`) |
 | Row groups | Multi-row-group files are fully supported |
 | Column subset | Only the recipe-mapped columns are decoded; unmapped columns are skipped |
 | Physical types | `BOOLEAN`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `BYTE_ARRAY` |
@@ -828,18 +839,18 @@ The following trigger a typed `PqError` (surfaced as a `REFRESH`
 failure; prior materialized data is left intact — all-or-nothing, same
 as every other format):
 
-- **REPEATED columns / repetition levels** — rejected with
+- **REPEATED columns / repetition levels** (including V2 repetition
+  levels; `rep_len > 0` in a `DATA_PAGE_V2`) — rejected with
   `Unsupported("REPEATED columns: OBJ-2c")`.
 - **Non-flat schema (nested / intermediate group nodes)** (non-flat
   schema; intermediate group nodes) — rejected with
   `Unsupported("nested schema: OBJ-2c")`.
 - **Zstd / lz4 / brotli compression** — rejected with
-  `Unsupported("compression codec (zstd/lz4/brotli): OBJ-2c")`. GZIP is now supported (OBJ-2c-1).
+  `Unsupported("compression codec (zstd/lz4/brotli): OBJ-2c")`. GZIP is
+  now supported (OBJ-2c-1); V2 pages with these codecs remain
+  Unsupported pending OBJ-2c-2.
 - **Snappy pages above 64 MiB decompressed** — rejected with
   `Unsupported("Snappy decompressed page too large: OBJ-2c")`.
-- **V2 data pages** (`DATA_PAGE_V2`) — rejected with
-  `Unsupported("non-V1 data page (V2/index): OBJ-2c")`. (Deferral
-  target is OBJ-2c; the typed error already tags OBJ-2c.)
 - **`INT96` / `FIXED_LEN_BYTE_ARRAY` / `DECIMAL`** physical types —
   rejected with `Unsupported("INT96/FIXED_LEN_BYTE_ARRAY: OBJ-2c")`.
 - **A mapped column name absent from the Parquet schema** — rejected

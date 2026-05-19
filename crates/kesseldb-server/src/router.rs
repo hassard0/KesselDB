@@ -922,7 +922,7 @@ impl<'a> Conn<'a> {
                         )),
                     };
                     ObjCreds::S3 { key_id, secret }
-                } else {
+                } else if *provider == 2 {
                     let key_b64 = match getenv(a_env) {
                         Ok(v) => v,
                         Err(_) => return OpResult::SchemaError(format!(
@@ -933,6 +933,10 @@ impl<'a> Conn<'a> {
                         account: account.clone().unwrap_or_default(),
                         key_b64,
                     }
+                } else {
+                    return OpResult::SchemaError(format!(
+                        "REFRESH `{name}`: unknown ObjStore provider code {provider}"
+                    ));
                 }
             }
             _ => {
@@ -943,6 +947,11 @@ impl<'a> Conn<'a> {
             }
         };
 
+        // Wall-clock injected here is non-deterministic, but is the
+        // SAME captured-once boundary as the router salt / the SP99 TLS
+        // handshake RNG: the signed URL + headers are transport-only;
+        // only the byte-deterministic kessel_codec record enters the
+        // replicated log. Moving this would NOT improve determinism.
         let now = DateTime {
             secs_since_epoch: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

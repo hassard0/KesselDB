@@ -3532,7 +3532,7 @@ impl<V: Vfs> StateMachine<V> {
                 mapping,
                 rows_path,
                 pagination,
-                objstore: _,
+                objstore,
             } => {
                 if self.catalog.types.iter().any(|t| t.name == name) {
                     return OpResult::SchemaError(format!(
@@ -3541,12 +3541,30 @@ impl<V: Vfs> StateMachine<V> {
                 }
                 // Validate auth_kind BEFORE creating the backing type
                 // so a bad value cannot orphan a type in the catalog.
+                // Derive objstore fields (empty string => None) for use
+                // in auth_kind 3 and region/endpoint below.
+                let (obj_provider, obj_account, obj_region, obj_endpoint) =
+                    match &objstore {
+                        None => (1u8, None, None, None),
+                        Some((p, acct, region, endpoint)) => (
+                            *p,
+                            (!acct.is_empty()).then(|| acct.clone()),
+                            (!region.is_empty()).then(|| region.clone()),
+                            (!endpoint.is_empty()).then(|| endpoint.clone()),
+                        ),
+                    };
                 let auth = match auth_kind {
                     0 => kessel_catalog::ExternalAuth::None,
                     1 => kessel_catalog::ExternalAuth::BearerEnv(auth_a),
                     2 => kessel_catalog::ExternalAuth::HeaderEnv {
                         header: auth_a,
                         env: auth_b,
+                    },
+                    3 => kessel_catalog::ExternalAuth::ObjStoreEnv {
+                        provider: obj_provider,
+                        a_env: auth_a,
+                        b_env: auth_b,
+                        account: obj_account,
                     },
                     _ => {
                         return OpResult::SchemaError(
@@ -3621,8 +3639,8 @@ impl<V: Vfs> StateMachine<V> {
                     // v2 catalog trailer; absent params serialize as None.
                     rows_path,
                     pagination,
-                    region: None,
-                    endpoint: None,
+                    region: obj_region,
+                    endpoint: obj_endpoint,
                 });
                 // Re-persist (same op_number): an idempotent overwrite of
                 // the single catalog key — unlike a counter this is safe
@@ -3899,6 +3917,47 @@ mod tests {
         // Backing type still present too.
         assert!(cat2.types.iter().any(|t| t.name == "parent"),
             "parent type still present after failed drop (I1)");
+    }
+
+    #[test]
+    fn apply_create_external_source_objstore_recipe() {
+        use kessel_catalog::ExternalAuth;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        let td = kessel_catalog::encode_type_def(
+            "feed",
+            &[Field { field_id: 1, name: "id".into(), kind: FieldKind::U64, nullable: false }],
+        );
+        let op = Op::CreateExternalSource {
+            name: "feed".into(),
+            type_def: td,
+            url: "s3://bucket/data.json".into(),
+            format: 0,
+            key_field_id: 1,
+            auth_kind: 3,
+            auth_a: "AWS_KEY_ID".into(),
+            auth_b: "AWS_SECRET".into(),
+            mapping: vec![(1, "id".into())],
+            rows_path: None,
+            pagination: None,
+            objstore: Some((1, String::new(), "us-east-1".into(), String::new())),
+        };
+        assert_eq!(sm.apply(1, op), OpResult::Ok, "objstore create should return Ok");
+        let cat = sm.catalog();
+        let rec = cat.external.iter()
+            .find(|e| e.url == "s3://bucket/data.json")
+            .expect("recipe by url");
+        assert_eq!(
+            rec.auth,
+            ExternalAuth::ObjStoreEnv {
+                provider: 1,
+                a_env: "AWS_KEY_ID".into(),
+                b_env: "AWS_SECRET".into(),
+                account: None,
+            },
+            "auth must be ObjStoreEnv with empty account => None"
+        );
+        assert_eq!(rec.region, Some("us-east-1".into()), "region must be Some(us-east-1)");
+        assert_eq!(rec.endpoint, None, "empty endpoint string => None");
     }
 
     /// SP94 (unblocks #74): after a crash+reopen, the state machine

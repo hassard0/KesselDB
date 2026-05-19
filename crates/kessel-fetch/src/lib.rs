@@ -264,6 +264,10 @@ fn pq_to_cell(v: kessel_parquet::PqValue) -> json::Cell {
         // numeric token carries, so coerce::to_field_bytes is byte-identical.
         I64(i) => json::Cell::Text(i.to_string()),
         F64(f) => json::Cell::Text(json::canonical_f64(f)),
+        // BYTE_ARRAY/UTF8: lossy is intentional — same string semantics as
+        // the JSON path (non-UTF8 bytes → replacement chars); do NOT change
+        // to from_utf8()? (would break legitimate replacement-char inputs
+        // and shift error handling on this determinism-relevant decode arm).
         Bytes(b) => json::Cell::Text(
             String::from_utf8_lossy(&b).into_owned(),
         ),

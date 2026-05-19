@@ -160,9 +160,18 @@ impl<'a> StructReader<'a> {
         }
         Ok((etype, size))
     }
-    /// Skip one field's value of the given ctype. Recursive for
-    /// struct/list; bounded.
+    /// Skip one field's value of the given ctype. Recursion is
+    /// depth-capped (attacker-facing: a crafted deeply-nested struct
+    /// must not smash the stack — real Parquet metadata never nests
+    /// anywhere near this).
     pub fn skip(&mut self, ctype: u8) -> TResult<()> {
+        self.skip_depth(ctype, 0)
+    }
+
+    fn skip_depth(&mut self, ctype: u8, depth: u32) -> TResult<()> {
+        if depth > MAX_SKIP_DEPTH {
+            return Err(err("skip: nesting too deep"));
+        }
         match ctype {
             ctype::BOOL_TRUE | ctype::BOOL_FALSE => {}
             ctype::I8 | ctype::I16 | ctype::I32 | ctype::I64 => {
@@ -179,20 +188,25 @@ impl<'a> StructReader<'a> {
             ctype::LIST | ctype::SET => {
                 let (et, count) = self.list_header()?;
                 for _ in 0..count {
-                    self.skip(et)?;
+                    self.skip_depth(et, depth + 1)?;
                 }
             }
             ctype::STRUCT => {
                 while let Some(f) = self.next_field()? {
                     let ct = f.ctype;
-                    self.skip(ct)?;
+                    self.skip_depth(ct, depth + 1)?;
                 }
             }
-            _ => return Err(err("skip: unknown ctype")),
+            // MAP (ctype 11) intentionally not implemented: not used by
+            // the OBJ-2a Parquet metadata schema subset. Returns a typed
+            // error (never a panic) if ever encountered.
+            _ => return Err(err("skip: unsupported/unknown ctype")),
         }
         Ok(())
     }
 }
+
+const MAX_SKIP_DEPTH: u32 = 64;
 
 #[cfg(test)]
 mod tests {
@@ -249,5 +263,24 @@ mod tests {
         let mut s = StructReader::new(&[0x18, 0x05]);
         let f = s.next_field().unwrap().unwrap();
         assert!(s.read_binary(&f).is_err());
+    }
+
+    #[test]
+    fn deeply_nested_skip_is_typed_error_not_stack_overflow() {
+        // 200 nested STRUCT headers (each byte 0x1c = delta1|STRUCT),
+        // then STOPs. ~200 bytes, but nesting depth 200 > the cap.
+        // Must return Err (typed), never recurse to a stack smash.
+        let mut bytes = vec![0x1cu8; 200];
+        bytes.extend(std::iter::repeat(0x00u8).take(200));
+        let mut s = StructReader::new(&bytes);
+        // The outermost field is a STRUCT (0x1c): next_field then
+        // skip its value -> recursion. Drive it via skip directly:
+        let f = s.next_field().unwrap().unwrap();
+        let ct = f.ctype;
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || s.skip(ct),
+        ));
+        assert!(r.is_ok(), "must not panic/stack-overflow");
+        assert!(r.unwrap().is_err(), "deep nesting must be a typed Err");
     }
 }

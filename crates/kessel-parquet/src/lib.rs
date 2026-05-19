@@ -102,6 +102,9 @@ fn decode_page(
     if defs.len() != n {
         return Err(PqError::Bad("def-level count != num_values".into()));
     }
+    // bit_width=1 does not structurally prevent an RLE run whose
+    // repeated-value byte has high bits set; a value > max_def_level (1)
+    // is malformed input — reject as Bad, never silently treat as present.
     for &d in &defs {
         if d > 1 {
             return Err(PqError::Bad("definition level exceeds max".into()));
@@ -229,6 +232,11 @@ fn read_chunk_values(
         let uncomp = usize::try_from(ph.uncompressed_size)
             .map_err(|_| PqError::Bad("page size range".into()))?;
         let payload = page_payload(file, dstart, comp, uncomp, cc.codec)?;
+        // decode_page's dict arms (dp_encoding 2|8, both REQUIRED and
+        // OPTIONAL) call dict::resolve_dict_indices, which needs a populated
+        // `dict`; `dict` is only populated when dictionary_page_offset is
+        // present. Guard here so the failure is a precise typed Bad rather
+        // than an empty-dict OOB inside decode_page.
         if matches!(ph.dp_encoding, 2 | 8) && cc.dictionary_page_offset.is_none() {
             return Err(PqError::Bad(
                 "dictionary-encoded data page without dictionary_page_offset"
@@ -267,8 +275,15 @@ pub fn extract(
     let md_bytes = footer::metadata_slice(bytes)?;
     let md = meta::FileMetaData::decode(md_bytes)?;
 
-    // Resolve each wanted name to its leaf; enforce flat schema + known
-    // repetition + supported physical type.
+    // Reject nested schemas once, file-level, before any per-leaf work.
+    // A non-flat file is rejected with the same Unsupported error regardless
+    // of which (or how many) columns are requested.
+    if !md.flat_schema {
+        return Err(PqError::Unsupported("nested schema: OBJ-2c".into()));
+    }
+
+    // Resolve each wanted name to its leaf; enforce known repetition +
+    // supported physical type.
     // Also collect the schema-declared physical type for each wanted column
     // so the per-row-group loop can verify ColumnMetaData type consistency.
     let mut wanted_ptypes: Vec<meta::Type> = Vec::with_capacity(wanted.len());
@@ -281,9 +296,6 @@ pub fn extract(
             .ok_or_else(|| {
                 PqError::Bad(format!("column `{w}` not found in Parquet schema"))
             })?;
-        if !md.flat_schema {
-            return Err(PqError::Unsupported("nested schema: OBJ-2c".into()));
-        }
         let max_def_level: u32 = match leaf.repetition {
             meta::Repetition::Required => 0,
             meta::Repetition::Optional => 1,

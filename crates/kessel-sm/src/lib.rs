@@ -3560,12 +3560,19 @@ impl<V: Vfs> StateMachine<V> {
                         header: auth_a,
                         env: auth_b,
                     },
-                    3 => kessel_catalog::ExternalAuth::ObjStoreEnv {
-                        provider: obj_provider,
-                        a_env: auth_a,
-                        b_env: auth_b,
-                        account: obj_account,
-                    },
+                    3 => {
+                        if objstore.is_none() {
+                            return OpResult::SchemaError(
+                                "object-store source (auth_kind 3) requires objstore metadata".into(),
+                            );
+                        }
+                        kessel_catalog::ExternalAuth::ObjStoreEnv {
+                            provider: obj_provider,
+                            a_env: auth_a,
+                            b_env: auth_b,
+                            account: obj_account,
+                        }
+                    }
                     _ => {
                         return OpResult::SchemaError(
                             "invalid auth_kind".into(),
@@ -3958,6 +3965,48 @@ mod tests {
         );
         assert_eq!(rec.region, Some("us-east-1".into()), "region must be Some(us-east-1)");
         assert_eq!(rec.endpoint, None, "empty endpoint string => None");
+    }
+
+    #[test]
+    fn apply_create_external_source_objstore_none_rejected_pre_mutation() {
+        // auth_kind 3 with objstore None must be rejected as a typed
+        // SchemaError BEFORE the backing type is created (no orphan).
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        let td = kessel_catalog::encode_type_def(
+            "nofeed",
+            &[Field { field_id: 1, name: "id".into(), kind: FieldKind::U64, nullable: false }],
+        );
+        let op = Op::CreateExternalSource {
+            name: "nofeed".into(),
+            type_def: td,
+            url: "s3://b/k".into(),
+            format: 0,
+            key_field_id: 1,
+            auth_kind: 3,
+            auth_a: "X".into(),
+            auth_b: "Y".into(),
+            mapping: vec![(1, "id".into())],
+            rows_path: None,
+            pagination: None,
+            objstore: None,
+        };
+        let result = sm.apply(1, op);
+        // Must be a SchemaError (pre-mutation rejection).
+        assert!(
+            matches!(result, OpResult::SchemaError(_)),
+            "auth_kind 3 with objstore None must return SchemaError, got {result:?}"
+        );
+        // No orphan: the backing type "nofeed" must NOT have been created.
+        let cat = sm.catalog();
+        assert!(
+            cat.types.iter().all(|t| t.name != "nofeed"),
+            "rejected op must not create an orphan backing type (pre-mutation guarantee)"
+        );
+        // No orphan recipe either.
+        assert!(
+            cat.external.iter().all(|e| e.url != "s3://b/k"),
+            "rejected op must not create an orphan recipe"
+        );
     }
 
     /// SP94 (unblocks #74): after a crash+reopen, the state machine

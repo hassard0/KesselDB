@@ -43,6 +43,134 @@ impl std::fmt::Display for PqError {
     }
 }
 
+/// Read one column chunk's values across all its pages.
+/// Flat REQUIRED, UNCOMPRESSED, V1. Supports: an optional leading
+/// DICTIONARY_PAGE then one-or-more DATA_PAGEs; each data page is
+/// PLAIN (dictionary-fallback) or PLAIN_DICTIONARY/RLE_DICTIONARY.
+fn read_chunk_values(
+    file: &[u8],
+    cc: &meta::ColumnChunk,
+    want_ptype: meta::Type,
+) -> Result<Vec<PqValue>, PqError> {
+    if cc.codec != meta::Codec::Uncompressed {
+        return Err(PqError::Unsupported("compression: OBJ-2b-3".into()));
+    }
+    if cc.encodings.iter().any(|e| {
+        !matches!(
+            e,
+            meta::Encoding::Plain
+                | meta::Encoding::Rle
+                | meta::Encoding::PlainDictionary
+                | meta::Encoding::RleDictionary
+        )
+    }) {
+        return Err(PqError::Unsupported(
+            "non-PLAIN/dictionary encoding (DELTA/BYTE_STREAM_SPLIT): OBJ-2c"
+                .into(),
+        ));
+    }
+
+    let dict: Vec<PqValue> = if let Some(dpo) = cc.dictionary_page_offset {
+        let off = usize::try_from(dpo)
+            .map_err(|_| PqError::Bad("dict page offset range".into()))?;
+        let region = file
+            .get(off..)
+            .ok_or_else(|| PqError::Bad("dict page offset past EOF".into()))?;
+        let (ph, hlen) = meta::decode_page_header(region)?;
+        if ph.page_type != 2 {
+            return Err(PqError::Bad(
+                "dictionary_page_offset does not point at a DICTIONARY_PAGE"
+                    .into(),
+            ));
+        }
+        if ph.dict_encoding != 0 && ph.dict_encoding != 2 {
+            return Err(PqError::Unsupported(
+                "dictionary page encoding (not PLAIN/PLAIN_DICTIONARY): OBJ-2c"
+                    .into(),
+            ));
+        }
+        let dn = usize::try_from(ph.dict_num_values)
+            .map_err(|_| PqError::Bad("dict num_values range".into()))?;
+        let dstart = off
+            .checked_add(hlen)
+            .ok_or_else(|| PqError::Bad("dict page hdr len ovf".into()))?;
+        let dend = dstart
+            .checked_add(
+                usize::try_from(ph.uncompressed_size)
+                    .map_err(|_| PqError::Bad("dict page size range".into()))?,
+            )
+            .ok_or_else(|| PqError::Bad("dict page size ovf".into()))?;
+        let dpage = file
+            .get(dstart..dend)
+            .ok_or_else(|| PqError::Bad("dict page data truncated".into()))?;
+        plain::decode_plain(dpage, want_ptype, dn)?
+    } else {
+        Vec::new()
+    };
+
+    let want_rows = usize::try_from(cc.num_values)
+        .map_err(|_| PqError::Bad("chunk num_values range".into()))?;
+    let mut out: Vec<PqValue> = Vec::with_capacity(want_rows);
+    let mut off = usize::try_from(cc.data_page_offset)
+        .map_err(|_| PqError::Bad("data page offset range".into()))?;
+    while out.len() < want_rows {
+        let region = file
+            .get(off..)
+            .ok_or_else(|| PqError::Bad("data page offset past EOF".into()))?;
+        let (ph, hlen) = meta::decode_page_header(region)?;
+        if ph.page_type != 0 {
+            return Err(PqError::Unsupported(
+                "non-V1 data page (V2/index): OBJ-2c".into(),
+            ));
+        }
+        let n = usize::try_from(ph.dp_num_values)
+            .map_err(|_| PqError::Bad("num_values range".into()))?;
+        let dstart = off
+            .checked_add(hlen)
+            .ok_or_else(|| PqError::Bad("page hdr len ovf".into()))?;
+        let dend = dstart
+            .checked_add(
+                usize::try_from(ph.uncompressed_size)
+                    .map_err(|_| PqError::Bad("page size range".into()))?,
+            )
+            .ok_or_else(|| PqError::Bad("page size ovf".into()))?;
+        let page = file
+            .get(dstart..dend)
+            .ok_or_else(|| PqError::Bad("page data truncated".into()))?;
+        let vals = match ph.dp_encoding {
+            0 => plain::decode_plain(page, want_ptype, n)?,
+            2 | 8 => {
+                if cc.dictionary_page_offset.is_none() {
+                    return Err(PqError::Bad(
+                        "dictionary-encoded data page without dictionary_page_offset"
+                            .into(),
+                    ));
+                }
+                dict::resolve_dict_indices(page, &dict, n)?
+            }
+            _ => {
+                return Err(PqError::Unsupported(
+                    "data page encoding (DELTA/BYTE_STREAM_SPLIT): OBJ-2c"
+                        .into(),
+                ))
+            }
+        };
+        if out.len().checked_add(vals.len()).map(|t| t > want_rows).unwrap_or(true) {
+            return Err(PqError::Bad(
+                "data page values exceed chunk num_values".into(),
+            ));
+        }
+        out.extend(vals);
+        off = dend;
+    }
+    if out.len() != want_rows {
+        return Err(PqError::Bad(
+            "data page values do not sum to chunk num_values".into(),
+        ));
+    }
+    Ok(out)
+}
+
 /// Decode the `wanted` leaf columns (in that output order) from a
 /// whole Parquet object. OBJ-2a: flat REQUIRED columns, PLAIN,
 /// UNCOMPRESSED, V1 data pages, all row groups concatenated.
@@ -111,56 +239,7 @@ pub fn extract(
                     w
                 )));
             }
-            if cc.codec != meta::Codec::Uncompressed {
-                return Err(PqError::Unsupported(
-                    "compression: OBJ-2b/2c".into(),
-                ));
-            }
-            // Allow Plain or Rle in the encoding list. For flat REQUIRED
-            // columns, Parquet producers (pyarrow etc.) may list Rle to
-            // describe the definition/repetition level encoding — no actual
-            // level bytes appear in V1 REQUIRED pages. The data page
-            // encoding is enforced separately via ph.dp_encoding == 0.
-            if cc.encodings.iter().any(|e| {
-                !matches!(e, meta::Encoding::Plain | meta::Encoding::Rle)
-            }) {
-                return Err(PqError::Unsupported(
-                    "non-PLAIN encoding (dictionary/DELTA/BYTE_STREAM_SPLIT): OBJ-2b"
-                        .into(),
-                ));
-            }
-            let off = usize::try_from(cc.data_page_offset)
-                .map_err(|_| PqError::Bad("page offset range".into()))?;
-            let page_region = bytes
-                .get(off..)
-                .ok_or_else(|| PqError::Bad("page offset past EOF".into()))?;
-            let (ph, hdr_len) = meta::decode_page_header(page_region)?;
-            // V1 data page only (PageType DATA_PAGE == 0).
-            if ph.page_type != 0 {
-                return Err(PqError::Unsupported(
-                    "non-V1 / dictionary / index page: OBJ-2b".into(),
-                ));
-            }
-            if ph.dp_encoding != 0 {
-                return Err(PqError::Unsupported(
-                    "data page encoding != PLAIN: OBJ-2b".into(),
-                ));
-            }
-            let n = usize::try_from(ph.dp_num_values)
-                .map_err(|_| PqError::Bad("num_values range".into()))?;
-            let dstart = off
-                .checked_add(hdr_len)
-                .ok_or_else(|| PqError::Bad("page hdr len ovf".into()))?;
-            let dend = dstart
-                .checked_add(
-                    usize::try_from(ph.uncompressed_size)
-                        .map_err(|_| PqError::Bad("page size range".into()))?,
-                )
-                .ok_or_else(|| PqError::Bad("page size ovf".into()))?;
-            let page = bytes
-                .get(dstart..dend)
-                .ok_or_else(|| PqError::Bad("page data truncated".into()))?;
-            let vals = plain::decode_plain(page, cc.ptype, n)?;
+            let vals = read_chunk_values(bytes, cc, wanted_ptypes[ci])?;
             cols[ci].extend(vals);
         }
     }
@@ -409,17 +488,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_rejects_dict_columnmeta_encoding() {
-        // encoding = PLAIN_DICTIONARY(2) in ColumnMetaData encodings
-        // → triggers "non-PLAIN encoding" gate
-        let dict_file = build_parquet_file(2, 0, 0, false);
-        assert!(
-            matches!(extract(&dict_file, &["id"]), Err(PqError::Unsupported(_))),
-            "dict encoding must be Unsupported"
-        );
-    }
-
-    #[test]
     fn extract_rejects_snappy_codec() {
         // codec = SNAPPY(2) in ColumnMetaData
         // → triggers "compression" gate
@@ -438,17 +506,6 @@ mod tests {
         assert!(
             matches!(extract(&optional_file, &["id"]), Err(PqError::Unsupported(_))),
             "optional repetition must be Unsupported"
-        );
-    }
-
-    #[test]
-    fn extract_rejects_dict_data_page_encoding() {
-        // page header encoding field = PLAIN_DICTIONARY(2)
-        // → triggers "data page encoding != PLAIN" gate
-        let dict_page_file = build_parquet_file(0, 0, 0, true);
-        assert!(
-            matches!(extract(&dict_page_file, &["id"]), Err(PqError::Unsupported(_))),
-            "dict page encoding must be Unsupported"
         );
     }
 
@@ -473,6 +530,117 @@ mod tests {
         assert!(
             matches!(extract(&mismatch_file, &["id"]), Err(PqError::Bad(_))),
             "schema/chunk ptype mismatch must be Bad (Fix-1 gate)"
+        );
+    }
+
+    /// Build a complete dict-encoded INT64 file for column "id":
+    ///   logical rows [7,7,-2]; dictionary [7,-2]; indices [0,0,1].
+    /// Layout: [PAR1][dict_hdr][dict_data][data_hdr][data_payload]
+    ///         [FileMetaData][mlen u32 LE][PAR1]
+    fn build_dict_int64_file() -> Vec<u8> {
+        let mut dict_data = Vec::new();
+        dict_data.extend_from_slice(&7i64.to_le_bytes());
+        dict_data.extend_from_slice(&(-2i64).to_le_bytes());
+        let dbytes = dict_data.len() as i64; // 16
+        let mut dict_hdr = Vec::new();
+        dict_hdr.push(0x15); uv(&mut dict_hdr, zz(2));        // f1 type=DICTIONARY_PAGE(2)
+        dict_hdr.push(0x25); uv(&mut dict_hdr, zz(dbytes));   // f3 uncompressed_page_size
+        dict_hdr.push(0x15); uv(&mut dict_hdr, zz(dbytes));   // f4 compressed_page_size
+        dict_hdr.push(0x3c);                                  // f7 struct (delta 4->7=3)
+        dict_hdr.push(0x15); uv(&mut dict_hdr, zz(2));        // g1 num_values=2
+        dict_hdr.push(0x15); uv(&mut dict_hdr, zz(2));        // g2 encoding=PLAIN_DICTIONARY(2)
+        dict_hdr.push(0x12);                                  // g3 is_sorted=false
+        dict_hdr.push(0x00);                                  // stop DictionaryPageHeader
+        dict_hdr.push(0x00);                                  // stop PageHeader
+
+        let data_payload: Vec<u8> = vec![0x01, 0x03, 0x04];
+        let pbytes = data_payload.len() as i64; // 3
+        let mut data_hdr = Vec::new();
+        data_hdr.push(0x15); uv(&mut data_hdr, zz(0));        // f1 type=DATA_PAGE(0)
+        data_hdr.push(0x25); uv(&mut data_hdr, zz(pbytes));   // f3 uncompressed_page_size
+        data_hdr.push(0x15); uv(&mut data_hdr, zz(pbytes));   // f4 compressed_page_size
+        data_hdr.push(0x1c);                                  // f5 struct (delta 4->5=1)
+        data_hdr.push(0x15); uv(&mut data_hdr, zz(3));        // g1 num_values=3
+        data_hdr.push(0x15); uv(&mut data_hdr, zz(2));        // g2 encoding=PLAIN_DICTIONARY(2)
+        data_hdr.push(0x00);                                  // stop DataPageHeader
+        data_hdr.push(0x00);                                  // stop PageHeader
+
+        let dict_page_offset: i64 = 4;
+        let data_page_offset: i64 =
+            4 + dict_hdr.len() as i64 + dict_data.len() as i64;
+
+        let mut m = Vec::new();
+        m.push(0x15); uv(&mut m, zz(2));                      // f1 version=2
+        m.push(0x19); m.push(0x2c);                           // f2 list<SchemaElement> 2
+        m.push(0x48); uv(&mut m, 6); m.extend_from_slice(b"schema"); // schema[0] name
+        m.push(0x15); uv(&mut m, zz(1));                      // schema[0] f5 num_children=1
+        m.push(0x00);                                         // stop schema[0]
+        m.push(0x15); uv(&mut m, zz(2));                      // schema[1] f1 type=INT64(2)
+        m.push(0x25); uv(&mut m, zz(0));                      // f3 repetition=REQUIRED
+        m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id"); // f4 name
+        m.push(0x00);                                         // stop schema[1]
+        m.push(0x16); uv(&mut m, zz(3));                      // f3 num_rows=3
+        m.push(0x19); m.push(0x1c);                           // f4 list<RowGroup> 1
+        m.push(0x19); m.push(0x1c);                           // RG f1 list<ColumnChunk> 1
+        m.push(0x3c);                                         // ColumnChunk f3 ColumnMetaData
+        m.push(0x15); uv(&mut m, zz(2));                      // CMD f1 type=INT64(2)
+        m.push(0x19); m.push(0x15); uv(&mut m, zz(2));        // f2 encodings [PLAIN_DICTIONARY(2)]
+        m.push(0x19); m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id"); // f3 path ["id"]
+        m.push(0x15); uv(&mut m, zz(0));                      // f4 codec=UNCOMPRESSED
+        m.push(0x16); uv(&mut m, zz(3));                      // f5 num_values=3
+        m.push(0x46); uv(&mut m, zz(data_page_offset));       // f9 data_page_offset (delta 5->9=4,i64)
+        m.push(0x26); uv(&mut m, zz(dict_page_offset));       // f11 dictionary_page_offset (delta 9->11=2,i64)
+        m.push(0x00);                                         // stop ColumnMetaData
+        m.push(0x00);                                         // stop ColumnChunk
+        m.push(0x26); uv(&mut m, zz(3));                      // RG f3 num_rows=3
+        m.push(0x00);                                         // stop RowGroup
+        m.push(0x00);                                         // stop FileMetaData
+
+        let mut f = Vec::new();
+        f.extend_from_slice(b"PAR1");
+        f.extend_from_slice(&dict_hdr);
+        f.extend_from_slice(&dict_data);
+        f.extend_from_slice(&data_hdr);
+        f.extend_from_slice(&data_payload);
+        let mlen = m.len() as u32;
+        f.extend_from_slice(&m);
+        f.extend_from_slice(&mlen.to_le_bytes());
+        f.extend_from_slice(b"PAR1");
+        f
+    }
+
+    #[test]
+    fn extract_decodes_dictionary_int64() {
+        let file = build_dict_int64_file();
+        let rows = extract(&file, &["id"]).expect("extract");
+        assert_eq!(rows, vec![
+            vec![PqValue::I64(7)],
+            vec![PqValue::I64(7)],
+            vec![PqValue::I64(-2)],
+        ]);
+    }
+
+    #[test]
+    fn extract_plain_and_dict_are_identical() {
+        let plain = build_parquet_file(0, 0, 0, false);
+        let plain_rows = extract(&plain, &["id"]).expect("plain");
+        let dict_rows = extract(&build_dict_int64_file(), &["id"])
+            .expect("dict");
+        assert_eq!(plain_rows, vec![vec![PqValue::I64(7)],
+                                    vec![PqValue::I64(-2)]]);
+        assert_eq!(dict_rows, vec![vec![PqValue::I64(7)],
+                                   vec![PqValue::I64(7)],
+                                   vec![PqValue::I64(-2)]]);
+        assert_eq!(plain_rows[0], dict_rows[0]);
+        assert_eq!(plain_rows[1], dict_rows[2]);
+    }
+
+    #[test]
+    fn extract_rejects_delta_encoding() {
+        let file = build_parquet_file(5, 0, 0, false);
+        assert!(
+            matches!(extract(&file, &["id"]), Err(PqError::Unsupported(_))),
+            "DELTA encoding must be Unsupported"
         );
     }
 }

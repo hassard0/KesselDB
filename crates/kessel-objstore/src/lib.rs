@@ -105,7 +105,6 @@ pub fn sign_get(
 /// `YYYYMMDD` and `YYYYMMDDTHHMMSSZ` from epoch seconds (UTC,
 /// proleptic Gregorian). Pure — used by both signers and unit-tested
 /// directly so the AWS/Azure known-answer vectors are reproducible.
-#[allow(dead_code)] // consumed by sigv4.rs (Task 2) + azure.rs (Task 3)
 pub(crate) fn ymd_hms(secs: u64) -> (String, String) {
     let days = (secs / 86_400) as i64;
     let sod = (secs % 86_400) as u32;

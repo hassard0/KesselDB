@@ -1,6 +1,6 @@
 //! Minimal std-alphabet base64 (encode + decode) — no external dep.
 //! Azure account keys are base64; the signature is base64-encoded.
-#![allow(dead_code)] // encode/decode consumed by azure.rs (Task 3) + sigv4.rs (Task 2)
+#![allow(dead_code)] // encode/decode consumed by azure.rs (Task 3)
 
 const ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

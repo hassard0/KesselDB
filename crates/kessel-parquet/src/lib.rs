@@ -52,6 +52,9 @@ pub fn extract(
     let md = meta::FileMetaData::decode(md_bytes)?;
 
     // Resolve each wanted name to its leaf; enforce REQUIRED + flat.
+    // Also collect the schema-declared physical type for each wanted column
+    // so the per-row-group loop can verify ColumnMetaData type consistency.
+    let mut wanted_ptypes: Vec<meta::Type> = Vec::with_capacity(wanted.len());
     for w in wanted {
         let leaf = md
             .leaves
@@ -78,6 +81,7 @@ pub fn extract(
                 )))
             }
         }
+        wanted_ptypes.push(leaf.ptype);
     }
 
     // Per wanted column: concatenate its values across all row groups.
@@ -94,6 +98,17 @@ pub fn extract(
                         "row group missing column `{w}`"
                     ))
                 })?;
+            // STRICT early guard (Fix 1): schema-declared ptype must equal
+            // the ColumnMetaData ptype. A crafted file could pass the schema
+            // gate with one type and encode a different type in ColumnMetaData.
+            // Reject such divergence immediately as a typed Bad error rather
+            // than deferring detection to decode_plain's Unsupported arm.
+            if cc.ptype != wanted_ptypes[ci] {
+                return Err(PqError::Bad(format!(
+                    "column `{}` schema/column-chunk physical-type mismatch",
+                    w
+                )));
+            }
             if cc.codec != meta::Codec::Uncompressed {
                 return Err(PqError::Unsupported(
                     "compression: OBJ-2b/2c".into(),
@@ -222,14 +237,17 @@ mod tests {
     ///
     /// Parameters allow toggling individual fields to test support-matrix
     /// gates:
-    ///   - `encoding`:   Encoding enum value (0=PLAIN, 2=PLAIN_DICTIONARY)
-    ///   - `codec`:      CompressionCodec enum value (0=UNCOMPRESSED, 2=SNAPPY)
-    ///   - `repetition`: RepetitionType enum value (0=REQUIRED, 1=OPTIONAL)
+    ///   - `encoding`:    Encoding enum value (0=PLAIN, 2=PLAIN_DICTIONARY)
+    ///   - `codec`:       CompressionCodec enum value (0=UNCOMPRESSED, 2=SNAPPY)
+    ///   - `repetition`:  RepetitionType enum value (0=REQUIRED, 1=OPTIONAL)
+    ///   - `chunk_ptype`: ColumnMetaData physical type (normally == schema type
+    ///                    INT64=2; set to a different value to trigger Fix-1 guard)
     ///   - `data_page_offset`: actual byte offset of the page header in the file
     fn filemetadata_bytes(
         encoding: i64,
         codec: i64,
         repetition: i64,
+        chunk_ptype: i64,
         data_page_offset: i64,
     ) -> Vec<u8> {
         let mut b = Vec::new();
@@ -272,8 +290,8 @@ mod tests {
         b.push(0x3c);
 
         // ColumnMetaData:
-        //   f1 type=INT64(2): (1<<4)|5=0x15, zz(2)=4
-        b.push(0x15); uv(&mut b, zz(2));
+        //   f1 type=chunk_ptype: (1<<4)|5=0x15, zz(chunk_ptype)
+        b.push(0x15); uv(&mut b, zz(chunk_ptype));
         //   f2 encodings list<Encoding> 1 elem:
         //     delta 1→2=1 → (1<<4)|9=0x19
         //     list-hdr 1 elem i32: (1<<4)|5=0x15
@@ -308,11 +326,30 @@ mod tests {
     ///
     /// `encoding`/`codec`/`repetition` are passed through to
     /// `filemetadata_bytes` to allow toggling individual fields for
-    /// support-matrix rejection tests.
+    /// support-matrix rejection tests. `chunk_ptype` is the physical type
+    /// written into ColumnMetaData (normally INT64=2 to match the schema
+    /// leaf; set to another value to trigger the Fix-1 schema/chunk guard).
     fn build_parquet_file(
         encoding: i64,
         codec: i64,
         repetition: i64,
+        use_dict_page_hdr: bool,
+    ) -> Vec<u8> {
+        build_parquet_file_inner(encoding, codec, repetition, 2, use_dict_page_hdr)
+    }
+
+    /// Like `build_parquet_file` but also overrides the ColumnMetaData
+    /// physical type (`chunk_ptype`) independently of the schema leaf type
+    /// (always INT64=2). Used by the Fix-1 lock test.
+    fn build_parquet_file_with_chunk_type(chunk_ptype: i64) -> Vec<u8> {
+        build_parquet_file_inner(0, 0, 0, chunk_ptype, false)
+    }
+
+    fn build_parquet_file_inner(
+        encoding: i64,
+        codec: i64,
+        repetition: i64,
+        chunk_ptype: i64,
         use_dict_page_hdr: bool,
     ) -> Vec<u8> {
         // PLAIN page data: 7i64 + (-2)i64 in little-endian
@@ -332,7 +369,9 @@ mod tests {
         let data_page_offset: i64 = 4;
 
         // Build FileMetaData
-        let meta = filemetadata_bytes(encoding, codec, repetition, data_page_offset);
+        let meta = filemetadata_bytes(
+            encoding, codec, repetition, chunk_ptype, data_page_offset,
+        );
         let mlen = meta.len() as u32;
 
         // Assemble file:
@@ -347,57 +386,84 @@ mod tests {
         file
     }
 
+    // ── Split support-matrix tests (Fix 2) ────────────────────────────
+
     #[test]
-    fn extract_kat_spec_faithful_parquet_file() {
+    fn extract_golden_int64_two_rows() {
         // Good file: PLAIN(0), UNCOMPRESSED(0), REQUIRED(0), plain page hdr
         let file = build_parquet_file(0, 0, 0, false);
-
-        // KAT: extract "id" → rows [[I64(7)], [I64(-2)]]
         let rows = extract(&file, &["id"]).expect("extract");
         assert_eq!(rows, vec![
             vec![PqValue::I64(7)],
             vec![PqValue::I64(-2)],
         ]);
+    }
 
-        // ── support-matrix rejection tests ────────────────────────────
-
-        // dict_file: encoding = PLAIN_DICTIONARY(2) in ColumnMetaData encodings
+    #[test]
+    fn extract_rejects_dict_columnmeta_encoding() {
+        // encoding = PLAIN_DICTIONARY(2) in ColumnMetaData encodings
         // → triggers "non-PLAIN encoding" gate
         let dict_file = build_parquet_file(2, 0, 0, false);
         assert!(
             matches!(extract(&dict_file, &["id"]), Err(PqError::Unsupported(_))),
             "dict encoding must be Unsupported"
         );
+    }
 
-        // snappy_file: codec = SNAPPY(2) in ColumnMetaData
+    #[test]
+    fn extract_rejects_snappy_codec() {
+        // codec = SNAPPY(2) in ColumnMetaData
         // → triggers "compression" gate
         let snappy_file = build_parquet_file(0, 2, 0, false);
         assert!(
             matches!(extract(&snappy_file, &["id"]), Err(PqError::Unsupported(_))),
             "snappy codec must be Unsupported"
         );
+    }
 
-        // optional_file: repetition = OPTIONAL(1) in SchemaElement
+    #[test]
+    fn extract_rejects_optional_repetition() {
+        // repetition = OPTIONAL(1) in SchemaElement
         // → triggers "OPTIONAL/REPEATED columns" gate (checked at schema level)
         let optional_file = build_parquet_file(0, 0, 1, false);
         assert!(
             matches!(extract(&optional_file, &["id"]), Err(PqError::Unsupported(_))),
             "optional repetition must be Unsupported"
         );
+    }
 
-        // good_file + missing column name → Bad
-        let good_file = build_parquet_file(0, 0, 0, false);
-        assert!(
-            matches!(extract(&good_file, &["missing"]), Err(PqError::Bad(_))),
-            "missing column must be Bad"
-        );
-
-        // dict_page_hdr: page header encoding field = PLAIN_DICTIONARY(2)
+    #[test]
+    fn extract_rejects_dict_data_page_encoding() {
+        // page header encoding field = PLAIN_DICTIONARY(2)
         // → triggers "data page encoding != PLAIN" gate
         let dict_page_file = build_parquet_file(0, 0, 0, true);
         assert!(
             matches!(extract(&dict_page_file, &["id"]), Err(PqError::Unsupported(_))),
             "dict page encoding must be Unsupported"
+        );
+    }
+
+    #[test]
+    fn extract_rejects_missing_column() {
+        // good file + missing column name → Bad
+        let good_file = build_parquet_file(0, 0, 0, false);
+        assert!(
+            matches!(extract(&good_file, &["missing"]), Err(PqError::Bad(_))),
+            "missing column must be Bad"
+        );
+    }
+
+    /// Lock test for Fix 1: schema leaf says INT64(2) but ColumnMetaData
+    /// says INT32(1). The strict ptype guard must fire and return Bad,
+    /// NOT Unsupported (which is what decode_plain's `other=>Unsupported`
+    /// arm would produce without the guard) and NOT a successful decode.
+    #[test]
+    fn extract_rejects_schema_chunk_type_mismatch() {
+        // Schema leaf type = INT64(2), ColumnMetaData type = INT32(1).
+        let mismatch_file = build_parquet_file_with_chunk_type(1); // INT32=1
+        assert!(
+            matches!(extract(&mismatch_file, &["id"]), Err(PqError::Bad(_))),
+            "schema/chunk ptype mismatch must be Bad (Fix-1 gate)"
         );
     }
 }

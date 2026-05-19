@@ -261,13 +261,21 @@ member — including the new `kessel-objstore` crate. Nothing in the
 workspace excludes it. The 20 new tests that appear in the default-build
 total are:
 
-1. The `kessel-objstore` crate's 12 unit tests (b64, date formatters,
-   SigV4 KAT, Azure KAT, RFC-3986, anti-injection, secret-leak sentinels).
-2. The `kessel-catalog` v3 trailer round-trip and back-compat tests.
-3. The `kessel-proto` additive objstore tolerant-decode test.
-4. The `kessel-sm` auth_kind 3 map test + none-rejected test.
-5. The `kessel-sql` grammar tests (s3:// parses, az:// parses, Parquet
-   rejected, PAGE on object-store rejected).
+1. **`kessel-objstore` — 12 tests** (b64, date formatters, SigV4 KAT,
+   Azure KAT, RFC-3986, anti-injection, secret-leak sentinels). All new;
+   this is a new workspace member with no prior baseline.
+2. **`kessel-catalog` — 1 test** (v3 trailer back-compat round-trip;
+   catalog 7 → 8).
+3. **`kessel-proto` — 1 test** (additive objstore tolerant-decode;
+   proto 9 → 10).
+4. **`kessel-sm` — 2 tests** (auth_kind 3 map + none-rejected apply;
+   sm 69 → 71).
+5. **`kessel-sql` — 4 tests** (s3:// parses, az:// parses, Parquet
+   rejected, PAGE on object-store rejected; sql 29 → 33).
+
+Total: 12 + 1 + 1 + 2 + 4 = **20** (`cargo test`-measured; kessel-objstore
+12 unit tests + 8 back-compat/validation tests across
+kessel-catalog/proto/sm/sql).
 
 **The invariants that DO hold (these are the correct claims):**
 

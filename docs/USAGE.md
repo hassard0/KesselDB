@@ -650,7 +650,7 @@ Clause rules for `s3://`:
 ### Azure Blob Storage
 
 ```sql
--- Azure Blob — ACCOUNT inferred from az:// URL (az://container/blob)
+-- Azure Blob — ACCOUNT declared explicitly in the AUTH clause (or use ENDPOINT instead; exactly one)
 CREATE EXTERNAL SOURCE catalog (
     sku    BYTES  NOT NULL FROM 'sku',
     price  I64    NOT NULL FROM 'price_cents'

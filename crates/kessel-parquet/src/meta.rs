@@ -111,7 +111,7 @@ pub struct SchemaLeaf {
 /// (nested struct node, including the root). Used internally to compute
 /// `FileMetaData::flat_schema`.
 #[derive(Clone, Debug)]
-pub enum SchemaNode {
+pub(crate) enum SchemaNode {
     Leaf(SchemaLeaf),
     Group { num_children: i32 },
 }
@@ -137,8 +137,9 @@ pub struct RowGroup {
 pub struct FileMetaData {
     pub version: i32,
     pub num_rows: i64,
-    /// Flat leaf schema elements (root group element with
-    /// num_children>0 is excluded; only true leaves kept).
+    /// Only `SchemaNode::Leaf` elements (true leaves: a physical type,
+    /// `num_children == 0`) are collected here; `Group` elements
+    /// (root/intermediate/typeless) are excluded.
     pub leaves: Vec<SchemaLeaf>,
     pub row_groups: Vec<RowGroup>,
     /// True iff the schema is flat: exactly one root group whose
@@ -190,17 +191,22 @@ impl FileMetaData {
                 _ => s.skip(f.ctype)?,
             }
         }
-        // flat_schema: true iff the schema is exactly one root group
-        // whose num_children equals the count of leaf elements, with no
-        // intermediate group nodes anywhere else.
-        let flat_schema = !nodes.is_empty()
-            && matches!(nodes[0], SchemaNode::Group { .. })
-            && nodes[1..].iter().all(|n| matches!(n, SchemaNode::Leaf(_)))
-            && (if let SchemaNode::Group { num_children } = nodes[0] {
-                num_children as usize == nodes.len() - 1
-            } else {
-                false
-            });
+        // Flat schema = exactly one root Group followed only by Leaf
+        // elements, and the root's declared num_children matches the
+        // actual leaf count (catches a lying child count). `.first()`
+        // also handles the empty-schema case (=> false). A nc==0 root
+        // with zero leaves is vacuously "flat" but yields no leaves and
+        // fails downstream OBJ-2b column resolution — harmless.
+        // Negative nc: a negative i32 cast to usize becomes a huge
+        // number, != nodes.len()-1, so flat_schema=false — safe.
+        let flat_schema = if let Some(SchemaNode::Group { num_children: nc }) =
+            nodes.first()
+        {
+            nodes[1..].iter().all(|n| matches!(n, SchemaNode::Leaf(_)))
+                && *nc as usize == nodes.len() - 1
+        } else {
+            false
+        };
         Ok(FileMetaData { version, num_rows, leaves, row_groups, flat_schema })
     }
 }

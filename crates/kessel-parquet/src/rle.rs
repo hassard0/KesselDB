@@ -309,11 +309,12 @@ mod tests {
             state = state
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
+            // LCG; `>> 11` yields 53-bit values (top bits of bw 30..=32 stay 0 — still exercises the decoder).
             state >> 11
         };
         for bw in 1u32..=32 {
             for &count in &[8usize, 16, 64, 256] {
-                let mask = if bw == 64 { u64::MAX } else { (1u64 << bw) - 1 };
+                let mask = (1u64 << bw) - 1;
                 let vals: Vec<u64> =
                     (0..count).map(|_| next() & mask).collect();
                 let stream = enc_bitpacked(&vals, bw);

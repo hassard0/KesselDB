@@ -15,6 +15,7 @@ KesselDB. Every feature described here is covered by the test suite.
 - [7c. External sources (JSON/CSV over HTTP)](#7c-external-sources-jsoncsv-over-http)
 - [7d. Paginated & NDJSON sources](#7d-paginated--ndjson-sources)
 - [7e. Object-store sources (S3 / Azure Blob)](#7e-object-store-sources-s3--azure-blob)
+- [7f. FORMAT PARQUET for object-store sources (OBJ-2a)](#7f-format-parquet-for-object-store-sources-obj-2a)
 - [8. Authentication, quotas & backpressure](#8-authentication-quotas--backpressure)
 - [9. Backup & monitoring](#9-backup--monitoring)
 - [10. Wire protocol](#10-wire-protocol)
@@ -721,17 +722,138 @@ messages.
 
 ### Honest boundaries
 
-- **`FORMAT PARQUET`, Iceberg manifests, prefix/multi-object listing,
-  and STS/SAS/IMDS credential providers** are explicit follow-ons
-  (OBJ-2 through OBJ-5) and are **rejected at `CREATE`** with a clear
-  error message. Only `FORMAT JSON`, `FORMAT CSV`, and `FORMAT NDJSON`
-  are accepted.
+- **`FORMAT PARQUET`** is supported for `s3://` / `az://` sources with
+  the `--features external-sources-objstore` build (OBJ-2a, §7f below).
+  See §7f for the precise scope (PLAIN/UNCOMPRESSED/flat REQUIRED/V1
+  pages) and the supported-vs-deferred matrix.
+- **Iceberg manifests, prefix/multi-object listing, and STS/SAS/IMDS
+  credential providers** are explicit follow-ons (OBJ-3 through OBJ-5)
+  and are **rejected at `CREATE`** with a clear error message.
 - **Single object per source.** A `REFRESH` fetches exactly one
   object. Listing a prefix or walking a multi-object partition is OBJ-4.
 - **Upsert only.** Same as §7c — rows deleted from the upstream object
   are not automatically pruned from the materialized table.
 - **Snapshot since last `REFRESH`.** Queries read the last materialized
   snapshot; live object-store reads are never issued by a `SELECT`.
+
+## 7f. FORMAT PARQUET for object-store sources (OBJ-2a)
+
+`FORMAT PARQUET` is supported for `s3://` and `az://` sources when the
+server is built with `--features external-sources-objstore`. Plain
+`http://` / `https://` URLs are **rejected** with a clear message if
+`FORMAT PARQUET` is specified — Parquet is object-store only. `PAGE`
+and `ROWS` clauses are also **rejected** at `CREATE` with `FORMAT
+PARQUET` (they are not applicable: a Parquet object is self-describing
+and multi-row-group; row selection is column-map driven, not page-cursor
+driven).
+
+> **Requires `--features external-sources-objstore`** (same as §7e);
+> the default build and plain `--features external-sources` do not
+> compile Parquet support and do not link any parquet/objstore/rustls
+> dependency.
+
+### SQL syntax
+
+```sql
+CREATE EXTERNAL SOURCE readings (
+    sensor_id  U64    NOT NULL FROM 'sensor_id',
+    temp_c     I64    NOT NULL FROM 'temp_celsius',
+    label      BYTES  NOT NULL FROM 'label'
+) FROM 's3://my-bucket/data/readings.parquet'
+  FORMAT PARQUET
+  KEY sensor_id
+  REGION 'us-east-1'
+  AUTH OBJSTORE S3 KEYID ENV 'AWS_ACCESS_KEY_ID' SECRET ENV 'AWS_SECRET_ACCESS_KEY'
+```
+
+- `FROM '<col_name>'` after each column is the **flat Parquet leaf
+  column name** (`ColumnMap.source`). It must be a leaf column present
+  in the Parquet schema at the top level (no nested group path syntax
+  in OBJ-2a).
+- All other clauses (`REGION`, `ENDPOINT`, `AUTH OBJSTORE S3/AZURE`,
+  `KEY`) are identical to §7e.
+- `REFRESH` and `DROP EXTERNAL SOURCE` work identically to §7e.
+
+### OBJ-2a scope: what is supported
+
+| Parquet property | OBJ-2a |
+|---|---|
+| Encoding | `PLAIN` only |
+| Compression codec | `UNCOMPRESSED` only |
+| Column repetition | `REQUIRED` flat columns only (no `OPTIONAL`, no `REPEATED`, no nested groups) |
+| Data page version | V1 (`DATA_PAGE`) only |
+| Row groups | Multi-row-group files are fully supported |
+| Column subset | Only the recipe-mapped columns are decoded; unmapped columns are skipped |
+| Physical types | `BOOLEAN`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `BYTE_ARRAY` |
+
+### What is NOT supported (rejected at REFRESH with a precise error)
+
+The following trigger a typed `PqError` (surfaced as a `REFRESH`
+failure; prior materialized data is left intact — all-or-nothing, same
+as every other format):
+
+- **Dictionary / RLE-data encoding** — rejected with
+  `Unsupported("<enc> encoding: OBJ-2b")`.
+- **Snappy compression** — rejected with
+  `Unsupported("compression SNAPPY: OBJ-2b")`.
+- **Gzip / Zstd compression** — rejected with
+  `Unsupported("compression GZIP/ZSTD: OBJ-2c")`.
+- **OPTIONAL or REPEATED columns** (definition/repetition levels) —
+  rejected with `Unsupported("OPTIONAL/REPEATED/nested columns: OBJ-2b")`.
+- **Nested group columns** — same `Unsupported` as OPTIONAL/REPEATED.
+- **V2 data pages** (`DATA_PAGE_V2`) — rejected with
+  `Unsupported("Parquet V2 data pages: OBJ-2b")`.
+- **`INT96` / `FIXED_LEN_BYTE_ARRAY` / `DECIMAL`** physical types —
+  rejected with `Unsupported("INT96/FIXED_LEN_BYTE_ARRAY: OBJ-2c")`.
+- **A mapped column name absent from the Parquet schema** — rejected
+  with `Bad("column \`<name>\` not found in Parquet schema")`.
+
+None of the above are decoded silently or partially. Failure is
+precise, typed, and fail-closed — the error message names the
+OBJ-2b/2c follow-on that will address it.
+
+### Producing a compatible Parquet file
+
+A file compatible with OBJ-2a can be written with pyarrow:
+
+```python
+import pyarrow as pa, pyarrow.parquet as pq
+
+schema = pa.schema([
+    pa.field("sensor_id", pa.int64(), nullable=False),
+    pa.field("temp_celsius", pa.int64(), nullable=False),
+    pa.field("label", pa.large_binary(), nullable=False),
+])
+table = pa.table({
+    "sensor_id":   pa.array([1, 2, 3], type=pa.int64()),
+    "temp_celsius": pa.array([22, 18, 25], type=pa.int64()),
+    "label":        pa.array([b"A", b"B", b"C"], type=pa.large_binary()),
+})
+pq.write_table(table, "readings.parquet",
+               use_dictionary=False,
+               compression="none",
+               data_page_version="1.0")
+```
+
+Key options: `use_dictionary=False` (forces PLAIN encoding),
+`compression="none"` (UNCOMPRESSED), `data_page_version="1.0"` (V1
+pages). Multi-row-group files are supported — all row groups are
+iterated in order.
+
+### Physical-type-to-KesselDB-column mapping
+
+| Parquet physical type | Mapped as (`ColumnMap.source`) | Notes |
+|---|---|---|
+| `INT32` | `I64` or `U64` column | Value widened to i64 |
+| `INT64` | `I64` or `U64` column | Value taken as i64 |
+| `FLOAT` | Any numeric column | Rendered via canonical-f64 formatting |
+| `DOUBLE` | Any numeric column | Rendered via canonical-f64 formatting |
+| `BOOLEAN` | Any column | Rendered as `"true"` or `"false"` |
+| `BYTE_ARRAY` | `BYTES` or `CHAR` column | Decoded as UTF-8 (lossy) |
+
+The mapping goes through the same `coerce::to_field_bytes` path the
+JSON decoder uses, so the same logical value yields identical
+`FieldKind` bytes regardless of whether it arrived as JSON or Parquet.
 
 ## 8. Authentication, quotas & backpressure
 

@@ -6,7 +6,7 @@
 
 *"It's the database that made the Kessel Run in 12 parsecs."*
 
-`267 tests green` · `0 external dependencies` · `Rust 1.95+` · single‑binary
+`293 tests green` · `0 external dependencies` · `Rust 1.95+` · single‑binary
 
 </div>
 
@@ -60,11 +60,13 @@ feature, not an aspiration.
 - **External sources** — register and `REFRESH` JSON/NDJSON/CSV from HTTP/HTTPS
   endpoints or directly from S3-compatible and Azure Blob object storage
   (`CREATE EXTERNAL SOURCE … FROM 'http://…' | 's3://…' | 'az://…' FORMAT
-  JSON|NDJSON|CSV`); a single `REFRESH` can walk multi-page HTTP APIs via
-  next-URL, `Link` header, or cursor-param pagination; all queried with ordinary
-  SQL (`--features external-sources`, default off; `--features
-  external-sources-objstore` for S3/Azure; deterministic kernel unaffected when
-  off).
+  JSON|NDJSON|CSV|PARQUET`); `FORMAT PARQUET` is supported for `s3://`/`az://`
+  (OBJ-2a: PLAIN/UNCOMPRESSED/flat-REQUIRED/V1-pages/multi-RG); a single
+  `REFRESH` can walk multi-page HTTP APIs via next-URL, `Link` header, or
+  cursor-param pagination; all queried with ordinary SQL
+  (`--features external-sources`, default off; `--features
+  external-sources-objstore` for S3/Azure + Parquet; deterministic kernel
+  unaffected when off).
 - **Deterministic & verifiable** — the whole engine is a seedable state machine;
   the test suite includes a seeded partition/fault simulation corpus.
 
@@ -198,6 +200,10 @@ Honest boundaries (documented, not hidden):
   register `s3://` or `az://` endpoints; without it those URL schemes are
   rejected at `CREATE` with a clear message. Object-store requests are
   HTTPS-only with full webpki certificate verification and no bypass.
+  `FORMAT PARQUET` for `s3://`/`az://` is supported under this same
+  feature (OBJ-2a: PLAIN/UNCOMPRESSED/flat‑REQUIRED/V1‑page/multi‑RG;
+  dictionary, RLE, Snappy, OPTIONAL columns and V2 pages are rejected
+  at `REFRESH` with precise typed errors naming the OBJ‑2b/2c follow‑ons).
 - **Cross‑shard transactions** are implemented, **deterministically**
   (Calvin‑style), over real sockets — *not* blocking two‑phase commit.
   A deployment runs K independent VSR shard groups behind a router
@@ -226,7 +232,7 @@ Honest boundaries (documented, not hidden):
   `Delete`); cross‑shard scatter‑gather *reads*/SQL text routing is a
   separate, later concern from cross‑shard *transactions*.
 
-Every claim in this repository is backed by the test suite (`267 tests`); the
+Every claim in this repository is backed by the test suite (`293 tests`); the
 docs call out exactly what is proven versus roadmap.
 
 ## Documentation
@@ -246,7 +252,7 @@ docs call out exactly what is proven versus roadmap.
 
 ```bash
 cargo build                 # all crates, zero external deps
-cargo test --workspace      # 267 tests (incl. seeded partition/fault simulation)
+cargo test --workspace      # 293 tests (incl. seeded partition/fault simulation)
 cargo run -p kessel-bench --release -- --help   # benchmarks
 ```
 

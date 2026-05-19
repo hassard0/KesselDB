@@ -249,7 +249,7 @@ to confirm physical type and encoding match expectations:
 ### Matched-precision 3-way DECIMAL cross-physical-type determinism pin
 
 Three additional fixtures carry the **same 5 logical DECIMAL values** at
-equal precision=38 (so the same value fits in all three physical types):
+matched scale=2 with precision chosen per physical type (9 for INT32, 18 for INT64, 30 for FLBA — max unscaled ~10^8 fits all three):
 
 - `decimal_int32_eq_9_2.parquet` — precision=9, scale=2, INT32 physical type.
 - `decimal_int64_eq_18_2.parquet` — precision=18, scale=2, INT64 physical type.
@@ -320,7 +320,7 @@ errors only. Wall time < 0.142s for all 27 tests combined.
 
 **Positive locks (8):**
 - INT96 plain REQUIRED — asserts `Ok([Timestamp(ns), …])`.
-- INT96 optional REQUIRED — asserts null scatter correct.
+- INT96 plain OPTIONAL — asserts null scatter correct.
 - DECIMAL INT32 5/2 fixture roundtrip — asserts exact unscaled values.
 - DECIMAL INT64 18/3 fixture roundtrip — asserts exact unscaled values.
 - DECIMAL FLBA 30/5 fixture roundtrip — asserts exact unscaled values.

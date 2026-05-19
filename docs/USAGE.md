@@ -755,6 +755,14 @@ messages.
 > unsupported (→ OBJ-2b-4); gzip/zstd and Snappy pages >64 MiB →
 > OBJ-2c.
 
+> **OBJ-2b-4 (SP105):** vanilla `pq.write_table(df)` — flat REQUIRED
+> or OPTIONAL columns, UNCOMPRESSED or Snappy, PLAIN or dictionary, V1
+> — is now fully supported, including NULLs (OPTIONAL def-level 0 →
+> `PqValue::Null`). The OBJ-2b arc is COMPLETE. REPEATED columns /
+> repetition levels, nested/optional groups, gzip/zstd/lz4/brotli,
+> INT96/DECIMAL, V2 data pages, and Snappy pages >64 MiB remain
+> Unsupported (→ OBJ-2c).
+
 `FORMAT PARQUET` is supported for `s3://` and `az://` sources when the
 server is built with `--features external-sources-objstore`. Plain
 `http://` / `https://` URLs are **rejected** with a clear message if
@@ -791,17 +799,18 @@ CREATE EXTERNAL SOURCE readings (
   `KEY`) are identical to §7e.
 - `REFRESH` and `DROP EXTERNAL SOURCE` work identically to §7e.
 
-### Parquet scope: what is currently supported (OBJ-2a → OBJ-2b-3)
+### Parquet scope: what is currently supported (OBJ-2a → OBJ-2b-4)
 
-| Parquet property | OBJ-2a → OBJ-2b-3 |
+| Parquet property | OBJ-2a → OBJ-2b-4 |
 |---|---|
 | Encoding | `PLAIN` and dictionary (`PLAIN_DICTIONARY`/`RLE_DICTIONARY`); RLE/bit-packing hybrid for dictionary indices |
 | Compression codec | `UNCOMPRESSED` and `SNAPPY` (raw block; pages ≤ 64 MiB decompressed) |
-| Column repetition | `REQUIRED` flat columns only (no `OPTIONAL`, no `REPEATED`, no nested groups) |
+| Column repetition | `REQUIRED` or `OPTIONAL` flat columns (nullable; V1 definition levels) |
 | Data page version | V1 (`DATA_PAGE`) only |
 | Row groups | Multi-row-group files are fully supported |
 | Column subset | Only the recipe-mapped columns are decoded; unmapped columns are skipped |
 | Physical types | `BOOLEAN`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `BYTE_ARRAY` |
+| Null values | OPTIONAL def-level 0 rows → `PqValue::Null` (coerced via the same path as JSON `null`) |
 
 ### What is NOT supported (rejected at REFRESH with a precise error)
 
@@ -809,9 +818,10 @@ The following trigger a typed `PqError` (surfaced as a `REFRESH`
 failure; prior materialized data is left intact — all-or-nothing, same
 as every other format):
 
-- **OPTIONAL or REPEATED columns** (definition/repetition levels) —
-  rejected with `Unsupported("OPTIONAL/REPEATED/nested columns: OBJ-2b")`.
-- **Nested group columns** — same `Unsupported` as OPTIONAL/REPEATED.
+- **REPEATED columns / repetition levels** — rejected with
+  `Unsupported("REPEATED columns: OBJ-2c")`.
+- **Nested / optional groups** (non-flat schema; intermediate group
+  nodes) — rejected with `Unsupported("nested schema: OBJ-2c")`.
 - **Gzip / Zstd / lz4 / brotli compression** — rejected with
   `Unsupported("compression GZIP/ZSTD: OBJ-2c")`.
 - **Snappy pages above 64 MiB decompressed** — rejected with

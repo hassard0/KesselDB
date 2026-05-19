@@ -44,17 +44,49 @@ impl std::fmt::Display for PqError {
     }
 }
 
+/// The on-disk page payload, decompressed if needed. Slices the
+/// `comp`-byte on-disk region at `dstart`; Uncompressed → borrowed
+/// (zero-copy), Snappy → owned decompressed (length `uncomp`).
+fn page_payload<'a>(
+    file: &'a [u8],
+    dstart: usize,
+    comp: usize,
+    uncomp: usize,
+    codec: meta::Codec,
+) -> Result<std::borrow::Cow<'a, [u8]>, PqError> {
+    let end = dstart
+        .checked_add(comp)
+        .ok_or_else(|| PqError::Bad("page region ovf".into()))?;
+    let on_disk = file
+        .get(dstart..end)
+        .ok_or_else(|| PqError::Bad("page data truncated".into()))?;
+    match codec {
+        meta::Codec::Uncompressed => Ok(std::borrow::Cow::Borrowed(on_disk)),
+        meta::Codec::Snappy => {
+            Ok(std::borrow::Cow::Owned(snappy::decompress(on_disk, uncomp)?))
+        }
+        meta::Codec::Other(_) => Err(PqError::Unsupported(
+            "compression codec (gzip/zstd/lz4/brotli): OBJ-2c".into(),
+        )),
+    }
+}
+
 /// Read one column chunk's values across all its pages.
-/// Flat REQUIRED, UNCOMPRESSED, V1. Supports: an optional leading
-/// DICTIONARY_PAGE then zero-or-more DATA_PAGEs; each data page is
-/// PLAIN (dictionary-fallback) or PLAIN_DICTIONARY/RLE_DICTIONARY.
+/// Flat REQUIRED, UNCOMPRESSED or SNAPPY, V1. Supports: an optional
+/// leading DICTIONARY_PAGE then zero-or-more DATA_PAGEs; each data
+/// page is PLAIN (dictionary-fallback) or PLAIN_DICTIONARY/RLE_DICTIONARY.
 fn read_chunk_values(
     file: &[u8],
     cc: &meta::ColumnChunk,
     want_ptype: meta::Type,
 ) -> Result<Vec<PqValue>, PqError> {
-    if cc.codec != meta::Codec::Uncompressed {
-        return Err(PqError::Unsupported("compression: OBJ-2b-3".into()));
+    match cc.codec {
+        meta::Codec::Uncompressed | meta::Codec::Snappy => {}
+        meta::Codec::Other(_) => {
+            return Err(PqError::Unsupported(
+                "compression codec (gzip/zstd/lz4/brotli): OBJ-2c".into(),
+            ))
+        }
     }
     if cc.encodings.iter().any(|e| {
         !matches!(
@@ -95,16 +127,12 @@ fn read_chunk_values(
         let dstart = off
             .checked_add(hlen)
             .ok_or_else(|| PqError::Bad("dict page hdr len ovf".into()))?;
-        let dend = dstart
-            .checked_add(
-                usize::try_from(ph.uncompressed_size)
-                    .map_err(|_| PqError::Bad("dict page size range".into()))?,
-            )
-            .ok_or_else(|| PqError::Bad("dict page size ovf".into()))?;
-        let dpage = file
-            .get(dstart..dend)
-            .ok_or_else(|| PqError::Bad("dict page data truncated".into()))?;
-        plain::decode_plain(dpage, want_ptype, dn)?
+        let comp = usize::try_from(ph.compressed_size)
+            .map_err(|_| PqError::Bad("dict page comp size range".into()))?;
+        let uncomp = usize::try_from(ph.uncompressed_size)
+            .map_err(|_| PqError::Bad("dict page size range".into()))?;
+        let payload = page_payload(file, dstart, comp, uncomp, cc.codec)?;
+        plain::decode_plain(&payload, want_ptype, dn)?
     } else {
         Vec::new()
     };
@@ -129,17 +157,13 @@ fn read_chunk_values(
         let dstart = off
             .checked_add(hlen)
             .ok_or_else(|| PqError::Bad("page hdr len ovf".into()))?;
-        let dend = dstart
-            .checked_add(
-                usize::try_from(ph.uncompressed_size)
-                    .map_err(|_| PqError::Bad("page size range".into()))?,
-            )
-            .ok_or_else(|| PqError::Bad("page size ovf".into()))?;
-        let page = file
-            .get(dstart..dend)
-            .ok_or_else(|| PqError::Bad("page data truncated".into()))?;
+        let comp = usize::try_from(ph.compressed_size)
+            .map_err(|_| PqError::Bad("page comp size range".into()))?;
+        let uncomp = usize::try_from(ph.uncompressed_size)
+            .map_err(|_| PqError::Bad("page size range".into()))?;
+        let payload = page_payload(file, dstart, comp, uncomp, cc.codec)?;
         let vals = match ph.dp_encoding {
-            0 => plain::decode_plain(page, want_ptype, n)?,
+            0 => plain::decode_plain(&payload, want_ptype, n)?,
             2 | 8 => {
                 if cc.dictionary_page_offset.is_none() {
                     return Err(PqError::Bad(
@@ -147,7 +171,7 @@ fn read_chunk_values(
                             .into(),
                     ));
                 }
-                dict::resolve_dict_indices(page, &dict, n)?
+                dict::resolve_dict_indices(&payload, &dict, n)?
             }
             _ => {
                 return Err(PqError::Unsupported(
@@ -162,12 +186,12 @@ fn read_chunk_values(
             ));
         }
         out.extend(vals);
-        // off strictly advances: dend = off + hlen + uncompressed_size,
+        // off strictly advances: off_next = dstart + comp = off + hlen + comp,
         // and hlen >= 1 (decode_page_header always consumes at least the
-        // STOP byte), so even a zero-uncompressed_size / zero-num_values
-        // page makes forward progress — the loop cannot spin; it
-        // terminates at want_rows or an EOF-bounds PqError::Bad.
-        off = dend;
+        // STOP byte), so even a zero-comp page makes forward progress —
+        // the loop cannot spin; it terminates at want_rows or an EOF-bounds
+        // PqError::Bad.
+        off = dstart.checked_add(comp).ok_or_else(|| PqError::Bad("page advance ovf".into()))?;
     }
     if out.len() != want_rows {
         return Err(PqError::Bad(
@@ -293,12 +317,12 @@ mod tests {
         let mut h = Vec::new();
         // f1 page_type = DATA_PAGE(0): (1<<4)|5=0x15, zz(0)=0
         h.push(0x15); uv(&mut h, zz(0));
-        // f3 uncompressed_page_size: delta 1→3=2 → (2<<4)|5=0x25
-        h.push(0x25); uv(&mut h, zz(data_bytes as i64));
-        // f4 compressed_page_size: delta 3→4=1 → (1<<4)|5=0x15
+        // f2 uncompressed_page_size: delta 1→2=1 → (1<<4)|5=0x15
         h.push(0x15); uv(&mut h, zz(data_bytes as i64));
-        // f5 DataPageHeader struct: delta 4→5=1 → (1<<4)|12=0x1c
-        h.push(0x1c);
+        // f3 compressed_page_size: delta 2→3=1 → (1<<4)|5=0x15
+        h.push(0x15); uv(&mut h, zz(data_bytes as i64));
+        // f5 DataPageHeader struct: delta 3→5=2 → (2<<4)|12=0x2c
+        h.push(0x2c);
         // (nested struct: reset last_id → 0)
         // g1 num_values: (1<<4)|5=0x15
         h.push(0x15); uv(&mut h, zz(num_values as i64));
@@ -315,9 +339,9 @@ mod tests {
     fn page_header_dict_bytes(num_values: i32, data_bytes: i32) -> Vec<u8> {
         let mut h = Vec::new();
         h.push(0x15); uv(&mut h, zz(0));
-        h.push(0x25); uv(&mut h, zz(data_bytes as i64));
         h.push(0x15); uv(&mut h, zz(data_bytes as i64));
-        h.push(0x1c);
+        h.push(0x15); uv(&mut h, zz(data_bytes as i64));
+        h.push(0x2c);
         h.push(0x15); uv(&mut h, zz(num_values as i64));
         // encoding = PLAIN_DICTIONARY(2): zz(2)=4
         h.push(0x15); uv(&mut h, zz(2));
@@ -494,13 +518,14 @@ mod tests {
     }
 
     #[test]
-    fn extract_rejects_snappy_codec() {
-        // codec = SNAPPY(2) in ColumnMetaData
-        // → triggers "compression" gate
-        let snappy_file = build_parquet_file(0, 2, 0, false);
+    fn extract_rejects_gzip_codec_obj2c() {
+        // codec = GZIP(2) in ColumnMetaData (note: 2 is GZIP, not SNAPPY;
+        // SNAPPY is 1 — the original comment was inaccurate).
+        // GZIP still Unsupported (OBJ-2c); this test verifies that gate.
+        let gzip_file = build_parquet_file(0, 2, 0, false);
         assert!(
-            matches!(extract(&snappy_file, &["id"]), Err(PqError::Unsupported(_))),
-            "snappy codec must be Unsupported"
+            matches!(extract(&gzip_file, &["id"]), Err(PqError::Unsupported(_))),
+            "gzip codec must be Unsupported (OBJ-2c)"
         );
     }
 
@@ -556,9 +581,9 @@ mod tests {
         let dbytes = dict_data.len() as i64; // 16
         let mut dict_hdr = Vec::new();
         dict_hdr.push(0x15); uv(&mut dict_hdr, zz(2));        // f1 type=DICTIONARY_PAGE(2)
-        dict_hdr.push(0x25); uv(&mut dict_hdr, zz(dbytes));   // f3 uncompressed_page_size
-        dict_hdr.push(0x15); uv(&mut dict_hdr, zz(dbytes));   // f4 compressed_page_size
-        dict_hdr.push(0x3c);                                  // f7 struct (delta 4->7=3)
+        dict_hdr.push(0x15); uv(&mut dict_hdr, zz(dbytes));   // f2 uncompressed_page_size
+        dict_hdr.push(0x15); uv(&mut dict_hdr, zz(dbytes));   // f3 compressed_page_size
+        dict_hdr.push(0x4c);                                  // f7 struct (delta 3->7=4)
         dict_hdr.push(0x15); uv(&mut dict_hdr, zz(2));        // g1 num_values=2
         dict_hdr.push(0x15); uv(&mut dict_hdr, zz(2));        // g2 encoding=PLAIN_DICTIONARY(2)
         dict_hdr.push(0x12);                                  // g3 is_sorted=false
@@ -569,9 +594,9 @@ mod tests {
         let pbytes = data_payload.len() as i64; // 3
         let mut data_hdr = Vec::new();
         data_hdr.push(0x15); uv(&mut data_hdr, zz(0));        // f1 type=DATA_PAGE(0)
-        data_hdr.push(0x25); uv(&mut data_hdr, zz(pbytes));   // f3 uncompressed_page_size
-        data_hdr.push(0x15); uv(&mut data_hdr, zz(pbytes));   // f4 compressed_page_size
-        data_hdr.push(0x1c);                                  // f5 struct (delta 4->5=1)
+        data_hdr.push(0x15); uv(&mut data_hdr, zz(pbytes));   // f2 uncompressed_page_size
+        data_hdr.push(0x15); uv(&mut data_hdr, zz(pbytes));   // f3 compressed_page_size
+        data_hdr.push(0x2c);                                  // f5 struct (delta 3->5=2)
         data_hdr.push(0x15); uv(&mut data_hdr, zz(3));        // g1 num_values=3
         data_hdr.push(0x15); uv(&mut data_hdr, zz(2));        // g2 encoding=PLAIN_DICTIONARY(2)
         data_hdr.push(0x00);                                  // stop DataPageHeader
@@ -690,6 +715,103 @@ mod tests {
         assert!(r.is_ok(), "must not panic");
         assert!(matches!(r.unwrap(), Err(PqError::Bad(_))));
     }
+
+    /// A Snappy "literal-only" block wrapping `raw` exactly (preamble +
+    /// one literal). Valid spec-faithful Snappy (literal-only is the
+    /// trivial correct encoding). Used to build Snappy test files.
+    fn snappy_literal_block(raw: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        // preamble varint = raw.len()
+        let mut n = raw.len() as u64;
+        loop {
+            let byte = (n & 0x7f) as u8;
+            n >>= 7;
+            if n == 0 { b.push(byte); break; } else { b.push(byte | 0x80); }
+        }
+        // literal: if len-1 < 60 single tag; raw.len() here is small (16)
+        let l1 = (raw.len() - 1) as u8;
+        assert!((raw.len() as u64) >= 1 && l1 < 60, "helper: small literals only");
+        b.push(l1 << 2); // tag, type 00
+        b.extend_from_slice(raw);
+        b
+    }
+
+    /// Build a PLAIN INT64 [7,-2] file compressed with Snappy (codec=1).
+    /// Page raw payload = 7i64 LE ++ (-2)i64 LE (16 bytes); on-disk page
+    /// = snappy_literal_block(raw). compressed_page_size = block.len(),
+    /// uncompressed_page_size = 16.
+    fn build_snappy_plain_int64_file() -> Vec<u8> {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&7i64.to_le_bytes());
+        raw.extend_from_slice(&(-2i64).to_le_bytes());
+        let block = snappy_literal_block(&raw);     // on-disk page bytes
+        let uncomp = raw.len() as i64;              // 16
+        let comp = block.len() as i64;              // 18
+
+        let mut hdr = Vec::new();
+        hdr.push(0x15); uv(&mut hdr, zz(0));        // f1 type=DATA_PAGE(0)
+        hdr.push(0x15); uv(&mut hdr, zz(uncomp));   // f2 uncompressed_page_size=16
+        hdr.push(0x15); uv(&mut hdr, zz(comp));     // f3 compressed_page_size=18
+        hdr.push(0x2c);                             // f5 DataPageHeader struct (delta 3->5=2)
+        hdr.push(0x15); uv(&mut hdr, zz(2));        // g1 num_values=2
+        hdr.push(0x15); uv(&mut hdr, zz(0));        // g2 encoding=PLAIN(0)
+        hdr.push(0x00); hdr.push(0x00);             // stop DPH / PH
+
+        let data_page_offset: i64 = 4;
+
+        let mut m = Vec::new();
+        m.push(0x15); uv(&mut m, zz(2));            // f1 version=2
+        m.push(0x19); m.push(0x2c);                 // f2 list<SchemaElement> 2
+        m.push(0x48); uv(&mut m, 6); m.extend_from_slice(b"schema");
+        m.push(0x15); uv(&mut m, zz(1));            // schema[0] num_children=1
+        m.push(0x00);
+        m.push(0x15); uv(&mut m, zz(2));            // schema[1] f1 type=INT64
+        m.push(0x25); uv(&mut m, zz(0));            // f3 repetition=REQUIRED
+        m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x00);
+        m.push(0x16); uv(&mut m, zz(2));            // f3 num_rows=2
+        m.push(0x19); m.push(0x1c);                 // f4 list<RowGroup> 1
+        m.push(0x19); m.push(0x1c);                 // RG f1 list<ColumnChunk> 1
+        m.push(0x3c);                               // ColumnChunk f3 ColumnMetaData
+        m.push(0x15); uv(&mut m, zz(2));            // CMD f1 type=INT64
+        m.push(0x19); m.push(0x15); uv(&mut m, zz(0)); // f2 encodings [PLAIN]
+        m.push(0x19); m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x15); uv(&mut m, zz(1));            // f4 codec=SNAPPY(1)
+        m.push(0x16); uv(&mut m, zz(2));            // f5 num_values=2
+        m.push(0x46); uv(&mut m, zz(data_page_offset)); // f9 data_page_offset=4
+        m.push(0x00); m.push(0x00);                 // stop CMD / ColumnChunk
+        m.push(0x26); uv(&mut m, zz(2));            // RG f3 num_rows=2
+        m.push(0x00); m.push(0x00);                 // stop RG / FileMetaData
+
+        let mut f = Vec::new();
+        f.extend_from_slice(b"PAR1");
+        f.extend_from_slice(&hdr);
+        f.extend_from_slice(&block);
+        let mlen = m.len() as u32;
+        f.extend_from_slice(&m);
+        f.extend_from_slice(&mlen.to_le_bytes());
+        f.extend_from_slice(b"PAR1");
+        f
+    }
+
+    #[test]
+    fn extract_decodes_snappy_plain_int64() {
+        let file = build_snappy_plain_int64_file();
+        let rows = extract(&file, &["id"]).expect("snappy extract");
+        assert_eq!(rows, vec![vec![PqValue::I64(7)], vec![PqValue::I64(-2)]]);
+    }
+
+    #[test]
+    fn extract_snappy_and_uncompressed_identical() {
+        // Same logical [7,-2]: existing build_parquet_file(0,0,0,false)
+        // is the UNCOMPRESSED PLAIN baseline.
+        let plain = extract(&build_parquet_file(0, 0, 0, false), &["id"])
+            .expect("plain");
+        let snap = extract(&build_snappy_plain_int64_file(), &["id"])
+            .expect("snappy");
+        assert_eq!(plain, snap); // source-format independence
+        assert_eq!(snap, vec![vec![PqValue::I64(7)], vec![PqValue::I64(-2)]]);
+    }
 }
 
 // ── Task 12 PENTEST PASS — adversarial lock tests ─────────────────────
@@ -730,9 +852,9 @@ mod pentest {
     fn page_header_bytes(num_values: i32, data_bytes: i32) -> Vec<u8> {
         let mut h = Vec::new();
         h.push(0x15); uv(&mut h, zz(0)); // f1 type = DATA_PAGE(0)
-        h.push(0x25); uv(&mut h, zz(data_bytes as i64)); // f3 uncompressed
-        h.push(0x15); uv(&mut h, zz(data_bytes as i64)); // f4 compressed
-        h.push(0x1c); // f5 DataPageHeader struct
+        h.push(0x15); uv(&mut h, zz(data_bytes as i64)); // f2 uncompressed
+        h.push(0x15); uv(&mut h, zz(data_bytes as i64)); // f3 compressed
+        h.push(0x2c); // f5 DataPageHeader struct (delta 3->5=2)
         h.push(0x15); uv(&mut h, zz(num_values as i64)); // g1 num_values
         h.push(0x15); uv(&mut h, zz(0)); // g2 encoding = PLAIN(0)
         h.push(0x00); // stop DataPageHeader

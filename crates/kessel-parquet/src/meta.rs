@@ -351,8 +351,8 @@ pub fn decode_page_header(
     while let Some(f) = s.next_field()? {
         match f.id {
             1 => ph.page_type = s.read_i32(&f)?,
-            3 => ph.uncompressed_size = s.read_i32(&f)?,
-            4 => ph.compressed_size = s.read_i32(&f)?,
+            2 => ph.uncompressed_size = s.read_i32(&f)?,
+            3 => ph.compressed_size = s.read_i32(&f)?,
             5 => {
                 // nested DataPageHeader struct
                 if f.ctype != ctype::STRUCT { return Err(bad("PageHeader.data_page_header: expected struct")); }
@@ -571,9 +571,9 @@ mod tests {
     fn pageheader_decodes_dictionary_page_header_field7() {
         let mut h = Vec::new();
         h.push(0x15); uv(&mut h, zz(2));   // f1 type=DICTIONARY_PAGE(2)
-        h.push(0x25); uv(&mut h, zz(16));  // f3 uncompressed_page_size=16 (delta 1->3=2,i32=5 ->0x25)
-        h.push(0x15); uv(&mut h, zz(16));  // f4 compressed_page_size=16 (delta 3->4=1 ->0x15)
-        h.push(0x3c);                      // f7 DictionaryPageHeader struct (delta 4->7=3, struct=12 ->0x3c)
+        h.push(0x15); uv(&mut h, zz(16));  // f2 uncompressed_page_size=16 (delta 1->2=1,i32=5 ->0x15)
+        h.push(0x15); uv(&mut h, zz(16));  // f3 compressed_page_size=16 (delta 2->3=1 ->0x15)
+        h.push(0x4c);                      // f7 DictionaryPageHeader struct (delta 3->7=4, struct=12 ->0x4c)
         h.push(0x15); uv(&mut h, zz(2));   // g1 num_values=2
         h.push(0x15); uv(&mut h, zz(2));   // g2 encoding=PLAIN_DICTIONARY(2) (delta 1->2=1 ->0x15)
         h.push(0x12);                      // g3 is_sorted=false (delta 2->3=1, BOOL_FALSE=2 ->0x12)

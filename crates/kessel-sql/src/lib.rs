@@ -766,10 +766,13 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
                         };
                         obj = Some((1u8, String::new()));
                     } else if p.kw("AZURE") {
-                        p.expect_kw("ACCOUNT")?;
-                        let acct = match p.next() {
-                            Some(Tok::Str(s)) => s,
-                            _ => return Err("expected 'account'".into()),
+                        let acct = if p.kw("ACCOUNT") {
+                            match p.next() {
+                                Some(Tok::Str(s)) => s,
+                                _ => return Err("expected 'account' string after ACCOUNT".into()),
+                            }
+                        } else {
+                            String::new()
                         };
                         p.expect_kw("KEY")?;
                         p.expect_kw("ENV")?;
@@ -779,7 +782,7 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
                         };
                         obj = Some((2u8, acct));
                     } else {
-                        return Err("AUTH OBJSTORE must be S3 KEYID ENV '..' SECRET ENV '..' | AZURE ACCOUNT '..' KEY ENV '..'".into());
+                        return Err("AUTH OBJSTORE must be S3 KEYID ENV '..' SECRET ENV '..' | AZURE [ACCOUNT '<a>'] KEY ENV '..'".into());
                     }
                 } else {
                     return Err(
@@ -840,7 +843,7 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
             }
             let objstore: Option<(u8, String, String, String)> = if is_obj {
                 if format == 3 {
-                    return Err("FORMAT Parquet over object store is OBJ-2 (not yet shipped)".into());
+                    return Err("FORMAT PARQUET over object store is OBJ-2 (not yet shipped)".into());
                 }
                 if pagination.is_some() {
                     return Err("PAGE clauses are not supported for object store (s3://|az://) sources".into());
@@ -864,7 +867,7 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
                         return Err("az:// requires exactly one of AUTH OBJSTORE AZURE ACCOUNT '<a>' or ENDPOINT '<url>'".into());
                     }
                 }
-                Some((prov, acct, region.clone().unwrap_or_default(), endpoint.clone().unwrap_or_default()))
+                Some((prov, acct, region.unwrap_or_default(), endpoint.unwrap_or_default()))
             } else {
                 if obj.is_some() {
                     return Err("AUTH OBJSTORE is only valid for s3://|az:// sources".into());
@@ -1841,7 +1844,7 @@ mod tests {
             "CREATE EXTERNAL SOURCE g (id U64 NOT NULL FROM 'id') \
              FROM 'az://cont/blob.csv' FORMAT CSV KEY id \
              ENDPOINT 'https://acct.blob.core.windows.net' \
-             AUTH OBJSTORE AZURE ACCOUNT '' KEY ENV 'AZ_KEY'",
+             AUTH OBJSTORE AZURE KEY ENV 'AZ_KEY'",
             &cat,
         ).unwrap();
         match op {
@@ -1857,7 +1860,7 @@ mod tests {
     fn objstore_rejections_at_create() {
         let cat = Catalog::default();
         let bad = |sql: &str| compile(sql, &cat).unwrap_err();
-        assert!(bad("CREATE EXTERNAL SOURCE a (id U64 NOT NULL FROM 'id') FROM 's3://b/k' FORMAT PARQUET KEY id REGION 'r' AUTH OBJSTORE S3 KEYID ENV 'I' SECRET ENV 'S'").contains("Parquet"));
+        assert!(bad("CREATE EXTERNAL SOURCE a (id U64 NOT NULL FROM 'id') FROM 's3://b/k' FORMAT PARQUET KEY id REGION 'r' AUTH OBJSTORE S3 KEYID ENV 'I' SECRET ENV 'S'").contains("PARQUET"));
         assert!(bad("CREATE EXTERNAL SOURCE a (id U64 NOT NULL FROM 'id') FROM 's3://b/k' FORMAT JSON KEY id REGION 'r' AUTH OBJSTORE S3 KEYID ENV 'I' SECRET ENV 'S' PAGE NEXT LINK").to_lowercase().contains("object store"));
         assert!(bad("CREATE EXTERNAL SOURCE a (id U64 NOT NULL FROM 'id') FROM 's3://b/k' FORMAT JSON KEY id REGION 'r' ENDPOINT 'http://x' AUTH OBJSTORE S3 KEYID ENV 'I' SECRET ENV 'S'").to_lowercase().contains("https"));
         assert!(bad("CREATE EXTERNAL SOURCE a (id U64 NOT NULL FROM 'id') FROM 's3://b/k' FORMAT JSON KEY id").to_lowercase().contains("auth objstore"));

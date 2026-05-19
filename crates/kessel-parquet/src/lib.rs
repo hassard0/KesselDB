@@ -200,7 +200,7 @@ fn decode_data_page_v2(
     let (defs, present): (Option<Vec<u64>>, usize) = if max_def_level == 1 {
         let d = rle::decode_hybrid(def_bytes, 1, n)?;
         if d.len() != n {
-            return Err(PqError::Bad("v2 def count".into()));
+            return Err(PqError::Bad("v2 def-level count != num_values".into()));
         }
         if d.iter().any(|&x| x > 1) {
             return Err(PqError::Bad("v2 def-level exceeds max".into()));
@@ -231,6 +231,10 @@ fn decode_data_page_v2(
         .ok_or_else(|| PqError::Bad("v2 values target underflow".into()))?;
     let values_raw: std::borrow::Cow<[u8]> = match codec {
         meta::Codec::Uncompressed => std::borrow::Cow::Borrowed(values_section),
+        // Per-page is_compressed=false overrides the column codec:
+        // values are raw even when the codec is not Uncompressed.
+        // This arm MUST stay above the concrete codec arms (Snappy/
+        // Gzip/…future zstd) so they only fire when is_compressed.
         _ if !ph.v2_is_compressed => std::borrow::Cow::Borrowed(values_section),
         meta::Codec::Snappy => {
             std::borrow::Cow::Owned(snappy::decompress(values_section, vt)?)
@@ -244,11 +248,13 @@ fn decode_data_page_v2(
             ))
         }
     };
-    // when uncompressed/raw, values_section must be exactly vt
-    if matches!(codec, meta::Codec::Uncompressed) || !ph.v2_is_compressed {
-        if values_section.len() != vt {
-            return Err(PqError::Bad("v2 raw values length mismatch".into()));
-        }
+    // values section was NOT decompressed (codec is Uncompressed,
+    // or this page's is_compressed override is false) — the on-disk
+    // bytes must therefore equal the target uncompressed length vt.
+    if (matches!(codec, meta::Codec::Uncompressed) || !ph.v2_is_compressed)
+        && values_section.len() != vt
+    {
+        return Err(PqError::Bad("v2 raw values length mismatch".into()));
     }
     let vals = match ph.v2_encoding {
         0 => plain::decode_plain(&values_raw, want_ptype, present)?,

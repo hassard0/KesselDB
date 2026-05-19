@@ -361,6 +361,16 @@ pub enum ExternalAuth {
     BearerEnv(String),
     /// Arbitrary header `header` whose value is read from env `env`.
     HeaderEnv { header: String, env: String },
+    /// Object-store credentials by env-var NAME (resolved router-side
+    /// at fetch time, never persisted/logged). provider 1=S3 (a=key
+    /// -id env, b=secret env), 2=Azure (a=account-key env, b unused;
+    /// `account` = the storage account).
+    ObjStoreEnv {
+        provider: u8,
+        a_env: String,
+        b_env: String,
+        account: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -385,6 +395,10 @@ pub struct ExternalRecipe {
     pub rows_path: Option<String>,
     /// How to advance to the next page (None ⇒ single-shot fetch).
     pub pagination: Option<PaginationRecipe>,
+    /// S3 region (object-store sources). None ⇒ not object-store / Azure.
+    pub region: Option<String>,
+    /// Custom endpoint (S3-compatible path-style / custom Azure host).
+    pub endpoint: Option<String>,
 }
 
 /// The whole catalog, persisted by the state machine as object type 0.
@@ -475,8 +489,14 @@ impl Catalog {
             // followed by `[u8 version]` then `[u32 n]`. A v1-persisted
             // catalog (no sentinel, n>=1) still decodes correctly via the
             // back-compat branch in `decode`.
-            b.extend_from_slice(&0u32.to_le_bytes()); // v2 sentinel
-            b.push(2u8); // trailer version
+            b.extend_from_slice(&0u32.to_le_bytes()); // v2/v3 sentinel
+            let need_v3 = self.external.iter().any(|r| {
+                matches!(r.auth, ExternalAuth::ObjStoreEnv { .. })
+                    || r.region.is_some()
+                    || r.endpoint.is_some()
+            });
+            let ver: u8 = if need_v3 { 3 } else { 2 };
+            b.push(ver);
             b.extend_from_slice(&(self.external.len() as u32).to_le_bytes());
             for r in &self.external {
                 b.extend_from_slice(&r.type_id.to_le_bytes());
@@ -493,6 +513,16 @@ impl Catalog {
                         b.push(2);
                         put_str32(&mut b, header);
                         put_str32(&mut b, env);
+                    }
+                    ExternalAuth::ObjStoreEnv { provider, a_env, b_env, account } => {
+                        b.push(3);
+                        b.push(*provider);
+                        put_str32(&mut b, a_env);
+                        put_str32(&mut b, b_env);
+                        match account {
+                            None => b.push(0),
+                            Some(a) => { b.push(1); put_str32(&mut b, a); }
+                        }
                     }
                 }
                 b.extend_from_slice(&(r.mapping.len() as u32).to_le_bytes());
@@ -519,6 +549,16 @@ impl Catalog {
                         b.push(3);
                         put_str32(&mut b, path);
                         put_str32(&mut b, param);
+                    }
+                }
+                if ver == 3 {
+                    match &r.region {
+                        None => b.push(0),
+                        Some(s) => { b.push(1); put_str32(&mut b, s); }
+                    }
+                    match &r.endpoint {
+                        None => b.push(0),
+                        Some(s) => { b.push(1); put_str32(&mut b, s); }
                     }
                 }
             }
@@ -641,7 +681,7 @@ impl Catalog {
             let first =
                 u32::from_le_bytes(b.get(p..p + 4)?.try_into().ok()?) as usize;
             p += 4;
-            let (n, is_v2) = if first == 0 {
+            let (n, is_v2, is_v3) = if first == 0 {
                 let ver = *b.get(p)?;
                 p += 1;
                 // Unknown trailer version: this build predates it. Drop the
@@ -650,19 +690,20 @@ impl Catalog {
                 // philosophy. Assumes uniform-version clusters; a rolling
                 // upgrade introducing a new version must gate it behind a
                 // catalog epoch.
-                if ver != 2 {
+                if ver != 2 && ver != 3 {
                     return None;
                 }
                 let n =
                     u32::from_le_bytes(b.get(p..p + 4)?.try_into().ok()?) as usize;
                 p += 4;
-                (n, true)
+                let is_v3 = ver == 3;
+                (n, true, is_v3)
             } else {
                 // v1 (slice-1) trailer: `first` is the recipe count, no
                 // sentinel, no per-recipe rows_path/pagination. This is the
                 // backward-compat path — a slice-1-persisted catalog decodes
                 // unchanged, with the new fields defaulting to None.
-                (first, false)
+                (first, false, false)
             };
             let mut out = Vec::with_capacity(n);
             for _ in 0..n {
@@ -684,6 +725,20 @@ impl Catalog {
                         let header = get_str32(b, &mut p)?;
                         let env = get_str32(b, &mut p)?;
                         ExternalAuth::HeaderEnv { header, env }
+                    }
+                    3 => {
+                        let provider = *b.get(p)?;
+                        p += 1;
+                        let a_env = get_str32(b, &mut p)?;
+                        let b_env = get_str32(b, &mut p)?;
+                        let acc_tag = *b.get(p)?;
+                        p += 1;
+                        let account = match acc_tag {
+                            0 => None,
+                            1 => Some(get_str32(b, &mut p)?),
+                            _ => return None,
+                        };
+                        ExternalAuth::ObjStoreEnv { provider, a_env, b_env, account }
                     }
                     // Unknown auth tag: this build predates the variant.
                     // We drop the WHOLE recipe trailer (-> empty list),
@@ -735,6 +790,15 @@ impl Catalog {
                 } else {
                     (None, None)
                 };
+                let (region, endpoint) = if is_v3 {
+                    let rt = *b.get(p)?;
+                    p += 1;
+                    let region = match rt { 0 => None, 1 => Some(get_str32(b, &mut p)?), _ => return None };
+                    let et = *b.get(p)?;
+                    p += 1;
+                    let endpoint = match et { 0 => None, 1 => Some(get_str32(b, &mut p)?), _ => return None };
+                    (region, endpoint)
+                } else { (None, None) };
                 out.push(ExternalRecipe {
                     type_id,
                     url,
@@ -744,6 +808,8 @@ impl Catalog {
                     mapping,
                     rows_path,
                     pagination,
+                    region,
+                    endpoint,
                 });
             }
             Some(out)
@@ -842,7 +908,7 @@ mod tests {
             type_id: 1, url: "http://x/y".into(), format: 0, key_field_id: 1,
             auth: ExternalAuth::BearerEnv("TOK".into()),
             mapping: vec![(1, "id".into()), (2, "u.name".into())],
-            rows_path: None, pagination: None,
+            rows_path: None, pagination: None, region: None, endpoint: None,
         });
         c.external.push(ExternalRecipe {
             type_id: 2, url: "http://h/k".into(), format: 0, key_field_id: 1,
@@ -851,13 +917,13 @@ mod tests {
                 env: "API_ENV".into(),
             },
             mapping: vec![(1, "hid".into())],
-            rows_path: None, pagination: None,
+            rows_path: None, pagination: None, region: None, endpoint: None,
         });
         c.external.push(ExternalRecipe {
             type_id: 3, url: "http://n/o".into(), format: 0, key_field_id: 1,
             auth: ExternalAuth::None,
             mapping: vec![(1, "nid".into())],
-            rows_path: None, pagination: None,
+            rows_path: None, pagination: None, region: None, endpoint: None,
         });
         let back = Catalog::decode(&c.encode()).unwrap();
         assert_eq!(back.external.len(), 3);
@@ -895,6 +961,7 @@ mod tests {
                 path: "m.cur".into(),
                 param: "cursor".into(),
             }),
+            region: None, endpoint: None,
         });
         let back = Catalog::decode(&c.encode()).unwrap();
         assert_eq!(back.external.len(), 1);
@@ -916,6 +983,7 @@ mod tests {
             auth: ExternalAuth::BearerEnv("E".into()), mapping: vec![(1, "a".into())],
             rows_path: None,
             pagination: Some(PaginationRecipe::NextUrlJson("p.next".into())),
+            region: None, endpoint: None,
         });
         c2.external.push(ExternalRecipe {
             type_id: 1, url: "u2".into(), format: 0, key_field_id: 1,
@@ -923,11 +991,12 @@ mod tests {
             mapping: vec![(2, "b".into())],
             rows_path: Some("d".into()),
             pagination: Some(PaginationRecipe::NextLink),
+            region: None, endpoint: None,
         });
         c2.external.push(ExternalRecipe {
             type_id: 1, url: "u3".into(), format: 1, key_field_id: 1,
             auth: ExternalAuth::None, mapping: vec![],
-            rows_path: None, pagination: None,
+            rows_path: None, pagination: None, region: None, endpoint: None,
         });
         let b2 = Catalog::decode(&c2.encode()).unwrap();
         assert_eq!(b2.external.len(), 3);
@@ -944,6 +1013,74 @@ mod tests {
         e.types.push(c.types[0].clone());
         let enc = e.encode();
         assert!(Catalog::decode(&enc).unwrap().external.is_empty());
+    }
+
+    #[test]
+    fn catalog_v3_objstore_roundtrip_and_v1v2_backcompat() {
+        let mut c = Catalog::default();
+        c.next_type_id = 5;
+        c.external.push(ExternalRecipe {
+            type_id: 9,
+            url: "s3://buck/data/x.json".into(),
+            format: 0,
+            key_field_id: 1,
+            auth: ExternalAuth::ObjStoreEnv {
+                provider: 1,
+                a_env: "AWS_KEY_ID".into(),
+                b_env: "AWS_SECRET".into(),
+                account: None,
+            },
+            mapping: vec![(1, "id".into())],
+            rows_path: Some("items".into()),
+            pagination: None,
+            region: Some("us-east-1".into()),
+            endpoint: None,
+        });
+        let enc = c.encode();
+        let dec = Catalog::decode(&enc).expect("decode v3");
+        assert_eq!(dec.external, c.external);
+        assert_eq!(dec.next_type_id, 5);
+
+        let mut c2 = Catalog::default();
+        c2.next_type_id = 1;
+        c2.external.push(ExternalRecipe {
+            type_id: 3,
+            url: "http://h/p".into(),
+            format: 0,
+            key_field_id: 1,
+            auth: ExternalAuth::BearerEnv("TOK".into()),
+            mapping: vec![(1, "id".into())],
+            rows_path: None,
+            pagination: None,
+            region: None,
+            endpoint: None,
+        });
+        let enc2 = c2.encode();
+        let mut want = Vec::new();
+        want.extend_from_slice(&1u32.to_le_bytes());
+        want.extend_from_slice(&0u32.to_le_bytes());
+        want.extend_from_slice(&0u32.to_le_bytes());
+        want.push(2u8);
+        want.extend_from_slice(&1u32.to_le_bytes());
+        want.extend_from_slice(&3u32.to_le_bytes());
+        want.push(0u8);
+        want.extend_from_slice(&1u16.to_le_bytes());
+        want.extend_from_slice(&("http://h/p".len() as u32).to_le_bytes());
+        want.extend_from_slice(b"http://h/p");
+        want.push(1u8);
+        want.extend_from_slice(&("TOK".len() as u32).to_le_bytes());
+        want.extend_from_slice(b"TOK");
+        want.extend_from_slice(&1u32.to_le_bytes());
+        want.extend_from_slice(&1u16.to_le_bytes());
+        want.extend_from_slice(&("id".len() as u32).to_le_bytes());
+        want.extend_from_slice(b"id");
+        want.push(0u8);
+        want.push(0u8);
+        assert_eq!(
+            enc2, want,
+            "a no-objstore recipe MUST stay byte-identical to v2"
+        );
+        assert_eq!(Catalog::decode(&enc2).unwrap().external, c2.external);
     }
 
     #[test]

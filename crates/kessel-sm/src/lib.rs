@@ -3620,6 +3620,8 @@ impl<V: Vfs> StateMachine<V> {
                     // v2 catalog trailer; absent params serialize as None.
                     rows_path,
                     pagination,
+                    region: None,
+                    endpoint: None,
                 });
                 // Re-persist (same op_number): an idempotent overwrite of
                 // the single catalog key — unlike a counter this is safe

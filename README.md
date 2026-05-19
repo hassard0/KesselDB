@@ -182,6 +182,11 @@ Honest boundaries (documented, not hidden):
   zero‑dependency. Without it the wire is plaintext but token‑authenticated
   with a timing‑safe comparison (deploy behind a TLS proxy / private
   network). Hand‑rolling TLS would be irresponsible, hence the feature.
+- **HTTPS external sources** are an **opt‑in cargo feature**
+  (`--features external-sources-tls`, rustls + webpki‑roots) so the default
+  build and plain `--features external-sources` remain zero‑new‑dependency
+  and `http://`‑only. Enable this feature to register `https://` endpoints;
+  without it only plaintext HTTP is accepted.
 - **Cross‑shard transactions** are implemented, **deterministically**
   (Calvin‑style), over real sockets — *not* blocking two‑phase commit.
   A deployment runs K independent VSR shard groups behind a router

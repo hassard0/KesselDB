@@ -6,6 +6,7 @@ use kessel_parquet::{extract, PqValue};
 
 const FLAT: &[u8] = include_bytes!("fixtures/flat_required.parquet");
 const MRG: &[u8] = include_bytes!("fixtures/flat_multirg.parquet");
+const DICT: &[u8] = include_bytes!("fixtures/dict_flat.parquet");
 
 #[test]
 fn fixture_flat_required_decodes_expected_rows() {
@@ -25,4 +26,20 @@ fn fixture_multi_row_group_concatenates() {
     let rows = extract(MRG, &["id"]).unwrap();
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[2], vec![PqValue::I64(100)]);
+}
+
+#[test]
+fn dict_flat_fixture_roundtrips() {
+    let rows = extract(DICT, &["id", "s"])
+        .expect("extract dict fixture");
+    assert_eq!(
+        rows,
+        vec![
+            vec![PqValue::I64(7),   PqValue::Bytes(b"a".to_vec())],
+            vec![PqValue::I64(7),   PqValue::Bytes(b"a".to_vec())],
+            vec![PqValue::I64(-2),  PqValue::Bytes(b"b".to_vec())],
+            vec![PqValue::I64(7),   PqValue::Bytes(b"c".to_vec())],
+            vec![PqValue::I64(100), PqValue::Bytes(b"a".to_vec())],
+        ]
+    );
 }

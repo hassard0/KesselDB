@@ -57,3 +57,17 @@ Same logical table, 2 row groups (row_group_size=2: RG0 rows 0-1, RG1 row 2).
 - Test data only; not security-sensitive.
 - These files are committed and tracked by git (not gitignored; verified via `git check-ignore`).
 - The round-trip test `tests/fixture_roundtrip.rs` uses `include_bytes!` to load these at compile time.
+
+## dict_flat.parquet (OBJ-2b-2)
+
+Regenerate:
+
+    python -c "import pyarrow as pa, pyarrow.parquet as pq; \
+    t=pa.table({'id':pa.array([7,7,-2,7,100],type=pa.int64()), \
+    's':pa.array(['a','a','b','c','a'],type=pa.string())}); \
+    pq.write_table(t,'crates/kessel-parquet/tests/fixtures/dict_flat.parquet', \
+    use_dictionary=True, compression=None, version='1.0', data_page_version='1.0')"
+
+Real pyarrow 24.0.0 output: dictionary-encoded, UNCOMPRESSED, V1, flat
+REQUIRED. Expected logical rows:
+id = [7, 7, -2, 7, 100]; s = ["a", "a", "b", "c", "a"].

@@ -74,11 +74,13 @@ sidecar deployment continues to pull zero new dependencies.
   `rustls::pki_types::ServerName::try_from(host)` (SNI + cert name check
   bound to URL host); wraps into `StreamOwned`. Handshake / cert-invalid /
   bad-SNI errors map to `FetchError::Http("tls: …")`.
-- `pub(crate) fn connect_tls_with(host, port, config)` — test seam
-  accepting an arbitrary `Arc<ClientConfig>` (used only by test helpers).
-- `#[doc(hidden)] pub fn test_config_trusting(cert_der)` — builds a
-  `ClientConfig` that trusts a single DER-encoded cert; only reachable
-  from `#[cfg(feature = "tls")]` test entrypoints.
+- `pub(crate) fn connect_tls_with(cfg: Arc<ClientConfig>, host, port)` —
+  shared connect seam; `connect_tls` calls it with the production
+  `client_config()`, the test entrypoint with a fixture-trusting config.
+- `#[doc(hidden)] pub fn test_config_trusting(pem: &[u8])` — builds a
+  `ClientConfig` trusting every cert parsed from the supplied PEM bytes
+  (the checked-in localhost fixture); only reachable from
+  `#[cfg(feature = "tls")]` test entrypoints.
 
 **`src/lib.rs`:**
 - `rows_from_body(body, recipe)` — factored out of the inline fetch

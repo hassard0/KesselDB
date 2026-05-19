@@ -155,6 +155,90 @@ pub fn decompress(
     Ok(out)
 }
 
+// ── PENTEST PASS — adversarial lock tests ─────────────────────────
+// Snappy page bytes are operator-source-controlled. Each case: no
+// panic / no OOM / no stack-overflow, and a well-formed Result
+// (typed Bad/Unsupported, OR correct Ok for the positive
+// overlapping-copy correctness lock).
+#[cfg(test)]
+mod pentest {
+    use super::*;
+
+    fn nb(src: &[u8], expected: usize) {
+        let s = src.to_vec();
+        let r = std::panic::catch_unwind(move || decompress(&s, expected));
+        assert!(r.is_ok(), "must NOT panic/OOM-unwind");
+        assert!(
+            matches!(r.unwrap(),
+                Err(PqError::Bad(_)) | Err(PqError::Unsupported(_))),
+            "hostile input must be a typed error"
+        );
+    }
+
+    #[test]
+    fn over_cap_no_alloc() {
+        // expected_len > 64 MiB → Unsupported BEFORE allocation.
+        nb(&[0xFF, 0xFF, 0xFF, 0xFF, 0x7F], SNAPPY_MAX_DECOMP + 1);
+    }
+
+    #[test]
+    fn decompression_bomb_bounded() {
+        // tiny src, preamble claims a 2 GiB uncompressed length, but
+        // expected_len passed in is the (capped) page header value;
+        // here expected_len within cap but src can't satisfy it →
+        // Bad, no multi-GB alloc (Vec::with_capacity(expected_len) is
+        // ≤ 64 MiB; the per-element guards reject before overrun).
+        nb(&[0x80, 0x80, 0x80, 0x10 /*~32 MiB preamble*/], 1 << 25);
+    }
+
+    #[test]
+    fn preamble_mismatch_bad() {
+        nb(&[0x03, 0x08, 0x61, 0x62, 0x63], 5); // declares 3, expect 5
+    }
+
+    #[test]
+    fn copy_offset_zero_bad() {
+        nb(&[0x02, 0x00, 0x61, 0x06, 0x00, 0x00], 2);
+    }
+
+    #[test]
+    fn copy_offset_past_output_bad() {
+        nb(&[0x06, 0x00, 0x61, 0x12, 0x09, 0x00], 6);
+    }
+
+    #[test]
+    fn copy_overproduces_bad() {
+        // 1-byte literal then a copy whose length pushes past
+        // expected_len (expected 2 but copy len 5).
+        nb(&[0x02, 0x00, 0x61, 0x12, 0x01, 0x00], 2);
+    }
+
+    #[test]
+    fn literal_past_src_bad() {
+        nb(&[0x0A, 0x24, 0x61, 0x62], 10);
+    }
+
+    #[test]
+    fn truncated_offset_bad() {
+        // 2-byte-offset copy tag but only 1 offset byte present.
+        nb(&[0x06, 0x00, 0x61, 0x12, 0x01], 6);
+    }
+
+    #[test]
+    fn trailing_after_full_bad() {
+        // literal fills output (len 3) then a spurious extra tag.
+        nb(&[0x03, 0x08, 0x61, 0x62, 0x63, 0x00, 0x61], 3);
+    }
+
+    #[test]
+    fn overlapping_copy_positive_correctness_lock() {
+        // VALID Snappy: 1-byte literal 'a' + 2-byte-offset copy
+        // len 5 off 1 → "aaaaaa". MUST decode Ok (not over-rejected).
+        let blk = [0x06u8, 0x00, 0x61, 0x12, 0x01, 0x00];
+        assert_eq!(decompress(&blk, 6).unwrap(), b"aaaaaa".to_vec());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

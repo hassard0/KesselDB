@@ -795,6 +795,89 @@ mod tests {
         f
     }
 
+    /// Build a PLAIN INT64 [7,-2] Snappy file where the PageHeader
+    /// f3 compressed_page_size is set to `comp_override` instead of the
+    /// true on-disk size. The footer, mlen, PAR1 framing, and
+    /// FileMetaData all remain parseable; only the PageHeader f3 field
+    /// changes. This lets `page_payload` reach
+    /// `file.get(dstart..dstart+comp)` where comp >> actual bytes →
+    /// None → Err(Bad("page data truncated")).
+    ///
+    /// Analogous to `build_dict_int64_file_with_dict_offset(Option)` in
+    /// SP103: the rest of the file is byte-identical; only one i64 field
+    /// in the PageHeader changes.
+    fn build_snappy_plain_int64_file_with_comp_override(comp_override: i64) -> Vec<u8> {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&7i64.to_le_bytes());
+        raw.extend_from_slice(&(-2i64).to_le_bytes());
+        let block = snappy_literal_block(&raw);     // on-disk page bytes (18 bytes)
+        let uncomp = raw.len() as i64;              // 16
+
+        let mut hdr = Vec::new();
+        hdr.push(0x15); uv(&mut hdr, zz(0));              // f1 type=DATA_PAGE(0)
+        hdr.push(0x15); uv(&mut hdr, zz(uncomp));         // f2 uncompressed_page_size=16
+        hdr.push(0x15); uv(&mut hdr, zz(comp_override));  // f3 compressed_page_size=LYING
+        hdr.push(0x2c);                                    // f5 DataPageHeader struct
+        hdr.push(0x15); uv(&mut hdr, zz(2));               // g1 num_values=2
+        hdr.push(0x15); uv(&mut hdr, zz(0));               // g2 encoding=PLAIN(0)
+        hdr.push(0x00); hdr.push(0x00);                   // stop DPH / PH
+
+        let data_page_offset: i64 = 4;
+
+        let mut m = Vec::new();
+        m.push(0x15); uv(&mut m, zz(2));            // f1 version=2
+        m.push(0x19); m.push(0x2c);                 // f2 list<SchemaElement> 2
+        m.push(0x48); uv(&mut m, 6); m.extend_from_slice(b"schema");
+        m.push(0x15); uv(&mut m, zz(1));            // schema[0] num_children=1
+        m.push(0x00);
+        m.push(0x15); uv(&mut m, zz(2));            // schema[1] f1 type=INT64
+        m.push(0x25); uv(&mut m, zz(0));            // f3 repetition=REQUIRED
+        m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x00);
+        m.push(0x16); uv(&mut m, zz(2));            // f3 num_rows=2
+        m.push(0x19); m.push(0x1c);                 // f4 list<RowGroup> 1
+        m.push(0x19); m.push(0x1c);                 // RG f1 list<ColumnChunk> 1
+        m.push(0x3c);                               // ColumnChunk f3 ColumnMetaData
+        m.push(0x15); uv(&mut m, zz(2));            // CMD f1 type=INT64
+        m.push(0x19); m.push(0x15); uv(&mut m, zz(0)); // f2 encodings [PLAIN]
+        m.push(0x19); m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x15); uv(&mut m, zz(1));            // f4 codec=SNAPPY(1)
+        m.push(0x16); uv(&mut m, zz(2));            // f5 num_values=2
+        m.push(0x46); uv(&mut m, zz(data_page_offset)); // f9 data_page_offset=4
+        m.push(0x00); m.push(0x00);                 // stop CMD / ColumnChunk
+        m.push(0x26); uv(&mut m, zz(2));            // RG f3 num_rows=2
+        m.push(0x00); m.push(0x00);                 // stop RG / FileMetaData
+
+        let mut f = Vec::new();
+        f.extend_from_slice(b"PAR1");
+        f.extend_from_slice(&hdr);
+        f.extend_from_slice(&block);
+        let mlen = m.len() as u32;
+        f.extend_from_slice(&m);
+        f.extend_from_slice(&mlen.to_le_bytes());
+        f.extend_from_slice(b"PAR1");
+        f
+    }
+
+    /// Genuine lying-compressed-size lock (option b): the PageHeader f3
+    /// compressed_page_size is 10_000_000 (far larger than the actual
+    /// on-disk Snappy block), while the footer/FileMetaData remain fully
+    /// parseable. extract() reaches read_chunk_values → page_payload →
+    /// `file.get(dstart..dstart+10_000_000)` → None →
+    /// Err(Bad("page data truncated")). Wrapped in catch_unwind
+    /// asserting no panic + Err(Bad).
+    ///
+    /// This exercises the page_payload bounds check, NOT the footer-short
+    /// path. Named accurately: "lying_compressed_size".
+    #[test]
+    fn extract_snappy_lying_compressed_size_is_bad() {
+        let file = build_snappy_plain_int64_file_with_comp_override(10_000_000);
+        let owned = file.clone();
+        let r = std::panic::catch_unwind(move || extract(&owned, &["id"]));
+        assert!(r.is_ok(), "must not panic");
+        assert!(matches!(r.unwrap(), Err(PqError::Bad(_))));
+    }
+
     #[test]
     fn extract_decodes_snappy_plain_int64() {
         let file = build_snappy_plain_int64_file();

@@ -14,6 +14,7 @@ KesselDB. Every feature described here is covered by the test suite.
 - [7b. Sharded deployment & cross-shard transactions](#7b-sharded-deployment--cross-shard-transactions)
 - [7c. External sources (JSON/CSV over HTTP)](#7c-external-sources-jsoncsv-over-http)
 - [7d. Paginated & NDJSON sources](#7d-paginated--ndjson-sources)
+- [7e. Object-store sources (S3 / Azure Blob)](#7e-object-store-sources-s3--azure-blob)
 - [8. Authentication, quotas & backpressure](#8-authentication-quotas--backpressure)
 - [9. Backup & monitoring](#9-backup--monitoring)
 - [10. Wire protocol](#10-wire-protocol)
@@ -589,6 +590,148 @@ aborted and **nothing is materialized** — prior data remains intact
   now optional.
 - **Upsert only.** Rows deleted from the upstream source are not
   automatically removed.
+
+## 7e. Object-store sources (S3 / Azure Blob)
+
+An external source can read its bytes directly from an S3-compatible or
+Azure Blob object store — `CREATE EXTERNAL SOURCE … FROM 's3://…' |
+'az://…'` — using the same fetch → decode → atomic-upsert pipeline as
+§7c and §7d. The difference is transport: the router builds a signed
+HTTPS GET (AWS SigV4 for S3; Azure Shared Key for Azure Blob), fetches
+the object body, and feeds it through the existing decoder. Pagination
+(`PAGE …`) is not applicable to object-store sources; a single object
+is fetched per `REFRESH`.
+
+> **Requires the `external-sources-objstore` cargo feature** (which
+> implies `external-sources-tls`; the default build and plain
+> `--features external-sources` remain `http(s)://`-only and pull no
+> rustls/webpki/objstore):
+>
+> ```bash
+> cargo build --release --features external-sources-objstore
+> cargo run  --release --bin kesseldb --features external-sources-objstore -- 127.0.0.1:7878 ./data
+> ```
+
+### S3 / S3-compatible (MinIO, Cloudflare R2, Ceph)
+
+```sql
+-- AWS S3 — IAM-key auth, inferred path-style URL from region + bucket/key
+CREATE EXTERNAL SOURCE prices (
+    ticker  BYTES  NOT NULL FROM 'symbol',
+    price   I64    NOT NULL FROM 'quote.last'
+) FROM 's3://my-bucket/data/prices.json'
+  FORMAT JSON
+  KEY ticker
+  REGION 'us-east-1'
+  AUTH OBJSTORE S3 KEYID ENV 'AWS_ACCESS_KEY_ID' SECRET ENV 'AWS_SECRET_ACCESS_KEY'
+
+-- S3-compatible (MinIO / R2 / Ceph) — ENDPOINT overrides the host; REGION optional
+CREATE EXTERNAL SOURCE events (
+    id    U64   NOT NULL FROM 'id',
+    kind  BYTES NOT NULL FROM 'type'
+) FROM 's3://warehouse/events.ndjson'
+  FORMAT NDJSON
+  KEY id
+  ENDPOINT 'https://minio.internal:9000'
+  AUTH OBJSTORE S3 KEYID ENV 'MINIO_KEY' SECRET ENV 'MINIO_SECRET'
+```
+
+Clause rules for `s3://`:
+- `REGION '<r>'` — required for AWS S3 unless `ENDPOINT` is supplied.
+  Ignored for presigning purposes when `ENDPOINT` is given.
+- `ENDPOINT '<https-url>'` — overrides the request host for
+  path-style access (MinIO / R2 / Ceph / any S3-compatible). The
+  value **must** start with `https://` (rejected at `CREATE` if not).
+- `AUTH OBJSTORE S3 KEYID ENV '<idvar>' SECRET ENV '<secretvar>'` —
+  env-var **names** only; the actual key and secret are resolved from
+  the router's process environment at each `REFRESH` and never appear
+  in any op, WAL entry, or log line.
+
+### Azure Blob Storage
+
+```sql
+-- Azure Blob — ACCOUNT inferred from az:// URL (az://container/blob)
+CREATE EXTERNAL SOURCE catalog (
+    sku    BYTES  NOT NULL FROM 'sku',
+    price  I64    NOT NULL FROM 'price_cents'
+) FROM 'az://my-container/catalog.json'
+  FORMAT JSON
+  KEY sku
+  AUTH OBJSTORE AZURE ACCOUNT 'mystorageaccount' KEY ENV 'AZURE_STORAGE_KEY'
+
+-- Custom / sovereign endpoint — ENDPOINT replaces the default host
+CREATE EXTERNAL SOURCE archive (
+    id     U64   NOT NULL FROM 'id',
+    label  BYTES NOT NULL FROM 'label'
+) FROM 'az://archive-container/records.ndjson'
+  FORMAT NDJSON
+  KEY id
+  ENDPOINT 'https://mystorageaccount.blob.core.windows.net'
+  AUTH OBJSTORE AZURE KEY ENV 'AZURE_STORAGE_KEY'
+```
+
+Clause rules for `az://`:
+- `ACCOUNT '<a>'` — the Azure storage account name. Exactly one of
+  `ACCOUNT` or `ENDPOINT` is required; both present is also accepted
+  when the `ENDPOINT` is the account's canonical blob URL.
+- `ENDPOINT '<https-url>'` — overrides the default
+  `https://<account>.blob.core.windows.net` host. Must start with
+  `https://` (rejected at `CREATE` if not).
+- `AUTH OBJSTORE AZURE [ACCOUNT '<a>'] KEY ENV '<keyvar>'` — the
+  storage account shared key is resolved from the named env var at
+  `REFRESH` time; never persisted.
+
+### Refresh & query
+
+```sql
+REFRESH prices     -- fetches, decodes, upserts; prior data intact on any error
+SELECT * FROM prices WHERE ticker = 'AAPL'
+DROP EXTERNAL SOURCE prices
+```
+
+`REFRESH` is all-or-nothing: any fetch error, HTTP error status,
+parse failure, or type-coercion failure aborts the entire operation
+and leaves the prior materialized rows unchanged. Re-`REFRESH` with
+the same upstream data is idempotent (same rows → same IDs → same
+digest, same as §7c).
+
+### Security
+
+**Signing.** AWS SigV4 (HMAC-SHA256, no external crypto library — the
+same zero-dep SHA-256/HMAC-SHA256 already in the kessel-sm kernel);
+Azure Shared Key (HMAC-SHA256). Both are implemented entirely inside
+the `kessel-objstore` crate.
+
+**HTTPS-only, no bypass.** Every object-store request goes over TLS
+(rustls + bundled Mozilla webpki roots, full certificate + hostname
+verification). There is no flag, env var, or clause to disable
+certificate verification.
+
+**Injection-safe.** Container names, blob keys, and the S3 bucket/key
+are RFC-3986 percent-encoded before being placed in the request URI
+and the signing string. CRLF and query-parameter injection are
+blocked.
+
+**Secret references only.** Only the env-var **name** strings are
+stored in the catalog trailer and replicated in the WAL. The actual
+key/secret values are resolved from the router's environment at each
+`REFRESH`, are never logged, never included in any operation or WAL
+entry, never appear in digest output, and are never surfaced in error
+messages.
+
+### Honest boundaries
+
+- **`FORMAT PARQUET`, Iceberg manifests, prefix/multi-object listing,
+  and STS/SAS/IMDS credential providers** are explicit follow-ons
+  (OBJ-2 through OBJ-5) and are **rejected at `CREATE`** with a clear
+  error message. Only `FORMAT JSON`, `FORMAT CSV`, and `FORMAT NDJSON`
+  are accepted.
+- **Single object per source.** A `REFRESH` fetches exactly one
+  object. Listing a prefix or walking a multi-object partition is OBJ-4.
+- **Upsert only.** Same as §7c — rows deleted from the upstream object
+  are not automatically pruned from the materialized table.
+- **Snapshot since last `REFRESH`.** Queries read the last materialized
+  snapshot; live object-store reads are never issued by a `SELECT`.
 
 ## 8. Authentication, quotas & backpressure
 

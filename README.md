@@ -6,7 +6,7 @@
 
 *"It's the database that made the Kessel Run in 12 parsecs."*
 
-`247 tests green` · `0 external dependencies` · `Rust 1.95+` · single‑binary
+`267 tests green` · `0 external dependencies` · `Rust 1.95+` · single‑binary
 
 </div>
 
@@ -57,11 +57,14 @@ feature, not an aspiration.
   `MIN`/`MAX` from the index extreme without scanning, and an in‑memory read
   cache for hot keys — all on by default, each proven equivalent to a full
   scan by a randomized oracle.
-- **External sources** — register and `REFRESH` paginated JSON/NDJSON/CSV-over-HTTP
-  into a table (`CREATE EXTERNAL SOURCE … FORMAT JSON|NDJSON|CSV`); a single
-  `REFRESH` can walk multi-page APIs via next-URL, `Link` header, or cursor-param
-  pagination; all queried with ordinary SQL (`--features external-sources`,
-  default off; the deterministic kernel is unaffected when off).
+- **External sources** — register and `REFRESH` JSON/NDJSON/CSV from HTTP/HTTPS
+  endpoints or directly from S3-compatible and Azure Blob object storage
+  (`CREATE EXTERNAL SOURCE … FROM 'http://…' | 's3://…' | 'az://…' FORMAT
+  JSON|NDJSON|CSV`); a single `REFRESH` can walk multi-page HTTP APIs via
+  next-URL, `Link` header, or cursor-param pagination; all queried with ordinary
+  SQL (`--features external-sources`, default off; `--features
+  external-sources-objstore` for S3/Azure; deterministic kernel unaffected when
+  off).
 - **Deterministic & verifiable** — the whole engine is a seedable state machine;
   the test suite includes a seeded partition/fault simulation corpus.
 
@@ -187,6 +190,14 @@ Honest boundaries (documented, not hidden):
   build and plain `--features external-sources` remain zero‑new‑dependency
   and `http://`‑only. Enable this feature to register `https://` endpoints;
   without it only plaintext HTTP is accepted.
+- **Object-store external sources (S3 / Azure Blob)** are an **opt‑in
+  cargo feature** (`--features external-sources-objstore`, which implies
+  `external-sources-tls` and pulls rustls + webpki‑roots + the
+  `kessel-objstore` crate). The default build and plain
+  `--features external-sources` remain unaffected. Enable this feature to
+  register `s3://` or `az://` endpoints; without it those URL schemes are
+  rejected at `CREATE` with a clear message. Object-store requests are
+  HTTPS-only with full webpki certificate verification and no bypass.
 - **Cross‑shard transactions** are implemented, **deterministically**
   (Calvin‑style), over real sockets — *not* blocking two‑phase commit.
   A deployment runs K independent VSR shard groups behind a router
@@ -215,7 +226,7 @@ Honest boundaries (documented, not hidden):
   `Delete`); cross‑shard scatter‑gather *reads*/SQL text routing is a
   separate, later concern from cross‑shard *transactions*.
 
-Every claim in this repository is backed by the test suite (`247 tests`); the
+Every claim in this repository is backed by the test suite (`267 tests`); the
 docs call out exactly what is proven versus roadmap.
 
 ## Documentation
@@ -235,7 +246,7 @@ docs call out exactly what is proven versus roadmap.
 
 ```bash
 cargo build                 # all crates, zero external deps
-cargo test --workspace      # 247 tests (incl. seeded partition/fault simulation)
+cargo test --workspace      # 267 tests (incl. seeded partition/fault simulation)
 cargo run -p kessel-bench --release -- --help   # benchmarks
 ```
 

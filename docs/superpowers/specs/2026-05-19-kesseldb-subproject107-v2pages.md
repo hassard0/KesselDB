@@ -100,7 +100,7 @@ assertion).
 byte-identity defect was introduced mid-slice (the shared `scatter_nulls`
 refactor initially mis-ordered a step for the V1 path). The gate caught
 this via the existing V1-OPTIONAL regression tests. A permanent regression
-KAT (`extract_optional_v1_byte_identity_regression`) was added to lock the
+KAT (`v1_check_order_num_values_before_comp_size_unchanged`) was added to lock the
 correct V1 output order permanently. This is an honest disclosure: the gate
 is working as intended, the defect was corrected before any commit to main,
 and the regression test ensures it cannot recur silently.

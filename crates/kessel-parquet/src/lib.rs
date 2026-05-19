@@ -45,7 +45,7 @@ impl std::fmt::Display for PqError {
 
 /// Read one column chunk's values across all its pages.
 /// Flat REQUIRED, UNCOMPRESSED, V1. Supports: an optional leading
-/// DICTIONARY_PAGE then one-or-more DATA_PAGEs; each data page is
+/// DICTIONARY_PAGE then zero-or-more DATA_PAGEs; each data page is
 /// PLAIN (dictionary-fallback) or PLAIN_DICTIONARY/RLE_DICTIONARY.
 fn read_chunk_values(
     file: &[u8],
@@ -161,6 +161,11 @@ fn read_chunk_values(
             ));
         }
         out.extend(vals);
+        // off strictly advances: dend = off + hlen + uncompressed_size,
+        // and hlen >= 1 (decode_page_header always consumes at least the
+        // STOP byte), so even a zero-uncompressed_size / zero-num_values
+        // page makes forward progress — the loop cannot spin; it
+        // terminates at want_rows or an EOF-bounds PqError::Bad.
         off = dend;
     }
     if out.len() != want_rows {

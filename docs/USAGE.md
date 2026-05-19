@@ -738,6 +738,11 @@ messages.
 
 ## 7f. FORMAT PARQUET for object-store sources (OBJ-2a)
 
+> **OBJ-2b in progress:** the RLE/bit-packing-hybrid primitive is
+> implemented (SP102) but not yet wired. Until OBJ-2b-2/3/4 ship,
+> `FORMAT PARQUET` still requires PLAIN-encoded, UNCOMPRESSED,
+> REQUIRED columns (pyarrow `use_dictionary=False, compression=None`).
+
 `FORMAT PARQUET` is supported for `s3://` and `az://` sources when the
 server is built with `--features external-sources-objstore`. Plain
 `http://` / `https://` URLs are **rejected** with a clear message if

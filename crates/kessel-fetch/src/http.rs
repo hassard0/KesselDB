@@ -92,12 +92,22 @@ pub(crate) fn exchange<S: Read + Write>(
     let mut raw = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
-        let n = s
-            .read(&mut chunk)
-            .map_err(|e| FetchError::Http(format!("read: {e}")))?;
-        if n == 0 {
-            break;
-        }
+        let n = match s.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            // kessel-fetch is strictly length-framed (Content-Length /
+            // chunked) and always sends `Connection: close`. A TLS peer
+            // that closes the TCP connection without a `close_notify`
+            // alert surfaces here as `UnexpectedEof`; for a length-framed
+            // client that is a normal end-of-stream (rustls documents
+            // this as safe to ignore), so treat it exactly like `Ok(0)`.
+            // Any genuine truncation is still caught downstream by the
+            // de-chunk `b.len() < size + 2` guard and the body caps.
+            Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                break
+            }
+            Err(e) => return Err(FetchError::Http(format!("read: {e}"))),
+        };
         raw.extend_from_slice(&chunk[..n]);
         if raw.len() as u64 > max_body + MAX_HEADER_SLACK {
             return Err(FetchError::TooLarge(max_body));

@@ -27,6 +27,11 @@ pub fn decode_plain(
     // `push`ed and the per-type `.get(..need)?` still returns
     // `PqError::Bad` for genuinely short data). This caps the eager
     // allocation without altering correct-decode behavior.
+    // NOTE: for BOOLEAN (bit-packed, >=1 value per BIT) data.len() may
+    // under-reserve by up to 8x the decoded count — harmless: the loop
+    // still push()es every value (reallocating as needed). The point of
+    // the .min is purely the OOM bound vs a lying huge `count`; do NOT
+    // revert to with_capacity(count).
     let mut out = Vec::with_capacity(count.min(data.len()));
     match ptype {
         Type::Int32 => {

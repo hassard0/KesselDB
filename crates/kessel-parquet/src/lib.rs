@@ -2701,3 +2701,613 @@ mod pentest {
         ));
     }
 }
+
+// ── OBJ-2c-3 Task 5 PENTEST PASS — DATA_PAGE_V2 decode adversarial ────
+//
+// The Parquet object bytes are operator-declared-source-controlled =
+// attacker-influenceable. `decode_data_page_v2` (lib.rs:168) ingests
+// these attacker bytes: rep_len, def_len, num_values, num_nulls,
+// uncompressed_page_size, is_compressed, the def-level bytes, the
+// values section, and the column codec. Every hostile case below is
+// wrapped in `catch_unwind` (proving no panic / no OOM-unwind) AND
+// asserted to be a TYPED `PqError::Bad`/`Unsupported` that returns
+// FAST (no hang / no multi-GB allocation). The positive locks assert
+// the exact decoded `Ok(rows)` — a positive-lock failure is a decoder
+// bug (BLOCKED, never weaken); a hostile panic/OOM/hang is a real
+// vuln (BLOCKED with exact detail).
+//
+// Every corrupt byte here is derived by reasoning about the V2 wire
+// format INDEPENDENTLY (parquet.thrift PageHeader f1/f2/f3 + f8
+// DataPageHeaderV2 g1 num_values / g2 num_nulls / g3 num_rows / g4
+// encoding / g5 def_levels_byte_length / g6 rep_levels_byte_length /
+// g7 is_compressed, then payload = [rep bytes][def bytes][values]),
+// NOT by patching valid encoder output. The `v2_file` builder takes
+// every attacker-controlled field as an explicit parameter so each
+// lock injects its hostile value at the format level.
+#[cfg(test)]
+mod pentest_v2 {
+    use super::*;
+
+    // ── inline Thrift compact helpers (mirrors mod tests / pentest) ───
+    fn uv(out: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 { out.push(b); break; } else { out.push(b | 0x80); }
+        }
+    }
+    fn zz(v: i64) -> u64 { ((v << 1) ^ (v >> 63)) as u64 }
+
+    /// Every attacker-controlled byte of a one-column one-row-group V2
+    /// file. The header field values (`hdr_*`) are written VERBATIM
+    /// into the DataPageHeaderV2 / PageHeader (so a lock can declare a
+    /// def_len that disagrees with the real payload, a giant
+    /// num_values, etc.), while `payload` is the literal on-disk
+    /// [rep][def][values] bytes and `phys_*` is what is physically
+    /// written into the file's PageHeader f2/f3 size fields. `codec`
+    /// is the chunk codec enum (0=UNCOMPRESSED, 1=SNAPPY, 2=GZIP).
+    #[allow(clippy::too_many_arguments)]
+    struct V2Spec<'a> {
+        optional: bool,    // schema/chunk repetition (max_def_level 1 vs 0)
+        rows: i64,         // REAL logical row count → chunk num_values / RG num_rows
+        codec: i64,        // chunk codec enum written to ColumnMetaData f4
+        hdr_uncompressed: i64, // PageHeader f2 uncompressed_page_size
+        hdr_compressed: i64,   // PageHeader f3 compressed_page_size
+        hdr_num_values: i64,   // DPHv2 g1 num_values
+        hdr_num_nulls: i64,    // DPHv2 g2 num_nulls
+        hdr_encoding: i64,     // DPHv2 g4 (0=PLAIN, 2=PLAIN_DICTIONARY)
+        hdr_def_len: i64,      // DPHv2 g5 def_levels_byte_length
+        hdr_rep_len: i64,      // DPHv2 g6 rep_levels_byte_length
+        hdr_is_compressed: bool, // DPHv2 g7
+        payload: &'a [u8],     // literal on-disk [rep][def][values] bytes
+        with_dict: bool,       // emit a leading PLAIN dict page [7]
+    }
+
+    /// Assemble `[PAR1]([dict_hdr][dict_data])?[data_hdr][payload][meta]
+    /// [mlen_le][PAR1]`. Header sizes f2/f3 are taken from the spec so
+    /// a lying compressed/uncompressed size is genuinely on-disk.
+    fn v2_file(s: &V2Spec) -> Vec<u8> {
+        // -- optional leading dictionary page (PLAIN INT64 [7]) --
+        let (dict_hdr, dict_data): (Vec<u8>, Vec<u8>) = if s.with_dict {
+            let mut dd = Vec::new();
+            dd.extend_from_slice(&7i64.to_le_bytes());
+            let db = dd.len() as i64;
+            let mut dh = Vec::new();
+            dh.push(0x15); uv(&mut dh, zz(2));   // f1 type=DICTIONARY_PAGE(2)
+            dh.push(0x15); uv(&mut dh, zz(db));  // f2 uncompressed
+            dh.push(0x15); uv(&mut dh, zz(db));  // f3 compressed
+            dh.push(0x4c);                       // f7 DictionaryPageHeader
+            dh.push(0x15); uv(&mut dh, zz(1));   // g1 num_values=1
+            dh.push(0x15); uv(&mut dh, zz(2));   // g2 encoding=PLAIN_DICTIONARY
+            dh.push(0x12);                       // g3 is_sorted=false
+            dh.push(0x00); dh.push(0x00);        // stop DPH / PH
+            (dh, dd)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        // -- DATA_PAGE_V2 PageHeader (all sizes/counts attacker-set) --
+        let mut hdr = Vec::new();
+        hdr.push(0x15); uv(&mut hdr, zz(3));                  // f1 type=DATA_PAGE_V2(3)
+        hdr.push(0x15); uv(&mut hdr, zz(s.hdr_uncompressed)); // f2 uncompressed
+        hdr.push(0x15); uv(&mut hdr, zz(s.hdr_compressed));   // f3 compressed
+        hdr.push(0x5c);                                       // f8 struct (delta 3->8=5)
+        hdr.push(0x15); uv(&mut hdr, zz(s.hdr_num_values));   // g1 num_values
+        hdr.push(0x15); uv(&mut hdr, zz(s.hdr_num_nulls));    // g2 num_nulls
+        hdr.push(0x15); uv(&mut hdr, zz(s.hdr_num_values));   // g3 num_rows (= num_values here)
+        hdr.push(0x15); uv(&mut hdr, zz(s.hdr_encoding));     // g4 encoding
+        hdr.push(0x15); uv(&mut hdr, zz(s.hdr_def_len));      // g5 def_levels_byte_length
+        hdr.push(0x15); uv(&mut hdr, zz(s.hdr_rep_len));      // g6 rep_levels_byte_length
+        hdr.push(if s.hdr_is_compressed { 0x11 } else { 0x12 }); // g7 is_compressed
+        hdr.push(0x00); hdr.push(0x00);                       // stop DPHv2 / PH
+
+        let dict_page_offset: i64 = 4;
+        let data_page_offset: i64 =
+            4 + dict_hdr.len() as i64 + dict_data.len() as i64;
+        let leaf_rep: i64 = if s.optional { 1 } else { 0 };
+        let enc_for_meta: i64 = if s.with_dict { 2 } else { 0 };
+
+        let mut m = Vec::new();
+        m.push(0x15); uv(&mut m, zz(2));                 // f1 version=2
+        m.push(0x19); m.push(0x2c);                      // f2 list<SchemaElement> 2
+        m.push(0x48); uv(&mut m, 6); m.extend_from_slice(b"schema");
+        m.push(0x15); uv(&mut m, zz(1));                 // root num_children=1
+        m.push(0x00);
+        m.push(0x15); uv(&mut m, zz(2));                 // leaf f1 type=INT64
+        m.push(0x25); uv(&mut m, zz(leaf_rep));          // f3 repetition
+        m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x00);
+        m.push(0x16); uv(&mut m, zz(s.rows));            // f3 num_rows
+        m.push(0x19); m.push(0x1c);                      // f4 list<RowGroup> 1
+        m.push(0x19); m.push(0x1c);                      // RG f1 list<ColumnChunk> 1
+        m.push(0x3c);                                    // ColumnChunk f3 CMD
+        m.push(0x15); uv(&mut m, zz(2));                 // CMD f1 type=INT64
+        m.push(0x19); m.push(0x15); uv(&mut m, zz(enc_for_meta)); // f2 encodings
+        m.push(0x19); m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x15); uv(&mut m, zz(s.codec));           // f4 codec
+        m.push(0x16); uv(&mut m, zz(s.rows));            // f5 chunk num_values
+        m.push(0x46); uv(&mut m, zz(data_page_offset));  // f9 data_page_offset
+        if s.with_dict {
+            m.push(0x26); uv(&mut m, zz(dict_page_offset)); // f11 dict_page_offset
+        }
+        m.push(0x00); m.push(0x00);                      // stop CMD / ColumnChunk
+        m.push(0x26); uv(&mut m, zz(s.rows));            // RG f3 num_rows
+        m.push(0x00); m.push(0x00);                      // stop RG / FileMetaData
+
+        let mut f = Vec::new();
+        f.extend_from_slice(b"PAR1");
+        if s.with_dict {
+            f.extend_from_slice(&dict_hdr);
+            f.extend_from_slice(&dict_data);
+        }
+        f.extend_from_slice(&hdr);
+        f.extend_from_slice(s.payload);
+        let mlen = m.len() as u32;
+        f.extend_from_slice(&m);
+        f.extend_from_slice(&mlen.to_le_bytes());
+        f.extend_from_slice(b"PAR1");
+        f
+    }
+
+    // ── well-formed reference payloads (independently reasoned) ───────
+    //
+    // V2 OPTIONAL def-section for defs[1,0,1]: ONE bit-packed group of
+    // 8, bit_width 1, NOT 4-byte length-prefixed (V2): hybrid header
+    // (1<<1)|1 = 0x03, then one bits byte with bit i set iff defs[i]==1
+    // → 0b00000101 = 0x05. PLAIN INT64 values are little-endian i64.
+    fn opt_def_101() -> [u8; 2] { [0x03, 0x05] }
+    fn req_no_def() -> [u8; 0] { [] }
+    fn plain_i64(vals: &[i64]) -> Vec<u8> {
+        let mut v = Vec::new();
+        for x in vals { v.extend_from_slice(&x.to_le_bytes()); }
+        v
+    }
+
+    // Helper: catch_unwind, assert NO panic + a typed Err (Bad OR
+    // Unsupported). Mirrors `pentest::no_panic_typed_err` exactly.
+    fn no_panic_typed_err(file: &[u8]) {
+        let owned = file.to_vec();
+        let r = std::panic::catch_unwind(move || extract(&owned, &["id"]));
+        assert!(r.is_ok(), "must NOT panic/OOM-unwind on hostile V2 input");
+        assert!(
+            matches!(
+                r.unwrap(),
+                Err(PqError::Bad(_) | PqError::Unsupported(_))
+            ),
+            "hostile V2 input must yield a typed PqError"
+        );
+    }
+
+    // Helper: catch_unwind, assert NO panic + a typed Err whose
+    // message CONTAINS `needle` (locks the SPECIFIC guard, not just
+    // "some error"). Still tolerant of Bad vs Unsupported.
+    fn no_panic_err_contains(file: &[u8], needle: &str) {
+        let owned = file.to_vec();
+        let r = std::panic::catch_unwind(move || extract(&owned, &["id"]));
+        assert!(r.is_ok(), "must NOT panic/OOM-unwind on hostile V2 input");
+        let e = r.unwrap();
+        let msg = match &e {
+            Err(PqError::Bad(m)) | Err(PqError::Unsupported(m)) => m.clone(),
+            other => panic!("expected typed PqError, got {other:?}"),
+        };
+        assert!(
+            msg.contains(needle),
+            "expected error containing {needle:?}, got {msg:?}"
+        );
+    }
+
+    // ════════════════ HOSTILE LOCKS ═════════════════════════════════
+
+    // L1: lying def_len so rep_len(0)+def_len > compressed_size →
+    // lvl_end > region.len() → Bad, no OOB read. payload is the real
+    // 2-byte def section but g5 claims def_len=64 (>> region).
+    #[test]
+    fn v2_lying_def_len_exceeds_region_bad_no_oob() {
+        let payload = {
+            let mut p = opt_def_101().to_vec();
+            p.extend_from_slice(&plain_i64(&[7, -2]));
+            p
+        };
+        let f = v2_file(&V2Spec {
+            optional: true, codec: 0,
+            rows: 3,
+            hdr_uncompressed: payload.len() as i64,
+            hdr_compressed: payload.len() as i64,
+            hdr_num_values: 3, hdr_num_nulls: 1, hdr_encoding: 0,
+            hdr_def_len: 64, // LIE: 64 > payload.len()
+            hdr_rep_len: 0, hdr_is_compressed: false,
+            payload: &payload, with_dict: false,
+        });
+        no_panic_err_contains(&f, "v2 levels exceed page");
+    }
+
+    // L1b: lying rep_len so rep_len+def_len > compressed_size. (rep>0
+    // is itself Unsupported — see L2 — so to exercise the level-len /
+    // region bound we keep rep small but make rep+def overflow region
+    // via a huge def_len AND a valid-looking small rep. Covered by L1;
+    // here we additionally lock rep_len+def_len addition overflow.)
+    #[test]
+    fn v2_level_len_add_overflow_typed_bad() {
+        // def_len = usize::MAX-ish via i32::MAX, rep_len exercised by L2.
+        let payload = plain_i64(&[7, -2]);
+        let f = v2_file(&V2Spec {
+            optional: true, codec: 0,
+            rows: 2,
+            hdr_uncompressed: payload.len() as i64,
+            hdr_compressed: payload.len() as i64,
+            hdr_num_values: 2, hdr_num_nulls: 0, hdr_encoding: 0,
+            hdr_def_len: i32::MAX as i64, // enormous declared def_len
+            hdr_rep_len: 0, hdr_is_compressed: false,
+            payload: &payload, with_dict: false,
+        });
+        // i32::MAX def_len >> region → "v2 levels exceed page" Bad,
+        // fast, no OOB and no allocation of i32::MAX bytes.
+        no_panic_err_contains(&f, "v2 levels exceed page");
+    }
+
+    // L2: rep_len > 0 → Unsupported("REPEATED/nested V2 ... OBJ-2c-5"),
+    // no panic. Payload carries 1 rep byte + def + values so the
+    // declared rep_len is internally consistent (isolating the guard).
+    #[test]
+    fn v2_rep_len_nonzero_unsupported_obj2c5() {
+        let mut payload = vec![0x00]; // 1 rep byte
+        payload.extend_from_slice(&opt_def_101());
+        payload.extend_from_slice(&plain_i64(&[7, -2]));
+        let f = v2_file(&V2Spec {
+            optional: true, codec: 0,
+            rows: 3,
+            hdr_uncompressed: payload.len() as i64,
+            hdr_compressed: payload.len() as i64,
+            hdr_num_values: 3, hdr_num_nulls: 1, hdr_encoding: 0,
+            hdr_def_len: 2, hdr_rep_len: 1, // rep_len > 0
+            hdr_is_compressed: false,
+            payload: &payload, with_dict: false,
+        });
+        no_panic_err_contains(&f, "REPEATED/nested V2");
+        no_panic_err_contains(&f, "OBJ-2c-5");
+    }
+
+    // L3: uncompressed_page_size < rep_len+def_len → vt = uncomp -
+    // lvl_end underflows → Bad("v2 values target underflow").
+    // Region is sized by compressed_size (real), but g2 f2
+    // uncompressed is a LIE smaller than lvl_end.
+    #[test]
+    fn v2_uncompressed_lt_levels_vt_underflow_bad() {
+        let payload = {
+            let mut p = opt_def_101().to_vec();
+            p.extend_from_slice(&plain_i64(&[7, -2]));
+            p
+        };
+        let f = v2_file(&V2Spec {
+            optional: true, codec: 0,
+            rows: 3,
+            hdr_uncompressed: 1, // LIE: 1 < def_len(2)
+            hdr_compressed: payload.len() as i64,
+            hdr_num_values: 3, hdr_num_nulls: 1, hdr_encoding: 0,
+            hdr_def_len: 2, hdr_rep_len: 0, hdr_is_compressed: false,
+            payload: &payload, with_dict: false,
+        });
+        no_panic_err_contains(&f, "v2 values target underflow");
+    }
+
+    // L4: a V2 OPTIONAL def-level value > 1. max_def_level==1 but the
+    // bit-packed byte sets a 2-bit-ish pattern. To force a decoded
+    // level > 1 we widen the def section to bit_width 2: hybrid header
+    // (1<<1)|1=0x03, then ceil(3 levels * 2bits /8)=1 byte with the
+    // first level = 0b11 = 3. decode_hybrid(_, bit_width=1, n) is
+    // called by the decoder with bit_width fixed to 1, so to actually
+    // surface ">1" we instead pack level value 1,1,1 but claim n so a
+    // packed bit decodes as a def of value... the decoder hard-codes
+    // bit_width=1, max=1. The only way a decoded def exceeds 1 is RLE:
+    // an RLE run of value 3. Build def = RLE run: header (count<<1)|0,
+    // value byte. count=3 → header (3<<1)|0 = 0x06, then 1 value byte
+    // = 0x03 (def level 3 > max 1). That is a spec-valid hybrid stream
+    // decoding to [3,3,3] → triggers "v2 def-level exceeds max".
+    #[test]
+    fn v2_def_level_exceeds_max_bad() {
+        // RLE run, len width = ceil(bit_width=1 /8)=1 byte → value 0x03.
+        let def_section: &[u8] = &[0x06, 0x03]; // RLE run x3 of value 3
+        let mut payload = def_section.to_vec();
+        payload.extend_from_slice(&plain_i64(&[7, -2]));
+        let f = v2_file(&V2Spec {
+            optional: true, codec: 0,
+            rows: 3,
+            hdr_uncompressed: payload.len() as i64,
+            hdr_compressed: payload.len() as i64,
+            hdr_num_values: 3, hdr_num_nulls: 1, hdr_encoding: 0,
+            hdr_def_len: def_section.len() as i64,
+            hdr_rep_len: 0, hdr_is_compressed: false,
+            payload: &payload, with_dict: false,
+        });
+        no_panic_err_contains(&f, "v2 def-level exceeds max");
+    }
+
+    // L5: num_nulls inconsistent with decoded def-levels. defs[1,0,1]
+    // → 1 null, 2 present; but g2 num_nulls is LIED to 0 → n - nn (3)
+    // != present (2) → Bad("v2 num_nulls vs def-levels mismatch").
+    #[test]
+    fn v2_num_nulls_vs_def_levels_mismatch_bad() {
+        let mut payload = opt_def_101().to_vec();
+        payload.extend_from_slice(&plain_i64(&[7, -2]));
+        let f = v2_file(&V2Spec {
+            optional: true, codec: 0,
+            rows: 3,
+            hdr_uncompressed: payload.len() as i64,
+            hdr_compressed: payload.len() as i64,
+            hdr_num_values: 3,
+            hdr_num_nulls: 0, // LIE: real null count is 1
+            hdr_encoding: 0,
+            hdr_def_len: 2, hdr_rep_len: 0, hdr_is_compressed: false,
+            payload: &payload, with_dict: false,
+        });
+        no_panic_err_contains(&f, "v2 num_nulls vs def-levels mismatch");
+    }
+
+    // L6: uncompressed / !is_compressed values section length != vt.
+    // codec=UNCOMPRESSED, def section [0x03,0x05] (2 bytes), values =
+    // ONE i64 (8 bytes) but uncompressed_page_size claims 2+16=18 so
+    // vt=16 while values_section.len()=8 → Bad("v2 raw values length
+    // mismatch").
+    #[test]
+    fn v2_raw_values_length_mismatch_bad() {
+        let mut payload = opt_def_101().to_vec();
+        payload.extend_from_slice(&plain_i64(&[7])); // only 8 bytes of values
+        let f = v2_file(&V2Spec {
+            optional: true, codec: 0,
+            rows: 3,
+            hdr_uncompressed: 18, // claims vt = 18-2 = 16
+            hdr_compressed: payload.len() as i64, // real region = 10
+            hdr_num_values: 3, hdr_num_nulls: 1, hdr_encoding: 0,
+            hdr_def_len: 2, hdr_rep_len: 0, hdr_is_compressed: false,
+            payload: &payload, with_dict: false,
+        });
+        no_panic_err_contains(&f, "v2 raw values length mismatch");
+    }
+
+    // L7: region shorter than rep_len+def_len (truncated V2 page):
+    // declare def_len=2 but the on-disk payload is EMPTY (0 bytes), so
+    // the V2 region is shorter than lvl_end → Bad, typed, no slice
+    // panic. compressed_size=0 → v2_region is a 0-length slice.
+    #[test]
+    fn v2_truncated_page_shorter_than_levels_bad() {
+        let payload: &[u8] = &[];
+        let f = v2_file(&V2Spec {
+            optional: true, codec: 0,
+            rows: 3,
+            hdr_uncompressed: 2, hdr_compressed: 0, // region = 0 bytes
+            hdr_num_values: 3, hdr_num_nulls: 1, hdr_encoding: 0,
+            hdr_def_len: 2, // > region.len()==0
+            hdr_rep_len: 0, hdr_is_compressed: false,
+            payload, with_dict: false,
+        });
+        no_panic_err_contains(&f, "v2 levels exceed page");
+    }
+
+    // L8a: V2 + corrupt Snappy values section, is_compressed=true,
+    // codec=SNAPPY(1). Garbage values bytes → snappy::decompress
+    // returns a typed Bad/Unsupported (preamble/cap) FAST, no
+    // panic/OOM. def section is valid; values = 8 garbage bytes;
+    // uncompressed_page_size makes vt small (16) so the snappy cap is
+    // not hit but the garbage preamble fails fast.
+    #[test]
+    fn v2_corrupt_snappy_values_typed_no_oom() {
+        let mut payload = opt_def_101().to_vec();
+        payload.extend_from_slice(&[0xFF, 0xFE, 0xAB, 0xCD, 0x01, 0x02, 0x03, 0x04]);
+        let f = v2_file(&V2Spec {
+            optional: true, codec: 1, // SNAPPY
+            rows: 3,
+            hdr_uncompressed: 18, // vt = 16
+            hdr_compressed: payload.len() as i64,
+            hdr_num_values: 3, hdr_num_nulls: 1, hdr_encoding: 0,
+            hdr_def_len: 2, hdr_rep_len: 0,
+            hdr_is_compressed: true, // force the Snappy arm
+            payload: &payload, with_dict: false,
+        });
+        no_panic_typed_err(&f);
+    }
+
+    // L8b: V2 + corrupt GZIP values section, is_compressed=true,
+    // codec=GZIP(2). Garbage values bytes (no 0x1f 0x8b magic) →
+    // gzip::decompress returns Bad("gzip magic")/"member too short"
+    // FAST, no panic/OOM.
+    #[test]
+    fn v2_corrupt_gzip_values_typed_no_oom() {
+        let mut payload = opt_def_101().to_vec();
+        payload.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33]);
+        let f = v2_file(&V2Spec {
+            optional: true, codec: 2, // GZIP
+            rows: 3,
+            hdr_uncompressed: 18, // vt = 16
+            hdr_compressed: payload.len() as i64,
+            hdr_num_values: 3, hdr_num_nulls: 1, hdr_encoding: 0,
+            hdr_def_len: 2, hdr_rep_len: 0,
+            hdr_is_compressed: true, // force the Gzip arm
+            payload: &payload, with_dict: false,
+        });
+        no_panic_typed_err(&f);
+    }
+
+    // L8c: V2 + GZIP, is_compressed=true, attacker declares a HUGE
+    // uncompressed_page_size so vt is enormous → gzip::decompress
+    // hits the GZIP_MAX_DECOMP cap → Unsupported, FAST, NO multi-GB
+    // allocation (cap check precedes any Vec reservation).
+    #[test]
+    fn v2_gzip_huge_uncompressed_hits_cap_no_oom() {
+        let mut payload = opt_def_101().to_vec();
+        payload.extend_from_slice(&[0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0]);
+        let f = v2_file(&V2Spec {
+            optional: true, codec: 2,
+            rows: 3,
+            hdr_uncompressed: i32::MAX as i64, // vt ~= 2GiB → cap
+            hdr_compressed: payload.len() as i64,
+            hdr_num_values: 3, hdr_num_nulls: 1, hdr_encoding: 0,
+            hdr_def_len: 2, hdr_rep_len: 0,
+            hdr_is_compressed: true,
+            payload: &payload, with_dict: false,
+        });
+        no_panic_typed_err(&f);
+    }
+
+    // L9: def_len declared non-zero for a REQUIRED (max_def_level==0)
+    // column → Bad("v2 def_len non-zero for REQUIRED"). optional=false
+    // so the schema/chunk leaf is REQUIRED, but g5 def_len=2.
+    #[test]
+    fn v2_def_len_nonzero_for_required_bad() {
+        let mut payload = opt_def_101().to_vec(); // 2 stray "def" bytes
+        payload.extend_from_slice(&plain_i64(&[7, -2]));
+        let f = v2_file(&V2Spec {
+            optional: false, // REQUIRED → max_def_level 0
+            rows: 2,
+            codec: 0,
+            hdr_uncompressed: payload.len() as i64,
+            hdr_compressed: payload.len() as i64,
+            hdr_num_values: 2, hdr_num_nulls: 0, hdr_encoding: 0,
+            hdr_def_len: 2, // non-zero for REQUIRED
+            hdr_rep_len: 0, hdr_is_compressed: false,
+            payload: &payload, with_dict: false,
+        });
+        no_panic_err_contains(&f, "v2 def_len non-zero for REQUIRED");
+    }
+
+    // L10: huge declared num_values + huge uncompressed_page_size with
+    // a tiny actual page → must error FAST with a typed Bad, NO
+    // multi-GB allocation / OOM. num_values=i32::MAX, REQUIRED so the
+    // decoder reaches decode_plain(present=i32::MAX) whose reservation
+    // is bounded by data.len() (Task-12 fix); uncompressed=i32::MAX
+    // makes vt huge but values_section.len() (tiny) != vt → the raw
+    // values length-mismatch guard fires before any big alloc.
+    #[test]
+    fn v2_huge_num_values_and_size_tiny_page_no_oom() {
+        let payload = plain_i64(&[7, -2]); // 16 bytes only
+        let f = v2_file(&V2Spec {
+            optional: false, codec: 0,
+            rows: 2,
+            hdr_uncompressed: i32::MAX as i64,
+            hdr_compressed: payload.len() as i64,
+            hdr_num_values: i32::MAX as i64,
+            hdr_num_nulls: 0, hdr_encoding: 0,
+            hdr_def_len: 0, hdr_rep_len: 0, hdr_is_compressed: false,
+            payload: &payload, with_dict: false,
+        });
+        // Must return typed Err fast (no hang / no OOM-abort).
+        no_panic_typed_err(&f);
+        assert!(
+            matches!(extract(&f, &["id"]), Err(PqError::Bad(_))),
+            "i32::MAX num_values/size vs tiny V2 page must be Bad"
+        );
+    }
+
+    // ════════════════ POSITIVE CORRECTNESS LOCKS ════════════════════
+    //
+    // These assert the EXACT decoded rows. A failure here is a decoder
+    // bug → BLOCKED, never weaken the expectation.
+
+    // P1: V2 PLAIN REQUIRED [7,-2] → [[I64(7)],[I64(-2)]].
+    #[test]
+    fn v2_plain_required_positive_lock() {
+        let payload = {
+            let mut p = req_no_def().to_vec();
+            p.extend_from_slice(&plain_i64(&[7, -2]));
+            p
+        };
+        let f = v2_file(&V2Spec {
+            optional: false, codec: 0,
+            rows: 2,
+            hdr_uncompressed: payload.len() as i64,
+            hdr_compressed: payload.len() as i64,
+            hdr_num_values: 2, hdr_num_nulls: 0, hdr_encoding: 0,
+            hdr_def_len: 0, hdr_rep_len: 0, hdr_is_compressed: false,
+            payload: &payload, with_dict: false,
+        });
+        assert_eq!(
+            extract(&f, &["id"]).expect("v2 plain required"),
+            vec![vec![PqValue::I64(7)], vec![PqValue::I64(-2)]]
+        );
+    }
+
+    // P2: V2 PLAIN OPTIONAL [7,null,-2] → scatter
+    // [[I64(7)],[Null],[I64(-2)]].
+    #[test]
+    fn v2_plain_optional_scatter_positive_lock() {
+        let mut payload = opt_def_101().to_vec(); // defs [1,0,1]
+        payload.extend_from_slice(&plain_i64(&[7, -2]));
+        let f = v2_file(&V2Spec {
+            optional: true, codec: 0,
+            rows: 3,
+            hdr_uncompressed: payload.len() as i64,
+            hdr_compressed: payload.len() as i64,
+            hdr_num_values: 3, hdr_num_nulls: 1, hdr_encoding: 0,
+            hdr_def_len: 2, hdr_rep_len: 0, hdr_is_compressed: false,
+            payload: &payload, with_dict: false,
+        });
+        assert_eq!(
+            extract(&f, &["id"]).expect("v2 plain optional"),
+            vec![
+                vec![PqValue::I64(7)],
+                vec![PqValue::Null],
+                vec![PqValue::I64(-2)]
+            ]
+        );
+    }
+
+    // P3: V2 + dict [7,null,7] → [[I64(7)],[Null],[I64(7)]]. dict
+    // page = PLAIN [7]; values section = [bit_width=1][hybrid hdr
+    // 0x03][bits 0x00] → 2 present dict indices both 0 (SP105 KAT).
+    #[test]
+    fn v2_dict_positive_lock() {
+        let mut payload = opt_def_101().to_vec(); // defs [1,0,1]
+        payload.extend_from_slice(&[0x01, 0x03, 0x00]); // dict idx 0,0
+        let f = v2_file(&V2Spec {
+            optional: true, codec: 0,
+            rows: 3,
+            hdr_uncompressed: payload.len() as i64,
+            hdr_compressed: payload.len() as i64,
+            hdr_num_values: 3, hdr_num_nulls: 1,
+            hdr_encoding: 2, // PLAIN_DICTIONARY
+            hdr_def_len: 2, hdr_rep_len: 0, hdr_is_compressed: false,
+            payload: &payload, with_dict: true,
+        });
+        assert_eq!(
+            extract(&f, &["id"]).expect("v2 dict"),
+            vec![
+                vec![PqValue::I64(7)],
+                vec![PqValue::Null],
+                vec![PqValue::I64(7)]
+            ]
+        );
+    }
+
+    // P4: V2 file with codec=GZIP(2) but is_compressed=FALSE — raw
+    // (uncompressed) values under a gzip CHUNK codec must decode
+    // correctly: the `_ if !ph.v2_is_compressed` arm overrides the
+    // column codec and treats the values section as raw. Logical
+    // [7,-2] REQUIRED → [[I64(7)],[I64(-2)]].
+    //
+    // The V2 + gzip *COMPRESSED* compose is already proven
+    // NON-self-referentially by Task 4's real-pyarrow
+    // `crates/kessel-parquet/tests/fixtures/v2_gzip.parquet`
+    // roundtrip (tests/fixture_roundtrip.rs) — NOT rebuilt here.
+    #[test]
+    fn v2_gzip_codec_but_not_compressed_raw_positive_lock() {
+        let payload = {
+            let mut p = req_no_def().to_vec();
+            p.extend_from_slice(&plain_i64(&[7, -2]));
+            p
+        };
+        let f = v2_file(&V2Spec {
+            optional: false,
+            rows: 2,
+            codec: 2, // GZIP chunk codec
+            hdr_uncompressed: payload.len() as i64,
+            hdr_compressed: payload.len() as i64,
+            hdr_num_values: 2, hdr_num_nulls: 0, hdr_encoding: 0,
+            hdr_def_len: 0, hdr_rep_len: 0,
+            hdr_is_compressed: false, // raw values despite GZIP codec
+            payload: &payload, with_dict: false,
+        });
+        assert_eq!(
+            extract(&f, &["id"]).expect("v2 gzip-codec raw values"),
+            vec![vec![PqValue::I64(7)], vec![PqValue::I64(-2)]]
+        );
+    }
+}

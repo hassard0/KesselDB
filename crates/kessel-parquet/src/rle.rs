@@ -2,6 +2,7 @@
 //! Authority: parquet-format `Encodings.md`. Zero external deps.
 //! Pure, bounds-checked: never panics / OOMs on hostile bytes.
 #![allow(dead_code)]
+// pub fns consumed by later OBJ-2b sub-slices (dictionary/levels).
 
 use crate::PqError;
 
@@ -10,7 +11,7 @@ fn bad(s: &str) -> PqError {
 }
 
 /// Unsigned LEB128 varint at `data[*pos..]`; advances `*pos`.
-/// Rejects > 10 continuation groups (cannot fit u64) as `Bad`.
+/// Rejects a varint whose continuation runs past 64 bits (shift >= 64) as `Bad`.
 fn uvarint(data: &[u8], pos: &mut usize) -> Result<u64, PqError> {
     let mut result: u64 = 0;
     let mut shift: u32 = 0;
@@ -78,6 +79,7 @@ pub fn decode_hybrid(
             let tv = usize::try_from(total_vals)
                 .map_err(|_| bad("rle bitpack value count range"))?;
             if bit_width == 0 {
+                // bit_width==0: no payload bytes exist; emit groups*8 zeros (chunk is empty here).
                 for _ in 0..tv {
                     if out.len() >= num_values {
                         break;
@@ -93,14 +95,18 @@ pub fn decode_hybrid(
                     }
                     let mut v: u64 = 0;
                     for k in 0..bw {
-                        let bp = bitpos + k;
+                        let bp = bitpos
+                            .checked_add(k)
+                            .ok_or_else(|| bad("rle bitpack bitpos overflow"))?;
                         let byte = *chunk
                             .get(bp / 8)
                             .ok_or_else(|| bad("rle bitpack index"))?;
                         let bit = (byte >> (bp % 8)) & 1;
                         v |= (bit as u64) << k;
                     }
-                    bitpos += bw;
+                    bitpos = bitpos
+                        .checked_add(bw)
+                        .ok_or_else(|| bad("rle bitpack bitpos overflow"))?;
                     out.push(v);
                 }
             }
@@ -157,7 +163,7 @@ mod tests {
 
     // KAT 2 — RLE run: value 5 repeated 8 times, bit_width=3.
     // header = varint(run_len << 1) = varint(8<<1) = varint(16) = 0x10.
-    // repeated-value width = ceil(3/8) = 1 byte = 0x05.
+    // repeated-value width = ceil(bit_width/8) = ceil(3/8) = 1 byte = 0x05.
     #[test]
     fn kat_rle_run_value5_x8_width3() {
         let stream = [0x10u8, 0x05];

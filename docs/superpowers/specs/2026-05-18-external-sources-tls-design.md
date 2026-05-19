@@ -10,8 +10,7 @@ design `…-external-sources-pagination-design.md`, record
 `https://` URLs **directly**, removing the single biggest usability
 caveat ("HTTP-only — front it with a TLS-terminating sidecar"), while
 preserving every slice-1 invariant: the deterministic kernel stays
-zero-dependency, the default workspace build is byte-identical, and
-the seed-7 corpus is untouched by construction.
+zero-dependency, the default workspace build pulls no new dependencies and the kernel/WAL/seed-7 outputs are byte-identical (the only default-build change is +2 feature-exempt tests — see §4).
 
 ## 1. Architecture & invariants
 
@@ -54,7 +53,7 @@ external fetch is **captured once at the router** and replicated as a
 single atomic `Op::Txn`. TLS bytes never enter the WAL, the digest,
 or the seed-7 corpus. Feature OFF ⇒ `rustls` / `webpki-roots` are
 absent from the dependency graph and `cargo test --workspace
---release` is byte-identical to today.
+--release` kernel/WAL/determinism output is byte-identical to today and the default build pulls no new deps (the default-build test total rises by 2 feature-exempt tests — see §4).
 
 Rejected alternatives: a separate `https_get` parallel to `get_resp`
 (duplicates the hardened header/dechunk/cap/loop logic into a second

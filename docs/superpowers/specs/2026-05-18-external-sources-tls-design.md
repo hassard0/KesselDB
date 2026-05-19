@@ -168,9 +168,16 @@ the default build. The existing `http://` unit/integration tests stay
 green unchanged.
 
 **Determinism gate.** `cargo test --workspace --release` ⇒
-FAILED=0, the established default-build TOTAL **unchanged** (the new
-tests are `#[cfg(feature = "tls")]`, not compiled by default —
-exactly the slice-1 oracle pattern), `large_seed_corpus_…` green.
+FAILED=0. The default-build test total increases by **two** (245 →
+247): the feature-off `https://` rejection test
+(`stub_server.rs::https_without_tls_feature_is_typed_error_naming_the_feature`)
+and the `rows_from_body` decode unit test (`lib.rs` ptests). Every
+other new test is `#[cfg(feature = "tls")]` /
+`#[cfg(feature = "external-sources-tls")]` and is not compiled by the
+default workspace build. `README.md` / `STATUS.md` test counts are
+bumped accordingly. Seed-7 (`large_seed_corpus_is_deterministic_and_converges`)
+stays green; the kernel/default build pulls no rustls/webpki (verified
+via `cargo tree`).
 Feature-on coverage runs via `cargo test -p kessel-fetch --features
 tls`. A feature-gated server-level smoke
 (`#[cfg(feature = "external-sources-tls")]`) does one `REFRESH` of an
@@ -185,10 +192,9 @@ TLS-terminating sidecar; TLS in `kessel-fetch` deferred."* Update the
 boundary to: *"`http://` always; `https://` when built with
 `--features external-sources-tls` (bundled Mozilla roots, full
 certificate + hostname verification, no bypass); the sidecar is now
-optional."* `docs/STATUS.md` gets the slice line. `README.md`
-test-count line is updated only if the default-build TOTAL changes —
-it will not (new tests are feature-gated), so expect "no change". A
-new internal slice record
+optional."* `docs/STATUS.md` gets the slice line and SP99 row.
+`README.md` test-count line is bumped from 245 to 247 (the two
+default-build additions — see §4 above). A new internal slice record
 `docs/superpowers/specs/2026-05-18-kesseldb-subproject99-ext-tls.md`.
 
 **In scope:** the scheme-dispatch + boxed-stream seam in `http.rs`;

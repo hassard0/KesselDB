@@ -470,10 +470,11 @@ cargo run --release --bin kesseldb --features external-sources -- 127.0.0.1:7878
 - **Snapshot since last REFRESH.** A source reflects only its last
   successful `REFRESH`; queries read the materialized snapshot, never
   live upstream. Re-run `REFRESH` whenever you need fresh data.
-- **HTTP only — no TLS.** The fetch client speaks plain HTTP/1.1.
-  For HTTPS upstreams, put a TLS-terminating reverse proxy (nginx,
-  Caddy, etc.) in front of your data endpoint and point the source URL
-  at the proxy.
+- **HTTP and HTTPS.** The fetch client speaks plain HTTP/1.1 for
+  `http://` sources. `https://` is supported when the server is built
+  with `--features external-sources-tls` (rustls client, bundled Mozilla
+  webpki-roots, full certificate + hostname verification, no bypass under
+  any flag). The TLS-terminating sidecar is now optional.
 - **Upsert only.** Rows deleted from the upstream source are NOT
   automatically removed; only creates and updates are applied.
 
@@ -582,8 +583,10 @@ aborted and **nothing is materialized** — prior data remains intact
 - **Snapshot since last `REFRESH`.** A source reflects only its last
   successful `REFRESH`; queries read the materialized snapshot, never
   live upstream.
-- **HTTP only — no TLS.** Plain HTTP/1.1. For HTTPS upstreams, use a
-  TLS-terminating reverse proxy and point the source URL at it.
+- **HTTP and HTTPS.** Plain HTTP/1.1 for `http://` sources. `https://`
+  when built with `--features external-sources-tls` (bundled Mozilla
+  roots, full certificate + hostname verification, no bypass). Sidecar
+  now optional.
 - **Upsert only.** Rows deleted from the upstream source are not
   automatically removed.
 

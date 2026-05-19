@@ -128,10 +128,12 @@ the last captured page containing that key wins, deterministically,
 given the captured page sequence. Because the whole walk is
 captured once at the router and replicated as one `Txn`, every
 replica applies the identical result. Boundaries remain exactly as
-slice-1: snapshot-since-last-`REFRESH` (never live), HTTP-only
-(HTTPS via a TLS-terminating sidecar; TLS in `kessel-fetch`
-deferred), materialize+replicate, captured-once, upsert-only
-(no upstream-delete prune).
+slice-1: snapshot-since-last-`REFRESH` (never live), HTTP and HTTPS
+(`https://` via the optional `--features external-sources-tls` build,
+shipped in subproject 99 — see
+`docs/superpowers/specs/2026-05-18-kesseldb-subproject99-ext-tls.md`;
+TLS-terminating sidecar now optional), materialize+replicate,
+captured-once, upsert-only (no upstream-delete prune).
 
 ## 6. Testing
 

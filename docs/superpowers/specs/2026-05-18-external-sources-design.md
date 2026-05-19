@@ -129,9 +129,13 @@ replicated. A failed/partial fetch submits **nothing**
   chunked decode, redirects off by default).
 - **TLS decision for slice 1: plain-HTTP + a documented
   TLS-terminating sidecar/proxy.** A from-scratch or vendored
-  minimal TLS stack is a large, security-sensitive effort; it is
-  deferred to its own slice behind the same feature. Slice 1 stays
-  small and ships no unaudited crypto.
+  minimal TLS stack is a large, security-sensitive effort; it was
+  deferred to its own slice behind the same feature. Slice 1 shipped no
+  unaudited crypto. *(TLS shipped in subproject 99 — see
+  `docs/superpowers/specs/2026-05-18-kesseldb-subproject99-ext-tls.md`.
+  `https://` sources are now supported when the server is built with
+  `--features external-sources-tls`; the TLS-terminating sidecar is
+  now optional.)*
 
 ## 7. Failure modes & limits
 

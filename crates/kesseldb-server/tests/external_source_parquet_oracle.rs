@@ -109,6 +109,24 @@ fn tls_stub_with_fixture(fixture: &'static [u8]) -> u16 {
     port
 }
 
+/// Parameters bundled into a struct for `run_fail_closed_parquet_e2e`
+/// (behavior-preserving refactor; all fields map 1-to-1 to the prior
+/// positional params — see helper doc for semantics).
+/// All str fields are `&'static str` because every call-site passes
+/// string literals; `fixture` is `&'static [u8]` for the same reason.
+/// Zero allocation — no `String` ownership needed (review).
+struct FailClosedCase {
+    fixture: &'static [u8],
+    tag: &'static str,
+    keyid_env: &'static str,
+    secret_env: &'static str,
+    keyid_val: &'static str,
+    secret_val: &'static str,
+    source: &'static str,
+    ddl_cols: &'static str,
+    s3_path: &'static str,
+}
+
 /// Shared fail-closed e2e: serves `fixture` over a self-signed
 /// localhost TLS stub; the production webpki-roots client must
 /// reject it; REFRESH must return OpResult::SchemaError (refresh/
@@ -116,7 +134,8 @@ fn tls_stub_with_fixture(fixture: &'static [u8]) -> u16 {
 /// (atomic-abort, state intact). No router fixture-trust bypass.
 ///
 /// Per-test varying fields (all must reproduce the original test's
-/// exact byte-for-byte observable statements):
+/// exact byte-for-byte observable statements) — params bundled into
+/// FailClosedCase struct (review):
 /// - `fixture`:     the parquet bytes served by the TLS stub
 /// - `tag`:         shard temp-dir discriminator
 /// - `keyid_env`:   name of the env var holding the AWS key ID
@@ -127,22 +146,12 @@ fn tls_stub_with_fixture(fixture: &'static [u8]) -> u16 {
 /// - `ddl_cols`:    the column list in the CREATE EXTERNAL SOURCE DDL
 ///                  (e.g. `"id U64 NOT NULL FROM 'id', nm CHAR(16) NOT NULL FROM 'nm'"`)
 /// - `s3_path`:     the object path within `s3://bucket/` (e.g. `"data.parquet"`)
-fn run_fail_closed_parquet_e2e(
-    fixture: &'static [u8],
-    tag: &str,
-    keyid_env: &str,
-    secret_env: &str,
-    keyid_val: &str,
-    secret_val: &str,
-    source: &str,
-    ddl_cols: &str,
-    s3_path: &str,
-) {
-    std::env::set_var(keyid_env, keyid_val);
-    std::env::set_var(secret_env, secret_val);
+fn run_fail_closed_parquet_e2e(c: FailClosedCase) {
+    std::env::set_var(c.keyid_env, c.keyid_val);
+    std::env::set_var(c.secret_env, c.secret_val);
 
-    let port = tls_stub_with_fixture(fixture);
-    let shard = spawn_shard(tag);
+    let port = tls_stub_with_fixture(c.fixture);
+    let shard = spawn_shard(c.tag);
     let router = Arc::new(Router::new(vec![shard.clone()]));
     let rl = TcpListener::bind("127.0.0.1:0").unwrap();
     let raddr = rl.local_addr().unwrap();
@@ -165,7 +174,13 @@ fn run_fail_closed_parquet_e2e(
          ) FROM 's3://bucket/{s3_path}' FORMAT PARQUET KEY id \
          REGION 'us-east-1' \
          ENDPOINT 'https://127.0.0.1:{port}' \
-         AUTH OBJSTORE S3 KEYID ENV '{keyid_env}' SECRET ENV '{secret_env}'"
+         AUTH OBJSTORE S3 KEYID ENV '{keyid_env}' SECRET ENV '{secret_env}'",
+        source = c.source,
+        ddl_cols = c.ddl_cols,
+        s3_path = c.s3_path,
+        port = port,
+        keyid_env = c.keyid_env,
+        secret_env = c.secret_env,
     );
     assert!(
         matches!(
@@ -177,7 +192,7 @@ fn run_fail_closed_parquet_e2e(
 
     let mut rc = Client::connect(raddr).expect("connect router");
     let res = rc
-        .call(&Op::RefreshExternalSource { name: source.into() })
+        .call(&Op::RefreshExternalSource { name: c.source.into() })
         .expect("refresh wire");
 
     // Untrusted self-signed cert ⇒ typed failure surfaced at REFRESH.
@@ -201,11 +216,11 @@ fn run_fail_closed_parquet_e2e(
     }
 
     // Atomic abort held: SELECT still works and returns no rows.
-    let blob = match sc.sql(&format!("SELECT * FROM {source}")).expect("select wire") {
+    let blob = match sc.sql(&format!("SELECT * FROM {}", c.source)).expect("select wire") {
         OpResult::Got(b) => b,
-        o => panic!("SELECT {source}: {o:?}"),
+        o => panic!("SELECT {}: {:?}", c.source, o),
     };
-    assert!(blob.is_empty(), "no rows must have been materialized for {source}");
+    assert!(blob.is_empty(), "no rows must have been materialized for {}", c.source);
 }
 
 #[test]
@@ -220,17 +235,17 @@ fn refresh_parquet_from_s3_fails_closed_and_state_intact() {
     // The trusted happy-path (Parquet bytes decoded to rows) is proven
     // at the kessel-fetch layer by parquet_decode.rs (Task 8) —
     // injecting fixture trust here would bypass SP100.
-    run_fail_closed_parquet_e2e(
-        PARQUET_FIXTURE,
-        "pq",
-        "OBJ_PQ_KEYID",
-        "OBJ_PQ_SECRET",
-        "AKIAEXAMPLE",
-        "secretexamplekey",
-        "feed",
-        "id U64 NOT NULL FROM 'id', nm CHAR(16) NOT NULL FROM 'nm'",
-        "data.parquet",
-    );
+    run_fail_closed_parquet_e2e(FailClosedCase {
+        fixture: PARQUET_FIXTURE,
+        tag: "pq",
+        keyid_env: "OBJ_PQ_KEYID",
+        secret_env: "OBJ_PQ_SECRET",
+        keyid_val: "AKIAEXAMPLE",
+        secret_val: "secretexamplekey",
+        source: "feed",
+        ddl_cols: "id U64 NOT NULL FROM 'id', nm CHAR(16) NOT NULL FROM 'nm'",
+        s3_path: "data.parquet",
+    });
 }
 
 /// Mirrors `refresh_parquet_from_s3_fails_closed_and_state_intact` for the
@@ -242,17 +257,17 @@ fn refresh_parquet_from_s3_fails_closed_and_state_intact() {
 /// path is proven at the kessel-parquet layer by `fixture_roundtrip.rs`.
 #[test]
 fn refresh_dict_parquet_from_s3_fails_closed_and_state_intact() {
-    run_fail_closed_parquet_e2e(
-        DICT_PARQUET_FIXTURE,
-        "dpq",
-        "OBJ_DPQ_KEYID",
-        "OBJ_DPQ_SECRET",
-        "AKIAEXAMPLE2",
-        "secretexamplekey2",
-        "dfeed",
-        "id U64 NOT NULL FROM 'id', s CHAR(4) NOT NULL FROM 's'",
-        "dict.parquet",
-    );
+    run_fail_closed_parquet_e2e(FailClosedCase {
+        fixture: DICT_PARQUET_FIXTURE,
+        tag: "dpq",
+        keyid_env: "OBJ_DPQ_KEYID",
+        secret_env: "OBJ_DPQ_SECRET",
+        keyid_val: "AKIAEXAMPLE2",
+        secret_val: "secretexamplekey2",
+        source: "dfeed",
+        ddl_cols: "id U64 NOT NULL FROM 'id', s CHAR(4) NOT NULL FROM 's'",
+        s3_path: "dict.parquet",
+    });
 }
 
 /// Mirrors `refresh_parquet_from_s3_fails_closed_and_state_intact` for the
@@ -266,17 +281,17 @@ fn refresh_dict_parquet_from_s3_fails_closed_and_state_intact() {
 /// is introduced here (SP100/SP101 precedent).
 #[test]
 fn refresh_snappy_parquet_from_s3_fails_closed_and_state_intact() {
-    run_fail_closed_parquet_e2e(
-        SNAPPY_DICT_PARQUET_FIXTURE,
-        "spq",
-        "OBJ_SPQ_KEYID",
-        "OBJ_SPQ_SECRET",
-        "AKIAEXAMPLE3",
-        "secretexamplekey3",
-        "sfeed",
-        "id U64 NOT NULL FROM 'id', s CHAR(4) NOT NULL FROM 's'",
-        "snappy.parquet",
-    );
+    run_fail_closed_parquet_e2e(FailClosedCase {
+        fixture: SNAPPY_DICT_PARQUET_FIXTURE,
+        tag: "spq",
+        keyid_env: "OBJ_SPQ_KEYID",
+        secret_env: "OBJ_SPQ_SECRET",
+        keyid_val: "AKIAEXAMPLE3",
+        secret_val: "secretexamplekey3",
+        source: "sfeed",
+        ddl_cols: "id U64 NOT NULL FROM 'id', s CHAR(4) NOT NULL FROM 's'",
+        s3_path: "snappy.parquet",
+    });
 }
 
 /// Mirrors `refresh_parquet_from_s3_fails_closed_and_state_intact` for the
@@ -290,17 +305,17 @@ fn refresh_snappy_parquet_from_s3_fails_closed_and_state_intact() {
 /// fixture-trust bypass is introduced here (SP100/SP101 precedent).
 #[test]
 fn refresh_nullable_parquet_from_s3_fails_closed_and_state_intact() {
-    run_fail_closed_parquet_e2e(
-        NULLABLE_PARQUET_FIXTURE,
-        "npq",
-        "OBJ_NPQ_KEYID",
-        "OBJ_NPQ_SECRET",
-        "AKIAEXAMPLE4",
-        "secretexamplekey4",
-        "nfeed",
-        "id U64 NOT NULL FROM 'id', s CHAR(4) NOT NULL FROM 's'",
-        "nullable.parquet",
-    );
+    run_fail_closed_parquet_e2e(FailClosedCase {
+        fixture: NULLABLE_PARQUET_FIXTURE,
+        tag: "npq",
+        keyid_env: "OBJ_NPQ_KEYID",
+        secret_env: "OBJ_NPQ_SECRET",
+        keyid_val: "AKIAEXAMPLE4",
+        secret_val: "secretexamplekey4",
+        source: "nfeed",
+        ddl_cols: "id U64 NOT NULL FROM 'id', s CHAR(4) NOT NULL FROM 's'",
+        s3_path: "nullable.parquet",
+    });
 }
 
 /// Mirrors `refresh_parquet_from_s3_fails_closed_and_state_intact` for the
@@ -314,17 +329,17 @@ fn refresh_nullable_parquet_from_s3_fails_closed_and_state_intact() {
 /// is introduced here (SP100/SP101 precedent).
 #[test]
 fn refresh_gzip_parquet_from_s3_fails_closed_and_state_intact() {
-    run_fail_closed_parquet_e2e(
-        GZIP_DICT_PARQUET_FIXTURE,
-        "gpq",
-        "OBJ_GPQ_KEYID",
-        "OBJ_GPQ_SECRET",
-        "AKIAEXAMPLE5",
-        "secretexamplekey5",
-        "gfeed",
-        "id U64 NOT NULL FROM 'id', s CHAR(4) NOT NULL FROM 's'",
-        "gzip.parquet",
-    );
+    run_fail_closed_parquet_e2e(FailClosedCase {
+        fixture: GZIP_DICT_PARQUET_FIXTURE,
+        tag: "gpq",
+        keyid_env: "OBJ_GPQ_KEYID",
+        secret_env: "OBJ_GPQ_SECRET",
+        keyid_val: "AKIAEXAMPLE5",
+        secret_val: "secretexamplekey5",
+        source: "gfeed",
+        ddl_cols: "id U64 NOT NULL FROM 'id', s CHAR(4) NOT NULL FROM 's'",
+        s3_path: "gzip.parquet",
+    });
 }
 
 /// Mirrors `refresh_parquet_from_s3_fails_closed_and_state_intact` for the
@@ -338,15 +353,15 @@ fn refresh_gzip_parquet_from_s3_fails_closed_and_state_intact() {
 /// is introduced here (SP100/SP101 precedent).
 #[test]
 fn refresh_v2_parquet_from_s3_fails_closed_and_state_intact() {
-    run_fail_closed_parquet_e2e(
-        V2_DICT_PARQUET_FIXTURE,
-        "v2pq",
-        "OBJ_V2PQ_KEYID",
-        "OBJ_V2PQ_SECRET",
-        "AKIAEXAMPLE6",
-        "secretexamplekey6",
-        "v2feed",
-        "id U64 NOT NULL FROM 'id', s CHAR(4) NOT NULL FROM 's'",
-        "v2dict.parquet",
-    );
+    run_fail_closed_parquet_e2e(FailClosedCase {
+        fixture: V2_DICT_PARQUET_FIXTURE,
+        tag: "v2pq",
+        keyid_env: "OBJ_V2PQ_KEYID",
+        secret_env: "OBJ_V2PQ_SECRET",
+        keyid_val: "AKIAEXAMPLE6",
+        secret_val: "secretexamplekey6",
+        source: "v2feed",
+        ddl_cols: "id U64 NOT NULL FROM 'id', s CHAR(4) NOT NULL FROM 's'",
+        s3_path: "v2dict.parquet",
+    });
 }

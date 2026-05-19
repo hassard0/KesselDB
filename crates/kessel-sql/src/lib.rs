@@ -697,6 +697,8 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
                 1u8
             } else if p.kw("NDJSON") {
                 2u8
+            } else if p.kw("PARQUET") {
+                3u8
             } else {
                 return Err("FORMAT must be JSON, CSV, or NDJSON".into());
             };
@@ -709,8 +711,25 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
                 .ok_or_else(|| {
                     format!("KEY `{key_name}` is not a declared column")
                 })?;
+            let is_obj = url.starts_with("s3://") || url.starts_with("az://");
+            let is_s3 = url.starts_with("s3://");
+            let mut region: Option<String> = None;
+            let mut endpoint: Option<String> = None;
+            if p.kw("REGION") {
+                region = Some(match p.next() {
+                    Some(Tok::Str(s)) => s,
+                    _ => return Err("expected 'region' string after REGION".into()),
+                });
+            }
+            if p.kw("ENDPOINT") {
+                endpoint = Some(match p.next() {
+                    Some(Tok::Str(s)) => s,
+                    _ => return Err("expected 'endpoint' url after ENDPOINT".into()),
+                });
+            }
             let (mut auth_kind, mut auth_a, mut auth_b) =
                 (0u8, String::new(), String::new());
+            let mut obj: Option<(u8, String)> = None;
             if p.kw("AUTH") {
                 if p.kw("BEARER") {
                     p.expect_kw("ENV")?;
@@ -730,9 +749,41 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
                         Some(Tok::Str(s)) => s,
                         _ => return Err("expected 'ENV_NAME'".into()),
                     };
+                } else if p.kw("OBJSTORE") {
+                    auth_kind = 3;
+                    if p.kw("S3") {
+                        p.expect_kw("KEYID")?;
+                        p.expect_kw("ENV")?;
+                        auth_a = match p.next() {
+                            Some(Tok::Str(s)) => s,
+                            _ => return Err("expected 'KEYID_ENV'".into()),
+                        };
+                        p.expect_kw("SECRET")?;
+                        p.expect_kw("ENV")?;
+                        auth_b = match p.next() {
+                            Some(Tok::Str(s)) => s,
+                            _ => return Err("expected 'SECRET_ENV'".into()),
+                        };
+                        obj = Some((1u8, String::new()));
+                    } else if p.kw("AZURE") {
+                        p.expect_kw("ACCOUNT")?;
+                        let acct = match p.next() {
+                            Some(Tok::Str(s)) => s,
+                            _ => return Err("expected 'account'".into()),
+                        };
+                        p.expect_kw("KEY")?;
+                        p.expect_kw("ENV")?;
+                        auth_a = match p.next() {
+                            Some(Tok::Str(s)) => s,
+                            _ => return Err("expected 'ACCOUNT_KEY_ENV'".into()),
+                        };
+                        obj = Some((2u8, acct));
+                    } else {
+                        return Err("AUTH OBJSTORE must be S3 KEYID ENV '..' SECRET ENV '..' | AZURE ACCOUNT '..' KEY ENV '..'".into());
+                    }
                 } else {
                     return Err(
-                        "AUTH must be BEARER ENV '..' or HEADER '..' ENV '..'"
+                        "AUTH must be BEARER ENV '..' or HEADER '..' ENV '..' or OBJSTORE S3|AZURE .."
                             .into(),
                     );
                 }
@@ -787,6 +838,48 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
                     return Err("FORMAT NDJSON cannot use a body cursor (no envelope object); use PAGE NEXT LINK or omit PAGE".into());
                 }
             }
+            let objstore: Option<(u8, String, String, String)> = if is_obj {
+                if format == 3 {
+                    return Err("FORMAT Parquet over object store is OBJ-2 (not yet shipped)".into());
+                }
+                if pagination.is_some() {
+                    return Err("PAGE clauses are not supported for object store (s3://|az://) sources".into());
+                }
+                if let Some(ep) = &endpoint {
+                    if !ep.starts_with("https://") {
+                        return Err("object-store ENDPOINT must be https://".into());
+                    }
+                }
+                let (prov, acct) = obj.ok_or_else(|| "object-store (s3://|az://) requires AUTH OBJSTORE S3 …|AZURE …".to_string())?;
+                if is_s3 && region.is_none() && endpoint.is_none() {
+                    return Err("S3 (s3://) source requires REGION '<r>' (or an ENDPOINT)".into());
+                }
+                if !is_s3 {
+                    let has_acct = !acct.is_empty();
+                    match &endpoint {
+                        Some(ep) if has_acct => {
+                            // Allow only if endpoint is the canonical Azure Blob Storage URL for this account
+                            let canonical = format!("https://{}.blob.core.windows.net", acct);
+                            if ep != &canonical {
+                                return Err("az:// requires exactly one of AUTH OBJSTORE AZURE ACCOUNT '<a>' or ENDPOINT '<url>'".into());
+                            }
+                        }
+                        None if !has_acct => {
+                            return Err("az:// requires exactly one of AUTH OBJSTORE AZURE ACCOUNT '<a>' or ENDPOINT '<url>'".into());
+                        }
+                        _ => {}
+                    }
+                }
+                Some((prov, acct, region.clone().unwrap_or_default(), endpoint.clone().unwrap_or_default()))
+            } else {
+                if obj.is_some() {
+                    return Err("AUTH OBJSTORE is only valid for s3://|az:// sources".into());
+                }
+                if format == 3 {
+                    return Err("FORMAT PARQUET is not supported (OBJ-2)".into());
+                }
+                None
+            };
             let type_def = encode_type_def(&name, &fields);
             return Ok(Op::CreateExternalSource {
                 name,
@@ -800,7 +893,7 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
                 mapping,
                 rows_path,
                 pagination,
-                objstore: None,
+                objstore,
             });
         }
         // CREATE [UNIQUE|RANGE] INDEX ON t (cols) — DDL for indexes.
@@ -1702,6 +1795,62 @@ mod tests {
         // JSON + body cursor WITH ROWS => OK
         assert!(compile("CREATE EXTERNAL SOURCE e (id U64 NOT NULL FROM 'id') \
             FROM 'http://h' FORMAT JSON KEY id ROWS 'd' PAGE NEXT JSON 'p.next'",&cat).is_ok());
+    }
+
+    #[test]
+    fn parse_external_source_objstore_s3() {
+        let cat = Catalog::default();
+        let op = compile(
+            "CREATE EXTERNAL SOURCE feed (id U64 NOT NULL FROM 'id') \
+             FROM 's3://bucket/data/x.json' FORMAT JSON KEY id \
+             REGION 'us-east-1' \
+             AUTH OBJSTORE S3 KEYID ENV 'AWS_ID' SECRET ENV 'AWS_SEC'",
+            &cat,
+        ).unwrap();
+        match op {
+            Op::CreateExternalSource { url, auth_kind, auth_a, auth_b, objstore, .. } => {
+                assert_eq!(url, "s3://bucket/data/x.json");
+                assert_eq!(auth_kind, 3);
+                assert_eq!(auth_a, "AWS_ID");
+                assert_eq!(auth_b, "AWS_SEC");
+                assert_eq!(objstore, Some((1, String::new(), "us-east-1".into(), String::new())));
+            }
+            o => panic!("{o:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_external_source_objstore_azure_and_endpoint() {
+        let cat = Catalog::default();
+        let op = compile(
+            "CREATE EXTERNAL SOURCE f (id U64 NOT NULL FROM 'id') \
+             FROM 'az://cont/blob.csv' FORMAT CSV KEY id \
+             ENDPOINT 'https://acct.blob.core.windows.net' \
+             AUTH OBJSTORE AZURE ACCOUNT 'acct' KEY ENV 'AZ_KEY'",
+            &cat,
+        ).unwrap();
+        match op {
+            Op::CreateExternalSource { url, auth_kind, auth_a, objstore, .. } => {
+                assert_eq!(url, "az://cont/blob.csv");
+                assert_eq!(auth_kind, 3);
+                assert_eq!(auth_a, "AZ_KEY");
+                assert_eq!(objstore, Some((2, "acct".into(), String::new(), "https://acct.blob.core.windows.net".into())));
+            }
+            o => panic!("{o:?}"),
+        }
+    }
+
+    #[test]
+    fn objstore_rejections_at_create() {
+        let cat = Catalog::default();
+        let bad = |sql: &str| compile(sql, &cat).unwrap_err();
+        assert!(bad("CREATE EXTERNAL SOURCE a (id U64 NOT NULL FROM 'id') FROM 's3://b/k' FORMAT PARQUET KEY id REGION 'r' AUTH OBJSTORE S3 KEYID ENV 'I' SECRET ENV 'S'").contains("Parquet"));
+        assert!(bad("CREATE EXTERNAL SOURCE a (id U64 NOT NULL FROM 'id') FROM 's3://b/k' FORMAT JSON KEY id REGION 'r' AUTH OBJSTORE S3 KEYID ENV 'I' SECRET ENV 'S' PAGE NEXT LINK").to_lowercase().contains("object store"));
+        assert!(bad("CREATE EXTERNAL SOURCE a (id U64 NOT NULL FROM 'id') FROM 's3://b/k' FORMAT JSON KEY id REGION 'r' ENDPOINT 'http://x' AUTH OBJSTORE S3 KEYID ENV 'I' SECRET ENV 'S'").to_lowercase().contains("https"));
+        assert!(bad("CREATE EXTERNAL SOURCE a (id U64 NOT NULL FROM 'id') FROM 's3://b/k' FORMAT JSON KEY id").to_lowercase().contains("auth objstore"));
+        assert!(bad("CREATE EXTERNAL SOURCE a (id U64 NOT NULL FROM 'id') FROM 's3://b/k' FORMAT JSON KEY id AUTH OBJSTORE S3 KEYID ENV 'I' SECRET ENV 'S'").to_lowercase().contains("region"));
+        assert!(bad("CREATE EXTERNAL SOURCE a (id U64 NOT NULL FROM 'id') FROM 'az://c/b' FORMAT JSON KEY id ENDPOINT 'https://h' AUTH OBJSTORE AZURE ACCOUNT 'acct' KEY ENV 'K'").to_lowercase().contains("exactly one"));
+        assert!(compile("CREATE EXTERNAL SOURCE ok (id U64 NOT NULL FROM 'id') FROM 'http://h/p' FORMAT JSON KEY id AUTH BEARER ENV 'T'", &cat).is_ok());
     }
 
     #[test]

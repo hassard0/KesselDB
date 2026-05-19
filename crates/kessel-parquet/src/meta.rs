@@ -839,6 +839,7 @@ mod tests {
         assert_eq!(ph.page_type, 3);
         assert_eq!(ph.v2_num_values, 3);
         assert_eq!(ph.v2_num_nulls, 1);
+        assert_eq!(ph.v2_num_rows, 3);
         assert_eq!(ph.v2_encoding, 0);
         assert_eq!(ph.v2_def_len, 2);
         assert_eq!(ph.v2_rep_len, 0);

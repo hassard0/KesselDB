@@ -9,6 +9,8 @@ mod coerce;
 mod csv;
 mod ndjson;
 mod http;
+#[cfg(feature = "tls")]
+mod tls;
 pub(crate) mod json;
 
 use kessel_catalog::FieldKind;

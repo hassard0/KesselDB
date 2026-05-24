@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 pub mod mvcc;
+pub mod ssi;
 pub mod tx;
 
 use kessel_io::{Disk, Vfs};

@@ -476,8 +476,93 @@ impl<'a, V: Vfs> Tx<'a, V> {
     /// integration), `commit_ssi` will construct an `Op::CommitTx` payload
     /// with the read_set populated and submit it to VSR; the verdict will
     /// arrive back via the SM apply callback.
-    pub fn commit_ssi(self, _commit_opnum: u64) -> Result<TxCommitOutcome, TxError> {
-        todo!("S2.4 T2: SSI commit — drive SM apply on local Storage")
+    pub fn commit_ssi(self, commit_opnum: u64) -> Result<TxCommitOutcome, TxError> {
+        // Decisions 4 + 5 (SP112-carried): malformed snapshot rejected
+        // before any check or apply. `snapshot == commit` is allowed.
+        if self.snapshot_opnum > commit_opnum {
+            return Err(TxError::SnapshotOutOfRange {
+                snapshot: self.snapshot_opnum,
+                commit: commit_opnum,
+            });
+        }
+        // SP112 T2 storage-mutability discipline (carried): commit_ssi
+        // requires the Exclusive borrow (constructed via Tx::begin_ssi
+        // or Tx::begin_rw). A Tx::begin (Shared) Tx cannot commit —
+        // return the typed error so callers can switch constructors.
+        let store_mut = match self.store {
+            TxStore::Exclusive(s) => s,
+            TxStore::Shared(_) => return Err(TxError::ReadOnlyCannotCommit),
+        };
+        // SP112 SI write-write conflict check — fires FIRST so SP112's
+        // verdict precedence (WW > SSI) holds even on the standalone
+        // path. commit_opnum == 0 skips the check (no prior versions
+        // can exist below opnum=0).
+        if commit_opnum > 0 {
+            let hi = commit_opnum - 1;
+            for ((type_id, object_id), _new_value) in &self.write_set {
+                if crate::mvcc::has_version_in_range(
+                    store_mut,
+                    *type_id,
+                    object_id,
+                    self.snapshot_opnum,
+                    hi,
+                ) {
+                    return Ok(TxCommitOutcome::Aborted {
+                        conflicting_key: (*type_id, *object_id),
+                    });
+                }
+            }
+        }
+        // SP113 / S2.4 SSI dangerous-structure detector — runs
+        // against a LOCAL empty pending_txs map (the standalone form
+        // has no access to the SM's pending_txs; documented
+        // limitation per the plan T2 nuance). On an empty
+        // pending_txs no rw-edges can form, so this branch can never
+        // abort a non-conflicting commit. The branch exists so the
+        // standalone form structurally composes byte-identically
+        // with the SM apply form for the empty-pending_txs case
+        // (verified by T3's byte-equivalence test). When read_set is
+        // empty (Decision 8 SP112 fast path), skip the branch
+        // entirely — preserves byte-net-0 vs `Tx::commit` for that
+        // shape.
+        if !self.read_set.is_empty() {
+            let mut local_pending: std::collections::BTreeMap<
+                u64,
+                crate::ssi::PendingTxRecord,
+            > = std::collections::BTreeMap::new();
+            // BTreeSet iteration is sorted ⇒ Vec is sorted.
+            let sorted_read_set: Vec<(u32, [u8; 16])> =
+                self.read_set.iter().copied().collect();
+            // BTreeMap iteration is sorted ⇒ Vec is sorted.
+            let sorted_write_keys: Vec<(u32, [u8; 16])> =
+                self.write_set.keys().copied().collect();
+            if let Some(other_commit_opnum) =
+                crate::ssi::detect_dangerous_structure(
+                    &mut local_pending,
+                    self.snapshot_opnum,
+                    &sorted_read_set,
+                    &sorted_write_keys,
+                    commit_opnum,
+                )
+            {
+                return Ok(TxCommitOutcome::AbortedDangerousStructure {
+                    other_commit_opnum,
+                });
+            }
+        }
+        // No conflict: install every write at commit_opnum. Same
+        // shape as Tx::commit — sorted lex by (type_id, object_id)
+        // via BTreeMap discipline. The standalone form does NOT
+        // record into a pending_txs (no map exists here); the SM
+        // apply path handles that for the production flow.
+        for ((type_id, object_id), value) in self.write_set {
+            crate::mvcc::put_versioned(store_mut, type_id, &object_id, commit_opnum, value)
+                .map_err(|e| TxError::StorageIo {
+                    kind: e.kind(),
+                    message: e.to_string(),
+                })?;
+        }
+        Ok(TxCommitOutcome::Committed { commit_opnum })
     }
 }
 

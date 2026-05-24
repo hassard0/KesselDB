@@ -1066,3 +1066,157 @@ mod tx_coverage {
         assert!(tx.commit_read_only().is_ok());
     }
 }
+
+#[cfg(test)]
+mod tx_si_coverage {
+    //! SP112 T4 coverage tests for SI edge cases.
+    //!
+    //! Five scenarios that exercise the boundary behaviour of the
+    //! SI write-side path added in SP112 T2/T3 but not covered by the
+    //! 11 KATs or 5 integration tests:
+    //!   CV-1  empty write-set commit is a no-op
+    //!   CV-2  abort discards buffered writes
+    //!   CV-3  same-key writes coalesce (last-write-wins within Tx)
+    //!   CV-4  1000-write commit (large write-set, spot-check visibility)
+    //!   CV-5  mixed write→tombstone→write same key (tombstone overwritten)
+    use super::*;
+    use crate::mvcc::{get_at_snapshot, put_versioned, SnapshotRead};
+    use crate::Storage;
+    use kessel_io::MemVfs;
+
+    fn obj(n: u8) -> [u8; 16] {
+        let mut a = [0u8; 16];
+        a[15] = n;
+        a
+    }
+
+    // CV-1: Empty write_set commit is a no-op — storage state unchanged.
+    // Hand-derived: begin_rw at snap=0; no writes; commit(5) =>
+    // Committed{5}; get_at_snapshot(obj(1), 5) still returns the pre-existing
+    // opnum=0 version (no new MVCC entry was installed by the Tx).
+    #[test]
+    fn cv_empty_write_set_commit_no_op() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        put_versioned(&mut store, 1, &obj(1), 0, Some(vec![0xAA])).unwrap();
+        let tx = Tx::begin_rw(&mut store, 0);
+        let out = tx.commit(5).unwrap();
+        assert_eq!(
+            out,
+            TxCommitOutcome::Committed { commit_opnum: 5 },
+            "empty write-set must commit with Committed{{5}}"
+        );
+        // No new version installed; snapshot at opnum=5 still sees only opnum=0 version.
+        match get_at_snapshot(&store, 1, &obj(1), 5) {
+            SnapshotRead::Found(v) => assert_eq!(v, vec![0xAA], "pre-existing value unchanged"),
+            other => panic!("got {:?}", other),
+        }
+    }
+
+    // CV-2: Tx::abort discards buffered writes — no version installed.
+    // Hand-derived: begin(&store, 0); write(obj(1), [0xAA]); write(obj(2), [0xBB]);
+    // abort(); get_at_snapshot(obj(1), 100) => NotYetWritten;
+    // get_at_snapshot(obj(2), 100) => NotYetWritten.
+    #[test]
+    fn cv_abort_discards_buffered_writes() {
+        let store = Storage::open(MemVfs::new()).unwrap();
+        let mut tx = Tx::begin(&store, 0);
+        tx.write(1, &obj(1), Some(vec![0xAA]));
+        tx.write(1, &obj(2), Some(vec![0xBB]));
+        tx.abort();
+        // No version was installed for either key — abort drops the write_set.
+        assert!(
+            matches!(get_at_snapshot(&store, 1, &obj(1), 100), SnapshotRead::NotYetWritten),
+            "aborted write on obj(1) must not appear in storage"
+        );
+        assert!(
+            matches!(get_at_snapshot(&store, 1, &obj(2), 100), SnapshotRead::NotYetWritten),
+            "aborted write on obj(2) must not appear in storage"
+        );
+    }
+
+    // CV-3: Same-key writes coalesce in write_set (last-write-wins);
+    // only the final value lands at commit.
+    // Hand-derived: begin_rw at snap=0; write(obj(1), [0xAA]); write(obj(1), [0xBB]);
+    // write(obj(1), [0xCC]); write_set.len()==1 (coalesced); commit(1) =>
+    // Committed{1}; get_at_snapshot(obj(1), 1) => Found([0xCC]).
+    #[test]
+    fn cv_same_key_writes_coalesce_in_write_set() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        let mut tx = Tx::begin_rw(&mut store, 0);
+        tx.write(1, &obj(1), Some(vec![0xAA]));
+        tx.write(1, &obj(1), Some(vec![0xBB]));
+        tx.write(1, &obj(1), Some(vec![0xCC]));
+        assert_eq!(tx.write_set().len(), 1, "three writes to same key must coalesce to 1 entry");
+        let out = tx.commit(1).unwrap();
+        assert_eq!(
+            out,
+            TxCommitOutcome::Committed { commit_opnum: 1 },
+            "coalesced commit must succeed"
+        );
+        match get_at_snapshot(&store, 1, &obj(1), 1) {
+            SnapshotRead::Found(v) => assert_eq!(v, vec![0xCC], "last write wins"),
+            other => panic!("got {:?}", other),
+        }
+    }
+
+    // CV-4: Large write_set — 1000 distinct writes commit cleanly;
+    // all 1000 entries are visible at the commit snapshot.
+    // Hand-derived: begin_rw at snap=0; write 1000 keys with deterministic
+    // key `[0,0,0,0, 0,0,0,0, 0,0,0,0, i>>24, i>>16, i>>8, i&0xFF]`
+    // and value `[(i & 0xFF) as u8]`; write_set.len()==1000; commit(1) =>
+    // Committed{1}; spot-check key 500 => Found([500 & 0xFF]).
+    #[test]
+    fn cv_large_write_set_1000_writes_commit() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        let mut tx = Tx::begin_rw(&mut store, 0);
+        for i in 0..1000u32 {
+            let mut k = [0u8; 16];
+            k[12..16].copy_from_slice(&i.to_be_bytes());
+            tx.write(1, &k, Some(vec![(i & 0xFF) as u8]));
+        }
+        assert_eq!(tx.write_set().len(), 1000, "1000 distinct keys must not coalesce");
+        let out = tx.commit(1).unwrap();
+        assert_eq!(
+            out,
+            TxCommitOutcome::Committed { commit_opnum: 1 },
+            "1000-write commit must succeed"
+        );
+        // Spot-check: key 500 has value [500 & 0xFF == 244].
+        let mut k = [0u8; 16];
+        k[12..16].copy_from_slice(&500u32.to_be_bytes());
+        match get_at_snapshot(&store, 1, &k, 1) {
+            SnapshotRead::Found(v) => assert_eq!(v, vec![(500u32 & 0xFF) as u8], "key 500 value matches"),
+            other => panic!("got {:?}", other),
+        }
+    }
+
+    // CV-5: Mixed write-tombstone-write same key — final state is the
+    // last write. The intermediate tombstone is overwritten before commit.
+    // Hand-derived: begin_rw at snap=0; write(obj(1), Some([0xAA]));
+    // write(obj(1), None) [tombstone]; write(obj(1), Some([0xCC]));
+    // write_set.len()==1 (coalesced); commit(1) => Committed{1};
+    // get_at_snapshot(obj(1), 1) => Found([0xCC]) (not Tombstoned).
+    #[test]
+    fn cv_mixed_write_tombstone_write_same_key() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        let mut tx = Tx::begin_rw(&mut store, 0);
+        tx.write(1, &obj(1), Some(vec![0xAA])); // initial write
+        tx.write(1, &obj(1), None);             // intermediate tombstone
+        tx.write(1, &obj(1), Some(vec![0xCC])); // final write overwrites tombstone
+        assert_eq!(tx.write_set().len(), 1, "write-tombstone-write coalesces to 1 entry");
+        let out = tx.commit(1).unwrap();
+        assert_eq!(
+            out,
+            TxCommitOutcome::Committed { commit_opnum: 1 },
+            "mixed write-tombstone-write must commit"
+        );
+        match get_at_snapshot(&store, 1, &obj(1), 1) {
+            SnapshotRead::Found(v) => assert_eq!(
+                v,
+                vec![0xCC],
+                "final write [0xCC] wins after intermediate tombstone"
+            ),
+            other => panic!("expected Found([0xCC]) after tombstone overwrite, got {:?}", other),
+        }
+    }
+}

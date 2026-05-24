@@ -244,6 +244,29 @@ pub enum WasmError {
     InvalidMemoryLimits { min: u32, max: u32 },
     /// A `memory.*` opcode executed without a memory section declared.
     MemoryNotDeclared,
+    /// SP124: too many tables declared (MVP cap = 1).
+    TooManyTables(u32),
+    /// SP124: table section declared a reftype other than funcref (0x70).
+    /// MVP supports funcref only.
+    UnsupportedRefType(u8),
+    /// SP124: `call_indirect` referenced a table_idx not present in the
+    /// module's table section.
+    UnknownTableIdx(u32),
+    /// SP124: `call_indirect` loaded an element index past the table's
+    /// current size.
+    TableIndexOutOfBounds { index: u32, table_size: u32 },
+    /// SP124: `call_indirect` loaded an uninitialized funcref slot.
+    IndirectCallUninit { table_idx: u32, element_idx: u32 },
+    /// SP124: `call_indirect`'s declared type_idx didn't match the
+    /// callee's actual function type. The expected vs actual indices
+    /// surface for diagnostics.
+    IndirectCallTypeMismatch { expected_type_idx: u32, actual_type_idx: u32 },
+    /// SP124: element segment referenced a func_idx not present in the
+    /// function section.
+    ElementSegmentUnknownFunc { func_idx: u32, total_funcs: u32 },
+    /// SP124: element segment offset + funcref-count would write past
+    /// the table's declared min size.
+    ElementSegmentOutOfRange { offset: u32, n_funcs: u32, table_size: u32 },
     /// SP121: float-to-int conversion (`i*.trunc_f*_*`) where the source
     /// is NaN, +/-inf, or outside the destination integer range. Per WASM
     /// spec this traps (the `*_sat_*` saturating variants are deferred to
@@ -287,6 +310,22 @@ pub struct Module {
     bodies: Vec<FuncBody>,
     /// At most one memory in MVP; `None` if no memory section was present.
     memory: Option<MemoryType>,
+    /// SP124 — funcref tables. WASM MVP allows AT MOST one table; we
+    /// honor that cap. Each table has limits (min/max in elements) +
+    /// reftype (funcref = 0x70 only in this slice).
+    tables: Vec<TableType>,
+    /// SP124 — funcref slots, indexed [table_idx][element_idx] → Some(func_idx)
+    /// if the element segment initialized it, None otherwise.
+    /// `call_indirect` traps with `IndirectCallUninit` if it loads a None.
+    table_funcs: Vec<Vec<Option<u32>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TableType {
+    /// MVP supports funcref only. Encoded as 0x70 in the WASM spec.
+    _ref_type_byte: u8,
+    min_elems: u32,
+    max_elems: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -328,6 +367,11 @@ impl Module {
         let mut functions: Vec<u32> = Vec::new();
         let mut bodies_raw: Vec<FuncBody> = Vec::new();
         let mut memory: Option<MemoryType> = None;
+        let mut tables: Vec<TableType> = Vec::new();
+        // SP124: defer element-section processing until BOTH the table
+        // section AND the function section are decoded — the segment
+        // initializers reference both.
+        let mut pending_element_section: Option<Vec<u8>> = None;
 
         while !c.eof() {
             let section_id = c.read_byte()?;
@@ -343,6 +387,7 @@ impl Module {
             match section_id {
                 1 => decode_type_section(&mut c, &mut types)?,
                 3 => decode_function_section(&mut c, &mut functions, types.len())?,
+                4 => decode_table_section(&mut c, &mut tables)?,
                 5 => {
                     let n = c.read_u32_leb()?;
                     if n > 1 {
@@ -351,6 +396,12 @@ impl Module {
                     if n == 1 {
                         memory = Some(decode_memory_type(&mut c)?);
                     }
+                }
+                9 => {
+                    // Element section — buffer raw bytes; process after
+                    // all sections are seen so we can resolve func_idx + table.
+                    let body = c.read_n(section_size)?.to_vec();
+                    pending_element_section = Some(body);
                 }
                 10 => decode_code_section(&mut c, &mut bodies_raw)?,
                 _ => c.skip(section_size)?,
@@ -365,11 +416,23 @@ impl Module {
             return Err(WasmError::BadSection(10));
         }
 
+        // SP124: initialize the funcref tables to all-None, then apply
+        // element segments in declaration order.
+        let mut table_funcs: Vec<Vec<Option<u32>>> = tables
+            .iter()
+            .map(|t| vec![None; t.min_elems as usize])
+            .collect();
+        if let Some(elem_bytes) = pending_element_section {
+            apply_element_section(&elem_bytes, &tables, functions.len() as u32, &mut table_funcs)?;
+        }
+
         Ok(Module {
             types,
             functions,
             bodies: bodies_raw,
             memory,
+            tables,
+            table_funcs,
         })
     }
 
@@ -416,6 +479,101 @@ fn decode_function_section(
             return Err(WasmError::UnknownTypeIdx(t));
         }
         functions.push(t);
+    }
+    Ok(())
+}
+
+/// SP124 — Table section (id=4): `vec<TableType>`. MVP cap = 1 table.
+fn decode_table_section(c: &mut Cursor, tables: &mut Vec<TableType>) -> Result<(), WasmError> {
+    let n = c.read_u32_leb()?;
+    if n > 1 {
+        return Err(WasmError::TooManyTables(n));
+    }
+    for _ in 0..n {
+        let ref_type = c.read_byte()?;
+        if ref_type != 0x70 {
+            // 0x70 = funcref. 0x6F = externref (deferred — needs the
+            // reference-types proposal which we explicitly defer).
+            return Err(WasmError::UnsupportedRefType(ref_type));
+        }
+        let flags = c.read_byte()?;
+        let min = c.read_u32_leb()?;
+        let max = if flags & 0x01 != 0 {
+            let m = c.read_u32_leb()?;
+            if m < min {
+                return Err(WasmError::InvalidMemoryLimits { min, max: m });
+            }
+            Some(m)
+        } else {
+            None
+        };
+        tables.push(TableType { _ref_type_byte: ref_type, min_elems: min, max_elems: max });
+    }
+    Ok(())
+}
+
+/// SP124 — Apply element segments. WASM MVP element-section format:
+///   vec<ElementSegment>
+///   ElementSegment (MVP variant 0 only, active table=0):
+///     mode: u32_leb (= 0 for active)
+///     offset: const-expr (i32.const N; end) — bytes: 0x41 N_leb 0x0B
+///     funcs: vec<u32_leb>
+///
+/// We support ONLY mode 0 (active, implicit table 0). Other variants
+/// (passive, declarative, with-table-idx) are reference-types-proposal
+/// extensions and deferred.
+fn apply_element_section(
+    bytes: &[u8],
+    tables: &[TableType],
+    total_funcs: u32,
+    table_funcs: &mut [Vec<Option<u32>>],
+) -> Result<(), WasmError> {
+    let mut c = Cursor::new(bytes);
+    let n_segs = c.read_u32_leb()? as usize;
+    for _ in 0..n_segs {
+        let mode = c.read_u32_leb()?;
+        if mode != 0 {
+            return Err(WasmError::BadSection(9));
+        }
+        // Const-expr offset: 0x41 i32_leb 0x0B
+        let op = c.read_byte()?;
+        if op != 0x41 {
+            return Err(WasmError::BadSection(9));
+        }
+        let mut tmp_ip = c.pos();
+        let offset = read_i32_leb(c.buf, &mut tmp_ip)?;
+        c.pos = tmp_ip;
+        let end_op = c.read_byte()?;
+        if end_op != 0x0B {
+            return Err(WasmError::BadSection(9));
+        }
+        if offset < 0 {
+            return Err(WasmError::BadSection(9));
+        }
+        let offset = offset as u32;
+        // vec<func_idx>
+        let n_funcs = c.read_u32_leb()?;
+        if tables.is_empty() {
+            return Err(WasmError::UnknownTableIdx(0));
+        }
+        let table_size = tables[0].min_elems;
+        if offset.checked_add(n_funcs).map(|e| e > table_size).unwrap_or(true) {
+            return Err(WasmError::ElementSegmentOutOfRange {
+                offset,
+                n_funcs,
+                table_size,
+            });
+        }
+        for i in 0..n_funcs {
+            let fidx = c.read_u32_leb()?;
+            if fidx >= total_funcs {
+                return Err(WasmError::ElementSegmentUnknownFunc {
+                    func_idx: fidx,
+                    total_funcs,
+                });
+            }
+            table_funcs[0][(offset + i) as usize] = Some(fidx);
+        }
     }
     Ok(())
 }
@@ -906,6 +1064,65 @@ fn exec_one(
             let split = stack.len() - n_args;
             let call_args: Vec<Value> = stack.drain(split..).collect();
             // Validate arg types match callee signature.
+            for (i, (a, expected)) in call_args.iter().zip(callee_type.params.iter()).enumerate() {
+                if a.ty() != *expected {
+                    return Err(WasmError::EntryArgTypeMismatch {
+                        idx: i,
+                        expected: *expected,
+                        got: a.ty(),
+                    });
+                }
+            }
+            let r = call_function(module, callee, &call_args, gas, mem, call_depth + 1)?;
+            for v in r {
+                stack.push(v);
+            }
+        }
+        // SP124 — call_indirect <type_idx> <table_idx>
+        // Pops i32 (element_idx in the table), validates bounds + non-
+        // None funcref + type signature match, then dispatches.
+        0x11 => {
+            let type_idx = read_u32_leb(code, ip)?;
+            let table_idx = read_u32_leb(code, ip)?;
+            if (table_idx as usize) >= module.tables.len() {
+                return Err(WasmError::UnknownTableIdx(table_idx));
+            }
+            if (type_idx as usize) >= module.types.len() {
+                return Err(WasmError::UnknownTypeIdx(type_idx));
+            }
+            let element_idx = pop_i32(stack, "call_indirect")? as u32;
+            let table = &module.table_funcs[table_idx as usize];
+            if (element_idx as usize) >= table.len() {
+                return Err(WasmError::TableIndexOutOfBounds {
+                    index: element_idx,
+                    table_size: table.len() as u32,
+                });
+            }
+            let callee = match table[element_idx as usize] {
+                Some(f) => f,
+                None => {
+                    return Err(WasmError::IndirectCallUninit {
+                        table_idx,
+                        element_idx,
+                    });
+                }
+            };
+            // Runtime type-check: the callee's actual type_idx MUST match
+            // the call_indirect's declared type_idx.
+            let actual = module.functions[callee as usize];
+            if actual != type_idx {
+                return Err(WasmError::IndirectCallTypeMismatch {
+                    expected_type_idx: type_idx,
+                    actual_type_idx: actual,
+                });
+            }
+            let callee_type = &module.types[type_idx as usize];
+            let n_args = callee_type.params.len();
+            if stack.len() < n_args {
+                return Err(WasmError::StackUnderflow { opcode: "call_indirect" });
+            }
+            let split = stack.len() - n_args;
+            let call_args: Vec<Value> = stack.drain(split..).collect();
             for (i, (a, expected)) in call_args.iter().zip(callee_type.params.iter()).enumerate() {
                 if a.ty() != *expected {
                     return Err(WasmError::EntryArgTypeMismatch {
@@ -1923,6 +2140,11 @@ fn scan_block_until(
             0x0C | 0x0D | 0x10 | 0x20 | 0x21 | 0x22 => {
                 skip_u32_leb(code, &mut ip)?;
             }
+            // SP124: call_indirect — TWO u32 LEB immediates (type_idx + table_idx)
+            0x11 => {
+                skip_u32_leb(code, &mut ip)?;
+                skip_u32_leb(code, &mut ip)?;
+            }
             // i32.const — signed LEB128 (sign-extension; we just skip
             // the byte stream until top bit clear, no need for separate
             // signed-skipper)
@@ -2010,7 +2232,7 @@ fn is_known_wasm_opcode(b: u8) -> bool {
     // - 0xFE                 : threads/atomic prefix (deferred)
     matches!(
         b,
-        0x06..=0x0A | 0x0E | 0x11 | 0x12..=0x19 | 0x1C..=0x1F |
+        0x06..=0x0A | 0x0E | 0x12..=0x19 | 0x1C..=0x1F |
         0x23..=0x27 |
         0xD0..=0xD4 | 0xFC | 0xFD..=0xFE
     )
@@ -2150,6 +2372,115 @@ mod test_helpers {
             ValType::F32 => 0x7D,
             ValType::F64 => 0x7C,
         }
+    }
+
+    /// SP124: Build a module with N functions, a table of size
+    /// `table_min`, and a single element segment initializing
+    /// `table[0..init_funcs.len()] = init_funcs`. The K-th function
+    /// has signature `bodies[K].signature` and body `bodies[K].code`.
+    /// The ENTRY function is `entry_idx`.
+    ///
+    /// Useful for `call_indirect` KATs that need real table state.
+    pub fn build_module_with_table(
+        function_types: &[(Vec<ValType>, Vec<ValType>)],
+        bodies: &[(Vec<(u32, ValType)>, Vec<u8>)],
+        table_min: u32,
+        init_funcs: &[u32],
+    ) -> Vec<u8> {
+        assert_eq!(function_types.len(), bodies.len());
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
+
+        // SP124: deduplicate identical signatures so call_indirect's
+        // type_idx-equality check (per WASM spec) lines up with the
+        // semantic "identical signatures share a type" intent of the
+        // caller. function_type_idx[i] is the type_idx assigned to
+        // function i in the function section.
+        let mut deduped_types: Vec<(Vec<ValType>, Vec<ValType>)> = Vec::new();
+        let mut function_type_idx: Vec<u32> = Vec::with_capacity(function_types.len());
+        for sig in function_types {
+            let idx = match deduped_types.iter().position(|s| s == sig) {
+                Some(i) => i as u32,
+                None => {
+                    deduped_types.push(sig.clone());
+                    (deduped_types.len() - 1) as u32
+                }
+            };
+            function_type_idx.push(idx);
+        }
+
+        // Type section
+        let mut type_sec = Vec::new();
+        write_u32_leb(&mut type_sec, deduped_types.len() as u32);
+        for (params, results) in &deduped_types {
+            type_sec.push(0x60);
+            write_u32_leb(&mut type_sec, params.len() as u32);
+            for p in params {
+                type_sec.push(val_type_byte(*p));
+            }
+            write_u32_leb(&mut type_sec, results.len() as u32);
+            for r in results {
+                type_sec.push(val_type_byte(*r));
+            }
+        }
+        out.push(0x01);
+        write_u32_leb(&mut out, type_sec.len() as u32);
+        out.extend_from_slice(&type_sec);
+
+        // Function section: function_idx → deduplicated type_idx.
+        let mut func_sec = Vec::new();
+        write_u32_leb(&mut func_sec, function_type_idx.len() as u32);
+        for &t in &function_type_idx {
+            write_u32_leb(&mut func_sec, t);
+        }
+        out.push(0x03);
+        write_u32_leb(&mut out, func_sec.len() as u32);
+        out.extend_from_slice(&func_sec);
+
+        // Table section (id=4): 1 table of funcref with min=table_min, no max.
+        let mut table_sec = Vec::new();
+        table_sec.push(0x01); // 1 table
+        table_sec.push(0x70); // funcref
+        table_sec.push(0x00); // flags: no max
+        write_u32_leb(&mut table_sec, table_min);
+        out.push(0x04);
+        write_u32_leb(&mut out, table_sec.len() as u32);
+        out.extend_from_slice(&table_sec);
+
+        // Element section (id=9): 1 segment, mode 0 (active table=0), offset = i32.const 0; end
+        let mut elem_sec = Vec::new();
+        elem_sec.push(0x01); // 1 segment
+        elem_sec.push(0x00); // mode 0 (active table 0)
+        elem_sec.push(0x41); // i32.const
+        write_i32_leb(&mut elem_sec, 0); // offset 0
+        elem_sec.push(0x0B); // end
+        write_u32_leb(&mut elem_sec, init_funcs.len() as u32);
+        for &f in init_funcs {
+            write_u32_leb(&mut elem_sec, f);
+        }
+        out.push(0x09);
+        write_u32_leb(&mut out, elem_sec.len() as u32);
+        out.extend_from_slice(&elem_sec);
+
+        // Code section (id=10).
+        let mut code_sec = Vec::new();
+        write_u32_leb(&mut code_sec, bodies.len() as u32);
+        for (locals, code) in bodies {
+            let mut body = Vec::new();
+            write_u32_leb(&mut body, locals.len() as u32);
+            for (cnt, vt) in locals {
+                write_u32_leb(&mut body, *cnt);
+                body.push(val_type_byte(*vt));
+            }
+            body.extend_from_slice(code);
+            write_u32_leb(&mut code_sec, body.len() as u32);
+            code_sec.extend_from_slice(&body);
+        }
+        out.push(0x0A);
+        write_u32_leb(&mut out, code_sec.len() as u32);
+        out.extend_from_slice(&code_sec);
+
+        out
     }
 
     pub fn write_u32_leb(out: &mut Vec<u8>, mut v: u32) {
@@ -3070,5 +3401,158 @@ mod tests {
                 Value::I32(15.0f32.to_bits() as i32),       // 7.5 * 2.0 = 15.0
             ]
         );
+    }
+
+    // ============================================================================
+    // SP124 — tables + call_indirect KATs
+    // ============================================================================
+
+    /// SP124-KAT-1: minimal call_indirect. Entry calls table[0] (=double)
+    /// with arg 21 → 42. The helper deduplicates identical signatures,
+    /// so both entry + double share type_idx=0.
+    #[test]
+    fn sp124_kat_minimal_call_indirect() {
+        // entry: local.get 0; i32.const 0; call_indirect type=0 table=0; end
+        let entry: Vec<u8> = vec![0x20, 0x00, 0x41, 0x00, 0x11, 0x00, 0x00, 0x0B];
+        // double: local.get 0; i32.const 2; i32.mul; end
+        let double_fn: Vec<u8> = vec![0x20, 0x00, 0x41, 0x02, 0x6C, 0x0B];
+        let m = build_module_with_table(
+            &[
+                (vec![ValType::I32], vec![ValType::I32]),
+                (vec![ValType::I32], vec![ValType::I32]),
+            ],
+            &[(vec![], entry), (vec![], double_fn)],
+            1,
+            &[1], // table[0] = func_idx 1
+        );
+        assert_eq!(
+            wasm_exec(&m, 0, &[Value::I32(21)], 100).unwrap(),
+            vec![Value::I32(42)]
+        );
+    }
+
+    /// SP124-KAT-2: element_idx out of bounds traps.
+    #[test]
+    fn sp124_kat_call_indirect_oob_traps() {
+        let entry: Vec<u8> = vec![0x20, 0x00, 0x41, 0x05, 0x11, 0x00, 0x00, 0x0B];
+        let double_fn: Vec<u8> = vec![0x20, 0x00, 0x41, 0x02, 0x6C, 0x0B];
+        let m = build_module_with_table(
+            &[
+                (vec![ValType::I32], vec![ValType::I32]),
+                (vec![ValType::I32], vec![ValType::I32]),
+            ],
+            &[(vec![], entry), (vec![], double_fn)],
+            1,
+            &[1],
+        );
+        assert!(matches!(
+            wasm_exec(&m, 0, &[Value::I32(10)], 100).unwrap_err(),
+            WasmError::TableIndexOutOfBounds { index: 5, table_size: 1 }
+        ));
+    }
+
+    /// SP124-KAT-3: uninitialized slot traps.
+    #[test]
+    fn sp124_kat_call_indirect_uninit_slot_traps() {
+        let entry: Vec<u8> = vec![0x20, 0x00, 0x41, 0x03, 0x11, 0x00, 0x00, 0x0B];
+        let double_fn: Vec<u8> = vec![0x20, 0x00, 0x41, 0x02, 0x6C, 0x0B];
+        let m = build_module_with_table(
+            &[
+                (vec![ValType::I32], vec![ValType::I32]),
+                (vec![ValType::I32], vec![ValType::I32]),
+            ],
+            &[(vec![], entry), (vec![], double_fn)],
+            4,
+            &[1],
+        );
+        assert!(matches!(
+            wasm_exec(&m, 0, &[Value::I32(10)], 100).unwrap_err(),
+            WasmError::IndirectCallUninit { table_idx: 0, element_idx: 3 }
+        ));
+    }
+
+    /// SP124-KAT-4: type mismatch at call_indirect traps. Entry has
+    /// type ()->I32 (distinct from callee's (I32)->I32), so the helper
+    /// keeps two type entries. call_indirect declares type 0 (entry's)
+    /// but callee has type 1 → mismatch trap.
+    #[test]
+    fn sp124_kat_call_indirect_type_mismatch_traps() {
+        let entry: Vec<u8> = vec![0x41, 0x00, 0x11, 0x00, 0x00, 0x0B];
+        let other: Vec<u8> = vec![0x20, 0x00, 0x41, 0x02, 0x6C, 0x0B];
+        let m = build_module_with_table(
+            &[
+                (vec![], vec![ValType::I32]),
+                (vec![ValType::I32], vec![ValType::I32]),
+            ],
+            &[(vec![], entry), (vec![], other)],
+            1,
+            &[1],
+        );
+        assert!(matches!(
+            wasm_exec(&m, 0, &[], 100).unwrap_err(),
+            WasmError::IndirectCallTypeMismatch { expected_type_idx: 0, actual_type_idx: 1 }
+        ));
+    }
+
+    /// SP124-KAT-5: dispatch table — entry routes by integer index to
+    /// one of three handlers via call_indirect. Locks the common UDF
+    /// vtable / function-pointer pattern. All 4 functions share
+    /// type=(I32)->I32 (deduplicated to type_idx=0 by the helper).
+    #[test]
+    fn sp124_kat_call_indirect_dispatch_table() {
+        // entry(idx): i32.const 7; local.get 0; call_indirect type=0 table=0; end
+        let entry: Vec<u8> = vec![0x41, 0x07, 0x20, 0x00, 0x11, 0x00, 0x00, 0x0B];
+        // f1: local.get 0; i32.const 100; i32.add; end → arg + 100
+        let f1: Vec<u8> = vec![0x20, 0x00, 0x41, 0xE4, 0x00, 0x6A, 0x0B];
+        // f2: local.get 0; i32.const 200; i32.add; end → arg + 200
+        let f2: Vec<u8> = vec![0x20, 0x00, 0x41, 0xC8, 0x01, 0x6A, 0x0B];
+        // f3: local.get 0; i32.const 300; i32.add; end → arg + 300
+        let f3: Vec<u8> = vec![0x20, 0x00, 0x41, 0xAC, 0x02, 0x6A, 0x0B];
+
+        let m = build_module_with_table(
+            &[
+                (vec![ValType::I32], vec![ValType::I32]),
+                (vec![ValType::I32], vec![ValType::I32]),
+                (vec![ValType::I32], vec![ValType::I32]),
+                (vec![ValType::I32], vec![ValType::I32]),
+            ],
+            &[(vec![], entry), (vec![], f1), (vec![], f2), (vec![], f3)],
+            3,
+            &[1, 2, 3],
+        );
+        assert_eq!(wasm_exec(&m, 0, &[Value::I32(0)], 100).unwrap(), vec![Value::I32(107)]);
+        assert_eq!(wasm_exec(&m, 0, &[Value::I32(1)], 100).unwrap(), vec![Value::I32(207)]);
+        assert_eq!(wasm_exec(&m, 0, &[Value::I32(2)], 100).unwrap(), vec![Value::I32(307)]);
+    }
+
+    /// SP124-KAT-6: element segment that writes past table_min is
+    /// REJECTED at decode time with typed ElementSegmentOutOfRange.
+    #[test]
+    fn sp124_kat_element_segment_oob_rejected() {
+        let mut bytes = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        let type_sec = vec![0x01u8, 0x60, 0x01, 0x7F, 0x01, 0x7F];
+        bytes.push(0x01);
+        write_u32_leb(&mut bytes, type_sec.len() as u32);
+        bytes.extend_from_slice(&type_sec);
+        bytes.push(0x03);
+        bytes.extend_from_slice(&[0x02, 0x01, 0x00]);
+        bytes.push(0x04);
+        bytes.extend_from_slice(&[0x04, 0x01, 0x70, 0x00, 0x02]);
+        bytes.push(0x09);
+        let elem_payload = vec![0x01u8, 0x00, 0x41, 0x00, 0x0B, 0x03, 0x00, 0x00, 0x00];
+        write_u32_leb(&mut bytes, elem_payload.len() as u32);
+        bytes.extend_from_slice(&elem_payload);
+        bytes.push(0x0A);
+        let body: Vec<u8> = vec![0x00, 0x20, 0x00, 0x0B];
+        let mut code_sec = vec![0x01u8];
+        write_u32_leb(&mut code_sec, body.len() as u32);
+        code_sec.extend_from_slice(&body);
+        write_u32_leb(&mut bytes, code_sec.len() as u32);
+        bytes.extend_from_slice(&code_sec);
+
+        assert!(matches!(
+            Module::decode(&bytes).unwrap_err(),
+            WasmError::ElementSegmentOutOfRange { offset: 0, n_funcs: 3, table_size: 2 }
+        ));
     }
 }

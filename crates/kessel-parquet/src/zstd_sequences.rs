@@ -82,6 +82,144 @@ pub(crate) struct SequencesHeader {
 /// appear in valid zstd output).
 pub(crate) const MAX_NUM_SEQUENCES: u32 = (1u32 << 17) + 32767;
 
+// ============================================================================
+// Predefined FSE tables for LL/OF/ML per RFC 8478 §3.1.1.3.2.1.1.
+// ============================================================================
+
+/// Literal Length default normalized distribution — accuracy_log = 6,
+/// 36 entries per RFC §3.1.1.3.2.1.1 ("Literal Length Default Distribution").
+pub(crate) const LL_DEFAULT_COUNTS: &[i16] = &[
+     4,  3,  2,  2,  2,  2,  2,  2,
+     2,  2,  2,  2,  2,  1,  1,  1,
+     2,  2,  2,  2,  2,  2,  2,  2,
+     2,  3,  2,  1,  1,  1,  1,  1,
+    -1, -1, -1, -1,
+];
+pub(crate) const LL_DEFAULT_ACCURACY_LOG: u32 = 6;
+
+/// Offset default normalized distribution — accuracy_log = 5, 28 entries
+/// per RFC §3.1.1.3.2.1.1 ("Offset Codes Default Distribution").
+pub(crate) const OF_DEFAULT_COUNTS: &[i16] = &[
+     1,  1,  1,  1,  1,  1,  2,  2,
+     2,  1,  1,  1,  1,  1,  1,  1,
+     1,  1,  1,  1,  1,  1,  1, -1,
+    -1, -1, -1, -1,
+];
+pub(crate) const OF_DEFAULT_ACCURACY_LOG: u32 = 5;
+
+/// Match Length default normalized distribution — accuracy_log = 6,
+/// 53 entries per RFC §3.1.1.3.2.1.1 ("Match Length Default Distribution").
+pub(crate) const ML_DEFAULT_COUNTS: &[i16] = &[
+     1,  4,  3,  2,  2,  2,  2,  2,
+     2,  1,  1,  1,  1,  1,  1,  1,
+     1,  1,  1,  1,  1,  1,  1,  1,
+     1,  1,  1,  1,  1,  1,  1,  1,
+     1,  1,  1,  1,  1,  1,  1,  1,
+     1,  1,  1,  1,  1,  1,  1,  1,
+     1,  1, -1, -1, -1,
+];
+pub(crate) const ML_DEFAULT_ACCURACY_LOG: u32 = 6;
+
+/// Symbol-class discriminator for the predefined-table selection +
+/// max-symbol-value bounds per RFC §3.1.1.3.2.1.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SeqSymbolClass {
+    LiteralLength,
+    Offset,
+    MatchLength,
+}
+
+impl SeqSymbolClass {
+    pub fn default_counts(self) -> &'static [i16] {
+        match self {
+            SeqSymbolClass::LiteralLength => LL_DEFAULT_COUNTS,
+            SeqSymbolClass::Offset => OF_DEFAULT_COUNTS,
+            SeqSymbolClass::MatchLength => ML_DEFAULT_COUNTS,
+        }
+    }
+    pub fn default_accuracy_log(self) -> u32 {
+        match self {
+            SeqSymbolClass::LiteralLength => LL_DEFAULT_ACCURACY_LOG,
+            SeqSymbolClass::Offset => OF_DEFAULT_ACCURACY_LOG,
+            SeqSymbolClass::MatchLength => ML_DEFAULT_ACCURACY_LOG,
+        }
+    }
+    /// Max symbol value (= max FSE alphabet index) for this class —
+    /// derived from the predefined table length minus 1.
+    pub fn max_symbol_value(self) -> u32 {
+        (self.default_counts().len() - 1) as u32
+    }
+    /// Max accuracy_log permitted for FseCompressed mode per RFC §5.4.2.
+    pub fn max_accuracy_log(self) -> u32 {
+        match self {
+            SeqSymbolClass::LiteralLength => 9,
+            SeqSymbolClass::Offset => 8,
+            SeqSymbolClass::MatchLength => 9,
+        }
+    }
+}
+
+/// Load the FSE table for one of the 3 sequence symbol classes per
+/// `mode` per RFC §5.4.2. Returns the built table + the number of
+/// input bytes consumed by the mode's payload (0 for Predefined and
+/// Repeat; 1 for Rle; variable for FseCompressed).
+///
+/// `prev` is the previous block's table for this code; passed `None`
+/// for the first sequences-block in a frame. Repeat mode without a
+/// previous table → typed err.
+pub(crate) fn load_fse_table_for_mode(
+    class: SeqSymbolClass,
+    mode: SeqSymbolMode,
+    input: &[u8],
+    prev: Option<&crate::zstd_fse::FseTable>,
+) -> Result<(crate::zstd_fse::FseTable, usize), ZstdError> {
+    use crate::zstd_fse::{build_fse_table, parse_normalized_counts, ForwardBitReader};
+    match mode {
+        SeqSymbolMode::Predefined => {
+            let table = build_fse_table(class.default_counts(), class.default_accuracy_log())?;
+            Ok((table, 0))
+        }
+        SeqSymbolMode::Rle => {
+            if input.is_empty() {
+                return Err(ZstdError::UnexpectedEof);
+            }
+            let sym = input[0];
+            if (sym as u32) > class.max_symbol_value() {
+                return Err(ZstdError::UnexpectedEof);
+            }
+            // Build a degenerate 1-entry table with accuracy_log=0; every
+            // state lands on this single symbol with nb_bits=0.
+            // build_fse_table expects log >= 1 typically; we synthesize the
+            // table directly here.
+            let table = crate::zstd_fse::FseTable {
+                accuracy_log: 0,
+                entries: vec![crate::zstd_fse::FseEntry {
+                    symbol: sym,
+                    nb_bits: 0,
+                    base_state: 0,
+                }],
+            };
+            Ok((table, 1))
+        }
+        SeqSymbolMode::FseCompressed => {
+            let mut fr = ForwardBitReader::new(input);
+            let normalized = parse_normalized_counts(&mut fr, class.max_symbol_value())?;
+            if normalized.accuracy_log > class.max_accuracy_log() {
+                return Err(ZstdError::UnexpectedEof);
+            }
+            let table = build_fse_table(&normalized.counts, normalized.accuracy_log)?;
+            let consumed = (fr.bit_pos() + 7) / 8;
+            Ok((table, consumed))
+        }
+        SeqSymbolMode::Repeat => {
+            match prev {
+                Some(table) => Ok((table.clone(), 0)),
+                None => Err(ZstdError::UnexpectedEof),
+            }
+        }
+    }
+}
+
 /// Parse the sequences section header per RFC §5.4.1.
 pub(crate) fn parse_sequences_header(input: &[u8]) -> Result<SequencesHeader, ZstdError> {
     if input.is_empty() {
@@ -303,5 +441,176 @@ mod tests {
         assert_eq!(h1.ll_mode, h2.ll_mode);
         assert_eq!(h1.of_mode, h2.of_mode);
         assert_eq!(h1.ml_mode, h2.ml_mode);
+    }
+
+    // ========================================================================
+    // SP133 KATs — predefined FSE tables + 4-mode dispatcher.
+    // ========================================================================
+
+    /// SP133-KAT-1: predefined LL table sizes correctly.
+    /// LL: 36 entries, accuracy_log = 6.
+    #[test]
+    fn sp133_kat_ll_predefined_table_builds() {
+        let (table, consumed) = load_fse_table_for_mode(
+            SeqSymbolClass::LiteralLength,
+            SeqSymbolMode::Predefined,
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(table.accuracy_log, 6);
+        assert_eq!(table.entries.len(), 64); // 1 << 6
+        assert_eq!(consumed, 0);
+    }
+
+    /// SP133-KAT-2: predefined OF table sizes correctly.
+    /// OF: 28 entries, accuracy_log = 5.
+    #[test]
+    fn sp133_kat_of_predefined_table_builds() {
+        let (table, consumed) = load_fse_table_for_mode(
+            SeqSymbolClass::Offset,
+            SeqSymbolMode::Predefined,
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(table.accuracy_log, 5);
+        assert_eq!(table.entries.len(), 32);
+        assert_eq!(consumed, 0);
+    }
+
+    /// SP133-KAT-3: predefined ML table sizes correctly.
+    /// ML: 53 entries, accuracy_log = 6.
+    #[test]
+    fn sp133_kat_ml_predefined_table_builds() {
+        let (table, consumed) = load_fse_table_for_mode(
+            SeqSymbolClass::MatchLength,
+            SeqSymbolMode::Predefined,
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(table.accuracy_log, 6);
+        assert_eq!(table.entries.len(), 64);
+        assert_eq!(consumed, 0);
+    }
+
+    /// SP133-KAT-4: Rle mode reads 1 byte = the single symbol. The
+    /// returned table is degenerate: 1 entry with nb_bits=0.
+    #[test]
+    fn sp133_kat_rle_mode_one_byte_payload() {
+        let (table, consumed) = load_fse_table_for_mode(
+            SeqSymbolClass::LiteralLength,
+            SeqSymbolMode::Rle,
+            &[0x05u8, 0xFF, 0xFF],
+            None,
+        )
+        .unwrap();
+        assert_eq!(consumed, 1);
+        assert_eq!(table.accuracy_log, 0);
+        assert_eq!(table.entries.len(), 1);
+        assert_eq!(table.entries[0].symbol, 5);
+        assert_eq!(table.entries[0].nb_bits, 0);
+    }
+
+    /// SP133-KAT-5: Rle mode rejects out-of-range symbol.
+    /// LL max symbol value = 35 (36 entries indexed 0..35). Try sym=100.
+    #[test]
+    fn sp133_kat_rle_mode_oob_symbol_traps() {
+        assert_eq!(
+            load_fse_table_for_mode(
+                SeqSymbolClass::LiteralLength,
+                SeqSymbolMode::Rle,
+                &[100u8],
+                None,
+            )
+            .unwrap_err(),
+            ZstdError::UnexpectedEof
+        );
+    }
+
+    /// SP133-KAT-6: Rle mode empty input → typed err.
+    #[test]
+    fn sp133_kat_rle_mode_empty_input_traps() {
+        assert_eq!(
+            load_fse_table_for_mode(
+                SeqSymbolClass::LiteralLength,
+                SeqSymbolMode::Rle,
+                &[],
+                None,
+            )
+            .unwrap_err(),
+            ZstdError::UnexpectedEof
+        );
+    }
+
+    /// SP133-KAT-7: Repeat mode without prev table → typed err.
+    #[test]
+    fn sp133_kat_repeat_without_prev_traps() {
+        assert_eq!(
+            load_fse_table_for_mode(
+                SeqSymbolClass::LiteralLength,
+                SeqSymbolMode::Repeat,
+                &[],
+                None,
+            )
+            .unwrap_err(),
+            ZstdError::UnexpectedEof
+        );
+    }
+
+    /// SP133-KAT-8: Repeat mode with prev table → clones the prev table.
+    #[test]
+    fn sp133_kat_repeat_with_prev_clones_table() {
+        let (predefined, _) = load_fse_table_for_mode(
+            SeqSymbolClass::LiteralLength,
+            SeqSymbolMode::Predefined,
+            &[],
+            None,
+        )
+        .unwrap();
+        let (cloned, consumed) = load_fse_table_for_mode(
+            SeqSymbolClass::LiteralLength,
+            SeqSymbolMode::Repeat,
+            &[],
+            Some(&predefined),
+        )
+        .unwrap();
+        assert_eq!(consumed, 0);
+        assert_eq!(cloned.accuracy_log, predefined.accuracy_log);
+        assert_eq!(cloned.entries.len(), predefined.entries.len());
+    }
+
+    /// SP133-KAT-9: deterministic — predefined LL table built twice is
+    /// byte-identical.
+    #[test]
+    fn sp133_kat_predefined_deterministic_repeat() {
+        let (t1, _) = load_fse_table_for_mode(
+            SeqSymbolClass::LiteralLength,
+            SeqSymbolMode::Predefined,
+            &[],
+            None,
+        )
+        .unwrap();
+        let (t2, _) = load_fse_table_for_mode(
+            SeqSymbolClass::LiteralLength,
+            SeqSymbolMode::Predefined,
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(t1.accuracy_log, t2.accuracy_log);
+        assert_eq!(t1.entries, t2.entries);
+    }
+
+    /// SP133-KAT-10: class accessors return correct values.
+    #[test]
+    fn sp133_kat_class_accessors() {
+        assert_eq!(SeqSymbolClass::LiteralLength.max_symbol_value(), 35);
+        assert_eq!(SeqSymbolClass::Offset.max_symbol_value(), 27);
+        assert_eq!(SeqSymbolClass::MatchLength.max_symbol_value(), 52);
+        assert_eq!(SeqSymbolClass::LiteralLength.default_accuracy_log(), 6);
+        assert_eq!(SeqSymbolClass::Offset.default_accuracy_log(), 5);
+        assert_eq!(SeqSymbolClass::MatchLength.default_accuracy_log(), 6);
     }
 }

@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 pub mod mvcc;
+pub mod tx;
 
 use kessel_io::{Disk, Vfs};
 use kessel_proto::codec::crc32c;

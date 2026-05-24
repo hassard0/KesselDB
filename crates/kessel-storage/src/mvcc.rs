@@ -313,6 +313,33 @@ pub fn delete_versions_older_than<V: Vfs>(
     Ok(count)
 }
 
+/// SP115 / S2.6: Full-type scan returning the latest version
+/// <= snapshot_opnum per object_id. Used by the Op::Select /
+/// Op::Query* family rewrite at SM apply time (Decision 1
+/// SQL→MVCC mapping).
+///
+/// Algorithm: walk every versioned key with the matching type_id
+/// prefix; for each distinct object_id, keep the version with the
+/// largest commit_opnum that is <= snapshot_opnum. Skip tombstoned
+/// entries (value = None / empty marker).
+///
+/// Complexity: O(N) where N is the total versions for type_id.
+/// Range-pruning optimisation deferred.
+///
+/// Determinism: the scan order is BTreeMap-deterministic (sorted
+/// by 28-byte key); the resulting Vec is sorted by object_id.
+///
+/// Returns: Vec of (object_id bytes [16], payload bytes) for every
+/// live (non-tombstoned) object visible at snapshot_opnum.
+pub fn scan_at_snapshot<V: Vfs>(
+    store: &Storage<V>,
+    type_id: u32,
+    snapshot_opnum: u64,
+) -> Vec<([u8; 16], Vec<u8>)> {
+    let _ = (store, type_id, snapshot_opnum);
+    todo!("S2.6 T2: implement full-type scan returning latest visible version per object_id")
+}
+
 // ----------------------------------------------------------------------------
 // Tests
 // ----------------------------------------------------------------------------

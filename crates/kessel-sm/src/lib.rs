@@ -132,6 +132,25 @@ pub struct StateMachine<V: Vfs> {
     /// the log. Monotonic across the lifetime of the SM (per Decision 5
     /// validation in the apply arm).
     low_water_mark: u64,
+    /// SP115 / S2.6: Per-replica local multiset of active Tx
+    /// snapshot_opnum values. Mapped to a count (`BTreeMap<u64, usize>`)
+    /// so concurrent Tx pinning the same snapshot are tracked
+    /// separately — removal decrements the count; the key is dropped only
+    /// at count = 0 (Decision 7).
+    ///
+    /// Registered by `register_snapshot(s)` (called by the server's
+    /// `apply_one` at auto-commit Tx::begin); unregistered by
+    /// `unregister_snapshot(s)` (at auto-commit Tx::commit/abort).
+    /// Read by `min_active_snapshot()` for the heartbeat producer
+    /// (Decision 6).
+    ///
+    /// Per-replica local; NOT replicated. The standalone-form Tx (no
+    /// SM context) does NOT register/unregister — same as SP113's
+    /// pending_txs limitation. Multi-replica heartbeat with consensus
+    /// on global min is deferred to S2.X.
+    ///
+    /// Initial value: empty.
+    active_snapshots: std::collections::BTreeMap<u64, usize>,
 }
 
 /// SP113 / S2.4: Per-committed-Tx record retained in
@@ -179,6 +198,8 @@ impl<V: Vfs> StateMachine<V> {
             pending_txs: std::collections::BTreeMap::new(),
             // SP114 / S2.5: no GC has run yet; watermark = 0.
             low_water_mark: 0,
+            // SP115 / S2.6: no active Tx snapshots yet.
+            active_snapshots: std::collections::BTreeMap::new(),
         })
     }
 
@@ -1123,6 +1144,61 @@ impl<V: Vfs> StateMachine<V> {
     /// after a reopen to know which committed ops it already has.
     pub fn applied(&self) -> Option<u64> {
         self.storage.high_op()
+    }
+
+    /// SP115 / S2.6 (Decision 7): Register a new auto-commit Tx's
+    /// snapshot_opnum in the active-snapshots multiset. Called by the
+    /// server's apply_one immediately before Tx::begin/begin_rw/begin_ssi.
+    ///
+    /// Idempotent w.r.t. multiset semantics — same snapshot called twice
+    /// increments the count to 2; two `unregister_snapshot(s)` calls
+    /// remove it.
+    pub fn register_snapshot(&mut self, snapshot_opnum: u64) {
+        *self.active_snapshots.entry(snapshot_opnum).or_insert(0) += 1;
+    }
+
+    /// SP115 / S2.6 (Decision 7): Unregister an auto-commit Tx's
+    /// snapshot_opnum. Called by the server's apply_one at Tx::commit /
+    /// abort / commit_read_only. Decrements the count; removes the key
+    /// at count = 0.
+    ///
+    /// If the snapshot was never registered (count = 0), this is a
+    /// no-op — defensive against caller mismatch but should never happen
+    /// in correctly-wired code (T5 pentest exercises the edge).
+    pub fn unregister_snapshot(&mut self, snapshot_opnum: u64) {
+        use std::collections::btree_map::Entry;
+        match self.active_snapshots.entry(snapshot_opnum) {
+            Entry::Occupied(mut e) => {
+                let v = e.get_mut();
+                *v = v.saturating_sub(1);
+                if *v == 0 {
+                    e.remove_entry();
+                }
+            }
+            Entry::Vacant(_) => {} // defensive no-op
+        }
+    }
+
+    /// SP115 / S2.6 (Decision 6): The minimum active snapshot_opnum
+    /// across all currently-registered auto-commit Tx. Returns `None`
+    /// when no Tx is active (heartbeat producer interprets None as
+    /// "watermark may advance to current_commit_opnum"). Deterministic
+    /// at the BTreeMap iteration level.
+    pub fn min_active_snapshot(&self) -> Option<u64> {
+        self.active_snapshots.keys().next().copied()
+    }
+
+    /// SP115 / S2.6 (Decision 3): The latest committed op_number visible
+    /// to the SM. Auto-commit Tx reads this at Tx::begin to pin its
+    /// snapshot at READ COMMITTED. Deterministic: equal across replicas
+    /// at the same log prefix.
+    ///
+    /// Implementation: returns the SM's authoritative "highest applied
+    /// op_number" tracker via `storage.high_op()`, which is the same
+    /// cursor exposed by `applied()`. Returns 0 when no op has been
+    /// applied yet (fresh SM — matches the low_water_mark default).
+    pub fn current_commit_opnum(&self) -> u64 {
+        self.storage.high_op().unwrap_or(0)
     }
 
     pub fn apply(&mut self, op_number: u64, op: Op) -> OpResult {
@@ -3741,6 +3817,12 @@ impl<V: Vfs> StateMachine<V> {
             ),
 
             Op::CommitTx { snapshot_opnum, write_set, commit_opnum, read_set } => {
+                // SP115 / S2.6 (Decision 5): SOFT ACCEPT — to be implemented in T2.
+                // At T2: replace `commit_opnum` usage below with `effective_commit_opnum`
+                // computed as:
+                //   let effective_commit_opnum = if commit_opnum == 0 { op_number } else { commit_opnum };
+                // For T1 the existing SP112-SP114 behavior is preserved (commit_opnum as-is).
+                //
                 // S2.3 T2: THE thesis-fit headline path. The conflict-check
                 // verdict is a DETERMINISTIC function of the log prefix —
                 // every replica running this identical arm against byte-
@@ -11476,5 +11558,70 @@ mod tests {
             kessel_storage::mvcc::SnapshotRead::Tombstoned,
             "COV-5: snap=3 k2 must be Tombstoned (GC wrote tombstone over k2@opnum=2)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // SP115 / S2.6 T1 scaffold tests
+    // -----------------------------------------------------------------------
+
+    /// kat_scaffold_active_snapshots_default_empty
+    ///
+    /// Verify: newly-constructed StateMachine has `active_snapshots` empty
+    /// (min_active_snapshot returns None) and that current_commit_opnum
+    /// returns 0 on a fresh SM.
+    #[test]
+    fn kat_scaffold_active_snapshots_default_empty() {
+        let sm = StateMachine::open(MemVfs::new()).unwrap();
+        assert_eq!(
+            sm.min_active_snapshot(),
+            None,
+            "fresh SM must have no active snapshots"
+        );
+        assert_eq!(
+            sm.current_commit_opnum(),
+            0,
+            "fresh SM current_commit_opnum must be 0 (no ops applied)"
+        );
+    }
+
+    /// kat_scaffold_register_unregister_count_keyed
+    ///
+    /// Verify: register_snapshot / unregister_snapshot / min_active_snapshot
+    /// multiset semantics — count-keyed, removes key at count = 0.
+    ///
+    /// Sequence: register(42); min==Some(42); register(42) again (count=2);
+    /// min still Some(42); unregister(42) (count=1); min still Some(42);
+    /// unregister(42) (count=0 → key removed); min==None.
+    #[test]
+    fn kat_scaffold_register_unregister_count_keyed() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+
+        sm.register_snapshot(42);
+        assert_eq!(sm.min_active_snapshot(), Some(42), "after first register(42)");
+
+        sm.register_snapshot(42);
+        assert_eq!(
+            sm.min_active_snapshot(),
+            Some(42),
+            "after second register(42) — count=2, key still present"
+        );
+
+        sm.unregister_snapshot(42);
+        assert_eq!(
+            sm.min_active_snapshot(),
+            Some(42),
+            "after first unregister(42) — count=1, key still present"
+        );
+
+        sm.unregister_snapshot(42);
+        assert_eq!(
+            sm.min_active_snapshot(),
+            None,
+            "after second unregister(42) — count=0, key removed"
+        );
+
+        // Defensive: unregister on empty map is a no-op (no panic).
+        sm.unregister_snapshot(42);
+        assert_eq!(sm.min_active_snapshot(), None, "unregister on empty is no-op");
     }
 }

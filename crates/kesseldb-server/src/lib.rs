@@ -209,12 +209,41 @@ fn mutates_schema(op: &Op) -> bool {
 /// same compile-cache use/invalidation, same result). It deliberately
 /// does NOT handle the admin/txn/pipeline tags (those need the engine's
 /// `start`/`dir` and are handled by the driver).
+/// SP115 / S2.6 (Decision 6): Heartbeat producer for the MVCC
+/// AdvanceWatermark protocol. Spawned at server startup on the VSR
+/// primary; runs in a background task at a configurable interval
+/// (default 1s); reads `sm.min_active_snapshot()` and submits
+/// `Op::AdvanceWatermark` ops via VSR.
+///
+/// Non-deterministic at the SUBMISSION boundary (each replica's
+/// wall-clock fires independently); deterministic at SM apply
+/// (the resulting AdvanceWatermark op flows through VSR's
+/// totally-ordered log).
+///
+/// T1 ships the function signature + spawn surface; T2 implements
+/// the loop body.
+pub fn spawn_heartbeat_loop(
+    // T2: sm: Arc<std::sync::Mutex<StateMachine<DirVfs>>>,
+    // T2: vsr_submit: ...,
+    // T2: interval: std::time::Duration,
+) {
+    todo!("S2.6 T2: implement heartbeat loop body — submit Op::AdvanceWatermark at interval respecting min_active_snapshot");
+}
+
 fn apply_one(
     sm: &mut StateMachine<DirVfs>,
     cache: &mut CompileCache,
     n: &mut u64,
     frame: &[u8],
 ) -> OpResult {
+    // SP115 / S2.6 (Decision 2): AUTO-COMMIT TX WRAPPER — to be implemented in T2.
+    // At T2: every SQL-derived Op wraps in an auto-commit Tx:
+    //   - snapshot = sm.current_commit_opnum()
+    //   - sm.register_snapshot(snapshot)
+    //   - SELECT family → Tx::begin (read-only)
+    //   - INSERT/UPDATE/DELETE family → Tx::begin_rw + Tx::write + Tx::commit_ssi
+    //   - sm.unregister_snapshot(snapshot)
+    // For T1 the existing SP1-SP114 direct-apply path is preserved.
     let op = if frame.first() == Some(&0xFE) {
         let sql = match std::str::from_utf8(&frame[1..]) {
             Ok(s) => s,

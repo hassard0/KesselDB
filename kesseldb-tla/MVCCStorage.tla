@@ -298,8 +298,8 @@ Spec == Init /\ [][Next]_vars
 (* TypeOK — well-typed state envelope.                                     *)
 (*                                                                          *)
 (* `versions` is a function from Keys to subsets of VersionEntry. opCount *)
-(* is a bounded natural. readLog is a set of read-result records with     *)
-(* the documented shape.                                                   *)
+(* is a bounded natural. Plus a per-(t, o) opnum-uniqueness constraint    *)
+(* reflecting the LSM 28-byte key uniqueness.                              *)
 (***************************************************************************)
 TypeOK ==
     /\ versions \in [Keys -> SUBSET VersionEntry]
@@ -389,8 +389,8 @@ NeverNotYetWrittenAfterPut ==
 (*                                                                          *)
 (* This captures the storage's snapshot-read contract directly as a     *)
 (* property of the SnapshotReadOf function over reachable states; the    *)
-(* recorded readLog still anchors SnapshotMonotonic, which is the only   *)
-(* cross-snapshot relational invariant we need.                           *)
+(* cross-snapshot relational invariant (SnapshotMonotonic above) is also *)
+(* a universal current-state property post-TLC-fix-#1.                   *)
 (***************************************************************************)
 TombstoneObservability ==
     \A t \in TypeIds, o \in ObjectIds, s \in OpNums :

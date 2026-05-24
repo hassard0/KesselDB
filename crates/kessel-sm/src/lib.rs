@@ -1228,24 +1228,31 @@ impl<V: Vfs> StateMachine<V> {
     // surface) would have needed migration.
     // ----------------------------------------------------------------
 
-    /// SP115 / S2.6: Read the latest committed version of a data row,
-    /// equivalent to the SP1-SP114 `self.storage.get(&make_key(type_id,
-    /// oid))` semantic but routed through the MVCC `scan_range_versions`
-    /// snapshot read. The snapshot is `u64::MAX` (read latest) because
-    /// the apply arm runs serially in the log-position order — there
-    /// is no in-flight concurrent writer to filter out at this seam.
-    /// (Concurrent-Tx semantics surface ONLY in Op::CommitTx, which
-    /// already uses `has_version_in_range` for its conflict check.)
+    /// SP115 / S2.6: Read the committed version of a data row visible at
+    /// `snapshot_opnum`, routed through the MVCC `get_at_snapshot`
+    /// primitive (SP110).
+    ///
+    /// **SP116 / S2.7 (Decision 4):** `snapshot_opnum` is now a caller-
+    /// supplied parameter instead of the former hardcoded `u64::MAX`.
+    /// - Apply arms executing per-statement auto-commit (SP116 T2.B / T2.C)
+    ///   pass `u64::MAX` (read-latest-committed; READ COMMITTED semantics).
+    /// - Future S2.X multi-statement Tx callers will pass their captured
+    ///   snapshot opnum from `Tx::begin` to observe point-in-time state.
+    ///
+    /// Both `SnapshotRead::Tombstoned` and `SnapshotRead::NotYetWritten`
+    /// collapse to `None` (row absent) — matching the SP1-SP114 `Option`
+    /// contract that apply arms expect.
     pub(crate) fn data_row_get(
         &self,
         type_id: u32,
         oid: &[u8; 16],
+        snapshot_opnum: u64, // SP116 / S2.7 (Decision 4): caller-provided snapshot
     ) -> Option<Vec<u8>> {
         match kessel_storage::mvcc::get_at_snapshot(
             &self.storage,
             type_id,
             oid,
-            u64::MAX,
+            snapshot_opnum, // was hardcoded u64::MAX; now caller-controlled
         ) {
             kessel_storage::mvcc::SnapshotRead::Found(v) => Some(v),
             // Tombstoned + NotYetWritten both collapse to "row absent"
@@ -1287,18 +1294,27 @@ impl<V: Vfs> StateMachine<V> {
         self.data_row_put(op_number, type_id, oid, None)
     }
 
-    /// SP115 / S2.6: Full-type scan returning the latest visible
-    /// (non-tombstoned) version per object_id at the latest snapshot.
-    /// Used by Op::Select / Op::Query* / Op::Aggregate / etc.
-    /// rewrites. Snapshot = `u64::MAX` (latest committed) because the
-    /// apply arm is serial in log order at this seam.
+    /// SP115 / S2.6: Full-type scan returning every live (non-tombstoned)
+    /// version per object_id visible at `snapshot_opnum`, routed through
+    /// the MVCC `scan_at_snapshot` primitive (SP110).
     ///
-    /// Returns Vec<(reconstructed-20-byte-key, payload)> so callers
-    /// that internally key by `make_key(type_id, oid)` need NO churn
-    /// — the reconstructed key is byte-equivalent to what `scan_range`
-    /// over the legacy 20-byte range would have produced.
-    pub(crate) fn data_row_scan(&self, type_id: u32) -> Vec<(Key, Vec<u8>)> {
-        kessel_storage::mvcc::scan_at_snapshot(&self.storage, type_id, u64::MAX)
+    /// **SP116 / S2.7 (Decision 4):** `snapshot_opnum` is now a caller-
+    /// supplied parameter instead of the former hardcoded `u64::MAX`.
+    /// - Apply arms executing per-statement auto-commit (SP116 T2.B / T2.C)
+    ///   pass `u64::MAX` (scan-latest-committed; READ COMMITTED semantics).
+    /// - Future S2.X multi-statement Tx callers will pass their captured
+    ///   snapshot opnum from `Tx::begin` to observe point-in-time state.
+    ///
+    /// Returns `Vec<(reconstructed-20-byte-key, payload)>` so callers that
+    /// key by `make_key(type_id, oid)` require no churn — the reconstructed
+    /// key is byte-equivalent to what a legacy `scan_range` over the 20-byte
+    /// prefix would have produced.
+    pub(crate) fn data_row_scan(
+        &self,
+        type_id: u32,
+        snapshot_opnum: u64, // SP116 / S2.7 (Decision 4): caller-provided snapshot
+    ) -> Vec<(Key, Vec<u8>)> {
+        kessel_storage::mvcc::scan_at_snapshot(&self.storage, type_id, snapshot_opnum)
             .into_iter()
             .map(|(oid, v)| (make_key(type_id, &oid), v))
             .collect()
@@ -1692,6 +1708,10 @@ impl<V: Vfs> StateMachine<V> {
                 self.persist_catalog(op_number)
             }
 
+            // SP116 / S2.7 (Decision 3): cutover scheduled for T2.A.
+            // Current body uses legacy 20-byte data-row keyspace; T2.A rewrites against
+            // data_row_put per Decision 4 + inner Tx::begin / Tx::commit_ssi wrap per
+            // Decision 6 (write arm).
             Op::Create { type_id, id, record } => {
                 if self.catalog.get(type_id).is_none() {
                     return OpResult::SchemaError(format!("no type {type_id}"));
@@ -1747,6 +1767,10 @@ impl<V: Vfs> StateMachine<V> {
                 }
             }
 
+            // SP116 / S2.7 (Decision 3): cutover scheduled for T2.A.
+            // Current body uses legacy 20-byte data-row keyspace; T2.A rewrites against
+            // data_row_put per Decision 4 + inner Tx::begin / Tx::commit_ssi wrap per
+            // Decision 6 (write arm).
             Op::Update { type_id, id, record } => {
                 if self.catalog.get(type_id).is_none() {
                     return OpResult::SchemaError(format!("no type {type_id}"));
@@ -1822,6 +1846,10 @@ impl<V: Vfs> StateMachine<V> {
                 }
             }
 
+            // SP116 / S2.7 (Decision 3): cutover scheduled for T2.A.
+            // Current body uses legacy 20-byte data-row keyspace; T2.A rewrites against
+            // data_row_get + data_row_put per Decision 4 + inner Tx::begin /
+            // Tx::commit_ssi wrap per Decision 6 (write arm).
             Op::UpdateSet { type_id, id, sets } => {
                 // SP84: deterministic server-side RMW as ONE replicated
                 // op, so SQL UPDATE composes inside Op::Txn (the read is
@@ -1876,6 +1904,10 @@ impl<V: Vfs> StateMachine<V> {
                 self.apply(op_number, Op::Update { type_id, id, record })
             }
 
+            // SP116 / S2.7 (Decision 3): cutover scheduled for T2.A.
+            // Current body uses legacy 20-byte data-row keyspace; T2.A rewrites against
+            // data_row_delete per Decision 4 + inner Tx::begin / Tx::commit_ssi wrap
+            // per Decision 6 (write arm).
             Op::Delete { type_id, id } => {
                 let key = make_key(type_id, &id.0);
                 if self.storage.get(&key).is_none() {
@@ -1972,6 +2004,10 @@ impl<V: Vfs> StateMachine<V> {
                 OpResult::Ok
             }
 
+            // SP116 / S2.7 (Decision 3): cutover scheduled for T2.B.
+            // Current body uses legacy 20-byte data-row keyspace; T2.B rewrites against
+            // data_row_get(type_id, &id.0, u64::MAX) per Decision 4 (read arm,
+            // per-statement auto-commit at u64::MAX snapshot).
             Op::GetById { type_id, id } => {
                 let key = make_key(type_id, &id.0);
                 if let Some(c) = self.cache.as_mut() {
@@ -2325,6 +2361,10 @@ impl<V: Vfs> StateMachine<V> {
                 self.apply(op_number, Op::AddCheck { type_id, program })
             }
 
+            // SP116 / S2.7 (Decision 3): cutover scheduled for T2.C.
+            // Current body uses legacy 20-byte data-row keyspace (scan_range × 2);
+            // T2.C rewrites against data_row_scan(type_id, u64::MAX) for both sides
+            // per Decision 4 (composite read arm, per-statement auto-commit).
             Op::Join { left_type, right_type, left_field, right_field, limit } => {
                 let lt = match self.catalog.get(left_type) {
                     Some(t) => t.clone(),
@@ -2654,6 +2694,10 @@ impl<V: Vfs> StateMachine<V> {
                 self.persist_catalog(op_number)
             }
 
+            // SP116 / S2.7 (Decision 3): cutover scheduled for T2.B.
+            // Current body uses legacy 20-byte data-row keyspace (scan_range);
+            // T2.B rewrites against data_row_scan(type_id, u64::MAX) per Decision 4
+            // (read arm, per-statement auto-commit at u64::MAX snapshot).
             Op::Query { type_id, preds } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
@@ -2883,6 +2927,10 @@ impl<V: Vfs> StateMachine<V> {
                 self.persist_catalog(op_number)
             }
 
+            // SP116 / S2.7 (Decision 3): cutover scheduled for T2.B.
+            // Current body uses legacy 20-byte data-row keyspace (scan_range);
+            // T2.B rewrites against data_row_scan(type_id, u64::MAX) per Decision 4
+            // (read arm, per-statement auto-commit at u64::MAX snapshot).
             Op::QueryExpr { type_id, program } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
@@ -2914,6 +2962,10 @@ impl<V: Vfs> StateMachine<V> {
                 OpResult::Got(out)
             }
 
+            // SP116 / S2.7 (Decision 3): cutover scheduled for T2.B.
+            // Current body uses legacy 20-byte data-row keyspace (scan_range);
+            // T2.B rewrites against data_row_scan(type_id, u64::MAX) per Decision 4
+            // (read arm, per-statement auto-commit at u64::MAX snapshot).
             Op::Select { type_id, program, limit } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
@@ -2945,6 +2997,10 @@ impl<V: Vfs> StateMachine<V> {
                 OpResult::Got(out)
             }
 
+            // SP116 / S2.7 (Decision 3): cutover scheduled for T2.B.
+            // Current body uses legacy 20-byte data-row keyspace (scan_range);
+            // T2.B rewrites candidates lookup against data_row_get(type_id, &oid, u64::MAX)
+            // per Decision 4 (read arm; index keyspace stays legacy 20-byte per Decision 7).
             Op::QueryRows { type_id, eq_preds, program, limit, range_preds } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
@@ -3187,6 +3243,10 @@ impl<V: Vfs> StateMachine<V> {
                 OpResult::Got(out)
             }
 
+            // SP116 / S2.7 (Decision 3): cutover scheduled for T2.B.
+            // Current body uses legacy 20-byte data-row keyspace (scan_range);
+            // T2.B rewrites against data_row_scan(type_id, u64::MAX) per Decision 4
+            // (read arm, per-statement auto-commit at u64::MAX snapshot).
             Op::SelectFields { type_id, program, fields, limit } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
@@ -3230,6 +3290,10 @@ impl<V: Vfs> StateMachine<V> {
                 OpResult::Got(out)
             }
 
+            // SP116 / S2.7 (Decision 3): cutover scheduled for T2.C.
+            // Current body uses legacy 20-byte data-row keyspace (scan_range + reduce);
+            // T2.C rewrites against data_row_scan(type_id, u64::MAX) per Decision 4
+            // (composite read arm, per-statement auto-commit).
             Op::Aggregate { type_id, program, kind, field_id } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
@@ -3405,6 +3469,10 @@ impl<V: Vfs> StateMachine<V> {
                 OpResult::Got(result.to_le_bytes().to_vec())
             }
 
+            // SP116 / S2.7 (Decision 3): cutover scheduled for T2.C.
+            // Current body uses legacy 20-byte data-row keyspace (scan_range + sort);
+            // T2.C rewrites against data_row_scan(type_id, u64::MAX) per Decision 4
+            // (composite read arm, per-statement auto-commit).
             Op::SelectSorted { type_id, program, sort_field, desc, offset, limit } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
@@ -3456,6 +3524,10 @@ impl<V: Vfs> StateMachine<V> {
                 OpResult::Got(out)
             }
 
+            // SP116 / S2.7 (Decision 3): cutover scheduled for T2.C.
+            // Current body uses legacy 20-byte data-row keyspace; T2.C rewrites against
+            // data_row_scan(type_id, u64::MAX) per Decision 4 (read arm,
+            // per-statement auto-commit at u64::MAX snapshot).
             Op::GroupAggregate { type_id, program, group_field, kind, agg_field } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
@@ -13415,5 +13487,108 @@ mod tests {
             .unwrap_or_else(|| sm.current_commit_opnum());
         let lwm = sm.low_water_mark();
         (target, lwm)
+    }
+
+    // -----------------------------------------------------------------------
+    // SP116 T1 scaffold tests — prove the new `snapshot_opnum` param on
+    // `data_row_get` / `data_row_scan` actually routes through to the
+    // underlying SP110 MVCC primitive (was hardcoded `u64::MAX` in SP115).
+    //
+    // Hand-derived expectations from the SP110 MVCC primitive contract:
+    //   - versioned key = type_id (4 LE) || object_id (16) || (u64::MAX - commit_opnum) (8 BE)
+    //   - get_at_snapshot(snapshot) returns Found(v) iff the latest commit_opnum <= snapshot
+    //     is a live (non-tombstone) version; NotYetWritten if no commit <= snapshot;
+    //     Tombstoned if the latest commit <= snapshot was None.
+    //   - scan_at_snapshot returns one (oid, value) entry per object_id with a live
+    //     version at the given snapshot.
+    // Therefore: a write at op=5 is invisible at snapshot=4, visible at snapshot=5
+    // and snapshot=u64::MAX.
+    // -----------------------------------------------------------------------
+
+    /// it_data_row_get_passes_snapshot_opnum
+    ///
+    /// Claim: `data_row_get` honors caller-supplied `snapshot_opnum`.
+    /// Workload: data_row_put(op=5, oid, Some(A)); read at snapshot=4/5/MAX.
+    /// Expected: snapshot=4 → None (NotYetWritten); snapshot=5 → Some(A);
+    ///   snapshot=u64::MAX → Some(A).
+    #[test]
+    fn it_data_row_get_passes_snapshot_opnum() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        let oid = {
+            let mut a = [0u8; 16];
+            a[15] = 0x55;
+            a
+        };
+        let a = vec![0xCDu8; 16];
+        sm.data_row_put(5, 1, &oid, Some(a.clone())).unwrap();
+
+        // Snapshot strictly before the write → NotYetWritten collapses to None.
+        assert_eq!(
+            sm.data_row_get(1, &oid, 4),
+            None,
+            "SP116 T1: snapshot=4 must see no version (write at op=5 is in the future)"
+        );
+
+        // Snapshot at the write's commit_opnum → Found(A) collapses to Some(A).
+        assert_eq!(
+            sm.data_row_get(1, &oid, 5),
+            Some(a.clone()),
+            "SP116 T1: snapshot=5 must see the value written at op=5"
+        );
+
+        // Snapshot u64::MAX (latest committed) → Found(A) collapses to Some(A).
+        assert_eq!(
+            sm.data_row_get(1, &oid, u64::MAX),
+            Some(a),
+            "SP116 T1: snapshot=u64::MAX (latest) must see the value"
+        );
+    }
+
+    /// it_data_row_scan_passes_snapshot_opnum
+    ///
+    /// Claim: `data_row_scan` honors caller-supplied `snapshot_opnum` —
+    /// versions written AFTER the snapshot are excluded.
+    /// Workload: data_row_put(op=5, oid_a, Some(A)); data_row_put(op=10, oid_b, Some(B)).
+    /// Expected: scan(snapshot=7) → only oid_a/A visible; scan(snapshot=u64::MAX) → both.
+    #[test]
+    fn it_data_row_scan_passes_snapshot_opnum() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        let oid_a = {
+            let mut a = [0u8; 16];
+            a[15] = 0xA1;
+            a
+        };
+        let oid_b = {
+            let mut a = [0u8; 16];
+            a[15] = 0xB2;
+            a
+        };
+        let a = vec![0xAAu8; 8];
+        let b = vec![0xBBu8; 8];
+        sm.data_row_put(5, 1, &oid_a, Some(a.clone())).unwrap();
+        sm.data_row_put(10, 1, &oid_b, Some(b.clone())).unwrap();
+
+        // Snapshot=7 sits between the two writes — only A is committed by then.
+        let at_7 = sm.data_row_scan(1, 7);
+        assert_eq!(
+            at_7.len(),
+            1,
+            "SP116 T1: scan(snapshot=7) must see exactly 1 row (A); got {} rows",
+            at_7.len()
+        );
+        assert_eq!(at_7[0].1, a, "SP116 T1: scan(snapshot=7) must see A");
+
+        // Snapshot=u64::MAX sees both committed rows.
+        let at_max = sm.data_row_scan(1, u64::MAX);
+        assert_eq!(
+            at_max.len(),
+            2,
+            "SP116 T1: scan(snapshot=u64::MAX) must see both rows (A,B); got {} rows",
+            at_max.len()
+        );
+        // BTreeMap iteration order over object_id means A (oid_a=...0xA1) comes
+        // before B (oid_b=...0xB2) deterministically.
+        assert_eq!(at_max[0].1, a, "SP116 T1: oid_a A comes first by oid ordering");
+        assert_eq!(at_max[1].1, b, "SP116 T1: oid_b B comes second");
     }
 }

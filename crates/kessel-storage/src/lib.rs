@@ -33,6 +33,43 @@ pub fn make_key(type_id: u32, object_id: &[u8; 16]) -> Key {
     k
 }
 
+/// SP116 / S2.7 — Storage-layer MVCC dispatch discriminator.
+///
+/// Returns `Some(type_id)` iff `key` is a **user-type data-row key**:
+///   - exactly 20 bytes (matches `make_key` shape), AND
+///   - the type_id's high byte (`key[3]`, the most-significant byte of the
+///     little-endian u32) is NOT 0xFF, AND
+///   - the type_id is NOT 0 (type_id=0 is reserved for the catalog's own
+///     blob, which the SM persists via `self.storage.put` at
+///     `make_key(0, &[0; 16])`; routing that to MVCC would version the
+///     catalog and break the empty-data-row-keyspace invariants).
+///
+/// Reserved-range exclusions:
+///   - **type_id = 0**            — catalog self-storage blob
+///   - **type_id ≥ 0xFF00_0000**  — aux + index keyspaces (high-byte 0xFF):
+///     OVERFLOW=0xFFFF_FFFF, SEQ=0xFFFF_FFF0, XSHARD=0xFFFF_FFF1,
+///     SEQ_DEDUP=0xFFFF_FFF2, XVOTE=0xFFFF_FFF3, IDX_EQ=0xFFFE_xxxx,
+///     IDX_NUM=0xFFFD_xxxx, IDX_STR=0xFFFC_xxxx
+///
+/// User types are allocated monotonically from 1 by the catalog and stay
+/// safely in the open interval (0, 0xFF00_0000).
+///
+/// This is the safe shape; a naive `key.len() == 20` discriminator would
+/// MVCC-versionize index entries AND the catalog blob (both also use
+/// `make_key`). The classifier flagged the unsafe form during SP116 T2;
+/// the failing `it_coverage_catalog_ddl_byte_net_zero_versioned_keyspace`
+/// test surfaced the catalog-blob trap one iteration later.
+#[inline]
+pub(crate) fn data_row_dispatch(key: &[u8]) -> Option<u32> {
+    if key.len() == mvcc::PREFIX_LEN && key[3] != 0xFF {
+        let type_id = u32::from_le_bytes([key[0], key[1], key[2], key[3]]);
+        if type_id != 0 {
+            return Some(type_id);
+        }
+    }
+    None
+}
+
 const WAL_NAME: &str = "wal";
 const MANIFEST_NAME: &str = "MANIFEST";
 const SST_MAGIC: u32 = 0x4B53_5354; // "KSST"
@@ -548,6 +585,15 @@ impl<V: Vfs> Storage<V> {
     }
 
     pub fn put(&mut self, op_number: u64, key: Key, value: Vec<u8>) -> io::Result<()> {
+        // SP116 / S2.7 — transparent MVCC dispatch for user-type data rows.
+        // See `data_row_dispatch` for the discriminator rationale. Non-data-row
+        // keys (catalog 3-byte, indexes 0xFFFx-prefix 20-byte, aux 0xFFFF_FFFx
+        // 20-byte) fall through to the legacy commit() path unchanged.
+        if let Some(type_id) = data_row_dispatch(&key) {
+            let mut oid = [0u8; 16];
+            oid.copy_from_slice(&key[4..20]);
+            return mvcc::put_versioned(self, type_id, &oid, op_number, Some(value));
+        }
         self.commit(Entry {
             op_number,
             key,
@@ -556,6 +602,13 @@ impl<V: Vfs> Storage<V> {
     }
 
     pub fn delete(&mut self, op_number: u64, key: Key) -> io::Result<()> {
+        // SP116 / S2.7 — user-type data-row deletes become MVCC tombstone
+        // versions at the same (type_id, oid) at commit_opnum=op_number.
+        if let Some(type_id) = data_row_dispatch(&key) {
+            let mut oid = [0u8; 16];
+            oid.copy_from_slice(&key[4..20]);
+            return mvcc::put_versioned(self, type_id, &oid, op_number, None);
+        }
         self.commit(Entry {
             op_number,
             key,
@@ -636,6 +689,17 @@ impl<V: Vfs> Storage<V> {
     }
 
     pub fn get(&self, key: &Key) -> Option<Vec<u8>> {
+        // SP116 / S2.7 — user-type data-row point read goes to MVCC at the
+        // latest committed snapshot (READ COMMITTED for the apply seam, which
+        // is serial in log-position order). Tombstone collapses to None.
+        if let Some(type_id) = data_row_dispatch(key) {
+            let mut oid = [0u8; 16];
+            oid.copy_from_slice(&key[4..20]);
+            return match mvcc::get_at_snapshot(self, type_id, &oid, u64::MAX) {
+                mvcc::SnapshotRead::Found(v) => Some(v),
+                mvcc::SnapshotRead::Tombstoned | mvcc::SnapshotRead::NotYetWritten => None,
+            };
+        }
         if let Some(ov) = &self.txn {
             if let Some((_, v)) = ov.get(key) {
                 return v.clone(); // read-your-writes within the txn
@@ -758,6 +822,25 @@ impl<V: Vfs> Storage<V> {
     /// memtable over SSTables, tombstones dropped. Backs index lookups and
     /// type-range backfill. O(matching + #sstables·log n).
     pub fn scan_range(&self, lo: &Key, hi: &Key) -> Vec<(Key, Vec<u8>)> {
+        // SP116 / S2.7 — user-type data-row range scan dispatches to MVCC at
+        // u64::MAX snapshot. The discriminator requires BOTH bounds to be
+        // 20-byte user-type keys with the SAME type_id (the canonical
+        // type-prefix range produced by callers as
+        // `[make_key(t, &[0;16]), make_key(t, &[255;16])]`). Sub-ranges within
+        // a single type also dispatch — `mvcc::scan_at_snapshot` returns all
+        // live versions for the type, which we then post-filter against the
+        // requested [lo, hi]. Cross-type or partial-prefix ranges fall through.
+        if let (Some(t_lo), Some(t_hi)) = (data_row_dispatch(lo), data_row_dispatch(hi)) {
+            if t_lo == t_hi {
+                let mut out: Vec<(Key, Vec<u8>)> = mvcc::scan_at_snapshot(self, t_lo, u64::MAX)
+                    .into_iter()
+                    .map(|(oid, v)| (make_key(t_lo, &oid), v))
+                    .filter(|(k, _)| k >= lo && k <= hi)
+                    .collect();
+                out.sort_by(|a, b| a.0.cmp(&b.0));
+                return out;
+            }
+        }
         // An inverted inclusive range `[lo, hi]` with `lo > hi` contains
         // nothing — and `BTreeMap::range(lo..=hi)` *panics* on it. A
         // caller can legitimately produce one (e.g. a planner narrowing
@@ -1301,6 +1384,160 @@ mod tests {
         };
         assert_eq!(build(&[]), build(&[3, 10, 20]));
         assert_eq!(build(&[3, 10, 20]), build(&[0, 1, 2, 29]));
+    }
+
+    /// SP116 / S2.7 — Hand-derived KATs for the storage-layer MVCC dispatch
+    /// discriminator (`data_row_dispatch`). These lock the discriminator's
+    /// reserved-range exclusions so a future tweak that "simplifies" the
+    /// gate (e.g. removes the `type_id != 0` check or the `key[3] != 0xFF`
+    /// check) fires here, not in a downstream test that's hard to trace
+    /// back to the discriminator.
+
+    /// `dispatch_user_type_routes_to_mvcc` — a 20-byte key with a user
+    /// `type_id` in (0, 0xFF00_0000) routes through MVCC; the write lands
+    /// at a 28-byte versioned key, and the same 20-byte key reads it back
+    /// via `Storage::get`.
+    #[test]
+    fn dispatch_user_type_routes_to_mvcc() {
+        let mut s = Storage::open(MemVfs::new()).unwrap();
+        let key = make_key(42, &[0x55u8; 16]); // type_id=42 → user type
+        let value = vec![0xABu8; 8];
+        s.put(7, key.clone(), value.clone()).unwrap();
+        // The 20-byte legacy key MUST NOT exist in any direct (non-MVCC) form;
+        // a raw scan over the 20-byte key range finds the reconstructed key
+        // by way of the MVCC dispatch on scan_range.
+        assert_eq!(
+            s.get(&key),
+            Some(value),
+            "SP116 dispatch: 20-byte user-type key must round-trip via MVCC"
+        );
+        // And the raw 28-byte versioned key IS present in the scan_all sweep.
+        let any_28 = s.scan_all().iter().any(|(k, _)| k.len() == 28);
+        assert!(any_28, "SP116 dispatch: write must land at a 28-byte MVCC key");
+    }
+
+    /// `dispatch_excludes_catalog_type_id_zero` — type_id=0 is reserved for
+    /// the catalog's own blob storage; that path MUST stay on legacy.
+    #[test]
+    fn dispatch_excludes_catalog_type_id_zero() {
+        let mut s = Storage::open(MemVfs::new()).unwrap();
+        let key = make_key(0, &[0u8; 16]); // type_id=0 → catalog
+        let value = vec![0xC1u8; 8];
+        s.put(3, key.clone(), value.clone()).unwrap();
+        // The 20-byte legacy key MUST appear unchanged in the dump.
+        let dump: Vec<_> = s.scan_all();
+        assert!(
+            dump.iter().any(|(k, v)| k == &key && v == &value),
+            "SP116 dispatch: type_id=0 (catalog) must stay on legacy 20-byte path"
+        );
+        // No 28-byte MVCC keys should exist (catalog NOT versioned).
+        assert!(
+            dump.iter().all(|(k, _)| k.len() != 28),
+            "SP116 dispatch: catalog write must NOT land at a 28-byte MVCC key"
+        );
+    }
+
+    /// `dispatch_excludes_high_byte_ff_aux_and_index_keys` — index + aux
+    /// keyspaces all use 0xFFxx_xxxx prefixes; their 20-byte
+    /// `make_key`-shaped entries MUST stay on legacy (NOT MVCC-versioned).
+    #[test]
+    fn dispatch_excludes_high_byte_ff_aux_and_index_keys() {
+        let mut s = Storage::open(MemVfs::new()).unwrap();
+        // One key per known reserved range — IDX_STR, IDX_NUM, IDX_EQ,
+        // XSHARD, XVOTE, SEQ_DEDUP, SEQ, OVERFLOW.
+        let reserved_types: &[u32] = &[
+            0xFFFC_0001, // IDX_STR (ordered, str/u128)
+            0xFFFD_0001, // IDX_NUM (ordered, numeric)
+            0xFFFE_0001, // IDX_EQ (equality / composite)
+            0xFFFF_FFF0, // SEQ
+            0xFFFF_FFF1, // XSHARD
+            0xFFFF_FFF2, // SEQ_DEDUP
+            0xFFFF_FFF3, // XVOTE
+            0xFFFF_FFFF, // OVERFLOW
+        ];
+        for (i, &t) in reserved_types.iter().enumerate() {
+            let key = make_key(t, &[i as u8; 16]);
+            s.put((i + 1) as u64, key.clone(), vec![i as u8; 4]).unwrap();
+            assert_eq!(
+                s.get(&key),
+                Some(vec![i as u8; 4]),
+                "SP116 dispatch: reserved type {t:#x} (20-byte aux/index key) \
+                 must round-trip via legacy, not MVCC"
+            );
+        }
+        // No 28-byte MVCC keys must have leaked from the reserved-range puts.
+        assert!(
+            s.scan_all().iter().all(|(k, _)| k.len() != 28),
+            "SP116 dispatch: reserved 0xFFxx_xxxx keys must NEVER produce 28-byte \
+             MVCC keys — they stay on legacy by construction"
+        );
+    }
+
+    /// `dispatch_excludes_non_20_byte_keys` — only keys of length exactly 20
+    /// participate in the dispatch. Catalog 3-byte, MVCC 28-byte, and any
+    /// other length pass through unchanged.
+    #[test]
+    fn dispatch_excludes_non_20_byte_keys() {
+        let mut s = Storage::open(MemVfs::new()).unwrap();
+        // 3-byte catalog-shaped key.
+        s.put(1, vec![0x00, 0x00, 0x01], vec![0xAAu8; 4]).unwrap();
+        assert_eq!(s.get(&vec![0x00, 0x00, 0x01]), Some(vec![0xAAu8; 4]));
+        // 19-byte off-by-one (too short).
+        let short = vec![1u8; 19];
+        s.put(2, short.clone(), vec![0xBBu8; 4]).unwrap();
+        assert_eq!(s.get(&short), Some(vec![0xBBu8; 4]));
+        // 21-byte off-by-one (too long).
+        let long = vec![2u8; 21];
+        s.put(3, long.clone(), vec![0xCCu8; 4]).unwrap();
+        assert_eq!(s.get(&long), Some(vec![0xCCu8; 4]));
+        // Synthetic 28-byte key (NOT an MVCC versioned key — distinct payload
+        // pattern). The 28-byte length matches what mvcc::PREFIX_LEN + 8
+        // would produce so the dispatch must NOT fire on a put with this
+        // shape (the 28-byte length is OUTPUT-only for MVCC).
+        let v28 = vec![0xDDu8; 28];
+        s.put(4, v28.clone(), vec![0xEEu8; 4]).unwrap();
+        assert_eq!(s.get(&v28), Some(vec![0xEEu8; 4]));
+    }
+
+    /// `dispatch_delete_writes_mvcc_tombstone` — Storage::delete on a 20-byte
+    /// user-type key emits an MVCC tombstone version (None value at
+    /// commit_opnum); subsequent Storage::get returns None.
+    #[test]
+    fn dispatch_delete_writes_mvcc_tombstone() {
+        let mut s = Storage::open(MemVfs::new()).unwrap();
+        let key = make_key(99, &[0x77u8; 16]);
+        let value = vec![0xF0u8; 16];
+        s.put(5, key.clone(), value.clone()).unwrap();
+        assert_eq!(s.get(&key), Some(value));
+        s.delete(10, key.clone()).unwrap();
+        assert_eq!(
+            s.get(&key),
+            None,
+            "SP116 dispatch: tombstone at op=10 must collapse to None on Storage::get"
+        );
+        // Both versions (live at 5 + tombstone at 10) exist as 28-byte MVCC keys.
+        let mvcc_keys: Vec<_> = s.scan_all().into_iter().filter(|(k, _)| k.len() == 28).collect();
+        // Two MVCC physical keys were written (op=5 live, op=10 tombstone)
+        // at DISTINCT 28-byte keys (different inverted-opnum suffix). scan_all
+        // drops `value.is_none()` (the tombstone), leaving exactly the older
+        // physical entry from op=5 visible at the raw scan layer. The MVCC
+        // visibility filter at scan_at_snapshot(u64::MAX) hides it (see the
+        // scan_range assertion below) — that's the MVCC semantic layer.
+        assert_eq!(
+            mvcc_keys.len(),
+            1,
+            "SP116 dispatch: scan_all (live-filter) keeps the op=5 physical \
+             entry; the op=10 tombstone is value-filtered out. Got {} entries.",
+            mvcc_keys.len()
+        );
+        // Sanity: scan_range over the type-prefix returns nothing (the
+        // tombstone hides the prior version under MVCC semantics at u64::MAX).
+        let lo = make_key(99, &[0u8; 16]);
+        let hi = make_key(99, &[0xFFu8; 16]);
+        assert!(
+            s.scan_range(&lo, &hi).is_empty(),
+            "SP116 dispatch: scan_range at u64::MAX after tombstone must be empty"
+        );
     }
 
     /// SP116 / S2.7 (Decision 1) — Storage::digest MVCC-keyspace skip.

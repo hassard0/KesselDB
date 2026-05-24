@@ -513,4 +513,251 @@ mod tests {
         assert_ne!(a, SnapshotRead::Tombstoned);
         assert_ne!(SnapshotRead::Tombstoned, SnapshotRead::NotYetWritten);
     }
+
+    // -----------------------------------------------------------------------
+    // T4.1: Snapshot read of a never-written (type_id, object_id) → NotYetWritten.
+    //
+    // KAT derivation: no put_versioned calls reference type_id=7 / obj(99).
+    // All snapshot windows must see an empty version chain → NotYetWritten.
+    // Checks snapshot=0 (absolute minimum) and snapshot=1000 (far future).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn never_written_prefix_returns_not_yet_written() {
+        let store = Storage::open(MemVfs::new()).unwrap();
+        assert_eq!(
+            get_at_snapshot(&store, 7, &obj(99), 1000),
+            SnapshotRead::NotYetWritten,
+            "large snapshot on empty key must be NotYetWritten"
+        );
+        assert_eq!(
+            get_at_snapshot(&store, 7, &obj(99), 0),
+            SnapshotRead::NotYetWritten,
+            "snapshot=0 on empty key must be NotYetWritten"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // T4.2: Snapshot far beyond the latest written opnum returns the latest value.
+    //
+    // KAT derivation:
+    //   write opnum=10 value="v10"
+    //   snapshot=u64::MAX: newest version with commit_opnum ≤ u64::MAX is opnum=10
+    //     → Found("v10")
+    //   snapshot=1<<40 (=1_099_511_627_776) >> 10: same reasoning → Found("v10")
+    //   snapshot=9: no version with commit_opnum ≤ 9 exists → NotYetWritten
+    // -----------------------------------------------------------------------
+    #[test]
+    fn snapshot_beyond_max_written_returns_latest() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        let oid = obj(100);
+        put_versioned(&mut store, 7, &oid, 10, Some(b"v10".to_vec())).unwrap();
+
+        match get_at_snapshot(&store, 7, &oid, u64::MAX) {
+            SnapshotRead::Found(b) => assert_eq!(b, b"v10", "snapshot=u64::MAX must return v10"),
+            o => panic!("expected Found(v10) at snapshot=u64::MAX, got {:?}", o),
+        }
+        match get_at_snapshot(&store, 7, &oid, 1u64 << 40) {
+            SnapshotRead::Found(b) => assert_eq!(b, b"v10", "snapshot=1<<40 must return v10"),
+            o => panic!("expected Found(v10) at snapshot=1<<40, got {:?}", o),
+        }
+        // Sanity: snapshot before the single write.
+        assert_eq!(
+            get_at_snapshot(&store, 7, &oid, 9),
+            SnapshotRead::NotYetWritten,
+            "snapshot=9 must be NotYetWritten (write was at opnum=10)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // T4.3: Snapshot exactly AT a commit_opnum returns that version (inclusive boundary).
+    //
+    // KAT derivation:
+    //   write opnum=50 value="x"
+    //   snapshot=50: newest version with commit_opnum ≤ 50 is opnum=50 → Found("x")
+    //   snapshot=49: no version with commit_opnum ≤ 49 exists → NotYetWritten
+    //
+    // This test pins the INCLUSIVE boundary of the ≤ predicate — snapshot==commit_opnum
+    // must resolve, not be excluded.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn snapshot_at_commit_opnum_returns_that_version() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        let oid = obj(101);
+        put_versioned(&mut store, 7, &oid, 50, Some(b"x".to_vec())).unwrap();
+
+        match get_at_snapshot(&store, 7, &oid, 50) {
+            SnapshotRead::Found(b) => assert_eq!(b, b"x", "snapshot=50 must find value at opnum=50"),
+            o => panic!("expected Found at snapshot==commit_opnum=50, got {:?}", o),
+        }
+        assert_eq!(
+            get_at_snapshot(&store, 7, &oid, 49),
+            SnapshotRead::NotYetWritten,
+            "snapshot=49 must be NotYetWritten (write is at opnum=50, exclusive)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // T4.4: Many versions on one key; exhaustive sweep of all snapshot values.
+    //
+    // KAT derivation:
+    //   writes: (5,"a"), (10,"b"), (15,"c"), (20,"d"), (25,"e"), (30,"f")
+    //   For each snapshot s in 0..=40, expected = max(opnum | opnum ≤ s).value
+    //     s=0..4   → None          → NotYetWritten
+    //     s=5..9   → opnum=5       → Found("a")
+    //     s=10..14 → opnum=10      → Found("b")
+    //     s=15..19 → opnum=15      → Found("c")
+    //     s=20..24 → opnum=20      → Found("d")
+    //     s=25..29 → opnum=25      → Found("e")
+    //     s=30..40 → opnum=30      → Found("f")
+    //
+    // The expected value is derived inline from the `writes` slice — same rule
+    // as the implementation ("newest commit_opnum ≤ snapshot wins") — making
+    // this a full KAT sweep rather than a tautological self-check.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn many_versions_many_snapshots_exhaustive() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        let oid = obj(102);
+        let writes: Vec<(u64, &[u8])> = vec![
+            (5, b"a"),
+            (10, b"b"),
+            (15, b"c"),
+            (20, b"d"),
+            (25, b"e"),
+            (30, b"f"),
+        ];
+        for &(c, v) in &writes {
+            put_versioned(&mut store, 7, &oid, c, Some(v.to_vec())).unwrap();
+        }
+        for snap in 0u64..=40 {
+            // Hand-derive: take max opnum ≤ snap from the writes list.
+            let expected: Option<&[u8]> = writes
+                .iter()
+                .filter(|(c, _)| *c <= snap)
+                .max_by_key(|(c, _)| *c)
+                .map(|(_, v)| *v);
+            match (expected, get_at_snapshot(&store, 7, &oid, snap)) {
+                (None, SnapshotRead::NotYetWritten) => {}
+                (Some(e), SnapshotRead::Found(b)) => {
+                    assert_eq!(b, e, "wrong version at snap={}", snap);
+                }
+                (e, r) => panic!("snap={}: expected {:?} got {:?}", snap, e, r),
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // T4.5: Write → tombstone → write-again lifecycle sweep.
+    //
+    // KAT derivation:
+    //   opnum=10 → Found("v1")
+    //   opnum=20 → None (tombstone)
+    //   opnum=30 → Found("v3")
+    //
+    //   snapshot=9:  no version ≤ 9              → NotYetWritten
+    //   snapshot=10: newest ≤ 10 is opnum=10     → Found("v1")
+    //   snapshot=19: newest ≤ 19 is opnum=10     → Found("v1")  (tombstone is at 20)
+    //   snapshot=20: newest ≤ 20 is opnum=20     → Tombstoned
+    //   snapshot=25: newest ≤ 25 is opnum=20     → Tombstoned   (revival at 30)
+    //   snapshot=30: newest ≤ 30 is opnum=30     → Found("v3")
+    //   snapshot=99: newest ≤ 99 is opnum=30     → Found("v3")
+    // -----------------------------------------------------------------------
+    #[test]
+    fn write_after_tombstone_revives_key() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        let oid = obj(103);
+        put_versioned(&mut store, 7, &oid, 10, Some(b"v1".to_vec())).unwrap();
+        put_versioned(&mut store, 7, &oid, 20, None).unwrap(); // tombstone
+        put_versioned(&mut store, 7, &oid, 30, Some(b"v3".to_vec())).unwrap();
+
+        assert_eq!(
+            get_at_snapshot(&store, 7, &oid, 9),
+            SnapshotRead::NotYetWritten,
+            "snapshot=9: key not yet written"
+        );
+        match get_at_snapshot(&store, 7, &oid, 10) {
+            SnapshotRead::Found(b) => assert_eq!(b, b"v1", "snapshot=10 → v1"),
+            o => panic!("snapshot=10: expected Found(v1), got {:?}", o),
+        }
+        match get_at_snapshot(&store, 7, &oid, 19) {
+            SnapshotRead::Found(b) => assert_eq!(b, b"v1", "snapshot=19 → v1 (tombstone at 20)"),
+            o => panic!("snapshot=19: expected Found(v1), got {:?}", o),
+        }
+        assert_eq!(
+            get_at_snapshot(&store, 7, &oid, 20),
+            SnapshotRead::Tombstoned,
+            "snapshot=20: tombstone visible"
+        );
+        assert_eq!(
+            get_at_snapshot(&store, 7, &oid, 25),
+            SnapshotRead::Tombstoned,
+            "snapshot=25: still tombstoned (revival at 30)"
+        );
+        match get_at_snapshot(&store, 7, &oid, 30) {
+            SnapshotRead::Found(b) => assert_eq!(b, b"v3", "snapshot=30 → v3 (revival)"),
+            o => panic!("snapshot=30: expected Found(v3), got {:?}", o),
+        }
+        match get_at_snapshot(&store, 7, &oid, 99) {
+            SnapshotRead::Found(b) => assert_eq!(b, b"v3", "snapshot=99 → v3"),
+            o => panic!("snapshot=99: expected Found(v3), got {:?}", o),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // T4.6: Out-of-order put_versioned calls — calls arrive with non-monotonic
+    // commit_opnums. The storage layer sorts by key (inverted opnum), so even
+    // when puts arrive 30→10→20, all three versions coexist correctly and
+    // snapshot reads return the right version at every query point.
+    //
+    // KAT derivation:
+    //   put order: opnum=30→"c", opnum=10→"a", opnum=20→"b"
+    //   logical version chain (sorted by opnum): 10→"a", 20→"b", 30→"c"
+    //
+    //   snapshot=9:  newest ≤ 9 is nothing        → NotYetWritten
+    //   snapshot=10: newest ≤ 10 is opnum=10      → Found("a")
+    //   snapshot=15: newest ≤ 15 is opnum=10      → Found("a")
+    //   snapshot=20: newest ≤ 20 is opnum=20      → Found("b")
+    //   snapshot=25: newest ≤ 25 is opnum=20      → Found("b")
+    //   snapshot=30: newest ≤ 30 is opnum=30      → Found("c")
+    //   snapshot=99: newest ≤ 99 is opnum=30      → Found("c")
+    // -----------------------------------------------------------------------
+    #[test]
+    fn out_of_order_writes_still_yield_correct_snapshot_reads() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        let oid = obj(104);
+        // Deliberately insert in reverse / scrambled order.
+        put_versioned(&mut store, 7, &oid, 30, Some(b"c".to_vec())).unwrap();
+        put_versioned(&mut store, 7, &oid, 10, Some(b"a".to_vec())).unwrap();
+        put_versioned(&mut store, 7, &oid, 20, Some(b"b".to_vec())).unwrap();
+
+        assert_eq!(
+            get_at_snapshot(&store, 7, &oid, 9),
+            SnapshotRead::NotYetWritten,
+            "snapshot=9: nothing written yet"
+        );
+        match get_at_snapshot(&store, 7, &oid, 10) {
+            SnapshotRead::Found(b) => assert_eq!(b, b"a", "snapshot=10 → a"),
+            o => panic!("snapshot=10: expected Found(a), got {:?}", o),
+        }
+        match get_at_snapshot(&store, 7, &oid, 15) {
+            SnapshotRead::Found(b) => assert_eq!(b, b"a", "snapshot=15 → a (next write at 20)"),
+            o => panic!("snapshot=15: expected Found(a), got {:?}", o),
+        }
+        match get_at_snapshot(&store, 7, &oid, 20) {
+            SnapshotRead::Found(b) => assert_eq!(b, b"b", "snapshot=20 → b"),
+            o => panic!("snapshot=20: expected Found(b), got {:?}", o),
+        }
+        match get_at_snapshot(&store, 7, &oid, 25) {
+            SnapshotRead::Found(b) => assert_eq!(b, b"b", "snapshot=25 → b (next write at 30)"),
+            o => panic!("snapshot=25: expected Found(b), got {:?}", o),
+        }
+        match get_at_snapshot(&store, 7, &oid, 30) {
+            SnapshotRead::Found(b) => assert_eq!(b, b"c", "snapshot=30 → c"),
+            o => panic!("snapshot=30: expected Found(c), got {:?}", o),
+        }
+        match get_at_snapshot(&store, 7, &oid, 99) {
+            SnapshotRead::Found(b) => assert_eq!(b, b"c", "snapshot=99 → c"),
+            o => panic!("snapshot=99: expected Found(c), got {:?}", o),
+        }
+    }
 }

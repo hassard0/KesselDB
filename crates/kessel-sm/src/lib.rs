@@ -1646,6 +1646,25 @@ impl<V: Vfs> StateMachine<V> {
                 if self.catalog.types.iter().any(|t| t.name == name) {
                     return OpResult::SchemaError(format!("type '{name}' exists"));
                 }
+                // SP116 / S2.7 caveat-closure: refuse to mint a user-type ID
+                // that would alias the reserved aux/index range
+                // (`0xFF00_0000..=u32::MAX`) — the storage-layer MVCC dispatch
+                // discriminator relies on `1 <= type_id <= MAX_USER_TYPE_ID`
+                // to route data-row keys through MVCC. Without this gate, a
+                // long-lived deployment that allocated 4 billion+ user types
+                // would silently violate the dispatch contract; with it, the
+                // catalog refuses cleanly instead of corrupting routing.
+                // Single source of truth: kessel_storage::MAX_USER_TYPE_ID.
+                if self.catalog.next_type_id > kessel_storage::MAX_USER_TYPE_ID {
+                    return OpResult::SchemaError(format!(
+                        "catalog: user-type ID space exhausted (next_type_id={} > \
+                         MAX_USER_TYPE_ID={:#010x}); the reserved range starts at \
+                         0xFF00_0000 (aux/index keyspaces) and routing data rows \
+                         there would silently corrupt the MVCC dispatch",
+                        self.catalog.next_type_id,
+                        kessel_storage::MAX_USER_TYPE_ID
+                    ));
+                }
                 let type_id = self.catalog.next_type_id;
                 // Deterministically (re)assign field ids 1..=n.
                 let fields: Vec<Field> = raw_fields
@@ -13638,6 +13657,103 @@ mod tests {
         let vals =
             vec![value_from_raw(FieldKind::U64, &qty.to_le_bytes())];
         kessel_codec::encode(&ot, &vals).unwrap()
+    }
+
+    /// SP116 caveat-closure (kessel-sm side): the catalog allocator
+    /// REFUSES to mint a user-type ID that would alias the reserved
+    /// `0xFF00_0000..=u32::MAX` range. Setting `next_type_id` past
+    /// `MAX_USER_TYPE_ID` and then issuing Op::CreateType produces a
+    /// `SchemaError` — NOT silent corruption of the MVCC dispatch
+    /// routing.
+    ///
+    /// This is the kessel-sm-side mirror of the kessel-storage tests
+    /// that lock the dispatch boundary. The single source of truth is
+    /// `kessel_storage::MAX_USER_TYPE_ID = 0xFEFF_FFFF`.
+    #[test]
+    fn it_caveat_catalog_refuses_user_type_id_beyond_max() {
+        use kessel_catalog::FieldKind;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        // Fast-forward the catalog allocator past the safe boundary.
+        // This is a TEST-only invariant violation that the gate must
+        // catch — in production no path can produce this state, but
+        // the gate is the structural protection against future-someone
+        // adding such a path.
+        sm.catalog.next_type_id = kessel_storage::MAX_USER_TYPE_ID + 1;
+        let def = encode_type_def(
+            "boundary",
+            &[Field {
+                field_id: 0,
+                name: "v".into(),
+                kind: FieldKind::U64,
+                nullable: false,
+            }],
+        );
+        let r = sm.apply(2, Op::CreateType { def });
+        match r {
+            OpResult::SchemaError(msg) => {
+                assert!(
+                    msg.contains("MAX_USER_TYPE_ID")
+                        || msg.contains("exhausted"),
+                    "SP116 caveat: error message must surface the cause; got: {msg}"
+                );
+            }
+            other => panic!(
+                "SP116 caveat: CreateType past MAX_USER_TYPE_ID must return \
+                 SchemaError; got {other:?}"
+            ),
+        }
+    }
+
+    /// SP116 caveat-closure: same gate at the EXACT boundary —
+    /// next_type_id == MAX_USER_TYPE_ID + 1 → SchemaError; but
+    /// next_type_id == MAX_USER_TYPE_ID → still allocates cleanly.
+    #[test]
+    fn it_caveat_catalog_allocates_at_max_user_type_id_inclusive() {
+        use kessel_catalog::FieldKind;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.catalog.next_type_id = kessel_storage::MAX_USER_TYPE_ID;
+        let def = encode_type_def(
+            "last_safe",
+            &[Field {
+                field_id: 0,
+                name: "v".into(),
+                kind: FieldKind::U64,
+                nullable: false,
+            }],
+        );
+        let r = sm.apply(2, Op::CreateType { def });
+        match r {
+            OpResult::TypeCreated(t) => {
+                assert_eq!(
+                    t,
+                    kessel_storage::MAX_USER_TYPE_ID,
+                    "SP116 caveat: type_id == MAX_USER_TYPE_ID IS a valid \
+                     user type and must allocate cleanly (the boundary is \
+                     INCLUSIVE at the upper end)"
+                );
+            }
+            other => panic!(
+                "SP116 caveat: CreateType at MAX_USER_TYPE_ID must succeed; \
+                 got {other:?}"
+            ),
+        }
+        // After allocation, next_type_id advanced to MAX + 1; the next
+        // Op::CreateType must REFUSE.
+        let def2 = encode_type_def(
+            "one_too_far",
+            &[Field {
+                field_id: 0,
+                name: "v".into(),
+                kind: FieldKind::U64,
+                nullable: false,
+            }],
+        );
+        let r2 = sm.apply(3, Op::CreateType { def: def2 });
+        assert!(
+            matches!(r2, OpResult::SchemaError(_)),
+            "SP116 caveat: after exhausting the user-type range, the next \
+             CreateType MUST fail. Got {r2:?}"
+        );
     }
 
     /// SP116 T3-1: LegacyKeyspaceEmpty integration gate.

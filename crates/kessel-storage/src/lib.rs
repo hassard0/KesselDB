@@ -33,37 +33,68 @@ pub fn make_key(type_id: u32, object_id: &[u8; 16]) -> Key {
     k
 }
 
+/// SP116 / S2.7 — **Single source of truth** for the user-type ID range.
+///
+/// User-type IDs MUST satisfy `1 <= type_id <= MAX_USER_TYPE_ID`. The catalog
+/// allocator in `kessel-sm::StateMachine::apply` `Op::CreateType` enforces
+/// this at allocation time (returns `SchemaError` if exhaustion); the
+/// storage-layer MVCC dispatch in `data_row_dispatch` enforces it at every
+/// read/write (keys with `type_id > MAX_USER_TYPE_ID` route to legacy, NOT
+/// MVCC). Both sites import this constant — the two-place enforcement keeps
+/// the contract verifiable in either direction.
+///
+/// **Reserved values above MAX_USER_TYPE_ID** (the entire `0xFF00_0000..=u32::MAX`
+/// range is reserved for aux/index keyspaces per the kessel-sm convention):
+///   - `0xFFFC_xxxx` — IDX_STR (ordered, string + u128)
+///   - `0xFFFD_xxxx` — IDX_NUM (ordered, numeric)
+///   - `0xFFFE_xxxx` — IDX_EQ (equality + composite)
+///   - `0xFFFF_FFF0` — SEQ (sequencer)
+///   - `0xFFFF_FFF1` — XSHARD (cross-shard coordinator)
+///   - `0xFFFF_FFF2` — SEQ_DEDUP
+///   - `0xFFFF_FFF3` — XVOTE (cross-shard vote)
+///   - `0xFFFF_FFFF` — OVERFLOW (blob storage)
+///
+/// SP116-shipped caveat addressed by this constant: prior to this fix the
+/// dispatch implicitly trusted the catalog allocator's monotonic-from-1
+/// behavior. Now the constraint is statically named, exported, and
+/// double-enforced at the allocation seam (catalog) and the usage seam
+/// (dispatch).
+pub const MAX_USER_TYPE_ID: u32 = 0xFEFF_FFFF;
+
+/// SP116 / S2.7 — Reserved value for the catalog's self-storage blob.
+///
+/// The catalog persists itself at `make_key(CATALOG_TYPE_ID, &[0; 16])`
+/// (20-byte key, all-zero object_id). `data_row_dispatch` MUST NOT route
+/// this key through MVCC — versioning the catalog would silently break the
+/// catalog reload path (a fresh open would read whichever version the LSM
+/// happened to surface first instead of the latest).
+pub const CATALOG_TYPE_ID: u32 = 0;
+
 /// SP116 / S2.7 — Storage-layer MVCC dispatch discriminator.
 ///
 /// Returns `Some(type_id)` iff `key` is a **user-type data-row key**:
 ///   - exactly 20 bytes (matches `make_key` shape), AND
-///   - the type_id's high byte (`key[3]`, the most-significant byte of the
-///     little-endian u32) is NOT 0xFF, AND
-///   - the type_id is NOT 0 (type_id=0 is reserved for the catalog's own
-///     blob, which the SM persists via `self.storage.put` at
-///     `make_key(0, &[0; 16])`; routing that to MVCC would version the
-///     catalog and break the empty-data-row-keyspace invariants).
+///   - `type_id` is in the user-type range `[1, MAX_USER_TYPE_ID]`
+///     (excludes `CATALOG_TYPE_ID = 0` and the entire `0xFF00_0000..=u32::MAX`
+///     reserved range — see `MAX_USER_TYPE_ID` for the full reserved table).
 ///
-/// Reserved-range exclusions:
-///   - **type_id = 0**            — catalog self-storage blob
-///   - **type_id ≥ 0xFF00_0000**  — aux + index keyspaces (high-byte 0xFF):
-///     OVERFLOW=0xFFFF_FFFF, SEQ=0xFFFF_FFF0, XSHARD=0xFFFF_FFF1,
-///     SEQ_DEDUP=0xFFFF_FFF2, XVOTE=0xFFFF_FFF3, IDX_EQ=0xFFFE_xxxx,
-///     IDX_NUM=0xFFFD_xxxx, IDX_STR=0xFFFC_xxxx
-///
-/// User types are allocated monotonically from 1 by the catalog and stay
-/// safely in the open interval (0, 0xFF00_0000).
+/// Single source of truth: this gate uses the `MAX_USER_TYPE_ID` constant
+/// that the catalog allocator (in kessel-sm) ALSO references when refusing
+/// to mint a user type that would alias the reserved range. The two-place
+/// enforcement makes the invariant inspectable from either direction.
 ///
 /// This is the safe shape; a naive `key.len() == 20` discriminator would
 /// MVCC-versionize index entries AND the catalog blob (both also use
 /// `make_key`). The classifier flagged the unsafe form during SP116 T2;
 /// the failing `it_coverage_catalog_ddl_byte_net_zero_versioned_keyspace`
-/// test surfaced the catalog-blob trap one iteration later.
+/// test surfaced the catalog-blob trap one iteration later; this constant
+/// addresses the remaining "currently enforced by catalog allocator but
+/// not statically guaranteed" caveat from the SP116 shipped record.
 #[inline]
 pub(crate) fn data_row_dispatch(key: &[u8]) -> Option<u32> {
-    if key.len() == mvcc::PREFIX_LEN && key[3] != 0xFF {
+    if key.len() == mvcc::PREFIX_LEN {
         let type_id = u32::from_le_bytes([key[0], key[1], key[2], key[3]]);
-        if type_id != 0 {
+        if type_id != CATALOG_TYPE_ID && type_id <= MAX_USER_TYPE_ID {
             return Some(type_id);
         }
     }
@@ -1537,6 +1568,107 @@ mod tests {
         assert!(
             s.scan_range(&lo, &hi).is_empty(),
             "SP116 dispatch: scan_range at u64::MAX after tombstone must be empty"
+        );
+    }
+
+    /// SP116 / S2.7 — caveat-closure KATs for the user-type ID boundary.
+    ///
+    /// These lock the discriminator behavior at the exact MAX_USER_TYPE_ID
+    /// boundary: type_id = MAX_USER_TYPE_ID is the LAST routable user type;
+    /// type_id = MAX_USER_TYPE_ID + 1 (i.e., 0xFF00_0000) is the FIRST
+    /// reserved address and MUST stay legacy. Mirror tests verify the
+    /// CATALOG_TYPE_ID = 0 exclusion (catalog blob stays legacy).
+    /// The catalog-side allocator gate is exercised separately in kessel-sm
+    /// (the SP116-caveat-closure test there asserts CreateType refuses to
+    /// allocate next_type_id > MAX_USER_TYPE_ID).
+
+    /// `dispatch_at_max_user_type_id_routes_to_mvcc` — the LAST routable
+    /// user type. Off-by-one paranoia: if a future change tightens the
+    /// gate to `<` instead of `<=`, this catches it.
+    #[test]
+    fn dispatch_at_max_user_type_id_routes_to_mvcc() {
+        let mut s = Storage::open(MemVfs::new()).unwrap();
+        let key = make_key(MAX_USER_TYPE_ID, &[0x33u8; 16]);
+        s.put(1, key.clone(), vec![0xABu8; 4]).unwrap();
+        assert_eq!(
+            s.get(&key),
+            Some(vec![0xABu8; 4]),
+            "SP116 caveat: type_id == MAX_USER_TYPE_ID (0xFEFF_FFFF) IS \
+             a user type and MUST route to MVCC"
+        );
+        assert!(
+            s.scan_all().iter().any(|(k, _)| k.len() == 28),
+            "SP116 caveat: max-user-type write must land at a 28-byte MVCC key"
+        );
+    }
+
+    /// `dispatch_at_first_reserved_type_id_stays_legacy` — exactly one above
+    /// MAX_USER_TYPE_ID is the first reserved value (0xFF00_0000). Must NOT
+    /// be MVCC-routed (would alias the reserved aux/index range).
+    #[test]
+    fn dispatch_at_first_reserved_type_id_stays_legacy() {
+        let mut s = Storage::open(MemVfs::new()).unwrap();
+        let key = make_key(MAX_USER_TYPE_ID.wrapping_add(1), &[0x44u8; 16]);
+        s.put(1, key.clone(), vec![0xCDu8; 4]).unwrap();
+        let dump = s.scan_all();
+        assert!(
+            dump.iter().any(|(k, v)| k == &key && v == &vec![0xCDu8; 4]),
+            "SP116 caveat: type_id = MAX_USER_TYPE_ID + 1 (= 0xFF00_0000, \
+             first reserved address) MUST stay on the legacy 20-byte path"
+        );
+        assert!(
+            dump.iter().all(|(k, _)| k.len() != 28),
+            "SP116 caveat: first-reserved write must NOT produce a 28-byte MVCC key"
+        );
+    }
+
+    /// `dispatch_at_catalog_type_id_stays_legacy` — explicit re-test of
+    /// the CATALOG_TYPE_ID (= 0) exclusion that was added when the
+    /// `it_coverage_catalog_ddl_byte_net_zero_versioned_keyspace` test
+    /// surfaced the catalog-blob trap. Mirrors the constant naming.
+    #[test]
+    fn dispatch_at_catalog_type_id_stays_legacy() {
+        let mut s = Storage::open(MemVfs::new()).unwrap();
+        let key = make_key(CATALOG_TYPE_ID, &[0u8; 16]);
+        s.put(1, key.clone(), vec![0xC0u8; 4]).unwrap();
+        let dump = s.scan_all();
+        assert!(
+            dump.iter().any(|(k, v)| k == &key && v == &vec![0xC0u8; 4]),
+            "SP116 caveat: CATALOG_TYPE_ID (0) MUST stay on legacy path"
+        );
+        assert!(
+            dump.iter().all(|(k, _)| k.len() != 28),
+            "SP116 caveat: catalog-key write must NOT produce a 28-byte MVCC key"
+        );
+    }
+
+    /// `max_user_type_id_constant_value_locked` — pin the literal value so
+    /// a future "simplification" to a different boundary can't silently
+    /// change the contract. If this value ever changes, the catalog
+    /// allocator gate in kessel-sm + the dispatch gate here MUST update
+    /// together.
+    #[test]
+    fn max_user_type_id_constant_value_locked() {
+        assert_eq!(
+            MAX_USER_TYPE_ID, 0xFEFF_FFFF,
+            "SP116 caveat: MAX_USER_TYPE_ID is the single source of truth \
+             for the user-type-vs-reserved boundary; the catalog allocator \
+             AND data_row_dispatch BOTH reference this constant. If this \
+             value changes, update both sites in lockstep."
+        );
+        assert_eq!(
+            CATALOG_TYPE_ID, 0,
+            "SP116 caveat: CATALOG_TYPE_ID is reserved for the catalog blob; \
+             value is locked at 0 (the catalog's persisted-at make_key(0, \
+             &[0;16]) shape)."
+        );
+        // The reserved range starts EXACTLY at MAX_USER_TYPE_ID + 1.
+        assert_eq!(
+            MAX_USER_TYPE_ID.wrapping_add(1),
+            0xFF00_0000,
+            "SP116 caveat: reserved-range start MUST be MAX_USER_TYPE_ID + 1; \
+             the kessel-sm aux constants (SEQ=0xFFFF_FFF0 etc.) all live in \
+             0xFF00_0000..=u32::MAX."
         );
     }
 

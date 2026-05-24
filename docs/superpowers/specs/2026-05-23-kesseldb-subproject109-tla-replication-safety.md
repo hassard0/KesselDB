@@ -139,25 +139,32 @@ No file was trimmed or edited post-run; each is the raw output of the TLC invoca
 |---|---|---|---|---|---|---|
 | `2026-05-23-partial-MR3-d19.txt` | Windows (ihass) | MR=3 (post-fix#4) | 117,241,088 | 19 | ~35 min | Disk-exhausted (no violation) |
 | `2026-05-23-partial-MR2-windows-killed.txt` | Windows (ihass) | MR=2 (post-fix#4) | 160,145,912 | 20 | ~50 min | User-requested cleanup / exit code -1 (no violation) |
-| `2026-05-23-vulcan-MR3.txt` | Vulcan (4x V100, 251 GB RAM) | MR=3 (post-fix#4) | **435,273,398** | **20** | **~44 min** | Disk-exhausted at ~44 min (no violation) |
+| `2026-05-23-vulcan-MR3.txt` | Vulcan (4x V100, 251 GB RAM) | MR=3 (post-fix#4) | **528,599,314** | **21** | **~55 min** | Disk-exhausted, exit=1 (no violation) |
 
 **Vulcan MR=3 is the headline evidence.** Running on a 251 GB RAM machine with
--Xmx64g -fpmem 0.9 and 16 workers, TLC explored 435 million distinct states at depth
-20 before the host disk (915 GB NVMe, 867 GB used) was exhausted. The TLC process
-exited when the disk filled; the log contains no invariant violation. The last
+-Xmx64g -fpmem 0.9 and 16 workers, TLC explored **528 million distinct states at
+depth 21** before the host disk (915 GB NVMe, 867 GB used) was exhausted. TLC
+terminated with exit code 1 and the explicit JVM message `java.io.IOException:
+No space left on device`; the log contains no invariant violation. The last
 progress entry in `2026-05-23-vulcan-MR3.txt` reads:
 
 ```
-Progress(20) at 2026-05-23 23:57:25: 2,444,797,542 states generated (54,401,484 s/min),
-435,273,398 distinct states found (9,598,567 ds/min), 245,441,944 states left on queue.
+Progress(21) at 2026-05-24 00:07:25: 2,995,777,589 states generated (55,046,961 s/min),
+528,599,314 distinct states found (8,599,543 ds/min), 296,785,573 states left on queue.
 ```
+
+Honest history note: an interim T6 snapshot captured this file at 435M / depth 20
+(commit `325f308`); TLC continued running past that point and reached the final
+528M / depth 21 numbers above before the host disk filled. The committed file is
+the final raw log (90 lines, including the explicit exit-1 disk-full diagnostic);
+this section quotes the actual end-state.
 
 **Summary:** Three independent runs at two different hosts and two different bound
 configurations (MR=2 and MR=3) all reach hundreds of millions of distinct states
-at depth 20 without finding any invariant violation (TypeOK, LogPrefixSafety,
+at depth 20-21 without finding any invariant violation (TypeOK, LogPrefixSafety,
 NoDivergence, ExactlyOnceApply). The rigor-checkpoint baseline for SP109 is the
-vulcan MR=3 run: **435M distinct states / depth 20 / no violation / disk-exhausted
-at ~44 min**.
+vulcan MR=3 run: **528M distinct states / depth 21 / no violation / disk-exhausted
+exit=1 at ~55 min**.
 
 Partial-coverage-at-disk-exhaustion is the honest characterization. The rigor value
 is real: hundreds of millions of distinct states explored in the configured invariant
@@ -246,7 +253,7 @@ SP109 SHIPS S1. The strategic-tier backlog after SP109:
 
 **Thesis-fit:** SP109's thesis-fit is the **verifiable-behavior pillar** of the
 project THESIS (`docs/THESIS.md`): "every correctness claim is checkable (formal
-specs, adversarial tests, Jepsen)." A 435M-state TLC run post four TLC-found spec
+specs, adversarial tests, Jepsen)." A 528M-state TLC run post four TLC-found spec
 tightenings is a direct instantiation of that pillar. The spec is a live artifact —
 every future kessel-vsr change should be reflected in Replication.tla.
 

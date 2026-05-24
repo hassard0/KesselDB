@@ -70,3 +70,21 @@ Progress(20) at 2026-05-23 23:54:25: 2,284,586,409 states generated (54,861,462 
 Progress(20) at 2026-05-23 23:55:25: 2,338,989,953 states generated (54,403,544 s/min), 416,187,663 distinct states found (9,997,105 ds/min), 234,469,780 states left on queue.
 Progress(20) at 2026-05-23 23:56:25: 2,390,396,058 states generated (51,406,105 s/min), 425,674,831 distinct states found (9,487,168 ds/min), 239,862,423 states left on queue.
 Progress(20) at 2026-05-23 23:57:25: 2,444,797,542 states generated (54,401,484 s/min), 435,273,398 distinct states found (9,598,567 ds/min), 245,441,944 states left on queue.
+Progress(20) at 2026-05-23 23:58:25: 2,500,704,208 states generated (55,906,666 s/min), 444,336,235 distinct states found (9,062,837 ds/min), 250,279,767 states left on queue.
+Progress(20) at 2026-05-23 23:59:25: 2,555,213,212 states generated (54,509,004 s/min), 453,192,177 distinct states found (8,855,942 ds/min), 255,000,795 states left on queue.
+Progress(20) at 2026-05-24 00:00:25: 2,609,215,895 states generated (54,002,683 s/min), 462,152,032 distinct states found (8,959,855 ds/min), 259,804,810 states left on queue.
+Progress(20) at 2026-05-24 00:01:25: 2,662,777,375 states generated (53,561,480 s/min), 472,125,003 distinct states found (9,972,971 ds/min), 265,573,246 states left on queue.
+Progress(20) at 2026-05-24 00:02:25: 2,718,698,556 states generated (55,921,181 s/min), 482,233,903 distinct states found (10,108,900 ds/min), 271,396,022 states left on queue.
+Progress(20) at 2026-05-24 00:03:25: 2,771,634,333 states generated (52,935,777 s/min), 492,305,563 distinct states found (10,071,660 ds/min), 277,301,084 states left on queue.
+Progress(21) at 2026-05-24 00:04:25: 2,828,268,115 states generated (56,633,782 s/min), 502,401,072 distinct states found (10,095,509 ds/min), 283,283,166 states left on queue.
+Progress(21) at 2026-05-24 00:05:25: 2,886,134,428 states generated (57,866,313 s/min), 511,335,415 distinct states found (8,934,343 ds/min), 288,015,765 states left on queue.
+Progress(21) at 2026-05-24 00:06:25: 2,940,730,628 states generated (54,596,200 s/min), 519,999,771 distinct states found (8,664,356 ds/min), 292,417,348 states left on queue.
+Progress(21) at 2026-05-24 00:07:25: 2,995,777,589 states generated (55,046,961 s/min), 528,599,314 distinct states found (8,599,543 ds/min), 296,785,573 states left on queue.
+Error: when writing the disk (StatePoolWriter.run):
+No space left on device
+Error: TLC threw an unexpected exception.
+This was probably caused by an error in the spec or model.
+See the User Output or TLC Console for clues to what happened.
+The exception was a java.io.IOException
+: No space left on device
+=== TLC exit=1 finished 2026-05-24T00:08:02-04:00 ===

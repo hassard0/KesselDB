@@ -266,10 +266,17 @@ pub fn prune_pending_txs(
 ///
 /// Determinism: BTreeMap::split_off — deterministic across replicas.
 pub fn prune_pending_txs_by_watermark(
-    _pending_txs: &mut BTreeMap<u64, PendingTxRecord>,
-    _low_water_mark: u64,
+    pending_txs: &mut BTreeMap<u64, PendingTxRecord>,
+    low_water_mark: u64,
 ) {
-    todo!("S2.5 T2: implement watermark-driven prune")
+    // BTreeMap::split_off(&k) returns the right half (keys >= k) and
+    // leaves the left half (keys <  k) in `self`. We KEEP the right
+    // half (recent commits at-or-above the watermark) and DROP the
+    // left half (pre-watermark commits — definitively superseded by
+    // the watermark advance per Cahill: every live reader's snapshot
+    // is >= low_water_mark, so no live reader can hold a snapshot
+    // older than an evicted Tx's commit_opnum).
+    *pending_txs = pending_txs.split_off(&low_water_mark);
 }
 
 #[cfg(test)]
@@ -381,5 +388,84 @@ mod tests {
             100,
         );
         assert!(res.is_none());
+    }
+
+    // ========================================================================
+    // SP114 / S2.5 T2 — prune_pending_txs_by_watermark KAT (1 of 11).
+    //
+    // Decision 4: STRICT less-than — entries with commit_opnum <
+    // low_water_mark are EVICTED; entries with commit_opnum >=
+    // low_water_mark are KEPT. The implementation is
+    // `BTreeMap::split_off(&low_water_mark)`, which returns the right
+    // half (>=) and leaves the left half (<) in `self`; we KEEP the
+    // right half.
+    // ========================================================================
+
+    /// KAT-5 (plan): prune_pending_txs_by_watermark strict-less-than.
+    /// Claim:    With pending_txs records at commit_opnums {1,3,5,7}
+    ///           and low_water_mark = 4, only opnums {5,7} survive —
+    ///           opnums {1,3} are strictly less than 4 and evicted;
+    ///           opnum 5 is >= 4 and kept; opnum 7 is >= 4 and kept.
+    /// Workload: Insert 4 records at opnums {1,3,5,7}. Call
+    ///           prune_pending_txs_by_watermark(low_water_mark = 4).
+    /// Expected: pending_txs.keys() == [5, 7]; len == 2.
+    /// Boundary: also exercise low_water_mark exactly at a key (=5).
+    ///           That MUST keep opnum 5 (>=) and drop opnums {1,3}
+    ///           — surviving keys [5, 7].
+    #[test]
+    fn kat_prune_pending_txs_by_watermark() {
+        // Helper record (snapshot_opnum is not material to the prune
+        // — only the BTreeMap key (commit_opnum) is).
+        fn rec(snap: u64) -> PendingTxRecord {
+            PendingTxRecord {
+                snapshot_opnum: snap,
+                read_set: vec![],
+                write_set: vec![],
+                has_incoming_rw: false,
+                has_outgoing_rw: false,
+            }
+        }
+
+        // Body 1: watermark strictly between two keys (4 splits {1,3}|{5,7}).
+        let mut map: BTreeMap<u64, PendingTxRecord> = BTreeMap::new();
+        for k in [1u64, 3, 5, 7] {
+            map.insert(k, rec(0));
+        }
+        prune_pending_txs_by_watermark(&mut map, 4);
+        let kept: Vec<u64> = map.keys().copied().collect();
+        assert_eq!(
+            kept,
+            vec![5u64, 7],
+            "watermark=4 must keep [5,7] (opnums >= 4) and evict {{1,3}}",
+        );
+
+        // Body 2: watermark EXACTLY at a key (5 keeps {5,7}).
+        let mut map: BTreeMap<u64, PendingTxRecord> = BTreeMap::new();
+        for k in [1u64, 3, 5, 7] {
+            map.insert(k, rec(0));
+        }
+        prune_pending_txs_by_watermark(&mut map, 5);
+        let kept: Vec<u64> = map.keys().copied().collect();
+        assert_eq!(
+            kept,
+            vec![5u64, 7],
+            "watermark=5 (== key) must keep [5,7] (>=) and evict {{1,3}}",
+        );
+
+        // Body 3: watermark = 0 evicts nothing.
+        let mut map: BTreeMap<u64, PendingTxRecord> = BTreeMap::new();
+        for k in [1u64, 3, 5, 7] {
+            map.insert(k, rec(0));
+        }
+        prune_pending_txs_by_watermark(&mut map, 0);
+        assert_eq!(map.len(), 4, "watermark=0 must keep everything (>=0 always)");
+
+        // Body 4: watermark above all keys evicts everything.
+        let mut map: BTreeMap<u64, PendingTxRecord> = BTreeMap::new();
+        for k in [1u64, 3, 5, 7] {
+            map.insert(k, rec(0));
+        }
+        prune_pending_txs_by_watermark(&mut map, 100);
+        assert!(map.is_empty(), "watermark above all keys must evict everything");
     }
 }

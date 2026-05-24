@@ -257,8 +257,16 @@ impl<'a, V: Vfs> Tx<'a, V> {
     /// At watermark=0 (the T1 default), this always returns `Ok(...)`,
     /// preserving byte-net-0 behaviour for all SP110/111/112/113 callers.
     pub fn begin(store: &'a Storage<V>, snapshot_opnum: u64) -> Result<Self, TxError> {
-        // SP114 / S2.5 T1 scaffold: snapshot-too-old check lands in T2.
-        // watermark = 0 => every snapshot >= 0 is valid => always Ok.
+        // SP114 / S2.5 T2: snapshot-too-old check (Decision 7). At
+        // watermark=0 (the SP110-113 default), every snapshot >= 0 is
+        // valid; byte-net-0 for all SP110-113 callers.
+        // STRICT less-than rejection: snapshot == low_water_mark is
+        // SERVEABLE (the at-watermark version is the oldest preserved
+        // by GC — Decision 3); only snapshot < low_water_mark fails.
+        let lwm = store.low_water_mark();
+        if snapshot_opnum < lwm {
+            return Err(TxError::SnapshotTooOld { low_water_mark: lwm });
+        }
         Ok(Self {
             store: TxStore::Shared(store),
             snapshot_opnum,
@@ -279,7 +287,13 @@ impl<'a, V: Vfs> Tx<'a, V> {
     /// SP114 / S2.5 T1 BREAKING CHANGE: returns `Result<Self, TxError>`.
     /// T2 adds the snapshot-too-old check. At watermark=0 always Ok.
     pub fn begin_rw(store: &'a mut Storage<V>, snapshot_opnum: u64) -> Result<Self, TxError> {
-        // SP114 / S2.5 T1 scaffold: snapshot-too-old check lands in T2.
+        // SP114 / S2.5 T2: snapshot-too-old check (Decision 7). See
+        // `Tx::begin` for the strict-less-than rationale + at-watermark
+        // serveable contract.
+        let lwm = store.low_water_mark();
+        if snapshot_opnum < lwm {
+            return Err(TxError::SnapshotTooOld { low_water_mark: lwm });
+        }
         Ok(Self {
             store: TxStore::Exclusive(store),
             snapshot_opnum,
@@ -483,7 +497,13 @@ impl<'a, V: Vfs> Tx<'a, V> {
     /// SP114 / S2.5 T1 BREAKING CHANGE: returns `Result<Self, TxError>`.
     /// T2 adds the snapshot-too-old check. At watermark=0 always Ok.
     pub fn begin_ssi(store: &'a mut Storage<V>, snapshot_opnum: u64) -> Result<Self, TxError> {
-        // SP114 / S2.5 T1 scaffold: snapshot-too-old check lands in T2.
+        // SP114 / S2.5 T2: snapshot-too-old check (Decision 7). See
+        // `Tx::begin` for the strict-less-than rationale + at-watermark
+        // serveable contract.
+        let lwm = store.low_water_mark();
+        if snapshot_opnum < lwm {
+            return Err(TxError::SnapshotTooOld { low_water_mark: lwm });
+        }
         Ok(Self {
             store: TxStore::Exclusive(store),
             snapshot_opnum,
@@ -889,6 +909,90 @@ mod tx_kats {
         // `tx` is consumed above; `tx.snapshot_opnum()` here would be a
         // compile-time "use of moved value" error — the lifecycle is
         // compile-time-enforced.
+    }
+
+    // ========================================================================
+    // SP114 / S2.5 T2 — Tx::begin* snapshot-too-old KAT (1 of 11).
+    //
+    // Decision 7: STRICT less-than. snapshot_opnum < low_water_mark is
+    // rejected with Err(TxError::SnapshotTooOld { low_water_mark }).
+    // snapshot_opnum == low_water_mark is SERVEABLE (the at-watermark
+    // version is the oldest preserved by GC — Decision 3). Each of
+    // Tx::begin / Tx::begin_rw / Tx::begin_ssi enforces the same rule.
+    // ========================================================================
+
+    /// KAT-6 (plan): Tx::begin* rejects snapshot below the watermark.
+    /// Claim:    With Storage::low_water_mark = 10, begin(snap=5) /
+    ///           begin_rw(snap=5) / begin_ssi(snap=5) all return
+    ///           Err(SnapshotTooOld { low_water_mark: 10 }). With the
+    ///           SAME watermark, begin(snap=10) / begin(snap=11) all
+    ///           return Ok (>= 10 is serveable, strict less-than).
+    /// Workload: Open Storage; set_low_water_mark(10); attempt all
+    ///           three constructors at snap in {5, 10, 11}.
+    /// Expected: snap=5  → Err(SnapshotTooOld { low_water_mark: 10 })
+    ///                     for all three constructors.
+    ///           snap=10 → Ok (at-watermark serveable).
+    ///           snap=11 → Ok (post-watermark serveable).
+    #[test]
+    fn kat_tx_begin_rejects_below_watermark() {
+        // ---- shared: begin (Shared) ----
+        let store = Storage::open(MemVfs::new()).unwrap();
+        // First: with default lwm=0, begin(snap=5) must Ok (preserves
+        // SP110-113 byte-net-0 behaviour).
+        assert!(
+            Tx::begin(&store, 5).is_ok(),
+            "lwm=0 default: snap=5 must Ok (byte-net-0)",
+        );
+
+        // ---- Now lift the watermark and test all three constructors. ----
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        store.set_low_water_mark(10);
+
+        // begin (Shared): snap=5 strictly less than lwm=10 → rejected.
+        // Use match (Tx doesn't impl Debug; expect_err can't print it).
+        match Tx::begin(&store, 5) {
+            Err(TxError::SnapshotTooOld { low_water_mark: 10 }) => {}
+            Err(other) => panic!(
+                "snap=5 < lwm=10 expected SnapshotTooOld{{10}}, got {other:?}"
+            ),
+            Ok(_) => panic!("snap=5 < lwm=10 must reject — got Ok(_)"),
+        }
+        // begin (Shared): snap=10 at watermark → serveable (Decision 3+7).
+        assert!(
+            Tx::begin(&store, 10).is_ok(),
+            "snap=10 == lwm=10 must Ok (at-watermark serveable)",
+        );
+        // begin (Shared): snap=11 above watermark → serveable.
+        assert!(
+            Tx::begin(&store, 11).is_ok(),
+            "snap=11 > lwm=10 must Ok (post-watermark serveable)",
+        );
+
+        // begin_rw (Exclusive): same contract.
+        match Tx::begin_rw(&mut store, 5) {
+            Err(TxError::SnapshotTooOld { low_water_mark: 10 }) => {}
+            Err(other) => panic!(
+                "begin_rw snap=5 < lwm=10 expected SnapshotTooOld{{10}}, got {other:?}"
+            ),
+            Ok(_) => panic!("begin_rw snap=5 < lwm=10 must reject — got Ok(_)"),
+        }
+        assert!(
+            Tx::begin_rw(&mut store, 10).is_ok(),
+            "begin_rw snap=10 == lwm=10 must Ok (at-watermark serveable)",
+        );
+
+        // begin_ssi (Exclusive, SSI commit path): same contract.
+        match Tx::begin_ssi(&mut store, 5) {
+            Err(TxError::SnapshotTooOld { low_water_mark: 10 }) => {}
+            Err(other) => panic!(
+                "begin_ssi snap=5 < lwm=10 expected SnapshotTooOld{{10}}, got {other:?}"
+            ),
+            Ok(_) => panic!("begin_ssi snap=5 < lwm=10 must reject — got Ok(_)"),
+        }
+        assert!(
+            Tx::begin_ssi(&mut store, 10).is_ok(),
+            "begin_ssi snap=10 == lwm=10 must Ok (at-watermark serveable)",
+        );
     }
 }
 

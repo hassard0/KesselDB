@@ -261,11 +261,56 @@ pub fn has_version_in_range<V: Vfs>(
 /// 28-byte key); deletion order is therefore deterministic; the
 /// resulting LSM state is byte-identical across replicas given the
 /// same pre-GC state + the same low_water_mark.
-pub fn delete_versions_older_than<V: kessel_io::Vfs>(
-    _store: &mut crate::Storage<V>,
-    _low_water_mark: u64,
+pub fn delete_versions_older_than<V: Vfs>(
+    store: &mut Storage<V>,
+    low_water_mark: u64,
 ) -> Result<usize, MvccKeyError> {
-    todo!("S2.5 T2: implement full-scan GC primitive")
+    // Build the FULL versioned-key range. The 28-byte key space is
+    // bounded lex-min = [0x00; 28] and lex-max = [0xFF; 28]; legacy
+    // 20-byte keys produced by `make_key` cannot satisfy the length
+    // check inside `decode_commit_opnum` and are skipped on the
+    // length-error branch, so a "full scan" is safe even when both
+    // 20-byte and 28-byte keys coexist in the LSM (the 20-byte keys
+    // sort INSIDE the 28-byte range because lex-comparison treats the
+    // shorter key as a strict prefix; `decode_commit_opnum` rejects
+    // them with `MvccKeyError::Length(_)` and we skip).
+    let lo: Key = vec![0x00u8; VERSIONED_KEY_LEN];
+    let hi: Key = vec![0xFFu8; VERSIONED_KEY_LEN];
+
+    // Collect keys to delete in a Vec first (avoid mutating storage
+    // mid-scan; `scan_range_versions` already returns owned Vec). The
+    // scan order is BTreeMap-deterministic (sorted ASCENDING by 28-byte
+    // key), so `to_delete` is deterministic across replicas, and so is
+    // the subsequent delete iteration.
+    let mut to_delete: Vec<Key> = Vec::new();
+    for (k, _v) in store.scan_range_versions(&lo, &hi) {
+        match decode_commit_opnum(&k) {
+            // Strict-less-than (Decision 3): a version at EXACTLY
+            // `low_water_mark` is PRESERVED — it remains the oldest
+            // serveable version for any `Tx::begin(snapshot=low_water_mark)`.
+            Ok(c) if c < low_water_mark => to_delete.push(k),
+            Ok(_) => continue,
+            // Malformed key (length != 28) — skip. The 20-byte legacy
+            // catalog/data keys land here on the length-error branch.
+            Err(_) => continue,
+        }
+    }
+
+    let count = to_delete.len();
+    // Deletion: `Storage::delete` writes a tombstone at `op_number =
+    // low_water_mark`. This is the deterministic "apply timestamp" of
+    // the GC: every replica's apply path calls into this function with
+    // the same `low_water_mark`, so every replica records tombstones
+    // under the same op_number. NB: `Storage::delete` can only fail on
+    // WAL I/O; the only `MvccKeyError` variant is `Length` — repurposed
+    // defensively here as a generic "storage delete failed" signal so
+    // the SM apply arm can reject the op atomically.
+    for k in to_delete {
+        store
+            .delete(low_water_mark, k)
+            .map_err(|_| MvccKeyError::Length(0))?;
+    }
+    Ok(count)
 }
 
 // ----------------------------------------------------------------------------
@@ -1288,6 +1333,139 @@ mod pentest_mvcc {
             mvcc_at_snap_1,
             SnapshotRead::NotYetWritten,
             "MVCC snap=1 must be NotYetWritten — legacy_val MUST NOT leak in"
+        );
+    }
+
+    // ========================================================================
+    // SP114 / S2.5 T2 — GC + watermark KATs (4 of 11).
+    //
+    // Each KAT carries a leading Claim / Workload / Expected comment block
+    // deriving the expected outcome from the watermark contract:
+    //   - delete_versions_older_than uses STRICT less-than:
+    //     versions with commit_opnum < low_water_mark are deleted;
+    //     a version at commit_opnum == low_water_mark is PRESERVED
+    //     (Decision 3). It returns the deletion count.
+    //   - Storage::low_water_mark() / set_low_water_mark are the
+    //     Tx-side accessor symmetry the SM apply arm uses to sync
+    //     the storage's view with the SM's.
+    // ========================================================================
+
+    /// KAT-1 (plan): delete_versions_older_than on empty storage.
+    /// Claim:    A fresh Storage with no versioned writes has nothing
+    ///           to delete; the primitive must return Ok(0) for any
+    ///           low_water_mark (including 0, MAX, and mid-range).
+    /// Workload: Open an empty Storage. Call delete_versions_older_than
+    ///           with low_water_mark in {0, 1, 100, u64::MAX}.
+    /// Expected: Ok(0) for every call; the storage version-scan range
+    ///           remains empty afterward (no spurious tombstones
+    ///           emitted — the function only deletes keys it visited).
+    #[test]
+    fn kat_delete_versions_older_than_empty_storage() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        for &lwm in &[0u64, 1, 100, u64::MAX] {
+            let n = delete_versions_older_than(&mut store, lwm).unwrap();
+            assert_eq!(n, 0, "empty storage: lwm={lwm} must return Ok(0)");
+        }
+        // Sanity: the version-scan range remains empty.
+        let lo = vec![0x00u8; VERSIONED_KEY_LEN];
+        let hi = vec![0xFFu8; VERSIONED_KEY_LEN];
+        let rows = store.scan_range_versions(&lo, &hi);
+        assert!(
+            rows.iter().all(|(_, v)| v.is_none() || v.is_some() == false),
+            "empty storage must remain empty (no spurious tombstones)",
+        );
+        // Stronger: scan_range_versions on empty storage returns empty.
+        assert!(rows.is_empty(), "empty storage scan must be empty");
+    }
+
+    /// KAT-7 (plan): delete_versions_older_than reclaims pre-watermark
+    /// versions and returns the count.
+    /// Claim:    With versions at commit_opnums {1,2,3,4,5,6,7},
+    ///           low_water_mark = 4 must reclaim opnums {1,2,3}
+    ///           (strict less-than) — three deletions, count == 3.
+    ///           Versions at opnums {4,5,6,7} are PRESERVED (Decision 3
+    ///           — strict less-than; at-watermark serveable).
+    /// Workload: Write 7 versions of the same key at opnums 1..=7.
+    ///           Call delete_versions_older_than(low_water_mark = 4).
+    /// Expected: returns Ok(3). Subsequent get_at_snapshot at snap >=
+    ///           4 still finds the v4..v7 versions; the version-scan
+    ///           range no longer contains the v1..v3 ORIGINAL entries
+    ///           (the storage carries tombstones for them, but their
+    ///           original Some(value) payloads are gone).
+    #[test]
+    fn kat_delete_versions_older_than_count() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        let oid = obj(50);
+        for c in 1u64..=7 {
+            let v = format!("v{c}").into_bytes();
+            put_versioned(&mut store, 7, &oid, c, Some(v)).unwrap();
+        }
+        // Hand-derived count: opnums {1,2,3} are strictly less than
+        // low_water_mark=4 ⇒ 3 deletions. opnums {4,5,6,7} preserved.
+        let n = delete_versions_older_than(&mut store, 4).unwrap();
+        assert_eq!(n, 3, "must delete exactly the 3 versions with opnum < 4");
+        // Post-GC: snap=4 still finds v4 (at-watermark serveable).
+        match get_at_snapshot(&store, 7, &oid, 4) {
+            SnapshotRead::Found(b) => assert_eq!(b, b"v4", "v4 must survive at the watermark"),
+            o => panic!("snap=4 expected Found(v4), got {o:?}"),
+        }
+        // Post-GC: snap=7 still finds v7 (newest preserved).
+        match get_at_snapshot(&store, 7, &oid, 7) {
+            SnapshotRead::Found(b) => assert_eq!(b, b"v7", "v7 must survive (newest)"),
+            o => panic!("snap=7 expected Found(v7), got {o:?}"),
+        }
+    }
+
+    /// KAT-8 (plan): version at EXACTLY low_water_mark is preserved
+    /// (strict-less-than semantics — Decision 3).
+    /// Claim:    A version at commit_opnum == low_water_mark is NOT
+    ///           reclaimed; only commit_opnum < low_water_mark goes.
+    /// Workload: Write a single version at opnum=5. Call
+    ///           delete_versions_older_than(low_water_mark = 5).
+    /// Expected: Ok(0) (nothing to delete; the at-watermark version
+    ///           is preserved). Subsequent get_at_snapshot(snap=5)
+    ///           still Found("v5"); subsequent get_at_snapshot(snap=4)
+    ///           is NotYetWritten (no version <= 4 exists).
+    #[test]
+    fn kat_delete_versions_older_than_preserves_at_watermark() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        let oid = obj(51);
+        put_versioned(&mut store, 7, &oid, 5, Some(b"v5".to_vec())).unwrap();
+        let n = delete_versions_older_than(&mut store, 5).unwrap();
+        assert_eq!(n, 0, "at-watermark version MUST be preserved (strict <)");
+        match get_at_snapshot(&store, 7, &oid, 5) {
+            SnapshotRead::Found(b) => assert_eq!(b, b"v5", "snap=5 must still Found(v5)"),
+            o => panic!("snap=5 expected Found(v5) — at-watermark serveable, got {o:?}"),
+        }
+        assert_eq!(
+            get_at_snapshot(&store, 7, &oid, 4),
+            SnapshotRead::NotYetWritten,
+            "snap=4 must be NotYetWritten (no version <= 4 exists)",
+        );
+    }
+
+    /// KAT-10 (plan): Storage::low_water_mark accessor symmetry.
+    /// Claim:    A newly-opened Storage has low_water_mark() == 0
+    ///           (the SP114 T1 default). After set_low_water_mark(W),
+    ///           low_water_mark() returns W. The accessor is a
+    ///           transparent pass-through (no normalisation, no
+    ///           validation — those are the SM apply arm's job).
+    /// Workload: Open Storage. Read low_water_mark() (expect 0).
+    ///           set_low_water_mark(42); re-read (expect 42).
+    ///           set_low_water_mark(0); re-read (expect 0 — accessor
+    ///           does NOT enforce monotonicity at this layer).
+    /// Expected: 0, then 42, then 0.
+    #[test]
+    fn kat_storage_low_water_mark_accessor() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        assert_eq!(store.low_water_mark(), 0, "fresh Storage default == 0");
+        store.set_low_water_mark(42);
+        assert_eq!(store.low_water_mark(), 42, "set then read symmetry");
+        store.set_low_water_mark(0);
+        assert_eq!(
+            store.low_water_mark(),
+            0,
+            "accessor does NOT validate monotonicity (SM apply arm's job)",
         );
     }
 }

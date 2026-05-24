@@ -1667,4 +1667,71 @@ mod tests {
         assert!(Op::decode(&[]).is_none());
         assert!(Op::decode(&[99]).is_none());
     }
+
+    // ========================================================================
+    // SP114 / S2.5 T2 — wire roundtrip KAT (1 of 11).
+    //
+    // Each watermark surface (Op::AdvanceWatermark + both
+    // OpResult::WatermarkAdvanced / WatermarkRejected + both
+    // WatermarkRejection variants) must roundtrip byte-identically
+    // (encode → decode → equal).
+    // ========================================================================
+
+    /// KAT-9 (plan): Op::AdvanceWatermark + OpResult::WatermarkAdvanced
+    /// + OpResult::WatermarkRejected (both rejection variants) wire
+    /// roundtrip byte-identically.
+    /// Claim:    Each watermark surface encodes deterministically to a
+    ///           byte string that decodes back to itself (PartialEq).
+    /// Workload: For three Op::AdvanceWatermark values {0, 42, u64::MAX}
+    ///           assert decode(encode(op)) == Some(op). For five
+    ///           OpResult values (WatermarkAdvanced with three count
+    ///           shapes + WatermarkRejected with both rejection
+    ///           variants) assert decode(encode(r)) == Some(r).
+    /// Expected: every roundtrip succeeds.
+    #[test]
+    fn kat_op_advancewatermark_wire_roundtrip() {
+        // Op::AdvanceWatermark
+        for lwm in [0u64, 42, u64::MAX] {
+            let op = Op::AdvanceWatermark { low_water_mark: lwm };
+            let bytes = op.encode();
+            assert_eq!(
+                Op::decode(&bytes),
+                Some(op.clone()),
+                "Op::AdvanceWatermark {{ lwm: {lwm} }} must roundtrip",
+            );
+        }
+        // OpResult::WatermarkAdvanced — exercise three count shapes.
+        for (lwm, dv, ev) in [(0u64, 0usize, 0usize), (42, 3, 1), (u64::MAX, 100, 50)] {
+            let r = OpResult::WatermarkAdvanced {
+                new_low_water_mark: lwm,
+                versions_deleted: dv,
+                pending_txs_evicted: ev,
+            };
+            assert_eq!(
+                OpResult::decode(&r.encode()),
+                Some(r.clone()),
+                "OpResult::WatermarkAdvanced{{lwm:{lwm}, vd:{dv}, ev:{ev}}} must roundtrip",
+            );
+        }
+        // OpResult::WatermarkRejected — both variants.
+        let r_nm = OpResult::WatermarkRejected {
+            reason: WatermarkRejection::NotMonotonic { proposed: 3, current: 5 },
+        };
+        assert_eq!(
+            OpResult::decode(&r_nm.encode()),
+            Some(r_nm.clone()),
+            "WatermarkRejected{{NotMonotonic{{3,5}}}} must roundtrip",
+        );
+        let r_ac = OpResult::WatermarkRejected {
+            reason: WatermarkRejection::AboveCommitCeiling {
+                proposed: 1000,
+                current_commit: 10,
+            },
+        };
+        assert_eq!(
+            OpResult::decode(&r_ac.encode()),
+            Some(r_ac),
+            "WatermarkRejected{{AboveCommitCeiling{{1000,10}}}} must roundtrip",
+        );
+    }
 }

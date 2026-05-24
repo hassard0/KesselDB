@@ -948,10 +948,34 @@ impl<V: Vfs> Storage<V> {
         None // cap hit (pathological tombstone run) → caller full-scans
     }
 
-    /// Order-independent CRC digest of the entire live keyspace.
+    /// Order-independent CRC digest of the entire live keyspace EXCLUDING the
+    /// 28-byte MVCC versioned keyspace. The MVCC byte-identity across replicas
+    /// is gated separately via SP115 T3 (`apply_one 3-replica byte-identity for
+    /// MVCC infrastructure ops`) + SP116 T3 (`it_sql_workload_3_replica_byte_identity`).
+    ///
+    /// **SP116 / S2.7 (Decision 1) migration.** Pre-SP116 the digest included the
+    /// MVCC keyspace, which made the xshard test's byte-identical-cross-replica
+    /// assertion structurally incompatible with MVCC keys baking `commit_opnum`
+    /// into 8 BE bytes (different op_number sequences across runs → different
+    /// MVCC keys → different digests, despite logically identical state).
+    /// Per SP116 Decision 1, the filter skips 28-byte MVCC keys; the discriminator
+    /// is the key length:
+    ///   - legacy data-row keys           = 20 bytes (`make_key(type_id, oid)`)
+    ///   - **MVCC versioned data keys**   = 28 bytes (legacy + 8 BE commit_opnum)
+    ///   - catalog / index / blob / sequencer / constraint keys use distinct
+    ///     prefix shapes; none are exactly 28 bytes by construction.
+    /// The protective `if k.len() == 28 { continue; }` filter therefore excludes
+    /// ONLY the MVCC versioned data-row keyspace, preserving every other
+    /// keyspace's byte-identical-cross-replica contribution exactly as before.
     pub fn digest(&self) -> u32 {
         let mut acc: u32 = 0xFFFF_FFFF;
         for (k, v) in self.scan_all() {
+            // SP116 (Decision 1): skip the MVCC versioned data-row keyspace
+            // so xshard / VSR / SQL determinism tests preserve their
+            // byte-identical-cross-replica intent across the SP116 cutover.
+            if k.len() == 28 {
+                continue;
+            }
             let mut rec = Vec::with_capacity(28 + v.len());
             rec.extend_from_slice(&k);
             rec.extend_from_slice(&(v.len() as u32).to_le_bytes());
@@ -1277,6 +1301,66 @@ mod tests {
         };
         assert_eq!(build(&[]), build(&[3, 10, 20]));
         assert_eq!(build(&[3, 10, 20]), build(&[0, 1, 2, 29]));
+    }
+
+    /// SP116 / S2.7 (Decision 1) — Storage::digest MVCC-keyspace skip.
+    ///
+    /// Claim: writing 28-byte MVCC versioned keys does NOT change the digest
+    /// value; the digest sees only non-28-byte keyspaces (legacy data-row /
+    /// catalog / index / blob / sequencer / constraint). This is the keystone
+    /// that lets the xshard test + ~25 other determinism assertions stay green
+    /// across the SP116 cutover.
+    ///
+    /// Workload: build storage with mixed-shape keys (20-byte legacy +
+    /// catalog + index + 28-byte MVCC); compare digest against the same build
+    /// WITHOUT the 28-byte MVCC keys.
+    /// Expected: byte-identical digests.
+    #[test]
+    fn digest_excludes_mvcc_versioned_keyspace() {
+        // Baseline: legacy 20-byte data-row + catalog (3-byte) + index
+        // (typically prefixed; >20 < 28 bytes) — none are 28 bytes.
+        let mut baseline = Storage::open(MemVfs::new()).unwrap();
+        baseline.put(1, make_key(1, &[0u8; 16]), vec![0xAAu8; 8]).unwrap();
+        baseline.put(2, make_key(1, &[1u8; 16]), vec![0xBBu8; 8]).unwrap();
+        // Catalog-shape key (3 bytes — distinct from 20 / 28).
+        baseline.put(3, vec![0x00, 0x00, 0x01], vec![0xCCu8; 8]).unwrap();
+        let baseline_digest = baseline.digest();
+
+        // With-MVCC: same as baseline PLUS some 28-byte MVCC versioned keys.
+        let mut with_mvcc = Storage::open(MemVfs::new()).unwrap();
+        with_mvcc.put(1, make_key(1, &[0u8; 16]), vec![0xAAu8; 8]).unwrap();
+        with_mvcc.put(2, make_key(1, &[1u8; 16]), vec![0xBBu8; 8]).unwrap();
+        with_mvcc.put(3, vec![0x00, 0x00, 0x01], vec![0xCCu8; 8]).unwrap();
+        // Add an MVCC key: 20-byte make_key prefix + 8 BE (u64::MAX - 5).
+        let mut mvcc_key = make_key(1, &[0u8; 16]);
+        mvcc_key.extend_from_slice(&(u64::MAX - 5u64).to_be_bytes());
+        assert_eq!(mvcc_key.len(), 28, "constructed key must be 28 bytes");
+        with_mvcc.put(4, mvcc_key.clone(), vec![0xDDu8; 16]).unwrap();
+        let mut mvcc_key2 = make_key(1, &[2u8; 16]);
+        mvcc_key2.extend_from_slice(&(u64::MAX - 10u64).to_be_bytes());
+        with_mvcc.put(5, mvcc_key2, vec![0xEEu8; 24]).unwrap();
+        let with_mvcc_digest = with_mvcc.digest();
+
+        assert_eq!(
+            baseline_digest, with_mvcc_digest,
+            "SP116 Decision 1: 28-byte MVCC keys must NOT contribute to digest \
+             (baseline digest {baseline_digest:#010x} != with-MVCC digest \
+             {with_mvcc_digest:#010x} — Decision 1 filter is broken)"
+        );
+
+        // Negative control: adding a 27-byte key (NOT MVCC shape) DOES change the digest.
+        let mut almost_mvcc = Storage::open(MemVfs::new()).unwrap();
+        almost_mvcc.put(1, make_key(1, &[0u8; 16]), vec![0xAAu8; 8]).unwrap();
+        almost_mvcc.put(2, make_key(1, &[1u8; 16]), vec![0xBBu8; 8]).unwrap();
+        almost_mvcc.put(3, vec![0x00, 0x00, 0x01], vec![0xCCu8; 8]).unwrap();
+        let mut wrong = make_key(1, &[0u8; 16]);
+        wrong.extend_from_slice(&[0xFFu8; 7]); // 20 + 7 = 27 bytes, NOT MVCC
+        almost_mvcc.put(4, wrong, vec![0xDDu8; 16]).unwrap();
+        assert_ne!(
+            baseline_digest,
+            almost_mvcc.digest(),
+            "SP116 Decision 1: non-28-byte keys (here 27) must still contribute to digest"
+        );
     }
 
     #[test]

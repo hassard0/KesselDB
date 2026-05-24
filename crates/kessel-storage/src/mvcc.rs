@@ -761,3 +761,511 @@ mod tests {
         }
     }
 }
+
+// ----------------------------------------------------------------------------
+// Pentest: hostile-input + adversarial-correctness locks (SP110 T5).
+//
+// Every attacker-controlled byte of the MVCC storage layer surface is
+// reasoned about independently:
+//   * type_id (the 4 LE bytes)         — extremes, adjacent prefixes
+//   * object_id (16 bytes verbatim)    — adjacent prefixes (last-byte bleed)
+//   * commit_opnum (8 BE inverted)     — 0 and u64::MAX boundaries; arbitrary
+//                                        out-of-order arrival
+//   * snapshot_opnum                   — 0, u64::MAX, exact-match boundaries
+//   * decode input length              — every reachable non-28 length
+//   * write/read ordering              — reverse-order puts vs has_version_in_range
+//   * legacy/versioned key coexistence — 20-byte vs 28-byte non-collision
+//
+// Each HOSTILE test wraps the call in `catch_unwind` and asserts:
+//   (a) NO panic / NO unwind (so OOM-via-panic is also caught here);
+//   (b) a TYPED `Err(MvccKeyError::...)` OR the EXACT correct `Ok(...)` /
+//       `SnapshotRead::Found(value)` per the scenario.
+// Each POSITIVE correctness lock asserts the EXACT value (no
+// `matches!(.., Found(_))` shortcuts).
+//
+// Discipline: hostile bytes (e.g., the [0x00;8] / [0xFF;8] suffixes,
+// the adjacent type_id LE encodings) are HAND-DERIVED from the encoding
+// recipe in this file's doc-comment, NOT taken from the production
+// encoder's output. A failure here is either a real vulnerability
+// (BLOCKED, report; never weaken the encoder/decoder to silence) or a
+// test bug (fix the test). Production code in this file MUST NOT change
+// to make a pentest pass.
+#[cfg(test)]
+mod pentest_mvcc {
+    use super::*;
+    use crate::{make_key, Storage};
+    use kessel_io::MemVfs;
+
+    /// Helper: deterministic 16-byte object_id from a single byte.
+    fn obj(n: u8) -> [u8; 16] {
+        let mut a = [0u8; 16];
+        a[15] = n;
+        a
+    }
+
+    /// Mirrors SP107 `pentest_v2::no_panic_typed_err`: run a closure under
+    /// `catch_unwind`, assert it did NOT panic AND yielded a typed
+    /// `Err(MvccKeyError::Length(_))`. Used by the malformed-length lock.
+    fn decode_no_panic_typed_err(key: Vec<u8>, expected_len: usize) {
+        let r = std::panic::catch_unwind(move || decode_commit_opnum(&key));
+        assert!(
+            r.is_ok(),
+            "decode_commit_opnum must NOT panic on hostile input of length {expected_len}"
+        );
+        match r.unwrap() {
+            Err(MvccKeyError::Length(n)) => assert_eq!(
+                n, expected_len,
+                "Length error must report actual length {expected_len}, got {n}"
+            ),
+            other => panic!(
+                "decode_commit_opnum on len={expected_len} must return Err(MvccKeyError::Length), got {other:?}"
+            ),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // T5.1: commit_opnum = u64::MAX (the inverted suffix is [0x00; 8],
+    // which equals the `lo` bound of the scan range exactly).
+    //
+    // KAT derivation:
+    //   inverted = u64::MAX - u64::MAX = 0
+    //   BE bytes of suffix: [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+    //   key suffix == lo's suffix [0x00;8] → matched by inclusive lo bound.
+    //   snapshot=u64::MAX is the only snapshot ≥ commit_opnum=u64::MAX,
+    //   so reads at snapshot < u64::MAX must be NotYetWritten.
+    //
+    // Hostile angle: an off-by-one in the lo bound (exclusive vs inclusive)
+    // would silently drop the u64::MAX version. This test pins inclusive.
+    // -------------------------------------------------------------------
+    #[test]
+    fn t5_1_commit_opnum_u64_max_no_panic_and_round_trips() {
+        let r = std::panic::catch_unwind(|| {
+            let mut store = Storage::open(MemVfs::new()).unwrap();
+            put_versioned(&mut store, 7, &obj(1), u64::MAX, Some(b"max".to_vec())).unwrap();
+            // Exact-suffix sanity (KAT): key suffix MUST be all-zeros BE.
+            let k = make_versioned_key(7, &obj(1), u64::MAX);
+            assert_eq!(&k[PREFIX_LEN..VERSIONED_KEY_LEN], &[0x00u8; 8]);
+            // Snapshot at the commit point must Found exactly "max".
+            let at_max = get_at_snapshot(&store, 7, &obj(1), u64::MAX);
+            // Snapshot one below must NOT see it (commit_opnum > snapshot).
+            let below = get_at_snapshot(&store, 7, &obj(1), u64::MAX - 1);
+            (at_max, below)
+        });
+        assert!(r.is_ok(), "u64::MAX commit_opnum must NOT panic");
+        let (at_max, below) = r.unwrap();
+        match at_max {
+            SnapshotRead::Found(b) => assert_eq!(b, b"max", "snap=u64::MAX must Found(max)"),
+            o => panic!("snap=u64::MAX expected Found(max), got {o:?}"),
+        }
+        assert_eq!(
+            below,
+            SnapshotRead::NotYetWritten,
+            "snap=u64::MAX-1 must NOT see a write committed at u64::MAX"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // T5.2: commit_opnum = 0 (the inverted suffix is [0xFF; 8], which
+    // equals the `hi` bound of the scan range exactly).
+    //
+    // KAT derivation:
+    //   inverted = u64::MAX - 0 = u64::MAX
+    //   BE bytes of suffix: [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+    //   key suffix == hi's suffix [0xFF;8] → matched by inclusive hi bound.
+    //   This is the LAST 28-byte key of the (type_id, object_id) prefix.
+    //
+    // Hostile angle: an off-by-one in the hi bound would silently drop
+    // the opnum=0 version. This test pins inclusive.
+    // -------------------------------------------------------------------
+    #[test]
+    fn t5_2_commit_opnum_zero_no_panic_and_round_trips() {
+        let r = std::panic::catch_unwind(|| {
+            let mut store = Storage::open(MemVfs::new()).unwrap();
+            put_versioned(&mut store, 7, &obj(2), 0, Some(b"zero".to_vec())).unwrap();
+            // Exact-suffix sanity (KAT): key suffix MUST be all-ones BE.
+            let k = make_versioned_key(7, &obj(2), 0);
+            assert_eq!(&k[PREFIX_LEN..VERSIONED_KEY_LEN], &[0xFFu8; 8]);
+            // Every snapshot ≥ 0 must Found "zero".
+            let s0 = get_at_snapshot(&store, 7, &obj(2), 0);
+            let s1 = get_at_snapshot(&store, 7, &obj(2), 1);
+            let s_max = get_at_snapshot(&store, 7, &obj(2), u64::MAX);
+            (s0, s1, s_max)
+        });
+        assert!(r.is_ok(), "opnum=0 must NOT panic");
+        let (s0, s1, s_max) = r.unwrap();
+        match s0 {
+            SnapshotRead::Found(b) => assert_eq!(b, b"zero", "snap=0 must Found(zero)"),
+            o => panic!("snap=0 expected Found(zero), got {o:?}"),
+        }
+        match s1 {
+            SnapshotRead::Found(b) => assert_eq!(b, b"zero", "snap=1 must Found(zero)"),
+            o => panic!("snap=1 expected Found(zero), got {o:?}"),
+        }
+        match s_max {
+            SnapshotRead::Found(b) => assert_eq!(b, b"zero", "snap=u64::MAX must Found(zero)"),
+            o => panic!("snap=u64::MAX expected Found(zero), got {o:?}"),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // T5.3: decode_commit_opnum rejects EVERY non-28 byte length with a
+    // typed `Err(MvccKeyError::Length(n))`, never panics.
+    //
+    // KAT lengths (per the T5 plan): 0, 1, 20 (legacy prefix length), 27
+    // (just under), 29 (just over), 100 (far over). Each is wrapped in
+    // `catch_unwind` and the returned length-field is verified to equal
+    // the input length (so an attacker cannot smuggle a wrong-length
+    // report into the error path).
+    //
+    // Hostile angle: a careless `try_into().unwrap()` on a shorter slice
+    // would panic, and `&key[20..28]` on a sub-28 slice would index-OOB.
+    // -------------------------------------------------------------------
+    #[test]
+    fn t5_3_decode_rejects_every_non_28_length_no_panic() {
+        for &len in &[0usize, 1, 19, 20, 21, 27, 29, 36, 100, 1024] {
+            decode_no_panic_typed_err(vec![0u8; len], len);
+        }
+        // Also lock: a 28-byte all-zeros buffer is accepted (decodes to
+        // commit_opnum = u64::MAX - 0 = u64::MAX). Hand-derived KAT.
+        let r = std::panic::catch_unwind(|| decode_commit_opnum(&[0u8; VERSIONED_KEY_LEN]));
+        assert!(r.is_ok(), "28-byte input must NOT panic");
+        assert_eq!(
+            r.unwrap(),
+            Ok(u64::MAX),
+            "decode([0;28]) must yield u64::MAX (inversion identity)"
+        );
+        // And a 28-byte buffer whose suffix is all-ones decodes to 0.
+        let mut all_ones_suffix = [0u8; VERSIONED_KEY_LEN];
+        for b in &mut all_ones_suffix[PREFIX_LEN..] {
+            *b = 0xFF;
+        }
+        let r2 = std::panic::catch_unwind(move || decode_commit_opnum(&all_ones_suffix));
+        assert!(r2.is_ok(), "28-byte input must NOT panic");
+        assert_eq!(
+            r2.unwrap(),
+            Ok(0u64),
+            "decode([_,_,_,_, 0xFF;8 suffix]) must yield commit_opnum=0"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // T5.4a: Two object_ids that share the first 15 bytes (only the last
+    // byte differs) MUST NOT bleed into each other's snapshot reads.
+    //
+    // KAT derivation:
+    //   obj(1) = [0,…,0, 1]; obj(2) = [0,…,0, 2]. Their full 20-byte
+    //   prefixes differ in the LAST byte → adjacent in the BTreeMap.
+    //   A bug in lo/hi construction (e.g., not including the full prefix
+    //   in the bounds) would cause obj(1)'s scan to also yield obj(2)'s
+    //   key. This test pins isolation.
+    // -------------------------------------------------------------------
+    #[test]
+    fn t5_4a_adjacent_object_id_prefixes_do_not_bleed() {
+        let r = std::panic::catch_unwind(|| {
+            let mut store = Storage::open(MemVfs::new()).unwrap();
+            put_versioned(&mut store, 7, &obj(1), 10, Some(b"obj1".to_vec())).unwrap();
+            put_versioned(&mut store, 7, &obj(2), 10, Some(b"obj2".to_vec())).unwrap();
+            put_versioned(&mut store, 7, &obj(3), 10, Some(b"obj3".to_vec())).unwrap();
+            (
+                get_at_snapshot(&store, 7, &obj(1), 100),
+                get_at_snapshot(&store, 7, &obj(2), 100),
+                get_at_snapshot(&store, 7, &obj(3), 100),
+            )
+        });
+        assert!(r.is_ok(), "adjacent-prefix reads must NOT panic");
+        let (r1, r2, r3) = r.unwrap();
+        match r1 {
+            SnapshotRead::Found(b) => assert_eq!(b, b"obj1", "obj(1) must Found(obj1) exactly"),
+            o => panic!("obj(1): {o:?}"),
+        }
+        match r2 {
+            SnapshotRead::Found(b) => assert_eq!(b, b"obj2", "obj(2) must Found(obj2) exactly"),
+            o => panic!("obj(2): {o:?}"),
+        }
+        match r3 {
+            SnapshotRead::Found(b) => assert_eq!(b, b"obj3", "obj(3) must Found(obj3) exactly"),
+            o => panic!("obj(3): {o:?}"),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // T5.4b: Two type_ids that share the first 3 LE bytes (only the last
+    // byte differs) MUST NOT bleed. Specifically:
+    //   tA = 0x0100_0000 → LE [0x00, 0x00, 0x00, 0x01]
+    //   tB = 0x0100_0001 → LE [0x01, 0x00, 0x00, 0x01]
+    // These differ in the FIRST LE byte; adjacency in BTreeMap lex order
+    // depends on the full 4-byte LE. Combined with the same object_id,
+    // their 20-byte prefixes differ in byte[0] only.
+    //
+    // Hostile angle: a scan that didn't include the FULL type_id+object_id
+    // in lo/hi could pick up tB's versions when querying tA.
+    // -------------------------------------------------------------------
+    #[test]
+    fn t5_4b_adjacent_type_id_prefixes_do_not_bleed() {
+        let r = std::panic::catch_unwind(|| {
+            let mut store = Storage::open(MemVfs::new()).unwrap();
+            let oid = obj(42);
+            let ta: u32 = 0x0100_0000;
+            let tb: u32 = 0x0100_0001;
+            put_versioned(&mut store, ta, &oid, 10, Some(b"ta".to_vec())).unwrap();
+            put_versioned(&mut store, tb, &oid, 10, Some(b"tb".to_vec())).unwrap();
+            (
+                get_at_snapshot(&store, ta, &oid, 100),
+                get_at_snapshot(&store, tb, &oid, 100),
+            )
+        });
+        assert!(r.is_ok(), "adjacent type_id reads must NOT panic");
+        let (ra, rb) = r.unwrap();
+        match ra {
+            SnapshotRead::Found(b) => assert_eq!(b, b"ta", "type_id=0x01000000 must Found(ta)"),
+            o => panic!("type_id=ta: {o:?}"),
+        }
+        match rb {
+            SnapshotRead::Found(b) => assert_eq!(b, b"tb", "type_id=0x01000001 must Found(tb)"),
+            o => panic!("type_id=tb: {o:?}"),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // T5.5: type_id = u32::MAX boundary. Encoding LE = [0xFF;4], which
+    // is the lex-maximum 4-byte prefix; if any callsite confused the
+    // type_id bound with a sentinel, this would surface it.
+    //
+    // KAT: write+read at type_id=u32::MAX, also verify another type_id
+    // (u32::MAX - 1) doesn't bleed (adjacent in lex).
+    // -------------------------------------------------------------------
+    #[test]
+    fn t5_5_type_id_u32_max_no_panic_and_no_bleed_with_adjacent() {
+        let r = std::panic::catch_unwind(|| {
+            let mut store = Storage::open(MemVfs::new()).unwrap();
+            put_versioned(&mut store, u32::MAX, &obj(3), 5, Some(b"x".to_vec())).unwrap();
+            put_versioned(&mut store, u32::MAX - 1, &obj(3), 5, Some(b"y".to_vec())).unwrap();
+            // KAT prefix bytes for type_id=u32::MAX (LE all-ones).
+            let k = make_versioned_key(u32::MAX, &obj(3), 5);
+            assert_eq!(&k[0..4], &[0xFFu8; 4]);
+            (
+                get_at_snapshot(&store, u32::MAX, &obj(3), 10),
+                get_at_snapshot(&store, u32::MAX - 1, &obj(3), 10),
+                // Reading at a *completely unrelated* type_id must NOT
+                // bleed from either of the above.
+                get_at_snapshot(&store, 0u32, &obj(3), 10),
+            )
+        });
+        assert!(r.is_ok(), "type_id=u32::MAX must NOT panic");
+        let (rmax, rmax_minus_1, runrelated) = r.unwrap();
+        match rmax {
+            SnapshotRead::Found(b) => assert_eq!(b, b"x", "type_id=u32::MAX must Found(x)"),
+            o => panic!("type_id=u32::MAX: {o:?}"),
+        }
+        match rmax_minus_1 {
+            SnapshotRead::Found(b) => assert_eq!(b, b"y", "type_id=u32::MAX-1 must Found(y)"),
+            o => panic!("type_id=u32::MAX-1: {o:?}"),
+        }
+        assert_eq!(
+            runrelated,
+            SnapshotRead::NotYetWritten,
+            "unrelated type_id=0 must NOT inherit u32::MAX-area writes"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // T5.6: Writes arrive in arbitrary order. has_version_in_range MUST
+    // return the same answer as if the writes had arrived monotonically.
+    //
+    // The pentest twist (beyond T4.6 correctness): a window
+    // (lo_excl, hi_incl] is queried AFTER older opnums are written that
+    // would naively be skipped if the scan assumed a monotonic write log.
+    //
+    // KAT scenario:
+    //   sequence of writes (in arrival order): opnum=30, 10, 50, 20, 40
+    //   logical chain (by opnum): 10,20,30,40,50.
+    //
+    //   query (15, 35]:  expected true   (matches 20, 30)
+    //   query (35, 49]:  expected true   (matches 40)
+    //   query (50, 60]:  expected false  (50 excluded; nothing > 50)
+    //   query (0, 9]:    expected false  (nothing ≤ 9)
+    //   query (10, 10]:  expected false  (half-open: 10 excluded; no version > 10 AND ≤ 10)
+    //   query (9, 10]:   expected true   (10 included)
+    //   query (40, 50]:  expected true   (50 included)
+    // -------------------------------------------------------------------
+    #[test]
+    fn t5_6_reverse_order_writes_have_version_in_range_consistent() {
+        let r = std::panic::catch_unwind(|| {
+            let mut store = Storage::open(MemVfs::new()).unwrap();
+            let oid = obj(7);
+            // Deliberately scrambled arrival order.
+            for &c in &[30u64, 10, 50, 20, 40] {
+                put_versioned(&mut store, 7, &oid, c, Some(b"v".to_vec())).unwrap();
+            }
+            (
+                has_version_in_range(&store, 7, &oid, 15, 35),
+                has_version_in_range(&store, 7, &oid, 35, 49),
+                has_version_in_range(&store, 7, &oid, 50, 60),
+                has_version_in_range(&store, 7, &oid, 0, 9),
+                has_version_in_range(&store, 7, &oid, 10, 10),
+                has_version_in_range(&store, 7, &oid, 9, 10),
+                has_version_in_range(&store, 7, &oid, 40, 50),
+            )
+        });
+        assert!(r.is_ok(), "scrambled-arrival has_version_in_range must NOT panic");
+        let (q1, q2, q3, q4, q5, q6, q7) = r.unwrap();
+        assert!(q1, "(15,35] must be true (matches opnum 20, 30)");
+        assert!(q2, "(35,49] must be true (matches opnum 40)");
+        assert!(!q3, "(50,60] must be false (50 excluded by lo)");
+        assert!(!q4, "(0,9] must be false (no version ≤ 9)");
+        assert!(!q5, "(10,10] must be false (empty half-open window)");
+        assert!(q6, "(9,10] must be true (10 included by hi)");
+        assert!(q7, "(40,50] must be true (50 included by hi)");
+    }
+
+    // -------------------------------------------------------------------
+    // T5.7: Legacy 20-byte keys and MVCC 28-byte keys MUST NOT collide
+    // for the same (type_id, object_id). This is the S2.6 cutover
+    // prerequisite — the byte-identity invariant requires that an MVCC
+    // write never mutates a legacy-written key.
+    //
+    // KAT derivation:
+    //   legacy = type_id(4 LE) ++ object_id(16)               [20 bytes]
+    //   mvcc   = type_id(4 LE) ++ object_id(16) ++ inv(8 BE)  [28 bytes]
+    //   Vec<u8> equality includes length → length mismatch alone
+    //   guarantees inequality, but we also independently confirm:
+    //     (a) the 20-byte prefix matches the first 20 bytes of EVERY
+    //         28-byte key for the same (type_id, object_id),
+    //     (b) a legacy-key write is invisible to the MVCC reader, and
+    //     (c) MVCC writes for the same (type_id, object_id) do not appear
+    //         as a legacy 20-byte key when scanned by the legacy path.
+    //
+    // Hostile angle: an encoder bug that omitted the inverted suffix when
+    // commit_opnum==0 (because inversion → u64::MAX → "no trailing
+    // bytes"?) would collapse a 28-byte key to 20 bytes and collide
+    // with the legacy path. This test pins length and lock byte content.
+    // -------------------------------------------------------------------
+    #[test]
+    fn t5_7_legacy_20byte_and_mvcc_28byte_keys_never_collide() {
+        let r = std::panic::catch_unwind(|| {
+            let legacy = make_key(7, &obj(8));
+            let mvcc_v0 = make_versioned_key(7, &obj(8), 0);
+            let mvcc_vmax = make_versioned_key(7, &obj(8), u64::MAX);
+            let mvcc_v_mid = make_versioned_key(7, &obj(8), 0x1234_5678_9ABC_DEF0);
+            // Length locks.
+            assert_eq!(legacy.len(), 20, "legacy key MUST be 20 bytes");
+            assert_eq!(mvcc_v0.len(), 28, "MVCC key MUST be 28 bytes (opnum=0)");
+            assert_eq!(
+                mvcc_vmax.len(),
+                28,
+                "MVCC key MUST be 28 bytes (opnum=u64::MAX)"
+            );
+            assert_eq!(mvcc_v_mid.len(), 28, "MVCC key MUST be 28 bytes (mid opnum)");
+            // Prefix-match locks (the first 20 bytes are shared by design).
+            assert_eq!(&legacy[..], &mvcc_v0[..PREFIX_LEN]);
+            assert_eq!(&legacy[..], &mvcc_vmax[..PREFIX_LEN]);
+            assert_eq!(&legacy[..], &mvcc_v_mid[..PREFIX_LEN]);
+            // Inequality locks (Vec<u8> equality includes length).
+            assert_ne!(legacy, mvcc_v0);
+            assert_ne!(legacy, mvcc_vmax);
+            assert_ne!(legacy, mvcc_v_mid);
+            // Suffix locks (independent of the prefix).
+            assert_eq!(&mvcc_v0[PREFIX_LEN..], &[0xFFu8; 8]);
+            assert_eq!(&mvcc_vmax[PREFIX_LEN..], &[0x00u8; 8]);
+            // Mid opnum: inv = u64::MAX - 0x1234_5678_9ABC_DEF0
+            //          = 0xEDCB_A987_6543_210F
+            // BE bytes: [0xED, 0xCB, 0xA9, 0x87, 0x65, 0x43, 0x21, 0x0F]
+            assert_eq!(
+                &mvcc_v_mid[PREFIX_LEN..],
+                &[0xED, 0xCB, 0xA9, 0x87, 0x65, 0x43, 0x21, 0x0F]
+            );
+        });
+        assert!(r.is_ok(), "legacy-vs-MVCC key construction must NOT panic");
+        r.unwrap();
+    }
+
+    // -------------------------------------------------------------------
+    // T5.7b: Live coexistence — write a legacy 20-byte key AND a 28-byte
+    // MVCC key under the same (type_id, object_id), then verify the
+    // legacy read path and the MVCC read path each see only their own
+    // entries. This is the S2.6 cutover invariant in motion.
+    //
+    // KAT scenario:
+    //   1. legacy put @ (type_id=7, obj(9)) := "legacy_val"     [20-byte key, opnum=1]
+    //   2. mvcc   put @ (type_id=7, obj(9), opnum=5) := "mvcc_v5"  [28-byte key]
+    //
+    //   Expectations:
+    //     * Scan over the legacy 20-byte key exactly yields "legacy_val".
+    //     * get_at_snapshot(7, obj(9), 100) yields Found("mvcc_v5").
+    //     * The legacy entry is NOT visible to get_at_snapshot (its key
+    //       length is 20, decode_commit_opnum would return Length(20),
+    //       which the scan handler skips via the `Err(_) => continue`
+    //       branch in get_at_snapshot).
+    //     * The MVCC entry is NOT visible to the legacy read (different
+    //       key bytes; legacy seek for a 20-byte key cannot match the
+    //       28-byte entry).
+    //
+    // Hostile angle: if get_at_snapshot's scan_range_versions emitted a
+    // legacy 20-byte key, decode_commit_opnum would either panic
+    // (defended by T5.3) or be silently misinterpreted (defended HERE
+    // — the legacy key value MUST NOT leak into MVCC snapshot reads).
+    // -------------------------------------------------------------------
+    #[test]
+    fn t5_7b_legacy_and_mvcc_coexist_without_interference() {
+        let r = std::panic::catch_unwind(|| {
+            let mut store = Storage::open(MemVfs::new()).unwrap();
+            // 1. Legacy put: 20-byte key via crate::make_key, value "legacy_val".
+            //    Use put_entry_versioned with opnum=1 so the WAL accepts it;
+            //    the LEGACY shape is the KEY length (20), not the opnum field.
+            let legacy_key = make_key(7, &obj(9));
+            assert_eq!(legacy_key.len(), 20, "legacy key sanity");
+            store
+                .put_entry_versioned(1, legacy_key.clone(), Some(b"legacy_val".to_vec()))
+                .expect("legacy put must succeed");
+            // 2. MVCC put: 28-byte key at opnum=5, value "mvcc_v5".
+            put_versioned(&mut store, 7, &obj(9), 5, Some(b"mvcc_v5".to_vec()))
+                .expect("mvcc put must succeed");
+            // Now scan the legacy key range: hi == lo+1 sentinel suffix
+            // would cross into MVCC territory, so we use the EXACT legacy
+            // key as both lo and hi (inclusive single-point read).
+            let legacy_scan = store.scan_range_versions(&legacy_key, &legacy_key);
+            // And MVCC snapshot read.
+            let mvcc_read = get_at_snapshot(&store, 7, &obj(9), 100);
+            // And MVCC snapshot at the legacy opnum (= 1) — MUST be
+            // NotYetWritten because the legacy key has length 20 and
+            // get_at_snapshot's decode_commit_opnum skips non-28-byte
+            // keys via the `Err(_) => continue` branch. The MVCC write
+            // is at opnum=5 > 1, so it's also not visible at snap=1.
+            let mvcc_at_snap_1 = get_at_snapshot(&store, 7, &obj(9), 1);
+            (legacy_scan, mvcc_read, mvcc_at_snap_1)
+        });
+        assert!(r.is_ok(), "legacy+MVCC coexistence must NOT panic");
+        let (legacy_scan, mvcc_read, mvcc_at_snap_1) = r.unwrap();
+        // Legacy scan: EXACTLY one entry, with value "legacy_val".
+        assert_eq!(
+            legacy_scan.len(),
+            1,
+            "legacy single-point scan must return exactly one entry, got {legacy_scan:?}"
+        );
+        assert_eq!(
+            legacy_scan[0].0.len(),
+            20,
+            "legacy scan must return a 20-byte key (not the 28-byte MVCC variant)"
+        );
+        assert_eq!(
+            legacy_scan[0].1.as_deref(),
+            Some(b"legacy_val".as_slice()),
+            "legacy scan must yield the legacy value, not the MVCC value"
+        );
+        // MVCC read at snap=100: Found("mvcc_v5") EXACTLY.
+        match mvcc_read {
+            SnapshotRead::Found(b) => assert_eq!(
+                b, b"mvcc_v5",
+                "MVCC snap=100 must Found(mvcc_v5) — NOT the legacy_val"
+            ),
+            o => panic!("MVCC snap=100 expected Found(mvcc_v5), got {o:?}"),
+        }
+        // MVCC read at snap=1: NotYetWritten (MVCC write is at opnum=5;
+        // legacy 20-byte key is invisible to MVCC's 28-byte decoder).
+        assert_eq!(
+            mvcc_at_snap_1,
+            SnapshotRead::NotYetWritten,
+            "MVCC snap=1 must be NotYetWritten — legacy_val MUST NOT leak in"
+        );
+    }
+}

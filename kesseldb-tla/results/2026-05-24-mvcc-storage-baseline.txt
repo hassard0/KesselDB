@@ -1,0 +1,34 @@
+TLC2 Version 2026.05.18.174321 (rev: 8ba1027)
+Running breadth-first search Model-Checking with fp 119 and seed -4569730297134007058 with 16 workers on 16 cores with 3641MB heap and 64MB offheap memory [pid: 43828] (Windows 11 10.0 amd64, Microsoft 21.0.11 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file C:\Users\ihass\KesselDB\kesseldb-tla\MVCCStorage.tla
+Parsing file C:\Users\ihass\AppData\Local\Temp\tlc-18197917393404391645\Integers.tla (jar:file:/C:/Users/ihass/.tla2tools/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Parsing file C:\Users\ihass\AppData\Local\Temp\tlc-18197917393404391645\FiniteSets.tla (jar:file:/C:/Users/ihass/.tla2tools/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file C:\Users\ihass\AppData\Local\Temp\tlc-18197917393404391645\TLC.tla (jar:file:/C:/Users/ihass/.tla2tools/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file C:\Users\ihass\AppData\Local\Temp\tlc-18197917393404391645\_TLCTrace.tla (jar:file:/C:/Users/ihass/.tla2tools/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
+Parsing file C:\Users\ihass\AppData\Local\Temp\tlc-18197917393404391645\Naturals.tla (jar:file:/C:/Users/ihass/.tla2tools/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file C:\Users\ihass\AppData\Local\Temp\tlc-18197917393404391645\Sequences.tla (jar:file:/C:/Users/ihass/.tla2tools/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file C:\Users\ihass\AppData\Local\Temp\tlc-18197917393404391645\TLCExt.tla (jar:file:/C:/Users/ihass/.tla2tools/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
+Semantic processing of module Naturals
+Semantic processing of module Integers
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module TLCExt
+Semantic processing of module _TLCTrace
+Semantic processing of module MVCCStorage
+Linting of module TLCExt
+Linting of module _TLCTrace
+Linting of module MVCCStorage
+Starting... (2026-05-24 01:17:10)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-05-24 01:17:11.
+Progress(6) at 2026-05-24 01:17:14: 160,639 states generated (160,639 s/min), 70,100 distinct states found (70,100 ds/min), 65,586 states left on queue.
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = 3.1E-7
+  based on the actual fingerprints:  val = 2.5E-7
+5944369 states generated, 1225093 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 6.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 31 and the 95th percentile is 8).
+Finished in 46s at (2026-05-24 01:17:56)

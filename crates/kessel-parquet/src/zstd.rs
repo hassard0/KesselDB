@@ -793,19 +793,16 @@ mod tests {
     /// → 1-byte FCS=0x2e=46). One Compressed block of 30 bytes. Decoded
     /// by the reference zstd tool to 46 bytes.
     ///
-    /// **SP137 PENDING**: the SP125-SP135 pipeline traps with
-    /// `UnexpectedEof` on this frame even though SP136-DIAG-1 (the
-    /// reference `zstd -3` "hello hello..." stream) DOES decode
-    /// correctly. The bug is somewhere in the sequence-stream or
-    /// Compressed-literal decode path that triggers only on pyarrow's
-    /// libzstd output (which differs from CLI zstd in some
-    /// spec-corner: single_segment+1-byte-FCS frames + specific FSE
-    /// table mode combinations). The pipeline DOES work on standalone
-    /// reference streams (SP136-DIAG-1 + the 113 SP125-SP135 KATs);
-    /// real-pyarrow compatibility requires further debug isolation —
-    /// SP137 follow-up.
+    /// **SP137 FIXED**: the FSE `(nb_bits, base_state)` per-cell
+    /// computation in SP126's `build_fse_table` was approximated with
+    /// a max_state-overflow fallback that produced wrong `nb_bits` for
+    /// power-of-two-count symbols. The corrected algorithm (canonical
+    /// libzstd `FSE_buildDTable_internal`) uses
+    /// `nb_bits = L - high_bit_position(next_state)` and
+    /// `base_state = (next_state << nb_bits) - table_size`. The fix
+    /// landed in SP137 and this test now passes — it locks the
+    /// pyarrow-specific encoding-corner that surfaced the bug.
     #[test]
-    #[ignore = "SP137 pending: pyarrow zstd Parquet frame triggers pipeline UnexpectedEof; reference zstd CLI stream (SP136-DIAG-1) decodes correctly — bug isolated to pyarrow-specific encoding path"]
     fn sp136_kat_decode_pyarrow_parquet_frame() {
         let compressed: &[u8] = &[
             0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x2e, 0xf5, 0x00, 0x00,
@@ -826,6 +823,82 @@ mod tests {
             let bytes: [u8; 8] = decoded[off..off + 8].try_into().unwrap();
             assert_eq!(u64::from_le_bytes(bytes), *v);
         }
+    }
+
+    /// SP137-DIAG: step-by-step trace through the (formerly failing)
+    /// pyarrow frame. Kept #[ignore]'d so it doesn't pollute the gate
+    /// output, but available as a debugging aid for future FSE work.
+    /// Run with `cargo test sp137_diag -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "diagnostic — print-trace, run with --nocapture"]
+    fn sp137_diag_pyarrow_frame_step_by_step() {
+        use crate::zstd_huffstream::{decode_compressed_literals, decode_treeless_literals};
+        use crate::zstd_literals::{
+            decode_raw_literals, parse_literals_header, LiteralsBlockType,
+        };
+        use crate::zstd_sequences::{
+            decode_sequences_stream, load_fse_table_for_mode, parse_sequences_header,
+            SeqSymbolClass,
+        };
+        use crate::zstd_seqexec::{execute_sequences, RepeatOffsets};
+        // Compressed block bytes (after the frame + block header).
+        let block: &[u8] = &[
+            0xb0, 0x02, 0x00, 0x00, 0x00, 0x0a, 0x01, 0x01, 0x00, 0x02,
+            0x00, 0x03, 0x00, 0x04, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x04, 0x14, 0x00, 0x03, 0x18, 0x63, 0x2e,
+        ];
+        eprintln!("block = {} bytes", block.len());
+        let lit_hdr = parse_literals_header(block).expect("lit hdr");
+        eprintln!("lit_hdr = {:?}", lit_hdr);
+        let after_hdr = &block[lit_hdr.header_len..];
+        let lit = match lit_hdr.block_type {
+            LiteralsBlockType::Raw => decode_raw_literals(after_hdr, lit_hdr.regenerated_size as usize).unwrap(),
+            _ => panic!("expected Raw"),
+        };
+        eprintln!("literals ({} bytes) = {:02x?}", lit.len(), &lit[..]);
+        let lit_consumed = lit_hdr.header_len + lit_hdr.regenerated_size as usize;
+        let after_lit = &block[lit_consumed..];
+        eprintln!("after literals: {} bytes = {:02x?}", after_lit.len(), after_lit);
+        let seq_hdr = parse_sequences_header(after_lit).expect("seq hdr");
+        eprintln!("seq_hdr = {:?}", seq_hdr);
+        let after_seq_hdr = &after_lit[seq_hdr.header_len..];
+        let (ll_table, ll_consumed) = load_fse_table_for_mode(
+            SeqSymbolClass::LiteralLength, seq_hdr.ll_mode, after_seq_hdr, None,
+        ).expect("ll table");
+        eprintln!("LL table: log={} entries={} consumed={}", ll_table.accuracy_log, ll_table.entries.len(), ll_consumed);
+        eprintln!("LL[28] = {:?}", ll_table.entries[28]);
+        let after_ll = &after_seq_hdr[ll_consumed..];
+        let (of_table, of_consumed) = load_fse_table_for_mode(
+            SeqSymbolClass::Offset, seq_hdr.of_mode, after_ll, None,
+        ).expect("of table");
+        eprintln!("OF table: log={} entries={} consumed={}", of_table.accuracy_log, of_table.entries.len(), of_consumed);
+        let after_of = &after_ll[of_consumed..];
+        let (ml_table, ml_consumed) = load_fse_table_for_mode(
+            SeqSymbolClass::MatchLength, seq_hdr.ml_mode, after_of, None,
+        ).expect("ml table");
+        eprintln!("ML table: log={} entries={} consumed={}", ml_table.accuracy_log, ml_table.entries.len(), ml_consumed);
+        let bitstream = &after_of[ml_consumed..];
+        eprintln!("bitstream ({} bytes) = {:02x?}", bitstream.len(), bitstream);
+        let seqs = decode_sequences_stream(bitstream, &ll_table, &of_table, &ml_table, seq_hdr.num_sequences);
+        match &seqs {
+            Ok(s) => eprintln!("sequences ({}) = {:?}", s.len(), s),
+            Err(e) => {
+                eprintln!("sequences FAILED: {:?}", e);
+                panic!("seq decode failed");
+            }
+        }
+        let mut repeats = RepeatOffsets::new();
+        let mut out: Vec<u8> = Vec::new();
+        let r = execute_sequences(&seqs.unwrap(), &lit, &mut repeats, &mut out, 64 * 1024);
+        match r {
+            Ok(n) => eprintln!("OK: {} bytes; out = {:02x?}", n, &out[..]),
+            Err(e) => {
+                eprintln!("EXECUTE FAILED: {:?}", e);
+                panic!("execute failed");
+            }
+        }
+        // Suppress unused warnings.
+        let _ = (decode_compressed_literals, decode_treeless_literals);
     }
 
     /// SP136-E2E-DIAG-1: known-good zstd stream produced by the reference

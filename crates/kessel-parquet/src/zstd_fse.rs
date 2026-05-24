@@ -302,6 +302,28 @@ pub(crate) fn build_fse_table(
             next_state[sym] = c as u16;
         }
     }
+    // Canonical FSE per-cell (nb_bits, base_state) computation, mirroring
+    // the libzstd reference algorithm (`FSE_buildDTable_internal`):
+    //
+    //   For each cell, given the symbol's running counter `ns` (initialised
+    //   to the symbol's count `c`, incremented on each cell visit, so
+    //   values walk c, c+1, …, 2c-1):
+    //     nb_bits    = L - high_bit_position(ns)
+    //                  (where high_bit_position(x) is the 0-indexed position
+    //                  of the highest set bit of x; equivalently 31 - clz(x))
+    //     base_state = (ns << nb_bits) - table_size
+    //
+    //   Properties:
+    //     - When c is a power of two: all c cells get nb_bits = L - log2(c)
+    //       and base_states 0, 2^nb, 2×2^nb, …, (c-1)×2^nb.
+    //     - When c is NOT a power of two: cells with ns ∈ [c, 2^ceil(log2(c)))
+    //       get the higher nb_bits (more bits read), and cells with
+    //       ns ∈ [2^ceil(log2(c)), 2c) get the lower nb_bits. Together they
+    //       cover the full state space.
+    //
+    //   This replaces the SP126 approximation that used a max_state-overflow
+    //   reduction (which produced wrong nb_bits for power-of-two counts —
+    //   surfaced by SP136 e2e against pyarrow output).
     for i in 0..size {
         let sym = entries[i].symbol;
         let mut c = counts.get(sym as usize).copied().unwrap_or(0);
@@ -312,22 +334,19 @@ pub(crate) fn build_fse_table(
             return Err(ZstdError::UnexpectedEof);
         }
         let sym_idx = sym as usize;
-        let c_u = c as u32;
-        let log2_floor = 31 - c_u.leading_zeros();
-        let is_power_of_two = c_u.is_power_of_two();
-        let log2_ceil = if is_power_of_two { log2_floor } else { log2_floor + 1 };
-        let nb_bits = accuracy_log - log2_ceil;
-        let base = (next_state[sym_idx] as u32) * (1u32 << nb_bits);
-        let max_state = base + (1u32 << nb_bits);
-        let (final_nb_bits, final_base) = if max_state > size as u32 {
-            let nb = nb_bits.saturating_sub(1);
-            let b = (next_state[sym_idx] as u32 - (size as u32 >> nb_bits)) * (1u32 << nb);
-            (nb as u8, b as u16)
-        } else {
-            (nb_bits as u8, base as u16)
-        };
-        entries[i].nb_bits = final_nb_bits;
-        entries[i].base_state = final_base;
+        let ns = next_state[sym_idx] as u32;
+        // high_bit_position(ns) = 31 - leading_zeros(ns); requires ns >= 1.
+        if ns == 0 {
+            return Err(ZstdError::UnexpectedEof);
+        }
+        let high_bit = 31 - ns.leading_zeros();
+        if high_bit > accuracy_log {
+            return Err(ZstdError::UnexpectedEof);
+        }
+        let nb_bits = accuracy_log - high_bit;
+        let base = (ns << nb_bits).wrapping_sub(size as u32);
+        entries[i].nb_bits = nb_bits as u8;
+        entries[i].base_state = base as u16;
         next_state[sym_idx] = next_state[sym_idx].wrapping_add(1);
     }
 

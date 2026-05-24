@@ -514,7 +514,7 @@ const ZSTD_NULLABLE: &[u8] = include_bytes!("fixtures/zstd_nullable.parquet");
 /// literals/sequences/execution pipeline); pyarrow-libzstd specific
 /// encoding-corner compatibility is the SP137 follow-up.
 #[test]
-#[ignore = "SP137 pending: pyarrow zstd Parquet frame triggers pipeline UnexpectedEof; wire + structural KATs are green"]
+// SP137 FIXED: FSE base_state algorithm corrected; pyarrow zstd e2e now passes.
 fn zstd_plain_fixture_roundtrips() {
     let rows = extract(ZSTD_PLAIN, &["id"])
         .expect("extract zstd_plain.parquet (REQUIRED+PLAIN+zstd)");
@@ -530,7 +530,7 @@ fn zstd_plain_fixture_roundtrips() {
 /// SP136-E2E-2: REQUIRED INT64 with dictionary encoding under zstd.
 /// **SP137 PENDING** (see SP136-E2E-1 doc).
 #[test]
-#[ignore = "SP137 pending: pyarrow zstd Parquet frame triggers pipeline UnexpectedEof"]
+// SP137 FIXED.
 fn zstd_dict_fixture_roundtrips() {
     let rows = extract(ZSTD_DICT, &["id"])
         .expect("extract zstd_dict.parquet (REQUIRED+dict+zstd)");
@@ -541,7 +541,7 @@ fn zstd_dict_fixture_roundtrips() {
 /// SP136-E2E-3: OPTIONAL INT64 with nulls under zstd.
 /// **SP137 PENDING** (see SP136-E2E-1 doc).
 #[test]
-#[ignore = "SP137 pending: pyarrow zstd Parquet frame triggers pipeline UnexpectedEof"]
+// SP137 FIXED.
 fn zstd_nullable_fixture_roundtrips() {
     let rows = extract(ZSTD_NULLABLE, &["v"])
         .expect("extract zstd_nullable.parquet (OPTIONAL+PLAIN+zstd)");

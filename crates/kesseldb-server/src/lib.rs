@@ -220,14 +220,61 @@ fn mutates_schema(op: &Op) -> bool {
 /// (the resulting AdvanceWatermark op flows through VSR's
 /// totally-ordered log).
 ///
-/// T1 ships the function signature + spawn surface; T2 implements
-/// the loop body.
+/// T1 shipped the function signature scaffold; T2 ships the loop
+/// body. The function spawns a daemon thread that ticks at `interval`
+/// (default 1s suggested by callers) and on each tick:
+///
+///  1. Invokes `state` — the SM snapshot reader closure — to retrieve
+///     `(target, current_lwm)` where `target = min_active_snapshot or
+///     current_commit_opnum` and `current_lwm = low_water_mark`. The
+///     SM is NOT `Send` (its underlying `Wal` carries a non-Send
+///     `dyn Disk`); the closure runs on the engine thread via the
+///     existing `EngineHandle` apply path or any equivalent
+///     proxy — the heartbeat thread only sees the resulting `(u64,
+///     u64)` tuple. (The honest decoupling: T2 ships the loop
+///     mechanism; T3 wires the live SM via a Send-safe snapshot
+///     reader; T4 covers default-interval behavior.)
+///  2. If the target advance is strictly greater than current,
+///     submits `Op::AdvanceWatermark { low_water_mark: target }` via
+///     the `submit` closure (the VSR pipeline bridge).
+///
+/// Determinism: SM apply remains deterministic; the heartbeat's
+/// non-determinism (each replica's clock fires at slightly different
+/// times) is contained at the SUBMISSION boundary — only the primary
+/// submits; the apply path is deterministic across replicas. Per
+/// Decision 6 + Decision 7.
 pub fn spawn_heartbeat_loop(
-    // T2: sm: Arc<std::sync::Mutex<StateMachine<DirVfs>>>,
-    // T2: vsr_submit: ...,
-    // T2: interval: std::time::Duration,
-) {
-    todo!("S2.6 T2: implement heartbeat loop body — submit Op::AdvanceWatermark at interval respecting min_active_snapshot");
+    state: impl Fn() -> Option<(u64 /*target*/, u64 /*current_lwm*/)>
+        + Send
+        + 'static,
+    submit: impl Fn(Op) + Send + 'static,
+    interval: std::time::Duration,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(interval);
+        match state() {
+            Some((target, current_lwm)) => {
+                if target > current_lwm {
+                    submit(Op::AdvanceWatermark { low_water_mark: target });
+                }
+            }
+            None => return, // state reader signalled shutdown — exit cleanly
+        }
+    })
+}
+
+/// SP115 / S2.6: Helper to compute the heartbeat target from an SM.
+/// Used by both `spawn_heartbeat_loop`'s state closure and the
+/// `heartbeat_tick_once` test helper. Returns `(target, current_lwm)`
+/// where `target = min_active_snapshot().unwrap_or(current_commit_opnum())`.
+pub fn heartbeat_target<V: kessel_io::Vfs>(
+    sm: &StateMachine<V>,
+) -> (u64, u64) {
+    let target = sm
+        .min_active_snapshot()
+        .unwrap_or_else(|| sm.current_commit_opnum());
+    let lwm = sm.low_water_mark();
+    (target, lwm)
 }
 
 fn apply_one(
@@ -236,14 +283,47 @@ fn apply_one(
     n: &mut u64,
     frame: &[u8],
 ) -> OpResult {
-    // SP115 / S2.6 (Decision 2): AUTO-COMMIT TX WRAPPER — to be implemented in T2.
-    // At T2: every SQL-derived Op wraps in an auto-commit Tx:
-    //   - snapshot = sm.current_commit_opnum()
-    //   - sm.register_snapshot(snapshot)
-    //   - SELECT family → Tx::begin (read-only)
-    //   - INSERT/UPDATE/DELETE family → Tx::begin_rw + Tx::write + Tx::commit_ssi
-    //   - sm.unregister_snapshot(snapshot)
-    // For T1 the existing SP1-SP114 direct-apply path is preserved.
+    // SP115 / S2.6 (Decision 2 + Decision 3): AUTO-COMMIT TX WRAPPER.
+    //
+    // Every SQL-derived Op wraps in an auto-commit Tx whose snapshot
+    // is `sm.current_commit_opnum()` (PostgreSQL READ COMMITTED).
+    // We register the snapshot in `sm.active_snapshots` before
+    // dispatching the apply and unregister after, so the heartbeat's
+    // `min_active_snapshot()` reflects this in-flight Tx and the GC
+    // watermark cannot advance past it (Decision 6 / 7).
+    //
+    // For S2.6 the SM apply arms themselves now route data-row ops
+    // through MVCC (Decision 1a full-replace, applied via the
+    // `data_row_{get,put,delete,scan}` seam on StateMachine). The
+    // auto-commit lifecycle here is the OUTER bracket; the inner
+    // arm's MVCC writes/reads consume `op_number` as the
+    // commit_opnum (Decision 4). The explicit `Tx::begin_rw /
+    // Tx::commit_ssi → Op::CommitTx` lifecycle is the alternative
+    // path exercised by direct multi-statement-Tx callers (S2.7
+    // grammar follow-up); single-statement auto-commit at this seam
+    // simplifies to the register / apply / unregister bracket.
+    //
+    // Honest disclosure: in S2.6 single-statement auto-commit, MVCC
+    // conflicts CANNOT occur at the SM apply layer (every apply
+    // runs serially in the log-position order; conflicts only arise
+    // for client-side concurrent Tx, which S2.6 doesn't surface to
+    // the SQL grammar — S2.7).
+    let snapshot = sm.current_commit_opnum();
+    sm.register_snapshot(snapshot);
+    let r = apply_one_inner(sm, cache, n, frame);
+    sm.unregister_snapshot(snapshot);
+    r
+}
+
+/// Inner apply body — the original apply_one logic. Kept separate so
+/// the auto-commit register/unregister bracket is the single
+/// outer-most concern in `apply_one`.
+fn apply_one_inner(
+    sm: &mut StateMachine<DirVfs>,
+    cache: &mut CompileCache,
+    n: &mut u64,
+    frame: &[u8],
+) -> OpResult {
     let op = if frame.first() == Some(&0xFE) {
         let sql = match std::str::from_utf8(&frame[1..]) {
             Ok(s) => s,

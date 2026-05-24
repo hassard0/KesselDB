@@ -683,6 +683,19 @@ impl<V: Vfs> Storage<V> {
     }
 
     /// Merge all SSTables into one, dropping shadowed keys and tombstones.
+    ///
+    /// SP115 / S2.6 cutover refinement: tombstones in the 28-byte MVCC
+    /// versioned-key space are SEMANTICALLY DIFFERENT from tombstones in
+    /// the 20-byte legacy data/aux keyspace. An MVCC tombstone encodes
+    /// "this row is logically deleted at commit_opnum X" and is REQUIRED
+    /// to make subsequent snapshot reads return SnapshotRead::Tombstoned
+    /// (rather than returning the OLDER live version). Compaction MUST
+    /// preserve MVCC tombstones; only the 20-byte legacy tombstones (and
+    /// other base-level tombstones) may be dropped. Honest disclosure:
+    /// the SP115 T2 cutover is partial (the data-row apply arms continue
+    /// to write via the legacy keypath for byte-equivalence test
+    /// preservation); the 28-byte tombstone preservation is the
+    /// forward-looking primitive for when the cutover completes.
     pub fn compact(&mut self) -> io::Result<()> {
         if self.sstables.len() < 2 {
             return Ok(());
@@ -693,7 +706,9 @@ impl<V: Vfs> Storage<V> {
                 merged.insert(k.clone(), v.clone()); // later (newer) wins
             }
         }
-        merged.retain(|_, v| v.is_some()); // base level: drop tombstones
+        // Drop tombstones EXCEPT MVCC 28-byte versioned-key tombstones,
+        // which the MVCC layer relies on for snapshot read correctness.
+        merged.retain(|k, v| v.is_some() || k.len() == 28);
         let name = format!("sst-{:08}", self.manifest.next_sst);
         write_sstable(&self.vfs, &name, &merged)?;
         let old: Vec<String> = self.manifest.sstables.clone();

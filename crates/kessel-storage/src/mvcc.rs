@@ -336,8 +336,82 @@ pub fn scan_at_snapshot<V: Vfs>(
     type_id: u32,
     snapshot_opnum: u64,
 ) -> Vec<([u8; 16], Vec<u8>)> {
-    let _ = (store, type_id, snapshot_opnum);
-    todo!("S2.6 T2: implement full-type scan returning latest visible version per object_id")
+    // Build the full type-prefixed 28-byte range. The 28-byte key is
+    // `type_id (4 LE) ++ object_id (16) ++ inverted_commit_opnum (8 BE)`.
+    // Lo bound: type_id LE ++ [0u8;16] ++ [0u8;8].
+    // Hi bound: type_id LE ++ [0xFFu8;16] ++ [0xFFu8;8].
+    let mut lo = Vec::with_capacity(VERSIONED_KEY_LEN);
+    lo.extend_from_slice(&type_id.to_le_bytes());
+    lo.extend_from_slice(&[0x00u8; 16]);
+    lo.extend_from_slice(&[0x00u8; 8]);
+
+    let mut hi = Vec::with_capacity(VERSIONED_KEY_LEN);
+    hi.extend_from_slice(&type_id.to_le_bytes());
+    hi.extend_from_slice(&[0xFFu8; 16]);
+    hi.extend_from_slice(&[0xFFu8; 8]);
+
+    // scan_range_versions yields (Key, Option<Vec<u8>>) in ascending
+    // lex-key order. Within an (type_id, object_id) prefix the
+    // inverted_commit_opnum suffix makes newest-first (smallest
+    // inverted = largest commit_opnum sorts first).
+    //
+    // Algorithm: linear pass, grouping by object_id. For each group
+    // take the FIRST (lex-min within the group) entry whose
+    // commit_opnum <= snapshot_opnum — that IS the latest visible
+    // version. Skip the entry if it is a tombstone (value = None);
+    // either way mark the group as "taken" so subsequent older
+    // versions of the same object_id are skipped.
+    //
+    // Determinism: scan order is BTreeMap-deterministic; the resulting
+    // Vec is sorted by object_id (the (type_id, object_id) prefix is
+    // the major sort key).
+    let mut out: Vec<([u8; 16], Vec<u8>)> = Vec::new();
+    let mut current_oid: Option<[u8; 16]> = None;
+    let mut current_taken: bool = false;
+
+    for (k, v) in store.scan_range_versions(&lo, &hi) {
+        if k.len() != VERSIONED_KEY_LEN {
+            // Length-mismatched (e.g. 20-byte legacy keys whose lex
+            // bytes fall inside the 28-byte range) — defensively skip.
+            continue;
+        }
+        let oid: [u8; 16] = k[4..20]
+            .try_into()
+            .expect("28-byte key has 16-byte oid slice");
+        let commit_opnum = match decode_commit_opnum(&k) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        if Some(oid) != current_oid {
+            // New object_id group begins. Reset the "taken" flag.
+            current_oid = Some(oid);
+            current_taken = false;
+        }
+
+        if current_taken {
+            // Already emitted (or skipped) the newest visible
+            // version for this object_id; skip remaining (older).
+            continue;
+        }
+
+        if commit_opnum <= snapshot_opnum {
+            // First entry in the object_id group with commit_opnum
+            // <= snapshot_opnum — by the inversion ordering this IS
+            // the latest visible version at the snapshot.
+            current_taken = true;
+            // Tombstones (v = None) are visible-as-deleted: do NOT
+            // emit them; the row is logically deleted at this
+            // snapshot.
+            if let Some(bytes) = v {
+                out.push((oid, bytes));
+            }
+        }
+        // commit_opnum > snapshot_opnum: too new for our snapshot;
+        // keep scanning to find an older entry within this object_id.
+    }
+
+    out
 }
 
 // ----------------------------------------------------------------------------

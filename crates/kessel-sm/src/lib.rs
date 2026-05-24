@@ -9154,4 +9154,325 @@ mod tests {
             "IT-6: after Op4, pending_txs must have 2 entries (Op1 + Op4)"
         );
     }
+
+    // ====================================================================
+    // SP113 / S2.4 T4 COVERAGE TESTS
+    //
+    // Placement: kessel-sm internal test module (same discipline as T3)
+    // because both tests require StateMachine + pending_txs field access.
+    // The storage-only coverage tests (COV-1/COV-2) live in:
+    //   crates/kessel-storage/tests/integration_mvcc_ssi.rs
+    //
+    // Test index:
+    //   COV-3 — it_coverage_dangerous_structure_detected_identically_on_3_replicas
+    //            3 independent SM instances apply the same write-skew workload;
+    //            ALL THREE reach TxAborted DangerousStructure with the SAME
+    //            other_commit_opnum. Byte-identical dump_all_versions too.
+    //   COV-4 — it_coverage_si_and_ssi_tx_interleaved_no_corruption
+    //            20-commit interleaved SI/SSI workload; pending_txs grows only
+    //            on SSI commits; never exceeds count of in-window SSI commits;
+    //            SI-only replay produces identical SI-key portion as the
+    //            interleaved replay.
+    // ====================================================================
+
+    // -----------------------------------------------------------------------
+    // COV-3: 3-replica dangerous-structure verdict identity.
+    //
+    // Claim: Three independent StateMachine instances applying the SAME
+    // write-skew op sequence EACH produce the SAME abort verdict — including
+    // the same `other_commit_opnum` — without any shared state or coordination.
+    //
+    // This is the byte-identity claim extended to the SSI abort verdict:
+    // not just "committed state is identical" but "aborted verdict is identical
+    // down to the other_commit_opnum field."
+    //
+    // Workload (hand-derived — classic write-skew, same shape as SSI-KAT-1):
+    //   type_id=11. K1=(11,obj_kat(0xA1)), K2=(11,obj_kat(0xA2)).
+    //
+    //   Op1: snapshot=0, read_set={K1}, write_set={K2→"A"}, commit=1.
+    //     No concurrent Tx ⇒ TxCommitted{1}. pending_txs: {1}.
+    //
+    //   Op2: snapshot=0, read_set={K2}, write_set={K1→"B"}, commit=2.
+    //     Concurrent = {Tx_1 (commit=1)}.
+    //     Tx_1.write_set={K2} ∩ Op2.read_set={K2} = {K2}
+    //       ⇒ Op2 has_outgoing; Tx_1.has_incoming=true.
+    //     Op2.write_set={K1} ∩ Tx_1.read_set={K1} = {K1}
+    //       ⇒ Op2 has_incoming; Tx_1.has_outgoing=true.
+    //     has_outgoing && has_incoming ⇒ Op2 is pivot ⇒ abort.
+    //     other_commit_opnum = 1 (Tx_1's commit slot, last edge from BTreeMap walk).
+    //
+    //   Expected on EVERY replica:
+    //     Op1 → TxCommitted { commit_opnum: 1 }
+    //     Op2 → TxAborted { DangerousStructure { other_commit_opnum: 1 } }
+    //
+    // After Op1 (committed), dump contains K2@1→"A".
+    // After Op2 (aborted), K1 is NOT installed. dump unchanged.
+    //
+    // All three replicas must have IDENTICAL dump_all_versions_sm AND identical
+    // abort verdict (including other_commit_opnum=1) at both checkpoints.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn it_coverage_dangerous_structure_detected_identically_on_3_replicas() {
+        let type_id: u32 = 11;
+        let k1 = (type_id, obj_kat(0xA1)); // read by Op1, written by Op2
+        let k2 = (type_id, obj_kat(0xA2)); // written by Op1, read by Op2
+
+        // Apply the 2-op write-skew workload to one SM; return (res1, res2, dump).
+        fn run_replica(
+            k1: (u32, [u8; 16]),
+            k2: (u32, [u8; 16]),
+        ) -> (OpResult, OpResult, std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>) {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            let res1 = sm.apply(
+                1,
+                Op::CommitTx {
+                    snapshot_opnum: 0,
+                    write_set: vec![(k2.0, k2.1, Some(b"A".to_vec()))],
+                    commit_opnum: 1,
+                    read_set: vec![k1],
+                },
+            );
+            let res2 = sm.apply(
+                2,
+                Op::CommitTx {
+                    snapshot_opnum: 0,
+                    write_set: vec![(k1.0, k1.1, Some(b"B".to_vec()))],
+                    commit_opnum: 2,
+                    read_set: vec![k2],
+                },
+            );
+            let dump = dump_all_versions_sm(&sm);
+            (res1, res2, dump)
+        }
+
+        // Run 3 independent replicas.
+        let (r1_res1, r1_res2, r1_dump) = run_replica(k1, k2);
+        let (r2_res1, r2_res2, r2_dump) = run_replica(k1, k2);
+        let (r3_res1, r3_res2, r3_dump) = run_replica(k1, k2);
+
+        // KAT (hand-derived): Op1 must commit on every replica.
+        let expected_committed_1 = OpResult::TxCommitted { commit_opnum: 1 };
+        assert_eq!(r1_res1, expected_committed_1, "COV-3 r1: Op1 must commit");
+        assert_eq!(r2_res1, expected_committed_1, "COV-3 r2: Op1 must commit");
+        assert_eq!(r3_res1, expected_committed_1, "COV-3 r3: Op1 must commit");
+
+        // KAT (hand-derived): Op2 must abort with DangerousStructure{1} on every replica.
+        // other_commit_opnum=1: both edge derivations in the BTreeMap-ordered walk record
+        // other=1 (only Tx_1 is concurrent); last-write wins in the local `other` variable
+        // yields 1 on both edge types (check (a) and check (b)), so the abort carries 1.
+        let expected_abort_2 = OpResult::TxAborted {
+            reason: AbortReason::DangerousStructure { other_commit_opnum: 1 },
+        };
+        assert_eq!(
+            r1_res2, expected_abort_2,
+            "COV-3 r1: Op2 must abort with DangerousStructure{{other_commit_opnum:1}}"
+        );
+        assert_eq!(
+            r2_res2, expected_abort_2,
+            "COV-3 r2: Op2 must abort with DangerousStructure{{other_commit_opnum:1}}"
+        );
+        assert_eq!(
+            r3_res2, expected_abort_2,
+            "COV-3 r3: Op2 must abort with DangerousStructure{{other_commit_opnum:1}}"
+        );
+
+        // HEADLINE: all 3 replicas produced identical verdicts (locked above via
+        // assert_eq! to the same expected values) AND identical byte storage state.
+        assert_eq!(
+            r1_dump, r2_dump,
+            "COV-3 (THESIS-FIT): replica 1 and replica 2 dump must be byte-identical"
+        );
+        assert_eq!(
+            r1_dump, r3_dump,
+            "COV-3 (THESIS-FIT): replica 1 and replica 3 dump must be byte-identical"
+        );
+
+        // KAT: dump has exactly 1 entry — Op1's write to K2 at opnum=1.
+        // Op2's write to K1 was aborted → NOT installed.
+        assert_eq!(
+            r1_dump.len(),
+            1,
+            "COV-3: dump must have exactly 1 versioned entry (Op1's K2@1; Op2 aborted)"
+        );
+
+        // KAT: K1 is NOT in the dump on any replica (Op2 aborted, never installed K1).
+        use kessel_storage::mvcc::make_versioned_key;
+        let k1_key_op2 = make_versioned_key(k1.0, &k1.1, 2);
+        assert!(
+            !r1_dump.contains_key(k1_key_op2.as_slice()),
+            "COV-3 r1: K1@opnum=2 must NOT be in dump (Op2 aborted)"
+        );
+        assert!(
+            !r2_dump.contains_key(k1_key_op2.as_slice()),
+            "COV-3 r2: K1@opnum=2 must NOT be in dump (Op2 aborted)"
+        );
+        assert!(
+            !r3_dump.contains_key(k1_key_op2.as_slice()),
+            "COV-3 r3: K1@opnum=2 must NOT be in dump (Op2 aborted)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // COV-4: SI/SSI interleaving — 20-commit workload, no corruption.
+    //
+    // Claim: Alternating SI commits (empty read_set) and SSI commits (non-empty
+    // read_set + write_set) in the same SM log produce the following invariants:
+    //   (a) `pending_txs` grows only on SSI commits (non-empty read_set).
+    //   (b) `pending_txs.len()` after commit N never exceeds the count of SSI
+    //       commits applied so far (MAX_TX_AGE=4096 >> 20 so no pruning).
+    //   (c) The SI-keyed portion of storage state is identical between an
+    //       SI-only replay and the interleaved (SI+SSI) replay. SSI commits
+    //       do not corrupt SI writes.
+    //
+    // Workload (hand-derived, 20 commits, NO SSI conflicts):
+    //   type_id_si=12 (SI commits), type_id_ssi=13 (SSI commits — separate namespace).
+    //
+    //   Odd opnums (1,3,...,19) = SI commits:
+    //     snapshot=opnum-1, write_set={(12, obj_kat(opnum), [opnum])}, read_set=[].
+    //
+    //   Even opnums (2,4,...,20) = SSI commits:
+    //     read_key = obj_kat(opnum as u8 wrapping_sub 50)  — e.g. 2u8.wrapping_sub(50)=208.
+    //     write_key = obj_kat(opnum as u8).
+    //     snapshot=opnum-1, read_set=[(13,read_key)], write_set=[(13,write_key,[opnum])].
+    //     Read keys (208,210,...,226) are all distinct from write keys (2,4,...,20) and
+    //     from each other ⇒ no WW conflict, no rw-edge overlap within any concurrent window.
+    //     All 10 SSI commits produce TxCommitted.
+    //
+    // Invariant checks after each commit i:
+    //   ssi_count = i / 2.  pending_txs.len() == ssi_count.
+    // After 20 commits: pending_txs.len() == 10; dump has 20 entries.
+    // SI-only replay: 10 entries matching the SI-key subset of interleaved dump.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn it_coverage_si_and_ssi_tx_interleaved_no_corruption() {
+        let type_id_si: u32 = 12;
+        let type_id_ssi: u32 = 13;
+
+        // Build the 20 ops. Odd opnums = SI; even opnums = SSI.
+        let mut ops: Vec<Op> = Vec::new();
+        for opnum in 1u64..=20 {
+            let snapshot = opnum - 1;
+            if opnum % 2 == 1 {
+                // SI commit: write (type_id_si, obj_kat(opnum as u8), [opnum as u8]).
+                ops.push(Op::CommitTx {
+                    snapshot_opnum: snapshot,
+                    write_set: vec![(
+                        type_id_si,
+                        obj_kat(opnum as u8),
+                        Some(vec![opnum as u8]),
+                    )],
+                    commit_opnum: opnum,
+                    read_set: vec![],
+                });
+            } else {
+                // SSI commit: read obj_kat(opnum as u8 wrapping_sub 50), write obj_kat(opnum as u8).
+                // wrapping_sub(50): opnum ∈ {2,4,...,20} → (2-50)=208, (4-50)=210, ..., (20-50)=226.
+                // Read keys (208,210,...,226) are distinct from write keys (2,4,...,20)
+                // and from the SI write keys (1,3,...,19). No WW conflict.
+                let read_key = obj_kat((opnum as u8).wrapping_sub(50));
+                let write_key = obj_kat(opnum as u8);
+                ops.push(Op::CommitTx {
+                    snapshot_opnum: snapshot,
+                    write_set: vec![(type_id_ssi, write_key, Some(vec![opnum as u8]))],
+                    commit_opnum: opnum,
+                    read_set: vec![(type_id_ssi, read_key)],
+                });
+            }
+        }
+
+        // ---- Interleaved replay ----
+        let mut sm_interleaved = StateMachine::open(MemVfs::new()).unwrap();
+        for (i, op) in ops.iter().enumerate() {
+            let opnum = (i as u64) + 1;
+            let res = sm_interleaved.apply(opnum, op.clone());
+
+            // All 20 commits must succeed (workload is designed to have no conflicts).
+            assert_eq!(
+                res,
+                OpResult::TxCommitted { commit_opnum: opnum },
+                "COV-4: commit {opnum} must return TxCommitted — workload has no conflicts"
+            );
+
+            // (a)+(b): pending_txs.len() == count of SSI commits applied so far.
+            // SSI commits are at even opnums. After commit i, ssi_count = i / 2.
+            let ssi_count = opnum / 2;
+            assert_eq!(
+                sm_interleaved.pending_txs.len(),
+                ssi_count as usize,
+                "COV-4 (a)+(b): after commit {opnum}, pending_txs.len() must equal \
+                 SSI count {ssi_count} — SI commits (empty read_set) must not insert"
+            );
+        }
+
+        // Final state: 10 SSI commits tracked, 20 versioned entries.
+        assert_eq!(
+            sm_interleaved.pending_txs.len(),
+            10,
+            "COV-4 (b): after 20 commits, pending_txs must have exactly 10 entries \
+             (one per SSI commit; MAX_TX_AGE=4096 >> 20 so no pruning)"
+        );
+
+        // ---- SI-only replay ----
+        // Apply only the SI commits (odd opnums) to an independent SM.
+        let mut sm_si_only = StateMachine::open(MemVfs::new()).unwrap();
+        for (i, op) in ops.iter().enumerate() {
+            let opnum = (i as u64) + 1;
+            if opnum % 2 == 1 {
+                let res = sm_si_only.apply(opnum, op.clone());
+                assert_eq!(
+                    res,
+                    OpResult::TxCommitted { commit_opnum: opnum },
+                    "COV-4 SI-only replay: commit {opnum} must succeed"
+                );
+            }
+            // SSI commits skipped in SI-only replay.
+        }
+
+        // (a): SI-only replay must have empty pending_txs (Decision 8).
+        assert!(
+            sm_si_only.pending_txs.is_empty(),
+            "COV-4 (a): SI-only replay must have empty pending_txs — SI commits \
+             (empty read_set) do not insert into pending_txs (Decision 8)"
+        );
+
+        // (c): The SI-keyed entries in the interleaved dump match the SI-only dump.
+        let dump_interleaved = dump_all_versions_sm(&sm_interleaved);
+        let dump_si_only = dump_all_versions_sm(&sm_si_only);
+
+        // Interleaved dump: 20 entries (10 SI + 10 SSI).
+        assert_eq!(
+            dump_interleaved.len(),
+            20,
+            "COV-4: interleaved dump must have 20 versioned entries (10 SI + 10 SSI)"
+        );
+        // SI-only dump: 10 entries.
+        assert_eq!(
+            dump_si_only.len(),
+            10,
+            "COV-4: SI-only dump must have 10 versioned entries"
+        );
+
+        // Every SI-only entry must be present byte-identically in the interleaved dump.
+        // SSI commits write to type_id_ssi=13 which is a separate namespace — they cannot
+        // overwrite SI entries at type_id_si=12.
+        for (si_key, si_val) in &dump_si_only {
+            assert_eq!(
+                dump_interleaved.get(si_key.as_slice()),
+                Some(si_val),
+                "COV-4 (c): SI entry must be present and byte-identical in the \
+                 interleaved dump. SSI commits must not corrupt SI writes."
+            );
+        }
+
+        // Verify pending_txs keys are exactly the 10 SSI commit opnums {2,4,...,20}.
+        let expected_ssi_opnums: Vec<u64> = (1u64..=10).map(|i| i * 2).collect();
+        let actual_ssi_opnums: Vec<u64> =
+            sm_interleaved.pending_txs.keys().copied().collect();
+        assert_eq!(
+            actual_ssi_opnums, expected_ssi_opnums,
+            "COV-4 (b): pending_txs must contain exactly the 10 SSI commit opnums \
+             {{2,4,...,20}}; actual: {:?}",
+            actual_ssi_opnums
+        );
+    }
 }

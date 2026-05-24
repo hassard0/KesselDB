@@ -19,6 +19,7 @@ mod zstd_fse;
 mod zstd_literals;
 mod zstd_huffman;
 mod zstd_huffstream;
+mod zstd_sequences;
 
 /// One decoded Parquet physical value, format-agnostic. The caller
 /// (`kessel-fetch`) maps this to its own `Cell` so the existing

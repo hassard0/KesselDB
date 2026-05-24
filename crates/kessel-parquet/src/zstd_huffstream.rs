@@ -110,10 +110,103 @@ pub(crate) fn decode_huffman_stream(
     Ok(out)
 }
 
-/// Decode a single-stream Compressed literals section (block_type=2,
-/// size_format=00). `input` MUST begin at the literals section header.
-/// Returns the decoded literals + the total bytes consumed by the
-/// section (header + tree description + bitstream).
+/// Decode a 4-stream Huffman bitstream per RFC 8478 §4.2.2.
+///
+/// Layout of `input` (the post-tree-description bitstream bytes):
+///   bytes 0..2  : `jump1` u16-LE — byte length of stream 1
+///   bytes 2..4  : `jump2` u16-LE — byte length of stream 2
+///   bytes 4..6  : `jump3` u16-LE — byte length of stream 3
+///   bytes 6..(6+jump1)        : stream 1 reverse bitstream
+///   bytes (6+jump1)..(+jump2) : stream 2 reverse bitstream
+///   bytes (+jump2)..(+jump3)  : stream 3 reverse bitstream
+///   bytes (+jump3)..end       : stream 4 reverse bitstream
+///
+/// Per-stream decoded sizes:
+///   streams 1, 2, 3 : `(regenerated_size + 3) / 4` bytes each
+///   stream 4        : `regenerated_size - 3 * per_stream` bytes (the rest)
+///
+/// Output = concatenation of (stream1, stream2, stream3, stream4) decoded.
+pub(crate) fn decode_huffman_4streams(
+    input: &[u8],
+    tree: &HuffmanTree,
+    regenerated_size: usize,
+) -> Result<Vec<u8>, ZstdError> {
+    if regenerated_size > LITERALS_MAX_SIZE {
+        return Err(ZstdError::DecompressionBomb {
+            decoded: regenerated_size,
+            cap: LITERALS_MAX_SIZE,
+        });
+    }
+    if input.len() < 6 {
+        return Err(ZstdError::UnexpectedEof);
+    }
+    let jump1 = u16::from_le_bytes([input[0], input[1]]) as usize;
+    let jump2 = u16::from_le_bytes([input[2], input[3]]) as usize;
+    let jump3 = u16::from_le_bytes([input[4], input[5]]) as usize;
+    let after_jump = &input[6..];
+    // Validate that jumps fit within the remaining input (stream 4 takes
+    // whatever's left; jump1+jump2+jump3 MUST be <= after_jump.len()).
+    let sum_first_three = jump1
+        .checked_add(jump2)
+        .and_then(|v| v.checked_add(jump3))
+        .ok_or(ZstdError::UnexpectedEof)?;
+    if sum_first_three > after_jump.len() {
+        return Err(ZstdError::UnexpectedEof);
+    }
+    let stream1 = &after_jump[..jump1];
+    let stream2 = &after_jump[jump1..jump1 + jump2];
+    let stream3 = &after_jump[jump1 + jump2..jump1 + jump2 + jump3];
+    let stream4 = &after_jump[jump1 + jump2 + jump3..];
+
+    // Per-stream regenerated sizes.
+    let per = (regenerated_size + 3) / 4;
+    let last = regenerated_size
+        .checked_sub(3 * per)
+        .ok_or(ZstdError::UnexpectedEof)?;
+
+    let mut out = Vec::with_capacity(regenerated_size);
+    out.extend(decode_huffman_stream(stream1, tree, per)?);
+    out.extend(decode_huffman_stream(stream2, tree, per)?);
+    out.extend(decode_huffman_stream(stream3, tree, per)?);
+    out.extend(decode_huffman_stream(stream4, tree, last)?);
+    Ok(out)
+}
+
+/// Decode a Compressed literals section per RFC 8478 §5.3.4 — dispatches
+/// to single-stream or 4-stream decode based on the literals header's
+/// `num_streams` field.
+///
+/// `input` MUST begin at the literals section header. Returns the decoded
+/// literals + the total bytes consumed by the section.
+pub(crate) fn decode_compressed_literals(
+    input: &[u8],
+) -> Result<(Vec<u8>, usize), ZstdError> {
+    let header = parse_literals_header(input)?;
+    if header.block_type != LiteralsBlockType::Compressed {
+        return Err(ZstdError::LiteralsBlockTypeNotYetSupported {
+            block_type: header.block_type as u8,
+        });
+    }
+    let after_header = &input[header.header_len..];
+    let comp_size = header.compressed_size as usize;
+    if after_header.len() < comp_size {
+        return Err(ZstdError::UnexpectedEof);
+    }
+    let stream_bytes = &after_header[..comp_size];
+    let (tree, tree_consumed) = parse_huffman_tree(stream_bytes)?;
+    let bitstream = &stream_bytes[tree_consumed..];
+    let decoded = match header.num_streams {
+        1 => decode_huffman_stream(bitstream, &tree, header.regenerated_size as usize)?,
+        4 => decode_huffman_4streams(bitstream, &tree, header.regenerated_size as usize)?,
+        _ => return Err(ZstdError::UnexpectedEof),
+    };
+    let total_consumed = header.header_len + comp_size;
+    Ok((decoded, total_consumed))
+}
+
+/// Compatibility wrapper for SP129 callers — same semantics as
+/// `decode_compressed_literals` but rejects 4-stream with the SP129
+/// sentinel marker for any caller still expecting single-stream-only.
 pub(crate) fn decode_compressed_literals_single_stream(
     input: &[u8],
 ) -> Result<(Vec<u8>, usize), ZstdError> {
@@ -124,25 +217,11 @@ pub(crate) fn decode_compressed_literals_single_stream(
         });
     }
     if header.num_streams != 1 {
-        // 4-stream variant defers to SP130.
         return Err(ZstdError::LiteralsBlockTypeNotYetSupported {
-            block_type: 0xFE, // marker: "Compressed-4stream not yet supported"
+            block_type: 0xFE,
         });
     }
-    let after_header = &input[header.header_len..];
-    let comp_size = header.compressed_size as usize;
-    if after_header.len() < comp_size {
-        return Err(ZstdError::UnexpectedEof);
-    }
-    let stream_bytes = &after_header[..comp_size];
-    // Tree description starts at byte 0 of the stream; parse_huffman_tree
-    // returns the byte count it consumed; the rest is the Huffman
-    // bitstream.
-    let (tree, tree_consumed) = parse_huffman_tree(stream_bytes)?;
-    let bitstream = &stream_bytes[tree_consumed..];
-    let decoded = decode_huffman_stream(bitstream, &tree, header.regenerated_size as usize)?;
-    let total_consumed = header.header_len + comp_size;
-    Ok((decoded, total_consumed))
+    decode_compressed_literals(input)
 }
 
 // ============================================================================
@@ -326,5 +405,120 @@ mod tests {
             decode_huffman_stream(&[0x80u8], &tree, 1).unwrap_err(),
             ZstdError::UnexpectedEof
         );
+    }
+
+    // ========================================================================
+    // SP130 KATs — 4-stream Huffman bitstream decoder.
+    // ========================================================================
+
+    /// SP130-KAT-1: truncated input (<6 bytes for jump table) → typed err.
+    #[test]
+    fn sp130_kat_jump_table_truncated_traps() {
+        let tree = uniform_2sym_tree();
+        assert_eq!(
+            decode_huffman_4streams(&[0x00u8; 5], &tree, 4).unwrap_err(),
+            ZstdError::UnexpectedEof
+        );
+    }
+
+    /// SP130-KAT-2: jump values sum > available bytes → typed err.
+    /// Jump table = [10, 10, 10] = 30; but only 6 bytes after = stream 4
+    /// would have NEGATIVE size. Trap.
+    #[test]
+    fn sp130_kat_jump_overrun_traps() {
+        let tree = uniform_2sym_tree();
+        let mut bytes = vec![10u8, 0, 10, 0, 10, 0]; // jumps 10/10/10
+        bytes.extend(vec![0x80u8; 6]); // only 6 bytes after jump table
+        assert_eq!(
+            decode_huffman_4streams(&bytes, &tree, 16).unwrap_err(),
+            ZstdError::UnexpectedEof
+        );
+    }
+
+    /// SP130-KAT-3: regen=0 → all streams decode to empty. Jump = [0,0,0];
+    /// 4 empty streams need 0 bytes after the jump table. per_stream =
+    /// (0+3)/4 = 0, last = 0 - 0 = 0. All `decode_huffman_stream`
+    /// invocations with regen=0 short-circuit to empty.
+    #[test]
+    fn sp130_kat_regen_zero_yields_empty() {
+        let tree = uniform_2sym_tree();
+        let bytes = vec![0u8; 6]; // jump table all zeros
+        let out = decode_huffman_4streams(&bytes, &tree, 0).unwrap();
+        assert_eq!(out, Vec::<u8>::new());
+    }
+
+    /// SP130-KAT-4: regen beyond LITERALS_MAX_SIZE → typed bomb.
+    #[test]
+    fn sp130_kat_bomb_cap_traps() {
+        let tree = uniform_2sym_tree();
+        let bytes = vec![0u8; 6];
+        let err = decode_huffman_4streams(&bytes, &tree, LITERALS_MAX_SIZE + 1).unwrap_err();
+        match err {
+            ZstdError::DecompressionBomb { decoded, cap } => {
+                assert_eq!(decoded, LITERALS_MAX_SIZE + 1);
+                assert_eq!(cap, LITERALS_MAX_SIZE);
+            }
+            other => panic!("expected DecompressionBomb; got {other:?}"),
+        }
+    }
+
+    /// SP130-KAT-5: 4 identical streams each decoding to 2 symbols.
+    /// Use uniform_4sym_tree (max_bits=2). Each stream = [0x1B, 0x01]
+    /// (from SP129-KAT-3) decodes to [0, 1, 2, 3]. But we want each
+    /// stream to produce 2 symbols (per_stream = (8+3)/4 = 2; last = 8-6 = 2).
+    /// For 2 symbols at max_bits=2: each stream needs 4 payload bits.
+    /// Use payload byte 0x1B with pad in a separate byte: stream = [0x1B, 0x01]
+    /// where 0x01 = pad_bit=0 (single payload of 4 bits all from 0x1B):
+    /// Reading reverse MSB-first from 0x1B = 0b0001_1011: bits 7..0 = 0001_1011.
+    /// pad in 0x01 = bit 0; payload in 0x1B (8 bits): MSB first = 0,0,0,1,1,0,1,1.
+    /// First 2 bits = 00 → sym 0; next 2 = 01 → sym 1; next 2 = 10 → sym 2;
+    /// last 2 = 11 → sym 3. → decoded = [0,1,2,3] (4 symbols).
+    /// With per_stream = 2, decoder reads only first 2 symbols: [0, 1].
+    /// 4 streams × [0, 1] = output [0,1, 0,1, 0,1, 0,1] (8 syms).
+    /// Each stream length = 2 bytes. jumps = [2, 2, 2]. Total layout:
+    ///   bytes 0..6 = [2,0, 2,0, 2,0]
+    ///   bytes 6..8 = stream1 = [0x1B, 0x01]
+    ///   bytes 8..10 = stream2 = [0x1B, 0x01]
+    ///   bytes 10..12 = stream3 = [0x1B, 0x01]
+    ///   bytes 12..14 = stream4 = [0x1B, 0x01]
+    #[test]
+    fn sp130_kat_four_identical_streams_concat() {
+        let tree = uniform_4sym_tree();
+        let mut bytes = vec![2u8, 0, 2, 0, 2, 0]; // jumps
+        bytes.extend(&[0x1Bu8, 0x01u8]); // stream 1
+        bytes.extend(&[0x1Bu8, 0x01u8]); // stream 2
+        bytes.extend(&[0x1Bu8, 0x01u8]); // stream 3
+        bytes.extend(&[0x1Bu8, 0x01u8]); // stream 4
+        let out = decode_huffman_4streams(&bytes, &tree, 8).unwrap();
+        assert_eq!(out, vec![0u8, 1, 0, 1, 0, 1, 0, 1]);
+    }
+
+    /// SP130-KAT-6: deterministic — same input twice → identical output.
+    #[test]
+    fn sp130_kat_deterministic_repeat() {
+        let tree = uniform_4sym_tree();
+        let mut bytes = vec![2u8, 0, 2, 0, 2, 0];
+        for _ in 0..4 {
+            bytes.extend(&[0x1Bu8, 0x01u8]);
+        }
+        let r1 = decode_huffman_4streams(&bytes, &tree, 8).unwrap();
+        let r2 = decode_huffman_4streams(&bytes, &tree, 8).unwrap();
+        assert_eq!(r1, r2);
+    }
+
+    /// SP130-KAT-7: decode_compressed_literals (the dispatcher) routes
+    /// num_streams=1 to the single-stream decoder. Reuses the SP129
+    /// single-stream test path indirectly — we verify the dispatcher
+    /// rejects non-Compressed types identically to single-stream.
+    #[test]
+    fn sp130_kat_dispatcher_rejects_non_compressed() {
+        // Raw header byte 0x10 (regen=2)
+        let bytes = [0x10u8, b'a', b'b'];
+        match decode_compressed_literals(&bytes).unwrap_err() {
+            ZstdError::LiteralsBlockTypeNotYetSupported { block_type } => {
+                assert_eq!(block_type, 0); // Raw
+            }
+            other => panic!("expected LiteralsBlockTypeNotYetSupported; got {other:?}"),
+        }
     }
 }

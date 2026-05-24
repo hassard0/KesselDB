@@ -8,4 +8,6 @@ Replication_TTrace_*.bin
 Replication_TTrace_*.tla
 MVCCStorage_TTrace_*.bin
 MVCCStorage_TTrace_*.tla
+MVCCTx_TTrace_*.bin
+MVCCTx_TTrace_*.tla
 *.log

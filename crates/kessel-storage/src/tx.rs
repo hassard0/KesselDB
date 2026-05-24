@@ -439,3 +439,86 @@ mod tx_kats {
         // compile-time-enforced.
     }
 }
+
+#[cfg(test)]
+mod tx_coverage {
+    use super::*;
+    use crate::mvcc::{put_versioned, SnapshotRead};
+    use crate::Storage;
+    use kessel_io::MemVfs;
+
+    fn obj(n: u8) -> [u8; 16] {
+        let mut a = [0u8; 16];
+        a[15] = n;
+        a
+    }
+
+    // CV-1: Tx with zero reads — read_set stays empty; commit_read_only Ok.
+    #[test]
+    fn cv_tx_with_zero_reads() {
+        let store = Storage::open(MemVfs::new()).unwrap();
+        let tx = Tx::begin(&store, 0);
+        assert!(tx.read_set().is_empty());
+        assert!(tx.commit_read_only().is_ok());
+    }
+
+    // CV-2: Re-read same key 100 times — read_set stays at size 1 (set semantics).
+    #[test]
+    fn cv_re_read_same_key_100x_size_1() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        put_versioned(&mut store, 1, &obj(1), 0, Some(vec![0xAA])).unwrap();
+        let mut tx = Tx::begin(&store, 0);
+        for _ in 0..100 {
+            let _ = tx.read(1, &obj(1));
+        }
+        assert_eq!(tx.read_set().len(), 1);
+    }
+
+    // CV-3: Large read-set scaling — 1000 distinct keys, read_set size == 1000.
+    #[test]
+    fn cv_large_read_set_1000_keys() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        for i in 0..1000u32 {
+            let mut k = [0u8; 16];
+            k[12..16].copy_from_slice(&i.to_be_bytes());
+            put_versioned(&mut store, 1, &k, i as u64, Some(vec![(i & 0xFF) as u8])).unwrap();
+        }
+        let mut tx = Tx::begin(&store, 999);
+        for i in 0..1000u32 {
+            let mut k = [0u8; 16];
+            k[12..16].copy_from_slice(&i.to_be_bytes());
+            let _ = tx.read(1, &k);
+        }
+        assert_eq!(tx.read_set().len(), 1000);
+    }
+
+    // CV-4: read_set is clone-equivalent — cloning the BTreeSet yields an equal set
+    // with deterministic iteration (the property S2.4 SSI will rely on).
+    #[test]
+    fn cv_read_set_clone_equivalence() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        put_versioned(&mut store, 1, &obj(1), 0, Some(vec![0xAA])).unwrap();
+        put_versioned(&mut store, 2, &obj(2), 0, Some(vec![0xBB])).unwrap();
+        let mut tx = Tx::begin(&store, 0);
+        let _ = tx.read(1, &obj(1));
+        let _ = tx.read(2, &obj(2));
+        let original: Vec<_> = tx.read_set().iter().cloned().collect();
+        let cloned: Vec<_> = tx.read_set().clone().into_iter().collect();
+        assert_eq!(original, cloned);
+    }
+
+    // CV-5: commit_read_only after many reads — still Ok (no failure mode in S2.2).
+    #[test]
+    fn cv_commit_after_many_reads_ok() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        for i in 0..50u8 {
+            put_versioned(&mut store, 1, &obj(i), i as u64, Some(vec![i])).unwrap();
+        }
+        let mut tx = Tx::begin(&store, 49);
+        for i in 0..50u8 {
+            let _ = tx.read(1, &obj(i));
+        }
+        assert_eq!(tx.read_set().len(), 50);
+        assert!(tx.commit_read_only().is_ok());
+    }
+}

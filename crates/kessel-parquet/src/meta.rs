@@ -62,6 +62,9 @@ pub enum Codec {
     Snappy,
     /// GZIP (parquet CompressionCodec id = 2), RFC 1952 member.
     Gzip,
+    /// ZSTD (parquet CompressionCodec id = 6), RFC 8478. Wired by SP136
+    /// — full decoder pipeline lives in crate::zstd.
+    Zstd,
     Other(i32),
 }
 impl Codec {
@@ -70,6 +73,7 @@ impl Codec {
             0 => Codec::Uncompressed,
             1 => Codec::Snappy,
             2 => Codec::Gzip,
+            6 => Codec::Zstd,
             o => Codec::Other(o),
         }
     }
@@ -760,9 +764,14 @@ mod tests {
         assert_eq!(
             FileMetaData::decode(&build(2)).unwrap()
                 .row_groups[0].columns[0].codec, Codec::Gzip);
+        // SP136: codec 6 = ZSTD is now mapped to Codec::Zstd (was Other(6) pre-SP136).
         assert_eq!(
             FileMetaData::decode(&build(6)).unwrap()
-                .row_groups[0].columns[0].codec, Codec::Other(6));
+                .row_groups[0].columns[0].codec, Codec::Zstd);
+        // Codec 4 (LZ4) remains Other for the lz4-deferred boundary.
+        assert_eq!(
+            FileMetaData::decode(&build(4)).unwrap()
+                .row_groups[0].columns[0].codec, Codec::Other(4));
     }
 
     #[test]

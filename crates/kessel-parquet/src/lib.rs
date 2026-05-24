@@ -86,8 +86,20 @@ fn page_payload<'a>(
         meta::Codec::Gzip => Ok(std::borrow::Cow::Owned(
             gzip::decompress(on_disk, uncomp)?
         )),
+        meta::Codec::Zstd => {
+            let decoded = zstd::decompress(on_disk)
+                .map_err(|e| PqError::Bad(format!("zstd decode: {e:?}")))?;
+            if decoded.len() != uncomp {
+                return Err(PqError::Bad(format!(
+                    "zstd page decompressed size {} != declared {}",
+                    decoded.len(),
+                    uncomp
+                )));
+            }
+            Ok(std::borrow::Cow::Owned(decoded))
+        }
         meta::Codec::Other(_) => Err(PqError::Unsupported(
-            "compression codec (zstd/lz4/brotli): OBJ-2c".into(),
+            "compression codec (lz4/brotli): OBJ-2c".into(),
         )),
     }
 }
@@ -259,9 +271,21 @@ fn decode_data_page_v2(
         meta::Codec::Gzip => {
             std::borrow::Cow::Owned(gzip::decompress(values_section, vt)?)
         }
+        meta::Codec::Zstd => {
+            let decoded = zstd::decompress(values_section)
+                .map_err(|e| PqError::Bad(format!("v2 zstd values decode: {e:?}")))?;
+            if decoded.len() != vt {
+                return Err(PqError::Bad(format!(
+                    "v2 zstd values decompressed size {} != target {}",
+                    decoded.len(),
+                    vt
+                )));
+            }
+            std::borrow::Cow::Owned(decoded)
+        }
         meta::Codec::Other(_) => {
             return Err(PqError::Unsupported(
-                "compression codec (zstd/lz4/brotli): OBJ-2c".into(),
+                "compression codec (lz4/brotli): OBJ-2c".into(),
             ))
         }
     };
@@ -304,10 +328,13 @@ fn read_chunk_values(
     max_def_level: u32,
 ) -> Result<Vec<PqValue>, PqError> {
     match cc.codec {
-        meta::Codec::Uncompressed | meta::Codec::Snappy | meta::Codec::Gzip => {}
+        meta::Codec::Uncompressed
+        | meta::Codec::Snappy
+        | meta::Codec::Gzip
+        | meta::Codec::Zstd => {}
         meta::Codec::Other(_) => {
             return Err(PqError::Unsupported(
-                "compression codec (zstd/lz4/brotli): OBJ-2c".into(),
+                "compression codec (lz4/brotli): OBJ-2c".into(),
             ))
         }
     }
@@ -1031,13 +1058,13 @@ mod tests {
     }
 
     #[test]
-    fn extract_rejects_zstd_codec_obj2c() {
-        // Repurposed from extract_rejects_gzip_codec_obj2c: GZIP(2) is now
-        // SUPPORTED; ZSTD(6) is still Unsupported (OBJ-2c follow-on).
-        let f = build_parquet_file(0, 6, 0, false); // codec=ZSTD(6)=Other(6)
+    fn extract_rejects_lz4_codec_obj2c() {
+        // Repurposed from extract_rejects_zstd_codec_obj2c: ZSTD(6) is now
+        // SUPPORTED (SP136 wire); LZ4(4) is still Unsupported (OBJ-2c follow-on).
+        let f = build_parquet_file(0, 4, 0, false); // codec=LZ4(4)=Other(4)
         assert!(
             matches!(extract(&f, &["id"]), Err(PqError::Unsupported(_))),
-            "ZSTD codec must be Unsupported (OBJ-2c)"
+            "LZ4 codec must be Unsupported (OBJ-2c)"
         );
     }
 

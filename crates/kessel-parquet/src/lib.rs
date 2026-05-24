@@ -16,6 +16,7 @@ mod snappy;
 mod gzip;
 mod zstd;
 mod zstd_fse;
+mod zstd_literals;
 
 /// One decoded Parquet physical value, format-agnostic. The caller
 /// (`kessel-fetch`) maps this to its own `Cell` so the existing

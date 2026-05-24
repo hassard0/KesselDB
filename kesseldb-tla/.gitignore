@@ -1,0 +1,9 @@
+# TLC auto-generated artifacts (re-created on every run)
+#  - states/                  : TLC's on-disk fingerprint set + checkpoint queue
+#  - Replication_TTrace_*.bin : TLC trace-exploration binary
+#  - Replication_TTrace_*.tla : TLC trace-exploration spec
+#  - *.log                    : ad-hoc TLC log files (anything not in results/)
+states/
+Replication_TTrace_*.bin
+Replication_TTrace_*.tla
+*.log

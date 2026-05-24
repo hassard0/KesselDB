@@ -131,14 +131,17 @@ Max(a, b) == IF a >= b THEN a ELSE b
 \* Opaque "operations" — bounded sub-universes for TLC enumeration. The
 \* bounds mirror the TypeOK envelope below so they do NOT change protocol
 \* semantics; they merely make the Messages record-set finite (TLC bails
-\* on Nat-valued record fields during initial-state enumeration). Safety
-\* properties do not require multiple clients, so Clients is a singleton
-\* (1..1); modelling multiple clients explodes the state space without
-\* strengthening the invariants. SP109 T3-TLC-found fix (2026-05-23).
+\* on Nat-valued record fields during initial-state enumeration). Clients
+\* is bounded to 1..MaxRequests because the ClientRequest action assigns
+\* `client |-> requested + 1`, which grows up to MaxRequests; this is the
+\* tightest bound that doesn't reject any reachable state. SP109 T3-TLC-
+\* found fix #2 (2026-05-23 — first attempt used Clients=1..1, TypeOK-
+\* violated at trace state 3 client=2; honest disclosure of the gate
+\* working as designed twice on the way to the rigor-checkpoint baseline).
 OpNums       == 1..MaxRequests
 CommitPoints == 0..MaxRequests
 Views        == 0..(MaxViewChanges + 1)
-Clients      == 1..1
+Clients      == 1..MaxRequests
 Reqs         == 1..MaxRequests
 
 Entries == [opnum: OpNums, client: Clients, req: Reqs]

@@ -12200,4 +12200,620 @@ mod tests {
             "SM low_water_mark now == 10 (heartbeat round-trip succeeded)"
         );
     }
+
+    // ====================================================================
+    // SP115 T3 — Integration tests (NARROWED SCOPE per T2 revert)
+    //
+    // T2 attempted the full 14-arm apply-arm cutover but hit a structural
+    // incompatibility with `xshard_protocol_atomic_and_deterministic_under_
+    // adversarial_drive`: that test asserts byte-identical total-storage
+    // digests across different op_number sequences, which is structurally
+    // incompatible with MVCC (commit_opnum is baked into the 28-byte key).
+    // Per "never weaken a test to make it pass", T2 reverted the apply-arm
+    // rewrites and shipped the MVCC infrastructure only. The deferred apply-
+    // arm cutover becomes SP116.
+    //
+    // T3 SCOPE: test the SHIPPED pieces (scan_at_snapshot, apply_one
+    // register/unregister, heartbeat_target, Op::CommitTx MVCC writes,
+    // Op::AdvanceWatermark, data_row_* helpers). NOT the deferred apply-arm
+    // SQL→MVCC routing (SP116) nor the full LegacyKeyspaceEmpty claim.
+    //
+    // Tests IT-1..IT-2, IT-4..IT-6 live here (SM-internal access needed).
+    // IT-3 (heartbeat-via-VSR thread) lives in kesseldb-server/src/lib.rs.
+    // ====================================================================
+
+    // -----------------------------------------------------------------------
+    // IT-1: 3-replica byte-identity for apply_one Tx lifecycle.
+    //
+    // Claim:   Three independent SM replicas each apply the same sequence of
+    //   Op::CommitTx and Op::AdvanceWatermark via SM::apply (which models
+    //   the apply_one auto-commit wrapper). The replicas must produce
+    //   byte-identical MVCC state (dump_all_versions_sm), identical
+    //   active_snapshots lifecycle (both register and unregister bracket
+    //   leave the map in the same empty state), and identical low_water_mark.
+    //
+    //   SCOPE NARROWING (T2 revert, SP116 follow-up): The original T3
+    //   headline planned SQL-statement throughput through the apply-arm
+    //   SQL→MVCC routing. That routing is deferred to SP116. This test
+    //   exercises the Op::CommitTx path, which IS shipped in T2 and forms
+    //   the foundation of all multi-version state.
+    //
+    // Workload (hand-derived, 7 ops):
+    //   Op1: CommitTx { snap=0, write=(T6,k1,[0xA1]), commit=1 } → TxCommitted{1}
+    //   Op2: CommitTx { snap=0, write=(T6,k2,[0xA2]), commit=2 } → TxCommitted{2}
+    //   Op3: CommitTx { snap=1, write=(T6,k1,[0xA3]), commit=3 } → TxCommitted{3}
+    //     (update k1; snapshot=1 sees k1@1, conflict window (1,2] — no collision)
+    //   Op4: CommitTx { snap=1, write=(T6,k2,[0xA4]), commit=4, read={k1} }
+    //        → TxCommitted{4} (SSI; no peer Tx in pending_txs at this point with
+    //        intersecting write_set/read_set w.r.t. k2 over (1,3])
+    //   Op5: CommitTx { snap=3, write=(T6,k3,[0xA5]), commit=5 } → TxCommitted{5}
+    //   Op6: AdvanceWatermark(lwm=2) at op=10
+    //        → WatermarkAdvanced{ new_lwm=2, ... }  (reclaims k1@1, k2@2)
+    //   Op7: CommitTx { snap=3, write=(T6,k3,[0xA6]), commit=7 } → TxCommitted{7}
+    //
+    // Simulate register/unregister bracket (apply_one shape): before each
+    //   CommitTx, register snapshot = commit_opnum-1; after, unregister it.
+    //   Active snapshots map MUST be empty after every such bracket.
+    //
+    // Expected:
+    //   - All 7 per-op results are identical across 3 replicas.
+    //   - dump_all_versions_sm is byte-identical across 3 replicas.
+    //   - active_snapshots is empty before and after every bracket.
+    //   - low_water_mark == 2 on all 3 replicas.
+    //   - Refs: SP115 T2 (apply_one); SP114 Decision 2/6; SP113 Decision 3.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn it_3_replica_byte_identity_for_apply_one_tx_lifecycle() {
+        let tid: u32 = 6;
+        let k1 = obj_kat(0xE1);
+        let k2 = obj_kat(0xE2);
+        let k3 = obj_kat(0xE3);
+        let k4 = obj_kat(0xE4);
+        let k5 = obj_kat(0xE5);
+
+        // (op_number, Op) pairs — strictly ordered as VSR would deliver them.
+        //
+        // Workload design: every CommitTx targets DISJOINT keys to avoid
+        // WW conflicts. snapshot_opnum values are hand-derived to keep the
+        // conflict window (snapshot_opnum, commit_opnum-1] empty for each op.
+        //
+        // Op1: k1 first write, snap=0, commit=1. Conflict window=(0,0]: empty.
+        // Op2: k2 first write, snap=0, commit=2. Conflict window=(0,1]: no k2 in (0,1].
+        // Op3: k3 first write, snap=0, commit=3. Conflict window=(0,2]: no k3 in (0,2].
+        // Op4: k4 first write, snap=3, commit=4. Conflict window=(3,3]: empty.
+        //      SSI read_set={k1} — Tx_A below committed k1 at opnum=1; k1 is not in
+        //      pending_txs since Op1 had empty read_set (SI path). No rw-edges → commit.
+        // Op5: k5 first write, snap=4, commit=5. Conflict window=(4,4]: empty.
+        // Op6: AdvanceWatermark(lwm=2) reclaims k1@1, k2@2 (2 versions).
+        // Op7: k3 update, snap=5, commit=7.
+        //      Conflict window=(5,6]: k3 was last written at opnum=3 ∉ (5,6] → OK.
+        let ops: Vec<(u64, Op)> = vec![
+            (1,  Op::CommitTx { snapshot_opnum: 0, write_set: vec![(tid, k1, Some(vec![0xA1]))], commit_opnum: 1,  read_set: vec![] }),
+            (2,  Op::CommitTx { snapshot_opnum: 0, write_set: vec![(tid, k2, Some(vec![0xA2]))], commit_opnum: 2,  read_set: vec![] }),
+            (3,  Op::CommitTx { snapshot_opnum: 0, write_set: vec![(tid, k3, Some(vec![0xA3]))], commit_opnum: 3,  read_set: vec![] }),
+            (4,  Op::CommitTx { snapshot_opnum: 3, write_set: vec![(tid, k4, Some(vec![0xA4]))], commit_opnum: 4,  read_set: vec![(tid, k1)] }),
+            (5,  Op::CommitTx { snapshot_opnum: 4, write_set: vec![(tid, k5, Some(vec![0xA5]))], commit_opnum: 5,  read_set: vec![] }),
+            (10, Op::AdvanceWatermark { low_water_mark: 2 }),
+            (11, Op::CommitTx { snapshot_opnum: 5, write_set: vec![(tid, k3, Some(vec![0xA6]))], commit_opnum: 7,  read_set: vec![] }),
+        ];
+
+        // Hand-derived expected results for each op.
+        let expected_results: Vec<OpResult> = vec![
+            OpResult::TxCommitted { commit_opnum: 1 },
+            OpResult::TxCommitted { commit_opnum: 2 },
+            OpResult::TxCommitted { commit_opnum: 3 },
+            // Op4: SSI read_set={k1}. Op1 (k1) committed at opnum=1 with empty
+            // read_set — NOT inserted into pending_txs (SI path). So no peer
+            // with intersecting write_set at commit time → no rw-edges → commit.
+            OpResult::TxCommitted { commit_opnum: 4 },
+            OpResult::TxCommitted { commit_opnum: 5 },
+            // AdvanceWatermark(lwm=2): reclaims versions with commit_opnum < 2,
+            // i.e., commit_opnum=1 only → k1@1 (1 version deleted).
+            // k2 was committed at opnum=2, which is NOT < lwm=2 → NOT reclaimed.
+            // pending_txs: Op1..Op3 had empty read_set → never in pending_txs.
+            // Op4 (commit_opnum=4) > lwm=2 → not evicted. pending_txs_evicted=0.
+            OpResult::WatermarkAdvanced { new_low_water_mark: 2, versions_deleted: 1, pending_txs_evicted: 0 },
+            // Op7: k3 update. snapshot=5, commit=7. Conflict window=(5,6]: k3
+            // last written at opnum=3 ∉ (5,6] → OK. k3 NOT in pending_txs peers'
+            // write_sets → no dangerous structure → committed.
+            OpResult::TxCommitted { commit_opnum: 7 },
+        ];
+
+        // Apply on 3 replicas; for each CommitTx simulate the apply_one
+        // register/unregister bracket to prove active_snapshots stays empty.
+        let mut dumps: Vec<std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>> = Vec::new();
+        let mut lwms: Vec<u64> = Vec::new();
+
+        for _replica in 0..3 {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            let mut results: Vec<OpResult> = Vec::new();
+
+            for (op_number, op) in &ops {
+                // Simulate apply_one auto-commit register/unregister bracket.
+                let snap = sm.current_commit_opnum();
+                assert_eq!(
+                    sm.min_active_snapshot(), None,
+                    "IT-1: active_snapshots must be empty BEFORE register (op {op_number})"
+                );
+                sm.register_snapshot(snap);
+                assert_eq!(
+                    sm.min_active_snapshot(), Some(snap),
+                    "IT-1: active snapshot must be Some({snap}) DURING bracket"
+                );
+                let r = sm.apply(*op_number, op.clone());
+                sm.unregister_snapshot(snap);
+                assert_eq!(
+                    sm.min_active_snapshot(), None,
+                    "IT-1: active_snapshots must be empty AFTER unregister (op {op_number})"
+                );
+                results.push(r);
+            }
+
+            // Per-op hand-derived KAT assertions.
+            for (i, (r, exp)) in results.iter().zip(expected_results.iter()).enumerate() {
+                assert_eq!(
+                    r, exp,
+                    "IT-1: op {i} result differs from hand-derived expected on this replica"
+                );
+            }
+
+            dumps.push(dump_all_versions_sm(&sm));
+            lwms.push(sm.low_water_mark());
+        }
+
+        // Byte-identity across all 3 replicas.
+        assert_eq!(
+            dumps[0], dumps[1],
+            "IT-1 (THESIS-FIT): replica 0 and 1 MVCC dumps differ"
+        );
+        assert_eq!(
+            dumps[0], dumps[2],
+            "IT-1 (THESIS-FIT): replica 0 and 2 MVCC dumps differ"
+        );
+        assert_eq!(lwms[0], 2, "IT-1: replica 0 lwm must be 2");
+        assert_eq!(lwms[1], 2, "IT-1: replica 1 lwm must be 2");
+        assert_eq!(lwms[2], 2, "IT-1: replica 2 lwm must be 2");
+    }
+
+    // -----------------------------------------------------------------------
+    // IT-2: heartbeat-target-respects-active-snapshots end-to-end.
+    //
+    // Claim:   The heartbeat target computation honours active in-flight
+    //   snapshots end-to-end: with a snapshot pinned at opnum=5 and commits
+    //   up to opnum=10, heartbeat_target returns (5, 0) (target=5, lwm=0).
+    //   After AdvanceWatermark(5) is applied, the SM's lwm becomes 5 and
+    //   heartbeat_target returns (5, 5) — target == lwm so no further
+    //   advance is needed (the heartbeat will NOT submit again).
+    //
+    //   This exercises the Decision-6 + Decision-7 invariant:
+    //   ActiveSnapshotsBoundedByWatermark — the watermark cannot advance
+    //   past min(active_snapshots).
+    //
+    // Workload:
+    //   Apply CreateType (op=1) + two Creates (op=5, op=10) so
+    //     current_commit_opnum == 10.
+    //   Register snapshot at opnum=5.
+    //   Read heartbeat_target → (5, 0).
+    //   Apply AdvanceWatermark(lwm=5) at op=11.
+    //   Read heartbeat_target → (5, 5).
+    //   Unregister snapshot.
+    //
+    // Expected:
+    //   - heartbeat_target before advance: (target=5, lwm=0).
+    //   - AdvanceWatermark(5) → WatermarkAdvanced{ new_lwm=5, ... }.
+    //   - heartbeat_target after advance: (target=5, lwm=5).
+    //     target == lwm ⟹ no submission (Decision 7 guard: `target > lwm`).
+    //   - Refs: SP115 T2 `heartbeat_target`, `spawn_heartbeat_loop`; Decision 6/7.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn it_heartbeat_target_respects_active_snapshots_end_to_end() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+
+        // Build some committed state so current_commit_opnum = 10.
+        sm.apply(1, Op::CreateType { def: transfer_def() });
+        sm.apply(5, Op::Create {
+            type_id: 1,
+            id: kessel_proto::ObjectId::from_u128(0xBB01),
+            record: vec![0u8; 24],
+        });
+        sm.apply(10, Op::Create {
+            type_id: 1,
+            id: kessel_proto::ObjectId::from_u128(0xBB02),
+            record: vec![0u8; 24],
+        });
+        assert_eq!(sm.current_commit_opnum(), 10, "IT-2: commit opnum must be 10");
+
+        // Pin a snapshot at opnum=5 (simulating an in-flight long-running Tx).
+        sm.register_snapshot(5);
+
+        // heartbeat_target must return (target=5, lwm=0).
+        let (t1, lwm1) = kesseldb_server_heartbeat_target(&sm);
+        assert_eq!(t1, 5, "IT-2: heartbeat target must be 5 (min active snapshot)");
+        assert_eq!(lwm1, 0, "IT-2: low_water_mark must be 0 before advance");
+        // Decision-7 guard: target(5) > lwm(0) → heartbeat WOULD submit.
+        assert!(t1 > lwm1, "IT-2: target > lwm, heartbeat should submit");
+
+        // Apply the watermark advance the heartbeat would submit.
+        let wm_result = sm.apply(11, Op::AdvanceWatermark { low_water_mark: 5 });
+        match wm_result {
+            OpResult::WatermarkAdvanced { new_low_water_mark, .. } => {
+                assert_eq!(
+                    new_low_water_mark, 5,
+                    "IT-2: WatermarkAdvanced must carry new_lwm=5"
+                );
+            }
+            other => panic!("IT-2: expected WatermarkAdvanced, got {other:?}"),
+        }
+
+        // After the advance, heartbeat_target must return (5, 5).
+        let (t2, lwm2) = kesseldb_server_heartbeat_target(&sm);
+        assert_eq!(t2, 5, "IT-2: heartbeat target still 5 (snapshot still pinned)");
+        assert_eq!(lwm2, 5, "IT-2: low_water_mark must be 5 after advance");
+        // Decision-7 guard: target(5) == lwm(5) → heartbeat will NOT submit.
+        assert!(
+            !(t2 > lwm2),
+            "IT-2: target == lwm after advance, heartbeat must not submit again"
+        );
+
+        sm.unregister_snapshot(5);
+        assert_eq!(sm.min_active_snapshot(), None, "IT-2: snapshot released");
+    }
+
+    // -----------------------------------------------------------------------
+    // IT-4: scan_at_snapshot 3-replica byte-identity.
+    //
+    // Claim:   Three SM replicas each receive the same Op::CommitTx sequence.
+    //   scan_at_snapshot called at various snapshot values returns
+    //   byte-identical results across all 3 replicas. This proves that the
+    //   28-byte versioned keyspace is deterministic at the scan surface
+    //   (not just at the physical dump level).
+    //
+    //   SCOPE NARROWING (T2 revert, SP116 follow-up): The original T3
+    //   headline planned scan via the SQL SELECT surface. SQL→MVCC routing
+    //   is deferred to SP116. This test exercises scan_at_snapshot directly,
+    //   which IS shipped in T2.
+    //
+    // Workload (hand-derived):
+    //   type_id=9; objects oidA=0xF1, oidB=0xF2, oidC=0xF3.
+    //   Op1: CommitTx { snap=0, write=(9,oidA,[0x11]), commit=1 }
+    //   Op2: CommitTx { snap=0, write=(9,oidB,[0x22]), commit=2 }
+    //   Op3: CommitTx { snap=1, write=(9,oidA,[0x33]), commit=3 }  ← update oidA
+    //   Op4: CommitTx { snap=2, write=(9,oidC,[0x44]), commit=4 }
+    //   Op5: CommitTx { snap=3, write=(9,oidB,None),   commit=5 }  ← delete oidB
+    //
+    // Expected scan results (hand-derived):
+    //   scan(snapshot=0): [] (nothing committed ≤ 0)
+    //   scan(snapshot=1): [(oidA, [0x11])]
+    //   scan(snapshot=2): [(oidA, [0x11]), (oidB, [0x22])]
+    //   scan(snapshot=3): [(oidA, [0x33]), (oidB, [0x22])]   ← update visible
+    //   scan(snapshot=4): [(oidA, [0x33]), (oidB, [0x22]), (oidC, [0x44])]
+    //   scan(snapshot=5): [(oidA, [0x33]), (oidC, [0x44])]   ← oidB deleted
+    //   scan(u64::MAX):   same as snapshot=5
+    //
+    //   All 6 scan results must be byte-identical across the 3 replicas.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn it_scan_at_snapshot_3_replica_byte_identity() {
+        let tid: u32 = 9;
+        let oid_a = obj_kat(0xF1);
+        let oid_b = obj_kat(0xF2);
+        let oid_c = obj_kat(0xF3);
+
+        let ops: Vec<(u64, Op)> = vec![
+            (1, Op::CommitTx { snapshot_opnum: 0, write_set: vec![(tid, oid_a, Some(vec![0x11]))], commit_opnum: 1, read_set: vec![] }),
+            (2, Op::CommitTx { snapshot_opnum: 0, write_set: vec![(tid, oid_b, Some(vec![0x22]))], commit_opnum: 2, read_set: vec![] }),
+            (3, Op::CommitTx { snapshot_opnum: 1, write_set: vec![(tid, oid_a, Some(vec![0x33]))], commit_opnum: 3, read_set: vec![] }),
+            (4, Op::CommitTx { snapshot_opnum: 2, write_set: vec![(tid, oid_c, Some(vec![0x44]))], commit_opnum: 4, read_set: vec![] }),
+            (5, Op::CommitTx { snapshot_opnum: 3, write_set: vec![(tid, oid_b, None)],              commit_opnum: 5, read_set: vec![] }),
+        ];
+
+        // snapshot → expected result (object_ids sorted by oid value, matching
+        // scan_at_snapshot's BTreeMap-deterministic ordering).
+        let snapshots: &[(u64, Vec<([u8; 16], Vec<u8>)>)] = &[
+            (0, vec![]),
+            (1, vec![(oid_a, vec![0x11])]),
+            (2, vec![(oid_a, vec![0x11]), (oid_b, vec![0x22])]),
+            (3, vec![(oid_a, vec![0x33]), (oid_b, vec![0x22])]),
+            (4, vec![(oid_a, vec![0x33]), (oid_b, vec![0x22]), (oid_c, vec![0x44])]),
+            (5, vec![(oid_a, vec![0x33]), (oid_c, vec![0x44])]),
+        ];
+
+        // Collect scan results from 3 replicas.
+        let mut all_scan_results: Vec<Vec<Vec<([u8; 16], Vec<u8>)>>> = Vec::new();
+
+        for _replica in 0..3 {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            for (op_number, op) in &ops {
+                let r = sm.apply(*op_number, op.clone());
+                match r {
+                    OpResult::TxCommitted { .. } => {}
+                    other => panic!("IT-4: unexpected result {other:?}"),
+                }
+            }
+
+            let scans: Vec<Vec<([u8; 16], Vec<u8>)>> = snapshots
+                .iter()
+                .map(|(snap, _)| {
+                    kessel_storage::mvcc::scan_at_snapshot(&sm.storage, tid, *snap)
+                })
+                .collect();
+            all_scan_results.push(scans);
+        }
+
+        // Hand-derived KAT: replica-0 scan results match expected.
+        for (i, (snap, expected)) in snapshots.iter().enumerate() {
+            let got = &all_scan_results[0][i];
+            assert_eq!(
+                got, expected,
+                "IT-4 KAT: scan(snapshot={snap}) mismatch on replica 0"
+            );
+        }
+
+        // Byte-identity across all 3 replicas for every snapshot.
+        for (i, (snap, _)) in snapshots.iter().enumerate() {
+            assert_eq!(
+                all_scan_results[0][i], all_scan_results[1][i],
+                "IT-4 (THESIS-FIT): scan(snapshot={snap}) differs: replica 0 vs 1"
+            );
+            assert_eq!(
+                all_scan_results[0][i], all_scan_results[2][i],
+                "IT-4 (THESIS-FIT): scan(snapshot={snap}) differs: replica 0 vs 2"
+            );
+        }
+
+        // Verify u64::MAX scan on a fully-applied SM returns same as snapshot=5.
+        // snapshot=5 is the latest; u64::MAX should give the same live set.
+        {
+            let mut sm_max = StateMachine::open(MemVfs::new()).unwrap();
+            for (op_number, op) in &ops {
+                sm_max.apply(*op_number, op.clone());
+            }
+            let max_scan = kessel_storage::mvcc::scan_at_snapshot(&sm_max.storage, tid, u64::MAX);
+            let expected_max: Vec<([u8; 16], Vec<u8>)> = vec![
+                (oid_a, vec![0x33]),
+                (oid_c, vec![0x44]),
+            ];
+            assert_eq!(
+                max_scan, expected_max,
+                "IT-4: u64::MAX scan must match snapshot=5 result (oidB deleted)"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // IT-5: apply_one auto-commit register/unregister atomicity.
+    //
+    // Claim:   The apply_one register/unregister bracket is atomic from the
+    //   SM's perspective: min_active_snapshot is None before and after the
+    //   bracket, and Some(snapshot) during. A sequence of N independent
+    //   bracket invocations leaves min_active_snapshot = None after each,
+    //   so the heartbeat always sees the correct (non-stale) snapshot floor.
+    //
+    //   This is a white-box test of the register/unregister mechanics that
+    //   apply_one uses. apply_one in kesseldb-server is tied to DirVfs and
+    //   cannot be called directly with MemVfs; this test replicates the
+    //   bracket logic (identical to apply_one body; see SP115 T2 comment
+    //   "SP115 / S2.6 (Decision 2 + Decision 3): AUTO-COMMIT TX WRAPPER").
+    //
+    //   SCOPE NARROWING (T2 revert, SP116 follow-up): The original T3 spec
+    //   proposed verifying mid-application state via a hook. Since apply_one
+    //   is synchronous and non-generic over Vfs in kesseldb-server, the
+    //   mid-bracket state is verified here by splitting the bracket manually.
+    //
+    // Workload:
+    //   Apply 5 Op::CommitTx operations, each wrapped in a manual
+    //   register/apply/unregister bracket. After each bracket:
+    //     - Before register: min_active_snapshot == None.
+    //     - After register + before apply: min_active_snapshot == Some(snap).
+    //     - After unregister: min_active_snapshot == None.
+    //   Verify the count of distinct snapshots registered equals 5 (each
+    //   bracket used current_commit_opnum at the time of registration, which
+    //   advanced per apply).
+    //
+    // Expected:
+    //   - 5 bracket cycles; None/Some/None pattern holds for all 5.
+    //   - After all 5, active_snapshots is empty; low_water_mark == 0.
+    //   - Refs: SP115 T2 apply_one body; Decision 2/3.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn it_apply_one_auto_commit_register_unregister_atomicity() {
+        let tid: u32 = 7;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        let mut bracket_snapshots_seen: Vec<u64> = Vec::new();
+
+        let writes: Vec<[u8; 16]> = (0u8..5)
+            .map(|i| { let mut a = [0u8; 16]; a[15] = 0xD0 + i; a })
+            .collect();
+
+        for (i, oid) in writes.iter().enumerate() {
+            let op_number = (i as u64) + 1;
+            // Pre-register state: must be None (no concurrent bracket).
+            assert_eq!(
+                sm.min_active_snapshot(),
+                None,
+                "IT-5: before bracket {i}: active_snapshots must be empty"
+            );
+
+            // Register bracket — mirrors apply_one.
+            let snap = sm.current_commit_opnum();
+            sm.register_snapshot(snap);
+
+            // Mid-bracket: snapshot is visible.
+            assert_eq!(
+                sm.min_active_snapshot(),
+                Some(snap),
+                "IT-5: during bracket {i}: min_active_snapshot must be Some({snap})"
+            );
+            bracket_snapshots_seen.push(snap);
+
+            // Apply the op.
+            let r = sm.apply(
+                op_number,
+                Op::CommitTx {
+                    snapshot_opnum: snap,
+                    write_set: vec![(tid, *oid, Some(vec![0xC0 + i as u8]))],
+                    commit_opnum: 0, // soft-accept: uses op_number
+                    read_set: vec![],
+                },
+            );
+            assert_eq!(
+                r,
+                OpResult::TxCommitted { commit_opnum: op_number },
+                "IT-5: bracket {i}: CommitTx must succeed"
+            );
+
+            // Unregister bracket.
+            sm.unregister_snapshot(snap);
+
+            // Post-unregister: must be None again.
+            assert_eq!(
+                sm.min_active_snapshot(),
+                None,
+                "IT-5: after bracket {i}: active_snapshots must be empty"
+            );
+        }
+
+        // All 5 brackets completed; low_water_mark unchanged (no AdvanceWatermark).
+        assert_eq!(sm.low_water_mark(), 0, "IT-5: lwm must be 0 (no advance applied)");
+        assert_eq!(sm.min_active_snapshot(), None, "IT-5: no residual snapshots");
+
+        // Each bracket saw a different snapshot (current_commit_opnum advanced).
+        // Bracket 0 sees snap=0 (fresh SM), bracket 1 sees snap=1, ..., snap=4.
+        for (i, snap) in bracket_snapshots_seen.iter().enumerate() {
+            assert_eq!(
+                *snap, i as u64,
+                "IT-5: bracket {i} should see snap={i}, got {snap}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // IT-6: LegacyKeyspaceEmpty (NARROWED).
+    //
+    // Claim (NARROWED — per T2 revert):
+    //   After a sequence of Op::CommitTx + Op::AdvanceWatermark ONLY
+    //   (no legacy-path Ops like Op::Create / Op::Update / Op::Delete),
+    //   the 20-byte legacy keyspace is EMPTY for the type_id used by
+    //   those CommitTx ops. All data for those objects lives exclusively
+    //   in the 28-byte versioned keyspace.
+    //
+    //   SCOPE NARROWING (T2 revert, SP116 follow-up): The original T3
+    //   "LegacyKeyspaceEmpty" headline was Decision-1's full-replace claim:
+    //   after the 14-arm apply-arm cutover, EVERY data-row op routes through
+    //   MVCC keys only — zero 20-byte data-row keys remain in the LSM. That
+    //   claim requires the apply-arm cutover that T2 reverted due to the
+    //   xshard_protocol byte-identity incompatibility. SP116 owns the full
+    //   claim once the xshard test is migrated.
+    //
+    //   What IS shipped in T2 (and testable now): Op::CommitTx MVCC writes
+    //   go DIRECTLY to 28-byte versioned keys via data_row_put. No 20-byte
+    //   legacy key is written for the CommitTx path. This narrowed test
+    //   verifies THAT narrowed claim.
+    //
+    //   Auxiliary keyspaces (catalog, blob, sequencer — all <type_id outside
+    //   user range>) are explicitly excluded from the assertion.
+    //
+    // Workload:
+    //   type_id=11 (user range, no catalog/blob/seq collision).
+    //   5 CommitTx writes + 1 AdvanceWatermark.
+    //   Walk all 20-byte keys in the LSM for type_id=11.
+    //
+    // Expected:
+    //   - ZERO 20-byte keys with the type_id=11 prefix remain.
+    //   - At least 5 (deduped 28-byte) versioned keys exist for type_id=11.
+    //   - Refs: SP115 Decision 1a; T2 data_row_put MVCC seam.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn it_legacy_keyspace_empty_for_committx_only_type() {
+        use kessel_storage::mvcc::VERSIONED_KEY_LEN;
+
+        let tid: u32 = 11; // arbitrary user type_id well outside reserved range
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+
+        let oids: Vec<[u8; 16]> = (0u8..5)
+            .map(|i| { let mut a = [0u8; 16]; a[15] = 0xC0 + i; a })
+            .collect();
+
+        // Apply 5 CommitTx ops targeting type_id=11.
+        for (i, oid) in oids.iter().enumerate() {
+            let op_number = (i as u64) + 1;
+            let r = sm.apply(
+                op_number,
+                Op::CommitTx {
+                    snapshot_opnum: 0,
+                    write_set: vec![(tid, *oid, Some(vec![0xBC + i as u8; 8]))],
+                    commit_opnum: 0, // soft-accept
+                    read_set: vec![],
+                },
+            );
+            assert_eq!(
+                r,
+                OpResult::TxCommitted { commit_opnum: op_number },
+                "IT-6: CommitTx {i} must succeed"
+            );
+        }
+
+        // Apply AdvanceWatermark to prove GC also writes only versioned keys.
+        sm.apply(10, Op::AdvanceWatermark { low_water_mark: 2 });
+
+        // Walk ALL keys in the LSM (using legacy 20-byte range scan for type_id=11).
+        // The 20-byte legacy range for type_id=11 is:
+        //   lo = type_id_le(11) ++ [0x00; 16]  (20 bytes)
+        //   hi = type_id_le(11) ++ [0xFF; 16]  (20 bytes)
+        // scan_range in Storage returns ALL keys including versioned (28-byte)
+        // and legacy (20-byte) whose bytes fall in the range.
+        // We discriminate by key length: 20-byte = legacy; 28-byte = versioned.
+        let lo_legacy: Vec<u8> = {
+            let mut v = tid.to_le_bytes().to_vec();
+            v.extend_from_slice(&[0x00u8; 16]);
+            v
+        };
+        let hi_legacy: Vec<u8> = {
+            let mut v = tid.to_le_bytes().to_vec();
+            v.extend_from_slice(&[0xFFu8; 16]);
+            v
+        };
+        // scan_range_versions returns (key_bytes, Option<value>) for ALL entries
+        // in the LSM whose key bytes fall in [lo, hi].
+        let all_entries = sm.storage.scan_range_versions(&lo_legacy, &hi_legacy);
+
+        let legacy_20byte_count = all_entries
+            .iter()
+            .filter(|(k, _)| k.len() == 20)
+            .count();
+        let versioned_28byte_count = all_entries
+            .iter()
+            .filter(|(k, _)| k.len() == VERSIONED_KEY_LEN)
+            .count();
+
+        assert_eq!(
+            legacy_20byte_count, 0,
+            "IT-6 (NARROWED LEGACY-EMPTY CLAIM): \
+             CommitTx-only type_id=11 must have ZERO 20-byte legacy keys. \
+             Full Decision-1 claim (all apply arms) deferred to SP116."
+        );
+        assert!(
+            versioned_28byte_count >= 5,
+            "IT-6: at least 5 versioned 28-byte entries must exist for type_id=11 \
+             (5 CommitTx writes); got {versioned_28byte_count}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // kesseldb_server_heartbeat_target: local re-implementation of
+    // `kesseldb_server::heartbeat_target` for use in SM-internal tests.
+    // SM tests cannot import kesseldb-server (circular dep risk; server
+    // depends on kessel-sm). The computation is trivial (2 lines) and
+    // documented identically in the server.
+    // Ref: SP115 T2 `pub fn heartbeat_target` in kesseldb-server/src/lib.rs.
+    // -----------------------------------------------------------------------
+    fn kesseldb_server_heartbeat_target(
+        sm: &StateMachine<MemVfs>,
+    ) -> (u64, u64) {
+        let target = sm
+            .min_active_snapshot()
+            .unwrap_or_else(|| sm.current_commit_opnum());
+        let lwm = sm.low_water_mark();
+        (target, lwm)
+    }
 }

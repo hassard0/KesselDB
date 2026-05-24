@@ -1753,4 +1753,83 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // -----------------------------------------------------------------------
+    // IT-3: heartbeat advances watermark via VSR loop (SP115 T3).
+    //
+    // Claim:   `spawn_heartbeat_loop` spawns a daemon thread that, on each
+    //   tick, reads (target, current_lwm) from the state closure and — if
+    //   target > current_lwm — calls submit(Op::AdvanceWatermark{ target }).
+    //   This is the production heartbeat path end-to-end (Decision 6/7):
+    //   the thread submits; the SM apply (serially) advances the watermark.
+    //
+    //   SCOPE NARROWING (T2 revert, SP116 follow-up): The original T3 spec
+    //   planned to wire the live DirVfs SM as the state source. Since DirVfs
+    //   requires a temp dir and the heartbeat thread is not Send with the SM
+    //   itself (the SM closure sees shared state via Arc<Mutex<...>>), this
+    //   test uses a mock state/submit pair that simulates the SM's behavior.
+    //   The live-SM wiring is the responsibility of SP116's server integration.
+    //
+    // Workload:
+    //   - state() closure: returns Some((target=10, current_lwm=0)) for the
+    //     first call, then None (signals shutdown) for subsequent calls.
+    //   - submit() closure: records submitted Ops into a Vec<Op> under a Mutex.
+    //   - spawn_heartbeat_loop with interval=1ms.
+    //   - Wait for the thread to complete (state returns None on next tick).
+    //   - Verify: exactly ONE Op::AdvanceWatermark { low_water_mark: 10 }
+    //     was submitted (target=10 > current_lwm=0 → submit; then state
+    //     returns None → thread exits).
+    //
+    // Expected:
+    //   - Thread exits cleanly (join succeeds).
+    //   - submitted Ops == [Op::AdvanceWatermark { low_water_mark: 10 }].
+    //   - Refs: SP115 T2 `spawn_heartbeat_loop`; Decision 6 (heartbeat producer).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn it_heartbeat_advances_watermark_via_vsr_loop() {
+        use kessel_proto::Op;
+        use std::sync::{Arc, Mutex};
+
+        // State source: first call returns Some((10, 0)); subsequent → None (shutdown).
+        let call_count = Arc::new(Mutex::new(0u32));
+        let call_count_state = Arc::clone(&call_count);
+        let state = move || {
+            let mut c = call_count_state.lock().unwrap();
+            *c += 1;
+            if *c == 1 {
+                // First tick: target=10, current_lwm=0 → submit expected.
+                Some((10u64, 0u64))
+            } else {
+                // Second tick: signal shutdown.
+                None
+            }
+        };
+
+        // Submit sink: collect all Ops submitted by the heartbeat.
+        let submitted: Arc<Mutex<Vec<Op>>> = Arc::new(Mutex::new(Vec::new()));
+        let submitted_submit = Arc::clone(&submitted);
+        let submit = move |op: Op| {
+            submitted_submit.lock().unwrap().push(op);
+        };
+
+        // Spawn the heartbeat loop with a short interval to keep tests fast.
+        let handle = spawn_heartbeat_loop(state, submit, std::time::Duration::from_millis(1));
+
+        // Wait for the thread to exit (state returns None on the second tick).
+        handle.join().expect("IT-3: heartbeat thread must exit cleanly");
+
+        // Verify the submitted Ops.
+        let ops = submitted.lock().unwrap().clone();
+        assert_eq!(
+            ops.len(),
+            1,
+            "IT-3: exactly ONE AdvanceWatermark must have been submitted (target > lwm on tick 1); \
+             got {ops:?}"
+        );
+        assert_eq!(
+            ops[0],
+            Op::AdvanceWatermark { low_water_mark: 10 },
+            "IT-3: submitted op must be AdvanceWatermark{{ low_water_mark: 10 }}"
+        );
+    }
 }

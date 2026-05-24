@@ -109,7 +109,11 @@ impl<'a, V: Vfs> Tx<'a, V> {
     /// Decision 2 (S2.2 design doc): caller-supplied snapshot opnum keeps
     /// kessel-storage decoupled from kessel-sm. SM wiring is S2.6's job.
     pub fn begin(store: &'a Storage<V>, snapshot_opnum: u64) -> Self {
-        todo!("filled in T2")
+        Self {
+            store,
+            snapshot_opnum,
+            read_set: BTreeSet::new(),
+        }
     }
 
     /// Snapshot read at the Tx's pinned snapshot_opnum.
@@ -124,7 +128,14 @@ impl<'a, V: Vfs> Tx<'a, V> {
     /// because SSI dangerous-cycle detection tracks anti-dependencies on
     /// absent keys too.
     pub fn read(&mut self, type_id: u32, object_id: &[u8; 16]) -> SnapshotRead {
-        todo!("filled in T2")
+        // Decision 4: insert UNCONDITIONALLY — the Tx observed the key
+        // regardless of whether it found a live version, a tombstone, or
+        // nothing. The BTreeSet deduplicates re-reads at no extra cost.
+        // Dereferencing *object_id copies 16 bytes into the set entry;
+        // that is the expected per-read cost and is documented here for
+        // future profiling reference.
+        self.read_set.insert((type_id, *object_id));
+        crate::mvcc::get_at_snapshot(self.store, type_id, object_id, self.snapshot_opnum)
     }
 
     /// The snapshot_opnum the Tx was pinned at. Never changes after `begin`.
@@ -132,7 +143,7 @@ impl<'a, V: Vfs> Tx<'a, V> {
     /// S2.3 uses this to compute the `(snapshot_opnum, commit_opnum]`
     /// conflict window for plain SI commit validation.
     pub fn snapshot_opnum(&self) -> u64 {
-        todo!("filled in T2")
+        self.snapshot_opnum
     }
 
     /// Immutable view of the read_set so far.
@@ -144,7 +155,7 @@ impl<'a, V: Vfs> Tx<'a, V> {
     /// Decision 3 (S2.2 design doc): BTreeSet guarantees deterministic
     /// iteration order for the SSI pass in S2.4.
     pub fn read_set(&self) -> &BTreeSet<(u32, [u8; 16])> {
-        todo!("filled in T2")
+        &self.read_set
     }
 
     /// Commit a read-only Tx.
@@ -157,7 +168,10 @@ impl<'a, V: Vfs> Tx<'a, V> {
     /// so S2.3 can add `ConflictAborted` without changing the call-sites
     /// that use `commit_read_only` for SELECT-only transactions.
     pub fn commit_read_only(self) -> Result<(), TxError> {
-        todo!("filled in T2")
+        // S2.2 read-only Tx has no failure mode. Drop self (releases the
+        // &Storage borrow), return Ok. S2.3 will insert the conflict-check
+        // here before returning and may return Err(TxError::ConflictAborted).
+        Ok(())
     }
 
     /// Explicit abort.
@@ -167,7 +181,8 @@ impl<'a, V: Vfs> Tx<'a, V> {
     /// S2.3 write variant which will need explicit abort semantics
     /// to discard buffered writes.
     pub fn abort(self) {
-        todo!("filled in T2")
+        // Drop self. No buffered writes to discard in S2.2. S2.3 will
+        // add write-set rollback logic here.
     }
 }
 
@@ -210,5 +225,217 @@ mod tx_scaffold_tests {
         }
         // Display trait formats to a non-empty string.
         assert!(!format!("{e}").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tx_kats {
+    use super::*;
+    use crate::mvcc::{put_versioned, SnapshotRead};
+    use crate::Storage;
+    use kessel_io::MemVfs;
+
+    /// Construct a 16-byte object_id with `n` in the last byte.
+    fn obj(n: u8) -> [u8; 16] {
+        let mut a = [0u8; 16];
+        a[15] = n;
+        a
+    }
+
+    // KAT-1: Tx::begin pins snapshot_opnum; snapshot_opnum() returns exactly
+    // the value supplied. read_set is empty immediately after begin.
+    // Hand-derived: begin(store, 42) → snapshot_opnum()==42, read_set empty.
+    #[test]
+    fn kat_begin_pins_snapshot_opnum() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        put_versioned(&mut store, 1, &obj(1), 0, Some(vec![0xAA])).unwrap();
+        let tx = Tx::begin(&store, 42);
+        assert_eq!(tx.snapshot_opnum(), 42, "snapshot pin must equal begin arg");
+        assert!(tx.read_set().is_empty(), "read_set must be empty on begin");
+        // Consume tx so the borrow is released.
+        tx.abort();
+    }
+
+    // KAT-2: Tx::read returns SnapshotRead::Found for a written key visible
+    // at the snapshot, AND records the key in read_set.
+    // Hand-derived: put_versioned at commit_opnum=0 with value=[0xAA];
+    // Tx pinned at snapshot=0; read(type_id=1, obj(1)) → Found([0xAA]);
+    // read_set contains (1, obj(1)).
+    #[test]
+    fn kat_read_returns_found_with_value() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        put_versioned(&mut store, 1, &obj(1), 0, Some(vec![0xAA])).unwrap();
+        let mut tx = Tx::begin(&store, 0);
+        match tx.read(1, &obj(1)) {
+            SnapshotRead::Found(v) => assert_eq!(v, vec![0xAA], "value must be byte-identical"),
+            other => panic!("expected Found([0xAA]), got {:?}", other),
+        }
+        assert_eq!(tx.read_set().len(), 1, "exactly one entry in read_set");
+        assert!(
+            tx.read_set().contains(&(1u32, obj(1))),
+            "read_set must contain the key"
+        );
+        tx.abort();
+    }
+
+    // KAT-3: Tx::read returns SnapshotRead::NotYetWritten for a key that has
+    // never been written; read_set STILL records (type_id, object_id).
+    // Decision 4: absence-observation is a read-set entry.
+    // Hand-derived: fresh store; Tx at snapshot=100; read(7, obj(7)) →
+    // NotYetWritten; read_set contains (7, obj(7)).
+    #[test]
+    fn kat_read_never_written_still_in_read_set() {
+        let store = Storage::open(MemVfs::new()).unwrap();
+        let mut tx = Tx::begin(&store, 100);
+        assert!(
+            matches!(tx.read(7, &obj(7)), SnapshotRead::NotYetWritten),
+            "unwritten key must return NotYetWritten"
+        );
+        assert_eq!(
+            tx.read_set().len(),
+            1,
+            "absence-observation must enter read_set (Decision 4)"
+        );
+        assert!(
+            tx.read_set().contains(&(7u32, obj(7))),
+            "read_set must contain the absence-observed key"
+        );
+        tx.abort();
+    }
+
+    // KAT-4: Tx::read returns SnapshotRead::Tombstoned for a deleted key;
+    // read_set STILL records (type_id, object_id) per Decision 4.
+    // Hand-derived: put at commit_opnum=0 (live), put None at commit_opnum=1
+    // (tombstone); Tx at snapshot=1; read(1, obj(1)) → Tombstoned;
+    // read_set contains (1, obj(1)).
+    #[test]
+    fn kat_read_tombstoned_still_in_read_set() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        put_versioned(&mut store, 1, &obj(1), 0, Some(vec![0xAA])).unwrap();
+        put_versioned(&mut store, 1, &obj(1), 1, None).unwrap(); // tombstone at opnum=1
+        let mut tx = Tx::begin(&store, 1);
+        assert!(
+            matches!(tx.read(1, &obj(1)), SnapshotRead::Tombstoned),
+            "tombstoned key must return Tombstoned"
+        );
+        assert_eq!(
+            tx.read_set().len(),
+            1,
+            "tombstone-observation must enter read_set (Decision 4)"
+        );
+        assert!(
+            tx.read_set().contains(&(1u32, obj(1))),
+            "read_set must contain the tombstone-observed key"
+        );
+        tx.abort();
+    }
+
+    // KAT-5: Re-reading the same key multiple times produces exactly one
+    // entry in read_set (BTreeSet set-semantics deduplication).
+    // Hand-derived: 3 reads of same key → read_set.len()==1.
+    #[test]
+    fn kat_re_read_same_key_no_dup_in_read_set() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        put_versioned(&mut store, 1, &obj(1), 0, Some(vec![0xAA])).unwrap();
+        let mut tx = Tx::begin(&store, 0);
+        let _ = tx.read(1, &obj(1));
+        let _ = tx.read(1, &obj(1));
+        let _ = tx.read(1, &obj(1));
+        assert_eq!(
+            tx.read_set().len(),
+            1,
+            "BTreeSet must deduplicate re-reads of the same key"
+        );
+        tx.abort();
+    }
+
+    // KAT-6: read_set iteration order is sorted by (type_id, object_id) lex.
+    // Keys inserted in reverse-sorted order; iteration must yield them sorted.
+    // Hand-derived: read (type_id=2, obj(2)), (type_id=1, obj(2)),
+    // (type_id=1, obj(1)) in that order; sorted iteration yields:
+    //   (1, obj(1)) < (1, obj(2)) < (2, obj(2))
+    // because (1 < 2) for the type_id field and obj(1)[15]=1 < obj(2)[15]=2
+    // for the object_id field.
+    #[test]
+    fn kat_read_set_sorted_iteration() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        put_versioned(&mut store, 1, &obj(1), 0, Some(vec![0xAA])).unwrap();
+        put_versioned(&mut store, 1, &obj(2), 0, Some(vec![0xBB])).unwrap();
+        put_versioned(&mut store, 2, &obj(2), 0, Some(vec![0xCC])).unwrap();
+        let mut tx = Tx::begin(&store, 0);
+        // Insert in reverse-sorted order to exercise the BTreeSet sort.
+        let _ = tx.read(2, &obj(2));
+        let _ = tx.read(1, &obj(2));
+        let _ = tx.read(1, &obj(1));
+        let actual: Vec<(u32, [u8; 16])> = tx.read_set().iter().cloned().collect();
+        let expected: Vec<(u32, [u8; 16])> = vec![
+            (1u32, obj(1)),
+            (1u32, obj(2)),
+            (2u32, obj(2)),
+        ];
+        assert_eq!(
+            actual, expected,
+            "BTreeSet iteration must be sorted lex by (type_id, object_id)"
+        );
+        tx.abort();
+    }
+
+    // KAT-7: Snapshot pin is honored — a write at opnum > snapshot_opnum is
+    // invisible to the Tx.
+    // Hand-derived: put at commit_opnum=0 value=[0xAA]; Tx at snapshot=0;
+    // then put at commit_opnum=1 value=[0xBB] (future write); Tx::read
+    // returns Found([0xAA]) — the snapshot=0 view, not the opnum=1 version.
+    //
+    // Lifetime note: Tx holds &store; we cannot take &mut store while the Tx
+    // borrow is live. We instead call put_versioned with its own &mut borrow
+    // BEFORE we begin the Tx for the "later write" step. The effect is
+    // identical: Storage contains both versions (opnum=0 and opnum=1); the
+    // Tx pinned at snapshot=0 must not see the opnum=1 entry.
+    #[test]
+    fn kat_snapshot_pin_invisible_future_write() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        // Write opnum=0 (the "before-snapshot" version).
+        put_versioned(&mut store, 1, &obj(1), 0, Some(vec![0xAA])).unwrap();
+        // Write opnum=1 (the "after-snapshot" version — future write).
+        put_versioned(&mut store, 1, &obj(1), 1, Some(vec![0xBB])).unwrap();
+        // Tx pinned at snapshot=0 must see opnum=0 version only.
+        let mut tx = Tx::begin(&store, 0);
+        match tx.read(1, &obj(1)) {
+            SnapshotRead::Found(v) => {
+                assert_eq!(v, vec![0xAA], "snapshot pin must suppress opnum=1 write");
+            }
+            other => panic!(
+                "snapshot pin broken: expected Found([0xAA]), got {:?}",
+                other
+            ),
+        }
+        tx.abort();
+    }
+
+    // KAT-8: commit_read_only consumes the Tx and returns Ok(()).
+    // The consumption is compile-time-checked (using tx after
+    // commit_read_only would be a borrow-of-moved-value error).
+    // This test verifies the runtime Ok(()) contract.
+    #[test]
+    fn kat_commit_read_only_ok_and_consumes_tx() {
+        let store = Storage::open(MemVfs::new()).unwrap();
+        let tx = Tx::begin(&store, 0);
+        let result = tx.commit_read_only();
+        assert!(result.is_ok(), "commit_read_only must return Ok(()) in S2.2");
+        // `tx` is consumed above; `tx.snapshot_opnum()` here would be a
+        // compile-time "use of moved value" error — this is the
+        // borrow-checker-enforced lifecycle contract.
+    }
+
+    // KAT-9: abort consumes the Tx and returns (). Identical lifecycle
+    // contract to commit_read_only from the borrow-checker's perspective.
+    #[test]
+    fn kat_abort_consumes_tx() {
+        let store = Storage::open(MemVfs::new()).unwrap();
+        let tx = Tx::begin(&store, 0);
+        tx.abort(); // consumes tx
+        // `tx` is consumed above; `tx.snapshot_opnum()` here would be a
+        // compile-time "use of moved value" error — the lifecycle is
+        // compile-time-enforced.
     }
 }

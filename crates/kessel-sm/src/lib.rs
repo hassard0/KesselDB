@@ -13839,4 +13839,105 @@ mod tests {
             "SP116 T3 mixed: snapshot=u64::MAX must see tombstoned (None)"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // SP116 T4 — coverage tests for the apply arms exercised through the
+    // storage-layer dispatch. Lock the previously-broken (under per-arm
+    // partial cutover) read arms (Op::Query / Op::Aggregate / etc.) by
+    // driving them over data written via Op::Create — the data MUST be
+    // visible to the read arms because both paths now route through the
+    // same MVCC dispatch.
+    // -----------------------------------------------------------------------
+
+    /// SP116 T4-1: large-batch coverage — 50 Op::Create + 50 Op::GetById
+    /// proves the cutover scales (no per-row pathology) and the read arm
+    /// recovers the EXACT write payload for every row.
+    #[test]
+    fn it_coverage_50_create_then_50_getbyid_via_mvcc() {
+        let (mut sm, tid) = setup_widget_sm();
+        let n: u128 = 50;
+        let mut expected: Vec<(ObjectId, Vec<u8>)> = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            let id = ObjectId::from_u128(i);
+            let rec = widget_rec(&sm, tid, (i * 13 + 7) as u64);
+            let r = sm.apply(i as u64 + 2, Op::Create {
+                type_id: tid,
+                id,
+                record: rec.clone(),
+            });
+            assert!(matches!(r, OpResult::Ok), "Op::Create #{i} must succeed; got {r:?}");
+            expected.push((id, rec));
+        }
+        // Now read every one back via Op::GetById.
+        for (i, (id, rec)) in expected.iter().enumerate() {
+            let r = sm.apply((n + i as u128 + 2) as u64, Op::GetById {
+                type_id: tid,
+                id: *id,
+            });
+            match r {
+                OpResult::Got(v) => assert_eq!(
+                    &v, rec,
+                    "SP116 T4-1: row #{i} (oid={:?}) must round-trip through MVCC", id
+                ),
+                other => panic!("SP116 T4-1: row #{i} GetById must be Got(rec); got {other:?}"),
+            }
+        }
+    }
+
+    /// SP116 T4-2: Op::Aggregate composite-read arm via MVCC.
+    ///
+    /// Drives Op::Aggregate (kind=COUNT, field_id=0 trivially-true predicate)
+    /// over 8 widget rows created via Op::Create. The Op::Aggregate arm scans
+    /// the type's data rows — under the cutover those scans dispatch to MVCC
+    /// transparently. The result MUST equal the row count.
+    #[test]
+    fn it_coverage_aggregate_count_over_mvcc_populated() {
+        use kessel_expr::Program;
+        let (mut sm, tid) = setup_widget_sm();
+        for i in 0..8u128 {
+            let rec = widget_rec(&sm, tid, i as u64);
+            sm.apply(i as u64 + 2, Op::Create {
+                type_id: tid,
+                id: ObjectId::from_u128(i),
+                record: rec,
+            });
+        }
+        let always_true = Program::new().push_int(1).bytes();
+        let r = sm.apply(20, Op::Aggregate {
+            type_id: tid,
+            program: always_true,
+            kind: 0, // COUNT
+            field_id: 0,
+        });
+        match r {
+            OpResult::Got(b) => {
+                let count = i128::from_le_bytes(b.try_into().unwrap());
+                assert_eq!(
+                    count, 8,
+                    "SP116 T4-2: COUNT over 8 MVCC-written widget rows must be 8; got {count}"
+                );
+            }
+            other => panic!("SP116 T4-2: Op::Aggregate must return Got; got {other:?}"),
+        }
+    }
+
+    /// SP116 T4-3: catalog DDL byte-net-0 — already locked by
+    /// `it_coverage_catalog_ddl_byte_net_zero_versioned_keyspace` (line ~13378).
+    /// Re-run the same invariant in compact form to make the SP116 carry-
+    /// forward explicit: catalog/index/aux DDL ops MUST NOT produce any
+    /// 28-byte MVCC entries (Decision 7 — those keyspaces stay legacy).
+    #[test]
+    fn it_coverage_catalog_ddl_no_mvcc_entries_post_cutover() {
+        let (sm, _tid) = setup_widget_sm();
+        // After setup (which only ran Op::CreateType), MVCC keyspace is empty.
+        let dump = sm.storage.scan_all();
+        let mvcc_entries: Vec<_> = dump.iter().filter(|(k, _)| k.len() == 28).collect();
+        assert!(
+            mvcc_entries.is_empty(),
+            "SP116 T4-3: post-setup (DDL only), MVCC keyspace must be empty; \
+             found {} 28-byte entries (Decision 7 violation: catalog/aux/index \
+             writes leaked into the MVCC versioned keyspace)",
+            mvcc_entries.len()
+        );
+    }
 }

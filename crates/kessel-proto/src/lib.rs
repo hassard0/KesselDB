@@ -275,6 +275,39 @@ pub enum Op {
         /// SM-side iteration order (mirrors write_set ordering).
         read_set: Vec<(u32, [u8; 16])>,
     },
+    /// SP114 / S2.5: Advance the global low_water_mark for MVCC GC. The
+    /// SM apply arm validates monotonicity (must be > current low_water_mark)
+    /// and commit_opnum ceiling (must be <= current commit_opnum); on
+    /// validation success, deletes every MVCC version with commit_opnum <
+    /// low_water_mark via `mvcc::delete_versions_older_than`, prunes
+    /// every pending_txs record with commit_opnum < low_water_mark via
+    /// `ssi::prune_pending_txs_by_watermark`, and updates the SM's
+    /// `low_water_mark` field. Outcome: `OpResult::WatermarkAdvanced` on
+    /// success; `OpResult::WatermarkRejected` on validation failure.
+    ///
+    /// Heartbeat protocol: the value `low_water_mark` is computed externally
+    /// (typically by the leader as `min(active_snapshot_opnum)` across the
+    /// cluster) and submitted as this op. S2.5 ships the apply path; the
+    /// heartbeat producer is OUT of scope (Decision 2). See
+    /// `docs/superpowers/specs/2026-05-24-mvcc-si-s2-5-design.md`.
+    AdvanceWatermark { low_water_mark: u64 },
+}
+
+/// SP114 / S2.5: Why an `Op::AdvanceWatermark` was rejected by the
+/// SM apply arm. Per S2.5 design Decision 5: strict monotonicity +
+/// commit_opnum ceiling. Both rejection variants are deterministic
+/// pure functions of `(proposed watermark, prior SM state)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WatermarkRejection {
+    /// Proposed watermark is <= current watermark (strict monotonicity
+    /// violation). Heartbeat producer error — duplicate or out-of-order op.
+    /// Encoded at sub-tag 0.
+    NotMonotonic { proposed: u64, current: u64 },
+    /// Proposed watermark exceeds the SM's current commit_opnum
+    /// (would reclaim versions that have not been committed).
+    /// Heartbeat producer bug. Encoded at sub-tag 1.
+    AboveCommitCeiling { proposed: u64, current_commit: u64 },
 }
 
 /// Why an `Op::CommitTx` apply path aborted. Carried inside
@@ -342,6 +375,15 @@ pub enum OpResult {
     /// snapshot for `WriteWriteConflict`, or surface the error for
     /// `SnapshotOutOfRange` / `StorageIo`.
     TxAborted { reason: AbortReason },
+    /// SP114 / S2.5: `Op::AdvanceWatermark` accepted by the SM apply arm.
+    /// Surfaces the new watermark + observability counts.
+    WatermarkAdvanced {
+        new_low_water_mark: u64,
+        versions_deleted: usize,
+        pending_txs_evicted: usize,
+    },
+    /// SP114 / S2.5: `Op::AdvanceWatermark` rejected by SM validation.
+    WatermarkRejected { reason: WatermarkRejection },
 }
 
 impl OpResult {
@@ -397,6 +439,34 @@ impl OpResult {
                     }
                 }
             }
+            // SP114 / S2.5: WatermarkAdvanced at tag 11.
+            // wire: [u64 new_low_water_mark][u64 versions_deleted][u64 pending_txs_evicted]
+            // (usize encoded as u64 LE for platform-independence)
+            OpResult::WatermarkAdvanced { new_low_water_mark, versions_deleted, pending_txs_evicted } => {
+                b.push(11);
+                codec::put_u64(&mut b, *new_low_water_mark);
+                codec::put_u64(&mut b, *versions_deleted as u64);
+                codec::put_u64(&mut b, *pending_txs_evicted as u64);
+            }
+            // SP114 / S2.5: WatermarkRejected at tag 12.
+            // wire: [u8 sub-tag] [payload per variant]
+            //   sub-tag 0 = NotMonotonic:       [u64 proposed][u64 current]
+            //   sub-tag 1 = AboveCommitCeiling: [u64 proposed][u64 current_commit]
+            OpResult::WatermarkRejected { reason } => {
+                b.push(12);
+                match reason {
+                    WatermarkRejection::NotMonotonic { proposed, current } => {
+                        b.push(0);
+                        codec::put_u64(&mut b, *proposed);
+                        codec::put_u64(&mut b, *current);
+                    }
+                    WatermarkRejection::AboveCommitCeiling { proposed, current_commit } => {
+                        b.push(1);
+                        codec::put_u64(&mut b, *proposed);
+                        codec::put_u64(&mut b, *current_commit);
+                    }
+                }
+            }
         }
         b
     }
@@ -429,6 +499,27 @@ impl OpResult {
                     _ => return None,
                 };
                 OpResult::TxAborted { reason }
+            }
+            // SP114 / S2.5: WatermarkAdvanced (11) + WatermarkRejected (12).
+            11 => {
+                let new_low_water_mark = c.u64()?;
+                let versions_deleted = c.u64()? as usize;
+                let pending_txs_evicted = c.u64()? as usize;
+                OpResult::WatermarkAdvanced { new_low_water_mark, versions_deleted, pending_txs_evicted }
+            }
+            12 => {
+                let reason = match c.u8()? {
+                    0 => WatermarkRejection::NotMonotonic {
+                        proposed: c.u64()?,
+                        current: c.u64()?,
+                    },
+                    1 => WatermarkRejection::AboveCommitCeiling {
+                        proposed: c.u64()?,
+                        current_commit: c.u64()?,
+                    },
+                    _ => return None,
+                };
+                OpResult::WatermarkRejected { reason }
             }
             _ => return None,
         })
@@ -483,6 +574,8 @@ impl Op {
             Op::AddCompositeIndex { .. } => 24,
             Op::FindByComposite { .. } => 25,
             Op::CommitTx { .. } => 44,
+            // SP114 / S2.5: GC watermark advance op at wire tag 45.
+            Op::AdvanceWatermark { .. } => 45,
         }
     }
 
@@ -803,6 +896,11 @@ impl Op {
                     codec::put_u32(&mut b, *type_id);
                     b.extend_from_slice(object_id);
                 }
+            }
+            // SP114 / S2.5: wire tag 45 — [u64 low_water_mark] (LE).
+            // Uses the same put_u64 helper as CommitTx's commit_opnum field.
+            Op::AdvanceWatermark { low_water_mark } => {
+                codec::put_u64(&mut b, *low_water_mark);
             }
         }
         b
@@ -1129,6 +1227,8 @@ impl Op {
                 };
                 Op::CommitTx { snapshot_opnum, write_set, commit_opnum, read_set }
             }
+            // SP114 / S2.5: wire tag 45 — [u64 low_water_mark] (LE).
+            45 => Op::AdvanceWatermark { low_water_mark: c.u64()? },
             _ => return None,
         };
         Some(op)

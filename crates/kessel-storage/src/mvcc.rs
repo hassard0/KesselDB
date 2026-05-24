@@ -246,6 +246,28 @@ pub fn has_version_in_range<V: Vfs>(
     false
 }
 
+/// SP114 / S2.5: Garbage-collect MVCC versions whose commit_opnum is
+/// strictly less than `low_water_mark`. Returns the count of versions
+/// deleted. See S2.5 design Decision 3.
+///
+/// Algorithm: scan the full versioned-storage range, decode every
+/// 28-byte key's commit_opnum, delete every entry whose commit_opnum
+/// < low_water_mark. Tombstones are also reclaimed.
+///
+/// Complexity: O(N) where N is the total number of versioned entries.
+/// Range-pruning / bloom-filter optimisations are S2.X follow-ups.
+///
+/// Determinism: scan order is BTreeMap-deterministic (sorted by
+/// 28-byte key); deletion order is therefore deterministic; the
+/// resulting LSM state is byte-identical across replicas given the
+/// same pre-GC state + the same low_water_mark.
+pub fn delete_versions_older_than<V: kessel_io::Vfs>(
+    _store: &mut crate::Storage<V>,
+    _low_water_mark: u64,
+) -> Result<usize, MvccKeyError> {
+    todo!("S2.5 T2: implement full-scan GC primitive")
+}
+
 // ----------------------------------------------------------------------------
 // Tests
 // ----------------------------------------------------------------------------

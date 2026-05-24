@@ -247,6 +247,31 @@ pub fn prune_pending_txs(
     *pending_txs = kept;
 }
 
+/// SP114 / S2.5: Prune pending_txs records whose commit_opnum is
+/// strictly less than `low_water_mark`. Replaces SP113's fixed
+/// MAX_TX_AGE-driven prune AT THE WATERMARK-ADVANCE SEAM ONLY.
+/// (SP113's `prune_pending_txs(MAX_TX_AGE)` is RETAINED on the
+/// commit-apply seam as a fallback ceiling per Decision 4.)
+///
+/// Correctness: a Tx evicted at low_water_mark cannot participate in
+/// any dangerous structure with a still-live reader, because by
+/// definition low_water_mark = min(active_snapshot_opnum) — every
+/// live reader pins a snapshot >= low_water_mark; an evicted Tx's
+/// commit_opnum < low_water_mark, so no live reader's snapshot is
+/// older than the evicted Tx's commit. The Cahill rw-edge
+/// concurrent-Tx condition (snapshot < pending.commit_opnum)
+/// requires snapshot < (some pending Tx's commit_opnum); for an
+/// evicted record this is provably FALSE. This is the formal
+/// closure of the SP113 bounded-window false-negative.
+///
+/// Determinism: BTreeMap::split_off — deterministic across replicas.
+pub fn prune_pending_txs_by_watermark(
+    _pending_txs: &mut BTreeMap<u64, PendingTxRecord>,
+    _low_water_mark: u64,
+) {
+    todo!("S2.5 T2: implement watermark-driven prune")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

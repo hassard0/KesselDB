@@ -435,6 +435,12 @@ pub struct Storage<V: Vfs> {
     /// the state machine as its replay/recovery apply-cursor; not part
     /// of the digest (it is derived from the WAL, not stored state).
     high_op: Option<u64>,
+    /// SP114 / S2.5: The local view of the SM's low_water_mark. Set by
+    /// the SM apply arm on `Op::AdvanceWatermark` apply via
+    /// `set_low_water_mark`. Read by `Tx::begin*` to validate the
+    /// snapshot_opnum is serveable. Initial value 0 (no GC has happened;
+    /// every snapshot >= 0 is serveable, which is every snapshot).
+    low_water_mark: u64,
 }
 
 impl<V: Vfs> Storage<V> {
@@ -467,7 +473,21 @@ impl<V: Vfs> Storage<V> {
             txn: None,
             compact_threshold: 0,
             high_op,
+            // SP114 / S2.5: no GC has run yet; every snapshot is serveable.
+            low_water_mark: 0,
         })
+    }
+
+    /// SP114 / S2.5: Read the storage's current low_water_mark.
+    pub fn low_water_mark(&self) -> u64 {
+        self.low_water_mark
+    }
+
+    /// SP114 / S2.5: Set the storage's low_water_mark. Called by the SM
+    /// apply arm on `Op::AdvanceWatermark` apply. Caller is responsible
+    /// for monotonicity — the SM apply path validates this before calling.
+    pub fn set_low_water_mark(&mut self, w: u64) {
+        self.low_water_mark = w;
     }
 
     /// Enable bounded-segment auto-compaction (SP49): once `flush` produces

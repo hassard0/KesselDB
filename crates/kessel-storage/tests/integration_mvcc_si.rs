@@ -114,7 +114,7 @@ fn it_read_your_writes_integration() {
     put_versioned(&mut store, 1, &obj(1), 0, Some(vec![0xAA])).unwrap();
 
     // Begin a write-capable Tx at snapshot=0.
-    let mut tx = Tx::begin_rw(&mut store, 0);
+    let mut tx = Tx::begin_rw(&mut store, 0).expect("SP114 T1: watermark=0; begin_rw always Ok");
 
     // First read: snapshot value [0xAA] (no buffered write yet).
     match tx.read(1, &obj(1)) {
@@ -173,7 +173,7 @@ fn it_disjoint_write_sets_both_commit() {
 
     // Tx_A: write (1, obj(1)) → commit at opnum=1.
     {
-        let mut tx_a = Tx::begin_rw(&mut store, 0);
+let mut tx_a = Tx::begin_rw(&mut store, 0).expect("SP114 T1: watermark=0; begin always Ok");
         tx_a.write(1, &obj(1), Some(vec![0xAA]));
         let out_a = tx_a.commit(1).expect("IT-2: Tx_A commit must not return TxError");
         assert_eq!(
@@ -187,7 +187,7 @@ fn it_disjoint_write_sets_both_commit() {
     // snapshot=0 (started from the same snapshot as Tx_A — simulates
     // concurrent Tx that both began before either committed).
     {
-        let mut tx_b = Tx::begin_rw(&mut store, 0);
+let mut tx_b = Tx::begin_rw(&mut store, 0).expect("SP114 T1: watermark=0; begin always Ok");
         tx_b.write(1, &obj(2), Some(vec![0xBB]));
         let out_b = tx_b.commit(2).expect("IT-2: Tx_B commit must not return TxError");
         assert_eq!(
@@ -242,7 +242,7 @@ fn it_overlap_aborts_second_committer() {
 
     // Tx_A: snapshot=0, write obj(1) → commit at opnum=20. First committer wins.
     {
-        let mut tx_a = Tx::begin_rw(&mut store, 0);
+let mut tx_a = Tx::begin_rw(&mut store, 0).expect("SP114 T1: watermark=0; begin always Ok");
         tx_a.write(1, &obj(1), Some(vec![0xAA]));
         let out_a = tx_a.commit(20).expect("IT-3: Tx_A commit must not return TxError");
         assert_eq!(
@@ -255,7 +255,7 @@ fn it_overlap_aborts_second_committer() {
     // Tx_B: snapshot=0 (stale — both Tx had the same empty starting state),
     // writes the SAME key obj(1) → commit at opnum=30. Must abort.
     {
-        let mut tx_b = Tx::begin_rw(&mut store, 0);
+let mut tx_b = Tx::begin_rw(&mut store, 0).expect("SP114 T1: watermark=0; begin always Ok");
         tx_b.write(1, &obj(1), Some(vec![0xBB]));
         let out_b = tx_b.commit(30).expect("IT-3: Tx_B commit must not return TxError");
         assert_eq!(
@@ -352,7 +352,7 @@ fn it_three_replica_byte_identity_for_si_commits() {
         // Expected: Committed { 1 }. Conflict window=(0,0] is empty (hi=0,
         // and the only version at opnum=0 is on type_id=2 — different type).
         let out1 = {
-            let mut tx1 = Tx::begin_rw(&mut store, 0);
+let mut tx1 = Tx::begin_rw(&mut store, 0).expect("SP114 T1: watermark=0; begin always Ok");
             tx1.write(1, &obj(1), Some(vec![0xCC]));
             tx1.commit(1).expect("IT-4: Tx_1 commit must not TxError")
         };
@@ -361,7 +361,7 @@ fn it_three_replica_byte_identity_for_si_commits() {
         // Expected: Committed { 2 }. Conflict window=(1,1]. No version of
         // (2,obj(2)) committed at opnum=1 (Tx_1 wrote type_id=1). → OK.
         let out2 = {
-            let mut tx2 = Tx::begin_rw(&mut store, 1);
+let mut tx2 = Tx::begin_rw(&mut store, 1).expect("SP114 T1: watermark=0; begin always Ok");
             tx2.write(2, &obj(2), Some(vec![0xDD]));
             tx2.commit(2).expect("IT-4: Tx_2 commit must not TxError")
         };
@@ -371,7 +371,7 @@ fn it_three_replica_byte_identity_for_si_commits() {
         // Conflict window=(0,2]. has_version_in_range(1, obj(1), 0, 2) finds
         // the version installed by Tx_1 at opnum=1 ∈ (0,2]. → Conflict.
         let out3 = {
-            let mut tx3 = Tx::begin_rw(&mut store, 0);
+let mut tx3 = Tx::begin_rw(&mut store, 0).expect("SP114 T1: watermark=0; begin always Ok");
             tx3.write(1, &obj(1), Some(vec![0xEE]));
             tx3.commit(3).expect("IT-4: Tx_3 commit must not TxError")
         };

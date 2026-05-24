@@ -85,7 +85,7 @@ fn integration_snapshot_pin_survives_concurrent_writes() {
 
     // --- Tx-A: pin at snapshot=10, read BEFORE the opnum=20 write exists ---
     {
-        let mut tx_a = Tx::begin(&store, 10);
+let mut tx_a = Tx::begin(&store, 10).expect("SP114 T1: watermark=0; begin always Ok");
         // Hand-derived: snapshot=10 sees opnum=0 ([0xAA]). No opnum=20 yet.
         match tx_a.read(1, &obj(1)) {
             SnapshotRead::Found(v) => assert_eq!(
@@ -112,7 +112,7 @@ fn integration_snapshot_pin_survives_concurrent_writes() {
     // opnum=20, opnum=25 for (type_id=1, obj(1)). A Tx pinned at snapshot=10
     // must return Found([0xAA]) — the opnum=0 version — NOT [0xBB] or [0xCC].
     {
-        let mut tx_b = Tx::begin(&store, 10);
+let mut tx_b = Tx::begin(&store, 10).expect("SP114 T1: watermark=0; begin always Ok");
         // Hand-derived: snapshot=10 sees only versions with commit_opnum ≤ 10.
         // opnum=0 ≤ 10 → visible; opnum=20 > 10 → invisible; opnum=25 > 10 → invisible.
         // get_at_snapshot scans newest-first; the first version with opnum ≤ 10 is opnum=0.
@@ -140,7 +140,7 @@ fn integration_snapshot_pin_survives_concurrent_writes() {
     // Sanity check: a Tx at snapshot=20 DOES see [0xBB] (opnum=20 is now visible).
     // This proves the store is correct and the pin is the only thing differentiating outcomes.
     {
-        let mut tx_late = Tx::begin(&store, 20);
+let mut tx_late = Tx::begin(&store, 20).expect("SP114 T1: watermark=0; begin always Ok");
         match tx_late.read(1, &obj(1)) {
             SnapshotRead::Found(v) => assert_eq!(
                 v,
@@ -190,9 +190,9 @@ fn integration_multi_tx_same_snapshot_byte_identity() {
     put_versioned(&mut store, 3, &obj(7), 3, Some(vec![0xC7])).unwrap(); // opnum=3 > snapshot=2
 
     // Three independent Tx instances, all pinned at snapshot=2.
-    let mut tx_a = Tx::begin(&store, 2);
-    let mut tx_b = Tx::begin(&store, 2);
-    let mut tx_c = Tx::begin(&store, 2);
+let mut tx_a = Tx::begin(&store, 2).expect("SP114 T1: watermark=0; begin always Ok");
+let mut tx_b = Tx::begin(&store, 2).expect("SP114 T1: watermark=0; begin always Ok");
+let mut tx_c = Tx::begin(&store, 2).expect("SP114 T1: watermark=0; begin always Ok");
 
     // --- Same read sequence on each Tx. ---
 
@@ -317,7 +317,7 @@ fn integration_read_set_monotonic_growth() {
         put_versioned(&mut store, 1, &obj(i), i as u64, Some(vec![i])).unwrap();
     }
 
-    let mut tx = Tx::begin(&store, 9); // snapshot=9 sees all 6 versions.
+    let mut tx = Tx::begin(&store, 9).expect("SP114 T1: watermark=0; begin always Ok"); // snapshot=9 sees all 6 versions.
 
     // Read 5 distinct keys; verify len grows 0→1→2→3→4→5.
     for i in 0u8..5 {
@@ -402,7 +402,7 @@ fn integration_tombstone_in_read_set_observability() {
     let read_high: SnapshotRead;
     let read_set_high: std::collections::BTreeSet<(u32, [u8; 16])>;
     {
-        let mut tx_high = Tx::begin(&store, 25);
+let mut tx_high = Tx::begin(&store, 25).expect("SP114 T1: watermark=0; begin always Ok");
         // Hand-derived: opnum=20 ≤ 25 → newest visible → tombstone.
         read_high = tx_high.read(5, &obj(99));
         assert_eq!(
@@ -427,7 +427,7 @@ fn integration_tombstone_in_read_set_observability() {
     let read_low: SnapshotRead;
     let read_set_low: std::collections::BTreeSet<(u32, [u8; 16])>;
     {
-        let mut tx_low = Tx::begin(&store, 15);
+let mut tx_low = Tx::begin(&store, 15).expect("SP114 T1: watermark=0; begin always Ok");
         // Hand-derived: opnum=20 > 15 → invisible; opnum=10 ≤ 15 → visible → Found([0xFF]).
         read_low = tx_low.read(5, &obj(99));
         assert_eq!(

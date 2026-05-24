@@ -120,6 +120,18 @@ pub struct StateMachine<V: Vfs> {
     /// state after the same log prefix is byte-identical (BTreeMap +
     /// sorted-Vec deterministic iteration; no hashing).
     pending_txs: std::collections::BTreeMap<u64 /* commit_opnum */, PendingTxRecord>,
+    /// SP114 / S2.5: The global low_water_mark in opnum space. Any MVCC
+    /// version with commit_opnum < low_water_mark has been reclaimed by
+    /// a prior Op::AdvanceWatermark apply. Any Tx with commit_opnum <
+    /// low_water_mark has been evicted from pending_txs. Any Tx::begin*
+    /// request with snapshot_opnum < low_water_mark is rejected with
+    /// TxError::SnapshotTooOld.
+    ///
+    /// In-memory only; not persisted (S2.X follow-up). Restored on
+    /// replica restart via log replay of every Op::AdvanceWatermark in
+    /// the log. Monotonic across the lifetime of the SM (per Decision 5
+    /// validation in the apply arm).
+    low_water_mark: u64,
 }
 
 /// SP113 / S2.4: Per-committed-Tx record retained in
@@ -165,6 +177,8 @@ impl<V: Vfs> StateMachine<V> {
             catalog_epoch: 0,
             // SP113 / S2.4: SSI pending-tx window, initially empty.
             pending_txs: std::collections::BTreeMap::new(),
+            // SP114 / S2.5: no GC has run yet; watermark = 0.
+            low_water_mark: 0,
         })
     }
 
@@ -3864,7 +3878,22 @@ impl<V: Vfs> StateMachine<V> {
                 }
                 OpResult::TxCommitted { commit_opnum }
             }
+            // SP114 / S2.5: GC watermark advance. T2 will implement the
+            // full validation + reclamation path. T1 scaffold: todo!().
+            Op::AdvanceWatermark { low_water_mark } => {
+                // SP114 / S2.5 T1 scaffold: full implementation in T2.
+                // T2: validate monotonicity + commit ceiling; call
+                // mvcc::delete_versions_older_than + ssi::prune_pending_txs_by_watermark;
+                // update self.low_water_mark + self.storage.set_low_water_mark.
+                let _ = low_water_mark; // T2 will consume.
+                todo!("S2.5 T2: Op::AdvanceWatermark apply")
+            }
         }
+    }
+
+    /// SP114 / S2.5: Read the SM's current low_water_mark.
+    pub fn low_water_mark(&self) -> u64 {
+        self.low_water_mark
     }
 
     /// Apply a batch of committed ops with a SINGLE fsync at the end
@@ -7337,7 +7366,7 @@ mod tests {
 
             // Op1: Committed { 1 }.
             let out1 = {
-                let mut tx = Tx::begin_rw(&mut store, 0);
+                let mut tx = Tx::begin_rw(&mut store, 0).expect("SP114 T1: watermark=0; begin_rw always Ok");
                 tx.write(1, &obj5(), Some(vec![0xAA]));
                 tx.commit(1).expect("IT-5 Tx-path Op1: must not TxError")
             };
@@ -7349,7 +7378,7 @@ mod tests {
 
             // Op2: Aborted (conflict with Op1).
             let out2 = {
-                let mut tx = Tx::begin_rw(&mut store, 0);
+                let mut tx = Tx::begin_rw(&mut store, 0).expect("SP114 T1: watermark=0; begin_rw always Ok");
                 tx.write(1, &obj5(), Some(vec![0xBB]));
                 tx.commit(2).expect("IT-5 Tx-path Op2: must not TxError")
             };
@@ -7361,7 +7390,7 @@ mod tests {
 
             // Op3: Committed { 3 }.
             let out3 = {
-                let mut tx = Tx::begin_rw(&mut store, 1);
+                let mut tx = Tx::begin_rw(&mut store, 1).expect("SP114 T1: watermark=0; begin_rw always Ok");
                 tx.write(2, &obj9(), Some(vec![0xCC]));
                 tx.commit(3).expect("IT-5 Tx-path Op3: must not TxError")
             };
@@ -8012,7 +8041,7 @@ mod tests {
         let mut store = kessel_storage::Storage::open(MemVfs::new()).unwrap();
         // Seed K2 so reads see Found / NotYetWritten as appropriate
         // (irrelevant for ordering; we only verify wire sort).
-        let mut tx = kessel_storage::tx::Tx::begin_ssi(&mut store, 0);
+        let mut tx = kessel_storage::tx::Tx::begin_ssi(&mut store, 0).expect("SP114 T1: watermark=0; begin_ssi always Ok");
         let t1: u32 = 1;
         // Read in scrambled order.
         for n in [3u8, 2, 1, 4, 5] {
@@ -8637,7 +8666,7 @@ mod tests {
                 kessel_storage::Storage::open(MemVfs::new()).unwrap();
             put_versioned(&mut store, type_id, &obj_seed, 0, Some(vec![0xDD])).unwrap();
 
-            let mut tx = Tx::begin_ssi(&mut store, 0);
+            let mut tx = Tx::begin_ssi(&mut store, 0).expect("SP114 T1: watermark=0; begin_ssi always Ok");
             let _ = tx.read(type_id, &obj_seed); // records obj_seed in read_set
             tx.write(type_id, &obj_new, Some(vec![0xEE]));
             let outcome = tx.commit_ssi(1)

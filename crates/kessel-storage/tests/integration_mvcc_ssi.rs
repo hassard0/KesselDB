@@ -110,7 +110,7 @@ fn it_coverage_empty_read_set_via_commit_ssi_degenerates_to_si() {
             if use_commit_ssi {
                 // SSI mode — but read_set is LEFT EMPTY (degenerated to SI).
                 // No tx.read() calls ⇒ read_set stays empty.
-                let mut tx = Tx::begin_ssi(&mut store, snapshot);
+                let mut tx = Tx::begin_ssi(&mut store, snapshot).expect("SP114 T1: watermark=0; begin_ssi always Ok");
                 tx.write(TYPE_ID, &obj(i as u8), Some(vec![i as u8]));
                 // Verify read_set is empty (structural assertion on the degeneration).
                 assert_eq!(
@@ -123,7 +123,7 @@ fn it_coverage_empty_read_set_via_commit_ssi_degenerates_to_si() {
                 outcomes.push(out);
             } else {
                 // SI mode — Tx::commit (baseline).
-                let mut tx = Tx::begin_rw(&mut store, snapshot);
+                let mut tx = Tx::begin_rw(&mut store, snapshot).expect("SP114 T1: watermark=0; begin_rw always Ok");
                 tx.write(TYPE_ID, &obj(i as u8), Some(vec![i as u8]));
                 let out = tx.commit(commit_opnum)
                     .expect("COV-1: commit must not TxError");
@@ -222,7 +222,7 @@ fn it_coverage_large_read_set_commit_ssi_success() {
 
     // Build the Tx with 1000 reads (no writes). Measure construction time
     // separately to keep the perf gate focused on commit_ssi overhead.
-    let mut tx = Tx::begin_ssi(&mut store, 0);
+    let mut tx = Tx::begin_ssi(&mut store, 0).expect("SP114 T1: watermark=0; begin_ssi always Ok");
     for idx in 0..N_READS {
         let key = big_key(idx);
         let _ = tx.read(TYPE_ID, &key); // result is NotYetWritten; side-effect: records read_set

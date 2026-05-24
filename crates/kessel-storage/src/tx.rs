@@ -169,6 +169,15 @@ pub enum TxError {
     /// SP112's T2-decided storage-mutability choice surfacing — see
     /// the `Tx::store` field doc for the rationale.
     ReadOnlyCannotCommit,
+    /// SP114 / S2.5: The requested snapshot_opnum is below the storage's
+    /// low_water_mark; the versions that would be visible have been
+    /// reclaimed by a prior Op::AdvanceWatermark apply. Replay with a
+    /// fresh snapshot >= low_water_mark.
+    ///
+    /// Note: `snapshot` field is NOT included here (only `low_water_mark`)
+    /// because the caller already knows which snapshot they requested;
+    /// `low_water_mark` is the new floor they need to beat.
+    SnapshotTooOld { low_water_mark: u64 },
 }
 
 impl std::fmt::Display for TxError {
@@ -192,6 +201,13 @@ impl std::fmt::Display for TxError {
                 "TxError::ReadOnlyCannotCommit — Tx::commit requires the \
                  Tx to be constructed via Tx::begin_rw(&mut store, ...); \
                  a Tx::begin(&store, ...) Tx is read-only"
+            ),
+            TxError::SnapshotTooOld { low_water_mark } => write!(
+                f,
+                "TxError::SnapshotTooOld {{ low_water_mark: {low_water_mark} }} \
+                 — snapshot_opnum is below the storage low_water_mark; \
+                 versions have been reclaimed; retry with a fresh snapshot \
+                 >= {low_water_mark}"
             ),
         }
     }
@@ -234,13 +250,21 @@ impl<'a, V: Vfs> Tx<'a, V> {
     ///
     /// Decision 2 (S2.2 design doc): caller-supplied snapshot opnum keeps
     /// kessel-storage decoupled from kessel-sm. SM wiring is S2.6's job.
-    pub fn begin(store: &'a Storage<V>, snapshot_opnum: u64) -> Self {
-        Self {
+    ///
+    /// SP114 / S2.5 T1 BREAKING CHANGE: returns `Result<Self, TxError>`.
+    /// T2 will add the snapshot-too-old check (`snapshot_opnum <
+    /// store.low_water_mark()` => `Err(TxError::SnapshotTooOld)`).
+    /// At watermark=0 (the T1 default), this always returns `Ok(...)`,
+    /// preserving byte-net-0 behaviour for all SP110/111/112/113 callers.
+    pub fn begin(store: &'a Storage<V>, snapshot_opnum: u64) -> Result<Self, TxError> {
+        // SP114 / S2.5 T1 scaffold: snapshot-too-old check lands in T2.
+        // watermark = 0 => every snapshot >= 0 is valid => always Ok.
+        Ok(Self {
             store: TxStore::Shared(store),
             snapshot_opnum,
             read_set: BTreeSet::new(),
             write_set: BTreeMap::new(),
-        }
+        })
     }
 
     /// Begin a write-capable Tx pinned at `snapshot_opnum`. The exclusive
@@ -251,13 +275,17 @@ impl<'a, V: Vfs> Tx<'a, V> {
     /// `Tx::store` field doc for the full rationale. SP111's
     /// `Tx::begin(&store, ...)` is left untouched for the read-only
     /// path; write-capable callers must use `begin_rw` instead.
-    pub fn begin_rw(store: &'a mut Storage<V>, snapshot_opnum: u64) -> Self {
-        Self {
+    ///
+    /// SP114 / S2.5 T1 BREAKING CHANGE: returns `Result<Self, TxError>`.
+    /// T2 adds the snapshot-too-old check. At watermark=0 always Ok.
+    pub fn begin_rw(store: &'a mut Storage<V>, snapshot_opnum: u64) -> Result<Self, TxError> {
+        // SP114 / S2.5 T1 scaffold: snapshot-too-old check lands in T2.
+        Ok(Self {
             store: TxStore::Exclusive(store),
             snapshot_opnum,
             read_set: BTreeSet::new(),
             write_set: BTreeMap::new(),
-        }
+        })
     }
 
     /// Snapshot read at the Tx's pinned snapshot_opnum.
@@ -452,13 +480,16 @@ impl<'a, V: Vfs> Tx<'a, V> {
     /// The SI/SSI distinction is purely per-call-site (which commit
     /// method is invoked) — there is no SSI-mode flag on the Tx struct.
     /// See S2.4 design Decision 6.
-    pub fn begin_ssi(store: &'a mut Storage<V>, snapshot_opnum: u64) -> Self {
-        Self {
+    /// SP114 / S2.5 T1 BREAKING CHANGE: returns `Result<Self, TxError>`.
+    /// T2 adds the snapshot-too-old check. At watermark=0 always Ok.
+    pub fn begin_ssi(store: &'a mut Storage<V>, snapshot_opnum: u64) -> Result<Self, TxError> {
+        // SP114 / S2.5 T1 scaffold: snapshot-too-old check lands in T2.
+        Ok(Self {
             store: TxStore::Exclusive(store),
             snapshot_opnum,
             read_set: BTreeSet::new(),
             write_set: BTreeMap::new(),
-        }
+        })
     }
 
     /// Conflict-checked SSI commit (Cahill SSI). Ships the Tx's read_set
@@ -670,7 +701,7 @@ mod tx_kats {
     fn kat_begin_pins_snapshot_opnum() {
         let mut store = Storage::open(MemVfs::new()).unwrap();
         put_versioned(&mut store, 1, &obj(1), 0, Some(vec![0xAA])).unwrap();
-        let tx = Tx::begin(&store, 42);
+        let tx = Tx::begin(&store, 42).expect("SP114 T1: watermark=0; begin always Ok");
         assert_eq!(tx.snapshot_opnum(), 42, "snapshot pin must equal begin arg");
         assert!(tx.read_set().is_empty(), "read_set must be empty on begin");
         // Consume tx so the borrow is released.
@@ -686,7 +717,7 @@ mod tx_kats {
     fn kat_read_returns_found_with_value() {
         let mut store = Storage::open(MemVfs::new()).unwrap();
         put_versioned(&mut store, 1, &obj(1), 0, Some(vec![0xAA])).unwrap();
-        let mut tx = Tx::begin(&store, 0);
+        let mut tx = Tx::begin(&store, 0).expect("SP114 T1: watermark=0; begin always Ok");
         match tx.read(1, &obj(1)) {
             SnapshotRead::Found(v) => assert_eq!(v, vec![0xAA], "value must be byte-identical"),
             other => panic!("expected Found([0xAA]), got {:?}", other),
@@ -707,7 +738,7 @@ mod tx_kats {
     #[test]
     fn kat_read_never_written_still_in_read_set() {
         let store = Storage::open(MemVfs::new()).unwrap();
-        let mut tx = Tx::begin(&store, 100);
+        let mut tx = Tx::begin(&store, 100).expect("SP114 T1: watermark=0; begin always Ok");
         assert!(
             matches!(tx.read(7, &obj(7)), SnapshotRead::NotYetWritten),
             "unwritten key must return NotYetWritten"
@@ -734,7 +765,7 @@ mod tx_kats {
         let mut store = Storage::open(MemVfs::new()).unwrap();
         put_versioned(&mut store, 1, &obj(1), 0, Some(vec![0xAA])).unwrap();
         put_versioned(&mut store, 1, &obj(1), 1, None).unwrap(); // tombstone at opnum=1
-        let mut tx = Tx::begin(&store, 1);
+        let mut tx = Tx::begin(&store, 1).expect("SP114 T1: watermark=0; begin always Ok");
         assert!(
             matches!(tx.read(1, &obj(1)), SnapshotRead::Tombstoned),
             "tombstoned key must return Tombstoned"
@@ -758,7 +789,7 @@ mod tx_kats {
     fn kat_re_read_same_key_no_dup_in_read_set() {
         let mut store = Storage::open(MemVfs::new()).unwrap();
         put_versioned(&mut store, 1, &obj(1), 0, Some(vec![0xAA])).unwrap();
-        let mut tx = Tx::begin(&store, 0);
+        let mut tx = Tx::begin(&store, 0).expect("SP114 T1: watermark=0; begin always Ok");
         let _ = tx.read(1, &obj(1));
         let _ = tx.read(1, &obj(1));
         let _ = tx.read(1, &obj(1));
@@ -783,7 +814,7 @@ mod tx_kats {
         put_versioned(&mut store, 1, &obj(1), 0, Some(vec![0xAA])).unwrap();
         put_versioned(&mut store, 1, &obj(2), 0, Some(vec![0xBB])).unwrap();
         put_versioned(&mut store, 2, &obj(2), 0, Some(vec![0xCC])).unwrap();
-        let mut tx = Tx::begin(&store, 0);
+        let mut tx = Tx::begin(&store, 0).expect("SP114 T1: watermark=0; begin always Ok");
         // Insert in reverse-sorted order to exercise the BTreeSet sort.
         let _ = tx.read(2, &obj(2));
         let _ = tx.read(1, &obj(2));
@@ -820,7 +851,7 @@ mod tx_kats {
         // Write opnum=1 (the "after-snapshot" version — future write).
         put_versioned(&mut store, 1, &obj(1), 1, Some(vec![0xBB])).unwrap();
         // Tx pinned at snapshot=0 must see opnum=0 version only.
-        let mut tx = Tx::begin(&store, 0);
+        let mut tx = Tx::begin(&store, 0).expect("SP114 T1: watermark=0; begin always Ok");
         match tx.read(1, &obj(1)) {
             SnapshotRead::Found(v) => {
                 assert_eq!(v, vec![0xAA], "snapshot pin must suppress opnum=1 write");
@@ -840,7 +871,7 @@ mod tx_kats {
     #[test]
     fn kat_commit_read_only_ok_and_consumes_tx() {
         let store = Storage::open(MemVfs::new()).unwrap();
-        let tx = Tx::begin(&store, 0);
+        let tx = Tx::begin(&store, 0).expect("SP114 T1: watermark=0; begin always Ok");
         let result = tx.commit_read_only();
         assert!(result.is_ok(), "commit_read_only must return Ok(()) in S2.2");
         // `tx` is consumed above; `tx.snapshot_opnum()` here would be a
@@ -853,7 +884,7 @@ mod tx_kats {
     #[test]
     fn kat_abort_consumes_tx() {
         let store = Storage::open(MemVfs::new()).unwrap();
-        let tx = Tx::begin(&store, 0);
+        let tx = Tx::begin(&store, 0).expect("SP114 T1: watermark=0; begin always Ok");
         tx.abort(); // consumes tx
         // `tx` is consumed above; `tx.snapshot_opnum()` here would be a
         // compile-time "use of moved value" error — the lifecycle is
@@ -890,7 +921,7 @@ mod tx_si_kats {
     #[test]
     fn kat_write_inserts_into_write_set() {
         let store = Storage::open(MemVfs::new()).unwrap();
-        let mut tx = Tx::begin(&store, 0);
+        let mut tx = Tx::begin(&store, 0).expect("SP114 T1: watermark=0; begin always Ok");
         tx.write(1, &obj(1), Some(vec![0xAA]));
         assert_eq!(tx.write_set().len(), 1, "exactly one buffered write");
         assert_eq!(
@@ -910,7 +941,7 @@ mod tx_si_kats {
     fn kat_read_your_writes_returns_buffered_found() {
         let mut store = Storage::open(MemVfs::new()).unwrap();
         put_versioned(&mut store, 1, &obj(1), 0, Some(vec![0xAA])).unwrap();
-        let mut tx = Tx::begin(&store, 0);
+        let mut tx = Tx::begin(&store, 0).expect("SP114 T1: watermark=0; begin always Ok");
         tx.write(1, &obj(1), Some(vec![0xBB]));
         match tx.read(1, &obj(1)) {
             SnapshotRead::Found(v) => assert_eq!(
@@ -932,7 +963,7 @@ mod tx_si_kats {
     fn kat_read_your_writes_buffered_tombstone() {
         let mut store = Storage::open(MemVfs::new()).unwrap();
         put_versioned(&mut store, 1, &obj(1), 0, Some(vec![0xAA])).unwrap();
-        let mut tx = Tx::begin(&store, 0);
+        let mut tx = Tx::begin(&store, 0).expect("SP114 T1: watermark=0; begin always Ok");
         tx.write(1, &obj(1), None);
         assert!(
             matches!(tx.read(1, &obj(1)), SnapshotRead::Tombstoned),
@@ -949,7 +980,7 @@ mod tx_si_kats {
     fn kat_read_then_write_subsequent_read_sees_buffer() {
         let mut store = Storage::open(MemVfs::new()).unwrap();
         put_versioned(&mut store, 1, &obj(1), 0, Some(vec![0xAA])).unwrap();
-        let mut tx = Tx::begin(&store, 0);
+        let mut tx = Tx::begin(&store, 0).expect("SP114 T1: watermark=0; begin always Ok");
         match tx.read(1, &obj(1)) {
             SnapshotRead::Found(v) => assert_eq!(
                 v,
@@ -976,7 +1007,7 @@ mod tx_si_kats {
     #[test]
     fn kat_same_key_coalesce_last_write_wins() {
         let store = Storage::open(MemVfs::new()).unwrap();
-        let mut tx = Tx::begin(&store, 0);
+        let mut tx = Tx::begin(&store, 0).expect("SP114 T1: watermark=0; begin always Ok");
         tx.write(1, &obj(1), Some(vec![0xAA]));
         tx.write(1, &obj(1), Some(vec![0xBB]));
         assert_eq!(tx.write_set().len(), 1, "same-key writes coalesce");
@@ -995,7 +1026,7 @@ mod tx_si_kats {
     #[test]
     fn kat_commit_empty_write_set_succeeds() {
         let mut store = Storage::open(MemVfs::new()).unwrap();
-        let tx = Tx::begin_rw(&mut store, 0);
+        let tx = Tx::begin_rw(&mut store, 0).expect("SP114 T1: watermark=0; begin_rw always Ok");
         let out = tx.commit(5).expect("commit must not err");
         assert_eq!(out, TxCommitOutcome::Committed { commit_opnum: 5 });
         // Verify no writes leaked: any read returns NotYetWritten.
@@ -1014,7 +1045,7 @@ mod tx_si_kats {
     fn kat_commit_single_write_visible_at_commit_opnum() {
         let mut store = Storage::open(MemVfs::new()).unwrap();
         {
-            let mut tx = Tx::begin_rw(&mut store, 0);
+            let mut tx = Tx::begin_rw(&mut store, 0).expect("SP114 T1: watermark=0; begin_rw always Ok");
             tx.write(1, &obj(1), Some(vec![0xAA]));
             let out = tx.commit(1).expect("no err");
             assert_eq!(out, TxCommitOutcome::Committed { commit_opnum: 1 });
@@ -1035,7 +1066,7 @@ mod tx_si_kats {
     fn kat_commit_write_write_conflict_aborts_second() {
         let mut store = Storage::open(MemVfs::new()).unwrap();
         {
-            let mut tx_a = Tx::begin_rw(&mut store, 10);
+let mut tx_a = Tx::begin_rw(&mut store, 10).expect("SP114 T1: watermark=0; begin always Ok");
             tx_a.write(1, &obj(1), Some(vec![0xAA]));
             let out_a = tx_a.commit(20).expect("a no-err");
             assert_eq!(
@@ -1048,7 +1079,7 @@ mod tx_si_kats {
         // tx_b sees the snapshot=10 world (no version of k); writes k;
         // commits at 30. The has_version_in_range(10, 29) check finds
         // tx_a's commit at opnum=20 — CONFLICT.
-        let mut tx_b = Tx::begin_rw(&mut store, 10);
+let mut tx_b = Tx::begin_rw(&mut store, 10).expect("SP114 T1: watermark=0; begin always Ok");
         tx_b.write(1, &obj(1), Some(vec![0xBB]));
         let out_b = tx_b.commit(30).expect("b no-err");
         assert_eq!(
@@ -1067,12 +1098,12 @@ mod tx_si_kats {
     fn kat_commit_disjoint_keys_both_succeed() {
         let mut store = Storage::open(MemVfs::new()).unwrap();
         {
-            let mut tx_a = Tx::begin_rw(&mut store, 0);
+let mut tx_a = Tx::begin_rw(&mut store, 0).expect("SP114 T1: watermark=0; begin always Ok");
             tx_a.write(1, &obj(1), Some(vec![0xAA]));
             let out_a = tx_a.commit(1).expect("a no-err");
             assert_eq!(out_a, TxCommitOutcome::Committed { commit_opnum: 1 });
         }
-        let mut tx_b = Tx::begin_rw(&mut store, 0);
+let mut tx_b = Tx::begin_rw(&mut store, 0).expect("SP114 T1: watermark=0; begin always Ok");
         tx_b.write(1, &obj(2), Some(vec![0xBB])); // disjoint key
         let out_b = tx_b.commit(2).expect("b no-err");
         assert_eq!(out_b, TxCommitOutcome::Committed { commit_opnum: 2 });
@@ -1086,7 +1117,7 @@ mod tx_si_kats {
     #[test]
     fn kat_commit_opnum_zero_skips_conflict_check() {
         let mut store = Storage::open(MemVfs::new()).unwrap();
-        let mut tx = Tx::begin_rw(&mut store, 0);
+        let mut tx = Tx::begin_rw(&mut store, 0).expect("SP114 T1: watermark=0; begin_rw always Ok");
         tx.write(1, &obj(1), Some(vec![0xAA]));
         let out = tx.commit(0).expect("no err — no underflow");
         assert_eq!(out, TxCommitOutcome::Committed { commit_opnum: 0 });
@@ -1099,7 +1130,7 @@ mod tx_si_kats {
     #[test]
     fn kat_commit_snapshot_greater_than_commit_errors() {
         let mut store = Storage::open(MemVfs::new()).unwrap();
-        let mut tx = Tx::begin_rw(&mut store, 20);
+        let mut tx = Tx::begin_rw(&mut store, 20).expect("SP114 T1: watermark=0; begin_rw always Ok");
         tx.write(1, &obj(1), Some(vec![0xAA]));
         let err = tx.commit(10).expect_err("snapshot > commit must err");
         assert!(
@@ -1130,7 +1161,7 @@ mod tx_coverage {
     #[test]
     fn cv_tx_with_zero_reads() {
         let store = Storage::open(MemVfs::new()).unwrap();
-        let tx = Tx::begin(&store, 0);
+        let tx = Tx::begin(&store, 0).expect("SP114 T1: watermark=0; begin always Ok");
         assert!(tx.read_set().is_empty());
         assert!(tx.commit_read_only().is_ok());
     }
@@ -1140,7 +1171,7 @@ mod tx_coverage {
     fn cv_re_read_same_key_100x_size_1() {
         let mut store = Storage::open(MemVfs::new()).unwrap();
         put_versioned(&mut store, 1, &obj(1), 0, Some(vec![0xAA])).unwrap();
-        let mut tx = Tx::begin(&store, 0);
+        let mut tx = Tx::begin(&store, 0).expect("SP114 T1: watermark=0; begin always Ok");
         for _ in 0..100 {
             let _ = tx.read(1, &obj(1));
         }
@@ -1156,7 +1187,7 @@ mod tx_coverage {
             k[12..16].copy_from_slice(&i.to_be_bytes());
             put_versioned(&mut store, 1, &k, i as u64, Some(vec![(i & 0xFF) as u8])).unwrap();
         }
-        let mut tx = Tx::begin(&store, 999);
+        let mut tx = Tx::begin(&store, 999).expect("SP114 T1: watermark=0; begin always Ok");
         for i in 0..1000u32 {
             let mut k = [0u8; 16];
             k[12..16].copy_from_slice(&i.to_be_bytes());
@@ -1172,7 +1203,7 @@ mod tx_coverage {
         let mut store = Storage::open(MemVfs::new()).unwrap();
         put_versioned(&mut store, 1, &obj(1), 0, Some(vec![0xAA])).unwrap();
         put_versioned(&mut store, 2, &obj(2), 0, Some(vec![0xBB])).unwrap();
-        let mut tx = Tx::begin(&store, 0);
+        let mut tx = Tx::begin(&store, 0).expect("SP114 T1: watermark=0; begin always Ok");
         let _ = tx.read(1, &obj(1));
         let _ = tx.read(2, &obj(2));
         let original: Vec<_> = tx.read_set().iter().cloned().collect();
@@ -1187,7 +1218,7 @@ mod tx_coverage {
         for i in 0..50u8 {
             put_versioned(&mut store, 1, &obj(i), i as u64, Some(vec![i])).unwrap();
         }
-        let mut tx = Tx::begin(&store, 49);
+        let mut tx = Tx::begin(&store, 49).expect("SP114 T1: watermark=0; begin always Ok");
         for i in 0..50u8 {
             let _ = tx.read(1, &obj(i));
         }
@@ -1227,7 +1258,7 @@ mod tx_si_coverage {
     fn cv_empty_write_set_commit_no_op() {
         let mut store = Storage::open(MemVfs::new()).unwrap();
         put_versioned(&mut store, 1, &obj(1), 0, Some(vec![0xAA])).unwrap();
-        let tx = Tx::begin_rw(&mut store, 0);
+        let tx = Tx::begin_rw(&mut store, 0).expect("SP114 T1: watermark=0; begin_rw always Ok");
         let out = tx.commit(5).unwrap();
         assert_eq!(
             out,
@@ -1248,7 +1279,7 @@ mod tx_si_coverage {
     #[test]
     fn cv_abort_discards_buffered_writes() {
         let store = Storage::open(MemVfs::new()).unwrap();
-        let mut tx = Tx::begin(&store, 0);
+        let mut tx = Tx::begin(&store, 0).expect("SP114 T1: watermark=0; begin always Ok");
         tx.write(1, &obj(1), Some(vec![0xAA]));
         tx.write(1, &obj(2), Some(vec![0xBB]));
         tx.abort();
@@ -1271,7 +1302,7 @@ mod tx_si_coverage {
     #[test]
     fn cv_same_key_writes_coalesce_in_write_set() {
         let mut store = Storage::open(MemVfs::new()).unwrap();
-        let mut tx = Tx::begin_rw(&mut store, 0);
+        let mut tx = Tx::begin_rw(&mut store, 0).expect("SP114 T1: watermark=0; begin_rw always Ok");
         tx.write(1, &obj(1), Some(vec![0xAA]));
         tx.write(1, &obj(1), Some(vec![0xBB]));
         tx.write(1, &obj(1), Some(vec![0xCC]));
@@ -1297,7 +1328,7 @@ mod tx_si_coverage {
     #[test]
     fn cv_large_write_set_1000_writes_commit() {
         let mut store = Storage::open(MemVfs::new()).unwrap();
-        let mut tx = Tx::begin_rw(&mut store, 0);
+        let mut tx = Tx::begin_rw(&mut store, 0).expect("SP114 T1: watermark=0; begin_rw always Ok");
         for i in 0..1000u32 {
             let mut k = [0u8; 16];
             k[12..16].copy_from_slice(&i.to_be_bytes());
@@ -1328,7 +1359,7 @@ mod tx_si_coverage {
     #[test]
     fn cv_mixed_write_tombstone_write_same_key() {
         let mut store = Storage::open(MemVfs::new()).unwrap();
-        let mut tx = Tx::begin_rw(&mut store, 0);
+        let mut tx = Tx::begin_rw(&mut store, 0).expect("SP114 T1: watermark=0; begin_rw always Ok");
         tx.write(1, &obj(1), Some(vec![0xAA])); // initial write
         tx.write(1, &obj(1), None);             // intermediate tombstone
         tx.write(1, &obj(1), Some(vec![0xCC])); // final write overwrites tombstone

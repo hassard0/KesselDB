@@ -92,6 +92,32 @@ pub fn format_result(r: &OpResult) -> String {
                 _ => "ABORTED  (unknown reason — future variant)".to_string(),
             }
         }
+        // SP114 / S2.5: GC watermark advance outcomes.
+        OpResult::WatermarkAdvanced { new_low_water_mark, versions_deleted, pending_txs_evicted } => {
+            format!(
+                "OK  (watermark advanced to {new_low_water_mark}; \
+                 {versions_deleted} versions deleted; \
+                 {pending_txs_evicted} pending_txs evicted)"
+            )
+        }
+        OpResult::WatermarkRejected { reason } => {
+            use kessel_proto::WatermarkRejection;
+            match reason {
+                WatermarkRejection::NotMonotonic { proposed, current } => {
+                    format!(
+                        "REJECTED  (watermark not monotonic: proposed={proposed} \
+                         <= current={current})"
+                    )
+                }
+                WatermarkRejection::AboveCommitCeiling { proposed, current_commit } => {
+                    format!(
+                        "REJECTED  (watermark above commit ceiling: proposed={proposed} \
+                         > current_commit={current_commit})"
+                    )
+                }
+                _ => "REJECTED  (unknown reason — future variant)".to_string(),
+            }
+        }
     }
 }
 
@@ -335,6 +361,28 @@ pub fn format_result_json(r: &OpResult) -> String {
                     format!(r#"{{"status":"tx_aborted","reason":"storage_io","kind":{kind}}}"#)
                 }
                 _ => r#"{"status":"tx_aborted","reason":"unknown"}"#.to_string(),
+            }
+        }
+        // SP114 / S2.5: GC watermark advance outcomes.
+        OpResult::WatermarkAdvanced { new_low_water_mark, versions_deleted, pending_txs_evicted } => {
+            format!(
+                r#"{{"status":"watermark_advanced","new_low_water_mark":{new_low_water_mark},"versions_deleted":{versions_deleted},"pending_txs_evicted":{pending_txs_evicted}}}"#
+            )
+        }
+        OpResult::WatermarkRejected { reason } => {
+            use kessel_proto::WatermarkRejection;
+            match reason {
+                WatermarkRejection::NotMonotonic { proposed, current } => {
+                    format!(
+                        r#"{{"status":"watermark_rejected","reason":"not_monotonic","proposed":{proposed},"current":{current}}}"#
+                    )
+                }
+                WatermarkRejection::AboveCommitCeiling { proposed, current_commit } => {
+                    format!(
+                        r#"{{"status":"watermark_rejected","reason":"above_commit_ceiling","proposed":{proposed},"current_commit":{current_commit}}}"#
+                    )
+                }
+                _ => r#"{"status":"watermark_rejected","reason":"unknown"}"#.to_string(),
             }
         }
     }

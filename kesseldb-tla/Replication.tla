@@ -655,7 +655,26 @@ BecomePrimary ==
     \E v \in 1..(MaxViewChanges + 1) :
         LET p == PrimaryOf(v)
         IN  /\ Cardinality(DvcSenders(v, p)) >= Quorum
-            /\ ~ (status[p] = "Normal" /\ normalView[p] = v)
+            \* Real-VSR tightening (T3-TLC-found #4, SP109): BecomePrimary
+            \* for view v fires at most once across the entire history of p
+            \* for views <= v. The previous guard ~(status=Normal /\
+            \* normalView=v) was insufficient: once p had been Normal at
+            \* view v (i.e., normalView[p] = v), a subsequent legitimate
+            \* StartViewChange for view v+1 could regress status[p] to
+            \* ViewChange while leaving normalView[p] at v — re-enabling
+            \* BecomePrimary(v) using stale DoViewChange(v) messages still
+            \* in flight from the first round. Strict normalView[p] < v
+            \* mirrors kessel-vsr's maybe_finish_view_change, which acts
+            \* only on the view the replica is CURRENTLY executing a view
+            \* change for (i.e., view > the last normal view).
+            \* Trace 2026-05-23 fix-#3 round: states 7,15 both fire
+            \* BecomePrimary(v=1) on r2 because r2's normalView stays at 1
+            \* across r1's StartViewChange(view=2)-driven regression of
+            \* status[r2] to ViewChange. The second firing wipes
+            \* log[r2]/commit[r2] while applied[r2] = <<1>> remains,
+            \* violating TypeOK's Len(applied[r]) <= commit[r].
+            /\ normalView[p] < v
+            /\ view[p] <= v
             /\ LET dvcs == DvcAt(v, p)
                    \* Lexicographic max on (normalView, log length).
                    bestMsg == CHOOSE m \in dvcs :

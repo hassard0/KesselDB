@@ -80,7 +80,8 @@ pub(crate) fn parse_huffman_tree(input: &[u8]) -> Result<(HuffmanTree, usize), Z
     }
     let header_byte = input[0];
     if header_byte < 128 {
-        return Err(ZstdError::FseWeightHuffmanNotYetSupported { header_byte });
+        // FSE-weight path — RFC §4.2.1.1.
+        return parse_fse_weight_huffman_tree(input);
     }
 
     // Direct-weight path.
@@ -108,6 +109,103 @@ pub(crate) fn parse_huffman_tree(input: &[u8]) -> Result<(HuffmanTree, usize), Z
         }
         weights.push(nibble);
     }
+    let (weights, max_bits) = compute_last_weight_and_max_bits(weights)?;
+    let tree = build_huffman_tree_from_weights(&weights, max_bits)?;
+    Ok((tree, total_consumed))
+}
+
+/// FSE-weight Huffman tree decoder per RFC 8478 §4.2.1.1 (the path where
+/// the header byte is in `0..=127` and is interpreted as the byte length
+/// of the FSE-encoded weight stream that follows).
+///
+/// The weight stream layout:
+///   bytes 0..1                : FSE table description start (forward LSB-first)
+///   bytes ... up to N         : FSE normalized counts (variable bit width)
+///   byte N (byte-aligned)..end: REVERSE bitstream of FSE-state-decoded weights
+///
+/// Two FSE state machines (state1 + state2) alternately decode weight
+/// symbols from the reverse bitstream. The decoded sequence of weights
+/// — terminated when the reverse bitstream is exhausted — feeds into
+/// the same canonical-code construction as the direct-weight path.
+fn parse_fse_weight_huffman_tree(input: &[u8]) -> Result<(HuffmanTree, usize), ZstdError> {
+    use crate::zstd_fse::{
+        build_fse_table, parse_normalized_counts, FseState, ForwardBitReader, ReverseBitReader,
+    };
+    if input.is_empty() {
+        return Err(ZstdError::UnexpectedEof);
+    }
+    let header_byte = input[0];
+    if header_byte >= 128 {
+        return Err(ZstdError::UnexpectedEof);
+    }
+    let compressed_weights_size = header_byte as usize;
+    let total_consumed = 1 + compressed_weights_size;
+    if input.len() < total_consumed {
+        return Err(ZstdError::UnexpectedEof);
+    }
+    let weight_stream = &input[1..total_consumed];
+
+    // Parse the FSE table description from the FORWARD bit stream at the
+    // start of weight_stream. max_symbol_value = MAX_HUFFMAN_BITS (11)
+    // because the FSE alphabet here is the weight values 0..=11.
+    let mut fr = ForwardBitReader::new(weight_stream);
+    let normalized = parse_normalized_counts(&mut fr, MAX_HUFFMAN_BITS)?;
+    // RFC §4.2.1.1: FSE-weight accuracy_log is 5 or 6.
+    if normalized.accuracy_log < 5 || normalized.accuracy_log > 6 {
+        return Err(ZstdError::UnexpectedEof);
+    }
+    let fse_table = build_fse_table(&normalized.counts, normalized.accuracy_log)?;
+
+    // The bytes AFTER the FSE table description (byte-aligned) form the
+    // reverse bitstream. The forward bit reader's bit_pos has been
+    // aligned to the next byte by parse_normalized_counts.
+    let table_end_byte = fr.bit_pos() / 8;
+    if table_end_byte > weight_stream.len() {
+        return Err(ZstdError::UnexpectedEof);
+    }
+    let reverse_payload = &weight_stream[table_end_byte..];
+    let mut rr = ReverseBitReader::new(reverse_payload)?;
+
+    // Initialize the two state machines.
+    let mut state1 = FseState::init(&fse_table, &mut rr)?;
+    let mut state2 = FseState::init(&fse_table, &mut rr)?;
+
+    // Decode weights via the two-interleaved FSE pattern. Cap at
+    // MAX_HUFFMAN_SYMBOLS - 1 (the implicit last weight is added by
+    // compute_last_weight_and_max_bits).
+    let mut weights: Vec<u8> = Vec::new();
+    let mut emit_state1_next = true;
+    loop {
+        // Emit current state's symbol.
+        let sym = if emit_state1_next {
+            state1.current_symbol(&fse_table)
+        } else {
+            state2.current_symbol(&fse_table)
+        };
+        weights.push(sym);
+        if weights.len() >= MAX_HUFFMAN_SYMBOLS - 1 {
+            // Can't fit any more explicit weights (the implicit last
+            // weight would push to MAX_HUFFMAN_SYMBOLS).
+            break;
+        }
+        // Try to step the current state's machine. If insufficient bits,
+        // we're done (the current symbol was the last one to emit).
+        let entry = if emit_state1_next {
+            state1.current_entry(&fse_table)
+        } else {
+            state2.current_entry(&fse_table)
+        };
+        if rr.remaining() < entry.nb_bits as usize {
+            break;
+        }
+        if emit_state1_next {
+            state1.step(&fse_table, &mut rr)?;
+        } else {
+            state2.step(&fse_table, &mut rr)?;
+        }
+        emit_state1_next = !emit_state1_next;
+    }
+
     let (weights, max_bits) = compute_last_weight_and_max_bits(weights)?;
     let tree = build_huffman_tree_from_weights(&weights, max_bits)?;
     Ok((tree, total_consumed))
@@ -226,15 +324,16 @@ fn build_huffman_tree_from_weights(weights: &[u8], max_bits: u32) -> Result<Huff
 mod tests {
     use super::*;
 
-    /// SP128-KAT-1: FSE-weight header (byte < 128) traps with typed err.
+    /// SP128-KAT-1: FSE-weight header (byte < 128) routes to the
+    /// FSE-weight parser (SP131). With a single-byte input declaring
+    /// compressed_weights_size=5 but no following bytes, the parser
+    /// traps with typed UnexpectedEof.
     #[test]
-    fn sp128_kat_fse_weight_header_deferred() {
-        match parse_huffman_tree(&[0x05u8]).unwrap_err() {
-            ZstdError::FseWeightHuffmanNotYetSupported { header_byte } => {
-                assert_eq!(header_byte, 5);
-            }
-            other => panic!("expected FseWeightHuffmanNotYetSupported; got {other:?}"),
-        }
+    fn sp128_kat_fse_weight_header_truncated_traps() {
+        assert_eq!(
+            parse_huffman_tree(&[0x05u8]).unwrap_err(),
+            ZstdError::UnexpectedEof
+        );
     }
 
     /// SP128-KAT-2: empty input → typed UnexpectedEof.
@@ -329,6 +428,8 @@ mod tests {
     }
 
     /// SP128-KAT-6: deterministic — same input twice → identical tree.
+    /// Uses a direct-weight header (0x82 = 130) so the result is a
+    /// well-defined Huffman tree, not a deferred trap.
     #[test]
     fn sp128_kat_deterministic_repeat() {
         let r1 = parse_huffman_tree(&[0x82u8, 0x21u8, 0x10u8]).unwrap().0;
@@ -372,6 +473,60 @@ mod tests {
             parse_huffman_tree(&[0x82u8, 0x22u8, 0x10u8]).unwrap_err(),
             ZstdError::UnexpectedEof
         );
+    }
+
+    // ========================================================================
+    // SP131 KATs — FSE-weight Huffman tree path.
+    // ========================================================================
+
+    /// SP131-KAT-1: FSE-weight header byte 0 = compressed_weights_size 0
+    /// → empty weight stream → trap (no FSE table description bytes).
+    #[test]
+    fn sp131_kat_fse_weight_zero_compressed_size_traps() {
+        // header_byte = 0; no following bytes needed but the parser
+        // must report a malformed/empty FSE table.
+        assert_eq!(
+            parse_huffman_tree(&[0x00u8]).unwrap_err(),
+            ZstdError::UnexpectedEof
+        );
+    }
+
+    /// SP131-KAT-2: FSE-weight declared compressed_weights_size = 5 but
+    /// only 1 byte (header) provided → truncated trap.
+    #[test]
+    fn sp131_kat_fse_weight_declared_size_overruns_input() {
+        assert_eq!(
+            parse_huffman_tree(&[0x05u8]).unwrap_err(),
+            ZstdError::UnexpectedEof
+        );
+    }
+
+    /// SP131-KAT-3: FSE-weight declared compressed_weights_size = 3 with
+    /// 3 follower bytes — exercises the code path through to FSE table
+    /// parsing. With 3 random bytes the FSE table description will
+    /// almost certainly fail validation (accuracy_log out of range or
+    /// normalized counts inconsistent); we just assert it doesn't
+    /// PANIC and returns a typed error.
+    #[test]
+    fn sp131_kat_fse_weight_invalid_table_returns_typed_err() {
+        let bytes = [0x03u8, 0x00, 0x00, 0x00];
+        match parse_huffman_tree(&bytes) {
+            Err(_) => {} // any typed err is fine — no panic is the assertion
+            Ok(_) => panic!("expected error from garbage FSE-weight table"),
+        }
+    }
+
+    /// SP131-KAT-4: FSE-weight path is DETERMINISTIC — same bytes twice
+    /// → same Result variant (both error in the same way).
+    #[test]
+    fn sp131_kat_fse_weight_deterministic_repeat() {
+        let bytes = [0x05u8, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let r1 = parse_huffman_tree(&bytes);
+        let r2 = parse_huffman_tree(&bytes);
+        assert_eq!(r1.is_err(), r2.is_err());
+        if let (Err(e1), Err(e2)) = (&r1, &r2) {
+            assert_eq!(format!("{e1:?}"), format!("{e2:?}"));
+        }
     }
 
     /// SP128-KAT-10: tree contains 0-weight (absent) symbol.

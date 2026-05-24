@@ -204,6 +204,37 @@ pub(crate) fn decode_compressed_literals(
     Ok((decoded, total_consumed))
 }
 
+/// Decode a Treeless literals section per RFC 8478 §5.3.5 — same layout
+/// as Compressed but with NO Huffman tree description (the previous
+/// block's tree is reused). The caller supplies `prev_tree`.
+///
+/// `input` MUST begin at the literals section header. Returns the
+/// decoded literals + the total bytes consumed by the section.
+pub(crate) fn decode_treeless_literals(
+    input: &[u8],
+    prev_tree: &HuffmanTree,
+) -> Result<(Vec<u8>, usize), ZstdError> {
+    let header = parse_literals_header(input)?;
+    if header.block_type != LiteralsBlockType::Treeless {
+        return Err(ZstdError::LiteralsBlockTypeNotYetSupported {
+            block_type: header.block_type as u8,
+        });
+    }
+    let after_header = &input[header.header_len..];
+    let comp_size = header.compressed_size as usize;
+    if after_header.len() < comp_size {
+        return Err(ZstdError::UnexpectedEof);
+    }
+    let bitstream = &after_header[..comp_size];
+    let decoded = match header.num_streams {
+        1 => decode_huffman_stream(bitstream, prev_tree, header.regenerated_size as usize)?,
+        4 => decode_huffman_4streams(bitstream, prev_tree, header.regenerated_size as usize)?,
+        _ => return Err(ZstdError::UnexpectedEof),
+    };
+    let total_consumed = header.header_len + comp_size;
+    Ok((decoded, total_consumed))
+}
+
 /// Compatibility wrapper for SP129 callers — same semantics as
 /// `decode_compressed_literals` but rejects 4-stream with the SP129
 /// sentinel marker for any caller still expecting single-stream-only.
@@ -520,5 +551,68 @@ mod tests {
             }
             other => panic!("expected LiteralsBlockTypeNotYetSupported; got {other:?}"),
         }
+    }
+
+    // ========================================================================
+    // SP131 KATs — Treeless literal mode.
+    // ========================================================================
+
+    /// SP131-KAT-T1: decode_treeless_literals rejects non-Treeless types
+    /// (here: Raw with header 0x10 → block_type=0).
+    #[test]
+    fn sp131_kat_treeless_rejects_non_treeless() {
+        let tree = uniform_2sym_tree();
+        let bytes = [0x10u8, b'a', b'b'];
+        match decode_treeless_literals(&bytes, &tree).unwrap_err() {
+            ZstdError::LiteralsBlockTypeNotYetSupported { block_type } => {
+                assert_eq!(block_type, 0); // Raw
+            }
+            other => panic!("expected LiteralsBlockTypeNotYetSupported; got {other:?}"),
+        }
+    }
+
+    /// SP131-KAT-T2: Treeless single-stream decode with the SP129 KAT-3
+    /// bitstream + a uniform_4sym_tree. Header = Treeless / size_format=00
+    /// / 1-stream / regen=4 / comp=2.
+    /// combined = (4 << 4) | (2 << 14) | (0b00 << 2) | 0b11
+    ///          = 0x40 | 0x8000 | 0x00 | 0x03 = 0x8043.
+    /// b0 = 0x43, b1 = 0x80, b2 = 0x00. Bitstream = [0x1B, 0x01].
+    /// Expected decoded = [0, 1, 2, 3] (same as SP129-KAT-3).
+    #[test]
+    fn sp131_kat_treeless_single_stream_decodes() {
+        let tree = uniform_4sym_tree();
+        let bytes = [0x43u8, 0x80, 0x00, 0x1B, 0x01];
+        let (out, consumed) = decode_treeless_literals(&bytes, &tree).unwrap();
+        assert_eq!(out, vec![0u8, 1, 2, 3]);
+        assert_eq!(consumed, 5); // 3-byte header + 2-byte bitstream
+    }
+
+    /// SP131-KAT-T3: Treeless 4-stream decode. Header = Treeless /
+    /// size_format=01 / 4-stream / regen=8 / comp=14 (6 jump + 4 × 2 = 14).
+    /// combined = (8 << 4) | (14 << 14) | (0b01 << 2) | 0b11
+    ///          = 0x80 | 0x38000 | 0x04 | 0x03 = 0x38087.
+    /// b0 = 0x87, b1 = 0x80, b2 = 0x03.
+    /// Then jump table [2,0, 2,0, 2,0] + 4 × [0x1B, 0x01] = 14 bytes.
+    /// Per-stream output = [0, 1] each → concat = [0,1,0,1,0,1,0,1].
+    #[test]
+    fn sp131_kat_treeless_four_stream_decodes() {
+        let tree = uniform_4sym_tree();
+        let mut bytes = vec![0x87u8, 0x80, 0x03]; // Treeless header
+        bytes.extend(&[2u8, 0, 2, 0, 2, 0]); // jump table
+        for _ in 0..4 {
+            bytes.extend(&[0x1Bu8, 0x01u8]);
+        }
+        let (out, _) = decode_treeless_literals(&bytes, &tree).unwrap();
+        assert_eq!(out, vec![0u8, 1, 0, 1, 0, 1, 0, 1]);
+    }
+
+    /// SP131-KAT-T4: deterministic — same input + same tree twice → same output.
+    #[test]
+    fn sp131_kat_treeless_deterministic_repeat() {
+        let tree = uniform_4sym_tree();
+        let bytes = [0x43u8, 0x80, 0x00, 0x1B, 0x01];
+        let r1 = decode_treeless_literals(&bytes, &tree).unwrap().0;
+        let r2 = decode_treeless_literals(&bytes, &tree).unwrap().0;
+        assert_eq!(r1, r2);
     }
 }

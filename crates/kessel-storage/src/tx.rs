@@ -24,6 +24,7 @@
 use crate::Storage;
 use crate::mvcc::SnapshotRead;
 use kessel_io::Vfs;
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 /// A read-only transaction pinned at a snapshot opnum.
@@ -62,6 +63,12 @@ pub struct Tx<'a, V: Vfs> {
     /// is replica-byte-identical. S2.4 SSI cycle-detection pass consumes
     /// this and requires deterministic ordering for replica-identical results.
     read_set: BTreeSet<(u32, [u8; 16])>,
+    /// Buffered writes (S2.3 / SP112). Same-key writes coalesce
+    /// last-write-wins via BTreeMap insertion. `None` value = buffered
+    /// tombstone. Deterministic iteration (sorted lex by
+    /// (type_id, object_id)) so Op::CommitTx's wire encoding is
+    /// replica-byte-identical. Decision 2 of the S2.3 design.
+    write_set: BTreeMap<(u32, [u8; 16]), Option<Vec<u8>>>,
 }
 
 /// Errors a Tx commit/abort can return.
@@ -84,6 +91,18 @@ pub enum TxError {
     /// `#[non_exhaustive]` marker.
     #[doc(hidden)]
     _Reserved,
+    /// Hostile / malformed commit: `snapshot_opnum > commit_opnum`. The
+    /// SM cursor-stall semantics for `snapshot_opnum > current_opnum`
+    /// ship in S2.6; S2.3 treats this case as malformed input.
+    SnapshotOutOfRange { snapshot: u64, commit: u64 },
+    /// `put_versioned` failed during commit's apply phase. Wraps the
+    /// underlying I/O error kind + message so callers can recover or
+    /// escalate. Uses `std::io::ErrorKind` (which IS `Clone + Eq`) instead
+    /// of `std::io::Error` (which is NOT) to preserve the `Clone + Eq`
+    /// derive on `TxError` (Decision 3, S2.3 design — picks option (2)
+    /// to preserve SP111's trait-shape contract). T2 ships the
+    /// `From<std::io::Error>` conversion that extracts kind + message.
+    StorageIo { kind: std::io::ErrorKind, message: String },
 }
 
 impl std::fmt::Display for TxError {
@@ -93,11 +112,39 @@ impl std::fmt::Display for TxError {
                 f,
                 "TxError::_Reserved (reserved variant — S2.2 produces no errors)"
             ),
+            TxError::SnapshotOutOfRange { snapshot, commit } => write!(
+                f,
+                "TxError::SnapshotOutOfRange {{ snapshot: {snapshot}, commit: {commit} }} \
+                 — snapshot_opnum must not exceed commit_opnum"
+            ),
+            TxError::StorageIo { kind, message } => write!(
+                f,
+                "TxError::StorageIo {{ kind: {kind:?}, message: {message:?} }}"
+            ),
         }
     }
 }
 
 impl std::error::Error for TxError {}
+
+/// Outcome of a conflict-checked commit (S2.3 / SP112). `Committed`
+/// echoes the `commit_opnum` back for audit. `Aborted` carries the
+/// `(type_id, object_id)` of the FIRST conflicting key encountered.
+///
+/// IMPORTANT: an `Aborted` outcome is `Ok(_)`, NOT `Err(_)` — an SI
+/// conflict is a normal/expected outcome (the Tx must retry with a
+/// fresher snapshot), not an error. `TxError` is reserved for
+/// malformed input + infrastructure failures. Decision 6 of the S2.3
+/// design.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TxCommitOutcome {
+    /// The transaction committed successfully at `commit_opnum`.
+    Committed { commit_opnum: u64 },
+    /// The transaction was aborted due to a write-write conflict on
+    /// `conflicting_key`. The caller should retry with a fresher snapshot.
+    Aborted { conflicting_key: (u32, [u8; 16]) },
+}
 
 impl<'a, V: Vfs> Tx<'a, V> {
     /// Begin a read-only Tx pinned at `snapshot_opnum`.
@@ -113,6 +160,7 @@ impl<'a, V: Vfs> Tx<'a, V> {
             store,
             snapshot_opnum,
             read_set: BTreeSet::new(),
+            write_set: BTreeMap::new(),
         }
     }
 
@@ -184,6 +232,50 @@ impl<'a, V: Vfs> Tx<'a, V> {
         // Drop self. No buffered writes to discard in S2.2. S2.3 will
         // add write-set rollback logic here.
     }
+
+    /// Buffer a write of `value` (or a tombstone if `value == None`)
+    /// for `(type_id, object_id)`. Same-key writes coalesce
+    /// (last-write-wins via BTreeMap insertion). Visible to subsequent
+    /// `Tx::read` calls in this Tx via the read-your-writes overlay
+    /// (Decision 3 of the S2.3 design). Per-Tx semantic only — no other
+    /// Tx observes the buffered write until this Tx commits.
+    pub fn write(&mut self, type_id: u32, object_id: &[u8; 16], value: Option<Vec<u8>>) {
+        todo!("S2.3 T2: insert into self.write_set");
+    }
+
+    /// Immutable view of the buffered writes. S2.4 SSI consumes this for
+    /// rw-antidependency cycle detection. Deterministic iteration
+    /// (sorted lex) by BTreeMap discipline (Decision 2).
+    pub fn write_set(&self) -> &BTreeMap<(u32, [u8; 16]), Option<Vec<u8>>> {
+        todo!("S2.3 T2: return &self.write_set");
+    }
+
+    /// Conflict-checked commit (S2.3 / SP112).
+    ///
+    /// In standalone form (this S2.3 cut), runs the SAME deterministic
+    /// conflict check that the SM apply path runs — directly against
+    /// `self.store`. In production (S2.6), this will be replaced by an
+    /// `Op::CommitTx` submission to VSR + the verdict coming back via
+    /// the SM apply callback. The S2.3 standalone form runs the check
+    /// locally for testability + the dormant-module discipline.
+    ///
+    /// Returns:
+    /// - `Ok(TxCommitOutcome::Committed { commit_opnum })` if no conflict
+    ///   was found and every write was installed at `commit_opnum`.
+    /// - `Ok(TxCommitOutcome::Aborted { conflicting_key })` if a
+    ///   write-write conflict was detected (first conflicting key wins).
+    /// - `Err(TxError::SnapshotOutOfRange { snapshot, commit })` if
+    ///   `snapshot_opnum > commit_opnum` (malformed input).
+    /// - `Err(TxError::StorageIo { kind, message })` if `put_versioned`
+    ///   fails during apply.
+    ///
+    /// Edge cases:
+    /// - Empty write_set => `Ok(Committed { commit_opnum })` (no-op).
+    /// - `commit_opnum == 0` => conflict check SKIPPED (no prior versions
+    ///   can exist below opnum=0). Edge case from Decision 5.
+    pub fn commit(self, commit_opnum: u64) -> Result<TxCommitOutcome, TxError> {
+        todo!("S2.3 T2: run conflict check then install writes");
+    }
 }
 
 #[cfg(test)]
@@ -215,16 +307,57 @@ mod tx_scaffold_tests {
         // Construct via the doc-hidden variant (in-crate code can; per
         // the non_exhaustive contract, external crates cannot).
         let e = TxError::_Reserved;
-        // Pattern-match must include `_` arm (or all variants); for
-        // S2.2 there is exactly one variant. The shape lock is the
-        // discipline that future variants ship with their own pattern
-        // arms.
+        // Pattern-match must include `_` arm (or all variants).
         match &e {
             TxError::_Reserved => {}
+            TxError::SnapshotOutOfRange { .. } => {}
+            TxError::StorageIo { .. } => {}
             _ => panic!("non-exhaustive: future variant unhandled"),
         }
         // Display trait formats to a non-empty string.
         assert!(!format!("{e}").is_empty());
+    }
+
+    // SP112 T1 scaffold test 1: TxCommitOutcome derives Debug + Clone + PartialEq + Eq.
+    #[test]
+    fn tx_commit_outcome_trait_shape_locked() {
+        fn assert_debug<T: std::fmt::Debug>() {}
+        fn assert_clone<T: Clone>() {}
+        fn assert_partial_eq<T: PartialEq>() {}
+        fn assert_eq_trait<T: Eq>() {}
+        assert_debug::<TxCommitOutcome>();
+        assert_clone::<TxCommitOutcome>();
+        assert_partial_eq::<TxCommitOutcome>();
+        assert_eq_trait::<TxCommitOutcome>();
+        // Verify both variants are constructible and clone correctly.
+        let committed = TxCommitOutcome::Committed { commit_opnum: 42 };
+        assert_eq!(committed.clone(), committed);
+        let aborted = TxCommitOutcome::Aborted { conflicting_key: (1u32, [0u8; 16]) };
+        assert_eq!(aborted.clone(), aborted);
+        assert_ne!(committed, aborted);
+    }
+
+    // SP112 T1 scaffold test 2: extended TxError variants are constructible
+    // and Display + Clone + PartialEq + Eq all hold.
+    #[test]
+    fn tx_error_extends_with_snapshot_out_of_range() {
+        let e1 = TxError::SnapshotOutOfRange { snapshot: 10, commit: 5 };
+        // Display returns a non-empty string.
+        let display = format!("{e1}");
+        assert!(!display.is_empty(), "Display must produce non-empty string");
+        // Clone produces an equal value.
+        assert_eq!(e1.clone(), e1);
+        // matches! macro works (confirms the variant is constructible and matchable).
+        assert!(matches!(e1, TxError::SnapshotOutOfRange { snapshot: 10, commit: 5 }));
+
+        let e2 = TxError::StorageIo {
+            kind: std::io::ErrorKind::Other,
+            message: "disk full".to_string(),
+        };
+        let display2 = format!("{e2}");
+        assert!(!display2.is_empty());
+        assert_eq!(e2.clone(), e2);
+        assert!(matches!(e2, TxError::StorageIo { .. }));
     }
 }
 

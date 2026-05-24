@@ -3694,6 +3694,18 @@ impl<V: Vfs> StateMachine<V> {
                  state machine"
                     .into(),
             ),
+
+            Op::CommitTx { snapshot_opnum, write_set, commit_opnum } => {
+                // S2.3 T2 will fill in the conflict-check + apply logic. The
+                // shape mirrors `Tx::commit` so the two paths are
+                // byte-equivalent on identical storage states (verified by T3's
+                // SM-apply-vs-Tx-commit byte-equivalence test).
+                let _ = (snapshot_opnum, write_set, commit_opnum);
+                todo!(
+                    "S2.3 T2: implement Op::CommitTx apply path with \
+                     has_version_in_range conflict check + put_versioned apply"
+                )
+            }
         }
     }
 

@@ -253,6 +253,21 @@ pub enum Op {
         offset: u32,
         limit: u32,
     },
+    /// Plain SI conflict-checked commit (S2.3 / SP112). Carries the Tx's
+    /// snapshot opnum + the deterministic-iteration write_set + the
+    /// SM-assigned commit opnum. SM apply runs the
+    /// `has_version_in_range(snapshot_opnum, commit_opnum-1)` check for
+    /// each write_set key; on conflict, aborts; on no conflict, installs
+    /// every write via put_versioned at commit_opnum. The verdict is a
+    /// deterministic function of the log prefix (parent S2 design Decision
+    /// 4). write_set is sorted by (type_id, object_id) at construction.
+    /// Empty write_set => trivial commit (no-op apply). commit_opnum=0
+    /// edge: the conflict check is skipped (no prior versions can exist).
+    CommitTx {
+        snapshot_opnum: u64,
+        write_set: Vec<(u32, [u8; 16], Option<Vec<u8>>)>,
+        commit_opnum: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -369,6 +384,7 @@ impl Op {
             Op::SelectSorted { .. } => 23,
             Op::AddCompositeIndex { .. } => 24,
             Op::FindByComposite { .. } => 25,
+            Op::CommitTx { .. } => 44,
         }
     }
 
@@ -661,6 +677,26 @@ impl Op {
                 codec::put_u32(&mut b, *offset);
                 codec::put_u32(&mut b, *limit);
             }
+            Op::CommitTx { snapshot_opnum, write_set, commit_opnum } => {
+                // wire: [u64 snapshot_opnum][u32 write_set_len]
+                //       { [u32 type_id][16B object_id][u8 presence][?bytes value] }*
+                //       [u64 commit_opnum]
+                // presence byte: 0 = tombstone (None), 1 = live (Some(value follows))
+                b.extend_from_slice(&snapshot_opnum.to_le_bytes());
+                codec::put_u32(&mut b, write_set.len() as u32);
+                for (type_id, object_id, value) in write_set {
+                    codec::put_u32(&mut b, *type_id);
+                    b.extend_from_slice(object_id);
+                    match value {
+                        None => b.push(0),
+                        Some(v) => {
+                            b.push(1);
+                            codec::put_bytes(&mut b, v);
+                        }
+                    }
+                }
+                b.extend_from_slice(&commit_opnum.to_le_bytes());
+            }
         }
         b
     }
@@ -950,6 +986,27 @@ impl Op {
                 offset: c.u32()?,
                 limit: c.u32()?,
             },
+            44 => {
+                let snapshot_opnum = c.u64()?;
+                let n = c.u32()? as usize;
+                let mut write_set = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let type_id = c.u32()?;
+                    // Decode the 16-byte object_id via the Cursor::object_id helper;
+                    // the helper returns ObjectId(bytes) so we take its inner array.
+                    let oid = c.object_id()?;
+                    let object_id: [u8; 16] = oid.0;
+                    let presence = c.u8()?;
+                    let value = match presence {
+                        0 => None,
+                        1 => Some(c.bytes()?),
+                        _ => return None,
+                    };
+                    write_set.push((type_id, object_id, value));
+                }
+                let commit_opnum = c.u64()?;
+                Op::CommitTx { snapshot_opnum, write_set, commit_opnum }
+            }
             _ => return None,
         };
         Some(op)
@@ -1167,6 +1224,17 @@ mod tests {
                 commit: true,
             },
             Op::FindByComposite { type_id: 4, fields: vec![1, 3], values: vec![vec![9], vec![8, 8]] },
+            // SP112 T1: CommitTx scaffold wire roundtrip.
+            Op::CommitTx {
+                snapshot_opnum: 7,
+                write_set: vec![
+                    (1u32, [0u8; 16], Some(vec![0xAA, 0xBB])),
+                    (2u32, {let mut k=[0u8;16]; k[15]=5; k}, None),
+                ],
+                commit_opnum: 42,
+            },
+            // Empty write_set edge case.
+            Op::CommitTx { snapshot_opnum: 0, write_set: vec![], commit_opnum: 0 },
         ];
         for op in ops {
             let enc = op.encode();

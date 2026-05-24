@@ -541,6 +541,56 @@ impl<V: Vfs> Storage<V> {
         })
     }
 
+    /// MVCC variant of `put`/`delete`: accepts `Option<Vec<u8>>` so a
+    /// tombstone (`None`) is expressible in a single call. Reuses the same
+    /// Entry/WAL commit path; `op_number` becomes the version's commit_opnum.
+    /// Added for S2.1; the only change to this file in that slice.
+    pub fn put_entry_versioned(
+        &mut self,
+        op_number: u64,
+        key: Key,
+        value: Option<Vec<u8>>,
+    ) -> io::Result<()> {
+        self.commit(Entry { op_number, key, value })
+    }
+
+    /// Like `scan_range` but yields `(Key, Option<Vec<u8>>)` — tombstones
+    /// are visible as `None`. Used by the MVCC layer to scan a versioned-key
+    /// prefix where a tombstone encodes a logical deletion rather than
+    /// a missing key. Merge order: older SSTables < newer SSTables < memtable
+    /// < txn overlay (latest wins).
+    pub fn scan_range_versions(
+        &self,
+        lo: &Key,
+        hi: &Key,
+    ) -> Vec<(Key, Option<Vec<u8>>)> {
+        if lo > hi {
+            return Vec::new();
+        }
+        let mut merged: BTreeMap<Key, Option<Vec<u8>>> = BTreeMap::new();
+        for sst in &self.sstables {
+            if !sst.overlaps(lo, hi) {
+                continue;
+            }
+            let s = sst.entries.partition_point(|(k, _)| k < lo);
+            for (k, v) in &sst.entries[s..] {
+                if k > hi {
+                    break;
+                }
+                merged.insert(k.clone(), v.clone());
+            }
+        }
+        for (k, v) in self.memtable.range(lo.clone()..=hi.clone()) {
+            merged.insert(k.clone(), v.clone());
+        }
+        if let Some(ov) = &self.txn {
+            for (k, (_, v)) in ov.range(lo.clone()..=hi.clone()) {
+                merged.insert(k.clone(), v.clone());
+            }
+        }
+        merged.into_iter().collect()
+    }
+
     fn commit(&mut self, e: Entry) -> io::Result<()> {
         if let Some(ov) = self.txn.as_mut() {
             ov.insert(e.key, (e.op_number, e.value)); // buffered, not durable

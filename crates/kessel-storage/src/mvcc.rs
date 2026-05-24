@@ -32,7 +32,7 @@ pub const VERSIONED_KEY_LEN: usize = 28;
 ///
 /// The prefix is identical to what `crate::make_key` produces, so a full scan
 /// of all versions for a logical key is a `scan_range` over
-/// `[prefix, prefix ++ 0x00…00]` to `[prefix, prefix ++ 0xFF…FF]`.
+/// `[prefix, prefix ++ 0x00..00]` to `[prefix, prefix ++ 0xFF..FF]`.
 pub const PREFIX_LEN: usize = 20;
 
 /// Result of a snapshot read.
@@ -93,7 +93,15 @@ impl std::error::Error for MvccKeyError {}
 /// `commit_opnum` is the SM-assigned opnum at which this version was
 /// committed (Decision 2: log opnum as timestamp, no wall-clock).
 pub fn make_versioned_key(type_id: u32, object_id: &[u8; 16], commit_opnum: u64) -> Key {
-    todo!("filled in T2")
+    // Inversion: u64::MAX - commit_opnum (== !commit_opnum for u64).
+    // Newer opnums produce smaller inverted values, so BE encoding makes
+    // newer versions lex-sort BEFORE older ones within the same prefix.
+    let inverted = u64::MAX - commit_opnum;
+    let mut k = Vec::with_capacity(VERSIONED_KEY_LEN);
+    k.extend_from_slice(&type_id.to_le_bytes());
+    k.extend_from_slice(object_id);
+    k.extend_from_slice(&inverted.to_be_bytes());
+    k
 }
 
 /// Decode the `commit_opnum` out of a 28-byte MVCC versioned key.
@@ -102,22 +110,30 @@ pub fn make_versioned_key(type_id: u32, object_id: &[u8; 16], commit_opnum: u64)
 /// Returns `Err(MvccKeyError::Length(_))` for any slice whose length
 /// is not exactly [`VERSIONED_KEY_LEN`].
 pub fn decode_commit_opnum(key: &[u8]) -> Result<u64, MvccKeyError> {
-    todo!("filled in T2")
+    if key.len() != VERSIONED_KEY_LEN {
+        return Err(MvccKeyError::Length(key.len()));
+    }
+    // Length-checked above — this try_into().unwrap() is statically
+    // infallible: key[PREFIX_LEN..VERSIONED_KEY_LEN] is exactly 8 bytes.
+    let be_bytes: [u8; 8] = key[PREFIX_LEN..VERSIONED_KEY_LEN]
+        .try_into()
+        .expect("slice is exactly 8 bytes after length check");
+    let inverted = u64::from_be_bytes(be_bytes);
+    // Invert back: u64::MAX - inverted == original commit_opnum.
+    Ok(u64::MAX - inverted)
 }
 
 /// Append a new version of `(type_id, object_id)` at `commit_opnum`.
 ///
 /// `value = Some(bytes)` for a write; `value = None` for a tombstone (logical
 /// deletion). The versioned key is built via [`make_versioned_key`] and written
-/// to the underlying `Storage` using `put` (non-`None`) or `delete` (`None`).
+/// to the underlying `Storage` using `put_entry_versioned` which accepts
+/// `Option<Vec<u8>>` so tombstones flow naturally.
 ///
 /// Append-only: prior versions of the same `(type_id, object_id)` remain
 /// in the store until S2.5 GC reclaims them. Callers MUST ensure that
 /// `commit_opnum` is strictly greater than any opnum previously written for
-/// this logical key — the function does not enforce this in S2.1 (T2 may add
-/// an assertion).
-///
-/// Implements the "version write" path of Decision 3.
+/// this logical key — the function does not enforce this in S2.1.
 pub fn put_versioned<V: Vfs>(
     store: &mut Storage<V>,
     type_id: u32,
@@ -125,20 +141,22 @@ pub fn put_versioned<V: Vfs>(
     commit_opnum: u64,
     value: Option<Vec<u8>>,
 ) -> std::io::Result<()> {
-    todo!("filled in T2")
+    let key = make_versioned_key(type_id, object_id, commit_opnum);
+    store.put_entry_versioned(commit_opnum, key, value)
 }
 
 /// Snapshot read: returns the newest version of `(type_id, object_id)`
 /// with `commit_opnum <= snapshot_opnum`.
 ///
 /// Algorithm (Decision 5):
-/// 1. Build the prefix `type_id (4 LE) ++ object_id (16)`.
-/// 2. Seek the LSM to the first key ≥ `prefix ++ inverted(snapshot_opnum)`.
-///    Because inversion makes newer versions sort first, the first key in the
-///    prefix range that is ≥ the seek point is the newest visible version.
-/// 3. If the matching entry is a tombstone → `Tombstoned`.
-/// 4. If no key in the prefix range satisfies the constraint → `NotYetWritten`.
-/// 5. Otherwise → `Found(value)`.
+/// 1. Build the full prefix `type_id (4 LE) ++ object_id (16)`.
+/// 2. Scan the LSM over the (type_id, object_id) prefix range — keys come
+///    out in ascending lex order, which equals DESCENDING commit_opnum order
+///    because of the inversion. The first key whose decoded commit_opnum is
+///    <= snapshot_opnum is the newest visible version.
+/// 3. If the matching entry is a tombstone (`None`) -> `Tombstoned`.
+/// 4. If no key in the prefix range satisfies the constraint -> `NotYetWritten`.
+/// 5. Otherwise -> `Found(value)`.
 ///
 /// Reads are non-mutating; takes a shared reference to `Storage`.
 pub fn get_at_snapshot<V: Vfs>(
@@ -147,7 +165,38 @@ pub fn get_at_snapshot<V: Vfs>(
     object_id: &[u8; 16],
     snapshot_opnum: u64,
 ) -> SnapshotRead {
-    todo!("filled in T2")
+    // Build the inclusive [lo, hi] bounds spanning all versions for this
+    // logical key. Inverted suffix 0x00..00 corresponds to commit_opnum=u64::MAX
+    // (newest possible); 0xFF..FF corresponds to commit_opnum=0 (oldest).
+    // BTreeMap range scan yields ascending lex = descending opnum.
+    let mut lo = Vec::with_capacity(VERSIONED_KEY_LEN);
+    lo.extend_from_slice(&type_id.to_le_bytes());
+    lo.extend_from_slice(object_id);
+    lo.extend_from_slice(&[0x00u8; 8]); // inverted(u64::MAX) = newest-possible
+
+    let mut hi = Vec::with_capacity(VERSIONED_KEY_LEN);
+    hi.extend_from_slice(&type_id.to_le_bytes());
+    hi.extend_from_slice(object_id);
+    hi.extend_from_slice(&[0xFFu8; 8]); // inverted(0) = oldest-possible
+
+    // scan_range_versions yields tombstones as None; keys are in ascending
+    // lex order = descending commit_opnum order.
+    for (k, v) in store.scan_range_versions(&lo, &hi) {
+        match decode_commit_opnum(&k) {
+            Ok(c) if c <= snapshot_opnum => {
+                return match v {
+                    Some(bytes) => SnapshotRead::Found(bytes),
+                    None => SnapshotRead::Tombstoned,
+                };
+            }
+            _ => {
+                // commit_opnum > snapshot_opnum: this version is too new.
+                // Continue scanning to find an older one.
+                continue;
+            }
+        }
+    }
+    SnapshotRead::NotYetWritten
 }
 
 /// Returns `true` iff any version of `(type_id, object_id)` exists in the
@@ -157,11 +206,7 @@ pub fn get_at_snapshot<V: Vfs>(
 /// Required by S2.3 (SI write-set conflict detection): before a transaction
 /// at snapshot `lo` commits, it checks whether any concurrent writer committed
 /// a version of the same key in `(lo, now_opnum]`. If so, the committing
-/// transaction aborts (first-committer-wins). Shipping this signature in S2.1
-/// lets S2.3 import it without expanding the module surface.
-///
-/// Implementation uses two `make_versioned_key` bounds and a `scan_range`
-/// over the LSM — to be filled in T2.
+/// transaction aborts (first-committer-wins).
 pub fn has_version_in_range<V: Vfs>(
     store: &Storage<V>,
     type_id: u32,
@@ -169,7 +214,36 @@ pub fn has_version_in_range<V: Vfs>(
     lo_opnum_exclusive: u64,
     hi_opnum_inclusive: u64,
 ) -> bool {
-    todo!("filled in T2")
+    // Build the full prefix range (same as get_at_snapshot).
+    let mut lo = Vec::with_capacity(VERSIONED_KEY_LEN);
+    lo.extend_from_slice(&type_id.to_le_bytes());
+    lo.extend_from_slice(object_id);
+    lo.extend_from_slice(&[0x00u8; 8]);
+
+    let mut hi = Vec::with_capacity(VERSIONED_KEY_LEN);
+    hi.extend_from_slice(&type_id.to_le_bytes());
+    hi.extend_from_slice(object_id);
+    hi.extend_from_slice(&[0xFFu8; 8]);
+
+    for (k, _v) in store.scan_range_versions(&lo, &hi) {
+        match decode_commit_opnum(&k) {
+            Ok(c) => {
+                // Scan is in descending opnum order.
+                // If c <= lo_opnum_exclusive, all remaining entries are
+                // also <= lo_opnum_exclusive (outside the window).
+                if c <= lo_opnum_exclusive {
+                    return false;
+                }
+                if c <= hi_opnum_inclusive {
+                    // c > lo_opnum_exclusive AND c <= hi_opnum_inclusive: match.
+                    return true;
+                }
+                // c > hi_opnum_inclusive: still too new, keep scanning.
+            }
+            Err(_) => continue, // malformed key — skip
+        }
+    }
+    false
 }
 
 // ----------------------------------------------------------------------------
@@ -179,63 +253,258 @@ pub fn has_version_in_range<V: Vfs>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Storage;
+    use kessel_io::MemVfs;
 
-    /// Smoke test: the module compiles and all public symbols link correctly.
-    ///
-    /// Each public function is referenced (but not called — the `todo!()`
-    /// bodies would panic). The test is `#[should_panic]` so the harness
-    /// records it as passing even though calling any function hits `todo!()`.
-    ///
-    /// What this validates:
-    /// - Every type (`SnapshotRead`, `MvccKeyError`) is reachable.
-    /// - Every constant (`VERSIONED_KEY_LEN`, `PREFIX_LEN`) is readable.
-    /// - Every function has a valid signature that the compiler accepts.
-    #[test]
-    #[should_panic]
-    fn compiles_and_links() {
-        // Constants are readable without panicking.
-        assert_eq!(VERSIONED_KEY_LEN, 28);
-        assert_eq!(PREFIX_LEN, 20);
-
-        // Enum variants are constructible and comparable.
-        let _found = SnapshotRead::Found(vec![1, 2, 3]);
-        let _tomb = SnapshotRead::Tombstoned;
-        let _nyw = SnapshotRead::NotYetWritten;
-        assert_ne!(SnapshotRead::Tombstoned, SnapshotRead::NotYetWritten);
-
-        // MvccKeyError is constructible and Display works.
-        let err = MvccKeyError::Length(5);
-        let msg = format!("{err}");
-        assert!(msg.contains("28"));
-
-        // Call each public function — all hit todo!() and panic, which is
-        // expected (hence #[should_panic]).  The type-checker has already
-        // verified the signatures at compile time; this just proves linkage.
-        let object_id = [0u8; 16];
-        let _key: Key = make_versioned_key(1, &object_id, 42);
-        // Unreachable past here, but the signatures below are type-checked:
-        let _ = decode_commit_opnum(&[]);
-        // put_versioned / get_at_snapshot / has_version_in_range require a
-        // Storage<V> which cannot be constructed in a unit test without a VFS.
-        // Their signatures are validated at compile time; no runtime call needed.
+    /// Helper: build a deterministic 16-byte object_id from a single byte.
+    fn obj(n: u8) -> [u8; 16] {
+        let mut a = [0u8; 16];
+        a[15] = n;
+        a
     }
 
-    /// Verify the MvccKeyError::Length display message format.
-    ///
-    /// Does NOT call any todo!() function, so this test always passes cleanly.
+    // -----------------------------------------------------------------------
+    // T2.5.1: Key encoding round-trip — boundary opnums + samples.
+    //
+    // KAT derivation for opnum=1:
+    //   inverted = u64::MAX - 1 = 0xFFFF_FFFF_FFFF_FFFE
+    //   BE bytes: [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE]
+    //   decode: from_be_bytes([FF,FF,FF,FF,FF,FF,FF,FE]) = 0xFFFFFFFFFFFFFFFE
+    //           u64::MAX - 0xFFFFFFFFFFFFFFFE = 1 (round-trips correctly)
+    //
+    // KAT derivation for opnum=u64::MAX:
+    //   inverted = u64::MAX - u64::MAX = 0x0000_0000_0000_0000
+    //   BE bytes: [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+    //   => u64::MAX sorts FIRST (lex) = newest-first ordering correct.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn versioned_key_roundtrip_boundary_opnums() {
+        let oid = obj(1);
+        for &c in &[0u64, 1, 2, u64::MAX - 1, u64::MAX, 1 << 20, 1 << 40] {
+            let k = make_versioned_key(7, &oid, c);
+            assert_eq!(k.len(), VERSIONED_KEY_LEN, "key must be 28 bytes for opnum={c}");
+            assert_eq!(
+                decode_commit_opnum(&k),
+                Ok(c),
+                "round-trip must recover opnum={c}"
+            );
+        }
+
+        // Spot-check KAT bytes for opnum=1:
+        //   type_id=7 LE = [7, 0, 0, 0]
+        //   object_id[15]=1 = [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]
+        //   inverted(1) = 0xFFFFFFFFFFFFFFFE -> BE = [FF,FF,FF,FF,FF,FF,FF,FE]
+        let k1 = make_versioned_key(7, &obj(1), 1u64);
+        assert_eq!(&k1[0..4], &[7u8, 0, 0, 0]);
+        assert_eq!(&k1[20..28], &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE]);
+
+        // Spot-check KAT bytes for opnum=u64::MAX:
+        //   inverted(u64::MAX) = 0 -> BE = [00,00,00,00,00,00,00,00]
+        let k_max = make_versioned_key(7, &obj(1), u64::MAX);
+        assert_eq!(&k_max[20..28], &[0x00u8; 8]);
+    }
+
+    // -----------------------------------------------------------------------
+    // T2.5.2: Length-validation — decode_commit_opnum rejects keys != 28 bytes.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn decode_rejects_non_28_byte_keys() {
+        assert_eq!(decode_commit_opnum(&[]), Err(MvccKeyError::Length(0)));
+        assert_eq!(
+            decode_commit_opnum(&[0u8; 20]),
+            Err(MvccKeyError::Length(20))
+        );
+        assert_eq!(
+            decode_commit_opnum(&[0u8; 27]),
+            Err(MvccKeyError::Length(27))
+        );
+        assert_eq!(
+            decode_commit_opnum(&[0u8; 29]),
+            Err(MvccKeyError::Length(29))
+        );
+        // Exactly 28 bytes must succeed.
+        assert!(decode_commit_opnum(&[0u8; 28]).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // T2.5.3: Newer versions lex-sort BEFORE older versions (inverted-BE).
+    //
+    // Derivation:
+    //   opnum=200 -> inverted = u64::MAX - 200 = 0xFFFFFFFFFFFFFF37 (BE last byte 0x37)
+    //   opnum=100 -> inverted = u64::MAX - 100 = 0xFFFFFFFFFFFFFF9B (BE last byte 0x9B)
+    //   0x...37 < 0x...9B => k(opnum=200) < k(opnum=100) => newer-first ✓
+    // -----------------------------------------------------------------------
+    #[test]
+    fn newer_versions_sort_first() {
+        let oid = obj(2);
+        let k_old = make_versioned_key(7, &oid, 100);
+        let k_new = make_versioned_key(7, &oid, 200);
+        assert!(
+            k_new < k_old,
+            "newer commit_opnum must sort earlier (lex) than older"
+        );
+        let k_newest = make_versioned_key(7, &oid, 300);
+        assert!(k_newest < k_new, "opnum=300 must sort before opnum=200");
+    }
+
+    // -----------------------------------------------------------------------
+    // T2.5.4: Single put + snapshot read.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn put_then_get_at_snapshot_returns_value() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        put_versioned(&mut store, 7, &obj(3), 10, Some(b"v1".to_vec())).unwrap();
+
+        // At-version snapshot.
+        match get_at_snapshot(&store, 7, &obj(3), 10) {
+            SnapshotRead::Found(b) => assert_eq!(b, b"v1"),
+            other => panic!("expected Found, got {:?}", other),
+        }
+        // Snapshot BEFORE the write: NotYetWritten.
+        assert_eq!(
+            get_at_snapshot(&store, 7, &obj(3), 9),
+            SnapshotRead::NotYetWritten
+        );
+        // Snapshot AFTER the write: still Found.
+        match get_at_snapshot(&store, 7, &obj(3), 999) {
+            SnapshotRead::Found(b) => assert_eq!(b, b"v1"),
+            other => panic!("expected Found at snapshot=999, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // T2.5.5: Multiple versions coexist; snapshot reads choose the correct one.
+    //   write at 10->"a", 20->"b", 30->"c"
+    //   snapshot=9  -> NotYetWritten
+    //   snapshot=10 -> "a";  snapshot=15 -> "a" (newest <=15 is 10)
+    //   snapshot=20 -> "b";  snapshot=29 -> "b" (newest <=29 is 20)
+    //   snapshot=30 -> "c";  snapshot=9999 -> "c"
+    // -----------------------------------------------------------------------
+    #[test]
+    fn multiple_versions_coexist_snapshot_reads_choose_correct_one() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        let oid = obj(4);
+        put_versioned(&mut store, 7, &oid, 10, Some(b"a".to_vec())).unwrap();
+        put_versioned(&mut store, 7, &oid, 20, Some(b"b".to_vec())).unwrap();
+        put_versioned(&mut store, 7, &oid, 30, Some(b"c".to_vec())).unwrap();
+
+        assert!(matches!(
+            get_at_snapshot(&store, 7, &oid, 9),
+            SnapshotRead::NotYetWritten
+        ));
+        match get_at_snapshot(&store, 7, &oid, 10) {
+            SnapshotRead::Found(b) => assert_eq!(b, b"a"),
+            o => panic!("snapshot=10: {:?}", o),
+        }
+        match get_at_snapshot(&store, 7, &oid, 15) {
+            SnapshotRead::Found(b) => assert_eq!(b, b"a"),
+            o => panic!("snapshot=15: {:?}", o),
+        }
+        match get_at_snapshot(&store, 7, &oid, 20) {
+            SnapshotRead::Found(b) => assert_eq!(b, b"b"),
+            o => panic!("snapshot=20: {:?}", o),
+        }
+        match get_at_snapshot(&store, 7, &oid, 29) {
+            SnapshotRead::Found(b) => assert_eq!(b, b"b"),
+            o => panic!("snapshot=29: {:?}", o),
+        }
+        match get_at_snapshot(&store, 7, &oid, 30) {
+            SnapshotRead::Found(b) => assert_eq!(b, b"c"),
+            o => panic!("snapshot=30: {:?}", o),
+        }
+        match get_at_snapshot(&store, 7, &oid, 9999) {
+            SnapshotRead::Found(b) => assert_eq!(b, b"c"),
+            o => panic!("snapshot=9999: {:?}", o),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // T2.5.6: Tombstone is observable at and after the snapshot it was written.
+    //   write at 10->"a", tombstone at 20, write at 30->"c"
+    //   snapshot=10 -> Found("a")
+    //   snapshot=20 -> Tombstoned
+    //   snapshot=25 -> Tombstoned  (newest <=25 is opnum=20 tombstone)
+    //   snapshot=30 -> Found("c")
+    // -----------------------------------------------------------------------
+    #[test]
+    fn tombstone_is_observable_at_its_snapshot() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        let oid = obj(5);
+        put_versioned(&mut store, 7, &oid, 10, Some(b"a".to_vec())).unwrap();
+        put_versioned(&mut store, 7, &oid, 20, None).unwrap(); // tombstone
+        put_versioned(&mut store, 7, &oid, 30, Some(b"c".to_vec())).unwrap();
+
+        match get_at_snapshot(&store, 7, &oid, 10) {
+            SnapshotRead::Found(b) => assert_eq!(b, b"a"),
+            o => panic!("snapshot=10: {:?}", o),
+        }
+        assert_eq!(
+            get_at_snapshot(&store, 7, &oid, 20),
+            SnapshotRead::Tombstoned,
+            "snapshot=20 must see the tombstone"
+        );
+        assert_eq!(
+            get_at_snapshot(&store, 7, &oid, 25),
+            SnapshotRead::Tombstoned,
+            "snapshot=25 must still see the tombstone"
+        );
+        match get_at_snapshot(&store, 7, &oid, 30) {
+            SnapshotRead::Found(b) => assert_eq!(b, b"c"),
+            o => panic!("snapshot=30: {:?}", o),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // T2.5.7: has_version_in_range half-open interval (lo_excl, hi_incl].
+    //   write at opnums 10 and 20.
+    //   (10, 20] contains 20      -> true
+    //   (20, 30] nothing          -> false
+    //   (9,  10] contains 10      -> true
+    //   (0,   9] nothing          -> false
+    //   (10, 19] nothing          -> false (10 excluded; 20 above hi)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn has_version_in_range_half_open_lo() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        let oid = obj(8);
+        put_versioned(&mut store, 7, &oid, 10, Some(b"v".to_vec())).unwrap();
+        put_versioned(&mut store, 7, &oid, 20, Some(b"v".to_vec())).unwrap();
+
+        assert!(
+            has_version_in_range(&store, 7, &oid, 10, 20),
+            "(10,20] should be true"
+        );
+        assert!(
+            !has_version_in_range(&store, 7, &oid, 20, 30),
+            "(20,30] should be false"
+        );
+        assert!(
+            has_version_in_range(&store, 7, &oid, 9, 10),
+            "(9,10] should be true"
+        );
+        assert!(
+            !has_version_in_range(&store, 7, &oid, 0, 9),
+            "(0,9] should be false"
+        );
+        assert!(
+            !has_version_in_range(&store, 7, &oid, 10, 19),
+            "(10,19] should be false"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Bonus: MvccKeyError display + SnapshotRead derives (non-todo tests).
+    // -----------------------------------------------------------------------
     #[test]
     fn mvcc_key_error_display() {
         let err = MvccKeyError::Length(0);
         let msg = format!("{err}");
-        assert!(msg.contains("28"), "display should mention the expected length");
-        assert!(msg.contains('0'), "display should mention the actual length");
-
+        assert!(msg.contains("28"), "display should mention expected length");
+        assert!(msg.contains('0'), "display should mention actual length");
         let err2 = MvccKeyError::Length(100);
-        let msg2 = format!("{err2}");
-        assert!(msg2.contains("100"));
+        assert!(format!("{err2}").contains("100"));
     }
 
-    /// Verify SnapshotRead derives work correctly.
     #[test]
     fn snapshot_read_clone_eq() {
         let a = SnapshotRead::Found(vec![7, 8, 9]);

@@ -11,6 +11,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod mvcc;
+
 use kessel_io::{Disk, Vfs};
 use kessel_proto::codec::crc32c;
 use std::collections::BTreeMap;

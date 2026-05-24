@@ -118,6 +118,16 @@ pub fn format_result(r: &OpResult) -> String {
                 _ => "REJECTED  (unknown reason — future variant)".to_string(),
             }
         }
+        // SP123 / S2.X: per-replica active-snapshot reports.
+        OpResult::ActiveSnapshotReported { replica_id, accepted_min } => {
+            format!("OK  (replica {replica_id} reported active_snapshot={accepted_min})")
+        }
+        OpResult::ActiveSnapshotRejected { replica_id, previous_min, proposed } => {
+            format!(
+                "REJECTED  (replica {replica_id} non-monotonic snapshot: \
+                 proposed={proposed} < previous_min={previous_min})"
+            )
+        }
     }
 }
 
@@ -384,6 +394,17 @@ pub fn format_result_json(r: &OpResult) -> String {
                 }
                 _ => r#"{"status":"watermark_rejected","reason":"unknown"}"#.to_string(),
             }
+        }
+        // SP123 / S2.X: per-replica active-snapshot reports (JSON form).
+        OpResult::ActiveSnapshotReported { replica_id, accepted_min } => {
+            format!(
+                r#"{{"status":"active_snapshot_reported","replica_id":{replica_id},"accepted_min":{accepted_min}}}"#
+            )
+        }
+        OpResult::ActiveSnapshotRejected { replica_id, previous_min, proposed } => {
+            format!(
+                r#"{{"status":"active_snapshot_rejected","replica_id":{replica_id},"previous_min":{previous_min},"proposed":{proposed}}}"#
+            )
         }
     }
 }

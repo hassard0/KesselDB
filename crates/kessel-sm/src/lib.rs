@@ -151,6 +151,25 @@ pub struct StateMachine<V: Vfs> {
     ///
     /// Initial value: empty.
     active_snapshots: std::collections::BTreeMap<u64, usize>,
+
+    /// SP123 / S2.X — per-replica reported min-active-snapshot.
+    /// Each replica periodically broadcasts `Op::ReportActiveSnapshot {
+    /// replica_id, min_active_snapshot }` via VSR; every replica's SM
+    /// observes the same sequence of reports and updates this BTreeMap
+    /// deterministically. The map's GLOBAL min (across all keys) is the
+    /// safe upper bound for `Op::AdvanceWatermark` — preventing the
+    /// watermark from advancing past a snapshot held by ANY replica,
+    /// not just the proposing one.
+    ///
+    /// Monotonicity: per-replica values are monotonic-strict (a replica
+    /// can only RELEASE earlier snapshots, never re-acquire them with a
+    /// smaller min). The apply arm rejects non-monotonic reports with
+    /// `OpResult::ActiveSnapshotRejected`.
+    ///
+    /// Initial value: empty (= no known replicas reported → falls back
+    /// to local min_active_snapshot for AdvanceWatermark validation,
+    /// preserving SP114-SP116 behavior in single-replica deployments).
+    pub(crate) replica_min_snapshots: std::collections::BTreeMap<u32, u64>,
 }
 
 /// SP113 / S2.4: Per-committed-Tx record retained in
@@ -200,6 +219,7 @@ impl<V: Vfs> StateMachine<V> {
             low_water_mark: 0,
             // SP115 / S2.6: no active Tx snapshots yet.
             active_snapshots: std::collections::BTreeMap::new(),
+            replica_min_snapshots: std::collections::BTreeMap::new(),
         })
     }
 
@@ -1186,6 +1206,31 @@ impl<V: Vfs> StateMachine<V> {
     /// at the BTreeMap iteration level.
     pub fn min_active_snapshot(&self) -> Option<u64> {
         self.active_snapshots.keys().next().copied()
+    }
+
+    /// SP123 / S2.X — GLOBAL minimum active snapshot across ALL replicas
+    /// that have submitted `Op::ReportActiveSnapshot`. Closes the SP115
+    /// honest caveat that `active_snapshots` is per-replica local.
+    ///
+    /// Returns `None` if no replica has ever reported (empty BTreeMap),
+    /// which preserves single-replica deployments' behavior: the
+    /// heartbeat producer + AdvanceWatermark fall back to the local
+    /// `min_active_snapshot()`.
+    ///
+    /// Returns `Some(g)` once any replica has reported; `g` is the
+    /// minimum claimed-min across the cluster. AdvanceWatermark MUST
+    /// respect this bound: a watermark advance past `g` would invalidate
+    /// snapshots that SOME replica still holds, which under multi-
+    /// statement Tx (S2.X) would silently lose data.
+    pub fn global_min_active_snapshot(&self) -> Option<u64> {
+        self.replica_min_snapshots.values().copied().min()
+    }
+
+    /// SP123 / S2.X — read-only accessor for the per-replica snapshot
+    /// map. Used by KATs + the heartbeat-target computation in the
+    /// kesseldb-server crate.
+    pub fn replica_snapshot_for(&self, replica_id: u32) -> Option<u64> {
+        self.replica_min_snapshots.get(&replica_id).copied()
     }
 
     /// SP115 / S2.6 (Decision 3): The latest committed op_number visible
@@ -4207,6 +4252,23 @@ impl<V: Vfs> StateMachine<V> {
                         },
                     };
                 }
+                // SP123 / S2.X — Step 2b: respect the GLOBAL min active
+                // snapshot across all replicas. If any replica has reported
+                // a min_active_snapshot < proposed, refuse the advance —
+                // advancing past `g` would invalidate snapshots SOME
+                // replica still holds. Bound under `AboveCommitCeiling`
+                // (re-use the variant; the rejection reason is a
+                // pinned-by-active-snapshot ceiling).
+                if let Some(g) = self.global_min_active_snapshot() {
+                    if low_water_mark > g {
+                        return OpResult::WatermarkRejected {
+                            reason: WatermarkRejection::AboveCommitCeiling {
+                                proposed: low_water_mark,
+                                current_commit: g,
+                            },
+                        };
+                    }
+                }
                 // Step 3: reclaim MVCC versions (Decision 3).
                 let versions_deleted = match kessel_storage::mvcc::delete_versions_older_than(
                     &mut self.storage,
@@ -4245,6 +4307,34 @@ impl<V: Vfs> StateMachine<V> {
                     new_low_water_mark: low_water_mark,
                     versions_deleted,
                     pending_txs_evicted,
+                }
+            }
+
+            // SP123 / S2.X — per-replica active-snapshot report. Each
+            // replica broadcasts (its replica_id, its current min). All
+            // replicas observe the SAME sequence of reports via VSR and
+            // update `replica_min_snapshots` deterministically.
+            //
+            // Monotonicity-strict-per-replica: a replica can only RELEASE
+            // earlier snapshots; the report's claimed-min must be >= any
+            // previously-reported value for the SAME replica_id. A non-
+            // monotonic report is rejected with typed
+            // `ActiveSnapshotRejected` (preserves the SP114-style
+            // monotonicity discipline + makes regressions auditable).
+            Op::ReportActiveSnapshot { replica_id, min_active_snapshot } => {
+                if let Some(&prev) = self.replica_min_snapshots.get(&replica_id) {
+                    if min_active_snapshot < prev {
+                        return OpResult::ActiveSnapshotRejected {
+                            replica_id,
+                            previous_min: prev,
+                            proposed: min_active_snapshot,
+                        };
+                    }
+                }
+                self.replica_min_snapshots.insert(replica_id, min_active_snapshot);
+                OpResult::ActiveSnapshotReported {
+                    replica_id,
+                    accepted_min: min_active_snapshot,
                 }
             }
         }
@@ -14054,6 +14144,149 @@ mod tests {
              found {} 28-byte entries (Decision 7 violation: catalog/aux/index \
              writes leaked into the MVCC versioned keyspace)",
             mvcc_entries.len()
+        );
+    }
+
+    // =======================================================================
+    // SP123 / S2.X — multi-replica heartbeat consensus KATs
+    //
+    // Closes the SP115 honest caveat that `active_snapshots` is per-replica
+    // local. With Op::ReportActiveSnapshot, each replica broadcasts its
+    // claimed min via VSR; all replicas observe the same sequence + compute
+    // the same global min from replica_min_snapshots. AdvanceWatermark
+    // then respects the GLOBAL min (not just local).
+    // =======================================================================
+
+    /// SP123-KAT-1: an unreported single-replica deployment behaves
+    /// identically to pre-SP123 (global_min_active_snapshot returns None
+    /// → AdvanceWatermark validation falls back to local commit-ceiling).
+    /// SP114-SP116 byte-net-0 preserved.
+    #[test]
+    fn sp123_kat_no_reports_preserves_pre_sp123_behavior() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        assert_eq!(sm.global_min_active_snapshot(), None);
+        // AdvanceWatermark to 0 (no-op; not monotonic relative to default 0
+        // — but watermark=0 is the SP114 byte-net-0 path). Actually use a
+        // small positive proposed.
+        sm.apply(1, Op::CreateType { def: encode_type_def("t", &[]) });
+        let r = sm.apply(2, Op::AdvanceWatermark { low_water_mark: 1 });
+        assert!(
+            matches!(r, OpResult::WatermarkAdvanced { new_low_water_mark: 1, .. }),
+            "SP123: no reports → falls back to standard SP114 validation; \
+             AdvanceWatermark to 1 must succeed; got {r:?}"
+        );
+    }
+
+    /// SP123-KAT-2: single-replica report → global_min_active_snapshot
+    /// returns the reported value.
+    #[test]
+    fn sp123_kat_single_replica_report_drives_global_min() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        let r = sm.apply(1, Op::ReportActiveSnapshot { replica_id: 0, min_active_snapshot: 42 });
+        assert!(matches!(
+            r,
+            OpResult::ActiveSnapshotReported { replica_id: 0, accepted_min: 42 }
+        ));
+        assert_eq!(sm.global_min_active_snapshot(), Some(42));
+        assert_eq!(sm.replica_snapshot_for(0), Some(42));
+        assert_eq!(sm.replica_snapshot_for(1), None);
+    }
+
+    /// SP123-KAT-3: 3-replica reports → global_min is the actual min across
+    /// the three. Updates respect monotonicity per replica.
+    #[test]
+    fn sp123_kat_3replica_global_min() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::ReportActiveSnapshot { replica_id: 0, min_active_snapshot: 100 });
+        sm.apply(2, Op::ReportActiveSnapshot { replica_id: 1, min_active_snapshot: 50 });
+        sm.apply(3, Op::ReportActiveSnapshot { replica_id: 2, min_active_snapshot: 75 });
+        assert_eq!(
+            sm.global_min_active_snapshot(),
+            Some(50),
+            "SP123: global min across 3 reports = 50 (the smallest claimed-min)"
+        );
+        // Replica 1 RELEASES its old snapshot — bumps to 80. Global min now = 75.
+        sm.apply(4, Op::ReportActiveSnapshot { replica_id: 1, min_active_snapshot: 80 });
+        assert_eq!(sm.global_min_active_snapshot(), Some(75));
+    }
+
+    /// SP123-KAT-4: non-monotonic per-replica report REJECTED — typed error.
+    #[test]
+    fn sp123_kat_non_monotonic_replica_report_rejected() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::ReportActiveSnapshot { replica_id: 0, min_active_snapshot: 100 });
+        let r = sm.apply(2, Op::ReportActiveSnapshot { replica_id: 0, min_active_snapshot: 50 });
+        match r {
+            OpResult::ActiveSnapshotRejected { replica_id: 0, previous_min: 100, proposed: 50 } => {}
+            other => panic!("SP123: non-monotonic report MUST reject typed; got {other:?}"),
+        }
+        // State unchanged — replica 0's min is still 100.
+        assert_eq!(sm.replica_snapshot_for(0), Some(100));
+    }
+
+    /// SP123-KAT-5: THE THESIS-FIT CENTERPIECE. AdvanceWatermark
+    /// RESPECTS the global min — if a remote replica pins watermark at G,
+    /// any AdvanceWatermark > G is rejected even if local has no active
+    /// snapshots. Note: op_number must be > both `proposed` AND
+    /// `global_min` to bypass the SP114 commit-ceiling check; the test
+    /// uses small numbers so the SP123 gate fires distinctly.
+    #[test]
+    fn sp123_kat_advance_watermark_respects_global_min() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        // Drive opnum to 10 so the commit-ceiling check passes for small
+        // proposed values; the SP123 global-min check (Step 2b) is what
+        // we want to exercise.
+        for i in 0..9u64 {
+            sm.apply(i + 1, Op::CreateType { def: encode_type_def(&format!("t{i}"), &[]) });
+        }
+        // Replica 1 reports a low min — pins the watermark at 2.
+        sm.apply(10, Op::ReportActiveSnapshot { replica_id: 1, min_active_snapshot: 2 });
+        assert_eq!(sm.global_min_active_snapshot(), Some(2));
+        // AdvanceWatermark to 5 — must REJECT (would invalidate replica 1's
+        // snapshot=2; commit-ceiling at op_number=11 doesn't rescue us).
+        let r = sm.apply(11, Op::AdvanceWatermark { low_water_mark: 5 });
+        match r {
+            OpResult::WatermarkRejected {
+                reason: WatermarkRejection::AboveCommitCeiling { proposed: 5, current_commit: 2 },
+            } => {}
+            other => panic!("SP123: AdvanceWatermark past global min MUST reject; got {other:?}"),
+        }
+        // AdvanceWatermark to exactly 2 — must SUCCEED (at the bound;
+        // commit-ceiling=12 ≥ proposed=2; global_min=2 ≥ proposed=2).
+        let r2 = sm.apply(12, Op::AdvanceWatermark { low_water_mark: 2 });
+        assert!(
+            matches!(r2, OpResult::WatermarkAdvanced { new_low_water_mark: 2, .. }),
+            "SP123: AdvanceWatermark to exactly global_min must succeed; got {r2:?}"
+        );
+    }
+
+    /// SP123-KAT-6: deterministic across replicas — submitting the SAME
+    /// sequence of reports on two independent SMs produces byte-identical
+    /// global_min. Locks the replication-determinism contract.
+    #[test]
+    fn sp123_kat_2sm_deterministic_global_min() {
+        let mut sm_a = StateMachine::open(MemVfs::new()).unwrap();
+        let mut sm_b = StateMachine::open(MemVfs::new()).unwrap();
+        let workload = vec![
+            (1, 0u32, 200u64),
+            (2, 1, 150),
+            (3, 2, 175),
+            (4, 0, 220), // replica 0 releases up to 220 (monotonic)
+            (5, 1, 180), // replica 1 releases up to 180
+        ];
+        for (op, rid, mn) in &workload {
+            sm_a.apply(*op, Op::ReportActiveSnapshot { replica_id: *rid, min_active_snapshot: *mn });
+            sm_b.apply(*op, Op::ReportActiveSnapshot { replica_id: *rid, min_active_snapshot: *mn });
+        }
+        assert_eq!(
+            sm_a.global_min_active_snapshot(),
+            sm_b.global_min_active_snapshot(),
+            "SP123: deterministic across replicas (same log → same global min)"
+        );
+        assert_eq!(
+            sm_a.global_min_active_snapshot(),
+            Some(175),
+            "SP123: after the workload, global min = 175 (replica 2 unchanged)"
         );
     }
 }

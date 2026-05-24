@@ -291,6 +291,30 @@ pub enum Op {
     /// heartbeat producer is OUT of scope (Decision 2). See
     /// `docs/superpowers/specs/2026-05-24-mvcc-si-s2-5-design.md`.
     AdvanceWatermark { low_water_mark: u64 },
+
+    /// SP123 / S2.X: per-replica active-snapshot report — closes the
+    /// SP115-shipped honest caveat that `active_snapshots` is per-replica
+    /// local. Each replica periodically submits this op via VSR carrying
+    /// `(self.replica_id, sm.min_active_snapshot())`. Since VSR replicates
+    /// the log, all replicas observe all reports + deterministically
+    /// compute the GLOBAL minimum across their `replica_min_snapshots`
+    /// BTreeMap.
+    ///
+    /// The heartbeat producer THEN submits `Op::AdvanceWatermark` with
+    /// `low_water_mark <= sm.global_min_active_snapshot()` instead of just
+    /// `sm.min_active_snapshot()` — preventing the watermark from
+    /// advancing past a snapshot held by a DIFFERENT replica.
+    ///
+    /// Monotonicity per replica: each replica's claimed min is
+    /// monotonic-strict (a replica can only RELEASE earlier snapshots,
+    /// never re-acquire them with a smaller min); the SM apply arm
+    /// rejects a report whose claimed min is < the replica's previously
+    /// reported value.
+    ///
+    /// Outcome: `OpResult::ActiveSnapshotReported { replica_id, accepted_min }`
+    /// on accept; `OpResult::ActiveSnapshotRejected { reason }` on
+    /// validation failure.
+    ReportActiveSnapshot { replica_id: u32, min_active_snapshot: u64 },
 }
 
 /// SP114 / S2.5: Why an `Op::AdvanceWatermark` was rejected by the
@@ -384,6 +408,12 @@ pub enum OpResult {
     },
     /// SP114 / S2.5: `Op::AdvanceWatermark` rejected by SM validation.
     WatermarkRejected { reason: WatermarkRejection },
+    /// SP123 / S2.X: `Op::ReportActiveSnapshot` accepted; carries the
+    /// (replica_id, accepted_min) for observability + replay validation.
+    ActiveSnapshotReported { replica_id: u32, accepted_min: u64 },
+    /// SP123 / S2.X: `Op::ReportActiveSnapshot` rejected (non-monotonic
+    /// per-replica). Carries the previously-reported min for diagnostics.
+    ActiveSnapshotRejected { replica_id: u32, previous_min: u64, proposed: u64 },
 }
 
 impl OpResult {
@@ -467,6 +497,21 @@ impl OpResult {
                     }
                 }
             }
+            // SP123 / S2.X: ActiveSnapshotReported (13) wire encode.
+            //   wire: [u32 replica_id (LE)] [u64 accepted_min (LE)]
+            OpResult::ActiveSnapshotReported { replica_id, accepted_min } => {
+                b.push(13);
+                codec::put_u32(&mut b, *replica_id);
+                codec::put_u64(&mut b, *accepted_min);
+            }
+            // SP123 / S2.X: ActiveSnapshotRejected (14) wire encode.
+            //   wire: [u32 replica_id (LE)] [u64 previous_min] [u64 proposed]
+            OpResult::ActiveSnapshotRejected { replica_id, previous_min, proposed } => {
+                b.push(14);
+                codec::put_u32(&mut b, *replica_id);
+                codec::put_u64(&mut b, *previous_min);
+                codec::put_u64(&mut b, *proposed);
+            }
         }
         b
     }
@@ -521,6 +566,16 @@ impl OpResult {
                 };
                 OpResult::WatermarkRejected { reason }
             }
+            // SP123 / S2.X
+            13 => OpResult::ActiveSnapshotReported {
+                replica_id: c.u32()?,
+                accepted_min: c.u64()?,
+            },
+            14 => OpResult::ActiveSnapshotRejected {
+                replica_id: c.u32()?,
+                previous_min: c.u64()?,
+                proposed: c.u64()?,
+            },
             _ => return None,
         })
     }
@@ -576,6 +631,8 @@ impl Op {
             Op::CommitTx { .. } => 44,
             // SP114 / S2.5: GC watermark advance op at wire tag 45.
             Op::AdvanceWatermark { .. } => 45,
+            // SP123 / S2.X: per-replica active-snapshot report at wire tag 46.
+            Op::ReportActiveSnapshot { .. } => 46,
         }
     }
 
@@ -901,6 +958,12 @@ impl Op {
             // Uses the same put_u64 helper as CommitTx's commit_opnum field.
             Op::AdvanceWatermark { low_water_mark } => {
                 codec::put_u64(&mut b, *low_water_mark);
+            }
+            // SP123 / S2.X: wire tag 46 — [u32 replica_id (LE)] +
+            // [u64 min_active_snapshot (LE)].
+            Op::ReportActiveSnapshot { replica_id, min_active_snapshot } => {
+                codec::put_u32(&mut b, *replica_id);
+                codec::put_u64(&mut b, *min_active_snapshot);
             }
         }
         b
@@ -1229,6 +1292,11 @@ impl Op {
             }
             // SP114 / S2.5: wire tag 45 — [u64 low_water_mark] (LE).
             45 => Op::AdvanceWatermark { low_water_mark: c.u64()? },
+            // SP123 / S2.X: wire tag 46 — [u32 replica_id] + [u64 min].
+            46 => Op::ReportActiveSnapshot {
+                replica_id: c.u32()?,
+                min_active_snapshot: c.u64()?,
+            },
             _ => return None,
         };
         Some(op)

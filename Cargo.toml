@@ -20,6 +20,7 @@ members = [
     "crates/kessel-sim",
     "crates/kessel-objstore",
     "crates/kessel-parquet",
+    "crates/kessel-wasm",
 ]
 
 [workspace.package]

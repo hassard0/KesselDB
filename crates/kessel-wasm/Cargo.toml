@@ -1,0 +1,22 @@
+[package]
+name = "kessel-wasm"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+# Zero-dep deterministic WASM-MVP-subset interpreter for in-tree UDFs.
+# - No host crate dependencies (matches kessel-expr / kessel-crypto stance).
+# - No third-party WASM dependency (no wasmtime / wasmer / wasmi).
+# - Implements: WASM module decoder (LEB128, type+function+code sections),
+#   stack-machine interpreter (i32 const+arith+cmp+local + control flow
+#   block/loop/if/else/end/br/br_if/return/call), gas-bounded execution.
+# - Out of scope (documented in src/lib.rs): memory, tables, imports,
+#   exports beyond the entry function, floats, SIMD, threads, reference
+#   types, GC, exceptions, multi-value returns.
+#
+# Strategic-tier slice S4 of THESIS.md.
+
+[dependencies]
+
+[lib]
+path = "src/lib.rs"

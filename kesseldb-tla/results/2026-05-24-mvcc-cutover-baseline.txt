@@ -1,0 +1,55 @@
+TLC2 Version 2026.05.18.174321 (rev: 8ba1027)
+Running breadth-first search Model-Checking with fp 23 and seed 138726275830729675 with 16 workers on 16 cores with 6372MB heap and 64MB offheap memory [pid: 48656] (Windows 11 10.0 amd64, Microsoft 21.0.11 64bit, MSBDiskFPSet, DiskStateQueue).
+Parsing file C:\Users\ihass\KesselDB\kesseldb-tla\MVCCCutover.tla
+Parsing file C:\Users\ihass\KesselDB\kesseldb-tla\MVCCGc.tla
+Parsing file C:\Users\ihass\AppData\Local\Temp\tlc-9716335539894702429\_TLCTrace.tla (jar:file:/C:/Users/ihass/.tla2tools/tla2tools.jar!/tla2sany/StandardModules/_TLCTrace.tla)
+Parsing file C:\Users\ihass\KesselDB\kesseldb-tla\MVCCSsi.tla
+Parsing file C:\Users\ihass\KesselDB\kesseldb-tla\MVCCSi.tla
+Parsing file C:\Users\ihass\KesselDB\kesseldb-tla\MVCCTx.tla
+Parsing file C:\Users\ihass\KesselDB\kesseldb-tla\MVCCStorage.tla
+Parsing file C:\Users\ihass\AppData\Local\Temp\tlc-9716335539894702429\Integers.tla (jar:file:/C:/Users/ihass/.tla2tools/tla2tools.jar!/tla2sany/StandardModules/Integers.tla)
+Parsing file C:\Users\ihass\AppData\Local\Temp\tlc-9716335539894702429\FiniteSets.tla (jar:file:/C:/Users/ihass/.tla2tools/tla2tools.jar!/tla2sany/StandardModules/FiniteSets.tla)
+Parsing file C:\Users\ihass\AppData\Local\Temp\tlc-9716335539894702429\TLC.tla (jar:file:/C:/Users/ihass/.tla2tools/tla2tools.jar!/tla2sany/StandardModules/TLC.tla)
+Parsing file C:\Users\ihass\AppData\Local\Temp\tlc-9716335539894702429\Naturals.tla (jar:file:/C:/Users/ihass/.tla2tools/tla2tools.jar!/tla2sany/StandardModules/Naturals.tla)
+Parsing file C:\Users\ihass\AppData\Local\Temp\tlc-9716335539894702429\Sequences.tla (jar:file:/C:/Users/ihass/.tla2tools/tla2tools.jar!/tla2sany/StandardModules/Sequences.tla)
+Parsing file C:\Users\ihass\AppData\Local\Temp\tlc-9716335539894702429\TLCExt.tla (jar:file:/C:/Users/ihass/.tla2tools/tla2tools.jar!/tla2sany/StandardModules/TLCExt.tla)
+Semantic processing of module Naturals
+Semantic processing of module Integers
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module MVCCStorage
+Semantic processing of module MVCCTx
+Semantic processing of module MVCCSi
+Semantic processing of module MVCCSsi
+Semantic processing of module MVCCGc
+Semantic processing of module TLCExt
+Semantic processing of module _TLCTrace
+Semantic processing of module MVCCCutover
+Linting of module MVCCStorage
+Linting of module MVCCTx
+Linting of module MVCCSi
+Linting of module MVCCSsi
+Linting of module MVCCGc
+Linting of module TLCExt
+Linting of module _TLCTrace
+Linting of module MVCCCutover
+Starting... (2026-05-24 12:27:26)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-05-24 12:27:27.
+Progress(8) at 2026-05-24 12:27:30: 104,252 states generated (104,252 s/min), 33,187 distinct states found (33,187 ds/min), 28,837 states left on queue.
+Progress(11) at 2026-05-24 12:28:30: 12,326,501 states generated (12,222,249 s/min), 2,299,866 distinct states found (2,266,679 ds/min), 1,456,912 states left on queue.
+Progress(12) at 2026-05-24 12:29:30: 28,441,240 states generated (16,114,739 s/min), 4,820,218 distinct states found (2,520,352 ds/min), 2,585,875 states left on queue.
+Progress(12) at 2026-05-24 12:30:30: 45,877,071 states generated (17,435,831 s/min), 7,361,657 distinct states found (2,541,439 ds/min), 3,347,865 states left on queue.
+Progress(13) at 2026-05-24 12:31:30: 64,982,007 states generated (19,104,936 s/min), 9,971,157 distinct states found (2,609,500 ds/min), 3,661,902 states left on queue.
+Progress(14) at 2026-05-24 12:32:30: 81,993,150 states generated (17,011,143 s/min), 12,158,905 distinct states found (2,187,748 ds/min), 3,020,512 states left on queue.
+Progress(15) at 2026-05-24 12:33:30: 97,868,649 states generated (15,875,499 s/min), 14,165,714 distinct states found (2,006,809 ds/min), 1,492,728 states left on queue.
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = 7.3E-5
+  based on the actual fingerprints:  val = 5.5E-6
+104077999 states generated, 15084092 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 17.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 29 and the 95th percentile is 3).
+Finished in 06min 36s at (2026-05-24 12:34:02)

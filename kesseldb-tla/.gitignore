@@ -14,4 +14,8 @@ MVCCSi_TTrace_*.bin
 MVCCSi_TTrace_*.tla
 MVCCSsi_TTrace_*.bin
 MVCCSsi_TTrace_*.tla
+MVCCGc_TTrace_*.bin
+MVCCGc_TTrace_*.tla
+MVCCCutover_TTrace_*.bin
+MVCCCutover_TTrace_*.tla
 *.log

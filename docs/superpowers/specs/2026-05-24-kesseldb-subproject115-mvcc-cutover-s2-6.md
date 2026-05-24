@@ -1,4 +1,17 @@
-# KesselDB — Subproject 115: S2.6 — MVCC Infrastructure Cutover (Narrowed; Data-Row Apply-Arm Cutover Deferred to SP116)
+# KesselDB — Subproject 115: S2.6 — MVCC Infrastructure Cutover (Narrowed; Data-Row Apply-Arm Cutover RESOLVED at SP116)
+
+> **Cross-reference (SP116 closure):** the narrowing disclosed in this record is
+> RESOLVED by [SP116 / S2.7](2026-05-24-kesseldb-subproject116-mvcc-data-row-cutover.md).
+> The 14 data-row apply arms required NO direct rewrite in the end — SP116 T2
+> pivoted to a single-place storage-layer transparent MVCC dispatch (commit
+> `ade0d98`) that routes 20-byte user-type data-row keys (`type_id` in
+> `(0, 0xFF00_0000)`) through the MVCC primitives by construction. The
+> `data_row_*` helpers shipped by SP115 ARE the primitives the dispatch routes
+> through internally, so SP115's infrastructure work remains load-bearing.
+> The MVCCCutover.tla `CommitTxWritesVersionedKeyspaceOnly` narrowed invariant
+> was renamed in place to `LegacyKeyspaceEmpty` at SP116 T6 (mechanical form
+> unchanged; semantic claim broadened from "Op::CommitTx only" to "every
+> data-row write path"). S2 strategic-tier item CLOSES at SP116 T6.
 
 **Date:** 2026-05-24  **Status:** done at NARROWED scope — `kessel-sm::StateMachine::active_snapshots: BTreeMap<u64, usize>` field + `register_snapshot` / `unregister_snapshot` / `min_active_snapshot` / `current_commit_opnum` accessors + `data_row_{get,put,delete,scan}` MVCC seam helpers (READY for SP116; not yet called by the 14 data-row apply arms per the T2 narrowing disclosure) + `Op::CommitTx` SM apply-arm soft-accept semantic (Decision 5 — `commit_opnum=0` → SM overrides with `op_number`; non-zero used as-is) + `kessel-storage::mvcc::scan_at_snapshot` primitive (full-type tombstone-aware) + `kessel-storage::compact` MVCC-tombstone preservation for 28-byte versioned keys + `kesseldb-server::apply_one` auto-commit register/unregister bracket + `kesseldb-server::spawn_heartbeat_loop` closure-based body + `kesseldb-server::heartbeat_target` helper + `MVCCCutover.tla` TLA+ rigor checkpoint (seventh module) committed and pushed.
 

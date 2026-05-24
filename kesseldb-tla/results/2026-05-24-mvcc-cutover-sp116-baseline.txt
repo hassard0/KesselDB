@@ -1,0 +1,35 @@
+tar: Ignoring unknown extended header keyword 'SCHILY.fflags'
+tar: Ignoring unknown extended header keyword 'SCHILY.fflags'
+tar: Ignoring unknown extended header keyword 'SCHILY.fflags'
+tar: Ignoring unknown extended header keyword 'SCHILY.fflags'
+tar: Ignoring unknown extended header keyword 'SCHILY.fflags'
+Parsing file /tmp/FiniteSets.tla
+Parsing file /tmp/TLC.tla
+Parsing file /tmp/Naturals.tla
+Parsing file /tmp/Sequences.tla
+Semantic processing of module Naturals
+Semantic processing of module Integers
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module MVCCStorage
+Semantic processing of module MVCCTx
+Semantic processing of module MVCCSi
+Semantic processing of module MVCCSsi
+Semantic processing of module MVCCGc
+Semantic processing of module MVCCCutover
+Starting... (2026-05-24 14:35:21)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-05-24 14:35:21.
+Progress(9) at 2026-05-24 14:35:24: 424,166 states generated (424,166 s/min), 118,802 distinct states found (118,802 ds/min), 99,095 states left on queue.
+Progress(13) at 2026-05-24 14:36:24: 42,386,061 states generated (41,961,895 s/min), 6,918,051 distinct states found (6,799,249 ds/min), 3,342,168 states left on queue.
+Progress(15) at 2026-05-24 14:37:24: 86,867,977 states generated (44,481,916 s/min), 12,802,731 distinct states found (5,884,680 ds/min), 2,584,716 states left on queue.
+Model checking completed. No error has been found.
+  Estimates of the probability that TLC did not check all reachable states
+  because two distinct states had the same fingerprint:
+  calculated (optimistic):  val = 7.3E-5
+  based on the actual fingerprints:  val = 2.8E-5
+104077999 states generated, 15084092 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 17.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 29 and the 95th percentile is 3).
+Finished in 02min 31s at (2026-05-24 14:37:52)

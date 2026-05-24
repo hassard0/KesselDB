@@ -220,6 +220,131 @@ pub(crate) fn load_fse_table_for_mode(
     }
 }
 
+// ============================================================================
+// LL / ML baseline + extra-bits tables for value reconstruction per
+// RFC §5.4.3 Table 1 (Literal Length code → baseline + extra_bits) and
+// Table 2 (Match Length code → baseline + extra_bits).
+//
+// For Offset, the rule is simpler: offset_value = (1 << code) + read_bits(code)
+// (where `code` is itself the FSE-decoded symbol; max code is 31). No const
+// table needed.
+// ============================================================================
+
+pub(crate) const LL_BASELINES: [u32; 36] = [
+    0, 1, 2, 3, 4, 5, 6, 7,
+    8, 9, 10, 11, 12, 13, 14, 15,
+    16, 18, 20, 22, 24, 28, 32, 40,
+    48, 64, 128, 256, 512, 1024, 2048, 4096,
+    8192, 16384, 32768, 65536,
+];
+pub(crate) const LL_EXTRA_BITS: [u32; 36] = [
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 1, 1, 2, 2, 3, 3,
+    4, 6, 7, 8, 9, 10, 11, 12,
+    13, 14, 15, 16,
+];
+
+pub(crate) const ML_BASELINES: [u32; 53] = [
+    3, 4, 5, 6, 7, 8, 9, 10,
+    11, 12, 13, 14, 15, 16, 17, 18,
+    19, 20, 21, 22, 23, 24, 25, 26,
+    27, 28, 29, 30, 31, 32, 33, 34,
+    35, 37, 39, 41, 43, 47, 51, 59,
+    67, 83, 99, 131, 259, 515, 1027, 2051,
+    4099, 8195, 16387, 32771, 65539,
+];
+pub(crate) const ML_EXTRA_BITS: [u32; 53] = [
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 1, 1, 2, 2, 3, 3,
+    4, 4, 5, 7, 8, 9, 10, 11,
+    12, 13, 14, 15, 16,
+];
+
+/// One decoded sequence per RFC §5.4.3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Sequence {
+    /// Number of literal bytes to copy from the literals section
+    /// BEFORE the back-reference.
+    pub literal_length: u32,
+    /// Raw offset value (see RFC §5.4.3): 0..=3 → repeat-offset slot
+    /// reference; >= 4 → real offset = raw - 3.
+    pub offset: u32,
+    /// Match length of the back-reference (always >= 3 per spec — but
+    /// our decoder propagates whatever the bitstream says; validation
+    /// is sequence-execution's job).
+    pub match_length: u32,
+}
+
+/// Decode `num_sequences` sequences from a reverse bitstream using the
+/// 3 FSE tables. RFC §5.4.3 decode order (per sequence):
+///
+///   1. Read OF_EXTRA_BITS[of_state.symbol] bits → offset extra bits.
+///      offset = (1 << of_state.symbol) + extra (since OF code IS the bit width).
+///   2. Read ML_EXTRA_BITS[ml_state.symbol] bits → ml extra bits.
+///      match_length = ML_BASELINES[ml_state.symbol] + ml_extra.
+///   3. Read LL_EXTRA_BITS[ll_state.symbol] bits → ll extra bits.
+///      literal_length = LL_BASELINES[ll_state.symbol] + ll_extra.
+///   4. For sequences > 0 remaining, step the state machines in order:
+///      ll, then ml, then of.
+pub(crate) fn decode_sequences_stream(
+    input: &[u8],
+    ll_table: &crate::zstd_fse::FseTable,
+    of_table: &crate::zstd_fse::FseTable,
+    ml_table: &crate::zstd_fse::FseTable,
+    num_sequences: u32,
+) -> Result<Vec<Sequence>, ZstdError> {
+    use crate::zstd_fse::{FseState, ReverseBitReader};
+    if num_sequences == 0 {
+        return Ok(Vec::new());
+    }
+    let mut rr = ReverseBitReader::new(input)?;
+    // Initialize state machines in spec order: LL, then OF, then ML.
+    let mut ll_state = FseState::init(ll_table, &mut rr)?;
+    let mut of_state = FseState::init(of_table, &mut rr)?;
+    let mut ml_state = FseState::init(ml_table, &mut rr)?;
+
+    let mut out: Vec<Sequence> = Vec::with_capacity(num_sequences as usize);
+    for seq_idx in 0..num_sequences {
+        let ll_sym = ll_state.current_symbol(ll_table);
+        let of_sym = of_state.current_symbol(of_table);
+        let ml_sym = ml_state.current_symbol(ml_table);
+        if (ll_sym as usize) >= LL_BASELINES.len()
+            || (ml_sym as usize) >= ML_BASELINES.len()
+        {
+            return Err(ZstdError::UnexpectedEof);
+        }
+        if (of_sym as u32) > 31 {
+            // Spec bound — offset codes > 31 are invalid (would produce
+            // an offset > 2^32 which overflows our u32).
+            return Err(ZstdError::UnexpectedEof);
+        }
+        // Read extra bits per RFC §5.4.3 (offset, then ml, then ll).
+        let of_extra = rr.read_bits(of_sym as u32)?;
+        let offset = (1u32 << of_sym) + of_extra;
+        let ml_extra = rr.read_bits(ML_EXTRA_BITS[ml_sym as usize])?;
+        let match_length = ML_BASELINES[ml_sym as usize] + ml_extra;
+        let ll_extra = rr.read_bits(LL_EXTRA_BITS[ll_sym as usize])?;
+        let literal_length = LL_BASELINES[ll_sym as usize] + ll_extra;
+        out.push(Sequence {
+            literal_length,
+            offset,
+            match_length,
+        });
+        // Don't step after the LAST sequence — RFC §5.4.3.
+        if seq_idx + 1 < num_sequences {
+            // Step order: LL, then ML, then OF.
+            ll_state.step(ll_table, &mut rr)?;
+            ml_state.step(ml_table, &mut rr)?;
+            of_state.step(of_table, &mut rr)?;
+        }
+    }
+    Ok(out)
+}
+
 /// Parse the sequences section header per RFC §5.4.1.
 pub(crate) fn parse_sequences_header(input: &[u8]) -> Result<SequencesHeader, ZstdError> {
     if input.is_empty() {
@@ -612,5 +737,91 @@ mod tests {
         assert_eq!(SeqSymbolClass::LiteralLength.default_accuracy_log(), 6);
         assert_eq!(SeqSymbolClass::Offset.default_accuracy_log(), 5);
         assert_eq!(SeqSymbolClass::MatchLength.default_accuracy_log(), 6);
+    }
+
+    // ========================================================================
+    // SP134 KATs — 3-interleaved sequence stream decoder.
+    // ========================================================================
+
+    /// SP134-KAT-1: num_sequences = 0 → empty output without touching bitstream.
+    #[test]
+    fn sp134_kat_zero_sequences_yields_empty() {
+        let (ll, _) = load_fse_table_for_mode(SeqSymbolClass::LiteralLength, SeqSymbolMode::Predefined, &[], None).unwrap();
+        let (of, _) = load_fse_table_for_mode(SeqSymbolClass::Offset, SeqSymbolMode::Predefined, &[], None).unwrap();
+        let (ml, _) = load_fse_table_for_mode(SeqSymbolClass::MatchLength, SeqSymbolMode::Predefined, &[], None).unwrap();
+        let out = decode_sequences_stream(&[], &ll, &of, &ml, 0).unwrap();
+        assert!(out.is_empty());
+    }
+
+    /// SP134-KAT-2: empty input with num_sequences > 0 → typed err.
+    #[test]
+    fn sp134_kat_empty_input_with_sequences_traps() {
+        let (ll, _) = load_fse_table_for_mode(SeqSymbolClass::LiteralLength, SeqSymbolMode::Predefined, &[], None).unwrap();
+        let (of, _) = load_fse_table_for_mode(SeqSymbolClass::Offset, SeqSymbolMode::Predefined, &[], None).unwrap();
+        let (ml, _) = load_fse_table_for_mode(SeqSymbolClass::MatchLength, SeqSymbolMode::Predefined, &[], None).unwrap();
+        assert_eq!(
+            decode_sequences_stream(&[], &ll, &of, &ml, 1).unwrap_err(),
+            ZstdError::UnexpectedEof
+        );
+    }
+
+    /// SP134-KAT-3: insufficient bits for state machine init → typed err.
+    /// Predefined LL/ML need accuracy_log=6 = 6 bits per init; OF
+    /// accuracy_log=5 = 5 bits. Total 17 bits for 3 inits + more for
+    /// extra-bits reads. A 1-byte payload [0x80] has pad_bit=7 → 7
+    /// payload bits, insufficient for 17-bit init.
+    #[test]
+    fn sp134_kat_insufficient_init_bits_traps() {
+        let (ll, _) = load_fse_table_for_mode(SeqSymbolClass::LiteralLength, SeqSymbolMode::Predefined, &[], None).unwrap();
+        let (of, _) = load_fse_table_for_mode(SeqSymbolClass::Offset, SeqSymbolMode::Predefined, &[], None).unwrap();
+        let (ml, _) = load_fse_table_for_mode(SeqSymbolClass::MatchLength, SeqSymbolMode::Predefined, &[], None).unwrap();
+        assert_eq!(
+            decode_sequences_stream(&[0x80u8], &ll, &of, &ml, 1).unwrap_err(),
+            ZstdError::UnexpectedEof
+        );
+    }
+
+    /// SP134-KAT-4: LL/ML baseline + extra_bits tables are well-formed.
+    /// The baseline of code N == baseline of N-1 + 2^(extra_bits[N-1])
+    /// for the "predictable" portion (codes 16+ for LL, 32+ for ML where
+    /// extra_bits transition from 0 to non-zero). Sanity-check known
+    /// values from RFC §5.4.3 Table 1:
+    ///   LL baseline[16] = 16, extra_bits = 1
+    ///   LL baseline[20] = 24, extra_bits = 2
+    ///   LL baseline[35] = 65536, extra_bits = 16 → max_ll = 65536 + (2^16 - 1) = 131071
+    /// And RFC §5.4.3 Table 2:
+    ///   ML baseline[32] = 35, extra_bits = 1
+    ///   ML baseline[52] = 65539, extra_bits = 16 → max_ml = 65539 + 65535 = 131074
+    #[test]
+    fn sp134_kat_baseline_extra_bits_tables_correct() {
+        assert_eq!(LL_BASELINES[16], 16);
+        assert_eq!(LL_EXTRA_BITS[16], 1);
+        assert_eq!(LL_BASELINES[20], 24);
+        assert_eq!(LL_EXTRA_BITS[20], 2);
+        assert_eq!(LL_BASELINES[35], 65536);
+        assert_eq!(LL_EXTRA_BITS[35], 16);
+        assert_eq!(ML_BASELINES[32], 35);
+        assert_eq!(ML_EXTRA_BITS[32], 1);
+        assert_eq!(ML_BASELINES[52], 65539);
+        assert_eq!(ML_EXTRA_BITS[52], 16);
+    }
+
+    /// SP134-KAT-5: deterministic — same input + same tables → same output.
+    /// Use ABUNDANT bits (8 bytes of 0x80...) — even if decode produces
+    /// "garbage" sequences (we didn't hand-craft a valid sequence stream),
+    /// both runs MUST produce the same output. Either both Err or both
+    /// Ok with identical Vec<Sequence>.
+    #[test]
+    fn sp134_kat_deterministic_repeat() {
+        let (ll, _) = load_fse_table_for_mode(SeqSymbolClass::LiteralLength, SeqSymbolMode::Predefined, &[], None).unwrap();
+        let (of, _) = load_fse_table_for_mode(SeqSymbolClass::Offset, SeqSymbolMode::Predefined, &[], None).unwrap();
+        let (ml, _) = load_fse_table_for_mode(SeqSymbolClass::MatchLength, SeqSymbolMode::Predefined, &[], None).unwrap();
+        let bytes = [0xFFu8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x80];
+        let r1 = decode_sequences_stream(&bytes, &ll, &of, &ml, 1);
+        let r2 = decode_sequences_stream(&bytes, &ll, &of, &ml, 1);
+        assert_eq!(r1.is_ok(), r2.is_ok());
+        if let (Ok(s1), Ok(s2)) = (&r1, &r2) {
+            assert_eq!(s1, s2);
+        }
     }
 }

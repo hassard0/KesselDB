@@ -82,6 +82,15 @@ pub enum ZstdError {
     /// is deferred to a follow-up (the decoded bytes are the
     /// authoritative output regardless).
     TrailingChecksumTruncated,
+    /// Literals section block type is recognized but the decoder for it
+    /// is not yet implemented in the current slice. Carries the type
+    /// discriminator (RFC §5.3.1.1: 0=Raw, 1=RLE, 2=Compressed, 3=Treeless).
+    /// Compressed/Treeless modes (which need Huffman) land at SP129.
+    LiteralsBlockTypeNotYetSupported { block_type: u8 },
+    /// Huffman tree description uses the FSE-weight encoding (header byte
+    /// 0..=127); decoder for that path defers to SP129 paired with the
+    /// Huffman bitstream + Compressed/Treeless literal payload decoder.
+    FseWeightHuffmanNotYetSupported { header_byte: u8 },
 }
 
 impl core::fmt::Display for ZstdError {

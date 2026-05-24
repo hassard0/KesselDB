@@ -7156,4 +7156,196 @@ mod tests {
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // SP112 T3 IT-5: SM-apply ↔ Tx-commit byte-equivalence.
+    //
+    // Placement note: this test lives in kessel-sm's internal #[cfg(test)]
+    // module (not in kessel-storage/tests/) because kessel-storage cannot
+    // depend on kessel-sm (that would be a circular dependency). The internal
+    // test module has access to `self.storage` and can scan versioned keys
+    // directly. Documented in the SP112 record.
+    //
+    // Claim: submitting a CommitTx workload via (a) `Tx::commit` against a
+    // `Storage<MemVfs>` and (b) `Op::CommitTx` through `StateMachine::apply`
+    // on an identical starting state produces:
+    //   1. Identical outcome variants (Committed or Aborted at the same opnum
+    //      for the same reason) on every operation.
+    //   2. Byte-identical versioned MVCC state in both storages (physical LSM
+    //      bytes, not just the semantic MVCC read API).
+    //
+    // Workload (hand-derived):
+    //   Seed: put_versioned(2, obj(9), opnum=0, [0x99]) on both stores.
+    //   Op1: snapshot=0, write(1,obj(5),[0xAA]); commit opnum=1 → Committed { 1 }
+    //     Conflict window=(0,0]: empty → OK.
+    //   Op2: snapshot=0, write(1,obj(5),[0xBB]); commit opnum=2 → Aborted
+    //     Conflict window=(0,1]: version of (1,obj(5)) at opnum=1 ∈ (0,1] → conflict.
+    //   Op3: snapshot=1, write(2,obj(9),[0xCC]); commit opnum=3 → Committed { 3 }
+    //     Conflict window=(1,2]: seed is at opnum=0 NOT in (1,2] → OK.
+    //
+    // Expected versioned dump (both paths identical):
+    //   (2,obj(9),opnum=0) → Some([0x99])
+    //   (1,obj(5),opnum=1) → Some([0xAA])
+    //   (2,obj(9),opnum=3) → Some([0xCC])
+    //   NO entry at opnum=2 for [0xBB] (Op2 aborted).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn it_sm_apply_matches_tx_commit_byte_identical() {
+        use kessel_proto::{AbortReason, Op, OpResult};
+        use kessel_storage::mvcc::{put_versioned, VERSIONED_KEY_LEN};
+        use kessel_storage::tx::{Tx, TxCommitOutcome};
+        use std::collections::BTreeMap;
+
+        fn obj5() -> [u8; 16] {
+            let mut a = [0u8; 16];
+            a[15] = 5;
+            a
+        }
+        fn obj9() -> [u8; 16] {
+            let mut a = [0u8; 16];
+            a[15] = 9;
+            a
+        }
+
+        fn dump_versioned<V: kessel_io::Vfs>(
+            store: &kessel_storage::Storage<V>,
+        ) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
+            let lo = vec![0x00u8; VERSIONED_KEY_LEN];
+            let hi = vec![0xFFu8; VERSIONED_KEY_LEN];
+            store
+                .scan_range_versions(&lo, &hi)
+                .into_iter()
+                .filter(|(k, _)| k.len() == VERSIONED_KEY_LEN)
+                .collect()
+        }
+
+        // ---- PATH A: Tx::commit directly against Storage ----
+        let dump_tx_path = {
+            let mut store = kessel_storage::Storage::open(kessel_io::MemVfs::new()).unwrap();
+
+            // Seed.
+            put_versioned(&mut store, 2, &obj9(), 0, Some(vec![0x99])).unwrap();
+
+            // Op1: Committed { 1 }.
+            let out1 = {
+                let mut tx = Tx::begin_rw(&mut store, 0);
+                tx.write(1, &obj5(), Some(vec![0xAA]));
+                tx.commit(1).expect("IT-5 Tx-path Op1: must not TxError")
+            };
+            assert_eq!(
+                out1,
+                TxCommitOutcome::Committed { commit_opnum: 1 },
+                "IT-5 Tx-path Op1 must be Committed {{ 1 }}"
+            );
+
+            // Op2: Aborted (conflict with Op1).
+            let out2 = {
+                let mut tx = Tx::begin_rw(&mut store, 0);
+                tx.write(1, &obj5(), Some(vec![0xBB]));
+                tx.commit(2).expect("IT-5 Tx-path Op2: must not TxError")
+            };
+            assert_eq!(
+                out2,
+                TxCommitOutcome::Aborted { conflicting_key: (1u32, obj5()) },
+                "IT-5 Tx-path Op2 must be Aborted (conflict with Op1)"
+            );
+
+            // Op3: Committed { 3 }.
+            let out3 = {
+                let mut tx = Tx::begin_rw(&mut store, 1);
+                tx.write(2, &obj9(), Some(vec![0xCC]));
+                tx.commit(3).expect("IT-5 Tx-path Op3: must not TxError")
+            };
+            assert_eq!(
+                out3,
+                TxCommitOutcome::Committed { commit_opnum: 3 },
+                "IT-5 Tx-path Op3 must be Committed {{ 3 }}"
+            );
+
+            dump_versioned(&store)
+        };
+
+        // ---- PATH B: Op::CommitTx through StateMachine::apply ----
+        //
+        // The SM internal test module has access to `sm.storage` directly,
+        // avoiding the need for a new public accessor API on StateMachine.
+        let dump_sm_path = {
+            let mut sm = StateMachine::open(kessel_io::MemVfs::new()).unwrap();
+
+            // Seed via put_versioned on the SM-owned storage.
+            put_versioned(&mut sm.storage, 2, &obj9(), 0, Some(vec![0x99])).unwrap();
+
+            // Op1: TxCommitted { 1 }.
+            let res1 = sm.apply(
+                1,
+                Op::CommitTx {
+                    snapshot_opnum: 0,
+                    write_set: vec![(1u32, obj5(), Some(vec![0xAA]))],
+                    commit_opnum: 1,
+                },
+            );
+            assert_eq!(
+                res1,
+                OpResult::TxCommitted { commit_opnum: 1 },
+                "IT-5 SM-path Op1 must be TxCommitted {{ 1 }}"
+            );
+
+            // Op2: TxAborted (conflict with Op1).
+            let res2 = sm.apply(
+                2,
+                Op::CommitTx {
+                    snapshot_opnum: 0,
+                    write_set: vec![(1u32, obj5(), Some(vec![0xBB]))],
+                    commit_opnum: 2,
+                },
+            );
+            assert_eq!(
+                res2,
+                OpResult::TxAborted {
+                    reason: AbortReason::WriteWriteConflict {
+                        type_id: 1,
+                        object_id: obj5(),
+                    },
+                },
+                "IT-5 SM-path Op2 must be TxAborted (conflict with Op1)"
+            );
+
+            // Op3: TxCommitted { 3 }.
+            let res3 = sm.apply(
+                3,
+                Op::CommitTx {
+                    snapshot_opnum: 1,
+                    write_set: vec![(2u32, obj9(), Some(vec![0xCC]))],
+                    commit_opnum: 3,
+                },
+            );
+            assert_eq!(
+                res3,
+                OpResult::TxCommitted { commit_opnum: 3 },
+                "IT-5 SM-path Op3 must be TxCommitted {{ 3 }}"
+            );
+
+            dump_versioned(&sm.storage)
+        };
+
+        // ---- BYTE-EQUIVALENCE ASSERTION ----
+        //
+        // Both paths applied the same seed + same three logical operations.
+        // Tx::commit and SM apply must produce byte-identical versioned MVCC
+        // state. If the conflict check differed between paths (e.g., Op2
+        // committed in one path and aborted in the other), the dumps would
+        // disagree at the versioned key for (1,obj5(),opnum=2).
+        assert_eq!(
+            dump_tx_path, dump_sm_path,
+            "IT-5 (THESIS-FIT): Tx::commit path and SM apply path must produce \
+             byte-identical versioned MVCC state for the same workload"
+        );
+
+        // Extra KAT: 3 entries total (seed + Op1 + Op3; Op2 aborted).
+        assert_eq!(
+            dump_tx_path.len(),
+            3,
+            "IT-5: dump must have 3 entries (seed + Op1 + Op3; Op2 aborted)"
+        );
+    }
 }

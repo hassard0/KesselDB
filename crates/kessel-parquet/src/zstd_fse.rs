@@ -136,6 +136,12 @@ impl<'a> ReverseBitReader<'a> {
     pub fn is_empty(&self) -> bool {
         self.bit_pos >= self.total
     }
+    /// Rewind the bit cursor by `nb` bits — used by the Huffman bitstream
+    /// decoder when it over-reads a max_bits-wide index for a shorter code.
+    /// Saturating: rewinding past 0 is clamped to 0.
+    pub fn rewind(&mut self, nb: u32) {
+        self.bit_pos = self.bit_pos.saturating_sub(nb as usize);
+    }
     pub fn read_bits(&mut self, nb: u32) -> Result<u32, ZstdError> {
         if nb == 0 {
             return Ok(0);

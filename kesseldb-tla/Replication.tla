@@ -128,10 +128,20 @@ Max(a, b) == IF a >= b THEN a ELSE b
 (* identity, not about op semantics).                                       *)
 (***************************************************************************)
 
-\* Opaque "operations" — the spec only needs Nat for the bounded model.
-OpNums == 1..MaxRequests
+\* Opaque "operations" — bounded sub-universes for TLC enumeration. The
+\* bounds mirror the TypeOK envelope below so they do NOT change protocol
+\* semantics; they merely make the Messages record-set finite (TLC bails
+\* on Nat-valued record fields during initial-state enumeration). Safety
+\* properties do not require multiple clients, so Clients is a singleton
+\* (1..1); modelling multiple clients explodes the state space without
+\* strengthening the invariants. SP109 T3-TLC-found fix (2026-05-23).
+OpNums       == 1..MaxRequests
+CommitPoints == 0..MaxRequests
+Views        == 0..(MaxViewChanges + 1)
+Clients      == 1..1
+Reqs         == 1..MaxRequests
 
-Entries == [opnum: Nat, client: Nat, req: Nat]
+Entries == [opnum: OpNums, client: Clients, req: Reqs]
 
 \* Message-kind universes. Each is a record set; the spec uses tagged
 \* records with a kind field for clarity. Bounded sub-universes are used
@@ -142,26 +152,26 @@ BoundedLogs == UNION { [1..k -> Entries] : k \in 0..MaxRequests }
 
 Messages ==
     [kind: {"Prepare"},
-     view: Nat, opnum: Nat, entry: Entries, commit: Nat,
+     view: Views, opnum: OpNums, entry: Entries, commit: CommitPoints,
      from: Replicas, to: Replicas]
   \cup
     [kind: {"PrepareOk"},
-     view: Nat, opnum: Nat,
+     view: Views, opnum: OpNums,
      from: Replicas, to: Replicas]
   \cup
     [kind: {"Commit"},
-     view: Nat, commit: Nat,
+     view: Views, commit: CommitPoints,
      from: Replicas, to: Replicas]
   \cup
     [kind: {"StartViewChange"},
-     view: Nat, from: Replicas, to: Replicas]
+     view: Views, from: Replicas, to: Replicas]
   \cup
     [kind: {"DoViewChange"},
-     view: Nat, log: BoundedLogs, commit: Nat, normalView: Nat,
+     view: Views, log: BoundedLogs, commit: CommitPoints, normalView: Views,
      from: Replicas, to: Replicas]
   \cup
     [kind: {"StartView"},
-     view: Nat, log: BoundedLogs, commit: Nat,
+     view: Views, log: BoundedLogs, commit: CommitPoints,
      from: Replicas, to: Replicas]
 
 ----------------------------------------------------------------------------

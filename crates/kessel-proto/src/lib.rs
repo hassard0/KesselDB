@@ -267,6 +267,13 @@ pub enum Op {
         snapshot_opnum: u64,
         write_set: Vec<(u32, [u8; 16], Option<Vec<u8>>)>,
         commit_opnum: u64,
+        /// SP113 / S2.4: SSI read-set tracking. Empty vec preserves SP112
+        /// plain-SI behaviour (the SM apply arm's SSI inner branch is
+        /// gated on `read_set.is_empty() == false`). Non-empty vec
+        /// activates the Cahill SSI dangerous-structure detector. Sorted
+        /// by (type_id, object_id) at construction for deterministic
+        /// SM-side iteration order (mirrors write_set ordering).
+        read_set: Vec<(u32, [u8; 16])>,
     },
 }
 
@@ -298,6 +305,13 @@ pub enum AbortReason {
     /// `put_versioned` failed during the install phase. `kind` is
     /// `std::io::ErrorKind as i32` so the variant stays `Clone + Eq`.
     StorageIo { kind: i32 },
+    /// SP113 / S2.4: The committing Tx was the pivot or outer node of
+    /// an SSI dangerous structure (two consecutive rw-antidependency
+    /// edges in the rw-edge graph). Aborted per Cahill SSI to preserve
+    /// serializability. Replay with a fresh snapshot. `other_commit_opnum`
+    /// is the commit_opnum of the other Tx in the rw-edge chain (for
+    /// debugging + observability; does NOT affect the verdict).
+    DangerousStructure { other_commit_opnum: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -376,6 +390,11 @@ impl OpResult {
                         // i32 LE via u32 transmute-bytes (Clone+Eq friendly).
                         codec::put_u32(&mut b, *kind as u32);
                     }
+                    // SP113 / S2.4: DangerousStructure at sub-tag 3.
+                    AbortReason::DangerousStructure { other_commit_opnum } => {
+                        b.push(3);
+                        codec::put_u64(&mut b, *other_commit_opnum);
+                    }
                 }
             }
         }
@@ -405,6 +424,8 @@ impl OpResult {
                         AbortReason::WriteWriteConflict { type_id, object_id }
                     }
                     2 => AbortReason::StorageIo { kind: c.u32()? as i32 },
+                    // SP113 / S2.4: DangerousStructure at sub-tag 3.
+                    3 => AbortReason::DangerousStructure { other_commit_opnum: c.u64()? },
                     _ => return None,
                 };
                 OpResult::TxAborted { reason }
@@ -754,11 +775,14 @@ impl Op {
                 codec::put_u32(&mut b, *offset);
                 codec::put_u32(&mut b, *limit);
             }
-            Op::CommitTx { snapshot_opnum, write_set, commit_opnum } => {
+            Op::CommitTx { snapshot_opnum, write_set, commit_opnum, read_set } => {
                 // wire: [u64 snapshot_opnum][u32 write_set_len]
                 //       { [u32 type_id][16B object_id][u8 presence][?bytes value] }*
                 //       [u64 commit_opnum]
+                //       [u32 read_set_len] { [u32 type_id][16B object_id] }*
                 // presence byte: 0 = tombstone (None), 1 = live (Some(value follows))
+                // SP113 / S2.4: read_set appended after commit_opnum (additive;
+                // absent bytes in SP112-shaped frames are decoded as empty vec).
                 b.extend_from_slice(&snapshot_opnum.to_le_bytes());
                 codec::put_u32(&mut b, write_set.len() as u32);
                 for (type_id, object_id, value) in write_set {
@@ -773,6 +797,12 @@ impl Op {
                     }
                 }
                 b.extend_from_slice(&commit_opnum.to_le_bytes());
+                // SP113 / S2.4: read_set suffix. Empty vec = SP112 compat default.
+                codec::put_u32(&mut b, read_set.len() as u32);
+                for (type_id, object_id) in read_set {
+                    codec::put_u32(&mut b, *type_id);
+                    b.extend_from_slice(object_id);
+                }
             }
         }
         b
@@ -1082,7 +1112,22 @@ impl Op {
                     write_set.push((type_id, object_id, value));
                 }
                 let commit_opnum = c.u64()?;
-                Op::CommitTx { snapshot_opnum, write_set, commit_opnum }
+                // SP113 / S2.4: read_set suffix — additive. If buffer is
+                // exhausted here, this is an SP112-shaped frame → treat
+                // read_set as vec![] for backward read-compat.
+                let read_set = if c.remaining() == 0 {
+                    vec![]
+                } else {
+                    let n = c.u32()? as usize;
+                    let mut rs = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        let type_id = c.u32()?;
+                        let object_id = c.object_id()?.0;
+                        rs.push((type_id, object_id));
+                    }
+                    rs
+                };
+                Op::CommitTx { snapshot_opnum, write_set, commit_opnum, read_set }
             }
             _ => return None,
         };
@@ -1301,7 +1346,7 @@ mod tests {
                 commit: true,
             },
             Op::FindByComposite { type_id: 4, fields: vec![1, 3], values: vec![vec![9], vec![8, 8]] },
-            // SP112 T1: CommitTx scaffold wire roundtrip.
+            // SP112 T1: CommitTx scaffold wire roundtrip (read_set: vec![] = SP112 compat).
             Op::CommitTx {
                 snapshot_opnum: 7,
                 write_set: vec![
@@ -1309,9 +1354,17 @@ mod tests {
                     (2u32, {let mut k=[0u8;16]; k[15]=5; k}, None),
                 ],
                 commit_opnum: 42,
+                read_set: vec![],
             },
-            // Empty write_set edge case.
-            Op::CommitTx { snapshot_opnum: 0, write_set: vec![], commit_opnum: 0 },
+            // Empty write_set edge case (read_set: vec![] = SP112 compat).
+            Op::CommitTx { snapshot_opnum: 0, write_set: vec![], commit_opnum: 0, read_set: vec![] },
+            // SP113 T1: CommitTx with non-empty read_set (SSI frame).
+            Op::CommitTx {
+                snapshot_opnum: 7,
+                write_set: vec![],
+                commit_opnum: 11,
+                read_set: vec![(2u32, [3u8; 16]), (4u32, [5u8; 16])],
+            },
         ];
         for op in ops {
             let enc = op.encode();

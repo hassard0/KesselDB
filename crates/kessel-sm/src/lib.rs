@@ -106,7 +106,49 @@ pub struct StateMachine<V: Vfs> {
     /// Engine-local schema epoch (SP51). Not part of the digest; bumped by
     /// `persist_catalog` on every catalog change.
     catalog_epoch: u64,
+    /// SP113 / S2.4: SSI pending-tx window. Stores per-Tx metadata for
+    /// every Tx that has committed at-or-after the current SSI lookback
+    /// horizon (commit_opnum >= current_apply_opnum - MAX_TX_AGE). Used
+    /// by `Op::CommitTx` apply to derive rw-antidependency edges
+    /// deterministically. Restart-rebuilt via log replay (the SP112 SM
+    /// apply path naturally reconstructs every pending_txs entry as it
+    /// re-applies each Op::CommitTx; eviction re-runs as it did
+    /// originally).
+    ///
+    /// In-memory only; not persisted. The byte-identity property is
+    /// preserved by the deterministic apply: every replica's pending_txs
+    /// state after the same log prefix is byte-identical (BTreeMap +
+    /// sorted-Vec deterministic iteration; no hashing).
+    pending_txs: std::collections::BTreeMap<u64 /* commit_opnum */, PendingTxRecord>,
 }
+
+/// SP113 / S2.4: Per-committed-Tx record retained in
+/// `StateMachine::pending_txs` for SSI rw-edge derivation. Keys-only
+/// read_set + write_set halves the memory footprint vs the wire
+/// shape (the SSI algorithm operates on key sets, not values).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingTxRecord {
+    pub snapshot_opnum: u64,
+    /// Sorted by (type_id, object_id) for deterministic iteration.
+    pub read_set: Vec<(u32, [u8; 16])>,
+    /// Sorted by (type_id, object_id) for deterministic iteration.
+    /// Keys only — values discarded (rw-edges are over keys).
+    pub write_set: Vec<(u32, [u8; 16])>,
+    /// Cahill SSI per-Tx tag: TRUE iff this Tx has an outgoing rw-edge
+    /// to some later committer (i.e. some later Tx wrote a key this
+    /// Tx had read).
+    pub has_outgoing_rw: bool,
+    /// Cahill SSI per-Tx tag: TRUE iff this Tx has an incoming rw-edge
+    /// from some earlier committer (i.e. some earlier Tx's read overlaps
+    /// this Tx's write).
+    pub has_incoming_rw: bool,
+}
+
+/// SP113 / S2.4: SSI pending-tx window horizon, in opnums. A Tx
+/// whose commit_opnum is older than (current_apply_opnum - MAX_TX_AGE)
+/// is evicted from `pending_txs`. Decision 5: fixed bound; S2.5
+/// watermark protocol supersedes with a dynamic horizon.
+pub(crate) const MAX_TX_AGE: u64 = 4096;
 
 impl<V: Vfs> StateMachine<V> {
     pub fn open(vfs: V) -> std::io::Result<Self> {
@@ -134,6 +176,8 @@ impl<V: Vfs> StateMachine<V> {
             // capacity; cache-off remains available for the raw primitive.
             cache: Some(kessel_cache::ReadCache::new(DEFAULT_READ_CACHE)),
             catalog_epoch: 0,
+            // SP113 / S2.4: SSI pending-tx window, initially empty.
+            pending_txs: std::collections::BTreeMap::new(),
         })
     }
 
@@ -3695,7 +3739,7 @@ impl<V: Vfs> StateMachine<V> {
                     .into(),
             ),
 
-            Op::CommitTx { snapshot_opnum, write_set, commit_opnum } => {
+            Op::CommitTx { snapshot_opnum, write_set, commit_opnum, read_set } => {
                 // S2.3 T2: THE thesis-fit headline path. The conflict-check
                 // verdict is a DETERMINISTIC function of the log prefix —
                 // every replica running this identical arm against byte-
@@ -3714,6 +3758,11 @@ impl<V: Vfs> StateMachine<V> {
                 // Edge: commit_opnum == 0 skips the conflict check (no
                 // prior versions can exist below opnum=0; `commit_opnum - 1`
                 // would underflow u64). Decision 5.
+                //
+                // SP113 / S2.4 T1 scaffold: read_set is bound but unused.
+                // T2 wires the SSI dangerous-structure detector + the
+                // pending_txs window maintenance (gated on !read_set.is_empty()).
+                let _ = &read_set; // T2 will consume.
                 if snapshot_opnum > commit_opnum {
                     return OpResult::TxAborted {
                         reason: AbortReason::SnapshotOutOfRange,
@@ -7282,6 +7331,7 @@ mod tests {
                     snapshot_opnum: 0,
                     write_set: vec![(1u32, obj5(), Some(vec![0xAA]))],
                     commit_opnum: 1,
+                    read_set: vec![],
                 },
             );
             assert_eq!(
@@ -7297,6 +7347,7 @@ mod tests {
                     snapshot_opnum: 0,
                     write_set: vec![(1u32, obj5(), Some(vec![0xBB]))],
                     commit_opnum: 2,
+                    read_set: vec![],
                 },
             );
             assert_eq!(
@@ -7317,6 +7368,7 @@ mod tests {
                     snapshot_opnum: 1,
                     write_set: vec![(2u32, obj9(), Some(vec![0xCC]))],
                     commit_opnum: 3,
+                    read_set: vec![],
                 },
             );
             assert_eq!(

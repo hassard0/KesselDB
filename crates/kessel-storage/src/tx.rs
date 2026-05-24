@@ -216,6 +216,13 @@ pub enum TxCommitOutcome {
     /// The transaction was aborted due to a write-write conflict on
     /// `conflicting_key`. The caller should retry with a fresher snapshot.
     Aborted { conflicting_key: (u32, [u8; 16]) },
+    /// SP113 / S2.4: SSI-specific dangerous-structure abort. The
+    /// committing Tx had a dangerous rw-antidependency structure in the
+    /// SM's pending_txs window; Cahill SSI aborts the committing Tx
+    /// (Decision 3) to preserve serializability. `other_commit_opnum`
+    /// surfaces the other Tx in the chain for debugging; the caller
+    /// should retry with a fresh snapshot.
+    AbortedDangerousStructure { other_commit_opnum: u64 },
 }
 
 impl<'a, V: Vfs> Tx<'a, V> {
@@ -434,6 +441,43 @@ impl<'a, V: Vfs> Tx<'a, V> {
                 })?;
         }
         Ok(TxCommitOutcome::Committed { commit_opnum })
+    }
+
+    /// Begin an SSI-mode write-capable Tx pinned at `snapshot_opnum`.
+    /// SP113 / S2.4. Structurally identical to `begin_rw` at the
+    /// storage-borrow level; differs only in the eventual commit path:
+    /// `commit_ssi` ships the read_set over the wire so the SM can run
+    /// Cahill's dangerous-structure check.
+    ///
+    /// The SI/SSI distinction is purely per-call-site (which commit
+    /// method is invoked) — there is no SSI-mode flag on the Tx struct.
+    /// See S2.4 design Decision 6.
+    pub fn begin_ssi(store: &'a mut Storage<V>, snapshot_opnum: u64) -> Self {
+        Self {
+            store: TxStore::Exclusive(store),
+            snapshot_opnum,
+            read_set: BTreeSet::new(),
+            write_set: BTreeMap::new(),
+        }
+    }
+
+    /// Conflict-checked SSI commit (Cahill SSI). Ships the Tx's read_set
+    /// + write_set + snapshot_opnum in `Op::CommitTx`; the SM's apply arm
+    /// derives rw-antidependency edges against its pending_txs window and
+    /// aborts on a dangerous structure. Behaviour identical to `commit`
+    /// (SI mode) on the SI write-write check + on the install path; the
+    /// SSI step runs between them, gated on `!read_set.is_empty()`.
+    ///
+    /// SP113 / S2.4. Outcome shape extends `TxCommitOutcome::Aborted` to
+    /// surface the `AbortedDangerousStructure` variant.
+    ///
+    /// IMPORTANT: like `commit`, the standalone form here runs the SM
+    /// apply path locally for testability. In production (S2.6 SM caller
+    /// integration), `commit_ssi` will construct an `Op::CommitTx` payload
+    /// with the read_set populated and submit it to VSR; the verdict will
+    /// arrive back via the SM apply callback.
+    pub fn commit_ssi(self, _commit_opnum: u64) -> Result<TxCommitOutcome, TxError> {
+        todo!("S2.4 T2: SSI commit — drive SM apply on local Storage")
     }
 }
 

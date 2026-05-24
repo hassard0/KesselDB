@@ -559,6 +559,19 @@ TimeoutPrimary ==
 StartViewChange(m) ==
     /\ m.kind = "StartViewChange"
     /\ m.view >= view[m.to]
+    \* Real-VSR tightening (T3-TLC-found #3, SP109): a replica that has
+    \* ALREADY completed view-change for some view >= m.view (status =
+    \* "Normal" /\ normalView[m.to] >= m.view) does not regress to
+    \* ViewChange when a stale StartViewChange for that view trickles in
+    \* — kessel-vsr's on_svc ignores StartViewChange whose view does not
+    \* exceed the replica's current normal view. Without this guard, a
+    \* stale StartViewChange could push the newly-elected primary (or any
+    \* backup that has already adopted the new view via StartView) back
+    \* to ViewChange status, which then re-enables a duplicate
+    \* BecomePrimary that overwrites a freshly-committed log entry while
+    \* leaving `applied` stranded (TypeOK violation, baseline trace
+    \* 2026-05-23 states 10 -> 13).
+    /\ ~ (status[m.to] = "Normal" /\ normalView[m.to] >= m.view)
     /\ LET adopted == Max(view[m.to], m.view)
        IN  /\ view' = [view EXCEPT ![m.to] = adopted]
            /\ status' = [status EXCEPT ![m.to] = "ViewChange"]
@@ -687,6 +700,16 @@ StartView(m) ==
     /\ m.view >= view[m.to]
     /\ m.to # PrimaryOf(m.view)
     /\ m.commit <= Len(m.log)
+    \* Real-VSR tightening (T3-TLC-found #3, SP109): a replica that has
+    \* already completed view-change for some view >= m.view does not
+    \* re-overwrite its log + commit from a stale StartView. kessel-vsr's
+    \* on_start_view returns early when the incoming view does not
+    \* advance the local normal-view. Without this guard, a stale
+    \* StartView could overwrite a backup's locally-extended log (post-
+    \* Prepare) with a shorter stale log, breaking TypeOK's commit <=
+    \* Len(log) and ExactlyOnceApply's applied[i] = log[i].opnum
+    \* alignment.
+    /\ ~ (status[m.to] = "Normal" /\ normalView[m.to] >= m.view)
     /\ log' = [log EXCEPT ![m.to] = m.log]
     /\ commit' = [commit EXCEPT ![m.to] = Max(commit[m.to], m.commit)]
     /\ view' = [view EXCEPT ![m.to] = m.view]

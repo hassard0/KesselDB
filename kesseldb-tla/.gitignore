@@ -10,4 +10,6 @@ MVCCStorage_TTrace_*.bin
 MVCCStorage_TTrace_*.tla
 MVCCTx_TTrace_*.bin
 MVCCTx_TTrace_*.tla
+MVCCSi_TTrace_*.bin
+MVCCSi_TTrace_*.tla
 *.log

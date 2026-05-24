@@ -270,6 +270,36 @@ pub enum Op {
     },
 }
 
+/// Why an `Op::CommitTx` apply path aborted. Carried inside
+/// `OpResult::TxAborted`. SP112 T2 adds this enum alongside the
+/// `TxCommitted` / `TxAborted` OpResult variants.
+///
+/// SP112 T2-DECIDED CHOICE (OpResult shape) — Strategy (a) from the
+/// design's "Add new OpResult variants" option. Rationale:
+///   - Strategy (a): typed, no string-parsing on the caller side; the
+///     `conflicting_key` / underlying I/O `kind` survive the wire trip
+///     without being losslessly re-extracted from a payload bag.
+///   - Strategy (b): "encode via existing variant + a payload byte
+///     sequence" would have hidden the typed result inside e.g.
+///     `OpResult::Got(bytes)`, forcing every consumer to know the
+///     bag's shape — a footgun and a maintenance hazard.
+/// Implementation cost: ~12 lines of encode/decode in this file +
+/// no callsite churn (all existing `match` arms continue to work via
+/// the SP1-existing `_` arms or are non-exhaustive-flagged).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AbortReason {
+    /// `snapshot_opnum > commit_opnum` — malformed input on the wire.
+    /// Mirrors `TxError::SnapshotOutOfRange` from kessel-storage::tx.
+    SnapshotOutOfRange,
+    /// `has_version_in_range(snapshot, commit-1)` returned `true` for
+    /// `(type_id, object_id)` — first-committer-wins; this Tx aborts.
+    WriteWriteConflict { type_id: u32, object_id: [u8; 16] },
+    /// `put_versioned` failed during the install phase. `kind` is
+    /// `std::io::ErrorKind as i32` so the variant stays `Clone + Eq`.
+    StorageIo { kind: i32 },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OpResult {
     Ok,
@@ -289,6 +319,15 @@ pub enum OpResult {
     /// Connection-level auth failed (missing/incorrect shared-secret
     /// token). Transport-level, not a committed result (Sub-project 43).
     Unauthorized,
+    /// SP112 / S2.3: `Op::CommitTx` succeeded; every write installed at
+    /// `commit_opnum` via `put_versioned`. Echoes the commit_opnum for
+    /// audit. The verdict is a deterministic function of the log prefix.
+    TxCommitted { commit_opnum: u64 },
+    /// SP112 / S2.3: `Op::CommitTx` aborted; reason explains why. The
+    /// caller (Tx wrapper or SQL driver) should retry with a fresher
+    /// snapshot for `WriteWriteConflict`, or surface the error for
+    /// `SnapshotOutOfRange` / `StorageIo`.
+    TxAborted { reason: AbortReason },
 }
 
 impl OpResult {
@@ -316,6 +355,29 @@ impl OpResult {
             }
             OpResult::Unavailable => b.push(7),
             OpResult::Unauthorized => b.push(8),
+            // SP112 T2: TxCommitted/TxAborted tagged 9 and 10. AbortReason
+            // is sub-tagged inside the TxAborted payload (0=SnapshotOOR,
+            // 1=WriteWriteConflict{type,obj16}, 2=StorageIo{kind:i32}).
+            OpResult::TxCommitted { commit_opnum } => {
+                b.push(9);
+                codec::put_u64(&mut b, *commit_opnum);
+            }
+            OpResult::TxAborted { reason } => {
+                b.push(10);
+                match reason {
+                    AbortReason::SnapshotOutOfRange => b.push(0),
+                    AbortReason::WriteWriteConflict { type_id, object_id } => {
+                        b.push(1);
+                        codec::put_u32(&mut b, *type_id);
+                        b.extend_from_slice(object_id);
+                    }
+                    AbortReason::StorageIo { kind } => {
+                        b.push(2);
+                        // i32 LE via u32 transmute-bytes (Clone+Eq friendly).
+                        codec::put_u32(&mut b, *kind as u32);
+                    }
+                }
+            }
         }
         b
     }
@@ -332,6 +394,21 @@ impl OpResult {
             6 => OpResult::Constraint(String::from_utf8_lossy(&c.bytes()?).into_owned()),
             7 => OpResult::Unavailable,
             8 => OpResult::Unauthorized,
+            // SP112 T2: TxCommitted (9) + TxAborted (10) wire decode.
+            9 => OpResult::TxCommitted { commit_opnum: c.u64()? },
+            10 => {
+                let reason = match c.u8()? {
+                    0 => AbortReason::SnapshotOutOfRange,
+                    1 => {
+                        let type_id = c.u32()?;
+                        let object_id = c.object_id()?.0;
+                        AbortReason::WriteWriteConflict { type_id, object_id }
+                    }
+                    2 => AbortReason::StorageIo { kind: c.u32()? as i32 },
+                    _ => return None,
+                };
+                OpResult::TxAborted { reason }
+            }
             _ => return None,
         })
     }

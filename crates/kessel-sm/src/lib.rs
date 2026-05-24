@@ -12,7 +12,7 @@ use kessel_catalog::{
     decode_field, decode_type_def, encode_type_def, Catalog, Field, ObjectType,
 };
 use kessel_io::Vfs;
-use kessel_proto::{Op, OpResult};
+use kessel_proto::{AbortReason, Op, OpResult};
 use kessel_storage::{make_key, Key, Storage};
 
 /// Catalog persisted as object type 0, single well-known key.
@@ -3696,15 +3696,64 @@ impl<V: Vfs> StateMachine<V> {
             ),
 
             Op::CommitTx { snapshot_opnum, write_set, commit_opnum } => {
-                // S2.3 T2 will fill in the conflict-check + apply logic. The
-                // shape mirrors `Tx::commit` so the two paths are
-                // byte-equivalent on identical storage states (verified by T3's
-                // SM-apply-vs-Tx-commit byte-equivalence test).
-                let _ = (snapshot_opnum, write_set, commit_opnum);
-                todo!(
-                    "S2.3 T2: implement Op::CommitTx apply path with \
-                     has_version_in_range conflict check + put_versioned apply"
-                )
+                // S2.3 T2: THE thesis-fit headline path. The conflict-check
+                // verdict is a DETERMINISTIC function of the log prefix —
+                // every replica running this identical arm against byte-
+                // identical storage state at the same op_number reaches
+                // the same verdict. No distributed coordination protocol
+                // is needed (Spanner's TrueTime / CockroachDB's HLC are
+                // structurally absent because the VSR log already orders
+                // every commit op and the SM apply already agrees on the
+                // verdict). Parent S2 design Decision 4 + S2.3 Decision 4.
+                //
+                // Mirrors `Tx::commit` in crates/kessel-storage/src/tx.rs.
+                // The two paths produce BYTE-EQUIVALENT results on
+                // identical storage state (gated by T3's byte-equivalence
+                // test — coming in the next task).
+                //
+                // Edge: commit_opnum == 0 skips the conflict check (no
+                // prior versions can exist below opnum=0; `commit_opnum - 1`
+                // would underflow u64). Decision 5.
+                if snapshot_opnum > commit_opnum {
+                    return OpResult::TxAborted {
+                        reason: AbortReason::SnapshotOutOfRange,
+                    };
+                }
+                if commit_opnum > 0 {
+                    let hi = commit_opnum - 1;
+                    for (type_id, object_id, _value) in &write_set {
+                        if kessel_storage::mvcc::has_version_in_range(
+                            &self.storage,
+                            *type_id,
+                            object_id,
+                            snapshot_opnum,
+                            hi,
+                        ) {
+                            return OpResult::TxAborted {
+                                reason: AbortReason::WriteWriteConflict {
+                                    type_id: *type_id,
+                                    object_id: *object_id,
+                                },
+                            };
+                        }
+                    }
+                }
+                for (type_id, object_id, value) in write_set {
+                    if let Err(e) = kessel_storage::mvcc::put_versioned(
+                        &mut self.storage,
+                        type_id,
+                        &object_id,
+                        commit_opnum,
+                        value,
+                    ) {
+                        return OpResult::TxAborted {
+                            reason: AbortReason::StorageIo {
+                                kind: e.kind() as i32,
+                            },
+                        };
+                    }
+                }
+                OpResult::TxCommitted { commit_opnum }
             }
         }
     }

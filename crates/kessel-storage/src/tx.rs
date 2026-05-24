@@ -27,6 +27,41 @@ use kessel_io::Vfs;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
+/// Internal: the kind of borrow a Tx holds against Storage. SP112 T2
+/// introduces the `Exclusive` variant so `Tx::commit` can call
+/// `put_versioned(&mut Storage)` to install writes. The `Shared` variant
+/// is the SP111 read-only path (which allows e.g. multi-Tx tests where
+/// tx_a/tx_b/tx_c all borrow the same `&store` concurrently).
+///
+/// SP112 T2-DECIDED CHOICE — see the doc on `Tx::store` for the full
+/// rationale. The enum is `pub(crate)` because external callers route
+/// through `Tx::begin` (Shared) or `Tx::begin_rw` (Exclusive); the enum
+/// itself is an implementation detail.
+pub(crate) enum TxStore<'a, V: Vfs> {
+    /// Shared borrow (`&Storage`). SP111 read-only flow. Multi-Tx
+    /// tests in tx_integration.rs depend on this allowing several
+    /// Tx to coexist against one `&store`.
+    Shared(&'a Storage<V>),
+    /// Exclusive borrow (`&mut Storage`). SP112 write-capable flow.
+    /// `Tx::commit` requires this variant; `Tx::commit` on a `Shared`
+    /// Tx returns `Err(TxError::ReadOnlyCannotCommit)`.
+    Exclusive(&'a mut Storage<V>),
+}
+
+impl<'a, V: Vfs> TxStore<'a, V> {
+    /// View as `&Storage` regardless of variant. Used by all read paths
+    /// (`Tx::read`, `Tx::commit`'s conflict check via
+    /// `has_version_in_range(&Storage, ...)`) so they work uniformly on
+    /// both Shared and Exclusive Tx.
+    #[inline]
+    fn as_ref(&self) -> &Storage<V> {
+        match self {
+            TxStore::Shared(s) => s,
+            TxStore::Exclusive(s) => s,
+        }
+    }
+}
+
 /// A read-only transaction pinned at a snapshot opnum.
 ///
 /// Holds a shared borrow of the underlying `Storage`. The borrow is
@@ -44,12 +79,37 @@ use std::collections::BTreeSet;
 /// Design Decision 2 (S2.2 design doc): snapshot opnum is caller-supplied
 /// to preserve the kessel-storage / kessel-sm boundary; SM wiring in S2.6.
 pub struct Tx<'a, V: Vfs> {
-    /// Shared borrow of the underlying storage; reads only.
+    /// Borrow of the underlying storage. Shared (SP111 read-only) OR
+    /// exclusive (SP112 write-capable). The exclusive variant is required
+    /// for `Tx::commit` (which calls `put_versioned(&mut Storage)` to
+    /// install writes); the shared variant supports the SP111 read-only
+    /// flow + multi-Tx tests that hold several `&store` borrows at once.
     ///
     /// Decision 2: Tx lives in kessel-storage::tx and holds a borrow of
     /// Storage<V> rather than coupling to kessel-sm. S2.6 SM integration
-    /// will call `Tx::begin(&store, sm.last_committed_opnum())`.
-    store: &'a Storage<V>,
+    /// will call `Tx::begin(&store, sm.last_committed_opnum())` for
+    /// read-only flows and `Tx::begin_rw(&mut store, ...)` for committing
+    /// flows.
+    ///
+    /// SP112 T2-DECIDED CHOICE (storage-mutability) — Strategy (b) per
+    /// the design's Tx::commit-mutability note. Rationale:
+    ///   - Strategy (a) "interior mutability" is not viable: SP110's
+    ///     `mvcc::put_versioned` signature requires `&mut Storage<V>` and
+    ///     T2 is forbidden from changing mvcc.rs (T2 only composes its
+    ///     primitives).
+    ///   - Strategy (b) "add a Tx::begin_rw constructor" is the
+    ///     minimum-churn safe-Rust path. The enum-of-shared-or-mut keeps
+    ///     SP111 read-only call-sites (e.g., the multi-Tx tests in
+    ///     tx_integration.rs that hold tx_a/tx_b/tx_c against the same
+    ///     `&store`) compiling byte-identically. `Tx::begin` keeps its
+    ///     S2.2 signature (`&'a Storage<V>`); the new `Tx::begin_rw`
+    ///     takes `&'a mut Storage<V>` for the commit-capable flow.
+    ///   - Per-method behavior: `read`, `read_set`, `snapshot_opnum`,
+    ///     `write`, `write_set`, `commit_read_only`, `abort` work
+    ///     uniformly on BOTH variants (read-only Tx may still buffer
+    ///     writes but cannot commit them — `commit` on a Shared Tx
+    ///     returns `Err(TxError::ReadOnlyCannotCommit)`).
+    store: TxStore<'a, V>,
     /// Pinned at `begin`; never mutated for Tx's lifetime.
     ///
     /// Decision 2: caller-supplied. In production (S2.6) the SM supplies
@@ -103,6 +163,12 @@ pub enum TxError {
     /// to preserve SP111's trait-shape contract). T2 ships the
     /// `From<std::io::Error>` conversion that extracts kind + message.
     StorageIo { kind: std::io::ErrorKind, message: String },
+    /// `Tx::commit` was called on a Tx constructed via `Tx::begin`
+    /// (shared borrow — read-only). To commit writes, construct the Tx
+    /// via `Tx::begin_rw(&mut store, snapshot_opnum)` instead. This is
+    /// SP112's T2-decided storage-mutability choice surfacing — see
+    /// the `Tx::store` field doc for the rationale.
+    ReadOnlyCannotCommit,
 }
 
 impl std::fmt::Display for TxError {
@@ -120,6 +186,12 @@ impl std::fmt::Display for TxError {
             TxError::StorageIo { kind, message } => write!(
                 f,
                 "TxError::StorageIo {{ kind: {kind:?}, message: {message:?} }}"
+            ),
+            TxError::ReadOnlyCannotCommit => write!(
+                f,
+                "TxError::ReadOnlyCannotCommit — Tx::commit requires the \
+                 Tx to be constructed via Tx::begin_rw(&mut store, ...); \
+                 a Tx::begin(&store, ...) Tx is read-only"
             ),
         }
     }
@@ -157,7 +229,24 @@ impl<'a, V: Vfs> Tx<'a, V> {
     /// kessel-storage decoupled from kessel-sm. SM wiring is S2.6's job.
     pub fn begin(store: &'a Storage<V>, snapshot_opnum: u64) -> Self {
         Self {
-            store,
+            store: TxStore::Shared(store),
+            snapshot_opnum,
+            read_set: BTreeSet::new(),
+            write_set: BTreeMap::new(),
+        }
+    }
+
+    /// Begin a write-capable Tx pinned at `snapshot_opnum`. The exclusive
+    /// `&mut Storage<V>` borrow allows `Tx::commit` to install writes via
+    /// `mvcc::put_versioned`.
+    ///
+    /// SP112 T2-DECIDED CHOICE (storage-mutability) — see the
+    /// `Tx::store` field doc for the full rationale. SP111's
+    /// `Tx::begin(&store, ...)` is left untouched for the read-only
+    /// path; write-capable callers must use `begin_rw` instead.
+    pub fn begin_rw(store: &'a mut Storage<V>, snapshot_opnum: u64) -> Self {
+        Self {
+            store: TxStore::Exclusive(store),
             snapshot_opnum,
             read_set: BTreeSet::new(),
             write_set: BTreeMap::new(),
@@ -176,14 +265,28 @@ impl<'a, V: Vfs> Tx<'a, V> {
     /// because SSI dangerous-cycle detection tracks anti-dependencies on
     /// absent keys too.
     pub fn read(&mut self, type_id: u32, object_id: &[u8; 16]) -> SnapshotRead {
-        // Decision 4: insert UNCONDITIONALLY — the Tx observed the key
-        // regardless of whether it found a live version, a tombstone, or
-        // nothing. The BTreeSet deduplicates re-reads at no extra cost.
-        // Dereferencing *object_id copies 16 bytes into the set entry;
-        // that is the expected per-read cost and is documented here for
-        // future profiling reference.
+        // S2.2 Decision 4: insert UNCONDITIONALLY — the Tx observed the
+        // key regardless of which path serves it (overlay or snapshot)
+        // or which `SnapshotRead` variant returns. BTreeSet dedups
+        // re-reads at no extra cost. *object_id copies 16 bytes into
+        // the set entry. S2.3 Decision 3 explicitly carries this
+        // discipline forward: the buffered-read overlay path STILL
+        // records the read_set entry; SSI in S2.4 consumes both
+        // overlay-served and snapshot-served observations.
         self.read_set.insert((type_id, *object_id));
-        crate::mvcc::get_at_snapshot(self.store, type_id, object_id, self.snapshot_opnum)
+        // S2.3 Decision 3: read-your-writes overlay. Check write_set
+        // FIRST. If the key has a buffered write or tombstone in this
+        // Tx, return it instead of the snapshot version (per-Tx-only
+        // semantic — other Tx do not see this Tx's buffered writes
+        // until commit).
+        if let Some(buffered) = self.write_set.get(&(type_id, *object_id)) {
+            return match buffered {
+                Some(v) => SnapshotRead::Found(v.clone()),
+                None => SnapshotRead::Tombstoned,
+            };
+        }
+        // Fall through to the S2.2 snapshot-read path (unchanged).
+        crate::mvcc::get_at_snapshot(self.store.as_ref(), type_id, object_id, self.snapshot_opnum)
     }
 
     /// The snapshot_opnum the Tx was pinned at. Never changes after `begin`.
@@ -240,14 +343,20 @@ impl<'a, V: Vfs> Tx<'a, V> {
     /// (Decision 3 of the S2.3 design). Per-Tx semantic only — no other
     /// Tx observes the buffered write until this Tx commits.
     pub fn write(&mut self, type_id: u32, object_id: &[u8; 16], value: Option<Vec<u8>>) {
-        todo!("S2.3 T2: insert into self.write_set");
+        // Decision 2: BTreeMap::insert REPLACES any prior buffered write
+        // for the same `(type_id, *object_id)` key — last-write-wins
+        // coalescing within a single Tx. The 16-byte object_id is copied
+        // (dereferenced) into the map entry; same cost shape as read_set.
+        // Decision 3 (carried): write does NOT update read_set; read_set
+        // tracks OBSERVED reads only. A Tx may write without ever reading.
+        self.write_set.insert((type_id, *object_id), value);
     }
 
     /// Immutable view of the buffered writes. S2.4 SSI consumes this for
     /// rw-antidependency cycle detection. Deterministic iteration
     /// (sorted lex) by BTreeMap discipline (Decision 2).
     pub fn write_set(&self) -> &BTreeMap<(u32, [u8; 16]), Option<Vec<u8>>> {
-        todo!("S2.3 T2: return &self.write_set");
+        &self.write_set
     }
 
     /// Conflict-checked commit (S2.3 / SP112).
@@ -274,7 +383,57 @@ impl<'a, V: Vfs> Tx<'a, V> {
     /// - `commit_opnum == 0` => conflict check SKIPPED (no prior versions
     ///   can exist below opnum=0). Edge case from Decision 5.
     pub fn commit(self, commit_opnum: u64) -> Result<TxCommitOutcome, TxError> {
-        todo!("S2.3 T2: run conflict check then install writes");
+        // Decision 4 + 5: malformed snapshot_opnum is rejected before any
+        // check or apply. Boundary: `snapshot_opnum == commit_opnum` is
+        // ALLOWED (commit at the same opnum we snapshotted at — the
+        // conflict window `(snapshot, commit-1]` is empty so any single
+        // writer trivially commits). Only `snapshot > commit` is the
+        // error boundary.
+        if self.snapshot_opnum > commit_opnum {
+            return Err(TxError::SnapshotOutOfRange {
+                snapshot: self.snapshot_opnum,
+                commit: commit_opnum,
+            });
+        }
+        // SP112 T2-DECIDED CHOICE (storage-mutability): commit requires
+        // the Exclusive borrow (constructed via Tx::begin_rw). A
+        // Tx::begin Tx (Shared) cannot commit — return a typed error so
+        // the caller can switch constructors. This decision is detailed
+        // in the `Tx::store` field doc.
+        let store_mut = match self.store {
+            TxStore::Exclusive(s) => s,
+            TxStore::Shared(_) => return Err(TxError::ReadOnlyCannotCommit),
+        };
+        // Conflict check (the SI thesis-fit). Skip for commit_opnum == 0
+        // edge: no prior versions can exist below opnum=0, and
+        // `commit_opnum - 1` would underflow u64. Decision 5.
+        if commit_opnum > 0 {
+            let hi = commit_opnum - 1;
+            for ((type_id, object_id), _new_value) in &self.write_set {
+                if crate::mvcc::has_version_in_range(
+                    store_mut,
+                    *type_id,
+                    object_id,
+                    self.snapshot_opnum,
+                    hi,
+                ) {
+                    return Ok(TxCommitOutcome::Aborted {
+                        conflicting_key: (*type_id, *object_id),
+                    });
+                }
+            }
+        }
+        // No conflict: install every write at commit_opnum. Iteration is
+        // sorted lex by (type_id, object_id) via BTreeMap discipline
+        // (Decision 2) — the install order is replica-byte-identical.
+        for ((type_id, object_id), value) in self.write_set {
+            crate::mvcc::put_versioned(store_mut, type_id, &object_id, commit_opnum, value)
+                .map_err(|e| TxError::StorageIo {
+                    kind: e.kind(),
+                    message: e.to_string(),
+                })?;
+        }
+        Ok(TxCommitOutcome::Committed { commit_opnum })
     }
 }
 
@@ -570,6 +729,258 @@ mod tx_kats {
         // `tx` is consumed above; `tx.snapshot_opnum()` here would be a
         // compile-time "use of moved value" error — the lifecycle is
         // compile-time-enforced.
+    }
+}
+
+#[cfg(test)]
+mod tx_si_kats {
+    //! SP112 T2 hand-derived KATs for the SI write-side path:
+    //! Tx::write buffering, read-your-writes overlay, Tx::commit's
+    //! conflict-check + apply, snapshot/commit boundary validation,
+    //! and the commit_opnum=0 edge case.
+    //!
+    //! Each KAT writes the expected output BY HAND before running the
+    //! code (KAT discipline — never capture-and-assert). Tests exercise
+    //! the SI contract surface described in the S2.3 design Decisions
+    //! 2-6 (BTreeMap write_set, read-your-writes overlay, apply-time
+    //! conflict check at SM, commit API split).
+    use super::*;
+    use crate::mvcc::{put_versioned, SnapshotRead};
+    use crate::Storage;
+    use kessel_io::MemVfs;
+
+    fn obj(n: u8) -> [u8; 16] {
+        let mut a = [0u8; 16];
+        a[15] = n;
+        a
+    }
+
+    // KAT-1 (`Tx::write buffers`): Tx::write inserts into write_set.
+    // Hand-derived: empty write_set; write(1, obj(1), Some([0xAA])) =>
+    // write_set has exactly one entry ((1, obj(1)) -> Some([0xAA])).
+    #[test]
+    fn kat_write_inserts_into_write_set() {
+        let store = Storage::open(MemVfs::new()).unwrap();
+        let mut tx = Tx::begin(&store, 0);
+        tx.write(1, &obj(1), Some(vec![0xAA]));
+        assert_eq!(tx.write_set().len(), 1, "exactly one buffered write");
+        assert_eq!(
+            tx.write_set().get(&(1u32, obj(1))),
+            Some(&Some(vec![0xAA])),
+            "value must be Some([0xAA])"
+        );
+        tx.abort();
+    }
+
+    // KAT-2 (`read-your-writes Found`): write(k, Some(v_new)); read(k) =>
+    // Found(v_new), NOT the snapshot version.
+    // Hand-derived: put_versioned(1, obj(1), 0, [0xAA]); Tx at snap=0;
+    // write(1, obj(1), Some([0xBB])); read(1, obj(1)) => Found([0xBB])
+    // (the buffered value wins over the snapshot value [0xAA]).
+    #[test]
+    fn kat_read_your_writes_returns_buffered_found() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        put_versioned(&mut store, 1, &obj(1), 0, Some(vec![0xAA])).unwrap();
+        let mut tx = Tx::begin(&store, 0);
+        tx.write(1, &obj(1), Some(vec![0xBB]));
+        match tx.read(1, &obj(1)) {
+            SnapshotRead::Found(v) => assert_eq!(
+                v,
+                vec![0xBB],
+                "buffered [0xBB] wins over snapshot [0xAA]"
+            ),
+            other => panic!("expected Found([0xBB]); got {:?}", other),
+        }
+    }
+
+    // KAT-3 (`read-your-writes Tombstoned`): write(k, None); read(k) =>
+    // Tombstoned, honoring the buffered tombstone even though the
+    // snapshot has a Found value.
+    // Hand-derived: put_versioned(1, obj(1), 0, [0xAA]); Tx at snap=0;
+    // write(1, obj(1), None); read => Tombstoned (buffered tombstone
+    // shadows the snapshot's live [0xAA]).
+    #[test]
+    fn kat_read_your_writes_buffered_tombstone() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        put_versioned(&mut store, 1, &obj(1), 0, Some(vec![0xAA])).unwrap();
+        let mut tx = Tx::begin(&store, 0);
+        tx.write(1, &obj(1), None);
+        assert!(
+            matches!(tx.read(1, &obj(1)), SnapshotRead::Tombstoned),
+            "buffered tombstone must return Tombstoned"
+        );
+    }
+
+    // KAT-4 (`read-then-write doesn't override`): read returns the
+    // snapshot value first; then write shadows it on subsequent reads.
+    // Hand-derived: put_versioned(1, obj(1), 0, [0xAA]); Tx at snap=0;
+    // read1 => Found([0xAA]) (snapshot path); write(1, obj(1), Some([0xCC]));
+    // read2 => Found([0xCC]) (overlay path now wins).
+    #[test]
+    fn kat_read_then_write_subsequent_read_sees_buffer() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        put_versioned(&mut store, 1, &obj(1), 0, Some(vec![0xAA])).unwrap();
+        let mut tx = Tx::begin(&store, 0);
+        match tx.read(1, &obj(1)) {
+            SnapshotRead::Found(v) => assert_eq!(
+                v,
+                vec![0xAA],
+                "pre-write read returns snapshot [0xAA]"
+            ),
+            other => panic!("expected Found([0xAA]); got {:?}", other),
+        }
+        tx.write(1, &obj(1), Some(vec![0xCC]));
+        match tx.read(1, &obj(1)) {
+            SnapshotRead::Found(v) => assert_eq!(
+                v,
+                vec![0xCC],
+                "post-write read returns buffered [0xCC]"
+            ),
+            other => panic!("expected Found([0xCC]); got {:?}", other),
+        }
+    }
+
+    // KAT-5 (`same-key coalesce`): write(k, v1); write(k, v2). BTreeMap
+    // insert REPLACES — buffer has one entry with v2 (last-write-wins).
+    // Hand-derived: write(1, obj(1), Some([0xAA])); write(1, obj(1),
+    // Some([0xBB])); write_set.len() == 1; value == Some([0xBB]).
+    #[test]
+    fn kat_same_key_coalesce_last_write_wins() {
+        let store = Storage::open(MemVfs::new()).unwrap();
+        let mut tx = Tx::begin(&store, 0);
+        tx.write(1, &obj(1), Some(vec![0xAA]));
+        tx.write(1, &obj(1), Some(vec![0xBB]));
+        assert_eq!(tx.write_set().len(), 1, "same-key writes coalesce");
+        assert_eq!(
+            tx.write_set().get(&(1u32, obj(1))),
+            Some(&Some(vec![0xBB])),
+            "last-write [0xBB] wins"
+        );
+        tx.abort();
+    }
+
+    // KAT-6 (`commit empty write-set`): Tx with no writes, commit =>
+    // Committed { commit_opnum }; no MVCC writes happen.
+    // Hand-derived: empty store; begin_rw at snap=0; commit(5) =>
+    // Committed{5}; reading any key still returns NotYetWritten.
+    #[test]
+    fn kat_commit_empty_write_set_succeeds() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        let tx = Tx::begin_rw(&mut store, 0);
+        let out = tx.commit(5).expect("commit must not err");
+        assert_eq!(out, TxCommitOutcome::Committed { commit_opnum: 5 });
+        // Verify no writes leaked: any read returns NotYetWritten.
+        assert!(matches!(
+            crate::mvcc::get_at_snapshot(&store, 1, &obj(1), 5),
+            SnapshotRead::NotYetWritten
+        ));
+    }
+
+    // KAT-7 (`commit single write succeeds`): single write commit;
+    // verify get_at_snapshot returns the value at commit_opnum.
+    // Hand-derived: empty store; Tx at snap=0; write(1, obj(1),
+    // Some([0xAA])); commit(1) => Committed{1};
+    // get_at_snapshot(1, obj(1), 1) => Found([0xAA]).
+    #[test]
+    fn kat_commit_single_write_visible_at_commit_opnum() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        {
+            let mut tx = Tx::begin_rw(&mut store, 0);
+            tx.write(1, &obj(1), Some(vec![0xAA]));
+            let out = tx.commit(1).expect("no err");
+            assert_eq!(out, TxCommitOutcome::Committed { commit_opnum: 1 });
+        }
+        match crate::mvcc::get_at_snapshot(&store, 1, &obj(1), 1) {
+            SnapshotRead::Found(v) => assert_eq!(v, vec![0xAA]),
+            other => panic!("expected Found([0xAA]); got {:?}", other),
+        }
+    }
+
+    // KAT-8 (`commit conflict detection`): Tx_A at snap=10 writes k;
+    // Tx_A commits at 20 => Committed. Tx_B at snap=10 writes same k;
+    // Tx_B commits at 30 => Aborted{conflicting_key=k} (because k now
+    // has a version at opnum=20, which is in (snap=10, commit-1=29]).
+    // Hand-derived: the first committer wins; the second sees a
+    // version in its conflict window and must abort.
+    #[test]
+    fn kat_commit_write_write_conflict_aborts_second() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        {
+            let mut tx_a = Tx::begin_rw(&mut store, 10);
+            tx_a.write(1, &obj(1), Some(vec![0xAA]));
+            let out_a = tx_a.commit(20).expect("a no-err");
+            assert_eq!(
+                out_a,
+                TxCommitOutcome::Committed { commit_opnum: 20 },
+                "first committer wins"
+            );
+        }
+        // Tx_B at the SAME snapshot (10) — pinned BEFORE tx_a committed.
+        // tx_b sees the snapshot=10 world (no version of k); writes k;
+        // commits at 30. The has_version_in_range(10, 29) check finds
+        // tx_a's commit at opnum=20 — CONFLICT.
+        let mut tx_b = Tx::begin_rw(&mut store, 10);
+        tx_b.write(1, &obj(1), Some(vec![0xBB]));
+        let out_b = tx_b.commit(30).expect("b no-err");
+        assert_eq!(
+            out_b,
+            TxCommitOutcome::Aborted { conflicting_key: (1u32, obj(1)) },
+            "second committer aborts on the first's commit"
+        );
+    }
+
+    // KAT-9 (`commit no conflict on disjoint`): Tx_A writes k1; Tx_B
+    // writes k2; both at same snap; both commit at different opnums =>
+    // both Committed.
+    // Hand-derived: disjoint keys never conflict — has_version_in_range
+    // for k1 finds nothing in tx_b's window, and vice versa.
+    #[test]
+    fn kat_commit_disjoint_keys_both_succeed() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        {
+            let mut tx_a = Tx::begin_rw(&mut store, 0);
+            tx_a.write(1, &obj(1), Some(vec![0xAA]));
+            let out_a = tx_a.commit(1).expect("a no-err");
+            assert_eq!(out_a, TxCommitOutcome::Committed { commit_opnum: 1 });
+        }
+        let mut tx_b = Tx::begin_rw(&mut store, 0);
+        tx_b.write(1, &obj(2), Some(vec![0xBB])); // disjoint key
+        let out_b = tx_b.commit(2).expect("b no-err");
+        assert_eq!(out_b, TxCommitOutcome::Committed { commit_opnum: 2 });
+    }
+
+    // KAT-10 (`commit_opnum=0 skip-check`): Tx writes; commit at opnum=0
+    // => Committed (no underflow; conflict-check skipped per Decision 5).
+    // Hand-derived: empty store; Tx at snap=0; write(1, obj(1),
+    // Some([0xAA])); commit(0) => Committed{0}. The `commit_opnum - 1`
+    // underflow guard must NOT trip.
+    #[test]
+    fn kat_commit_opnum_zero_skips_conflict_check() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        let mut tx = Tx::begin_rw(&mut store, 0);
+        tx.write(1, &obj(1), Some(vec![0xAA]));
+        let out = tx.commit(0).expect("no err — no underflow");
+        assert_eq!(out, TxCommitOutcome::Committed { commit_opnum: 0 });
+    }
+
+    // KAT-11 (`snapshot > commit_opnum rejection`): Tx at snap=20;
+    // commit at opnum=10 => Err(SnapshotOutOfRange{snap:20, commit:10}).
+    // Hand-derived: malformed input — snapshot must NOT exceed commit;
+    // boundary is strict `>`.
+    #[test]
+    fn kat_commit_snapshot_greater_than_commit_errors() {
+        let mut store = Storage::open(MemVfs::new()).unwrap();
+        let mut tx = Tx::begin_rw(&mut store, 20);
+        tx.write(1, &obj(1), Some(vec![0xAA]));
+        let err = tx.commit(10).expect_err("snapshot > commit must err");
+        assert!(
+            matches!(
+                err,
+                TxError::SnapshotOutOfRange { snapshot: 20, commit: 10 }
+            ),
+            "expected SnapshotOutOfRange{{snap:20, commit:10}}; got {:?}",
+            err
+        );
     }
 }
 

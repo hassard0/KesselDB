@@ -70,6 +70,28 @@ pub fn format_result(r: &OpResult) -> String {
         OpResult::Got(b) => {
             format!("GOT  {} bytes  (use `DESCRIBE <table>` to decode rows)", b.len())
         }
+        // SP112 T2: Op::CommitTx outcomes surfaced at the CLI.
+        OpResult::TxCommitted { commit_opnum } => {
+            format!("OK  (tx committed at opnum={commit_opnum})")
+        }
+        OpResult::TxAborted { reason } => {
+            use kessel_proto::AbortReason;
+            match reason {
+                AbortReason::SnapshotOutOfRange => {
+                    "ABORTED  (snapshot_opnum > commit_opnum — malformed input)".to_string()
+                }
+                AbortReason::WriteWriteConflict { type_id, .. } => {
+                    format!(
+                        "ABORTED  (write-write conflict on type_id={type_id}; \
+                         retry with a fresher snapshot)"
+                    )
+                }
+                AbortReason::StorageIo { kind } => {
+                    format!("ABORTED  (storage I/O kind={kind})")
+                }
+                _ => "ABORTED  (unknown reason — future variant)".to_string(),
+            }
+        }
     }
 }
 
@@ -293,6 +315,27 @@ pub fn format_result_json(r: &OpResult) -> String {
         }
         OpResult::Got(b) => {
             format!(r#"{{"status":"ok","bytes":{}}}"#, b.len())
+        }
+        // SP112 T2: Op::CommitTx JSON outcomes.
+        OpResult::TxCommitted { commit_opnum } => {
+            format!(r#"{{"status":"tx_committed","commit_opnum":{commit_opnum}}}"#)
+        }
+        OpResult::TxAborted { reason } => {
+            use kessel_proto::AbortReason;
+            match reason {
+                AbortReason::SnapshotOutOfRange => {
+                    r#"{"status":"tx_aborted","reason":"snapshot_out_of_range"}"#.to_string()
+                }
+                AbortReason::WriteWriteConflict { type_id, .. } => {
+                    format!(
+                        r#"{{"status":"tx_aborted","reason":"write_write_conflict","type_id":{type_id}}}"#
+                    )
+                }
+                AbortReason::StorageIo { kind } => {
+                    format!(r#"{{"status":"tx_aborted","reason":"storage_io","kind":{kind}}}"#)
+                }
+                _ => r#"{"status":"tx_aborted","reason":"unknown"}"#.to_string(),
+            }
         }
     }
 }

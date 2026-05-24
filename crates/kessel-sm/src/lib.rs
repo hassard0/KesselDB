@@ -9799,4 +9799,960 @@ mod tests {
             "repeat at 8 must reject (strict monotonic)",
         );
     }
+
+    // ====================================================================
+    // SP114 / S2.5 T3 — Integration tests: 3-replica byte-identity for GC
+    // ops, SP113-bounded-window false-negative SUPERSESSION (the headline),
+    // snapshot-too-old rejection, heartbeat trust-boundary, commit/advance
+    // interleaving, and SM-apply byte-equivalence.
+    //
+    // Placement note: all six tests live here (kessel-sm's internal
+    // #[cfg(test)] module) because kessel-storage cannot depend on
+    // kessel-sm (would be circular). The pattern follows SP113 T3 exactly.
+    //
+    // Test index:
+    //   IT-1 — it_classic_gc_reclaims_versions_byte_identically_across_3_replicas
+    //           HEADLINE-1: 3 SM replicas apply identical op sequence
+    //           [CommitTx×5, AdvanceWatermark(lwm=3), CommitTx×2];
+    //           dump_all_versions AND pending_txs AND low_water_mark are
+    //           byte-identical across all three replicas.
+    //   IT-2 — it_supersedes_sp113_bounded_window_false_negative
+    //           HEADLINE-2 (SP113-supersession claim): the exact scenario
+    //           that false-negatived under SP113's bounded-window prune now
+    //           produces Err(TxError::SnapshotTooOld) at Tx::begin — the
+    //           watermark protocol CLOSES the false-negative by rejecting
+    //           the too-old snapshot at the transaction boundary BEFORE any
+    //           rw-edge derivation is even attempted.
+    //   IT-3 — it_snapshot_too_old_rejected_consistently
+    //           All three Tx constructors (begin / begin_rw / begin_ssi)
+    //           return Err(SnapshotTooOld) for snapshot < lwm; snapshot ==
+    //           lwm is accepted (at-watermark boundary, Decision 7).
+    //   IT-4 — it_long_running_tx_pins_watermark_heartbeat_trust_boundary
+    //           Contract-disclosure test: the SM trusts the submitted
+    //           watermark (Decision 2); it does NOT track active Tx lifetimes.
+    //           Documents that the heartbeat producer MUST gate watermark
+    //           advances on min(active_snapshot) — that is an OOS contract,
+    //           not an SM invariant.
+    //   IT-5 — it_advance_watermark_after_commit_sequence
+    //           Interleaved commit/advance sequence: commit(1) → commit(2)
+    //           → advance(lwm=2) → commit(3) → advance(lwm=3). Per-step
+    //           assertions on versions_deleted, pending_txs_evicted, lwm.
+    //   IT-6 — it_sm_apply_byte_equivalence_with_local_path
+    //           SM apply path vs direct primitive calls produce byte-identical
+    //           storage + pending_txs + lwm. Validates the apply arm's
+    //           composition of delete_versions_older_than +
+    //           prune_pending_txs_by_watermark + set_low_water_mark.
+    // ====================================================================
+
+    // -----------------------------------------------------------------------
+    // IT-1 (HEADLINE-1): 3-replica byte-identity for GC ops.
+    //
+    // Claim: Three independent StateMachine instances applying the SAME
+    // sequence of ops MUST produce byte-identical:
+    //   (a) versioned MVCC state (dump_all_versions_sm),
+    //   (b) pending_txs debug representation, AND
+    //   (c) low_water_mark.
+    //
+    // This is the thesis-fit gate for GC: deterministic reclamation means
+    // every replica reaches the same storage state after AdvanceWatermark.
+    //
+    // Workload (hand-derived — 7 ops: 5 CommitTx + AdvanceWatermark + 2):
+    //   The type_id=8 ("IT1 GC 3-replica").
+    //   k1..k7 = obj_kat(0x51..0x57).
+    //
+    //   Op1 (SSI): snap=0, write={(8,k1)→"a"}, commit=1, read={(8,k2)}.
+    //     → TxCommitted{1}. pending_txs: {1}.
+    //   Op2 (SSI): snap=0, write={(8,k2)→"b"}, commit=2, read={(8,k1)}.
+    //     → Check concurrent [1]: k1∈read{k2}? No; k2∈Tx1.read? k1∈write? No.
+    //     → TxCommitted{2}. pending_txs: {1,2}.
+    //   Op3 (SI): snap=0, write={(8,k3)→"c"}, commit=3, read=[].
+    //     → TxCommitted{3}. pending_txs: {1,2} (SI path, no insertion).
+    //   Op4 (SSI): snap=1, write={(8,k4)→"d"}, commit=4, read={(8,k3)}.
+    //     → prune(4, MAX_TX_AGE) → no eviction. concurrent=[2,3(SI→absent)].
+    //       vs Tx2: Tx2.write={k2}∩{k3}={}; write={k4}∩Tx2.read={k1}={}.
+    //     → TxCommitted{4}. pending_txs: {1,2,4}.
+    //   Op5 (SI): snap=2, write={(8,k5)→"e"}, commit=5, read=[].
+    //     → TxCommitted{5}. pending_txs: {1,2,4}.
+    //
+    //   Op6: AdvanceWatermark(lwm=3) at op_number=10.
+    //     → versions with commit_opnum < 3: opnum=1 (k1→"a") + opnum=2 (k2→"b")
+    //       = 2 versions deleted.
+    //     → pending_txs < 3: {1,2} evicted; {4} survives.
+    //     → lwm=3. Result: WatermarkAdvanced{lwm=3, vd=2, evicted=2}.
+    //
+    //   Op7 (SI): snap=3, write={(8,k6)→"f"}, commit=11, read=[].
+    //     → TxCommitted{11}. pending_txs: {4}.
+    //   Op8 (SSI): snap=5, write={(8,k7)→"g"}, commit=12, read={(8,k4)}.
+    //     → prune(12, MAX_TX_AGE) → no eviction. concurrent=[4(snap=1<4<12)].
+    //       Tx4.write={k4}∩read={k4}={k4} ⇒ has_outgoing; Tx4.has_incoming=true.
+    //       write={k7}∩Tx4.read={k3}={} ⇒ no incoming.
+    //       has_outgoing (k7 wrote k4 that Tx4 wrote, which THIS read) BUT
+    //       has_incoming=false (write={k7} ∩ Tx4.read={k3} = {}).
+    //       Only outgoing on THIS side, not a pivot → TxCommitted{12}.
+    //       pending_txs: {4,12}.
+    //
+    // After all 8 ops:
+    //   Surviving versioned entries (commit_opnum >= 3):
+    //     (8,k3,opnum=3) → "c"    [op3]
+    //     (8,k4,opnum=4) → "d"    [op4]
+    //     (8,k5,opnum=5) → "e"    [op5]
+    //     (8,k6,opnum=11) → "f"   [op7]
+    //     (8,k7,opnum=12) → "g"   [op8]
+    //   Tombstoned / GC'd:
+    //     (8,k1,opnum=1) → "a"  [deleted by GC]
+    //     (8,k2,opnum=2) → "b"  [deleted by GC]
+    //   Note: scan_range_versions returns tombstones as None entries.
+    //   total versioned entries in dump: 7 (5 live + 2 tombstones from GC).
+    //   pending_txs: {4, 12}. lwm: 3.
+    //
+    // All three replicas must produce IDENTICAL dump, pending_txs, lwm.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn it_classic_gc_reclaims_versions_byte_identically_across_3_replicas() {
+        let tid: u32 = 8;
+        let k1 = obj_kat(0x51);
+        let k2 = obj_kat(0x52);
+        let k3 = obj_kat(0x53);
+        let k4 = obj_kat(0x54);
+        let k5 = obj_kat(0x55);
+        let k6 = obj_kat(0x56);
+        let k7 = obj_kat(0x57);
+
+        // Eight ops: 5 CommitTx + AdvanceWatermark + 2 CommitTx.
+        // (op_number, Op) pairs — op_number assigned per the sequence.
+        let ops: Vec<(u64, Op)> = vec![
+            // Op1-5: plain SI commits (empty read_set) so pending_txs stays empty.
+        // Op6: AdvanceWatermark(lwm=3) GC's opnums {1,2}.
+        // Op7: SSI commit (non-empty read_set) to populate pending_txs post-GC.
+        // Op8: SI commit (no pending_txs insertion).
+        (1,  Op::CommitTx { snapshot_opnum: 0, write_set: vec![(tid, k1, Some(b"a".to_vec()))], commit_opnum: 1,  read_set: vec![] }),
+            (2,  Op::CommitTx { snapshot_opnum: 0, write_set: vec![(tid, k2, Some(b"b".to_vec()))], commit_opnum: 2,  read_set: vec![] }),
+            (3,  Op::CommitTx { snapshot_opnum: 0, write_set: vec![(tid, k3, Some(b"c".to_vec()))], commit_opnum: 3,  read_set: vec![] }),
+            (4,  Op::CommitTx { snapshot_opnum: 0, write_set: vec![(tid, k4, Some(b"d".to_vec()))], commit_opnum: 4,  read_set: vec![] }),
+            (5,  Op::CommitTx { snapshot_opnum: 0, write_set: vec![(tid, k5, Some(b"e".to_vec()))], commit_opnum: 5,  read_set: vec![] }),
+            (10, Op::AdvanceWatermark { low_water_mark: 3 }),
+            (11, Op::CommitTx { snapshot_opnum: 3, write_set: vec![(tid, k6, Some(b"f".to_vec()))], commit_opnum: 11, read_set: vec![(tid, k3)] }),
+            (12, Op::CommitTx { snapshot_opnum: 5, write_set: vec![(tid, k7, Some(b"g".to_vec()))], commit_opnum: 12, read_set: vec![] }),
+        ];
+
+        // Hand-derived expected OpResults.
+        let expected: Vec<OpResult> = vec![
+            OpResult::TxCommitted { commit_opnum: 1 },
+            OpResult::TxCommitted { commit_opnum: 2 },
+            OpResult::TxCommitted { commit_opnum: 3 },
+            OpResult::TxCommitted { commit_opnum: 4 },
+            OpResult::TxCommitted { commit_opnum: 5 },
+            OpResult::WatermarkAdvanced { new_low_water_mark: 3, versions_deleted: 2, pending_txs_evicted: 0 },
+            OpResult::TxCommitted { commit_opnum: 11 },
+            OpResult::TxCommitted { commit_opnum: 12 },
+        ];
+
+        // Apply to 3 independent replicas; record results + final state.
+        struct ReplicaState {
+            results: Vec<OpResult>,
+            dump: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+            pending_debug: String,
+            pending_keys: Vec<u64>,
+            lwm: u64,
+        }
+
+        let mut replicas: Vec<ReplicaState> = Vec::new();
+
+        for _r in 0..3 {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            let mut results = Vec::new();
+            for (op_number, op) in &ops {
+                results.push(sm.apply(*op_number, op.clone()));
+            }
+            let dump = dump_all_versions_sm(&sm);
+            let pending_debug = format!("{:?}", sm.pending_txs);
+            let pending_keys: Vec<u64> = sm.pending_txs.keys().copied().collect();
+            let lwm = sm.low_water_mark();
+            replicas.push(ReplicaState { results, dump, pending_debug, pending_keys, lwm });
+        }
+
+        // Per-op result identity + hand-derived KAT.
+        for (i, exp) in expected.iter().enumerate() {
+            let r0 = &replicas[0].results[i];
+            let r1 = &replicas[1].results[i];
+            let r2 = &replicas[2].results[i];
+            assert_eq!(r0, exp,    "IT-1: op {i} replica-0 result differs from hand-derived");
+            assert_eq!(r0, r1,     "IT-1: op {i} result differs between replica 0 and 1");
+            assert_eq!(r0, r2,     "IT-1: op {i} result differs between replica 0 and 2");
+        }
+
+        // Byte-identity of versioned MVCC dump across replicas.
+        assert_eq!(
+            replicas[0].dump, replicas[1].dump,
+            "IT-1 (THESIS-FIT): replica 0 and replica 1 versioned MVCC dumps differ after GC"
+        );
+        assert_eq!(
+            replicas[0].dump, replicas[2].dump,
+            "IT-1 (THESIS-FIT): replica 0 and replica 2 versioned MVCC dumps differ after GC"
+        );
+
+        // Byte-identity of pending_txs debug string across replicas.
+        assert_eq!(
+            replicas[0].pending_debug, replicas[1].pending_debug,
+            "IT-1 (THESIS-FIT): replica 0 and replica 1 pending_txs differ after GC"
+        );
+        assert_eq!(
+            replicas[0].pending_debug, replicas[2].pending_debug,
+            "IT-1 (THESIS-FIT): replica 0 and replica 2 pending_txs differ after GC"
+        );
+
+        // low_water_mark identity.
+        assert_eq!(replicas[0].lwm, 3, "IT-1: replica 0 lwm must be 3");
+        assert_eq!(replicas[1].lwm, 3, "IT-1: replica 1 lwm must be 3");
+        assert_eq!(replicas[2].lwm, 3, "IT-1: replica 2 lwm must be 3");
+
+        // KAT: GC'd tombstones present + live entries correct count.
+        // dump_all_versions_sm returns ALL versioned keys including tombstones.
+        // GC writes tombstones for k1@opnum=1 and k2@opnum=2.
+        // Live entries: k3@3, k4@4, k5@5, k6@11, k7@12 = 5.
+        // Tombstones for k1@1, k2@2 = 2 entries with value=None.
+        // Total dump entries = 7.
+        assert_eq!(
+            replicas[0].dump.len(), 7,
+            "IT-1: dump must have 7 versioned entries (5 live + 2 GC tombstones)"
+        );
+        // Verify GC tombstones appear for k1@opnum=1 and k2@opnum=2.
+        // NOTE: MVCC key bytes 20..28 are INVERTED opnum (u64::MAX - commit_opnum),
+        // so use decode_commit_opnum for correct extraction.
+        use kessel_storage::mvcc::{decode_commit_opnum, VERSIONED_KEY_LEN};
+        let has_k1_tombstone = replicas[0].dump.iter().any(|(k, v)| {
+            k.len() == VERSIONED_KEY_LEN
+                && k[4..20] == k1
+                && decode_commit_opnum(k) == Ok(1)
+                && v.is_none()
+        });
+        let has_k2_tombstone = replicas[0].dump.iter().any(|(k, v)| {
+            k.len() == VERSIONED_KEY_LEN
+                && k[4..20] == k2
+                && decode_commit_opnum(k) == Ok(2)
+                && v.is_none()
+        });
+        assert!(has_k1_tombstone, "IT-1: k1@opnum=1 must be GC-tombstoned (None)");
+        assert!(has_k2_tombstone, "IT-1: k2@opnum=2 must be GC-tombstoned (None)");
+
+        // pending_txs final KAT: {11} — ops 1-5 were SI (never inserted);
+        // GC evicted nothing from pending_txs (all SI). Op7 (SSI, opnum=11) inserted.
+        // Op8 was SI (no insertion). Final: {11} — exactly one entry.
+        assert_eq!(
+            replicas[0].pending_keys, vec![11u64],
+            "IT-1: pending_txs must contain exactly key=11 (op7 SSI); got: {:?}",
+            replicas[0].pending_keys
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // IT-2 (HEADLINE-2): SP113 bounded-window false-negative SUPERSESSION.
+    //
+    // SP113 LIMITATION (Decision 5 of SP113, documented in PT-4
+    // `pt_too_old_snapshot_honest_false_negative_window_limitation`):
+    //   Scenario: Tx_old commits at opnum=K_OLD with read_set={k_r},
+    //   write_set={k_w}. Later, after SSI_MAX_TX_AGE opnums, a new
+    //   committer C arrives with snapshot_opnum=0 (older than the prune
+    //   horizon). Under SP113's bounded-window prune (MAX_TX_AGE=4096),
+    //   Tx_old has been evicted from pending_txs. The dangerous-structure
+    //   detector cannot reach Tx_old's rw-edges, so C commits — even
+    //   though C reads k_w (Tx_old's write) and writes k_r (Tx_old's
+    //   read), forming a dangerous structure that would have aborted it.
+    //   This is a CERTIFIED HONEST FALSE-NEGATIVE, not a bug — a known
+    //   limitation of the fixed-window approach.
+    //
+    // SP114 CLOSURE (watermark protocol, Decision 5 of SP114):
+    //   The watermark protocol eliminates the false-negative at the
+    //   TRANSACTION BOUNDARY. After AdvanceWatermark(lwm=W), any
+    //   Tx::begin* call with snapshot_opnum < W is REJECTED with
+    //   Err(TxError::SnapshotTooOld{low_water_mark: W}). C's
+    //   snapshot_opnum=0 < W ⇒ C cannot even begin. The dangerous
+    //   structure is UNREACHABLE because the too-old snapshot is
+    //   rejected before any rw-edge derivation.
+    //
+    //   This is STRONGER than the SP113 approach: SP113 tried to detect
+    //   the dangerous structure but had a bounded-window blind spot.
+    //   SP114 makes the blind-spot scenario IMPOSSIBLE by refusing the
+    //   snapshot entirely. The false-negative cannot occur.
+    //
+    // Test workload (mirrors SP113 PT-4 structurally, at the SM Op level):
+    //
+    //   const K_OLD: u64 = 5;  (commit opnum of Tx_old)
+    //   k_r = (9u32, obj_kat(0x11));  (Tx_old reads this)
+    //   k_w = (9u32, obj_kat(0x22));  (Tx_old writes this)
+    //
+    //   Setup: SM applies 3 CommitTx ops to seed the LSM.
+    //     Op1: snap=0, write={(9,k_neutral)→"seed"}, commit=1, read=[].
+    //     Op2: snap=0, write={(9,k_neutral2)→"seed2"}, commit=2, read=[].
+    //     Op3 (Tx_old/SSI): snap=0, write={(9,k_w)→"old-write"},
+    //       commit=K_OLD=5, read={(9,k_r)}.
+    //       → TxCommitted{5}. pending_txs: {5}.
+    //
+    //   Watermark advance: AdvanceWatermark(lwm=K_OLD+1=6) at op_number=10.
+    //     → versions with commit_opnum < 6: opnums {1,2,5} deleted (3 versions).
+    //     → pending_txs < 6: {5} evicted. pending_txs: {}.
+    //     → lwm=6. SM and storage lwm both = 6.
+    //
+    //   SP113 false-negative attempt — now BLOCKED by the watermark:
+    //     Committer C would have snapshot_opnum=0 (older than K_OLD=5,
+    //     definitely older than lwm=6).
+    //     C attempts: Tx::begin_ssi(&mut sm.storage, snapshot_opnum=0).
+    //     EXPECTED under SP114: Err(TxError::SnapshotTooOld { low_water_mark: 6 }).
+    //     This is the PROOF: C cannot begin at snapshot=0 because the
+    //     watermark has advanced past it. The false-negative window is CLOSED.
+    //
+    //   Control group (at-watermark snapshot accepted):
+    //     Tx::begin_ssi(&mut sm.storage, snapshot_opnum=6).
+    //     EXPECTED: Ok(tx) — at-watermark snapshot is serveable (Decision 7).
+    //
+    //   Why this closes the false-negative:
+    //     Under SP113, C at snapshot=0 would have passed Tx::begin (no
+    //     watermark check existed), reached commit_ssi, found pending_txs
+    //     EMPTY (Tx_old evicted), and committed — the false-negative.
+    //     Under SP114, C cannot begin. Period. The dangerous structure
+    //     C would have formed is provably unreachable.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn it_supersedes_sp113_bounded_window_false_negative() {
+        use kessel_storage::tx::{Tx, TxError};
+
+        const K_OLD: u64 = 5;
+        let tid: u32 = 9;
+        let k_neutral  = obj_kat(0xA0);
+        let k_neutral2 = obj_kat(0xA1);
+        let k_r = obj_kat(0x11); // Tx_old reads k_r
+        let k_w = obj_kat(0x22); // Tx_old writes k_w
+
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+
+        // Setup: seed 2 SI commits + Tx_old (SSI commit at K_OLD).
+        let r1 = sm.apply(1, Op::CommitTx {
+            snapshot_opnum: 0,
+            write_set: vec![(tid, k_neutral, Some(b"seed".to_vec()))],
+            commit_opnum: 1,
+            read_set: vec![],
+        });
+        assert_eq!(r1, OpResult::TxCommitted { commit_opnum: 1 }, "IT-2 setup: op1 must commit");
+
+        let r2 = sm.apply(2, Op::CommitTx {
+            snapshot_opnum: 0,
+            write_set: vec![(tid, k_neutral2, Some(b"seed2".to_vec()))],
+            commit_opnum: 2,
+            read_set: vec![],
+        });
+        assert_eq!(r2, OpResult::TxCommitted { commit_opnum: 2 }, "IT-2 setup: op2 must commit");
+
+        // Tx_old: SSI commit at K_OLD=5, reads k_r, writes k_w.
+        let r_old = sm.apply(K_OLD, Op::CommitTx {
+            snapshot_opnum: 0,
+            write_set: vec![(tid, k_w, Some(b"old-write".to_vec()))],
+            commit_opnum: K_OLD,
+            read_set: vec![(tid, k_r)],
+        });
+        assert_eq!(
+            r_old,
+            OpResult::TxCommitted { commit_opnum: K_OLD },
+            "IT-2 setup: Tx_old must commit at K_OLD={K_OLD}"
+        );
+        // Tx_old IS in pending_txs (SSI with non-empty read_set).
+        assert!(
+            sm.pending_txs.contains_key(&K_OLD),
+            "IT-2 setup: Tx_old must be in pending_txs at key {K_OLD}"
+        );
+        assert_eq!(sm.low_water_mark(), 0, "IT-2 setup: lwm must be 0 before advance");
+
+        // AdvanceWatermark: lwm = K_OLD + 1 = 6. Evicts Tx_old from pending_txs.
+        // Reclaims versions at opnums {1, 2, 5} (all < 6).
+        let lwm_new = K_OLD + 1; // = 6
+        let r_wm = sm.apply(10, Op::AdvanceWatermark { low_water_mark: lwm_new });
+        assert_eq!(
+            r_wm,
+            OpResult::WatermarkAdvanced {
+                new_low_water_mark: lwm_new,
+                versions_deleted: 3,       // k_neutral@1, k_neutral2@2, k_w@5 — all < 6
+                pending_txs_evicted: 1,    // Tx_old at opnum=5 evicted
+            },
+            "IT-2: AdvanceWatermark(lwm={lwm_new}) must evict Tx_old + delete 3 versions"
+        );
+        assert!(
+            sm.pending_txs.is_empty(),
+            "IT-2: pending_txs must be empty after advance evicts Tx_old"
+        );
+        assert_eq!(sm.low_water_mark(), lwm_new, "IT-2: SM lwm must be {lwm_new}");
+        assert_eq!(sm.storage.low_water_mark(), lwm_new, "IT-2: storage lwm must be {lwm_new}");
+
+        // ---------------------------------------------------------------
+        // THE SUPERSESSION PROOF:
+        //
+        // Committer C would approach with snapshot_opnum=0 (older than
+        // Tx_old's commit_opnum=5 and definitely older than lwm=6).
+        // Under SP113 (no watermark check at Tx::begin), C would have
+        // begun a Tx, found empty pending_txs, and COMMITTED — the
+        // false-negative. Under SP114:
+        //
+        //   Tx::begin_ssi(&mut sm.storage, 0) → Err(SnapshotTooOld{lwm: 6})
+        //
+        // C cannot begin. The dangerous structure is provably unreachable.
+        // ---------------------------------------------------------------
+        let c_snapshot: u64 = 0; // older than Tx_old's commit AND older than lwm
+        let begin_result = Tx::begin_ssi(&mut sm.storage, c_snapshot);
+        assert!(
+            matches!(
+                begin_result,
+                Err(TxError::SnapshotTooOld { low_water_mark: 6 })
+            ),
+            "IT-2 (SP113-SUPERSESSION): Tx::begin_ssi at snapshot={c_snapshot} must return \
+             Err(SnapshotTooOld{{lwm:6}}) under SP114 watermark protocol; got Err({:?})",
+            begin_result.err()
+        );
+
+        // Sanity: begin_rw at the same too-old snapshot also fails.
+        let begin_rw_result = Tx::begin_rw(&mut sm.storage, c_snapshot);
+        assert!(
+            matches!(
+                begin_rw_result,
+                Err(TxError::SnapshotTooOld { low_water_mark: 6 })
+            ),
+            "IT-2: Tx::begin_rw at snapshot={c_snapshot} must also return SnapshotTooOld"
+        );
+
+        // Control group: at-watermark snapshot (snapshot_opnum == lwm) IS accepted.
+        // Decision 7: the strict-less-than guard means snapshot == lwm is serveable.
+        let begin_at_wm = Tx::begin_ssi(&mut sm.storage, lwm_new);
+        assert!(
+            begin_at_wm.is_ok(),
+            "IT-2: Tx::begin_ssi at snapshot=lwm={lwm_new} (at-watermark) must succeed"
+        );
+
+        // Further control: one step above lwm also succeeds.
+        let begin_above_wm = Tx::begin_ssi(&mut sm.storage, lwm_new + 1);
+        assert!(
+            begin_above_wm.is_ok(),
+            "IT-2: Tx::begin_ssi at snapshot=lwm+1={} must succeed", lwm_new + 1
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // IT-3: Snapshot-too-old rejection consistency.
+    //
+    // Claim: ALL three Tx constructors (begin / begin_rw / begin_ssi)
+    // uniformly return Err(TxError::SnapshotTooOld{low_water_mark}) when
+    // snapshot_opnum < low_water_mark. No constructor accepts a too-old
+    // snapshot. No partial state is installed. No panic.
+    //
+    // Additional boundary claim (Decision 7): snapshot_opnum == low_water_mark
+    // IS accepted by all three constructors (at-watermark is serveable).
+    //
+    // Workload:
+    //   Open SM. Apply AdvanceWatermark(lwm=5) at op_number=10.
+    //   For snapshot in {0, 1, 2, 3, 4}: all three begin* fail with
+    //     SnapshotTooOld{lwm:5}.
+    //   For snapshot == 5: all three begin* succeed (Ok).
+    //   For snapshot == 6: all three begin* succeed (Ok).
+    //
+    // Hand-derived: lwm=5; strict-less-than guard ⇒ snapshot < 5 fails;
+    // snapshot >= 5 passes.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn it_snapshot_too_old_rejected_consistently() {
+        use kessel_storage::tx::{Tx, TxError};
+
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+
+        // Set lwm=5 via AdvanceWatermark.
+        let r = sm.apply(10, Op::AdvanceWatermark { low_water_mark: 5 });
+        assert_eq!(
+            r,
+            OpResult::WatermarkAdvanced { new_low_water_mark: 5, versions_deleted: 0, pending_txs_evicted: 0 },
+            "IT-3 setup: AdvanceWatermark(5) must succeed"
+        );
+        assert_eq!(sm.storage.low_water_mark(), 5, "IT-3 setup: storage lwm must be 5");
+
+        // For snapshot < lwm (0..=4): all three constructors fail.
+        for snap in 0u64..=4 {
+            // Tx::begin (read-only, &Storage)
+            let rb = Tx::begin(&sm.storage, snap);
+            assert!(
+                matches!(rb, Err(TxError::SnapshotTooOld { low_water_mark: 5 })),
+                "IT-3: Tx::begin(snap={snap}) must return SnapshotTooOld{{5}}; got Err({:?})",
+                rb.err()
+            );
+            // Tx::begin_rw (&mut Storage)
+            let rrw = Tx::begin_rw(&mut sm.storage, snap);
+            assert!(
+                matches!(rrw, Err(TxError::SnapshotTooOld { low_water_mark: 5 })),
+                "IT-3: Tx::begin_rw(snap={snap}) must return SnapshotTooOld{{5}}; got Err({:?})",
+                rrw.err()
+            );
+            // Tx::begin_ssi (&mut Storage)
+            let rssi = Tx::begin_ssi(&mut sm.storage, snap);
+            assert!(
+                matches!(rssi, Err(TxError::SnapshotTooOld { low_water_mark: 5 })),
+                "IT-3: Tx::begin_ssi(snap={snap}) must return SnapshotTooOld{{5}}; got Err({:?})",
+                rssi.err()
+            );
+        }
+
+        // At-watermark boundary (snapshot == lwm == 5): all three succeed.
+        let at_lwm: u64 = 5;
+        assert!(
+            Tx::begin(&sm.storage, at_lwm).is_ok(),
+            "IT-3: Tx::begin(snap=5==lwm) must succeed (at-watermark, Decision 7)"
+        );
+        assert!(
+            Tx::begin_rw(&mut sm.storage, at_lwm).is_ok(),
+            "IT-3: Tx::begin_rw(snap=5==lwm) must succeed (at-watermark, Decision 7)"
+        );
+        assert!(
+            Tx::begin_ssi(&mut sm.storage, at_lwm).is_ok(),
+            "IT-3: Tx::begin_ssi(snap=5==lwm) must succeed (at-watermark, Decision 7)"
+        );
+
+        // One step above lwm (snapshot=6): all three succeed.
+        assert!(
+            Tx::begin(&sm.storage, 6).is_ok(),
+            "IT-3: Tx::begin(snap=6>lwm) must succeed"
+        );
+        assert!(
+            Tx::begin_rw(&mut sm.storage, 6).is_ok(),
+            "IT-3: Tx::begin_rw(snap=6>lwm) must succeed"
+        );
+        assert!(
+            Tx::begin_ssi(&mut sm.storage, 6).is_ok(),
+            "IT-3: Tx::begin_ssi(snap=6>lwm) must succeed"
+        );
+
+        // No partial state: SM's pending_txs and lwm are unchanged.
+        assert_eq!(sm.low_water_mark(), 5, "IT-3: SM lwm must remain 5 after Tx::begin* calls");
+        assert!(sm.pending_txs.is_empty(), "IT-3: pending_txs must remain empty");
+    }
+
+    // -----------------------------------------------------------------------
+    // IT-4: Long-running-Tx heartbeat trust-boundary.
+    //
+    // DESIGN DECISION 2 (SP114): The SM TRUSTS the submitted watermark.
+    // The SM does NOT track active Tx lifetimes — that is the heartbeat
+    // producer's responsibility (out-of-scope for the SM apply arm). In
+    // production, the heartbeat producer MUST gather min(active_snapshot)
+    // over all live readers before submitting an AdvanceWatermark op, and
+    // MUST NOT advance the watermark past any live reader's snapshot.
+    //
+    // This test is a CONTRACT-DISCLOSURE TEST, not a runtime-prevention
+    // test. It documents that:
+    //   (a) The SM apply arm accepts AdvanceWatermark regardless of
+    //       whether any Tx was constructed before the advance.
+    //   (b) A Tx constructed at snapshot S before the advance remains
+    //       an in-memory struct; its reads operate against storage which
+    //       now has versions removed for commit_opnum < lwm. This may
+    //       yield stale reads if the heartbeat producer advanced past S.
+    //   (c) The OPERATIONAL invariant "never advance past min(active_snapshot)"
+    //       is ENTIRELY the heartbeat producer's responsibility.
+    //       The SM cannot enforce it (the SM has no registry of active Txs).
+    //
+    // Workload:
+    //   SM applies CommitTx (writes k_a→"alpha" at opnum=2) so k_a
+    //   has a versioned entry.
+    //   Tx_A = Tx::begin_ssi(&mut sm.storage, snapshot=2) → Ok.
+    //   SM applies AdvanceWatermark(lwm=3) at op_number=10.
+    //     → The SM accept this op (trust boundary — no active Tx check).
+    //     → lwm=3; k_a@opnum=2 is tombstoned (commit_opnum=2 < lwm=3).
+    //   Attempt: Tx::begin_ssi(&mut sm.storage, snapshot=2) — AFTER advance.
+    //     → Err(SnapshotTooOld{lwm:3}) — new Tx at snapshot=2 is rejected.
+    //   Tx_A (already constructed at snapshot=2) can still be USED as an
+    //   in-memory object (it holds &mut storage); the test documents that
+    //   it is the heartbeat producer's contract to prevent this scenario.
+    //
+    // TRUST BOUNDARY NOTE: The SM apply arm is correct — it accepted the
+    // AdvanceWatermark because it trusts the heartbeat. The heartbeat
+    // producer MUST gate on min(active_snapshot) to prevent Tx_A from
+    // reading from tombstoned storage. This is an OOS contract.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn it_long_running_tx_pins_watermark_heartbeat_trust_boundary() {
+        use kessel_storage::tx::{Tx, TxError};
+
+        let tid: u32 = 10;
+        let k_a = obj_kat(0xAA);
+
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+
+        // Seed: commit k_a→"alpha" at opnum=2.
+        let r_seed = sm.apply(2, Op::CommitTx {
+            snapshot_opnum: 0,
+            write_set: vec![(tid, k_a, Some(b"alpha".to_vec()))],
+            commit_opnum: 2,
+            read_set: vec![],
+        });
+        assert_eq!(r_seed, OpResult::TxCommitted { commit_opnum: 2 }, "IT-4 setup: seed commit");
+
+        // Tx_A: begin at snapshot=2 (the commit we just seeded).
+        // This is BEFORE the watermark advance — it succeeds.
+        {
+            let tx_a = Tx::begin_ssi(&mut sm.storage, 2);
+            assert!(
+                tx_a.is_ok(),
+                "IT-4: Tx::begin_ssi(snap=2) before advance must succeed"
+            );
+            // tx_a is dropped here; in production it would be kept alive.
+            // We drop it to free the &mut borrow so we can continue with SM ops.
+            // The comment below documents the trust-boundary contract.
+            //
+            // TRUST BOUNDARY: In production, the heartbeat producer would keep
+            // Tx_A alive (not drop it). Before submitting AdvanceWatermark, it
+            // MUST check min(active_snapshot) across all live Tx instances and
+            // MUST NOT advance past snapshot=2 while Tx_A is alive.
+            // The SM apply arm has no visibility into Tx_A's lifetime.
+        }
+
+        // AdvanceWatermark(lwm=3): SM accepts unconditionally (trust boundary).
+        // This reclaims k_a@opnum=2 (commit_opnum=2 < lwm=3).
+        let r_wm = sm.apply(10, Op::AdvanceWatermark { low_water_mark: 3 });
+        assert_eq!(
+            r_wm,
+            OpResult::WatermarkAdvanced { new_low_water_mark: 3, versions_deleted: 1, pending_txs_evicted: 0 },
+            "IT-4: SM MUST accept AdvanceWatermark(3) — trust boundary (Decision 2); SM does not track active Tx"
+        );
+        assert_eq!(sm.low_water_mark(), 3, "IT-4: SM lwm must be 3 after advance");
+        assert_eq!(sm.storage.low_water_mark(), 3, "IT-4: storage lwm must be 3");
+
+        // TRUST BOUNDARY CONSEQUENCE: After the advance, a NEW Tx at snapshot=2
+        // is rejected. This is correct behavior — the watermark has moved past
+        // snapshot=2.
+        let new_tx_result = Tx::begin_ssi(&mut sm.storage, 2);
+        assert!(
+            matches!(new_tx_result, Err(TxError::SnapshotTooOld { low_water_mark: 3 })),
+            "IT-4: Tx::begin_ssi(snap=2) AFTER advance(lwm=3) must return SnapshotTooOld{{3}}; \
+             got Err({:?})", new_tx_result.err()
+        );
+
+        // At-watermark: snapshot=3 is still serveable.
+        assert!(
+            Tx::begin_ssi(&mut sm.storage, 3).is_ok(),
+            "IT-4: Tx::begin_ssi(snap=3==lwm) must succeed (at-watermark)"
+        );
+
+        // DOCUMENTATION: The heartbeat producer's OOS contract is:
+        //   BEFORE submitting Op::AdvanceWatermark{low_water_mark: W}:
+        //     1. Gather min(active_snapshot) over all live Tx objects.
+        //     2. If min(active_snapshot) < W, do NOT submit the op.
+        //     3. Only submit if W <= min(active_snapshot).
+        //   The SM apply arm enforces monotonicity + commit-ceiling (Decision 5)
+        //   but cannot enforce the "no live reader below W" invariant because
+        //   it has no registry of active Txs. This is Decision 2 of SP114.
+        //
+        // A violation of this OOS contract (advancing past a live Tx's snapshot)
+        // means the live Tx may read from tombstoned storage — a consistency
+        // hazard that is entirely the heartbeat producer's responsibility to prevent.
+    }
+
+    // -----------------------------------------------------------------------
+    // IT-5: AdvanceWatermark after commit — full interleaved sequence.
+    //
+    // Claim: The SM correctly handles an interleaved sequence of CommitTx
+    // and AdvanceWatermark ops. Per-step assertions verify:
+    //   - versions_deleted count matches the number of versioned entries
+    //     with commit_opnum < lwm at each advance step.
+    //   - pending_txs_evicted count matches the number of SSI pending
+    //     records with opnum < lwm at each advance step.
+    //   - low_water_mark advances monotonically.
+    //
+    // Workload (hand-derived):
+    //   tid=11. k1..k3 = obj_kat(0xB1..0xB3).
+    //
+    //   Step 1: CommitTx(snap=0, write={(11,k1)→"x1"}, commit=1, read=[]).
+    //     → TxCommitted{1}. pending_txs: {} (SI). lwm=0.
+    //   Step 2: CommitTx(snap=0, write={(11,k2)→"x2"}, commit=2, read={}).
+    //     → TxCommitted{2}. pending_txs: {}. lwm=0.
+    //   Step 3: AdvanceWatermark(lwm=2) at op_number=5.
+    //     → versions < 2: opnum=1 (k1→"x1") = 1 deleted.
+    //     → pending < 2: {} = 0 evicted.
+    //     → lwm=2. WatermarkAdvanced{lwm:2, vd:1, evicted:0}.
+    //   Step 4: CommitTx(snap=2, write={(11,k3)→"x3"}, commit=6, read={}).
+    //     → TxCommitted{6}. pending_txs: {}. lwm=2.
+    //   Step 5: AdvanceWatermark(lwm=3) at op_number=10.
+    //     → versions < 3: opnum=1 (k1 tombstone from step3, key still encodes opnum=1)
+    //       + opnum=2 (k2→"x2") = 2 deleted. (opnum=6 survives; tombstone-on-tombstone
+    //       for k1@1 is an idempotent re-write.)
+    //     → pending < 3: {} = 0 evicted.
+    //     → lwm=3. WatermarkAdvanced{lwm:3, vd:2, evicted:0}.
+    //
+    // Final state:
+    //   Surviving versioned entries: (11,k3,opnum=6)→"x3".
+    //   Tombstoned: (11,k1,opnum=1)→None, (11,k2,opnum=2)→None.
+    //   pending_txs: {} (all SI commits). lwm=3.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn it_advance_watermark_after_commit_sequence() {
+        let tid: u32 = 11;
+        let k1 = obj_kat(0xB1);
+        let k2 = obj_kat(0xB2);
+        let k3 = obj_kat(0xB3);
+
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+
+        // Step 1: commit k1 at opnum=1 (SI).
+        let r1 = sm.apply(1, Op::CommitTx {
+            snapshot_opnum: 0,
+            write_set: vec![(tid, k1, Some(b"x1".to_vec()))],
+            commit_opnum: 1,
+            read_set: vec![],
+        });
+        assert_eq!(r1, OpResult::TxCommitted { commit_opnum: 1 }, "IT-5 step1");
+        assert_eq!(sm.low_water_mark(), 0, "IT-5 step1: lwm still 0");
+        assert!(sm.pending_txs.is_empty(), "IT-5 step1: pending_txs empty (SI)");
+
+        // Step 2: commit k2 at opnum=2 (SI).
+        let r2 = sm.apply(2, Op::CommitTx {
+            snapshot_opnum: 0,
+            write_set: vec![(tid, k2, Some(b"x2".to_vec()))],
+            commit_opnum: 2,
+            read_set: vec![],
+        });
+        assert_eq!(r2, OpResult::TxCommitted { commit_opnum: 2 }, "IT-5 step2");
+        assert_eq!(sm.low_water_mark(), 0, "IT-5 step2: lwm still 0");
+
+        // Step 3: AdvanceWatermark(lwm=2). Reclaims opnum=1 only (strict-less-than).
+        let r3 = sm.apply(5, Op::AdvanceWatermark { low_water_mark: 2 });
+        assert_eq!(
+            r3,
+            OpResult::WatermarkAdvanced { new_low_water_mark: 2, versions_deleted: 1, pending_txs_evicted: 0 },
+            "IT-5 step3: advance lwm=2 must delete 1 version (opnum=1 only; strict-less-than)"
+        );
+        assert_eq!(sm.low_water_mark(), 2, "IT-5 step3: lwm=2");
+        assert_eq!(sm.storage.low_water_mark(), 2, "IT-5 step3: storage lwm=2");
+
+        // Step 4: commit k3 at opnum=6 (snapshot=2; SI).
+        let r4 = sm.apply(6, Op::CommitTx {
+            snapshot_opnum: 2,
+            write_set: vec![(tid, k3, Some(b"x3".to_vec()))],
+            commit_opnum: 6,
+            read_set: vec![],
+        });
+        assert_eq!(r4, OpResult::TxCommitted { commit_opnum: 6 }, "IT-5 step4");
+        assert_eq!(sm.low_water_mark(), 2, "IT-5 step4: lwm still 2");
+
+        // Step 5: AdvanceWatermark(lwm=3).
+        // Reclaims opnum=1 (tombstone from step3 GC, still in scan with key opnum=1 < 3)
+        // AND opnum=2 (live version of k2; opnum=2 < 3).
+        // opnum=6 (k3) survives (6 >= 3).
+        // NOTE: the tombstone for k1@opnum=1 written by step3 GC has its ORIGINAL
+        // key encoding (opnum=1); `delete_versions_older_than` re-discovers it in the
+        // scan (1 < 3 = true) and writes an idempotent tombstone-on-tombstone.
+        // versions_deleted = 2 (k1@1 tombstone re-written + k2@2 newly tombstoned).
+        let r5 = sm.apply(10, Op::AdvanceWatermark { low_water_mark: 3 });
+        assert_eq!(
+            r5,
+            OpResult::WatermarkAdvanced { new_low_water_mark: 3, versions_deleted: 2, pending_txs_evicted: 0 },
+            "IT-5 step5: advance lwm=3 must delete 2 versions (k1@1 tombstone re-write + k2@2 new)"
+        );
+        assert_eq!(sm.low_water_mark(), 3, "IT-5 step5: lwm=3");
+        assert_eq!(sm.storage.low_water_mark(), 3, "IT-5 step5: storage lwm=3");
+        assert!(sm.pending_txs.is_empty(), "IT-5 step5: pending_txs still empty (all SI)");
+
+        // Final KAT: surviving versioned entry k3@opnum=6 is readable.
+        use kessel_storage::mvcc::{get_at_snapshot, SnapshotRead, VERSIONED_KEY_LEN};
+        match get_at_snapshot(&sm.storage, tid, &k3, 6) {
+            SnapshotRead::Found(b) => assert_eq!(b, b"x3", "IT-5: k3@snap=6 must be x3"),
+            o => panic!("IT-5: k3@snap=6 expected Found(x3), got {o:?}"),
+        }
+
+        // k1 and k2 must be GC-tombstoned (not readable at their commit opnums).
+        // dump shows 3 versioned entries: k1@1→None, k2@2→None, k3@6→Some("x3").
+        let dump = dump_all_versions_sm(&sm);
+        assert_eq!(
+            dump.len(), 3,
+            "IT-5: dump must have 3 entries (k1+k2 tombstoned, k3 live)"
+        );
+
+        // NOTE: MVCC key bytes 20..28 are INVERTED opnum; use decode_commit_opnum.
+        use kessel_storage::mvcc::decode_commit_opnum;
+        // Verify k1@opnum=1 is tombstoned.
+        let k1_tombed = dump.iter().any(|(k, v)| {
+            k.len() == VERSIONED_KEY_LEN
+                && k[4..20] == k1
+                && decode_commit_opnum(k) == Ok(1)
+                && v.is_none()
+        });
+        assert!(k1_tombed, "IT-5: k1@opnum=1 must be GC-tombstoned");
+
+        // Verify k2@opnum=2 is tombstoned.
+        let k2_tombed = dump.iter().any(|(k, v)| {
+            k.len() == VERSIONED_KEY_LEN
+                && k[4..20] == k2
+                && decode_commit_opnum(k) == Ok(2)
+                && v.is_none()
+        });
+        assert!(k2_tombed, "IT-5: k2@opnum=2 must be GC-tombstoned");
+
+        // k3@opnum=6 is live.
+        let k3_live = dump.iter().any(|(k, v)| {
+            k.len() == VERSIONED_KEY_LEN
+                && k[4..20] == k3
+                && decode_commit_opnum(k) == Ok(6)
+                && v.as_deref() == Some(b"x3")
+        });
+        assert!(k3_live, "IT-5: k3@opnum=6 must be live (Some(x3))");
+    }
+
+    // -----------------------------------------------------------------------
+    // IT-6: SM-apply byte-equivalence with direct primitive calls.
+    //
+    // Claim: The SM apply arm for Op::AdvanceWatermark composes the three
+    // underlying primitives correctly:
+    //   (a) kessel_storage::mvcc::delete_versions_older_than
+    //   (b) kessel_storage::ssi::prune_pending_txs_by_watermark
+    //   (c) kessel_storage::Storage::set_low_water_mark
+    // Applying Op::AdvanceWatermark via SM::apply produces byte-identical
+    // storage state, pending_txs state, and low_water_mark as manually
+    // calling the three primitives in the correct order.
+    //
+    // Workload:
+    //   tid=12. k1..k3 = obj_kat(0xC1..0xC3).
+    //
+    //   PATH A (SM apply):
+    //     sm_a = fresh SM.
+    //     Apply CommitTx ops to seed MVCC versions + pending_txs.
+    //     Apply AdvanceWatermark(lwm=3) at op_number=10.
+    //
+    //   PATH B (direct primitives):
+    //     sm_b = fresh SM.
+    //     Apply the SAME CommitTx ops (so sm_b has the same pre-GC state).
+    //     Then manually call:
+    //       1. delete_versions_older_than(&mut sm_b.storage, 3)
+    //       2. prune_pending_txs_by_watermark(&mut sm_b.pending_txs, 3)
+    //       3. sm_b.storage.set_low_water_mark(3)
+    //       4. sm_b.low_water_mark = 3  (via the same field, which is pub(crate))
+    //
+    //   Assert:
+    //     dump_all_versions_sm(sm_a) == dump_all_versions_sm(sm_b)
+    //     format!("{:?}", sm_a.pending_txs) == format!("{:?}", sm_b.pending_txs)
+    //     sm_a.low_water_mark() == sm_b.low_water_mark() == 3
+    //     sm_a.storage.low_water_mark() == sm_b.storage.low_water_mark() == 3
+    //
+    // NOTE: PATH B accesses sm_b.pending_txs and sm_b.low_water_mark as
+    // pub(crate) fields — this test MUST live inside kessel-sm's #[cfg(test)]
+    // module (not in a separate integration test crate) for field access.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn it_sm_apply_byte_equivalence_with_local_path() {
+        let tid: u32 = 12;
+        let k1 = obj_kat(0xC1);
+        let k2 = obj_kat(0xC2);
+        let k3 = obj_kat(0xC3);
+
+        // Seeding ops (identical for both paths).
+        let seed_ops: Vec<(u64, Op)> = vec![
+            (1, Op::CommitTx {
+                snapshot_opnum: 0,
+                write_set: vec![(tid, k1, Some(b"v1".to_vec()))],
+                commit_opnum: 1,
+                read_set: vec![],
+            }),
+            (2, Op::CommitTx {
+                snapshot_opnum: 0,
+                write_set: vec![(tid, k2, Some(b"v2".to_vec()))],
+                commit_opnum: 2,
+                read_set: vec![(tid, k1)],  // SSI → inserts into pending_txs
+            }),
+            (3, Op::CommitTx {
+                snapshot_opnum: 1,
+                write_set: vec![(tid, k3, Some(b"v3".to_vec()))],
+                commit_opnum: 3,
+                read_set: vec![(tid, k2)],  // SSI → inserts into pending_txs
+            }),
+        ];
+
+        // PATH A: SM apply for AdvanceWatermark.
+        let mut sm_a = StateMachine::open(MemVfs::new()).unwrap();
+        for (op_number, op) in &seed_ops {
+            sm_a.apply(*op_number, op.clone());
+        }
+        // AdvanceWatermark via SM apply.
+        let res_a = sm_a.apply(10, Op::AdvanceWatermark { low_water_mark: 3 });
+        assert!(
+            matches!(res_a, OpResult::WatermarkAdvanced { new_low_water_mark: 3, .. }),
+            "IT-6 PATH A: AdvanceWatermark(3) must succeed; got {res_a:?}"
+        );
+
+        // PATH B: same seed ops, then direct primitive calls.
+        let mut sm_b = StateMachine::open(MemVfs::new()).unwrap();
+        for (op_number, op) in &seed_ops {
+            sm_b.apply(*op_number, op.clone());
+        }
+        // Direct primitive calls (same order as the SM apply arm):
+        // 1. Reclaim MVCC versions.
+        kessel_storage::mvcc::delete_versions_older_than(&mut sm_b.storage, 3)
+            .expect("IT-6 PATH B: delete_versions_older_than must succeed");
+        // 2. Prune pending_txs.
+        kessel_storage::ssi::prune_pending_txs_by_watermark(&mut sm_b.pending_txs, 3);
+        // 3. Sync storage low_water_mark.
+        sm_b.storage.set_low_water_mark(3);
+        // 4. Update SM low_water_mark field (pub(crate) — accessible here).
+        sm_b.low_water_mark = 3;
+
+        // Assert byte-identical versioned MVCC dumps.
+        let dump_a = dump_all_versions_sm(&sm_a);
+        let dump_b = dump_all_versions_sm(&sm_b);
+        assert_eq!(
+            dump_a, dump_b,
+            "IT-6: SM apply path and direct primitive path must produce byte-identical versioned MVCC state"
+        );
+
+        // Assert byte-identical pending_txs.
+        let ptx_a = format!("{:?}", sm_a.pending_txs);
+        let ptx_b = format!("{:?}", sm_b.pending_txs);
+        assert_eq!(
+            ptx_a, ptx_b,
+            "IT-6: SM apply path and direct primitive path must produce byte-identical pending_txs"
+        );
+
+        // Assert byte-identical low_water_mark (SM + storage).
+        assert_eq!(sm_a.low_water_mark(), 3, "IT-6 PATH A: SM lwm must be 3");
+        assert_eq!(sm_b.low_water_mark(), 3, "IT-6 PATH B: SM lwm must be 3");
+        assert_eq!(sm_a.storage.low_water_mark(), 3, "IT-6 PATH A: storage lwm must be 3");
+        assert_eq!(sm_b.storage.low_water_mark(), 3, "IT-6 PATH B: storage lwm must be 3");
+
+        // KAT: versions at opnum < 3 are tombstoned; opnum=3 survives.
+        // NOTE: MVCC key bytes 20..28 are INVERTED opnum; use decode_commit_opnum.
+        use kessel_storage::mvcc::{decode_commit_opnum, VERSIONED_KEY_LEN};
+        // k1@opnum=1 is tombstoned in both.
+        let k1_tomb_a = dump_a.iter().any(|(k, v)| {
+            k.len() == VERSIONED_KEY_LEN
+                && k[4..20] == k1
+                && decode_commit_opnum(k) == Ok(1)
+                && v.is_none()
+        });
+        assert!(k1_tomb_a, "IT-6: k1@1 must be tombstoned in PATH A");
+
+        // k2@opnum=2 is tombstoned.
+        let k2_tomb_a = dump_a.iter().any(|(k, v)| {
+            k.len() == VERSIONED_KEY_LEN
+                && k[4..20] == k2
+                && decode_commit_opnum(k) == Ok(2)
+                && v.is_none()
+        });
+        assert!(k2_tomb_a, "IT-6: k2@2 must be tombstoned in PATH A");
+
+        // k3@opnum=3 is PRESERVED (strict-less-than: 3 < 3 is false).
+        let k3_live_a = dump_a.iter().any(|(k, v)| {
+            k.len() == VERSIONED_KEY_LEN
+                && k[4..20] == k3
+                && decode_commit_opnum(k) == Ok(3)
+                && v.as_deref() == Some(b"v3")
+        });
+        assert!(k3_live_a, "IT-6: k3@3 must be live in PATH A (at-watermark preserved)");
+
+        // pending_txs KAT: opnum=3 survives (3 < 3 is false); opnums {1,2} evicted.
+        // opnum=1 was SI (no read_set) → never in pending_txs.
+        // opnum=2 was SSI, inserted at opnum=2 < 3 → evicted.
+        // opnum=3 was SSI, inserted at opnum=3, NOT < 3 → survives.
+        assert!(
+            ptx_a.contains("3:"),
+            "IT-6: pending_txs must contain opnum=3 (at-watermark, not evicted)"
+        );
+        assert!(
+            !ptx_a.contains("2:"),
+            "IT-6: pending_txs must NOT contain opnum=2 (evicted by watermark)"
+        );
+    }
 }

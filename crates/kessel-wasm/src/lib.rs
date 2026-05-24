@@ -1206,6 +1206,69 @@ fn exec_one(
         }
 
         // ===========================================================
+        // SP122 — bit-manipulation ops (clz / ctz / popcnt for i32+i64)
+        // ===========================================================
+        0x67 => {
+            // i32.clz
+            let a = pop_i32(stack, "i32.clz")? as u32;
+            stack.push(Value::I32(a.leading_zeros() as i32));
+        }
+        0x68 => {
+            // i32.ctz
+            let a = pop_i32(stack, "i32.ctz")? as u32;
+            stack.push(Value::I32(a.trailing_zeros() as i32));
+        }
+        0x69 => {
+            // i32.popcnt
+            let a = pop_i32(stack, "i32.popcnt")? as u32;
+            stack.push(Value::I32(a.count_ones() as i32));
+        }
+        0x79 => {
+            // i64.clz
+            let a = pop_i64(stack, "i64.clz")? as u64;
+            stack.push(Value::I64(a.leading_zeros() as i64));
+        }
+        0x7A => {
+            // i64.ctz
+            let a = pop_i64(stack, "i64.ctz")? as u64;
+            stack.push(Value::I64(a.trailing_zeros() as i64));
+        }
+        0x7B => {
+            // i64.popcnt
+            let a = pop_i64(stack, "i64.popcnt")? as u64;
+            stack.push(Value::I64(a.count_ones() as i64));
+        }
+
+        // ===========================================================
+        // SP122 — sign-extension ops (0xC0..=0xC4)
+        // ===========================================================
+        0xC0 => {
+            // i32.extend8_s
+            let a = pop_i32(stack, "i32.extend8_s")?;
+            stack.push(Value::I32((a as i8) as i32));
+        }
+        0xC1 => {
+            // i32.extend16_s
+            let a = pop_i32(stack, "i32.extend16_s")?;
+            stack.push(Value::I32((a as i16) as i32));
+        }
+        0xC2 => {
+            // i64.extend8_s
+            let a = pop_i64(stack, "i64.extend8_s")?;
+            stack.push(Value::I64((a as i8) as i64));
+        }
+        0xC3 => {
+            // i64.extend16_s
+            let a = pop_i64(stack, "i64.extend16_s")?;
+            stack.push(Value::I64((a as i16) as i64));
+        }
+        0xC4 => {
+            // i64.extend32_s
+            let a = pop_i64(stack, "i64.extend32_s")?;
+            stack.push(Value::I64((a as i32) as i64));
+        }
+
+        // ===========================================================
         // SP121 — float opcodes (f32 + f64) with deterministic NaN
         // canonicalization. Every float push goes through push_f32/_f64
         // which calls canonicalize_f*(); cross-host NaN payload
@@ -1933,17 +1996,14 @@ fn do_branch(
 }
 
 fn is_known_wasm_opcode(b: u8) -> bool {
-    // After SP121 the deferred set shrinks: floats (0x43, 0x44, 0x5B..=0x66,
-    // 0x8B..=0xA6, 0xA8..=0xBF) all moved to supported. Remaining deferred:
+    // After SP122 the deferred set shrinks further: bit-manipulation
+    // (0x67..=0x69, 0x79..=0x7B) + sign-extension (0xC0..=0xC4) all
+    // moved to supported. Remaining deferred:
     // - 0x06..=0x0A, 0x0E    : try/catch/throw (exceptions; deferred)
-    // - 0x11, 0x12..=0x19    : call_indirect, return_call*, ref types (deferred)
-    // - 0x1C..=0x1F          : reserved / typed select (deferred)
+    // - 0x11                 : call_indirect (tables; deferred)
+    // - 0x12..=0x19          : return_call* / reference types (deferred)
+    // - 0x1C..=0x1F          : typed select / reserved (deferred)
     // - 0x23..=0x27          : global.get/set, table.get/set (deferred)
-    // - 0x67..=0x69          : i32 clz/ctz/popcnt (could ship; deferred for next slice)
-    // - 0x6E (i32.div_u), 0x70 (i32.rem_u), 0x4D (i32.le_u),
-    //   0x77/0x78 (i32.rotl/r) all SHIPPED in SP120
-    // - 0x89..=0x8A          : i64.rotl/r (SHIPPED in SP120)
-    // - 0xC0..=0xC4          : sign extension ops (deferred)
     // - 0xD0..=0xD4          : reference type ops (deferred)
     // - 0xFC                 : prefix for saturating-trunc + bulk memory (deferred)
     // - 0xFD                 : SIMD prefix (deferred)
@@ -1952,8 +2012,6 @@ fn is_known_wasm_opcode(b: u8) -> bool {
         b,
         0x06..=0x0A | 0x0E | 0x11 | 0x12..=0x19 | 0x1C..=0x1F |
         0x23..=0x27 |
-        0x67..=0x69 |
-        0xC0..=0xC4 |
         0xD0..=0xD4 | 0xFC | 0xFD..=0xFE
     )
 }
@@ -2577,18 +2635,138 @@ mod tests {
         );
     }
 
-    /// SP121 — float deferral boundary moved. The original SP120-KAT-17
-    /// asserted `f32.add (0x92) → UnsupportedOpcode`. SP121 SHIPPED floats
-    /// (with deterministic NaN canonicalization), so the deferral boundary
-    /// shifts to other opcodes. This test pins the NEW boundary: i32.clz
-    /// (0x67) — bit-manipulation opcodes remain deferred per the
-    /// is_known_wasm_opcode list.
+    /// SP122 — deferral boundary moved AGAIN. After SP121 the boundary
+    /// was at 0x67 (i32.clz). After SP122 bit-manipulation + sign-extension
+    /// also ship. The new boundary is at global.get (0x23) — global vars
+    /// require a global section + state model that's its own slice.
     #[test]
-    fn sp121_kat_deferred_boundary_shifted_to_bit_ops() {
-        let code = vec![0x41, 0x10, 0x67, 0x0B]; // i32.const 16; i32.clz; end
+    fn sp122_kat_deferred_boundary_shifted_to_globals() {
+        let code = vec![0x23, 0x00, 0x0B]; // global.get 0; end
         let m = build_module(&[], &[ValType::I32], &[], &code);
         let r = wasm_exec(&m, 0, &[], 100);
-        assert_eq!(r.unwrap_err(), WasmError::UnsupportedOpcode(0x67));
+        assert_eq!(r.unwrap_err(), WasmError::UnsupportedOpcode(0x23));
+    }
+
+    // ============================================================================
+    // SP122 — bit-manipulation + sign-extension KATs
+    // ============================================================================
+
+    /// SP122-KAT-1: i32.clz / ctz / popcnt over known bit patterns.
+    #[test]
+    fn sp122_kat_i32_bit_manip() {
+        // i32.const 0x0000_FF00; i32.clz; end → 16 (16 leading zeros)
+        let mut code = vec![0x41];
+        write_i32_leb(&mut code, 0x0000_FF00);
+        code.extend_from_slice(&[0x67, 0x0B]);
+        let m = build_module(&[], &[ValType::I32], &[], &code);
+        assert_eq!(wasm_exec(&m, 0, &[], 100).unwrap(), vec![Value::I32(16)]);
+
+        // i32.const 0x0000_FF00; i32.ctz; end → 8 (8 trailing zeros)
+        let mut code = vec![0x41];
+        write_i32_leb(&mut code, 0x0000_FF00);
+        code.extend_from_slice(&[0x68, 0x0B]);
+        let m = build_module(&[], &[ValType::I32], &[], &code);
+        assert_eq!(wasm_exec(&m, 0, &[], 100).unwrap(), vec![Value::I32(8)]);
+
+        // i32.const 0x0000_FF00; i32.popcnt; end → 8 (8 bits set)
+        let mut code = vec![0x41];
+        write_i32_leb(&mut code, 0x0000_FF00);
+        code.extend_from_slice(&[0x69, 0x0B]);
+        let m = build_module(&[], &[ValType::I32], &[], &code);
+        assert_eq!(wasm_exec(&m, 0, &[], 100).unwrap(), vec![Value::I32(8)]);
+    }
+
+    /// SP122-KAT-2: i64 bit-manipulation (clz/ctz/popcnt) over a 64-bit pattern.
+    #[test]
+    fn sp122_kat_i64_bit_manip() {
+        // i64.const 0x0000_0000_FF00_0000; i64.clz → 32
+        let mut code = vec![0x42];
+        write_i64_leb(&mut code, 0x0000_0000_FF00_0000);
+        code.extend_from_slice(&[0x79, 0x0B]);
+        let m = build_module(&[], &[ValType::I64], &[], &code);
+        assert_eq!(wasm_exec(&m, 0, &[], 100).unwrap(), vec![Value::I64(32)]);
+
+        // i64.const 0x0000_0000_FF00_0000; i64.ctz → 24
+        let mut code = vec![0x42];
+        write_i64_leb(&mut code, 0x0000_0000_FF00_0000);
+        code.extend_from_slice(&[0x7A, 0x0B]);
+        let m = build_module(&[], &[ValType::I64], &[], &code);
+        assert_eq!(wasm_exec(&m, 0, &[], 100).unwrap(), vec![Value::I64(24)]);
+
+        // i64.const 0x0000_0000_FF00_0000; i64.popcnt → 8
+        let mut code = vec![0x42];
+        write_i64_leb(&mut code, 0x0000_0000_FF00_0000);
+        code.extend_from_slice(&[0x7B, 0x0B]);
+        let m = build_module(&[], &[ValType::I64], &[], &code);
+        assert_eq!(wasm_exec(&m, 0, &[], 100).unwrap(), vec![Value::I64(8)]);
+    }
+
+    /// SP122-KAT-3: clz of 0 returns the type width (32 for i32, 64 for i64) per spec.
+    #[test]
+    fn sp122_kat_clz_of_zero_returns_width() {
+        let mut code = vec![0x41, 0x00, 0x67, 0x0B];
+        let _ = &mut code;
+        let m = build_module(&[], &[ValType::I32], &[], &code);
+        assert_eq!(wasm_exec(&m, 0, &[], 100).unwrap(), vec![Value::I32(32)]);
+
+        let mut code = vec![0x42, 0x00, 0x79, 0x0B];
+        let _ = &mut code;
+        let m = build_module(&[], &[ValType::I64], &[], &code);
+        assert_eq!(wasm_exec(&m, 0, &[], 100).unwrap(), vec![Value::I64(64)]);
+    }
+
+    /// SP122-KAT-4: i32.extend8_s sign-extends a signed-byte-shaped i32.
+    #[test]
+    fn sp122_kat_i32_extend8_s() {
+        // i32.const 0xFF (= 255 as low byte = -1 as i8); i32.extend8_s → -1
+        let mut code = vec![0x41];
+        write_i32_leb(&mut code, 0xFF);
+        code.extend_from_slice(&[0xC0, 0x0B]);
+        let m = build_module(&[], &[ValType::I32], &[], &code);
+        assert_eq!(wasm_exec(&m, 0, &[], 100).unwrap(), vec![Value::I32(-1)]);
+
+        // i32.const 0x7F (= 127 as i8); i32.extend8_s → 127 (positive; no sign-extension)
+        let mut code = vec![0x41];
+        write_i32_leb(&mut code, 0x7F);
+        code.extend_from_slice(&[0xC0, 0x0B]);
+        let m = build_module(&[], &[ValType::I32], &[], &code);
+        assert_eq!(wasm_exec(&m, 0, &[], 100).unwrap(), vec![Value::I32(127)]);
+    }
+
+    /// SP122-KAT-5: i32.extend16_s sign-extension at the 16-bit boundary.
+    #[test]
+    fn sp122_kat_i32_extend16_s() {
+        // i32.const 0xFFFF (= -1 as i16); i32.extend16_s → -1
+        let mut code = vec![0x41];
+        write_i32_leb(&mut code, 0xFFFF);
+        code.extend_from_slice(&[0xC1, 0x0B]);
+        let m = build_module(&[], &[ValType::I32], &[], &code);
+        assert_eq!(wasm_exec(&m, 0, &[], 100).unwrap(), vec![Value::I32(-1)]);
+    }
+
+    /// SP122-KAT-6: i64 sign-extension ops (extend8_s, extend16_s, extend32_s).
+    #[test]
+    fn sp122_kat_i64_sign_extensions() {
+        // i64.const 0xFF; i64.extend8_s → -1
+        let mut code = vec![0x42];
+        write_i64_leb(&mut code, 0xFF);
+        code.extend_from_slice(&[0xC2, 0x0B]);
+        let m = build_module(&[], &[ValType::I64], &[], &code);
+        assert_eq!(wasm_exec(&m, 0, &[], 100).unwrap(), vec![Value::I64(-1)]);
+
+        // i64.const 0xFFFF; i64.extend16_s → -1
+        let mut code = vec![0x42];
+        write_i64_leb(&mut code, 0xFFFF);
+        code.extend_from_slice(&[0xC3, 0x0B]);
+        let m = build_module(&[], &[ValType::I64], &[], &code);
+        assert_eq!(wasm_exec(&m, 0, &[], 100).unwrap(), vec![Value::I64(-1)]);
+
+        // i64.const 0xFFFF_FFFF; i64.extend32_s → -1
+        let mut code = vec![0x42];
+        write_i64_leb(&mut code, 0xFFFF_FFFF);
+        code.extend_from_slice(&[0xC4, 0x0B]);
+        let m = build_module(&[], &[ValType::I64], &[], &code);
+        assert_eq!(wasm_exec(&m, 0, &[], 100).unwrap(), vec![Value::I64(-1)]);
     }
 
     // ============================================================================

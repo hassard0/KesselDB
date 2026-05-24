@@ -13591,4 +13591,252 @@ mod tests {
         assert_eq!(at_max[0].1, a, "SP116 T1: oid_a A comes first by oid ordering");
         assert_eq!(at_max[1].1, b, "SP116 T1: oid_b B comes second");
     }
+
+    // -----------------------------------------------------------------------
+    // SP116 T3 — integration tests for the storage-layer transparent MVCC
+    // dispatch cutover. These prove the cutover end-to-end through the full
+    // apply-arm stack (Op::Create / Op::GetById / Op::Update / etc.), not
+    // just at the data_row_* helper boundary. Together they close the S2
+    // strategic-tier "data-row apply-arm cutover" claim:
+    //   - LegacyKeyspaceEmpty after data-row workload (THE invariant SP115
+    //     deferred + SP116 lands)
+    //   - MVCC keyspace IS populated after data-row workload
+    //   - 3-replica byte-identity via Storage::digest (digest filter +
+    //     MVCC dispatch compose: deterministic across replicas)
+    //   - Op::Create → Op::GetById round-trips through MVCC dispatch
+    //   - Mixed workload: Op::Create + Op::Update + Op::Delete + Op::GetById
+    //     all route through MVCC; final state is consistent
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a fresh SM with a minimal user-type defined for the
+    /// integration tests below. Returns the SM and the assigned type_id.
+    fn setup_widget_sm() -> (StateMachine<MemVfs>, u32) {
+        use kessel_catalog::FieldKind;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        let def = encode_type_def(
+            "widget",
+            &[Field {
+                field_id: 0,
+                name: "qty".into(),
+                kind: FieldKind::U64,
+                nullable: false,
+            }],
+        );
+        let r = sm.apply(1, Op::CreateType { def });
+        let tid = match r {
+            OpResult::TypeCreated(t) => t,
+            other => panic!("setup_widget_sm: CreateType must succeed; got {other:?}"),
+        };
+        (sm, tid)
+    }
+
+    /// Helper: encode a u64 qty as the widget record bytes.
+    fn widget_rec(sm: &StateMachine<MemVfs>, tid: u32, qty: u64) -> Vec<u8> {
+        use kessel_codec::value_from_raw;
+        use kessel_catalog::FieldKind;
+        let ot = sm.catalog.get(tid).unwrap().clone();
+        let vals =
+            vec![value_from_raw(FieldKind::U64, &qty.to_le_bytes())];
+        kessel_codec::encode(&ot, &vals).unwrap()
+    }
+
+    /// SP116 T3-1: LegacyKeyspaceEmpty integration gate.
+    ///
+    /// THE headline invariant — after a data-row workload, the legacy 20-byte
+    /// user-type keyspace MUST be empty. Every data-row write should land in
+    /// the 28-byte MVCC keyspace via the storage-layer dispatch.
+    #[test]
+    fn it_integration_legacy_data_row_keyspace_empty_after_workload() {
+        let (mut sm, tid) = setup_widget_sm();
+        // Apply 10 Op::Create of widget rows.
+        for i in 0..10u128 {
+            let oid = {
+                let mut a = [0u8; 16];
+                a[15] = i as u8;
+                a
+            };
+            let rec = widget_rec(&sm, tid, i as u64);
+            let r = sm.apply(i as u64 + 2, Op::Create {
+                type_id: tid,
+                id: ObjectId::from_u128(i),
+                record: rec,
+            });
+            assert!(matches!(r, OpResult::Ok), "Op::Create #{i} must succeed; got {r:?}");
+            // Suppress unused-variable warning while still asserting on oid.
+            let _ = oid;
+        }
+        // Scan the entire storage. Filter to 20-byte keys with type_id == tid
+        // (user-type data-row keys). MUST be empty — all writes went to MVCC.
+        let dump = sm.storage.scan_all();
+        let leaked: Vec<_> = dump
+            .iter()
+            .filter(|(k, _)| {
+                k.len() == 20
+                    && u32::from_le_bytes([k[0], k[1], k[2], k[3]]) == tid
+            })
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "SP116 T3 LegacyKeyspaceEmpty: post-cutover, NO 20-byte user-type \
+             (tid={tid}) data-row keys must appear in storage. Found {} leaked \
+             keys — the storage-layer MVCC dispatch failed for the data-row \
+             write path.",
+            leaked.len()
+        );
+    }
+
+    /// SP116 T3-2: MVCC keyspace IS populated after data-row workload.
+    ///
+    /// The dual of T3-1: prove the writes DID go somewhere — the 28-byte MVCC
+    /// keyspace must have entries for every Op::Create applied.
+    #[test]
+    fn it_integration_mvcc_keyspace_populated_after_workload() {
+        let (mut sm, tid) = setup_widget_sm();
+        for i in 0..7u128 {
+            let rec = widget_rec(&sm, tid, i as u64);
+            sm.apply(i as u64 + 2, Op::Create {
+                type_id: tid,
+                id: ObjectId::from_u128(i),
+                record: rec,
+            });
+        }
+        let dump = sm.storage.scan_all();
+        let mvcc_for_tid: Vec<_> = dump
+            .iter()
+            .filter(|(k, _)| {
+                k.len() == 28
+                    && u32::from_le_bytes([k[0], k[1], k[2], k[3]]) == tid
+            })
+            .collect();
+        assert_eq!(
+            mvcc_for_tid.len(),
+            7,
+            "SP116 T3: exactly 7 MVCC versioned entries for tid={tid} (one per Op::Create); got {}",
+            mvcc_for_tid.len()
+        );
+    }
+
+    /// SP116 T3-3: 3-replica byte-identity via Storage::digest.
+    ///
+    /// Drive the SAME data-row workload on 3 independent SMs. Storage::digest
+    /// (which now skips the 28-byte MVCC keyspace per Decision 1) MUST be
+    /// byte-identical across all 3 replicas — the digest filter + the
+    /// transparent MVCC dispatch compose without conflict.
+    #[test]
+    fn it_integration_3replica_data_row_workload_digest_identical() {
+        let workload: Vec<(u64, u128, u64)> = vec![
+            (2, 1, 10),
+            (3, 2, 20),
+            (4, 1, 11),  // Op::Update would also work; Op::Create is enough
+            (5, 3, 30),
+        ];
+        let digests: Vec<u32> = (0..3)
+            .map(|_| {
+                let (mut sm, tid) = setup_widget_sm();
+                for &(op, oid_n, qty) in &workload {
+                    let rec = widget_rec(&sm, tid, qty);
+                    // Op::Create for oid_n; if it Exists, fall back to Update.
+                    let id = ObjectId::from_u128(oid_n);
+                    let r1 = sm.apply(op, Op::Create { type_id: tid, id, record: rec.clone() });
+                    if matches!(r1, OpResult::Exists) {
+                        sm.apply(op, Op::Update { type_id: tid, id, record: rec });
+                    }
+                }
+                sm.digest()
+            })
+            .collect();
+        assert_eq!(
+            digests[0], digests[1],
+            "SP116 T3 3-replica byte-identity: replica 0 vs 1 must match (digests excludes MVCC; \
+             other state must be deterministic). Got {:#010x} vs {:#010x}",
+            digests[0], digests[1]
+        );
+        assert_eq!(
+            digests[1], digests[2],
+            "SP116 T3 3-replica byte-identity: replica 1 vs 2 must match. Got {:#010x} vs {:#010x}",
+            digests[1], digests[2]
+        );
+    }
+
+    /// SP116 T3-4: Op::Create → Op::GetById round-trip via MVCC dispatch.
+    ///
+    /// End-to-end proof that the SAME row written by Op::Create (now goes to
+    /// MVCC via storage-layer dispatch) is readable by Op::GetById (also goes
+    /// to MVCC via the same dispatch). Before SP116 T2 this is precisely the
+    /// case the per-arm cutover broke; with the storage-layer dispatch, both
+    /// sides agree by construction.
+    #[test]
+    fn it_integration_create_then_getbyid_roundtrip_via_mvcc() {
+        let (mut sm, tid) = setup_widget_sm();
+        let id = ObjectId::from_u128(0xDEAD_BEEF);
+        let rec = widget_rec(&sm, tid, 42);
+        let r1 = sm.apply(2, Op::Create { type_id: tid, id, record: rec.clone() });
+        assert!(matches!(r1, OpResult::Ok), "Op::Create must succeed; got {r1:?}");
+        let r2 = sm.apply(3, Op::GetById { type_id: tid, id });
+        match r2 {
+            OpResult::Got(v) => assert_eq!(
+                v, rec,
+                "SP116 T3 end-to-end: Op::GetById must return exactly the bytes Op::Create wrote"
+            ),
+            other => panic!(
+                "SP116 T3 end-to-end: Op::GetById on a fresh row MUST return Got(rec); got {other:?}"
+            ),
+        }
+    }
+
+    /// SP116 T3-5: mixed workload Op::Create + Op::Update + Op::Delete +
+    /// Op::GetById all route through MVCC; the final state is consistent.
+    ///
+    /// Locks the entire data-row contract under the cutover: create + update
+    /// the same row, then delete it; the final GetById sees NotFound; an
+    /// older snapshot read via data_row_get sees the prior version.
+    #[test]
+    fn it_integration_mixed_workload_create_update_delete_via_mvcc() {
+        let (mut sm, tid) = setup_widget_sm();
+        let id = ObjectId::from_u128(7);
+        let rec_v1 = widget_rec(&sm, tid, 100);
+        let rec_v2 = widget_rec(&sm, tid, 200);
+
+        // Op 2: Create at op=2 (commit_opnum=2 under MVCC).
+        sm.apply(2, Op::Create { type_id: tid, id, record: rec_v1.clone() });
+
+        // Op 3: Update at op=3 (new MVCC version superseding v1).
+        sm.apply(3, Op::Update { type_id: tid, id, record: rec_v2.clone() });
+
+        // Op 4: GetById sees v2 (latest committed at u64::MAX snapshot).
+        let r = sm.apply(4, Op::GetById { type_id: tid, id });
+        match r {
+            OpResult::Got(ref v) if v == &rec_v2 => {}
+            other => panic!("SP116 T3 mixed: GetById after Update must see v2; got {other:?}"),
+        }
+
+        // Op 5: Delete at op=5 (writes MVCC tombstone).
+        sm.apply(5, Op::Delete { type_id: tid, id });
+
+        // Op 6: GetById sees NotFound (tombstone collapses to None).
+        let r = sm.apply(6, Op::GetById { type_id: tid, id });
+        assert!(
+            matches!(r, OpResult::NotFound),
+            "SP116 T3 mixed: GetById after Delete must be NotFound (tombstone visible); got {r:?}"
+        );
+
+        // The MVCC history is preserved: data_row_get at snapshot=2 sees v1,
+        // at snapshot=3 sees v2, at snapshot=u64::MAX sees None (tombstoned).
+        let oid = id.0;
+        assert_eq!(
+            sm.data_row_get(tid, &oid, 2),
+            Some(rec_v1.clone()),
+            "SP116 T3 mixed: snapshot=2 must see v1 (write history preserved by MVCC)"
+        );
+        assert_eq!(
+            sm.data_row_get(tid, &oid, 3),
+            Some(rec_v2.clone()),
+            "SP116 T3 mixed: snapshot=3 must see v2"
+        );
+        assert_eq!(
+            sm.data_row_get(tid, &oid, u64::MAX),
+            None,
+            "SP116 T3 mixed: snapshot=u64::MAX must see tombstoned (None)"
+        );
+    }
 }

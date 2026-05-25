@@ -108,6 +108,15 @@ pub struct ServerConfig {
     /// off this field is ignored (the default build stays zero-dependency
     /// and plaintext+token — deploy behind a TLS proxy / private network).
     pub tls: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    /// SP141: HTTP/1.1 gateway address (opt-in via the `http-gateway`
+    /// feature). `None` = no plaintext gateway.
+    pub http_addr: Option<std::net::SocketAddr>,
+    /// SP141: HTTPS gateway address. Requires both `http-gateway` AND
+    /// `tls` features. `None` = no HTTPS gateway.
+    pub http_tls_addr: Option<std::net::SocketAddr>,
+    /// SP141: HTTP gateway body cap (default 8 MiB). Mirrors the binary
+    /// frame cap.
+    pub http_max_body: usize,
 }
 
 impl Default for ServerConfig {
@@ -117,6 +126,9 @@ impl Default for ServerConfig {
             max_conns: 1024,
             max_inflight: 4096,
             tls: None,
+            http_addr: None,
+            http_tls_addr: None,
+            http_max_body: 8 * 1024 * 1024,
         }
     }
 }
@@ -844,6 +856,54 @@ pub fn serve_cfg(listener: TcpListener, engine: EngineHandle, cfg: ServerConfig)
         return;
     }
 
+    // SP141: opt-in HTTP/1.1 gateway. Sibling threads; binary listener
+    // continues untouched.
+    #[cfg(feature = "http-gateway")]
+    if let Some(http_addr) = cfg.http_addr {
+        let engine_for_http = engine.clone();
+        let token_for_http = cfg.token.clone();
+        let max_conns = cfg.max_conns;
+        let max_body = cfg.http_max_body;
+        std::thread::spawn(move || {
+            match std::net::TcpListener::bind(http_addr) {
+                Ok(l) => kessel_http_gateway::serve(
+                    l,
+                    std::sync::Arc::new(engine_for_http) as
+                        std::sync::Arc<dyn kessel_http_gateway::EngineApply>,
+                    token_for_http,
+                    max_conns,
+                    max_body,
+                ),
+                Err(e) => eprintln!(
+                    "kesseldb: http-gateway bind {http_addr} failed: {e}"),
+            }
+        });
+    }
+    // HTTPS gateway requires both http-gateway AND tls features.
+    #[cfg(all(feature = "http-gateway", feature = "tls"))]
+    if let (Some(https_addr), Some(tls_arc)) =
+        (cfg.http_tls_addr, tls_acceptor.clone())
+    {
+        let engine_for_https = engine.clone();
+        let token_for_https = cfg.token.clone();
+        let max_conns = cfg.max_conns;
+        let max_body = cfg.http_max_body;
+        std::thread::spawn(move || {
+            match std::net::TcpListener::bind(https_addr) {
+                Ok(l) => kessel_http_gateway::serve_tls(
+                    l,
+                    RustlsAcceptor(tls_arc),
+                    std::sync::Arc::new(engine_for_https) as _,
+                    token_for_https,
+                    max_conns,
+                    max_body,
+                ),
+                Err(e) => eprintln!(
+                    "kesseldb: http-gateway HTTPS bind {https_addr} failed: {e}"),
+            }
+        });
+    }
+
     for stream in listener.incoming().flatten() {
         if active.load(Ordering::Acquire) >= cfg.max_conns {
             drop(stream); // at capacity — refuse
@@ -918,6 +978,22 @@ mod tls {
     }
 }
 
+// SP141 — RustlsAcceptor adapter: bridges the gateway's TlsAccept trait to
+// the existing rustls-based TLS termination machinery, so the gateway crate
+// stays rustls-dep-free while reusing the server's cert/key wiring.
+#[cfg(all(feature = "http-gateway", feature = "tls"))]
+struct RustlsAcceptor(std::sync::Arc<rustls::ServerConfig>);
+
+#[cfg(all(feature = "http-gateway", feature = "tls"))]
+impl kessel_http_gateway::TlsAccept for RustlsAcceptor {
+    type Stream =
+        rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>;
+    fn accept(&self, sock: std::net::TcpStream) -> Option<Self::Stream> {
+        let conn = rustls::ServerConnection::new(self.0.clone()).ok()?;
+        Some(rustls::StreamOwned::new(conn, sock))
+    }
+}
+
 /// Open the data dir and serve on `addr` (blocking), default config.
 pub fn run(addr: impl ToSocketAddrs, data_dir: impl AsRef<Path>) -> io::Result<()> {
     run_cfg(addr, data_dir, ServerConfig::default())
@@ -933,6 +1009,65 @@ pub fn run_cfg(
     let listener = TcpListener::bind(addr)?;
     serve_cfg(listener, engine, cfg);
     Ok(())
+}
+
+// SP141 — EngineApply bridge: lets the gateway dispatch into the existing
+// engine via the same single-threaded apply path used by the binary
+// listener. apply_op_with_session goes through session_frame so the engine's
+// exactly-once dedup map sees the same (client_id, req_seq) shape it does
+// from binary callers; apply_sql_with_session falls through to apply_sql
+// (V1 raw-SQL frames bypass session dedup — spec §11).
+#[cfg(feature = "http-gateway")]
+impl kessel_http_gateway::EngineApply for EngineHandle {
+    fn apply_op(&self, op: kessel_proto::Op) -> kessel_proto::OpResult {
+        self.apply(op)
+    }
+    fn apply_op_with_session(
+        &self,
+        client: kessel_proto::ClientId,
+        req: u64,
+        op: kessel_proto::Op,
+    ) -> kessel_proto::OpResult {
+        let frame = kessel_client::session_frame(client, req, &op);
+        self.apply_raw(frame)
+    }
+    fn apply_sql(&self, sql: &str) -> kessel_proto::OpResult {
+        let mut f = vec![0xFE];
+        f.extend_from_slice(sql.as_bytes());
+        self.apply_raw(f)
+    }
+    fn apply_sql_with_session(
+        &self,
+        _client: kessel_proto::ClientId,
+        _req: u64,
+        sql: &str,
+    ) -> kessel_proto::OpResult {
+        // SP141 V1: SQL-with-session routes through apply_sql (no
+        // (client_id, req_seq) dedup for raw-SQL frames — matches the
+        // binary path's behavior for [0xFE]++SQL frames sent outside a
+        // session_frame envelope). Documented in spec §11 open questions.
+        self.apply_sql(sql)
+    }
+    fn snapshot_health(&self) -> kessel_http_gateway::HealthSnapshot {
+        let s = self.stats();
+        kessel_http_gateway::HealthSnapshot {
+            primary: true,
+            view: 0,
+            op_number: s.applied_ops,
+            role: "primary",
+        }
+    }
+    fn snapshot_metrics(&self) -> kessel_http_gateway::MetricsSnapshot {
+        // T6 fills this; T4 ships the placeholder so /v1/health works.
+        kessel_http_gateway::MetricsSnapshot {
+            ops_total: Vec::new(),
+            inflight: 0,
+            last_op_number: 0,
+            view_number: 0,
+            is_primary: true,
+            http_requests_total: Vec::new(),
+        }
+    }
 }
 
 #[cfg(all(test, feature = "tls"))]

@@ -30,6 +30,18 @@ pub trait EngineApply: Send + Sync + 'static {
     /// `[0xFE] ++ sql_bytes` and dispatches through `apply_raw`.
     fn apply_sql(&self, sql: &str) -> OpResult;
 
+    /// Apply raw SQL under a (client_id, req_seq) exactly-once binding.
+    /// `kesseldb-server`'s impl wraps the SQL as `[0xFE] ++ sql_bytes` and
+    /// routes through the engine's existing session-aware raw path (or, in
+    /// V1, simply falls through to `apply_sql` if session dedup for raw-SQL
+    /// frames is not yet wired — documented in spec §11 open questions).
+    fn apply_sql_with_session(
+        &self,
+        client: ClientId,
+        req: u64,
+        sql: &str,
+    ) -> OpResult;
+
     /// Snapshot of liveness state for `GET /v1/health`. Cheap — three
     /// integers + a bool — no engine apply.
     fn snapshot_health(&self) -> HealthSnapshot;

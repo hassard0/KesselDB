@@ -12,3 +12,12 @@ kessel-client = { path = "../kessel-client" }
 
 [lib]
 path = "src/lib.rs"
+
+[features]
+default = []
+test-server = []
+
+[dev-dependencies]
+kesseldb-server = { path = "../kesseldb-server", features = ["http-gateway"] }
+kessel-proto = { path = "../kessel-proto" }
+kessel-client = { path = "../kessel-client" }

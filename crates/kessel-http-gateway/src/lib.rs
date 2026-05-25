@@ -19,4 +19,4 @@ pub mod routes;
 pub mod server;
 
 pub use engine::{EngineApply, HealthSnapshot, HttpRequestCounter, MetricsSnapshot, OpKindCounter};
-pub use server::serve;
+pub use server::{serve, serve_tls, TlsAccept, DEFAULT_MAX_CONNS};

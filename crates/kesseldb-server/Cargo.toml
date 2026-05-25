@@ -34,12 +34,17 @@ kessel-crypto = { path = "../kessel-crypto", optional = true }
 # router signs requests router-side (env-resolved creds, never logged).
 kessel-objstore = { path = "../kessel-objstore", optional = true }
 
+# SP141 opt-in HTTP/1.1 gateway. OFF by default — default build links no
+# extra crate. Enable with `cargo build --features http-gateway`.
+kessel-http-gateway = { path = "../kessel-http-gateway", optional = true }
+
 [features]
 default = []
 tls = ["dep:rustls", "dep:rustls-pemfile"]
 external-sources = ["dep:kessel-fetch", "dep:kessel-crypto"]
 external-sources-tls = ["external-sources", "kessel-fetch/tls", "dep:rustls", "dep:rustls-pemfile"]
 external-sources-objstore = ["external-sources", "kessel-fetch/object-store", "dep:kessel-objstore", "dep:rustls", "dep:rustls-pemfile"]
+http-gateway = ["dep:kessel-http-gateway"]
 
 [dev-dependencies]
 kessel-expr = { path = "../kessel-expr" }

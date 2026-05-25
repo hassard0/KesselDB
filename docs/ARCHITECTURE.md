@@ -27,6 +27,8 @@ VSR reimplementation verifiable rather than hopeful.
 
 **Optional (feature-gated, behind `--features external-sources*`):**
 `kessel-fetch` (HTTP/HTTPS/object-store reader) ·
+`kessel-http-gateway` (opt-in HTTP/1.1 surface, behind `--features http-gateway`;
+zero external (non-workspace) deps) ·
 `kessel-objstore` (S3 SigV4 + Azure Shared-Key signers) ·
 `kessel-parquet` (zero-dep Parquet reader — Snappy/GZIP/zstd + V1/V2 +
 PLAIN/dict + REQUIRED/OPTIONAL + INT96/DECIMAL/FLBA + sub-modules
@@ -246,3 +248,28 @@ transparent MVCC dispatch preserves linearizability across the full VSR +
 MVCC stack under partition + message loss. `Cluster::drive_until_digests_converge`
 extends the simulation past replies-complete so isolated minority replicas
 finish state-transfer + catch up.
+
+### Listeners (with `--features http-gateway`)
+
+When `kesseldb-server` is built with the opt-in `http-gateway` feature, it
+runs TWO sibling listener threads (or three with `--features http-gateway,tls`):
+
+1. **Binary wire** on the primary port — the deterministic hot path; this
+   is what the SP69 pipelined-batch perf number measures and what every
+   replication / VSR / Jepsen oracle exercises.
+2. **HTTP gateway** on `ServerConfig.http_addr` — translates HTTP/1.1
+   requests into the same engine apply path via the
+   `kessel_http_gateway::EngineApply` trait that `EngineHandle` impls.
+3. **HTTPS gateway** on `ServerConfig.http_tls_addr` (with `tls` feature)
+   — same gateway, TLS-terminated via the existing rustls config used by
+   the binary listener.
+
+Each listener has its own `max_conns` cap (per-listener, not joint — so a
+saturated HTTP gateway can never starve the binary protocol). The shared
+engine `max_inflight` cap bounds total in-flight ops across all listeners
+honestly.
+
+The gateway crate `kessel-http-gateway` has zero external (non-workspace)
+runtime dependencies. The default `cargo build -p kesseldb-server` (without
+`--features http-gateway`) does not link the gateway crate — `cargo tree`
+verifies the binary stays untouched.

@@ -6,7 +6,7 @@
 
 *"It's the database that made the Kessel Run in 12 parsecs."*
 
-`891 tests green` · `0 external dependencies in the kernel` · `Rust 1.95+` · single‑binary
+`931 default tests green / 958 with --features kessel-http-gateway/test-server` · `0 external dependencies in the kernel` · `Rust 1.95+` · single‑binary
 
 </div>
 
@@ -85,8 +85,17 @@ feature, not an aspiration.
   (`--features external-sources`, default off; `--features
   external-sources-objstore` for S3/Azure + Parquet; deterministic kernel
   unaffected when off.)
+- **HTTP/1.1 gateway (opt‑in `--features http-gateway`)** — full Op
+  surface + SQL + `/v1/health` + `/v1/metrics` (Prometheus text v0.0.4)
+  on a sibling TCP listener (`ServerConfig.http_addr`; HTTPS on
+  `http_tls_addr` with the `tls` feature). `Authorization: Bearer`
+  constant‑time, optional `X-Kessel-Client-Id` + `X-Kessel-Req-Seq`
+  exactly‑once headers. JSON responses via the existing
+  `kessel_client::format_result_json` contract. Binary protocol
+  byte‑untouched; zero external (non‑workspace) deps on the gateway
+  crate. See `docs/USAGE.md` §HTTP gateway.
 - **Deterministic & verifiable** — the whole engine is a seedable state machine;
-  the test suite (890 tests, 0 ignored) includes seeded partition/fault
+  the test suite (931 default tests / 958 with `--features kessel-http-gateway/test-server`, 0 ignored) includes seeded partition/fault
   simulation, multi‑replica Jepsen, hand‑derived KATs against published
   spec text for every codec, and adversarial pentests for every public input
   surface.
@@ -101,7 +110,7 @@ cargo build --release
 
 # start a node:  kesseldb [LISTEN_ADDR] [DATA_DIR]
 cargo run --release --bin kesseldb -- 127.0.0.1:7878 ./data
-# Workspace gate: 891 tests, 0 ignored
+# Workspace gate: 931 default tests, 0 ignored (958 with --features kessel-http-gateway/test-server)
 cargo test --workspace --release
 ```
 
@@ -285,7 +294,7 @@ Honest boundaries (documented, not hidden):
   `Delete`); cross‑shard scatter‑gather *reads*/SQL text routing is a
   separate, later concern from cross‑shard *transactions*.
 
-Every claim in this repository is backed by the test suite (`891 tests, 0 ignored`); the
+Every claim in this repository is backed by the test suite (`931 default tests / 958 with --features kessel-http-gateway/test-server, 0 ignored`); the
 docs call out exactly what is proven versus roadmap. The four
 **strategic‑tier items S1–S4** (TLA+/model‑checked safety, serializable
 MVCC/SI, Jepsen linearizability under partition, deterministic WASM
@@ -312,7 +321,7 @@ records (SP109 / SP110‑SP116 / SP117 / SP118).
 
 ```bash
 cargo build                 # all kernel crates, zero external deps
-cargo test --workspace      # 891 tests (incl. seeded partition/fault sim,
+cargo test --workspace      # 931 default tests / 958 with --features kessel-http-gateway/test-server (incl. seeded partition/fault sim,
                             # Jepsen linearizability, MVCC TLA+ refinement,
                             # pyarrow Parquet round-trips, WASM-MVP KATs)
 cargo run -p kessel-bench --release -- --help   # benchmarks

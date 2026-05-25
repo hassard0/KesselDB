@@ -984,6 +984,8 @@ run_cfg("0.0.0.0:7878", "./data", ServerConfig {
 would require bundling cryptography and break the zero‑dependency design). Run it
 behind a TLS‑terminating reverse proxy, or on a private/encrypted network
 (WireGuard, tailnet, VPC). The wire is plaintext but token‑authenticated.
+Or build with `--features http-gateway,tls` to terminate HTTPS in-process on
+`ServerConfig.http_tls_addr` — see §HTTP gateway below.
 
 ## 9. Backup & monitoring
 
@@ -1036,3 +1038,108 @@ length framing. `kessel-client` implements all of it.
 
 For internals see [`docs/ARCHITECTURE.md`](ARCHITECTURE.md); for exactly what is
 proven vs. roadmap and the performance log see [`docs/STATUS.md`](STATUS.md).
+
+## HTTP gateway
+
+Opt-in HTTP/1.1 surface for operators, browsers, and tools that prefer
+HTTP/JSON over the binary wire protocol. Built with
+`cargo build --release -p kesseldb-server --features http-gateway` (add
+`,tls` for HTTPS). The binary wire protocol is byte-untouched and remains
+the default + fast path; the gateway runs on a sibling TCP listener.
+
+### Configuration
+
+```rust
+let cfg = kesseldb_server::ServerConfig {
+    http_addr: Some("127.0.0.1:6789".parse().unwrap()),
+    http_tls_addr: Some("127.0.0.1:6790".parse().unwrap()), // requires `tls`
+    tls: Some((cert_pem.into(), key_pem.into())),           // requires `tls`
+    token: Some(b"my-token".to_vec()),                      // optional Bearer
+    ..Default::default()
+};
+```
+
+### Routes
+
+| Method | Path | Body | Response |
+|---|---|---|---|
+| POST | `/v1/sql` | `text/plain` SQL | JSON `OpResult` |
+| POST | `/v1/op` | `application/x-kessel-op` binary `Op::encode()` | JSON `OpResult` |
+| GET | `/v1/health` | — | JSON liveness |
+| GET | `/v1/metrics` | — | Prometheus text v0.0.4 |
+
+### Auth
+
+In token mode (`ServerConfig.token == Some(...)`), every request must carry
+`Authorization: Bearer <token>` (constant-time compared, RFC 6750 §2.1
+case-insensitive scheme). In open mode the header is ignored. Mismatched
+or missing in token mode → HTTP `401` with `{"status":"unauthorized"}`.
+
+### Exactly-once (optional)
+
+Add the headers `X-Kessel-Client-Id: <32-char lowercase hex u128>` and
+`X-Kessel-Req-Seq: <decimal u64>` together to bind the request to the
+engine's per-client dedup map — retrying the same `(client_id, req_seq)`
+returns the cached `OpResult`. Both-or-neither (one alone → `400`).
+Duplicate `Authorization` / `X-Kessel-Client-Id` / `X-Kessel-Req-Seq`
+headers are rejected at parse-time per the exactly-once contract.
+
+### curl examples
+
+```bash
+# Health
+curl -s http://127.0.0.1:6789/v1/health
+# → {"status":"ok","primary":true,"view":0,"op_number":42,"role":"primary"}
+
+# SQL
+curl -s -X POST --data-binary 'CREATE TABLE t (v U64 NOT NULL)' \
+  -H 'Content-Type: text/plain' \
+  http://127.0.0.1:6789/v1/sql
+# → {"status":"ok"}
+
+# Metrics (for Prometheus scrape)
+curl -s http://127.0.0.1:6789/v1/metrics
+# → # HELP kesseldb_ops_total Number of Ops applied since process start.
+#   # TYPE kesseldb_ops_total counter
+#   kesseldb_ops_total{kind="applied"} 1234
+#   ...
+
+# Token mode
+curl -s -H 'Authorization: Bearer my-token' \
+  http://127.0.0.1:6789/v1/health
+```
+
+### Error mapping (excerpt — full table in spec §4.4)
+
+| Body / situation | HTTP status |
+|---|---|
+| `OpResult::Ok` and most variants | 200 |
+| `OpResult::Unauthorized` (engine denied) | 401 |
+| `OpResult::Unavailable` (engine in-flight cap) | 429 |
+| `OpResult::Unavailable` (cluster — no primary) | 503 |
+| Body > 8 MiB (default cap; configurable via `http_max_body`) | 413 |
+| Request line / headers > 64 KiB | 414 |
+| Missing `Content-Length` on POST | 411 |
+| Wrong `Content-Type` | 415 |
+| `Expect: 100-continue` with body (V1 unsupported) | 417 |
+| Conflicting `Content-Length` + `Transfer-Encoding` | 400 |
+| Duplicate `Host` header | 400 |
+| Differing `Content-Length` headers | 400 |
+| Malformed chunked encoding | 400 |
+| Unsupported `Transfer-Encoding` (V1 supports only `chunked`) | 400 |
+
+Full mapping: `docs/superpowers/specs/2026-05-24-kesseldb-http-gateway-design.md` §4.4.
+
+### Prometheus metrics (bounded cardinality)
+
+- `kesseldb_ops_total{kind="applied"}` — counter
+- `kesseldb_inflight` — gauge
+- `kesseldb_last_op_number` — gauge
+- `kesseldb_view_number` — gauge
+- `kesseldb_is_primary` — gauge (0 or 1)
+- `kesseldb_http_requests_total{path,status}` — counter (V1: empty; wiring in follow-up)
+
+### Spec + design
+
+- Spec: `docs/superpowers/specs/2026-05-24-kesseldb-http-gateway-design.md`
+- Internal record: `docs/superpowers/specs/2026-05-24-kesseldb-subproject141-http-gateway.md`

@@ -149,32 +149,35 @@ use kessel_http_gateway::parse::{
 
 #[test]
 fn kat_chunked_simple() {
-    // RFC 9112 §7.1 — two chunks then terminator. "Hello" = 5 bytes; chunk
-    // size in hex.
+    // RFC 9112 §7.1 — one chunk then terminator. "Hello" = 5 bytes; chunk
+    // size in hex. `dechunk` reports the full byte count consumed including
+    // the trailer-section CRLF that closes the chunk-stream.
     let body = b"5\r\nHello\r\n0\r\n\r\n";
-    let decoded = dechunk(body, 1024).expect("simple chunked decodes");
+    let (decoded, consumed) = dechunk(body, 1024).expect("simple chunked decodes");
     assert_eq!(decoded, b"Hello");
+    assert_eq!(consumed, body.len());
 }
 
 #[test]
 fn kat_chunked_two_chunks() {
     let body = b"5\r\nHello\r\n6\r\n World\r\n0\r\n\r\n";
-    let decoded = dechunk(body, 1024).expect("two-chunk decodes");
+    let (decoded, consumed) = dechunk(body, 1024).expect("two-chunk decodes");
     assert_eq!(decoded, b"Hello World");
+    assert_eq!(consumed, body.len());
 }
 
 #[test]
 fn kat_chunked_truncated_missing_crlf_after_data() {
     let body = b"5\r\nHello"; // no trailing CRLF, no 0-chunk
     let err = dechunk(body, 1024).unwrap_err();
-    assert!(format!("{:?}", err).contains("BadChunk"), "got {:?}", err);
+    assert!(matches!(err, ParseError::BadChunk(_)), "got {:?}", err);
 }
 
 #[test]
 fn kat_chunked_bad_size_hex() {
     let body = b"zz\r\nHello\r\n0\r\n\r\n";
     let err = dechunk(body, 1024).unwrap_err();
-    assert!(format!("{:?}", err).contains("BadChunk"), "got {:?}", err);
+    assert!(matches!(err, ParseError::BadChunk(_)), "got {:?}", err);
 }
 
 #[test]
@@ -182,30 +185,30 @@ fn kat_chunked_exceeds_cap() {
     // 8 bytes total, cap 4 → BodyTooLarge.
     let body = b"5\r\nHello\r\n3\r\n!!!\r\n0\r\n\r\n";
     let err = dechunk(body, 4).unwrap_err();
-    assert!(format!("{:?}", err).contains("BodyTooLarge"), "got {:?}", err);
+    assert_eq!(err, ParseError::BodyTooLarge);
 }
 
 #[test]
 fn kat_decode_body_content_length_under_cap() {
     let buf = b"hello";
-    let decoded = decode_body(buf, Some(5), false, 1024).unwrap();
+    let (decoded, consumed) = decode_body(buf, Some(5), false, 1024).unwrap();
     assert_eq!(decoded.as_ref(), b"hello");
+    assert_eq!(consumed, 5);
 }
 
 #[test]
 fn kat_decode_body_content_length_over_cap() {
     let buf = b"hello";
     let err = decode_body(buf, Some(5), false, 4).unwrap_err();
-    assert!(format!("{:?}", err).contains("BodyTooLarge"), "got {:?}", err);
+    assert_eq!(err, ParseError::BodyTooLarge);
 }
 
 #[test]
 fn kat_decode_body_both_te_and_cl_rejected() {
     let buf = b"5\r\nHello\r\n0\r\n\r\n";
-    // chunked=true AND content_length=Some → 400.
+    // chunked=true AND content_length=Some → ConflictingFraming.
     let err = decode_body(buf, Some(5), true, 1024).unwrap_err();
-    assert!(format!("{:?}", err).contains("ConflictingFraming"),
-            "got {:?}", err);
+    assert_eq!(err, ParseError::ConflictingFraming);
 }
 
 #[test]
@@ -213,20 +216,36 @@ fn kat_bearer_extraction() {
     let headers = vec![
         ("Authorization".into(), "Bearer abc123def".into()),
     ];
-    let tok = extract_bearer(&headers).expect("bearer present");
+    let tok = extract_bearer(&headers).expect("ok").expect("bearer present");
     assert_eq!(tok, b"abc123def");
 }
 
 #[test]
 fn kat_bearer_missing() {
     let headers: Vec<(String, String)> = Vec::new();
-    assert!(extract_bearer(&headers).is_none());
+    assert!(extract_bearer(&headers).expect("ok").is_none());
 }
 
 #[test]
 fn kat_bearer_wrong_scheme() {
     let headers = vec![("Authorization".into(), "Basic abc".into())];
-    assert!(extract_bearer(&headers).is_none());
+    assert!(extract_bearer(&headers).expect("ok").is_none());
+}
+
+#[test]
+fn kat_bearer_scheme_case_insensitive() {
+    // RFC 6750 §2.1 — scheme name is case-insensitive ("bearer" / "BEARER"
+    // must both be accepted). Token bytes preserve original casing.
+    for (name, scheme) in [
+        ("lowercase", "bearer abc123"),
+        ("UPPERCASE", "BEARER abc123"),
+        ("MiXeD",     "BeArEr abc123"),
+    ] {
+        let headers = vec![("Authorization".into(), scheme.to_string())];
+        let tok = extract_bearer(&headers).expect("ok").unwrap_or_else(||
+            panic!("{name} scheme should match"));
+        assert_eq!(tok, b"abc123", "{name} token preserved");
+    }
 }
 
 #[test]
@@ -246,14 +265,14 @@ fn kat_client_id_non_hex_rejected() {
         "GG23456789abcdef0123456789abcdef".into(),
     )];
     let err = extract_client_id(&headers).unwrap_err();
-    assert!(format!("{:?}", err).contains("BadHeaderValue"), "got {:?}", err);
+    assert!(matches!(err, ParseError::BadHeaderValue(_)), "got {:?}", err);
 }
 
 #[test]
 fn kat_client_id_wrong_length() {
     let headers = vec![("X-Kessel-Client-Id".into(), "abc".into())];
     let err = extract_client_id(&headers).unwrap_err();
-    assert!(format!("{:?}", err).contains("BadHeaderValue"), "got {:?}", err);
+    assert!(matches!(err, ParseError::BadHeaderValue(_)), "got {:?}", err);
 }
 
 #[test]
@@ -267,5 +286,78 @@ fn kat_req_seq_decimal() {
 fn kat_req_seq_non_decimal() {
     let headers = vec![("X-Kessel-Req-Seq".into(), "abc".into())];
     let err = extract_req_seq(&headers).unwrap_err();
-    assert!(format!("{:?}", err).contains("BadHeaderValue"), "got {:?}", err);
+    assert!(matches!(err, ParseError::BadHeaderValue(_)), "got {:?}", err);
+}
+
+// ---------------------------------------------------------------------------
+// T3 fix KATs: parse_request-level smuggling primitives + exactly-once
+// extractor enforcement. The 3 smuggling fixes in parse_request used to only
+// have decode_body-unit coverage; these exercise the full-request path.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn kat_parse_request_rejects_duplicate_host() {
+    // RFC 9112 §3.2 — a request MUST contain exactly one Host header.
+    let bytes = b"GET /v1/health HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n";
+    let err = parse_request(bytes).unwrap_err();
+    assert_eq!(err, ParseError::DuplicateHost);
+}
+
+#[test]
+fn kat_parse_request_rejects_differing_content_length() {
+    // RFC 9112 §6.3.5 — multiple Content-Length values that disagree are
+    // a smuggling primitive; reject before any byte is decoded.
+    let bytes = b"POST /v1/sql HTTP/1.1\r\nHost: h\r\n\
+                  Content-Type: text/plain\r\n\
+                  Content-Length: 5\r\nContent-Length: 6\r\n\r\nhello";
+    let err = parse_request(bytes).unwrap_err();
+    assert_eq!(err, ParseError::DuplicateContentLength);
+}
+
+#[test]
+fn kat_parse_request_rejects_te_plus_cl() {
+    // RFC 9112 §6.1 — Transfer-Encoding and Content-Length together is a
+    // smuggling primitive; reject the request.
+    let bytes = b"POST /v1/sql HTTP/1.1\r\nHost: h\r\n\
+                  Content-Type: text/plain\r\n\
+                  Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\
+                  \r\n5\r\nHello\r\n0\r\n\r\n";
+    let err = parse_request(bytes).unwrap_err();
+    assert_eq!(err, ParseError::ConflictingFraming);
+}
+
+#[test]
+fn kat_parse_request_rejects_te_non_chunked() {
+    // RFC 9112 §7 — V1 only supports the `chunked` token; anything else
+    // (gzip/identity/deflate/comma-list) is rejected.
+    let bytes = b"POST /v1/sql HTTP/1.1\r\nHost: h\r\n\
+                  Content-Type: text/plain\r\n\
+                  Transfer-Encoding: gzip\r\n\r\nhello";
+    let err = parse_request(bytes).unwrap_err();
+    assert!(matches!(err, ParseError::UnsupportedTransferEncoding(_)),
+            "got {:?}", err);
+}
+
+#[test]
+fn kat_extract_bearer_rejects_duplicate_authorization() {
+    // Authorization is an exactly-once header — duplicates would let a peer
+    // smuggle a second token past header-aware proxies.
+    let headers = vec![
+        ("Authorization".into(), "Bearer a".into()),
+        ("Authorization".into(), "Bearer b".into()),
+    ];
+    let err = extract_bearer(&headers).unwrap_err();
+    assert!(matches!(err, ParseError::DuplicateHeader(_)), "got {:?}", err);
+}
+
+#[test]
+fn kat_extract_client_id_rejects_duplicate() {
+    let headers = vec![
+        ("X-Kessel-Client-Id".into(),
+         "0123456789abcdef0123456789abcdef".into()),
+        ("X-Kessel-Client-Id".into(),
+         "fedcba9876543210fedcba9876543210".into()),
+    ];
+    let err = extract_client_id(&headers).unwrap_err();
+    assert!(matches!(err, ParseError::DuplicateHeader(_)), "got {:?}", err);
 }

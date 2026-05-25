@@ -51,6 +51,8 @@ pub enum ParseError {
     MissingHost,
     Ipv6LiteralHost,
     LengthRequired,
+    /// Generic catch-all for malformed header values that don't fit a more
+    /// specific variant (e.g. missing colon, non-decimal Content-Length).
     BadHeaderValue(String),
     NoHeaderTerminator,
     HeaderTooLarge,
@@ -58,6 +60,23 @@ pub enum ParseError {
     ShortBody,
     /// T3 adds these.
     BodyTooLarge,
+    /// Both `Content-Length` and `Transfer-Encoding` present in the same
+    /// request — RFC 9112 §6.1 smuggling primitive; reject.
+    ConflictingFraming,
+    /// Duplicate `Host` header. RFC 9112 §3.2.
+    DuplicateHost,
+    /// Differing `Content-Length` values across multiple Content-Length
+    /// headers. RFC 9112 §6.3.5.
+    DuplicateContentLength,
+    /// A duplicate single-instance header (Authorization, X-Kessel-Client-Id,
+    /// X-Kessel-Req-Seq). The String carries the header name.
+    DuplicateHeader(String),
+    /// Malformed chunked transfer-encoding (bad size, missing CRLF, etc.).
+    /// The String carries a debugging detail.
+    BadChunk(String),
+    /// Transfer-Encoding token other than `chunked` (V1 only supports
+    /// chunked). The String carries the offending token for diagnostics.
+    UnsupportedTransferEncoding(String),
 }
 
 /// Parse one HTTP/1.1 request. Returns `Ok(Request)` if well-formed AND
@@ -94,8 +113,7 @@ pub fn parse_request(buf: &[u8]) -> Result<Request<'_>, ParseError> {
         if name.eq_ignore_ascii_case("host") {
             // RFC 9112 §3.2 — duplicate Host is a smuggling primitive; reject.
             if host.is_some() {
-                return Err(ParseError::BadHeaderValue(
-                    "duplicate Host header".into()));
+                return Err(ParseError::DuplicateHost);
             }
             if value.starts_with('[') {
                 return Err(ParseError::Ipv6LiteralHost);
@@ -113,8 +131,7 @@ pub fn parse_request(buf: &[u8]) -> Result<Request<'_>, ParseError> {
                 ParseError::BadHeaderValue(format!("Content-Length: {value:?}")))?;
             if let Some(existing) = content_length {
                 if existing != new {
-                    return Err(ParseError::BadHeaderValue(
-                        format!("conflicting Content-Length: {existing} vs {new}")));
+                    return Err(ParseError::DuplicateContentLength);
                 }
             } else {
                 content_length = Some(new);
@@ -126,8 +143,7 @@ pub fn parse_request(buf: &[u8]) -> Result<Request<'_>, ParseError> {
             if value.eq_ignore_ascii_case("chunked") {
                 chunked = true;
             } else {
-                return Err(ParseError::BadHeaderValue(
-                    format!("unsupported Transfer-Encoding: {value:?}")));
+                return Err(ParseError::UnsupportedTransferEncoding(value.clone()));
             }
         }
         headers.push((name, value));
@@ -136,8 +152,7 @@ pub fn parse_request(buf: &[u8]) -> Result<Request<'_>, ParseError> {
 
     // RFC 9112 §6.1 — if BOTH framings are present, reject (smuggling).
     if chunked && content_length.is_some() {
-        return Err(ParseError::BadHeaderValue(
-            "ConflictingFraming: both Content-Length and Transfer-Encoding".into()));
+        return Err(ParseError::ConflictingFraming);
     }
 
     let body: Cow<'_, [u8]>;
@@ -150,20 +165,13 @@ pub fn parse_request(buf: &[u8]) -> Result<Request<'_>, ParseError> {
         Method::Post => {
             let body_start = header_end;
             let remaining = buf.get(body_start..).unwrap_or(&[]);
-            let decoded = decode_body(
+            let (decoded, body_consumed_bytes) = decode_body(
                 remaining, content_length, chunked, DEFAULT_MAX_BODY)?;
             // `consumed` reports headers + framed-body-bytes-on-the-wire.
             // For Content-Length that's exactly `cl`; for chunked it's the
-            // entire `remaining` (we required a 0-CRLF-CRLF terminator).
-            let on_wire = match (content_length, chunked) {
-                (Some(cl), false) => usize::try_from(cl).map_err(|_|
-                    ParseError::BodyTooLarge)?,
-                (None, true) => remaining.len(),
-                // The (Some, true) and (None, false) cases already errored
-                // inside decode_body — unreachable here.
-                _ => 0,
-            };
-            consumed = body_start.checked_add(on_wire).ok_or(
+            // exact byte count `dechunk` walked (post-0-CRLF trailer CRLF
+            // included).
+            consumed = body_start.checked_add(body_consumed_bytes).ok_or(
                 ParseError::BodyTooLarge)?;
             body = decoded;
         }
@@ -212,17 +220,18 @@ fn is_known_path(p: &str) -> bool {
     matches!(p, "/v1/sql" | "/v1/op" | "/v1/health" | "/v1/metrics")
 }
 
-/// Decode the body slice according to framing headers. Returns `Cow::Borrowed`
-/// for the Content-Length path (zero-copy) and `Cow::Owned` for chunked.
+/// Decode the body slice according to framing headers. Returns the decoded
+/// body bytes plus the number of bytes consumed from `buf` (which equals
+/// `cl` for Content-Length and the exact chunk-stream length for chunked).
+/// `Cow::Borrowed` for Content-Length (zero-copy) and `Cow::Owned` for chunked.
 pub fn decode_body<'a>(
     buf: &'a [u8],
     content_length: Option<u64>,
     chunked: bool,
     max_body: usize,
-) -> Result<Cow<'a, [u8]>, ParseError> {
+) -> Result<(Cow<'a, [u8]>, usize), ParseError> {
     match (content_length, chunked) {
-        (Some(_), true) => Err(ParseError::BadHeaderValue(
-            "ConflictingFraming: both Content-Length and Transfer-Encoding".into())),
+        (Some(_), true) => Err(ParseError::ConflictingFraming),
         (None, false) => Err(ParseError::LengthRequired),
         (Some(cl), false) => {
             let cl_usize = usize::try_from(cl).map_err(|_|
@@ -233,67 +242,107 @@ pub fn decode_body<'a>(
             if buf.len() < cl_usize {
                 return Err(ParseError::ShortBody);
             }
-            Ok(Cow::Borrowed(buf.get(..cl_usize).unwrap_or(&[])))
+            Ok((Cow::Borrowed(buf.get(..cl_usize).unwrap_or(&[])), cl_usize))
         }
         (None, true) => {
-            let owned = dechunk(buf, max_body)?;
-            Ok(Cow::Owned(owned))
+            let (owned, consumed) = dechunk(buf, max_body)?;
+            Ok((Cow::Owned(owned), consumed))
         }
     }
 }
 
 /// Decode RFC 9112 §7.1 chunked transfer-encoding. Cap on the OUTPUT length —
 /// a lying chunk-size header can't exhaust memory because we check against
-/// `max_body` on every appended chunk.
-pub fn dechunk(mut b: &[u8], max_body: usize) -> Result<Vec<u8>, ParseError> {
+/// `max_body` on every appended chunk. Returns `(decoded, consumed)` where
+/// `consumed` is the number of bytes from `b` that belonged to the
+/// chunk-stream (last-chunk `0\r\n` + trailer-section CRLF inclusive).
+pub fn dechunk(b: &[u8], max_body: usize) -> Result<(Vec<u8>, usize), ParseError> {
+    let start_len = b.len();
+    let mut b = b;
     let mut out: Vec<u8> = Vec::new();
     loop {
         let nl = b.windows(2).position(|w| w == b"\r\n").ok_or(
-            ParseError::BadHeaderValue("BadChunk: missing chunk-size CRLF".into()))?;
+            ParseError::BadChunk("missing chunk-size CRLF".into()))?;
         let line = std::str::from_utf8(b.get(..nl).unwrap_or(&[])).map_err(|_|
-            ParseError::BadHeaderValue("BadChunk: chunk-size not ASCII".into()))?;
+            ParseError::BadChunk("chunk-size not ASCII".into()))?;
         // Strip any chunk-ext after a ';'.
         let size_hex = line.split(';').next().unwrap_or("").trim();
         let size = usize::from_str_radix(size_hex, 16).map_err(|_|
-            ParseError::BadHeaderValue("BadChunk: bad chunk size".into()))?;
+            ParseError::BadChunk("bad chunk size".into()))?;
         b = b.get(nl + 2..).unwrap_or(&[]);
         if size == 0 {
-            return Ok(out);
+            // RFC 9112 §7.1: last-chunk = "0" CRLF (above), then
+            // trailer-section, then a final CRLF. We don't support trailers,
+            // so the only thing we expect here is a bare CRLF closing the
+            // trailer-section. Consume it if present so `consumed` reflects
+            // the full chunk-stream length.
+            if let Some(rest) = b.strip_prefix(b"\r\n") {
+                b = rest;
+            }
+            return Ok((out, start_len - b.len()));
         }
-        if b.len() < size + 2 {
-            return Err(ParseError::BadHeaderValue(
-                "BadChunk: short chunk-data or missing trailing CRLF".into()));
+        // CRITICAL: a lying `size` like `ffffffffffffffff` parses to
+        // `usize::MAX`; `size + 2` would panic in debug or wrap to 1 in
+        // release. Use `checked_add` so any chunk-size that overflows the
+        // address space is treated as oversized body, not arithmetic UB.
+        let needed = size.checked_add(2).ok_or(ParseError::BodyTooLarge)?;
+        if b.len() < needed {
+            return Err(ParseError::BadChunk(
+                "short chunk-data or missing trailing CRLF".into()));
         }
         if out.len().saturating_add(size) > max_body {
             return Err(ParseError::BodyTooLarge);
         }
         out.extend_from_slice(b.get(..size).unwrap_or(&[]));
-        b = b.get(size + 2..).unwrap_or(&[]);
+        b = b.get(needed..).unwrap_or(&[]);
     }
 }
 
-/// Extract `Authorization: Bearer <token>` value as raw bytes, or None if
-/// the header is absent / scheme is not Bearer.
-pub fn extract_bearer(headers: &[(String, String)]) -> Option<&[u8]> {
+/// Extract `Authorization: Bearer <token>` value as raw bytes, or `Ok(None)`
+/// if the header is absent / scheme is not Bearer. Returns
+/// `Err(DuplicateHeader)` if the header appears more than once — Authorization
+/// is an exactly-once header per the gateway spec, and accepting duplicates
+/// would let a peer smuggle a second token past header-aware proxies.
+pub fn extract_bearer(headers: &[(String, String)]) -> Result<Option<&[u8]>, ParseError> {
+    let mut found: Option<&[u8]> = None;
+    let mut seen = false;
     for (name, value) in headers {
         if name.eq_ignore_ascii_case("authorization") {
-            if let Some(tok) = value.strip_prefix("Bearer ") {
-                return Some(tok.as_bytes());
+            if seen {
+                return Err(ParseError::DuplicateHeader("Authorization".into()));
             }
+            seen = true;
+            // RFC 6750 §2.1 — the `Bearer` scheme name is case-insensitive.
+            // Match the scheme via a lowercase comparison while preserving
+            // the original casing of the token bytes that follow.
+            let lower = value.to_ascii_lowercase();
+            if let Some(rest) = lower.strip_prefix("bearer ") {
+                let token_start = value.len() - rest.len();
+                found = Some(value.as_bytes().get(token_start..).unwrap_or(&[]));
+            }
+            // Wrong scheme → treated as "no Bearer found", not an error.
         }
     }
-    None
+    Ok(found)
 }
 
 /// Extract `X-Kessel-Client-Id` as a `u128`. Returns:
 ///   Ok(Some(id)) when present and well-formed (32 lowercase hex chars),
 ///   Ok(None) when absent,
-///   Err(BadHeaderValue) when present but malformed.
+///   Err(BadHeaderValue) when present but malformed,
+///   Err(DuplicateHeader) when the header appears more than once.
 pub fn extract_client_id(
     headers: &[(String, String)],
 ) -> Result<Option<u128>, ParseError> {
+    let mut found: Option<u128> = None;
+    let mut seen = false;
     for (name, value) in headers {
         if name.eq_ignore_ascii_case("x-kessel-client-id") {
+            if seen {
+                return Err(ParseError::DuplicateHeader(
+                    "X-Kessel-Client-Id".into()));
+            }
+            seen = true;
             if value.len() != 32 {
                 return Err(ParseError::BadHeaderValue(
                     format!("X-Kessel-Client-Id length {} (want 32)", value.len())));
@@ -304,23 +353,30 @@ pub fn extract_client_id(
             }
             let id = u128::from_str_radix(value, 16).map_err(|e|
                 ParseError::BadHeaderValue(format!("X-Kessel-Client-Id parse: {e}")))?;
-            return Ok(Some(id));
+            found = Some(id);
         }
     }
-    Ok(None)
+    Ok(found)
 }
 
 /// Extract `X-Kessel-Req-Seq` as a `u64` (decimal). Same shape as
-/// `extract_client_id`.
+/// `extract_client_id`: exactly-once, duplicates rejected.
 pub fn extract_req_seq(
     headers: &[(String, String)],
 ) -> Result<Option<u64>, ParseError> {
+    let mut found: Option<u64> = None;
+    let mut seen = false;
     for (name, value) in headers {
         if name.eq_ignore_ascii_case("x-kessel-req-seq") {
+            if seen {
+                return Err(ParseError::DuplicateHeader(
+                    "X-Kessel-Req-Seq".into()));
+            }
+            seen = true;
             let seq = value.parse::<u64>().map_err(|e|
                 ParseError::BadHeaderValue(format!("X-Kessel-Req-Seq parse: {e}")))?;
-            return Ok(Some(seq));
+            found = Some(seq);
         }
     }
-    Ok(None)
+    Ok(found)
 }

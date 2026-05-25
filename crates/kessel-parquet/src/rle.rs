@@ -50,7 +50,17 @@ pub fn decode_hybrid(
     // caller's expected count, itself bounded upstream by the page
     // header's dp_num_values (SP101 Task-12 capped). We NEVER reserve
     // from a run-length/group-count read out of the (attacker) header.
-    let mut out: Vec<u64> = Vec::with_capacity(num_values);
+    //
+    // SP143 T10 defense-in-depth: cap the INITIAL reservation so a
+    // direct caller passing a hostile `num_values` (e.g. 1e9) can't
+    // OOM-abort via `Vec::with_capacity(1e9)` ~= 8 GB pre-reserve.
+    // The vec still grows as values are pushed; growth is bounded by
+    // the input data's bit-packed/RLE run capacity which the loop
+    // validates with `data.get(..)?`. So a tiny payload claiming
+    // num_values=1e9 cannot actually produce 1e9 values without
+    // bailing on `truncated`/`run truncated` first.
+    const RLE_INITIAL_CAP: usize = 64 * 1024; // 64 K * 8 B = 512 KB upper bound
+    let mut out: Vec<u64> = Vec::with_capacity(num_values.min(RLE_INITIAL_CAP));
     let val_bytes = ((bit_width as usize) + 7) / 8; // ceil; 0 when bw==0
     let mut pos = 0usize;
 

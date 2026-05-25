@@ -117,6 +117,15 @@ pub fn assemble_list_primitive(
 
     let n = rep_levels.len();
     if n == 0 {
+        // SP143 T10: even when there are no levels, a non-empty values
+        // vec is malformed input (the value stream MUST be drained by
+        // present-item def levels). Reject typed Bad — never silently
+        // discard.
+        if !values.is_empty() {
+            return Err(PqError::Bad(format!(
+                "no levels but {} values supplied", values.len()
+            )));
+        }
         return Ok(Vec::new());
     }
 

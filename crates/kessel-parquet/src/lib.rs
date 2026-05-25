@@ -5686,3 +5686,307 @@ mod nested_decode_tests {
         assert_eq!(values, vec![PqValue::I64(10), PqValue::I64(20)]);
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────
+// SP143 T10: adversarial pentest matrix for List<primitive> nested decode.
+//
+// Every test below is wrapped in `std::panic::catch_unwind` and asserts:
+//   (1) NO panic / NO OOM-abort on hostile input
+//   (2) returns a TYPED `PqError` (Bad or Unsupported), not Ok
+//
+// Spec reference: docs/superpowers/specs/2026-05-25-kesseldb-parquet-
+// nested-list-design.md §4 (13-row pentest matrix). Each `pt<N>_…` test
+// below maps 1:1 to a spec row; the few rows that are already covered
+// by the T5/T6/T7 unit suites (and would require crate-private schema
+// builders to re-prove here) are tagged with `_covered_by` documentation.
+//
+// Direct-stream approach (Steps 2/3 of T10): we call
+// `assemble_list_primitive`, `decode_page_v1_nested`,
+// `decode_data_page_v2_nested`, and `rle::decode_hybrid` directly with
+// hand-built byte arrays / level vecs. This isolates the decode layer
+// from the full-file pipeline (which is independently pentested in
+// `mod pentest` / `mod pentest_v2`).
+// ────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod sp143_pentest {
+    use super::*;
+    use crate::assembly::assemble_list_primitive;
+    use std::panic::catch_unwind;
+
+    /// Asserts a closure does not panic AND returns Err of any typed
+    /// PqError variant. Mirrors `pentest::no_panic_typed_err` but for
+    /// the direct-call (no full-file) pentest layer.
+    fn assert_well_behaved_err<F, T>(name: &str, f: F)
+    where
+        F: FnOnce() -> Result<T, PqError> + std::panic::UnwindSafe,
+    {
+        let r = catch_unwind(f);
+        match r {
+            Ok(Ok(_)) => panic!("{name}: expected Err, got Ok"),
+            Ok(Err(_)) => { /* OK — typed error */ }
+            Err(_) => panic!("{name}: PANICKED on adversarial input"),
+        }
+    }
+
+    // ── Row 1: def value > max_def_level ─────────────────────────────
+    // OPT-REP-OPT shape: max_def=2. A def stream containing 3 (> max)
+    // must be rejected by `classify`.
+    #[test]
+    fn pt1_def_level_overflow() {
+        assert_well_behaved_err("def overflow", || {
+            assemble_list_primitive(
+                &[0u32, 0],
+                &[3u32, 1],
+                &[PqValue::I64(1)],
+                2,
+                false,
+                true,
+            )
+        });
+    }
+
+    // ── Row 2: rep value > max_rep_level ─────────────────────────────
+    // Single-level LIST has max_rep=1 by construction. A rep stream
+    // containing 2 must be rejected at the per-position rep>1 guard.
+    #[test]
+    fn pt2_rep_level_overflow() {
+        assert_well_behaved_err("rep overflow", || {
+            assemble_list_primitive(
+                &[0u32, 2],
+                &[1u32, 1],
+                &[PqValue::I64(1), PqValue::I64(2)],
+                1,
+                false,
+                false,
+            )
+        });
+    }
+
+    // ── Row 3: bit_width > 64 in the level-decoder ───────────────────
+    // The rle::decode_hybrid validates bit_width ≤ 64 up front and
+    // returns Bad on overflow. (Spec mentions bit_width=33; we test
+    // 65 which is the actual rejection boundary — 33 is a legal value
+    // for u32-wide outputs.) Call decode_hybrid directly.
+    #[test]
+    fn pt3_bit_width_too_large() {
+        use crate::rle::decode_hybrid;
+        assert_well_behaved_err("bit_width too large", || {
+            decode_hybrid(&[0x01, 0x02, 0x03], 65, 4)
+        });
+    }
+
+    // ── Row 4: rep_levels_byte_length > V2 page payload ──────────────
+    // decode_data_page_v2_nested guards `lvl_end > payload.len()` with
+    // a typed Bad before any slice. rep_len=100 against a 5-byte
+    // payload triggers the guard.
+    #[test]
+    fn pt4_v2_rep_section_overrun() {
+        assert_well_behaved_err("v2 rep section overrun", || {
+            decode_data_page_v2_nested(
+                &[0u8; 5],
+                0, // PLAIN
+                plain::PlainSpec::plain(meta::Type::Int64),
+                3,   // n
+                1,   // max_rep_level
+                1,   // max_def_level
+                100, // rep_levels_byte_length — LIES (> payload.len())
+                0,   // def_levels_byte_length
+                false,
+                meta::Codec::Uncompressed,
+                10,
+                &[],
+            )
+        });
+    }
+
+    // ── Row 5: value stream truncated (def says present, no value) ───
+    // REQ-REP-REQ: max_def=1, 3 positions all "present", but values
+    // vec has only 1 element. Assembler returns Bad("value stream
+    // exhausted").
+    #[test]
+    fn pt5_value_stream_truncated() {
+        assert_well_behaved_err("value truncated", || {
+            assemble_list_primitive(
+                &[0u32, 1, 1],
+                &[1u32, 1, 1],
+                &[PqValue::I64(1)], // only 1 value, def implies 3
+                1,
+                false,
+                false,
+            )
+        });
+    }
+
+    // ── Row 6: value stream overrun (values vec longer than implied) ─
+    // OPT-REP-REQ: max_def=2. One ItemPresent, but values vec has 2.
+    // Assembler returns Bad("values not fully consumed").
+    #[test]
+    fn pt6_value_stream_overrun() {
+        assert_well_behaved_err("value overrun", || {
+            assemble_list_primitive(
+                &[0u32],
+                &[2u32],
+                &[PqValue::I64(1), PqValue::I64(2)],
+                2,
+                true,
+                false,
+            )
+        });
+    }
+
+    // ── Row 7: rep_levels and def_levels lengths differ ──────────────
+    // First-line invariant in assemble_list_primitive.
+    #[test]
+    fn pt7_rep_def_length_mismatch() {
+        assert_well_behaved_err("len mismatch", || {
+            assemble_list_primitive(
+                &[0u32, 1, 0], // 3 reps
+                &[1u32, 1],    // 2 defs
+                &[PqValue::I64(1), PqValue::I64(2)],
+                1,
+                false,
+                false,
+            )
+        });
+    }
+
+    // ── Row 8: rep level far above max (e.g. 5 for max_rep=1) ────────
+    // Same guard as Row 2 but with a value way above the bit_width
+    // implied by max_rep_level — exercises that the assembler's rep>1
+    // check fires before any over-decoded level slips through.
+    #[test]
+    fn pt8_rep_level_far_overflow() {
+        assert_well_behaved_err("rep far overflow", || {
+            assemble_list_primitive(
+                &[0u32, 5],
+                &[1u32, 1],
+                &[PqValue::I64(1)],
+                1,
+                false,
+                false,
+            )
+        });
+    }
+
+    // ── Row 9: rep=1 at first position (no active list) ──────────────
+    // A continuation marker can only appear after an open list; the
+    // very first position with rep=1 must be rejected.
+    #[test]
+    fn pt9_rep1_without_active_list() {
+        assert_well_behaved_err("rep1 first", || {
+            assemble_list_primitive(
+                &[1u32, 0],
+                &[1u32, 1],
+                &[PqValue::I64(1), PqValue::I64(2)],
+                1,
+                false,
+                false,
+            )
+        });
+    }
+
+    // ── Row 10: def implies item-null but element is REQUIRED ────────
+    // OPT outer + REP + REQ element: max_def=3 hypothetically (the
+    // canonical such shape has max_def=2 = outer_opt + rep, so def=2
+    // is ItemPresent). But hostile inputs can lie about max_def_level
+    // and produce a def value strictly between the empty-list
+    // threshold and max → the classifier sees ItemNull but the schema
+    // says REQ element → returns Bad ("def N implies item null but
+    // element is REQUIRED").
+    #[test]
+    fn pt10_item_null_with_required_element() {
+        assert_well_behaved_err("item null with REQ element", || {
+            assemble_list_primitive(
+                &[0u32],
+                &[2u32],
+                &[],
+                3,
+                true,
+                false,
+            )
+        });
+    }
+
+    // ── Row 11: empty level streams but non-empty values ─────────────
+    // 0 levels + N values: should return Bad ("values not fully
+    // consumed") — the empty-input short-circuit must still validate
+    // the value stream is also empty.
+    #[test]
+    fn pt11_empty_streams_with_values() {
+        assert_well_behaved_err("empty streams with values", || {
+            assemble_list_primitive(
+                &[],
+                &[],
+                &[PqValue::I64(1)],
+                1,
+                false,
+                false,
+            )
+        });
+    }
+
+    // ── Row 12: huge num_values claim into the level decoder ─────────
+    // decode_hybrid is the lowest-level RLE decoder; it must NOT
+    // attempt `Vec::with_capacity(num_values)` with a hostile huge
+    // num_values (8 GB for 1e9 u64 → process OOM-abort). The T10
+    // fix caps initial capacity to RLE_INITIAL_CAP and lets the vec
+    // grow naturally; the bit-packed/RLE run loop will bail on the
+    // first truncated payload byte. Confirm: typed Err, no OOM.
+    #[test]
+    fn pt12_huge_num_values_no_oom() {
+        use crate::rle::decode_hybrid;
+        assert_well_behaved_err("huge num_values direct", || {
+            // 1-byte payload, ask for 1e9 values: decoder must bail
+            // on the first run/header read (input exhaustion), NOT
+            // pre-allocate Vec<u64> of 1e9 capacity.
+            decode_hybrid(&[0x00], 1, 1_000_000_000)
+        });
+    }
+
+    // ── Row 12b: same OOM-defense via the nested page-level path ─────
+    // End-to-end variant: the V1 nested page decoder receives a tiny
+    // payload but the upstream caller claims n=1e9. Must bail typed
+    // Err, no OOM, no panic.
+    #[test]
+    fn pt12b_huge_n_via_page_v1_nested_no_oom() {
+        assert_well_behaved_err("huge n via v1 nested page", || {
+            // 5 bytes payload: a 4-byte u32 LE level-length prefix
+            // of 1 + 1 byte of (truncated) level data. The
+            // decode_level_v1 length prefix says "1 byte of level
+            // data", which is way too few for 1e9 levels →
+            // decode_hybrid bails on input exhaustion.
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&1u32.to_le_bytes());
+            payload.push(0x00);
+            decode_page_v1_nested(
+                &payload,
+                0, // PLAIN
+                plain::PlainSpec::plain(meta::Type::Int64),
+                1_000_000_000, // n — HOSTILE
+                1,             // max_rep_level
+                1,             // max_def_level
+                &[],
+            )
+        });
+    }
+
+    // ── Row 13: deep / non-canonical nesting — _covered_by_T6 ────────
+    // T6 (commit b15bc7d) added classify_column_plan rejections for:
+    //   • List<group<…>>  → Unsupported(SP145)
+    //   • non-canonical 3-node LIST pattern → Bad
+    //   • Map / struct columns → Unsupported(SP144)
+    // Those rejections fire BEFORE any nested page decoder is invoked;
+    // proving them again here would require constructing a full
+    // FileMetaData with a hostile schema thrift, which is materially
+    // covered by T6 unit tests and (end-to-end) by `mod pentest`'s
+    // `pentest_opt_non_flat_schema_unsupported_no_panic` test. T10's
+    // mandate is the decode-layer adversarial surface; the schema
+    // gate is upstream of that surface. Inline-skip with rationale.
+    #[test]
+    fn pt13_deep_nesting_rejected_covered_by_t6() {
+        // Documentation-only: see T6 commit b15bc7d for the actual
+        // classify_column_plan rejection paths. This test exists so
+        // the spec row's coverage is explicit in the test suite
+        // namespace (sp143_pentest::pt13_…) for traceability.
+    }
+}

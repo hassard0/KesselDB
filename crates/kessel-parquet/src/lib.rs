@@ -467,6 +467,268 @@ fn decode_data_page_v2(
     }
 }
 
+/// SP143 T4: minimum bits needed to represent `max_level` values in
+/// `0..=max_level`. `max_level == 0` → 0 (level stream is absent /
+/// degenerate). Matches the Parquet/Dremel definition: `bit_width =
+/// ceil(log2(max_level + 1))`, computed as `32 - leading_zeros`.
+fn bit_width_for_max(max_level: u32) -> u32 {
+    if max_level == 0 {
+        0
+    } else {
+        32 - max_level.leading_zeros()
+    }
+}
+
+/// SP143 T4: dispatch the values-section bytes of a NESTED page to the
+/// right encoding. Mirrors the inline `match dp_encoding { 0|2|8|_ }`
+/// of the flat `decode_page`/`decode_data_page_v2`, but takes the
+/// `present`-count rather than `n`.  PLAIN takes a raw value payload;
+/// `2|8` (PLAIN_DICTIONARY / RLE_DICTIONARY) take the standard
+/// `<1-byte bit_width><hybrid-stream>` layout — i.e. the WHOLE
+/// dictionary-data-page body. The `Unsupported(...)` message uses the
+/// same "data page encoding (...): OBJ-2c" phrasing as the flat path so
+/// the dispatch is uniform.
+fn decode_values_by_encoding(
+    payload: &[u8],
+    encoding: i32,
+    spec: plain::PlainSpec,
+    n: usize,
+    dict: &[PqValue],
+) -> Result<Vec<PqValue>, PqError> {
+    match encoding {
+        0 => plain::decode_plain(payload, spec, n),
+        2 | 8 => dict::resolve_dict_indices(payload, dict, n),
+        _ => Err(PqError::Unsupported(
+            "data page encoding (DELTA/BYTE_STREAM_SPLIT): OBJ-2c".into(),
+        )),
+    }
+}
+
+/// SP143 T4: V1 page decode for NESTED columns
+/// (`max_rep_level > 0` OR `max_def_level > 1`). Returns the parallel
+/// `(rep_levels, def_levels, values)` triple the upcoming Dremel
+/// assembler (T5/T6) will fold into `PqValue::List(...)`.
+///
+/// V1 page layout for a NESTED column:
+/// ```text
+///   [4-byte LE u32 rep_len][rep_data: hybrid, bit_width=ceil(log2(max_rep+1))]
+///   [4-byte LE u32 def_len][def_data: hybrid, bit_width=ceil(log2(max_def+1))]
+///   [value section: dp_encoding bytes, COUNT = number of def==max_def slots]
+/// ```
+/// `max_rep_level == 0` SKIPS the rep section entirely (no length prefix
+/// either — same convention as `decode_page`'s `max_def_level == 0`
+/// arm for the def section). Rep/def levels are range-validated against
+/// their max (Bad on overrun) to defeat malformed hybrid headers whose
+/// repeated-value byte has high bits set (same defense the flat path
+/// applies for `max_def_level==1`, generalized here).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn decode_page_v1_nested(
+    payload: &[u8],
+    dp_encoding: i32,
+    spec: plain::PlainSpec,
+    n: usize,
+    max_rep_level: u32,
+    max_def_level: u32,
+    dict: &[PqValue],
+) -> Result<(Vec<u32>, Vec<u32>, Vec<PqValue>), PqError> {
+    let mut cursor: &[u8] = payload;
+    // Rep section (V1: 4-byte LE length prefix + hybrid).
+    let rep_levels: Vec<u32> = if max_rep_level == 0 {
+        vec![0u32; n]
+    } else {
+        let bw = bit_width_for_max(max_rep_level);
+        let (levels_u64, consumed) = rle::decode_level_v1(cursor, bw, n)?;
+        if levels_u64.len() != n {
+            return Err(PqError::Bad("nested v1 rep-level count != num_values".into()));
+        }
+        cursor = cursor
+            .get(consumed..)
+            .ok_or_else(|| PqError::Bad("nested v1 rep section consumed past payload".into()))?;
+        let mut out = Vec::with_capacity(levels_u64.len());
+        for l in levels_u64 {
+            if l > max_rep_level as u64 {
+                return Err(PqError::Bad(format!(
+                    "nested v1 rep level {l} > max {max_rep_level}"
+                )));
+            }
+            out.push(l as u32);
+        }
+        out
+    };
+    // Def section (V1: 4-byte LE length prefix + hybrid).
+    let def_levels: Vec<u32> = if max_def_level == 0 {
+        vec![0u32; n]
+    } else {
+        let bw = bit_width_for_max(max_def_level);
+        let (levels_u64, consumed) = rle::decode_level_v1(cursor, bw, n)?;
+        if levels_u64.len() != n {
+            return Err(PqError::Bad("nested v1 def-level count != num_values".into()));
+        }
+        cursor = cursor
+            .get(consumed..)
+            .ok_or_else(|| PqError::Bad("nested v1 def section consumed past payload".into()))?;
+        let mut out = Vec::with_capacity(levels_u64.len());
+        for l in levels_u64 {
+            if l > max_def_level as u64 {
+                return Err(PqError::Bad(format!(
+                    "nested v1 def level {l} > max {max_def_level}"
+                )));
+            }
+            out.push(l as u32);
+        }
+        out
+    };
+    let present_count = def_levels.iter().filter(|&&d| d == max_def_level).count();
+    let values = decode_values_by_encoding(cursor, dp_encoding, spec, present_count, dict)?;
+    if values.len() != present_count {
+        return Err(PqError::Bad(
+            "nested v1 value count != present (def==max_def) count".into(),
+        ));
+    }
+    Ok((rep_levels, def_levels, values))
+}
+
+/// SP143 T4: V2 page decode for NESTED columns.
+///
+/// V2 page layout (NO 4-byte length prefix on the level sections — the
+/// `rep_levels_byte_length`/`def_levels_byte_length` page-header fields
+/// give the byte lengths directly):
+/// ```text
+///   [rep_data: rep_len bytes RAW hybrid]
+///   [def_data: def_len bytes RAW hybrid]
+///   [values: (uncompressed_page_size - rep_len - def_len) bytes,
+///    independently compressed iff ph.v2_is_compressed (per the V2
+///    flat-path convention in decode_data_page_v2)]
+/// ```
+/// `max_rep_level == 0` REQUIRES `rep_len == 0` (Bad otherwise); same
+/// for def. Rep/def levels are range-validated. The values section is
+/// decompressed the same way as the flat V2 path (Snappy/Gzip/Zstd/
+/// Uncompressed) — `is_compressed=false` overrides the column codec to
+/// raw (matches `decode_data_page_v2`'s `_ if !ph.v2_is_compressed`
+/// override).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn decode_data_page_v2_nested(
+    payload: &[u8],
+    dp_encoding: i32,
+    spec: plain::PlainSpec,
+    n: usize,
+    max_rep_level: u32,
+    max_def_level: u32,
+    rep_levels_byte_length: u32,
+    def_levels_byte_length: u32,
+    is_compressed: bool,
+    codec: meta::Codec,
+    uncompressed_page_size: u32,
+    dict: &[PqValue],
+) -> Result<(Vec<u32>, Vec<u32>, Vec<PqValue>), PqError> {
+    let rep_len = rep_levels_byte_length as usize;
+    let def_len = def_levels_byte_length as usize;
+    let lvl_end = rep_len
+        .checked_add(def_len)
+        .ok_or_else(|| PqError::Bad("nested v2 level len ovf".into()))?;
+    if lvl_end > payload.len() {
+        return Err(PqError::Bad("nested v2 level sections exceed page".into()));
+    }
+    // Rep section: raw hybrid, NO length prefix.
+    let rep_bytes = payload
+        .get(..rep_len)
+        .ok_or_else(|| PqError::Bad("nested v2 rep slice".into()))?;
+    let rep_levels: Vec<u32> = if max_rep_level == 0 {
+        if rep_len != 0 {
+            return Err(PqError::Bad("nested v2 rep_len non-zero for max_rep_level=0".into()));
+        }
+        vec![0u32; n]
+    } else {
+        let bw = bit_width_for_max(max_rep_level);
+        let levels_u64 = rle::decode_hybrid(rep_bytes, bw, n)?;
+        if levels_u64.len() != n {
+            return Err(PqError::Bad("nested v2 rep-level count != num_values".into()));
+        }
+        let mut out = Vec::with_capacity(levels_u64.len());
+        for l in levels_u64 {
+            if l > max_rep_level as u64 {
+                return Err(PqError::Bad(format!(
+                    "nested v2 rep level {l} > max {max_rep_level}"
+                )));
+            }
+            out.push(l as u32);
+        }
+        out
+    };
+    // Def section: raw hybrid, NO length prefix.
+    let def_bytes = payload
+        .get(rep_len..lvl_end)
+        .ok_or_else(|| PqError::Bad("nested v2 def slice".into()))?;
+    let def_levels: Vec<u32> = if max_def_level == 0 {
+        if def_len != 0 {
+            return Err(PqError::Bad("nested v2 def_len non-zero for max_def_level=0".into()));
+        }
+        vec![0u32; n]
+    } else {
+        let bw = bit_width_for_max(max_def_level);
+        let levels_u64 = rle::decode_hybrid(def_bytes, bw, n)?;
+        if levels_u64.len() != n {
+            return Err(PqError::Bad("nested v2 def-level count != num_values".into()));
+        }
+        let mut out = Vec::with_capacity(levels_u64.len());
+        for l in levels_u64 {
+            if l > max_def_level as u64 {
+                return Err(PqError::Bad(format!(
+                    "nested v2 def level {l} > max {max_def_level}"
+                )));
+            }
+            out.push(l as u32);
+        }
+        out
+    };
+    // Values section: decompressed per V2 convention (mirrors
+    // decode_data_page_v2's codec arm, including the per-page
+    // is_compressed=false override).
+    let values_section = payload
+        .get(lvl_end..)
+        .ok_or_else(|| PqError::Bad("nested v2 values slice".into()))?;
+    let uncomp = uncompressed_page_size as usize;
+    let vt = uncomp
+        .checked_sub(lvl_end)
+        .ok_or_else(|| PqError::Bad("nested v2 values target underflow".into()))?;
+    let values_raw: std::borrow::Cow<[u8]> = match codec {
+        meta::Codec::Uncompressed => std::borrow::Cow::Borrowed(values_section),
+        _ if !is_compressed => std::borrow::Cow::Borrowed(values_section),
+        meta::Codec::Snappy => std::borrow::Cow::Owned(snappy::decompress(values_section, vt)?),
+        meta::Codec::Gzip => std::borrow::Cow::Owned(gzip::decompress(values_section, vt)?),
+        meta::Codec::Zstd => {
+            let decoded = zstd::decompress(values_section)
+                .map_err(|e| PqError::Bad(format!("nested v2 zstd values decode: {e:?}")))?;
+            if decoded.len() != vt {
+                return Err(PqError::Bad(format!(
+                    "nested v2 zstd values decompressed size {} != target {}",
+                    decoded.len(),
+                    vt
+                )));
+            }
+            std::borrow::Cow::Owned(decoded)
+        }
+        meta::Codec::Other(_) => {
+            return Err(PqError::Unsupported(
+                "compression codec (lz4/brotli): OBJ-2c".into(),
+            ))
+        }
+    };
+    if (matches!(codec, meta::Codec::Uncompressed) || !is_compressed)
+        && values_section.len() != vt
+    {
+        return Err(PqError::Bad("nested v2 raw values length mismatch".into()));
+    }
+    let present_count = def_levels.iter().filter(|&&d| d == max_def_level).count();
+    let values = decode_values_by_encoding(&values_raw, dp_encoding, spec, present_count, dict)?;
+    if values.len() != present_count {
+        return Err(PqError::Bad(
+            "nested v2 value count != present (def==max_def) count".into(),
+        ));
+    }
+    Ok((rep_levels, def_levels, values))
+}
+
 /// Read one column chunk's values across all its pages.
 /// Flat REQUIRED or OPTIONAL, UNCOMPRESSED or SNAPPY, V1. Supports: an
 /// optional leading DICTIONARY_PAGE then zero-or-more DATA_PAGEs; each data
@@ -4509,5 +4771,96 @@ mod pentest_int96_decimal {
             extract(&f, &["d"]).expect("flba i128::MIN"),
             vec![vec![PqValue::Decimal { unscaled: i128::MIN, scale: 0 }]]
         );
+    }
+}
+
+#[cfg(test)]
+mod nested_decode_tests {
+    //! SP143 T4: KATs for the multi-bit rep/def-level decode sibling
+    //! helpers. Hand-built payloads (no reliance on a Parquet writer)
+    //! prove the V1 (length-prefixed) and V2 (raw) layout difference
+    //! is correctly routed to `decode_level_v1` vs `decode_hybrid`.
+    //!
+    //! Scenario: a `List<Optional<i64>>` column with `max_rep_level=1`
+    //! and `max_def_level=3`. One logical record with list = [10, null, 20]:
+    //!   - rep = [0, 1, 1] (start of record, continue list, continue list)
+    //!   - def = [3, 2, 3] (item present, item null, item present)
+    //!   - values = [10, 20] (only the two present slots)
+    //!
+    //! Hand-derived bit-packed bytes:
+    //!   rep, bit_width=1, 3 values [0,1,1] padded to 8 with zeros:
+    //!     header = (1 << 1) | 1 = 0x03   (1 group of 8, bit-packed)
+    //!     payload byte = bit0=0, bit1=1, bit2=1, bits3-7=0
+    //!                  = 0b00000110 = 0x06
+    //!     => rep_data = [0x03, 0x06]      (rep_len = 2)
+    //!
+    //!   def, bit_width=2, 3 values [3,2,3] padded to 8 with zeros:
+    //!     header = (1 << 1) | 1 = 0x03
+    //!     byte0 bits (0-1)=3=11, (2-3)=2=10, (4-5)=3=11, (6-7)=0=00
+    //!         = 0b00_11_10_11 = 0x3B
+    //!     byte1 = remaining 5 zero values @ 2 bits each = 0x00
+    //!     => def_data = [0x03, 0x3B, 0x00] (def_len = 3)
+    //!
+    //!   values, PLAIN INT64 [10, 20] = 16 bytes LE.
+    use super::*;
+
+    #[test]
+    fn nested_v1_decode_one_rep_three_def_levels() {
+        let mut payload = Vec::new();
+        // V1: 4-byte LE u32 length prefix on each level section.
+        payload.extend_from_slice(&2u32.to_le_bytes());           // rep_len = 2
+        payload.extend_from_slice(&[0x03, 0x06]);                  // rep_data
+        payload.extend_from_slice(&3u32.to_le_bytes());           // def_len = 3
+        payload.extend_from_slice(&[0x03, 0x3B, 0x00]);            // def_data
+        payload.extend_from_slice(&10i64.to_le_bytes());           // value 0
+        payload.extend_from_slice(&20i64.to_le_bytes());           // value 1
+
+        let (rep, def, values) = decode_page_v1_nested(
+            &payload,
+            0, // dp_encoding: PLAIN
+            plain::PlainSpec::plain(meta::Type::Int64),
+            3, // n = num_values
+            1, // max_rep_level
+            3, // max_def_level
+            &[],
+        )
+        .expect("nested v1 decode");
+
+        assert_eq!(rep, vec![0u32, 1, 1]);
+        assert_eq!(def, vec![3u32, 2, 3]);
+        assert_eq!(values, vec![PqValue::I64(10), PqValue::I64(20)]);
+    }
+
+    #[test]
+    fn nested_v2_decode_one_rep_three_def_levels_uncompressed() {
+        // V2: NO 4-byte length prefix on the level sections — the byte
+        // lengths come from rep_levels_byte_length / def_levels_byte_length
+        // arguments (i.e. the page-header fields).
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0x03, 0x06]);                  // rep_data, 2 bytes
+        payload.extend_from_slice(&[0x03, 0x3B, 0x00]);            // def_data, 3 bytes
+        payload.extend_from_slice(&10i64.to_le_bytes());           // value 0
+        payload.extend_from_slice(&20i64.to_le_bytes());           // value 1
+        let uncomp = payload.len() as u32;
+
+        let (rep, def, values) = decode_data_page_v2_nested(
+            &payload,
+            0, // dp_encoding: PLAIN
+            plain::PlainSpec::plain(meta::Type::Int64),
+            3, // n = num_values
+            1, // max_rep_level
+            3, // max_def_level
+            2, // rep_levels_byte_length
+            3, // def_levels_byte_length
+            false, // is_compressed
+            meta::Codec::Uncompressed,
+            uncomp,
+            &[],
+        )
+        .expect("nested v2 decode");
+
+        assert_eq!(rep, vec![0u32, 1, 1]);
+        assert_eq!(def, vec![3u32, 2, 3]);
+        assert_eq!(values, vec![PqValue::I64(10), PqValue::I64(20)]);
     }
 }

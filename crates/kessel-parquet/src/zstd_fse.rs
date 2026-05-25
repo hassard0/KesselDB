@@ -209,19 +209,41 @@ pub(crate) fn parse_normalized_counts(
     let mut counts: Vec<i16> = Vec::new();
     let mut symbol: u32 = 0;
     while remaining > 1 && symbol <= max_symbol_value {
-        // RFC §4.1.1.1 + libzstd `FSE_readNCount`: max_bits is the
-        // SMALLEST k such that `2^k >= remaining + 1`, equivalent to
-        // `bit_length(remaining)` for remaining >= 1 (since
-        // bit_length(x) = smallest k with 2^k > x = smallest k with
-        // 2^k >= x+1).
+        // libzstd `FSE_readNCount_body` canonical algorithm:
+        //   max_bits = bit_length(remaining)  (smallest k with 2^k > remaining)
+        //   threshold = 1 << (max_bits - 1)   (the "low-bits-only" cutoff)
+        //   max_val   = 2*threshold - 1 - remaining   (libzstd's "max"; = low_threshold)
+        //
+        //   read max_bits bits → bitStream (LSB-first within byte, low to high)
+        //   low_bits = bitStream & (threshold - 1)    (the LOW max_bits-1 bits)
+        //
+        //   if low_bits < max_val:
+        //     // low branch: only max_bits - 1 bits effectively consumed
+        //     pushback 1 bit (the high bit was a free "pad")
+        //     count_raw = low_bits
+        //   else:
+        //     // high branch: full max_bits bits consumed
+        //     count_raw = bitStream  (full max_bits bits)
+        //     if count_raw >= threshold: count_raw -= max_val
+        //
+        //   count = count_raw - 1
+        //   remaining -= |count|
+        //
+        // SP139 FIX: my SP126 implementation matched the simpler
+        // educational-decoder reference which checks the FULL max_bits
+        // value against low_threshold — that's an off-by-pattern bug
+        // surfaced by the SP138 stress fixture (FSE-Compressed LL+OF+ML).
+        // The libzstd convention checks LOW max_bits-1 bits, which is
+        // what pyarrow's encoder produces.
         let max_bits = (64 - (remaining as u64).leading_zeros()) as u32;
         let low_threshold = ((1i64 << max_bits) - 1 - remaining) as u32;
-        let mask = (1u32 << max_bits) - 1;
+        let threshold = 1u32 << (max_bits - 1);
         let mut value = reader.read_bits(max_bits)?;
-        if (value & mask) < low_threshold {
+        let low_bits = value & (threshold - 1);
+        if low_bits < low_threshold {
             reader.bit_pos -= 1;
-            value &= (1u32 << (max_bits - 1)) - 1;
-        } else if value > (mask >> 1) {
+            value = low_bits;
+        } else if value >= threshold {
             value = value.saturating_sub(low_threshold);
         }
         let count: i32 = (value as i32) - 1;

@@ -505,11 +505,15 @@ const ZSTD_PLAIN: &[u8]         = include_bytes!("fixtures/zstd_plain.parquet");
 const ZSTD_DICT: &[u8]          = include_bytes!("fixtures/zstd_dict.parquet");
 const ZSTD_NULLABLE: &[u8]      = include_bytes!("fixtures/zstd_nullable.parquet");
 // SP138 stress fixtures: BYTE_ARRAY strings + dict+nullable + V2+zstd.
-// The 2000-row `zstd_stress.parquet` fixture (kept on disk) exercises the
-// FSE-Compressed LL/OF/ML mode (all 3 modes simultaneously) and surfaces a
-// subtle FSE-counts-summation discrepancy with libzstd's parse — deferred
-// to SP139 deep-libzstd-source comparison. The 4 SP138 fixtures below all
-// PASS through the existing SP125-SP137 pipeline.
+// The `zstd_stress.parquet` fixture (kept on disk) exercises the
+// FSE-Compressed LL/OF/ML mode SIMULTANEOUSLY at concentrated
+// distributions — that path partially works after SP139 (FSE table
+// parsing is now correct; SP137-fix-lock + 3 SP138 e2e tests confirm
+// the small/medium fixtures), but the stress sequence-stream decode
+// trips a downstream bug (likely in the FSE state machine's
+// 0-nb-bits transition handling or the bit-bookkeeping at a
+// 3-state-interleaved decode) that SP140 will isolate via bit-by-bit
+// comparison against a libzstd reference C trace.
 const ZSTD_STRINGS: &[u8]       = include_bytes!("fixtures/zstd_strings.parquet");
 const ZSTD_DICT_NULLABLE: &[u8] = include_bytes!("fixtures/zstd_dict_nullable.parquet");
 const ZSTD_V2: &[u8]            = include_bytes!("fixtures/zstd_v2.parquet");
@@ -615,12 +619,12 @@ fn zstd_v2_fixture_roundtrips() {
     ], "zstd_v2.parquet");
 }
 
-// SP138-E2E-4 (zstd_stress 2000-row fixture) DEFERRED to SP139.
-// Per-byte trace via the SP138 diagnostic showed pyarrow's stress fixture
-// uses FSE-Compressed mode for ALL THREE LL/OF/ML codes. My
-// parse_normalized_counts produces structurally-valid counts for the LL
-// FSE table (sum|c|=table_size, all spec invariants satisfied), but
-// libzstd's parse produces DIFFERENT counts from the same bytes (and
-// consumes more bytes for LL → OF starts at a different offset). The
-// fixture itself (`zstd_stress.parquet`) is kept on disk for the SP139
-// follow-up that does the deep libzstd-source-level FSE comparison.
+// SP139 progress (kept fixture on disk for SP140 follow-up): the
+// `parse_normalized_counts` fix here resolves the FSE-table-parsing
+// alignment bug (LL parse now correctly consumes 7 bytes vs the
+// pre-SP139 over-quick 8 bytes that mis-decoded acc_log=20 for OF).
+// All 3 FSE tables now parse cleanly for the stress fixture; the
+// remaining stress e2e failure is in sequence-stream decode (likely
+// a 0-nb-bits / 3-state-interleaved bookkeeping bug — SP140).
+// The SP137-fix-lock test + 3 SP138 fixtures continue to PASS with
+// the SP139 fix (proving it's a strict improvement, not a regression).

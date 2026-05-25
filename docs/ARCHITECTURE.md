@@ -31,8 +31,19 @@ VSR reimplementation verifiable rather than hopeful.
 zero external (non-workspace) deps) ·
 `kessel-objstore` (S3 SigV4 + Azure Shared-Key signers) ·
 `kessel-parquet` (zero-dep Parquet reader — Snappy/GZIP/zstd + V1/V2 +
-PLAIN/dict + REQUIRED/OPTIONAL + INT96/DECIMAL/FLBA + sub-modules
-`snappy.rs` / `gzip.rs` / `zstd*.rs`).
+PLAIN/dict + REQUIRED/OPTIONAL + INT96/DECIMAL/FLBA + **`LIST<primitive>`
+(SP143)** + sub-modules `snappy.rs` / `gzip.rs` / `zstd*.rs` /
+`assembly.rs` (Dremel record assembler)).
+
+SP143 extends kessel-parquet with `SchemaTree` (recursive nested schema
+model alongside the flat `leaves` list), multi-bit rep/def level decoders
+(`decode_page_v1_nested`, `decode_data_page_v2_nested`), and the
+Dremel-style `assemble_list_primitive` record assembler. The `extract`
+entry-point dispatches flat vs nested via `FileMetaData.flat_schema` —
+flat-schema files take the byte-identical pre-SP143 path; nested files
+route through `extract_nested` which currently supports canonical
+3-node `LIST<primitive>` patterns and rejects Map/struct/deep-nesting
+with typed errors naming SP144 / SP145.
 
 **Mechanically-checked artifacts:**
 `kesseldb-tla/` — seven layered TLA+ specs

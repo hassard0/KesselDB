@@ -6,7 +6,7 @@
 
 *"It's the database that made the Kessel Run in 12 parsecs."*
 
-`931 default tests green / 958 with --features kessel-http-gateway/test-server` · `0 external dependencies in the kernel` · `Rust 1.95+` · single‑binary
+`976 default tests green / 1003 with --features kessel-http-gateway/test-server` · `0 external dependencies in the kernel` · `Rust 1.95+` · single‑binary
 
 </div>
 
@@ -95,7 +95,7 @@ feature, not an aspiration.
   byte‑untouched; zero external (non‑workspace) deps on the gateway
   crate. See `docs/USAGE.md` §HTTP gateway.
 - **Deterministic & verifiable** — the whole engine is a seedable state machine;
-  the test suite (931 default tests / 958 with `--features kessel-http-gateway/test-server`, 0 ignored) includes seeded partition/fault
+  the test suite (976 default tests / 1003 with `--features kessel-http-gateway/test-server`, 0 ignored) includes seeded partition/fault
   simulation, multi‑replica Jepsen, hand‑derived KATs against published
   spec text for every codec, and adversarial pentests for every public input
   surface.
@@ -215,16 +215,17 @@ round‑trip fixtures**:
 | **Page version** | V1 + **V2** | V2 raw‑level‑split path (def/rep levels uncompressed, values section compressed) |
 | **Compression** | UNCOMPRESSED, **Snappy**, **GZIP**, **zstd** | All decompressors are zero‑dep hand‑written (`snappy.rs` 338 LOC / `gzip.rs` RFC 1951 inflate / `zstd*.rs` full RFC 8478 pipeline: frame + block + literals (Raw/RLE/Compressed/Treeless) + Huffman (direct + FSE‑weight × 1‑stream + 4‑stream) + sequences (Predefined/RLE/FseCompressed × LL/OF/ML) + 3‑slot repeat‑offset LZ77 execution). All real pyarrow zstd fixtures pass end‑to‑end through `extract()` incl. a 2000‑row stress fixture exercising FseCompressed mode for all three LL/OF/ML codes simultaneously. |
 | **Encoding** | PLAIN, **PLAIN_DICTIONARY / RLE_DICTIONARY** | Dictionary page + data‑page index resolve |
-| **Repetition** | flat REQUIRED + **flat OPTIONAL (nullable)** | OPTIONAL via RLE‑hybrid def‑level decode + null‑scatter; REPEATED/nested deferred (OBJ‑2c‑5) |
+| **Repetition** | flat REQUIRED + **flat OPTIONAL (nullable)** + **`LIST<primitive>` (SP143)** | OPTIONAL via RLE‑hybrid def‑level decode + null‑scatter; SP143 adds Dremel‑style record assembly for the canonical 3‑node `LIST<primitive>` pattern (`List<i64>`, `List<f64>`, `List<bool>`, `List<String>`, `List<Optional<T>>`, `Optional<List<T>>` — 4‑shape matrix); Map / struct / deep nesting deferred to SP144 / SP145 |
 | **Physical types** | INT32, **INT64**, **INT96 (timestamp)**, **FLBA**, **BYTE_ARRAY** | INT96 → `PqValue::Timestamp(i64 ns)` via checked Julian‑day arithmetic |
 | **Logical types** | **DECIMAL (INT32/INT64/FLBA, precision 1..=38)**, **FLBA‑UUID** | DECIMAL → `PqValue::Decimal { unscaled: i128, scale: i32 }` |
 | **Multi‑row‑group** | yes | Cross‑row‑group column concatenation |
 | **Bounds + safety** | `#![forbid(unsafe_code)]`, 64 MiB per‑page cap, every offset bounds‑checked, typed `PqError` on every failure mode, no panics on attacker bytes | + dedicated pentest module per codec (`pentest_optional` / `pentest_int96_decimal` / `pentest_v2` / etc.) |
 
 **Still deferred** (typed `Unsupported` at `REFRESH` with a precise
-error naming the OBJ‑2c follow‑on):
+error naming the follow‑on slice):
 - LZ4 / Brotli compression (OBJ‑2c‑2 follow‑ons)
-- REPEATED / nested groups / V2 repetition levels (OBJ‑2c‑5)
+- `Map<K, V>` columns and `struct<...>` columns (SP144)
+- Deep nesting: `List<List<T>>`, `List<Map>`, `List<struct>`, `Map<K, struct>`, etc. (SP145)
 - DECIMAL precision > 38 (would need i256)
 - Per‑page decompressed size > 64 MiB
 

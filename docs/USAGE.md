@@ -855,20 +855,33 @@ CREATE EXTERNAL SOURCE readings (
   `KEY`) are identical to §7e.
 - `REFRESH` and `DROP EXTERNAL SOURCE` work identically to §7e.
 
-### Parquet scope: what is currently supported (OBJ-2a → OBJ-2c-4)
+### Parquet scope: what is currently supported (OBJ-2a → OBJ-2c-5 SP143)
 
-| Parquet property | OBJ-2a → OBJ-2c-4 |
+| Parquet property | OBJ-2a → OBJ-2c-5 SP143 |
 |---|---|
 | Encoding | `PLAIN` and dictionary (`PLAIN_DICTIONARY`/`RLE_DICTIONARY`); RLE/bit-packing hybrid for dictionary indices |
 | Compression codec | `UNCOMPRESSED`, `SNAPPY` (raw block; pages ≤ 64 MiB decompressed), or `GZIP` (RFC 1952; pages ≤ 64 MiB decompressed) |
 | Column repetition | `REQUIRED` or `OPTIONAL` flat columns (nullable; V1 and V2 definition levels) |
+| Schema shape | flat (REQUIRED + OPTIONAL), and `LIST<primitive>` (SP143) |
+| Nested LIST (SP143) | `List<i64>`, `List<f64>`, `List<bool>`, `List<String>`, `List<Optional<T>>`, `Optional<List<T>>` — 4-shape matrix supported (REQ-REP-REQ, REQ-REP-OPT, OPT-REP-REQ, OPT-REP-OPT) |
+| Deferred nesting | `Map<K,V>` (SP144), `struct<...>` (SP144), nested `List<List<T>>` (SP145), `List<Map>`/`List<struct>` (SP145) |
 | Data page version | V1 and V2 (`DATA_PAGE_V2`) |
 | Row groups | Multi-row-group files are fully supported |
 | Column subset | Only the recipe-mapped columns are decoded; unmapped columns are skipped |
 | Physical types | `BOOLEAN`, `INT32`, `INT64`, `FLOAT`, `DOUBLE`, `BYTE_ARRAY`, `INT96` (→ Timestamp), `FixedLenByteArray` (raw bytes or DECIMAL) |
-| Logical types | `DECIMAL{precision ≤ 38, scale ≤ precision}` (typed `PqValue::Decimal{ unscaled: i128, scale }`) |
+| Logical types | `DECIMAL{precision ≤ 38, scale ≤ precision}` (typed `PqValue::Decimal{ unscaled: i128, scale }`); `LIST` (SP143; element values typed `PqValue::List(Vec<PqValue>)`) |
 | Temporal | `INT96` → `PqValue::Timestamp` (Unix nanoseconds; ≥ 1970 end-to-end today via `FieldKind::Timestamp`; any sign via `FieldKind::I64`) |
-| Null values | OPTIONAL def-level 0 rows → `PqValue::Null` (coerced via the same path as JSON `null`) |
+| Null values | OPTIONAL def-level 0 rows → `PqValue::Null` (coerced via the same path as JSON `null`); LIST element nulls handled via def-level scatter per Dremel record assembly |
+
+> **SP143 nested decode**: SP143 lifts the OBJ-2c flat-schema restriction
+> for `List<primitive>` columns specifically. Each `List<primitive>` row's
+> value is decoded as `PqValue::List(Vec<PqValue>)` per Dremel-style record
+> assembly using the canonical 3-node LIST encoding pattern (outer group
+> `LIST { repeated middle group { primitive element }}`). 5 pyarrow 24.0.0
+> fixtures roundtrip-tested (`list_i64_required`, `list_i64_optional`,
+> `list_string`, `optional_list_i64`, `list_with_null_items`). Map, struct,
+> and deep nesting (`List<List<T>>` etc.) are explicitly rejected with
+> `Unsupported(...)` errors naming the future slice (SP144 / SP145).
 
 ### What is NOT supported (rejected at REFRESH with a precise error)
 
@@ -876,12 +889,15 @@ The following trigger a typed `PqError` (surfaced as a `REFRESH`
 failure; prior materialized data is left intact — all-or-nothing, same
 as every other format):
 
-- **REPEATED columns / repetition levels** (including V2 repetition
-  levels; `rep_len > 0` in a `DATA_PAGE_V2`) — rejected with
-  `Unsupported("REPEATED columns: OBJ-2c")`.
-- **Non-flat schema (nested / intermediate group nodes)** (non-flat
-  schema; intermediate group nodes) — rejected with
-  `Unsupported("nested schema: OBJ-2c")`.
+- **REPEATED columns / repetition levels** outside the canonical
+  `LIST<primitive>` 3-node pattern — rejected with
+  `Unsupported(...)`. SP143 supports the canonical `LIST<primitive>`
+  shape only.
+- **Non-flat schema beyond `LIST<primitive>`** (Map / struct / deep
+  nesting) — rejected with `Unsupported("...: SP144")` or
+  `Unsupported("...: SP145")` (Map and struct deferred to SP144;
+  `List<List<T>>`, `List<Map>`, `List<struct>` and other deep nesting
+  deferred to SP145).
 - **Zstd / lz4 / brotli compression** — rejected with
   `Unsupported("compression codec (zstd/lz4/brotli): OBJ-2c")`. GZIP is
   now supported (OBJ-2c-1); V2 pages with these codecs remain

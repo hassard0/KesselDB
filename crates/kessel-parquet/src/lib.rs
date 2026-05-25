@@ -1033,6 +1033,522 @@ fn build_plain_spec(leaf: &meta::SchemaLeaf) -> Result<plain::PlainSpec, PqError
     }
 }
 
+/// SP143 T6: dispatch plan classification for one wanted column —
+/// either a flat physical leaf (existing path) or a recognized
+/// canonical LIST<primitive> column (new path).
+enum ColumnKind {
+    Flat {
+        spec: plain::PlainSpec,
+        ptype: meta::Type,
+        max_def_level: u32,
+    },
+    NestedListPrimitive {
+        spec: plain::PlainSpec,
+        ptype: meta::Type,
+        max_def_level: u32,
+        max_rep_level: u32,
+        outer_optional: bool,
+        element_optional: bool,
+    },
+}
+
+struct ColumnPlan {
+    /// Full leaf path WITHOUT the schema root group name — matches the
+    /// shape stored in `ColumnChunk::path` (parquet-format
+    /// `path_in_schema`).
+    chunk_path: Vec<String>,
+    kind: ColumnKind,
+}
+
+/// SP143 T6: walk the SchemaTree to classify a wanted column. For the
+/// V1 scope we accept:
+///   - a flat physical leaf directly under root (existing path), OR
+///   - a canonical LIST<primitive> group with the 3-node pattern
+///     `outer{ repeated middle { primitive_leaf } }`.
+/// Everything else surfaces a typed `Unsupported` error naming the
+/// next slice (SP144 for Map/struct, SP145 for deep nesting / List<group>).
+fn classify_column_plan(
+    root: &meta::SchemaNode,
+    col_name: &str,
+    leaves: &[meta::SchemaLeaf],
+) -> Result<ColumnPlan, PqError> {
+    let root_children = match root {
+        meta::SchemaNode::Group { children, .. } => children,
+        _ => return Err(PqError::Bad("schema root is not a group".into())),
+    };
+    let node = root_children
+        .iter()
+        .find(|n| match n {
+            meta::SchemaNode::Group { name, .. } => name == col_name,
+            meta::SchemaNode::Leaf { name, .. } => name == col_name,
+        })
+        .ok_or_else(|| {
+            PqError::Bad(format!(
+                "column `{col_name}` not found in Parquet schema"
+            ))
+        })?;
+
+    match node {
+        meta::SchemaNode::Leaf { name, ptype, repetition, max_def_level, path, .. } => {
+            // Flat column under a non-flat schema (mixed file): preserve
+            // the existing flat-path semantics — REQUIRED/OPTIONAL OK,
+            // REPEATED and unknown rejected with the same OBJ-2c phrasing
+            // so the test corpus stays stable across the flat-vs-nested
+            // dispatch split.
+            let mdl: u32 = match repetition {
+                meta::Repetition::Required => 0,
+                meta::Repetition::Optional => 1,
+                meta::Repetition::Repeated => {
+                    return Err(PqError::Unsupported(
+                        "REPEATED columns: OBJ-2c".into(),
+                    ))
+                }
+                meta::Repetition::Other(_) => {
+                    return Err(PqError::Unsupported(
+                        "unknown repetition: OBJ-2c".into(),
+                    ))
+                }
+            };
+            // Defense-in-depth: the schema-tree's computed max_def_level
+            // for a flat leaf must agree with the simple 0/1 derivation
+            // above. Disagreement = malformed schema the flat-path math
+            // would otherwise silently mis-decode.
+            if *max_def_level != mdl {
+                return Err(PqError::Bad(format!(
+                    "flat leaf `{name}` schema-tree max_def_level={max_def_level} \
+                     disagrees with repetition-derived {mdl}"
+                )));
+            }
+            match ptype {
+                meta::Type::Boolean
+                | meta::Type::Int32
+                | meta::Type::Int64
+                | meta::Type::Float
+                | meta::Type::Double
+                | meta::Type::ByteArray
+                | meta::Type::Int96
+                | meta::Type::FixedLenByteArray => {}
+                t => {
+                    return Err(PqError::Unsupported(format!(
+                        "physical type {t:?}: OBJ-2c"
+                    )))
+                }
+            }
+            // Build the PlainSpec via the flat-list lookup so DECIMAL /
+            // FLBA width validation runs identically to the flat path
+            // (SchemaTree::Leaf doesn't yet carry the DECIMAL metadata).
+            let leaf_struct = leaves
+                .iter()
+                .find(|l| &l.name == name)
+                .ok_or_else(|| {
+                    PqError::Bad(format!(
+                        "tree leaf `{name}` missing from flat leaves list"
+                    ))
+                })?;
+            let spec = build_plain_spec(leaf_struct)?;
+            // path on a tree Leaf includes the root group name as path[0];
+            // strip it to match ColumnChunk::path (`path_in_schema`).
+            let chunk_path = path.iter().skip(1).cloned().collect();
+            Ok(ColumnPlan {
+                chunk_path,
+                kind: ColumnKind::Flat {
+                    spec,
+                    ptype: *ptype,
+                    max_def_level: mdl,
+                },
+            })
+        }
+        meta::SchemaNode::Group { name, repetition, children, logical_type } => {
+            // Group without the LIST annotation: either a struct, Map,
+            // or some other nested shape — all SP144 territory.
+            if *logical_type != Some(meta::LogicalType::List) {
+                return Err(PqError::Unsupported(format!(
+                    "non-LIST group column `{name}`: SP144 follow-up (struct/Map)"
+                )));
+            }
+            let outer_optional = matches!(repetition, meta::Repetition::Optional);
+            // Canonical LIST: exactly one child, a REPEATED middle group
+            // with exactly one primitive-leaf child. Anything else is
+            // List<group> / List<List<_>> / non-canonical → SP145.
+            if children.len() != 1 {
+                return Err(PqError::Unsupported(format!(
+                    "non-canonical LIST `{name}` (outer children != 1): SP145 follow-up"
+                )));
+            }
+            let middle_children = match &children[0] {
+                meta::SchemaNode::Group {
+                    repetition: meta::Repetition::Repeated,
+                    children: gc,
+                    ..
+                } => gc,
+                _ => {
+                    return Err(PqError::Unsupported(format!(
+                        "non-canonical LIST `{name}` (middle not REPEATED group): SP145 follow-up"
+                    )))
+                }
+            };
+            if middle_children.len() != 1 {
+                return Err(PqError::Unsupported(format!(
+                    "non-canonical LIST `{name}` (middle children != 1): SP145 follow-up"
+                )));
+            }
+            let leaf_node = &middle_children[0];
+            let (leaf_name, leaf_ptype, leaf_rep, leaf_max_def, leaf_max_rep, leaf_path) =
+                match leaf_node {
+                    meta::SchemaNode::Leaf {
+                        name,
+                        ptype,
+                        repetition,
+                        max_def_level,
+                        max_rep_level,
+                        path,
+                    } => (
+                        name.clone(),
+                        *ptype,
+                        *repetition,
+                        *max_def_level,
+                        *max_rep_level,
+                        path.clone(),
+                    ),
+                    _ => {
+                        return Err(PqError::Unsupported(format!(
+                            "List<group> / List<List<_>> `{name}`: SP145 follow-up"
+                        )))
+                    }
+                };
+            let element_optional = matches!(leaf_rep, meta::Repetition::Optional);
+            // For canonical LIST<primitive>: outer contributes
+            // (outer_optional as u32), REPEATED middle contributes 1,
+            // leaf contributes (element_optional as u32). Schema-tree
+            // max_def_level on the leaf must agree.
+            let expected_max_def =
+                (outer_optional as u32) + 1 + (element_optional as u32);
+            if leaf_max_def != expected_max_def {
+                return Err(PqError::Bad(format!(
+                    "nested LIST `{name}` leaf max_def_level={leaf_max_def} \
+                     disagrees with expected {expected_max_def}"
+                )));
+            }
+            // max_rep_level for a single-level LIST is always 1.
+            if leaf_max_rep != 1 {
+                return Err(PqError::Bad(format!(
+                    "nested LIST `{name}` leaf max_rep_level={leaf_max_rep} != 1"
+                )));
+            }
+            match leaf_ptype {
+                meta::Type::Boolean
+                | meta::Type::Int32
+                | meta::Type::Int64
+                | meta::Type::Float
+                | meta::Type::Double
+                | meta::Type::ByteArray
+                | meta::Type::Int96
+                | meta::Type::FixedLenByteArray => {}
+                t => {
+                    return Err(PqError::Unsupported(format!(
+                        "LIST<{t:?}>: physical type not supported in OBJ-2c"
+                    )))
+                }
+            }
+            // Build the PlainSpec via the flat leaves list (the SchemaTree
+            // doesn't yet carry DECIMAL / FLBA metadata on its Leaf
+            // variant; the flat list does).
+            let leaf_struct = leaves
+                .iter()
+                .find(|l| l.name == leaf_name)
+                .ok_or_else(|| {
+                    PqError::Bad(format!(
+                        "LIST leaf `{leaf_name}` missing from flat leaves list"
+                    ))
+                })?;
+            let spec = build_plain_spec(leaf_struct)?;
+            // Strip root from the tree-recorded path so it matches the
+            // ColumnChunk path_in_schema convention.
+            let chunk_path = leaf_path.iter().skip(1).cloned().collect();
+            Ok(ColumnPlan {
+                chunk_path,
+                kind: ColumnKind::NestedListPrimitive {
+                    spec,
+                    ptype: leaf_ptype,
+                    max_def_level: leaf_max_def,
+                    max_rep_level: leaf_max_rep,
+                    outer_optional,
+                    element_optional,
+                },
+            })
+        }
+    }
+}
+
+/// SP143 T6: nested-schema extractor. Routes each wanted column either
+/// through the existing flat decode (when its plan classifies as Flat)
+/// or through the new nested decode + assembler (when LIST<primitive>).
+/// Mirrors `extract`'s row-major transpose so the caller's contract
+/// (Vec<row> of Vec<PqValue>) is unchanged.
+fn extract_nested(
+    file: &[u8],
+    md: &meta::FileMetaData,
+    wanted: &[&str],
+) -> Result<Vec<Vec<PqValue>>, PqError> {
+    let mut plans: Vec<ColumnPlan> = Vec::with_capacity(wanted.len());
+    for w in wanted {
+        plans.push(classify_column_plan(&md.schema_tree.root, w, &md.leaves)?);
+    }
+
+    let mut cols: Vec<Vec<PqValue>> = wanted.iter().map(|_| Vec::new()).collect();
+    for rg in &md.row_groups {
+        for (ci, plan) in plans.iter().enumerate() {
+            let cc = rg
+                .columns
+                .iter()
+                .find(|c| c.path == plan.chunk_path)
+                .ok_or_else(|| {
+                    PqError::Bad(format!(
+                        "row group missing column for path {:?}",
+                        plan.chunk_path
+                    ))
+                })?;
+            match plan.kind {
+                ColumnKind::Flat { spec, ptype, max_def_level } => {
+                    if cc.ptype != ptype {
+                        return Err(PqError::Bad(format!(
+                            "column for path {:?} schema/column-chunk physical-type mismatch",
+                            plan.chunk_path
+                        )));
+                    }
+                    let vals = read_chunk_values(file, cc, spec, max_def_level)?;
+                    cols[ci].extend(vals);
+                }
+                ColumnKind::NestedListPrimitive {
+                    spec,
+                    ptype,
+                    max_def_level,
+                    max_rep_level,
+                    outer_optional,
+                    element_optional,
+                } => {
+                    if cc.ptype != ptype {
+                        return Err(PqError::Bad(format!(
+                            "column for path {:?} schema/column-chunk physical-type mismatch",
+                            plan.chunk_path
+                        )));
+                    }
+                    let vals = read_chunk_values_nested(
+                        file,
+                        cc,
+                        spec,
+                        max_def_level,
+                        max_rep_level,
+                        outer_optional,
+                        element_optional,
+                    )?;
+                    cols[ci].extend(vals);
+                }
+            }
+        }
+    }
+
+    let nrows = cols.first().map(|c| c.len()).unwrap_or(0);
+    if cols.iter().any(|c| c.len() != nrows) {
+        return Err(PqError::Bad("column length mismatch".into()));
+    }
+    let mut rows = Vec::with_capacity(nrows);
+    for r in 0..nrows {
+        rows.push(cols.iter().map(|c| c[r].clone()).collect());
+    }
+    Ok(rows)
+}
+
+/// SP143 T6: nested sibling of `read_chunk_values`. Iterates the
+/// column chunk's pages (V1 / V2 / dictionary), accumulates the
+/// (rep_levels, def_levels, values) parallel streams across all data
+/// pages, then folds them ONCE through `assembly::assemble_list_primitive`
+/// at the end. Dictionary-page / codec / encoding handling mirrors
+/// `read_chunk_values` byte-for-byte; only the per-page decode call
+/// differs (decode_page_v1_nested / decode_data_page_v2_nested).
+///
+/// `cc.num_values` for a nested column counts (rep, def) PAIRS, not
+/// records — so the page-loop terminates when accumulated rep/def
+/// pairs reach `cc.num_values`, not when output records reach it.
+fn read_chunk_values_nested(
+    file: &[u8],
+    cc: &meta::ColumnChunk,
+    spec: plain::PlainSpec,
+    max_def_level: u32,
+    max_rep_level: u32,
+    outer_optional: bool,
+    element_optional: bool,
+) -> Result<Vec<PqValue>, PqError> {
+    match cc.codec {
+        meta::Codec::Uncompressed
+        | meta::Codec::Snappy
+        | meta::Codec::Gzip
+        | meta::Codec::Zstd => {}
+        meta::Codec::Other(_) => {
+            return Err(PqError::Unsupported(
+                "compression codec (lz4/brotli): OBJ-2c".into(),
+            ))
+        }
+    }
+    if cc.encodings.iter().any(|e| {
+        !matches!(
+            e,
+            meta::Encoding::Plain
+                | meta::Encoding::Rle
+                | meta::Encoding::PlainDictionary
+                | meta::Encoding::RleDictionary
+        )
+    }) {
+        return Err(PqError::Unsupported(
+            "non-PLAIN/dictionary encoding (DELTA/BYTE_STREAM_SPLIT): OBJ-2c".into(),
+        ));
+    }
+
+    let dict: Vec<PqValue> = if let Some(dpo) = cc.dictionary_page_offset {
+        let off = usize::try_from(dpo)
+            .map_err(|_| PqError::Bad("dict page offset range".into()))?;
+        let region = file
+            .get(off..)
+            .ok_or_else(|| PqError::Bad("dict page offset past EOF".into()))?;
+        let (ph, hlen) = meta::decode_page_header(region)?;
+        if ph.page_type != 2 {
+            return Err(PqError::Bad(
+                "dictionary_page_offset does not point at a DICTIONARY_PAGE".into(),
+            ));
+        }
+        if ph.dict_encoding != 0 && ph.dict_encoding != 2 {
+            return Err(PqError::Unsupported(
+                "dictionary page encoding (not PLAIN/PLAIN_DICTIONARY): OBJ-2c".into(),
+            ));
+        }
+        let dn = usize::try_from(ph.dict_num_values)
+            .map_err(|_| PqError::Bad("dict num_values range".into()))?;
+        let dstart = off
+            .checked_add(hlen)
+            .ok_or_else(|| PqError::Bad("dict page hdr len ovf".into()))?;
+        let comp = usize::try_from(ph.compressed_size)
+            .map_err(|_| PqError::Bad("dict page comp size range".into()))?;
+        let uncomp = usize::try_from(ph.uncompressed_size)
+            .map_err(|_| PqError::Bad("dict page size range".into()))?;
+        let payload = page_payload(file, dstart, comp, uncomp, cc.codec)?;
+        plain::decode_plain(&payload, spec, dn)?
+    } else {
+        Vec::new()
+    };
+
+    let want_pairs = usize::try_from(cc.num_values)
+        .map_err(|_| PqError::Bad("chunk num_values range".into()))?;
+    let mut all_rep: Vec<u32> = Vec::with_capacity(want_pairs);
+    let mut all_def: Vec<u32> = Vec::with_capacity(want_pairs);
+    let mut all_values: Vec<PqValue> = Vec::new();
+    let mut off = usize::try_from(cc.data_page_offset)
+        .map_err(|_| PqError::Bad("data page offset range".into()))?;
+    while all_rep.len() < want_pairs {
+        let region = file
+            .get(off..)
+            .ok_or_else(|| PqError::Bad("data page offset past EOF".into()))?;
+        let (ph, hlen) = meta::decode_page_header(region)?;
+        let (rep, def, vals, dstart, comp) = match ph.page_type {
+            0 => {
+                let n = usize::try_from(ph.dp_num_values)
+                    .map_err(|_| PqError::Bad("num_values range".into()))?;
+                let dstart = off
+                    .checked_add(hlen)
+                    .ok_or_else(|| PqError::Bad("page hdr len ovf".into()))?;
+                let comp = usize::try_from(ph.compressed_size)
+                    .map_err(|_| PqError::Bad("page comp size range".into()))?;
+                let uncomp = usize::try_from(ph.uncompressed_size)
+                    .map_err(|_| PqError::Bad("page size range".into()))?;
+                let payload = page_payload(file, dstart, comp, uncomp, cc.codec)?;
+                if matches!(ph.dp_encoding, 2 | 8)
+                    && cc.dictionary_page_offset.is_none()
+                {
+                    return Err(PqError::Bad(
+                        "dictionary-encoded data page without dictionary_page_offset".into(),
+                    ));
+                }
+                let (r, d, v) = decode_page_v1_nested(
+                    &payload,
+                    ph.dp_encoding,
+                    spec,
+                    n,
+                    max_rep_level,
+                    max_def_level,
+                    &dict,
+                )?;
+                (r, d, v, dstart, comp)
+            }
+            3 => {
+                let dstart = off
+                    .checked_add(hlen)
+                    .ok_or_else(|| PqError::Bad("v2 page hdr len ovf".into()))?;
+                let comp = usize::try_from(ph.compressed_size)
+                    .map_err(|_| PqError::Bad("v2 comp size range".into()))?;
+                let v2_region = file
+                    .get(
+                        dstart
+                            ..dstart.checked_add(comp).ok_or_else(|| {
+                                PqError::Bad("v2 region ovf".into())
+                            })?,
+                    )
+                    .ok_or_else(|| PqError::Bad("v2 page truncated".into()))?;
+                let n = usize::try_from(ph.v2_num_values)
+                    .map_err(|_| PqError::Bad("v2 num_values range".into()))?;
+                let rep_byte_len = u32::try_from(ph.v2_rep_len)
+                    .map_err(|_| PqError::Bad("v2 rep_len range".into()))?;
+                let def_byte_len = u32::try_from(ph.v2_def_len)
+                    .map_err(|_| PqError::Bad("v2 def_len range".into()))?;
+                let uncomp = u32::try_from(ph.uncompressed_size)
+                    .map_err(|_| PqError::Bad("v2 uncompressed size range".into()))?;
+                let (r, d, v) = decode_data_page_v2_nested(
+                    v2_region,
+                    ph.v2_encoding,
+                    spec,
+                    n,
+                    max_rep_level,
+                    max_def_level,
+                    rep_byte_len,
+                    def_byte_len,
+                    ph.v2_is_compressed,
+                    cc.codec,
+                    uncomp,
+                    &dict,
+                )?;
+                (r, d, v, dstart, comp)
+            }
+            _ => {
+                return Err(PqError::Unsupported(
+                    "non-V1/V2 data page (index): OBJ-2c".into(),
+                ))
+            }
+        };
+        if all_rep.len().checked_add(rep.len()).map(|t| t > want_pairs).unwrap_or(true) {
+            return Err(PqError::Bad(
+                "data page (rep,def) pairs exceed chunk num_values".into(),
+            ));
+        }
+        all_rep.extend(rep);
+        all_def.extend(def);
+        all_values.extend(vals);
+        off = dstart
+            .checked_add(comp)
+            .ok_or_else(|| PqError::Bad("page advance ovf".into()))?;
+    }
+    if all_rep.len() != want_pairs {
+        return Err(PqError::Bad(
+            "data page (rep,def) pairs do not sum to chunk num_values".into(),
+        ));
+    }
+    assembly::assemble_list_primitive(
+        &all_rep,
+        &all_def,
+        &all_values,
+        max_def_level,
+        outer_optional,
+        element_optional,
+    )
+}
+
 /// Decode the `wanted` leaf columns (in that output order) from a
 /// whole Parquet object. OBJ-2a: flat REQUIRED columns, PLAIN,
 /// UNCOMPRESSED, V1 data pages, all row groups concatenated.
@@ -1043,11 +1559,12 @@ pub fn extract(
     let md_bytes = footer::metadata_slice(bytes)?;
     let md = meta::FileMetaData::decode(md_bytes)?;
 
-    // Reject nested schemas once, file-level, before any per-leaf work.
-    // A non-flat file is rejected with the same Unsupported error regardless
-    // of which (or how many) columns are requested.
+    // SP143 T6: nested schemas — dispatch to the nested decode path if every
+    // wanted column is a recognized LIST<primitive>; otherwise reject with
+    // typed errors naming the future slice (SP144 Map/struct, SP145 deep
+    // nesting). Flat schemas stay on the legacy path below verbatim.
     if !md.flat_schema {
-        return Err(PqError::Unsupported("nested schema: OBJ-2c".into()));
+        return extract_nested(bytes, &md, wanted);
     }
 
     // Resolve each wanted name to its leaf; enforce known repetition +
@@ -2013,12 +2530,21 @@ mod tests {
 
     #[test]
     fn extract_rejects_nested_schema_obj2c() {
-        // A non-flat schema (root → intermediate group → leaf) must be
-        // Unsupported("nested schema: OBJ-2c") regardless of repetition.
+        // SP143 T6: the file's schema is `root → g (group) → id (leaf)` —
+        // a struct (no LIST annotation). The dispatch now routes through
+        // `extract_nested`, which classifies the top-level group "g" as a
+        // non-LIST group and rejects with Unsupported (SP144 follow-up).
+        // Requesting the inner-leaf name "id" is also rejected — it isn't
+        // a top-level field — with Bad("column ... not found"). Either
+        // way the file does NOT silently decode.
         let f = build_nested_schema_file();
         assert!(
-            matches!(extract(&f, &["id"]), Err(PqError::Unsupported(_))),
-            "nested schema must be Unsupported (OBJ-2c)"
+            matches!(extract(&f, &["g"]), Err(PqError::Unsupported(_))),
+            "non-LIST nested group must be Unsupported (SP144 follow-up)"
+        );
+        assert!(
+            matches!(extract(&f, &["id"]), Err(PqError::Bad(_))),
+            "deep-leaf name not in top-level fields must be Bad(not found)"
         );
     }
 
@@ -2687,6 +3213,11 @@ mod pentest_optional {
     }
 
     // Helper: no panic + Unsupported.
+    // SP143 T6: currently unused (its sole caller now inlines a "g" path
+    // request instead of "id" since the non-flat dispatch changed which
+    // column-name actually reaches the rejection). Kept for future
+    // pentest locks that need the same shape.
+    #[allow(dead_code)]
     fn assert_no_panic_unsupported(file: &[u8]) {
         let owned = file.to_vec();
         let r = std::panic::catch_unwind(move || extract(&owned, &["id"]));
@@ -3003,12 +3534,21 @@ mod pentest_optional {
 
     // ── Lock 6: non-flat schema → Unsupported, no panic ─────────────────
     //
-    // root → intermediate group → leaf: flat_schema=false → extract →
-    // Err(Unsupported("nested schema: OBJ-2c")), no panic.
+    // SP143 T6: dispatch now routes non-flat files to `extract_nested`,
+    // which classifies the top-level group "g" as a struct (no LIST
+    // annotation) and rejects with Unsupported (SP144 follow-up). The
+    // no-panic invariant is what this lock cares about — the error
+    // variant stays Unsupported.
     #[test]
     fn pentest_opt_non_flat_schema_unsupported_no_panic() {
         let f = build_nested_schema_file();
-        assert_no_panic_unsupported(&f);
+        let owned = f.clone();
+        let r = std::panic::catch_unwind(move || extract(&owned, &["g"]));
+        assert!(r.is_ok(), "must NOT panic on nested-schema input");
+        assert!(
+            matches!(r.unwrap(), Err(PqError::Unsupported(_))),
+            "non-LIST nested group must be Unsupported (SP144 follow-up)"
+        );
     }
 
     // ── Positive correctness locks (MUST be Ok with exact values) ────────

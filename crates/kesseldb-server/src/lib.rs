@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{TcpListener, ToSocketAddrs};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Sender, SyncSender};
 use std::sync::Arc;
 
@@ -421,6 +421,11 @@ pub struct EngineHandle {
     tx: Sender<EngineMsg>,
     inflight: Arc<AtomicUsize>,
     max_inflight: usize,
+    /// SP142: direct-read counter for /v1/metrics — populated atomically
+    /// from the engine thread on every applied op. Avoids the STATS_TAG
+    /// round-trip in snapshot_metrics/snapshot_health, which would return
+    /// 0 under engine saturation (Prometheus counter-reset).
+    applied_ops_atomic: Arc<AtomicU64>,
 }
 
 impl EngineHandle {
@@ -468,6 +473,13 @@ impl EngineHandle {
         self.inflight.load(Ordering::Acquire) as u64
     }
 
+    /// SP142: direct atomic read of the applied-op count. Cheap — no
+    /// engine round-trip, immune to backpressure. Use this for
+    /// observability paths (`/v1/metrics`, `/v1/health`).
+    pub fn applied_ops_snapshot(&self) -> u64 {
+        self.applied_ops_atomic.load(Ordering::Acquire)
+    }
+
     /// Take a consistent on-disk snapshot/backup into `dest`. The engine
     /// flushes, then copies its data dir while no apply is in flight, so
     /// `StateMachine::open(dest)` recovers an identical state.
@@ -498,6 +510,13 @@ pub fn spawn_engine_cfg(
     let dir = data_dir.as_ref().to_path_buf();
     let (tx, rx) = channel::<EngineMsg>();
     let (ready_tx, ready_rx) = channel::<io::Result<()>>();
+    // SP142: shared atomic counter for /v1/metrics & /v1/health. The
+    // engine thread bumps it on every `*n += 1` (i.e. every applied op,
+    // matching `stats().applied_ops` semantic exactly). The handle
+    // exposes it via `applied_ops_snapshot()` — no STATS_TAG round-trip,
+    // so observability is immune to engine backpressure.
+    let applied_ops_atomic_for_engine = Arc::new(AtomicU64::new(0));
+    let applied_ops_atomic_for_handle = applied_ops_atomic_for_engine.clone();
     std::thread::spawn(move || {
         let mut sm = match DirVfs::new(&dir).and_then(StateMachine::open) {
             Ok(sm) => {
@@ -708,15 +727,32 @@ pub fn spawn_engine_cfg(
 
         // Group-commit driver: block for one request, drain everything
         // else already queued, apply them all, fsync ONCE, release replies.
+        // SP142: after each compute(), publish the change in `n` to the
+        // shared atomic so `applied_ops_snapshot()` mirrors `*n - 1` (the
+        // same quantity `stats()` returns via STATS_TAG). A single frame
+        // may bump `n` by 0 (STATS/SNAPSHOT), 1 (ordinary Op), or 2+ (a
+        // SQL UPDATE doing GetById + Update); using a delta keeps that
+        // semantic identical without touching the inner helpers.
         const MAX_BATCH: usize = 4096;
         while let Ok((frame, reply)) = rx.recv() {
             let mut batch: Vec<(OpResult, SyncSender<OpResult>)> =
                 Vec::with_capacity(16);
-            batch.push((compute(&mut sm, &mut cache, &mut n, &frame), reply));
+            let n_before = n;
+            let res = compute(&mut sm, &mut cache, &mut n, &frame);
+            if n > n_before {
+                applied_ops_atomic_for_engine
+                    .fetch_add(n - n_before, Ordering::AcqRel);
+            }
+            batch.push((res, reply));
             while batch.len() < MAX_BATCH {
                 match rx.try_recv() {
                     Ok((f, rp)) => {
+                        let n_before = n;
                         let res = compute(&mut sm, &mut cache, &mut n, &f);
+                        if n > n_before {
+                            applied_ops_atomic_for_engine
+                                .fetch_add(n - n_before, Ordering::AcqRel);
+                        }
                         batch.push((res, rp));
                     }
                     Err(_) => break,
@@ -733,6 +769,7 @@ pub fn spawn_engine_cfg(
             tx,
             inflight: Arc::new(AtomicUsize::new(0)),
             max_inflight,
+            applied_ops_atomic: applied_ops_atomic_for_handle,
         }),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(io::Error::new(io::ErrorKind::Other, "engine failed to start")),
@@ -1060,16 +1097,23 @@ impl kessel_http_gateway::EngineApply for EngineHandle {
         self.apply_sql(sql)
     }
     fn snapshot_health(&self) -> kessel_http_gateway::HealthSnapshot {
-        let s = self.stats();
+        // SP142: read the atomic directly — no STATS_TAG round-trip. The
+        // old `self.stats()` path would return 0 under engine saturation
+        // (apply_raw → OpResult::Unavailable), which Prometheus would
+        // interpret as a counter reset.
         kessel_http_gateway::HealthSnapshot {
             primary: true,
             view: 0,
-            op_number: s.applied_ops,
+            op_number: self.applied_ops_snapshot(),
             role: "primary",
         }
     }
     fn snapshot_metrics(&self) -> kessel_http_gateway::MetricsSnapshot {
-        let s = self.stats();
+        // SP142: see snapshot_health — direct atomic read, immune to
+        // backpressure. `stats()` is still available to other callers
+        // (its STATS_TAG round-trip is the source-of-truth path); the
+        // observability surfaces just stop depending on it.
+        let ops = self.applied_ops_snapshot();
         kessel_http_gateway::MetricsSnapshot {
             ops_total: vec![
                 // SP141 V1: a single rolled-up counter using `applied_ops`
@@ -1078,11 +1122,11 @@ impl kessel_http_gateway::EngineApply for EngineHandle {
                 // per spec §11.
                 kessel_http_gateway::OpKindCounter {
                     kind: "applied",
-                    count: s.applied_ops,
+                    count: ops,
                 },
             ],
             inflight: self.inflight_snapshot(),
-            last_op_number: s.applied_ops,
+            last_op_number: ops,
             view_number: 0,    // single-node V1; cluster wiring is follow-up
             is_primary: true,
             http_requests_total: Vec::new(),  // wired in follow-up
@@ -1406,6 +1450,54 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn applied_ops_snapshot_increments_on_apply() {
+        // SP142 T1 invariant: the EngineHandle's atomic op counter
+        // increments by exactly 1 per successful Op::apply. This is the
+        // counter read by /v1/metrics and /v1/health — it must NOT go
+        // backwards (Prometheus counter-reset) under engine backpressure.
+        let dir = std::env::temp_dir()
+            .join(format!("kesseldb-sp142-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = spawn_engine(&dir).unwrap();
+        assert_eq!(engine.applied_ops_snapshot(), 0);
+
+        // Use the same Op variant the existing stats test uses: a
+        // CreateType. Any successful Op::apply is fine — what we're
+        // asserting is the per-apply increment delta, not the result.
+        let def_t1 = encode_type_def(
+            "t1",
+            &[Field {
+                field_id: 0,
+                name: "v".into(),
+                kind: FieldKind::U64,
+                nullable: false,
+            }],
+        );
+        let _ = engine.apply(Op::CreateType { def: def_t1 });
+        let after_one = engine.applied_ops_snapshot();
+        assert!(after_one >= 1, "after one apply: {after_one}");
+
+        let def_t2 = encode_type_def(
+            "t2",
+            &[Field {
+                field_id: 0,
+                name: "v".into(),
+                kind: FieldKind::U64,
+                nullable: false,
+            }],
+        );
+        let _ = engine.apply(Op::CreateType { def: def_t2 });
+        let after_two = engine.applied_ops_snapshot();
+        assert_eq!(
+            after_two,
+            after_one + 1,
+            "one apply must bump applied_ops_snapshot by exactly 1"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -26,7 +26,7 @@ fn kat_simple_post_sql_content_length() {
     let req = parse_request(bytes).expect("well-formed POST parses");
     assert_eq!(req.method, Method::Post);
     assert_eq!(req.path, "/v1/sql");
-    assert_eq!(req.body, body);
+    assert_eq!(req.body.as_ref(), body);
     assert_eq!(req.content_type.as_deref(), Some("text/plain"));
     assert_eq!(req.consumed, bytes.len());
 }
@@ -39,7 +39,7 @@ fn kat_post_op_binary_content_type() {
                       Content-Length: 3\r\n\r\n".to_vec();
     bytes.extend_from_slice(&body);
     let req = parse_request(&bytes).expect("binary body parses");
-    assert_eq!(req.body, body.as_slice());
+    assert_eq!(req.body.as_ref(), body.as_slice());
     assert_eq!(req.content_type.as_deref(),
                Some("application/x-kessel-op"));
 }
@@ -137,4 +137,135 @@ fn kat_content_type_with_charset() {
     let req = parse_request(bytes).expect("Content-Type with charset parses");
     // Only the media-type portion is returned; the charset suffix is dropped.
     assert_eq!(req.content_type.as_deref(), Some("text/plain"));
+}
+
+// ---------------------------------------------------------------------------
+// T3 KATs: chunked decode + body cap + Bearer + X-Kessel-* extractors.
+// ---------------------------------------------------------------------------
+
+use kessel_http_gateway::parse::{
+    dechunk, decode_body, extract_bearer, extract_client_id, extract_req_seq,
+};
+
+#[test]
+fn kat_chunked_simple() {
+    // RFC 9112 §7.1 — two chunks then terminator. "Hello" = 5 bytes; chunk
+    // size in hex.
+    let body = b"5\r\nHello\r\n0\r\n\r\n";
+    let decoded = dechunk(body, 1024).expect("simple chunked decodes");
+    assert_eq!(decoded, b"Hello");
+}
+
+#[test]
+fn kat_chunked_two_chunks() {
+    let body = b"5\r\nHello\r\n6\r\n World\r\n0\r\n\r\n";
+    let decoded = dechunk(body, 1024).expect("two-chunk decodes");
+    assert_eq!(decoded, b"Hello World");
+}
+
+#[test]
+fn kat_chunked_truncated_missing_crlf_after_data() {
+    let body = b"5\r\nHello"; // no trailing CRLF, no 0-chunk
+    let err = dechunk(body, 1024).unwrap_err();
+    assert!(format!("{:?}", err).contains("BadChunk"), "got {:?}", err);
+}
+
+#[test]
+fn kat_chunked_bad_size_hex() {
+    let body = b"zz\r\nHello\r\n0\r\n\r\n";
+    let err = dechunk(body, 1024).unwrap_err();
+    assert!(format!("{:?}", err).contains("BadChunk"), "got {:?}", err);
+}
+
+#[test]
+fn kat_chunked_exceeds_cap() {
+    // 8 bytes total, cap 4 → BodyTooLarge.
+    let body = b"5\r\nHello\r\n3\r\n!!!\r\n0\r\n\r\n";
+    let err = dechunk(body, 4).unwrap_err();
+    assert!(format!("{:?}", err).contains("BodyTooLarge"), "got {:?}", err);
+}
+
+#[test]
+fn kat_decode_body_content_length_under_cap() {
+    let buf = b"hello";
+    let decoded = decode_body(buf, Some(5), false, 1024).unwrap();
+    assert_eq!(decoded.as_ref(), b"hello");
+}
+
+#[test]
+fn kat_decode_body_content_length_over_cap() {
+    let buf = b"hello";
+    let err = decode_body(buf, Some(5), false, 4).unwrap_err();
+    assert!(format!("{:?}", err).contains("BodyTooLarge"), "got {:?}", err);
+}
+
+#[test]
+fn kat_decode_body_both_te_and_cl_rejected() {
+    let buf = b"5\r\nHello\r\n0\r\n\r\n";
+    // chunked=true AND content_length=Some → 400.
+    let err = decode_body(buf, Some(5), true, 1024).unwrap_err();
+    assert!(format!("{:?}", err).contains("ConflictingFraming"),
+            "got {:?}", err);
+}
+
+#[test]
+fn kat_bearer_extraction() {
+    let headers = vec![
+        ("Authorization".into(), "Bearer abc123def".into()),
+    ];
+    let tok = extract_bearer(&headers).expect("bearer present");
+    assert_eq!(tok, b"abc123def");
+}
+
+#[test]
+fn kat_bearer_missing() {
+    let headers: Vec<(String, String)> = Vec::new();
+    assert!(extract_bearer(&headers).is_none());
+}
+
+#[test]
+fn kat_bearer_wrong_scheme() {
+    let headers = vec![("Authorization".into(), "Basic abc".into())];
+    assert!(extract_bearer(&headers).is_none());
+}
+
+#[test]
+fn kat_client_id_32_hex() {
+    let headers = vec![(
+        "X-Kessel-Client-Id".into(),
+        "0123456789abcdef0123456789abcdef".into(),
+    )];
+    let id = extract_client_id(&headers).unwrap().unwrap();
+    assert_eq!(id, 0x0123456789abcdef0123456789abcdef_u128);
+}
+
+#[test]
+fn kat_client_id_non_hex_rejected() {
+    let headers = vec![(
+        "X-Kessel-Client-Id".into(),
+        "GG23456789abcdef0123456789abcdef".into(),
+    )];
+    let err = extract_client_id(&headers).unwrap_err();
+    assert!(format!("{:?}", err).contains("BadHeaderValue"), "got {:?}", err);
+}
+
+#[test]
+fn kat_client_id_wrong_length() {
+    let headers = vec![("X-Kessel-Client-Id".into(), "abc".into())];
+    let err = extract_client_id(&headers).unwrap_err();
+    assert!(format!("{:?}", err).contains("BadHeaderValue"), "got {:?}", err);
+}
+
+#[test]
+fn kat_req_seq_decimal() {
+    let headers = vec![("X-Kessel-Req-Seq".into(), "42".into())];
+    let seq = extract_req_seq(&headers).unwrap().unwrap();
+    assert_eq!(seq, 42);
+}
+
+#[test]
+fn kat_req_seq_non_decimal() {
+    let headers = vec![("X-Kessel-Req-Seq".into(), "abc".into())];
+    let err = extract_req_seq(&headers).unwrap_err();
+    assert!(format!("{:?}", err).contains("BadHeaderValue"), "got {:?}", err);
 }

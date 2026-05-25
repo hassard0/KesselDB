@@ -235,9 +235,11 @@ pub(crate) fn decode_treeless_literals(
     Ok((decoded, total_consumed))
 }
 
-/// Compatibility wrapper for SP129 callers — same semantics as
-/// `decode_compressed_literals` but rejects 4-stream with the SP129
-/// sentinel marker for any caller still expecting single-stream-only.
+/// SP129 compatibility wrapper — same semantics as
+/// `decode_compressed_literals` but rejects 4-stream input. Kept for the
+/// SP129-era KATs that document the single-stream boundary; the
+/// 4-stream path itself is fully wired by SP130 via
+/// `decode_compressed_literals`.
 pub(crate) fn decode_compressed_literals_single_stream(
     input: &[u8],
 ) -> Result<(Vec<u8>, usize), ZstdError> {
@@ -248,6 +250,7 @@ pub(crate) fn decode_compressed_literals_single_stream(
         });
     }
     if header.num_streams != 1 {
+        // Sentinel: SP130 4-stream variant rejected by this single-stream wrapper.
         return Err(ZstdError::LiteralsBlockTypeNotYetSupported {
             block_type: 0xFE,
         });

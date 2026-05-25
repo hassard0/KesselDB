@@ -825,80 +825,97 @@ mod tests {
         }
     }
 
-    /// SP137-DIAG: step-by-step trace through the (formerly failing)
-    /// pyarrow frame. Kept #[ignore]'d so it doesn't pollute the gate
-    /// output, but available as a debugging aid for future FSE work.
-    /// Run with `cargo test sp137_diag -- --ignored --nocapture`.
+    /// SP137-FIX-LOCK: step-by-step pipeline assertion through the
+    /// pyarrow Parquet frame that originally surfaced the SP126 FSE
+    /// `base_state` bug. Locks the full pipeline contract at each
+    /// stage (literals header → literals payload → sequences header →
+    /// LL/OF/ML FSE tables → sequence stream → execution) against
+    /// known-correct intermediate values. Run as part of the regular
+    /// gate (no `#[ignore]`).
     #[test]
-    #[ignore = "diagnostic — print-trace, run with --nocapture"]
-    fn sp137_diag_pyarrow_frame_step_by_step() {
-        use crate::zstd_huffstream::{decode_compressed_literals, decode_treeless_literals};
+    fn sp137_fix_lock_pyarrow_frame_pipeline() {
         use crate::zstd_literals::{
             decode_raw_literals, parse_literals_header, LiteralsBlockType,
         };
         use crate::zstd_sequences::{
             decode_sequences_stream, load_fse_table_for_mode, parse_sequences_header,
-            SeqSymbolClass,
+            SeqSymbolClass, SeqSymbolMode,
         };
         use crate::zstd_seqexec::{execute_sequences, RepeatOffsets};
-        // Compressed block bytes (after the frame + block header).
+        // 30-byte compressed block from the SP136 pyarrow zstd_plain
+        // fixture (bytes 9..39 of the 39-byte zstd frame).
         let block: &[u8] = &[
             0xb0, 0x02, 0x00, 0x00, 0x00, 0x0a, 0x01, 0x01, 0x00, 0x02,
             0x00, 0x03, 0x00, 0x04, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x04, 0x14, 0x00, 0x03, 0x18, 0x63, 0x2e,
         ];
-        eprintln!("block = {} bytes", block.len());
-        let lit_hdr = parse_literals_header(block).expect("lit hdr");
-        eprintln!("lit_hdr = {:?}", lit_hdr);
-        let after_hdr = &block[lit_hdr.header_len..];
-        let lit = match lit_hdr.block_type {
-            LiteralsBlockType::Raw => decode_raw_literals(after_hdr, lit_hdr.regenerated_size as usize).unwrap(),
-            _ => panic!("expected Raw"),
-        };
-        eprintln!("literals ({} bytes) = {:02x?}", lit.len(), &lit[..]);
-        let lit_consumed = lit_hdr.header_len + lit_hdr.regenerated_size as usize;
-        let after_lit = &block[lit_consumed..];
-        eprintln!("after literals: {} bytes = {:02x?}", after_lit.len(), after_lit);
-        let seq_hdr = parse_sequences_header(after_lit).expect("seq hdr");
-        eprintln!("seq_hdr = {:?}", seq_hdr);
-        let after_seq_hdr = &after_lit[seq_hdr.header_len..];
-        let (ll_table, ll_consumed) = load_fse_table_for_mode(
-            SeqSymbolClass::LiteralLength, seq_hdr.ll_mode, after_seq_hdr, None,
-        ).expect("ll table");
-        eprintln!("LL table: log={} entries={} consumed={}", ll_table.accuracy_log, ll_table.entries.len(), ll_consumed);
-        eprintln!("LL[28] = {:?}", ll_table.entries[28]);
-        let after_ll = &after_seq_hdr[ll_consumed..];
-        let (of_table, of_consumed) = load_fse_table_for_mode(
-            SeqSymbolClass::Offset, seq_hdr.of_mode, after_ll, None,
-        ).expect("of table");
-        eprintln!("OF table: log={} entries={} consumed={}", of_table.accuracy_log, of_table.entries.len(), of_consumed);
-        let after_of = &after_ll[of_consumed..];
-        let (ml_table, ml_consumed) = load_fse_table_for_mode(
-            SeqSymbolClass::MatchLength, seq_hdr.ml_mode, after_of, None,
-        ).expect("ml table");
-        eprintln!("ML table: log={} entries={} consumed={}", ml_table.accuracy_log, ml_table.entries.len(), ml_consumed);
-        let bitstream = &after_of[ml_consumed..];
-        eprintln!("bitstream ({} bytes) = {:02x?}", bitstream.len(), bitstream);
-        let seqs = decode_sequences_stream(bitstream, &ll_table, &of_table, &ml_table, seq_hdr.num_sequences);
-        match &seqs {
-            Ok(s) => eprintln!("sequences ({}) = {:?}", s.len(), s),
-            Err(e) => {
-                eprintln!("sequences FAILED: {:?}", e);
-                panic!("seq decode failed");
-            }
+        // Literals: Raw, regen=22, 1-byte header.
+        let lit_hdr = parse_literals_header(block).unwrap();
+        assert_eq!(lit_hdr.block_type, LiteralsBlockType::Raw);
+        assert_eq!(lit_hdr.regenerated_size, 22);
+        assert_eq!(lit_hdr.header_len, 1);
+        let literals =
+            decode_raw_literals(&block[1..], 22).unwrap();
+        assert_eq!(literals.len(), 22);
+        // Sequences: 4 sequences, LL=Predefined, OF=RLE(0), ML=RLE(3).
+        let seq_hdr = parse_sequences_header(&block[23..]).unwrap();
+        assert_eq!(seq_hdr.num_sequences, 4);
+        assert_eq!(seq_hdr.ll_mode, SeqSymbolMode::Predefined);
+        assert_eq!(seq_hdr.of_mode, SeqSymbolMode::Rle);
+        assert_eq!(seq_hdr.ml_mode, SeqSymbolMode::Rle);
+        assert_eq!(seq_hdr.header_len, 2);
+        // LL/OF/ML tables.
+        let after = &block[25..];
+        let (ll_table, ll_n) = load_fse_table_for_mode(
+            SeqSymbolClass::LiteralLength, seq_hdr.ll_mode, after, None,
+        ).unwrap();
+        assert_eq!(ll_table.accuracy_log, 6);
+        assert_eq!(ll_table.entries.len(), 64);
+        // SP137 LOCK: LL[28] after the canonical FSE construction.
+        assert_eq!(ll_table.entries[28].symbol, 8);
+        assert_eq!(ll_table.entries[28].nb_bits, 5);
+        assert_eq!(ll_table.entries[28].base_state, 0);
+        let (of_table, of_n) = load_fse_table_for_mode(
+            SeqSymbolClass::Offset, seq_hdr.of_mode, &after[ll_n..], None,
+        ).unwrap();
+        assert_eq!(of_table.accuracy_log, 0);
+        assert_eq!(of_n, 1);
+        let (ml_table, ml_n) = load_fse_table_for_mode(
+            SeqSymbolClass::MatchLength, seq_hdr.ml_mode, &after[ll_n + of_n..], None,
+        ).unwrap();
+        assert_eq!(ml_table.accuracy_log, 0);
+        assert_eq!(ml_n, 1);
+        let bitstream = &after[ll_n + of_n + ml_n..];
+        assert_eq!(bitstream.len(), 3); // [0x18, 0x63, 0x2e]
+        // Sequence decode: expected [LL=8, LL=2, LL=2, LL=2] all with
+        // offset=1 + ml=6 per the SP137 fix.
+        let seqs = decode_sequences_stream(
+            bitstream, &ll_table, &of_table, &ml_table, seq_hdr.num_sequences,
+        ).unwrap();
+        assert_eq!(seqs.len(), 4);
+        assert_eq!(seqs[0].literal_length, 8);
+        assert_eq!(seqs[1].literal_length, 2);
+        assert_eq!(seqs[2].literal_length, 2);
+        assert_eq!(seqs[3].literal_length, 2);
+        for s in &seqs {
+            assert_eq!(s.offset, 1);
+            assert_eq!(s.match_length, 6);
         }
+        // Execute: 46 bytes output matching the reference zstd tool.
         let mut repeats = RepeatOffsets::new();
         let mut out: Vec<u8> = Vec::new();
-        let r = execute_sequences(&seqs.unwrap(), &lit, &mut repeats, &mut out, 64 * 1024);
-        match r {
-            Ok(n) => eprintln!("OK: {} bytes; out = {:02x?}", n, &out[..]),
-            Err(e) => {
-                eprintln!("EXECUTE FAILED: {:?}", e);
-                panic!("execute failed");
-            }
+        let n = execute_sequences(
+            &seqs, &literals, &mut repeats, &mut out, 64 * 1024,
+        ).unwrap();
+        assert_eq!(n, 46);
+        // Spot-check the 5 INT64 values at the expected offsets.
+        let expected_prefix = [0x02, 0x00, 0x00, 0x00, 0x0a, 0x01];
+        assert_eq!(&out[0..6], &expected_prefix[..]);
+        for (i, v) in [1u64, 2, 3, 4, 5].iter().enumerate() {
+            let off = 6 + i * 8;
+            let bytes: [u8; 8] = out[off..off + 8].try_into().unwrap();
+            assert_eq!(u64::from_le_bytes(bytes), *v);
         }
-        // Suppress unused warnings.
-        let _ = (decode_compressed_literals, decode_treeless_literals);
     }
 
     /// SP136-E2E-DIAG-1: known-good zstd stream produced by the reference

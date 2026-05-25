@@ -269,7 +269,7 @@ fn build_huffman_tree_from_weights(weights: &[u8], max_bits: u32) -> Result<Huff
     }
     let bits_per_symbol: Vec<u8> = weights
         .iter()
-        .map(|&w| if w == 0 { 0u8 } else { (max_bits as u8 + 1 - w) })
+        .map(|&w| if w == 0 { 0u8 } else { max_bits as u8 + 1 - w })
         .collect();
 
     let table_size = 1usize << max_bits;

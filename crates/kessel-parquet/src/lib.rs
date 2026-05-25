@@ -3763,8 +3763,12 @@ mod pentest_int96_decimal {
 
     // ── catch_unwind helpers — mirrors `pentest_v2::no_panic_typed_err`
     // and `pentest_v2::no_panic_err_contains` EXACTLY (column name is
-    // always "d" for this module).
+    // always "d" for this module). Kept for parity with the V2 pentest
+    // module's helper surface; some specific call sites use the
+    // `_contains` variant below directly, so this fn may currently look
+    // unused in this module — leave it for future hostile-vector tests.
 
+    #[allow(dead_code)]
     fn no_panic_typed_err(file: &[u8]) {
         let owned = file.to_vec();
         let r = std::panic::catch_unwind(move || extract(&owned, &["d"]));

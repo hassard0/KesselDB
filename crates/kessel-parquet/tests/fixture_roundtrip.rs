@@ -501,9 +501,18 @@ fn flba_uuid_fixture_roundtrips_to_bytes() {
 // non-self-referential validator for the SP125-SP135 zstd pipeline.
 // ════════════════════════════════════════════════════════════════════════════
 
-const ZSTD_PLAIN: &[u8]    = include_bytes!("fixtures/zstd_plain.parquet");
-const ZSTD_DICT: &[u8]     = include_bytes!("fixtures/zstd_dict.parquet");
-const ZSTD_NULLABLE: &[u8] = include_bytes!("fixtures/zstd_nullable.parquet");
+const ZSTD_PLAIN: &[u8]         = include_bytes!("fixtures/zstd_plain.parquet");
+const ZSTD_DICT: &[u8]          = include_bytes!("fixtures/zstd_dict.parquet");
+const ZSTD_NULLABLE: &[u8]      = include_bytes!("fixtures/zstd_nullable.parquet");
+// SP138 stress fixtures: BYTE_ARRAY strings + dict+nullable + V2+zstd.
+// The 2000-row `zstd_stress.parquet` fixture (kept on disk) exercises the
+// FSE-Compressed LL/OF/ML mode (all 3 modes simultaneously) and surfaces a
+// subtle FSE-counts-summation discrepancy with libzstd's parse — deferred
+// to SP139 deep-libzstd-source comparison. The 4 SP138 fixtures below all
+// PASS through the existing SP125-SP137 pipeline.
+const ZSTD_STRINGS: &[u8]       = include_bytes!("fixtures/zstd_strings.parquet");
+const ZSTD_DICT_NULLABLE: &[u8] = include_bytes!("fixtures/zstd_dict_nullable.parquet");
+const ZSTD_V2: &[u8]            = include_bytes!("fixtures/zstd_v2.parquet");
 
 /// SP136-E2E-1: REQUIRED INT64 PLAIN under zstd.
 /// **SP137 PENDING**: pyarrow's libzstd output triggers a typed
@@ -554,3 +563,64 @@ fn zstd_nullable_fixture_roundtrips() {
     ], "zstd_nullable.parquet");
 }
 
+
+// ════════════════════════════════════════════════════════════════════════════
+// OBJ-2c-2 (SP138): expanded pyarrow zstd fixtures stressing the SP130
+// 4-stream Huffman + SP131 FSE-weight Huffman tree + V2-page paths
+// that the SP136 small-data fixtures were too small to trigger.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// SP138-E2E-1: zstd + BYTE_ARRAY strings (REQUIRED). Exercises the
+/// zstd pipeline over a literal alphabet that's NOT INT64-dominated.
+#[test]
+fn zstd_strings_fixture_roundtrips() {
+    let rows = extract(ZSTD_STRINGS, &["s"])
+        .expect("extract zstd_strings.parquet (REQUIRED+BYTE_ARRAY+zstd)");
+    assert_eq!(rows, vec![
+        vec![Bytes(b"alpha".to_vec())],
+        vec![Bytes(b"beta".to_vec())],
+        vec![Bytes(b"gamma".to_vec())],
+        vec![Bytes(b"delta".to_vec())],
+        vec![Bytes(b"epsilon".to_vec())],
+    ], "zstd_strings.parquet");
+}
+
+/// SP138-E2E-2: zstd + dict + OPTIONAL (nullable) INT64. Three-way
+/// composition: zstd page decode ∘ dict resolve ∘ def-level scatter.
+#[test]
+fn zstd_dict_nullable_fixture_roundtrips() {
+    let rows = extract(ZSTD_DICT_NULLABLE, &["v"])
+        .expect("extract zstd_dict_nullable.parquet (OPTIONAL+dict+zstd)");
+    assert_eq!(rows.len(), 35); // 7 rows × 5 repetitions
+    // Pattern: [10, None, 20, None, 10, 20, 10] repeated.
+    assert_eq!(rows[0], vec![I64(10)]);
+    assert_eq!(rows[1], vec![Null]);
+    assert_eq!(rows[2], vec![I64(20)]);
+    assert_eq!(rows[3], vec![Null]);
+    assert_eq!(rows[4], vec![I64(10)]);
+    assert_eq!(rows[5], vec![I64(20)]);
+    assert_eq!(rows[6], vec![I64(10)]);
+    assert_eq!(rows[7], vec![I64(10)]); // start of 2nd repetition
+}
+
+/// SP138-E2E-3: zstd + DATA_PAGE_V2 (data_page_version='2.0'). Proves
+/// zstd composes with the V2-page seam (the values-section-only
+/// decompression path at lib.rs::decode_data_page_v2).
+#[test]
+fn zstd_v2_fixture_roundtrips() {
+    let rows = extract(ZSTD_V2, &["id"])
+        .expect("extract zstd_v2.parquet (REQUIRED+PLAIN+zstd+V2)");
+    assert_eq!(rows, vec![
+        vec![I64(1)], vec![I64(2)], vec![I64(3)], vec![I64(4)], vec![I64(5)],
+    ], "zstd_v2.parquet");
+}
+
+// SP138-E2E-4 (zstd_stress 2000-row fixture) DEFERRED to SP139.
+// Per-byte trace via the SP138 diagnostic showed pyarrow's stress fixture
+// uses FSE-Compressed mode for ALL THREE LL/OF/ML codes. My
+// parse_normalized_counts produces structurally-valid counts for the LL
+// FSE table (sum|c|=table_size, all spec invariants satisfied), but
+// libzstd's parse produces DIFFERENT counts from the same bytes (and
+// consumes more bytes for LL → OF starts at a different offset). The
+// fixture itself (`zstd_stress.parquet`) is kept on disk for the SP139
+// follow-up that does the deep libzstd-source-level FSE comparison.

@@ -209,6 +209,11 @@ pub(crate) fn parse_normalized_counts(
     let mut counts: Vec<i16> = Vec::new();
     let mut symbol: u32 = 0;
     while remaining > 1 && symbol <= max_symbol_value {
+        // RFC §4.1.1.1 + libzstd `FSE_readNCount`: max_bits is the
+        // SMALLEST k such that `2^k >= remaining + 1`, equivalent to
+        // `bit_length(remaining)` for remaining >= 1 (since
+        // bit_length(x) = smallest k with 2^k > x = smallest k with
+        // 2^k >= x+1).
         let max_bits = (64 - (remaining as u64).leading_zeros()) as u32;
         let low_threshold = ((1i64 << max_bits) - 1 - remaining) as u32;
         let mask = (1u32 << max_bits) - 1;

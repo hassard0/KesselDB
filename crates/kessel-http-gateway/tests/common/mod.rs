@@ -52,8 +52,29 @@ pub fn spawn_server_with_token(
     std::thread::spawn(move || {
         kesseldb_server::serve_cfg(binary, engine, cfg);
     });
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    wait_for_listener(http_addr);
     (http_addr, guard)
+}
+
+/// SP142 T2: wait for the gateway listener to bind before the first
+/// connect. Replaces the prior 150ms thread::sleep — adaptive (returns
+/// on first successful connect) and capped (panics after 500ms so a
+/// truly broken listener fails fast instead of hanging the test run).
+///
+/// First iteration on a fast machine succeeds in ~1-5ms (30× faster than
+/// the prior 150ms sleep × ~25 calls). On a slow CI runner that takes
+/// 200ms to bind, ~20 iterations × 10ms = 200ms — still adaptive.
+fn wait_for_listener(addr: std::net::SocketAddr) {
+    for _ in 0..50 {
+        if std::net::TcpStream::connect_timeout(
+            &addr,
+            std::time::Duration::from_millis(50),
+        ).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("gateway listener never bound: {addr}");
 }
 
 /// Single-shot request → full response read (server sends Connection: close).

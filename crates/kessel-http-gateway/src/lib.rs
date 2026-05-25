@@ -13,6 +13,7 @@
 #![allow(dead_code)]
 
 pub mod engine;
+pub mod metrics_writer;
 pub mod parse;
 pub mod response;
 pub mod routes;

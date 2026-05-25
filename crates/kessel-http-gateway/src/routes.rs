@@ -120,11 +120,12 @@ fn handle_health<W: Write>(
 
 fn handle_metrics<W: Write>(
     w: &mut W,
-    _engine: &Arc<dyn EngineApply>,
+    engine: &Arc<dyn EngineApply>,
 ) -> std::io::Result<()> {
-    // T6 fills the metrics writer. For T4 we ship a placeholder so the route
-    // exists and the e2e test can verify the route is wired.
-    write_prometheus(w, "# T6 fills this\n")
+    use crate::metrics_writer::render;
+    let snap = engine.snapshot_metrics();
+    let text = render(&snap);
+    write_prometheus(w, &text)
 }
 
 /// Map an OpResult to (HTTP status, JSON body via format_result_json).

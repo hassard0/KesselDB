@@ -461,6 +461,13 @@ impl EngineHandle {
         }
     }
 
+    /// SP141 T6: snapshot of in-flight op count for /v1/metrics. `inflight`
+    /// is `pub(self)` (private to the module), so the `impl EngineApply` block
+    /// reaches it through this accessor.
+    pub fn inflight_snapshot(&self) -> u64 {
+        self.inflight.load(Ordering::Acquire) as u64
+    }
+
     /// Take a consistent on-disk snapshot/backup into `dest`. The engine
     /// flushes, then copies its data dir while no apply is in flight, so
     /// `StateMachine::open(dest)` recovers an identical state.
@@ -1062,14 +1069,23 @@ impl kessel_http_gateway::EngineApply for EngineHandle {
         }
     }
     fn snapshot_metrics(&self) -> kessel_http_gateway::MetricsSnapshot {
-        // T6 fills this; T4 ships the placeholder so /v1/health works.
+        let s = self.stats();
         kessel_http_gateway::MetricsSnapshot {
-            ops_total: Vec::new(),
-            inflight: 0,
-            last_op_number: 0,
-            view_number: 0,
+            ops_total: vec![
+                // SP141 V1: a single rolled-up counter using `applied_ops`
+                // (engine's existing counter). A per-Op-kind breakdown
+                // requires an atomic counter array — deferred to follow-up
+                // per spec §11.
+                kessel_http_gateway::OpKindCounter {
+                    kind: "applied",
+                    count: s.applied_ops,
+                },
+            ],
+            inflight: self.inflight_snapshot(),
+            last_op_number: s.applied_ops,
+            view_number: 0,    // single-node V1; cluster wiring is follow-up
             is_primary: true,
-            http_requests_total: Vec::new(),
+            http_requests_total: Vec::new(),  // wired in follow-up
         }
     }
 }

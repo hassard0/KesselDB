@@ -6,7 +6,7 @@
 
 *"It's the database that made the Kessel Run in 12 parsecs."*
 
-`890 tests green` · `0 external dependencies in the kernel` · `Rust 1.95+` · single‑binary
+`891 tests green` · `0 external dependencies in the kernel` · `Rust 1.95+` · single‑binary
 
 </div>
 
@@ -101,6 +101,8 @@ cargo build --release
 
 # start a node:  kesseldb [LISTEN_ADDR] [DATA_DIR]
 cargo run --release --bin kesseldb -- 127.0.0.1:7878 ./data
+# Workspace gate: 891 tests, 0 ignored
+cargo test --workspace --release
 ```
 
 ### Query it in one command — no code required
@@ -202,7 +204,7 @@ round‑trip fixtures**:
 | Axis | Supported | Notes |
 |---|---|---|
 | **Page version** | V1 + **V2** | V2 raw‑level‑split path (def/rep levels uncompressed, values section compressed) |
-| **Compression** | UNCOMPRESSED, **Snappy**, **GZIP**, **zstd** *(most files)* | All decompressors are zero‑dep hand‑written (`snappy.rs` 338 LOC / `gzip.rs` RFC 1951 inflate / `zstd*.rs` RFC 8478). zstd works for short pages + RLE/Predefined FSE‑sequence modes; concentrated‑FSE stress (large random data) is one bug‑fix away — tracked as SP140 |
+| **Compression** | UNCOMPRESSED, **Snappy**, **GZIP**, **zstd** | All decompressors are zero‑dep hand‑written (`snappy.rs` 338 LOC / `gzip.rs` RFC 1951 inflate / `zstd*.rs` full RFC 8478 pipeline: frame + block + literals (Raw/RLE/Compressed/Treeless) + Huffman (direct + FSE‑weight × 1‑stream + 4‑stream) + sequences (Predefined/RLE/FseCompressed × LL/OF/ML) + 3‑slot repeat‑offset LZ77 execution). All real pyarrow zstd fixtures pass end‑to‑end through `extract()` incl. a 2000‑row stress fixture exercising FseCompressed mode for all three LL/OF/ML codes simultaneously. |
 | **Encoding** | PLAIN, **PLAIN_DICTIONARY / RLE_DICTIONARY** | Dictionary page + data‑page index resolve |
 | **Repetition** | flat REQUIRED + **flat OPTIONAL (nullable)** | OPTIONAL via RLE‑hybrid def‑level decode + null‑scatter; REPEATED/nested deferred (OBJ‑2c‑5) |
 | **Physical types** | INT32, **INT64**, **INT96 (timestamp)**, **FLBA**, **BYTE_ARRAY** | INT96 → `PqValue::Timestamp(i64 ns)` via checked Julian‑day arithmetic |
@@ -216,7 +218,6 @@ error naming the OBJ‑2c follow‑on):
 - REPEATED / nested groups / V2 repetition levels (OBJ‑2c‑5)
 - DECIMAL precision > 38 (would need i256)
 - Per‑page decompressed size > 64 MiB
-- Concentrated‑FSE zstd stress pages (SP140 — see [`docs/STATUS.md`](docs/STATUS.md))
 
 The reader is feature‑gated through `kessel-fetch`'s `object-store`
 feature; the default `cargo build` links **no Parquet code at all**
@@ -284,7 +285,7 @@ Honest boundaries (documented, not hidden):
   `Delete`); cross‑shard scatter‑gather *reads*/SQL text routing is a
   separate, later concern from cross‑shard *transactions*.
 
-Every claim in this repository is backed by the test suite (`890 tests, 0 ignored`); the
+Every claim in this repository is backed by the test suite (`891 tests, 0 ignored`); the
 docs call out exactly what is proven versus roadmap. The four
 **strategic‑tier items S1–S4** (TLA+/model‑checked safety, serializable
 MVCC/SI, Jepsen linearizability under partition, deterministic WASM
@@ -311,7 +312,7 @@ records (SP109 / SP110‑SP116 / SP117 / SP118).
 
 ```bash
 cargo build                 # all kernel crates, zero external deps
-cargo test --workspace      # 890 tests (incl. seeded partition/fault sim,
+cargo test --workspace      # 891 tests (incl. seeded partition/fault sim,
                             # Jepsen linearizability, MVCC TLA+ refinement,
                             # pyarrow Parquet round-trips, WASM-MVP KATs)
 cargo run -p kessel-bench --release -- --help   # benchmarks

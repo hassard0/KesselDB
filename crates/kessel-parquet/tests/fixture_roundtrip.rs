@@ -619,12 +619,33 @@ fn zstd_v2_fixture_roundtrips() {
     ], "zstd_v2.parquet");
 }
 
-// SP139 progress (kept fixture on disk for SP140 follow-up): the
-// `parse_normalized_counts` fix here resolves the FSE-table-parsing
-// alignment bug (LL parse now correctly consumes 7 bytes vs the
-// pre-SP139 over-quick 8 bytes that mis-decoded acc_log=20 for OF).
-// All 3 FSE tables now parse cleanly for the stress fixture; the
-// remaining stress e2e failure is in sequence-stream decode (likely
-// a 0-nb-bits / 3-state-interleaved bookkeeping bug — SP140).
-// The SP137-fix-lock test + 3 SP138 fixtures continue to PASS with
-// the SP139 fix (proving it's a strict improvement, not a regression).
+const ZSTD_STRESS: &[u8] = include_bytes!("fixtures/zstd_stress.parquet");
+
+/// SP140-E2E: zstd stress — 2000 random INT64 values. Pyarrow's libzstd
+/// uses **FSE-Compressed mode for ALL THREE LL/OF/ML codes** here.
+/// The SP140 fix corrected a spurious `+ 128` in
+/// `parse_sequences_header`'s 2-byte VLQ formula that had been inflating
+/// `num_sequences` by 128 (the stress fixture's VLQ `[0x87, 0xcf]`
+/// correctly decodes to 1999, not the pre-SP140 buggy 2127). With the
+/// fix, the loop exits cleanly after the 1999th sequence and the full
+/// 2000-row table round-trips byte-identical to pyarrow's output.
+#[test]
+fn zstd_stress_fixture_roundtrips() {
+    let rows = extract(ZSTD_STRESS, &["big"])
+        .expect("extract zstd_stress.parquet (REQUIRED+PLAIN+zstd; FSE-Compressed all 3 modes)");
+    assert_eq!(rows.len(), 2000);
+    // Spot-check known values from the pyarrow generator (random.seed(42)).
+    assert_eq!(rows[0], vec![I64(2867825)]);
+    assert_eq!(rows[1], vec![I64(1419610)]);
+    assert_eq!(rows[2], vec![I64(5614226)]);
+    assert_eq!(rows[1999], vec![I64(3679603)]);
+    // Determinism cross-check: every row is non-null I64 in expected range.
+    for r in &rows {
+        assert_eq!(r.len(), 1);
+        match &r[0] {
+            I64(v) => assert!(*v >= 1_000_000 && *v <= 10_000_000,
+                "out-of-range value: {v}"),
+            other => panic!("non-I64 in zstd_stress: {other:?}"),
+        }
+    }
+}

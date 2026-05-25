@@ -318,11 +318,8 @@ pub(crate) fn decode_sequences_stream(
             return Err(ZstdError::UnexpectedEof);
         }
         if (of_sym as u32) > 31 {
-            // Spec bound — offset codes > 31 are invalid (would produce
-            // an offset > 2^32 which overflows our u32).
             return Err(ZstdError::UnexpectedEof);
         }
-        // Read extra bits per RFC §5.4.3 (offset, then ml, then ll).
         let of_extra = rr.read_bits(of_sym as u32)?;
         let offset = (1u32 << of_sym) + of_extra;
         let ml_extra = rr.read_bits(ML_EXTRA_BITS[ml_sym as usize])?;
@@ -334,9 +331,7 @@ pub(crate) fn decode_sequences_stream(
             offset,
             match_length,
         });
-        // Don't step after the LAST sequence — RFC §5.4.3.
         if seq_idx + 1 < num_sequences {
-            // Step order: LL, then ML, then OF.
             ll_state.step(ll_table, &mut rr)?;
             ml_state.step(ml_table, &mut rr)?;
             of_state.step(of_table, &mut rr)?;
@@ -351,19 +346,29 @@ pub(crate) fn parse_sequences_header(input: &[u8]) -> Result<SequencesHeader, Zs
         return Err(ZstdError::UnexpectedEof);
     }
     let b0 = input[0];
-    // Number_of_Sequences VLQ per RFC §5.4.1.1:
-    //   b0 < 128             : num_sequences = b0;            1-byte VLQ
-    //   b0 < 255             : num_sequences = ((b0 - 128) << 8) + b1 + 128;
-    //                                                          2-byte VLQ
-    //   b0 == 255            : num_sequences = b1 + (b2 << 8) + 0x7F00;
-    //                                                          3-byte VLQ
+    // Number_of_Sequences VLQ per libzstd `ZSTD_decodeSeqHeaders`:
+    //   b0 < 128             : num_sequences = b0;                   1-byte VLQ
+    //   b0 in [128, 254]     : num_sequences = ((b0 - 128) << 8) + b1;
+    //                                                                2-byte VLQ
+    //   b0 == 255            : num_sequences = b1 + (b2 << 8) + LONGNBSEQ
+    //                                          (where LONGNBSEQ = 0x7F00)
+    //                                                                3-byte VLQ
+    //
+    // **SP140 fix**: my SP132 implementation had a spurious `+ 128` in
+    // the 2-byte case (copy-paste error inflating num_sequences). The
+    // stress fixture's 2-byte VLQ [0x87, 0xcf] correctly decodes to
+    // 1999 (not 2127). The bug surfaced when the stress fixture's
+    // sequence-stream decoder ran through 1998 sequences successfully
+    // and then tripped on the LL state step at seq 1998 (which would
+    // have been the start of the spurious 1999..2126 sequences); with
+    // the fix, the loop exits cleanly after the actual 1999th sequence.
     let (num_sequences, vlq_len) = if b0 < 128 {
         (b0 as u32, 1usize)
     } else if b0 < 255 {
         if input.len() < 2 {
             return Err(ZstdError::UnexpectedEof);
         }
-        let n = (((b0 as u32) - 128) << 8) + (input[1] as u32) + 128;
+        let n = (((b0 as u32) - 128) << 8) + (input[1] as u32);
         (n, 2usize)
     } else {
         // b0 == 255
@@ -445,22 +450,14 @@ mod tests {
         assert_eq!(h.ml_mode, SeqSymbolMode::Predefined);
     }
 
-    /// SP132-KAT-3: num_sequences = 200 → 2-byte VLQ.
-    /// Encoding: b0 = ((200 - 128) >> 8) + 128 = 0 + 128 = 128;
-    ///           b1 = (200 - 128) & 0xFF = 72 = 0x48.
-    /// Wait that's wrong. Re-derive: per spec
-    ///   n = ((b0 - 128) << 8) + b1 + 128
-    ///   200 - 128 = 72. So we need (b0 - 128) << 8 + b1 + 128 = 200.
-    ///   (b0 - 128) << 8 + b1 = 72.
-    ///   With b0 in 128..255: b0 - 128 in 0..127. Smallest: b0 = 128 → 0
-    ///   shifted = 0; b1 = 72 = 0x48.
-    /// → b0 = 0x80, b1 = 0x48.
-    /// Modes = 0x80 (LL=Rle, others=Predefined): bits 7-6 = 0b10 = 2 (FseCompressed!).
-    /// Hmm 0b10 = 2 = FseCompressed. Let me use 0x40 = 0b01_00_00_00 →
-    /// LL_mode = 0b01 = Rle.
+    /// SP132-KAT-3 (SP140 update): num_sequences = 200 → 2-byte VLQ.
+    /// Per libzstd: `n = ((b0 - 128) << 8) + b1`, NO `+ 128` term.
+    /// For n=200: (b0 - 128) << 8 + b1 = 200. Smallest b0 = 128 → 0 shifted;
+    /// b1 = 200 = 0xC8.
+    /// → b0 = 0x80, b1 = 0xC8. Modes = 0x40 (LL=Rle, others=Predefined).
     #[test]
     fn sp132_kat_two_byte_vlq_with_rle_ll_mode() {
-        let h = parse_sequences_header(&[0x80u8, 0x48u8, 0x40u8]).unwrap();
+        let h = parse_sequences_header(&[0x80u8, 0xC8u8, 0x40u8]).unwrap();
         assert_eq!(h.num_sequences, 200);
         assert_eq!(h.header_len, 3);
         assert_eq!(h.ll_mode, SeqSymbolMode::Rle);
@@ -468,31 +465,26 @@ mod tests {
         assert_eq!(h.ml_mode, SeqSymbolMode::Predefined);
     }
 
-    /// SP132-KAT-4: num_sequences = 32767 → upper edge of 2-byte VLQ.
-    /// n = ((b0 - 128) << 8) + b1 + 128 = 32767.
-    /// → (b0 - 128) << 8 + b1 = 32639 = 0x7F7F.
-    /// b0 - 128 = 0x7F → b0 = 0xFF... but b0 = 255 means 3-byte VLQ!
-    /// So 2-byte VLQ tops at b0 = 254 → max n = ((254-128) << 8) + 255 + 128
-    ///                                       = (126 << 8) + 383 = 32256 + 383 = 32639.
-    /// So 32639 is the 2-byte ceiling. Use that.
-    /// b0 = 0xFE, b1 = 0xFF. Modes = 0x00 (all Predefined).
+    /// SP132-KAT-4 (SP140 update): num_sequences = 32511 → upper edge
+    /// of 2-byte VLQ per libzstd. Max for 2-byte: b0=0xFE (b0-128=126),
+    /// b1=0xFF → n = (126 << 8) + 255 = 32256 + 255 = 32511. (b0=0xFF
+    /// is the 3-byte VLQ escape.) The boundary then is:
+    ///   2-byte VLQ max = 32511
+    ///   3-byte VLQ min = 0x7F00 = 32512  (with b1=0, b2=0)
     #[test]
     fn sp132_kat_two_byte_vlq_max_value() {
         let h = parse_sequences_header(&[0xFEu8, 0xFFu8, 0x00u8]).unwrap();
-        assert_eq!(h.num_sequences, 32639);
+        assert_eq!(h.num_sequences, 32511);
         assert_eq!(h.header_len, 3);
     }
 
-    /// SP132-KAT-5: num_sequences = 32640 → smallest 3-byte VLQ.
-    /// n = b1 + (b2 << 8) + 0x7F00 = 32640.
-    ///   → b1 + (b2 << 8) = 32640 - 32512 = 128.
-    ///   → b1 = 128, b2 = 0; OR b1 = 0, b2 = 0... wait 0x7F00 = 32512.
-    ///   So b1 + (b2 << 8) = 128 = 0x80. b1 = 0x80, b2 = 0x00.
-    /// b0 = 0xFF (3-byte VLQ marker), b1 = 0x80, b2 = 0x00, modes = 0x00.
+    /// SP132-KAT-5 (SP140 update): num_sequences = 32512 → smallest 3-byte VLQ.
+    /// n = b1 + (b2 << 8) + 0x7F00. Smallest n is b1=0, b2=0 → n = 32512.
+    /// b0 = 0xFF (3-byte VLQ marker), b1 = 0x00, b2 = 0x00, modes = 0x00.
     #[test]
     fn sp132_kat_three_byte_vlq_min_value() {
-        let h = parse_sequences_header(&[0xFFu8, 0x80u8, 0x00u8, 0x00u8]).unwrap();
-        assert_eq!(h.num_sequences, 32640);
+        let h = parse_sequences_header(&[0xFFu8, 0x00u8, 0x00u8, 0x00u8]).unwrap();
+        assert_eq!(h.num_sequences, 32512);
         assert_eq!(h.header_len, 4);
     }
 

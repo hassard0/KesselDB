@@ -738,15 +738,15 @@ messages.
 
 ## 7f. FORMAT PARQUET for object-store sources
 
-> **Current capability (SP125‑SP139, OBJ‑2c arc 4/5 done):**
+> **Current capability (SP125‑SP140, OBJ‑2c‑2 zstd arc CLOSED):**
 > `FORMAT PARQUET` reads real `pyarrow 24.0.0` Parquet files end‑to‑end
 > across the **flat REQUIRED + OPTIONAL × UNCOMPRESSED + Snappy + GZIP + zstd
-> (small/medium pages) × PLAIN + dictionary × V1 + V2 data pages × INT32 +
-> INT64 + INT96 + FLBA + BYTE_ARRAY + DECIMAL (precision ≤ 38)** matrix.
+> × PLAIN + dictionary × V1 + V2 data pages × INT32 + INT64 + INT96 +
+> FLBA + BYTE_ARRAY + DECIMAL (precision ≤ 38)** matrix.
 > Vanilla `pq.write_table(df)` works zero‑flags for everything in that
-> matrix; pyarrow zstd output decodes for short pages + RLE/Predefined
-> FSE‑sequence modes (SP140 fills in the last concentrated‑FSE corner
-> for very large random‑data pages). Still typed‑Unsupported: LZ4 /
+> matrix; pyarrow zstd output decodes for all tested fixtures including
+> a 2000‑row stress fixture exercising the FseCompressed mode for all
+> three LL/OF/ML codes simultaneously. Still typed‑Unsupported: LZ4 /
 > Brotli (OBJ‑2c‑2 follow‑ons), REPEATED / nested groups / V2 rep‑levels
 > (OBJ‑2c‑5), DECIMAL precision > 38, per‑page > 64 MiB.
 >

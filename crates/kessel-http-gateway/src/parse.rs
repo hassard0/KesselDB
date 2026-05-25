@@ -77,6 +77,10 @@ pub enum ParseError {
     /// Transfer-Encoding token other than `chunked` (V1 only supports
     /// chunked). The String carries the offending token for diagnostics.
     UnsupportedTransferEncoding(String),
+    /// `Expect: 100-continue` is not supported by the V1 gateway (we read the
+    /// whole body off the wire eagerly into one parse buffer; we cannot
+    /// honor a hold-and-wait dance). RFC 9110 §10.1.1 — answer 417.
+    ExpectationFailed,
 }
 
 /// Parse one HTTP/1.1 request. Returns `Ok(Request)` if well-formed AND
@@ -157,6 +161,23 @@ pub fn parse_request(buf: &[u8], max_body: usize) -> Result<Request<'_>, ParseEr
     // RFC 9112 §6.1 — if BOTH framings are present, reject (smuggling).
     if chunked && content_length.is_some() {
         return Err(ParseError::ConflictingFraming);
+    }
+
+    // RFC 9110 §10.1.1 — `Expect: 100-continue` requires the server to
+    // respond 100 (Continue) before the client sends the body. The V1
+    // gateway reads the body eagerly off a single parse buffer and cannot
+    // honor the hold-and-wait dance; advertise 417 so clients fall back.
+    // Only flag when there's actually a body to expect (avoids penalizing
+    // a GET that carries the header by mistake).
+    let has_body = content_length.unwrap_or(0) > 0 || chunked;
+    if has_body {
+        for (name, value) in &headers {
+            if name.eq_ignore_ascii_case("expect")
+                && value.eq_ignore_ascii_case("100-continue")
+            {
+                return Err(ParseError::ExpectationFailed);
+            }
+        }
     }
 
     let body: Cow<'_, [u8]>;

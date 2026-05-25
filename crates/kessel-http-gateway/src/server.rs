@@ -145,6 +145,9 @@ fn write_parse_error<W: Write>(w: &mut W, e: &ParseError) -> std::io::Result<()>
         ParseError::UnsupportedTransferEncoding(m) =>
             ((400, "Bad Request"), "error",
              format!("unsupported Transfer-Encoding: {m}")),
+        ParseError::ExpectationFailed =>
+            ((417, "Expectation Failed"), "error",
+             "expectation failed".into()),
     };
     write_error_json(w, status, semantic, &msg)
 }

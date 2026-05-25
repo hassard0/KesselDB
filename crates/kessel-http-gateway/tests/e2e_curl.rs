@@ -4,78 +4,8 @@
 
 #![cfg(feature = "test-server")]
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
-
-fn temp_data_dir() -> std::path::PathBuf {
-    let pid = std::process::id();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let p = std::env::temp_dir().join(format!("kesseldb-sp141-{pid}-{nanos}"));
-    std::fs::create_dir_all(&p).unwrap();
-    p
-}
-
-/// RAII handle that wipes the test's temp data dir when the TEST THREAD
-/// drops it. The previous shape (cleanup inside the spawned server thread,
-/// after `serve_cfg` returns) never fired — `serve_cfg` blocks forever on
-/// its accept loop. Bind a `let (_addr, _guard) = spawn_server();` in each
-/// test so Drop runs at function return.
-///
-/// Limitation: the engine thread keeps reading the dir, so on Windows
-/// `remove_dir_all` can fail with `EBUSY` (file-in-use). Acceptable —
-/// the leak is reduced from "every test forever" to "at most one orphan
-/// per test run". A follow-up task can wire a shutdown channel through to
-/// the engine if this becomes a problem in CI.
-struct TempDirGuard(std::path::PathBuf);
-
-impl Drop for TempDirGuard {
-    fn drop(&mut self) {
-        // Best-effort: EBUSY on Windows is expected when the engine thread
-        // still holds the dir open. The harness logs aren't affected.
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn spawn_server() -> (std::net::SocketAddr, TempDirGuard) {
-    spawn_server_with_token(None)
-}
-
-fn spawn_server_with_token(token: Option<Vec<u8>>) -> (std::net::SocketAddr, TempDirGuard) {
-    let dir = temp_data_dir();
-    let guard = TempDirGuard(dir.clone());
-    let binary = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let http = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let http_addr = http.local_addr().unwrap();
-    drop(http);
-    let engine = kesseldb_server::spawn_engine(&dir).unwrap();
-    let cfg = kesseldb_server::ServerConfig {
-        token,
-        http_addr: Some(http_addr),
-        ..Default::default()
-    };
-    std::thread::spawn(move || {
-        kesseldb_server::serve_cfg(binary, engine, cfg);
-        // unreachable in practice — serve_cfg blocks forever
-    });
-    // Tiny sleep to let the gateway thread bind. (Idempotent — the e2e
-    // immediately retries the connect on failure via std blocking
-    // semantics.)
-    std::thread::sleep(std::time::Duration::from_millis(150));
-    (http_addr, guard)
-}
-
-fn raw_request(addr: std::net::SocketAddr, req: &[u8]) -> Vec<u8> {
-    let mut s = TcpStream::connect(addr).unwrap();
-    s.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
-    s.set_write_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
-    s.write_all(req).unwrap();
-    let mut buf = Vec::new();
-    s.read_to_end(&mut buf).unwrap();
-    buf
-}
+mod common;
+use common::{raw_request, spawn_server, spawn_server_with_token};
 
 #[test]
 fn e2e_health() {

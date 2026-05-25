@@ -79,6 +79,8 @@ of the HTTP gateway — they are hardening / observability upgrades:
    or a last-known-good cache. The trait doc in `engine.rs` already
    promises "no engine apply"; reconcile in follow-up. Same shape applies
    to `snapshot_health`.
+
+   **CLOSED in SP142 (commit `c95722a`)** — see `docs/superpowers/specs/2026-05-25-kesseldb-subproject142-http-gateway-hardening.md`.
 3. **Per-`(path, status)` HTTP request counter wired through the accept
    loop** (currently returns empty vec).
 4. **HTTP/2 / gRPC, WebSocket / SSE streaming, PostgreSQL wire compat** —
@@ -95,6 +97,8 @@ of the HTTP gateway — they are hardening / observability upgrades:
 8. **e2e `spawn_server` uses a 150ms sleep** rather than a connect-retry
    loop. Pre-existing CI risk; widened by T5's 17 additional spawn-server
    calls.
+
+   **CLOSED in SP142 (commit `2acea3f`)** — `wait_for_listener` connect-retry loop replaces the sleep. ~20× speedup on the pentest suite.
 9. **Pentest assertions are slightly loose** — most assert "HTTP/1.1 400"
    without distinguishing which `ParseError` variant produced it. A
    hardening pass could tighten body-text assertions.

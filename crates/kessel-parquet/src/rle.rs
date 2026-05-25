@@ -249,6 +249,31 @@ mod tests {
         assert_eq!(consumed, 6);
     }
 
+    // KAT 8 — SP143 T1: prove decode_level_v1 supports bit_width=2
+    // (needed for List<Optional<T>> def levels: max_def_level=3 →
+    // ceil(log2(4))=2). decode_level_v1 passes bit_width through
+    // unchanged to decode_hybrid, which already handles 0..=64; this
+    // KAT pins that contract for the multi-bit case the SP143 T4 page
+    // decoder will rely on.
+    //
+    // Body = one bit-packed group of 8 values [0,1,2,3,0,1,2,3] @ bw=2:
+    //   header = (1<<1)|1 = 0x03
+    //   bit-pack LSB-first per parquet-format Encodings.md:
+    //     byte0 (vals 0,1,2,3): bits (0-1)=0, (2-3)=1, (4-5)=2, (6-7)=3
+    //       → 0b11_10_01_00 = 0xE4
+    //     byte1 (vals 0,1,2,3): same → 0xE4
+    //   body = [0x03, 0xE4, 0xE4]  (3 bytes)
+    // Length prefix = [0x03, 0x00, 0x00, 0x00].
+    // total_consumed = 4 + 3 = 7.
+    #[test]
+    fn kat_decode_level_v1_bit_width_2_four_values() {
+        let data = [0x03u8, 0x00, 0x00, 0x00, 0x03, 0xE4, 0xE4];
+        let (levels, consumed) =
+            decode_level_v1(&data, 2, 8).expect("decode 4-level");
+        assert_eq!(levels, vec![0u64, 1, 2, 3, 0, 1, 2, 3]);
+        assert_eq!(consumed, 7);
+    }
+
     // ── Independent grammar-faithful encoders (NOT the decoder under test) ──
     // Written directly from the parquet-format grammar; entirely separate
     // code path from decode_hybrid so a round-trip failure indicates a real

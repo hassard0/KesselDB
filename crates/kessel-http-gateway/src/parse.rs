@@ -82,7 +82,11 @@ pub enum ParseError {
 /// Parse one HTTP/1.1 request. Returns `Ok(Request)` if well-formed AND
 /// fully received; `Err(ParseError)` otherwise. `consumed` reports how many
 /// bytes of `buf` belong to this request (so the caller can drop them).
-pub fn parse_request(buf: &[u8]) -> Result<Request<'_>, ParseError> {
+///
+/// `max_body` caps the decoded body length (RFC 9112 §4.1 — V1 spec defaults
+/// to `DEFAULT_MAX_BODY` = 8 MiB; `ServerConfig.http_max_body` overrides via
+/// `serve()`'s `max_body` parameter).
+pub fn parse_request(buf: &[u8], max_body: usize) -> Result<Request<'_>, ParseError> {
     // Cap headers up-front.
     let header_end = find_header_terminator(buf)?;
     if header_end > MAX_HEADER_BYTES {
@@ -166,7 +170,7 @@ pub fn parse_request(buf: &[u8]) -> Result<Request<'_>, ParseError> {
             let body_start = header_end;
             let remaining = buf.get(body_start..).unwrap_or(&[]);
             let (decoded, body_consumed_bytes) = decode_body(
-                remaining, content_length, chunked, DEFAULT_MAX_BODY)?;
+                remaining, content_length, chunked, max_body)?;
             // `consumed` reports headers + framed-body-bytes-on-the-wire.
             // For Content-Length that's exactly `cl`; for chunked it's the
             // exact byte count `dechunk` walked (post-0-CRLF trailer CRLF
@@ -188,6 +192,14 @@ pub fn parse_request(buf: &[u8]) -> Result<Request<'_>, ParseError> {
         consumed,
         headers,
     })
+}
+
+/// Convenience wrapper: parse with the spec's `DEFAULT_MAX_BODY` cap. Used
+/// by parse-time unit tests where the configurable cap is not under test.
+/// Production callers must use `parse_request` directly and pass the
+/// `ServerConfig.http_max_body` they were configured with.
+pub fn parse_request_default(buf: &[u8]) -> Result<Request<'_>, ParseError> {
+    parse_request(buf, DEFAULT_MAX_BODY)
 }
 
 /// `\r\n\r\n` terminator → returns index just past it (so `header_end` is

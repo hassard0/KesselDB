@@ -98,7 +98,11 @@ pub struct ServerConfig {
     /// `None` = open (no handshake expected). `Some(t)` = the first frame on
     /// every connection must be `[0xFC] ++ t` (constant-time compared).
     pub token: Option<Vec<u8>>,
-    /// Max concurrent client connections; the next is refused immediately.
+    /// Max concurrent client connections PER LISTENER (binary, HTTP, HTTPS
+    /// each independently cap at this value). A process with the gateway
+    /// feature enabled may hold up to `max_conns × num_listeners` concurrent
+    /// connections. The cap is per-listener so a misbehaving HTTP client
+    /// can't starve the binary protocol.
     pub max_conns: usize,
     /// Max requests in flight to the engine; over this, callers get
     /// `OpResult::Unavailable` (backpressure) instead of unbounded queueing.

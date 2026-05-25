@@ -7,7 +7,7 @@
 
 use crate::engine::EngineApply;
 use crate::parse::{
-    parse_request, ParseError, DEFAULT_MAX_BODY, MAX_HEADER_BYTES,
+    parse_request, ParseError, MAX_HEADER_BYTES,
 };
 use crate::response::write_error_json;
 use crate::routes;
@@ -17,7 +17,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Default per-process gateway connection cap.
+/// Default connection cap, applied PER LISTENER (binary, HTTP, HTTPS each
+/// independently cap at this value). A process with the gateway feature
+/// enabled may hold up to `DEFAULT_MAX_CONNS × num_listeners` concurrent
+/// connections. The cap is intentionally per-listener so a misbehaving HTTP
+/// client can't starve the binary protocol (and vice-versa).
 pub const DEFAULT_MAX_CONNS: usize = 1024;
 
 pub fn serve(
@@ -62,7 +66,6 @@ fn handle_one_stream<S: Read + Write>(
     token: Option<&[u8]>,
     max_body: usize,
 ) -> std::io::Result<()> {
-    let _ = DEFAULT_MAX_BODY; // imported for future use / parity with spec
     let mut raw: Vec<u8> = Vec::with_capacity(8 * 1024);
     let mut chunk = [0u8; 8192];
     loop {
@@ -77,7 +80,12 @@ fn handle_one_stream<S: Read + Write>(
                 "error", "payload too large");
             return Ok(());
         }
-        match parse_request(&raw) {
+        // Honor the configured `http_max_body` at parse time, not just at the
+        // outer raw.len() guard above — the inner `decode_body` path checks
+        // `max_body` against decoded chunk-stream output and Content-Length
+        // values, so a 16 MiB Content-Length only succeeds when the
+        // operator configured `http_max_body = 16 MiB` (or larger).
+        match parse_request(&raw, max_body) {
             Ok(req) => {
                 let _ = routes::handle(s, &req, token, engine);
                 return Ok(());
@@ -168,6 +176,13 @@ pub fn serve_tls<A>(
             continue;
         }
         let _ = stream.set_nodelay(true);
+        // Slowloris guard: cap how long an attacker can pin a thread by
+        // opening TCP and then never sending ClientHello / dribbling bytes.
+        // Mirrors the plaintext `serve()` path above; without these, an
+        // attacker could hold a TLS-acceptor thread until the OS kernel
+        // socket timeout (minutes) just by completing the TCP handshake.
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
         active.fetch_add(1, Ordering::AcqRel);
         let e = engine.clone();
         let t = token.clone();

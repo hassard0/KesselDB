@@ -2,7 +2,7 @@
 //! KAT is derived independently from the RFC and serves as the spec-compliance
 //! oracle for `parse.rs` — the spec-compliance reviewer re-derives each one.
 
-use kessel_http_gateway::parse::{parse_request, ParseError, Method};
+use kessel_http_gateway::parse::{parse_request_default as parse_request, ParseError, Method};
 
 #[test]
 fn kat_simple_get_health() {

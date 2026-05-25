@@ -42,6 +42,156 @@ pub enum PqValue {
     /// DECIMAL → unscaled i128 + scale. Logical value =
     /// `unscaled / 10^scale`. i128 covers Parquet's max precision (38).
     Decimal { unscaled: i128, scale: i32 },
+    /// SP143: a LIST<primitive> column's value. Each element is itself
+    /// a PqValue (typically Null + scalar primitives in V1; nested
+    /// List/struct/Map come in SP144/SP145).
+    List(Vec<PqValue>),
+}
+
+/// SP143 T2: minimal JSON serialization of a `PqValue::List`'s element
+/// vector — sufficient for round-trip display at the fetch boundary.
+/// Format: `[item1,item2,...]` with each element rendered per its type
+/// (null/true/false, decimal integers/floats, JSON-escaped strings,
+/// nested `{"unscaled":"...","scale":N}` for DECIMAL, and recursive
+/// `[...]` for nested lists). Non-printable bytes inside `Bytes(_)`
+/// are hex-escaped as `\uXXXX` for safe ASCII output. Used by
+/// `kessel-fetch`'s `pq_to_cell` to surface List values as
+/// `Cell::Blob(json)` without adding a new `Cell` variant (keeps the
+/// binary protocol UNCHANGED in this slice — a typed `Cell::List` is
+/// the SP144 follow-up).
+pub fn pqvalue_list_to_json(items: &[PqValue]) -> Vec<u8> {
+    let mut s = String::from("[");
+    for (i, v) in items.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        match v {
+            PqValue::Null => s.push_str("null"),
+            PqValue::Bool(b) => s.push_str(if *b { "true" } else { "false" }),
+            PqValue::I64(n) => s.push_str(&n.to_string()),
+            PqValue::F64(x) => s.push_str(&x.to_string()),
+            PqValue::Bytes(b) => {
+                s.push('"');
+                for &byte in b {
+                    if byte == b'"' {
+                        s.push_str("\\\"");
+                    } else if byte == b'\\' {
+                        s.push_str("\\\\");
+                    } else if (0x20..=0x7e).contains(&byte) {
+                        s.push(byte as char);
+                    } else {
+                        s.push_str(&format!("\\u{:04x}", byte));
+                    }
+                }
+                s.push('"');
+            }
+            PqValue::Timestamp(n) => s.push_str(&n.to_string()),
+            PqValue::Decimal { unscaled, scale } => {
+                s.push_str(&format!(r#"{{"unscaled":"{unscaled}","scale":{scale}}}"#));
+            }
+            PqValue::List(inner) => {
+                // Nested list — recurse via the same helper. Deeper
+                // nesting is a SP145 concern but handled gracefully
+                // here so V1 doesn't panic on malformed schemas.
+                let inner_bytes = pqvalue_list_to_json(inner);
+                s.push_str(std::str::from_utf8(&inner_bytes).unwrap_or("\"<binary>\""));
+            }
+        }
+    }
+    s.push(']');
+    s.into_bytes()
+}
+
+#[cfg(test)]
+mod pqvalue_list_tests {
+    use super::*;
+
+    #[test]
+    fn list_variant_constructs_and_compares() {
+        let v = PqValue::List(vec![
+            PqValue::I64(1),
+            PqValue::I64(2),
+            PqValue::Null,
+        ]);
+        let v2 = v.clone();
+        assert_eq!(v, v2);
+    }
+
+    #[test]
+    fn list_variant_nested_clone() {
+        let v = PqValue::List(vec![
+            PqValue::List(vec![PqValue::I64(1)]),
+            PqValue::List(vec![PqValue::Null]),
+        ]);
+        assert_eq!(v.clone(), v);
+    }
+
+    #[test]
+    fn list_variant_empty() {
+        let v = PqValue::List(Vec::new());
+        match &v {
+            PqValue::List(items) => assert!(items.is_empty()),
+            _ => panic!("expected List"),
+        }
+    }
+
+    #[test]
+    fn list_to_json_primitives() {
+        // Mixed primitive scalars + Null render as a JSON-shaped array.
+        let v = vec![
+            PqValue::Null,
+            PqValue::Bool(true),
+            PqValue::Bool(false),
+            PqValue::I64(-7),
+            PqValue::I64(0),
+            PqValue::I64(42),
+        ];
+        assert_eq!(
+            pqvalue_list_to_json(&v),
+            br#"[null,true,false,-7,0,42]"#.to_vec()
+        );
+    }
+
+    #[test]
+    fn list_to_json_bytes_escaping() {
+        // ASCII printable passes through; quote/backslash escaped;
+        // non-printables hex-escaped as \uXXXX (4-hex JSON escape).
+        let v = vec![PqValue::Bytes(vec![b'a', b'"', b'b', b'\\', b'c', 0x01, 0xff])];
+        let got = pqvalue_list_to_json(&v);
+        let s = std::str::from_utf8(&got).expect("ASCII-only output");
+        assert_eq!(s, "[\"a\\\"b\\\\c\\u0001\\u00ff\"]");
+    }
+
+    #[test]
+    fn list_to_json_decimal_and_timestamp() {
+        let v = vec![
+            PqValue::Timestamp(1_500_000_000),
+            PqValue::Decimal { unscaled: -12345, scale: 2 },
+        ];
+        assert_eq!(
+            pqvalue_list_to_json(&v),
+            br#"[1500000000,{"unscaled":"-12345","scale":2}]"#.to_vec()
+        );
+    }
+
+    #[test]
+    fn list_to_json_nested() {
+        let v = vec![
+            PqValue::List(vec![PqValue::I64(1), PqValue::I64(2)]),
+            PqValue::List(vec![]),
+            PqValue::List(vec![PqValue::Null]),
+        ];
+        assert_eq!(
+            pqvalue_list_to_json(&v),
+            br#"[[1,2],[],[null]]"#.to_vec()
+        );
+    }
+
+    #[test]
+    fn list_to_json_empty() {
+        let v: Vec<PqValue> = Vec::new();
+        assert_eq!(pqvalue_list_to_json(&v), b"[]".to_vec());
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -284,6 +284,19 @@ fn pq_to_cell(v: kessel_parquet::PqValue) -> json::Cell {
         // follow-up. Users targeting `FieldKind::I64` (or any text
         // sink) get the unscaled value losslessly today.
         Decimal { unscaled, scale: _ } => json::Cell::Text(unscaled.to_string()),
+        // SP143 T2: LIST<primitive> — serialize the element vector to
+        // a small JSON-shaped UTF-8 string and surface as Cell::Text.
+        // Routing through Cell::Text (rather than adding a new
+        // Cell::List variant) keeps the existing `Cell` enum + binary
+        // protocol UNCHANGED in this slice. A typed Cell::List + a
+        // FieldKind::List mapping is the explicit SP144 follow-up.
+        // `pqvalue_list_to_json` emits ASCII-safe JSON (non-printable
+        // bytes escaped as \uXXXX), so downstream string sinks are
+        // round-trip-safe today.
+        List(items) => json::Cell::Text(
+            String::from_utf8(kessel_parquet::pqvalue_list_to_json(&items))
+                .expect("pqvalue_list_to_json emits ASCII-safe UTF-8"),
+        ),
     }
 }
 

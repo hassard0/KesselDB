@@ -6,7 +6,7 @@
 
 *"It's the database that made the Kessel Run in 12 parsecs."*
 
-`293 tests green` · `0 external dependencies` · `Rust 1.95+` · single‑binary
+`890 tests green` · `0 external dependencies in the kernel` · `Rust 1.95+` · single‑binary
 
 </div>
 
@@ -57,18 +57,39 @@ feature, not an aspiration.
   `MIN`/`MAX` from the index extreme without scanning, and an in‑memory read
   cache for hot keys — all on by default, each proven equivalent to a full
   scan by a randomized oracle.
-- **External sources** — register and `REFRESH` JSON/NDJSON/CSV from HTTP/HTTPS
-  endpoints or directly from S3-compatible and Azure Blob object storage
-  (`CREATE EXTERNAL SOURCE … FROM 'http://…' | 's3://…' | 'az://…' FORMAT
-  JSON|NDJSON|CSV|PARQUET`); `FORMAT PARQUET` is supported for `s3://`/`az://`
-  (OBJ-2a: PLAIN/UNCOMPRESSED/flat-REQUIRED/V1-pages/multi-RG); a single
-  `REFRESH` can walk multi-page HTTP APIs via next-URL, `Link` header, or
-  cursor-param pagination; all queried with ordinary SQL
+- **Mechanically verified by TLA+ (S1)** — the Viewstamped Replication safety
+  invariants are model‑checked by TLC across 528 million distinct states /
+  depth 21 (zero counterexamples). Seven layered TLA+ modules cover the full
+  Replication → MVCC backbone (Replication / MVCCStorage / MVCCTx / MVCCSi /
+  MVCCSsi / MVCCGc / MVCCCutover). See `kesseldb-tla/`.
+- **Serializable MVCC (S2)** — every SQL statement that touches a user-type row
+  is, by construction, a deterministic MVCC transaction with snapshot-isolation
+  + Cahill SSI (write‑skew impossible) + GC under a dynamic watermark protocol.
+  Replicas reach byte‑identical state at every committed log position.
+- **Jepsen-style linearizability under partition (S3)** — 5 hand-derived Jepsen
+  tests against the in-process VSR + MVCC stack; multi-replica byte-identity
+  digests post-partition + post-recovery.
+- **Deterministic WASM UDFs (S4)** — zero‑dep WASM-MVP interpreter
+  (`kessel-wasm`) for `CHECK`/trigger user functions: i32/i64/f32/f64 +
+  memory + tables/call_indirect + canonical NaN, gas‑bounded, no host calls
+  / no clocks — every replica runs byte‑identical UDF logic; UDF behavior is
+  replayable from the log.
+- **External sources & Parquet** — register and `REFRESH`
+  JSON/NDJSON/CSV/Parquet from HTTP/HTTPS endpoints or directly from
+  S3‑compatible and Azure Blob object storage. The pure‑Rust zero‑dep
+  Parquet reader (`kessel-parquet`) supports **flat REQUIRED + OPTIONAL ×
+  UNCOMPRESSED + Snappy + GZIP + (most) zstd × PLAIN + dictionary × V1 +
+  V2 data pages × INT64 + INT32 + INT96 (timestamps) + DECIMAL (INT32 /
+  INT64 / FLBA, precision ≤ 38) + FLBA + BYTE_ARRAY** out of the box. See
+  [Parquet capability matrix](#parquet-capability-matrix) below.
   (`--features external-sources`, default off; `--features
   external-sources-objstore` for S3/Azure + Parquet; deterministic kernel
-  unaffected when off).
+  unaffected when off.)
 - **Deterministic & verifiable** — the whole engine is a seedable state machine;
-  the test suite includes a seeded partition/fault simulation corpus.
+  the test suite (890 tests, 0 ignored) includes seeded partition/fault
+  simulation, multi‑replica Jepsen, hand‑derived KATs against published
+  spec text for every codec, and adversarial pentests for every public input
+  surface.
 
 ## Quick start
 
@@ -171,6 +192,36 @@ methodology, the single‑core/fsync/RTT scaling model, and
 order‑of‑magnitude projections for common cloud instance + storage
 configurations are in **[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md)**.
 
+## Parquet capability matrix
+
+The `kessel-parquet` crate is a from‑scratch, zero‑external‑dependency
+Parquet reader. Its capability surface, **proven by hand‑derived
+KATs against published Apache spec text + by real `pyarrow 24.0.0`
+round‑trip fixtures**:
+
+| Axis | Supported | Notes |
+|---|---|---|
+| **Page version** | V1 + **V2** | V2 raw‑level‑split path (def/rep levels uncompressed, values section compressed) |
+| **Compression** | UNCOMPRESSED, **Snappy**, **GZIP**, **zstd** *(most files)* | All decompressors are zero‑dep hand‑written (`snappy.rs` 338 LOC / `gzip.rs` RFC 1951 inflate / `zstd*.rs` RFC 8478). zstd works for short pages + RLE/Predefined FSE‑sequence modes; concentrated‑FSE stress (large random data) is one bug‑fix away — tracked as SP140 |
+| **Encoding** | PLAIN, **PLAIN_DICTIONARY / RLE_DICTIONARY** | Dictionary page + data‑page index resolve |
+| **Repetition** | flat REQUIRED + **flat OPTIONAL (nullable)** | OPTIONAL via RLE‑hybrid def‑level decode + null‑scatter; REPEATED/nested deferred (OBJ‑2c‑5) |
+| **Physical types** | INT32, **INT64**, **INT96 (timestamp)**, **FLBA**, **BYTE_ARRAY** | INT96 → `PqValue::Timestamp(i64 ns)` via checked Julian‑day arithmetic |
+| **Logical types** | **DECIMAL (INT32/INT64/FLBA, precision 1..=38)**, **FLBA‑UUID** | DECIMAL → `PqValue::Decimal { unscaled: i128, scale: i32 }` |
+| **Multi‑row‑group** | yes | Cross‑row‑group column concatenation |
+| **Bounds + safety** | `#![forbid(unsafe_code)]`, 64 MiB per‑page cap, every offset bounds‑checked, typed `PqError` on every failure mode, no panics on attacker bytes | + dedicated pentest module per codec (`pentest_optional` / `pentest_int96_decimal` / `pentest_v2` / etc.) |
+
+**Still deferred** (typed `Unsupported` at `REFRESH` with a precise
+error naming the OBJ‑2c follow‑on):
+- LZ4 / Brotli compression (OBJ‑2c‑2 follow‑ons)
+- REPEATED / nested groups / V2 repetition levels (OBJ‑2c‑5)
+- DECIMAL precision > 38 (would need i256)
+- Per‑page decompressed size > 64 MiB
+- Concentrated‑FSE zstd stress pages (SP140 — see [`docs/STATUS.md`](docs/STATUS.md))
+
+The reader is feature‑gated through `kessel-fetch`'s `object-store`
+feature; the default `cargo build` links **no Parquet code at all**
+and the kernel's deterministic state machine is unaffected.
+
 ## Project status & maturity
 
 KesselDB is a **complete, functionally‑correct relational SQL database** on a
@@ -201,9 +252,10 @@ Honest boundaries (documented, not hidden):
   rejected at `CREATE` with a clear message. Object-store requests are
   HTTPS-only with full webpki certificate verification and no bypass.
   `FORMAT PARQUET` for `s3://`/`az://` is supported under this same
-  feature (OBJ-2a: PLAIN/UNCOMPRESSED/flat‑REQUIRED/V1‑page/multi‑RG;
-  dictionary, RLE, Snappy, OPTIONAL columns and V2 pages are rejected
-  at `REFRESH` with precise typed errors naming the OBJ‑2b/2c follow‑ons).
+  feature; the kessel‑parquet crate has its own empty `[dependencies]`
+  (the entire reader is hand‑written zero‑dep Rust). See the [Parquet
+  capability matrix](#parquet-capability-matrix) below for the exact
+  matrix of supported encodings / compressions / types / page versions.
 - **Cross‑shard transactions** are implemented, **deterministically**
   (Calvin‑style), over real sockets — *not* blocking two‑phase commit.
   A deployment runs K independent VSR shard groups behind a router
@@ -232,28 +284,40 @@ Honest boundaries (documented, not hidden):
   `Delete`); cross‑shard scatter‑gather *reads*/SQL text routing is a
   separate, later concern from cross‑shard *transactions*.
 
-Every claim in this repository is backed by the test suite (`293 tests`); the
-docs call out exactly what is proven versus roadmap.
+Every claim in this repository is backed by the test suite (`890 tests, 0 ignored`); the
+docs call out exactly what is proven versus roadmap. The four
+**strategic‑tier items S1–S4** (TLA+/model‑checked safety, serializable
+MVCC/SI, Jepsen linearizability under partition, deterministic WASM
+UDFs) are all **shipped** — see [`docs/THESIS.md`](docs/THESIS.md) for
+the framing, and [`docs/STATUS.md`](docs/STATUS.md) for per‑slice
+records (SP109 / SP110‑SP116 / SP117 / SP118).
 
 ## Documentation
 
 | Doc | Contents |
 |---|---|
 | [`AGENTS.md`](AGENTS.md) | Machine-first operating guide — build/test/run/CLI, wire protocol, repo map, working rules (read this first if you're an agent) |
-| [`docs/USAGE.md`](docs/USAGE.md) | Install, run, **CLI**, client API, **SQL reference**, clustering, auth, backup & monitoring |
+| [`docs/THESIS.md`](docs/THESIS.md) | The 5 thesis pillars (deterministic / verifiable / replayable / zero‑dep / honest‑docs) + strategic‑tier backlog S1–S4 (all shipped) |
+| [`docs/USAGE.md`](docs/USAGE.md) | Install, run, **CLI**, client API, **SQL reference**, clustering, auth, backup & monitoring, external sources + Parquet matrix |
 | [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) | Methodology, measured numbers, scaling model, cloud projections |
-| [`docs/STATUS.md`](docs/STATUS.md) | Production‑readiness gate, per‑slice status, performance log |
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Storage, replication, sharding, caching internals |
+| [`docs/STATUS.md`](docs/STATUS.md) | Production‑readiness gate, per‑slice status (incl. SP109‑SP139 strategic‑tier + Parquet codec arc), performance log |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Storage, replication, sharding, caching, MVCC + WASM + Parquet internals |
+| [`kesseldb-tla/`](kesseldb-tla/) | Seven layered TLA+ specs (Replication / MVCCStorage / MVCCTx / MVCCSi / MVCCSsi / MVCCGc / MVCCCutover) + TLC baselines |
 | [`clients/python/kesseldb.py`](clients/python/kesseldb.py) | Dependency‑free Python reference client (stdlib‑only, single file) |
 | [`docs/superpowers/specs/`](docs/superpowers/specs/) | One design spec per sub‑project |
-| [`docs/USAGE.md` → §7c–7d](docs/USAGE.md#7c-external-sources-jsoncsv-over-http) | External sources — register & `REFRESH` paginated JSON/NDJSON/CSV-over-HTTP into a table |
+| [`docs/USAGE.md` → §7c–7f](docs/USAGE.md#7c-external-sources-jsoncsv-over-http) | External sources — register & `REFRESH` paginated JSON/NDJSON/CSV‑over‑HTTP + Parquet over S3/Azure into a table |
 
 ## Building & testing
 
 ```bash
-cargo build                 # all crates, zero external deps
-cargo test --workspace      # 293 tests (incl. seeded partition/fault simulation)
+cargo build                 # all kernel crates, zero external deps
+cargo test --workspace      # 890 tests (incl. seeded partition/fault sim,
+                            # Jepsen linearizability, MVCC TLA+ refinement,
+                            # pyarrow Parquet round-trips, WASM-MVP KATs)
 cargo run -p kessel-bench --release -- --help   # benchmarks
+
+# Strategic-tier rigor artifacts:
+cd kesseldb-tla/ && tlc -workers auto Replication.tla   # ≥528M states / depth 21 / 0 violations
 ```
 
 Requires Rust stable 1.95+. No system libraries, no native build steps.

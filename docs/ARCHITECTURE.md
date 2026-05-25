@@ -11,11 +11,32 @@ VSR reimplementation verifiable rather than hopeful.
 
 ## Crates
 
+**Kernel (default `cargo build`, zero external dependencies):**
 `kessel-proto` (wire types) · `kessel-io` (clock/disk/net traits + real & sim impls) ·
-`kessel-storage` (LSM+WAL+recovery) · `kessel-catalog` (schema as object type 0) ·
-`kessel-codec` (record encode/decode) · `kessel-sm` (deterministic apply) ·
-`kessel-vsr` (replication) · `kessel-cache` (read cache) · `kessel-sim` (fault simulator) ·
-`kessel-bench` (perf harness) · `kesseldb` (node binary).
+`kessel-storage` (LSM+WAL+recovery + **MVCC versioned keyspace** + **MVCC Tx/SI/SSI**) ·
+`kessel-catalog` (schema as object type 0) ·
+`kessel-codec` (record encode/decode) · `kessel-sm` (deterministic apply + heartbeat watermark) ·
+`kessel-vsr` (replication + 5 Jepsen-style multi-replica linearizability tests) ·
+`kessel-cache` (read cache) · `kessel-sim` (fault simulator) ·
+`kessel-expr` (zero-dep gas-bounded expression VM for CHECK/triggers) ·
+`kessel-crypto` (zero-dep SHA-256 / HMAC-SHA256) ·
+`kessel-wasm` (zero-dep deterministic WASM-MVP interpreter for UDFs — S4) ·
+`kessel-sql` (SQL parser + planner) ·
+`kessel-bench` (perf harness) · `kessel-client` (CLI + cluster client) ·
+`kesseldb-server` (node library) · `kesseldb` (node binary).
+
+**Optional (feature-gated, behind `--features external-sources*`):**
+`kessel-fetch` (HTTP/HTTPS/object-store reader) ·
+`kessel-objstore` (S3 SigV4 + Azure Shared-Key signers) ·
+`kessel-parquet` (zero-dep Parquet reader — Snappy/GZIP/zstd + V1/V2 +
+PLAIN/dict + REQUIRED/OPTIONAL + INT96/DECIMAL/FLBA + sub-modules
+`snappy.rs` / `gzip.rs` / `zstd*.rs`).
+
+**Mechanically-checked artifacts:**
+`kesseldb-tla/` — seven layered TLA+ specs
+(Replication.tla / MVCCStorage.tla / MVCCTx.tla / MVCCSi.tla / MVCCSsi.tla /
+MVCCGc.tla / MVCCCutover.tla) + TLC baselines under `results/`. Replication.tla
+TLC: 528M distinct states / depth 21 / 0 violations.
 
 ## Replication (VSR)
 
@@ -171,3 +192,57 @@ rejected (the overlay does not cover the catalog or range scans).
 LSM key = `type_id(4B) ‖ primary_id(16B)`, value = codec-encoded fixed-width record with a
 per-record `schema_ver` header and null bitmap. A type is a contiguous key range (sets up
 future range scans). WAL frame: `(op_number, kind, type_id, payload, crc32c)`.
+
+## MVCC (Strategic-tier S2, SP110–SP116)
+
+Every SQL statement that touches a user-type row is, **by construction**, a
+deterministic MVCC transaction. The MVCC keyspace is a 28-byte
+`type_id(4) ‖ object_id(16) ‖ inverted_commit_opnum(8 BE)` layout living in
+the same LSM as the 20-byte legacy keyspace; the inverted op_number puts the
+newest version first under `scan_range`. The `data_row_dispatch(key)`
+discriminator at the storage layer routes 20-byte user-type data-row keys
+(type_id in `(0, 0xFF00_0000)`) through MVCC primitives at `u64::MAX`
+snapshot (reads) and `op_number` commit (writes) — **no apply-arm or
+schema-op rewrites needed**. The dispatch is a one-helper-function +
+4-call-site change in `Storage::{get,put,delete,scan_range}` covering
+~25-35 data-row I/O sites silently. Replicas reach byte-identical state
+at every committed log position (3-replica byte-identity tests gate this).
+
+Isolation: snapshot reads (`Tx::begin`), SI write-side (`Tx::begin_rw`,
+SP112), Cahill serializable SSI (`Tx::begin_ssi`, SP113 — write-skew
+impossible by construction). GC: `Op::AdvanceWatermark` is a deterministic
+op in the apply path (SP114); a heartbeat closure (SP115) submits it.
+The whole stack is mechanically verified by TLC across 7 layered TLA+
+modules (`kesseldb-tla/MVCC*.tla`).
+
+## Deterministic WASM UDFs (Strategic-tier S4, SP118 + extensions)
+
+`kessel-wasm` is a from-scratch zero-dependency WASM-MVP-subset
+interpreter for `CHECK` constraints and triggers. Supported: i32/i64/f32/f64
+values + arithmetic + comparison + control flow + locals + in-module call +
+**linear memory** (load/store/size/grow) + **tables + call_indirect** with
+runtime type_idx equality check + **bit-manipulation** (clz/ctz/popcnt) +
+**sign-extension** + **canonical NaN** (0x7FC00000 / 0x7FF8000000000000)
+per WASM determinism rules. Gas-bounded: 1 unit per executed instruction;
+trap `WasmError::OutOfGas` on limit. Bounds-checked decoder + opcode allow-
+list distinguishes "valid WASM-MVP unsupported" from "invalid garbage". A
+UDF is part of the replicated catalog; every replica runs byte-identical
+logic; UDF behavior is replayable from the log. 113+ hand-derived KATs
+against the official WASM-MVP spec.
+
+## Strategic-tier rigor artifacts (S1, S3)
+
+**`kesseldb-tla/`** — seven layered TLA+ modules with TLC baselines:
+Replication.tla (S1, SP109 — 528M states / depth 21 / 0 violations) →
+MVCCStorage.tla (SP110) → MVCCTx.tla (SP111, 7.36M / 8) →
+MVCCSi.tla (SP112, 3.73M / 13) → MVCCSsi.tla (SP113, 348K / 9) →
+MVCCGc.tla (SP114, 1.59M / 12) → MVCCCutover.tla (SP115/SP116, 15.08M / 17).
+Every module preserves prior invariants; SP109-SP114 discipline is
+"never weaken a test" — refinements TIGHTEN or RESTATE.
+
+**Jepsen-style multi-replica linearizability (S3, SP117)** — 5 hand-derived
+Jepsen tests in `kessel-vsr::sim::tests` validate the SP116 storage-layer
+transparent MVCC dispatch preserves linearizability across the full VSR +
+MVCC stack under partition + message loss. `Cluster::drive_until_digests_converge`
+extends the simulation past replies-complete so isolated minority replicas
+finish state-transfer + catch up.

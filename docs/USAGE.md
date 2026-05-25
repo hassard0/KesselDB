@@ -15,7 +15,7 @@ KesselDB. Every feature described here is covered by the test suite.
 - [7c. External sources (JSON/CSV over HTTP)](#7c-external-sources-jsoncsv-over-http)
 - [7d. Paginated & NDJSON sources](#7d-paginated--ndjson-sources)
 - [7e. Object-store sources (S3 / Azure Blob)](#7e-object-store-sources-s3--azure-blob)
-- [7f. FORMAT PARQUET for object-store sources (OBJ-2a)](#7f-format-parquet-for-object-store-sources-obj-2a)
+- [7f. FORMAT PARQUET for object-store sources](#7f-format-parquet-for-object-store-sources)
 - [8. Authentication, quotas & backpressure](#8-authentication-quotas--backpressure)
 - [9. Backup & monitoring](#9-backup--monitoring)
 - [10. Wire protocol](#10-wire-protocol)
@@ -736,7 +736,23 @@ messages.
 - **Snapshot since last `REFRESH`.** Queries read the last materialized
   snapshot; live object-store reads are never issued by a `SELECT`.
 
-## 7f. FORMAT PARQUET for object-store sources (OBJ-2a)
+## 7f. FORMAT PARQUET for object-store sources
+
+> **Current capability (SP125‑SP139, OBJ‑2c arc 4/5 done):**
+> `FORMAT PARQUET` reads real `pyarrow 24.0.0` Parquet files end‑to‑end
+> across the **flat REQUIRED + OPTIONAL × UNCOMPRESSED + Snappy + GZIP + zstd
+> (small/medium pages) × PLAIN + dictionary × V1 + V2 data pages × INT32 +
+> INT64 + INT96 + FLBA + BYTE_ARRAY + DECIMAL (precision ≤ 38)** matrix.
+> Vanilla `pq.write_table(df)` works zero‑flags for everything in that
+> matrix; pyarrow zstd output decodes for short pages + RLE/Predefined
+> FSE‑sequence modes (SP140 fills in the last concentrated‑FSE corner
+> for very large random‑data pages). Still typed‑Unsupported: LZ4 /
+> Brotli (OBJ‑2c‑2 follow‑ons), REPEATED / nested groups / V2 rep‑levels
+> (OBJ‑2c‑5), DECIMAL precision > 38, per‑page > 64 MiB.
+>
+> The slice‑by‑slice history below records how the capability grew —
+> kept verbatim for traceability — but the matrix above is the
+> authoritative current scope.
 
 > **OBJ-2b in progress:** the RLE/bit-packing-hybrid primitive is
 > implemented (SP102) but not yet wired. Until OBJ-2b-2/3/4 ship,

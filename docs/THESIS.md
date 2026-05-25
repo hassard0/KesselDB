@@ -158,7 +158,31 @@ explicitly out of scope:
 
 ---
 
-## Strategic-tier backlog (S1–S4)
+## Strategic-tier backlog (S1–S4) — **all four SHIPPED (2026-05-24)**
+
+> **Status addendum (2026-05-24):** All four strategic-tier items below
+> shipped over the SP109‑SP118 session arc (with the S2 MVCC sub-arc
+> completing at SP116). The original "backlog" framing below is kept
+> verbatim for historical context; the per-slice records under
+> `docs/superpowers/specs/2026-05-2*` are the authoritative ship
+> proofs, and the corresponding STATUS rows live in
+> [`docs/STATUS.md`](STATUS.md).
+>
+> Quick map:
+> - **S1** → SP109 (Replication.tla, TLC 528M states / depth 21 / 0 violations)
+> - **S2** → SP110-SP116 (7-layer MVCC TLA+ stack: MVCCStorage → MVCCTx →
+>   MVCCSi → MVCCSsi → MVCCGc → MVCCCutover; storage-layer transparent
+>   MVCC dispatch via `data_row_dispatch(key)`)
+> - **S3** → SP117 (5 hand-derived Jepsen tests in `kessel-vsr::sim::tests`
+>   + new `Cluster::drive_until_digests_converge` API)
+> - **S4** → SP118 (zero-dep `kessel-wasm` crate, evolved through
+>   SP119‑SP124 to cover i32/i64/f32/f64 + memory + tables/call_indirect
+>   + canonical NaN)
+>
+> The "backlog" sections that follow describe these items as they were
+> originally framed during the 2026-05-19 strategic review. Read them as
+> *intent*; read STATUS.md / `kesseldb-tla/` / `kessel-wasm/` for the
+> shipped artifacts.
 
 These four items were added during the 2026-05-19 strategic review.  They are
 ordered by thesis-leverage: each converts an existing design property from

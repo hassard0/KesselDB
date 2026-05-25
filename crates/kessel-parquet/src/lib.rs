@@ -2548,6 +2548,287 @@ mod tests {
         );
     }
 
+    // ── SP143 T7: end-to-end nested decode inline-roundtrip tests ────
+    //
+    // These hand-build complete Parquet files (Thrift compact footer
+    // including a nested LIST<primitive> schema + a row group + a
+    // column chunk + a V1 data page carrying rep/def streams + PLAIN
+    // INT64 values) and call `extract()` to prove the entire T1–T6
+    // pipeline (footer→FileMetaData→SchemaTree+max_def/max_rep→
+    // classify_column_plan→read_chunk_values_nested→decode_page_v1_nested→
+    // assembly::assemble_list_primitive) wires up correctly BEFORE
+    // SP143 T9 hands us real pyarrow-produced bytes.
+    //
+    // Three canonical shapes are exercised:
+    //   T7a REQ-REP-REQ : List<INT64>          two records [[1,2,3],[10,20]]
+    //   T7b REQ-REP-OPT : List<Optional<i64>>  one record [10, null, 20]
+    //   T7c OPT-REP-REQ : Optional<List<i64>>  two records [null, [7, 8]]
+    //
+    // The shared builder `build_list_int64_file` factors out the
+    // schema-encoding + footer-assembly so each test only writes its
+    // own (rep, def, values) page payload.
+
+    /// Per-shape config for `build_list_int64_file`.
+    /// `outer_optional`/`element_optional` map onto the SchemaElement
+    /// repetition_type for the my_list group and the element leaf
+    /// respectively (the middle "list" group is always REPEATED).
+    struct ListShape {
+        outer_optional: bool,
+        element_optional: bool,
+        /// Top-level record count (FileMetaData.num_rows + RG.num_rows).
+        num_rows: i64,
+        /// (rep, def) pair count for the chunk (cc.num_values + page.num_values).
+        num_values: i32,
+        /// Raw page payload: rep section (4-byte LE prefix + hybrid)
+        /// + def section (4-byte LE prefix + hybrid) + INT64 PLAIN values.
+        page_payload: Vec<u8>,
+    }
+
+    /// Build a complete Parquet file with the canonical 4-element
+    /// LIST<INT64> schema (root REQ → my_list {REQ|OPT, LIST(3)} →
+    /// list REP → element {REQ|OPT, INT64}) and a single row group
+    /// containing a single uncompressed V1 PLAIN data page whose
+    /// payload is provided verbatim by the caller. Path encoding for
+    /// the ColumnChunk is `["my_list", "list", "element"]` to match
+    /// the parquet.thrift `path_in_schema` convention for nested
+    /// columns.
+    fn build_list_int64_file(shape: ListShape) -> Vec<u8> {
+        let outer_rep: i64 = if shape.outer_optional { 1 } else { 0 }; // OPTIONAL=1 vs REQUIRED=0
+        let element_rep: i64 = if shape.element_optional { 1 } else { 0 };
+
+        // Page header: V1 DATA_PAGE, PLAIN encoding, num_values =
+        // (rep,def) pair count. Reuses `page_header_bytes` from the
+        // flat builders — its layout is shape-agnostic.
+        let data_bytes = shape.page_payload.len() as i32;
+        let hdr = page_header_bytes(shape.num_values, data_bytes);
+        let data_page_offset: i64 = 4; // page header starts right after leading "PAR1"
+
+        // FileMetaData (Thrift compact): version=2, 4 SchemaElements
+        // in DFS preorder, num_rows, 1 RowGroup with 1 ColumnChunk.
+        let mut m = Vec::new();
+        // f1 version=2: (1<<4)|5=0x15, zz(2)=4
+        m.push(0x15); uv(&mut m, zz(2));
+        // f2 list<SchemaElement> 4 structs: delta 1->2=1 -> (1<<4)|9=0x19;
+        // list-hdr (4<<4)|12=0x4c
+        m.push(0x19); m.push(0x4c);
+
+        // schema[0] root GROUP: f4 name="schema", f5 num_children=1
+        // (REQUIRED is the default; f1 type omitted ⇒ group).
+        m.push(0x48); uv(&mut m, 6); m.extend_from_slice(b"schema");
+        m.push(0x15); uv(&mut m, zz(1));
+        m.push(0x00);
+
+        // schema[1] "my_list" GROUP: f3 repetition, f4 name, f5
+        // num_children=1, f6 converted_type=LIST(3).
+        // f3 repetition: delta 0->3=3 -> (3<<4)|5=0x35
+        m.push(0x35); uv(&mut m, zz(outer_rep));
+        // f4 name="my_list": delta 3->4=1 -> (1<<4)|8=0x18; len=7
+        m.push(0x18); uv(&mut m, 7); m.extend_from_slice(b"my_list");
+        // f5 num_children=1: delta 4->5=1 -> 0x15; zz(1)=2
+        m.push(0x15); uv(&mut m, zz(1));
+        // f6 converted_type=LIST(3): delta 5->6=1 -> 0x15; zz(3)=6
+        m.push(0x15); uv(&mut m, zz(3));
+        m.push(0x00);
+
+        // schema[2] "list" GROUP: f3 repetition=REPEATED(2), f4 name,
+        // f5 num_children=1. No converted_type.
+        m.push(0x35); uv(&mut m, zz(2));
+        m.push(0x18); uv(&mut m, 4); m.extend_from_slice(b"list");
+        m.push(0x15); uv(&mut m, zz(1));
+        m.push(0x00);
+
+        // schema[3] "element" LEAF: f1 type=INT64(2), f3 repetition,
+        // f4 name="element". num_children defaults to 0 (leaf).
+        m.push(0x15); uv(&mut m, zz(2));
+        m.push(0x25); uv(&mut m, zz(element_rep));
+        m.push(0x18); uv(&mut m, 7); m.extend_from_slice(b"element");
+        m.push(0x00);
+
+        // f3 num_rows: delta 2->3=1 -> (1<<4)|6=0x16
+        m.push(0x16); uv(&mut m, zz(shape.num_rows));
+
+        // f4 list<RowGroup> 1: delta 3->4=1 -> (1<<4)|9=0x19;
+        // list-hdr (1<<4)|12=0x1c
+        m.push(0x19); m.push(0x1c);
+
+        // RowGroup: f1 list<ColumnChunk> 1, f3 num_rows.
+        m.push(0x19); m.push(0x1c);
+
+        // ColumnChunk: f3 ColumnMetaData struct. delta 0->3=3 -> 0x3c.
+        m.push(0x3c);
+
+        // ColumnMetaData:
+        // f1 type=INT64(2)
+        m.push(0x15); uv(&mut m, zz(2));
+        // f2 encodings list<Encoding> [PLAIN(0)]:
+        //   delta 1->2=1 -> 0x19; list-hdr (1<<4)|5=0x15
+        m.push(0x19); m.push(0x15); uv(&mut m, zz(0));
+        // f3 path_in_schema list<string> ["my_list","list","element"]:
+        //   delta 2->3=1 -> 0x19; list-hdr (3<<4)|8=0x38 (3 binary elements)
+        m.push(0x19); m.push(0x38);
+        uv(&mut m, 7); m.extend_from_slice(b"my_list");
+        uv(&mut m, 4); m.extend_from_slice(b"list");
+        uv(&mut m, 7); m.extend_from_slice(b"element");
+        // f4 codec=UNCOMPRESSED(0)
+        m.push(0x15); uv(&mut m, zz(0));
+        // f5 num_values: delta 4->5=1 -> 0x16 (i64); = (rep,def) pair count
+        m.push(0x16); uv(&mut m, zz(shape.num_values as i64));
+        // f9 data_page_offset: delta 5->9=4 -> (4<<4)|6=0x46
+        m.push(0x46); uv(&mut m, zz(data_page_offset));
+        m.push(0x00); m.push(0x00); // stop ColumnMetaData / ColumnChunk
+
+        // RowGroup f3 num_rows: delta 1->3=2 -> (2<<4)|6=0x26
+        m.push(0x26); uv(&mut m, zz(shape.num_rows));
+        m.push(0x00); // stop RowGroup
+        m.push(0x00); // stop FileMetaData
+
+        // Assemble: [PAR1][page_hdr][page_payload][FileMetaData][mlen u32 LE][PAR1]
+        let mut f = Vec::new();
+        f.extend_from_slice(b"PAR1");
+        f.extend_from_slice(&hdr);
+        f.extend_from_slice(&shape.page_payload);
+        let mlen = m.len() as u32;
+        f.extend_from_slice(&m);
+        f.extend_from_slice(&mlen.to_le_bytes());
+        f.extend_from_slice(b"PAR1");
+        f
+    }
+
+    /// Build the V1 page payload for SP143 T7a: REQ-REP-REQ
+    /// List<INT64>, two records `[[1,2,3], [10,20]]`. 5 (rep,def)
+    /// pairs total, all items present.
+    ///
+    /// rep = [0,1,1,0,1], bit_width=1 (max_rep=1).
+    ///   Bit-packed group of 8: header=(1<<1)|1=0x03;
+    ///   LSB-first bits of [0,1,1,0,1,0,0,0] = 0b00010110 = 0x16.
+    ///   Stream = [0x03, 0x16]; 4-byte LE length prefix = [0x02,0,0,0].
+    /// def = [1,1,1,1,1], bit_width=1 (max_def=1).
+    ///   Same bit-packed group; bits 0-4 set = 0b00011111 = 0x1F.
+    ///   Stream = [0x03, 0x1F]; prefix = [0x02,0,0,0].
+    /// values = 5 × INT64 LE = 40 bytes.
+    fn t7a_page_payload() -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&2u32.to_le_bytes()); // rep len prefix
+        p.extend_from_slice(&[0x03, 0x16]);       // rep hybrid
+        p.extend_from_slice(&2u32.to_le_bytes()); // def len prefix
+        p.extend_from_slice(&[0x03, 0x1F]);       // def hybrid
+        for v in [1i64, 2, 3, 10, 20] {
+            p.extend_from_slice(&v.to_le_bytes());
+        }
+        p
+    }
+
+    #[test]
+    fn extract_decodes_list_int64_required_inline_roundtrip() {
+        // SP143 T7a: REQ-REP-REQ List<INT64>.
+        // Two records `[[1,2,3], [10,20]]`; max_def=1, max_rep=1.
+        // Proves the whole nested pipeline ends-to-end on a controlled
+        // hand-built file (no pyarrow dependency).
+        let file = build_list_int64_file(ListShape {
+            outer_optional: false,
+            element_optional: false,
+            num_rows: 2,
+            num_values: 5,
+            page_payload: t7a_page_payload(),
+        });
+        let rows = extract(&file, &["my_list"]).expect("extract list<i64> required");
+        assert_eq!(rows.len(), 2, "two top-level records");
+        assert_eq!(rows[0], vec![
+            PqValue::List(vec![PqValue::I64(1), PqValue::I64(2), PqValue::I64(3)])
+        ]);
+        assert_eq!(rows[1], vec![
+            PqValue::List(vec![PqValue::I64(10), PqValue::I64(20)])
+        ]);
+    }
+
+    /// SP143 T7b page payload: REQ-REP-OPT List<Optional<i64>>, one
+    /// record `[10, null, 20]`. 3 (rep,def) pairs, 2 actual values.
+    ///
+    /// rep = [0,1,1], bit_width=1:
+    ///   header 0x03; bits [0,1,1,0,0,0,0,0] = 0b00000110 = 0x06.
+    ///   Stream = [0x03, 0x06]; prefix = [0x02,0,0,0].
+    /// def = [2,1,2], bit_width=2 (max_def=2):
+    ///   header 0x03; LSB-first 2-bit packing of [2,1,2,0,0,0,0,0]:
+    ///     val0=10 (bits0-1), val1=01 (bits2-3), val2=10 (bits4-5),
+    ///     padding=00 (bits6-7) -> 0b00 10 01 10 = 0x26; byte1=0x00.
+    ///   Stream = [0x03, 0x26, 0x00]; prefix = [0x03,0,0,0].
+    /// values = 2 × INT64 LE = [10, 20].
+    fn t7b_page_payload() -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&2u32.to_le_bytes());
+        p.extend_from_slice(&[0x03, 0x06]);
+        p.extend_from_slice(&3u32.to_le_bytes());
+        p.extend_from_slice(&[0x03, 0x26, 0x00]);
+        for v in [10i64, 20] {
+            p.extend_from_slice(&v.to_le_bytes());
+        }
+        p
+    }
+
+    #[test]
+    fn extract_decodes_list_optional_int64_inline_roundtrip() {
+        // SP143 T7b: REQ-REP-OPT List<Optional<i64>>.
+        // One record `[10, null, 20]`; max_def=2 (REP+inner OPT),
+        // max_rep=1, outer_optional=false, element_optional=true.
+        let file = build_list_int64_file(ListShape {
+            outer_optional: false,
+            element_optional: true,
+            num_rows: 1,
+            num_values: 3,
+            page_payload: t7b_page_payload(),
+        });
+        let rows = extract(&file, &["my_list"]).expect("extract list<opt i64>");
+        assert_eq!(rows.len(), 1, "one top-level record");
+        assert_eq!(rows[0], vec![
+            PqValue::List(vec![PqValue::I64(10), PqValue::Null, PqValue::I64(20)])
+        ]);
+    }
+
+    /// SP143 T7c page payload: OPT-REP-REQ Optional<List<i64>>, two
+    /// records `[null, [7, 8]]`. 3 (rep,def) pairs, 2 actual values.
+    ///
+    /// rep = [0,0,1], bit_width=1:
+    ///   header 0x03; bits [0,0,1,0,0,0,0,0] = 0b00000100 = 0x04.
+    ///   Stream = [0x03, 0x04]; prefix = [0x02,0,0,0].
+    /// def = [0,2,2], bit_width=2 (max_def=2: outer OPT + REP):
+    ///   header 0x03; LSB-first 2-bit packing of [0,2,2,0,0,0,0,0]:
+    ///     val0=00 (bits0-1), val1=10 (bits2-3), val2=10 (bits4-5),
+    ///     padding=00 (bits6-7) -> 0b00 10 10 00 = 0x28; byte1=0x00.
+    ///   Stream = [0x03, 0x28, 0x00]; prefix = [0x03,0,0,0].
+    /// values = 2 × INT64 LE = [7, 8].
+    fn t7c_page_payload() -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&2u32.to_le_bytes());
+        p.extend_from_slice(&[0x03, 0x04]);
+        p.extend_from_slice(&3u32.to_le_bytes());
+        p.extend_from_slice(&[0x03, 0x28, 0x00]);
+        for v in [7i64, 8] {
+            p.extend_from_slice(&v.to_le_bytes());
+        }
+        p
+    }
+
+    #[test]
+    fn extract_decodes_optional_list_int64_inline_roundtrip() {
+        // SP143 T7c: OPT-REP-REQ Optional<List<i64>>.
+        // Two records `[null, [7, 8]]`; max_def=2 (outer OPT + REP),
+        // max_rep=1, outer_optional=true, element_optional=false.
+        // Exercises the OuterNull def-case path through assemble_list_primitive.
+        let file = build_list_int64_file(ListShape {
+            outer_optional: true,
+            element_optional: false,
+            num_rows: 2,
+            num_values: 3,
+            page_payload: t7c_page_payload(),
+        });
+        let rows = extract(&file, &["my_list"]).expect("extract opt list<i64>");
+        assert_eq!(rows.len(), 2, "two top-level records");
+        assert_eq!(rows[0], vec![PqValue::Null]);
+        assert_eq!(rows[1], vec![
+            PqValue::List(vec![PqValue::I64(7), PqValue::I64(8)])
+        ]);
+    }
+
     /// Build an OPTIONAL+dict INT64 file for column "id".
     /// Logical rows: [7, null, 7]. defs=[1,0,1], dict=[7], present_count=2.
     /// Dict page: PLAIN [7i64]. Data page: PLAIN_DICTIONARY(2), n=3.

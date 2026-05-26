@@ -1496,4 +1496,324 @@ mod tests {
             }
         }
     }
+
+    // ---------- T4 sort-key extraction edges (SP155 §3.3) ----------
+    //
+    // The current `extract_sort_key(record, offset, width)` is a simple
+    // byte-slice copy + `cmp_sort_value` dispatches on `FieldKind`. T4
+    // stresses the edges: Char (variable-length lexicographic), Bytes
+    // (raw bytes, no UTF-8 assumption), NULL bitmap (per spec §3.3),
+    // empty-string vs absent column, sort field at non-zero offset.
+    //
+    // Lock the decisions:
+    //
+    //   - **NULLs sort by their raw stored bytes** (typically all-zero
+    //     padding). The per-shard SM (kessel-sm:3567) reads the field's
+    //     fixed-width byte slice without consulting the null bitmap;
+    //     the merger matches that. NULLs therefore sort FIRST in
+    //     ascending order (zero bytes ≤ any positive value). Documented;
+    //     a future `Op::SelectSortedWithKey` (spec OQ8) could surface a
+    //     NULL discriminator if Postgres-style "NULLS LAST" is needed.
+    //
+    //   - **Empty string vs single-char**: "" (zero-padded full width)
+    //     vs "a" (then zero pad) compare as `cmp(&"")=Less` because the
+    //     'a' byte > 0 — lexicographic byte order.
+    //
+    //   - **Sort field at non-zero offset**: the merger reads exactly
+    //     `record[offset..offset+width]`. Any preceding fields are
+    //     untouched. Locked by `merge_sorted_sort_field_at_nonzero_column_offset`.
+
+    /// **Char column sort key (lexicographic, byte-correct, no locale)**.
+    /// Sort field is a Char(8) — fixed-width 8-byte text. Records have
+    /// the Char field at offset 0. Locks that lexicographic compare is
+    /// pure byte compare (no UTF-8 / locale dependence per spec §3.3).
+    #[test]
+    fn merge_sorted_char_column_lexicographic() {
+        // Char(8): each record is exactly 8 bytes, zero-padded.
+        let s = |text: &str| -> Vec<u8> {
+            let mut r = [0u8; 8];
+            let bytes = text.as_bytes();
+            let n = bytes.len().min(8);
+            r[..n].copy_from_slice(&bytes[..n]);
+            r.to_vec()
+        };
+        // Per-shard already in lex order.
+        let s0 = rows_to_payload(&[&s("apple"), &s("banana"), &s("zebra")]);
+        let s1 = rows_to_payload(&[&s("aardvark"), &s("cat"), &s("yak")]);
+        let r = merge_scan_results(
+            vec![OpResult::Got(s0), OpResult::Got(s1)],
+            &ScatterKind::Sorted {
+                sort_kind: FieldKind::Char(8),
+                sort_offset: 0,
+                sort_width: 8,
+                desc: false,
+                offset: 0,
+                limit: 0,
+            },
+        );
+        let expected = rows_to_payload(&[
+            &s("aardvark"),
+            &s("apple"),
+            &s("banana"),
+            &s("cat"),
+            &s("yak"),
+            &s("zebra"),
+        ]);
+        assert_eq!(r, OpResult::Got(expected));
+    }
+
+    /// **Bytes column sort key (raw bytes, no UTF-8 assumption)**. Same
+    /// as Char but the column may contain non-printable / non-UTF-8
+    /// bytes (binary keys, hashes, etc). The merger uses byte compare,
+    /// so `0xFF` > `0x80` > `0x01` > `0x00`.
+    #[test]
+    fn merge_sorted_bytes_column_raw_byte_compare() {
+        let b = |bs: &[u8]| -> Vec<u8> {
+            let mut r = vec![0u8; 4];
+            r[..bs.len().min(4)].copy_from_slice(&bs[..bs.len().min(4)]);
+            r
+        };
+        let s0 = rows_to_payload(&[
+            &b(&[0x00, 0x00, 0x00, 0x00]),
+            &b(&[0x7F, 0xFF, 0x00, 0x00]),
+        ]);
+        let s1 = rows_to_payload(&[
+            &b(&[0x01, 0x00, 0x00, 0x00]),
+            &b(&[0xFF, 0xFE, 0xFD, 0xFC]),
+        ]);
+        let r = merge_scan_results(
+            vec![OpResult::Got(s0), OpResult::Got(s1)],
+            &ScatterKind::Sorted {
+                sort_kind: FieldKind::Bytes(4),
+                sort_offset: 0,
+                sort_width: 4,
+                desc: false,
+                offset: 0,
+                limit: 0,
+            },
+        );
+        let expected = rows_to_payload(&[
+            &b(&[0x00, 0x00, 0x00, 0x00]),
+            &b(&[0x01, 0x00, 0x00, 0x00]),
+            &b(&[0x7F, 0xFF, 0x00, 0x00]),
+            &b(&[0xFF, 0xFE, 0xFD, 0xFC]),
+        ]);
+        assert_eq!(r, OpResult::Got(expected));
+    }
+
+    /// **NULL sort key handling (NULLs sort FIRST in ascending)**. The
+    /// per-shard SM (kessel-sm:3567) does NOT consult the null bitmap
+    /// — it reads the field's fixed-width slice raw. A NULL field
+    /// stored as zero-padded bytes therefore compares as if it were
+    /// the zero value of the field's kind. For U64 that's value `0`,
+    /// which sorts FIRST in ascending order.
+    ///
+    /// This KAT locks the decision: V1 inherits the SM's
+    /// "NULL == zero-padded raw bytes" semantics. Documented in the
+    /// module doc; a future `SelectSortedWithKey` (spec OQ8) could
+    /// surface an explicit NULL discriminator if Postgres-style
+    /// "NULLS LAST" is wanted.
+    #[test]
+    fn merge_sorted_nulls_sort_first_ascending_u64() {
+        let rec = |v: u64| -> Vec<u8> { v.to_le_bytes().to_vec() };
+        // NULL stored as 8 zero bytes (matches the per-shard SM's
+        // zero-padded slice for a not-yet-written nullable field).
+        let null_row: Vec<u8> = vec![0u8; 8];
+        let s0 = rows_to_payload(&[&null_row, &rec(5), &rec(100)]);
+        let s1 = rows_to_payload(&[&rec(2), &rec(50)]);
+        let r = merge_scan_results(
+            vec![OpResult::Got(s0), OpResult::Got(s1)],
+            &ScatterKind::Sorted {
+                sort_kind: FieldKind::U64,
+                sort_offset: 0,
+                sort_width: 8,
+                desc: false,
+                offset: 0,
+                limit: 0,
+            },
+        );
+        // NULL (0 bytes) sorts first; ascending: 0, 2, 5, 50, 100.
+        let expected = rows_to_payload(&[
+            &null_row,
+            &rec(2),
+            &rec(5),
+            &rec(50),
+            &rec(100),
+        ]);
+        assert_eq!(r, OpResult::Got(expected));
+    }
+
+    /// **NULLs sort LAST descending** (the natural consequence of the
+    /// "NULL == zero-padded" decision: descending flips the order).
+    #[test]
+    fn merge_sorted_nulls_sort_last_descending_u64() {
+        let rec = |v: u64| -> Vec<u8> { v.to_le_bytes().to_vec() };
+        let null_row: Vec<u8> = vec![0u8; 8];
+        // Per-shard SM in desc mode returns rows desc-sorted; replicate
+        // that (the NULL on shard 0 ends up last there, and on shard 1
+        // there are no NULLs).
+        let s0 = rows_to_payload(&[&rec(100), &rec(5), &null_row]);
+        let s1 = rows_to_payload(&[&rec(50), &rec(2)]);
+        let r = merge_scan_results(
+            vec![OpResult::Got(s0), OpResult::Got(s1)],
+            &ScatterKind::Sorted {
+                sort_kind: FieldKind::U64,
+                sort_offset: 0,
+                sort_width: 8,
+                desc: true,
+                offset: 0,
+                limit: 0,
+            },
+        );
+        let expected = rows_to_payload(&[
+            &rec(100),
+            &rec(50),
+            &rec(5),
+            &rec(2),
+            &null_row,
+        ]);
+        assert_eq!(r, OpResult::Got(expected));
+    }
+
+    /// **Empty string vs non-empty Char(8)**. The empty string is
+    /// 8 zero bytes; "a" is `[b'a', 0, 0, 0, 0, 0, 0, 0]`. Byte compare:
+    /// empty < "a" because 0 < 'a'. Locks the per spec §3.3 decision
+    /// "" < any non-empty string in ascending order.
+    #[test]
+    fn merge_sorted_empty_string_less_than_nonempty_char() {
+        let s = |text: &str| -> Vec<u8> {
+            let mut r = [0u8; 8];
+            let bytes = text.as_bytes();
+            let n = bytes.len().min(8);
+            r[..n].copy_from_slice(&bytes[..n]);
+            r.to_vec()
+        };
+        let empty = s("");
+        let s0 = rows_to_payload(&[&empty, &s("a"), &s("z")]);
+        let s1 = rows_to_payload(&[&s("b"), &s("m")]);
+        let r = merge_scan_results(
+            vec![OpResult::Got(s0), OpResult::Got(s1)],
+            &ScatterKind::Sorted {
+                sort_kind: FieldKind::Char(8),
+                sort_offset: 0,
+                sort_width: 8,
+                desc: false,
+                offset: 0,
+                limit: 0,
+            },
+        );
+        let expected = rows_to_payload(&[
+            &empty,
+            &s("a"),
+            &s("b"),
+            &s("m"),
+            &s("z"),
+        ]);
+        assert_eq!(r, OpResult::Got(expected));
+    }
+
+    /// **Sort field at a non-zero column offset**. Simulate a row with
+    /// a leading "header" of bytes the merger should ignore, then the
+    /// sort field at offset 16, width 8 (a U64). The merger must read
+    /// bytes [16..24] for the sort key and leave the rest of the row
+    /// untouched.
+    #[test]
+    fn merge_sorted_sort_field_at_nonzero_column_offset() {
+        // record = [16 bytes of "header" / preceding columns][U64 sort field][trailing tag byte]
+        // total len = 16 + 8 + 1 = 25 bytes.
+        let rec = |hdr_byte: u8, sort_val: u64, tag: u8| -> Vec<u8> {
+            let mut r = Vec::with_capacity(25);
+            r.extend(std::iter::repeat(hdr_byte).take(16));
+            r.extend_from_slice(&sort_val.to_le_bytes());
+            r.push(tag);
+            r
+        };
+        // Per-shard already in (sort_value) ascending order.
+        let s0 = rows_to_payload(&[
+            &rec(0xAA, 1, b'a'),
+            &rec(0xBB, 7, b'b'),
+        ]);
+        let s1 = rows_to_payload(&[
+            &rec(0xCC, 3, b'c'),
+            &rec(0xDD, 5, b'd'),
+        ]);
+        let r = merge_scan_results(
+            vec![OpResult::Got(s0), OpResult::Got(s1)],
+            &ScatterKind::Sorted {
+                sort_kind: FieldKind::U64,
+                sort_offset: 16,
+                sort_width: 8,
+                desc: false,
+                offset: 0,
+                limit: 0,
+            },
+        );
+        // Expected merge by sort field (at offset 16): 1, 3, 5, 7.
+        let expected = rows_to_payload(&[
+            &rec(0xAA, 1, b'a'),
+            &rec(0xCC, 3, b'c'),
+            &rec(0xDD, 5, b'd'),
+            &rec(0xBB, 7, b'b'),
+        ]);
+        assert_eq!(r, OpResult::Got(expected));
+    }
+
+    /// **Record shorter than sort field offset+width → SchemaError**.
+    /// Defense against a malformed row that's too short to contain the
+    /// claimed sort field. The merger surfaces `SchemaError`, not a
+    /// panic, per SP155 §6 malformed-row defense.
+    #[test]
+    fn merge_sorted_record_too_short_surfaces_schema_error() {
+        // Sort field claims offset=0 width=8 but the record is only 4 bytes.
+        let short = vec![1u8, 2, 3, 4];
+        let s0 = rows_to_payload(&[&short]);
+        let r = merge_scan_results(
+            vec![OpResult::Got(s0)],
+            &ScatterKind::Sorted {
+                sort_kind: FieldKind::U64,
+                sort_offset: 0,
+                sort_width: 8,
+                desc: false,
+                offset: 0,
+                limit: 0,
+            },
+        );
+        assert!(
+            matches!(r, OpResult::SchemaError(_)),
+            "record too short for sort field must surface SchemaError, got {r:?}"
+        );
+    }
+
+    /// **I64 negative signed compare with NULL (zero bytes)**. NULL == 0
+    /// per the §3.3 decision; in signed compare 0 is greater than any
+    /// negative value, so NULLs sort BETWEEN negatives and positives
+    /// (i.e. at the "0" position) — NOT first. Documented edge: NULL
+    /// semantics under signed kinds differ from unsigned.
+    #[test]
+    fn merge_sorted_nulls_in_signed_i64_sort_at_zero_position() {
+        let rec = |v: i64| -> Vec<u8> { v.to_le_bytes().to_vec() };
+        let null_row: Vec<u8> = vec![0u8; 8];
+        let s0 = rows_to_payload(&[&rec(-100), &null_row, &rec(50)]);
+        let s1 = rows_to_payload(&[&rec(-10), &rec(20)]);
+        let r = merge_scan_results(
+            vec![OpResult::Got(s0), OpResult::Got(s1)],
+            &ScatterKind::Sorted {
+                sort_kind: FieldKind::I64,
+                sort_offset: 0,
+                sort_width: 8,
+                desc: false,
+                offset: 0,
+                limit: 0,
+            },
+        );
+        // Ascending signed: -100, -10, 0(NULL), 20, 50.
+        let expected = rows_to_payload(&[
+            &rec(-100),
+            &rec(-10),
+            &null_row,
+            &rec(20),
+            &rec(50),
+        ]);
+        assert_eq!(r, OpResult::Got(expected));
+    }
 }

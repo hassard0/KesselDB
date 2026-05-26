@@ -113,6 +113,18 @@ of the HTTP gateway — they are hardening / observability upgrades:
    without distinguishing which `ParseError` variant produced it. A
    hardening pass could tighten body-text assertions.
 
+   **CLOSED in SP148 (commit `ef74a46`)** — pentests now grep both status
+   code AND distinctive body-text substring per ParseError variant. Caught
+   one genuine latent issue: `routes.rs::handle_sql`/`handle_op` route
+   `Err(ParseError::IncompleteSessionBinding)` through `format!("{:?}", e)`
+   (Debug fallback) rather than `server::write_parse_error` (which has the
+   spec-correct "both X-Kessel-Client-Id and X-Kessel-Req-Seq required
+   together" arm). Wire body currently reads `"IncompleteSessionBinding"`;
+   the test pins this so any future refactor that converges on
+   `write_parse_error` will trip the assertion and be reviewed
+   intentionally. Tracked as an SP141 cosmetic follow-up rather than a
+   correctness bug (status code and listener invariants unaffected).
+
 ---
 
 ## Cross-links

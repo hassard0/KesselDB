@@ -34,6 +34,13 @@ const DICT: &[u8] = include_bytes!("fixtures/dict_flat.parquet");
 const NULLABLE: &[u8] = include_bytes!("fixtures/nullable.parquet");
 const NULLABLE_PLAIN: &[u8] = include_bytes!("fixtures/nullable_plain.parquet");
 
+// ── SP149: LZ4_RAW codec fixture ────────────────────────────────────────────
+// pyarrow 24.0.0 with `compression='lz4'` writes codec id 7 (LZ4_RAW) — the
+// modern raw LZ4 block format, no Hadoop 8-byte framing. Verified by
+// hand-decoding the footer thrift: field 4 (codec) = zigzag varint 0x0e
+// = value 7 = LZ4_RAW.
+const LZ4_RAW_FLAT: &[u8] = include_bytes!("fixtures/lz4_raw_flat.parquet");
+
 #[test]
 fn fixture_flat_required_decodes_expected_rows() {
     let rows = extract(FLAT, &["id", "name"]).unwrap();
@@ -1017,4 +1024,21 @@ fn pyarrow_map_string_list_string() {
             Bytes(b"only".to_vec()),
         ])),
     ])]);
+}
+
+/// SP149: pyarrow LZ4_RAW round-trip — real-data validation that the
+/// hand-rolled lz4.rs block decoder matches what pyarrow 24.0.0 emits
+/// for `compression='lz4'`. The fixture has 2 columns (id INT64 +
+/// name STRING), 5 rows, single row group, V1 data pages, no dictionary,
+/// codec id 7 (LZ4_RAW — verified via footer hex inspection: f4 codec
+/// header 0x15 followed by zigzag varint 0x0e = decoded value 7).
+#[test]
+fn pyarrow_lz4_raw_flat() {
+    let rows = extract(LZ4_RAW_FLAT, &["id", "name"]).expect("extract lz4_raw fixture");
+    assert_eq!(rows.len(), 5);
+    assert_eq!(rows[0], vec![I64(1), Bytes(b"alice".to_vec())]);
+    assert_eq!(rows[1], vec![I64(2), Bytes(b"bob".to_vec())]);
+    assert_eq!(rows[2], vec![I64(3), Bytes(b"carol".to_vec())]);
+    assert_eq!(rows[3], vec![I64(4), Bytes(b"dave".to_vec())]);
+    assert_eq!(rows[4], vec![I64(5), Bytes(b"eve".to_vec())]);
 }

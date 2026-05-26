@@ -349,6 +349,25 @@ pub enum PqError {
 /// the allocation before any OOM risk.
 pub const DEFAULT_MAX_PAGE_SIZE: usize = 256 * 1024 * 1024;
 
+/// SP153 (defense-in-depth): cap on the *initial* `Vec::with_capacity(n)`
+/// reservation when `n` is attacker-controlled (e.g. `cc.num_values`
+/// or `ph.dp_num_values` from a Parquet header). Pre-SP153 sites like
+/// `read_chunk_values` did `Vec::with_capacity(cc.num_values as usize)`,
+/// so a hostile `cc.num_values = i64::MAX` would request a ~80 GB
+/// `PqValue` pre-allocation → OOM-abort the process *before* any
+/// per-page decode could surface a typed `PqError::Bad`.
+///
+/// 1 MiB rows × `sizeof(PqValue)` ~= 64 MiB upper bound on the initial
+/// reservation. The `Vec` still grows naturally as values are pushed,
+/// so legitimate large files (>1 M rows in a chunk) still extract
+/// correctly — they just pay one growth realloc. Truncated/lying
+/// inputs bail on the page-size or page-payload bounds long before
+/// reaching the 1 MiB ceiling.
+///
+/// Matches the `RLE_INITIAL_CAP` pattern already in `rle::decode_hybrid`
+/// (SP143 T10): never reserve from a stream-supplied count.
+pub(crate) const MAX_INITIAL_ROWS: usize = 1024 * 1024;
+
 // Thread-local: per-call cap honored by every page-size check inside
 // the extract path. Set on entry to `extract_with_cap`, restored on
 // return. Defaults to `DEFAULT_MAX_PAGE_SIZE` outside an extract.
@@ -499,7 +518,11 @@ fn scatter_nulls(
     vals: Vec<PqValue>,
     n: usize,
 ) -> Result<Vec<PqValue>, PqError> {
-    let mut out = Vec::with_capacity(n);
+    // SP153: cap initial reservation. `n` is page-level `dp_num_values`,
+    // attacker-controlled. `defs.len()` is upstream-bounded by the page
+    // payload + RLE cap, but defense-in-depth keeps the pre-allocation
+    // OOM-safe even if a future caller stops checking.
+    let mut out = Vec::with_capacity(n.min(MAX_INITIAL_ROWS));
     let mut it = vals.into_iter();
     for &d in defs {
         if d == 1 {
@@ -797,7 +820,11 @@ pub(crate) fn decode_page_v1_nested(
         cursor = cursor
             .get(consumed..)
             .ok_or_else(|| PqError::Bad("nested v1 rep section consumed past payload".into()))?;
-        let mut out = Vec::with_capacity(levels_u64.len());
+        // SP153: cap initial reservation (see MAX_INITIAL_ROWS docstring).
+        // `levels_u64.len()` is bounded upstream by the page-size cap +
+        // `rle::RLE_INITIAL_CAP`, but defense-in-depth keeps this site
+        // OOM-safe even if an upstream cap regresses.
+        let mut out = Vec::with_capacity(levels_u64.len().min(MAX_INITIAL_ROWS));
         for l in levels_u64 {
             if l > max_rep_level as u64 {
                 return Err(PqError::Bad(format!(
@@ -820,7 +847,8 @@ pub(crate) fn decode_page_v1_nested(
         cursor = cursor
             .get(consumed..)
             .ok_or_else(|| PqError::Bad("nested v1 def section consumed past payload".into()))?;
-        let mut out = Vec::with_capacity(levels_u64.len());
+        // SP153: cap initial reservation (see SP153 note on rep_levels).
+        let mut out = Vec::with_capacity(levels_u64.len().min(MAX_INITIAL_ROWS));
         for l in levels_u64 {
             if l > max_def_level as u64 {
                 return Err(PqError::Bad(format!(
@@ -897,7 +925,8 @@ pub(crate) fn decode_data_page_v2_nested(
         if levels_u64.len() != n {
             return Err(PqError::Bad("nested v2 rep-level count != num_values".into()));
         }
-        let mut out = Vec::with_capacity(levels_u64.len());
+        // SP153: cap initial reservation (see MAX_INITIAL_ROWS).
+        let mut out = Vec::with_capacity(levels_u64.len().min(MAX_INITIAL_ROWS));
         for l in levels_u64 {
             if l > max_rep_level as u64 {
                 return Err(PqError::Bad(format!(
@@ -923,7 +952,8 @@ pub(crate) fn decode_data_page_v2_nested(
         if levels_u64.len() != n {
             return Err(PqError::Bad("nested v2 def-level count != num_values".into()));
         }
-        let mut out = Vec::with_capacity(levels_u64.len());
+        // SP153: cap initial reservation (see MAX_INITIAL_ROWS).
+        let mut out = Vec::with_capacity(levels_u64.len().min(MAX_INITIAL_ROWS));
         for l in levels_u64 {
             if l > max_def_level as u64 {
                 return Err(PqError::Bad(format!(
@@ -1089,7 +1119,11 @@ fn read_chunk_values(
 
     let want_rows = usize::try_from(cc.num_values)
         .map_err(|_| PqError::Bad("chunk num_values range".into()))?;
-    let mut out: Vec<PqValue> = Vec::with_capacity(want_rows);
+    // SP153: cap initial reservation. Pre-SP153, a hostile
+    // `cc.num_values = i64::MAX` would pre-allocate ~80 GB of `PqValue`
+    // here before the page loop ever read a byte → OOM-abort. The Vec
+    // still grows naturally for legitimate large chunks.
+    let mut out: Vec<PqValue> = Vec::with_capacity(want_rows.min(MAX_INITIAL_ROWS));
     let mut off = usize::try_from(cc.data_page_offset)
         .map_err(|_| PqError::Bad("data page offset range".into()))?;
     while out.len() < want_rows {
@@ -3251,8 +3285,12 @@ fn read_chunk_levels_and_values(
 
     let want_pairs = usize::try_from(cc.num_values)
         .map_err(|_| PqError::Bad("chunk num_values range".into()))?;
-    let mut all_rep: Vec<u32> = Vec::with_capacity(want_pairs);
-    let mut all_def: Vec<u32> = Vec::with_capacity(want_pairs);
+    // SP153: cap initial reservation (see MAX_INITIAL_ROWS docstring).
+    // Nested chunks pay 2 caps (rep + def). Pre-SP153 was ~16 GB per
+    // Vec for `cc.num_values = i64::MAX`.
+    let initial_cap = want_pairs.min(MAX_INITIAL_ROWS);
+    let mut all_rep: Vec<u32> = Vec::with_capacity(initial_cap);
+    let mut all_def: Vec<u32> = Vec::with_capacity(initial_cap);
     let mut all_values: Vec<PqValue> = Vec::new();
     let mut off = usize::try_from(cc.data_page_offset)
         .map_err(|_| PqError::Bad("data page offset range".into()))?;
@@ -6232,6 +6270,128 @@ mod tests {
                 );
             }
             other => panic!("expected PqError::Bad(num_values…), got {other:?}"),
+        }
+    }
+
+    // ── SP153 T1 OOM pentest ─────────────────────────────────────────
+    // Locks the `Vec::with_capacity(cc.num_values.min(MAX_INITIAL_ROWS))`
+    // cap added to `read_chunk_values`. Pre-SP153, a hostile
+    // `cc.num_values = i64::MAX` would request a ~80 GB `Vec<PqValue>`
+    // pre-allocation here, OOM-aborting the process BEFORE any page-loop
+    // bounds check could fire.
+    //
+    // Self-review note (the plan asks the builder to be honest):
+    //   - Without the cap, `Vec::with_capacity(i64::MAX as usize)` calls
+    //     `__rust_alloc` for ~80 GiB on a 64-bit system. Behavior is
+    //     allocator-dependent: glibc-based Linux returns null and Rust
+    //     panics with "memory allocation failed"; jemalloc/Windows may
+    //     SIGABRT directly. EITHER WAY: the test should observe a
+    //     well-formed `Result` AND no panic-unwind, but in the abort case
+    //     `catch_unwind` won't help — the process just dies. So this test
+    //     CANNOT actually catch the OOM-abort regression scenario on every
+    //     platform; it primarily LOCKS that the new cap is in place by
+    //     proving `extract()` returns a typed `Result` quickly on the
+    //     hostile input. (Pre-SP153, on glibc Linux at least, the alloc
+    //     would fail and bubble a panic that catch_unwind would catch and
+    //     the assertion would fire; on Windows it might just hang or
+    //     SIGABRT.) Documented honestly per the SP153 plan's request.
+    fn build_parquet_file_with_chunk_num_values(num_values: i64) -> Vec<u8> {
+        // Reuse the standard PLAIN INT64 [7,-2] page (16 bytes payload).
+        let mut page_data = Vec::new();
+        page_data.extend_from_slice(&7i64.to_le_bytes());
+        page_data.extend_from_slice(&(-2i64).to_le_bytes());
+        let data_bytes = page_data.len() as i32; // 16
+        let hdr = page_header_bytes(2, data_bytes);
+        let data_page_offset: i64 = 4;
+
+        // Hand-build FileMetaData (mirrors `filemetadata_bytes` but with
+        // `cc.num_values = num_values` instead of the hardcoded 2).
+        let mut b = Vec::new();
+        // f1 version=2
+        b.push(0x15); uv(&mut b, zz(2));
+        // f2 list<SchemaElement> 2 elems struct
+        b.push(0x19); b.push(0x2c);
+        // schema[0] root: name="schema", num_children=1
+        b.push(0x48); uv(&mut b, 6); b.extend_from_slice(b"schema");
+        b.push(0x15); uv(&mut b, zz(1));
+        b.push(0x00);
+        // schema[1] leaf: type=INT64(2), repetition=REQUIRED(0), name="id"
+        b.push(0x15); uv(&mut b, zz(2));
+        b.push(0x25); uv(&mut b, zz(0));
+        b.push(0x18); uv(&mut b, 2); b.extend_from_slice(b"id");
+        b.push(0x00);
+        // f3 num_rows=2
+        b.push(0x16); uv(&mut b, zz(2));
+        // f4 list<RowGroup> 1 elem
+        b.push(0x19); b.push(0x1c);
+        // RowGroup: f1 list<ColumnChunk> 1 elem
+        b.push(0x19); b.push(0x1c);
+        // ColumnChunk: f3 ColumnMetaData
+        b.push(0x3c);
+        // ColumnMetaData:
+        //   f1 type=INT64(2)
+        b.push(0x15); uv(&mut b, zz(2));
+        //   f2 encodings list<i32> [PLAIN(0)]
+        b.push(0x19); b.push(0x15); uv(&mut b, zz(0));
+        //   f3 path_in_schema ["id"]
+        b.push(0x19); b.push(0x18); uv(&mut b, 2); b.extend_from_slice(b"id");
+        //   f4 codec=UNCOMPRESSED(0)
+        b.push(0x15); uv(&mut b, zz(0));
+        //   f5 num_values = `num_values` (THE HOSTILE FIELD)
+        b.push(0x16); uv(&mut b, zz(num_values));
+        //   f9 data_page_offset
+        b.push(0x46); uv(&mut b, zz(data_page_offset));
+        b.push(0x00); // stop ColumnMetaData
+        b.push(0x00); // stop ColumnChunk
+        // RowGroup f3 num_rows=2
+        b.push(0x26); uv(&mut b, zz(2));
+        b.push(0x00); // stop RowGroup
+        b.push(0x00); // stop FileMetaData
+
+        let mlen = b.len() as u32;
+        let mut f = Vec::new();
+        f.extend_from_slice(b"PAR1");
+        f.extend_from_slice(&hdr);
+        f.extend_from_slice(&page_data);
+        f.extend_from_slice(&b);
+        f.extend_from_slice(&mlen.to_le_bytes());
+        f.extend_from_slice(b"PAR1");
+        f
+    }
+
+    #[test]
+    fn sp153_pt_baseline_chunk_num_values_2_still_decodes() {
+        // First lock: the new helper produces a valid file when used
+        // honestly (num_values=2 matches the 2 PLAIN INT64 values).
+        // Sanity-check before we throw i64::MAX at it.
+        let f = build_parquet_file_with_chunk_num_values(2);
+        let rows = extract(&f, &["id"]).expect("baseline extract");
+        assert_eq!(rows, vec![vec![PqValue::I64(7)], vec![PqValue::I64(-2)]]);
+    }
+
+    #[test]
+    fn sp153_pt_huge_chunk_num_values_no_oom() {
+        use std::panic::catch_unwind;
+        // Cap the test's per-call page size to its default — we are NOT
+        // exercising page-size; we are exercising the `cc.num_values`
+        // pre-allocation cap.
+        let f = build_parquet_file_with_chunk_num_values(i64::MAX);
+        let r = catch_unwind(|| extract(&f, &["id"]));
+        match r {
+            Ok(Ok(_rows)) => {
+                // Acceptable: the loop returned values without exceeding
+                // the cap (won't happen in practice — see Ok(Err) arm).
+            }
+            Ok(Err(_e)) => {
+                // EXPECTED: the page loop runs until `out.len() < want_rows`
+                // and the next page advance lands past EOF (or the
+                // "data page values exceed chunk num_values" guard fires
+                // on a different code path). Either way: typed Err, no OOM.
+            }
+            Err(_panic) => panic!(
+                "extract() with cc.num_values=i64::MAX panicked — \
+                 SP153 cap regressed (pre-SP153 OOM-abort was the failure mode)"
+            ),
         }
     }
 }

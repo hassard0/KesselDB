@@ -31,7 +31,11 @@ pub fn resolve_dict_indices(
     let idxs = rle::decode_hybrid(stream, bit_width as u32, n)?;
     // OOM bound (plain.rs:35 stance): `n` is the page num_values,
     // upstream-capped; never reserve from a stream-derived count.
-    let mut out: Vec<PqValue> = Vec::with_capacity(n);
+    // SP153: cap initial reservation against `crate::MAX_INITIAL_ROWS`
+    // (1 MiB) as defense-in-depth — `n` is attacker-controlled
+    // (`dp_num_values`), and even a tiny payload claiming n=1e9 would
+    // pre-reserve ~32 GB here pre-SP153.
+    let mut out: Vec<PqValue> = Vec::with_capacity(n.min(crate::MAX_INITIAL_ROWS));
     for raw in idxs {
         let i = usize::try_from(raw)
             .map_err(|_| bad("dict index range"))?;

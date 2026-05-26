@@ -861,3 +861,1273 @@ mod struct_tests {
         assert!(format!("{err:?}").contains("no fields"), "got {err:?}");
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────────
+// SP145: deep nesting (final OBJ-2c-5 slice). Per-shape compositional
+// assemblers for the 4 cases SP145 lifts:
+//   - List<List<primitive>>       → assemble_list_of_list_primitive
+//   - List<struct<primitives>>    → assemble_list_of_struct
+//   - Map<K, struct<primitives>>  → assemble_map_of_struct
+//   - struct<List/struct>         → assemble_struct (UNCHANGED — feed it
+//                                   recursively-built field columns)
+// Plus 2 BOLD cross-products:
+//   - Map<K, List<primitive>>     → assemble_map_of_list
+//   - struct fields can hold ANY  → reuse assemble_struct with nested cols
+//
+// The unifying property: each new assembler takes the SAME (rep, def)
+// stream that the inner leaves share (they share the outer REPEATED
+// ancestor by construction). The inner-shape decode is fed the SAME
+// per-position (rep, def) classification and produces N parallel
+// streams that we either zip (struct) or split per item slot
+// (list of struct / map of struct) before composing into outer
+// PqValue::List / PqValue::Map / PqValue::Struct records.
+// ──────────────────────────────────────────────────────────────────────────
+
+/// SP145: assemble a stream of (rep, def, value) into one PqValue per
+/// record for a `List<List<primitive>>` column (max_rep_level = 2).
+///
+/// Schema shape (pyarrow canonical):
+///
+///   [OPT|REQ] group outer (LIST) {
+///     REPEATED group list_outer {
+///       [OPT|REQ] group element (LIST) {
+///         REPEATED group list_inner {
+///           [OPT|REQ] <PRIMITIVE> item
+///         }
+///       }
+///     }
+///   }
+///
+/// Level math:
+///   max_rep_level = 2
+///   max_def_level = (outer_optional as u32) + 1 /*REP outer*/
+///                   + (inner_optional as u32) + 1 /*REP inner*/
+///                   + (item_optional as u32)
+///
+/// Def classification (let d = def value):
+///   d == 0 && outer_optional   → outer LIST is null
+///   d == empty_outer_threshold → outer LIST is empty
+///         where threshold = outer_optional as u32
+///   d == inner_null_threshold  → outer is non-empty, inner LIST is null
+///         where threshold = (outer_optional as u32) + 1
+///         (only valid when inner_optional)
+///   d == empty_inner_threshold → inner LIST is empty (no items)
+///         where threshold = (outer_optional as u32) + 1 + (inner_optional as u32)
+///   d == item_null_threshold   → inner has an item slot but item is null
+///         where threshold = max_def_level - 1
+///         (only valid when item_optional)
+///   d == max_def_level         → item present (consume value)
+///
+/// Rep handling:
+///   rep == 0 → start NEW outer record; flush previous
+///   rep == 1 → close current inner list; start NEW inner list inside outer
+///   rep == 2 → continue current inner list (append item)
+pub fn assemble_list_of_list_primitive(
+    rep_levels: &[u32],
+    def_levels: &[u32],
+    values: &[PqValue],
+    max_def_level: u32,
+    outer_optional: bool,
+    inner_optional: bool,
+    item_optional: bool,
+) -> Result<Vec<PqValue>, PqError> {
+    if rep_levels.len() != def_levels.len() {
+        return Err(PqError::Bad(format!(
+            "rep/def length mismatch: rep={} def={}",
+            rep_levels.len(), def_levels.len()
+        )));
+    }
+    let n = rep_levels.len();
+    if n == 0 {
+        if !values.is_empty() {
+            return Err(PqError::Bad(format!(
+                "no levels but {} values supplied", values.len()
+            )));
+        }
+        return Ok(Vec::new());
+    }
+
+    let empty_outer_threshold: u32 = outer_optional as u32;
+    let inner_null_threshold: u32 = (outer_optional as u32) + 1;
+    let empty_inner_threshold: u32 =
+        (outer_optional as u32) + 1 + (inner_optional as u32);
+    let item_null_threshold: u32 = if max_def_level > 0 {
+        max_def_level - 1
+    } else {
+        0
+    };
+
+    #[derive(Copy, Clone, Debug)]
+    enum LoLCase {
+        OuterNull,
+        OuterEmpty,
+        InnerNull,
+        InnerEmpty,
+        ItemNull,
+        ItemPresent,
+    }
+
+    let classify = |def: u32, pos: usize| -> Result<LoLCase, PqError> {
+        if def > max_def_level {
+            return Err(PqError::Bad(format!(
+                "def level {def} > max {max_def_level} (position {pos})"
+            )));
+        }
+        // Order matters: ItemPresent wins when max == another threshold
+        // (defensive, mirrors SP143's classify).
+        if def == max_def_level {
+            return Ok(LoLCase::ItemPresent);
+        }
+        if outer_optional && def == 0 {
+            return Ok(LoLCase::OuterNull);
+        }
+        if def == empty_outer_threshold {
+            return Ok(LoLCase::OuterEmpty);
+        }
+        if inner_optional && def == inner_null_threshold {
+            return Ok(LoLCase::InnerNull);
+        }
+        if def == empty_inner_threshold {
+            return Ok(LoLCase::InnerEmpty);
+        }
+        if item_optional && def == item_null_threshold {
+            return Ok(LoLCase::ItemNull);
+        }
+        Err(PqError::Bad(format!(
+            "unclassified def {def} (max={max_def_level}, \
+             outer_opt={outer_optional}, inner_opt={inner_optional}, \
+             item_opt={item_optional}) at position {pos}"
+        )))
+    };
+
+    let mut out: Vec<PqValue> = Vec::new();
+    // Outer accumulator: list of inner-lists.
+    let mut current_outer: Option<Vec<PqValue>> = None;
+    let mut current_outer_is_null: bool = false;
+    // Inner accumulator: list of items (within the current outer).
+    let mut current_inner: Option<Vec<PqValue>> = None;
+    let mut current_inner_is_null: bool = false;
+    let mut value_cursor = 0usize;
+
+    let flush_inner = |outer: &mut Option<Vec<PqValue>>,
+                       inner: &mut Option<Vec<PqValue>>,
+                       inner_null: &mut bool|
+     -> Result<(), PqError> {
+        if let Some(inner_items) = inner.take() {
+            outer
+                .as_mut()
+                .ok_or_else(|| PqError::Bad(
+                    "flush_inner with no active outer".into()))?
+                .push(PqValue::List(inner_items));
+        } else if *inner_null {
+            outer
+                .as_mut()
+                .ok_or_else(|| PqError::Bad(
+                    "flush_inner null with no active outer".into()))?
+                .push(PqValue::Null);
+            *inner_null = false;
+        }
+        Ok(())
+    };
+
+    let flush_outer = |out: &mut Vec<PqValue>,
+                       outer: &mut Option<Vec<PqValue>>,
+                       outer_null: &mut bool| {
+        if let Some(outer_items) = outer.take() {
+            out.push(PqValue::List(outer_items));
+        } else if *outer_null {
+            out.push(PqValue::Null);
+            *outer_null = false;
+        }
+    };
+
+    for i in 0..n {
+        let rep = rep_levels[i];
+        let def = def_levels[i];
+        if rep > 2 {
+            return Err(PqError::Bad(format!(
+                "rep level {rep} > max 2 for List<List> (position {i})"
+            )));
+        }
+        let dc = classify(def, i)?;
+
+        if rep == 0 {
+            // New outer record. Flush previous outer (and any in-flight inner).
+            flush_inner(&mut current_outer, &mut current_inner, &mut current_inner_is_null)?;
+            flush_outer(&mut out, &mut current_outer, &mut current_outer_is_null);
+
+            match dc {
+                LoLCase::OuterNull => {
+                    current_outer = None;
+                    current_outer_is_null = true;
+                    current_inner = None;
+                    current_inner_is_null = false;
+                }
+                LoLCase::OuterEmpty => {
+                    current_outer = Some(Vec::new());
+                    current_inner = None;
+                    current_inner_is_null = false;
+                }
+                LoLCase::InnerNull => {
+                    current_outer = Some(Vec::new());
+                    current_inner = None;
+                    current_inner_is_null = true;
+                }
+                LoLCase::InnerEmpty => {
+                    current_outer = Some(Vec::new());
+                    current_inner = Some(Vec::new());
+                    current_inner_is_null = false;
+                }
+                LoLCase::ItemNull => {
+                    current_outer = Some(Vec::new());
+                    current_inner = Some(vec![PqValue::Null]);
+                    current_inner_is_null = false;
+                }
+                LoLCase::ItemPresent => {
+                    let v = values.get(value_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("value stream exhausted at position {i}")))?;
+                    value_cursor += 1;
+                    current_outer = Some(Vec::new());
+                    current_inner = Some(vec![v]);
+                    current_inner_is_null = false;
+                }
+            }
+        } else if rep == 1 {
+            // New inner list within current outer. Outer must exist + be present.
+            if current_outer.is_none() {
+                return Err(PqError::Bad(format!(
+                    "rep=1 without active outer list (position {i})"
+                )));
+            }
+            // Flush previous inner into outer.
+            flush_inner(&mut current_outer, &mut current_inner, &mut current_inner_is_null)?;
+
+            match dc {
+                LoLCase::OuterNull => {
+                    return Err(PqError::Bad(format!(
+                        "rep=1 with outer-null def (position {i})"
+                    )));
+                }
+                LoLCase::OuterEmpty => {
+                    return Err(PqError::Bad(format!(
+                        "rep=1 with outer-empty def (position {i})"
+                    )));
+                }
+                LoLCase::InnerNull => {
+                    current_inner = None;
+                    current_inner_is_null = true;
+                }
+                LoLCase::InnerEmpty => {
+                    current_inner = Some(Vec::new());
+                    current_inner_is_null = false;
+                }
+                LoLCase::ItemNull => {
+                    current_inner = Some(vec![PqValue::Null]);
+                    current_inner_is_null = false;
+                }
+                LoLCase::ItemPresent => {
+                    let v = values.get(value_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("value stream exhausted at position {i}")))?;
+                    value_cursor += 1;
+                    current_inner = Some(vec![v]);
+                    current_inner_is_null = false;
+                }
+            }
+        } else {
+            // rep == 2: continue inner list.
+            let inner = current_inner.as_mut().ok_or_else(||
+                PqError::Bad(format!("rep=2 without active inner list (position {i})")))?;
+            match dc {
+                LoLCase::OuterNull | LoLCase::OuterEmpty | LoLCase::InnerNull | LoLCase::InnerEmpty => {
+                    return Err(PqError::Bad(format!(
+                        "rep=2 with non-item def {def:?} (position {i})", def = dc
+                    )));
+                }
+                LoLCase::ItemNull => {
+                    inner.push(PqValue::Null);
+                }
+                LoLCase::ItemPresent => {
+                    let v = values.get(value_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("value stream exhausted at position {i}")))?;
+                    value_cursor += 1;
+                    inner.push(v);
+                }
+            }
+        }
+    }
+
+    // Flush trailing record.
+    flush_inner(&mut current_outer, &mut current_inner, &mut current_inner_is_null)?;
+    flush_outer(&mut out, &mut current_outer, &mut current_outer_is_null);
+
+    if value_cursor != values.len() {
+        return Err(PqError::Bad(format!(
+            "values not fully consumed: cursor={value_cursor} len={}", values.len()
+        )));
+    }
+
+    Ok(out)
+}
+
+#[cfg(test)]
+mod lol_tests {
+    use super::*;
+
+    #[test]
+    fn req_req_req_one_outer_two_inner() {
+        // REQ outer, REQ inner, REQ item: max_def=2, max_rep=2.
+        // Record: [[1,2], [3]]
+        // Levels:
+        //   (rep=0, def=2, val=1)
+        //   (rep=2, def=2, val=2)
+        //   (rep=1, def=2, val=3)
+        let r = vec![0u32, 2, 1];
+        let d = vec![2u32, 2, 2];
+        let v = vec![PqValue::I64(1), PqValue::I64(2), PqValue::I64(3)];
+        let out = assemble_list_of_list_primitive(&r, &d, &v, 2, false, false, false).unwrap();
+        assert_eq!(out, vec![PqValue::List(vec![
+            PqValue::List(vec![PqValue::I64(1), PqValue::I64(2)]),
+            PqValue::List(vec![PqValue::I64(3)]),
+        ])]);
+    }
+
+    #[test]
+    fn req_opt_req_inner_null() {
+        // REQ outer, OPT inner, REQ item: max_def=3, max_rep=2.
+        // Record: [[1], null, [2,3]]
+        // For "null" inner-list inside, encoding:
+        //   (rep=0, def=3, val=1)  → outer starts, inner-list with item 1
+        //   (rep=1, def=1, _)      → new inner-list, inner is null (def==inner_null_thr=1)
+        //   (rep=1, def=3, val=2)  → new inner-list with item 2
+        //   (rep=2, def=3, val=3)  → continue inner-list, item 3
+        let r = vec![0u32, 1, 1, 2];
+        let d = vec![3u32, 1, 3, 3];
+        let v = vec![PqValue::I64(1), PqValue::I64(2), PqValue::I64(3)];
+        let out = assemble_list_of_list_primitive(&r, &d, &v, 3, false, true, false).unwrap();
+        assert_eq!(out, vec![PqValue::List(vec![
+            PqValue::List(vec![PqValue::I64(1)]),
+            PqValue::Null,
+            PqValue::List(vec![PqValue::I64(2), PqValue::I64(3)]),
+        ])]);
+    }
+
+    #[test]
+    fn req_opt_req_inner_empty_within() {
+        // Record: [[], [10, 20]]
+        // For empty inner, def == empty_inner_threshold = 0 + 1 + 1 = 2
+        //   (rep=0, def=2, _)      → outer starts, inner empty
+        //   (rep=1, def=3, val=10) → new inner-list, item 10
+        //   (rep=2, def=3, val=20) → continue, item 20
+        let r = vec![0u32, 1, 2];
+        let d = vec![2u32, 3, 3];
+        let v = vec![PqValue::I64(10), PqValue::I64(20)];
+        let out = assemble_list_of_list_primitive(&r, &d, &v, 3, false, true, false).unwrap();
+        assert_eq!(out, vec![PqValue::List(vec![
+            PqValue::List(vec![]),
+            PqValue::List(vec![PqValue::I64(10), PqValue::I64(20)]),
+        ])]);
+    }
+
+    #[test]
+    fn empty_outer_list() {
+        // REQ outer, OPT inner, REQ item: max_def=3.
+        // Record: [] (empty outer)
+        //   (rep=0, def=0, _)  → outer empty (threshold = outer_opt = 0)
+        let r = vec![0u32];
+        let d = vec![0u32];
+        let v: Vec<PqValue> = vec![];
+        let out = assemble_list_of_list_primitive(&r, &d, &v, 3, false, true, false).unwrap();
+        assert_eq!(out, vec![PqValue::List(vec![])]);
+    }
+
+    #[test]
+    fn opt_outer_null_record() {
+        // OPT outer, REQ inner, REQ item: max_def=2, threshold outer=1
+        // Record: null (outer is null)
+        //   (rep=0, def=0, _)  → outer null
+        let r = vec![0u32];
+        let d = vec![0u32];
+        let v: Vec<PqValue> = vec![];
+        let out = assemble_list_of_list_primitive(&r, &d, &v, 2, true, false, false).unwrap();
+        assert_eq!(out, vec![PqValue::Null]);
+    }
+
+    #[test]
+    fn rejects_rep_overflow() {
+        let r = vec![0u32, 3];
+        let d = vec![2u32, 2];
+        let v = vec![PqValue::I64(1), PqValue::I64(2)];
+        let err = assemble_list_of_list_primitive(&r, &d, &v, 2, false, false, false).unwrap_err();
+        assert!(format!("{err:?}").contains("rep level 3"), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_value_underflow() {
+        let r = vec![0u32, 2];
+        let d = vec![2u32, 2];
+        let v = vec![PqValue::I64(1)]; // need 2
+        let err = assemble_list_of_list_primitive(&r, &d, &v, 2, false, false, false).unwrap_err();
+        assert!(format!("{err:?}").contains("value stream exhausted"), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_value_unconsumed() {
+        let r = vec![0u32];
+        let d = vec![2u32];
+        let v = vec![PqValue::I64(1), PqValue::I64(2)]; // extra
+        let err = assemble_list_of_list_primitive(&r, &d, &v, 2, false, false, false).unwrap_err();
+        assert!(format!("{err:?}").contains("values not fully consumed"), "got {err:?}");
+    }
+}
+
+/// SP145: assemble `List<struct<F1, F2, ...>>` records.
+///
+/// Strategy: every struct field column shares the SAME REPEATED outer
+/// LIST ancestor, so all field columns have IDENTICAL rep streams at
+/// max_rep_level = 1 (one REPEATED ancestor). The def streams differ
+/// only in whether each field is OPT vs REQ — but the LIST-level
+/// boundaries (outer-null, empty-list, item-present) are determined by
+/// a SHARED authoritative leaf's (rep, def) stream.
+///
+/// Inputs:
+///   - `rep_levels`, `def_levels`: the shared LIST-level rep + def
+///     stream (taken from the FIRST field's column — any field's
+///     stream would be equivalent at the LIST boundary; the per-field
+///     differences come from inner OPTs at the leaf level, which we
+///     don't surface here since all SP145 V1 struct fields are REQUIRED).
+///   - `field_names`: struct field names in declared order.
+///   - `field_values`: per-field flat value vec, ALREADY produced by
+///     the upstream leaf decode. Length of each vec = count of
+///     item-present slots in the shared rep/def stream (= count of
+///     def == max_def_level entries).
+///   - `max_def_level`: the LIST-level max def
+///     (outer_optional + 1 /*REP*/ + 0 /*struct is REQ inside LIST*/).
+///   - `outer_optional`: is the outer LIST group OPTIONAL?
+///
+/// Output: one `PqValue::List(Vec<PqValue::Struct>)` per top-level
+/// record. Outer-null records emit `PqValue::Null`.
+pub fn assemble_list_of_struct(
+    rep_levels: &[u32],
+    def_levels: &[u32],
+    field_names: &[String],
+    field_values: &[Vec<PqValue>],
+    max_def_level: u32,
+    outer_optional: bool,
+) -> Result<Vec<PqValue>, PqError> {
+    if rep_levels.len() != def_levels.len() {
+        return Err(PqError::Bad(format!(
+            "rep/def length mismatch: rep={} def={}",
+            rep_levels.len(), def_levels.len()
+        )));
+    }
+    if field_names.len() != field_values.len() {
+        return Err(PqError::Bad(format!(
+            "list_of_struct: field_names len {} != field_values len {}",
+            field_names.len(), field_values.len()
+        )));
+    }
+    if field_names.is_empty() {
+        return Err(PqError::Bad("list_of_struct: no fields".into()));
+    }
+    // All field columns must have the same length (one entry per
+    // item-present slot).
+    let item_count = field_values[0].len();
+    for (i, col) in field_values.iter().enumerate() {
+        if col.len() != item_count {
+            return Err(PqError::Bad(format!(
+                "list_of_struct: field '{}' length {} != first-field length {}",
+                field_names[i], col.len(), item_count
+            )));
+        }
+    }
+
+    // Use the same SP143 classify primitive (single-level LIST classify).
+    // The struct value sits at the item slot; max_def is the LIST-level
+    // max (struct itself is REQ inside the LIST middle).
+    let n = rep_levels.len();
+    if n == 0 {
+        if item_count != 0 {
+            return Err(PqError::Bad(format!(
+                "list_of_struct: no levels but {item_count} struct items supplied"
+            )));
+        }
+        return Ok(Vec::new());
+    }
+
+    let mut out: Vec<PqValue> = Vec::new();
+    let mut current_list: Option<Vec<PqValue>> = None;
+    let mut current_is_null: bool = false;
+    let mut item_cursor = 0usize;
+
+    let make_struct = |idx: usize| -> Result<PqValue, PqError> {
+        let pairs: Vec<(String, PqValue)> = field_names
+            .iter()
+            .enumerate()
+            .map(|(fi, name)| (name.clone(), field_values[fi][idx].clone()))
+            .collect();
+        Ok(PqValue::Struct(pairs))
+    };
+
+    for i in 0..n {
+        let rep = rep_levels[i];
+        let def = def_levels[i];
+        if rep > 1 {
+            return Err(PqError::Bad(format!(
+                "rep level {rep} > max 1 for list_of_struct (position {i})"
+            )));
+        }
+        let def_case = classify(def, max_def_level, outer_optional, false, i)?;
+        if rep == 0 {
+            if let Some(list) = current_list.take() {
+                out.push(PqValue::List(list));
+            } else if i > 0 && current_is_null {
+                out.push(PqValue::Null);
+            }
+            current_is_null = false;
+
+            match def_case {
+                DefCase::OuterNull => {
+                    current_list = None;
+                    current_is_null = true;
+                }
+                DefCase::EmptyList => {
+                    current_list = Some(Vec::new());
+                }
+                DefCase::ItemPresent => {
+                    if item_cursor >= item_count {
+                        return Err(PqError::Bad(format!(
+                            "list_of_struct: item cursor exhausted at position {i}"
+                        )));
+                    }
+                    let s = make_struct(item_cursor)?;
+                    item_cursor += 1;
+                    current_list = Some(vec![s]);
+                }
+                DefCase::ItemNull => {
+                    // SP145 V1: structs inside lists are REQUIRED, so ItemNull
+                    // shouldn't fire (we pass element_optional=false). If
+                    // classify returned it anyway, treat it as a malformed
+                    // input.
+                    return Err(PqError::Bad(format!(
+                        "list_of_struct: unexpected ItemNull def case (position {i})"
+                    )));
+                }
+            }
+        } else {
+            let list = current_list.as_mut().ok_or_else(||
+                PqError::Bad(format!("rep=1 without active list (position {i})")))?;
+            match def_case {
+                DefCase::ItemPresent => {
+                    if item_cursor >= item_count {
+                        return Err(PqError::Bad(format!(
+                            "list_of_struct: item cursor exhausted at position {i}"
+                        )));
+                    }
+                    let s = make_struct(item_cursor)?;
+                    item_cursor += 1;
+                    list.push(s);
+                }
+                _ => {
+                    return Err(PqError::Bad(format!(
+                        "list_of_struct: rep=1 with non-item def case (position {i})"
+                    )));
+                }
+            }
+        }
+    }
+
+    if let Some(list) = current_list.take() {
+        out.push(PqValue::List(list));
+    } else if current_is_null {
+        out.push(PqValue::Null);
+    }
+
+    if item_cursor != item_count {
+        return Err(PqError::Bad(format!(
+            "list_of_struct: items not fully consumed: cursor={item_cursor} len={item_count}"
+        )));
+    }
+
+    Ok(out)
+}
+
+#[cfg(test)]
+mod los_tests {
+    use super::*;
+
+    #[test]
+    fn req_list_of_struct_two_items() {
+        // REQ outer, REQ struct, REQ fields: max_def=1, max_rep=1.
+        // Record: [{id:1, name:"a"}, {id:2, name:"b"}]
+        let r = vec![0u32, 1];
+        let d = vec![1u32, 1];
+        let names = vec!["id".to_string(), "name".to_string()];
+        let cols = vec![
+            vec![PqValue::I64(1), PqValue::I64(2)],
+            vec![PqValue::Bytes(b"a".to_vec()), PqValue::Bytes(b"b".to_vec())],
+        ];
+        let out = assemble_list_of_struct(&r, &d, &names, &cols, 1, false).unwrap();
+        assert_eq!(out, vec![PqValue::List(vec![
+            PqValue::Struct(vec![
+                ("id".into(), PqValue::I64(1)),
+                ("name".into(), PqValue::Bytes(b"a".to_vec())),
+            ]),
+            PqValue::Struct(vec![
+                ("id".into(), PqValue::I64(2)),
+                ("name".into(), PqValue::Bytes(b"b".to_vec())),
+            ]),
+        ])]);
+    }
+
+    #[test]
+    fn opt_list_of_struct_null_record() {
+        // OPT outer, REQ struct: max_def=2.
+        // [null, [{id:99, name:"z"}]]
+        let r = vec![0u32, 0];
+        let d = vec![0u32, 2];
+        let names = vec!["id".to_string(), "name".to_string()];
+        let cols = vec![
+            vec![PqValue::I64(99)],
+            vec![PqValue::Bytes(b"z".to_vec())],
+        ];
+        let out = assemble_list_of_struct(&r, &d, &names, &cols, 2, true).unwrap();
+        assert_eq!(out, vec![
+            PqValue::Null,
+            PqValue::List(vec![PqValue::Struct(vec![
+                ("id".into(), PqValue::I64(99)),
+                ("name".into(), PqValue::Bytes(b"z".to_vec())),
+            ])]),
+        ]);
+    }
+
+    #[test]
+    fn rejects_field_length_mismatch() {
+        let r = vec![0u32, 1];
+        let d = vec![1u32, 1];
+        let names = vec!["id".to_string(), "name".to_string()];
+        let cols = vec![
+            vec![PqValue::I64(1), PqValue::I64(2)],
+            vec![PqValue::Bytes(b"a".to_vec())], // length 1 vs 2
+        ];
+        let err = assemble_list_of_struct(&r, &d, &names, &cols, 1, false).unwrap_err();
+        assert!(format!("{err:?}").contains("first-field length"), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_item_cursor_overflow() {
+        // 2 item-present slots in levels but only 1 value supplied per field.
+        let r = vec![0u32, 1];
+        let d = vec![1u32, 1];
+        let names = vec!["id".to_string()];
+        let cols = vec![vec![PqValue::I64(1)]]; // only 1
+        let err = assemble_list_of_struct(&r, &d, &names, &cols, 1, false).unwrap_err();
+        assert!(format!("{err:?}").contains("item cursor exhausted")
+                || format!("{err:?}").contains("first-field length")
+                || format!("{err:?}").contains("not fully consumed"),
+                "got {err:?}");
+    }
+}
+
+/// SP145: assemble `Map<K, struct<F1, F2, ...>>` records.
+///
+/// Strategy: identical to SP144's `assemble_map_kv` except the V slot
+/// is a struct built by zipping N value-field columns. The shared
+/// REPEATED middle group ancestor means all V field columns + K share
+/// the same rep stream at max_rep_level=1.
+///
+/// Inputs:
+///   - `rep_levels`, `def_levels`: from the AUTHORITATIVE V-side stream
+///     (any V-field column's leaf stream works — they're identical at
+///     this layer since each V field is REQ inside the struct).
+///   - `keys`: K values, one per "key_value middle present" slot.
+///   - `value_field_names`, `value_field_columns`: per-V-field values,
+///     one per "key_value middle present" slot (each column same length).
+///   - `max_def_level`: V's max-def (outer_opt + 1 /*REP middle*/ + 0
+///     /*struct V is REQ — V's struct itself doesn't add a level*/).
+///   - `outer_optional`: is the outer MAP group OPTIONAL?
+///
+/// Output: one `PqValue::Map(Vec<(K, Struct)>)` per top-level record.
+/// Outer-null records emit `PqValue::Null`.
+pub fn assemble_map_of_struct(
+    rep_levels: &[u32],
+    def_levels: &[u32],
+    keys: &[PqValue],
+    value_field_names: &[String],
+    value_field_columns: &[Vec<PqValue>],
+    max_def_level: u32,
+    outer_optional: bool,
+) -> Result<Vec<PqValue>, PqError> {
+    if rep_levels.len() != def_levels.len() {
+        return Err(PqError::Bad(format!(
+            "rep/def length mismatch: rep={} def={}",
+            rep_levels.len(), def_levels.len()
+        )));
+    }
+    if value_field_names.len() != value_field_columns.len() {
+        return Err(PqError::Bad(format!(
+            "map_of_struct: value_field_names len {} != value_field_columns len {}",
+            value_field_names.len(), value_field_columns.len()
+        )));
+    }
+    if value_field_names.is_empty() {
+        return Err(PqError::Bad("map_of_struct: no value fields".into()));
+    }
+    let item_count = value_field_columns[0].len();
+    for (i, col) in value_field_columns.iter().enumerate() {
+        if col.len() != item_count {
+            return Err(PqError::Bad(format!(
+                "map_of_struct: value field '{}' length {} != first {}",
+                value_field_names[i], col.len(), item_count
+            )));
+        }
+    }
+    if keys.len() != item_count {
+        return Err(PqError::Bad(format!(
+            "map_of_struct: keys len {} != value-field length {}",
+            keys.len(), item_count
+        )));
+    }
+
+    let n = rep_levels.len();
+    if n == 0 {
+        if item_count != 0 {
+            return Err(PqError::Bad(format!(
+                "map_of_struct: no levels but {item_count} items supplied"
+            )));
+        }
+        return Ok(Vec::new());
+    }
+
+    let empty_threshold: u32 = outer_optional as u32;
+
+    #[derive(Copy, Clone, Debug)]
+    enum MosCase {
+        OuterNull,
+        EmptyMap,
+        ItemPresent,
+    }
+
+    let classify = |def: u32, pos: usize| -> Result<MosCase, PqError> {
+        if def > max_def_level {
+            return Err(PqError::Bad(format!(
+                "def level {def} > max {max_def_level} (position {pos})"
+            )));
+        }
+        if def == max_def_level {
+            return Ok(MosCase::ItemPresent);
+        }
+        if outer_optional && def == 0 {
+            return Ok(MosCase::OuterNull);
+        }
+        if def == empty_threshold {
+            return Ok(MosCase::EmptyMap);
+        }
+        Err(PqError::Bad(format!(
+            "map_of_struct: unclassified def {def} (max={max_def_level}, \
+             outer_opt={outer_optional}) at position {pos}"
+        )))
+    };
+
+    let make_struct = |idx: usize| -> PqValue {
+        let pairs: Vec<(String, PqValue)> = value_field_names
+            .iter()
+            .enumerate()
+            .map(|(fi, name)| (name.clone(), value_field_columns[fi][idx].clone()))
+            .collect();
+        PqValue::Struct(pairs)
+    };
+
+    let mut out: Vec<PqValue> = Vec::new();
+    let mut current_map: Option<Vec<(PqValue, PqValue)>> = None;
+    let mut current_is_null: bool = false;
+    let mut item_cursor = 0usize;
+
+    for i in 0..n {
+        let rep = rep_levels[i];
+        let def = def_levels[i];
+        if rep > 1 {
+            return Err(PqError::Bad(format!(
+                "rep level {rep} > max 1 for map_of_struct (position {i})"
+            )));
+        }
+        let dc = classify(def, i)?;
+        if rep == 0 {
+            if let Some(map) = current_map.take() {
+                out.push(PqValue::Map(map));
+            } else if i > 0 && current_is_null {
+                out.push(PqValue::Null);
+            }
+            current_is_null = false;
+
+            match dc {
+                MosCase::OuterNull => {
+                    current_map = None;
+                    current_is_null = true;
+                }
+                MosCase::EmptyMap => {
+                    current_map = Some(Vec::new());
+                }
+                MosCase::ItemPresent => {
+                    if item_cursor >= item_count {
+                        return Err(PqError::Bad(format!(
+                            "map_of_struct: item cursor exhausted at position {i}"
+                        )));
+                    }
+                    let k = keys[item_cursor].clone();
+                    let v = make_struct(item_cursor);
+                    item_cursor += 1;
+                    current_map = Some(vec![(k, v)]);
+                }
+            }
+        } else {
+            let map = current_map.as_mut().ok_or_else(||
+                PqError::Bad(format!("rep=1 without active map (position {i})")))?;
+            match dc {
+                MosCase::ItemPresent => {
+                    if item_cursor >= item_count {
+                        return Err(PqError::Bad(format!(
+                            "map_of_struct: item cursor exhausted at position {i}"
+                        )));
+                    }
+                    let k = keys[item_cursor].clone();
+                    let v = make_struct(item_cursor);
+                    item_cursor += 1;
+                    map.push((k, v));
+                }
+                _ => {
+                    return Err(PqError::Bad(format!(
+                        "map_of_struct: rep=1 with non-item def case (position {i})"
+                    )));
+                }
+            }
+        }
+    }
+
+    if let Some(map) = current_map.take() {
+        out.push(PqValue::Map(map));
+    } else if current_is_null {
+        out.push(PqValue::Null);
+    }
+
+    if item_cursor != item_count {
+        return Err(PqError::Bad(format!(
+            "map_of_struct: items not fully consumed: cursor={item_cursor} len={item_count}"
+        )));
+    }
+
+    Ok(out)
+}
+
+#[cfg(test)]
+mod mos_tests {
+    use super::*;
+
+    #[test]
+    fn req_map_of_struct_two_entries() {
+        // REQ outer, REQ struct V: max_def=1, max_rep=1.
+        let r = vec![0u32, 1];
+        let d = vec![1u32, 1];
+        let keys = vec![
+            PqValue::Bytes(b"a".to_vec()),
+            PqValue::Bytes(b"b".to_vec()),
+        ];
+        let vnames = vec!["count".to_string(), "ratio".to_string()];
+        let vcols = vec![
+            vec![PqValue::I64(1), PqValue::I64(2)],
+            vec![PqValue::F64(0.5), PqValue::F64(1.5)],
+        ];
+        let out = assemble_map_of_struct(&r, &d, &keys, &vnames, &vcols, 1, false).unwrap();
+        assert_eq!(out, vec![PqValue::Map(vec![
+            (PqValue::Bytes(b"a".to_vec()), PqValue::Struct(vec![
+                ("count".into(), PqValue::I64(1)),
+                ("ratio".into(), PqValue::F64(0.5)),
+            ])),
+            (PqValue::Bytes(b"b".to_vec()), PqValue::Struct(vec![
+                ("count".into(), PqValue::I64(2)),
+                ("ratio".into(), PqValue::F64(1.5)),
+            ])),
+        ])]);
+    }
+
+    #[test]
+    fn opt_map_of_struct_with_null() {
+        // OPT outer, REQ struct V: max_def=2.
+        // [null, {"k"->{a:9,b:0.1}}]
+        let r = vec![0u32, 0];
+        let d = vec![0u32, 2];
+        let keys = vec![PqValue::Bytes(b"k".to_vec())];
+        let vnames = vec!["a".to_string(), "b".to_string()];
+        let vcols = vec![
+            vec![PqValue::I64(9)],
+            vec![PqValue::F64(0.1)],
+        ];
+        let out = assemble_map_of_struct(&r, &d, &keys, &vnames, &vcols, 2, true).unwrap();
+        assert_eq!(out, vec![
+            PqValue::Null,
+            PqValue::Map(vec![(
+                PqValue::Bytes(b"k".to_vec()),
+                PqValue::Struct(vec![
+                    ("a".into(), PqValue::I64(9)),
+                    ("b".into(), PqValue::F64(0.1)),
+                ]),
+            )]),
+        ]);
+    }
+
+    #[test]
+    fn rejects_keys_count_mismatch() {
+        let r = vec![0u32, 1];
+        let d = vec![1u32, 1];
+        let keys = vec![PqValue::Bytes(b"a".to_vec())]; // 1 key
+        let vnames = vec!["x".to_string()];
+        let vcols = vec![vec![PqValue::I64(1), PqValue::I64(2)]]; // 2 values
+        let err = assemble_map_of_struct(&r, &d, &keys, &vnames, &vcols, 1, false).unwrap_err();
+        assert!(format!("{err:?}").contains("keys len"), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_value_field_length_mismatch() {
+        let r = vec![0u32, 1];
+        let d = vec![1u32, 1];
+        let keys = vec![PqValue::Bytes(b"a".to_vec()), PqValue::Bytes(b"b".to_vec())];
+        let vnames = vec!["x".to_string(), "y".to_string()];
+        let vcols = vec![
+            vec![PqValue::I64(1), PqValue::I64(2)],
+            vec![PqValue::I64(10)], // length 1 vs 2
+        ];
+        let err = assemble_map_of_struct(&r, &d, &keys, &vnames, &vcols, 1, false).unwrap_err();
+        assert!(format!("{err:?}").contains("value field 'y'"), "got {err:?}");
+    }
+}
+
+/// SP145: assemble `Map<K, List<T>>` records.
+///
+/// Strategy: same as `assemble_map_of_struct` but each V slot is a
+/// list of items rather than a struct. The V-side leaf has TWO
+/// REPEATED ancestors (the MAP middle + the LIST middle), so
+/// `max_rep_level = 2` on the V leaf stream. The K leaf still has
+/// `max_rep_level = 1` (only the MAP middle is REPEATED for K).
+///
+/// We DRIVE the assembly off the V leaf's stream (it carries all the
+/// MAP + LIST boundary information). K's values are consumed in
+/// parallel — one K per "key_value middle present + LIST opens" event.
+///
+/// Inputs:
+///   - `v_rep_levels`, `v_def_levels`: V leaf's full rep+def stream,
+///     max_rep_level=2.
+///   - `keys`: K values, one per key_value middle present slot.
+///   - `v_values`: V leaf values, one per leaf-present slot
+///     (def == max_def_level).
+///   - `max_def_level`: V leaf's max-def
+///     (outer_optional + 1 /*MAP REP*/ + value_list_outer_optional? no — value group is REQ
+///      + 1 /*LIST inner REP*/ + value_item_optional as u32).
+///   - `outer_optional`: is the outer MAP group OPTIONAL?
+///   - `value_item_optional`: is the inner LIST element OPTIONAL?
+///
+/// V's REP ancestors:
+///   - MAP middle (always REPEATED, +1 rep)
+///   - LIST middle (always REPEATED, +1 rep)
+///   So max_rep_level = 2.
+///
+/// Def classification (for max_def = outer_opt + 1 + 1 + item_opt = e.g. 2 or 3):
+///   d == 0 && outer_opt          → outer MAP null
+///   d == outer_opt               → empty MAP (no key_value entries)
+///   d == outer_opt + 1           → key_value present but V-LIST is empty
+///   d == max_def - (1 if item_opt else 0) — only for item_opt → V item null
+///   d == max_def                 → V item present
+///
+/// Rep handling:
+///   rep == 0 → new outer record
+///   rep == 1 → new MAP entry (new K + start V LIST)
+///   rep == 2 → continue current V LIST (append item)
+pub fn assemble_map_of_list(
+    v_rep_levels: &[u32],
+    v_def_levels: &[u32],
+    keys: &[PqValue],
+    v_values: &[PqValue],
+    max_def_level: u32,
+    outer_optional: bool,
+    value_item_optional: bool,
+) -> Result<Vec<PqValue>, PqError> {
+    if v_rep_levels.len() != v_def_levels.len() {
+        return Err(PqError::Bad(format!(
+            "rep/def length mismatch: rep={} def={}",
+            v_rep_levels.len(), v_def_levels.len()
+        )));
+    }
+    let n = v_rep_levels.len();
+    if n == 0 {
+        if !keys.is_empty() || !v_values.is_empty() {
+            return Err(PqError::Bad(format!(
+                "map_of_list: no levels but {} keys + {} values",
+                keys.len(), v_values.len()
+            )));
+        }
+        return Ok(Vec::new());
+    }
+
+    let empty_map_threshold: u32 = outer_optional as u32;
+    let empty_list_threshold: u32 = (outer_optional as u32) + 1;
+    let item_null_threshold: u32 = if max_def_level > 0 { max_def_level - 1 } else { 0 };
+
+    #[derive(Copy, Clone, Debug)]
+    enum MolCase {
+        OuterNull,
+        EmptyMap,
+        EmptyValueList,
+        ItemNull,
+        ItemPresent,
+    }
+
+    let classify = |def: u32, pos: usize| -> Result<MolCase, PqError> {
+        if def > max_def_level {
+            return Err(PqError::Bad(format!(
+                "def level {def} > max {max_def_level} (position {pos})"
+            )));
+        }
+        if def == max_def_level {
+            return Ok(MolCase::ItemPresent);
+        }
+        if outer_optional && def == 0 {
+            return Ok(MolCase::OuterNull);
+        }
+        if def == empty_map_threshold {
+            return Ok(MolCase::EmptyMap);
+        }
+        if def == empty_list_threshold {
+            return Ok(MolCase::EmptyValueList);
+        }
+        if value_item_optional && def == item_null_threshold {
+            return Ok(MolCase::ItemNull);
+        }
+        Err(PqError::Bad(format!(
+            "map_of_list: unclassified def {def} (max={max_def_level}, \
+             outer_opt={outer_optional}, item_opt={value_item_optional}) \
+             at position {pos}"
+        )))
+    };
+
+    let mut out: Vec<PqValue> = Vec::new();
+    let mut current_map: Option<Vec<(PqValue, PqValue)>> = None;
+    let mut current_is_null: bool = false;
+    let mut current_v_list: Option<Vec<PqValue>> = None;
+    let mut current_k: Option<PqValue> = None;
+    let mut k_cursor = 0usize;
+    let mut v_cursor = 0usize;
+
+    let flush_kv = |map: &mut Option<Vec<(PqValue, PqValue)>>,
+                    k: &mut Option<PqValue>,
+                    v_list: &mut Option<Vec<PqValue>>|
+     -> Result<(), PqError> {
+        if let Some(vl) = v_list.take() {
+            let key = k.take().ok_or_else(||
+                PqError::Bad("flush_kv: V list with no K".into()))?;
+            map.as_mut()
+                .ok_or_else(|| PqError::Bad("flush_kv: no active map".into()))?
+                .push((key, PqValue::List(vl)));
+        }
+        Ok(())
+    };
+
+    for i in 0..n {
+        let rep = v_rep_levels[i];
+        let def = v_def_levels[i];
+        if rep > 2 {
+            return Err(PqError::Bad(format!(
+                "rep level {rep} > max 2 for map_of_list (position {i})"
+            )));
+        }
+        let dc = classify(def, i)?;
+
+        if rep == 0 {
+            // Flush previous V-list into map, then flush map into out.
+            flush_kv(&mut current_map, &mut current_k, &mut current_v_list)?;
+            if let Some(m) = current_map.take() {
+                out.push(PqValue::Map(m));
+            } else if i > 0 && current_is_null {
+                out.push(PqValue::Null);
+            }
+            current_is_null = false;
+
+            match dc {
+                MolCase::OuterNull => {
+                    current_map = None;
+                    current_is_null = true;
+                    current_v_list = None;
+                    current_k = None;
+                }
+                MolCase::EmptyMap => {
+                    current_map = Some(Vec::new());
+                    current_v_list = None;
+                    current_k = None;
+                }
+                MolCase::EmptyValueList => {
+                    current_map = Some(Vec::new());
+                    let k = keys.get(k_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("map_of_list: key exhausted at {i}")))?;
+                    k_cursor += 1;
+                    current_k = Some(k);
+                    current_v_list = Some(Vec::new());
+                }
+                MolCase::ItemNull => {
+                    current_map = Some(Vec::new());
+                    let k = keys.get(k_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("map_of_list: key exhausted at {i}")))?;
+                    k_cursor += 1;
+                    current_k = Some(k);
+                    current_v_list = Some(vec![PqValue::Null]);
+                }
+                MolCase::ItemPresent => {
+                    current_map = Some(Vec::new());
+                    let k = keys.get(k_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("map_of_list: key exhausted at {i}")))?;
+                    k_cursor += 1;
+                    let v = v_values.get(v_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("map_of_list: value exhausted at {i}")))?;
+                    v_cursor += 1;
+                    current_k = Some(k);
+                    current_v_list = Some(vec![v]);
+                }
+            }
+        } else if rep == 1 {
+            // New MAP entry (new key_value middle), start fresh V-list.
+            if current_map.is_none() {
+                return Err(PqError::Bad(format!(
+                    "rep=1 without active map (position {i})"
+                )));
+            }
+            flush_kv(&mut current_map, &mut current_k, &mut current_v_list)?;
+            match dc {
+                MolCase::EmptyValueList => {
+                    let k = keys.get(k_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("map_of_list: key exhausted at {i}")))?;
+                    k_cursor += 1;
+                    current_k = Some(k);
+                    current_v_list = Some(Vec::new());
+                }
+                MolCase::ItemNull => {
+                    let k = keys.get(k_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("map_of_list: key exhausted at {i}")))?;
+                    k_cursor += 1;
+                    current_k = Some(k);
+                    current_v_list = Some(vec![PqValue::Null]);
+                }
+                MolCase::ItemPresent => {
+                    let k = keys.get(k_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("map_of_list: key exhausted at {i}")))?;
+                    k_cursor += 1;
+                    let v = v_values.get(v_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("map_of_list: value exhausted at {i}")))?;
+                    v_cursor += 1;
+                    current_k = Some(k);
+                    current_v_list = Some(vec![v]);
+                }
+                _ => {
+                    return Err(PqError::Bad(format!(
+                        "rep=1 with non-entry def (position {i})"
+                    )));
+                }
+            }
+        } else {
+            // rep == 2: continue current V-LIST.
+            let vl = current_v_list.as_mut().ok_or_else(||
+                PqError::Bad(format!("rep=2 without active V-list (position {i})")))?;
+            match dc {
+                MolCase::ItemPresent => {
+                    let v = v_values.get(v_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("map_of_list: value exhausted at {i}")))?;
+                    v_cursor += 1;
+                    vl.push(v);
+                }
+                MolCase::ItemNull => {
+                    vl.push(PqValue::Null);
+                }
+                _ => {
+                    return Err(PqError::Bad(format!(
+                        "rep=2 with non-item def (position {i})"
+                    )));
+                }
+            }
+        }
+    }
+
+    // Flush trailing record.
+    flush_kv(&mut current_map, &mut current_k, &mut current_v_list)?;
+    if let Some(m) = current_map.take() {
+        out.push(PqValue::Map(m));
+    } else if current_is_null {
+        out.push(PqValue::Null);
+    }
+
+    if k_cursor != keys.len() {
+        return Err(PqError::Bad(format!(
+            "map_of_list: keys not fully consumed: cursor={k_cursor} len={}", keys.len()
+        )));
+    }
+    if v_cursor != v_values.len() {
+        return Err(PqError::Bad(format!(
+            "map_of_list: values not fully consumed: cursor={v_cursor} len={}", v_values.len()
+        )));
+    }
+
+    Ok(out)
+}
+
+#[cfg(test)]
+mod mol_tests {
+    use super::*;
+
+    #[test]
+    fn req_map_string_list_string_one_record() {
+        // REQ outer, REQ V-list, REQ item: max_def=2 (REP+REP), max_rep=2.
+        // Record: {"langs": ["rust", "go"]}
+        // Levels (single entry, 2 items in V-list):
+        //   (rep=0, def=2, k="langs", v="rust")
+        //   (rep=2, def=2, _,        v="go")
+        let r = vec![0u32, 2];
+        let d = vec![2u32, 2];
+        let keys = vec![PqValue::Bytes(b"langs".to_vec())];
+        let v_vals = vec![
+            PqValue::Bytes(b"rust".to_vec()),
+            PqValue::Bytes(b"go".to_vec()),
+        ];
+        let out = assemble_map_of_list(&r, &d, &keys, &v_vals, 2, false, false).unwrap();
+        assert_eq!(out, vec![PqValue::Map(vec![
+            (PqValue::Bytes(b"langs".to_vec()),
+             PqValue::List(vec![
+                 PqValue::Bytes(b"rust".to_vec()),
+                 PqValue::Bytes(b"go".to_vec()),
+             ])),
+        ])]);
+    }
+
+    #[test]
+    fn req_map_two_entries_each_one_item() {
+        // {"a": ["x"], "b": ["y"]}: rep=[0,1], def=[2,2]
+        let r = vec![0u32, 1];
+        let d = vec![2u32, 2];
+        let keys = vec![
+            PqValue::Bytes(b"a".to_vec()),
+            PqValue::Bytes(b"b".to_vec()),
+        ];
+        let v_vals = vec![
+            PqValue::Bytes(b"x".to_vec()),
+            PqValue::Bytes(b"y".to_vec()),
+        ];
+        let out = assemble_map_of_list(&r, &d, &keys, &v_vals, 2, false, false).unwrap();
+        assert_eq!(out, vec![PqValue::Map(vec![
+            (PqValue::Bytes(b"a".to_vec()), PqValue::List(vec![PqValue::Bytes(b"x".to_vec())])),
+            (PqValue::Bytes(b"b".to_vec()), PqValue::List(vec![PqValue::Bytes(b"y".to_vec())])),
+        ])]);
+    }
+
+    #[test]
+    fn rejects_rep_overflow() {
+        let r = vec![0u32, 3];
+        let d = vec![2u32, 2];
+        let keys = vec![PqValue::Bytes(b"a".to_vec())];
+        let v_vals = vec![PqValue::Bytes(b"x".to_vec()), PqValue::Bytes(b"y".to_vec())];
+        let err = assemble_map_of_list(&r, &d, &keys, &v_vals, 2, false, false).unwrap_err();
+        assert!(format!("{err:?}").contains("rep level 3"), "got {err:?}");
+    }
+}

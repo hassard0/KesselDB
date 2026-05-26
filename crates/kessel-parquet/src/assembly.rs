@@ -674,3 +674,190 @@ mod map_tests {
         assert!(format!("{err:?}").contains("keys not fully consumed"), "got {err:?}");
     }
 }
+
+/// SP144 T4: struct-column "assembler" — a zip of N already-decoded
+/// primitive field columns into one `PqValue::Struct(Vec<(String, PqValue)>)`
+/// per output row.
+///
+/// V1 limitations:
+/// - All fields must be primitive (no nested LIST/MAP/struct within a
+///   struct — rejected upstream in `classify_column_plan` as SP145).
+/// - Outer-OPTIONAL detection uses the post-zip heuristic: if
+///   `outer_optional` is true AND every field's value at row i is
+///   `PqValue::Null`, the row emits `PqValue::Null` (the struct itself
+///   was null). This aliases with a non-null struct whose fields all
+///   happen to be Null — accepted V1 trade-off; documented here.
+///   SP145 may revisit using an explicit def-level read.
+///
+/// Errors:
+/// - `field_names.len() != field_columns.len()` — shape mismatch
+/// - any two field columns have different lengths — row-count mismatch
+pub fn assemble_struct(
+    field_names: &[String],
+    field_columns: &[Vec<PqValue>],
+    outer_optional: bool,
+) -> Result<Vec<PqValue>, PqError> {
+    if field_names.len() != field_columns.len() {
+        return Err(PqError::Bad(format!(
+            "struct field_names len {} != field_columns len {}",
+            field_names.len(), field_columns.len()
+        )));
+    }
+    if field_columns.is_empty() {
+        return Err(PqError::Bad("struct with no fields".into()));
+    }
+    let num_rows = field_columns[0].len();
+    for (i, col) in field_columns.iter().enumerate() {
+        if col.len() != num_rows {
+            return Err(PqError::Bad(format!(
+                "struct field '{}' length {} != row count {}",
+                field_names[i], col.len(), num_rows
+            )));
+        }
+    }
+
+    let mut out: Vec<PqValue> = Vec::with_capacity(num_rows);
+    for row in 0..num_rows {
+        // Outer-OPTIONAL heuristic: if outer is OPTIONAL AND all fields
+        // are Null at this row, treat the struct itself as null.
+        if outer_optional {
+            let all_null = field_columns.iter().all(|col| col[row] == PqValue::Null);
+            if all_null {
+                out.push(PqValue::Null);
+                continue;
+            }
+        }
+        let pairs: Vec<(String, PqValue)> = field_columns
+            .iter()
+            .enumerate()
+            .map(|(i, col)| (field_names[i].clone(), col[row].clone()))
+            .collect();
+        out.push(PqValue::Struct(pairs));
+    }
+
+    Ok(out)
+}
+
+#[cfg(test)]
+mod struct_tests {
+    use super::*;
+
+    #[test]
+    fn req_struct_two_fields_three_rows() {
+        // REQ struct {id: i64, name: String}; 3 rows
+        let names = vec!["id".to_string(), "name".to_string()];
+        let cols = vec![
+            vec![PqValue::I64(1), PqValue::I64(2), PqValue::I64(3)],
+            vec![
+                PqValue::Bytes(b"alice".to_vec()),
+                PqValue::Bytes(b"bob".to_vec()),
+                PqValue::Bytes(b"carol".to_vec()),
+            ],
+        ];
+        let out = assemble_struct(&names, &cols, false).unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0], PqValue::Struct(vec![
+            ("id".into(), PqValue::I64(1)),
+            ("name".into(), PqValue::Bytes(b"alice".to_vec())),
+        ]));
+        assert_eq!(out[1], PqValue::Struct(vec![
+            ("id".into(), PqValue::I64(2)),
+            ("name".into(), PqValue::Bytes(b"bob".to_vec())),
+        ]));
+        assert_eq!(out[2], PqValue::Struct(vec![
+            ("id".into(), PqValue::I64(3)),
+            ("name".into(), PqValue::Bytes(b"carol".to_vec())),
+        ]));
+    }
+
+    #[test]
+    fn opt_struct_with_null_row() {
+        // OPT struct, second row is null (all fields Null)
+        let names = vec!["id".to_string(), "name".to_string()];
+        let cols = vec![
+            vec![PqValue::I64(1), PqValue::Null, PqValue::I64(3)],
+            vec![
+                PqValue::Bytes(b"alice".to_vec()),
+                PqValue::Null,
+                PqValue::Bytes(b"carol".to_vec()),
+            ],
+        ];
+        let out = assemble_struct(&names, &cols, true).unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0], PqValue::Struct(vec![
+            ("id".into(), PqValue::I64(1)),
+            ("name".into(), PqValue::Bytes(b"alice".to_vec())),
+        ]));
+        assert_eq!(out[1], PqValue::Null, "all-Null row in OPT struct → Null");
+        assert_eq!(out[2], PqValue::Struct(vec![
+            ("id".into(), PqValue::I64(3)),
+            ("name".into(), PqValue::Bytes(b"carol".to_vec())),
+        ]));
+    }
+
+    #[test]
+    fn req_struct_three_fields_one_row() {
+        let names = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let cols = vec![
+            vec![PqValue::I64(1)],
+            vec![PqValue::Bool(true)],
+            vec![PqValue::F64(3.14)],
+        ];
+        let out = assemble_struct(&names, &cols, false).unwrap();
+        assert_eq!(out, vec![PqValue::Struct(vec![
+            ("a".into(), PqValue::I64(1)),
+            ("b".into(), PqValue::Bool(true)),
+            ("c".into(), PqValue::F64(3.14)),
+        ])]);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn opt_struct_with_partial_null_NOT_null() {
+        // OPT struct, row has SOME but not ALL fields Null → struct is
+        // present (not null), with the null fields preserved as PqValue::Null
+        // inside.
+        let names = vec!["id".to_string(), "name".to_string()];
+        let cols = vec![
+            vec![PqValue::I64(1)],
+            vec![PqValue::Null], // only one field is null, not all
+        ];
+        let out = assemble_struct(&names, &cols, true).unwrap();
+        assert_eq!(out, vec![PqValue::Struct(vec![
+            ("id".into(), PqValue::I64(1)),
+            ("name".into(), PqValue::Null),
+        ])]);
+    }
+
+    #[test]
+    fn rejects_field_length_mismatch() {
+        let names = vec!["a".to_string(), "b".to_string()];
+        let cols = vec![
+            vec![PqValue::I64(1), PqValue::I64(2)],
+            vec![PqValue::Bool(true)], // length 1 vs 2
+        ];
+        let err = assemble_struct(&names, &cols, false).unwrap_err();
+        assert!(format!("{err:?}").contains("length") && format!("{err:?}").contains("row count"),
+                "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_names_columns_mismatch() {
+        let names = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let cols = vec![
+            vec![PqValue::I64(1)],
+            vec![PqValue::Bool(true)],
+            // missing third column
+        ];
+        let err = assemble_struct(&names, &cols, false).unwrap_err();
+        assert!(format!("{err:?}").contains("field_names"), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_empty_fields() {
+        let names: Vec<String> = vec![];
+        let cols: Vec<Vec<PqValue>> = vec![];
+        let err = assemble_struct(&names, &cols, false).unwrap_err();
+        assert!(format!("{err:?}").contains("no fields"), "got {err:?}");
+    }
+}

@@ -297,6 +297,20 @@ fn pq_to_cell(v: kessel_parquet::PqValue) -> json::Cell {
             String::from_utf8(kessel_parquet::pqvalue_list_to_json(&items))
                 .expect("pqvalue_list_to_json emits ASCII-safe UTF-8"),
         ),
+        // SP144 T1: MAP<K,V> → JSON `[[k,v],...]` array-of-pair-arrays
+        // via the centralized `pqvalue_to_json` helper. Routed through
+        // Cell::Text (same pattern as SP143 List) so the binary
+        // protocol + Cell enum stay UNCHANGED in this slice — a typed
+        // Cell::Map + FieldKind::Map mapping is the SP145 follow-up.
+        Map(pairs) => json::Cell::Text(
+            kessel_parquet::pqvalue_to_json(&kessel_parquet::PqValue::Map(pairs)),
+        ),
+        // SP144 T1: STRUCT → JSON object `{"field":value,...}` via the
+        // centralized `pqvalue_to_json` helper. Same Cell::Text routing
+        // rationale as Map above.
+        Struct(fields) => json::Cell::Text(
+            kessel_parquet::pqvalue_to_json(&kessel_parquet::PqValue::Struct(fields)),
+        ),
     }
 }
 

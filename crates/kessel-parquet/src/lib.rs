@@ -47,6 +47,18 @@ pub enum PqValue {
     /// a PqValue (typically Null + scalar primitives in V1; nested
     /// List/struct/Map come in SP144/SP145).
     List(Vec<PqValue>),
+    /// SP144: Map<K, V> — key/value pairs preserving Parquet wire order.
+    /// Each pair is (key, value). Per Parquet spec, MAP keys are REQUIRED
+    /// (never null); values may be Null when the schema marks value
+    /// OPTIONAL. SP144 supports primitive K and V only (Map of struct or
+    /// Map of List is deferred to SP145).
+    Map(Vec<(PqValue, PqValue)>),
+    /// SP144: Struct — named fields in schema-declared order. An OPTIONAL
+    /// struct group whose def-level says "null" produces PqValue::Null at
+    /// the column position, NOT PqValue::Struct with all-Null fields.
+    /// SP144 supports struct of primitive fields only (struct of nested
+    /// LIST/MAP/struct deferred to SP145).
+    Struct(Vec<(String, PqValue)>),
 }
 
 /// SP143 T2: minimal JSON serialization of a `PqValue::List`'s element
@@ -66,41 +78,103 @@ pub fn pqvalue_list_to_json(items: &[PqValue]) -> Vec<u8> {
         if i > 0 {
             s.push(',');
         }
-        match v {
-            PqValue::Null => s.push_str("null"),
-            PqValue::Bool(b) => s.push_str(if *b { "true" } else { "false" }),
-            PqValue::I64(n) => s.push_str(&n.to_string()),
-            PqValue::F64(x) => s.push_str(&x.to_string()),
-            PqValue::Bytes(b) => {
-                s.push('"');
-                for &byte in b {
-                    if byte == b'"' {
-                        s.push_str("\\\"");
-                    } else if byte == b'\\' {
-                        s.push_str("\\\\");
-                    } else if (0x20..=0x7e).contains(&byte) {
-                        s.push(byte as char);
-                    } else {
-                        s.push_str(&format!("\\u{:04x}", byte));
-                    }
-                }
-                s.push('"');
-            }
-            PqValue::Timestamp(n) => s.push_str(&n.to_string()),
-            PqValue::Decimal { unscaled, scale } => {
-                s.push_str(&format!(r#"{{"unscaled":"{unscaled}","scale":{scale}}}"#));
-            }
-            PqValue::List(inner) => {
-                // Nested list — recurse via the same helper. Deeper
-                // nesting is a SP145 concern but handled gracefully
-                // here so V1 doesn't panic on malformed schemas.
-                let inner_bytes = pqvalue_list_to_json(inner);
-                s.push_str(std::str::from_utf8(&inner_bytes).unwrap_or("\"<binary>\""));
-            }
-        }
+        s.push_str(&pqvalue_to_json(v));
     }
     s.push(']');
     s.into_bytes()
+}
+
+/// SP144 T1: centralized JSON serialization for any `PqValue` (scalar
+/// or nested). All three nesting variants (`List`, `Map`, `Struct`)
+/// share this single implementation so the wire shape stays consistent
+/// regardless of where in a value tree the variant appears. Returns a
+/// UTF-8 `String` (ASCII-safe — non-printable bytes inside `Bytes(_)`
+/// are hex-escaped as `\uXXXX`).
+///
+/// Output shapes:
+/// - `Map(pairs)` → `[[k,v],[k,v],...]` (array of pair-arrays so any
+///   non-string key type round-trips — the alternative of a JSON object
+///   would require coercing the key to a string at serialize time).
+/// - `Struct(fields)` → `{"name":value,...}` with field names
+///   JSON-escaped conservatively.
+/// - All scalars + `List` render exactly as the SP143 helper did.
+pub fn pqvalue_to_json(v: &PqValue) -> String {
+    match v {
+        PqValue::Null => "null".to_string(),
+        PqValue::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+        PqValue::I64(n) => n.to_string(),
+        PqValue::F64(x) => x.to_string(),
+        PqValue::Bytes(b) => {
+            let mut s = String::from("\"");
+            for &byte in b {
+                if byte == b'"' {
+                    s.push_str("\\\"");
+                } else if byte == b'\\' {
+                    s.push_str("\\\\");
+                } else if (0x20..=0x7e).contains(&byte) {
+                    s.push(byte as char);
+                } else {
+                    s.push_str(&format!("\\u{:04x}", byte));
+                }
+            }
+            s.push('"');
+            s
+        }
+        PqValue::Timestamp(n) => n.to_string(),
+        PqValue::Decimal { unscaled, scale } => {
+            format!(r#"{{"unscaled":"{unscaled}","scale":{scale}}}"#)
+        }
+        PqValue::List(inner) => {
+            // Nested list — recurse via the list helper, which itself
+            // recurses through this function for each element.
+            String::from_utf8(pqvalue_list_to_json(inner))
+                .unwrap_or_else(|_| "\"<binary>\"".to_string())
+        }
+        PqValue::Map(pairs) => {
+            // SP144: emit as array-of-pair-arrays so non-string keys
+            // (Bytes, I64, etc.) round-trip without lossy coercion.
+            let mut s = String::from("[");
+            for (i, (k, val)) in pairs.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push('[');
+                s.push_str(&pqvalue_to_json(k));
+                s.push(',');
+                s.push_str(&pqvalue_to_json(val));
+                s.push(']');
+            }
+            s.push(']');
+            s
+        }
+        PqValue::Struct(fields) => {
+            // SP144: emit as a JSON object with string-quoted field
+            // names. Field names come from the Parquet schema (UTF-8);
+            // escape conservatively for JSON safety.
+            let mut s = String::from("{");
+            for (i, (name, val)) in fields.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push('"');
+                for c in name.chars() {
+                    match c {
+                        '"' => s.push_str("\\\""),
+                        '\\' => s.push_str("\\\\"),
+                        c if (c as u32) < 0x20 => {
+                            s.push_str(&format!("\\u{:04x}", c as u32))
+                        }
+                        c => s.push(c),
+                    }
+                }
+                s.push('"');
+                s.push(':');
+                s.push_str(&pqvalue_to_json(val));
+            }
+            s.push('}');
+            s
+        }
+    }
 }
 
 #[cfg(test)]
@@ -192,6 +266,61 @@ mod pqvalue_list_tests {
     fn list_to_json_empty() {
         let v: Vec<PqValue> = Vec::new();
         assert_eq!(pqvalue_list_to_json(&v), b"[]".to_vec());
+    }
+}
+
+#[cfg(test)]
+mod sp144_pqvalue_tests {
+    use super::*;
+
+    #[test]
+    fn map_variant_constructs_and_compares() {
+        let v = PqValue::Map(vec![
+            (PqValue::Bytes(b"a".to_vec()), PqValue::I64(1)),
+            (PqValue::Bytes(b"b".to_vec()), PqValue::I64(2)),
+        ]);
+        assert_eq!(v.clone(), v);
+    }
+
+    #[test]
+    fn struct_variant_constructs_and_compares() {
+        let v = PqValue::Struct(vec![
+            ("id".into(), PqValue::I64(42)),
+            ("name".into(), PqValue::Bytes(b"alice".to_vec())),
+        ]);
+        assert_eq!(v.clone(), v);
+    }
+
+    #[test]
+    fn map_json_serialization() {
+        let v = PqValue::Map(vec![
+            (PqValue::Bytes(b"x".to_vec()), PqValue::I64(10)),
+            (PqValue::Bytes(b"y".to_vec()), PqValue::Null),
+        ]);
+        let s = pqvalue_to_json(&v);
+        assert_eq!(s, r#"[["x",10],["y",null]]"#);
+    }
+
+    #[test]
+    fn struct_json_serialization() {
+        let v = PqValue::Struct(vec![
+            ("a".into(), PqValue::I64(1)),
+            ("b".into(), PqValue::Bool(true)),
+            ("c".into(), PqValue::Null),
+        ]);
+        let s = pqvalue_to_json(&v);
+        assert_eq!(s, r#"{"a":1,"b":true,"c":null}"#);
+    }
+
+    #[test]
+    fn nested_list_in_struct_json() {
+        let v = PqValue::Struct(vec![
+            ("items".into(), PqValue::List(vec![
+                PqValue::I64(1), PqValue::I64(2),
+            ])),
+        ]);
+        let s = pqvalue_to_json(&v);
+        assert_eq!(s, r#"{"items":[1,2]}"#);
     }
 }
 

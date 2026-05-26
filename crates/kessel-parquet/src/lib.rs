@@ -15,6 +15,7 @@ mod dict;
 mod snappy;
 mod gzip;
 mod zstd;
+mod lz4;
 mod zstd_fse;
 mod zstd_literals;
 mod zstd_huffman;

@@ -334,6 +334,91 @@ pub enum PqError {
     Unsupported(String),
 }
 
+/// SP151 (OBJ-2c-4 follow-up): default per-page (compressed OR
+/// uncompressed) size cap enforced by `extract`. 256 MiB — 4× the
+/// historical 64 MiB cap that rejected pyarrow files with
+/// high-cardinality dictionary pages or large value pages on
+/// many-row row groups. Users who need a different cap (tighter for
+/// memory-constrained ingest, looser for known-trusted producers) use
+/// `extract_with_cap` directly.
+///
+/// Per-codec module ceilings (`snappy::SNAPPY_MAX_DECOMP`,
+/// `gzip::GZIP_MAX_DECOMP`, `zstd::ZSTD_MAX_DECOMP`) match this
+/// value and act as defense-in-depth: even if a caller passes
+/// `usize::MAX` to `extract_with_cap`, the per-codec const blocks
+/// the allocation before any OOM risk.
+pub const DEFAULT_MAX_PAGE_SIZE: usize = 256 * 1024 * 1024;
+
+// Thread-local: per-call cap honored by every page-size check inside
+// the extract path. Set on entry to `extract_with_cap`, restored on
+// return. Defaults to `DEFAULT_MAX_PAGE_SIZE` outside an extract.
+//
+// V1 plumbing rationale: the cap needs to reach >10 internal
+// helpers (`page_payload`, the V2 flat/nested decompression sites,
+// every `read_chunk_*` page-loop) without adding a `max_page_size`
+// param to each. A thread-local is the smallest-blast-radius idiom
+// — one set+restore at the public boundary, one read at each
+// allocation site. Not Send across threads (each `extract*` call
+// initialises its own thread's local) and never observed outside
+// an extract (the default is the same 256 MiB ceiling).
+thread_local! {
+    static MAX_PAGE_SIZE: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(DEFAULT_MAX_PAGE_SIZE) };
+}
+
+/// Read the current per-call page-size cap (thread-local set by
+/// `extract_with_cap`). Used at every site that decodes a
+/// `uncompressed_page_size` / `compressed_page_size` from a page
+/// header BEFORE allocating a buffer of that size.
+#[inline]
+pub(crate) fn current_max_page_size() -> usize {
+    MAX_PAGE_SIZE.with(|c| c.get())
+}
+
+/// RAII guard: installs `max_page_size` as the thread-local cap on
+/// construction; restores the previous value on drop. Drop runs on
+/// any return path (Ok, Err, panic-unwind) so the cap state is
+/// always restored.
+struct MaxPageSizeGuard(usize);
+
+impl MaxPageSizeGuard {
+    fn new(new_cap: usize) -> Self {
+        let prev = MAX_PAGE_SIZE.with(|c| {
+            let p = c.get();
+            c.set(new_cap);
+            p
+        });
+        MaxPageSizeGuard(prev)
+    }
+}
+
+impl Drop for MaxPageSizeGuard {
+    fn drop(&mut self) {
+        let prev = self.0;
+        MAX_PAGE_SIZE.with(|c| c.set(prev));
+    }
+}
+
+/// SP151 (OBJ-2c-4 follow-up): assert a page-header-derived size is
+/// within the per-call cap BEFORE any allocation of that size.
+/// Returns typed `Unsupported` naming the cap and the operator knob
+/// (`extract_with_cap`) when the page exceeds it; otherwise Ok.
+///
+/// `what` is the per-site label (e.g. `"v1 page"`, `"dict page"`,
+/// `"v2 values"`) so an operator hitting the cap sees which page
+/// kind tripped it.
+#[inline]
+pub(crate) fn check_page_size(what: &str, size: usize) -> Result<(), PqError> {
+    let cap = current_max_page_size();
+    if size > cap {
+        return Err(PqError::Unsupported(format!(
+            "{what} size {size} exceeds max_page_size cap {cap}: SP151 \
+             (raise via kessel_parquet::extract_with_cap)"
+        )));
+    }
+    Ok(())
+}
+
 impl std::fmt::Display for PqError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -555,6 +640,9 @@ fn decode_data_page_v2(
     // values: target uncompressed length
     let uncomp = usize::try_from(ph.uncompressed_size)
         .map_err(|_| PqError::Bad("v2 uncompressed size range".into()))?;
+    // SP151: cap-check BEFORE the snappy/gzip/zstd/lz4 decompression
+    // path allocates a vt-byte buffer.
+    check_page_size("v2 page uncompressed", uncomp)?;
     let vt = uncomp
         .checked_sub(lvl_end)
         .ok_or_else(|| PqError::Bad("v2 values target underflow".into()))?;
@@ -986,6 +1074,13 @@ fn read_chunk_values(
             .map_err(|_| PqError::Bad("dict page comp size range".into()))?;
         let uncomp = usize::try_from(ph.uncompressed_size)
             .map_err(|_| PqError::Bad("dict page size range".into()))?;
+        // SP151: cap-check BEFORE page_payload reserves a buffer.
+        // Both comp and uncomp matter — Snappy/Gzip/Zstd allocate
+        // uncomp bytes; the on-disk slice is comp bytes (capped
+        // against the file separately, but a hostile comp value
+        // could still trigger pathological work in the decoder).
+        check_page_size("dict page compressed", comp)?;
+        check_page_size("dict page uncompressed", uncomp)?;
         let payload = page_payload(file, dstart, comp, uncomp, cc.codec)?;
         plain::decode_plain(&payload, spec, dn)?
     } else {
@@ -1026,6 +1121,9 @@ fn read_chunk_values(
                     .map_err(|_| PqError::Bad("page comp size range".into()))?;
                 let uncomp = usize::try_from(ph.uncompressed_size)
                     .map_err(|_| PqError::Bad("page size range".into()))?;
+                // SP151 cap-check (flat V1 data page).
+                check_page_size("v1 page compressed", comp)?;
+                check_page_size("v1 page uncompressed", uncomp)?;
                 let payload = page_payload(file, dstart, comp, uncomp, cc.codec)?;
                 // decode_page's dict arms (dp_encoding 2|8, both REQUIRED and
                 // OPTIONAL) call dict::resolve_dict_indices, which needs a populated
@@ -1059,6 +1157,9 @@ fn read_chunk_values(
                     .ok_or_else(|| PqError::Bad("v2 page hdr len ovf".into()))?;
                 let comp = usize::try_from(ph.compressed_size)
                     .map_err(|_| PqError::Bad("v2 comp size range".into()))?;
+                // SP151 cap-check (flat V2 data page). The internal
+                // uncompressed cap-check fires inside decode_data_page_v2.
+                check_page_size("v2 page compressed", comp)?;
                 let v2_region = file
                     .get(
                         dstart
@@ -3139,6 +3240,9 @@ fn read_chunk_levels_and_values(
             .map_err(|_| PqError::Bad("dict page comp size range".into()))?;
         let uncomp = usize::try_from(ph.uncompressed_size)
             .map_err(|_| PqError::Bad("dict page size range".into()))?;
+        // SP151 cap-check (nested dict page).
+        check_page_size("nested dict page compressed", comp)?;
+        check_page_size("nested dict page uncompressed", uncomp)?;
         let payload = page_payload(file, dstart, comp, uncomp, cc.codec)?;
         plain::decode_plain(&payload, spec, dn)?
     } else {
@@ -3168,6 +3272,9 @@ fn read_chunk_levels_and_values(
                     .map_err(|_| PqError::Bad("page comp size range".into()))?;
                 let uncomp = usize::try_from(ph.uncompressed_size)
                     .map_err(|_| PqError::Bad("page size range".into()))?;
+                // SP151 cap-check (nested V1 data page).
+                check_page_size("nested v1 page compressed", comp)?;
+                check_page_size("nested v1 page uncompressed", uncomp)?;
                 let payload = page_payload(file, dstart, comp, uncomp, cc.codec)?;
                 if matches!(ph.dp_encoding, 2 | 8)
                     && cc.dictionary_page_offset.is_none()
@@ -3193,6 +3300,8 @@ fn read_chunk_levels_and_values(
                     .ok_or_else(|| PqError::Bad("v2 page hdr len ovf".into()))?;
                 let comp = usize::try_from(ph.compressed_size)
                     .map_err(|_| PqError::Bad("v2 comp size range".into()))?;
+                // SP151 cap-check (nested V2 data page compressed).
+                check_page_size("nested v2 page compressed", comp)?;
                 let v2_region = file
                     .get(
                         dstart
@@ -3209,6 +3318,8 @@ fn read_chunk_levels_and_values(
                     .map_err(|_| PqError::Bad("v2 def_len range".into()))?;
                 let uncomp = u32::try_from(ph.uncompressed_size)
                     .map_err(|_| PqError::Bad("v2 uncompressed size range".into()))?;
+                // SP151 cap-check (nested V2 data page uncompressed).
+                check_page_size("nested v2 page uncompressed", uncomp as usize)?;
                 let (r, d, v) = decode_data_page_v2_nested(
                     v2_region,
                     ph.v2_encoding,
@@ -3925,10 +4036,40 @@ fn read_chunk_values_nested_map_of_map(
     )
 }
 
+/// SP151 (OBJ-2c-4 follow-up): decode with an explicit per-page size
+/// cap. Page headers whose declared `uncompressed_page_size` or
+/// `compressed_page_size` exceeds `max_page_size` are rejected with
+/// `Unsupported` BEFORE any allocation — the cap travels via a
+/// thread-local set on entry and restored on return (RAII).
+///
+/// Operators with known-trusted producers can raise the cap (up to
+/// the per-codec module ceiling — currently 256 MiB matching
+/// `DEFAULT_MAX_PAGE_SIZE`); memory-constrained ingest can lower it.
+/// Setting `max_page_size = 0` rejects every page (useful as a kill
+/// switch for hostile inputs).
+pub fn extract_with_cap(
+    bytes: &[u8],
+    wanted: &[&str],
+    max_page_size: usize,
+) -> Result<Vec<Vec<PqValue>>, PqError> {
+    let _guard = MaxPageSizeGuard::new(max_page_size);
+    extract_inner(bytes, wanted)
+}
+
 /// Decode the `wanted` leaf columns (in that output order) from a
 /// whole Parquet object. OBJ-2a: flat REQUIRED columns, PLAIN,
 /// UNCOMPRESSED, V1 data pages, all row groups concatenated.
+///
+/// SP151: uses `DEFAULT_MAX_PAGE_SIZE` (256 MiB) as the per-page cap.
+/// For a different cap use `extract_with_cap`.
 pub fn extract(
+    bytes: &[u8],
+    wanted: &[&str],
+) -> Result<Vec<Vec<PqValue>>, PqError> {
+    extract_with_cap(bytes, wanted, DEFAULT_MAX_PAGE_SIZE)
+}
+
+fn extract_inner(
     bytes: &[u8],
     wanted: &[&str],
 ) -> Result<Vec<Vec<PqValue>>, PqError> {
@@ -6941,7 +7082,13 @@ mod pentest {
 
     #[test]
     fn lying_page_size_and_offset_rejected() {
-        // (a) uncompressed_size huge (much larger than the file).
+        // (a) uncompressed_size huge (much larger than the file AND
+        // far beyond DEFAULT_MAX_PAGE_SIZE = 256 MiB). Pre-SP151 this
+        // surfaced as Bad("page data truncated") at the page_payload
+        // bounds check; SP151 catches it earlier as Unsupported via
+        // the cap check. Both are typed safety-bounded errors — the
+        // pentest contract is "no panic / no OOM / typed error", not
+        // a specific variant. Accept either Bad or Unsupported.
         let hdr_a = page_header_bytes(2, i32::MAX);
         let mut page = Vec::new();
         page.extend_from_slice(&7i64.to_le_bytes());
@@ -6951,7 +7098,7 @@ mod pentest {
         no_panic_typed_err(&file_a, "id");
         assert!(matches!(
             extract(&file_a, &["id"]),
-            Err(PqError::Bad(_))
+            Err(PqError::Bad(_)) | Err(PqError::Unsupported(_))
         ));
 
         // (b) data_page_offset past EOF: build a valid file, then
@@ -7435,12 +7582,15 @@ mod pentest_v2 {
     }
 
     // L10: huge declared num_values + huge uncompressed_page_size with
-    // a tiny actual page → must error FAST with a typed Bad, NO
-    // multi-GB allocation / OOM. num_values=i32::MAX, REQUIRED so the
-    // decoder reaches decode_plain(present=i32::MAX) whose reservation
-    // is bounded by data.len() (Task-12 fix); uncompressed=i32::MAX
-    // makes vt huge but values_section.len() (tiny) != vt → the raw
-    // values length-mismatch guard fires before any big alloc.
+    // a tiny actual page → must error FAST with a typed safety-bounded
+    // error, NO multi-GB allocation / OOM. num_values=i32::MAX,
+    // REQUIRED so the decoder reaches decode_plain(present=i32::MAX)
+    // whose reservation is bounded by data.len() (Task-12 fix);
+    // uncompressed=i32::MAX would make vt huge but the SP151 cap-check
+    // (256 MiB) now fires first as Unsupported. Either Bad or
+    // Unsupported satisfies the pentest contract ("no panic / no OOM /
+    // typed error") — the SP151 cap fast-rejects this hostile input
+    // earlier than the V1 raw-length-mismatch guard did.
     #[test]
     fn v2_huge_num_values_and_size_tiny_page_no_oom() {
         let payload = plain_i64(&[7, -2]); // 16 bytes only
@@ -7457,8 +7607,11 @@ mod pentest_v2 {
         // Must return typed Err fast (no hang / no OOM-abort).
         no_panic_typed_err(&f);
         assert!(
-            matches!(extract(&f, &["id"]), Err(PqError::Bad(_))),
-            "i32::MAX num_values/size vs tiny V2 page must be Bad"
+            matches!(
+                extract(&f, &["id"]),
+                Err(PqError::Bad(_)) | Err(PqError::Unsupported(_))
+            ),
+            "i32::MAX num_values/size vs tiny V2 page must be typed err"
         );
     }
 

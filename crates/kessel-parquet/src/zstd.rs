@@ -35,10 +35,15 @@
 #![allow(dead_code)]
 #![forbid(unsafe_code)]
 
-/// Hard cap on a single decompressed zstd frame. 64 MiB matches the
-/// Snappy + GZIP page cap shipped at SP104/SP106. Defeats a
-/// decompression-bomb header that lies about Frame_Content_Size.
-pub(crate) const ZSTD_MAX_DECOMP: usize = 64 << 20;
+/// Hard cap on a single decompressed zstd frame. Matches the Snappy +
+/// GZIP page cap. Defeats a decompression-bomb header that lies about
+/// Frame_Content_Size.
+///
+/// SP151: bumped from 64 → 256 MiB in lockstep with SNAPPY_MAX_DECOMP /
+/// GZIP_MAX_DECOMP. User-facing knob is `crate::DEFAULT_MAX_PAGE_SIZE` +
+/// `crate::extract_with_cap`; this const is the absolute per-codec
+/// ceiling enforced before allocation.
+pub(crate) const ZSTD_MAX_DECOMP: usize = 256 << 20;
 
 /// zstd frame magic per RFC 8478 §3.1.1: `0xFD 0x2F 0xB5 0x28` on the
 /// wire (LE u32 = `0xFD2FB528`). Encoded as the BYTE SEQUENCE in the

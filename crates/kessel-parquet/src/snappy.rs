@@ -15,8 +15,16 @@ fn bad(s: &str) -> PqError {
 /// default data_page_size ~1 MiB) are far below this; the cap defeats
 /// a decompression-bomb (tiny input claiming a multi-GB
 /// uncompressed_page_size). Pages above it are rejected as
-/// Unsupported (OBJ-2c may revisit).
-pub(crate) const SNAPPY_MAX_DECOMP: usize = 64 << 20; // 64 MiB
+/// Unsupported.
+///
+/// SP151: bumped from 64 → 256 MiB so pyarrow files with high-cardinality
+/// dictionary pages or large row-group value pages decode by default.
+/// The user-facing knob is `crate::DEFAULT_MAX_PAGE_SIZE` +
+/// `crate::extract_with_cap`; this module-level const is the absolute
+/// per-codec ceiling enforced before allocation (defense in depth so
+/// even a caller passing `usize::MAX` to `extract_with_cap` can't OOM
+/// the snappy module).
+pub(crate) const SNAPPY_MAX_DECOMP: usize = 256 << 20; // 256 MiB
 
 /// Read a little-endian base-128 varint at `data[*pos..]`; advance
 /// `*pos`. Rejects > 5 bytes (Snappy length is u32) as Bad.

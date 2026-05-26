@@ -1,6 +1,6 @@
 //! Pure RFC 1952 (gzip member) + RFC 1951 (DEFLATE inflate)
 //! decompressor for Parquet GZIP pages. Zero deps, iterative
-//! (no recursion), bounds-checked, 64 MiB hard cap, CRC32-verified.
+//! (no recursion), bounds-checked, 256 MiB hard cap, CRC32-verified.
 //! Never panics / OOM-aborts / stack-overflows.
 #![allow(dead_code)]
 
@@ -13,7 +13,10 @@ fn bad(s: &str) -> PqError {
 /// Hard cap on a single decompressed page. Mirrors
 /// snappy::SNAPPY_MAX_DECOMP (same value & rationale; separate const
 /// so gzip.rs stays self-contained — the sibling-module convention).
-pub(crate) const GZIP_MAX_DECOMP: usize = 64 << 20; // 64 MiB
+///
+/// SP151: bumped from 64 → 256 MiB in lockstep with SNAPPY_MAX_DECOMP /
+/// ZSTD_MAX_DECOMP. User-facing knob is `crate::DEFAULT_MAX_PAGE_SIZE`.
+pub(crate) const GZIP_MAX_DECOMP: usize = 256 << 20; // 256 MiB
 
 // ── CRC-32/ISO-HDLC ─────────────────────────────────────────────────
 

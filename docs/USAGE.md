@@ -747,7 +747,9 @@ messages.
 > matrix; pyarrow zstd output decodes for all tested fixtures including
 > a 2000‑row stress fixture exercising the FseCompressed mode for all
 > three LL/OF/ML codes simultaneously. Still typed‑Unsupported:
-> Brotli (OBJ‑2c‑2 follow‑on; LZ4_RAW shipped in SP149), 4+ deep nested
+> Brotli (recognized at meta-decode time per SP150 but decompression is a
+> dedicated multi-week SP-arc — workaround: re-encode with zstd or lz4),
+> 4+ deep nested
 > groups (would be SP147), DECIMAL precision > 38, per‑page > 64 MiB.
 > **All Parquet nested types supported (LIST, MAP, struct + arbitrary
 > nesting up to 3-deep — OBJ-2c-5 fully closed at SP146).**
@@ -862,7 +864,7 @@ CREATE EXTERNAL SOURCE readings (
 | Parquet property | OBJ-2a → OBJ-2c-5 SP146 |
 |---|---|
 | Encoding | `PLAIN` and dictionary (`PLAIN_DICTIONARY`/`RLE_DICTIONARY`); RLE/bit-packing hybrid for dictionary indices |
-| Compression codec | `UNCOMPRESSED`, `SNAPPY` (raw block; pages ≤ 64 MiB decompressed), `GZIP` (RFC 1952; pages ≤ 64 MiB decompressed), `ZSTD` (RFC 8478), or `LZ4_RAW` (SP149; codec id 7 — the modern raw LZ4 block format pyarrow emits for `compression='lz4'` since v8). Legacy LZ4 (codec id 5, deprecated Hadoop framing) and `BROTLI` (codec id 4) still rejected with named `Unsupported` errors. |
+| Compression codec | `UNCOMPRESSED`, `SNAPPY` (raw block; pages ≤ 64 MiB decompressed), `GZIP` (RFC 1952; pages ≤ 64 MiB decompressed), `ZSTD` (RFC 8478), or `LZ4_RAW` (SP149; codec id 7 — the modern raw LZ4 block format pyarrow emits for `compression='lz4'` since v8). `BROTLI` (codec id 4) is recognized at meta-decode time as of SP150 but decompression is rejected with a named follow-up — a zero-dep RFC 7932 decoder is a dedicated multi-week SP-arc; **workaround**: re-encode the file with `compression='zstd'` (often better ratio) or `compression='lz4'` (very fast). Legacy LZ4 (codec id 5, deprecated Hadoop framing) is also rejected with a named pointer to SP149. |
 | Column repetition | `REQUIRED` or `OPTIONAL` flat columns (nullable; V1 and V2 definition levels) |
 | Schema shape | **All Parquet nested types supported** (LIST, MAP, struct + arbitrary nesting up to 3-deep). Flat (REQUIRED + OPTIONAL), `LIST<primitive>` (SP143), `MAP<K, V>` (SP144), `struct<...>` (SP144), `List<List<T>>` / `List<struct<...>>` / `Map<K, struct<...>>` / `Map<K, List<T>>` / `struct<List/Map/struct>` (SP145), `List<List<List<T>>>` / `List<Map<K,V>>` / `Map<K1, Map<K2,V>>` (SP146 — closes the 3 SP145-deferred cross-products) |
 | Nested LIST (SP143/SP145/SP146) | `List<T>` for primitive T (SP143); `List<List<T>>` for primitive T (SP145; max_rep_level=2 generalized assembler); `List<struct<primitives>>` (SP145; field-zip per item slot); `List<List<List<T>>>` 3-deep (SP146; max_rep_level=3 3-level-stack assembler); `List<Map<K, V>>` (SP146; outer-list-of-inner-maps) |
@@ -941,10 +943,19 @@ as every other format):
   rejected with `Unsupported("...: SP147 follow-up")`. The per-shape
   composition pattern from SP145/SP146 generalizes to one more level
   the same way; no pyarrow corpus exercises this depth yet.
-- **Brotli compression (codec id 4)** — rejected with
-  `Unsupported("compression codec (brotli): OBJ-2c")`. GZIP (OBJ-2c-1),
-  ZSTD (OBJ-2c-2 SP125-SP140), and LZ4_RAW (SP149) are now supported;
-  only brotli remains open in the OBJ-2c-2 codec matrix.
+- **Brotli compression (codec id 4)** — recognized at meta-decode time
+  (`Codec::Brotli`) but decompression rejected with
+  `Unsupported("Brotli decode: zero-dep decoder is a dedicated multi-week
+  SP-arc (~10-15 tasks like SP125-SP140 zstd); workaround — ask the writer
+  to use compression='zstd' or compression='lz4' instead")`. **Workaround**:
+  re-encode with `compression='zstd'` (shipped — often a better ratio than
+  brotli on Parquet column data) or `compression='lz4'` (shipped — very
+  fast). A hand-rolled zero-dep RFC 7932 Brotli decoder is comparable in
+  complexity to the SP125-SP140 zstd arc (Brotli has its own Huffman
+  table format, context modeling, a static dictionary of common web
+  words, and metablock framing) and is the only OBJ-2c-2 codec the
+  decoder doesn't yet handle end-to-end. Tracked by SP150 (gate-only
+  shipped) → dedicated multi-slice SP-arc TBD.
 - **Legacy LZ4 compression (codec id 5, deprecated Hadoop framing)** —
   rejected with `Unsupported("LZ4 (deprecated Hadoop framing) — use
   LZ4_RAW; SP149 follow-up if needed")`. Pyarrow stopped writing this

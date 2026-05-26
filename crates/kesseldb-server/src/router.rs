@@ -27,6 +27,10 @@
 //! slice; each per-shard hop is already exactly-once via
 //! [`kessel_client::ClusterClient`].
 
+use crate::scatter_scan::{
+    merge_scan_results, scatter_scan_fanout, ScatterKind, ShardCaller,
+    DEFAULT_PER_SHARD_TIMEOUT,
+};
 use kessel_client::ClusterClient;
 use kessel_proto::wire::{read_frame, write_frame};
 use kessel_proto::{Op, OpResult};
@@ -46,8 +50,26 @@ enum Route {
     /// Router-side op: handled entirely in the router, not forwarded
     /// to any shard.
     Refresh,
+    /// SP-A (SP155): scatter the op to every shard, merge the per-
+    /// shard results per `ScatterKind`. The router does the work;
+    /// the wire stays unchanged (clients keep sending `Op::Select`
+    /// / `Op::SelectSorted` / etc.). See `crate::scatter_scan` and
+    /// the SP155 design spec §3.2.
+    Scatter(ScatterKind),
     /// Not routable by this slice (clear error, never a wrong answer).
     Unsupported(&'static str),
+}
+
+/// SP-A T2: `ClusterClient` IS the per-shard caller for the scatter
+/// path — `scatter_scan_fanout` owns one of these per shard. The
+/// `ShardCaller` trait wraps `ClusterClient::call`'s `io::Result` into
+/// the `Result<OpResult, String>` shape the scatter machinery needs;
+/// transport errors become the shard's `OpResult::Unavailable` slot
+/// (hard-fail per SP155 §6).
+impl ShardCaller for ClusterClient {
+    fn call(&mut self, op: &Op) -> Result<OpResult, String> {
+        ClusterClient::call(self, op).map_err(|e| e.to_string())
+    }
 }
 
 /// Front for K shard groups. Cheap to clone the address lists; the
@@ -182,10 +204,62 @@ impl Router {
                     _ => Route::Cross(set.into_iter().collect()),
                 }
             }
+            // SP-A (SP155 §3.2): the four scan ops scatter to every
+            // shard. The merge strategy is derived from the op's shape:
+            // `SelectSorted` ⇒ k-way heap (Sorted); the rest ⇒ shard-
+            // id-ordered concat (Unordered).
+            //
+            // The `sort_kind` / `sort_offset` / `sort_width` for the
+            // Sorted variant are catalog-derived; we discover them at
+            // dispatch time inside `Conn::scatter_read` (the router
+            // has access to the catalog via the per-shard `Describe`
+            // call). At `route()` time we only have the `Op`, so the
+            // discriminator carries the op's raw `sort_field` and the
+            // call site resolves the layout (cached per shard 0 per
+            // OQ5). `Conn::scatter_read` does the resolution; `route()`
+            // returns a marker that captures everything the merge
+            // needs that's already known from the `Op`.
+            //
+            // Implementation choice (T2): `Route::Scatter(ScatterKind)`
+            // carries only the catalog-INDEPENDENT bits (limit, desc,
+            // offset). The catalog-dependent extras (`sort_kind`,
+            // `sort_offset`, `sort_width`) are filled in by
+            // `Conn::scatter_read` after a catalog lookup. We stash
+            // the `sort_field` field-id inside the marker via a
+            // placeholder `ScatterKind::Sorted` with width=0 — the
+            // call site recognizes this shape and re-resolves. (An
+            // alternative would be a separate `Route::ScatterSorted`
+            // variant; chose to keep `Route` narrow.)
+            Op::Select { limit, .. }
+            | Op::QueryRows { limit, .. }
+            | Op::SelectFields { limit, .. } => {
+                Route::Scatter(ScatterKind::Unordered { limit: *limit })
+            }
+            Op::SelectSorted { sort_field, desc, offset, limit, .. } => {
+                // Width=0 is the sentinel meaning "resolve at the
+                // call site against the catalog". The catalog-aware
+                // resolver lives in `Conn::scatter_read`. We pack
+                // sort_field into `sort_offset` so the resolver knows
+                // which field to look up (the marker has nowhere else
+                // to put it; this is an intra-module convention, NOT
+                // a stable wire shape — `ScatterKind` is purely an
+                // internal router type per SP155 §4.1).
+                Route::Scatter(ScatterKind::Sorted {
+                    sort_kind: kessel_catalog::FieldKind::U8, // placeholder
+                    sort_offset: *sort_field as u32,
+                    sort_width: 0, // sentinel ⇒ resolve at call site
+                    desc: *desc,
+                    offset: *offset,
+                    limit: *limit,
+                })
+            }
             _ => Route::Unsupported(
                 "router (multi-shard, this slice) handles point ops, DDL, \
-                 and single/rejected-cross transactions; scatter-gather \
-                 reads and SQL text are a later slice",
+                 single/rejected-cross transactions, and scatter-gather \
+                 reads for Select/QueryRows/SelectFields/SelectSorted; \
+                 Aggregate/GroupAggregate (SP-B/SP-D), FindBy/FindByComposite \
+                 (T11 follow-up), Join (non-goal), and SQL text (SP-E) are \
+                 still later slices",
             ),
         }
     }
@@ -353,6 +427,146 @@ impl<'a> Conn<'a> {
         }
     }
 
+    /// SP-A (SP155 §3.1): driver for `Route::Scatter`. Builds a
+    /// per-shard `ClusterClient` snapshot, fans out the SAME `op` to
+    /// every shard in parallel via `scatter_scan_fanout`, then merges
+    /// the per-shard `OpResult`s per `kind`.
+    ///
+    /// For `ScatterKind::Sorted` with `sort_width == 0` (the sentinel
+    /// `route()` puts in to signal "resolve at the call site"), this
+    /// resolves the sort field's `(kind, offset, width)` from shard
+    /// 0's catalog via `Op::Describe` BEFORE fanning out — so the
+    /// merger has the layout info per SP155 §3.5. Per SP155 OQ5: the
+    /// per-shard catalogs are identical (DDL is broadcast), so shard
+    /// 0 is the canonical source. Fast-fail if the type / sort field
+    /// doesn't exist (errors surface as `SchemaError`).
+    fn scatter_read(&mut self, op: &Op, kind: ScatterKind) -> OpResult {
+        // 1. Resolve catalog-dependent merge parameters (Sorted only).
+        let resolved_kind = match kind {
+            ScatterKind::Unordered { .. } => kind,
+            ScatterKind::Sorted {
+                sort_offset,
+                sort_width,
+                desc,
+                offset,
+                limit,
+                ..
+            } if sort_width == 0 => {
+                // `sort_offset` carries the field-id sentinel from
+                // `route()`; resolve it against shard 0's catalog.
+                let sort_field = sort_offset as u16;
+                let type_id = match op {
+                    Op::SelectSorted { type_id, .. } => *type_id,
+                    _ => {
+                        return OpResult::SchemaError(
+                            "scatter: Sorted route on a non-SelectSorted op"
+                                .into(),
+                        )
+                    }
+                };
+                let def_blob = match self
+                    .client(0)
+                    .call(&Op::Describe { type_id })
+                {
+                    Ok(OpResult::Got(b)) => b,
+                    Ok(OpResult::NotFound) => {
+                        return OpResult::SchemaError(format!(
+                            "scatter: type {type_id} not found"
+                        ))
+                    }
+                    Ok(o) => {
+                        return OpResult::SchemaError(format!(
+                            "scatter: describe shard 0 returned {o:?}"
+                        ))
+                    }
+                    Err(e) => {
+                        return OpResult::SchemaError(format!(
+                            "scatter: describe shard 0: {e}"
+                        ))
+                    }
+                };
+                // Decode the type def (name + fields). The wire format
+                // is `kessel_catalog::decode_type_def` — same shape
+                // the SM's Op::Describe encodes from.
+                let (_name, fields) =
+                    match kessel_catalog::decode_type_def(&def_blob) {
+                        Some(p) => p,
+                        None => {
+                            return OpResult::SchemaError(
+                                "scatter: catalog describe blob decode failed"
+                                    .into(),
+                            )
+                        }
+                    };
+                // Walk fields in declaration order to find the sort
+                // field + its byte offset within the record. The
+                // record layout starts with `HEADER_BYTES` then each
+                // field at `kind.width()` increments — mirrors
+                // `kessel_catalog::ObjectType::compute_layout()`. We
+                // recompute it here from the parsed fields list since
+                // we don't have a full `ObjectType` to call
+                // `compute_layout()` on.
+                let mut record_offset: usize =
+                    kessel_catalog::HEADER_BYTES;
+                let mut found: Option<(
+                    kessel_catalog::FieldKind,
+                    usize,
+                    usize,
+                )> = None;
+                for f in &fields {
+                    let w = f.kind.width() as usize;
+                    if f.field_id == sort_field {
+                        found = Some((f.kind, record_offset, w));
+                        break;
+                    }
+                    record_offset += w;
+                }
+                let (sk, soff, sw) = match found {
+                    Some(t) => t,
+                    None => {
+                        return OpResult::SchemaError(format!(
+                            "scatter: sort field {sort_field} not in \
+                             type {type_id}"
+                        ))
+                    }
+                };
+                ScatterKind::Sorted {
+                    sort_kind: sk,
+                    sort_offset: soff as u32,
+                    sort_width: sw as u32,
+                    desc,
+                    offset,
+                    limit,
+                }
+            }
+            // Already-resolved Sorted (call sites that pre-resolve).
+            other @ ScatterKind::Sorted { .. } => other,
+        };
+        // 2. Build per-shard `ClusterClient` snapshots. We must hand
+        //    fresh, owned clients to the worker threads — the `Conn`'s
+        //    cached `self.clients[i]` are exclusive references. Per-
+        //    request clone is acceptable: TCP handshakes are lazy so
+        //    each clone connects on first call (SP155 OQ10 — lazy
+        //    pre-warming is V1 behavior).
+        let k = self.router.shards();
+        let mut shards: Vec<ClusterClient> = Vec::with_capacity(k);
+        for i in 0..k {
+            let mut c =
+                ClusterClient::new(self.router.shard_addrs[i].clone());
+            if let Some(t) = &self.router.token {
+                c = c.with_token(t.clone());
+            }
+            shards.push(c);
+        }
+        // 3. Fan out + merge.
+        let results = scatter_scan_fanout(
+            shards,
+            op,
+            DEFAULT_PER_SHARD_TIMEOUT,
+        );
+        merge_scan_results(results, &resolved_kind)
+    }
+
     /// Re-drive the entire ordered cross-shard log idempotently — used
     /// after a router restart so a transaction durably appended but not
     /// fully driven is completed (decide is verdict-stable, commit is
@@ -444,6 +658,7 @@ impl<'a> Conn<'a> {
                     ))
                 }
             }
+            Route::Scatter(kind) => self.scatter_read(op, kind),
             Route::Unsupported(why) => OpResult::SchemaError(why.into()),
         }
     }
@@ -1319,8 +1534,65 @@ mod tests {
             }),
             Route::One(_)
         ));
+        // SP-A T2 (SP155 §3.2): the four scan ops now route to
+        // `Route::Scatter` instead of `Unsupported`. `Select` /
+        // `QueryRows` / `SelectFields` get the `Unordered` merge;
+        // `SelectSorted` gets `Sorted` with a `sort_width = 0`
+        // sentinel that `Conn::scatter_read` resolves against the
+        // catalog at dispatch time.
         assert!(matches!(
-            r.route(&Op::Select { type_id: 1, program: vec![], limit: 0 }),
+            r.route(&Op::Select { type_id: 1, program: vec![], limit: 7 }),
+            Route::Scatter(ScatterKind::Unordered { limit: 7 })
+        ));
+        assert!(matches!(
+            r.route(&Op::QueryRows {
+                type_id: 1,
+                eq_preds: vec![],
+                program: vec![],
+                limit: 11,
+                range_preds: vec![],
+            }),
+            Route::Scatter(ScatterKind::Unordered { limit: 11 })
+        ));
+        assert!(matches!(
+            r.route(&Op::SelectFields {
+                type_id: 1,
+                program: vec![],
+                fields: vec![0],
+                limit: 5,
+            }),
+            Route::Scatter(ScatterKind::Unordered { limit: 5 })
+        ));
+        match r.route(&Op::SelectSorted {
+            type_id: 1,
+            program: vec![],
+            sort_field: 3,
+            desc: true,
+            offset: 10,
+            limit: 4,
+        }) {
+            Route::Scatter(ScatterKind::Sorted {
+                sort_offset, sort_width, desc, offset, limit, ..
+            }) => {
+                // sort_offset carries the field-id sentinel, width=0
+                // sentinel means "resolve at the call site".
+                assert_eq!(sort_offset, 3, "field-id passed through");
+                assert_eq!(sort_width, 0, "sentinel for catalog resolve");
+                assert!(desc);
+                assert_eq!(offset, 10);
+                assert_eq!(limit, 4);
+            }
+            other => panic!("SelectSorted must scatter, got {other:?}"),
+        }
+        // Aggregate / GroupAggregate / Join / FindBy stay
+        // `Unsupported` — SP-B/SP-D/T11/non-goal per spec.
+        assert!(matches!(
+            r.route(&Op::Aggregate {
+                type_id: 1,
+                program: vec![],
+                kind: 0,
+                field_id: 0,
+            }),
             Route::Unsupported(_)
         ));
         assert_eq!(

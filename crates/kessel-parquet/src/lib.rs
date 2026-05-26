@@ -379,8 +379,18 @@ fn page_payload<'a>(
             }
             Ok(std::borrow::Cow::Owned(decoded))
         }
+        meta::Codec::Lz4Raw => Ok(std::borrow::Cow::Owned(
+            lz4::decompress(on_disk, uncomp)?
+        )),
+        // Codec id 5 = legacy LZ4 (deprecated Hadoop framing). Pyarrow
+        // stopped writing this in v8; we don't support it in V1 — named
+        // separately so a user file that needs it gets a clear pointer
+        // at the SP149 follow-up rather than the generic OBJ-2c message.
+        meta::Codec::Other(5) => Err(PqError::Unsupported(
+            "LZ4 (deprecated Hadoop framing) — use LZ4_RAW; SP149 follow-up if needed".into(),
+        )),
         meta::Codec::Other(_) => Err(PqError::Unsupported(
-            "compression codec (lz4/brotli): OBJ-2c".into(),
+            "compression codec (brotli): OBJ-2c".into(),
         )),
     }
 }
@@ -564,9 +574,17 @@ fn decode_data_page_v2(
             }
             std::borrow::Cow::Owned(decoded)
         }
+        meta::Codec::Lz4Raw => {
+            std::borrow::Cow::Owned(lz4::decompress(values_section, vt)?)
+        }
+        meta::Codec::Other(5) => {
+            return Err(PqError::Unsupported(
+                "LZ4 (deprecated Hadoop framing) — use LZ4_RAW; SP149 follow-up if needed".into(),
+            ))
+        }
         meta::Codec::Other(_) => {
             return Err(PqError::Unsupported(
-                "compression codec (lz4/brotli): OBJ-2c".into(),
+                "compression codec (brotli): OBJ-2c".into(),
             ))
         }
     };
@@ -839,9 +857,17 @@ pub(crate) fn decode_data_page_v2_nested(
             }
             std::borrow::Cow::Owned(decoded)
         }
+        meta::Codec::Lz4Raw => {
+            std::borrow::Cow::Owned(lz4::decompress(values_section, vt)?)
+        }
+        meta::Codec::Other(5) => {
+            return Err(PqError::Unsupported(
+                "LZ4 (deprecated Hadoop framing) — use LZ4_RAW; SP149 follow-up if needed".into(),
+            ))
+        }
         meta::Codec::Other(_) => {
             return Err(PqError::Unsupported(
-                "compression codec (lz4/brotli): OBJ-2c".into(),
+                "compression codec (brotli): OBJ-2c".into(),
             ))
         }
     };
@@ -874,10 +900,16 @@ fn read_chunk_values(
         meta::Codec::Uncompressed
         | meta::Codec::Snappy
         | meta::Codec::Gzip
-        | meta::Codec::Zstd => {}
+        | meta::Codec::Zstd
+        | meta::Codec::Lz4Raw => {}
+        meta::Codec::Other(5) => {
+            return Err(PqError::Unsupported(
+                "LZ4 (deprecated Hadoop framing) — use LZ4_RAW; SP149 follow-up if needed".into(),
+            ))
+        }
         meta::Codec::Other(_) => {
             return Err(PqError::Unsupported(
-                "compression codec (lz4/brotli): OBJ-2c".into(),
+                "compression codec (brotli): OBJ-2c".into(),
             ))
         }
     }
@@ -2587,10 +2619,16 @@ fn read_chunk_levels_and_values(
         meta::Codec::Uncompressed
         | meta::Codec::Snappy
         | meta::Codec::Gzip
-        | meta::Codec::Zstd => {}
+        | meta::Codec::Zstd
+        | meta::Codec::Lz4Raw => {}
+        meta::Codec::Other(5) => {
+            return Err(PqError::Unsupported(
+                "LZ4 (deprecated Hadoop framing) — use LZ4_RAW; SP149 follow-up if needed".into(),
+            ))
+        }
         meta::Codec::Other(_) => {
             return Err(PqError::Unsupported(
-                "compression codec (lz4/brotli): OBJ-2c".into(),
+                "compression codec (brotli): OBJ-2c".into(),
             ))
         }
     }

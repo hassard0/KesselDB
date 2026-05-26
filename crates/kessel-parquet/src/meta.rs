@@ -65,6 +65,14 @@ pub enum Codec {
     /// ZSTD (parquet CompressionCodec id = 6), RFC 8478. Wired by SP136
     /// — full decoder pipeline lives in crate::zstd.
     Zstd,
+    /// LZ4_RAW (parquet CompressionCodec id = 7). The modern LZ4 codec
+    /// pyarrow emits for `compression='lz4'` since v8 — raw LZ4 block
+    /// (no Hadoop-style 8-byte framing). Wired by SP149 — decoder in
+    /// crate::lz4. The legacy LZ4 codec (id = 5, Hadoop framing) is
+    /// NOT supported in V1 and stays an `Other(5)` so the page-payload
+    /// dispatch can reject it with a distinct named error pointing at
+    /// the SP149 follow-up.
+    Lz4Raw,
     Other(i32),
 }
 impl Codec {
@@ -74,6 +82,7 @@ impl Codec {
             1 => Codec::Snappy,
             2 => Codec::Gzip,
             6 => Codec::Zstd,
+            7 => Codec::Lz4Raw,
             o => Codec::Other(o),
         }
     }
@@ -1103,8 +1112,10 @@ mod tests {
         }
         let md1 = FileMetaData::decode(&build(1)).expect("snappy");
         assert_eq!(md1.row_groups[0].columns[0].codec, Codec::Snappy);
-        let md7 = FileMetaData::decode(&build(7)).expect("other");
-        assert_eq!(md7.row_groups[0].columns[0].codec, Codec::Other(7));
+        // SP149: codec id 7 = LZ4_RAW is now mapped to Codec::Lz4Raw
+        // (was Other(7) pre-SP149).
+        let md7 = FileMetaData::decode(&build(7)).expect("lz4_raw");
+        assert_eq!(md7.row_groups[0].columns[0].codec, Codec::Lz4Raw);
     }
 
     #[test]

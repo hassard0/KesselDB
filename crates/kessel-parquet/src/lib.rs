@@ -7114,6 +7114,218 @@ mod pentest {
     }
 }
 
+// ── SP151 (OBJ-2c-4 follow-up) — synthetic >64 MiB page tests ────────
+//
+// Pre-SP151: a page declaring uncompressed_page_size > 64 MiB tripped
+// the per-codec module ceiling (SNAPPY_MAX_DECOMP / GZIP_MAX_DECOMP /
+// ZSTD_MAX_DECOMP, all 64 << 20) before any decode work. Pyarrow
+// produces such pages for high-cardinality dictionary pages and
+// many-row row groups; the default extract() then surfaced
+// Unsupported("snappy page X exceeds 67108864 cap: OBJ-2c").
+//
+// Post-SP151: per-codec ceilings are 256 MiB and the user-facing
+// DEFAULT_MAX_PAGE_SIZE is 256 MiB. Pages between 64 and 256 MiB
+// decode (subject to the rest of the parsing succeeding). Pages
+// above 256 MiB are rejected with a typed Unsupported naming the
+// SP151 follow-up AND the extract_with_cap operator knob.
+//
+// These tests are SYNTHETIC (no real >64 MiB fixture on disk —
+// pyarrow regen is a multi-GB job; the integration tests in
+// fixture_roundtrip.rs cover the operator-facing API and the
+// existing fixtures cover the regression surface). They construct a
+// V1 page header that claims uncompressed_page_size N, then assert
+// that:
+//   - N=65 MiB at default cap (256 MiB): the SP151 cap check
+//     PASSES (the decode then fails on missing page data because
+//     the file doesn't actually carry 65 MiB of bytes, but the
+//     failure is the truncated-page error from page_payload, NOT
+//     the SP151 cap error). This is the regression lock for the
+//     "64 MiB rejected" bug.
+//   - N=300 MiB at default cap (256 MiB): the SP151 cap check
+//     FIRES — typed Unsupported with the SP151 marker.
+//   - N=65 MiB at custom cap 60 MiB: the SP151 cap check FIRES —
+//     typed Unsupported (lower cap below the page size).
+//
+// Overflow safety: every page-header derivation uses checked_add /
+// usize::try_from BEFORE the cap check. The cap check itself is
+// `size > cap` — no arithmetic, no overflow risk. Vec::with_capacity
+// at the page_payload allocation site is bounded by uncomp (already
+// ≤ cap, ≤ per-codec ceiling).
+
+#[cfg(test)]
+mod sp151_tests {
+    use super::*;
+
+    fn uv(out: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 { out.push(b); break; } else { out.push(b | 0x80); }
+        }
+    }
+    fn zz(v: i64) -> u64 { ((v << 1) ^ (v >> 63)) as u64 }
+
+    /// V1 PageHeader claiming `uncompressed_page_size = uncomp_bytes`
+    /// and `compressed_page_size = uncomp_bytes`, num_values=2,
+    /// PLAIN encoding. Same shape as the in-module page_header_bytes
+    /// helper but accepts an i64 so we can exercise sizes > i32 range.
+    fn page_header_claim_size(uncomp_bytes: i64) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.push(0x15); uv(&mut h, zz(0));               // f1 type=DATA_PAGE(0)
+        h.push(0x15); uv(&mut h, zz(uncomp_bytes));    // f2 uncompressed_page_size
+        h.push(0x15); uv(&mut h, zz(uncomp_bytes));    // f3 compressed_page_size
+        h.push(0x2c);                                  // f5 DataPageHeader struct
+        h.push(0x15); uv(&mut h, zz(2));               // g1 num_values=2
+        h.push(0x15); uv(&mut h, zz(0));               // g2 encoding=PLAIN(0)
+        h.push(0x00); h.push(0x00);                    // stop DPH / PH
+        h
+    }
+
+    /// FileMetaData for one INT64 REQUIRED column "id", UNCOMPRESSED,
+    /// num_values=2, data_page_offset=4 (right after PAR1 magic).
+    fn filemetadata_int64_one_page() -> Vec<u8> {
+        let mut m = Vec::new();
+        m.push(0x15); uv(&mut m, zz(2));               // f1 version=2
+        m.push(0x19); m.push(0x2c);                    // f2 list<SchemaElement> 2
+        m.push(0x48); uv(&mut m, 6); m.extend_from_slice(b"schema");
+        m.push(0x15); uv(&mut m, zz(1));               // schema[0] num_children=1
+        m.push(0x00);
+        m.push(0x15); uv(&mut m, zz(2));               // schema[1] type=INT64
+        m.push(0x25); uv(&mut m, zz(0));               // f3 repetition=REQUIRED
+        m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x00);
+        m.push(0x16); uv(&mut m, zz(2));               // f3 num_rows=2
+        m.push(0x19); m.push(0x1c);                    // f4 list<RowGroup> 1
+        m.push(0x19); m.push(0x1c);                    // RG.f1 list<CC> 1
+        m.push(0x3c);                                  // CC.f3 CMD struct
+        m.push(0x15); uv(&mut m, zz(2));               // CMD f1 type=INT64
+        m.push(0x19); m.push(0x15); uv(&mut m, zz(0)); // f2 encodings [PLAIN]
+        m.push(0x19); m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x15); uv(&mut m, zz(0));               // f4 codec=UNCOMPRESSED
+        m.push(0x16); uv(&mut m, zz(2));               // f5 num_values=2
+        m.push(0x46); uv(&mut m, zz(4));               // f9 data_page_offset=4
+        m.push(0x00); m.push(0x00);                    // stop CMD / CC
+        m.push(0x26); uv(&mut m, zz(2));               // RG f3 num_rows=2
+        m.push(0x00); m.push(0x00);                    // stop RG / FMD
+        m
+    }
+
+    fn assemble(hdr: &[u8], page_payload: &[u8], meta: &[u8]) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(b"PAR1");
+        f.extend_from_slice(hdr);
+        f.extend_from_slice(page_payload);
+        f.extend_from_slice(meta);
+        f.extend_from_slice(&(meta.len() as u32).to_le_bytes());
+        f.extend_from_slice(b"PAR1");
+        f
+    }
+
+    #[test]
+    fn sp151_65mib_page_passes_cap_check() {
+        // 65 MiB declared uncompressed_size. Pre-SP151: rejected with
+        // "snappy page X exceeds 67108864 cap" (well, UNCOMPRESSED so
+        // codec-specific cap doesn't apply, but the conceptual
+        // regression is "page > 64 MiB"). The cap check at the page
+        // header site MUST PASS (256 MiB default ≥ 65 MiB).
+        // The decode then fails downstream on missing data (the file
+        // doesn't actually carry 65 MiB) — that's the page_payload
+        // bounds check, NOT the SP151 cap.
+        let hdr = page_header_claim_size(65 * 1024 * 1024);
+        let payload = vec![0u8; 16]; // tiny — file doesn't really have 65 MiB
+        let meta = filemetadata_int64_one_page();
+        let file = assemble(&hdr, &payload, &meta);
+
+        let err = extract(&file, &["id"])
+            .expect_err("file is truncated relative to its 65 MiB claim");
+        let msg = format!("{err:?}");
+        // Crucially: the error must NOT mention SP151 cap — the cap
+        // check PASSED. It should be the page_payload truncation
+        // error, which uses the "page data truncated" string.
+        assert!(
+            !msg.contains("SP151"),
+            "65 MiB page must NOT trip the SP151 cap at default 256 MiB: {msg}"
+        );
+        assert!(
+            !msg.contains("max_page_size"),
+            "65 MiB page must NOT trip the SP151 cap at default 256 MiB: {msg}"
+        );
+    }
+
+    #[test]
+    fn sp151_300mib_page_trips_cap_with_named_followup() {
+        // 300 MiB declared uncompressed_size > 256 MiB default cap.
+        // The SP151 cap check fires Unsupported NAMING SP151 + the
+        // operator knob (extract_with_cap).
+        let hdr = page_header_claim_size(300 * 1024 * 1024);
+        let payload = vec![0u8; 16];
+        let meta = filemetadata_int64_one_page();
+        let file = assemble(&hdr, &payload, &meta);
+
+        let err = extract(&file, &["id"])
+            .expect_err("300 MiB > 256 MiB cap must reject");
+        match err {
+            PqError::Unsupported(msg) => {
+                assert!(
+                    msg.contains("SP151"),
+                    "300 MiB page rejection must name SP151: {msg}"
+                );
+                assert!(
+                    msg.contains("extract_with_cap"),
+                    "300 MiB page rejection must name extract_with_cap: {msg}"
+                );
+            }
+            other => panic!("expected Unsupported(SP151...), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sp151_65mib_page_trips_custom_60mib_cap() {
+        // 65 MiB page WITH operator-supplied 60 MiB cap (lower than
+        // both the default and the page size). The cap check fires
+        // Unsupported naming the (lower) cap value.
+        let hdr = page_header_claim_size(65 * 1024 * 1024);
+        let payload = vec![0u8; 16];
+        let meta = filemetadata_int64_one_page();
+        let file = assemble(&hdr, &payload, &meta);
+
+        let cap = 60 * 1024 * 1024;
+        let err = extract_with_cap(&file, &["id"], cap)
+            .expect_err("65 MiB > 60 MiB user cap must reject");
+        match err {
+            PqError::Unsupported(msg) => {
+                assert!(msg.contains("SP151"), "{msg}");
+                let cap_str = format!("max_page_size cap {cap}");
+                assert!(
+                    msg.contains(&cap_str),
+                    "rejection must echo the operator's cap value {cap}: {msg}"
+                );
+            }
+            other => panic!("expected Unsupported(SP151...), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sp151_huge_uncomp_no_oom_no_panic() {
+        // Pentest: i32::MAX uncomp ≈ 2 GiB. Must FAST-reject as
+        // Unsupported (SP151 cap fires before any allocation).
+        // catch_unwind proves no panic / no OOM-abort.
+        let hdr = page_header_claim_size(i32::MAX as i64);
+        let payload = vec![0u8; 16];
+        let meta = filemetadata_int64_one_page();
+        let file = assemble(&hdr, &payload, &meta);
+
+        let r = std::panic::catch_unwind(move || extract(&file, &["id"]));
+        assert!(r.is_ok(), "huge uncomp must NOT panic/OOM");
+        match r.unwrap() {
+            Err(PqError::Unsupported(msg)) => {
+                assert!(msg.contains("SP151"), "{msg}");
+            }
+            other => panic!("expected Unsupported(SP151...), got {other:?}"),
+        }
+    }
+}
+
 // ── OBJ-2c-3 Task 5 PENTEST PASS — DATA_PAGE_V2 decode adversarial ────
 //
 // The Parquet object bytes are operator-declared-source-controlled =

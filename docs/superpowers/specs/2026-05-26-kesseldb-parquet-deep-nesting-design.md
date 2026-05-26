@@ -218,3 +218,15 @@ These can be added as new dispatch arms; the generalized assemblers from T3-T5 s
 SP145 is the largest single Parquet slice (~15-20 tasks if done granularly; ~10 if combined like SP147). Real-world data engineers most commonly use `List<struct>` and `Map<K, struct>` — these are the priority. `List<List>` and other rarely-seen cross-products are still BOLD V1 included.
 
 **The full Dremel automaton would be more general but considerably more complex code.** Per the V1 simplification in §3.3, we ship a per-shape compositional design that handles every common case. If a future pyarrow file exercises a shape the compositional design can't handle, that becomes a documented "SP146-or-later" follow-up.
+
+## 7. SP146 follow-ups — CLOSED
+
+SP146 (record: `docs/superpowers/specs/2026-05-26-kesseldb-parquet-deep-nesting-followups-design.md`) closes the 3 cross-products SP145 V1 deferred with named `SP146 follow-up` reject messages. All three now classify and roundtrip with pyarrow fixtures:
+
+| SP146 follow-up | Status | Anchor |
+|---|---|---|
+| `List<List<List<T>>>` (3-deep, max_rep_level=3) | **CLOSED** | `assemble_list_of_list_of_list_primitive` + `ColumnKind::NestedListOfListOfListPrimitive` + `classify_list_of_list_of_group` + `list_of_list_of_list_i64.parquet` |
+| `List<Map<K, V>>` | **CLOSED** | `assemble_list_of_map_kv` + `ColumnKind::NestedListOfMap` + classify_list_of_group LogicalType::Map arm + `list_of_map_string_i64.parquet` |
+| `Map<K1, Map<K2, V>>` | **CLOSED** | `assemble_map_of_map_kv` + `ColumnKind::NestedMapOfMap` + classify_map_of_group LogicalType::Map arm + `map_string_map_string_i64.parquet` |
+
+**OBJ-2c-5 arc FULLY CLOSED with NO remaining follow-ups** — KesselDB ingests every nested Parquet shape pyarrow writes (List + Map + struct + all cross-products up to 3-deep nesting).

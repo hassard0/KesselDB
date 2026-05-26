@@ -9783,6 +9783,128 @@ mod sp145_pentest {
             )
         });
     }
+
+    // ── SP146 pentest rows (rows 17-23) ────────────────────────────
+    // Adversarial inputs for the 3 new SP146 assemblers + classifier
+    // updates. Every row: well-behaved Err, no panic, no infinite loop.
+
+    use crate::assembly::{
+        assemble_list_of_list_of_list_primitive,
+        assemble_list_of_map_kv,
+        assemble_map_of_map_kv,
+    };
+
+    // ── Row 17: 3-deep List<List<List> rep overflow ────────────────
+    #[test]
+    fn sp146_pt17_lll_rep_overflow() {
+        assert_well_behaved_err("lll rep overflow", || {
+            assemble_list_of_list_of_list_primitive(
+                &[0u32, 5],
+                &[3u32, 3],
+                &[PqValue::I64(1), PqValue::I64(2)],
+                3, false, false, false, false,
+            )
+        });
+    }
+
+    // ── Row 18: 3-deep value-stream underflow ──────────────────────
+    #[test]
+    fn sp146_pt18_lll_value_underflow() {
+        assert_well_behaved_err("lll value underflow", || {
+            assemble_list_of_list_of_list_primitive(
+                &[0u32, 3],
+                &[3u32, 3],
+                &[PqValue::I64(1)], // need 2
+                3, false, false, false, false,
+            )
+        });
+    }
+
+    // ── Row 19: 3-deep def overflow ────────────────────────────────
+    #[test]
+    fn sp146_pt19_lll_def_overflow() {
+        assert_well_behaved_err("lll def overflow", || {
+            assemble_list_of_list_of_list_primitive(
+                &[0u32],
+                &[99u32], // > max_def
+                &[PqValue::I64(1)],
+                3, false, false, false, false,
+            )
+        });
+    }
+
+    // ── Row 20: List<Map> rep overflow ─────────────────────────────
+    #[test]
+    fn sp146_pt20_lom_rep_overflow() {
+        assert_well_behaved_err("lom rep overflow", || {
+            assemble_list_of_map_kv(
+                &[0u32, 5],
+                &[2u32, 2],
+                &[PqValue::Bytes(b"a".to_vec()), PqValue::Bytes(b"b".to_vec())],
+                &[PqValue::I64(1), PqValue::I64(2)],
+                2, false, false,
+            )
+        });
+    }
+
+    // ── Row 21: List<Map> value-stream underflow ───────────────────
+    #[test]
+    fn sp146_pt21_lom_value_underflow() {
+        assert_well_behaved_err("lom value underflow", || {
+            assemble_list_of_map_kv(
+                &[0u32, 2],
+                &[2u32, 2],
+                &[PqValue::Bytes(b"a".to_vec()), PqValue::Bytes(b"b".to_vec())],
+                &[PqValue::I64(1)], // need 2
+                2, false, false,
+            )
+        });
+    }
+
+    // ── Row 22: Map<_, Map> rep overflow ───────────────────────────
+    #[test]
+    fn sp146_pt22_mom_rep_overflow() {
+        assert_well_behaved_err("mom rep overflow", || {
+            assemble_map_of_map_kv(
+                &[0u32, 4],
+                &[2u32, 2],
+                &[PqValue::Bytes(b"a".to_vec())],
+                &[PqValue::Bytes(b"x".to_vec()), PqValue::Bytes(b"y".to_vec())],
+                &[PqValue::I64(1), PqValue::I64(2)],
+                2, false, false,
+            )
+        });
+    }
+
+    // ── Row 23: Map<_, Map> outer-key underflow ────────────────────
+    #[test]
+    fn sp146_pt23_mom_outer_key_underflow() {
+        assert_well_behaved_err("mom outer-key underflow", || {
+            assemble_map_of_map_kv(
+                &[0u32, 1],
+                &[2u32, 2],
+                &[PqValue::Bytes(b"a".to_vec())], // need 2 (one per rep=0 + rep=1)
+                &[PqValue::Bytes(b"x".to_vec()), PqValue::Bytes(b"y".to_vec())],
+                &[PqValue::I64(1), PqValue::I64(2)],
+                2, false, false,
+            )
+        });
+    }
+
+    // ── Row 24: Map<_, Map> inner-value unconsumed overflow ────────
+    #[test]
+    fn sp146_pt24_mom_inner_value_unconsumed() {
+        assert_well_behaved_err("mom inner-value unconsumed", || {
+            assemble_map_of_map_kv(
+                &[0u32],
+                &[2u32],
+                &[PqValue::Bytes(b"a".to_vec())],
+                &[PqValue::Bytes(b"x".to_vec())],
+                &[PqValue::I64(1), PqValue::I64(2)], // extra
+                2, false, false,
+            )
+        });
+    }
 }
 
 /// SP149 T4: pentest the LZ4_RAW block decoder against adversarial inputs.

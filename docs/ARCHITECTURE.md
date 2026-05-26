@@ -30,16 +30,19 @@ VSR reimplementation verifiable rather than hopeful.
 `kessel-http-gateway` (opt-in HTTP/1.1 surface, behind `--features http-gateway`;
 zero external (non-workspace) deps) ·
 `kessel-objstore` (S3 SigV4 + Azure Shared-Key signers) ·
-`kessel-parquet` (zero-dep Parquet reader — Snappy/GZIP/zstd + V1/V2 +
-PLAIN/dict + REQUIRED/OPTIONAL + INT96/DECIMAL/FLBA + **`LIST<primitive>`
-(SP143)** + **`MAP<K, V>` + struct of primitives (SP144)** +
-**`List<List<T>>` + `List<struct<...>>` + `Map<K, struct<...>>` +
-`Map<K, List<T>>` + `struct<List/Map/struct>` (SP145 — OBJ-2c-5 CLOSED)** +
-sub-modules `snappy.rs` / `gzip.rs` / `zstd*.rs` / `assembly.rs` (Dremel
-record assemblers: `assemble_list_primitive` / `assemble_map_kv` /
-`assemble_struct` / `assemble_list_of_list_primitive` /
-`assemble_list_of_struct` / `assemble_map_of_struct` /
-`assemble_map_of_list`)).
+`kessel-parquet` (zero-dep Parquet reader — Snappy/GZIP/zstd/LZ4_RAW +
+V1/V2 + PLAIN/dict + REQUIRED/OPTIONAL + INT96/DECIMAL/FLBA +
+**`LIST<primitive>` (SP143)** + **`MAP<K, V>` + struct of primitives
+(SP144)** + **`List<List<T>>` + `List<struct<...>>` + `Map<K, struct<...>>` +
+`Map<K, List<T>>` + `struct<List/Map/struct>` (SP145)** +
+**`List<List<List<T>>>` 3-deep + `List<Map<K,V>>` + `Map<K1, Map<K2,V>>`
+(SP146 — OBJ-2c-5 FULLY CLOSED)** + sub-modules `snappy.rs` /
+`gzip.rs` / `zstd*.rs` / `lz4.rs` / `assembly.rs` (Dremel record assemblers:
+`assemble_list_primitive` / `assemble_map_kv` / `assemble_struct` /
+`assemble_list_of_list_primitive` / `assemble_list_of_struct` /
+`assemble_map_of_struct` / `assemble_map_of_list` /
+`assemble_list_of_list_of_list_primitive` / `assemble_list_of_map_kv` /
+`assemble_map_of_map_kv`)).
 
 SP143 extends kessel-parquet with `SchemaTree` (recursive nested schema
 model alongside the flat `leaves` list), multi-bit rep/def level decoders
@@ -63,25 +66,30 @@ first REQUIRED`) and the bare struct-of-primitives pattern. The
 `read_chunk_levels_and_values` page-loop helper was factored out of the
 SP143 List path so List + Map share the V1/V2 + dict/codec dispatch.
 
-SP145 closes the OBJ-2c-5 arc via BOLD per-shape composition (no full
-Dremel automaton — see spec `docs/superpowers/specs/2026-05-26-kesseldb-parquet-deep-nesting-design.md`
-§3.3). Four new `ColumnKind` variants (`NestedListOfListPrimitive`,
-`NestedListOfStruct`, `NestedMapOfStruct`, `NestedMapOfList`) +
-`StructField.nested: Option<Box<ColumnKind>>` enable recursive
-composition. Four new assemblers in `assembly.rs` handle the new shapes:
-`assemble_list_of_list_primitive` (generalized to max_rep_level=2 via
-rep=0/1/2 dispatch into outer/inner/item accumulators);
-`assemble_list_of_struct` (field-zip per item slot using the shared
-REPEATED-ancestor rep stream); `assemble_map_of_struct` (analogous to
-list_of_struct but with K+struct V); `assemble_map_of_list` (BOLD
-cross-product: V leaf has max_rep_level=2 since both MAP middle and
-LIST middle are REPEATED ancestors). Five new decode helpers in
-`lib.rs` (`decode_field_by_kind` is the recursive entry point for
-struct fields that are themselves nested shapes; the per-shape helpers
-match on chunk-path filtering via `path.last() == "element"` for nested
-LIST leaves). Three-deep nesting (`List<List<List<T>>>`,
-`List<Map<K,V>>`, `Map<_, Map<...>>`) is rejected with typed
-`Unsupported("...: SP146 follow-up")` errors.
+SP145 + SP146 together close the OBJ-2c-5 arc via BOLD per-shape
+composition (no full Dremel automaton — see specs
+`docs/superpowers/specs/2026-05-26-kesseldb-parquet-deep-nesting-design.md` §3.3
+and `docs/superpowers/specs/2026-05-26-kesseldb-parquet-deep-nesting-followups-design.md`).
+SP145 shipped four new `ColumnKind` variants (`NestedListOfListPrimitive`,
+`NestedListOfStruct`, `NestedMapOfStruct`, `NestedMapOfList`) plus
+`StructField.nested: Option<Box<ColumnKind>>` for recursive composition.
+SP146 closes the 3 cross-products SP145 V1 deferred by adding three more
+ColumnKind variants and assemblers: `NestedListOfListOfListPrimitive` +
+`assemble_list_of_list_of_list_primitive` (max_rep_level=3 via
+8-case classifier + 3-level stack outer/middle/inner accumulators);
+`NestedListOfMap` + `assemble_list_of_map_kv` (outer LIST of inner Maps
+driven off K/V shared rep stream at max_rep=2); `NestedMapOfMap` +
+`assemble_map_of_map_kv` (outer Map of inner Maps with outer K at
+max_rep=1 + inner K/V at max_rep=2). The classifier path adds a recursive
+`classify_list_of_list_of_group` helper for the 3-deep List case, and
+lifts the `LogicalType::Map` arms inside both `classify_list_of_group`
+and `classify_map_of_group` to emit the new ColumnKind variants instead
+of rejecting. **Every nested Parquet shape pyarrow writes — including
+all cross-products up to 3-deep nesting — now decodes through
+`extract()`. OBJ-2c-5 arc FULLY CLOSED with NO follow-ups remaining.**
+4+ deep nesting (`List<List<List<List<T>>>>` etc.) rejects with
+typed `Unsupported("...: SP147 follow-up")` errors awaiting a real
+pyarrow fixture that exercises that depth.
 
 **Mechanically-checked artifacts:**
 `kesseldb-tla/` — seven layered TLA+ specs

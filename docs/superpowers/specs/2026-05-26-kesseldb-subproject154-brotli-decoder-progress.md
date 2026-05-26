@@ -1,9 +1,67 @@
 # SP154 — Zero-dep Brotli (RFC 7932) Decoder SP-arc — Progress Tracker
 
 Date: 2026-05-26
-Status: **PARTIAL WIN — Layers 1-12 shipped; pyarrow id column decodes
-byte-identical; byte_array column has a residual V1-decoder discrepancy
-that still needs diagnosis**
+Status: **COMPLETE — Layers 1-12 shipped; the pyarrow `brotli_flat.parquet`
+fixture (both i64 id-column and BYTE_ARRAY name-column) decodes
+byte-identical via the V1 compressed-metablock orchestrator. OBJ-2c-2
+codec matrix CLOSED at 6/7 codecs supported.**
+
+## Final fix (2026-05-26)
+
+The residual byte_array discrepancy from the L11+L12 session was traced
+to the **initial recent-distance ring orientation**. RFC 7932 §4 reads:
+
+> "The ring buffer of the four last distances is initialized by the
+> values 16, 15, 11, and 4 (i.e., the fourth-to-last is set to 16, the
+> third-to-last to 15, the second-to-last to 11, and the last distance
+> to 4) at the beginning of the stream."
+
+The parenthetical gloss is dispositive: the literal byte order
+"16, 15, 11, 4" is fourth-to-last → third-to-last → second-to-last →
+**last-distance**. So **d1 (last/most-recent) = 4**, d2 = 11, d3 = 15,
+d4 = 16 (fourth-to-last). The pre-fix code had `RING_INIT = [16, 15, 11, 4]`
+with slots[0]=d1=16, which reverses the d1/d4 assignment.
+
+Cross-checked against Google's reference C decoder
+(`google/brotli` c/dec/decode.c `TakeDistanceFromRingBuffer` +
+c/dec/state.c initial `dist_rb={16,15,11,4}, dist_rb_idx=0`): the
+reference uses a circular ring where d1 = `dist_rb[(idx + 3) & 3]`,
+d2 = `dist_rb[(idx + 2) & 3]`, etc. At idx=0 that maps to:
+d1=dist_rb[3]=4, d2=dist_rb[2]=11, d3=dist_rb[1]=15, d4=dist_rb[0]=16.
+Same answer as the RFC text, just expressed via a different storage
+convention.
+
+The fix is one-line in `brotli_distance.rs`:
+
+```rust
+pub(crate) const RING_INIT: [u32; 4] = [4, 11, 15, 16];  // was [16, 15, 11, 4]
+```
+
+11 existing KATs were updated to reflect the corrected semantics
+(content-preserving table flip; the table mappings + value-offsets +
+push semantics + decode_distance dispatcher are unchanged). 2 new
+diagnostic KATs pin the RFC-correct behaviour against Google's
+reference values for every short code 0..=15 + post-push ring state.
+
+With the fix, the pyarrow `brotli_flat.parquet` fixture decodes
+byte-identical:
+
+```
+[I64(1), Bytes("alice")]
+[I64(2), Bytes("bob")]
+[I64(3), Bytes("carol")]
+[I64(4), Bytes("dave")]
+[I64(5), Bytes("eve")]
+```
+
+The previously-relaxed rejection-lock test
+(`pyarrow_brotli_flat_rejects_with_named_followup`) is flipped to the
+positive round-trip `pyarrow_brotli_flat`. The `#[ignore]`'d
+`pyarrow_brotli_flat_ignored_until_decoder_ships` is removed
+(subsumed).
+
+Workspace counts: 1288→1290 default / 1321→1323 featured (+2 each;
+-1 ignored from the removed `#[ignore]` test).
 
 ## Mission
 

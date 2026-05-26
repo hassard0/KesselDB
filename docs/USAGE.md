@@ -973,19 +973,26 @@ as every other format):
   rejected with `Unsupported("...: SP147 follow-up")`. The per-shape
   composition pattern from SP145/SP146 generalizes to one more level
   the same way; no pyarrow corpus exercises this depth yet.
-- **Brotli compression (codec id 4)** — recognized at meta-decode time
-  (`Codec::Brotli`) but decompression rejected with
-  `Unsupported("Brotli decode: zero-dep decoder is a dedicated multi-week
-  SP-arc (~10-15 tasks like SP125-SP140 zstd); workaround — ask the writer
-  to use compression='zstd' or compression='lz4' instead")`. **Workaround**:
-  re-encode with `compression='zstd'` (shipped — often a better ratio than
-  brotli on Parquet column data) or `compression='lz4'` (shipped — very
-  fast). A hand-rolled zero-dep RFC 7932 Brotli decoder is comparable in
-  complexity to the SP125-SP140 zstd arc (Brotli has its own Huffman
-  table format, context modeling, a static dictionary of common web
-  words, and metablock framing) and is the only OBJ-2c-2 codec the
-  decoder doesn't yet handle end-to-end. Tracked by SP150 (gate-only
-  shipped) → dedicated multi-slice SP-arc TBD.
+- **Brotli compression (codec id 4)** — **fully supported** (SP154). A
+  hand-rolled zero-dep RFC 7932 Brotli decoder ships across 12 layers
+  (bit reader → stream/metablock framing → simple+complex prefix codes
+  → NBLTYPES + NPOSTFIX/NDIRECT + context-map headers → 704-symbol
+  insert-and-copy command alphabet → 64-symbol distance prefix code +
+  recent-distance ring → 122,784-byte static dictionary blob + 121
+  Appendix B transforms → compressed-metablock orchestration → flat
+  output buffer with pre-stream-zero copy semantics), comparable in
+  scope to the SP125-SP140 zstd arc. The decoder enforces V1 reductions
+  matching the common pyarrow-emitted shape (NBLTYPES=1, NPOSTFIX=0+NDIRECT=0,
+  NTREES=1 for both CMAPs, identity-only dictionary transforms); files
+  that exceed those reductions surface typed
+  `BrotliMetablockError::{UnsupportedBlockTypes, UnsupportedDistanceParams,
+  Context, Dictionary, ...}` mapped to `Unsupported` with a named
+  SP154-followup pointer. Pyarrow's `compression='brotli'` round-trips
+  byte-identical for the standard flat-i64 + flat-BYTE_ARRAY shape
+  (locked by the `pyarrow_brotli_flat` integration KAT). Closes
+  **OBJ-2c-2** codec matrix at 6/7 codecs supported (UNCOMPRESSED,
+  Snappy, GZIP, Zstd, LZ4_RAW, Brotli; LZO remains deprecated, legacy
+  LZ4 codec id 5 rejected with named pointer).
 - **Legacy LZ4 compression (codec id 5, deprecated Hadoop framing)** —
   rejected with `Unsupported("LZ4 (deprecated Hadoop framing) — use
   LZ4_RAW; SP149 follow-up if needed")`. Pyarrow stopped writing this

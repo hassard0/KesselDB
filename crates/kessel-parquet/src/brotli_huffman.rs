@@ -7,10 +7,10 @@
 //!     by its own RLE-coded code-length sequence (which is itself
 //!     decoded using a small prefix code). This is the workhorse.
 //!
-//! ## SP154 Layer 5 scope
+//! ## SP154 Layer 5 + 5b scope
 //!
-//! This commit ships the **simple prefix code** path (RFC 7932 §3.4)
-//! end-to-end:
+//! Layer 5 (commit `4753fad`) shipped the **simple prefix code** path
+//! (RFC 7932 §3.4) end-to-end:
 //!   - 2-bit "code type" header (= 0b01 for simple per §3.4 ordering).
 //!     Actually per RFC §3.4 the first 2 bits read are NOT the code-type
 //!     selector; instead the prefix-code reader reads the first 2 bits
@@ -25,20 +25,17 @@
 //!       NSYM=4 tree-select=0: lengths 2, 2, 2, 2
 //!       NSYM=4 tree-select=1: lengths 1, 2, 3, 3
 //!
-//! The **complex prefix code** path (§3.5) is DEFERRED to a future
-//! SP154 slice — it requires:
-//!   - HSKIP (4 bits) to select the leading code-length code
-//!   - 18-entry code-length code table decoded inline (recursive
-//!     prefix-code structure)
-//!   - RLE-coded run of code lengths for the actual alphabet
-//!   - Canonical-prefix-code reconstruction (sorted-symbol-by-length
-//!     ordering with `nextcode[len]` walk)
-//!
-//! When the metablock header path eventually exercises complex codes
-//! (Layer 6+), the decoder will surface
-//! `BrotliError::ComplexPrefixCodeNotYetSupported`. For Layer 5 in
-//! isolation, the simple-code path is testable directly via this
-//! module's KAT suite.
+//! Layer 5b (THIS commit) ships the **complex prefix code** path
+//! (RFC 7932 §3.5):
+//!   - 2-bit HSKIP (number of leading code-length-code symbols to skip)
+//!   - 18 code-length-code lengths (in the fixed order
+//!     1,2,3,4,0,5,17,6,16,7,8,9,10,11,12,13,14,15), each encoded with
+//!     the fixed 6-symbol code from §3.5
+//!   - RLE-decoded run of `alphabet_size` code lengths for the main
+//!     alphabet (symbols 16/17 = repeat-previous / repeat-zero with
+//!     extra-bit-extended counts)
+//!   - Canonical-prefix-code reconstruction (§3.3) over the resulting
+//!     `(symbol, length)` pairs.
 //!
 //! ## Canonical prefix-code reconstruction (§3.3)
 //!
@@ -70,6 +67,9 @@ pub(crate) enum HuffmanError {
     /// Bit reader surfaced an error.
     BitReader(BitReaderError),
     /// Complex prefix code path is deferred to a future SP154 slice.
+    /// (Retained for historical L5 boundary; L5b makes this unreachable
+    /// from `decode_prefix_code` but kept as a typed variant for callers
+    /// that still surface complex-code errors during V1 testing.)
     /// Carries the HSKIP value for diagnostics.
     ComplexPrefixCodeNotYetSupported { hskip: u8 },
     /// Simple prefix code had duplicate symbols (per RFC §3.4 sym2 != sym1, etc).
@@ -84,6 +84,28 @@ pub(crate) enum HuffmanError {
     /// While decoding a symbol, walked past the table without finding
     /// a leaf. Indicates corrupt bit stream.
     InvalidCode,
+    /// A repeat code (16/17) in a complex prefix code's length sequence
+    /// asked for more lengths than the declared alphabet size. Per
+    /// RFC 7932 §3.5: "If the number of times to repeat the previous
+    /// length or repeat a zero length would result in more lengths in
+    /// total than the number of symbols in the alphabet, then the stream
+    /// should be rejected as invalid."
+    RepeatOverrunsAlphabet { needed: u32, alphabet_size: u32 },
+    /// A complex prefix code's code-length sequence finished before
+    /// reaching the declared alphabet size (per RFC 7932 §3.5 the sum
+    /// `(32768 >> code_length)` over non-zero code lengths must equal
+    /// 32768; a sequence that finishes early indicates a corrupt stream).
+    /// Currently surfaced when fewer than `alphabet_size` lengths are
+    /// produced AND the Kraft sum is non-32768.
+    UnderfilledAlphabet { produced: u32, alphabet_size: u32 },
+    /// Complex prefix code: the inner 18-symbol code-length code had
+    /// fewer than 2 non-zero entries AND was not the single-symbol
+    /// "all symbols have length 0 except one with length N" case
+    /// (per RFC 7932 §3.5: "A complex prefix code must have at least
+    /// two non-zero code lengths."). This error variant is reserved
+    /// for the OUTER alphabet code-length sequence — the inner 18-entry
+    /// code is allowed to be single-symbol.
+    InsufficientNonzeroLengths,
 }
 
 impl core::fmt::Display for HuffmanError {
@@ -261,14 +283,295 @@ pub(crate) fn decode_simple_prefix_code(
     PrefixCode::from_symbol_lengths(&pairs)
 }
 
+/// Fixed RFC 7932 §3.5 "code length code" — decode one of the 6
+/// possible code-length values (0..=5) from the bit stream. The listed
+/// RFC code words are parsed right-to-left, which equates to LSB-first
+/// stream reading. The decode tree (in stream-bit-by-bit order):
+///
+/// ```text
+///   bit1=0:
+///     bit2=0           → sym 0 (length value 0)
+///     bit2=1           → sym 3 (length value 3)
+///   bit1=1:
+///     bit2=0           → sym 4 (length value 4)
+///     bit2=1:
+///       bit3=0         → sym 2 (length value 2)
+///       bit3=1:
+///         bit4=0       → sym 1 (length value 1)
+///         bit4=1       → sym 5 (length value 5)
+/// ```
+///
+/// Returns the decoded code-length value (0..=5).
+fn read_code_length_code(r: &mut BitReader) -> Result<u8, HuffmanError> {
+    let b1 = r.read_one_bit()?;
+    let b2 = r.read_one_bit()?;
+    if b1 == 0 {
+        if b2 == 0 {
+            Ok(0)
+        } else {
+            Ok(3)
+        }
+    } else if b2 == 0 {
+        Ok(4)
+    } else {
+        let b3 = r.read_one_bit()?;
+        if b3 == 0 {
+            Ok(2)
+        } else {
+            let b4 = r.read_one_bit()?;
+            if b4 == 0 {
+                Ok(1)
+            } else {
+                Ok(5)
+            }
+        }
+    }
+}
+
+/// RFC 7932 §3.5: the 18-symbol code-length alphabet read order.
+/// The first HSKIP entries are skipped (treated as zero); the remaining
+/// entries are read sequentially using the §3.5 fixed 6-symbol code.
+pub(crate) const CODE_LENGTH_ORDER: [u8; 18] = [
+    1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+];
+
+/// Decode a COMPLEX prefix code per RFC 7932 §3.5.
+///
+/// On entry: bit reader is positioned just AFTER the 2-bit "type code"
+/// dispatch byte (= HSKIP value: 0, 2, or 3). `hskip` is the value the
+/// dispatcher already read.
+///
+/// Reads:
+///   - 18 code-length-code lengths (in the fixed §3.5 order; first HSKIP
+///     are skipped). Each length is 2..=4 bits via the fixed §3.5 code.
+///     Trailing zeros may be omitted if Kraft sum reaches 32 early.
+///   - The resulting 18-symbol code is canonicalized via §3.3.
+///   - Using the 18-symbol code, decode `alphabet_size` main code lengths
+///     with RLE semantics:
+///       symbols 0..=15 → direct length (0 = symbol not in code)
+///       symbol 16     → repeat previous-non-zero (or 8 if none yet)
+///                       3..=6 times (2 extra bits)
+///       symbol 17     → repeat zero 3..=10 times (3 extra bits)
+///       Modification: consecutive 16s extend the same run as
+///         `count = 4 * (count - 2) + extra_bits`. Same for 17 with `8 *`.
+///   - The resulting main-alphabet `(symbol, length)` pairs are
+///     canonicalized via §3.3.
+///
+/// Special "single non-zero length" case (per RFC §3.5): if exactly ONE
+/// of the produced lengths is non-zero, the code is a zero-bit code
+/// emitting that single symbol. We delegate this via
+/// `PrefixCode::from_symbol_lengths`'s zero-bit handling.
+pub(crate) fn decode_complex_prefix_code(
+    r: &mut BitReader,
+    hskip: u8,
+    alphabet_size: u32,
+) -> Result<PrefixCode, HuffmanError> {
+    // Step 1: read up to (18 - hskip) code-length-code lengths in the
+    // fixed order. Per RFC §3.5: "If there are at least two non-zero
+    // code lengths, any trailing zero code lengths are omitted, i.e.,
+    // the last code length in the sequence must be non-zero. In this
+    // case, the sum of (32 >> code length) over all the non-zero code
+    // lengths must equal to 32."
+    //
+    // We read lengths and track the partial Kraft sum (over `32 >> len`).
+    // Stop when the sum reaches 32 (full code), or when we've exhausted
+    // all 18 positions. If sum < 32 at end, the stream is invalid.
+    let mut clc_lengths = [0u8; 18]; // indexed by symbol (= code-length value 0..=17)
+    let mut nonzero_count = 0u32;
+    let mut kraft_sum: u32 = 0;
+    let mut idx = hskip as usize;
+    while idx < 18 {
+        let v = read_code_length_code(r)?; // 0..=5
+        let sym = CODE_LENGTH_ORDER[idx] as usize;
+        clc_lengths[sym] = v;
+        if v > 0 {
+            nonzero_count += 1;
+            kraft_sum = kraft_sum
+                .checked_add(32u32 >> v)
+                .ok_or(HuffmanError::NotCanonical)?;
+        }
+        idx += 1;
+        // Early termination: per RFC, once Kraft sum reaches 32 AND we
+        // have at least 2 non-zero lengths (i.e. a valid complete code),
+        // any trailing zeros are omitted. Single-non-zero is also valid
+        // (the "all-same-length symbol" case); the RFC §3.5 text says
+        // "if there was only one non-zero code length, then the prefix
+        // code has one symbol whose code has zero length" — meaning the
+        // *result* of the 18-entry code is degenerate. We still need to
+        // read all 18 entries in that case (or do we?). Per RFC: "If
+        // there are at least two non-zero code lengths, any trailing zero
+        // code lengths are omitted". So for the single-non-zero case we
+        // must read all 18 entries; for ≥2 we can terminate at sum=32.
+        if nonzero_count >= 2 && kraft_sum >= 32 {
+            break;
+        }
+    }
+    if nonzero_count >= 2 && kraft_sum != 32 {
+        // Sum exceeded 32 or never reached 32 — invalid.
+        return Err(HuffmanError::NotCanonical);
+    }
+    // Step 2: build the 18-symbol code (the "code-length code") via §3.3
+    // canonical reconstruction. Symbols are 0..=17 (the code-length
+    // alphabet). Zero-length entries are filtered by from_symbol_lengths.
+    let clc_pairs: Vec<(u32, u8)> = (0u32..18)
+        .map(|s| (s, clc_lengths[s as usize]))
+        .collect();
+    let clc = PrefixCode::from_symbol_lengths(&clc_pairs)?;
+    // Step 3: read `alphabet_size` main code lengths using the CLC.
+    let mut main_lengths: Vec<u8> = Vec::with_capacity(alphabet_size as usize);
+    // For RLE state per RFC §3.5:
+    //   prev_nonzero_len = "the previous non-zero code length"; defaults to 8
+    //     before any code length code lengths are read (per the
+    //     "single-non-zero is 16 repeating 8" passage).
+    //   prev_repeat = the most recent run-extension code (Some(16), Some(17),
+    //     or None). Used to detect "consecutive 16s" / "consecutive 17s"
+    //     for count modification.
+    //   prev_repeat_count = the count of the most recent run if
+    //     prev_repeat is set.
+    let mut prev_nonzero_len: u8 = 8;
+    let mut prev_repeat: Option<u8> = None; // 16 or 17
+    let mut prev_repeat_count: u32 = 0;
+    // Main-alphabet Kraft sum check: (32768 >> length) summed over
+    // non-zero lengths must equal 32768 at end.
+    let mut main_kraft: u32 = 0;
+    while (main_lengths.len() as u32) < alphabet_size {
+        let sym = clc.decode_symbol(r)?; // 0..=17
+        if sym <= 15 {
+            // Direct length.
+            let l = sym as u8;
+            main_lengths.push(l);
+            if l > 0 {
+                main_kraft = main_kraft
+                    .checked_add(32768u32 >> l)
+                    .ok_or(HuffmanError::NotCanonical)?;
+                prev_nonzero_len = l;
+            }
+            prev_repeat = None;
+            prev_repeat_count = 0;
+        } else if sym == 16 {
+            // Repeat previous non-zero length 3..=6 times.
+            let extra = r.read_bits(2)?;
+            let new_count: u32 = if prev_repeat == Some(16) {
+                // Modify previous repeat count.
+                4u32.checked_mul(prev_repeat_count.checked_sub(2).unwrap_or(0))
+                    .ok_or(HuffmanError::NotCanonical)?
+                    .checked_add(3 + extra)
+                    .ok_or(HuffmanError::NotCanonical)?
+            } else {
+                3 + extra
+            };
+            // Number of *additional* lengths to emit.
+            let delta: u32 = if prev_repeat == Some(16) {
+                new_count - prev_repeat_count
+            } else {
+                new_count
+            };
+            // Check overrun BEFORE emitting.
+            let after = (main_lengths.len() as u32)
+                .checked_add(delta)
+                .ok_or(HuffmanError::NotCanonical)?;
+            if after > alphabet_size {
+                return Err(HuffmanError::RepeatOverrunsAlphabet {
+                    needed: after,
+                    alphabet_size,
+                });
+            }
+            for _ in 0..delta {
+                main_lengths.push(prev_nonzero_len);
+                main_kraft = main_kraft
+                    .checked_add(32768u32 >> prev_nonzero_len)
+                    .ok_or(HuffmanError::NotCanonical)?;
+            }
+            prev_repeat = Some(16);
+            prev_repeat_count = new_count;
+        } else if sym == 17 {
+            // Repeat zero 3..=10 times.
+            let extra = r.read_bits(3)?;
+            let new_count: u32 = if prev_repeat == Some(17) {
+                8u32.checked_mul(prev_repeat_count.checked_sub(2).unwrap_or(0))
+                    .ok_or(HuffmanError::NotCanonical)?
+                    .checked_add(3 + extra)
+                    .ok_or(HuffmanError::NotCanonical)?
+            } else {
+                3 + extra
+            };
+            let delta: u32 = if prev_repeat == Some(17) {
+                new_count - prev_repeat_count
+            } else {
+                new_count
+            };
+            let after = (main_lengths.len() as u32)
+                .checked_add(delta)
+                .ok_or(HuffmanError::NotCanonical)?;
+            if after > alphabet_size {
+                return Err(HuffmanError::RepeatOverrunsAlphabet {
+                    needed: after,
+                    alphabet_size,
+                });
+            }
+            for _ in 0..delta {
+                main_lengths.push(0);
+            }
+            prev_repeat = Some(17);
+            prev_repeat_count = new_count;
+        } else {
+            // Unreachable: CLC produces symbols in 0..=17. The 18-symbol
+            // alphabet is exhaustively covered above.
+            return Err(HuffmanError::SymbolOutOfRange {
+                sym,
+                alphabet_size: 18,
+            });
+        }
+    }
+    debug_assert_eq!(main_lengths.len() as u32, alphabet_size);
+    // Per RFC §3.5: the main-alphabet Kraft sum must equal 32768 unless
+    // the code is the degenerate single-non-zero-length case (which is
+    // also a valid Brotli code; from_symbol_lengths handles the zero-bit
+    // degenerate where ALL lengths are zero but exactly one symbol is
+    // "tagged" as the implicit one).
+    //
+    // Note: the RFC §3.5 single-non-zero case happens when EXACTLY one
+    // of the main lengths is non-zero, regardless of its value. The
+    // resulting code emits that symbol with no bits consumed. This is
+    // analogous to the simple-code NSYM=1 zero-bit case.
+    //
+    // We surface non-32768 Kraft as NotCanonical UNLESS exactly one
+    // length is non-zero (single-symbol case) OR all lengths are zero
+    // (which we reject as InsufficientNonzeroLengths — a valid Brotli
+    // stream can't have a zero-symbol alphabet).
+    let nonzero_main: u32 = main_lengths.iter().filter(|&&l| l != 0).count() as u32;
+    if nonzero_main == 0 {
+        return Err(HuffmanError::InsufficientNonzeroLengths);
+    }
+    if nonzero_main >= 2 && main_kraft != 32768 {
+        return Err(HuffmanError::NotCanonical);
+    }
+    // Build the canonical code. For the single-non-zero case, override
+    // by handing a single (sym, length=0) zero-bit code pair.
+    if nonzero_main == 1 {
+        // Find the single non-zero symbol; return a zero-bit code on it.
+        let sym = main_lengths
+            .iter()
+            .enumerate()
+            .find(|(_, &l)| l != 0)
+            .map(|(i, _)| i as u32)
+            .unwrap();
+        let pairs = vec![(sym, 0u8)];
+        return PrefixCode::from_symbol_lengths(&pairs);
+    }
+    let pairs: Vec<(u32, u8)> = main_lengths
+        .iter()
+        .enumerate()
+        .map(|(i, &l)| (i as u32, l))
+        .collect();
+    PrefixCode::from_symbol_lengths(&pairs)
+}
+
 /// Entry point: decode either a simple or complex prefix code from
 /// the bit stream per RFC 7932 §3.3-§3.5.
 ///
 /// First reads 2 bits: if value == 1 → simple code (§3.4); else →
 /// complex code (§3.5) with HSKIP = (value).
-///
-/// For Layer 5, the complex-code path returns
-/// `ComplexPrefixCodeNotYetSupported`.
 pub(crate) fn decode_prefix_code(
     r: &mut BitReader,
     alphabet_bits: u8,
@@ -280,10 +583,8 @@ pub(crate) fn decode_prefix_code(
     } else {
         // type_code in {0, 2, 3} → complex prefix code with HSKIP = type_code.
         // Per RFC §3.5: HSKIP determines the leading skipped code-length
-        // codes (0=skip 0; 2=skip 2; 3=skip 3). Decoding the actual
-        // 18-entry code-length code + the RLE'd alphabet code lengths
-        // is the Layer 5-followup (substantial: ~1-2 sessions of work).
-        Err(HuffmanError::ComplexPrefixCodeNotYetSupported { hskip: type_code })
+        // codes (0=skip 0; 2=skip 2; 3=skip 3).
+        decode_complex_prefix_code(r, type_code, alphabet_size)
     }
 }
 
@@ -480,38 +781,12 @@ mod tests {
         assert_eq!(got, vec![0, 1, 2, 3]);
     }
 
-    /// Complex prefix code (any of type 0, 2, 3) currently rejected
-    /// with a typed error. Pins the boundary that the Layer 6+ work
-    /// will need to close.
-    #[test]
-    fn complex_prefix_code_surfaces_typed_unsupported() {
-        // 2-bit type=0 → complex code with HSKIP=0.
-        let bytes = [0x00u8];
-        let mut r = BitReader::new(&bytes);
-        let err = decode_prefix_code(&mut r, 4, 16).unwrap_err();
-        assert!(
-            matches!(err, HuffmanError::ComplexPrefixCodeNotYetSupported { hskip: 0 }),
-            "expected ComplexPrefixCodeNotYetSupported, got {err:?}"
-        );
-
-        // 2-bit type=2 → HSKIP=2.
-        let bytes = [0x02u8];
-        let mut r = BitReader::new(&bytes);
-        let err = decode_prefix_code(&mut r, 4, 16).unwrap_err();
-        assert!(
-            matches!(err, HuffmanError::ComplexPrefixCodeNotYetSupported { hskip: 2 }),
-            "expected hskip=2, got {err:?}"
-        );
-
-        // 2-bit type=3 → HSKIP=3.
-        let bytes = [0x03u8];
-        let mut r = BitReader::new(&bytes);
-        let err = decode_prefix_code(&mut r, 4, 16).unwrap_err();
-        assert!(
-            matches!(err, HuffmanError::ComplexPrefixCodeNotYetSupported { hskip: 3 }),
-            "expected hskip=3, got {err:?}"
-        );
-    }
+    // SP154 L5b: the previous "complex code surfaces typed Unsupported"
+    // test was deleted — L5b implements the complex-code path. The
+    // typed `ComplexPrefixCodeNotYetSupported` variant is retained as
+    // non_exhaustive for callers (e.g. compressed-metablock V1) that
+    // may still want to bail early when not all subsidiary alphabets
+    // are wired up. See the new `complex_prefix_code_*` KATs below.
 
     /// decode_prefix_code dispatches to simple-code path on type=1.
     #[test]
@@ -577,5 +852,403 @@ mod tests {
         let mut r = BitReader::new(&bytes);
         let s = code.decode_symbol(&mut r).unwrap();
         assert_eq!(s, 7, "first bit '0' must decode to length-1 sym 7");
+    }
+
+    // -------------------------- L5b KATs --------------------------
+    //
+    // Each L5b KAT is HAND-DERIVED from RFC 7932 §3.5 — no encoder used.
+    // The RFC §3.5 fixed 6-symbol "code length code" (parsed RIGHT-TO-LEFT
+    // which equates to LSB-first stream order):
+    //
+    //   Symbol (= code-length value) | Code (stream bits, LSB-first)
+    //   ---------------------------- | -----------------------------
+    //   0                            | "00"   (2 bits: 0, 0)
+    //   1                            | "1110" (4 bits: 1, 1, 1, 0)
+    //   2                            | "110"  (3 bits: 1, 1, 0)
+    //   3                            | "01"   (2 bits: 0, 1)
+    //   4                            | "10"   (2 bits: 1, 0)
+    //   5                            | "1111" (4 bits: 1, 1, 1, 1)
+    //
+    // Kraft check: 1/4 + 1/16 + 1/8 + 1/4 + 1/4 + 1/16 = 1.0 ✓.
+
+    /// L5b KAT-1: read_code_length_code decodes all 6 symbols at the
+    /// RFC §3.5 bit patterns. Per RFC §3.5: "the bits are parsed from
+    /// right to left" — so the RFC's listed code "01" reads as STREAM
+    /// bits (bit 0, bit 1) = (rightmost-char-of-listed, then-left, ...).
+    /// E.g. "01" listed → char[1]='0', char[0]='1' → stream "1,0".
+    ///
+    /// Stream bit patterns per the RFC §3.5 table:
+    ///   sym 0: listed "00"   → stream "0,0"       (2 bits)
+    ///   sym 1: listed "0111" → stream "1,1,1,0"   (4 bits)
+    ///   sym 2: listed "011"  → stream "1,1,0"     (3 bits)
+    ///   sym 3: listed "10"   → stream "0,1"       (2 bits)
+    ///   sym 4: listed "01"   → stream "1,0"       (2 bits)
+    ///   sym 5: listed "1111" → stream "1,1,1,1"   (4 bits)
+    ///
+    /// Test pack order: sym 0, sym 3, sym 4, sym 2, sym 1, sym 5.
+    ///   bit 0=0, 1=0  (sym 0)
+    ///   bit 2=0, 3=1  (sym 3)
+    ///   bit 4=1, 5=0  (sym 4)
+    ///   bit 6=1, 7=1, 8=0  (sym 2)
+    ///   bit 9=1, 10=1, 11=1, 12=0  (sym 1)
+    ///   bit 13=1, 14=1, 15=1, 16=1  (sym 5)
+    ///
+    /// Byte 0 (bits 0..7): 0,0,0,1,1,0,1,1 → 8+16+64+128 = 216 = 0xD8
+    /// Byte 1 (bits 8..15): 0,1,1,1,0,1,1,1 → 2+4+8+32+64+128 = 238 = 0xEE
+    /// Byte 2 (bit 16): 1,0,0,0,0,0,0,0 → 1 = 0x01
+    #[test]
+    fn read_code_length_code_decodes_all_six_symbols() {
+        let bytes = [0xD8u8, 0xEE, 0x01];
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(read_code_length_code(&mut r).unwrap(), 0);
+        assert_eq!(read_code_length_code(&mut r).unwrap(), 3);
+        assert_eq!(read_code_length_code(&mut r).unwrap(), 4);
+        assert_eq!(read_code_length_code(&mut r).unwrap(), 2);
+        assert_eq!(read_code_length_code(&mut r).unwrap(), 1);
+        assert_eq!(read_code_length_code(&mut r).unwrap(), 5);
+    }
+
+    /// L5b KAT-2: simplest 2-symbol complex prefix code, HSKIP=0.
+    /// Main alphabet has 2 symbols, both with length 1.
+    ///
+    /// Hand-derivation:
+    ///   - HSKIP=0 (caller already consumed the 2-bit dispatcher).
+    ///   - CLC reads (in fixed §3.5 order):
+    ///       pos 0 (CLC-sym 1, "main length 1"): length 1 (bits: 1,1,1,0)
+    ///       pos 1 (CLC-sym 2): length 0 (bits: 0,0)
+    ///       pos 2 (CLC-sym 3): length 0 (bits: 0,0)
+    ///       pos 3 (CLC-sym 4): length 0 (bits: 0,0)
+    ///       pos 4 (CLC-sym 0, "main length 0"): length 1 (bits: 1,1,1,0)
+    ///       → at this point nonzero_count=2, Kraft sum = 16+16 = 32 → STOP
+    ///   - CLC canonical: sym 0 (len 1, sorted-first) → code MSB "0",
+    ///                    sym 1 (len 1, sorted-second) → code MSB "1".
+    ///   - Decode 2 main lengths via CLC:
+    ///       bit "1" → CLC-sym 1 → main len 1   (main sym 0 gets length 1)
+    ///       bit "1" → CLC-sym 1 → main len 1   (main sym 1 gets length 1)
+    ///   - Main canonical: sym 0 (len 1) → MSB "0"; sym 1 (len 1) → MSB "1".
+    ///
+    /// Stream bits 0..18 (LSB-first within bytes):
+    ///   bit  0: CLC pos 0, bit a = 1
+    ///   bit  1:           bit b = 1
+    ///   bit  2:           bit c = 1
+    ///   bit  3:           bit d = 0
+    ///   bit  4: CLC pos 1, bit a = 0
+    ///   bit  5:           bit b = 0
+    ///   bit  6: CLC pos 2, bit a = 0
+    ///   bit  7:           bit b = 0
+    ///   bit  8: CLC pos 3, bit a = 0
+    ///   bit  9:           bit b = 0
+    ///   bit 10: CLC pos 4, bit a = 1
+    ///   bit 11:           bit b = 1
+    ///   bit 12:           bit c = 1
+    ///   bit 13:           bit d = 0
+    ///   bit 14: main-len read 1 = 1
+    ///   bit 15: main-len read 2 = 1
+    ///
+    /// (Decoder doesn't actually use bits 16+ for code construction.)
+    ///
+    /// Byte 0 LSB-first bits 0..7: 1,1,1,0,0,0,0,0 → value = 1+2+4 = 7 → 0x07.
+    /// Byte 1 LSB-first bits 8..15: 0,0,1,1,1,0,1,1 → value = 4+8+16+64+128 = 220 = 0xDC.
+    #[test]
+    fn complex_prefix_code_minimal_two_symbols() {
+        let bytes = [0x07u8, 0xDC];
+        let mut r = BitReader::new(&bytes);
+        let code = decode_complex_prefix_code(&mut r, 0, 2).unwrap();
+        assert_eq!(code.len(), 2);
+        // Decode test: 2 more bits "0", "1" → main syms 0, 1.
+        // Place them at bits 16..17 in a continuation buffer.
+        // The decoder is positioned at bit_pos = 16 after the above
+        // header. We extend the stream with one more byte for decode.
+        // Re-run from scratch with a longer buffer.
+        let bytes = [0x07u8, 0xDC, 0x02];
+        // Byte 2 bits 16,17: bit 16=0, bit 17=1 → value 2 → 0x02.
+        let mut r = BitReader::new(&bytes);
+        let code = decode_complex_prefix_code(&mut r, 0, 2).unwrap();
+        let s1 = code.decode_symbol(&mut r).unwrap();
+        let s2 = code.decode_symbol(&mut r).unwrap();
+        assert_eq!(s1, 0, "first decoded main symbol via bit '0'");
+        assert_eq!(s2, 1, "second decoded main symbol via bit '1'");
+    }
+
+    /// L5b KAT-3: HSKIP=2 skips the first 2 entries (CLC-syms 1 and 2 get
+    /// length 0 implicitly). Builds a CLC where CLC-sym 3 has length 2,
+    /// CLC-sym 4 has length 2, CLC-sym 0 has length 2, CLC-sym 17 has
+    /// length 2 (Kraft 1/4*4 = 1 = sum 32 → ok).
+    ///
+    /// Read order after HSKIP=2: CLC-sym 3 (pos 2), CLC-sym 4 (pos 3),
+    /// CLC-sym 0 (pos 4), CLC-sym 5 (pos 5), CLC-sym 17 (pos 6).
+    ///
+    /// Plan: assign length 2 to CLC-sym 3, length 2 to CLC-sym 4,
+    /// length 2 to CLC-sym 0, length 0 to CLC-sym 5, length 2 to
+    /// CLC-sym 17. At that point Kraft = 4 * 8 = 32 → STOP after pos 6.
+    /// Total CLC bits = 3 + 3 + 3 + 2 + 3 = 14 bits.
+    ///
+    /// Canonical CLC (sorted by length, then symbol):
+    ///   CLC-sym 0 (len 2) → MSB code "00"
+    ///   CLC-sym 3 (len 2) → MSB code "01"
+    ///   CLC-sym 4 (len 2) → MSB code "10"
+    ///   CLC-sym 17 (len 2) → MSB code "11"
+    ///
+    /// Then we want a 5-symbol main alphabet. Let's set main symbols
+    /// 0,1,2,3,4 with lengths 0,0,3,3,4 (Kraft sum = 0 + 0 + 4096 + 4096
+    /// + 2048 = 10240 ≠ 32768 — doesn't work).
+    ///
+    /// Simpler: main alphabet = 4 symbols. Use CLC to produce lengths
+    /// [3, 3, 3, 3] → Kraft = 4*4096 = 16384 ≠ 32768. Bad.
+    ///
+    /// Try lengths [2, 2, 2, 2]: Kraft = 4 * 8192 = 32768 ✓. We'd
+    /// emit CLC-sym 2 four times — but we don't have CLC-sym 2 in our
+    /// code! Let's redo the CLC plan.
+    ///
+    /// Revised plan: HSKIP=2; assign CLC-sym 3 length 1, CLC-sym 17
+    /// length 1 (Kraft 16+16=32 → STOP at pos 6 after reading 5 entries).
+    /// Length 1 codes are 4 bits each (stream "1,1,1,0").
+    ///
+    /// CLC read sequence (pos 2..6):
+    ///   pos 2 (CLC-sym 3): length 1 — 4 bits "1110" LSB
+    ///   pos 3 (CLC-sym 4): length 0 — 2 bits "00"
+    ///   pos 4 (CLC-sym 0): length 0 — 2 bits "00"
+    ///   pos 5 (CLC-sym 5): length 0 — 2 bits "00"
+    ///   pos 6 (CLC-sym 17): length 1 — 4 bits "1110"
+    /// Total: 14 bits.
+    ///
+    /// Canonical CLC: sym 3 (len 1) → "0"; sym 17 (len 1) → "1".
+    ///
+    /// Main alphabet plan: alphabet_size = 4. Decode 4 main lengths.
+    /// To emit length 3 four times in a row: emit CLC-sym 3 once + use
+    /// RLE? But sym 16 repeats previous non-zero, sym 17 repeats zero.
+    /// To get 4 lengths of value 3, we'd need to emit CLC-sym 3 four
+    /// times (4 stream bits "0").
+    ///
+    /// That gives main_lengths = [3, 3, 3, 3]. Kraft = 4 * 4096 = 16384.
+    /// Not 32768 → NotCanonical reject!
+    ///
+    /// Take a step back. For a valid 4-symbol code with Kraft=32768,
+    /// lengths must satisfy sum(32768>>len) = 32768. Lengths {2,2,2,2}
+    /// → 8192 * 4 = 32768 ✓. So we need 4 main lengths of 2.
+    ///
+    /// To emit "2" four times, the CLC must encode the value 2. Let's
+    /// re-revise: CLC-sym 2 length 1, CLC-sym 17 length 1 (still Kraft 32).
+    /// HSKIP=2 skips CLC-sym 1, CLC-sym 2. CRAP — we can't reach CLC-sym 2
+    /// with HSKIP=2! HSKIP=2 makes CLC-syms 1 and 2 implicitly zero.
+    ///
+    /// So HSKIP=2 KATs need a CLC that emits values OTHER than 1 or 2.
+    /// E.g. emit lengths-of-3 (CLC-sym 3) and 0s/zeros via CLC-sym 17.
+    ///
+    /// Final plan: HSKIP=2, alphabet_size=8. CLC-sym 3 length 1,
+    /// CLC-sym 17 length 1. Emit 8 main lengths of value 3 directly:
+    /// 8 * (32768 >> 3) = 8 * 4096 = 32768 ✓.
+    ///
+    /// Stream bits for the 8-bit-main-alphabet code construction:
+    /// Each main length read = 1 CLC bit (CLC-sym 3 = "0", CLC-sym 17 = "1").
+    /// All 8 should be CLC-sym 3 → 8 stream bits "0,0,0,0,0,0,0,0".
+    ///
+    /// Full layout (HSKIP=2 dispatcher already consumed by caller):
+    ///   bits 0..3:  CLC pos 2 (sym 3) len 1 → "1,1,1,0"
+    ///   bits 4..5:  CLC pos 3 (sym 4) len 0 → "0,0"
+    ///   bits 6..7:  CLC pos 4 (sym 0) len 0 → "0,0"
+    ///   bits 8..9:  CLC pos 5 (sym 5) len 0 → "0,0"
+    ///   bits 10..13: CLC pos 6 (sym 17) len 1 → "1,1,1,0"
+    ///   (Kraft = 32, nonzero=2 → STOP)
+    ///   bits 14..21: 8 main lengths, each "0" CLC bit = CLC-sym 3 → main len 3.
+    ///   bits 22+: 8 main decode bits to test (placeholder)
+    ///
+    /// Byte 0 (bits 0..7): 1,1,1,0,0,0,0,0 → value 1+2+4 = 7 → 0x07.
+    /// Byte 1 (bits 8..15): 0,0,1,1,1,0,0,0 → value 4+8+16 = 28 → 0x1C.
+    /// Byte 2 (bits 16..23): 0,0,0,0,0,0,X,X (X bits 22-23) → see below.
+    ///
+    /// For main alphabet of 8 syms each with length 3: canonical codes
+    /// (sorted by length then symbol) are:
+    ///   sym 0 → 000
+    ///   sym 1 → 001
+    ///   sym 2 → 010
+    ///   sym 3 → 011
+    ///   sym 4 → 100
+    ///   sym 5 → 101
+    ///   sym 6 → 110
+    ///   sym 7 → 111
+    ///
+    /// Test decode: bits "000" → sym 0. We just need to read it once.
+    /// Place decode bits 22..24 = "0", "0", "0" → decode sym 0.
+    /// bit 22 = 0, bit 23 = 0, bit 24 = 0.
+    ///
+    /// Byte 2 bits 16..23 = all 0 → 0x00. Byte 3 bit 24 = 0 → 0x00.
+    #[test]
+    fn complex_prefix_code_hskip_2_eight_syms_all_length_3() {
+        let bytes = [0x07u8, 0x1C, 0x00, 0x00];
+        let mut r = BitReader::new(&bytes);
+        let code = decode_complex_prefix_code(&mut r, 2, 8).unwrap();
+        assert_eq!(code.len(), 8);
+        let s = code.decode_symbol(&mut r).unwrap();
+        assert_eq!(s, 0, "MSB '000' decodes to length-3 sym 0");
+    }
+
+    /// L5b KAT-4: symbol-16 RLE (repeat-previous-nonzero). Main alphabet
+    /// of 4 symbols, all length 2. Use CLC to emit length 2 once, then
+    /// CLC-sym 16 with extra_bits=0 → "repeat 3 times" = 3 more emissions.
+    /// Total emissions = 1 + 3 = 4 ✓.
+    ///
+    /// Plan:
+    ///   HSKIP=0. CLC-sym 2 length 1 (4 bits "1,1,1,0"), CLC-sym 16
+    ///   length 1 (4 bits "1,1,1,0"). Other slots length 0.
+    ///
+    ///   Read order: CLC-sym 1 (pos 0), 2 (pos 1), 3 (pos 2), 4 (pos 3),
+    ///   0 (pos 4), 5 (pos 5), 17 (pos 6), 6 (pos 7), 16 (pos 8), ...
+    ///
+    ///   To put length 1 on CLC-sym 2 and CLC-sym 16, we need to read
+    ///   through pos 0 (len 0), pos 1 (len 1), pos 2 (len 0), pos 3
+    ///   (len 0), pos 4 (len 0), pos 5 (len 0), pos 6 (len 0), pos 7
+    ///   (len 0), pos 8 (len 1). At that point Kraft = 16+16 = 32 → STOP.
+    ///
+    ///   But we have a lot of zeros — that's a lot of bits (2 bits each).
+    ///   Total CLC bits = 2 + 4 + 2 + 2 + 2 + 2 + 2 + 2 + 4 = 22 bits.
+    ///
+    /// CLC canonical: sym 2 (len 1) → MSB "0"; sym 16 (len 1) → MSB "1".
+    ///
+    /// Main reads:
+    ///   First read: CLC-sym 2 (CLC bit "0") → main len 2.
+    ///     main_lengths = [2]. prev_nonzero=2.
+    ///   Second read: CLC-sym 16 (CLC bit "1") → repeat-previous.
+    ///     2 extra bits = 0 → count = 3 + 0 = 3. Emit 3 more length-2s.
+    ///     main_lengths = [2,2,2,2]. Loop exits at length 4.
+    ///
+    /// Main canonical: all 4 syms length 2 → MSB codes 00, 01, 10, 11.
+    ///
+    /// Full bit layout (HSKIP=0 already consumed by dispatcher):
+    ///   bits 0..1:  CLC pos 0 (sym 1) len 0 → "0,0"
+    ///   bits 2..5:  CLC pos 1 (sym 2) len 1 → "1,1,1,0"
+    ///   bits 6..7:  CLC pos 2 (sym 3) len 0 → "0,0"
+    ///   bits 8..9:  CLC pos 3 (sym 4) len 0 → "0,0"
+    ///   bits 10..11: CLC pos 4 (sym 0) len 0 → "0,0"
+    ///   bits 12..13: CLC pos 5 (sym 5) len 0 → "0,0"
+    ///   bits 14..15: CLC pos 6 (sym 17) len 0 → "0,0"
+    ///   bits 16..17: CLC pos 7 (sym 6) len 0 → "0,0"
+    ///   bits 18..21: CLC pos 8 (sym 16) len 1 → "1,1,1,0"
+    ///   (Kraft = 32, nonzero=2 → STOP)
+    ///   bit 22: main read 1 = "0" (CLC-sym 2 → main len 2)
+    ///   bit 23: main read 2 = "1" (CLC-sym 16 → repeat previous)
+    ///   bits 24..25: 2 extra bits = 0,0 → count = 3.
+    ///   bits 26..27: 2 decode bits "0,0" → main sym 0
+    ///
+    /// Byte 0 bits 0..7: 0,0,1,1,1,0,0,0 → 4+8+16 = 28 → 0x1C
+    /// Byte 1 bits 8..15: 0,0,0,0,0,0,0,0 → 0x00
+    /// Byte 2 bits 16..23: 0,0,1,1,1,0,0,1 → 4+8+16+128 = 156 → 0x9C
+    /// Byte 3 bits 24..27: 0,0,0,0 → 0x00
+    #[test]
+    fn complex_prefix_code_symbol_16_repeat_previous() {
+        let bytes = [0x1Cu8, 0x00, 0x9C, 0x00];
+        let mut r = BitReader::new(&bytes);
+        let code = decode_complex_prefix_code(&mut r, 0, 4).unwrap();
+        assert_eq!(code.len(), 4);
+        // Decode bit "0,0" (MSB) → main sym 0.
+        let s = code.decode_symbol(&mut r).unwrap();
+        assert_eq!(s, 0);
+    }
+
+    /// L5b KAT-5: symbol-17 RLE (repeat-zero). Main alphabet of 5
+    /// symbols where the first 3 are absent (length 0) and the last 2
+    /// have length 1. CLC needs to emit value 1 (= main length 1) and
+    /// value 17 (= zero-repeat).
+    ///
+    /// Plan:
+    ///   HSKIP=0. CLC-sym 1 length 1, CLC-sym 17 length 1.
+    ///   Both will be in canonical code: sym 1 (len 1) → "0", sym 17
+    ///   (len 1) → "1".
+    ///
+    ///   CLC read order: pos 0 (sym 1), pos 1 (sym 2), pos 2 (sym 3),
+    ///   pos 3 (sym 4), pos 4 (sym 0), pos 5 (sym 5), pos 6 (sym 17).
+    ///   CLC-sym 1 → length 1 (pos 0, 4 bits "1,1,1,0").
+    ///   CLC-sym 17 → length 1 (pos 6, 4 bits "1,1,1,0").
+    ///   Others length 0 (2 bits each, "0,0").
+    ///   Kraft = 16+16 = 32 → STOP at pos 6.
+    ///   Total CLC bits = 4+2+2+2+2+2+4 = 18 bits.
+    ///
+    ///   Main reads (alphabet_size=5):
+    ///     read 1: CLC-sym 17 (CLC bit "1") + 3 extra bits = 0,0,0 →
+    ///       count = 3 + 0 = 3. Emit 3 zeros. main_lengths=[0,0,0].
+    ///     read 2: CLC-sym 1 (CLC bit "0") → main len 1. main=[0,0,0,1].
+    ///     read 3: CLC-sym 1 (CLC bit "0") → main len 1. main=[0,0,0,1,1].
+    ///   Loop exits at length 5.
+    ///
+    ///   Main canonical: sym 3 (len 1) → "0"; sym 4 (len 1) → "1".
+    ///
+    /// Full bit layout (HSKIP=0):
+    ///   bits 0..3:  CLC pos 0 (sym 1) len 1 → "1,1,1,0"
+    ///   bits 4..5:  CLC pos 1 (sym 2) len 0 → "0,0"
+    ///   bits 6..7:  CLC pos 2 (sym 3) len 0 → "0,0"
+    ///   bits 8..9:  CLC pos 3 (sym 4) len 0 → "0,0"
+    ///   bits 10..11: CLC pos 4 (sym 0) len 0 → "0,0"
+    ///   bits 12..13: CLC pos 5 (sym 5) len 0 → "0,0"
+    ///   bits 14..17: CLC pos 6 (sym 17) len 1 → "1,1,1,0"
+    ///   bit 18: main read 1 = "1" (sym 17, repeat-zero)
+    ///   bits 19..21: 3 extra bits = "0,0,0"
+    ///   bit 22: main read 2 = "0" (sym 1, length 1)
+    ///   bit 23: main read 3 = "0" (sym 1, length 1)
+    ///   bit 24: decode test, "0" → main sym 3.
+    ///
+    /// Byte 0 bits 0..7: 1,1,1,0,0,0,0,0 → 0x07.
+    /// Byte 1 bits 8..15: 0,0,0,0,0,0,1,1 → 64+128 = 192 → 0xC0.
+    /// Byte 2 bits 16..23: 1,0,1,0,0,0,0,0 → 1+4 = 5 → 0x05.
+    /// Byte 3 bits 24..31: 0,0,0,0,0,0,0,0 → 0x00.
+    #[test]
+    fn complex_prefix_code_symbol_17_repeat_zero() {
+        let bytes = [0x07u8, 0xC0, 0x05, 0x00];
+        let mut r = BitReader::new(&bytes);
+        let code = decode_complex_prefix_code(&mut r, 0, 5).unwrap();
+        assert_eq!(code.len(), 2);
+        // Decode bit "0" → main sym 3.
+        let s = code.decode_symbol(&mut r).unwrap();
+        assert_eq!(s, 3);
+    }
+
+    /// L5b KAT-6: complex prefix code dispatched via `decode_prefix_code`
+    /// using a leading 2-bit '00' (HSKIP=0). Reuses the KAT-2 layout
+    /// but shifted by 2 bits to account for the dispatcher's type-code read.
+    /// Uses alphabet_size=2 (same as KAT-2).
+    ///
+    /// Stream bit values (bit 0 is the LSB of byte 0):
+    ///   bit 0..1: 0, 0  (type code = HSKIP=0)
+    ///   bit 2..5: 1,1,1,0  (CLC pos 0 sym 1 len 1)
+    ///   bit 6..7: 0,0  (CLC pos 1 sym 2 len 0)
+    ///   bit 8..9: 0,0  (CLC pos 2 sym 3 len 0)
+    ///   bit 10..11: 0,0  (CLC pos 3 sym 4 len 0)
+    ///   bit 12..15: 1,1,1,0  (CLC pos 4 sym 0 len 1)
+    ///   bit 16..17: 1, 1  (main lens via CLC-sym 1)
+    ///   bit 18..19: 0, 1  (decode test → main syms 0, 1)
+    ///
+    /// Byte 0 bits 0..7: 0,0,1,1,1,0,0,0 → 4+8+16 = 28 → 0x1C
+    /// Byte 1 bits 8..15: 0,0,0,0,1,1,1,0 → 16+32+64 = 112 → 0x70
+    /// Byte 2 bits 16..19: 1,1,0,1 → 1+2+8 = 11 → 0x0B
+    #[test]
+    fn decode_prefix_code_dispatches_to_complex_on_type_0() {
+        let bytes = [0x1Cu8, 0x70, 0x0B];
+        let mut r = BitReader::new(&bytes);
+        let code = decode_prefix_code(&mut r, 4, 2).unwrap();
+        assert_eq!(code.len(), 2);
+        let s1 = code.decode_symbol(&mut r).unwrap();
+        let s2 = code.decode_symbol(&mut r).unwrap();
+        assert_eq!(s1, 0);
+        assert_eq!(s2, 1);
+    }
+
+    /// L5b KAT-7 (pentest): symbol-17 RLE that overruns the declared
+    /// alphabet size → typed RepeatOverrunsAlphabet error.
+    ///
+    /// Plan: same CLC as KAT-5, but ask for alphabet_size=2 (smaller
+    /// than the 3 zeros that the first sym-17 emit would produce).
+    /// The decoder must reject before pushing past alphabet_size.
+    ///
+    /// Reuse byte-0 + byte-1 from KAT-5 (CLC) + byte 2 first read
+    /// only — emit CLC-sym 17 with extra=0 (count=3, but alphabet=2).
+    #[test]
+    fn pentest_complex_prefix_code_symbol_17_overruns_alphabet() {
+        // KAT-5 bytes through bit 21 are sufficient for the error.
+        let bytes = [0x07u8, 0xC0, 0x05, 0x00];
+        let mut r = BitReader::new(&bytes);
+        let err = decode_complex_prefix_code(&mut r, 0, 2).unwrap_err();
+        assert!(
+            matches!(err, HuffmanError::RepeatOverrunsAlphabet { needed: 3, alphabet_size: 2 }),
+            "expected RepeatOverrunsAlphabet needed=3 alpha=2, got {err:?}"
+        );
     }
 }

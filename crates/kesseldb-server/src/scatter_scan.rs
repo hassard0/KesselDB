@@ -1142,4 +1142,358 @@ mod tests {
         let expected = rows_to_payload(&[&rec(42, b'A'), &rec(42, b'B')]);
         assert_eq!(r, OpResult::Got(expected));
     }
+
+    // ---------- T3 K-invariance property sweep (SP155 §7.2 + acceptance #1) ----------
+    //
+    // The killer correctness check: for K ∈ {1, 2, 4, 8, 16}, the merged
+    // SelectSorted output must be byte-identical to the K=1 baseline,
+    // when the input rows are deterministically split across K shards
+    // by a rendezvous-like hash + each shard's slice is locally sorted
+    // (which is what the per-shard SM does, per kessel-sm:3540-3589).
+    //
+    // The property test runs at the *merge layer* — no TCP, no VSR,
+    // no real shards. That keeps the per-seed cost at ~microseconds so
+    // we can sweep 20+ seeds × 5 K values without bloating CI. The
+    // real-socket K=1↔K=4 byte-identical test ships in `router.rs`
+    // (T2's `scatter_select_sorted_k4_matches_k1_byte_identical`); this
+    // sweep widens K-coverage at the merge layer where the tie-break
+    // decision lives.
+    //
+    // We use **unique sort values** in the main property sweep — that's
+    // the user-facing common case (a `created_at` timestamp, a unique
+    // row id, etc.). The §5.4 tie-break caveat manifests only when
+    // multiple rows have *byte-identical* sort values that fall on
+    // different shards; that case is locked separately in
+    // `merge_sorted_tie_broken_by_shard_id` (single-K determinism only,
+    // not K-invariance).
+
+    /// Mini rendezvous hash — same shape as `kessel_shard::ShardMap`
+    /// but inlined to keep this module zero-dep on `kessel-shard`. Uses
+    /// the splitmix64 PRNG from `kessel-proto` for hashing (the same
+    /// PRNG the SM uses for deterministic seeds), so the assignment is
+    /// reproducible and balanced.
+    fn assign_shard(oid: &[u8; 16], k: usize) -> usize {
+        if k <= 1 {
+            return 0;
+        }
+        // Hash the (oid, shard_id) pair via splitmix64-folded bytes;
+        // pick the shard with the max weight. Same idea as crc32c
+        // rendezvous but without pulling in kessel-storage's key type.
+        let oid_word_lo = u64::from_le_bytes(oid[..8].try_into().unwrap());
+        let oid_word_hi = u64::from_le_bytes(oid[8..].try_into().unwrap());
+        let mut best = (0usize, 0u64);
+        for s in 0..k as u64 {
+            let mut rng = kessel_proto::Rng::new(
+                oid_word_lo
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .wrapping_add(oid_word_hi)
+                    .wrapping_add(s.wrapping_mul(0xBF58_476D_1CE4_E5B9)),
+            );
+            let w = rng.next_u64();
+            if w > best.1 {
+                best = (s as usize, w);
+            }
+        }
+        best.0
+    }
+
+    /// One row in the property-test fixture. Mimics the per-shard SM
+    /// shape: an `oid` (16-byte object id) + a `record` blob whose
+    /// sort field lives at `(offset, width)`.
+    #[derive(Clone)]
+    struct PropRow {
+        oid: [u8; 16],
+        record: Vec<u8>,
+    }
+
+    /// Build a fixture: `n` rows with unique U64 sort values + unique
+    /// oids. The sort field is at byte offset 0, width 8.
+    ///
+    /// The sort values are a *random permutation* of `0..n` so they're
+    /// unique and in a non-trivial order. The oids are `oid_seed[i]`
+    /// — unique 16-byte sequences derived from the same PRNG.
+    fn build_unique_fixture(seed: u64, n: u64) -> Vec<PropRow> {
+        let mut rng = kessel_proto::Rng::new(seed);
+        // Pre-allocate sort values 0..n, shuffle with Fisher-Yates so
+        // each fixture is a different permutation but every value
+        // shows up exactly once.
+        let mut vals: Vec<u64> = (0..n).collect();
+        for i in (1..vals.len()).rev() {
+            let j = (rng.next_u64() as usize) % (i + 1);
+            vals.swap(i, j);
+        }
+        // Build the rows: record = [sort_field_u64 LE][oid bytes] (8+16=24 bytes).
+        // No header — keep the fixture minimal. The merger reads only
+        // the `(offset, width)` slice it's told to.
+        (0..n as usize)
+            .map(|i| {
+                let mut oid = [0u8; 16];
+                rng.fill(&mut oid);
+                let mut record = Vec::with_capacity(24);
+                record.extend_from_slice(&vals[i].to_le_bytes());
+                record.extend_from_slice(&oid);
+                PropRow { oid, record }
+            })
+            .collect()
+    }
+
+    /// Distribute `rows` across `k` shards using the rendezvous mock,
+    /// then for each shard sort that shard's rows by (sort_field_u64,
+    /// oid) ascending — exactly the per-shard SM's `SelectSorted` total
+    /// order (kessel-sm:3572). Return the per-shard `OpResult::Got`
+    /// vec in shard-id order, ready for `merge_scan_results`.
+    fn distribute_and_sort(
+        rows: &[PropRow],
+        k: usize,
+        desc: bool,
+    ) -> Vec<OpResult> {
+        let mut shards: Vec<Vec<PropRow>> = (0..k).map(|_| Vec::new()).collect();
+        for r in rows {
+            let s = assign_shard(&r.oid, k);
+            shards[s].push(r.clone());
+        }
+        shards
+            .into_iter()
+            .map(|mut s| {
+                // Per-shard (value, oid) sort — matches kessel-sm:3572.
+                s.sort_by(|a, b| {
+                    let av = u64::from_le_bytes(a.record[..8].try_into().unwrap());
+                    let bv = u64::from_le_bytes(b.record[..8].try_into().unwrap());
+                    av.cmp(&bv).then(a.oid.cmp(&b.oid))
+                });
+                if desc {
+                    s.reverse();
+                }
+                let payload: Vec<u8> = {
+                    let mut p = Vec::new();
+                    for r in &s {
+                        p.extend_from_slice(&(r.record.len() as u32).to_le_bytes());
+                        p.extend_from_slice(&r.record);
+                    }
+                    p
+                };
+                OpResult::Got(payload)
+            })
+            .collect()
+    }
+
+    /// **K-invariance property sweep (SP155 §7.2)**: for unique sort
+    /// values, the merged `SelectSorted` output at K ∈ {1, 2, 4, 8, 16}
+    /// MUST be byte-identical to the K=1 baseline. 25 seeds × 5 K values
+    /// = 125 fixture runs; 100 rows × 24 bytes/row keeps the total merge
+    /// cost in the milliseconds even in unoptimized test builds.
+    ///
+    /// This is the killer correctness check: the merge produces the
+    /// same byte sequence regardless of K when the inputs are
+    /// per-shard-sorted slices of the same underlying row set.
+    #[test]
+    fn k_invariance_select_sorted_unique_values_25_seeds() {
+        let n_rows: u64 = 100;
+        let ks: &[usize] = &[1, 2, 4, 8, 16];
+        for seed in 0..25u64 {
+            let rows = build_unique_fixture(seed, n_rows);
+            // K=1 baseline: a single shard holding all rows, fully sorted.
+            let k1 = distribute_and_sort(&rows, 1, false);
+            let baseline = merge_scan_results(
+                k1,
+                &ScatterKind::Sorted {
+                    sort_kind: FieldKind::U64,
+                    sort_offset: 0,
+                    sort_width: 8,
+                    desc: false,
+                    offset: 0,
+                    limit: 0,
+                },
+            );
+            for &k in ks {
+                let per_shard = distribute_and_sort(&rows, k, false);
+                let merged = merge_scan_results(
+                    per_shard,
+                    &ScatterKind::Sorted {
+                        sort_kind: FieldKind::U64,
+                        sort_offset: 0,
+                        sort_width: 8,
+                        desc: false,
+                        offset: 0,
+                        limit: 0,
+                    },
+                );
+                assert_eq!(
+                    merged, baseline,
+                    "seed={seed} k={k}: K-invariance violated (\
+                     SelectSorted merged bytes differ from K=1 baseline)"
+                );
+            }
+        }
+    }
+
+    /// **K-invariance with descending order**: same property but with
+    /// `desc=true`. Locks that the descending heap polarity is correct
+    /// across K.
+    #[test]
+    fn k_invariance_select_sorted_desc_unique_values_20_seeds() {
+        let n_rows: u64 = 100;
+        let ks: &[usize] = &[1, 2, 4, 8, 16];
+        for seed in 200..220u64 {
+            let rows = build_unique_fixture(seed, n_rows);
+            let k1 = distribute_and_sort(&rows, 1, true);
+            let baseline = merge_scan_results(
+                k1,
+                &ScatterKind::Sorted {
+                    sort_kind: FieldKind::U64,
+                    sort_offset: 0,
+                    sort_width: 8,
+                    desc: true,
+                    offset: 0,
+                    limit: 0,
+                },
+            );
+            for &k in ks {
+                let per_shard = distribute_and_sort(&rows, k, true);
+                let merged = merge_scan_results(
+                    per_shard,
+                    &ScatterKind::Sorted {
+                        sort_kind: FieldKind::U64,
+                        sort_offset: 0,
+                        sort_width: 8,
+                        desc: true,
+                        offset: 0,
+                        limit: 0,
+                    },
+                );
+                assert_eq!(
+                    merged, baseline,
+                    "seed={seed} k={k} desc=true: K-invariance violated"
+                );
+            }
+        }
+    }
+
+    /// **K-invariance with OFFSET + LIMIT**: same property but with a
+    /// non-zero OFFSET / LIMIT in the merge loop. Locks that the
+    /// post-merge slicing is K-invariant.
+    #[test]
+    fn k_invariance_select_sorted_offset_limit_15_seeds() {
+        let n_rows: u64 = 100;
+        let ks: &[usize] = &[1, 2, 4, 8];
+        for seed in 500..515u64 {
+            let rows = build_unique_fixture(seed, n_rows);
+            let k1 = distribute_and_sort(&rows, 1, false);
+            // OFFSET 20 LIMIT 30 over 100 rows = rows [20..50] of the
+            // sorted output.
+            let baseline = merge_scan_results(
+                k1,
+                &ScatterKind::Sorted {
+                    sort_kind: FieldKind::U64,
+                    sort_offset: 0,
+                    sort_width: 8,
+                    desc: false,
+                    offset: 20,
+                    limit: 30,
+                },
+            );
+            for &k in ks {
+                let per_shard = distribute_and_sort(&rows, k, false);
+                let merged = merge_scan_results(
+                    per_shard,
+                    &ScatterKind::Sorted {
+                        sort_kind: FieldKind::U64,
+                        sort_offset: 0,
+                        sort_width: 8,
+                        desc: false,
+                        offset: 20,
+                        limit: 30,
+                    },
+                );
+                assert_eq!(
+                    merged, baseline,
+                    "seed={seed} k={k} offset=20 limit=30: K-invariance violated"
+                );
+            }
+        }
+    }
+
+    /// **Unordered K-invariance (multiset equality)**: for `Select` /
+    /// `QueryRows` / `SelectFields`, the merge is shard-id-ordered
+    /// concat — the *byte* sequence varies with K (because rows
+    /// distribute differently across shards), but the **multiset of
+    /// rows** must be identical to K=1.
+    ///
+    /// Lock the multiset invariance: parse the merged payload, collect
+    /// rows into a `BTreeSet`, assert equality across K. This is the
+    /// honest acceptance criterion for unordered scatter merges per
+    /// the spec's §3.6 "deterministic but order varies with K"
+    /// language.
+    #[test]
+    fn k_invariance_unordered_multiset_equality_25_seeds() {
+        use std::collections::BTreeSet;
+        let n_rows: u64 = 100;
+        let ks: &[usize] = &[1, 2, 4, 8, 16];
+
+        fn payload_to_set(out: &OpResult) -> std::collections::BTreeSet<Vec<u8>> {
+            let bytes = match out {
+                OpResult::Got(b) => b,
+                other => panic!("expected Got, got {other:?}"),
+            };
+            let mut set = BTreeSet::new();
+            let mut p = 0;
+            while p < bytes.len() {
+                let len = u32::from_le_bytes(
+                    bytes[p..p + 4].try_into().unwrap(),
+                ) as usize;
+                p += 4;
+                set.insert(bytes[p..p + len].to_vec());
+                p += len;
+            }
+            set
+        }
+
+        for seed in 1000..1025u64 {
+            let rows = build_unique_fixture(seed, n_rows);
+            // For unordered scans, each shard returns rows in its
+            // local storage-key order (i.e. `oid` ascending — matches
+            // kessel-sm:3540's scan_range over `[(type,0)..(type,FF)]`).
+            // Build that shape and merge.
+            let mk_unordered = |k: usize| -> OpResult {
+                let mut shards: Vec<Vec<PropRow>> =
+                    (0..k).map(|_| Vec::new()).collect();
+                for r in &rows {
+                    let s = assign_shard(&r.oid, k);
+                    shards[s].push(r.clone());
+                }
+                let per_shard: Vec<OpResult> = shards
+                    .into_iter()
+                    .map(|mut s| {
+                        s.sort_by(|a, b| a.oid.cmp(&b.oid));
+                        let mut p = Vec::new();
+                        for r in &s {
+                            p.extend_from_slice(
+                                &(r.record.len() as u32).to_le_bytes(),
+                            );
+                            p.extend_from_slice(&r.record);
+                        }
+                        OpResult::Got(p)
+                    })
+                    .collect();
+                merge_scan_results(
+                    per_shard,
+                    &ScatterKind::Unordered { limit: 0 },
+                )
+            };
+            let baseline_set = payload_to_set(&mk_unordered(1));
+            assert_eq!(
+                baseline_set.len(),
+                n_rows as usize,
+                "seed={seed}: K=1 baseline must have all {n_rows} rows"
+            );
+            for &k in ks {
+                let set = payload_to_set(&mk_unordered(k));
+                assert_eq!(
+                    set, baseline_set,
+                    "seed={seed} k={k}: unordered scatter multiset \
+                     diverged from K=1 baseline"
+                );
+            }
+        }
+    }
 }

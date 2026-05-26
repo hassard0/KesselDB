@@ -2127,4 +2127,231 @@ mod tests {
             "Select over K=4 must return the same total bytes as K=1"
         );
     }
+
+    /// SP-A T3 (SP155 §7.1 widening): multi-shard integration tests for
+    /// the other three scan ops — `Op::QueryRows`, `Op::SelectFields`,
+    /// `Op::Select` (the full-table scan) — across K=1 vs K=4 over
+    /// real sockets. Each scan op lowers to `ScatterKind::Unordered`
+    /// via the router; per spec §3.6 the multiset of rows is K-invariant
+    /// even though the byte sequence is shard-id-ordered concat.
+    ///
+    /// Shared deployment shape: one K=1 + one K=4 cluster (= 15 VSR
+    /// nodes + 2 routers), 16 rows of a simple `(v: U64)` type. Each
+    /// op is dispatched to both clusters and the result is asserted as:
+    ///
+    ///   - **`Op::Select`**: total bytes length matches K=1 (already
+    ///     covered by the SelectSorted test; here we lock the
+    ///     multiset of records as a `BTreeSet` is equal).
+    ///   - **`Op::QueryRows`**: with no eq_preds / range_preds + an
+    ///     always-true `program`, behaves as a `Select` over the type.
+    ///     Multiset equal to K=1.
+    ///   - **`Op::SelectFields`**: project just `v` (field_id=1 after
+    ///     SM-side assignment); each returned row is exactly 8 bytes.
+    ///     Multiset of 8-byte rows == K=1's.
+    ///
+    /// Because unordered scatter's *byte* sequence depends on
+    /// per-shard placement (shard-id-ordered concat per SP155 §3.6),
+    /// we lock the multiset rather than byte-identity. The
+    /// byte-identical sorted case is covered separately by
+    /// `scatter_select_sorted_k4_matches_k1_byte_identical`.
+    #[test]
+    fn scatter_unordered_ops_k4_match_k1_multiset() {
+        use kessel_catalog::{decode_type_def, ObjectType};
+        use kessel_codec::{encode, Value};
+        use kessel_expr::Program;
+        use std::collections::BTreeSet;
+
+        // ---- helper: build a router with K shards over real sockets ----
+        fn spawn_k_router(k: usize, tag: &str) -> SocketAddr {
+            let mut shards: Vec<Vec<String>> = Vec::with_capacity(k);
+            for i in 0..k {
+                shards.push(spawn_shard(&format!("{tag}-{i}")));
+            }
+            let router = Arc::new(Router::new(shards));
+            let rl = TcpListener::bind("127.0.0.1:0").unwrap();
+            let raddr = rl.local_addr().unwrap();
+            {
+                let r = router.clone();
+                std::thread::spawn(move || serve_router(rl, r));
+            }
+            raddr
+        }
+
+        let k1_addr = spawn_k_router(1, "sp-a-t3-k1");
+        let k4_addr = spawn_k_router(4, "sp-a-t3-k4");
+
+        // 1×3 + 4×3 = 15 VSR nodes; let them settle.
+        std::thread::sleep(Duration::from_millis(2400));
+
+        // ---- create the same type on both deployments ----
+        let mut c_k1 = Client::connect(k1_addr).unwrap();
+        let mut c_k4 = Client::connect(k4_addr).unwrap();
+        let type_def_bytes = encode_type_def(
+            "t",
+            &[Field {
+                field_id: 0,
+                name: "v".into(),
+                kind: FieldKind::U64,
+                nullable: false,
+            }],
+        );
+        for c in [&mut c_k1, &mut c_k4] {
+            assert_eq!(
+                c.call(&Op::CreateType { def: type_def_bytes.clone() })
+                    .unwrap(),
+                OpResult::TypeCreated(1)
+            );
+        }
+        let (name, fields) = decode_type_def(&type_def_bytes).unwrap();
+        let ot = ObjectType::from_def(name, fields);
+        let make_record =
+            |v: u64| -> Vec<u8> { encode(&ot, &[Value::Uint(v as u128)]).unwrap() };
+
+        // ---- insert the same 16 rows into both deployments ----
+        let n: u128 = 16;
+        for i in 1..=n {
+            let id = ObjectId::from_u128(i);
+            let rec = make_record(i as u64);
+            for c in [&mut c_k1, &mut c_k4] {
+                assert_eq!(
+                    c.call(&Op::Create {
+                        type_id: 1,
+                        id,
+                        record: rec.clone(),
+                    })
+                    .unwrap(),
+                    OpResult::Ok,
+                );
+            }
+        }
+
+        // Parse a `[u32 rowlen][record]*` payload into a multiset of rows.
+        fn payload_to_multiset(bytes: &[u8]) -> BTreeSet<Vec<u8>> {
+            let mut set = BTreeSet::new();
+            let mut p = 0;
+            while p < bytes.len() {
+                let len = u32::from_le_bytes(
+                    bytes[p..p + 4].try_into().unwrap(),
+                ) as usize;
+                p += 4;
+                set.insert(bytes[p..p + len].to_vec());
+                p += len;
+            }
+            set
+        }
+
+        let always_true = Program::new().push_int(1).bytes();
+
+        // ---- (1) Op::Select multiset K=1 == K=4 ----
+        let r_k1 = c_k1
+            .call(&Op::Select {
+                type_id: 1,
+                program: always_true.clone(),
+                limit: 0,
+            })
+            .unwrap();
+        let r_k4 = c_k4
+            .call(&Op::Select {
+                type_id: 1,
+                program: always_true.clone(),
+                limit: 0,
+            })
+            .unwrap();
+        let (b_k1, b_k4) = match (&r_k1, &r_k4) {
+            (OpResult::Got(a), OpResult::Got(b)) => (a, b),
+            other => panic!("Select must Got on both, got {other:?}"),
+        };
+        let set_k1 = payload_to_multiset(b_k1);
+        let set_k4 = payload_to_multiset(b_k4);
+        assert_eq!(set_k1.len(), n as usize, "Select K=1 must have {n} rows");
+        assert_eq!(
+            set_k1, set_k4,
+            "Op::Select: K=4 scatter multiset must equal K=1's"
+        );
+
+        // ---- (2) Op::QueryRows multiset K=1 == K=4 ----
+        let q_k1 = c_k1
+            .call(&Op::QueryRows {
+                type_id: 1,
+                eq_preds: vec![],
+                program: always_true.clone(),
+                limit: 0,
+                range_preds: vec![],
+            })
+            .unwrap();
+        let q_k4 = c_k4
+            .call(&Op::QueryRows {
+                type_id: 1,
+                eq_preds: vec![],
+                program: always_true.clone(),
+                limit: 0,
+                range_preds: vec![],
+            })
+            .unwrap();
+        let (b_k1, b_k4) = match (&q_k1, &q_k4) {
+            (OpResult::Got(a), OpResult::Got(b)) => (a, b),
+            other => panic!("QueryRows must Got on both, got {other:?}"),
+        };
+        let q_set_k1 = payload_to_multiset(b_k1);
+        let q_set_k4 = payload_to_multiset(b_k4);
+        assert_eq!(
+            q_set_k1.len(),
+            n as usize,
+            "QueryRows K=1 must have {n} rows"
+        );
+        assert_eq!(
+            q_set_k1, q_set_k4,
+            "Op::QueryRows: K=4 scatter multiset must equal K=1's"
+        );
+        // Bonus: QueryRows over a Select-shaped query returns the same
+        // row multiset as Select itself (both are "all rows" scans).
+        assert_eq!(
+            set_k4, q_set_k4,
+            "QueryRows(all-true) and Select(all-true) must yield the \
+             same multiset on K=4"
+        );
+
+        // ---- (3) Op::SelectFields multiset K=1 == K=4 ----
+        // Project just `v` (the SM assigns field_id=1 to the 0th field
+        // at CreateType time; see the SelectSorted test above).
+        let f_k1 = c_k1
+            .call(&Op::SelectFields {
+                type_id: 1,
+                program: always_true.clone(),
+                fields: vec![1],
+                limit: 0,
+            })
+            .unwrap();
+        let f_k4 = c_k4
+            .call(&Op::SelectFields {
+                type_id: 1,
+                program: always_true,
+                fields: vec![1],
+                limit: 0,
+            })
+            .unwrap();
+        let (b_k1, b_k4) = match (&f_k1, &f_k4) {
+            (OpResult::Got(a), OpResult::Got(b)) => (a, b),
+            other => panic!("SelectFields must Got on both, got {other:?}"),
+        };
+        let f_set_k1 = payload_to_multiset(b_k1);
+        let f_set_k4 = payload_to_multiset(b_k4);
+        assert_eq!(
+            f_set_k1.len(),
+            n as usize,
+            "SelectFields K=1 must have {n} rows"
+        );
+        assert_eq!(
+            f_set_k1, f_set_k4,
+            "Op::SelectFields: K=4 scatter multiset must equal K=1's"
+        );
+        // Each projected row is exactly 8 bytes (the U64 v field).
+        for row in &f_set_k4 {
+            assert_eq!(
+                row.len(),
+                8,
+                "SelectFields projection: each row is the 8-byte U64 v"
+            );
+        }
+    }
 }

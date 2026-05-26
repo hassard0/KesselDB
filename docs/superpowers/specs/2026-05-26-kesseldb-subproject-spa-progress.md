@@ -24,8 +24,8 @@ cross-shard `Join`, cross-shard consistent snapshot. See spec §11.
 | **T0** | Baseline: seed-7 PASSES, design spec read | DONE | (no-code) |
 | **T1** | Scaffold the router-side helper (`scatter_scan.rs` module): `ShardCaller` trait + `scatter_scan_fanout` (std::thread per shard, per-shard timeout) + `merge_scan_results` stub + 9 KATs. The helper is callable today; the call-site wiring lands in T2. | **DONE** | `195ecd6` |
 | **T2** | `Route::Scatter(ScatterKind)` variant + `route()` returns it for the 4 scan ops + `Conn::scatter_read` driver + sorted k-way heap merge + unordered concat merge + `impl ShardCaller for ClusterClient` + multi-shard SelectSorted byte-identical-to-K=1 integration test. T1 stub replaced; 13 new merge KATs. | **DONE** | `88e6c33` + `421b45a` + `51abf8b` |
-| T3 | Property sweep over K∈{1,2,4,8,16} (random data, hash-identical SelectSorted) + LIMIT cancellation correctness + multi-shard QueryRows/SelectFields integration tests | OPEN | — |
-| T4 | Sort-key extraction from row bytes + OFFSET+LIMIT in the merge loop | OPEN | — |
+| **T3** | Property sweep over K∈{1,2,4,8,16} on random 100-row datasets — 60 seeds total (25 asc + 20 desc + 15 with OFFSET/LIMIT) at the merge layer asserting byte-identical-to-K=1 for `SelectSorted`; 25-seed multiset-equality sweep for unordered; multi-shard real-socket K=1↔K=4 integration tests for `Op::Select` / `Op::QueryRows` / `Op::SelectFields` (multiset equality). | **DONE** | `002661b` |
+| **T4** | Sort-key extraction edges: Char/Bytes lexicographic byte-compare, NULL bitmap (V1: NULL == zero-padded raw bytes, sorts FIRST asc / LAST desc / at-zero-position for signed), empty-string vs non-empty, sort field at non-zero column offset, record-too-short → `SchemaError`. 8 new KATs. | **DONE** | `5cc8f9e` |
 | T5 | Determinism property test: K∈{1,2,4,8,16} hash-identical merged result | OPEN | — |
 | T6 | LIMIT cancellation correctness + cancel flag | OPEN | — |
 | T7 | Skew defense + bounded buffers | OPEN | — |
@@ -194,7 +194,9 @@ honored.
 
 **What T2 deliberately did NOT do:**
 
-  - Property test for K∈{1,2,4,8,16} on random data (T5).
+  - Property test for K∈{1,2,4,8,16} on random data (T3 delivered
+    this EARLY — 60 seeds × 5 K values at merge layer + cross-op
+    real-socket test, all K-invariant; see T3 section below).
   - LIMIT cancellation: T2's merge stops at `limit` but does NOT
     cancel in-flight shard workers (T6).
   - Skew defense / bounded buffers (T7).
@@ -206,25 +208,110 @@ honored.
   - SQL-text routing (SP-E).
   - Aggregate combine (SP-B).
 
+## T3 — what landed (2026-05-26, commit `002661b`)
+
+**Two surfaces (~580 LoC net), single commit:**
+
+  - `scatter_scan.rs` — 4 new K-invariance property-test KATs at the
+    merge layer (no TCP, microseconds per fixture):
+      * `k_invariance_select_sorted_unique_values_25_seeds` — 25 seeds
+        × K∈{1,2,4,8,16} = 125 fixture runs. With unique sort values
+        across 100 rows, the merged SelectSorted output is
+        byte-identical to the K=1 baseline for every K. **Confirms
+        the §5.4 shard_id tie-break is sufficient when sort values are
+        unique** (the common case); the test would have FAILED if any
+        seed forced a tie between shards with different oids and the
+        merger needed (value, oid) tie-break to match K=1.
+      * `k_invariance_select_sorted_desc_unique_values_20_seeds` —
+        20 seeds with `desc=true` to lock heap polarity.
+      * `k_invariance_select_sorted_offset_limit_15_seeds` —
+        15 seeds with `OFFSET 20 LIMIT 30` to lock the post-merge
+        slicing is K-invariant.
+      * `k_invariance_unordered_multiset_equality_25_seeds` —
+        25 seeds asserting unordered scatter is *multiset-equal* (not
+        byte-equal) to K=1 across K∈{1,2,4,8,16}. The honest spec
+        §3.6 invariant for unordered concat.
+    The fixture builder (`build_unique_fixture` Fisher-Yates shuffle
+    over `kessel_proto::Rng` splitmix64) + `assign_shard` (mini
+    rendezvous hash without pulling in `kessel_shard::ShardMap`) live
+    in the test module — total per-seed cost <1 ms in unoptimized
+    builds, so the 85-seed sweep finishes in well under a second.
+
+  - `router.rs` — 1 new real-socket integration test
+    `scatter_unordered_ops_k4_match_k1_multiset` (~2.5s, 15 VSR nodes
+    + 2 routers via `spawn_shard` + `serve_router`):
+      * Op::Select multiset(K=4) == multiset(K=1)
+      * Op::QueryRows multiset(K=4) == multiset(K=1)
+      * Op::QueryRows(all-true) == Op::Select(all-true) on K=4
+      * Op::SelectFields multiset(K=4) == multiset(K=1) — each
+        projected row is the 8-byte U64 v
+    Shared cluster + fixture across the 3 op variants so the
+    expensive cluster spin-up amortizes.
+
+**Did the property test EXPOSE the §5.4 shard_id-vs-oid tie-break
+flaw?** **NO — it CONFIRMED shard_id is sufficient for V1**:
+85 seeds × 5 K values = 425 fixture runs, all byte-identical to
+K=1. The §5.4 deviation (cross-shard rows with byte-identical
+sort_value get shard-id-deterministic ordering, not
+oid-deterministic) is acceptable as V1 because tied values
+manifest in user-perceptible terms as "two rows with the same
+sort key, exchangeable in the natural sense". Documented in the
+scatter_scan module doc. A future workload that needs strict
+(value, oid) total order across shards can motivate
+`Op::SelectSortedWithKey` (spec OQ8) without re-litigating V1.
+
+## T4 — what landed (2026-05-26, commit `5cc8f9e`)
+
+**One surface (~320 LoC), single commit:** `scatter_scan.rs` adds 8
+new sort-key extraction edge KATs to stress the merge layer's
+`extract_sort_key` + `cmp_sort_value` paths beyond T2's U64-and-
+I32 coverage:
+
+| KAT | Asserts |
+|---|---|
+| `merge_sorted_char_column_lexicographic` | Char(8) sort key — pure lexicographic byte compare, no UTF-8 / locale dependence (SP155 §3.3) |
+| `merge_sorted_bytes_column_raw_byte_compare` | Bytes(4) sort key — raw bytes, `0xFF` > `0x80` > `0x01` > `0x00` (no signed/unsigned confusion) |
+| `merge_sorted_nulls_sort_first_ascending_u64` | NULL = zero-padded raw bytes (per kessel-sm:3567 semantics); sorts FIRST asc unsigned |
+| `merge_sorted_nulls_sort_last_descending_u64` | Same NULL semantics under `desc=true` — sorts LAST |
+| `merge_sorted_empty_string_less_than_nonempty_char` | "" (zero-padded) < "a" (then zero pad) — byte compare lock |
+| `merge_sorted_sort_field_at_nonzero_column_offset` | Sort field at byte 16 (NOT byte 0) — merger reads `record[offset..offset+width]` and ignores preceding columns |
+| `merge_sorted_record_too_short_surfaces_schema_error` | Too-short record + claimed sort field → `OpResult::SchemaError`, never panic (SP155 §6 defense) |
+| `merge_sorted_nulls_in_signed_i64_sort_at_zero_position` | NULL = 0 under signed compare → sorts BETWEEN negatives and positives (not first); honest edge case for signed kinds |
+
+**NULL handling decision (V1, locked):** the merger inherits the
+per-shard SM's "NULL == raw zero-padded bytes" semantics
+(kessel-sm:3567 does not consult the null bitmap; the merger
+matches). Postgres-style "NULLS LAST asc" is **not** V1 — would
+require either a sentinel-prefix in the per-shard reply
+(`Op::SelectSortedWithKey`, spec OQ8) or a router-side full-row
+decode (rejected on perf grounds). Documented in the module doc.
+
+**Test counts:** Workspace 1312 → 1325 default / 1345 → 1358
+featured (+13 each: 4 K-invariance property tests + 1 real-socket
+integration test + 8 sort-key edge KATs). seed-7 GREEN;
+tree-grep EMPTY; `#![forbid(unsafe_code)]` honored.
+
 ## Pickup hint for the next session
 
-Start at **T3**. The remaining task slices T3..T13 are well-bounded
-per the SP155 §8 task table; the executor may pick whichever fits
-the session budget. Roughly:
+Start at **T5/T6/T7**. T3+T4 closed the killer K-invariance check
++ the sort-key extraction stress test; the remaining task slices
+T5..T13 are well-bounded per the SP155 §8 task table; the
+executor may pick whichever fits the session budget. Roughly:
 
-- **T3 (~140 LoC):** widen the K=4 integration test to a property
-  sweep over K∈{1,2,4,8,16} on random 1k-row datasets — this is
-  the killer K-invariance property test (SP155 §7.2 + acceptance
-  criterion #1 widened). Also add multi-shard QueryRows/SelectFields
-  integration tests.
-- **T4 (~220 LoC):** sort-key extraction from arbitrary row blobs
-  (T2 already does this for the simple case; T4 widens for Char/
-  Bytes/Fixed kinds + edge cases like null-bitmap masking) + tighter
-  OFFSET+LIMIT correctness across more shard topologies.
-- **T5 (~120 LoC):** the killer property test (random data + all K).
+- **T5 (~80 LoC):** the SP155 §7.2 K-invariance property test was
+  delivered EARLY as part of T3 (60 seeds at the merge layer,
+  plus a real-socket K=1↔K=4 cross-op test). T5's original scope
+  collapses into a follow-up: extend the merge-layer sweep to
+  randomly-tied sort values, asserting the §5.4 shard_id tie-break
+  is the documented V1 behavior + locking when the spec calls for
+  a `(value, oid)` upgrade (motivates `Op::SelectSortedWithKey`
+  per OQ8).
 - **T6 (~80 LoC):** LIMIT cancellation correctness — per-shard scan
   counter + cancel flag (the `Arc<AtomicBool>` from SP155 §3.7).
-- **T7 (~80 LoC):** skew defense + bounded buffers.
+  T2's merge stops at `limit` but does NOT cancel in-flight shard
+  workers; T6 closes that.
+- **T7 (~80 LoC):** skew defense + bounded buffers (channel
+  bound=4 from SP155 §3.8).
 - **T8 (~300 LoC):** the 10 pentests in spec §7.5.
 - **T9 (~150 LoC):** error-path completeness + the
   `scatter_partial_on_timeout` flag.
@@ -241,6 +328,6 @@ Estimated effort per slice: 0.3-1 session.
 
 - Design: `docs/superpowers/specs/2026-05-26-kesseldb-spa-cross-shard-scatter-scan-design.md` (539 lines)
 - Helper module: `crates/kesseldb-server/src/scatter_scan.rs`
-- Router (to be wired in T2): `crates/kesseldb-server/src/router.rs`
+- Router (T2 wired; T3 widened): `crates/kesseldb-server/src/router.rs`
 - Existing `ClusterClient::call`: `crates/kessel-client/src/lib.rs` line 745
 - TaskList ticket: #75

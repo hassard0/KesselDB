@@ -6,7 +6,7 @@
 
 *"It's the database that made the Kessel Run in 12 parsecs."*
 
-`1023 default tests green / 1052 with --features kessel-http-gateway/test-server` · `0 external dependencies in the kernel` · `Rust 1.95+` · single‑binary
+`1131 default tests green / 1164 with --features kessel-http-gateway/test-server` · `0 external dependencies in the kernel` · `Rust 1.95+` · single‑binary
 
 </div>
 
@@ -103,7 +103,7 @@ feature, not an aspiration.
   byte‑untouched; zero external (non‑workspace) deps on the gateway
   crate. See `docs/USAGE.md` §HTTP gateway.
 - **Deterministic & verifiable** — the whole engine is a seedable state machine;
-  the test suite (1023 default tests / 1052 with `--features kessel-http-gateway/test-server`, 0 ignored) includes seeded partition/fault
+  the test suite (1131 default tests / 1164 with `--features kessel-http-gateway/test-server`, 1 ignored — `brotli` decoder pending) includes seeded partition/fault
   simulation, multi‑replica Jepsen, hand‑derived KATs against published
   spec text for every codec, and adversarial pentests for every public input
   surface.
@@ -118,7 +118,7 @@ cargo build --release
 
 # start a node:  kesseldb [LISTEN_ADDR] [DATA_DIR]
 cargo run --release --bin kesseldb -- 127.0.0.1:7878 ./data
-# Workspace gate: 1023 default tests, 0 ignored (1052 with --features kessel-http-gateway/test-server)
+# Workspace gate: 1131 default tests, 1 ignored (1164 with --features kessel-http-gateway/test-server)
 cargo test --workspace --release
 ```
 
@@ -221,7 +221,7 @@ round‑trip fixtures**:
 | Axis | Supported | Notes |
 |---|---|---|
 | **Page version** | V1 + **V2** | V2 raw‑level‑split path (def/rep levels uncompressed, values section compressed) |
-| **Compression** | UNCOMPRESSED, **Snappy**, **GZIP**, **zstd** | All decompressors are zero‑dep hand‑written (`snappy.rs` 338 LOC / `gzip.rs` RFC 1951 inflate / `zstd*.rs` full RFC 8478 pipeline: frame + block + literals (Raw/RLE/Compressed/Treeless) + Huffman (direct + FSE‑weight × 1‑stream + 4‑stream) + sequences (Predefined/RLE/FseCompressed × LL/OF/ML) + 3‑slot repeat‑offset LZ77 execution). All real pyarrow zstd fixtures pass end‑to‑end through `extract()` incl. a 2000‑row stress fixture exercising FseCompressed mode for all three LL/OF/ML codes simultaneously. |
+| **Compression** | UNCOMPRESSED, **Snappy**, **GZIP**, **zstd**, **LZ4_RAW (SP149)** | All decompressors are zero‑dep hand‑written (`snappy.rs` 338 LOC / `gzip.rs` RFC 1951 inflate / `zstd*.rs` full RFC 8478 pipeline: frame + block + literals (Raw/RLE/Compressed/Treeless) + Huffman (direct + FSE‑weight × 1‑stream + 4‑stream) + sequences (Predefined/RLE/FseCompressed × LL/OF/ML) + 3‑slot repeat‑offset LZ77 execution / `lz4.rs` raw LZ4 block format per the lz4 spec (literal + match sequences, minmatch=4, 2-byte LE offset, LZ77 overlapping-copy)). All real pyarrow zstd fixtures pass end‑to‑end through `extract()` incl. a 2000‑row stress fixture exercising FseCompressed mode for all three LL/OF/ML codes simultaneously. Brotli (codec id 4) is recognized at meta-decode time (SP150) but decompression is a named follow-up — workaround: re-encode the file with `compression='zstd'` or `compression='lz4'`. |
 | **Encoding** | PLAIN, **PLAIN_DICTIONARY / RLE_DICTIONARY** | Dictionary page + data‑page index resolve |
 | **Repetition** | flat REQUIRED + **flat OPTIONAL (nullable)** + **`LIST<primitive>` (SP143)** + **`MAP<K, V>` and `struct` (SP144)** + **`List<List<T>>`, `List<struct>`, `Map<K, struct>`, `Map<K, List<T>>`, `struct<List/Map/struct>` (SP145)** + **`List<List<List<T>>>` 3‑deep, `List<Map<K,V>>`, `Map<K1, Map<K2,V>>` (SP146 — OBJ-2c-5 FULLY CLOSED)** | OPTIONAL via RLE‑hybrid def‑level decode + null‑scatter; SP143 adds Dremel‑style record assembly for canonical 3‑node `LIST<primitive>` (4‑shape matrix); SP144 adds `Map<K, V>` via `assemble_map_kv` (REQUIRED key enforced) and `struct` via `assemble_struct`; SP145 adds 4 new variants via per‑shape composition; SP146 adds 3 more (`assemble_list_of_list_of_list_primitive` 3-level stack, `assemble_list_of_map_kv` outer-list-of-inner-maps, `assemble_map_of_map_kv` outer-map-of-inner-maps) — every nested Parquet shape pyarrow writes now decodes |
 | **Physical types** | INT32, **INT64**, **INT96 (timestamp)**, **FLBA**, **BYTE_ARRAY** | INT96 → `PqValue::Timestamp(i64 ns)` via checked Julian‑day arithmetic |
@@ -302,7 +302,7 @@ Honest boundaries (documented, not hidden):
   `Delete`); cross‑shard scatter‑gather *reads*/SQL text routing is a
   separate, later concern from cross‑shard *transactions*.
 
-Every claim in this repository is backed by the test suite (`1023 default tests / 1052 with --features kessel-http-gateway/test-server, 0 ignored`); the
+Every claim in this repository is backed by the test suite (`1131 default tests / 1164 with --features kessel-http-gateway/test-server, 1 ignored — brotli decoder pending`); the
 docs call out exactly what is proven versus roadmap. The four
 **strategic‑tier items S1–S4** (TLA+/model‑checked safety, serializable
 MVCC/SI, Jepsen linearizability under partition, deterministic WASM
@@ -318,7 +318,7 @@ records (SP109 / SP110‑SP116 / SP117 / SP118).
 | [`docs/THESIS.md`](docs/THESIS.md) | The 5 thesis pillars (deterministic / verifiable / replayable / zero‑dep / honest‑docs) + strategic‑tier backlog S1–S4 (all shipped) |
 | [`docs/USAGE.md`](docs/USAGE.md) | Install, run, **CLI**, client API, **SQL reference**, clustering, auth, backup & monitoring, external sources + Parquet matrix |
 | [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) | Methodology, measured numbers, scaling model, cloud projections |
-| [`docs/STATUS.md`](docs/STATUS.md) | Production‑readiness gate, per‑slice status (incl. SP109‑SP139 strategic‑tier + Parquet codec arc), performance log |
+| [`docs/STATUS.md`](docs/STATUS.md) | Production‑readiness gate, per‑slice status (incl. SP109‑SP140 strategic‑tier + Parquet codec arc through SP151), performance log |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Storage, replication, sharding, caching, MVCC + WASM + Parquet internals |
 | [`kesseldb-tla/`](kesseldb-tla/) | Seven layered TLA+ specs (Replication / MVCCStorage / MVCCTx / MVCCSi / MVCCSsi / MVCCGc / MVCCCutover) + TLC baselines |
 | [`clients/python/kesseldb.py`](clients/python/kesseldb.py) | Dependency‑free Python reference client (stdlib‑only, single file) |
@@ -329,7 +329,7 @@ records (SP109 / SP110‑SP116 / SP117 / SP118).
 
 ```bash
 cargo build                 # all kernel crates, zero external deps
-cargo test --workspace      # 1023 default tests / 1052 with --features kessel-http-gateway/test-server (incl. seeded partition/fault sim,
+cargo test --workspace      # 1131 default tests / 1164 with --features kessel-http-gateway/test-server (incl. seeded partition/fault sim,
                             # Jepsen linearizability, MVCC TLA+ refinement,
                             # pyarrow Parquet round-trips, WASM-MVP KATs)
 cargo run -p kessel-bench --release -- --help   # benchmarks

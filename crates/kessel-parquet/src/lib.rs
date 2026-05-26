@@ -20,6 +20,7 @@ mod brotli_bit_reader;
 mod brotli_huffman;
 mod brotli;
 mod brotli_context;
+mod brotli_command;
 mod zstd_fse;
 mod zstd_literals;
 mod zstd_huffman;

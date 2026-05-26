@@ -390,3 +390,52 @@ fn kat_exactly_once_binding_dedicated_variant() {
     let err = ParseError::IncompleteSessionBinding;
     assert_eq!(format!("{err:?}"), "IncompleteSessionBinding");
 }
+
+// =========================================================================
+// SP147 T1: `wants_close` helper for HTTP/1.1 keep-alive negotiation.
+// RFC 9112 §9.3 — HTTP/1.1 is persistent by default; explicit `Connection:
+// close` token in a (possibly comma-separated) value overrides that default.
+// =========================================================================
+
+#[test]
+fn kat_wants_close_default_false() {
+    use kessel_http_gateway::parse::wants_close;
+    let headers: Vec<(String, String)> = vec![];
+    assert_eq!(wants_close(&headers), false);
+}
+
+#[test]
+fn kat_wants_close_explicit_close_true() {
+    use kessel_http_gateway::parse::wants_close;
+    let headers = vec![("Connection".into(), "close".into())];
+    assert_eq!(wants_close(&headers), true);
+}
+
+#[test]
+fn kat_wants_close_explicit_keep_alive_false() {
+    use kessel_http_gateway::parse::wants_close;
+    let headers = vec![("Connection".into(), "keep-alive".into())];
+    assert_eq!(wants_close(&headers), false);
+}
+
+#[test]
+fn kat_wants_close_case_insensitive_value() {
+    use kessel_http_gateway::parse::wants_close;
+    let headers = vec![("Connection".into(), "CLOSE".into())];
+    assert_eq!(wants_close(&headers), true);
+}
+
+#[test]
+fn kat_wants_close_in_list_with_keep_alive() {
+    // Connection: keep-alive, close — close token wins
+    use kessel_http_gateway::parse::wants_close;
+    let headers = vec![("Connection".into(), "keep-alive, close".into())];
+    assert_eq!(wants_close(&headers), true);
+}
+
+#[test]
+fn kat_wants_close_case_insensitive_name() {
+    use kessel_http_gateway::parse::wants_close;
+    let headers = vec![("CONNECTION".into(), "close".into())];
+    assert_eq!(wants_close(&headers), true);
+}

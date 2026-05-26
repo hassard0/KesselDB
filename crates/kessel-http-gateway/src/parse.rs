@@ -229,6 +229,27 @@ pub fn parse_request_default(buf: &[u8]) -> Result<Request<'_>, ParseError> {
     parse_request(buf, DEFAULT_MAX_BODY)
 }
 
+/// SP147 T1: HTTP/1.1 keep-alive negotiation. Returns true if the request
+/// asked the server to close the connection after responding. Per RFC 9112
+/// §9.3, HTTP/1.1 is persistent by default — keep-alive unless explicitly
+/// `Connection: close` is sent. (The legacy `Connection: keep-alive` header
+/// is accepted as an explicit affirmative for clarity.)
+pub fn wants_close(headers: &[(String, String)]) -> bool {
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("connection") {
+            // RFC 9110 §7.6.1: Connection header is a comma-separated list
+            // of options. Look for "close" token (case-insensitive).
+            for token in value.split(',') {
+                let t = token.trim();
+                if t.eq_ignore_ascii_case("close") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// `\r\n\r\n` terminator → returns index just past it (so `header_end` is
 /// also `body_start`).
 fn find_header_terminator(buf: &[u8]) -> Result<usize, ParseError> {

@@ -10,6 +10,7 @@
 
 pub mod cluster;
 pub mod router;
+pub mod scatter_scan;
 
 use kessel_io::DirVfs;
 use kessel_proto::wire::{read_frame, write_frame};

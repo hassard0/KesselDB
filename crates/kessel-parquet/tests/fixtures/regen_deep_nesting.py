@@ -112,6 +112,22 @@ t5 = pa.Table.from_pydict(
 )
 pq.write_table(t5, HERE / 'struct_with_struct_field.parquet', **WRITER_KWARGS)
 
+# 5b. struct_with_map_field.parquet  (BONUS cross-product) ───────────────────
+# struct<id:i64, attrs:Map<string, i64>>: struct containing a Map field.
+swm_type = pa.struct([
+    pa.field('id', pa.int64(), nullable=False),
+    pa.field('attrs', pa.map_(pa.string(), pa.field('value', pa.int64(), nullable=False)),
+             nullable=False),
+])
+t5b = pa.Table.from_pydict(
+    {'my_swm': pa.array([
+        {'id': 1, 'attrs': [('a', 10), ('b', 20)]},
+        {'id': 2, 'attrs': [('x', 99)]},
+    ], type=swm_type)},
+    schema=pa.schema([pa.field('my_swm', swm_type, nullable=False)]),
+)
+pq.write_table(t5b, HERE / 'struct_with_map_field.parquet', **WRITER_KWARGS)
+
 # 6. map_string_list_string.parquet  (BOLD cross-product) ───────────────────
 # Map<string, List<string>>: tests the Map<_, List<_>> cross-product path.
 list_of_string_type = pa.list_(pa.field('item', pa.string(), nullable=False))
@@ -133,7 +149,7 @@ pq.write_table(t6, HERE / 'map_string_list_string.parquet', **WRITER_KWARGS)
 for name in [
     'list_of_list_i64', 'list_of_struct', 'map_string_struct',
     'struct_with_list_field', 'struct_with_struct_field',
-    'map_string_list_string',
+    'struct_with_map_field', 'map_string_list_string',
 ]:
     path = HERE / f'{name}.parquet'
     pf = pq.ParquetFile(path)

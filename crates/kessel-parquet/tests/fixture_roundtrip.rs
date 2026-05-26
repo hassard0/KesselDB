@@ -862,6 +862,7 @@ const MAP_STRING_STRUCT:          &[u8] = include_bytes!("fixtures/map_string_st
 const STRUCT_WITH_LIST_FIELD:     &[u8] = include_bytes!("fixtures/struct_with_list_field.parquet");
 const STRUCT_WITH_STRUCT_FIELD:   &[u8] = include_bytes!("fixtures/struct_with_struct_field.parquet");
 const MAP_STRING_LIST_STRING:     &[u8] = include_bytes!("fixtures/map_string_list_string.parquet");
+const STRUCT_WITH_MAP_FIELD:      &[u8] = include_bytes!("fixtures/struct_with_map_field.parquet");
 
 #[test]
 fn pyarrow_list_of_list_i64() {
@@ -969,6 +970,29 @@ fn pyarrow_struct_with_struct_field() {
         ("inner".into(), PqValue::Struct(vec![
             ("a".into(), I64(20)),
             ("b".into(), PqValue::Bool(false)),
+        ])),
+    ])]);
+}
+
+#[test]
+fn pyarrow_struct_with_map_field() {
+    // T9 cross-product: struct<id:i64, attrs:Map<string,i64>>.
+    // Exercises the recursive classify_nested_group_child(Map) +
+    // decode_field_by_kind(NestedMapKV) compositional path.
+    let rows = extract(STRUCT_WITH_MAP_FIELD, &["my_swm"])
+        .expect("extract struct_with_map_field");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], vec![PqValue::Struct(vec![
+        ("id".into(),    I64(1)),
+        ("attrs".into(), PqValue::Map(vec![
+            (Bytes(b"a".to_vec()), I64(10)),
+            (Bytes(b"b".to_vec()), I64(20)),
+        ])),
+    ])]);
+    assert_eq!(rows[1], vec![PqValue::Struct(vec![
+        ("id".into(),    I64(2)),
+        ("attrs".into(), PqValue::Map(vec![
+            (Bytes(b"x".to_vec()), I64(99)),
         ])),
     ])]);
 }

@@ -61,3 +61,30 @@ fn parse_counter(text: &str, name: &str) -> u64 {
     }
     0
 }
+
+#[test]
+fn metrics_http_request_counter_per_path_status() {
+    let (addr, _g) = spawn_server();
+    // Hit /v1/health (will be 200).
+    let _ = raw_request(addr,
+        b"GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    // Hit an unknown path → 404 (routes::handle's catch-all).
+    let _ = raw_request(addr,
+        b"GET /v2/sql HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    // Scrape /v1/metrics; the prior scrapes should be reflected.
+    let resp = raw_request(addr,
+        b"GET /v1/metrics HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    let text = String::from_utf8_lossy(&resp);
+    // Must contain a row for /v1/health 200 with count >= 1.
+    assert!(
+        text.contains("kesseldb_http_requests_total{path=\"/v1/health\",status=\"200\"}"),
+        "missing /v1/health 200 counter, got: {text}",
+    );
+    // The 404 case lands on /v1/sql (default for unknown paths in the
+    // 4×16 matrix) but the status bucket is 404 — verify the 404 row
+    // exists somewhere.
+    assert!(
+        text.contains("status=\"404\""),
+        "missing 404 counter, got: {text}",
+    );
+}

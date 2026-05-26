@@ -5,11 +5,11 @@
 
 #![allow(dead_code)]
 
-use crate::engine::EngineApply;
+use crate::engine::{EngineApply, HttpRequestCountersStatic};
 use crate::parse::{
     parse_request, ParseError, MAX_HEADER_BYTES,
 };
-use crate::response::write_error_json;
+use crate::response::write_error_json_counted;
 use crate::routes;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -30,6 +30,7 @@ pub fn serve(
     token: Option<Vec<u8>>,
     max_conns: usize,
     max_body: usize,
+    http_counters: Arc<HttpRequestCountersStatic>,
 ) {
     let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming().flatten() {
@@ -44,8 +45,9 @@ pub fn serve(
         let e = engine.clone();
         let t = token.clone();
         let a = active.clone();
+        let c = http_counters.clone();
         std::thread::spawn(move || {
-            handle_one(stream, &e, t.as_deref(), max_body);
+            handle_one(stream, &e, t.as_deref(), max_body, &c);
             a.fetch_sub(1, Ordering::AcqRel);
         });
     }
@@ -56,8 +58,9 @@ fn handle_one(
     engine: &Arc<dyn EngineApply>,
     token: Option<&[u8]>,
     max_body: usize,
+    http_counters: &Arc<HttpRequestCountersStatic>,
 ) {
-    let _ = handle_one_stream(&mut s, engine, token, max_body);
+    let _ = handle_one_stream(&mut s, engine, token, max_body, http_counters);
 }
 
 fn handle_one_stream<S: Read + Write>(
@@ -65,6 +68,7 @@ fn handle_one_stream<S: Read + Write>(
     engine: &Arc<dyn EngineApply>,
     token: Option<&[u8]>,
     max_body: usize,
+    http_counters: &Arc<HttpRequestCountersStatic>,
 ) -> std::io::Result<()> {
     let mut raw: Vec<u8> = Vec::with_capacity(8 * 1024);
     let mut chunk = [0u8; 8192];
@@ -76,8 +80,12 @@ fn handle_one_stream<S: Read + Write>(
         };
         raw.extend_from_slice(&chunk[..n]);
         if raw.len() > MAX_HEADER_BYTES + max_body {
-            let _ = write_error_json(s, (413, "Payload Too Large"),
-                "error", "payload too large");
+            // Parse failed before the path was known — bump against the
+            // defensive default ("/v1/sql"). The status bucket (413) is
+            // what operators actually monitor.
+            let _ = write_error_json_counted(s, (413, "Payload Too Large"),
+                "error", "payload too large",
+                http_counters, "/v1/sql");
             return Ok(());
         }
         // Honor the configured `http_max_body` at parse time, not just at the
@@ -87,20 +95,24 @@ fn handle_one_stream<S: Read + Write>(
         // operator configured `http_max_body = 16 MiB` (or larger).
         match parse_request(&raw, max_body) {
             Ok(req) => {
-                let _ = routes::handle(s, &req, token, engine);
+                let _ = routes::handle(s, &req, token, engine, http_counters);
                 return Ok(());
             }
             Err(ParseError::NoHeaderTerminator) => continue,
             Err(ParseError::ShortBody) => continue,
             Err(e) => {
-                let _ = write_parse_error(s, &e);
+                let _ = write_parse_error(s, &e, http_counters);
                 return Ok(());
             }
         }
     }
 }
 
-fn write_parse_error<W: Write>(w: &mut W, e: &ParseError) -> std::io::Result<()> {
+fn write_parse_error<W: Write>(
+    w: &mut W,
+    e: &ParseError,
+    http_counters: &Arc<HttpRequestCountersStatic>,
+) -> std::io::Result<()> {
     let (status, semantic, msg): ((u16, &'static str), &str, String) = match e {
         ParseError::BadRequestLine =>
             ((400, "Bad Request"), "error", "bad request line".into()),
@@ -149,7 +161,11 @@ fn write_parse_error<W: Write>(w: &mut W, e: &ParseError) -> std::io::Result<()>
             ((417, "Expectation Failed"), "error",
              "expectation failed".into()),
     };
-    write_error_json(w, status, semantic, &msg)
+    // SP144H T2: parse errors happen BEFORE the path is known. We bump
+    // against "/v1/sql" as a defensive default (the status bucket is what
+    // operators actually monitor; the path label is a minor accounting
+    // inaccuracy on malformed requests).
+    write_error_json_counted(w, status, semantic, &msg, http_counters, "/v1/sql")
 }
 
 // =========================================================================
@@ -168,6 +184,7 @@ pub fn serve_tls<A>(
     token: Option<Vec<u8>>,
     max_conns: usize,
     max_body: usize,
+    http_counters: Arc<HttpRequestCountersStatic>,
 ) where
     A: TlsAccept,
 {
@@ -191,9 +208,10 @@ pub fn serve_tls<A>(
         let t = token.clone();
         let a = active.clone();
         let acc = acceptor.clone();
+        let c = http_counters.clone();
         std::thread::spawn(move || {
             if let Some(mut tls) = acc.accept(stream) {
-                let _ = handle_one_stream(&mut tls, &e, t.as_deref(), max_body);
+                let _ = handle_one_stream(&mut tls, &e, t.as_deref(), max_body, &c);
             }
             a.fetch_sub(1, Ordering::AcqRel);
         });

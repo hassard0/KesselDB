@@ -433,6 +433,13 @@ pub struct EngineHandle {
     /// kinds + headroom + room for special tags like 0xFE. Out-of-range
     /// tags (≥64) are dropped (no overflow into another slot).
     op_kind_counts: Arc<[AtomicU64; 64]>,
+    /// SP144H T2: per-(path, status) HTTP request counters. Shared
+    /// between the gateway accept loop (bumps on every emitted response)
+    /// and `snapshot_metrics` (reads via `.snapshot()`). Bounded at 4×16
+    /// atomic slots. Only built/published when the `http-gateway` feature
+    /// is on — the field is cfg-gated so the default build pays nothing.
+    #[cfg(feature = "http-gateway")]
+    http_counters: Arc<kessel_http_gateway::HttpRequestCountersStatic>,
 }
 
 impl EngineHandle {
@@ -546,6 +553,14 @@ pub fn spawn_engine_cfg(
         std::array::from_fn(|_| AtomicU64::new(0))
     );
     let op_kind_counts_for_handle = op_kind_counts_for_engine.clone();
+    // SP144H T2: per-(path, status) HTTP counter matrix. Constructed
+    // once and shared by Arc with both the gateway accept loop (via
+    // serve_cfg → kessel_http_gateway::serve) and the metrics-snapshot
+    // path on EngineHandle. The field on EngineHandle is cfg-gated to
+    // `http-gateway`, so the no-feature build pays nothing.
+    #[cfg(feature = "http-gateway")]
+    let http_counters_for_handle: Arc<kessel_http_gateway::HttpRequestCountersStatic> =
+        Arc::new(kessel_http_gateway::HttpRequestCountersStatic::new());
     std::thread::spawn(move || {
         let mut sm = match DirVfs::new(&dir).and_then(StateMachine::open) {
             Ok(sm) => {
@@ -820,6 +835,8 @@ pub fn spawn_engine_cfg(
             max_inflight,
             applied_ops_atomic: applied_ops_atomic_for_handle,
             op_kind_counts: op_kind_counts_for_handle,
+            #[cfg(feature = "http-gateway")]
+            http_counters: http_counters_for_handle,
         }),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(io::Error::new(io::ErrorKind::Other, "engine failed to start")),
@@ -962,6 +979,10 @@ pub fn serve_cfg(listener: TcpListener, engine: EngineHandle, cfg: ServerConfig)
         let token_for_http = cfg.token.clone();
         let max_conns = cfg.max_conns;
         let max_body = cfg.http_max_body;
+        // SP144H T2: share the SAME counter Arc the EngineHandle's
+        // snapshot_metrics reads. Bumps from the accept loop must land
+        // in the same atomics that the metrics-snapshot path then reads.
+        let http_counters = engine.http_counters.clone();
         std::thread::spawn(move || {
             match std::net::TcpListener::bind(http_addr) {
                 Ok(l) => kessel_http_gateway::serve(
@@ -971,6 +992,7 @@ pub fn serve_cfg(listener: TcpListener, engine: EngineHandle, cfg: ServerConfig)
                     token_for_http,
                     max_conns,
                     max_body,
+                    http_counters,
                 ),
                 Err(e) => eprintln!(
                     "kesseldb: http-gateway bind {http_addr} failed: {e}"),
@@ -986,6 +1008,10 @@ pub fn serve_cfg(listener: TcpListener, engine: EngineHandle, cfg: ServerConfig)
         let token_for_https = cfg.token.clone();
         let max_conns = cfg.max_conns;
         let max_body = cfg.http_max_body;
+        // SP144H T2: same counter Arc as the plaintext path — plaintext
+        // + HTTPS bumps share the same matrix so the /v1/metrics scrape
+        // reflects the total across both listeners.
+        let http_counters = engine.http_counters.clone();
         std::thread::spawn(move || {
             match std::net::TcpListener::bind(https_addr) {
                 Ok(l) => kessel_http_gateway::serve_tls(
@@ -995,6 +1021,7 @@ pub fn serve_cfg(listener: TcpListener, engine: EngineHandle, cfg: ServerConfig)
                     token_for_https,
                     max_conns,
                     max_body,
+                    http_counters,
                 ),
                 Err(e) => eprintln!(
                     "kesseldb: http-gateway HTTPS bind {https_addr} failed: {e}"),
@@ -1192,7 +1219,10 @@ impl kessel_http_gateway::EngineApply for EngineHandle {
             last_op_number: total_applied,
             view_number: 0,    // single-node V1; cluster wiring is follow-up
             is_primary: true,
-            http_requests_total: Vec::new(),  // wired in follow-up (T2)
+            // SP144H T2: pull the per-(path, status) snapshot from the
+            // shared 4×16 atomic matrix. The matrix is bumped by the
+            // gateway accept loop on every emitted response.
+            http_requests_total: self.http_counters.snapshot(),
         }
     }
 }

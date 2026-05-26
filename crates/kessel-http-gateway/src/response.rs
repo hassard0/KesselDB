@@ -2,6 +2,7 @@
 //! routes module reads top-to-bottom with no hidden state. Every response
 //! sends `Connection: close` — V1 has no keep-alive (spec §4.2).
 
+use crate::engine::HttpRequestCountersStatic;
 use std::io::Write;
 
 /// CRLF — kept inline for visual symmetry with RFC 9112.
@@ -53,6 +54,49 @@ pub fn write_error_json<W: Write>(
     let escaped = json_escape(message);
     let body = format!(r#"{{"status":"{semantic}","message":"{escaped}"}}"#);
     write_json(w, status, &body)
+}
+
+// =========================================================================
+// SP144H T2: write-and-count wrappers. Wrap each `write_*` so we bump the
+// per-(path,status) counter on success. Failure to write to the socket (a
+// client disconnect mid-response) is NOT counted — we only count fully
+// emitted responses.
+// =========================================================================
+
+pub fn write_json_counted<W: Write>(
+    w: &mut W,
+    status: (u16, &'static str),
+    body_json: &str,
+    counters: &HttpRequestCountersStatic,
+    path: &str,
+) -> std::io::Result<()> {
+    write_json(w, status, body_json)?;
+    counters.bump(path, status.0);
+    Ok(())
+}
+
+pub fn write_error_json_counted<W: Write>(
+    w: &mut W,
+    status: (u16, &'static str),
+    semantic: &str,
+    message: &str,
+    counters: &HttpRequestCountersStatic,
+    path: &str,
+) -> std::io::Result<()> {
+    write_error_json(w, status, semantic, message)?;
+    counters.bump(path, status.0);
+    Ok(())
+}
+
+pub fn write_prometheus_counted<W: Write>(
+    w: &mut W,
+    body: &str,
+    counters: &HttpRequestCountersStatic,
+    path: &str,
+) -> std::io::Result<()> {
+    write_prometheus(w, body)?;
+    counters.bump(path, 200);
+    Ok(())
 }
 
 fn json_escape(s: &str) -> String {

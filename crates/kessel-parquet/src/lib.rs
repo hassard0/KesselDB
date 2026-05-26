@@ -2055,11 +2055,110 @@ fn classify_list_of_group(
                 },
             })
         }
-        // List<Map<K,V>> — V1 defers (composition would need another nested layer).
+        // List<Map<K,V>> — SP146 T3 lifts.
         Some(meta::LogicalType::Map) => {
-            Err(PqError::Unsupported(format!(
-                "List<Map<...>> `{outer_name}`: SP146 follow-up (V1 supports List<List/struct>)"
-            )))
+            // The element group is itself a MAP whose REPEATED middle has
+            // 2 leaves: key + value. Drill through.
+            if element_children.len() != 1 {
+                return Err(PqError::Unsupported(format!(
+                    "List<Map> `{outer_name}` inner-map outer children != 1: non-canonical"
+                )));
+            }
+            let map_middle = match &element_children[0] {
+                meta::SchemaNode::Group {
+                    repetition: meta::Repetition::Repeated, children: gc, ..
+                } => gc,
+                _ => return Err(PqError::Unsupported(format!(
+                    "List<Map> `{outer_name}` inner-map middle not REPEATED"
+                ))),
+            };
+            if map_middle.len() != 2 {
+                return Err(PqError::Unsupported(format!(
+                    "List<Map> `{outer_name}` inner-map middle children != 2"
+                )));
+            }
+            let (k_name, k_ptype, k_rep, k_max_def, k_max_rep, k_path) = match &map_middle[0] {
+                meta::SchemaNode::Leaf {
+                    name, ptype, repetition, max_def_level, max_rep_level, path,
+                } => (name.clone(), *ptype, *repetition, *max_def_level, *max_rep_level, path.clone()),
+                _ => return Err(PqError::Unsupported(format!(
+                    "List<Map<group, _>> `{outer_name}`: non-primitive key, SP147 follow-up"
+                ))),
+            };
+            let (v_name, v_ptype, v_rep, v_max_def, v_max_rep, v_path) = match &map_middle[1] {
+                meta::SchemaNode::Leaf {
+                    name, ptype, repetition, max_def_level, max_rep_level, path,
+                } => (name.clone(), *ptype, *repetition, *max_def_level, *max_rep_level, path.clone()),
+                _ => return Err(PqError::Unsupported(format!(
+                    "List<Map<_, group>> `{outer_name}`: non-primitive value, SP147 follow-up"
+                ))),
+            };
+            // Key must be REQUIRED.
+            if !matches!(k_rep, meta::Repetition::Required) {
+                return Err(PqError::Unsupported(format!(
+                    "List<Map<_>> `{outer_name}` key `{k_name}` not REQUIRED"
+                )));
+            }
+            let value_optional = matches!(v_rep, meta::Repetition::Optional);
+            // Physical-type allow-list for both K and V.
+            for (label, t) in [("key", k_ptype), ("value", v_ptype)] {
+                match t {
+                    meta::Type::Boolean | meta::Type::Int32 | meta::Type::Int64
+                    | meta::Type::Float | meta::Type::Double | meta::Type::ByteArray
+                    | meta::Type::Int96 | meta::Type::FixedLenByteArray => {}
+                    other => return Err(PqError::Unsupported(format!(
+                        "List<Map> `{outer_name}` {label} physical type {other:?}: OBJ-2c"
+                    ))),
+                }
+            }
+            // Expected max_def_levels:
+            //   K: outer_optional + 1 (LIST REP) + 1 (MAP REP) = outer_optional + 2
+            //   V: outer_optional + 1 + 1 + value_optional
+            let expected_k_max_def = (outer_optional as u32) + 2;
+            let expected_v_max_def = (outer_optional as u32) + 2 + (value_optional as u32);
+            if k_max_def != expected_k_max_def {
+                return Err(PqError::Bad(format!(
+                    "List<Map> `{outer_name}` K max_def_level={k_max_def} \
+                     disagrees with expected {expected_k_max_def}"
+                )));
+            }
+            if v_max_def != expected_v_max_def {
+                return Err(PqError::Bad(format!(
+                    "List<Map> `{outer_name}` V max_def_level={v_max_def} \
+                     disagrees with expected {expected_v_max_def}"
+                )));
+            }
+            if k_max_rep != 2 || v_max_rep != 2 {
+                return Err(PqError::Bad(format!(
+                    "List<Map> `{outer_name}` K/V max_rep_level={k_max_rep}/{v_max_rep} != 2"
+                )));
+            }
+            let k_struct = leaves.iter().find(|l| l.name == k_name)
+                .ok_or_else(|| PqError::Bad(format!(
+                    "List<Map> `{outer_name}` key leaf `{k_name}` missing from flat leaves"
+                )))?;
+            let v_struct = leaves.iter().find(|l| l.name == v_name)
+                .ok_or_else(|| PqError::Bad(format!(
+                    "List<Map> `{outer_name}` value leaf `{v_name}` missing from flat leaves"
+                )))?;
+            let k_spec = build_plain_spec(k_struct)?;
+            let v_spec = build_plain_spec(v_struct)?;
+            let k_chunk_path: Vec<String> = k_path.iter().skip(1).cloned().collect();
+            let v_chunk_path: Vec<String> = v_path.iter().skip(1).cloned().collect();
+            Ok(ColumnPlan {
+                chunk_path: v_chunk_path.clone(),
+                kind: ColumnKind::NestedListOfMap {
+                    outer_optional,
+                    key_spec: k_spec,
+                    key_ptype: k_ptype,
+                    key_chunk_path: k_chunk_path,
+                    value_spec: v_spec,
+                    value_ptype: v_ptype,
+                    value_chunk_path: v_chunk_path,
+                    max_def_level: v_max_def,
+                    value_optional,
+                },
+            })
         }
         // List<struct<...>> — element is a struct (no LogicalType).
         None => {
@@ -9357,9 +9456,13 @@ mod sp145_pentest {
         }
     }
 
-    // ── Row 12: classify rejects List<Map<K,V>> ─────────────────────
+    // ── Row 12: SP146 LIFTS the List<Map<K,V>> reject ──────────────
+    // Originally pinned "List<Map<...>>: SP146 follow-up" reject.
+    // SP146 T3 lifts. Schema now classifies into NestedListOfMap.
+    // With well-formed leaves provided in the flat list, classify_column_plan
+    // returns Ok(plan); we just verify it's no longer the SP146 reject.
     #[test]
-    fn sp145_pt12_classify_rejects_list_of_map() {
+    fn sp146_pt12_classify_accepts_list_of_map() {
         let root = meta::SchemaNode::Group {
             name: "root".into(),
             repetition: meta::Repetition::Required,
@@ -9405,12 +9508,13 @@ mod sp145_pentest {
             }],
             logical_type: None,
         };
+        // Empty leaves slice → classify reaches leaf-lookup and surfaces
+        // Bad("missing from flat leaves"). The SP146 reject no longer fires.
         let r = classify_column_plan(&root, "lom", &[]);
         match r {
-            Err(PqError::Unsupported(msg)) if msg.contains("SP146")
-                || msg.contains("List<Map") => { /* OK */ }
-            Err(other) => panic!("pt12: expected Unsupported(List<Map>), got Err({other:?})"),
-            Ok(_) => panic!("pt12: expected Unsupported, got Ok(_)"),
+            Err(PqError::Bad(msg)) if msg.contains("missing from flat leaves") => { /* OK */ }
+            Err(other) => panic!("pt12: expected Bad(leaf-missing), got Err({other:?})"),
+            Ok(_) => panic!("pt12: classified to Ok but leaves slice was empty"),
         }
     }
 

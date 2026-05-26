@@ -3485,6 +3485,471 @@ mod tests {
         ]);
     }
 
+    // ── SP144 T6: end-to-end Map+struct decode inline-roundtrip tests ─
+    //
+    // These hand-build complete Parquet files (Thrift compact footer
+    // including a Map / struct schema + a row group with TWO column
+    // chunks + per-chunk V1 data pages) and call `extract()` to prove
+    // the entire T1–T5 pipeline (footer→FileMetaData→SchemaTree+
+    // recognize_logical_type→classify_column_plan {NestedMapKV |
+    // NestedStruct}→read_chunk_values_nested_map /
+    // read_chunk_values_nested_struct→assembly::assemble_map_kv /
+    // assemble_struct) wires up correctly BEFORE SP144 T7 hands us real
+    // pyarrow-produced bytes.
+    //
+    // Three canonical shapes are exercised:
+    //   T6a REQ struct {id: i64, name: BYTE_ARRAY} 2 rows
+    //   T6b OPT struct {id: i64, name: BYTE_ARRAY} 2 rows (1 NULL row)
+    //   T6c REQ-REP-REQ-REQ Map<String, i64>       2 rows
+    //
+    // These are the FIRST tests in the crate that exercise a row group
+    // with TWO column chunks (one per struct field / map K and V leaf);
+    // the chunk-list header uses (2<<4)|12 = 0x2c instead of the 1-chunk
+    // 0x1c that every existing builder uses.
+
+    /// SP144 T6a: build a REQ struct file. Schema (4 DFS preorder elements):
+    ///   [0] root: Group num_children=1 REQUIRED
+    ///   [1] my_struct: Group num_children=2 REQUIRED
+    ///   [2] id: Leaf INT64 REQUIRED
+    ///   [3] name: Leaf BYTE_ARRAY REQUIRED
+    ///
+    /// Rows: [{id:1, name:"alice"}, {id:2, name:"bob"}]
+    ///   id chunk: PLAIN INT64 [1, 2] (16 bytes, max_def=0, no def stream)
+    ///   name chunk: PLAIN BYTE_ARRAY ["alice","bob"]
+    ///     (4-byte LE len 5 + "alice" + 4-byte LE len 3 + "bob" = 16 bytes)
+    fn build_struct_required_file() -> Vec<u8> {
+        // -- id chunk page --
+        let mut id_payload = Vec::new();
+        id_payload.extend_from_slice(&1i64.to_le_bytes());
+        id_payload.extend_from_slice(&2i64.to_le_bytes());
+        let id_bytes = id_payload.len() as i32; // 16
+        let id_hdr = page_header_bytes(2, id_bytes);
+
+        // -- name chunk page --
+        let mut name_payload = Vec::new();
+        name_payload.extend_from_slice(&5u32.to_le_bytes());
+        name_payload.extend_from_slice(b"alice");
+        name_payload.extend_from_slice(&3u32.to_le_bytes());
+        name_payload.extend_from_slice(b"bob");
+        let name_bytes = name_payload.len() as i32; // 16
+        let name_hdr = page_header_bytes(2, name_bytes);
+
+        // Page offsets relative to the start of the file:
+        // [PAR1: 4 bytes][id_hdr][id_payload][name_hdr][name_payload][footer]
+        let id_page_offset: i64 = 4;
+        let name_page_offset: i64 =
+            4 + id_hdr.len() as i64 + id_payload.len() as i64;
+
+        // -- FileMetaData --
+        let mut m = Vec::new();
+        // f1 version=2
+        m.push(0x15); uv(&mut m, zz(2));
+        // f2 list<SchemaElement> 4 structs: 0x19, list-hdr (4<<4)|12=0x4c
+        m.push(0x19); m.push(0x4c);
+
+        // schema[0] root GROUP num_children=1 REQUIRED.
+        m.push(0x48); uv(&mut m, 6); m.extend_from_slice(b"schema");
+        m.push(0x15); uv(&mut m, zz(1));
+        m.push(0x00);
+
+        // schema[1] my_struct GROUP num_children=2 REQUIRED (no f3 needed
+        // since REQUIRED=0 is the implicit default — matches build_nested_schema_file).
+        m.push(0x48); uv(&mut m, 9); m.extend_from_slice(b"my_struct");
+        m.push(0x15); uv(&mut m, zz(2));
+        m.push(0x00);
+
+        // schema[2] id LEAF INT64 REQUIRED.
+        m.push(0x15); uv(&mut m, zz(2));                   // f1 type=INT64
+        m.push(0x25); uv(&mut m, zz(0));                   // f3 repetition=REQUIRED
+        m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x00);
+
+        // schema[3] name LEAF BYTE_ARRAY REQUIRED.
+        m.push(0x15); uv(&mut m, zz(6));                   // f1 type=BYTE_ARRAY(6)
+        m.push(0x25); uv(&mut m, zz(0));                   // f3 repetition=REQUIRED
+        m.push(0x18); uv(&mut m, 4); m.extend_from_slice(b"name");
+        m.push(0x00);
+
+        // f3 num_rows=2
+        m.push(0x16); uv(&mut m, zz(2));
+        // f4 list<RowGroup> 1
+        m.push(0x19); m.push(0x1c);
+
+        // RowGroup: f1 list<ColumnChunk> with 2 chunks (id + name).
+        // list-hdr (2<<4)|12 = 0x2c — TWO ColumnChunk structs.
+        m.push(0x19); m.push(0x2c);
+
+        // ColumnChunk #1 (id):
+        m.push(0x3c);                                      // f3 ColumnMetaData (delta 0->3)
+        m.push(0x15); uv(&mut m, zz(2));                   // CMD f1 type=INT64
+        m.push(0x19); m.push(0x15); uv(&mut m, zz(0));     // f2 encodings [PLAIN(0)]
+        // f3 path_in_schema list<binary> ["my_struct","id"] — 2 elements: (2<<4)|8=0x28
+        m.push(0x19); m.push(0x28);
+        uv(&mut m, 9); m.extend_from_slice(b"my_struct");
+        uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x15); uv(&mut m, zz(0));                   // f4 codec=UNCOMPRESSED
+        m.push(0x16); uv(&mut m, zz(2));                   // f5 num_values=2
+        m.push(0x46); uv(&mut m, zz(id_page_offset));      // f9 data_page_offset
+        m.push(0x00); m.push(0x00);                        // stop CMD / ColumnChunk #1
+
+        // ColumnChunk #2 (name):
+        m.push(0x3c);
+        m.push(0x15); uv(&mut m, zz(6));                   // CMD f1 type=BYTE_ARRAY
+        m.push(0x19); m.push(0x15); uv(&mut m, zz(0));     // f2 encodings [PLAIN]
+        m.push(0x19); m.push(0x28);                        // f3 path: 2 elements
+        uv(&mut m, 9); m.extend_from_slice(b"my_struct");
+        uv(&mut m, 4); m.extend_from_slice(b"name");
+        m.push(0x15); uv(&mut m, zz(0));                   // f4 codec=UNCOMPRESSED
+        m.push(0x16); uv(&mut m, zz(2));                   // f5 num_values=2
+        m.push(0x46); uv(&mut m, zz(name_page_offset));    // f9 data_page_offset
+        m.push(0x00); m.push(0x00);                        // stop CMD / ColumnChunk #2
+
+        // RowGroup f3 num_rows=2 (delta 1->3=2 -> 0x26)
+        m.push(0x26); uv(&mut m, zz(2));
+        m.push(0x00); // stop RowGroup
+        m.push(0x00); // stop FileMetaData
+
+        // Assemble: [PAR1][id_hdr][id_payload][name_hdr][name_payload][footer][mlen u32 LE][PAR1]
+        let mut f = Vec::new();
+        f.extend_from_slice(b"PAR1");
+        f.extend_from_slice(&id_hdr);
+        f.extend_from_slice(&id_payload);
+        f.extend_from_slice(&name_hdr);
+        f.extend_from_slice(&name_payload);
+        let mlen = m.len() as u32;
+        f.extend_from_slice(&m);
+        f.extend_from_slice(&mlen.to_le_bytes());
+        f.extend_from_slice(b"PAR1");
+        f
+    }
+
+    #[test]
+    fn extract_decodes_struct_required_inline_roundtrip() {
+        // SP144 T6a: REQ struct {id: i64 REQ, name: BYTE_ARRAY REQ}, 2 rows.
+        //
+        // Validates the T1-T5 struct pipeline:
+        //   FileMetaData (4-elem schema, 1 RG, 2 chunks) →
+        //   classify_column_plan → recognize_logical_type=None →
+        //   classify_struct_plan → NestedStruct{outer_optional:false, 2 fields} →
+        //   read_chunk_values_nested_struct → read_chunk_values per field
+        //   (flat REQUIRED path, max_def=0) → assemble_struct zip.
+        let file = build_struct_required_file();
+        let result = extract(&file, &["my_struct"]).expect("extract REQ struct");
+        assert_eq!(result.len(), 2, "two rows");
+        assert_eq!(result[0], vec![PqValue::Struct(vec![
+            ("id".into(), PqValue::I64(1)),
+            ("name".into(), PqValue::Bytes(b"alice".to_vec())),
+        ])]);
+        assert_eq!(result[1], vec![PqValue::Struct(vec![
+            ("id".into(), PqValue::I64(2)),
+            ("name".into(), PqValue::Bytes(b"bob".to_vec())),
+        ])]);
+    }
+
+    /// SP144 T6b: build an OPT struct file. Schema:
+    ///   [0] root: Group num_children=1 REQUIRED
+    ///   [1] my_struct: Group num_children=2 OPTIONAL  ← OPT
+    ///   [2] id: Leaf INT64 REQUIRED  (within OPT parent → max_def=1)
+    ///   [3] name: Leaf BYTE_ARRAY REQUIRED  (max_def=1)
+    ///
+    /// Rows: [{id:1, name:"alice"}, NULL_struct]
+    ///   id chunk: max_def=1, n=2, def=[1,0], 1 present value:
+    ///     def_section: [0x02,0,0,0][0x03, 0x01]  (bit_width=1: header
+    ///       (1<<1)|1=0x03; LSB-first bits [1,0,0,0,0,0,0,0] = 0x01)
+    ///     values: [1i64 LE] = 8 bytes
+    ///   name chunk: same def shape; values: [4-byte LE len 5]["alice"]
+    fn build_struct_optional_file() -> Vec<u8> {
+        // -- id chunk page (max_def=1, 2 rows, 1 present) --
+        let id_def_len: u32 = 2;
+        let id_def_hybrid: &[u8] = &[0x03, 0x01]; // 1 bit-packed group, bits [1,0,0,0,0,0,0,0]
+        let mut id_payload = Vec::new();
+        id_payload.extend_from_slice(&id_def_len.to_le_bytes());
+        id_payload.extend_from_slice(id_def_hybrid);
+        id_payload.extend_from_slice(&1i64.to_le_bytes()); // present value
+        let id_bytes = id_payload.len() as i32;
+        let id_hdr = page_header_bytes(2, id_bytes); // n=2 (positions)
+
+        // -- name chunk page (max_def=1, 2 rows, 1 present) --
+        let name_def_len: u32 = 2;
+        let name_def_hybrid: &[u8] = &[0x03, 0x01];
+        let mut name_payload = Vec::new();
+        name_payload.extend_from_slice(&name_def_len.to_le_bytes());
+        name_payload.extend_from_slice(name_def_hybrid);
+        name_payload.extend_from_slice(&5u32.to_le_bytes()); // BYTE_ARRAY len prefix
+        name_payload.extend_from_slice(b"alice");
+        let name_bytes = name_payload.len() as i32;
+        let name_hdr = page_header_bytes(2, name_bytes);
+
+        let id_page_offset: i64 = 4;
+        let name_page_offset: i64 =
+            4 + id_hdr.len() as i64 + id_payload.len() as i64;
+
+        let mut m = Vec::new();
+        m.push(0x15); uv(&mut m, zz(2));                       // f1 version=2
+        m.push(0x19); m.push(0x4c);                            // f2 list<SchemaElement> 4
+
+        // schema[0] root GROUP REQUIRED num_children=1
+        m.push(0x48); uv(&mut m, 6); m.extend_from_slice(b"schema");
+        m.push(0x15); uv(&mut m, zz(1));
+        m.push(0x00);
+
+        // schema[1] my_struct GROUP OPTIONAL(1) num_children=2
+        // f3 repetition=OPTIONAL(1): delta 0->3=3 -> 0x35
+        m.push(0x35); uv(&mut m, zz(1));
+        m.push(0x18); uv(&mut m, 9); m.extend_from_slice(b"my_struct");
+        m.push(0x15); uv(&mut m, zz(2));                       // num_children=2
+        m.push(0x00);
+
+        // schema[2] id LEAF INT64 REQUIRED
+        m.push(0x15); uv(&mut m, zz(2));                       // f1 type=INT64
+        m.push(0x25); uv(&mut m, zz(0));                       // f3 REQUIRED
+        m.push(0x18); uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x00);
+
+        // schema[3] name LEAF BYTE_ARRAY REQUIRED
+        m.push(0x15); uv(&mut m, zz(6));                       // f1 type=BYTE_ARRAY
+        m.push(0x25); uv(&mut m, zz(0));                       // f3 REQUIRED
+        m.push(0x18); uv(&mut m, 4); m.extend_from_slice(b"name");
+        m.push(0x00);
+
+        // f3 num_rows=2
+        m.push(0x16); uv(&mut m, zz(2));
+        // f4 list<RowGroup> 1
+        m.push(0x19); m.push(0x1c);
+
+        // RowGroup: 2 ColumnChunks (id + name) — 0x2c list header.
+        m.push(0x19); m.push(0x2c);
+
+        // ColumnChunk #1 (id)
+        m.push(0x3c);
+        m.push(0x15); uv(&mut m, zz(2));                       // type=INT64
+        m.push(0x19); m.push(0x15); uv(&mut m, zz(0));         // encodings [PLAIN]
+        m.push(0x19); m.push(0x28);                            // path: 2 elements
+        uv(&mut m, 9); m.extend_from_slice(b"my_struct");
+        uv(&mut m, 2); m.extend_from_slice(b"id");
+        m.push(0x15); uv(&mut m, zz(0));                       // codec=UNCOMPRESSED
+        m.push(0x16); uv(&mut m, zz(2));                       // num_values=2
+        m.push(0x46); uv(&mut m, zz(id_page_offset));
+        m.push(0x00); m.push(0x00);
+
+        // ColumnChunk #2 (name)
+        m.push(0x3c);
+        m.push(0x15); uv(&mut m, zz(6));                       // type=BYTE_ARRAY
+        m.push(0x19); m.push(0x15); uv(&mut m, zz(0));         // encodings [PLAIN]
+        m.push(0x19); m.push(0x28);
+        uv(&mut m, 9); m.extend_from_slice(b"my_struct");
+        uv(&mut m, 4); m.extend_from_slice(b"name");
+        m.push(0x15); uv(&mut m, zz(0));
+        m.push(0x16); uv(&mut m, zz(2));
+        m.push(0x46); uv(&mut m, zz(name_page_offset));
+        m.push(0x00); m.push(0x00);
+
+        m.push(0x26); uv(&mut m, zz(2));                       // RG f3 num_rows=2
+        m.push(0x00);                                          // stop RG
+        m.push(0x00);                                          // stop FileMetaData
+
+        let mut f = Vec::new();
+        f.extend_from_slice(b"PAR1");
+        f.extend_from_slice(&id_hdr);
+        f.extend_from_slice(&id_payload);
+        f.extend_from_slice(&name_hdr);
+        f.extend_from_slice(&name_payload);
+        let mlen = m.len() as u32;
+        f.extend_from_slice(&m);
+        f.extend_from_slice(&mlen.to_le_bytes());
+        f.extend_from_slice(b"PAR1");
+        f
+    }
+
+    #[test]
+    fn extract_decodes_struct_optional_with_null_row_inline_roundtrip() {
+        // SP144 T6b: OPT struct, with one all-Null row.
+        //
+        // Pipeline: classify_struct_plan with outer_optional=true →
+        // 2 fields each with max_def_level=1 → per-field flat decode
+        // via decode_page (max_def=1 arm: [def_len][def_hybrid][PLAIN present])
+        // → scatter_nulls produces [I64(1), Null] for id, [Bytes("alice"), Null]
+        // for name → assemble_struct with outer_optional=true:
+        //   row 0: both fields present → Struct(id=1, name="alice")
+        //   row 1: both fields Null → all-Null heuristic → PqValue::Null
+        let file = build_struct_optional_file();
+        let result = extract(&file, &["my_struct"]).expect("extract OPT struct");
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], vec![PqValue::Struct(vec![
+            ("id".into(), PqValue::I64(1)),
+            ("name".into(), PqValue::Bytes(b"alice".to_vec())),
+        ])]);
+        assert_eq!(result[1], vec![PqValue::Null]);
+    }
+
+    /// SP144 T6c: build a REQ-REP-REQ-REQ Map<String, i64> file with
+    /// 2 records: [{"a":1, "b":2}, {"x":7}].
+    /// Schema (5 DFS preorder elements):
+    ///   [0] root: Group num_children=1 REQUIRED
+    ///   [1] my_map: Group num_children=1 REQUIRED converted_type=MAP(1)
+    ///   [2] key_value: Group num_children=2 REPEATED
+    ///   [3] key: Leaf BYTE_ARRAY REQUIRED
+    ///   [4] value: Leaf INT64 REQUIRED
+    ///
+    /// Schema-derived levels for both key and value:
+    ///   max_def_level = 1 (one REPEATED ancestor, both leaves REQUIRED)
+    ///   max_rep_level = 1
+    ///
+    /// Rep stream [0,1,0] bit_width=1: header (1<<1)|1=0x03; LSB-first
+    ///   bits [0,1,0,0,0,0,0,0] = 0b00000010 = 0x02. Stream [0x03, 0x02],
+    ///   length prefix u32 LE = 2.
+    /// Def stream [1,1,1] bit_width=1: header 0x03; bits [1,1,1,0,0,0,0,0]
+    ///   = 0b00000111 = 0x07. Stream [0x03, 0x07], length prefix 2.
+    ///
+    /// key chunk: rep+def + 3 PLAIN BYTE_ARRAY ("a","b","x") = 15 byte values.
+    /// value chunk: rep+def + 3 INT64 (1,2,7) = 24 byte values.
+    fn build_map_string_i64_required_file() -> Vec<u8> {
+        // Shared rep+def section for both chunks (byte-identical since
+        // both leaves share the REPEATED middle ancestor).
+        let rep_len: u32 = 2;
+        let rep_hybrid: &[u8] = &[0x03, 0x02];
+        let def_len: u32 = 2;
+        let def_hybrid: &[u8] = &[0x03, 0x07];
+
+        // -- key chunk page --
+        let mut key_payload = Vec::new();
+        key_payload.extend_from_slice(&rep_len.to_le_bytes());
+        key_payload.extend_from_slice(rep_hybrid);
+        key_payload.extend_from_slice(&def_len.to_le_bytes());
+        key_payload.extend_from_slice(def_hybrid);
+        for s in ["a", "b", "x"] {
+            key_payload.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            key_payload.extend_from_slice(s.as_bytes());
+        }
+        let key_bytes = key_payload.len() as i32;
+        let key_hdr = page_header_bytes(3, key_bytes); // 3 (rep,def) pairs
+
+        // -- value chunk page --
+        let mut value_payload = Vec::new();
+        value_payload.extend_from_slice(&rep_len.to_le_bytes());
+        value_payload.extend_from_slice(rep_hybrid);
+        value_payload.extend_from_slice(&def_len.to_le_bytes());
+        value_payload.extend_from_slice(def_hybrid);
+        for v in [1i64, 2, 7] {
+            value_payload.extend_from_slice(&v.to_le_bytes());
+        }
+        let value_bytes = value_payload.len() as i32;
+        let value_hdr = page_header_bytes(3, value_bytes);
+
+        let key_page_offset: i64 = 4;
+        let value_page_offset: i64 =
+            4 + key_hdr.len() as i64 + key_payload.len() as i64;
+
+        let mut m = Vec::new();
+        m.push(0x15); uv(&mut m, zz(2));                       // f1 version=2
+        // f2 list<SchemaElement> 5: list-hdr (5<<4)|12 = 0x5c
+        m.push(0x19); m.push(0x5c);
+
+        // schema[0] root GROUP num_children=1 REQUIRED.
+        m.push(0x48); uv(&mut m, 6); m.extend_from_slice(b"schema");
+        m.push(0x15); uv(&mut m, zz(1));
+        m.push(0x00);
+
+        // schema[1] my_map GROUP num_children=1 REQUIRED converted_type=MAP(1).
+        // REQUIRED is default (no f3 needed). Use f4 name, f5 nc, f6 ct.
+        m.push(0x48); uv(&mut m, 6); m.extend_from_slice(b"my_map");
+        m.push(0x15); uv(&mut m, zz(1));                       // num_children=1
+        m.push(0x15); uv(&mut m, zz(1));                       // converted_type=MAP(1)
+        m.push(0x00);
+
+        // schema[2] key_value GROUP REPEATED(2) num_children=2.
+        // f3 REPEATED: delta 0->3=3 -> 0x35; zz(2)=4
+        m.push(0x35); uv(&mut m, zz(2));
+        m.push(0x18); uv(&mut m, 9); m.extend_from_slice(b"key_value");
+        m.push(0x15); uv(&mut m, zz(2));
+        m.push(0x00);
+
+        // schema[3] key LEAF BYTE_ARRAY REQUIRED.
+        m.push(0x15); uv(&mut m, zz(6));                       // f1 type=BYTE_ARRAY
+        m.push(0x25); uv(&mut m, zz(0));                       // f3 REQUIRED
+        m.push(0x18); uv(&mut m, 3); m.extend_from_slice(b"key");
+        m.push(0x00);
+
+        // schema[4] value LEAF INT64 REQUIRED.
+        m.push(0x15); uv(&mut m, zz(2));                       // f1 type=INT64
+        m.push(0x25); uv(&mut m, zz(0));                       // f3 REQUIRED
+        m.push(0x18); uv(&mut m, 5); m.extend_from_slice(b"value");
+        m.push(0x00);
+
+        // f3 num_rows=2 (top-level records)
+        m.push(0x16); uv(&mut m, zz(2));
+        // f4 list<RowGroup> 1
+        m.push(0x19); m.push(0x1c);
+
+        // RowGroup: 2 ColumnChunks (key + value).
+        m.push(0x19); m.push(0x2c);
+
+        // ColumnChunk #1 (key)
+        m.push(0x3c);
+        m.push(0x15); uv(&mut m, zz(6));                       // type=BYTE_ARRAY
+        m.push(0x19); m.push(0x15); uv(&mut m, zz(0));         // encodings [PLAIN]
+        // f3 path: 3 elements ["my_map","key_value","key"] -> (3<<4)|8=0x38
+        m.push(0x19); m.push(0x38);
+        uv(&mut m, 6); m.extend_from_slice(b"my_map");
+        uv(&mut m, 9); m.extend_from_slice(b"key_value");
+        uv(&mut m, 3); m.extend_from_slice(b"key");
+        m.push(0x15); uv(&mut m, zz(0));                       // codec=UNCOMPRESSED
+        m.push(0x16); uv(&mut m, zz(3));                       // num_values=3 (rep/def pairs)
+        m.push(0x46); uv(&mut m, zz(key_page_offset));
+        m.push(0x00); m.push(0x00);
+
+        // ColumnChunk #2 (value)
+        m.push(0x3c);
+        m.push(0x15); uv(&mut m, zz(2));                       // type=INT64
+        m.push(0x19); m.push(0x15); uv(&mut m, zz(0));         // encodings [PLAIN]
+        m.push(0x19); m.push(0x38);
+        uv(&mut m, 6); m.extend_from_slice(b"my_map");
+        uv(&mut m, 9); m.extend_from_slice(b"key_value");
+        uv(&mut m, 5); m.extend_from_slice(b"value");
+        m.push(0x15); uv(&mut m, zz(0));
+        m.push(0x16); uv(&mut m, zz(3));
+        m.push(0x46); uv(&mut m, zz(value_page_offset));
+        m.push(0x00); m.push(0x00);
+
+        m.push(0x26); uv(&mut m, zz(2));                       // RG num_rows=2
+        m.push(0x00);                                          // stop RG
+        m.push(0x00);                                          // stop FileMetaData
+
+        let mut f = Vec::new();
+        f.extend_from_slice(b"PAR1");
+        f.extend_from_slice(&key_hdr);
+        f.extend_from_slice(&key_payload);
+        f.extend_from_slice(&value_hdr);
+        f.extend_from_slice(&value_payload);
+        let mlen = m.len() as u32;
+        f.extend_from_slice(&m);
+        f.extend_from_slice(&mlen.to_le_bytes());
+        f.extend_from_slice(b"PAR1");
+        f
+    }
+
+    #[test]
+    fn extract_decodes_map_string_i64_required_inline_roundtrip() {
+        // SP144 T6c: REQ-REP-REQ-REQ Map<String, i64>, 2 records.
+        //
+        // assemble_map_kv walk with max_def=1, outer_opt=false, value_opt=false:
+        //   R0 (rep=0, def=1): no previous map, start new map → push ("a"->1)
+        //   R1 (rep=1, def=1): continuing → push ("b"->2) into current map
+        //   R2 (rep=0, def=1): flush previous → push Map[{"a"->1,"b"->2}];
+        //                       start new map → push ("x"->7)
+        //   trailing flush → push Map[{"x"->7}]
+        let file = build_map_string_i64_required_file();
+        let result = extract(&file, &["my_map"]).expect("extract Map<String,i64>");
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], vec![PqValue::Map(vec![
+            (PqValue::Bytes(b"a".to_vec()), PqValue::I64(1)),
+            (PqValue::Bytes(b"b".to_vec()), PqValue::I64(2)),
+        ])]);
+        assert_eq!(result[1], vec![PqValue::Map(vec![
+            (PqValue::Bytes(b"x".to_vec()), PqValue::I64(7)),
+        ])]);
+    }
+
     /// Build an OPTIONAL+dict INT64 file for column "id".
     /// Logical rows: [7, null, 7]. defs=[1,0,1], dict=[7], present_count=2.
     /// Dict page: PLAIN [7i64]. Data page: PLAIN_DICTIONARY(2), n=3.

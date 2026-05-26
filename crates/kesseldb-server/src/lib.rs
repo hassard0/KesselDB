@@ -426,6 +426,13 @@ pub struct EngineHandle {
     /// round-trip in snapshot_metrics/snapshot_health, which would return
     /// 0 under engine saturation (Prometheus counter-reset).
     applied_ops_atomic: Arc<AtomicU64>,
+    /// SP144H T1: per-Op::kind() counters. Indexed by tag-byte (the first
+    /// byte of every Op::encode() frame, which equals `Op::kind() as u8`
+    /// for bare-Op frames; 0xFE for SQL frames; 0xFB STATS_TAG etc. are
+    /// engine-internal and excluded from publication). Size 64 = 46 Op
+    /// kinds + headroom + room for special tags like 0xFE. Out-of-range
+    /// tags (≥64) are dropped (no overflow into another slot).
+    op_kind_counts: Arc<[AtomicU64; 64]>,
 }
 
 impl EngineHandle {
@@ -480,6 +487,20 @@ impl EngineHandle {
         self.applied_ops_atomic.load(Ordering::Acquire)
     }
 
+    /// SP144H T1: snapshot of per-Op::kind() counters. Returns non-zero
+    /// rows only (bounded by ≤46 active kinds + ~5 special tags ≤ ~50).
+    /// Cheap — 64 atomic loads.
+    pub fn op_kind_counts_snapshot(&self) -> Vec<(u8, u64)> {
+        let mut out = Vec::new();
+        for (i, slot) in self.op_kind_counts.iter().enumerate() {
+            let v = slot.load(Ordering::Acquire);
+            if v > 0 {
+                out.push((i as u8, v));
+            }
+        }
+        out
+    }
+
     /// Take a consistent on-disk snapshot/backup into `dest`. The engine
     /// flushes, then copies its data dir while no apply is in flight, so
     /// `StateMachine::open(dest)` recovers an identical state.
@@ -517,6 +538,14 @@ pub fn spawn_engine_cfg(
     // so observability is immune to engine backpressure.
     let applied_ops_atomic_for_engine = Arc::new(AtomicU64::new(0));
     let applied_ops_atomic_for_handle = applied_ops_atomic_for_engine.clone();
+    // SP144H T1: per-Op::kind() counter array, shared between engine
+    // thread (write) and EngineHandle (read). Same dual-Arc shape as
+    // applied_ops_atomic above. Indexed by tag-byte (frame.first()),
+    // out-of-range tags dropped.
+    let op_kind_counts_for_engine: Arc<[AtomicU64; 64]> = Arc::new(
+        std::array::from_fn(|_| AtomicU64::new(0))
+    );
+    let op_kind_counts_for_handle = op_kind_counts_for_engine.clone();
     std::thread::spawn(move || {
         let mut sm = match DirVfs::new(&dir).and_then(StateMachine::open) {
             Ok(sm) => {
@@ -742,6 +771,18 @@ pub fn spawn_engine_cfg(
             if n > n_before {
                 applied_ops_atomic_for_engine
                     .fetch_add(n - n_before, Ordering::AcqRel);
+                // SP144H T1: also bump per-kind slot. Gating on n_after >
+                // n_before ensures STATS_TAG / SNAPSHOT_TAG / pipeline-control
+                // frames (which don't bump n) don't double-count. The frame's
+                // first byte is Op::kind() for bare-Op frames, 0xFE for SQL
+                // ([0xFE]++sql). Out-of-range tags (≥64) are dropped.
+                if let Some(&tag) = frame.first() {
+                    let idx = tag as usize;
+                    if idx < 64 {
+                        op_kind_counts_for_engine[idx]
+                            .fetch_add(1, Ordering::AcqRel);
+                    }
+                }
             }
             batch.push((res, reply));
             while batch.len() < MAX_BATCH {
@@ -752,6 +793,14 @@ pub fn spawn_engine_cfg(
                         if n > n_before {
                             applied_ops_atomic_for_engine
                                 .fetch_add(n - n_before, Ordering::AcqRel);
+                            // SP144H T1: per-kind bump (see comment above).
+                            if let Some(&tag) = f.first() {
+                                let idx = tag as usize;
+                                if idx < 64 {
+                                    op_kind_counts_for_engine[idx]
+                                        .fetch_add(1, Ordering::AcqRel);
+                                }
+                            }
                         }
                         batch.push((res, rp));
                     }
@@ -770,6 +819,7 @@ pub fn spawn_engine_cfg(
             inflight: Arc::new(AtomicUsize::new(0)),
             max_inflight,
             applied_ops_atomic: applied_ops_atomic_for_handle,
+            op_kind_counts: op_kind_counts_for_handle,
         }),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(io::Error::new(io::ErrorKind::Other, "engine failed to start")),
@@ -1113,23 +1163,36 @@ impl kessel_http_gateway::EngineApply for EngineHandle {
         // backpressure. `stats()` is still available to other callers
         // (its STATS_TAG round-trip is the source-of-truth path); the
         // observability surfaces just stop depending on it.
-        let ops = self.applied_ops_snapshot();
+        let total_applied = self.applied_ops_snapshot();
+        // SP144H T1: emit one OpKindCounter per (tag, count). Label is
+        // the stringified tag id (e.g. "kind_3" for Op::Create, "kind_254"
+        // for SQL frames). A future slice can swap in human-readable
+        // names via a const lookup. Static-lifetime requirement on
+        // OpKindCounter.kind is satisfied via Box::leak — bounded leak
+        // (≤64 distinct labels, each ≤12 chars, over process lifetime).
+        let per_kind = self.op_kind_counts_snapshot();
+        let mut ops_total: Vec<kessel_http_gateway::OpKindCounter> = per_kind
+            .into_iter()
+            .map(|(tag, count)| {
+                let label: &'static str =
+                    Box::leak(format!("kind_{}", tag).into_boxed_str());
+                kessel_http_gateway::OpKindCounter { kind: label, count }
+            })
+            .collect();
+        // Also emit a roll-up "applied" row for backward-compat with the
+        // pre-SP144H metric shape (Prometheus dashboards that summed all
+        // ops via this single metric continue to work).
+        ops_total.push(kessel_http_gateway::OpKindCounter {
+            kind: "applied",
+            count: total_applied,
+        });
         kessel_http_gateway::MetricsSnapshot {
-            ops_total: vec![
-                // SP141 V1: a single rolled-up counter using `applied_ops`
-                // (engine's existing counter). A per-Op-kind breakdown
-                // requires an atomic counter array — deferred to follow-up
-                // per spec §11.
-                kessel_http_gateway::OpKindCounter {
-                    kind: "applied",
-                    count: ops,
-                },
-            ],
+            ops_total,
             inflight: self.inflight_snapshot(),
-            last_op_number: ops,
+            last_op_number: total_applied,
             view_number: 0,    // single-node V1; cluster wiring is follow-up
             is_primary: true,
-            http_requests_total: Vec::new(),  // wired in follow-up
+            http_requests_total: Vec::new(),  // wired in follow-up (T2)
         }
     }
 }
@@ -1495,6 +1558,62 @@ mod tests {
             after_two,
             after_one + 1,
             "one apply must bump applied_ops_snapshot by exactly 1"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn op_kind_counts_snapshot_increments_per_tag() {
+        // SP144H T1: per-Op::kind() counter array. Verifies (a) empty at
+        // startup, (b) bumps the right slot per applied op (CreateType =
+        // tag 1), (c) the cumulative roll-up "applied" counter and the
+        // per-kind slot agree.
+        let dir = std::env::temp_dir()
+            .join(format!("kesseldb-sp144h-t1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = spawn_engine(&dir).unwrap();
+        assert_eq!(engine.op_kind_counts_snapshot(), vec![]);
+
+        // Apply two CreateType ops (Op::kind() = 1).
+        let def_t1 = encode_type_def(
+            "t1",
+            &[Field {
+                field_id: 0,
+                name: "v".into(),
+                kind: FieldKind::U64,
+                nullable: false,
+            }],
+        );
+        let _ = engine.apply(Op::CreateType { def: def_t1 });
+        let def_t2 = encode_type_def(
+            "t2",
+            &[Field {
+                field_id: 0,
+                name: "v".into(),
+                kind: FieldKind::U64,
+                nullable: false,
+            }],
+        );
+        let _ = engine.apply(Op::CreateType { def: def_t2 });
+
+        let snap = engine.op_kind_counts_snapshot();
+        let create_type_count = snap
+            .iter()
+            .find(|(tag, _)| *tag == 1)
+            .map(|(_, c)| *c)
+            .unwrap_or(0);
+        assert_eq!(
+            create_type_count, 2,
+            "CreateType (tag=1) should have count=2; snap={snap:?}"
+        );
+        // Roll-up applied counter must also reflect both applies (it is
+        // bumped from the same gate that publishes per-kind, so they
+        // can't diverge).
+        assert_eq!(
+            engine.applied_ops_snapshot(),
+            2,
+            "applied_ops_snapshot must agree with per-kind sum"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -10583,5 +10583,92 @@ mod sp149_pentest {
         assert!(msg.contains("truncated lit-len") || msg.contains("lit-len"),
                 "expected lit-len-extra truncation error, got: {msg}");
     }
+
+    // ── SP153 T2: deeper lz4 pentest gaps (SP149 self-review follow-ups) ──
+    //
+    // SP149 KATs covered positive minmatch=4 indirectly via `kat_lit_then_match`
+    // and the RLE pattern via `kat_overlapping_copy_rle`. The 5 rows below
+    // close the gaps SP149 noted: (a) the match-len extras path that grows
+    // match_len beyond the declared output size, (b) a LONG RLE match
+    // exercising the byte-by-byte copy loop, (c) truncated lit-len extras,
+    // (d) the spec-legal offset==out.len() edge, and (e) the minmatch=4
+    // invariant locked positively.
+
+    /// SP153 row 1: token low nibble = 15 triggers the match-len extra-byte
+    /// loop. With offset=1 and extras 0xff + 0x00 the decoder accumulates
+    /// match_len = 19 + 255 = 274 → exceeds declared uncompressed size (10) →
+    /// `match exceeds declared uncompressed size` Bad. The checked_add inside
+    /// the extras loop blocks the genuine usize-overflow case (impractical to
+    /// trigger directly: ~2^64/255 ≈ 7.2e16 extras of 0xff would be needed).
+    /// This row exercises the same OVERFLOW REJECTION DOWNSTREAM gate.
+    #[test]
+    fn sp153_pt_lz4_match_len_extra_overflow() {
+        // token 0x4f: lit_len=4, match_nibble=15 (extras pending)
+        // literals "abcd"; offset=1 (LE u16 = [0x01, 0x00])
+        // match-len extras: 0xff (255) then 0x00 (terminator)
+        // -> match_len = (15 + 4) + 255 + 0 = 274 ≫ expected_uncompressed_size=10
+        let src = vec![0x4f, b'a', b'b', b'c', b'd', 0x01, 0x00, 0xff, 0x00];
+        let err = decompress(&src, 10).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("exceed") || msg.contains("match"),
+            "expected match-overflow rejection, got: {msg}"
+        );
+    }
+
+    /// SP153 row 2: long RLE match (offset=1, match_len=99) — locks the
+    /// byte-by-byte forward copy. A naïve memcpy-style copy would read from
+    /// the source region while it grows, producing buffer overrun or stale
+    /// data. The decoder must copy one byte at a time so each push() sees
+    /// the previously pushed byte.
+    #[test]
+    fn sp153_pt_lz4_rle_long_match_no_buffer_overrun() {
+        // token 0x1f: lit_len=1, match_nibble=15 (extras pending)
+        // literal "a"; offset=1
+        // match_len = (15+4)=19; +80 (one extra 0x50, <255 → loop ends) = 99
+        // -> output: "a" + 99 more 'a's = 100 bytes total
+        let src = vec![0x1f, b'a', 0x01, 0x00, 0x50];
+        let out = decompress(&src, 100).expect("RLE expand");
+        assert_eq!(out.len(), 100);
+        assert!(out.iter().all(|&b| b == b'a'), "all 'a's expected, got {out:?}");
+    }
+
+    /// SP153 row 3: truncated lit-len extras path (parallel to SP149 row 7
+    /// for completeness — locks the "truncated" wording the SP153 plan
+    /// requested as the spec contract).
+    #[test]
+    fn sp153_pt_lz4_truncated_extra_byte_rejected() {
+        let src = vec![0xf0]; // lit_len=15+extras, no extras follow
+        let err = decompress(&src, 10).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("truncated"), "expected 'truncated' wording, got: {msg}");
+    }
+
+    /// SP153 row 4: offset==out.len() is the largest spec-legal back-reference.
+    /// It references the very first byte. The decoder's `offset > out.len()`
+    /// guard uses `>` (NOT `>=`) — this row locks that boundary.
+    #[test]
+    fn sp153_pt_lz4_offset_at_exact_output_length() {
+        // token 0x30: lit_len=3, match_nibble=0 → match_len=4
+        // literals "abc"; offset=3
+        // -> out: "abc" then copy out[0..4] forward = "abc" + "abca" = "abcabca"
+        let src = vec![0x30, b'a', b'b', b'c', 0x03, 0x00];
+        let out = decompress(&src, 7).expect("offset==out.len() edge");
+        assert_eq!(out, b"abcabca");
+    }
+
+    /// SP153 row 5: positive lock for the minmatch=4 invariant — even with
+    /// token low nibble = 0, match_len is 0 + 4 = 4 (the +4 baked into the
+    /// decoder's `(token & 0x0f) as usize + 4`). SP149's KAT covered this
+    /// indirectly via `kat_lit_then_match`; this row asserts it directly.
+    #[test]
+    fn sp153_pt_lz4_minmatch_4_locked() {
+        // token 0x40: lit_len=4, match_nibble=0 → match_len = 0 + 4 = 4
+        // literals "abcd"; offset=4 → match copies out[0..4] = "abcd"
+        // -> "abcd" + "abcd" = "abcdabcd"
+        let src = vec![0x40, b'a', b'b', b'c', b'd', 0x04, 0x00];
+        let out = decompress(&src, 8).expect("minmatch=4");
+        assert_eq!(out, b"abcdabcd");
+    }
 }
 

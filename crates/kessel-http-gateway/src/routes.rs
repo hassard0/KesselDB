@@ -1,6 +1,14 @@
 //! Four route handlers — single source of truth for /v1/sql, /v1/op,
 //! /v1/health. /v1/metrics handler shipped here as a placeholder; T6
 //! replaces it with the Prometheus text writer.
+//!
+//! SP147 (HTTP/1.1 keep-alive): `handle` computes `keep_alive` ONCE from
+//! `parse::wants_close(&req.headers)` and threads it through every
+//! `write_*` path. It returns `Result<bool, io::Error>` where the bool is
+//! "should this TCP connection close after this response" — `true` when
+//! the client asked for `Connection: close` (or when an internal-policy
+//! reason forces close). `false` means the per-connection loop in
+//! `server::handle_one_stream` should keep reading the next request.
 
 #![allow(dead_code)]
 
@@ -16,14 +24,20 @@ use kessel_proto::{Op, OpResult};
 use std::io::Write;
 use std::sync::Arc;
 
-/// Auth + dispatch.
+/// Auth + dispatch. Returns `Ok(close_after)` — true iff the per-connection
+/// loop should close the TCP connection after this response. SP147: derived
+/// once from `parse::wants_close(&req.headers)` (RFC 9112 §9.3 persistent
+/// default). `keep_alive = !close_after` is plumbed through to every
+/// `write_*_counted` so the response's `Connection:` header matches.
 pub fn handle<W: Write>(
     w: &mut W,
     req: &Request<'_>,
     token: Option<&[u8]>,
     engine: &Arc<dyn EngineApply>,
     http_counters: &Arc<HttpRequestCountersStatic>,
-) -> std::io::Result<()> {
+) -> std::io::Result<bool> {
+    let close_after = crate::parse::wants_close(&req.headers);
+    let keep_alive = !close_after;
     // Auth first (open-mode lets every request through; token-mode requires
     // a matching Bearer). SP144H T3: the `message` field disambiguates the
     // 401 source — auth-layer ("missing bearer" / "bearer mismatch") vs
@@ -33,33 +47,37 @@ pub fn handle<W: Write>(
         match extract_bearer(&req.headers) {
             Ok(Some(given)) => {
                 if !ct_eq(given, expected) {
-                    return write_error_json_counted(w, (401, "Unauthorized"),
+                    write_error_json_counted(w, (401, "Unauthorized"),
                         "unauthorized", "bearer mismatch",
-                        http_counters, req.path);
+                        http_counters, req.path, keep_alive)?;
+                    return Ok(close_after);
                 }
             }
             Ok(None) => {
-                return write_error_json_counted(w, (401, "Unauthorized"),
+                write_error_json_counted(w, (401, "Unauthorized"),
                     "unauthorized", "missing bearer",
-                    http_counters, req.path);
+                    http_counters, req.path, keep_alive)?;
+                return Ok(close_after);
             }
             Err(e) => {
-                return write_error_json_counted(w, (400, "Bad Request"),
+                write_error_json_counted(w, (400, "Bad Request"),
                     "error", &format!("{:?}", e),
-                    http_counters, req.path);
+                    http_counters, req.path, keep_alive)?;
+                return Ok(close_after);
             }
         }
     }
 
     match req.path {
-        "/v1/sql" => handle_sql(w, req, engine, http_counters),
-        "/v1/op" => handle_op(w, req, engine, http_counters),
-        "/v1/health" => handle_health(w, engine, http_counters),
-        "/v1/metrics" => handle_metrics(w, engine, http_counters),
+        "/v1/sql" => handle_sql(w, req, engine, http_counters, keep_alive)?,
+        "/v1/op" => handle_op(w, req, engine, http_counters, keep_alive)?,
+        "/v1/health" => handle_health(w, engine, http_counters, keep_alive)?,
+        "/v1/metrics" => handle_metrics(w, engine, http_counters, keep_alive)?,
         _ => write_error_json_counted(w, (404, "Not Found"),
             "error", "not found",
-            http_counters, req.path),
+            http_counters, req.path, keep_alive)?,
     }
+    Ok(close_after)
 }
 
 fn handle_sql<W: Write>(
@@ -67,28 +85,29 @@ fn handle_sql<W: Write>(
     req: &Request<'_>,
     engine: &Arc<dyn EngineApply>,
     http_counters: &Arc<HttpRequestCountersStatic>,
+    keep_alive: bool,
 ) -> std::io::Result<()> {
     if let Some(ct) = req.content_type.as_deref() {
         if !ct.eq_ignore_ascii_case("text/plain") {
             return write_error_json_counted(w, (415, "Unsupported Media Type"),
                 "error", "unsupported media type",
-                http_counters, req.path);
+                http_counters, req.path, keep_alive);
         }
     }
     let sql = match std::str::from_utf8(req.body.as_ref()) {
         Ok(s) => s,
         Err(_) => return write_error_json_counted(w, (400, "Bad Request"),
             "error", "invalid UTF-8 in SQL body",
-            http_counters, req.path),
+            http_counters, req.path, keep_alive),
     };
     let result = match exactly_once_binding(req) {
         Ok(Some((cid, seq))) => engine.apply_sql_with_session(cid, seq, sql),
         Ok(None) => engine.apply_sql(sql),
         Err(e) => return write_error_json_counted(w, (400, "Bad Request"),
             "error", &format!("{:?}", e),
-            http_counters, req.path),
+            http_counters, req.path, keep_alive),
     };
-    write_op_result(w, &result, http_counters, req.path)
+    write_op_result(w, &result, http_counters, req.path, keep_alive)
 }
 
 fn handle_op<W: Write>(
@@ -96,6 +115,7 @@ fn handle_op<W: Write>(
     req: &Request<'_>,
     engine: &Arc<dyn EngineApply>,
     http_counters: &Arc<HttpRequestCountersStatic>,
+    keep_alive: bool,
 ) -> std::io::Result<()> {
     let ct = req.content_type.as_deref().unwrap_or("");
     if !ct.eq_ignore_ascii_case("application/x-kessel-op")
@@ -103,51 +123,54 @@ fn handle_op<W: Write>(
     {
         return write_error_json_counted(w, (415, "Unsupported Media Type"),
             "error", "unsupported media type",
-            http_counters, req.path);
+            http_counters, req.path, keep_alive);
     }
     let op = match Op::decode(req.body.as_ref()) {
         Some(op) => op,
         None => return write_error_json_counted(w, (400, "Bad Request"),
             "error", "undecodable Op bytes",
-            http_counters, req.path),
+            http_counters, req.path, keep_alive),
     };
     let result = match exactly_once_binding(req) {
         Ok(Some((cid, seq))) => engine.apply_op_with_session(cid, seq, op),
         Ok(None) => engine.apply_op(op),
         Err(e) => return write_error_json_counted(w, (400, "Bad Request"),
             "error", &format!("{:?}", e),
-            http_counters, req.path),
+            http_counters, req.path, keep_alive),
     };
-    write_op_result(w, &result, http_counters, req.path)
+    write_op_result(w, &result, http_counters, req.path, keep_alive)
 }
 
 fn handle_health<W: Write>(
     w: &mut W,
     engine: &Arc<dyn EngineApply>,
     http_counters: &Arc<HttpRequestCountersStatic>,
+    keep_alive: bool,
 ) -> std::io::Result<()> {
     let s = engine.snapshot_health();
     if !s.primary {
         return write_json_counted(w, (503, "Service Unavailable"),
             r#"{"status":"unavailable"}"#,
-            http_counters, "/v1/health");
+            http_counters, "/v1/health", keep_alive);
     }
     let body = format!(
         r#"{{"status":"ok","primary":{},"view":{},"op_number":{},"role":"{}"}}"#,
         s.primary, s.view, s.op_number, s.role,
     );
-    write_json_counted(w, (200, "OK"), &body, http_counters, "/v1/health")
+    write_json_counted(w, (200, "OK"), &body, http_counters, "/v1/health",
+        keep_alive)
 }
 
 fn handle_metrics<W: Write>(
     w: &mut W,
     engine: &Arc<dyn EngineApply>,
     http_counters: &Arc<HttpRequestCountersStatic>,
+    keep_alive: bool,
 ) -> std::io::Result<()> {
     use crate::metrics_writer::render;
     let snap = engine.snapshot_metrics();
     let text = render(&snap);
-    write_prometheus_counted(w, &text, http_counters, "/v1/metrics")
+    write_prometheus_counted(w, &text, http_counters, "/v1/metrics", keep_alive)
 }
 
 /// Map an OpResult to (HTTP status, JSON body).
@@ -165,21 +188,23 @@ fn write_op_result<W: Write>(
     r: &OpResult,
     http_counters: &Arc<HttpRequestCountersStatic>,
     path: &str,
+    keep_alive: bool,
 ) -> std::io::Result<()> {
     match r {
         OpResult::Unauthorized => write_error_json_counted(
             w, (401, "Unauthorized"),
             "unauthorized", "engine denied",
-            http_counters, path,
+            http_counters, path, keep_alive,
         ),
         OpResult::Unavailable => write_error_json_counted(
             w, (503, "Service Unavailable"),
             "unavailable", "engine unavailable",
-            http_counters, path,
+            http_counters, path, keep_alive,
         ),
         _ => {
             let body = format_result_json(r);
-            write_json_counted(w, (200, "OK"), &body, http_counters, path)
+            write_json_counted(w, (200, "OK"), &body, http_counters, path,
+                keep_alive)
         }
     }
 }

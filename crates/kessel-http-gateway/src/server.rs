@@ -82,10 +82,11 @@ fn handle_one_stream<S: Read + Write>(
         if raw.len() > MAX_HEADER_BYTES + max_body {
             // Parse failed before the path was known — bump against the
             // defensive default ("/v1/sql"). The status bucket (413) is
-            // what operators actually monitor.
+            // what operators actually monitor. SP147: defensive close —
+            // abuse path always closes regardless of negotiation.
             let _ = write_error_json_counted(s, (413, "Payload Too Large"),
                 "error", "payload too large",
-                http_counters, "/v1/sql");
+                http_counters, "/v1/sql", /*keep_alive=*/ false);
             return Ok(());
         }
         // Honor the configured `http_max_body` at parse time, not just at the
@@ -95,13 +96,18 @@ fn handle_one_stream<S: Read + Write>(
         // operator configured `http_max_body = 16 MiB` (or larger).
         match parse_request(&raw, max_body) {
             Ok(req) => {
+                // SP147 T2: `routes::handle` returns close_after; T2 still
+                // ignores the value (single-shot per-connection behavior
+                // preserved). T3 will wire the loop.
                 let _ = routes::handle(s, &req, token, engine, http_counters);
                 return Ok(());
             }
             Err(ParseError::NoHeaderTerminator) => continue,
             Err(ParseError::ShortBody) => continue,
             Err(e) => {
-                let _ = write_parse_error(s, &e, http_counters);
+                // SP147: parse errors always close (defensive — a malformed
+                // request could mis-frame subsequent bytes on the connection).
+                let _ = write_parse_error(s, &e, http_counters, /*keep_alive=*/ false);
                 return Ok(());
             }
         }
@@ -112,6 +118,7 @@ fn write_parse_error<W: Write>(
     w: &mut W,
     e: &ParseError,
     http_counters: &Arc<HttpRequestCountersStatic>,
+    keep_alive: bool,
 ) -> std::io::Result<()> {
     let (status, semantic, msg): ((u16, &'static str), &str, String) = match e {
         ParseError::BadRequestLine =>
@@ -168,7 +175,8 @@ fn write_parse_error<W: Write>(
     // against "/v1/sql" as a defensive default (the status bucket is what
     // operators actually monitor; the path label is a minor accounting
     // inaccuracy on malformed requests).
-    write_error_json_counted(w, status, semantic, &msg, http_counters, "/v1/sql")
+    write_error_json_counted(w, status, semantic, &msg, http_counters, "/v1/sql",
+        keep_alive)
 }
 
 // =========================================================================

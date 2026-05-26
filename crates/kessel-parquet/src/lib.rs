@@ -1197,21 +1197,89 @@ enum ColumnKind {
         outer_optional: bool,
         value_optional: bool,
     },
-    /// SP144 T5: struct column with N primitive children. Each field
-    /// is decoded as a flat column then zipped via `assemble_struct`.
+    /// SP144 T5: struct column with N children. Each field is decoded
+    /// (possibly recursively for SP145 nested-shape fields) then zipped
+    /// via `assemble_struct`. SP145 extends this from "primitive fields
+    /// only" to "any shape" by storing per-field nested plans.
     NestedStruct {
         outer_optional: bool,
         fields: Vec<StructField>,
     },
+    /// SP145 T5: `List<List<primitive>>` — outer LIST with a nested
+    /// LIST<primitive> as its element. The leaf path points at the
+    /// innermost primitive leaf (the data column). Both LIST groups can
+    /// be REQUIRED or OPTIONAL independently; the leaf itself can also
+    /// be REQ or OPT.
+    NestedListOfListPrimitive {
+        spec: plain::PlainSpec,
+        ptype: meta::Type,
+        max_def_level: u32,
+        max_rep_level: u32,
+        outer_optional: bool,
+        inner_optional: bool,
+        item_optional: bool,
+    },
+    /// SP145 T5: `List<struct<...>>` — outer LIST whose element is a
+    /// REQUIRED struct with N primitive fields. Each field is its own
+    /// column chunk; all share the same REPEATED outer-LIST ancestor
+    /// (so all field columns have identical rep streams at max_rep=1).
+    /// The first field is used as the rep/def authority.
+    NestedListOfStruct {
+        outer_optional: bool,
+        /// Authoritative max_def_level at the LIST-of-struct level
+        /// (outer_optional + 1 /*REP*/ + 0 — struct REQ inside list).
+        list_max_def_level: u32,
+        fields: Vec<StructField>,
+    },
+    /// SP145 T5: `Map<K, struct<...>>` — outer MAP whose V is a
+    /// REQUIRED struct with N primitive fields. K is a REQUIRED leaf.
+    /// All V field columns share the same REPEATED middle ancestor as K,
+    /// so all have identical rep streams (max_rep=1).
+    NestedMapOfStruct {
+        outer_optional: bool,
+        key_spec: plain::PlainSpec,
+        key_ptype: meta::Type,
+        key_chunk_path: Vec<String>,
+        /// Authoritative max_def_level at the MAP-of-struct level
+        /// (outer_optional + 1 /*REP*/ + 0 — struct V is REQ).
+        map_max_def_level: u32,
+        value_fields: Vec<StructField>,
+    },
+    /// SP145 T5 (BOLD cross-product): `Map<K, List<T>>` — outer MAP
+    /// whose V is itself a LIST<primitive>. The V leaf's max_rep_level=2
+    /// (MAP REP + LIST REP). K's max_rep_level=1.
+    NestedMapOfList {
+        outer_optional: bool,
+        key_spec: plain::PlainSpec,
+        key_ptype: meta::Type,
+        key_chunk_path: Vec<String>,
+        value_spec: plain::PlainSpec,
+        value_ptype: meta::Type,
+        value_chunk_path: Vec<String>,
+        /// V leaf's max_def_level
+        /// (outer_optional + 1 /*MAP REP*/ + 1 /*LIST REP*/ + value_item_optional).
+        max_def_level: u32,
+        value_item_optional: bool,
+    },
 }
 
-/// SP144 T5: single field of a NestedStruct.
+/// SP144 T5: single field of a NestedStruct. SP145 enriches with an
+/// optional `nested` — when Some(kind), the field is itself a nested
+/// shape (LIST or struct) that requires recursive assembly. When None,
+/// the field is a flat primitive decoded via `read_chunk_values`.
 struct StructField {
     name: String,
     chunk_path: Vec<String>,
     spec: plain::PlainSpec,
     ptype: meta::Type,
     max_def_level: u32,
+    /// SP145: when Some, this field is a nested shape (recursively
+    /// classified). The recursion lets `struct<List<T>>` and
+    /// `struct<struct<...>>` work compositionally: the per-field
+    /// decode for a nested field calls the appropriate nested decoder
+    /// (which itself may recurse). When None (SP144 V1), this field
+    /// is a flat primitive — same code path as before.
+    nested: Option<Box<ColumnKind>>,
 }
 
 struct ColumnPlan {
@@ -1365,6 +1433,30 @@ fn classify_column_plan(
                 )));
             }
             let leaf_node = &middle_children[0];
+            // SP145 T5: when the LIST's element is itself a Group (not
+            // a Leaf), this is one of the SP145 deep-nesting shapes:
+            //   - List<List<T>>      → element is a group with LogicalType::List
+            //   - List<struct<...>>  → element is a group with LogicalType=None
+            //   - List<Map<K,V>>     → element is a group with LogicalType::Map
+            // Recursively classify the element group and emit one of
+            // the new ColumnKind variants.
+            if let meta::SchemaNode::Group {
+                name: element_name,
+                repetition: element_rep,
+                children: element_children,
+                logical_type: element_logical,
+            } = leaf_node
+            {
+                return classify_list_of_group(
+                    name,
+                    outer_optional,
+                    element_name,
+                    *element_rep,
+                    element_children,
+                    element_logical.as_ref(),
+                    leaves,
+                );
+            }
             let (leaf_name, leaf_ptype, leaf_rep, leaf_max_def, leaf_max_rep, leaf_path) =
                 match leaf_node {
                     meta::SchemaNode::Leaf {
@@ -1507,7 +1599,18 @@ fn classify_map_plan(
             )))
         }
     };
-    // Value: Leaf, REQUIRED or OPTIONAL.
+    // Value: Leaf, REQUIRED or OPTIONAL. SP145 T5: also accept Group
+    // (struct value or List value), dispatching to the appropriate
+    // composed-shape classifier.
+    if let meta::SchemaNode::Group {
+        name: vname, repetition: vrep, children: vchildren, logical_type: vlogical,
+    } = &middle_children[1]
+    {
+        return classify_map_of_group(
+            name, outer_optional, &key_name, key_ptype, key_max_def, &key_path,
+            vname, *vrep, vchildren, vlogical.as_ref(), leaves,
+        );
+    }
     let (value_name, value_ptype, value_repetition, value_max_def, value_path) =
         match &middle_children[1] {
             meta::SchemaNode::Leaf {
@@ -1695,12 +1798,41 @@ fn classify_struct_plan(
                     spec,
                     ptype: *ptype,
                     max_def_level: *max_def_level,
+                    nested: None,
                 });
             }
             meta::SchemaNode::Group { name: child_name, .. } => {
-                return Err(PqError::Unsupported(format!(
-                    "struct `{name}` contains nested group `{child_name}`: SP145 follow-up"
-                )));
+                // SP145 T5: lift the rejection — recursively classify
+                // the nested group child as its own ColumnPlan, then
+                // wrap as a struct field with `nested = Some(kind)`.
+                // The recursive classify_column_plan call needs a
+                // synthetic root that looks like the parent schema root
+                // would, but with this child as the only top-level
+                // group. Easier: factor the classification into
+                // `classify_group_node` that doesn't require a parent
+                // root walk, then wrap.
+                let nested_kind = classify_nested_group_child(
+                    child, leaves,
+                )?;
+                // The struct field's chunk_path is a placeholder for
+                // nested fields; the nested kind's own per-leaf paths
+                // are the authoritative source the decoder uses.
+                // We use the first reachable leaf under the child as
+                // the placeholder.
+                let placeholder = first_leaf_chunk_path(child)?;
+                fields.push(StructField {
+                    name: child_name.clone(),
+                    chunk_path: placeholder,
+                    // The spec/ptype/max_def_level are unused for
+                    // nested fields (decoder dispatches off `nested`),
+                    // but rust requires them populated — use bool i32
+                    // placeholders that won't crash if accidentally
+                    // read.
+                    spec: plain::PlainSpec::plain(meta::Type::Boolean),
+                    ptype: meta::Type::Boolean,
+                    max_def_level: 0,
+                    nested: Some(Box::new(nested_kind)),
+                });
             }
         }
     }
@@ -1715,6 +1847,505 @@ fn classify_struct_plan(
             fields,
         },
     })
+}
+
+/// SP145 T5: classify a List<group> shape (the element under the
+/// REPEATED middle is itself a Group, not a primitive Leaf). Dispatches
+/// to the appropriate compositional ColumnKind based on the element
+/// group's LogicalType + structural fingerprint.
+///
+/// Supported element shapes (V1):
+///   - struct (LogicalType=None, ≥1 primitive child): `List<struct>`
+///   - List (LogicalType=List, canonical 3-node):     `List<List<primitive>>`
+/// Rejects (V1):
+///   - struct with nested-group children (i.e. `List<struct<List>>`) —
+///     would need 2+ recursive composition levels. Documented follow-up.
+///   - List<Map<K,V>> — same reason.
+///   - List<List<List<T>>> (3+ deep) — same reason.
+fn classify_list_of_group(
+    outer_name: &str,
+    outer_optional: bool,
+    element_name: &str,
+    element_rep: meta::Repetition,
+    element_children: &[meta::SchemaNode],
+    element_logical: Option<&meta::LogicalType>,
+    leaves: &[meta::SchemaLeaf],
+) -> Result<ColumnPlan, PqError> {
+    // The element group sits inside a REPEATED middle and is itself
+    // typically REQUIRED (pyarrow default) or OPTIONAL. We accept both.
+    let _element_optional = matches!(element_rep, meta::Repetition::Optional);
+    match element_logical {
+        // List<List<primitive>> ──────────────────────────────────────────
+        Some(meta::LogicalType::List) => {
+            // The element group is itself an OPT|REQ outer List. Drill
+            // through its REPEATED middle to find the leaf.
+            if element_children.len() != 1 {
+                return Err(PqError::Unsupported(format!(
+                    "List<List> `{outer_name}` inner-list outer children != 1: \
+                     non-canonical nested LIST"
+                )));
+            }
+            let inner_middle = match &element_children[0] {
+                meta::SchemaNode::Group {
+                    repetition: meta::Repetition::Repeated,
+                    children: ic, ..
+                } => ic,
+                _ => return Err(PqError::Unsupported(format!(
+                    "List<List> `{outer_name}` inner-list middle not REPEATED"
+                ))),
+            };
+            if inner_middle.len() != 1 {
+                return Err(PqError::Unsupported(format!(
+                    "List<List> `{outer_name}` inner-list middle children != 1"
+                )));
+            }
+            let (leaf_name, leaf_ptype, leaf_rep, leaf_max_def, leaf_max_rep, leaf_path) =
+                match &inner_middle[0] {
+                    meta::SchemaNode::Leaf {
+                        name, ptype, repetition, max_def_level, max_rep_level, path,
+                    } => (name.clone(), *ptype, *repetition, *max_def_level, *max_rep_level, path.clone()),
+                    _ => return Err(PqError::Unsupported(format!(
+                        "List<List<group>> `{outer_name}` — 3+ deep LIST nesting: \
+                         SP146 follow-up (V1 supports List<List<primitive>> only)"
+                    ))),
+                };
+            let inner_optional = matches!(element_rep, meta::Repetition::Optional);
+            let item_optional = matches!(leaf_rep, meta::Repetition::Optional);
+            // Physical type allow-list (mirrors flat / LIST paths).
+            match leaf_ptype {
+                meta::Type::Boolean | meta::Type::Int32 | meta::Type::Int64
+                | meta::Type::Float | meta::Type::Double | meta::Type::ByteArray
+                | meta::Type::Int96 | meta::Type::FixedLenByteArray => {}
+                t => return Err(PqError::Unsupported(format!(
+                    "List<List<{t:?}>> `{outer_name}`: physical type not in OBJ-2c allow-list"
+                ))),
+            }
+            let expected_max_def = (outer_optional as u32) + 1 + (inner_optional as u32) + 1 + (item_optional as u32);
+            if leaf_max_def != expected_max_def {
+                return Err(PqError::Bad(format!(
+                    "List<List> `{outer_name}` leaf max_def_level={leaf_max_def} \
+                     disagrees with expected {expected_max_def} \
+                     (outer_opt={outer_optional}, inner_opt={inner_optional}, item_opt={item_optional})"
+                )));
+            }
+            if leaf_max_rep != 2 {
+                return Err(PqError::Bad(format!(
+                    "List<List> `{outer_name}` leaf max_rep_level={leaf_max_rep} != 2"
+                )));
+            }
+            let leaf_struct = leaves.iter().find(|l| l.name == leaf_name)
+                .ok_or_else(|| PqError::Bad(format!(
+                    "List<List> `{outer_name}` leaf `{leaf_name}` missing from flat leaves list"
+                )))?;
+            let spec = build_plain_spec(leaf_struct)?;
+            let chunk_path: Vec<String> = leaf_path.iter().skip(1).cloned().collect();
+            Ok(ColumnPlan {
+                chunk_path,
+                kind: ColumnKind::NestedListOfListPrimitive {
+                    spec,
+                    ptype: leaf_ptype,
+                    max_def_level: leaf_max_def,
+                    max_rep_level: leaf_max_rep,
+                    outer_optional,
+                    inner_optional,
+                    item_optional,
+                },
+            })
+        }
+        // List<Map<K,V>> — V1 defers (composition would need another nested layer).
+        Some(meta::LogicalType::Map) => {
+            Err(PqError::Unsupported(format!(
+                "List<Map<...>> `{outer_name}`: SP146 follow-up (V1 supports List<List/struct>)"
+            )))
+        }
+        // List<struct<...>> — element is a struct (no LogicalType).
+        None => {
+            if element_children.is_empty() {
+                return Err(PqError::Bad(format!(
+                    "List<struct> `{outer_name}` element `{element_name}` has no fields"
+                )));
+            }
+            // All struct fields must be primitive leaves (V1 — struct of
+            // nested-shape inside a list is the 3rd-tier nesting case).
+            let mut fields = Vec::with_capacity(element_children.len());
+            for child in element_children {
+                match child {
+                    meta::SchemaNode::Leaf {
+                        name: fname, repetition: frep, ptype, max_def_level, path, ..
+                    } => {
+                        let fopt = match frep {
+                            meta::Repetition::Required => false,
+                            meta::Repetition::Optional => true,
+                            meta::Repetition::Repeated => return Err(PqError::Unsupported(format!(
+                                "List<struct> `{outer_name}` field `{fname}` is REPEATED: SP146 follow-up"
+                            ))),
+                            meta::Repetition::Other(_) => return Err(PqError::Unsupported(format!(
+                                "List<struct> `{outer_name}` field `{fname}` unknown repetition"
+                            ))),
+                        };
+                        let _ = fopt; // OPT struct fields don't currently affect List-level def-classify
+                        match ptype {
+                            meta::Type::Boolean | meta::Type::Int32 | meta::Type::Int64
+                            | meta::Type::Float | meta::Type::Double | meta::Type::ByteArray
+                            | meta::Type::Int96 | meta::Type::FixedLenByteArray => {}
+                            other => return Err(PqError::Unsupported(format!(
+                                "List<struct> `{outer_name}` field `{fname}` physical type {other:?}: OBJ-2c"
+                            ))),
+                        };
+                        let leaf_struct = leaves.iter().find(|l| &l.name == fname)
+                            .ok_or_else(|| PqError::Bad(format!(
+                                "List<struct> `{outer_name}` field leaf `{fname}` missing"
+                            )))?;
+                        let spec = build_plain_spec(leaf_struct)?;
+                        let chunk_path: Vec<String> = path.iter().skip(1).cloned().collect();
+                        fields.push(StructField {
+                            name: fname.clone(),
+                            chunk_path,
+                            spec,
+                            ptype: *ptype,
+                            max_def_level: *max_def_level,
+                            nested: None,
+                        });
+                    }
+                    meta::SchemaNode::Group { name: gname, .. } => {
+                        return Err(PqError::Unsupported(format!(
+                            "List<struct<group>> `{outer_name}` field `{gname}`: \
+                             SP146 follow-up (V1 supports List<struct<primitives>>)"
+                        )));
+                    }
+                }
+            }
+            // List-of-struct max_def_level: outer_optional + 1 (REP outer)
+            // + 0 (struct middle is the REPEATED itself / element is REQ).
+            // Actually pyarrow's element group is REQ inside the REP list.
+            let list_max_def_level = (outer_optional as u32) + 1;
+            let primary_chunk_path = fields[0].chunk_path.clone();
+            Ok(ColumnPlan {
+                chunk_path: primary_chunk_path,
+                kind: ColumnKind::NestedListOfStruct {
+                    outer_optional,
+                    list_max_def_level,
+                    fields,
+                },
+            })
+        }
+    }
+}
+
+/// SP145 T5: classify a Map<_, group> shape — V is a Group (struct or
+/// List), not a primitive leaf. Dispatches based on V's LogicalType.
+#[allow(clippy::too_many_arguments)]
+fn classify_map_of_group(
+    map_name: &str,
+    outer_optional: bool,
+    key_name: &str,
+    key_ptype: meta::Type,
+    key_max_def: u32,
+    key_path: &[String],
+    value_name: &str,
+    value_rep: meta::Repetition,
+    value_children: &[meta::SchemaNode],
+    value_logical: Option<&meta::LogicalType>,
+    leaves: &[meta::SchemaLeaf],
+) -> Result<ColumnPlan, PqError> {
+    // K validation mirrors classify_map_plan: REQ + primitive + spec.
+    let expected_k_max_def = (outer_optional as u32) + 1;
+    if key_max_def != expected_k_max_def {
+        return Err(PqError::Bad(format!(
+            "MAP<_, group> `{map_name}` key max_def_level={key_max_def} disagrees with expected {expected_k_max_def}"
+        )));
+    }
+    match key_ptype {
+        meta::Type::Boolean | meta::Type::Int32 | meta::Type::Int64
+        | meta::Type::Float | meta::Type::Double | meta::Type::ByteArray
+        | meta::Type::Int96 | meta::Type::FixedLenByteArray => {}
+        other => return Err(PqError::Unsupported(format!(
+            "MAP `{map_name}` key physical type {other:?}: OBJ-2c"
+        ))),
+    }
+    let key_leaf = leaves.iter().find(|l| l.name == key_name)
+        .ok_or_else(|| PqError::Bad(format!(
+            "MAP<_, group> `{map_name}` key leaf `{key_name}` missing"
+        )))?;
+    let key_spec = build_plain_spec(key_leaf)?;
+    let key_chunk_path: Vec<String> = key_path.iter().skip(1).cloned().collect();
+
+    let value_is_required = matches!(value_rep, meta::Repetition::Required);
+    if !value_is_required {
+        return Err(PqError::Unsupported(format!(
+            "MAP `{map_name}` value group is not REQUIRED — Parquet spec quirk: \
+             pyarrow always writes value groups as REQ inside the REP middle"
+        )));
+    }
+    match value_logical {
+        // Map<K, struct<...>> ──────────────────────────────────────────
+        None => {
+            if value_children.is_empty() {
+                return Err(PqError::Bad(format!(
+                    "MAP<_, struct> `{map_name}` value `{value_name}` has no fields"
+                )));
+            }
+            let mut value_fields = Vec::with_capacity(value_children.len());
+            for child in value_children {
+                match child {
+                    meta::SchemaNode::Leaf {
+                        name: fname, repetition: frep, ptype, max_def_level, path, ..
+                    } => {
+                        if matches!(frep, meta::Repetition::Repeated) {
+                            return Err(PqError::Unsupported(format!(
+                                "MAP<_, struct> `{map_name}` value field `{fname}` REPEATED: \
+                                 SP146 follow-up"
+                            )));
+                        }
+                        match ptype {
+                            meta::Type::Boolean | meta::Type::Int32 | meta::Type::Int64
+                            | meta::Type::Float | meta::Type::Double | meta::Type::ByteArray
+                            | meta::Type::Int96 | meta::Type::FixedLenByteArray => {}
+                            other => return Err(PqError::Unsupported(format!(
+                                "MAP<_, struct> `{map_name}` value field `{fname}` physical type {other:?}: OBJ-2c"
+                            ))),
+                        };
+                        let leaf_struct = leaves.iter().find(|l| &l.name == fname)
+                            .ok_or_else(|| PqError::Bad(format!(
+                                "MAP<_, struct> `{map_name}` value field leaf `{fname}` missing"
+                            )))?;
+                        let spec = build_plain_spec(leaf_struct)?;
+                        let chunk_path: Vec<String> = path.iter().skip(1).cloned().collect();
+                        value_fields.push(StructField {
+                            name: fname.clone(),
+                            chunk_path,
+                            spec,
+                            ptype: *ptype,
+                            max_def_level: *max_def_level,
+                            nested: None,
+                        });
+                    }
+                    meta::SchemaNode::Group { name: gname, .. } => {
+                        return Err(PqError::Unsupported(format!(
+                            "MAP<_, struct<group>> `{map_name}` value field `{gname}`: \
+                             SP146 follow-up"
+                        )));
+                    }
+                }
+            }
+            let map_max_def_level = (outer_optional as u32) + 1;
+            let primary_chunk_path = value_fields[0].chunk_path.clone();
+            Ok(ColumnPlan {
+                chunk_path: primary_chunk_path,
+                kind: ColumnKind::NestedMapOfStruct {
+                    outer_optional,
+                    key_spec,
+                    key_ptype,
+                    key_chunk_path,
+                    map_max_def_level,
+                    value_fields,
+                },
+            })
+        }
+        // Map<K, List<T>> ─────────────────────────────────────────────
+        Some(meta::LogicalType::List) => {
+            // Drill through the inner List shape: V is the LIST outer
+            // group, value_children[0] is REPEATED middle, that middle's
+            // child is the leaf.
+            if value_children.len() != 1 {
+                return Err(PqError::Unsupported(format!(
+                    "MAP<_, List> `{map_name}` value-list outer children != 1"
+                )));
+            }
+            let v_middle = match &value_children[0] {
+                meta::SchemaNode::Group {
+                    repetition: meta::Repetition::Repeated, children: ic, ..
+                } => ic,
+                _ => return Err(PqError::Unsupported(format!(
+                    "MAP<_, List> `{map_name}` value-list middle not REPEATED"
+                ))),
+            };
+            if v_middle.len() != 1 {
+                return Err(PqError::Unsupported(format!(
+                    "MAP<_, List> `{map_name}` value-list middle children != 1"
+                )));
+            }
+            let (v_leaf_name, v_leaf_ptype, v_leaf_rep, v_leaf_max_def, v_leaf_max_rep, v_leaf_path) =
+                match &v_middle[0] {
+                    meta::SchemaNode::Leaf {
+                        name, ptype, repetition, max_def_level, max_rep_level, path,
+                    } => (name.clone(), *ptype, *repetition, *max_def_level, *max_rep_level, path.clone()),
+                    _ => return Err(PqError::Unsupported(format!(
+                        "MAP<_, List<group>> `{map_name}`: SP146 follow-up"
+                    ))),
+                };
+            let value_item_optional = matches!(v_leaf_rep, meta::Repetition::Optional);
+            match v_leaf_ptype {
+                meta::Type::Boolean | meta::Type::Int32 | meta::Type::Int64
+                | meta::Type::Float | meta::Type::Double | meta::Type::ByteArray
+                | meta::Type::Int96 | meta::Type::FixedLenByteArray => {}
+                t => return Err(PqError::Unsupported(format!(
+                    "MAP<_, List<{t:?}>> `{map_name}`: physical type not in OBJ-2c"
+                ))),
+            }
+            // V leaf's max_def: outer_optional + 1 (MAP REP) + 1 (LIST REP) + item_opt
+            // (the value-list outer group is REQ here since pyarrow writes it so).
+            let expected_v_max_def = (outer_optional as u32) + 1 + 1 + (value_item_optional as u32);
+            if v_leaf_max_def != expected_v_max_def {
+                return Err(PqError::Bad(format!(
+                    "MAP<_, List> `{map_name}` V leaf max_def_level={v_leaf_max_def} \
+                     disagrees with expected {expected_v_max_def}"
+                )));
+            }
+            if v_leaf_max_rep != 2 {
+                return Err(PqError::Bad(format!(
+                    "MAP<_, List> `{map_name}` V leaf max_rep_level={v_leaf_max_rep} != 2"
+                )));
+            }
+            let v_leaf_struct = leaves.iter().find(|l| l.name == v_leaf_name)
+                .ok_or_else(|| PqError::Bad(format!(
+                    "MAP<_, List> `{map_name}` V leaf `{v_leaf_name}` missing"
+                )))?;
+            let v_spec = build_plain_spec(v_leaf_struct)?;
+            let v_chunk_path: Vec<String> = v_leaf_path.iter().skip(1).cloned().collect();
+            Ok(ColumnPlan {
+                chunk_path: v_chunk_path.clone(),
+                kind: ColumnKind::NestedMapOfList {
+                    outer_optional,
+                    key_spec,
+                    key_ptype,
+                    key_chunk_path,
+                    value_spec: v_spec,
+                    value_ptype: v_leaf_ptype,
+                    value_chunk_path: v_chunk_path,
+                    max_def_level: v_leaf_max_def,
+                    value_item_optional,
+                },
+            })
+        }
+        // Map<K, Map<...>> — defer.
+        Some(meta::LogicalType::Map) => {
+            Err(PqError::Unsupported(format!(
+                "MAP<_, Map> `{map_name}`: SP146 follow-up"
+            )))
+        }
+    }
+}
+
+/// SP145 T5: classify a nested-group child INSIDE a struct field. The
+/// recursive entry point — given a SchemaNode (a Group child of a
+/// struct), classify it as one of the new SP145 ColumnKind variants
+/// (or an existing one if it happens to be a flat-ish shape).
+///
+/// Used by `classify_struct_plan` when it encounters a nested group
+/// field. The returned `ColumnKind` is wrapped in `StructField.nested`.
+fn classify_nested_group_child(
+    node: &meta::SchemaNode,
+    leaves: &[meta::SchemaLeaf],
+) -> Result<ColumnKind, PqError> {
+    let (gname, grep, gchildren, glogical) = match node {
+        meta::SchemaNode::Group { name, repetition, children, logical_type } =>
+            (name, repetition, children, logical_type),
+        _ => return Err(PqError::Bad(
+            "classify_nested_group_child: expected Group node".into(),
+        )),
+    };
+    let g_optional = matches!(grep, meta::Repetition::Optional);
+    match glogical {
+        Some(meta::LogicalType::List) => {
+            // Recursively classify the LIST. Reuse the LIST<primitive>
+            // and List<group> code paths by synthesizing the inputs.
+            if gchildren.len() != 1 {
+                return Err(PqError::Unsupported(format!(
+                    "struct<List> `{gname}` outer children != 1: SP146"
+                )));
+            }
+            let middle_children = match &gchildren[0] {
+                meta::SchemaNode::Group {
+                    repetition: meta::Repetition::Repeated, children: gc, ..
+                } => gc,
+                _ => return Err(PqError::Unsupported(format!(
+                    "struct<List> `{gname}` middle not REPEATED"
+                ))),
+            };
+            if middle_children.len() != 1 {
+                return Err(PqError::Unsupported(format!(
+                    "struct<List> `{gname}` middle children != 1"
+                )));
+            }
+            // If middle child is a Leaf, this is List<primitive>; if a
+            // Group, this is List<List/struct>.
+            match &middle_children[0] {
+                meta::SchemaNode::Leaf {
+                    name: lname, ptype, repetition: lrep, max_def_level, max_rep_level, path,
+                } => {
+                    let item_optional = matches!(lrep, meta::Repetition::Optional);
+                    match ptype {
+                        meta::Type::Boolean | meta::Type::Int32 | meta::Type::Int64
+                        | meta::Type::Float | meta::Type::Double | meta::Type::ByteArray
+                        | meta::Type::Int96 | meta::Type::FixedLenByteArray => {}
+                        t => return Err(PqError::Unsupported(format!(
+                            "struct<List<{t:?}>> `{gname}`: physical type not in OBJ-2c"
+                        ))),
+                    }
+                    // Note: max_def_level here is the LEAF's full path level,
+                    // including all ancestors up to the schema root. The
+                    // List<primitive> assembler expects the LIST-level math.
+                    let expected_max_def_relative = (g_optional as u32) + 1 + (item_optional as u32);
+                    let _ = expected_max_def_relative; // documentation only
+                    let leaf_struct = leaves.iter().find(|l| l.name == *lname)
+                        .ok_or_else(|| PqError::Bad(format!(
+                            "struct<List> `{gname}` leaf `{lname}` missing"
+                        )))?;
+                    let spec = build_plain_spec(leaf_struct)?;
+                    let _chunk_path: Vec<String> = path.iter().skip(1).cloned().collect();
+                    Ok(ColumnKind::NestedListPrimitive {
+                        spec,
+                        ptype: *ptype,
+                        max_def_level: *max_def_level,
+                        max_rep_level: *max_rep_level,
+                        outer_optional: g_optional,
+                        element_optional: item_optional,
+                    })
+                }
+                meta::SchemaNode::Group { name: en, repetition: er, children: ec, logical_type: el } => {
+                    let plan = classify_list_of_group(
+                        gname, g_optional, en, *er, ec, el.as_ref(), leaves,
+                    )?;
+                    Ok(plan.kind)
+                }
+            }
+        }
+        Some(meta::LogicalType::Map) => {
+            // Reuse classify_map_plan via a recursive call to
+            // classify_column_plan-like logic. We instead reach into
+            // classify_map_plan directly with the children list.
+            let plan = classify_map_plan(gname, *grep, gchildren, leaves)?;
+            Ok(plan.kind)
+        }
+        None => {
+            // struct — reuse classify_struct_plan.
+            let plan = classify_struct_plan(gname, *grep, gchildren, leaves)?;
+            Ok(plan.kind)
+        }
+    }
+}
+
+/// SP145 T5: helper — find the first reachable Leaf under a node and
+/// return its chunk_path (root-stripped). Used as a placeholder
+/// chunk_path for struct fields that are themselves nested shapes
+/// (the nested decoder uses its own per-leaf paths, but the outer
+/// StructField struct requires a chunk_path slot).
+fn first_leaf_chunk_path(
+    node: &meta::SchemaNode,
+) -> Result<Vec<String>, PqError> {
+    match node {
+        meta::SchemaNode::Leaf { path, .. } =>
+            Ok(path.iter().skip(1).cloned().collect()),
+        meta::SchemaNode::Group { children, .. } => {
+            for c in children {
+                if let Ok(p) = first_leaf_chunk_path(c) {
+                    return Ok(p);
+                }
+            }
+            Err(PqError::Bad("first_leaf_chunk_path: group with no leaves".into()))
+        }
+    }
 }
 
 /// SP143 T6: nested-schema extractor. Routes each wanted column either
@@ -1827,6 +2458,58 @@ fn extract_nested(
                         rg,
                         fields,
                         *outer_optional,
+                    )?;
+                    cols[ci].extend(vals);
+                }
+                ColumnKind::NestedListOfListPrimitive {
+                    spec, ptype, max_def_level, max_rep_level,
+                    outer_optional, inner_optional, item_optional,
+                } => {
+                    let cc = rg.columns.iter().find(|c| c.path == plan.chunk_path)
+                        .ok_or_else(|| PqError::Bad(format!(
+                            "List<List> row group missing column for path {:?}", plan.chunk_path
+                        )))?;
+                    if cc.ptype != *ptype {
+                        return Err(PqError::Bad(format!(
+                            "List<List> column path {:?} ptype mismatch", plan.chunk_path
+                        )));
+                    }
+                    let (rep, def, vals) = read_chunk_levels_and_values(
+                        file, cc, *spec, *max_def_level, *max_rep_level,
+                    )?;
+                    let assembled = assembly::assemble_list_of_list_primitive(
+                        &rep, &def, &vals, *max_def_level,
+                        *outer_optional, *inner_optional, *item_optional,
+                    )?;
+                    cols[ci].extend(assembled);
+                }
+                ColumnKind::NestedListOfStruct {
+                    outer_optional, list_max_def_level, fields,
+                } => {
+                    let vals = read_chunk_values_nested_list_of_struct(
+                        file, rg, fields, *outer_optional, *list_max_def_level,
+                    )?;
+                    cols[ci].extend(vals);
+                }
+                ColumnKind::NestedMapOfStruct {
+                    outer_optional, key_spec, key_ptype, key_chunk_path,
+                    map_max_def_level, value_fields,
+                } => {
+                    let vals = read_chunk_values_nested_map_of_struct(
+                        file, rg, key_chunk_path, *key_spec, *key_ptype,
+                        value_fields, *outer_optional, *map_max_def_level,
+                    )?;
+                    cols[ci].extend(vals);
+                }
+                ColumnKind::NestedMapOfList {
+                    outer_optional, key_spec, key_ptype, key_chunk_path,
+                    value_spec, value_ptype, value_chunk_path,
+                    max_def_level, value_item_optional,
+                } => {
+                    let vals = read_chunk_values_nested_map_of_list(
+                        file, rg, key_chunk_path, value_chunk_path,
+                        *key_spec, *value_spec, *key_ptype, *value_ptype,
+                        *max_def_level, *outer_optional, *value_item_optional,
                     )?;
                     cols[ci].extend(vals);
                 }
@@ -2169,6 +2852,14 @@ fn read_chunk_values_nested_struct(
     let mut field_names: Vec<String> = Vec::with_capacity(fields.len());
     let mut field_columns: Vec<Vec<PqValue>> = Vec::with_capacity(fields.len());
     for f in fields {
+        if let Some(nested_kind) = &f.nested {
+            // SP145: this field is itself a nested shape (List, Map,
+            // struct). Recursively decode it as its own column kind.
+            let col = decode_field_by_kind(file, rg, nested_kind)?;
+            field_names.push(f.name.clone());
+            field_columns.push(col);
+            continue;
+        }
         let cc = rg
             .columns
             .iter()
@@ -2193,6 +2884,348 @@ fn read_chunk_values_nested_struct(
         field_columns.push(col);
     }
     assembly::assemble_struct(&field_names, &field_columns, outer_optional)
+}
+
+/// SP145 T5: dispatch a nested-field decode by its inner ColumnKind.
+/// Used recursively by `read_chunk_values_nested_struct` when a
+/// StructField has `nested = Some(kind)`. Mirrors the extract_nested
+/// per-kind dispatch but operates on a single row group + returns the
+/// inner column directly (no row transpose).
+fn decode_field_by_kind(
+    file: &[u8],
+    rg: &meta::RowGroup,
+    kind: &ColumnKind,
+) -> Result<Vec<PqValue>, PqError> {
+    match kind {
+        ColumnKind::Flat { spec, ptype: _, max_def_level: _ } => {
+            // Flat fields should not be wrapped in nested — log + error.
+            let _ = spec;
+            Err(PqError::Bad("decode_field_by_kind: Flat should not be wrapped".into()))
+        }
+        ColumnKind::NestedListPrimitive {
+            spec, ptype, max_def_level, max_rep_level,
+            outer_optional, element_optional,
+        } => {
+            // Find the column chunk by walking down to the first leaf path.
+            // The plan stored on the nested kind doesn't carry chunk_path;
+            // re-derive from spec/ptype + a unique-match in the row group.
+            // Use a leaf-path walk: list all leaves under this kind. For
+            // List<primitive>, there's one leaf, identified by matching
+            // ptype only — but multiple ptype-matches in the same row
+            // group is ambiguous, so we'd need the chunk_path. For SP145
+            // V1 this dispatch only fires for struct<List<primitive>>,
+            // and the StructField's outer chunk_path placeholder is the
+            // leaf path. Surface a clear error if the chunk lookup is
+            // ambiguous so we don't silently grab the wrong column.
+            return decode_list_primitive_in_rg(
+                file, rg, *spec, *ptype, *max_def_level, *max_rep_level,
+                *outer_optional, *element_optional,
+            );
+        }
+        ColumnKind::NestedMapKV {
+            key_spec, value_spec, key_ptype, value_ptype,
+            key_chunk_path, value_chunk_path,
+            max_def_level, outer_optional, value_optional,
+        } => {
+            read_chunk_values_nested_map(
+                file, rg, key_chunk_path, value_chunk_path,
+                *key_spec, *value_spec, *key_ptype, *value_ptype,
+                *max_def_level, *outer_optional, *value_optional,
+            )
+        }
+        ColumnKind::NestedStruct { outer_optional, fields } => {
+            read_chunk_values_nested_struct(file, rg, fields, *outer_optional)
+        }
+        ColumnKind::NestedListOfListPrimitive {
+            spec, ptype, max_def_level, max_rep_level,
+            outer_optional, inner_optional, item_optional,
+        } => {
+            decode_list_of_list_primitive_in_rg(
+                file, rg, *spec, *ptype, *max_def_level, *max_rep_level,
+                *outer_optional, *inner_optional, *item_optional,
+            )
+        }
+        ColumnKind::NestedListOfStruct {
+            outer_optional, list_max_def_level, fields,
+        } => {
+            read_chunk_values_nested_list_of_struct(
+                file, rg, fields, *outer_optional, *list_max_def_level,
+            )
+        }
+        ColumnKind::NestedMapOfStruct {
+            outer_optional, key_spec, key_ptype, key_chunk_path,
+            map_max_def_level, value_fields,
+        } => {
+            read_chunk_values_nested_map_of_struct(
+                file, rg, key_chunk_path, *key_spec, *key_ptype,
+                value_fields, *outer_optional, *map_max_def_level,
+            )
+        }
+        ColumnKind::NestedMapOfList {
+            outer_optional, key_spec, key_ptype, key_chunk_path,
+            value_spec, value_ptype, value_chunk_path,
+            max_def_level, value_item_optional,
+        } => {
+            read_chunk_values_nested_map_of_list(
+                file, rg, key_chunk_path, value_chunk_path,
+                *key_spec, *value_spec, *key_ptype, *value_ptype,
+                *max_def_level, *outer_optional, *value_item_optional,
+            )
+        }
+    }
+}
+
+/// SP145: locate a single primitive-leaf column chunk in the row group
+/// by ptype (unique-match), then decode as List<primitive>. For SP145
+/// V1 this is only called from struct<List<primitive>> field-decode,
+/// where there's typically one matching ptype in the struct's leaf
+/// surface — but if not, we error rather than silently picking.
+#[allow(clippy::too_many_arguments)]
+fn decode_list_primitive_in_rg(
+    file: &[u8],
+    rg: &meta::RowGroup,
+    spec: plain::PlainSpec,
+    ptype: meta::Type,
+    max_def_level: u32,
+    max_rep_level: u32,
+    outer_optional: bool,
+    element_optional: bool,
+) -> Result<Vec<PqValue>, PqError> {
+    // Heuristic: find the chunk whose path has max_rep_level matching
+    // pattern — but ColumnChunk doesn't carry rep level. Instead, find
+    // by ptype + matching the "list" path component. SP145 V1: pick
+    // the chunk whose path[-1] is "element" and ptype matches (pyarrow
+    // canonical name for LIST leaves).
+    let candidates: Vec<_> = rg.columns.iter()
+        .filter(|c| c.ptype == ptype && c.path.last().map(|s| s.as_str()) == Some("element"))
+        .collect();
+    if candidates.len() != 1 {
+        return Err(PqError::Bad(format!(
+            "decode_list_primitive_in_rg: expected 1 candidate chunk, found {}",
+            candidates.len()
+        )));
+    }
+    let cc = candidates[0];
+    let (rep, def, vals) = read_chunk_levels_and_values(
+        file, cc, spec, max_def_level, max_rep_level,
+    )?;
+    assembly::assemble_list_primitive(
+        &rep, &def, &vals, max_def_level, outer_optional, element_optional,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_list_of_list_primitive_in_rg(
+    file: &[u8],
+    rg: &meta::RowGroup,
+    spec: plain::PlainSpec,
+    ptype: meta::Type,
+    max_def_level: u32,
+    max_rep_level: u32,
+    outer_optional: bool,
+    inner_optional: bool,
+    item_optional: bool,
+) -> Result<Vec<PqValue>, PqError> {
+    let candidates: Vec<_> = rg.columns.iter()
+        .filter(|c| c.ptype == ptype && c.path.last().map(|s| s.as_str()) == Some("element"))
+        .collect();
+    if candidates.len() != 1 {
+        return Err(PqError::Bad(format!(
+            "decode_list_of_list_primitive_in_rg: expected 1 candidate, found {}",
+            candidates.len()
+        )));
+    }
+    let cc = candidates[0];
+    let (rep, def, vals) = read_chunk_levels_and_values(
+        file, cc, spec, max_def_level, max_rep_level,
+    )?;
+    assembly::assemble_list_of_list_primitive(
+        &rep, &def, &vals, max_def_level,
+        outer_optional, inner_optional, item_optional,
+    )
+}
+
+/// SP145 T5: decode a `List<struct<...>>` column. Each struct field is
+/// its own column chunk; they all share the same REPEATED outer-LIST
+/// ancestor (so their rep streams are byte-identical at max_rep=1).
+///
+/// Strategy:
+/// 1. Decode each field column via `read_chunk_levels_and_values` —
+///    each returns parallel (rep, def, vals) at max_rep=1.
+/// 2. Validate that all field columns share the same rep stream.
+/// 3. Take the first field's (rep, def) as authoritative for the
+///    LIST-level boundaries.
+/// 4. Each field's `vals` is its per-item-present slot value vec.
+/// 5. Fold via `assemble_list_of_struct` with all field columns + the
+///    shared rep/def stream + outer LIST level.
+fn read_chunk_values_nested_list_of_struct(
+    file: &[u8],
+    rg: &meta::RowGroup,
+    fields: &[StructField],
+    outer_optional: bool,
+    list_max_def_level: u32,
+) -> Result<Vec<PqValue>, PqError> {
+    if fields.is_empty() {
+        return Err(PqError::Bad("list_of_struct: no fields".into()));
+    }
+    let mut field_names: Vec<String> = Vec::with_capacity(fields.len());
+    let mut field_values: Vec<Vec<PqValue>> = Vec::with_capacity(fields.len());
+    let mut shared_rep: Option<Vec<u32>> = None;
+    let mut shared_def: Option<Vec<u32>> = None;
+    for f in fields {
+        let cc = rg.columns.iter().find(|c| c.path == f.chunk_path)
+            .ok_or_else(|| PqError::Bad(format!(
+                "list_of_struct row group missing column for path {:?}", f.chunk_path
+            )))?;
+        if cc.ptype != f.ptype {
+            return Err(PqError::Bad(format!(
+                "list_of_struct field column for path {:?} ptype mismatch", f.chunk_path
+            )));
+        }
+        // Field max_def_level is the FULL path level
+        // (outer_optional + 1 REP + 0 struct-REQ + field_local_def).
+        let (rep, def, vals) = read_chunk_levels_and_values(
+            file, cc, f.spec, f.max_def_level, 1,
+        )?;
+        if shared_rep.is_none() {
+            shared_rep = Some(rep.clone());
+            shared_def = Some(def.clone());
+        } else if shared_rep.as_ref().unwrap() != &rep {
+            return Err(PqError::Bad(format!(
+                "list_of_struct: field '{}' rep stream diverges from authoritative field",
+                f.name
+            )));
+        }
+        // V1: don't strict-compare def streams across OPT fields — they
+        // may differ when one field is OPT and another REQ.
+        field_names.push(f.name.clone());
+        field_values.push(vals);
+    }
+    let rep = shared_rep.unwrap();
+    let def = shared_def.unwrap();
+    assembly::assemble_list_of_struct(
+        &rep, &def, &field_names, &field_values, list_max_def_level, outer_optional,
+    )
+}
+
+/// SP145 T5: decode a `Map<K, struct<...>>` column. K is a single
+/// column chunk; each V field is its own column chunk. All share the
+/// REPEATED middle ancestor (max_rep=1).
+#[allow(clippy::too_many_arguments)]
+fn read_chunk_values_nested_map_of_struct(
+    file: &[u8],
+    rg: &meta::RowGroup,
+    key_chunk_path: &[String],
+    key_spec: plain::PlainSpec,
+    key_ptype: meta::Type,
+    value_fields: &[StructField],
+    outer_optional: bool,
+    map_max_def_level: u32,
+) -> Result<Vec<PqValue>, PqError> {
+    if value_fields.is_empty() {
+        return Err(PqError::Bad("map_of_struct: no value fields".into()));
+    }
+    let key_cc = rg.columns.iter().find(|c| c.path == key_chunk_path)
+        .ok_or_else(|| PqError::Bad(format!(
+            "map_of_struct row group missing key column for path {:?}", key_chunk_path
+        )))?;
+    if key_cc.ptype != key_ptype {
+        return Err(PqError::Bad(format!(
+            "map_of_struct key column path {:?} ptype mismatch", key_chunk_path
+        )));
+    }
+    // K's max_def is map_max_def_level (key REQ inside REP middle).
+    let (k_rep, _k_def, k_vals) = read_chunk_levels_and_values(
+        file, key_cc, key_spec, map_max_def_level, 1,
+    )?;
+    let mut v_field_names: Vec<String> = Vec::with_capacity(value_fields.len());
+    let mut v_field_values: Vec<Vec<PqValue>> = Vec::with_capacity(value_fields.len());
+    let mut shared_rep: Option<Vec<u32>> = None;
+    let mut shared_def: Option<Vec<u32>> = None;
+    for vf in value_fields {
+        let cc = rg.columns.iter().find(|c| c.path == vf.chunk_path)
+            .ok_or_else(|| PqError::Bad(format!(
+                "map_of_struct row group missing value-field column for path {:?}", vf.chunk_path
+            )))?;
+        if cc.ptype != vf.ptype {
+            return Err(PqError::Bad(format!(
+                "map_of_struct value-field column path {:?} ptype mismatch", vf.chunk_path
+            )));
+        }
+        let (rep, def, vals) = read_chunk_levels_and_values(
+            file, cc, vf.spec, vf.max_def_level, 1,
+        )?;
+        if shared_rep.is_none() {
+            shared_rep = Some(rep.clone());
+            shared_def = Some(def.clone());
+        } else if shared_rep.as_ref().unwrap() != &rep {
+            return Err(PqError::Bad(format!(
+                "map_of_struct: value field '{}' rep stream diverges from authoritative", vf.name
+            )));
+        }
+        v_field_names.push(vf.name.clone());
+        v_field_values.push(vals);
+    }
+    let rep = shared_rep.unwrap();
+    let def = shared_def.unwrap();
+    // K rep stream must also match.
+    if k_rep != rep {
+        return Err(PqError::Bad(
+            "map_of_struct: K rep stream diverges from V field rep stream".into(),
+        ));
+    }
+    assembly::assemble_map_of_struct(
+        &rep, &def, &k_vals, &v_field_names, &v_field_values,
+        map_max_def_level, outer_optional,
+    )
+}
+
+/// SP145 T5: decode a `Map<K, List<T>>` column.
+#[allow(clippy::too_many_arguments)]
+fn read_chunk_values_nested_map_of_list(
+    file: &[u8],
+    rg: &meta::RowGroup,
+    key_chunk_path: &[String],
+    value_chunk_path: &[String],
+    key_spec: plain::PlainSpec,
+    value_spec: plain::PlainSpec,
+    key_ptype: meta::Type,
+    value_ptype: meta::Type,
+    max_def_level: u32,
+    outer_optional: bool,
+    value_item_optional: bool,
+) -> Result<Vec<PqValue>, PqError> {
+    let key_cc = rg.columns.iter().find(|c| c.path == key_chunk_path)
+        .ok_or_else(|| PqError::Bad(format!(
+            "map_of_list row group missing key column for path {:?}", key_chunk_path
+        )))?;
+    let value_cc = rg.columns.iter().find(|c| c.path == value_chunk_path)
+        .ok_or_else(|| PqError::Bad(format!(
+            "map_of_list row group missing value column for path {:?}", value_chunk_path
+        )))?;
+    if key_cc.ptype != key_ptype {
+        return Err(PqError::Bad(format!(
+            "map_of_list key column path {:?} ptype mismatch", key_chunk_path
+        )));
+    }
+    if value_cc.ptype != value_ptype {
+        return Err(PqError::Bad(format!(
+            "map_of_list value column path {:?} ptype mismatch", value_chunk_path
+        )));
+    }
+    // K's max_def_level = outer_optional + 1 (REP middle).
+    let key_max_def = (outer_optional as u32) + 1;
+    let (_k_rep, _k_def, k_vals) = read_chunk_levels_and_values(
+        file, key_cc, key_spec, key_max_def, 1,
+    )?;
+    // V leaf has max_rep_level=2 (MAP REP + LIST REP).
+    let (v_rep, v_def, v_vals) = read_chunk_levels_and_values(
+        file, value_cc, value_spec, max_def_level, 2,
+    )?;
+    assembly::assemble_map_of_list(
+        &v_rep, &v_def, &k_vals, &v_vals, max_def_level,
+        outer_optional, value_item_optional,
+    )
 }
 
 /// Decode the `wanted` leaf columns (in that output order) from a
@@ -7544,10 +8577,15 @@ mod sp144_pentest {
     // classify_struct_plan line 1700-1704: "struct `…` contains nested
     // group `…`: SP145 follow-up". The struct outer has logical_type
     // None, so the dispatch in classify_column_plan routes to
-    // classify_struct_plan; the nested LIST group child triggers
-    // SP145 rejection before any leaf find.
+    // classify_struct_plan; the nested LIST group child WAS rejected
+    // with SP145 in SP144 T8 — SP145 T5 LIFTS this rejection and the
+    // shape now classifies. Repurposed to verify SP145 acceptance:
+    // classify_column_plan should reach the leaf-finding stage (where
+    // an empty `leaves` slice fails with Bad("missing")), NOT return
+    // an SP145 Unsupported. The Bad("missing") is now the expected
+    // surface for an empty-leaves test fixture.
     #[test]
-    fn sp144_pt15_struct_with_nested_list_rejected() {
+    fn sp145_pt_struct_with_nested_list_accepted_classifies_until_leaf_lookup() {
         let root = meta::SchemaNode::Group {
             name: "root".into(),
             repetition: meta::Repetition::Required,
@@ -7555,11 +8593,6 @@ mod sp144_pentest {
                 name: "my_struct".into(),
                 repetition: meta::Repetition::Required,
                 children: vec![
-                    // Nested LIST inside struct → SP145.
-                    // Placed first so classify_struct_plan's in-order
-                    // child walk hits this group BEFORE the trailing
-                    // `id` leaf (which would otherwise fail an earlier
-                    // flat-leaves lookup masking the structural reject).
                     meta::SchemaNode::Group {
                         name: "tags".into(),
                         repetition: meta::Repetition::Required,
@@ -7603,14 +8636,18 @@ mod sp144_pentest {
         };
         let result = classify_column_plan(&root, "my_struct", &[]);
         match result {
-            Err(PqError::Unsupported(msg)) if msg.contains("SP145") => {
-                /* OK */
-            }
+            Err(PqError::Unsupported(msg)) if msg.contains("SP145") => panic!(
+                "SP145 regressed: struct<List> should classify, got Unsupported(SP145): {msg}"
+            ),
+            // SP145 acceptance — classification routed into the nested
+            // LIST path. Empty leaves list trips the leaf-lookup Bad —
+            // that's the expected post-lift surface.
+            Err(PqError::Bad(msg)) if msg.contains("missing") => { /* OK */ }
             Err(other) => panic!(
-                "pt15: expected Unsupported(SP145), got Err({other:?})"
+                "sp145_pt: expected Bad(missing) post-lift, got Err({other:?})"
             ),
             Ok(_) => panic!(
-                "pt15: expected Unsupported(SP145), got Ok(_)"
+                "sp145_pt: expected Bad(missing) post-lift (empty leaves), got Ok(_)"
             ),
         }
     }

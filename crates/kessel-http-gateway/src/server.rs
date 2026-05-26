@@ -160,6 +160,9 @@ fn write_parse_error<W: Write>(
         ParseError::ExpectationFailed =>
             ((417, "Expectation Failed"), "error",
              "expectation failed".into()),
+        ParseError::IncompleteSessionBinding =>
+            ((400, "Bad Request"), "error",
+             "both X-Kessel-Client-Id and X-Kessel-Req-Seq required together".into()),
     };
     // SP144H T2: parse errors happen BEFORE the path is known. We bump
     // against "/v1/sql" as a defensive default (the status bucket is what

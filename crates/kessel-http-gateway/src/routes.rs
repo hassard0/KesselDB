@@ -25,19 +25,22 @@ pub fn handle<W: Write>(
     http_counters: &Arc<HttpRequestCountersStatic>,
 ) -> std::io::Result<()> {
     // Auth first (open-mode lets every request through; token-mode requires
-    // a matching Bearer).
+    // a matching Bearer). SP144H T3: the `message` field disambiguates the
+    // 401 source — auth-layer ("missing bearer" / "bearer mismatch") vs
+    // engine ("engine denied"; see write_op_result below). HTTP status
+    // remains 401 in both cases.
     if let Some(expected) = token {
         match extract_bearer(&req.headers) {
             Ok(Some(given)) => {
                 if !ct_eq(given, expected) {
-                    return write_json_counted(w, (401, "Unauthorized"),
-                        r#"{"status":"unauthorized"}"#,
+                    return write_error_json_counted(w, (401, "Unauthorized"),
+                        "unauthorized", "bearer mismatch",
                         http_counters, req.path);
                 }
             }
             Ok(None) => {
-                return write_json_counted(w, (401, "Unauthorized"),
-                    r#"{"status":"unauthorized"}"#,
+                return write_error_json_counted(w, (401, "Unauthorized"),
+                    "unauthorized", "missing bearer",
                     http_counters, req.path);
             }
             Err(e) => {
@@ -147,20 +150,38 @@ fn handle_metrics<W: Write>(
     write_prometheus_counted(w, &text, http_counters, "/v1/metrics")
 }
 
-/// Map an OpResult to (HTTP status, JSON body via format_result_json).
+/// Map an OpResult to (HTTP status, JSON body).
+///
+/// SP144H T3: Unauthorized/Unavailable get the disambiguating `message`
+/// field via `write_error_json_counted` (auth-layer 401s use "missing
+/// bearer"/"bearer mismatch" in `handle()`; the engine-side 401 here uses
+/// "engine denied"). The Unavailable body changes shape too — was
+/// `{"status":"unavailable"}`, now
+/// `{"status":"unavailable","message":"engine unavailable"}`. All other
+/// OpResult variants still go through `format_result_json` verbatim so the
+/// kessel-client JSON contract for Ok/Exists/NotFound/etc. is unchanged.
 fn write_op_result<W: Write>(
     w: &mut W,
     r: &OpResult,
     http_counters: &Arc<HttpRequestCountersStatic>,
     path: &str,
 ) -> std::io::Result<()> {
-    let body = format_result_json(r);
-    let status = match r {
-        OpResult::Unauthorized => (401, "Unauthorized"),
-        OpResult::Unavailable => (503, "Service Unavailable"),
-        _ => (200, "OK"),
-    };
-    write_json_counted(w, status, &body, http_counters, path)
+    match r {
+        OpResult::Unauthorized => write_error_json_counted(
+            w, (401, "Unauthorized"),
+            "unauthorized", "engine denied",
+            http_counters, path,
+        ),
+        OpResult::Unavailable => write_error_json_counted(
+            w, (503, "Service Unavailable"),
+            "unavailable", "engine unavailable",
+            http_counters, path,
+        ),
+        _ => {
+            let body = format_result_json(r);
+            write_json_counted(w, (200, "OK"), &body, http_counters, path)
+        }
+    }
 }
 
 /// Both-or-neither: either both headers present (Ok(Some)), both absent
@@ -173,8 +194,10 @@ fn exactly_once_binding(
     match (cid, seq) {
         (Some(c), Some(s)) => Ok(Some((c, s))),
         (None, None) => Ok(None),
-        _ => Err(ParseError::BadHeaderValue(
-            "both X-Kessel-Client-Id and X-Kessel-Req-Seq required together".into())),
+        // SP144H T4: dedicated ParseError variant (was previously
+        // BadHeaderValue(String) — fragile because callers had to
+        // string-grep the message).
+        _ => Err(ParseError::IncompleteSessionBinding),
     }
 }
 

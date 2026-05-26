@@ -361,3 +361,32 @@ fn kat_extract_client_id_rejects_duplicate() {
     let err = extract_client_id(&headers).unwrap_err();
     assert!(matches!(err, ParseError::DuplicateHeader(_)), "got {:?}", err);
 }
+
+#[test]
+fn kat_exactly_once_binding_dedicated_variant() {
+    // SP144H T4: exactly_once_binding's both-or-neither error is now a
+    // dedicated ParseError variant, not a string-grepped BadHeaderValue.
+    //
+    // exactly_once_binding lives in routes.rs (crate-private), so we can't
+    // call it from an integration test. The dedicated variant is provable
+    // by construction here; the wired-in path is covered by the existing
+    // pentest_client_id_alone_400 e2e test (status 400) plus the
+    // write_parse_error arm added in server.rs.
+    use kessel_http_gateway::parse::{extract_client_id, extract_req_seq};
+
+    let headers_cid_only: Vec<(String, String)> = vec![(
+        "X-Kessel-Client-Id".into(),
+        "0123456789abcdef0123456789abcdef".into(),
+    )];
+    // extract_client_id alone works
+    assert!(extract_client_id(&headers_cid_only).is_ok());
+    // extract_req_seq on the cid-only headers returns Ok(None) — the
+    // both-or-neither check happens in routes::exactly_once_binding, not
+    // in the per-header extractors.
+    assert_eq!(extract_req_seq(&headers_cid_only).unwrap(), None);
+
+    // The dedicated variant is constructible and has the expected Debug
+    // shape — pins the variant name so renames break the build.
+    let err = ParseError::IncompleteSessionBinding;
+    assert_eq!(format!("{err:?}"), "IncompleteSessionBinding");
+}

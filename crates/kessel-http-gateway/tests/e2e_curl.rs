@@ -87,6 +87,38 @@ fn e2e_token_mode_authorized_with_bearer() {
 }
 
 #[test]
+fn e2e_unauthorized_messages_distinguish_auth_layer_vs_engine() {
+    // SP144H T3: 401 JSON body's `message` field differs by source.
+    // Auth-layer: "missing bearer" / "bearer mismatch"
+    // Engine: "engine denied"
+    //
+    // V1 scope: we verify the auth-layer disambig directly via the
+    // running server. The engine-side OpResult::Unauthorized requires a
+    // test that triggers an engine rejection, which the current test
+    // infrastructure doesn't easily produce (the engine doesn't have a
+    // built-in ACL path that returns Unauthorized for a benign request).
+    // So this test verifies the two auth-layer messages; the engine-side
+    // path is exercised by source-level audit (write_op_result maps
+    // OpResult::Unauthorized → message="engine denied").
+    let (addr, _g) = spawn_server_with_token(Some(b"secret123".to_vec()));
+
+    // 1. No Bearer: missing bearer
+    let r1 = raw_request(addr,
+        b"GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    let t1 = String::from_utf8_lossy(&r1);
+    assert!(t1.starts_with("HTTP/1.1 401"), "got: {t1}");
+    assert!(t1.contains(r#""message":"missing bearer""#), "got: {t1}");
+
+    // 2. Wrong Bearer: bearer mismatch
+    let r2 = raw_request(addr,
+        b"GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+          Authorization: Bearer wrongvalue\r\n\r\n");
+    let t2 = String::from_utf8_lossy(&r2);
+    assert!(t2.starts_with("HTTP/1.1 401"), "got: {t2}");
+    assert!(t2.contains(r#""message":"bearer mismatch""#), "got: {t2}");
+}
+
+#[test]
 fn e2e_json_contract_pin_for_op_result_ok() {
     // Lock the JSON contract: the gateway emits format_result_json(&result)
     // verbatim. format_result_json(&OpResult::Ok) is the canonical

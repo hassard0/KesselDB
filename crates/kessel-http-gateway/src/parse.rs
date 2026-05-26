@@ -81,6 +81,12 @@ pub enum ParseError {
     /// whole body off the wire eagerly into one parse buffer; we cannot
     /// honor a hold-and-wait dance). RFC 9110 §10.1.1 — answer 417.
     ExpectationFailed,
+    /// SP144H T4: Both `X-Kessel-Client-Id` and `X-Kessel-Req-Seq` headers
+    /// are required together (both-or-neither). One present without the
+    /// other is rejected with this dedicated variant (was previously
+    /// stuffed into BadHeaderValue(String) in SP141 — fragile because
+    /// KAT assertions string-grepped the message).
+    IncompleteSessionBinding,
 }
 
 /// Parse one HTTP/1.1 request. Returns `Ok(Request)` if well-formed AND

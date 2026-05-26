@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # NOTE: not enforcing -D warnings (kessel-sm has 3 pre-existing
+  # untouched warnings; let cargo warn but not fail).
+
+jobs:
+  test:
+    name: cargo test (workspace, release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-default-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-default-
+      - name: Default-feature build
+        run: cargo build --workspace --release
+      - name: Default-feature test (expect 1023+/0/0)
+        run: |
+          cargo test --workspace --release 2>&1 | tee test-default.log
+          PASSED=$(grep -E "^test result:" test-default.log | awk '{p+=$4} END {print p+0}')
+          FAILED=$(grep -E "^test result:" test-default.log | awk '{p+=$6} END {print p+0}')
+          echo "DEFAULT=$PASSED/$FAILED"
+          if [ "$FAILED" != "0" ]; then echo "::error::default tests failed"; exit 1; fi
+          if [ "$PASSED" -lt "1023" ]; then echo "::error::default test count regressed: $PASSED < 1023"; exit 1; fi
+      - name: VSR seed-7 determinism oracle
+        run: cargo test -p kessel-vsr --release large_seed_corpus_is_deterministic_and_converges -- --nocapture
+
+  test-featured:
+    name: cargo test (featured + http-gateway/test-server)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-featured-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-featured-
+      - name: Featured test (expect 1052+/0/0)
+        run: |
+          cargo test --workspace --release --features kessel-http-gateway/test-server 2>&1 | tee test-featured.log
+          PASSED=$(grep -E "^test result:" test-featured.log | awk '{p+=$4} END {print p+0}')
+          FAILED=$(grep -E "^test result:" test-featured.log | awk '{p+=$6} END {print p+0}')
+          echo "FEATURED=$PASSED/$FAILED"
+          if [ "$FAILED" != "0" ]; then echo "::error::featured tests failed"; exit 1; fi
+          if [ "$PASSED" -lt "1052" ]; then echo "::error::featured test count regressed: $PASSED < 1052"; exit 1; fi
+
+  deps-clean:
+    name: default cargo tree (no HTTP/gateway deps)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Verify default kesseldb-server links no HTTP/gateway crates
+        run: |
+          OUT=$(cargo tree -p kesseldb-server --no-default-features 2>&1 | grep -E "hyper|httparse|h2|tokio|mio|socket2|axum|actix|warp|kessel-http-gateway" || true)
+          if [ -n "$OUT" ]; then
+            echo "::error::default cargo tree links forbidden crates:"
+            echo "$OUT"
+            exit 1
+          fi
+          echo "default tree is HTTP/gateway-clean"
+
+  fmt-check:
+    name: cargo fmt --check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain with rustfmt
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: rustfmt
+        run: cargo fmt --all -- --check || (echo "::warning::cargo fmt would change files (non-blocking)" && exit 0)

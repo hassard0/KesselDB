@@ -91,6 +91,8 @@ of the HTTP gateway — they are hardening / observability upgrades:
    design spec §2 non-goals.
 5. **HTTP/1.1 keep-alive on the gateway** (V1 always sends
    `Connection: close`) — design spec §11 open question.
+
+   **CLOSED in SP147 (commit `f8e91c2`)** — see `docs/superpowers/specs/2026-05-26-kesseldb-subproject147-http-keep-alive.md`. `parse::wants_close` honors `Connection` header per RFC 9112 §9.3 (persistent default; explicit `close` token in comma-separated list wins); `handle_one_stream` loops per-connection until close/timeout/cap; `ServerConfig.http_max_requests_per_conn` (default 1000) prevents single-client monopoly; `write_*` helpers emit `Connection: keep-alive` or `close` per negotiation.
 6. **`OpResult::Unauthorized` HTTP status collides with auth-layer 401.**
    Both return 401 with `{"status":"unauthorized"}` — a caller cannot
    distinguish "wrong Bearer" from "engine ACL denied". Spec §4.4 needs a

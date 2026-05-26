@@ -9155,3 +9155,88 @@ mod sp145_pentest {
         });
     }
 }
+
+/// SP149 T4: pentest the LZ4_RAW block decoder against adversarial inputs.
+/// The hand-rolled `lz4::decompress` MUST reject every malformed input
+/// listed below with `PqError::Bad` — no panics, no infinite loops, no
+/// silent truncation. These pin the well-behaved-rejection invariants
+/// the SP149 KATs only check positively.
+#[cfg(test)]
+mod sp149_pentest {
+    use crate::lz4::decompress;
+
+    /// Row 1: zero-offset is invalid per the LZ4 spec (offset ranges
+    /// 1..=65_535). A zero would mean "copy from the current byte" —
+    /// would loop forever in a naïve decoder. We reject explicitly.
+    #[test]
+    fn sp149_pt_lz4_zero_offset_rejected() {
+        let src = vec![0x40, 0x61, 0x62, 0x63, 0x64, 0x00, 0x00];
+        assert!(decompress(&src, 8).is_err());
+    }
+
+    /// Row 2: an offset that points before the start of output. A naïve
+    /// decoder would underflow and panic; we surface a Bad error.
+    /// Token 0x00: lit_len=0, match_len=4; offset=1 with empty output
+    /// → match wants `out[0-1]` which doesn't exist.
+    #[test]
+    fn sp149_pt_lz4_offset_exceeds_output_rejected() {
+        let src = vec![0x00, 0x01, 0x00];
+        assert!(decompress(&src, 4).is_err());
+    }
+
+    /// Row 3: literal section that overruns the source buffer. Token
+    /// 0xa0 declares 10 literal bytes but src has only 5 trailing bytes.
+    /// Without the bounds check this would panic on the slice or extend
+    /// past EOF. With the check it's a Bad error.
+    #[test]
+    fn sp149_pt_lz4_truncated_literal_rejected() {
+        let src = vec![0xa0, 1, 2, 3, 4, 5];
+        assert!(decompress(&src, 10).is_err());
+    }
+
+    /// Row 4: decoded output shorter than declared `expected_uncompressed_size`.
+    /// Pyarrow's writer should always pad, but a tampered footer or a
+    /// truncated read could create this — we reject rather than silently
+    /// return short.
+    #[test]
+    fn sp149_pt_lz4_size_mismatch_rejected() {
+        let src = vec![0x50, 0x68, 0x65, 0x6c, 0x6c, 0x6f];
+        assert!(decompress(&src, 100).is_err());
+    }
+
+    /// Row 5: degenerate empty input with declared zero size MUST succeed
+    /// (empty in → empty out). Some codecs reject empty pages; LZ4_RAW
+    /// must not, because pyarrow can legally emit zero-byte pages for
+    /// all-null columns once null-only encoding lands.
+    #[test]
+    fn sp149_pt_lz4_empty_src_with_expected_zero() {
+        let out = decompress(&[], 0).expect("empty in empty out");
+        assert_eq!(out, vec![]);
+    }
+
+    /// Row 6: a truncated offset (only 1 of 2 expected bytes after
+    /// literals) must be rejected with Bad("truncated offset").
+    /// Token 0x40 declares lit_len=4, match_len=4, then literals "abcd",
+    /// then we leave only 1 offset byte (0x04) — the second is missing.
+    #[test]
+    fn sp149_pt_lz4_truncated_offset_rejected() {
+        let src = vec![0x40, 0x61, 0x62, 0x63, 0x64, 0x04];
+        let err = decompress(&src, 8).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("truncated offset") || msg.contains("offset"),
+                "expected truncated-offset error, got: {msg}");
+    }
+
+    /// Row 7: a missing lit-len extra byte (lit-nibble == 15 but src
+    /// runs out before the extra byte). Token 0xf0 says "lit_len = 15 +
+    /// extras" but we provide no extras at all.
+    #[test]
+    fn sp149_pt_lz4_truncated_lit_len_extra_rejected() {
+        let src = vec![0xf0]; // expects extra-byte, never delivered
+        let err = decompress(&src, 16).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("truncated lit-len") || msg.contains("lit-len"),
+                "expected lit-len-extra truncation error, got: {msg}");
+    }
+}
+

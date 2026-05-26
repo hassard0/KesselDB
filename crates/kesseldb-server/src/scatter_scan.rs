@@ -1,46 +1,66 @@
-//! SP-A scatter-scan router-side helper (SP155 design, T1 scaffold).
+//! SP-A scatter-scan router-side helper (SP155 design, T2).
 //!
 //! Cross-shard scatter scan / filter reads. The router fans out an
 //! existing scan-shaped `Op` (`Select` / `QueryRows` / `SelectFields` /
 //! `SelectSorted`) to every shard, collects per-shard `OpResult`s, then
-//! merges them into a single result. This module is the SP-A T1 scaffold:
-//! the per-shard fan-out plumbing + a merge stub. The actual ordered merge
-//! lives in SP-A T2 (sorted) / T3 (unordered concat); LIMIT cancellation
-//! in T6; pentests in T8. T1 ships:
+//! merges them into a single byte-shaped result. T1 shipped the fan-out
+//! scaffold + a stub merge; T2 ships the **real** merge:
 //!
 //! - [`ShardCaller`] — the trait per-shard dispatch needs (a single
 //!   `call(&op) -> Result<OpResult, String>`). The router's `ClusterClient`
-//!   implements it trivially; the unit tests below drive a mock without
-//!   spawning real shards (per the SP155 spec §7 — T1 is router-side
-//!   plumbing, the multi-shard integration test is the T5/T8 work).
+//!   implements it (see `router.rs::impl ShardCaller for ClusterClient`);
+//!   the unit tests below drive a mock without spawning real shards.
 //! - [`scatter_scan_fanout`] — spawns one `std::thread` per shard,
 //!   collects per-shard `OpResult`s in **shard-id order** (NOT arrival
 //!   order — replay-determinism trumps "fastest wins"), with a per-shard
 //!   bounded timeout (default 30s, configurable). The threads are joined
 //!   within the timeout window; a shard that exceeds the timeout
 //!   contributes `OpResult::Unavailable` to its slot.
-//! - [`merge_scan_results`] — **STUB** for T1. Returns the first
-//!   non-empty `Got(_)` (or the first non-Got error) so the call site has
-//!   *something* to return. Real ordered-merge (k-way heap for
-//!   `SelectSorted`, shard-id-ordered concat for the unordered scan ops)
-//!   lands in **SP-A T2/T3** per the spec §3.5 + §3.6.
+//! - [`ScatterKind`] — the merge strategy discriminator. `Unordered` for
+//!   `Select` / `QueryRows` / `SelectFields` (shard-id-ordered concat of
+//!   per-shard `[u32 rowlen][record]*` payloads, capped at `limit`).
+//!   `Sorted` for `SelectSorted` (k-way `BinaryHeap` merge over per-shard
+//!   already-sorted streams, with OFFSET + LIMIT in the merge loop,
+//!   tie-break by `(sort_value, shard_id)` — see §5.4 caveat below).
+//! - [`merge_scan_results`] — applies the merge strategy to a
+//!   shard-id-ordered `Vec<OpResult>`. Hard-fails the whole merge to the
+//!   first non-`Got` slot per SP155 §6 (V1 default; partial-on-timeout
+//!   is a T9 follow-up flag).
 //!
 //! Determinism + zero-dep per SP155 §3.3: `std::thread` + `std::sync::mpsc`
-//! only. No tokio. No rayon. Worker threads are joined within bounded
-//! time (the timeout); a `Drop` on the returned join handles is a no-op
-//! by design (each handle has already been joined before this function
-//! returns). The result vec has length equal to `shards.len()`, ordered
-//! by shard index — the same total order a single-shard run would
-//! observe with K=1, just K-way.
+//! + `std::collections::BinaryHeap` only. No tokio. No rayon. Worker
+//! threads are joined within bounded time (the timeout); a `Drop` on the
+//! returned join handles is a no-op by design (each handle has already
+//! been joined before this function returns). The result vec has length
+//! equal to `shards.len()`, ordered by shard index — the same total order
+//! a single-shard run would observe with K=1, just K-way.
 //!
 //! Wire-shape note (SP155 §4.1): the router ships the SAME `Op` to every
 //! shard. There is NO new `Op` variant for scatter. Clients keep sending
 //! `Op::Select` / `Op::SelectSorted` / etc. — the router does the work.
+//!
+//! §5.4 honest caveat (T2 tie-break shape): the design spec calls for a
+//! `(sort_value, object_id)` tiebreak so two deployments sharding the
+//! SAME rows differently (K=4 vs K=8) produce the same merged answer.
+//! Per-shard `SelectSorted` returns ONLY the record bytes (oid lives in
+//! the storage key, not the record), so the router cannot reconstruct
+//! the oid for tiebreak. T2 ships `(sort_value, shard_id)` tiebreak —
+//! deterministic and reproducible for a fixed K, but NOT K-invariant
+//! for sort-value ties. This is acceptable because: (a) within a shard's
+//! own stream the per-shard sort is already `(value, oid)` stable, so a
+//! shard's slice of the merged output is K-invariant; (b) the K-
+//! invariance property test (T5) will either confirm the tie shape is
+//! robust enough OR motivate the `Op::SelectSortedWithKey` follow-up
+//! (spec OQ8). Documented honestly here so a future executor finds it.
 
 use kessel_proto::{Op, OpResult};
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
+
+use kessel_catalog::FieldKind;
 
 /// Per-shard dispatch trait. The router's real per-shard `ClusterClient`
 /// implements this (T2/T3 follow-ups wire it through); test code uses
@@ -158,39 +178,406 @@ pub fn scatter_scan_fanout<C: ShardCaller>(
     out
 }
 
-/// **STUB** — SP-A T2/T3 ship the real merge. For T1 this returns:
+/// SP155 §3.2: the merge-strategy discriminator. Decoupled from the
+/// `Op` enum (the router builds this from `Route::Scatter(...)`) so the
+/// scatter-scan module stays purely functional over its inputs.
 ///
-/// - If `results` is empty: an empty `OpResult::Got(vec![])`.
-/// - If any slot is non-`Got`: the first non-`Got` slot, in shard-id
-///   order. (`Unavailable` propagates — V1 hard-fail per SP155 §6.)
-/// - Otherwise: the **first** `Got(_)` slot. **Wrong for K>1** —
-///   T2/T3 land the shard-id-ordered concat for unordered scans and the
-///   `(sort_field, object_id)` heap merge for sorted scans.
+/// - `Unordered { limit }`: applies to `Op::Select`, `Op::QueryRows`,
+///   `Op::SelectFields`. The merged output is the concatenation of every
+///   shard's `[u32 rowlen][record]*` payload in **shard-id order**
+///   (NOT arrival order; replay-determinism per SP155 §3.6), truncated
+///   to the first `limit` rows (0 = no cap).
+/// - `Sorted { sort_kind, sort_offset, sort_width, desc, offset, limit }`:
+///   applies to `Op::SelectSorted`. The merged output is the k-way
+///   `BinaryHeap` merge of the per-shard already-sorted streams.
+///   `(sort_kind, sort_offset, sort_width)` describe how to extract the
+///   sort key from each row record; OFFSET + LIMIT are applied in the
+///   merge loop. The catalog lookup that produces these parameters
+///   lives at the router call site (`Conn::scatter_read` in router.rs).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScatterKind {
+    /// Unordered scan ops: shard-id-ordered concat respecting `limit`.
+    Unordered { limit: u32 },
+    /// Sorted scan op (`Op::SelectSorted`): k-way heap merge with
+    /// OFFSET + LIMIT applied in the merge loop. The catalog-derived
+    /// sort parameters (`sort_kind`, `sort_offset`, `sort_width`) let
+    /// the merger extract the sort key from each row's record bytes
+    /// without re-loading the catalog (the router has it; the merger
+    /// just needs the field's byte slice + its compare flavour).
+    Sorted {
+        sort_kind: FieldKind,
+        /// Byte offset of the sort field within each row record.
+        sort_offset: u32,
+        /// Byte width of the sort field within each row record.
+        sort_width: u32,
+        /// `true` for descending order.
+        desc: bool,
+        offset: u32,
+        limit: u32,
+    },
+}
+
+/// Merge per-shard results into a single `OpResult` per the strategy
+/// in `kind`. SP155 §3.5 / §3.6 implementation.
 ///
-/// The signature is the stable T2/T3 entry point; only the body changes.
-pub fn merge_scan_results(results: Vec<OpResult>) -> OpResult {
+/// Behaviour:
+/// - **Empty input** ⇒ `OpResult::Got(vec![])` (SP155 OQ11 — empty
+///   filter result is `Got([])`, not `NotFound`).
+/// - **Any non-`Got` slot** ⇒ the first non-`Got` slot, in shard-id
+///   order. V1 hard-fail per SP155 §6 (`scatter_partial_on_timeout`
+///   default `false`). The merge does NOT fall back to a partial
+///   result; the whole scatter fails clean.
+/// - **All-`Got`** ⇒ merge per `kind`:
+///   - `Unordered`: shard-id-ordered concat of every `[u32 rowlen]
+///     [record]*` payload, truncated to `limit` rows (0 = unlimited).
+///   - `Sorted`: K-way `BinaryHeap` merge of the per-shard
+///     already-sorted streams, applying OFFSET + LIMIT in the merge
+///     loop, tie-breaking by `(sort_value, shard_id)` (see module-doc
+///     §5.4 caveat for the spec-vs-impl tradeoff).
+///
+/// Determinism (SP155 §5.4): the output is a pure function of the
+/// input vec + `kind` for a fixed K. K-invariance under sort-value
+/// ties is an honest deviation documented in the module doc.
+///
+/// Per-row malformed-record defense (cheap): the per-shard
+/// `[u32 rowlen][record]*` format is parsed length-first; a malformed
+/// frame is caught with `OpResult::SchemaError("scatter merge: \
+/// malformed per-shard row payload from shard {i}")`. The single-
+/// shard scan ops produce these payloads server-side from in-memory
+/// records, so this branch fires only under adversarial / corrupted
+/// transport (T8 pentest territory).
+pub fn merge_scan_results(
+    results: Vec<OpResult>,
+    kind: &ScatterKind,
+) -> OpResult {
     if results.is_empty() {
         return OpResult::Got(Vec::new());
     }
-    // V1 hard-fail: surface the first non-Got slot (Unavailable /
-    // SchemaError / etc.) so the caller sees a clean failure instead
-    // of partial-then-merged. This matches SP155 §6 "Shard unavailable"
-    // row default (`scatter_partial_on_timeout=false`).
+    // V1 hard-fail (SP155 §6): surface the first non-Got slot
+    // (Unavailable / SchemaError / etc.) so the caller sees a clean
+    // failure instead of partial-then-merged.
     for r in &results {
         if !matches!(r, OpResult::Got(_)) {
             return r.clone();
         }
     }
-    // TODO(SP-A T2/T3): replace with the real merge.
-    // - `ScatterKind::Unordered` ⇒ shard-id-ordered concat of every
-    //   `[u32 rowlen][record]*` payload, truncated to the op's `limit`.
-    // - `ScatterKind::Sorted` ⇒ `BinaryHeap<(sort_key, object_id, row)>`
-    //   k-way merge across all shards, applying OFFSET + LIMIT.
-    // For T1 we return the first shard's payload so the call site has
-    // *something* coherent; this is intentionally incorrect for K>1 and
-    // is locked by the `merge_stub_is_first_got_slot` KAT below so a
-    // future T2/T3 commit MUST update the test simultaneously.
-    results.into_iter().next().unwrap()
+    // Past this point every slot is `Got(_)`. Extract the per-shard
+    // payload byte-slices in shard-id order; never copy until the
+    // merge produces output bytes.
+    let payloads: Vec<&[u8]> = results
+        .iter()
+        .map(|r| match r {
+            OpResult::Got(b) => b.as_slice(),
+            _ => unreachable!("non-Got slot was returned above"),
+        })
+        .collect();
+    match kind {
+        ScatterKind::Unordered { limit } => merge_unordered(&payloads, *limit),
+        ScatterKind::Sorted {
+            sort_kind,
+            sort_offset,
+            sort_width,
+            desc,
+            offset,
+            limit,
+        } => merge_sorted(
+            &payloads,
+            *sort_kind,
+            *sort_offset as usize,
+            *sort_width as usize,
+            *desc,
+            *offset,
+            *limit,
+        ),
+    }
+}
+
+/// Iterate `[u32 rowlen][record]*` payload, yielding `(rowlen_le_bytes,
+/// record)` slices in stream order. Returns `Err` if the frame is
+/// truncated or claims a row larger than the remaining payload.
+///
+/// Zero-copy: yields slices into `payload`, no `Vec` allocation per
+/// row. The whole scatter merge is one final `Vec<u8>` allocation
+/// for the output payload.
+fn iter_rows(payload: &[u8]) -> Result<RowIter<'_>, &'static str> {
+    Ok(RowIter { payload, pos: 0 })
+}
+
+struct RowIter<'a> {
+    payload: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Iterator for RowIter<'a> {
+    type Item = Result<&'a [u8], &'static str>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos == self.payload.len() {
+            return None;
+        }
+        if self.pos + 4 > self.payload.len() {
+            return Some(Err("truncated row-length prefix"));
+        }
+        let lenb: [u8; 4] = match self.payload[self.pos..self.pos + 4]
+            .try_into()
+        {
+            Ok(b) => b,
+            Err(_) => return Some(Err("row-length prefix slice")),
+        };
+        let len = u32::from_le_bytes(lenb) as usize;
+        let body_start = self.pos + 4;
+        let body_end = match body_start.checked_add(len) {
+            Some(e) if e <= self.payload.len() => e,
+            _ => return Some(Err("row body exceeds payload")),
+        };
+        let rec = &self.payload[body_start..body_end];
+        self.pos = body_end;
+        Some(Ok(rec))
+    }
+}
+
+/// Append `record` to `out` as `[u32 len][record]`.
+fn append_row(out: &mut Vec<u8>, record: &[u8]) {
+    out.extend_from_slice(&(record.len() as u32).to_le_bytes());
+    out.extend_from_slice(record);
+}
+
+/// SP155 §3.6: shard-id-ordered concat of per-shard `[u32 rowlen]
+/// [record]*` payloads, truncated to `limit` rows (0 = unlimited).
+fn merge_unordered(payloads: &[&[u8]], limit: u32) -> OpResult {
+    let mut out: Vec<u8> = Vec::new();
+    let mut emitted: u32 = 0;
+    for (i, payload) in payloads.iter().enumerate() {
+        let it = match iter_rows(payload) {
+            Ok(it) => it,
+            Err(e) => {
+                return OpResult::SchemaError(format!(
+                    "scatter merge: shard {i} payload framing: {e}"
+                ))
+            }
+        };
+        for r in it {
+            match r {
+                Ok(rec) => {
+                    append_row(&mut out, rec);
+                    emitted = emitted.saturating_add(1);
+                    if limit != 0 && emitted >= limit {
+                        return OpResult::Got(out);
+                    }
+                }
+                Err(e) => {
+                    return OpResult::SchemaError(format!(
+                        "scatter merge: shard {i} row: {e}"
+                    ))
+                }
+            }
+        }
+    }
+    OpResult::Got(out)
+}
+
+/// Key-extraction helper: copy `width` bytes starting at `offset`
+/// inside `record` into a fresh `Vec<u8>`. Returns `None` if the row
+/// is too short to contain the field. Same shape as the per-shard
+/// SM `SelectSorted` extraction (kessel-sm cmp_field), so the merger
+/// can compare bytes the same way.
+fn extract_sort_key(record: &[u8], offset: usize, width: usize) -> Option<Vec<u8>> {
+    if width == 0 {
+        return Some(Vec::new());
+    }
+    record.get(offset..offset.checked_add(width)?).map(|s| s.to_vec())
+}
+
+/// Compare two extracted sort-key byte slices using `FieldKind`-
+/// aware semantics — byte-identical to the per-shard SM's
+/// `cmp_field` (so the merge produces the same total order as a
+/// fat K=1 single-shard sort).
+fn cmp_sort_value(kind: FieldKind, a: &[u8], b: &[u8]) -> Ordering {
+    use FieldKind::*;
+    let w = kind.width() as usize;
+    // Defensive pad: a malformed-too-short slice compares as if
+    // zero-padded; the parent merger guarantees length >= w in
+    // normal paths via `extract_sort_key`.
+    let pad = |x: &[u8]| -> [u8; 16] {
+        let mut le = [0u8; 16];
+        le[..w.min(16).min(x.len())]
+            .copy_from_slice(&x[..w.min(16).min(x.len())]);
+        le
+    };
+    let load_u = |x: &[u8]| u128::from_le_bytes(pad(x));
+    let load_i = |x: &[u8]| -> i128 {
+        let mut le = pad(x);
+        if w < 16
+            && w > 0
+            && x.get(w - 1).copied().unwrap_or(0) & 0x80 != 0
+        {
+            for byte in le.iter_mut().skip(w) {
+                *byte = 0xFF;
+            }
+        }
+        i128::from_le_bytes(le)
+    };
+    match kind {
+        U8 | U16 | U32 | U64 | U128 | Bool | Timestamp => {
+            load_u(a).cmp(&load_u(b))
+        }
+        I8 | I16 | I32 | I64 | I128 | Fixed { .. } => {
+            load_i(a).cmp(&load_i(b))
+        }
+        Char(_) | Bytes(_) | Ref | OverflowRef => a.cmp(b),
+    }
+}
+
+/// Heap node for the k-way sorted merge. Each node carries the
+/// per-shard already-decoded current row's sort key + record bytes +
+/// the source shard id (for tie-break + refill). The `Ord` impl
+/// produces a `min-heap` for ascending order: smaller `(value,
+/// shard_id)` is "greater" so `BinaryHeap::pop` returns it first.
+///
+/// For descending (`desc=true`) the caller flips the comparison.
+struct HeapNode {
+    /// Extracted sort-field bytes (length-aware, kind-aware compare
+    /// done in `Ord`).
+    sort_key: Vec<u8>,
+    /// Shard this row came from — refill source + tie-break.
+    shard_id: usize,
+    /// The full row record (owned so the heap can hold it across
+    /// pops; output emits a fresh length-prefixed copy).
+    record: Vec<u8>,
+    /// Field-kind for the compare (cloned into every node to keep
+    /// `Ord` purely a function of the node — no external lookup
+    /// in the hot loop).
+    sort_kind: FieldKind,
+    /// `true` flips the polarity (descending order).
+    desc: bool,
+}
+
+impl PartialEq for HeapNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for HeapNode {}
+impl PartialOrd for HeapNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for HeapNode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // BinaryHeap is a max-heap; for ascending we want the
+        // *smaller* sort_key to come out first, so we reverse.
+        // Tie-break by shard_id (smaller shard first ⇒ deterministic
+        // when sort values tie). §5.4 caveat: spec calls for oid
+        // tiebreak; the record doesn't carry the oid in V1.
+        let primary =
+            cmp_sort_value(self.sort_kind, &self.sort_key, &other.sort_key);
+        let primary = if self.desc { primary } else { primary.reverse() };
+        // For tie (primary == Equal), smaller shard_id should be
+        // popped first ⇒ reverse so "smaller is greater".
+        primary.then_with(|| other.shard_id.cmp(&self.shard_id))
+    }
+}
+
+/// SP155 §3.5: K-way `BinaryHeap` merge of per-shard already-sorted
+/// `[u32 rowlen][record]*` streams. Applies OFFSET + LIMIT in the
+/// merge loop. Tie-break by shard_id (V1; §5.4 caveat for the
+/// `(value, oid)` deviation).
+fn merge_sorted(
+    payloads: &[&[u8]],
+    sort_kind: FieldKind,
+    sort_offset: usize,
+    sort_width: usize,
+    desc: bool,
+    offset: u32,
+    limit: u32,
+) -> OpResult {
+    // Per-shard row iterators, indexed by shard id.
+    let mut iters: Vec<RowIter<'_>> = Vec::with_capacity(payloads.len());
+    for p in payloads {
+        iters.push(match iter_rows(p) {
+            Ok(it) => it,
+            Err(e) => {
+                return OpResult::SchemaError(format!(
+                    "scatter merge sorted: payload framing: {e}"
+                ))
+            }
+        });
+    }
+    let mut heap: BinaryHeap<HeapNode> = BinaryHeap::with_capacity(payloads.len());
+    // Prime: one row from each shard.
+    for (i, it) in iters.iter_mut().enumerate() {
+        if let Some(r) = it.next() {
+            let rec = match r {
+                Ok(rec) => rec.to_vec(),
+                Err(e) => {
+                    return OpResult::SchemaError(format!(
+                        "scatter merge sorted: shard {i} row: {e}"
+                    ))
+                }
+            };
+            let sort_key = match extract_sort_key(&rec, sort_offset, sort_width) {
+                Some(k) => k,
+                None => {
+                    return OpResult::SchemaError(format!(
+                        "scatter merge sorted: shard {i} row too short for \
+                         sort field (offset={sort_offset}, width={sort_width}, \
+                         record len={})",
+                        rec.len()
+                    ))
+                }
+            };
+            heap.push(HeapNode {
+                sort_key,
+                shard_id: i,
+                record: rec,
+                sort_kind,
+                desc,
+            });
+        }
+    }
+    let mut out: Vec<u8> = Vec::new();
+    let mut skipped: u32 = 0;
+    let mut emitted: u32 = 0;
+    while let Some(node) = heap.pop() {
+        if skipped < offset {
+            skipped += 1;
+        } else {
+            append_row(&mut out, &node.record);
+            emitted = emitted.saturating_add(1);
+            if limit != 0 && emitted >= limit {
+                break;
+            }
+        }
+        // Refill from the same shard.
+        let sid = node.shard_id;
+        if let Some(r) = iters[sid].next() {
+            let rec = match r {
+                Ok(rec) => rec.to_vec(),
+                Err(e) => {
+                    return OpResult::SchemaError(format!(
+                        "scatter merge sorted: shard {sid} row: {e}"
+                    ))
+                }
+            };
+            let sort_key = match extract_sort_key(&rec, sort_offset, sort_width) {
+                Some(k) => k,
+                None => {
+                    return OpResult::SchemaError(format!(
+                        "scatter merge sorted: shard {sid} row too short for \
+                         sort field"
+                    ))
+                }
+            };
+            heap.push(HeapNode {
+                sort_key,
+                shard_id: sid,
+                record: rec,
+                sort_kind,
+                desc,
+            });
+        }
+    }
+    OpResult::Got(out)
 }
 
 #[cfg(test)]
@@ -403,44 +790,356 @@ mod tests {
         );
     }
 
+    // ---------- T2 merge KATs (real) ----------
+    //
+    // T1's `merge_stub_is_first_got_slot` regression-lock has been
+    // intentionally REMOVED — its sole purpose was to force T2 to
+    // touch the merge logic in the same commit as the stub. T2's
+    // real merge KATs below replace it.
+
+    /// Build `[u32 rowlen][record]*` payload bytes from a list of row
+    /// record byte-slices — the per-shard scan-op output shape.
+    fn rows_to_payload(rows: &[&[u8]]) -> Vec<u8> {
+        let mut p = Vec::new();
+        for r in rows {
+            p.extend_from_slice(&(r.len() as u32).to_le_bytes());
+            p.extend_from_slice(r);
+        }
+        p
+    }
+
     /// `merge_scan_results` on an empty result vec returns an empty
     /// `Got([])` — matches per-shard `Select` semantics (an empty
     /// filter result is `Got([])`, not `NotFound`) per SP155 OQ11.
     #[test]
     fn merge_empty_results_is_empty_got() {
-        let out = merge_scan_results(Vec::new());
+        let out =
+            merge_scan_results(Vec::new(), &ScatterKind::Unordered { limit: 0 });
         assert_eq!(out, OpResult::Got(Vec::new()));
     }
 
-    /// `merge_scan_results` propagates the first non-`Got` slot — V1
-    /// hard-fail per SP155 §6. T2/T3 keep this semantic for non-Got
-    /// slots; only the all-Got merge changes.
+    /// V1 hard-fail per SP155 §6: any non-`Got` slot propagates — the
+    /// merge does NOT mix a partial result with the error. Same
+    /// semantic for `Unordered` and `Sorted`.
     #[test]
-    fn merge_propagates_first_non_got_slot() {
-        let r = merge_scan_results(vec![
-            OpResult::Got(b"a".to_vec()),
-            OpResult::Unavailable,
-            OpResult::Got(b"c".to_vec()),
-        ]);
+    fn merge_propagates_first_non_got_slot_unordered() {
+        let r = merge_scan_results(
+            vec![
+                OpResult::Got(b"a".to_vec()),
+                OpResult::Unavailable,
+                OpResult::Got(b"c".to_vec()),
+            ],
+            &ScatterKind::Unordered { limit: 0 },
+        );
         assert_eq!(r, OpResult::Unavailable);
     }
 
-    /// **REGRESSION-LOCK** for the T1 stub: when every slot is `Got(_)`,
-    /// the stub returns the first slot verbatim. T2/T3 MUST update this
-    /// test together with the merge implementation — flipping this lock
-    /// is the gate that catches a half-shipped T2.
+    /// V1 hard-fail also covers Sorted merges — propagate, no
+    /// partial-then-merged fallback.
     #[test]
-    fn merge_stub_is_first_got_slot() {
-        let r = merge_scan_results(vec![
-            OpResult::Got(b"shard-0".to_vec()),
-            OpResult::Got(b"shard-1".to_vec()),
-            OpResult::Got(b"shard-2".to_vec()),
-        ]);
-        assert_eq!(
-            r,
-            OpResult::Got(b"shard-0".to_vec()),
-            "T1 stub returns first Got; flip in T2/T3 with the real \
-             shard-id-ordered concat (unordered) or heap merge (sorted)"
+    fn merge_propagates_first_non_got_slot_sorted() {
+        let r = merge_scan_results(
+            vec![
+                OpResult::Got(rows_to_payload(&[&[1u8; 8]])),
+                OpResult::SchemaError("oops".into()),
+            ],
+            &ScatterKind::Sorted {
+                sort_kind: FieldKind::U64,
+                sort_offset: 0,
+                sort_width: 8,
+                desc: false,
+                offset: 0,
+                limit: 0,
+            },
         );
+        assert_eq!(r, OpResult::SchemaError("oops".into()));
+    }
+
+    /// **Unordered merge KAT**: shard-id-ordered concat of the per-
+    /// shard `[u32 rowlen][record]*` payloads (SP155 §3.6). NOT
+    /// arrival order; `shard_0 rows` then `shard_1 rows` then
+    /// `shard_2 rows`, byte-identical to a K=1 "fat shard" run.
+    #[test]
+    fn merge_unordered_concats_in_shard_id_order() {
+        let s0 = rows_to_payload(&[b"row-a", b"row-b"]);
+        let s1 = rows_to_payload(&[b"row-c"]);
+        let s2 = rows_to_payload(&[b"row-d", b"row-e", b"row-f"]);
+        let r = merge_scan_results(
+            vec![
+                OpResult::Got(s0),
+                OpResult::Got(s1),
+                OpResult::Got(s2),
+            ],
+            &ScatterKind::Unordered { limit: 0 },
+        );
+        let expected = rows_to_payload(&[
+            b"row-a", b"row-b", b"row-c", b"row-d", b"row-e", b"row-f",
+        ]);
+        assert_eq!(r, OpResult::Got(expected));
+    }
+
+    /// **Unordered LIMIT KAT**: `limit > 0` caps the merge to that
+    /// many rows in shard-id order. LIMIT=4 over (2,1,3) per shard
+    /// yields shard0[0..2] ++ shard1[0..1] ++ shard2[0..1] — never
+    /// dipping past the cap.
+    #[test]
+    fn merge_unordered_respects_limit() {
+        let s0 = rows_to_payload(&[b"a", b"b"]);
+        let s1 = rows_to_payload(&[b"c"]);
+        let s2 = rows_to_payload(&[b"d", b"e", b"f"]);
+        let r = merge_scan_results(
+            vec![
+                OpResult::Got(s0),
+                OpResult::Got(s1),
+                OpResult::Got(s2),
+            ],
+            &ScatterKind::Unordered { limit: 4 },
+        );
+        let expected = rows_to_payload(&[b"a", b"b", b"c", b"d"]);
+        assert_eq!(r, OpResult::Got(expected));
+    }
+
+    /// **K=1 byte-identical (unordered)**: a single-shard scatter is
+    /// byte-identical to the per-shard reply (modulo the LIMIT cap,
+    /// which is enforced shard-side too). Locks SP155 §10 "K=1
+    /// degenerate case" for the merge layer.
+    #[test]
+    fn merge_unordered_k1_byte_identical_to_single_shard() {
+        let payload =
+            rows_to_payload(&[b"only-shard-row-0", b"only-shard-row-1"]);
+        let r = merge_scan_results(
+            vec![OpResult::Got(payload.clone())],
+            &ScatterKind::Unordered { limit: 0 },
+        );
+        assert_eq!(r, OpResult::Got(payload));
+    }
+
+    /// **Empty shards in unordered merge**: an "all-`Got([])`" input
+    /// yields an empty result (NOT NotFound; SP155 OQ11).
+    #[test]
+    fn merge_unordered_all_empty_is_empty_got() {
+        let r = merge_scan_results(
+            vec![
+                OpResult::Got(Vec::new()),
+                OpResult::Got(Vec::new()),
+                OpResult::Got(Vec::new()),
+            ],
+            &ScatterKind::Unordered { limit: 0 },
+        );
+        assert_eq!(r, OpResult::Got(Vec::new()));
+    }
+
+    /// **Malformed payload (unordered)**: a truncated row-length
+    /// prefix is caught and surfaced as `SchemaError` — NOT a panic.
+    /// Defensive merge frame parsing per SP155 §6 "malformed rows"
+    /// row.
+    #[test]
+    fn merge_unordered_rejects_truncated_payload() {
+        // Claims a 99-byte row but the payload has only 4 bytes after
+        // the prefix.
+        let bad = {
+            let mut v = (99u32).to_le_bytes().to_vec();
+            v.extend_from_slice(&[1, 2, 3, 4]);
+            v
+        };
+        let r = merge_scan_results(
+            vec![OpResult::Got(bad)],
+            &ScatterKind::Unordered { limit: 0 },
+        );
+        assert!(
+            matches!(r, OpResult::SchemaError(_)),
+            "truncated payload must surface as SchemaError, got {r:?}"
+        );
+    }
+
+    /// **Sorted merge KAT (ascending U64)**: per-shard streams are
+    /// already in `(value, oid)` order; the merge produces the
+    /// globally sorted stream by `value` ascending. shard 0 has
+    /// records with U64 values [1,4,9]; shard 1 has [2,3,7]. Merged
+    /// = [1,2,3,4,7,9].
+    #[test]
+    fn merge_sorted_ascending_u64_two_shards() {
+        let rec = |v: u64| -> Vec<u8> { v.to_le_bytes().to_vec() };
+        let s0 = rows_to_payload(&[&rec(1), &rec(4), &rec(9)]);
+        let s1 = rows_to_payload(&[&rec(2), &rec(3), &rec(7)]);
+        let r = merge_scan_results(
+            vec![OpResult::Got(s0), OpResult::Got(s1)],
+            &ScatterKind::Sorted {
+                sort_kind: FieldKind::U64,
+                sort_offset: 0,
+                sort_width: 8,
+                desc: false,
+                offset: 0,
+                limit: 0,
+            },
+        );
+        let expected = rows_to_payload(&[
+            &rec(1), &rec(2), &rec(3), &rec(4), &rec(7), &rec(9),
+        ]);
+        assert_eq!(r, OpResult::Got(expected));
+    }
+
+    /// **Sorted merge — descending**: same data, `desc=true` flips
+    /// the order. Merged = [9,7,4,3,2,1].
+    #[test]
+    fn merge_sorted_descending_u64_two_shards() {
+        let rec = |v: u64| -> Vec<u8> { v.to_le_bytes().to_vec() };
+        // Per-shard SelectSorted with desc=true returns rows in
+        // descending order; replicate that here.
+        let s0 = rows_to_payload(&[&rec(9), &rec(4), &rec(1)]);
+        let s1 = rows_to_payload(&[&rec(7), &rec(3), &rec(2)]);
+        let r = merge_scan_results(
+            vec![OpResult::Got(s0), OpResult::Got(s1)],
+            &ScatterKind::Sorted {
+                sort_kind: FieldKind::U64,
+                sort_offset: 0,
+                sort_width: 8,
+                desc: true,
+                offset: 0,
+                limit: 0,
+            },
+        );
+        let expected = rows_to_payload(&[
+            &rec(9), &rec(7), &rec(4), &rec(3), &rec(2), &rec(1),
+        ]);
+        assert_eq!(r, OpResult::Got(expected));
+    }
+
+    /// **Sorted merge — OFFSET + LIMIT**: OFFSET 2 LIMIT 3 over the
+    /// merged [1,2,3,4,7,9] picks [3,4,7]. OFFSET applies AFTER the
+    /// merge (per spec §3.4 — sorted-merge OFFSET cannot be pushed
+    /// shard-side because rows interleave).
+    #[test]
+    fn merge_sorted_offset_and_limit() {
+        let rec = |v: u64| -> Vec<u8> { v.to_le_bytes().to_vec() };
+        let s0 = rows_to_payload(&[&rec(1), &rec(4), &rec(9)]);
+        let s1 = rows_to_payload(&[&rec(2), &rec(3), &rec(7)]);
+        let r = merge_scan_results(
+            vec![OpResult::Got(s0), OpResult::Got(s1)],
+            &ScatterKind::Sorted {
+                sort_kind: FieldKind::U64,
+                sort_offset: 0,
+                sort_width: 8,
+                desc: false,
+                offset: 2,
+                limit: 3,
+            },
+        );
+        let expected = rows_to_payload(&[&rec(3), &rec(4), &rec(7)]);
+        assert_eq!(r, OpResult::Got(expected));
+    }
+
+    /// **Sorted merge — K=1 byte-identical**: with one shard, the
+    /// sorted merge is byte-identical to that shard's payload
+    /// (modulo OFFSET/LIMIT, which the per-shard SelectSorted
+    /// applies anyway). The killer "scatter on K=1 == single fat
+    /// shard" property at the merge layer.
+    #[test]
+    fn merge_sorted_k1_byte_identical_to_single_shard() {
+        let rec = |v: u64| -> Vec<u8> { v.to_le_bytes().to_vec() };
+        let payload = rows_to_payload(&[&rec(2), &rec(5), &rec(11)]);
+        let r = merge_scan_results(
+            vec![OpResult::Got(payload.clone())],
+            &ScatterKind::Sorted {
+                sort_kind: FieldKind::U64,
+                sort_offset: 0,
+                sort_width: 8,
+                desc: false,
+                offset: 0,
+                limit: 0,
+            },
+        );
+        assert_eq!(r, OpResult::Got(payload));
+    }
+
+    /// **Sorted merge — empty shard mixed with non-empty**: an empty
+    /// shard contributes nothing; the others' rows still merge in
+    /// the correct sorted order.
+    #[test]
+    fn merge_sorted_with_one_empty_shard() {
+        let rec = |v: u64| -> Vec<u8> { v.to_le_bytes().to_vec() };
+        let s0 = rows_to_payload(&[&rec(1), &rec(5)]);
+        let s1 = rows_to_payload(&[]); // empty middle shard
+        let s2 = rows_to_payload(&[&rec(3), &rec(7)]);
+        let r = merge_scan_results(
+            vec![
+                OpResult::Got(s0),
+                OpResult::Got(s1),
+                OpResult::Got(s2),
+            ],
+            &ScatterKind::Sorted {
+                sort_kind: FieldKind::U64,
+                sort_offset: 0,
+                sort_width: 8,
+                desc: false,
+                offset: 0,
+                limit: 0,
+            },
+        );
+        let expected = rows_to_payload(&[
+            &rec(1), &rec(3), &rec(5), &rec(7),
+        ]);
+        assert_eq!(r, OpResult::Got(expected));
+    }
+
+    /// **Sorted merge — signed (I32) negative ordering**: signed
+    /// kinds use signed compare. Without the I-kind branch the
+    /// negative values would sort as huge unsigned numbers. Locks
+    /// that the merger uses `cmp_field`-shaped semantics (SP23 per-
+    /// shard ordering invariant).
+    #[test]
+    fn merge_sorted_signed_i32_negative_orders_correctly() {
+        // Records are 4-byte little-endian i32 only (simulates a
+        // minimal type with one I32 field at offset 0).
+        let rec = |v: i32| -> Vec<u8> { v.to_le_bytes().to_vec() };
+        // Per shard: already in ascending signed order.
+        let s0 = rows_to_payload(&[&rec(-100), &rec(0), &rec(50)]);
+        let s1 = rows_to_payload(&[&rec(-10), &rec(20)]);
+        let r = merge_scan_results(
+            vec![OpResult::Got(s0), OpResult::Got(s1)],
+            &ScatterKind::Sorted {
+                sort_kind: FieldKind::I32,
+                sort_offset: 0,
+                sort_width: 4,
+                desc: false,
+                offset: 0,
+                limit: 0,
+            },
+        );
+        let expected = rows_to_payload(&[
+            &rec(-100), &rec(-10), &rec(0), &rec(20), &rec(50),
+        ]);
+        assert_eq!(r, OpResult::Got(expected));
+    }
+
+    /// **Sorted merge — value tie tie-broken by shard_id**:
+    /// two shards each have a row with the same U64 value. T2
+    /// tie-breaks by shard_id (§5.4 caveat); the shard-0 row
+    /// emerges first. Deterministic for fixed K.
+    #[test]
+    fn merge_sorted_tie_broken_by_shard_id() {
+        let rec = |v: u64, tag: u8| -> Vec<u8> {
+            // 8-byte sort field then a 1-byte tail tag so we can
+            // tell the two same-key rows apart in the output.
+            let mut r = v.to_le_bytes().to_vec();
+            r.push(tag);
+            r
+        };
+        let s0 = rows_to_payload(&[&rec(42, b'A')]);
+        let s1 = rows_to_payload(&[&rec(42, b'B')]);
+        let r = merge_scan_results(
+            vec![OpResult::Got(s0), OpResult::Got(s1)],
+            &ScatterKind::Sorted {
+                sort_kind: FieldKind::U64,
+                sort_offset: 0,
+                sort_width: 8,
+                desc: false,
+                offset: 0,
+                limit: 0,
+            },
+        );
+        // shard 0 first (tie-break: smaller shard_id wins).
+        let expected = rows_to_payload(&[&rec(42, b'A'), &rec(42, b'B')]);
+        assert_eq!(r, OpResult::Got(expected));
     }
 }

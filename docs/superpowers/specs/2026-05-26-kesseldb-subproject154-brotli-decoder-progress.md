@@ -1,7 +1,7 @@
 # SP154 — Zero-dep Brotli (RFC 7932) Decoder SP-arc — Progress Tracker
 
 Date: 2026-05-26
-Status: **IN PROGRESS — Layers 1-7 of ~12 shipped**
+Status: **IN PROGRESS — Layers 1-9 of ~12 shipped**
 
 ## Mission
 
@@ -26,8 +26,9 @@ with a more specific SP154-followup pointer.
 | L5b | Huffman trees — COMPLEX prefix codes (§3.5) | DONE | `cbab152` |
 | L6 | NBLTYPES variable-length code (block-type counts) — V1 helper only, not yet wired into decompress_inner | DONE | `39f1d28` |
 | L7 | Distance code parameters (NPOSTFIX, NDIRECT) — V1 helper only, not yet wired into decompress_inner | DONE | `39f1d28` |
-| L8 | Context modes (CMODE / IMTF transform) | DEFERRED | — |
-| L9 | Insert-and-copy commands | DEFERRED | — |
+| L8 | Context-map header — NTREES read + reject-if->1 (RFC §7.3 step 1 only; CMAP body + IMTF deferred) | DONE | `f6b8e31` |
+| L9 | Insert-and-copy command alphabet (decomposition + insert/copy length decode; 704 symbols) | DONE | `c4d046d` |
+| L9b | Distance prefix code + NPOSTFIX/NDIRECT translation | DEFERRED | — |
 | L10 | Static dictionary (~122 KB constants + transforms) | DEFERRED | — |
 | L11 | Compressed metablock orchestration loop | DEFERRED | — |
 | L12 | Ring buffer with wraparound | DEFERRED | — |
@@ -37,6 +38,8 @@ with a more specific SP154-followup pointer.
 - `crates/kessel-parquet/src/brotli_bit_reader.rs` — Layer 1 (LSB-first bit reader, 14 KATs)
 - `crates/kessel-parquet/src/brotli.rs` — Layers 2-4 + L6/L7 helpers (stream header, metablock framing, uncompressed body, dispatch loop, NBLTYPES decoder, distance-params decoder) + 26 KATs
 - `crates/kessel-parquet/src/brotli_huffman.rs` — Layers 5 + 5b (simple + complex prefix codes + canonical code construction) + 16 KATs
+- `crates/kessel-parquet/src/brotli_context.rs` — Layer 8 (NTREES read + reject-if->1 for literal-context-map / distance-context-map) + 6 KATs
+- `crates/kessel-parquet/src/brotli_command.rs` — Layer 9 (704-symbol insert-and-copy command alphabet decomposition + insert/copy length decode + offset tables) + 22 KATs
 - `crates/kessel-parquet/src/lib.rs` — 5 wire sites: page_payload arm + 2 V2 data-page arms + 2 pre-flight gates
 
 ## What Works Right Now
@@ -58,6 +61,21 @@ with a more specific SP154-followup pointer.
   encoding, full 1..=256 range)
 - Distance-code parameters (NPOSTFIX, NDIRECT) can be decoded in
   isolation via `brotli::decode_distance_params`
+- Context-map header NTREES (RFC §7.3 step 1) can be decoded in
+  isolation via `brotli_context::decode_context_map_header_v1`; values
+  > 1 surface typed `UnsupportedMultipleTrees` with surface tag (the
+  V1 boundary — CMAP body + RLEMAX + IMTF deferred to a sub-slice
+  triggered by a real-world file that needs them)
+- A 704-alphabet insert-and-copy command symbol can be decomposed
+  via `brotli_command::decompose_command_code` into
+  `(insert_code, copy_code, distance_implicit)` per the RFC §5
+  cell-decomposition formula; per-code insert and copy lengths can
+  be decoded via `decode_insert_length` and `decode_copy_length` from
+  the constant 24-entry offset + extra-bits tables; the composed
+  `decode_command_components` calls all three. The whole 704-symbol
+  alphabet has been verified by an exhaustive-sweep KAT that decomposes
+  every symbol and confirms valid output codes + `distance_implicit`
+  matching the `cell_idx < 2` invariant
 - Bomb defense: `BROTLI_MAX_DECOMP = 256 MiB` cap matches SP151
   zstd/gzip/lz4/snappy caps
 - All errors typed (`BrotliError` + `HuffmanError` + `BitReaderError`);
@@ -69,11 +87,11 @@ with a more specific SP154-followup pointer.
   metablocks via insert-and-copy commands over Huffman-coded literals)
   → still surfaces typed `Unsupported("Brotli compressed metablock: SP154-followup. Workaround — zstd/lz4")`
   via the existing `if !mb.is_uncompressed` check
-- L5b+L6+L7 helpers exist in isolation but are not yet WIRED into
-  `decompress_inner` — the compressed metablock body needs L8 (context
-  modes) + L9 (insert-and-copy commands) + L10 (static dictionary) +
-  L11 (orchestration loop) + L12 (ring buffer) before the dispatcher
-  switches behavior
+- L5b+L6+L7+L8+L9 helpers exist in isolation but are not yet WIRED
+  into `decompress_inner` — the compressed metablock body needs L9b
+  (distance prefix code + NPOSTFIX/NDIRECT translation) + L10 (static
+  dictionary) + L11 (orchestration loop) + L12 (ring buffer) before
+  the dispatcher switches behavior
 - Static-dictionary back-references — required for the most common
   compression patterns (e.g. shared strings in JSON-like Parquet
   columns)
@@ -89,12 +107,25 @@ the SP125-SP140 zstd-arc cadence (~1 layer per session-slice):
   wires the compressed-metablock body decoder.
 - **L7 distance code parameters** — DONE (`39f1d28`). 3 KATs. Helper-only;
   the dispatcher reject-on-non-default happens at L11 wire-up.
-- **L8 context modes** — ~1 session. CMODE selects one of LSB6 /
-  MSB6 / UTF8 / Signed for literal context; for V1 we can support
-  only CMODE=0 (a single context) and reject the others.
-- **L9 insert-and-copy commands** — ~2 sessions. The insert-copy
-  alphabet is 704 symbols; each command produces (insert_length,
-  copy_length, distance_code). Substantial table-driven work.
+- **L8 context-map header NTREES read** — DONE (`f6b8e31`). 6 KATs.
+  V1: reads NTREES (same shape as NBLTYPES per RFC §7.3) and rejects
+  > 1 with a typed `UnsupportedMultipleTrees{surface,ntrees}` error.
+  CMAP body + RLEMAX + IMTF inversion (RFC §7.3 steps 2-4) are
+  deferred to a sub-slice triggered by a real-world file that uses
+  context modelling — pyarrow Parquet pages virtually always emit
+  NTREES=1.
+- **L9 insert-and-copy command alphabet** — DONE (`c4d046d`). 22 KATs.
+  The four 24-entry offset + extra-bits constant tables for insert
+  and copy lengths are hand-derived and pinned by re-derivation
+  KATs. `decompose_command_code` covers all 704 symbols via the
+  reference decoder's exact bit-arithmetic. The whole alphabet is
+  exhaustively swept by `all_704_command_symbols_decompose_to_valid_codes`.
+- **L9b distance prefix code + NPOSTFIX/NDIRECT translation** —
+  ~0.5 session. Reads a 16-symbol distance code via the prefix-code
+  machinery; translates it to an actual distance via the §4 formula
+  involving NPOSTFIX, NDIRECT, and the LRU last-distance ring. V1
+  may support NPOSTFIX=0 + NDIRECT=0 (the pyarrow default) and reject
+  the rest.
 - **L10 static dictionary** — ~2 sessions. ~122 KB of constants
   (Appendix A) plus 121 word-length-buckets indexing into them,
   plus 121 transforms (Appendix B). The transforms alone are a
@@ -104,10 +135,10 @@ the SP125-SP140 zstd-arc cadence (~1 layer per session-slice):
 - **L12 ring buffer** — ~0.5 session. The output buffer wraps at
   `1 << WBITS`; back-references can reach across the wraparound.
 
-**Total remaining estimate: ~5-7 sessions** (Layer 8 + 9 + 10 + 11 + 12
-+ wire-up of L5b/L6/L7 helpers into the dispatch loop + buffer for
-KAT-derivation surprises). The full Brotli decoder is genuinely a
-multi-week sub-project, matching the SP125-SP140 zstd arc length.
+**Total remaining estimate: ~4-5 sessions** (L9b + L10 + L11 + L12
++ wire-up of L5b/L6/L7/L8/L9 helpers into the dispatch loop + buffer
+for KAT-derivation surprises). The full Brotli decoder is genuinely
+a multi-week sub-project, matching the SP125-SP140 zstd arc length.
 
 ## Test Counts
 
@@ -115,7 +146,10 @@ multi-week sub-project, matching the SP125-SP140 zstd arc length.
 - Post-SP154 L1-L4: workspace 1170/0/1, 1203/0/1
 - Post-SP154 L5: workspace 1180/0/1, 1213/0/1
 - Post-SP154 L5b: workspace 1186/0/1, 1219/0/1 (+6: complex prefix code KATs)
-- Post-SP154 L6+L7: workspace 1194/0/1, 1227/0/1 (current) (+5 NBLTYPES, +3 distance-params)
+- Post-SP154 L6+L7: workspace 1194/0/1, 1227/0/1 (+5 NBLTYPES, +3 distance-params)
+- Post-SP154 L8: workspace 1200/0/1, 1233/0/1 (+6: NTREES/context-map header KATs)
+- Post-SP154 L9: workspace 1222/0/1, 1255/0/1 (current) (+22: command-alphabet
+  decomposition + insert/copy length decode + pentests + exhaustive sweep)
 
 All seed-7 GREEN; tree-grep EMPTY across all commits.
 
@@ -170,6 +204,33 @@ All seed-7 GREEN; tree-grep EMPTY across all commits.
    factor 8. A 16 following a 17 does NOT modify (only same-code
    consecutive). My implementation handles this via `prev_repeat`
    state tracking: Some(16), Some(17), or None.
+
+8. **L9 command-alphabet is RFC §5 cell-decomposition, not 704-entry
+   table.** The 704 symbols decompose via bit-arithmetic over an 11-
+   entry `CELL_POS = [0,1,0,1,8,9,2,16,10,17,18]` lookup, NOT a flat
+   704-entry table. Each cell contributes 64 symbols (11 × 64 = 704
+   exactly). The fields are extracted as:
+     copy_code = ((cell_pos << 3) & 0x18) + (sym & 0x7)
+     insert_code = (cell_pos & 0x18) + ((sym >> 3) & 0x7)
+     distance_implicit = (cell_idx < 2)
+   This is much more compact than a flat table and matches the
+   reference decoder's `kCmdLut` initialiser bit-for-bit. The bit-
+   masks `0x18` (= 0b11000) select bits 3-4 of cell_pos — the "range"
+   selector that divides 24 codes into 4 sub-ranges of 6.
+
+9. **Brotli copy lengths start at 2, NOT 1 like LZ77/DEFLATE.** The
+   `COPY_OFFSET[0] = 2` initialiser is the Brotli minimum match
+   length per RFC §5. Hand-derivation slip: a naive cumulative sum
+   starting at 0 gives the wrong base. The `decode_copy_length_code_
+   zero_returns_two` KAT pins this fast.
+
+10. **Insert length for code 12 is 34, not 50.** First-pass hand-
+    derivation of the `decode_insert_length_code_twelve_four_extra_
+    bits` KAT used the wrong offset (read off the column header
+    mid-stream rather than INSERT_OFFSET[12]). The
+    `insert_offsets_match_reference_table` KAT computes the table
+    from extras and pins anchor values at indices 0, 6, 12, 23 to
+    catch such slips.
 
 ## Open Questions for Future Implementers
 

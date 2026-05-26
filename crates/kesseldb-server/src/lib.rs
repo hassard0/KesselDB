@@ -121,6 +121,11 @@ pub struct ServerConfig {
     /// SP141: HTTP gateway body cap (default 8 MiB). Mirrors the binary
     /// frame cap.
     pub http_max_body: usize,
+    /// SP147: per-HTTP-connection request cap (default 1000). Prevents a
+    /// single client from monopolizing one keep-alive TCP connection
+    /// forever; after this many requests on one connection the gateway
+    /// closes cleanly and the client must open a fresh connection.
+    pub http_max_requests_per_conn: usize,
 }
 
 impl Default for ServerConfig {
@@ -133,6 +138,7 @@ impl Default for ServerConfig {
             http_addr: None,
             http_tls_addr: None,
             http_max_body: 8 * 1024 * 1024,
+            http_max_requests_per_conn: 1000,
         }
     }
 }
@@ -979,6 +985,10 @@ pub fn serve_cfg(listener: TcpListener, engine: EngineHandle, cfg: ServerConfig)
         let token_for_http = cfg.token.clone();
         let max_conns = cfg.max_conns;
         let max_body = cfg.http_max_body;
+        // SP147: per-connection request cap (default 1000) — propagates
+        // ServerConfig.http_max_requests_per_conn to the gateway's
+        // keep-alive loop.
+        let max_requests_per_conn = cfg.http_max_requests_per_conn;
         // SP144H T2: share the SAME counter Arc the EngineHandle's
         // snapshot_metrics reads. Bumps from the accept loop must land
         // in the same atomics that the metrics-snapshot path then reads.
@@ -993,6 +1003,7 @@ pub fn serve_cfg(listener: TcpListener, engine: EngineHandle, cfg: ServerConfig)
                     max_conns,
                     max_body,
                     http_counters,
+                    max_requests_per_conn,
                 ),
                 Err(e) => eprintln!(
                     "kesseldb: http-gateway bind {http_addr} failed: {e}"),
@@ -1008,6 +1019,7 @@ pub fn serve_cfg(listener: TcpListener, engine: EngineHandle, cfg: ServerConfig)
         let token_for_https = cfg.token.clone();
         let max_conns = cfg.max_conns;
         let max_body = cfg.http_max_body;
+        let max_requests_per_conn = cfg.http_max_requests_per_conn;
         // SP144H T2: same counter Arc as the plaintext path — plaintext
         // + HTTPS bumps share the same matrix so the /v1/metrics scrape
         // reflects the total across both listeners.
@@ -1022,6 +1034,7 @@ pub fn serve_cfg(listener: TcpListener, engine: EngineHandle, cfg: ServerConfig)
                     max_conns,
                     max_body,
                     http_counters,
+                    max_requests_per_conn,
                 ),
                 Err(e) => eprintln!(
                     "kesseldb: http-gateway HTTPS bind {https_addr} failed: {e}"),

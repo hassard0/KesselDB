@@ -77,15 +77,47 @@ fn wait_for_listener(addr: std::net::SocketAddr) {
     panic!("gateway listener never bound: {addr}");
 }
 
-/// Single-shot request → full response read (server sends Connection: close).
+/// Single-shot request → full response read.
+///
+/// SP147 (HTTP/1.1 keep-alive): the server now keeps the TCP connection
+/// open by default per RFC 9112 §9.3. To preserve the single-shot
+/// "send → read_to_end" shape these legacy tests want, we inject
+/// `Connection: close\r\n` into the request right before the final
+/// header-terminator `\r\n` (idempotent — if the caller already added
+/// `Connection: close` we still send it once more, which is harmless;
+/// `wants_close` looks for the token in either header occurrence). With
+/// the close header set, the server closes after responding and
+/// `read_to_end` returns cleanly.
 pub fn raw_request(addr: std::net::SocketAddr, req: &[u8]) -> Vec<u8> {
     let mut s = TcpStream::connect(addr).unwrap();
     s.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
     s.set_write_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
-    s.write_all(req).unwrap();
+    let req_closed = inject_connection_close(req);
+    s.write_all(&req_closed).unwrap();
     let mut buf = Vec::new();
     s.read_to_end(&mut buf).unwrap();
     buf
+}
+
+/// SP147: inject `Connection: close\r\n` before the final `\r\n` that
+/// terminates the request's header section. The request bytes are guaranteed
+/// to contain at least one `\r\n\r\n` (header terminator) — splice the close
+/// header in just before that terminator so the response carries
+/// `Connection: close` and the server closes after the single response,
+/// matching the legacy single-shot test semantic.
+fn inject_connection_close(req: &[u8]) -> Vec<u8> {
+    let needle = b"\r\n\r\n";
+    if let Some(pos) = req.windows(needle.len()).position(|w| w == needle) {
+        let mut out = Vec::with_capacity(req.len() + 19);
+        // Bytes up to and including the first \r\n that ends the last header.
+        out.extend_from_slice(&req[..pos + 2]);
+        out.extend_from_slice(b"Connection: close\r\n");
+        // The remaining bytes (the empty-line \r\n + body if any).
+        out.extend_from_slice(&req[pos + 2..]);
+        out
+    } else {
+        req.to_vec()
+    }
 }
 
 /// After an adversarial request, send a benign GET /v1/health on a FRESH

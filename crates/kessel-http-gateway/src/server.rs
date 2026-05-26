@@ -1,7 +1,15 @@
 //! TCP accept loop + per-connection thread. Mirrors the binary listener:
 //! one thread per connection, atomic in-flight counter for backpressure
-//! coordination with the engine. We send `Connection: close` on every
-//! response so a single TCP connection serves a single HTTP request.
+//! coordination with the engine.
+//!
+//! SP147 (HTTP/1.1 keep-alive): `handle_one_stream` is now a LOOP. Per RFC
+//! 9112 §9.3 HTTP/1.1 is persistent by default — the connection stays open
+//! for the next request unless the client sent `Connection: close`, an
+//! idle-timeout fires (`set_read_timeout(30s)` on the TcpStream), a parse
+//! error / abuse triggers defensive close, or the per-connection request
+//! cap (`max_requests_per_conn`, default 1000) is exhausted. Buffer drain
+//! via `Request.consumed` handles the rare pipelined / glued-packet shape
+//! where one read() returns bytes from two requests.
 
 #![allow(dead_code)]
 
@@ -24,6 +32,13 @@ use std::time::Duration;
 /// client can't starve the binary protocol (and vice-versa).
 pub const DEFAULT_MAX_CONNS: usize = 1024;
 
+/// SP147: per-HTTP-connection request cap. After this many requests on one
+/// keep-alive connection, the gateway responds + closes (the response keeps
+/// `Connection: close`) so a single client can't monopolize one TCP
+/// connection forever. Configurable via
+/// `ServerConfig.http_max_requests_per_conn`.
+pub const DEFAULT_MAX_REQUESTS_PER_CONN: usize = 1000;
+
 pub fn serve(
     listener: TcpListener,
     engine: Arc<dyn EngineApply>,
@@ -31,6 +46,7 @@ pub fn serve(
     max_conns: usize,
     max_body: usize,
     http_counters: Arc<HttpRequestCountersStatic>,
+    max_requests_per_conn: usize,
 ) {
     let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming().flatten() {
@@ -47,7 +63,8 @@ pub fn serve(
         let a = active.clone();
         let c = http_counters.clone();
         std::thread::spawn(move || {
-            handle_one(stream, &e, t.as_deref(), max_body, &c);
+            handle_one(stream, &e, t.as_deref(), max_body, &c,
+                max_requests_per_conn);
             a.fetch_sub(1, Ordering::AcqRel);
         });
     }
@@ -59,8 +76,10 @@ fn handle_one(
     token: Option<&[u8]>,
     max_body: usize,
     http_counters: &Arc<HttpRequestCountersStatic>,
+    max_requests_per_conn: usize,
 ) {
-    let _ = handle_one_stream(&mut s, engine, token, max_body, http_counters);
+    let _ = handle_one_stream(&mut s, engine, token, max_body, http_counters,
+        max_requests_per_conn);
 }
 
 fn handle_one_stream<S: Read + Write>(
@@ -69,14 +88,66 @@ fn handle_one_stream<S: Read + Write>(
     token: Option<&[u8]>,
     max_body: usize,
     http_counters: &Arc<HttpRequestCountersStatic>,
+    max_requests_per_conn: usize,
 ) -> std::io::Result<()> {
     let mut raw: Vec<u8> = Vec::with_capacity(8 * 1024);
     let mut chunk = [0u8; 8192];
+    let mut requests_served: usize = 0;
     loop {
+        // SP147: per-connection request cap. Stop accepting new requests on
+        // this connection once we've served `max_requests_per_conn`. Clean
+        // close — the previous response already carried `Connection:
+        // keep-alive` (the cap is enforced AFTER it landed). The next client
+        // simply opens a fresh TCP connection.
+        if requests_served >= max_requests_per_conn {
+            return Ok(());
+        }
+        // Try to parse what we already have buffered (from a prior iteration's
+        // glued packet). If not enough bytes, read more.
+        match parse_request(&raw, max_body) {
+            Ok(req) => {
+                // SP147: routes::handle returns close_after — true iff the
+                // client sent `Connection: close` (or another internal-policy
+                // reason forced close). The response's `Connection:` header
+                // was written matching this decision inside `handle`.
+                let consumed = req.consumed;
+                let close_after = match routes::handle(s, &req, token, engine,
+                    http_counters)
+                {
+                    Ok(c) => c,
+                    // Socket write failed mid-response — the peer disconnected
+                    // or the OS buffer broke. Nothing further to do on this
+                    // connection.
+                    Err(_) => return Ok(()),
+                };
+                requests_served += 1;
+                if close_after {
+                    return Ok(());
+                }
+                // Drain the consumed bytes; any trailing bytes (rare glued
+                // packet from a pipelining client) stay in `raw` for the next
+                // loop iteration's parse attempt.
+                if consumed <= raw.len() {
+                    raw.drain(..consumed);
+                } else {
+                    raw.clear();
+                }
+                continue;
+            }
+            Err(ParseError::NoHeaderTerminator) | Err(ParseError::ShortBody) => {
+                // Need more bytes — fall through to the read below.
+            }
+            Err(e) => {
+                // SP147: parse errors always close (defensive — a malformed
+                // request could mis-frame subsequent bytes on the connection).
+                let _ = write_parse_error(s, &e, http_counters, /*keep_alive=*/ false);
+                return Ok(());
+            }
+        }
         let n = match s.read(&mut chunk) {
-            Ok(0) => return Ok(()),
+            Ok(0) => return Ok(()),       // clean close from peer
             Ok(n) => n,
-            Err(_) => return Ok(()),
+            Err(_) => return Ok(()),      // timeout, broken pipe, etc.
         };
         raw.extend_from_slice(&chunk[..n]);
         if raw.len() > MAX_HEADER_BYTES + max_body {
@@ -88,28 +159,6 @@ fn handle_one_stream<S: Read + Write>(
                 "error", "payload too large",
                 http_counters, "/v1/sql", /*keep_alive=*/ false);
             return Ok(());
-        }
-        // Honor the configured `http_max_body` at parse time, not just at the
-        // outer raw.len() guard above — the inner `decode_body` path checks
-        // `max_body` against decoded chunk-stream output and Content-Length
-        // values, so a 16 MiB Content-Length only succeeds when the
-        // operator configured `http_max_body = 16 MiB` (or larger).
-        match parse_request(&raw, max_body) {
-            Ok(req) => {
-                // SP147 T2: `routes::handle` returns close_after; T2 still
-                // ignores the value (single-shot per-connection behavior
-                // preserved). T3 will wire the loop.
-                let _ = routes::handle(s, &req, token, engine, http_counters);
-                return Ok(());
-            }
-            Err(ParseError::NoHeaderTerminator) => continue,
-            Err(ParseError::ShortBody) => continue,
-            Err(e) => {
-                // SP147: parse errors always close (defensive — a malformed
-                // request could mis-frame subsequent bytes on the connection).
-                let _ = write_parse_error(s, &e, http_counters, /*keep_alive=*/ false);
-                return Ok(());
-            }
         }
     }
 }
@@ -196,6 +245,7 @@ pub fn serve_tls<A>(
     max_conns: usize,
     max_body: usize,
     http_counters: Arc<HttpRequestCountersStatic>,
+    max_requests_per_conn: usize,
 ) where
     A: TlsAccept,
 {
@@ -222,7 +272,8 @@ pub fn serve_tls<A>(
         let c = http_counters.clone();
         std::thread::spawn(move || {
             if let Some(mut tls) = acc.accept(stream) {
-                let _ = handle_one_stream(&mut tls, &e, t.as_deref(), max_body, &c);
+                let _ = handle_one_stream(&mut tls, &e, t.as_deref(), max_body,
+                    &c, max_requests_per_conn);
             }
             a.fetch_sub(1, Ordering::AcqRel);
         });

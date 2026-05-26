@@ -227,14 +227,14 @@ round‑trip fixtures**:
 | **Physical types** | INT32, **INT64**, **INT96 (timestamp)**, **FLBA**, **BYTE_ARRAY** | INT96 → `PqValue::Timestamp(i64 ns)` via checked Julian‑day arithmetic |
 | **Logical types** | **DECIMAL (INT32/INT64/FLBA, precision 1..=38)**, **FLBA‑UUID** | DECIMAL → `PqValue::Decimal { unscaled: i128, scale: i32 }` |
 | **Multi‑row‑group** | yes | Cross‑row‑group column concatenation |
-| **Bounds + safety** | `#![forbid(unsafe_code)]`, 64 MiB per‑page cap, every offset bounds‑checked, typed `PqError` on every failure mode, no panics on attacker bytes | + dedicated pentest module per codec (`pentest_optional` / `pentest_int96_decimal` / `pentest_v2` / etc.) |
+| **Bounds + safety** | `#![forbid(unsafe_code)]`, **256 MiB per‑page cap** (configurable via `extract_with_cap`, SP151), every offset bounds‑checked, typed `PqError` on every failure mode, no panics on attacker bytes | + dedicated pentest module per codec (`pentest_optional` / `pentest_int96_decimal` / `pentest_v2` / etc.) |
 
 **Still deferred** (typed `Unsupported` at `REFRESH` with a precise
 error naming the follow‑on slice):
 - Brotli compression (OBJ‑2c‑2 follow‑on; LZ4_RAW shipped in SP149)
 - 4‑deep nesting (`List<List<List<List<T>>>>` etc.) — would be SP147 if a real fixture demands it; **all 3‑deep and below now supported (OBJ-2c-5 fully closed at SP146)**
 - DECIMAL precision > 38 (would need i256)
-- Per‑page decompressed size > 64 MiB
+- Per‑page decompressed size > 256 MiB (SP151 lifted the 64 MiB historical cap; operators with known-trusted producers can lower or raise the cap via `extract_with_cap` up to the per-codec module ceiling)
 
 The reader is feature‑gated through `kessel-fetch`'s `object-store`
 feature; the default `cargo build` links **no Parquet code at all**

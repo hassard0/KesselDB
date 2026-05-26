@@ -750,7 +750,10 @@ messages.
 > Brotli (recognized at meta-decode time per SP150 but decompression is a
 > dedicated multi-week SP-arc — workaround: re-encode with zstd or lz4),
 > 4+ deep nested
-> groups (would be SP147), DECIMAL precision > 38, per‑page > 64 MiB.
+> groups (would be SP147), DECIMAL precision > 38, per‑page > 256 MiB
+> (SP151 raised the historical 64 MiB cap to a 256 MiB default + added
+> `kessel_parquet::extract_with_cap` for operators with known-trusted
+> producers or memory-constrained ingest).
 > **All Parquet nested types supported (LIST, MAP, struct + arbitrary
 > nesting up to 3-deep — OBJ-2c-5 fully closed at SP146).**
 >
@@ -822,6 +825,33 @@ messages.
 > be 1..=38 (backed by i128); precision > 38 is rejected with
 > `Unsupported`. ZSTD/lz4/brotli, REPEATED/nested (incl. V2
 > rep-levels), and pages >64 MiB remain Unsupported (→ OBJ-2c-2/5).
+
+> **OBJ-2c-4 follow-up (SP151):** the historical 64 MiB per-page cap
+> is lifted to **256 MiB default** + a configurable operator knob.
+> Pyarrow writers emit pages above 64 MiB on common shapes
+> (high-cardinality dictionary pages, large value pages on many-row
+> row groups); pre-SP151 those tripped a typed Unsupported with the
+> 64 MiB cap value. Post-SP151:
+>
+> - `kessel_parquet::extract(bytes, wanted)` uses
+>   `DEFAULT_MAX_PAGE_SIZE = 256 * 1024 * 1024` — covers every pyarrow
+>   shape seen in the wild without operator intervention.
+> - `kessel_parquet::extract_with_cap(bytes, wanted, max_page_size)`
+>   is the operator knob. Raise above 256 MiB up to the per-codec
+>   module ceiling (also 256 MiB) for known-trusted producers;
+>   lower for memory-constrained ingest; `cap=0` is the kill-switch
+>   that rejects every page (useful when sanitising hostile input).
+>   The cap is enforced as a thread-local set on entry and restored
+>   on return (RAII, including panic-unwind).
+> - Pages above the cap return `Unsupported` naming `SP151`, the
+>   `extract_with_cap` operator knob, and the cap value so an
+>   operator hitting the cap in production has a direct path to
+>   raise it.
+> - Defense in depth: the four per-codec module ceilings
+>   (`SNAPPY_MAX_DECOMP`, `GZIP_MAX_DECOMP`, `ZSTD_MAX_DECOMP`,
+>   `LZ4_MAX_DECOMP`) all bumped from 64 MiB → 256 MiB in lockstep.
+>   Even a caller passing `usize::MAX` to `extract_with_cap` can't
+>   OOM the decoder — the per-codec ceiling still gates allocation.
 
 `FORMAT PARQUET` is supported for `s3://` and `az://` sources when the
 server is built with `--features external-sources-objstore`. Plain
@@ -960,8 +990,14 @@ as every other format):
   rejected with `Unsupported("LZ4 (deprecated Hadoop framing) — use
   LZ4_RAW; SP149 follow-up if needed")`. Pyarrow stopped writing this
   variant in v8; the modern LZ4_RAW (codec id 7) is fully supported.
-- **Snappy pages above 64 MiB decompressed** — rejected with
-  `Unsupported("Snappy decompressed page too large: OBJ-2c")`.
+- **Pages above the per-call max_page_size cap** — rejected with
+  `Unsupported("<page kind> size <N> exceeds max_page_size cap <cap>:
+  SP151 (raise via kessel_parquet::extract_with_cap)")`. The default
+  cap is 256 MiB (4× the historical 64 MiB limit; SP151). The
+  per-codec module ceilings (`SNAPPY_MAX_DECOMP`, `GZIP_MAX_DECOMP`,
+  `ZSTD_MAX_DECOMP`, `LZ4_MAX_DECOMP`) are also 256 MiB and act as
+  the absolute defense-in-depth ceiling — `extract_with_cap` can
+  lower the cap but cannot raise it above the per-codec ceiling.
 - **DECIMAL precision > 38** — rejected with
   `Unsupported("DECIMAL precision … (must be 1..=38): OBJ-2c-4")`.
   DECIMAL backed by i128 (≤ 38 digits) is supported; wider types are not.

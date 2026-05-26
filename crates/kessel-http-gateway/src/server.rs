@@ -163,13 +163,16 @@ fn handle_one_stream<S: Read + Write>(
     }
 }
 
-fn write_parse_error<W: Write>(
-    w: &mut W,
+/// SP148 follow-up: single source of truth mapping ParseError → (status,
+/// semantic, message). Both write_parse_error AND routes.rs's auth /
+/// exactly_once_binding error sites use this so a future ParseError
+/// variant gains its friendly message in ONE place. Pre-SP148 those route
+/// sites used Debug-format which leaked variant names like
+/// "IncompleteSessionBinding" into HTTP bodies.
+pub(crate) fn parse_error_to_status_message(
     e: &ParseError,
-    http_counters: &Arc<HttpRequestCountersStatic>,
-    keep_alive: bool,
-) -> std::io::Result<()> {
-    let (status, semantic, msg): ((u16, &'static str), &str, String) = match e {
+) -> ((u16, &'static str), &'static str, String) {
+    match e {
         ParseError::BadRequestLine =>
             ((400, "Bad Request"), "error", "bad request line".into()),
         ParseError::MethodNotAllowed =>
@@ -219,7 +222,16 @@ fn write_parse_error<W: Write>(
         ParseError::IncompleteSessionBinding =>
             ((400, "Bad Request"), "error",
              "both X-Kessel-Client-Id and X-Kessel-Req-Seq required together".into()),
-    };
+    }
+}
+
+fn write_parse_error<W: Write>(
+    w: &mut W,
+    e: &ParseError,
+    http_counters: &Arc<HttpRequestCountersStatic>,
+    keep_alive: bool,
+) -> std::io::Result<()> {
+    let (status, semantic, msg) = parse_error_to_status_message(e);
     // SP144H T2: parse errors happen BEFORE the path is known. We bump
     // against "/v1/sql" as a defensive default (the status bucket is what
     // operators actually monitor; the path label is a minor accounting

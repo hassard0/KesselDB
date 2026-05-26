@@ -60,8 +60,14 @@ pub fn handle<W: Write>(
                 return Ok(close_after);
             }
             Err(e) => {
+                // SP148 follow-up: use the friendly message from
+                // parse_error_to_status_message (not Debug format) so the
+                // user-facing JSON body matches the messages emitted by
+                // server::write_parse_error.
+                let (_status, _semantic, msg) =
+                    crate::server::parse_error_to_status_message(&e);
                 write_error_json_counted(w, (400, "Bad Request"),
-                    "error", &format!("{:?}", e),
+                    "error", &msg,
                     http_counters, req.path, keep_alive)?;
                 return Ok(close_after);
             }
@@ -103,9 +109,17 @@ fn handle_sql<W: Write>(
     let result = match exactly_once_binding(req) {
         Ok(Some((cid, seq))) => engine.apply_sql_with_session(cid, seq, sql),
         Ok(None) => engine.apply_sql(sql),
-        Err(e) => return write_error_json_counted(w, (400, "Bad Request"),
-            "error", &format!("{:?}", e),
-            http_counters, req.path, keep_alive),
+        Err(e) => {
+            // SP148 follow-up: friendly message via parse_error_to_status_message
+            // (not Debug format) so exactly_once_binding's IncompleteSessionBinding
+            // returns "both X-Kessel-Client-Id and X-Kessel-Req-Seq required
+            // together" instead of leaking the variant name.
+            let (_status, _semantic, msg) =
+                crate::server::parse_error_to_status_message(&e);
+            return write_error_json_counted(w, (400, "Bad Request"),
+                "error", &msg,
+                http_counters, req.path, keep_alive);
+        }
     };
     write_op_result(w, &result, http_counters, req.path, keep_alive)
 }
@@ -134,9 +148,17 @@ fn handle_op<W: Write>(
     let result = match exactly_once_binding(req) {
         Ok(Some((cid, seq))) => engine.apply_op_with_session(cid, seq, op),
         Ok(None) => engine.apply_op(op),
-        Err(e) => return write_error_json_counted(w, (400, "Bad Request"),
-            "error", &format!("{:?}", e),
-            http_counters, req.path, keep_alive),
+        Err(e) => {
+            // SP148 follow-up: friendly message via parse_error_to_status_message
+            // (not Debug format) so exactly_once_binding's IncompleteSessionBinding
+            // returns "both X-Kessel-Client-Id and X-Kessel-Req-Seq required
+            // together" instead of leaking the variant name.
+            let (_status, _semantic, msg) =
+                crate::server::parse_error_to_status_message(&e);
+            return write_error_json_counted(w, (400, "Bad Request"),
+                "error", &msg,
+                http_counters, req.path, keep_alive);
+        }
     };
     write_op_result(w, &result, http_counters, req.path, keep_alive)
 }

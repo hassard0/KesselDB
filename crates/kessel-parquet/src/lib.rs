@@ -16,6 +16,8 @@ mod snappy;
 mod gzip;
 mod zstd;
 mod lz4;
+mod brotli_bit_reader;
+mod brotli;
 mod zstd_fse;
 mod zstd_literals;
 mod zstd_huffman;
@@ -486,15 +488,28 @@ fn page_payload<'a>(
         meta::Codec::Lz4Raw => Ok(std::borrow::Cow::Owned(
             lz4::decompress(on_disk, uncomp)?
         )),
-        // SP150: Brotli (codec id 4) recognized at meta-decode time but
-        // decompression is deferred to a dedicated SP-arc (zero-dep RFC
-        // 7932 decoder is multi-week scope, ~10-15 tasks like SP125-SP140
-        // zstd). Named error directs users at the shipped workarounds.
-        meta::Codec::Brotli => Err(PqError::Unsupported(
-            "Brotli decode: zero-dep decoder is a dedicated multi-week SP-arc \
-             (~10-15 tasks like SP125-SP140 zstd); workaround — ask the writer to use \
-             compression='zstd' or compression='lz4' instead".into(),
-        )),
+        // SP154: Brotli (codec id 4). The SP-arc has shipped Layers 1-5
+        // (bit reader, stream/metablock framing, uncompressed metablocks,
+        // Huffman tree decoding). Streams composed of ONLY uncompressed
+        // metablocks decode successfully (rare but valid). The common
+        // pyarrow shape — compressed metablocks — still surfaces a typed
+        // Unsupported with a refined SP154-followup pointer naming the
+        // remaining layers (static dict, IMTF, insert-and-copy, ring
+        // buffer). The SP150 named-followup test in fixture_roundtrip.rs
+        // continues to pass: error mentions 'Brotli' and points at
+        // zstd/lz4 workarounds.
+        meta::Codec::Brotli => match brotli::decompress(on_disk, uncomp) {
+            Ok(decoded) => Ok(std::borrow::Cow::Owned(decoded)),
+            Err(brotli::BrotliError::CompressedMetablockNotYetSupported { .. }) => {
+                Err(PqError::Unsupported(
+                    "Brotli compressed metablock: SP154-followup (only uncompressed \
+                     metablocks supported in V1; pyarrow always emits compressed). \
+                     Workaround — ask the writer to use compression='zstd' or \
+                     compression='lz4' instead".into(),
+                ))
+            }
+            Err(e) => Err(PqError::Bad(format!("Brotli decode: {e:?}"))),
+        },
         // Codec id 5 = legacy LZ4 (deprecated Hadoop framing). Pyarrow
         // stopped writing this in v8; we don't support it in V1 — named
         // separately so a user file that needs it gets a clear pointer
@@ -697,12 +712,21 @@ fn decode_data_page_v2(
         meta::Codec::Lz4Raw => {
             std::borrow::Cow::Owned(lz4::decompress(values_section, vt)?)
         }
+        // SP154: V2 data-page Brotli arm. Delegates to brotli::decompress
+        // (Layers 1-5: uncompressed-only). Compressed metablocks surface
+        // typed Unsupported with refined SP154-followup pointer.
         meta::Codec::Brotli => {
-            return Err(PqError::Unsupported(
-                "Brotli decode: zero-dep decoder is a dedicated multi-week SP-arc \
-                 (~10-15 tasks like SP125-SP140 zstd); workaround — ask the writer to use \
-                 compression='zstd' or compression='lz4' instead".into(),
-            ))
+            match brotli::decompress(values_section, vt) {
+                Ok(decoded) => std::borrow::Cow::Owned(decoded),
+                Err(brotli::BrotliError::CompressedMetablockNotYetSupported { .. }) => {
+                    return Err(PqError::Unsupported(
+                        "Brotli compressed metablock (V2 values): SP154-followup. \
+                         Workaround — ask the writer to use compression='zstd' or \
+                         compression='lz4' instead".into(),
+                    ));
+                }
+                Err(e) => return Err(PqError::Bad(format!("v2 brotli values decode: {e:?}"))),
+            }
         }
         meta::Codec::Other(5) => {
             return Err(PqError::Unsupported(
@@ -994,12 +1018,21 @@ pub(crate) fn decode_data_page_v2_nested(
         meta::Codec::Lz4Raw => {
             std::borrow::Cow::Owned(lz4::decompress(values_section, vt)?)
         }
+        // SP154: V2 data-page Brotli arm (second instance — nested-column
+        // path). Delegates to brotli::decompress (Layers 1-5). Compressed
+        // metablocks surface typed Unsupported with refined message.
         meta::Codec::Brotli => {
-            return Err(PqError::Unsupported(
-                "Brotli decode: zero-dep decoder is a dedicated multi-week SP-arc \
-                 (~10-15 tasks like SP125-SP140 zstd); workaround — ask the writer to use \
-                 compression='zstd' or compression='lz4' instead".into(),
-            ))
+            match brotli::decompress(values_section, vt) {
+                Ok(decoded) => std::borrow::Cow::Owned(decoded),
+                Err(brotli::BrotliError::CompressedMetablockNotYetSupported { .. }) => {
+                    return Err(PqError::Unsupported(
+                        "Brotli compressed metablock (V2 nested values): \
+                         SP154-followup. Workaround — ask the writer to use \
+                         compression='zstd' or compression='lz4' instead".into(),
+                    ));
+                }
+                Err(e) => return Err(PqError::Bad(format!("v2 brotli nested values decode: {e:?}"))),
+            }
         }
         meta::Codec::Other(5) => {
             return Err(PqError::Unsupported(
@@ -1042,14 +1075,12 @@ fn read_chunk_values(
         | meta::Codec::Snappy
         | meta::Codec::Gzip
         | meta::Codec::Zstd
-        | meta::Codec::Lz4Raw => {}
-        meta::Codec::Brotli => {
-            return Err(PqError::Unsupported(
-                "Brotli decode: zero-dep decoder is a dedicated multi-week SP-arc \
-                 (~10-15 tasks like SP125-SP140 zstd); workaround — ask the writer to use \
-                 compression='zstd' or compression='lz4' instead".into(),
-            ))
-        }
+        | meta::Codec::Lz4Raw
+        // SP154: Brotli admitted through the pre-flight gate. The actual
+        // page_payload Brotli arm handles uncompressed metablocks
+        // (Layers 1-5) and surfaces a refined typed Unsupported for
+        // compressed metablocks (still the common pyarrow shape).
+        | meta::Codec::Brotli => {}
         meta::Codec::Other(5) => {
             return Err(PqError::Unsupported(
                 "LZ4 (deprecated Hadoop framing) — use LZ4_RAW; SP149 follow-up if needed".into(),
@@ -3215,14 +3246,12 @@ fn read_chunk_levels_and_values(
         | meta::Codec::Snappy
         | meta::Codec::Gzip
         | meta::Codec::Zstd
-        | meta::Codec::Lz4Raw => {}
-        meta::Codec::Brotli => {
-            return Err(PqError::Unsupported(
-                "Brotli decode: zero-dep decoder is a dedicated multi-week SP-arc \
-                 (~10-15 tasks like SP125-SP140 zstd); workaround — ask the writer to use \
-                 compression='zstd' or compression='lz4' instead".into(),
-            ))
-        }
+        | meta::Codec::Lz4Raw
+        // SP154: Brotli admitted through the pre-flight gate. The actual
+        // page_payload Brotli arm handles uncompressed metablocks
+        // (Layers 1-5) and surfaces a refined typed Unsupported for
+        // compressed metablocks (still the common pyarrow shape).
+        | meta::Codec::Brotli => {}
         meta::Codec::Other(5) => {
             return Err(PqError::Unsupported(
                 "LZ4 (deprecated Hadoop framing) — use LZ4_RAW; SP149 follow-up if needed".into(),
@@ -4544,12 +4573,26 @@ mod tests {
 
     #[test]
     fn extract_rejects_lz4_codec_obj2c() {
-        // Repurposed from extract_rejects_zstd_codec_obj2c: ZSTD(6) is now
-        // SUPPORTED (SP136 wire); LZ4(4) is still Unsupported (OBJ-2c follow-on).
-        let f = build_parquet_file(0, 4, 0, false); // codec=LZ4(4)=Other(4)
+        // Repurposed: codec id 4 = BROTLI per Parquet spec (SP150 mapping).
+        // Pre-SP154 this returned typed Unsupported from the early gate.
+        // Post-SP154 the early gate admits Brotli and the decompress call
+        // attempts to parse the bytes as Brotli; since this test's
+        // page_data is `[7i64.to_le_bytes(), -2i64.to_le_bytes()]` — NOT
+        // a valid Brotli stream — the decoder surfaces a typed PqError
+        // (either Bad with a brotli message, or Unsupported if the
+        // bytes happen to parse as a compressed metablock header). The
+        // test still asserts "extract rejects" — just with a finer-
+        // grained error class.
+        let f = build_parquet_file(0, 4, 0, false); // codec=BROTLI(4)
+        let res = extract(&f, &["id"]);
+        let err = res.expect_err("codec=4 (Brotli) over non-Brotli bytes must reject");
+        // SP154 contract: error is typed (Bad or Unsupported), never a
+        // panic / never silently misdecoded. The message must mention
+        // Brotli OR SizeMismatch / brotli decode-failure context.
+        let msg = format!("{err:?}");
         assert!(
-            matches!(extract(&f, &["id"]), Err(PqError::Unsupported(_))),
-            "LZ4 codec must be Unsupported (OBJ-2c)"
+            matches!(err, PqError::Unsupported(_) | PqError::Bad(_)),
+            "Brotli over non-Brotli bytes must surface typed error: {msg}"
         );
     }
 

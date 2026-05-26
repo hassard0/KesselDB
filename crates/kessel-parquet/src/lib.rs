@@ -21,6 +21,7 @@ mod brotli_huffman;
 mod brotli;
 mod brotli_context;
 mod brotli_command;
+mod brotli_distance;
 mod zstd_fse;
 mod zstd_literals;
 mod zstd_huffman;

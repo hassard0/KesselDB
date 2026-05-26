@@ -2131,3 +2131,511 @@ mod mol_tests {
         assert!(format!("{err:?}").contains("rep level 3"), "got {err:?}");
     }
 }
+
+/// SP146: assemble `List<List<List<T>>>` records (3-deep LIST nesting,
+/// max_rep_level=3). Generalization of `assemble_list_of_list_primitive`
+/// one more level deep: there are now THREE nested accumulators
+/// (outer / middle / inner) and the rep level ranges {0,1,2,3}.
+///
+/// Rep semantics:
+///   rep == 0 → start NEW outer record; flush previous outer + middle + inner
+///   rep == 1 → flush middle + inner; start NEW middle list within outer
+///   rep == 2 → flush inner; start NEW inner list within middle
+///   rep == 3 → continue innermost list (append item)
+///
+/// Def classification (max_def = outer_opt + 1 + middle_opt + 1 + inner_opt + 1 + item_opt):
+///   d == 0 && outer_opt              → OuterNull
+///   d == outer_opt                   → OuterEmpty
+///   d == outer_opt + 1 + middle_opt  → MiddleNull (when middle_opt) or MiddleEmpty (when !middle_opt → degenerate, never EmptyMiddle below)
+///   Actually the math is:
+///     outer_empty_thr = outer_opt
+///     middle_null_thr = outer_opt + 1
+///     middle_empty_thr = outer_opt + 1 + middle_opt
+///     inner_null_thr = outer_opt + 1 + middle_opt + 1
+///     inner_empty_thr = outer_opt + 1 + middle_opt + 1 + inner_opt
+///     item_null_thr  = max_def_level - 1   (only when item_opt)
+///     item_present   = max_def_level
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_list_of_list_of_list_primitive(
+    rep_levels: &[u32],
+    def_levels: &[u32],
+    values: &[PqValue],
+    max_def_level: u32,
+    outer_optional: bool,
+    middle_optional: bool,
+    inner_optional: bool,
+    item_optional: bool,
+) -> Result<Vec<PqValue>, PqError> {
+    if rep_levels.len() != def_levels.len() {
+        return Err(PqError::Bad(format!(
+            "rep/def length mismatch: rep={} def={}",
+            rep_levels.len(), def_levels.len()
+        )));
+    }
+    let n = rep_levels.len();
+    if n == 0 {
+        if !values.is_empty() {
+            return Err(PqError::Bad(format!(
+                "no levels but {} values supplied", values.len()
+            )));
+        }
+        return Ok(Vec::new());
+    }
+
+    let outer_empty_thr: u32 = outer_optional as u32;
+    let middle_null_thr: u32 = (outer_optional as u32) + 1;
+    let middle_empty_thr: u32 = (outer_optional as u32) + 1 + (middle_optional as u32);
+    let inner_null_thr: u32 = (outer_optional as u32) + 1 + (middle_optional as u32) + 1;
+    let inner_empty_thr: u32 =
+        (outer_optional as u32) + 1 + (middle_optional as u32) + 1 + (inner_optional as u32);
+    let item_null_thr: u32 = if max_def_level > 0 { max_def_level - 1 } else { 0 };
+
+    #[derive(Copy, Clone, Debug)]
+    enum LolLCase {
+        OuterNull,
+        OuterEmpty,
+        MiddleNull,
+        MiddleEmpty,
+        InnerNull,
+        InnerEmpty,
+        ItemNull,
+        ItemPresent,
+    }
+
+    let classify = |def: u32, pos: usize| -> Result<LolLCase, PqError> {
+        if def > max_def_level {
+            return Err(PqError::Bad(format!(
+                "def level {def} > max {max_def_level} (position {pos})"
+            )));
+        }
+        // Order: ItemPresent first (priority — wins when max == any threshold).
+        if def == max_def_level {
+            return Ok(LolLCase::ItemPresent);
+        }
+        if outer_optional && def == 0 {
+            return Ok(LolLCase::OuterNull);
+        }
+        if def == outer_empty_thr {
+            return Ok(LolLCase::OuterEmpty);
+        }
+        if middle_optional && def == middle_null_thr {
+            return Ok(LolLCase::MiddleNull);
+        }
+        if def == middle_empty_thr {
+            return Ok(LolLCase::MiddleEmpty);
+        }
+        if inner_optional && def == inner_null_thr {
+            return Ok(LolLCase::InnerNull);
+        }
+        if def == inner_empty_thr {
+            return Ok(LolLCase::InnerEmpty);
+        }
+        if item_optional && def == item_null_thr {
+            return Ok(LolLCase::ItemNull);
+        }
+        Err(PqError::Bad(format!(
+            "unclassified def {def} (max={max_def_level}, \
+             outer_opt={outer_optional}, middle_opt={middle_optional}, \
+             inner_opt={inner_optional}, item_opt={item_optional}) at position {pos}"
+        )))
+    };
+
+    let mut out: Vec<PqValue> = Vec::new();
+    let mut current_outer: Option<Vec<PqValue>> = None;
+    let mut current_outer_null: bool = false;
+    let mut current_middle: Option<Vec<PqValue>> = None;
+    let mut current_middle_null: bool = false;
+    let mut current_inner: Option<Vec<PqValue>> = None;
+    let mut current_inner_null: bool = false;
+    let mut value_cursor = 0usize;
+
+    let flush_inner = |middle: &mut Option<Vec<PqValue>>,
+                       inner: &mut Option<Vec<PqValue>>,
+                       inner_null: &mut bool|
+     -> Result<(), PqError> {
+        if let Some(items) = inner.take() {
+            middle.as_mut()
+                .ok_or_else(|| PqError::Bad("flush_inner with no active middle".into()))?
+                .push(PqValue::List(items));
+        } else if *inner_null {
+            middle.as_mut()
+                .ok_or_else(|| PqError::Bad("flush_inner null with no active middle".into()))?
+                .push(PqValue::Null);
+            *inner_null = false;
+        }
+        Ok(())
+    };
+
+    let flush_middle = |outer: &mut Option<Vec<PqValue>>,
+                        middle: &mut Option<Vec<PqValue>>,
+                        middle_null: &mut bool|
+     -> Result<(), PqError> {
+        if let Some(items) = middle.take() {
+            outer.as_mut()
+                .ok_or_else(|| PqError::Bad("flush_middle with no active outer".into()))?
+                .push(PqValue::List(items));
+        } else if *middle_null {
+            outer.as_mut()
+                .ok_or_else(|| PqError::Bad("flush_middle null with no active outer".into()))?
+                .push(PqValue::Null);
+            *middle_null = false;
+        }
+        Ok(())
+    };
+
+    let flush_outer = |out: &mut Vec<PqValue>,
+                       outer: &mut Option<Vec<PqValue>>,
+                       outer_null: &mut bool| {
+        if let Some(items) = outer.take() {
+            out.push(PqValue::List(items));
+        } else if *outer_null {
+            out.push(PqValue::Null);
+            *outer_null = false;
+        }
+    };
+
+    for i in 0..n {
+        let rep = rep_levels[i];
+        let def = def_levels[i];
+        if rep > 3 {
+            return Err(PqError::Bad(format!(
+                "rep level {rep} > max 3 for List<List<List>> (position {i})"
+            )));
+        }
+        let dc = classify(def, i)?;
+
+        if rep == 0 {
+            // Flush 3 levels of state in inner→middle→outer order.
+            flush_inner(&mut current_middle, &mut current_inner, &mut current_inner_null)?;
+            flush_middle(&mut current_outer, &mut current_middle, &mut current_middle_null)?;
+            flush_outer(&mut out, &mut current_outer, &mut current_outer_null);
+
+            match dc {
+                LolLCase::OuterNull => {
+                    current_outer = None;
+                    current_outer_null = true;
+                    current_middle = None;
+                    current_middle_null = false;
+                    current_inner = None;
+                    current_inner_null = false;
+                }
+                LolLCase::OuterEmpty => {
+                    current_outer = Some(Vec::new());
+                    current_middle = None;
+                    current_middle_null = false;
+                    current_inner = None;
+                    current_inner_null = false;
+                }
+                LolLCase::MiddleNull => {
+                    current_outer = Some(Vec::new());
+                    current_middle = None;
+                    current_middle_null = true;
+                    current_inner = None;
+                    current_inner_null = false;
+                }
+                LolLCase::MiddleEmpty => {
+                    current_outer = Some(Vec::new());
+                    current_middle = Some(Vec::new());
+                    current_inner = None;
+                    current_inner_null = false;
+                }
+                LolLCase::InnerNull => {
+                    current_outer = Some(Vec::new());
+                    current_middle = Some(Vec::new());
+                    current_inner = None;
+                    current_inner_null = true;
+                }
+                LolLCase::InnerEmpty => {
+                    current_outer = Some(Vec::new());
+                    current_middle = Some(Vec::new());
+                    current_inner = Some(Vec::new());
+                    current_inner_null = false;
+                }
+                LolLCase::ItemNull => {
+                    current_outer = Some(Vec::new());
+                    current_middle = Some(Vec::new());
+                    current_inner = Some(vec![PqValue::Null]);
+                    current_inner_null = false;
+                }
+                LolLCase::ItemPresent => {
+                    let v = values.get(value_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("value stream exhausted at position {i}")))?;
+                    value_cursor += 1;
+                    current_outer = Some(Vec::new());
+                    current_middle = Some(Vec::new());
+                    current_inner = Some(vec![v]);
+                    current_inner_null = false;
+                }
+            }
+        } else if rep == 1 {
+            // New middle list within current outer. Flush inner → middle first.
+            if current_outer.is_none() {
+                return Err(PqError::Bad(format!(
+                    "rep=1 without active outer list (position {i})"
+                )));
+            }
+            flush_inner(&mut current_middle, &mut current_inner, &mut current_inner_null)?;
+            flush_middle(&mut current_outer, &mut current_middle, &mut current_middle_null)?;
+
+            match dc {
+                LolLCase::OuterNull | LolLCase::OuterEmpty => {
+                    return Err(PqError::Bad(format!(
+                        "rep=1 with outer-level def {dc:?} (position {i})"
+                    )));
+                }
+                LolLCase::MiddleNull => {
+                    current_middle = None;
+                    current_middle_null = true;
+                    current_inner = None;
+                    current_inner_null = false;
+                }
+                LolLCase::MiddleEmpty => {
+                    current_middle = Some(Vec::new());
+                    current_inner = None;
+                    current_inner_null = false;
+                }
+                LolLCase::InnerNull => {
+                    current_middle = Some(Vec::new());
+                    current_inner = None;
+                    current_inner_null = true;
+                }
+                LolLCase::InnerEmpty => {
+                    current_middle = Some(Vec::new());
+                    current_inner = Some(Vec::new());
+                    current_inner_null = false;
+                }
+                LolLCase::ItemNull => {
+                    current_middle = Some(Vec::new());
+                    current_inner = Some(vec![PqValue::Null]);
+                    current_inner_null = false;
+                }
+                LolLCase::ItemPresent => {
+                    let v = values.get(value_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("value stream exhausted at position {i}")))?;
+                    value_cursor += 1;
+                    current_middle = Some(Vec::new());
+                    current_inner = Some(vec![v]);
+                    current_inner_null = false;
+                }
+            }
+        } else if rep == 2 {
+            // New inner list within current middle. Flush inner first.
+            if current_middle.is_none() {
+                return Err(PqError::Bad(format!(
+                    "rep=2 without active middle list (position {i})"
+                )));
+            }
+            flush_inner(&mut current_middle, &mut current_inner, &mut current_inner_null)?;
+
+            match dc {
+                LolLCase::InnerNull => {
+                    current_inner = None;
+                    current_inner_null = true;
+                }
+                LolLCase::InnerEmpty => {
+                    current_inner = Some(Vec::new());
+                    current_inner_null = false;
+                }
+                LolLCase::ItemNull => {
+                    current_inner = Some(vec![PqValue::Null]);
+                    current_inner_null = false;
+                }
+                LolLCase::ItemPresent => {
+                    let v = values.get(value_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("value stream exhausted at position {i}")))?;
+                    value_cursor += 1;
+                    current_inner = Some(vec![v]);
+                    current_inner_null = false;
+                }
+                _ => {
+                    return Err(PqError::Bad(format!(
+                        "rep=2 with non-inner def {dc:?} (position {i})"
+                    )));
+                }
+            }
+        } else {
+            // rep == 3: continue innermost list.
+            let inner = current_inner.as_mut().ok_or_else(||
+                PqError::Bad(format!("rep=3 without active inner list (position {i})")))?;
+            match dc {
+                LolLCase::ItemNull => {
+                    inner.push(PqValue::Null);
+                }
+                LolLCase::ItemPresent => {
+                    let v = values.get(value_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("value stream exhausted at position {i}")))?;
+                    value_cursor += 1;
+                    inner.push(v);
+                }
+                _ => {
+                    return Err(PqError::Bad(format!(
+                        "rep=3 with non-item def {dc:?} (position {i})"
+                    )));
+                }
+            }
+        }
+    }
+
+    // Final flush in inner → middle → outer order.
+    flush_inner(&mut current_middle, &mut current_inner, &mut current_inner_null)?;
+    flush_middle(&mut current_outer, &mut current_middle, &mut current_middle_null)?;
+    flush_outer(&mut out, &mut current_outer, &mut current_outer_null);
+
+    if value_cursor != values.len() {
+        return Err(PqError::Bad(format!(
+            "values not fully consumed: cursor={value_cursor} len={}", values.len()
+        )));
+    }
+
+    Ok(out)
+}
+
+#[cfg(test)]
+mod loll_tests {
+    use super::*;
+
+    /// REQ-REP-REQ-REP-REQ-REP-REQ List<List<List<i64>>>
+    /// Record: [[[1,2],[3]],[[4]]]
+    /// outer_opt=false, middle_opt=false, inner_opt=false, item_opt=false
+    /// max_def = 0 + 1 + 0 + 1 + 0 + 1 + 0 = 3
+    /// max_rep = 3
+    /// Levels for [[[1,2],[3]],[[4]]]:
+    ///   item 1: rep=0, def=3  (new outer; new middle; new inner; item=1)
+    ///   item 2: rep=3, def=3  (continue inner; item=2)
+    ///   item 3: rep=2, def=3  (new inner within same middle; item=3)
+    ///   item 4: rep=1, def=3  (new middle within same outer; new inner; item=4)
+    #[test]
+    fn req_req_req_req_one_outer_two_middle_three_inner_items() {
+        let r = vec![0u32, 3, 2, 1];
+        let d = vec![3u32, 3, 3, 3];
+        let v = vec![PqValue::I64(1), PqValue::I64(2), PqValue::I64(3), PqValue::I64(4)];
+        let out = assemble_list_of_list_of_list_primitive(
+            &r, &d, &v, 3, false, false, false, false,
+        ).unwrap();
+        assert_eq!(out, vec![PqValue::List(vec![
+            PqValue::List(vec![
+                PqValue::List(vec![PqValue::I64(1), PqValue::I64(2)]),
+                PqValue::List(vec![PqValue::I64(3)]),
+            ]),
+            PqValue::List(vec![
+                PqValue::List(vec![PqValue::I64(4)]),
+            ]),
+        ])]);
+    }
+
+    /// Two top-level records to exercise the rep=0 flush logic.
+    /// R0: [[[10]]]  → r=0,d=3
+    /// R1: [[[20],[30]]]  → r=0,d=3,v=20  +  r=2,d=3,v=30
+    #[test]
+    fn req_req_req_req_two_records() {
+        let r = vec![0u32, 0, 2];
+        let d = vec![3u32, 3, 3];
+        let v = vec![PqValue::I64(10), PqValue::I64(20), PqValue::I64(30)];
+        let out = assemble_list_of_list_of_list_primitive(
+            &r, &d, &v, 3, false, false, false, false,
+        ).unwrap();
+        assert_eq!(out, vec![
+            PqValue::List(vec![PqValue::List(vec![PqValue::List(vec![PqValue::I64(10)])])]),
+            PqValue::List(vec![PqValue::List(vec![
+                PqValue::List(vec![PqValue::I64(20)]),
+                PqValue::List(vec![PqValue::I64(30)]),
+            ])]),
+        ]);
+    }
+
+    /// Empty innermost list. OPT-REP-OPT-REP-OPT-REP-OPT: every layer OPT.
+    /// max_def = 1+1+1+1+1+1+1 = 7
+    /// Empty INNER list def: outer_opt + 1 + middle_opt + 1 + inner_opt = 1+1+1+1+1 = 5
+    /// Record: [[[]]]
+    ///   r=0, d=5 → outer open, middle open, inner empty
+    #[test]
+    fn opt_opt_opt_opt_empty_inner_list() {
+        let r = vec![0u32];
+        let d = vec![5u32];
+        let v: Vec<PqValue> = vec![];
+        let out = assemble_list_of_list_of_list_primitive(
+            &r, &d, &v, 7, true, true, true, true,
+        ).unwrap();
+        assert_eq!(out, vec![PqValue::List(vec![
+            PqValue::List(vec![PqValue::List(vec![])]),
+        ])]);
+    }
+
+    /// Outer-null OPT outer: max_def varies, rep=0 d=0 → null record.
+    #[test]
+    fn opt_outer_null_record() {
+        let r = vec![0u32];
+        let d = vec![0u32];
+        let v: Vec<PqValue> = vec![];
+        // OPT-REQ-OPT-REQ-OPT-REQ-OPT: max_def = 1+1+0+1+0+1+0 = 4
+        let out = assemble_list_of_list_of_list_primitive(
+            &r, &d, &v, 4, true, false, false, false,
+        ).unwrap();
+        assert_eq!(out, vec![PqValue::Null]);
+    }
+
+    #[test]
+    fn rejects_rep_overflow() {
+        let r = vec![0u32, 5];
+        let d = vec![3u32, 3];
+        let v = vec![PqValue::I64(1), PqValue::I64(2)];
+        let err = assemble_list_of_list_of_list_primitive(
+            &r, &d, &v, 3, false, false, false, false,
+        ).unwrap_err();
+        assert!(format!("{err:?}").contains("rep level 5"), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_value_underflow() {
+        let r = vec![0u32, 3];
+        let d = vec![3u32, 3];
+        let v = vec![PqValue::I64(1)]; // need 2
+        let err = assemble_list_of_list_of_list_primitive(
+            &r, &d, &v, 3, false, false, false, false,
+        ).unwrap_err();
+        assert!(format!("{err:?}").contains("value stream exhausted"), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_value_unconsumed() {
+        let r = vec![0u32];
+        let d = vec![3u32];
+        let v = vec![PqValue::I64(1), PqValue::I64(2)];
+        let err = assemble_list_of_list_of_list_primitive(
+            &r, &d, &v, 3, false, false, false, false,
+        ).unwrap_err();
+        assert!(format!("{err:?}").contains("values not fully consumed"), "got {err:?}");
+    }
+}
+
+/// SP146: assemble `List<Map<K, V>>` records (outer LIST of inner Maps,
+/// max_rep_level=2 on both K and V leaves which share the same rep
+/// stream). T3 stub — full impl in next commit.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_list_of_map_kv(
+    _rep_levels: &[u32],
+    _def_levels: &[u32],
+    _keys: &[PqValue],
+    _values: &[PqValue],
+    _max_def_level: u32,
+    _outer_optional: bool,
+    _value_optional: bool,
+) -> Result<Vec<PqValue>, PqError> {
+    Err(PqError::Bad("assemble_list_of_map_kv: SP146 T3 not yet implemented".into()))
+}
+
+/// SP146: assemble `Map<K1, Map<K2, V>>` records (outer Map whose V is
+/// an inner Map with primitive K2 and V). T4 stub — full impl in next commit.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_map_of_map_kv(
+    _inner_rep_levels: &[u32],
+    _inner_def_levels: &[u32],
+    _outer_keys: &[PqValue],
+    _inner_keys: &[PqValue],
+    _inner_values: &[PqValue],
+    _max_def_level: u32,
+    _outer_optional: bool,
+    _inner_value_optional: bool,
+) -> Result<Vec<PqValue>, PqError> {
+    Err(PqError::Bad("assemble_map_of_map_kv: SP146 T4 not yet implemented".into()))
+}

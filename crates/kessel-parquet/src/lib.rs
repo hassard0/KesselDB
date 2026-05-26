@@ -1294,6 +1294,55 @@ enum ColumnKind {
         max_def_level: u32,
         value_item_optional: bool,
     },
+    /// SP146: `List<List<List<T>>>` — 3-deep LIST nesting (max_rep_level=3).
+    /// One primitive leaf below three nested LISTs.
+    NestedListOfListOfListPrimitive {
+        spec: plain::PlainSpec,
+        ptype: meta::Type,
+        max_def_level: u32,
+        max_rep_level: u32,
+        outer_optional: bool,
+        middle_optional: bool,
+        inner_optional: bool,
+        item_optional: bool,
+    },
+    /// SP146: `List<Map<K, V>>` — outer LIST whose element is itself a
+    /// Map<K, V> with primitive leaves. Both K and V leaves have
+    /// max_rep_level=2 (outer LIST REP + MAP key_value REP) — they share
+    /// the same rep stream.
+    NestedListOfMap {
+        outer_optional: bool,
+        key_spec: plain::PlainSpec,
+        key_ptype: meta::Type,
+        key_chunk_path: Vec<String>,
+        value_spec: plain::PlainSpec,
+        value_ptype: meta::Type,
+        value_chunk_path: Vec<String>,
+        /// V leaf's max_def_level
+        /// (outer_optional + 1 /*LIST REP*/ + 1 /*MAP REP*/ + value_optional).
+        max_def_level: u32,
+        value_optional: bool,
+    },
+    /// SP146: `Map<K1, Map<K2, V>>` — outer MAP whose V is itself a
+    /// Map<K2, V> with primitive leaves. Inner K and V leaves have
+    /// max_rep_level=2 (outer MAP REP + inner MAP REP) — they share the
+    /// same rep stream. Outer K has max_rep_level=1.
+    NestedMapOfMap {
+        outer_optional: bool,
+        outer_key_spec: plain::PlainSpec,
+        outer_key_ptype: meta::Type,
+        outer_key_chunk_path: Vec<String>,
+        inner_key_spec: plain::PlainSpec,
+        inner_key_ptype: meta::Type,
+        inner_key_chunk_path: Vec<String>,
+        inner_value_spec: plain::PlainSpec,
+        inner_value_ptype: meta::Type,
+        inner_value_chunk_path: Vec<String>,
+        /// V leaf's max_def_level
+        /// (outer_optional + 1 /*MAP REP*/ + 1 /*MAP REP*/ + inner_value_optional).
+        max_def_level: u32,
+        inner_value_optional: bool,
+    },
 }
 
 /// SP144 T5: single field of a NestedStruct. SP145 enriches with an
@@ -1932,14 +1981,35 @@ fn classify_list_of_group(
                     "List<List> `{outer_name}` inner-list middle children != 1"
                 )));
             }
+            // SP146: when inner_middle[0] is itself a Group with
+            // LogicalType=List, this is List<List<List<T>>> (3-deep);
+            // drill one more level. Other group shapes (List<List<struct>>,
+            // List<List<Map>>) remain SP147+ follow-ups.
+            if let meta::SchemaNode::Group {
+                name: inner_element_name,
+                repetition: inner_element_rep,
+                children: inner_element_children,
+                logical_type: inner_element_logical,
+            } = &inner_middle[0]
+            {
+                return classify_list_of_list_of_group(
+                    outer_name,
+                    outer_optional,
+                    matches!(element_rep, meta::Repetition::Optional),
+                    inner_element_name,
+                    *inner_element_rep,
+                    inner_element_children,
+                    inner_element_logical.as_ref(),
+                    leaves,
+                );
+            }
             let (leaf_name, leaf_ptype, leaf_rep, leaf_max_def, leaf_max_rep, leaf_path) =
                 match &inner_middle[0] {
                     meta::SchemaNode::Leaf {
                         name, ptype, repetition, max_def_level, max_rep_level, path,
                     } => (name.clone(), *ptype, *repetition, *max_def_level, *max_rep_level, path.clone()),
                     _ => return Err(PqError::Unsupported(format!(
-                        "List<List<group>> `{outer_name}` — 3+ deep LIST nesting: \
-                         SP146 follow-up (V1 supports List<List<primitive>> only)"
+                        "List<List<group>> `{outer_name}` non-canonical inner element"
                     ))),
                 };
             let inner_optional = matches!(element_rep, meta::Repetition::Optional);
@@ -2063,6 +2133,117 @@ fn classify_list_of_group(
             })
         }
     }
+}
+
+/// SP146: classify a `List<List<List<T>>>` shape. The inner-most LIST's
+/// element must be a primitive leaf. Deeper (4+) nesting still rejects.
+///
+/// Inputs are the inner-element group (a 2nd-level LIST sitting inside
+/// the outer-list's REPEATED middle), specifically its inner middle's
+/// children — which must contain exactly 1 group (the 3rd LIST), whose
+/// repeated middle contains exactly 1 leaf.
+#[allow(clippy::too_many_arguments)]
+fn classify_list_of_list_of_group(
+    outer_name: &str,
+    outer_optional: bool,
+    middle_optional: bool,
+    inner_element_name: &str,
+    inner_element_rep: meta::Repetition,
+    inner_element_children: &[meta::SchemaNode],
+    inner_element_logical: Option<&meta::LogicalType>,
+    leaves: &[meta::SchemaLeaf],
+) -> Result<ColumnPlan, PqError> {
+    let _ = inner_element_name;
+    // For a 3-deep List<List<List<T>>>, inner_element must itself be a
+    // LIST (LogicalType::List). Anything else is a different SP147 case.
+    match inner_element_logical {
+        Some(meta::LogicalType::List) => {}
+        Some(meta::LogicalType::Map) => {
+            return Err(PqError::Unsupported(format!(
+                "List<List<Map<...>>> `{outer_name}`: SP147 follow-up"
+            )));
+        }
+        None => {
+            return Err(PqError::Unsupported(format!(
+                "List<List<struct<...>>> `{outer_name}`: SP147 follow-up"
+            )));
+        }
+    }
+    let inner_optional = matches!(inner_element_rep, meta::Repetition::Optional);
+    if inner_element_children.len() != 1 {
+        return Err(PqError::Unsupported(format!(
+            "List<List<List>> `{outer_name}` inner-list outer children != 1: non-canonical"
+        )));
+    }
+    let innermost_middle = match &inner_element_children[0] {
+        meta::SchemaNode::Group {
+            repetition: meta::Repetition::Repeated, children: ic, ..
+        } => ic,
+        _ => return Err(PqError::Unsupported(format!(
+            "List<List<List>> `{outer_name}` innermost-list middle not REPEATED"
+        ))),
+    };
+    if innermost_middle.len() != 1 {
+        return Err(PqError::Unsupported(format!(
+            "List<List<List>> `{outer_name}` innermost-list middle children != 1"
+        )));
+    }
+    let (leaf_name, leaf_ptype, leaf_rep, leaf_max_def, leaf_max_rep, leaf_path) =
+        match &innermost_middle[0] {
+            meta::SchemaNode::Leaf {
+                name, ptype, repetition, max_def_level, max_rep_level, path,
+            } => (name.clone(), *ptype, *repetition, *max_def_level, *max_rep_level, path.clone()),
+            _ => return Err(PqError::Unsupported(format!(
+                "List<List<List<group>>> `{outer_name}` — 4+ deep LIST nesting: SP147 follow-up"
+            ))),
+        };
+    let item_optional = matches!(leaf_rep, meta::Repetition::Optional);
+    match leaf_ptype {
+        meta::Type::Boolean | meta::Type::Int32 | meta::Type::Int64
+        | meta::Type::Float | meta::Type::Double | meta::Type::ByteArray
+        | meta::Type::Int96 | meta::Type::FixedLenByteArray => {}
+        t => return Err(PqError::Unsupported(format!(
+            "List<List<List<{t:?}>>> `{outer_name}`: physical type not in OBJ-2c allow-list"
+        ))),
+    }
+    let expected_max_def = (outer_optional as u32)
+        + 1
+        + (middle_optional as u32)
+        + 1
+        + (inner_optional as u32)
+        + 1
+        + (item_optional as u32);
+    if leaf_max_def != expected_max_def {
+        return Err(PqError::Bad(format!(
+            "List<List<List>> `{outer_name}` leaf max_def_level={leaf_max_def} \
+             disagrees with expected {expected_max_def} (outer_opt={outer_optional}, \
+             middle_opt={middle_optional}, inner_opt={inner_optional}, item_opt={item_optional})"
+        )));
+    }
+    if leaf_max_rep != 3 {
+        return Err(PqError::Bad(format!(
+            "List<List<List>> `{outer_name}` leaf max_rep_level={leaf_max_rep} != 3"
+        )));
+    }
+    let leaf_struct = leaves.iter().find(|l| l.name == leaf_name)
+        .ok_or_else(|| PqError::Bad(format!(
+            "List<List<List>> `{outer_name}` leaf `{leaf_name}` missing from flat leaves list"
+        )))?;
+    let spec = build_plain_spec(leaf_struct)?;
+    let chunk_path: Vec<String> = leaf_path.iter().skip(1).cloned().collect();
+    Ok(ColumnPlan {
+        chunk_path,
+        kind: ColumnKind::NestedListOfListOfListPrimitive {
+            spec,
+            ptype: leaf_ptype,
+            max_def_level: leaf_max_def,
+            max_rep_level: leaf_max_rep,
+            outer_optional,
+            middle_optional,
+            inner_optional,
+            item_optional,
+        },
+    })
 }
 
 /// SP145 T5: classify a Map<_, group> shape — V is a Group (struct or
@@ -2546,7 +2727,57 @@ fn extract_nested(
                     )?;
                     cols[ci].extend(vals);
                 }
-            }
+                ColumnKind::NestedListOfListOfListPrimitive {
+                    spec, ptype, max_def_level, max_rep_level,
+                    outer_optional, middle_optional, inner_optional, item_optional,
+                } => {
+                    let cc = rg.columns.iter().find(|c| c.path == plan.chunk_path)
+                        .ok_or_else(|| PqError::Bad(format!(
+                            "List<List<List>> row group missing column for path {:?}", plan.chunk_path
+                        )))?;
+                    if cc.ptype != *ptype {
+                        return Err(PqError::Bad(format!(
+                            "List<List<List>> column path {:?} ptype mismatch", plan.chunk_path
+                        )));
+                    }
+                    let (rep, def, vals) = read_chunk_levels_and_values(
+                        file, cc, *spec, *max_def_level, *max_rep_level,
+                    )?;
+                    let assembled = assembly::assemble_list_of_list_of_list_primitive(
+                        &rep, &def, &vals, *max_def_level,
+                        *outer_optional, *middle_optional, *inner_optional, *item_optional,
+                    )?;
+                    cols[ci].extend(assembled);
+                }
+                ColumnKind::NestedListOfMap {
+                    outer_optional, key_spec, key_ptype, key_chunk_path,
+                    value_spec, value_ptype, value_chunk_path,
+                    max_def_level, value_optional,
+                } => {
+                    let vals = read_chunk_values_nested_list_of_map(
+                        file, rg, key_chunk_path, value_chunk_path,
+                        *key_spec, *value_spec, *key_ptype, *value_ptype,
+                        *max_def_level, *outer_optional, *value_optional,
+                    )?;
+                    cols[ci].extend(vals);
+                }
+                ColumnKind::NestedMapOfMap {
+                    outer_optional,
+                    outer_key_spec, outer_key_ptype, outer_key_chunk_path,
+                    inner_key_spec, inner_key_ptype, inner_key_chunk_path,
+                    inner_value_spec, inner_value_ptype, inner_value_chunk_path,
+                    max_def_level, inner_value_optional,
+                } => {
+                    let vals = read_chunk_values_nested_map_of_map(
+                        file, rg,
+                        outer_key_chunk_path, inner_key_chunk_path, inner_value_chunk_path,
+                        *outer_key_spec, *inner_key_spec, *inner_value_spec,
+                        *outer_key_ptype, *inner_key_ptype, *inner_value_ptype,
+                        *max_def_level, *outer_optional, *inner_value_optional,
+                    )?;
+                    cols[ci].extend(vals);
+                }
+            } // end match plan.kind
         }
     }
 
@@ -3011,6 +3242,41 @@ fn decode_field_by_kind(
                 *max_def_level, *outer_optional, *value_item_optional,
             )
         }
+        ColumnKind::NestedListOfListOfListPrimitive {
+            spec, ptype, max_def_level, max_rep_level,
+            outer_optional, middle_optional, inner_optional, item_optional,
+        } => {
+            decode_list_of_list_of_list_primitive_in_rg(
+                file, rg, *spec, *ptype, *max_def_level, *max_rep_level,
+                *outer_optional, *middle_optional, *inner_optional, *item_optional,
+            )
+        }
+        ColumnKind::NestedListOfMap {
+            outer_optional, key_spec, key_ptype, key_chunk_path,
+            value_spec, value_ptype, value_chunk_path,
+            max_def_level, value_optional,
+        } => {
+            read_chunk_values_nested_list_of_map(
+                file, rg, key_chunk_path, value_chunk_path,
+                *key_spec, *value_spec, *key_ptype, *value_ptype,
+                *max_def_level, *outer_optional, *value_optional,
+            )
+        }
+        ColumnKind::NestedMapOfMap {
+            outer_optional,
+            outer_key_spec, outer_key_ptype, outer_key_chunk_path,
+            inner_key_spec, inner_key_ptype, inner_key_chunk_path,
+            inner_value_spec, inner_value_ptype, inner_value_chunk_path,
+            max_def_level, inner_value_optional,
+        } => {
+            read_chunk_values_nested_map_of_map(
+                file, rg,
+                outer_key_chunk_path, inner_key_chunk_path, inner_value_chunk_path,
+                *outer_key_spec, *inner_key_spec, *inner_value_spec,
+                *outer_key_ptype, *inner_key_ptype, *inner_value_ptype,
+                *max_def_level, *outer_optional, *inner_value_optional,
+            )
+        }
     }
 }
 
@@ -3264,6 +3530,162 @@ fn read_chunk_values_nested_map_of_list(
     assembly::assemble_map_of_list(
         &v_rep, &v_def, &k_vals, &v_vals, max_def_level,
         outer_optional, value_item_optional,
+    )
+}
+
+/// SP146: locate the single primitive-leaf for `List<List<List<T>>>` and
+/// decode it. The leaf has max_rep_level=3.
+#[allow(clippy::too_many_arguments)]
+fn decode_list_of_list_of_list_primitive_in_rg(
+    file: &[u8],
+    rg: &meta::RowGroup,
+    spec: plain::PlainSpec,
+    ptype: meta::Type,
+    max_def_level: u32,
+    max_rep_level: u32,
+    outer_optional: bool,
+    middle_optional: bool,
+    inner_optional: bool,
+    item_optional: bool,
+) -> Result<Vec<PqValue>, PqError> {
+    let candidates: Vec<_> = rg.columns.iter()
+        .filter(|c| c.ptype == ptype && c.path.last().map(|s| s.as_str()) == Some("element"))
+        .collect();
+    if candidates.len() != 1 {
+        return Err(PqError::Bad(format!(
+            "decode_list_of_list_of_list_primitive_in_rg: expected 1 candidate, found {}",
+            candidates.len()
+        )));
+    }
+    let cc = candidates[0];
+    let (rep, def, vals) = read_chunk_levels_and_values(
+        file, cc, spec, max_def_level, max_rep_level,
+    )?;
+    assembly::assemble_list_of_list_of_list_primitive(
+        &rep, &def, &vals, max_def_level,
+        outer_optional, middle_optional, inner_optional, item_optional,
+    )
+}
+
+/// SP146: decode a `List<Map<K, V>>` column. K and V chunks share the
+/// same rep stream at max_rep_level=2 (outer LIST REP + MAP REP).
+#[allow(clippy::too_many_arguments)]
+fn read_chunk_values_nested_list_of_map(
+    file: &[u8],
+    rg: &meta::RowGroup,
+    key_chunk_path: &[String],
+    value_chunk_path: &[String],
+    key_spec: plain::PlainSpec,
+    value_spec: plain::PlainSpec,
+    key_ptype: meta::Type,
+    value_ptype: meta::Type,
+    max_def_level: u32,
+    outer_optional: bool,
+    value_optional: bool,
+) -> Result<Vec<PqValue>, PqError> {
+    let key_cc = rg.columns.iter().find(|c| c.path == key_chunk_path)
+        .ok_or_else(|| PqError::Bad(format!(
+            "list_of_map row group missing key column for path {:?}", key_chunk_path
+        )))?;
+    let value_cc = rg.columns.iter().find(|c| c.path == value_chunk_path)
+        .ok_or_else(|| PqError::Bad(format!(
+            "list_of_map row group missing value column for path {:?}", value_chunk_path
+        )))?;
+    if key_cc.ptype != key_ptype {
+        return Err(PqError::Bad(format!(
+            "list_of_map key column path {:?} ptype mismatch", key_chunk_path
+        )));
+    }
+    if value_cc.ptype != value_ptype {
+        return Err(PqError::Bad(format!(
+            "list_of_map value column path {:?} ptype mismatch", value_chunk_path
+        )));
+    }
+    // K has max_def = outer_optional + 1 (LIST REP) + 1 (MAP REP).
+    let key_max_def = (outer_optional as u32) + 2;
+    let (k_rep, _k_def, k_vals) = read_chunk_levels_and_values(
+        file, key_cc, key_spec, key_max_def, 2,
+    )?;
+    let (v_rep, v_def, v_vals) = read_chunk_levels_and_values(
+        file, value_cc, value_spec, max_def_level, 2,
+    )?;
+    if k_rep != v_rep {
+        return Err(PqError::Bad(
+            "list_of_map: K rep stream diverges from V rep stream".into(),
+        ));
+    }
+    assembly::assemble_list_of_map_kv(
+        &v_rep, &v_def, &k_vals, &v_vals, max_def_level,
+        outer_optional, value_optional,
+    )
+}
+
+/// SP146: decode a `Map<K1, Map<K2, V>>` column. Outer K has
+/// max_rep_level=1; inner K and inner V share max_rep_level=2.
+#[allow(clippy::too_many_arguments)]
+fn read_chunk_values_nested_map_of_map(
+    file: &[u8],
+    rg: &meta::RowGroup,
+    outer_key_chunk_path: &[String],
+    inner_key_chunk_path: &[String],
+    inner_value_chunk_path: &[String],
+    outer_key_spec: plain::PlainSpec,
+    inner_key_spec: plain::PlainSpec,
+    inner_value_spec: plain::PlainSpec,
+    outer_key_ptype: meta::Type,
+    inner_key_ptype: meta::Type,
+    inner_value_ptype: meta::Type,
+    max_def_level: u32,
+    outer_optional: bool,
+    inner_value_optional: bool,
+) -> Result<Vec<PqValue>, PqError> {
+    let ok_cc = rg.columns.iter().find(|c| c.path == outer_key_chunk_path)
+        .ok_or_else(|| PqError::Bad(format!(
+            "map_of_map row group missing outer-key column for path {:?}", outer_key_chunk_path
+        )))?;
+    let ik_cc = rg.columns.iter().find(|c| c.path == inner_key_chunk_path)
+        .ok_or_else(|| PqError::Bad(format!(
+            "map_of_map row group missing inner-key column for path {:?}", inner_key_chunk_path
+        )))?;
+    let iv_cc = rg.columns.iter().find(|c| c.path == inner_value_chunk_path)
+        .ok_or_else(|| PqError::Bad(format!(
+            "map_of_map row group missing inner-value column for path {:?}", inner_value_chunk_path
+        )))?;
+    if ok_cc.ptype != outer_key_ptype {
+        return Err(PqError::Bad(format!(
+            "map_of_map outer-key column path {:?} ptype mismatch", outer_key_chunk_path
+        )));
+    }
+    if ik_cc.ptype != inner_key_ptype {
+        return Err(PqError::Bad(format!(
+            "map_of_map inner-key column path {:?} ptype mismatch", inner_key_chunk_path
+        )));
+    }
+    if iv_cc.ptype != inner_value_ptype {
+        return Err(PqError::Bad(format!(
+            "map_of_map inner-value column path {:?} ptype mismatch", inner_value_chunk_path
+        )));
+    }
+    // Outer K's max_def_level = outer_optional + 1 (outer MAP REP).
+    let outer_key_max_def = (outer_optional as u32) + 1;
+    let (_ok_rep, _ok_def, ok_vals) = read_chunk_levels_and_values(
+        file, ok_cc, outer_key_spec, outer_key_max_def, 1,
+    )?;
+    // Inner K & V have max_rep_level=2.
+    let (ik_rep, _ik_def, ik_vals) = read_chunk_levels_and_values(
+        file, ik_cc, inner_key_spec, max_def_level, 2,
+    )?;
+    let (iv_rep, iv_def, iv_vals) = read_chunk_levels_and_values(
+        file, iv_cc, inner_value_spec, max_def_level, 2,
+    )?;
+    if ik_rep != iv_rep {
+        return Err(PqError::Bad(
+            "map_of_map: inner-K rep stream diverges from inner-V rep stream".into(),
+        ));
+    }
+    assembly::assemble_map_of_map_kv(
+        &iv_rep, &iv_def, &ok_vals, &ik_vals, &iv_vals, max_def_level,
+        outer_optional, inner_value_optional,
     )
 }
 
@@ -8867,13 +9289,15 @@ mod sp145_pentest {
         });
     }
 
-    // ── Row 11: classify rejects 3-deep List<List<List<T>>> ─────────
-    // V1 stops at 2-deep nesting per spec §3.5. A third LIST layer
-    // routes into classify_list_of_group → element is a List, then
-    // its inner element is also a Group (List), tripping the
-    // "List<List<group>>" SP146 reject.
+    // ── Row 11: SP146 LIFTS the 3-deep List<List<List<T>>> reject ───
+    // Originally pinned the SP145-era "3+ deep LIST nesting: SP146
+    // follow-up" reject. SP146 T2 implements 3-deep nesting, so this
+    // shape now CLASSIFIES into NestedListOfListOfListPrimitive. Empty
+    // `leaves` slice + tree-only classify causes a Bad("missing") at
+    // the leaf-lookup stage — the test pins acceptance up to that
+    // expected secondary failure.
     #[test]
-    fn sp145_pt11_classify_rejects_list_list_list() {
+    fn sp146_pt11_classify_accepts_list_list_list() {
         // Outer LIST → middle REP → element (LIST) → middle REP →
         //   element (LIST) → middle REP → element (i64)
         let root = meta::SchemaNode::Group {
@@ -8924,10 +9348,12 @@ mod sp145_pentest {
         };
         let r = classify_column_plan(&root, "lol_outer", &[]);
         match r {
-            Err(PqError::Unsupported(msg)) if msg.contains("SP146")
-                || msg.contains("3+ deep") => { /* OK */ }
-            Err(other) => panic!("pt11: expected Unsupported(SP146 3+ deep), got Err({other:?})"),
-            Ok(_) => panic!("pt11: expected Unsupported, got Ok(_)"),
+            // SP146 T2 lifts the reject; classify reaches leaf-lookup with
+            // empty leaves slice and surfaces Bad("missing from flat leaves list").
+            Err(PqError::Bad(msg)) if msg.contains("missing from flat leaves list")
+                || msg.contains("element") => { /* OK */ }
+            Err(other) => panic!("pt11: expected Bad(leaf-missing), got Err({other:?})"),
+            Ok(_) => panic!("pt11: classified to Ok but leaves slice was empty"),
         }
     }
 

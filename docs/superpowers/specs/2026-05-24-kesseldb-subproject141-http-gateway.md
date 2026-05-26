@@ -71,6 +71,8 @@ of the HTTP gateway — they are hardening / observability upgrades:
    `snapshot_metrics` rolls up to a single `kind="applied"` row using
    `EngineHandle.stats().applied_ops`. A per-kind breakdown needs an atomic
    counter array on the engine — additive, but touches the SM apply path.
+
+   **CLOSED in SP144H (commit `d5b9e3a`)** — see `docs/superpowers/specs/2026-05-25-kesseldb-subproject144h-http-gateway-gap-closures.md`.
 2. **`snapshot_metrics` round-trips through `apply_raw`.** The current impl
    calls `self.stats()`, which enqueues a STATS_TAG frame. Under engine
    saturation, this returns `OpResult::Unavailable` and the metrics endpoint
@@ -83,6 +85,8 @@ of the HTTP gateway — they are hardening / observability upgrades:
    **CLOSED in SP142 (commit `c95722a`)** — see `docs/superpowers/specs/2026-05-25-kesseldb-subproject142-http-gateway-hardening.md`.
 3. **Per-`(path, status)` HTTP request counter wired through the accept
    loop** (currently returns empty vec).
+
+   **CLOSED in SP144H (commit `392a2b1`)** — see `docs/superpowers/specs/2026-05-25-kesseldb-subproject144h-http-gateway-gap-closures.md`.
 4. **HTTP/2 / gRPC, WebSocket / SSE streaming, PostgreSQL wire compat** —
    design spec §2 non-goals.
 5. **HTTP/1.1 keep-alive on the gateway** (V1 always sends
@@ -91,9 +95,13 @@ of the HTTP gateway — they are hardening / observability upgrades:
    Both return 401 with `{"status":"unauthorized"}` — a caller cannot
    distinguish "wrong Bearer" from "engine ACL denied". Spec §4.4 needs a
    `message` disambiguation field.
+
+   **CLOSED in SP144H (commit `48e73fe`)** — see `docs/superpowers/specs/2026-05-25-kesseldb-subproject144h-http-gateway-gap-closures.md`.
 7. **`exactly_once_binding` stuffs "both required together" into
    `BadHeaderValue(String)` rather than a dedicated variant.** Cosmetic
    fragility (KAT could string-grep break on refactor).
+
+   **CLOSED in SP144H (commit `48e73fe`)** — see `docs/superpowers/specs/2026-05-25-kesseldb-subproject144h-http-gateway-gap-closures.md`.
 8. **e2e `spawn_server` uses a 150ms sleep** rather than a connect-retry
    loop. Pre-existing CI risk; widened by T5's 17 additional spawn-server
    calls.

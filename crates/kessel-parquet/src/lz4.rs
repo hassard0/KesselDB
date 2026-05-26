@@ -21,7 +21,26 @@
 
 use crate::PqError;
 
+/// Defense-in-depth cap mirroring SNAPPY_MAX_DECOMP / GZIP_MAX_DECOMP /
+/// ZSTD_MAX_DECOMP. SP151 (OBJ-2c-4 follow-up): the caller MUST already
+/// have cap-checked `expected_uncompressed_size` against
+/// `crate::DEFAULT_MAX_PAGE_SIZE` (or the user's custom cap via
+/// `extract_with_cap`) before reaching here. This module-level ceiling
+/// is the absolute fail-safe so even a buggy caller can't trigger an
+/// OOM through this path.
+pub(crate) const LZ4_MAX_DECOMP: usize = 256 << 20; // 256 MiB
+
 pub fn decompress(src: &[u8], expected_uncompressed_size: usize) -> Result<Vec<u8>, PqError> {
+    // SP151: defense-in-depth — if the caller forgot the SP151 cap
+    // check, this module-level ceiling still blocks OOM. Pre-SP151 this
+    // module had no internal ceiling at all (it inherited the bound
+    // entirely from the page_payload-supplied expected_uncompressed_size);
+    // SP151's audit closes that gap.
+    if expected_uncompressed_size > LZ4_MAX_DECOMP {
+        return Err(PqError::Unsupported(format!(
+            "lz4 page {expected_uncompressed_size} exceeds {LZ4_MAX_DECOMP} cap: SP151"
+        )));
+    }
     let mut out: Vec<u8> = Vec::with_capacity(expected_uncompressed_size.min(64 * 1024));
     let mut i: usize = 0;
 
@@ -168,6 +187,21 @@ mod tests {
         let err = decompress(&src, 10).unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("decoded 5") || msg.contains("expected 10"), "got: {msg}");
+    }
+
+    // SP151: over-cap expected_uncompressed_size → Unsupported BEFORE
+    // any allocation. Mirrors snappy/gzip/zstd `kat_over_cap_is_unsupported`.
+    #[test]
+    fn sp151_over_cap_is_unsupported() {
+        let huge = LZ4_MAX_DECOMP + 1;
+        let err = decompress(&[0x00], huge).unwrap_err();
+        match err {
+            PqError::Unsupported(msg) => {
+                assert!(msg.contains("SP151"), "{msg}");
+                assert!(msg.contains("lz4"), "{msg}");
+            }
+            other => panic!("expected Unsupported(SP151...), got {other:?}"),
+        }
     }
 
     #[test]

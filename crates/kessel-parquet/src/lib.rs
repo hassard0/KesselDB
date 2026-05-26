@@ -7827,6 +7827,38 @@ mod pentest_v2 {
         );
     }
 
+    // SP151: V2-specific cap pentest. Pins that the V2 cap-check fires
+    // BEFORE allocating decompression buffers — the V2 decode path is
+    // independent of V1's page_payload codec dispatch and was the
+    // hardest to plumb (two distinct cap sites: comp at the page-loop,
+    // uncomp at decode_data_page_v2). Hostile uncompressed=2 GiB +
+    // compressed=16 bytes (tiny actual payload) triggers the
+    // Unsupported(SP151) at the V2 comp-cap check first.
+    #[test]
+    fn v2_sp151_uncomp_cap_check_fires_with_named_followup() {
+        let payload = plain_i64(&[7, -2]);
+        let f = v2_file(&V2Spec {
+            optional: false, codec: 0,
+            rows: 2,
+            hdr_uncompressed: 300 * 1024 * 1024, // 300 MiB > 256 MiB cap
+            hdr_compressed: payload.len() as i64,
+            hdr_num_values: 2,
+            hdr_num_nulls: 0, hdr_encoding: 0,
+            hdr_def_len: 0, hdr_rep_len: 0, hdr_is_compressed: false,
+            payload: &payload, with_dict: false,
+        });
+        match extract(&f, &["id"]) {
+            Err(PqError::Unsupported(msg)) => {
+                assert!(msg.contains("SP151"), "V2 cap rejection must name SP151: {msg}");
+                assert!(
+                    msg.contains("v2 page"),
+                    "V2 cap rejection must identify the page kind: {msg}"
+                );
+            }
+            other => panic!("expected Unsupported(SP151 v2...), got {other:?}"),
+        }
+    }
+
     // ════════════════ POSITIVE CORRECTNESS LOCKS ════════════════════
     //
     // These assert the EXACT decoded rows. A failure here is a decoder

@@ -8652,3 +8652,467 @@ mod sp144_pentest {
         }
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────
+// SP145 T8: pentest matrix for the 4 new deep-nesting code paths.
+//
+// Every row: adversarial input → typed PqError, NO panic, NO OOM.
+//
+// Rows 1-7: per-assembler stream pathologies (rep/def overflow, value
+//   underflow, cursor exhaustion, level-mismatch overflow in each of
+//   the 4 new assemblers).
+// Rows 8-15: classify-side malformed inputs at the recursion boundary
+//   (List<List<List<T>>> 3-deep rejected, List<Map<...>> rejected,
+//   non-canonical inner shapes, struct field length mismatch in
+//   recursive assembly, K rep stream diverging from V rep stream).
+// ────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod sp145_pentest {
+    use super::*;
+    use crate::assembly::{
+        assemble_list_of_list_primitive, assemble_list_of_struct,
+        assemble_map_of_struct, assemble_map_of_list,
+    };
+    use std::panic::catch_unwind;
+
+    fn assert_well_behaved_err<F, T>(name: &str, f: F)
+    where
+        F: FnOnce() -> Result<T, PqError> + std::panic::UnwindSafe,
+    {
+        let r = catch_unwind(f);
+        match r {
+            Ok(Ok(_)) => panic!("{name}: expected Err, got Ok"),
+            Ok(Err(_)) => { /* OK */ }
+            Err(_) => panic!("{name}: PANICKED on adversarial input"),
+        }
+    }
+
+    // ── Row 1: list_of_list rep overflow ────────────────────────────
+    #[test]
+    fn sp145_pt1_lol_rep_overflow() {
+        assert_well_behaved_err("lol rep overflow", || {
+            assemble_list_of_list_primitive(
+                &[0u32, 5],
+                &[2u32, 2],
+                &[PqValue::I64(1), PqValue::I64(2)],
+                2, false, false, false,
+            )
+        });
+    }
+
+    // ── Row 2: list_of_list value underflow ─────────────────────────
+    #[test]
+    fn sp145_pt2_lol_value_underflow() {
+        assert_well_behaved_err("lol value underflow", || {
+            assemble_list_of_list_primitive(
+                &[0u32, 2],
+                &[2u32, 2],
+                &[PqValue::I64(1)],
+                2, false, false, false,
+            )
+        });
+    }
+
+    // ── Row 3: list_of_list value unconsumed overflow ───────────────
+    #[test]
+    fn sp145_pt3_lol_value_unconsumed_overflow() {
+        assert_well_behaved_err("lol value unconsumed", || {
+            assemble_list_of_list_primitive(
+                &[0u32],
+                &[2u32],
+                &[PqValue::I64(1), PqValue::I64(2)],
+                2, false, false, false,
+            )
+        });
+    }
+
+    // ── Row 4: list_of_list def overflow ────────────────────────────
+    #[test]
+    fn sp145_pt4_lol_def_overflow() {
+        assert_well_behaved_err("lol def overflow", || {
+            assemble_list_of_list_primitive(
+                &[0u32],
+                &[99u32], // > max_def
+                &[PqValue::I64(1)],
+                2, false, false, false,
+            )
+        });
+    }
+
+    // ── Row 5: list_of_struct field length mismatch ─────────────────
+    #[test]
+    fn sp145_pt5_los_field_length_mismatch() {
+        assert_well_behaved_err("los field length mismatch", || {
+            assemble_list_of_struct(
+                &[0u32, 1],
+                &[1u32, 1],
+                &["a".to_string(), "b".to_string()],
+                &[
+                    vec![PqValue::I64(1), PqValue::I64(2)],
+                    vec![PqValue::I64(3)], // length 1 vs 2
+                ],
+                1, false,
+            )
+        });
+    }
+
+    // ── Row 6: list_of_struct rep overflow ──────────────────────────
+    #[test]
+    fn sp145_pt6_los_rep_overflow() {
+        assert_well_behaved_err("los rep overflow", || {
+            assemble_list_of_struct(
+                &[0u32, 7],
+                &[1u32, 1],
+                &["a".to_string()],
+                &[vec![PqValue::I64(1), PqValue::I64(2)]],
+                1, false,
+            )
+        });
+    }
+
+    // ── Row 7: map_of_struct keys count mismatch ────────────────────
+    #[test]
+    fn sp145_pt7_mos_keys_mismatch() {
+        assert_well_behaved_err("mos keys mismatch", || {
+            assemble_map_of_struct(
+                &[0u32, 1],
+                &[1u32, 1],
+                &[PqValue::Bytes(b"a".to_vec())], // 1 key
+                &["v".to_string()],
+                &[vec![PqValue::I64(1), PqValue::I64(2)]], // 2 values
+                1, false,
+            )
+        });
+    }
+
+    // ── Row 8: map_of_struct rep overflow ───────────────────────────
+    #[test]
+    fn sp145_pt8_mos_rep_overflow() {
+        assert_well_behaved_err("mos rep overflow", || {
+            assemble_map_of_struct(
+                &[0u32, 4],
+                &[1u32, 1],
+                &[PqValue::Bytes(b"a".to_vec()), PqValue::Bytes(b"b".to_vec())],
+                &["v".to_string()],
+                &[vec![PqValue::I64(1), PqValue::I64(2)]],
+                1, false,
+            )
+        });
+    }
+
+    // ── Row 9: map_of_list rep overflow ─────────────────────────────
+    #[test]
+    fn sp145_pt9_mol_rep_overflow() {
+        assert_well_behaved_err("mol rep overflow", || {
+            assemble_map_of_list(
+                &[0u32, 9],
+                &[2u32, 2],
+                &[PqValue::Bytes(b"a".to_vec())],
+                &[PqValue::Bytes(b"x".to_vec()), PqValue::Bytes(b"y".to_vec())],
+                2, false, false,
+            )
+        });
+    }
+
+    // ── Row 10: map_of_list value-stream underflow ──────────────────
+    #[test]
+    fn sp145_pt10_mol_value_underflow() {
+        assert_well_behaved_err("mol value underflow", || {
+            assemble_map_of_list(
+                &[0u32, 2],
+                &[2u32, 2],
+                &[PqValue::Bytes(b"a".to_vec())],
+                &[PqValue::Bytes(b"x".to_vec())], // need 2
+                2, false, false,
+            )
+        });
+    }
+
+    // ── Row 11: classify rejects 3-deep List<List<List<T>>> ─────────
+    // V1 stops at 2-deep nesting per spec §3.5. A third LIST layer
+    // routes into classify_list_of_group → element is a List, then
+    // its inner element is also a Group (List), tripping the
+    // "List<List<group>>" SP146 reject.
+    #[test]
+    fn sp145_pt11_classify_rejects_list_list_list() {
+        // Outer LIST → middle REP → element (LIST) → middle REP →
+        //   element (LIST) → middle REP → element (i64)
+        let root = meta::SchemaNode::Group {
+            name: "root".into(),
+            repetition: meta::Repetition::Required,
+            children: vec![meta::SchemaNode::Group {
+                name: "lol_outer".into(),
+                repetition: meta::Repetition::Required,
+                children: vec![meta::SchemaNode::Group {
+                    name: "list".into(),
+                    repetition: meta::Repetition::Repeated,
+                    children: vec![meta::SchemaNode::Group {
+                        name: "element".into(),
+                        repetition: meta::Repetition::Required,
+                        children: vec![meta::SchemaNode::Group {
+                            name: "list".into(),
+                            repetition: meta::Repetition::Repeated,
+                            children: vec![meta::SchemaNode::Group {
+                                name: "element".into(),
+                                repetition: meta::Repetition::Required,
+                                children: vec![meta::SchemaNode::Group {
+                                    name: "list".into(),
+                                    repetition: meta::Repetition::Repeated,
+                                    children: vec![meta::SchemaNode::Leaf {
+                                        name: "element".into(),
+                                        repetition: meta::Repetition::Required,
+                                        ptype: meta::Type::Int64,
+                                        max_def_level: 3,
+                                        max_rep_level: 3,
+                                        path: vec!["root".into(), "lol_outer".into(),
+                                                   "list".into(), "element".into(),
+                                                   "list".into(), "element".into(),
+                                                   "list".into(), "element".into()],
+                                    }],
+                                    logical_type: None,
+                                }],
+                                logical_type: Some(meta::LogicalType::List),
+                            }],
+                            logical_type: None,
+                        }],
+                        logical_type: Some(meta::LogicalType::List),
+                    }],
+                    logical_type: None,
+                }],
+                logical_type: Some(meta::LogicalType::List),
+            }],
+            logical_type: None,
+        };
+        let r = classify_column_plan(&root, "lol_outer", &[]);
+        match r {
+            Err(PqError::Unsupported(msg)) if msg.contains("SP146")
+                || msg.contains("3+ deep") => { /* OK */ }
+            Err(other) => panic!("pt11: expected Unsupported(SP146 3+ deep), got Err({other:?})"),
+            Ok(_) => panic!("pt11: expected Unsupported, got Ok(_)"),
+        }
+    }
+
+    // ── Row 12: classify rejects List<Map<K,V>> ─────────────────────
+    #[test]
+    fn sp145_pt12_classify_rejects_list_of_map() {
+        let root = meta::SchemaNode::Group {
+            name: "root".into(),
+            repetition: meta::Repetition::Required,
+            children: vec![meta::SchemaNode::Group {
+                name: "lom".into(),
+                repetition: meta::Repetition::Required,
+                children: vec![meta::SchemaNode::Group {
+                    name: "list".into(),
+                    repetition: meta::Repetition::Repeated,
+                    children: vec![meta::SchemaNode::Group {
+                        name: "element".into(),
+                        repetition: meta::Repetition::Required,
+                        children: vec![meta::SchemaNode::Group {
+                            name: "key_value".into(),
+                            repetition: meta::Repetition::Repeated,
+                            children: vec![
+                                meta::SchemaNode::Leaf {
+                                    name: "key".into(),
+                                    repetition: meta::Repetition::Required,
+                                    ptype: meta::Type::ByteArray,
+                                    max_def_level: 2,
+                                    max_rep_level: 2,
+                                    path: vec!["root".into(), "lom".into(), "list".into(),
+                                               "element".into(), "key_value".into(), "key".into()],
+                                },
+                                meta::SchemaNode::Leaf {
+                                    name: "value".into(),
+                                    repetition: meta::Repetition::Required,
+                                    ptype: meta::Type::Int64,
+                                    max_def_level: 2,
+                                    max_rep_level: 2,
+                                    path: vec!["root".into(), "lom".into(), "list".into(),
+                                               "element".into(), "key_value".into(), "value".into()],
+                                },
+                            ],
+                            logical_type: None,
+                        }],
+                        logical_type: Some(meta::LogicalType::Map),
+                    }],
+                    logical_type: None,
+                }],
+                logical_type: Some(meta::LogicalType::List),
+            }],
+            logical_type: None,
+        };
+        let r = classify_column_plan(&root, "lom", &[]);
+        match r {
+            Err(PqError::Unsupported(msg)) if msg.contains("SP146")
+                || msg.contains("List<Map") => { /* OK */ }
+            Err(other) => panic!("pt12: expected Unsupported(List<Map>), got Err({other:?})"),
+            Ok(_) => panic!("pt12: expected Unsupported, got Ok(_)"),
+        }
+    }
+
+    // ── Row 13: classify rejects Map<_, Map<...>> ───────────────────
+    //
+    // The classify_map_of_group helper validates K first (find by
+    // name in flat leaves list), THEN dispatches on V's LogicalType.
+    // Provide the K leaf in `leaves` so we exercise the Map-V
+    // rejection rather than tripping the K-missing path early.
+    #[test]
+    fn sp145_pt13_classify_rejects_map_of_map() {
+        // The K leaf the classify lookup will need:
+        let outer_key_leaf = meta::SchemaLeaf {
+            name: "key".into(),
+            repetition: meta::Repetition::Required,
+            ptype: meta::Type::ByteArray,
+            type_length: None,
+            converted_type: None,
+            scale: None,
+            precision: None,
+            logical_type_decimal: None,
+        };
+        // The INNER (Map V's Map) K leaf path also called "key" —
+        // collisions are OK for this test because the lookup is by
+        // unique name, and `classify_map_of_group` only looks up the
+        // OUTER K. We add ONLY the outer K leaf to verify the path
+        // reaches the SP146 Map<_, Map> reject without other
+        // leaves interfering.
+        let leaves_for_test = vec![outer_key_leaf];
+        let root = meta::SchemaNode::Group {
+            name: "root".into(),
+            repetition: meta::Repetition::Required,
+            children: vec![meta::SchemaNode::Group {
+                name: "mom".into(),
+                repetition: meta::Repetition::Required,
+                children: vec![meta::SchemaNode::Group {
+                    name: "key_value".into(),
+                    repetition: meta::Repetition::Repeated,
+                    children: vec![
+                        meta::SchemaNode::Leaf {
+                            name: "key".into(),
+                            repetition: meta::Repetition::Required,
+                            ptype: meta::Type::ByteArray,
+                            max_def_level: 1,
+                            max_rep_level: 1,
+                            path: vec!["root".into(), "mom".into(), "key_value".into(), "key".into()],
+                        },
+                        meta::SchemaNode::Group {
+                            name: "value".into(),
+                            repetition: meta::Repetition::Required,
+                            children: vec![meta::SchemaNode::Group {
+                                name: "key_value".into(),
+                                repetition: meta::Repetition::Repeated,
+                                children: vec![
+                                    meta::SchemaNode::Leaf {
+                                        name: "key".into(),
+                                        repetition: meta::Repetition::Required,
+                                        ptype: meta::Type::ByteArray,
+                                        max_def_level: 2,
+                                        max_rep_level: 2,
+                                        path: vec!["root".into(), "mom".into(), "key_value".into(),
+                                                   "value".into(), "key_value".into(), "key".into()],
+                                    },
+                                    meta::SchemaNode::Leaf {
+                                        name: "value".into(),
+                                        repetition: meta::Repetition::Required,
+                                        ptype: meta::Type::Int64,
+                                        max_def_level: 2,
+                                        max_rep_level: 2,
+                                        path: vec!["root".into(), "mom".into(), "key_value".into(),
+                                                   "value".into(), "key_value".into(), "value".into()],
+                                    },
+                                ],
+                                logical_type: None,
+                            }],
+                            logical_type: Some(meta::LogicalType::Map),
+                        },
+                    ],
+                    logical_type: None,
+                }],
+                logical_type: Some(meta::LogicalType::Map),
+            }],
+            logical_type: None,
+        };
+        let r = classify_column_plan(&root, "mom", &leaves_for_test);
+        match r {
+            Err(PqError::Unsupported(msg)) if msg.contains("SP146")
+                || msg.contains("MAP<_, Map") => { /* OK */ }
+            Err(other) => panic!("pt13: expected Unsupported(Map<_,Map>), got Err({other:?})"),
+            Ok(_) => panic!("pt13: expected Unsupported, got Ok(_)"),
+        }
+    }
+
+    // ── Row 14: classify rejects non-canonical List inner — middle
+    //          not REPEATED in a nested-list shape ───────────────────
+    #[test]
+    fn sp145_pt14_classify_rejects_noncanonical_inner_list() {
+        let root = meta::SchemaNode::Group {
+            name: "root".into(),
+            repetition: meta::Repetition::Required,
+            children: vec![meta::SchemaNode::Group {
+                name: "lol_bad".into(),
+                repetition: meta::Repetition::Required,
+                children: vec![meta::SchemaNode::Group {
+                    name: "list".into(),
+                    repetition: meta::Repetition::Repeated,
+                    children: vec![meta::SchemaNode::Group {
+                        name: "element".into(),
+                        repetition: meta::Repetition::Required,
+                        // Inner LIST's middle should be REPEATED but
+                        // we set it REQUIRED → non-canonical.
+                        children: vec![meta::SchemaNode::Group {
+                            name: "list".into(),
+                            repetition: meta::Repetition::Required, // ← BAD
+                            children: vec![meta::SchemaNode::Leaf {
+                                name: "element".into(),
+                                repetition: meta::Repetition::Required,
+                                ptype: meta::Type::Int64,
+                                max_def_level: 2,
+                                max_rep_level: 1,
+                                path: vec!["root".into(), "lol_bad".into(),
+                                           "list".into(), "element".into(),
+                                           "list".into(), "element".into()],
+                            }],
+                            logical_type: None,
+                        }],
+                        logical_type: Some(meta::LogicalType::List),
+                    }],
+                    logical_type: None,
+                }],
+                logical_type: Some(meta::LogicalType::List),
+            }],
+            logical_type: None,
+        };
+        let r = classify_column_plan(&root, "lol_bad", &[]);
+        match r {
+            Err(PqError::Unsupported(msg)) if msg.contains("middle not REPEATED") => { /* OK */ }
+            Err(other) => panic!("pt14: expected Unsupported(middle not REPEATED), got Err({other:?})"),
+            Ok(_) => panic!("pt14: expected Unsupported, got Ok(_)"),
+        }
+    }
+
+    // ── Row 15: map_of_list value unconsumed overflow ───────────────
+    #[test]
+    fn sp145_pt15_mol_value_unconsumed() {
+        assert_well_behaved_err("mol value unconsumed", || {
+            assemble_map_of_list(
+                &[0u32],
+                &[2u32],
+                &[PqValue::Bytes(b"a".to_vec())],
+                &[PqValue::Bytes(b"x".to_vec()), PqValue::Bytes(b"y".to_vec())], // extra
+                2, false, false,
+            )
+        });
+    }
+
+    // ── Row 16 (bonus): list_of_struct empty rep/def with items ─────
+    #[test]
+    fn sp145_pt16_los_empty_levels_with_items() {
+        assert_well_behaved_err("los empty levels with items", || {
+            assemble_list_of_struct(
+                &[],
+                &[],
+                &["a".to_string()],
+                &[vec![PqValue::I64(1)]], // items but no levels
+                1, false,
+            )
+        });
+    }
+}

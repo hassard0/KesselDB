@@ -432,9 +432,16 @@ pub(crate) fn decode_complex_prefix_code(
     let mut prev_repeat: Option<u8> = None; // 16 or 17
     let mut prev_repeat_count: u32 = 0;
     // Main-alphabet Kraft sum check: (32768 >> length) summed over
-    // non-zero lengths must equal 32768 at end.
+    // non-zero lengths must equal 32768 at end. Per RFC 7932 §3.5 the
+    // decoder EARLY-EXITS once `main_kraft` reaches 32768 (the code is
+    // complete); remaining symbols up to `alphabet_size` are implicitly
+    // length 0 (= absent from the code). Without this early exit, the
+    // decoder would keep consuming bits / over-allocate Kraft and never
+    // terminate validly for real-world streams (e.g. pyarrow's
+    // sparse-literal alphabets where only 5-10 of 256 byte values
+    // actually appear in the page).
     let mut main_kraft: u32 = 0;
-    while (main_lengths.len() as u32) < alphabet_size {
+    while (main_lengths.len() as u32) < alphabet_size && main_kraft < 32768 {
         let sym = clc.decode_symbol(r)?; // 0..=17
         if sym <= 15 {
             // Direct length.
@@ -522,6 +529,12 @@ pub(crate) fn decode_complex_prefix_code(
                 alphabet_size: 18,
             });
         }
+    }
+    // Pad any remaining symbols with implicit length 0 per RFC §3.5
+    // (the decoder exits once `main_kraft` reaches 32768; the
+    // unwritten high-index symbols are implicitly absent).
+    while (main_lengths.len() as u32) < alphabet_size {
+        main_lengths.push(0);
     }
     debug_assert_eq!(main_lengths.len() as u32, alphabet_size);
     // Per RFC §3.5: the main-alphabet Kraft sum must equal 32768 unless

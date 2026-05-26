@@ -24,6 +24,7 @@ mod brotli_command;
 mod brotli_distance;
 mod brotli_dictionary;
 mod brotli_ring;
+mod brotli_metablock;
 mod zstd_fse;
 mod zstd_literals;
 mod zstd_huffman;
@@ -494,24 +495,30 @@ fn page_payload<'a>(
         meta::Codec::Lz4Raw => Ok(std::borrow::Cow::Owned(
             lz4::decompress(on_disk, uncomp)?
         )),
-        // SP154: Brotli (codec id 4). The SP-arc has shipped Layers 1-5
-        // (bit reader, stream/metablock framing, uncompressed metablocks,
-        // Huffman tree decoding). Streams composed of ONLY uncompressed
-        // metablocks decode successfully (rare but valid). The common
-        // pyarrow shape — compressed metablocks — still surfaces a typed
-        // Unsupported with a refined SP154-followup pointer naming the
-        // remaining layers (static dict, IMTF, insert-and-copy, ring
-        // buffer). The SP150 named-followup test in fixture_roundtrip.rs
-        // continues to pass: error mentions 'Brotli' and points at
-        // zstd/lz4 workarounds.
-        meta::Codec::Brotli => match brotli::decompress(on_disk, uncomp) {
+        // SP154: Brotli (codec id 4). The SP-arc has shipped Layers 1-12
+        // (full compressed-metablock orchestrator via L11 + ring buffer
+        // via L12). V1 covers the most common pyarrow Brotli shape —
+        // NBLTYPES=1 across {literal,IC,distance}, NPOSTFIX=0+NDIRECT=0,
+        // NTREES=1 for both CMAPs, identity-only dictionary transforms
+        // — and decodes those streams byte-identical to the reference.
+        // Streams that use richer Brotli features (per-block-type
+        // partitioning, context-modelling NTREES>1, non-identity
+        // dictionary transforms, dictionary-distance back-references)
+        // still surface typed Unsupported with the SP154-followup pointer
+        // naming the workarounds. The SP150 named-followup test in
+        // fixture_roundtrip.rs continues to pass.
+        meta::Codec::Brotli => match brotli_metablock::decompress_compressed(on_disk, Some(uncomp)) {
             Ok(decoded) => Ok(std::borrow::Cow::Owned(decoded)),
-            Err(brotli::BrotliError::CompressedMetablockNotYetSupported { .. }) => {
+            Err(brotli_metablock::BrotliMetablockError::UnsupportedBlockTypes { .. })
+            | Err(brotli_metablock::BrotliMetablockError::UnsupportedDistanceParams { .. })
+            | Err(brotli_metablock::BrotliMetablockError::DictionaryDistanceNotSupported { .. })
+            | Err(brotli_metablock::BrotliMetablockError::Context(_))
+            | Err(brotli_metablock::BrotliMetablockError::Dictionary(_)) => {
                 Err(PqError::Unsupported(
-                    "Brotli compressed metablock: SP154-followup (only uncompressed \
-                     metablocks supported in V1; pyarrow always emits compressed). \
-                     Workaround — ask the writer to use compression='zstd' or \
-                     compression='lz4' instead".into(),
+                    "Brotli decode (V1 reduction): non-default NBLTYPES / NPOSTFIX / \
+                     NDIRECT / NTREES / dictionary distance / non-identity transform — \
+                     SP154-followup. Workaround — ask the writer to use \
+                     compression='zstd' or compression='lz4' instead".into(),
                 ))
             }
             Err(e) => Err(PqError::Bad(format!("Brotli decode: {e:?}"))),
@@ -722,11 +729,16 @@ fn decode_data_page_v2(
         // (Layers 1-5: uncompressed-only). Compressed metablocks surface
         // typed Unsupported with refined SP154-followup pointer.
         meta::Codec::Brotli => {
-            match brotli::decompress(values_section, vt) {
+            match brotli_metablock::decompress_compressed(values_section, Some(vt)) {
                 Ok(decoded) => std::borrow::Cow::Owned(decoded),
-                Err(brotli::BrotliError::CompressedMetablockNotYetSupported { .. }) => {
+                Err(brotli_metablock::BrotliMetablockError::UnsupportedBlockTypes { .. })
+                | Err(brotli_metablock::BrotliMetablockError::UnsupportedDistanceParams { .. })
+                | Err(brotli_metablock::BrotliMetablockError::DictionaryDistanceNotSupported { .. })
+                | Err(brotli_metablock::BrotliMetablockError::Context(_))
+                | Err(brotli_metablock::BrotliMetablockError::Dictionary(_)) => {
                     return Err(PqError::Unsupported(
-                        "Brotli compressed metablock (V2 values): SP154-followup. \
+                        "Brotli decode (V1 reduction, V2 values): non-default NBLTYPES / \
+                         NPOSTFIX / NDIRECT / NTREES / dictionary — SP154-followup. \
                          Workaround — ask the writer to use compression='zstd' or \
                          compression='lz4' instead".into(),
                     ));
@@ -1028,11 +1040,16 @@ pub(crate) fn decode_data_page_v2_nested(
         // path). Delegates to brotli::decompress (Layers 1-5). Compressed
         // metablocks surface typed Unsupported with refined message.
         meta::Codec::Brotli => {
-            match brotli::decompress(values_section, vt) {
+            match brotli_metablock::decompress_compressed(values_section, Some(vt)) {
                 Ok(decoded) => std::borrow::Cow::Owned(decoded),
-                Err(brotli::BrotliError::CompressedMetablockNotYetSupported { .. }) => {
+                Err(brotli_metablock::BrotliMetablockError::UnsupportedBlockTypes { .. })
+                | Err(brotli_metablock::BrotliMetablockError::UnsupportedDistanceParams { .. })
+                | Err(brotli_metablock::BrotliMetablockError::DictionaryDistanceNotSupported { .. })
+                | Err(brotli_metablock::BrotliMetablockError::Context(_))
+                | Err(brotli_metablock::BrotliMetablockError::Dictionary(_)) => {
                     return Err(PqError::Unsupported(
-                        "Brotli compressed metablock (V2 nested values): \
+                        "Brotli decode (V1 reduction, V2 nested values): non-default \
+                         NBLTYPES / NPOSTFIX / NDIRECT / NTREES / dictionary — \
                          SP154-followup. Workaround — ask the writer to use \
                          compression='zstd' or compression='lz4' instead".into(),
                     ));

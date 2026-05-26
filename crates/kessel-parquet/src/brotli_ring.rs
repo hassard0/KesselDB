@@ -182,6 +182,53 @@ impl OutputBuffer {
         Ok(())
     }
 
+    /// LZ77 match copy with PRE-STREAM ZERO PADDING (Brotli ring-buffer
+    /// semantics, RFC 7932 §4 / §9.1). When `distance > current_output_len`
+    /// the read positions into the ring buffer's "pre-stream zone" — for
+    /// the FIRST metablock this zone is implicitly all zeros (= initial
+    /// ring buffer state). For subsequent metablocks it would contain the
+    /// previous metablock's tail, BUT in V1 we use a flat-Vec model where
+    /// all prior metablock data IS retained in `self.out`, so the
+    /// pre-stream case only triggers when distance exceeds the entire
+    /// accumulated stream.
+    ///
+    /// Behavior:
+    ///   - For each byte of `length`, if `current_offset >= distance` →
+    ///     read from `out[out.len() - distance]` (in-stream byte).
+    ///   - Else → emit byte 0x00 (= initial ring buffer value).
+    /// This matches the Brotli reference C decoder's ring-buffer behavior
+    /// when distance points into the implicit zero-padded pre-stream.
+    ///
+    /// Used by L11 orchestrator for distances where
+    /// `distance <= max_backward_distance` (= window_size) AND
+    /// `distance > current_output_len` — the "back-reference into
+    /// pre-stream zone" case.
+    pub(crate) fn copy_match_with_prestream_zeros(
+        &mut self,
+        distance: usize,
+        length: usize,
+    ) -> Result<(), BrotliRingError> {
+        if distance == 0 {
+            return Err(BrotliRingError::ZeroDistance);
+        }
+        self.out
+            .len()
+            .checked_add(length)
+            .ok_or(BrotliRingError::OutputLengthOverflow)?;
+        for _ in 0..length {
+            let cur_len = self.out.len();
+            if distance <= cur_len {
+                let src_idx = cur_len - distance;
+                let b = self.out[src_idx];
+                self.out.push(b);
+            } else {
+                // Pre-stream zone → zero.
+                self.out.push(0);
+            }
+        }
+        Ok(())
+    }
+
     /// Current accumulated output as a slice.
     pub(crate) fn as_slice(&self) -> &[u8] {
         &self.out

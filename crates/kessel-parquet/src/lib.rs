@@ -19,6 +19,7 @@ mod lz4;
 mod brotli_bit_reader;
 mod brotli_huffman;
 mod brotli;
+mod brotli_context;
 mod zstd_fse;
 mod zstd_literals;
 mod zstd_huffman;

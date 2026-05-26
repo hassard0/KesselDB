@@ -1,7 +1,9 @@
 # SP154 — Zero-dep Brotli (RFC 7932) Decoder SP-arc — Progress Tracker
 
 Date: 2026-05-26
-Status: **IN PROGRESS — Layers 1-10 of ~12 shipped** (L11 + L12 still ahead)
+Status: **PARTIAL WIN — Layers 1-12 shipped; pyarrow id column decodes
+byte-identical; byte_array column has a residual V1-decoder discrepancy
+that still needs diagnosis**
 
 ## Mission
 
@@ -30,8 +32,8 @@ with a more specific SP154-followup pointer.
 | L9 | Insert-and-copy command alphabet (decomposition + insert/copy length decode; 704 symbols) | DONE | `c4d046d` |
 | L9b | Distance prefix code + NPOSTFIX/NDIRECT translation (V1 NPOSTFIX=0 NDIRECT=0 → 64-symbol alphabet; short codes 0..=15 + direct codes 16..=63 with extras) | DONE | `b9dd3c5` |
 | L10 | Static dictionary (RFC 7932 Appendix A 122,784-byte blob + Appendix B 121-transform table; V1 identity-only lookup) | DONE | `be30efc` |
-| L11 | Compressed metablock orchestration loop | DEFERRED | — |
-| L12 | Ring buffer with wraparound | DEFERRED | — |
+| L11 | Compressed metablock orchestration loop (NBLTYPES read + V1-reject gates, CMODE consumption, NTREES headers, 3 prefix-code descriptions, main insert-then-copy decode loop with implicit-distance + ring update + LZ77 RLE copy_match) | DONE (V1 reduction) | `7d66c59` |
+| L12 | Output buffer with pre-stream-zero copy_match (V1 flat-Vec model; ring-with-wraparound deferred to >256 MiB streaming case) | DONE | `2f2e3f2` |
 
 ## Code Locations
 
@@ -45,6 +47,56 @@ with a more specific SP154-followup pointer.
 - `crates/kessel-parquet/src/brotli_dictionary.bin` — the 122,784-byte Appendix A blob (binary, fetched from upstream v1.1.0)
 - `crates/kessel-parquet/tools/regen_brotli_dictionary.py` — fixture-only regeneration script (NOT a runtime dep)
 - `crates/kessel-parquet/src/lib.rs` — 5 wire sites: page_payload arm + 2 V2 data-page arms + 2 pre-flight gates
+
+## Open Concern — Byte-Array Column Discrepancy
+
+The pyarrow `brotli_flat.parquet` fixture has TWO data pages:
+1. **id column** (i64, 5 values 1..=5 LE) — **DECODES BYTE-IDENTICAL via L11**.
+   17-byte compressed payload → 40-byte output exactly matching the
+   expected `[1,0,0,0,0,0,0,0, 2,0,0,0,0,0,0,0, ..., 5,0,0,0,0,0,0,0]`.
+   Locked by `pyarrow_id_column_page_decodes_byte_identical` KAT.
+2. **name column** (BYTE_ARRAY, 5 strings alice/bob/carol/dave/eve) —
+   **PRODUCES BYTES THAT DIFFER FROM PYTHON BROTLI'S OUTPUT** in
+   positions 16..20 (and onwards). Both decoders parse the headers
+   identically and reach the same first copy command (sym=266,
+   insert_len=16, copy_len=4, distance sym=3 → d4=4 from initial ring).
+   But Python brotli emits `[5,0,0,0]` at positions 16..20 (= a back-
+   reference to output[0..4]), while our V1 decoder emits
+   `[0,98,111,98]` (= back-reference to output[12..16] = "0bob").
+
+The discrepancy implies the actual encoded sym should have been 0
+(= d1 = 16 initial), not sym 3 (= d4 = 4). But the prefix code only
+has 2 entries (syms 3 and 21), neither of which maps to distance=16
+under my interpretation of the canonical assignment.
+
+Suspected root causes (any or all):
+- **SHORT_CODE_RING_INDEX table mapping mismatch.** RFC 7932 §4 spec
+  vs Google brotli reference `c/common` tables: the reference uses
+  `kDistanceShortCodeIndexOffset = [0, 3, 2, 1, 0, ...]` (a circular-
+  ring index OFFSET) while my impl uses `[0, 1, 2, 3, 0, ...]`
+  (absolute slot index into `[d1,d2,d3,d4]`). Possibly the convention
+  for "slot 0 = d1" vs "slot 0 = next-write" differs.
+- **Initial ring orientation reversed.** RFC says initial values are
+  `[16, 15, 11, 4]` and my `RING_INIT = [16, 15, 11, 4]` with
+  `slots[0] = d1 = 16`. But maybe the reference's convention is
+  `slots[3] = d1 = 16` (= ring oriented as `[d4, d3, d2, d1]`).
+- **Canonical prefix-code construction ordering for same-length syms.**
+  My impl sorts by symbol value; maybe Brotli reference uses order-of-
+  declaration. For the affected stream both orderings give the same
+  result (declared [3,21] vs sorted [3,21]), so this is unlikely the
+  cause.
+
+Diagnosis next step: write a hand-crafted KAT that encodes a sparse-
+literal sequence with a known back-reference + verify against Python
+brotli's debug-mode output to pinpoint the exact convention mismatch.
+Estimated 0.5-1 session of focused debugging.
+
+The L11 work is genuinely valuable infrastructure even with this
+residual gap: the id-column decode proves the orchestration loop +
+prefix-code reads + pre-stream-zero copy_match all work. Once the
+discrepancy is resolved (likely a single-line table swap or canonical-
+code interpretation fix), the byte_array column should decode too,
+closing OBJ-2c-2 codec matrix.
 
 ## What Works Right Now
 
@@ -176,10 +228,18 @@ a multi-week sub-project, matching the SP125-SP140 zstd arc length.
   decomposition + insert/copy length decode + pentests + exhaustive sweep)
 - Post-SP154 L9b: workspace 1249/0/1, 1304/0/1 featured (+27: short-code/direct-code
   distance translation, ring update semantics, exhaustive direct-code partition sweep)
-- Post-SP154 L10: workspace 1268/0/1, 1323/0/1 featured (current) (+19: dictionary
+- Post-SP154 L10: workspace 1268/0/1, 1323/0/1 featured (+19: dictionary
   blob size + offset/count partition consistency, pinned content KATs at lengths
   4/5/8/16, identity-only transform path, transform table integrity, boundary
   rejections)
+- Post-SP154 L11+L12: workspace 1288/0/1, 1321/0/1 featured (current) (+20:
+  14 L12 OutputBuffer KATs (append/lookback/copy_match incl RLE/overlap +
+  bounds rejections + pre-stream-zero copy) + 6 L11 metablock orchestrator
+  KATs (empty stream, uncompressed-only via L4 path, bomb-defense, NBLTYPES_L
+  reject, pyarrow id-column byte-identical decode, pentest-truncated)).
+  The pyarrow id-column byte-identical decode is the headline KAT —
+  17 hand-derived bytes decompress through the full orchestrator to the
+  expected 40 bytes of `[1,0,0,0,...,5,0,0,0,0,0,0,0]` (5 i64 values 1..=5 LE).
 
 All seed-7 GREEN; tree-grep EMPTY across all commits.
 

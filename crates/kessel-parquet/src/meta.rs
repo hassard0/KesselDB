@@ -73,6 +73,16 @@ pub enum Codec {
     /// dispatch can reject it with a distinct named error pointing at
     /// the SP149 follow-up.
     Lz4Raw,
+    /// SP150: Parquet Brotli codec (id 4). Recognized at meta-decode time
+    /// but decompression is NOT YET IMPLEMENTED. A hand-rolled zero-dep
+    /// Brotli decoder per RFC 7932 is a multi-week effort (~10-15 task
+    /// slices like the SP125-SP140 zstd arc — Brotli has its own Huffman
+    /// table format, context modeling, a static dictionary of common web
+    /// words, and metablock framing); deferred to a dedicated SP-arc.
+    /// Workaround for users: ask pyarrow to re-encode with
+    /// `compression='zstd'` (shipped, often better ratio) or
+    /// `compression='lz4'` (shipped, very fast).
+    Brotli,
     Other(i32),
 }
 impl Codec {
@@ -81,6 +91,11 @@ impl Codec {
             0 => Codec::Uncompressed,
             1 => Codec::Snappy,
             2 => Codec::Gzip,
+            // SP150: codec id 4 = BROTLI is recognized at meta-decode
+            // time as Codec::Brotli (was Other(4) pre-SP150). Page-payload
+            // dispatch returns a typed Unsupported naming the dedicated
+            // SP-arc follow-up; the workaround is zstd or lz4.
+            4 => Codec::Brotli,
             6 => Codec::Zstd,
             7 => Codec::Lz4Raw,
             o => Codec::Other(o),
@@ -1074,10 +1089,56 @@ mod tests {
         assert_eq!(
             FileMetaData::decode(&build(6)).unwrap()
                 .row_groups[0].columns[0].codec, Codec::Zstd);
-        // Codec 4 (LZ4) remains Other for the lz4-deferred boundary.
+        // SP150: codec id 4 = BROTLI is now mapped to Codec::Brotli
+        // (was Other(4) pre-SP150). Decompression is still rejected (the
+        // dispatch site returns a typed Unsupported naming the dedicated
+        // SP-arc); only the meta-decode recognition is asserted here.
         assert_eq!(
             FileMetaData::decode(&build(4)).unwrap()
-                .row_groups[0].columns[0].codec, Codec::Other(4));
+                .row_groups[0].columns[0].codec, Codec::Brotli);
+    }
+
+    /// SP150: dedicated round-trip on the (id 4 → Codec::Brotli) mapping
+    /// in isolation. Exists alongside the broader `columnmeta_decodes_gzip_codec`
+    /// row above so a future codec-id renumbering or accidental remap
+    /// would surface here with a Brotli-specific test failure message.
+    #[test]
+    fn codec_id_4_decodes_to_brotli_variant() {
+        // Reuses the same minimal-column-chunk builder convention as
+        // `columnmeta_decodes_gzip_codec` (hand-built compact-thrift
+        // ColumnMetaData with `f4 codec = <id>`).
+        fn build(codec: i64) -> Vec<u8> {
+            let mut b = Vec::new();
+            b.push(0x15); uv(&mut b, zz(1));                 // f1 version=1
+            b.push(0x19); b.push(0x2c);                      // f2 list<struct> 2
+            b.push(0x48); uv(&mut b, 4); b.extend_from_slice(b"root");
+            b.push(0x15); uv(&mut b, zz(1));                 // num_children=1
+            b.push(0x00);
+            b.push(0x15); uv(&mut b, zz(2));                 // leaf type=INT64
+            b.push(0x25); uv(&mut b, zz(0));                 // repetition=REQUIRED
+            b.push(0x18); uv(&mut b, 2); b.extend_from_slice(b"id");
+            b.push(0x00);
+            b.push(0x16); uv(&mut b, zz(1));                 // num_rows=1
+            b.push(0x19); b.push(0x1c);                      // list<RowGroup> 1
+            b.push(0x19); b.push(0x1c);                      // RG list<ColumnChunk> 1
+            b.push(0x3c);                                    // ColumnChunk f3 CMD
+            b.push(0x15); uv(&mut b, zz(2));                 // CMD type=INT64
+            b.push(0x19); b.push(0x15); uv(&mut b, zz(0));   // encodings [PLAIN]
+            b.push(0x19); b.push(0x18); uv(&mut b, 2); b.extend_from_slice(b"id");
+            b.push(0x15); uv(&mut b, zz(codec));             // f4 codec
+            b.push(0x16); uv(&mut b, zz(1));                 // num_values=1
+            b.push(0x46); uv(&mut b, zz(4));                 // data_page_offset=4
+            b.push(0x00); b.push(0x00);
+            b.push(0x26); uv(&mut b, zz(1));                 // RG num_rows=1
+            b.push(0x00); b.push(0x00);
+            b
+        }
+        let md = FileMetaData::decode(&build(4)).expect("brotli meta-decode");
+        assert_eq!(
+            md.row_groups[0].columns[0].codec,
+            Codec::Brotli,
+            "parquet codec id 4 must decode to Codec::Brotli (SP150 gate-only)"
+        );
     }
 
     #[test]

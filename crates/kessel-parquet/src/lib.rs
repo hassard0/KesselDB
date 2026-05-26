@@ -382,6 +382,15 @@ fn page_payload<'a>(
         meta::Codec::Lz4Raw => Ok(std::borrow::Cow::Owned(
             lz4::decompress(on_disk, uncomp)?
         )),
+        // SP150: Brotli (codec id 4) recognized at meta-decode time but
+        // decompression is deferred to a dedicated SP-arc (zero-dep RFC
+        // 7932 decoder is multi-week scope, ~10-15 tasks like SP125-SP140
+        // zstd). Named error directs users at the shipped workarounds.
+        meta::Codec::Brotli => Err(PqError::Unsupported(
+            "Brotli decode: zero-dep decoder is a dedicated multi-week SP-arc \
+             (~10-15 tasks like SP125-SP140 zstd); workaround — ask the writer to use \
+             compression='zstd' or compression='lz4' instead".into(),
+        )),
         // Codec id 5 = legacy LZ4 (deprecated Hadoop framing). Pyarrow
         // stopped writing this in v8; we don't support it in V1 — named
         // separately so a user file that needs it gets a clear pointer
@@ -390,7 +399,7 @@ fn page_payload<'a>(
             "LZ4 (deprecated Hadoop framing) — use LZ4_RAW; SP149 follow-up if needed".into(),
         )),
         meta::Codec::Other(_) => Err(PqError::Unsupported(
-            "compression codec (brotli): OBJ-2c".into(),
+            "compression codec: OBJ-2c".into(),
         )),
     }
 }
@@ -577,6 +586,13 @@ fn decode_data_page_v2(
         meta::Codec::Lz4Raw => {
             std::borrow::Cow::Owned(lz4::decompress(values_section, vt)?)
         }
+        meta::Codec::Brotli => {
+            return Err(PqError::Unsupported(
+                "Brotli decode: zero-dep decoder is a dedicated multi-week SP-arc \
+                 (~10-15 tasks like SP125-SP140 zstd); workaround — ask the writer to use \
+                 compression='zstd' or compression='lz4' instead".into(),
+            ))
+        }
         meta::Codec::Other(5) => {
             return Err(PqError::Unsupported(
                 "LZ4 (deprecated Hadoop framing) — use LZ4_RAW; SP149 follow-up if needed".into(),
@@ -584,7 +600,7 @@ fn decode_data_page_v2(
         }
         meta::Codec::Other(_) => {
             return Err(PqError::Unsupported(
-                "compression codec (brotli): OBJ-2c".into(),
+                "compression codec: OBJ-2c".into(),
             ))
         }
     };
@@ -860,6 +876,13 @@ pub(crate) fn decode_data_page_v2_nested(
         meta::Codec::Lz4Raw => {
             std::borrow::Cow::Owned(lz4::decompress(values_section, vt)?)
         }
+        meta::Codec::Brotli => {
+            return Err(PqError::Unsupported(
+                "Brotli decode: zero-dep decoder is a dedicated multi-week SP-arc \
+                 (~10-15 tasks like SP125-SP140 zstd); workaround — ask the writer to use \
+                 compression='zstd' or compression='lz4' instead".into(),
+            ))
+        }
         meta::Codec::Other(5) => {
             return Err(PqError::Unsupported(
                 "LZ4 (deprecated Hadoop framing) — use LZ4_RAW; SP149 follow-up if needed".into(),
@@ -867,7 +890,7 @@ pub(crate) fn decode_data_page_v2_nested(
         }
         meta::Codec::Other(_) => {
             return Err(PqError::Unsupported(
-                "compression codec (brotli): OBJ-2c".into(),
+                "compression codec: OBJ-2c".into(),
             ))
         }
     };
@@ -902,6 +925,13 @@ fn read_chunk_values(
         | meta::Codec::Gzip
         | meta::Codec::Zstd
         | meta::Codec::Lz4Raw => {}
+        meta::Codec::Brotli => {
+            return Err(PqError::Unsupported(
+                "Brotli decode: zero-dep decoder is a dedicated multi-week SP-arc \
+                 (~10-15 tasks like SP125-SP140 zstd); workaround — ask the writer to use \
+                 compression='zstd' or compression='lz4' instead".into(),
+            ))
+        }
         meta::Codec::Other(5) => {
             return Err(PqError::Unsupported(
                 "LZ4 (deprecated Hadoop framing) — use LZ4_RAW; SP149 follow-up if needed".into(),
@@ -909,7 +939,7 @@ fn read_chunk_values(
         }
         meta::Codec::Other(_) => {
             return Err(PqError::Unsupported(
-                "compression codec (brotli): OBJ-2c".into(),
+                "compression codec: OBJ-2c".into(),
             ))
         }
     }
@@ -3051,6 +3081,13 @@ fn read_chunk_levels_and_values(
         | meta::Codec::Gzip
         | meta::Codec::Zstd
         | meta::Codec::Lz4Raw => {}
+        meta::Codec::Brotli => {
+            return Err(PqError::Unsupported(
+                "Brotli decode: zero-dep decoder is a dedicated multi-week SP-arc \
+                 (~10-15 tasks like SP125-SP140 zstd); workaround — ask the writer to use \
+                 compression='zstd' or compression='lz4' instead".into(),
+            ))
+        }
         meta::Codec::Other(5) => {
             return Err(PqError::Unsupported(
                 "LZ4 (deprecated Hadoop framing) — use LZ4_RAW; SP149 follow-up if needed".into(),
@@ -3058,7 +3095,7 @@ fn read_chunk_levels_and_values(
         }
         meta::Codec::Other(_) => {
             return Err(PqError::Unsupported(
-                "compression codec (brotli): OBJ-2c".into(),
+                "compression codec: OBJ-2c".into(),
             ))
         }
     }

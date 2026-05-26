@@ -287,6 +287,71 @@ pub(crate) fn decode_metablock_header(r: &mut BitReader) -> Result<MetablockHead
     })
 }
 
+/// Decode an NBLTYPES variable-length code per RFC 7932 §9.2.
+///
+/// Encoding (listed right-to-left = stream LSB-first):
+///
+/// ```text
+///   stream bit "0"                   → NBLTYPES = 1
+///   stream bits "1,0,0,0"            → NBLTYPES = 2
+///   stream bits "1,1,0,0,b"          → NBLTYPES = 3 + b     (3..=4)
+///   stream bits "1,0,1,0,bb"         → NBLTYPES = 5 + bb    (5..=8)
+///   stream bits "1,1,1,0,bbb"        → NBLTYPES = 9 + bbb   (9..=16)
+///   stream bits "1,0,0,1,bbbb"       → NBLTYPES = 17 + ...  (17..=32)
+///   stream bits "1,1,0,1,bbbbb"      → NBLTYPES = 33 + ...  (33..=64)
+///   stream bits "1,0,1,1,bbbbbb"     → NBLTYPES = 65 + ...  (65..=128)
+///   stream bits "1,1,1,1,bbbbbbb"    → NBLTYPES = 129 + ... (129..=256)
+/// ```
+///
+/// Algorithm: read 1 bit. If 0 → NBLTYPES=1. Else read 3 more bits as
+/// LSB-first 3-bit value `n` (0..=7); read `n` extra bits as LSB-first
+/// integer `e`; NBLTYPES = (1 << n) + 1 + e.
+///
+/// Used three times in the metablock header (literal / insert-and-copy /
+/// distance block-type counts).
+pub(crate) fn decode_nbltypes(r: &mut BitReader) -> Result<u32, BrotliError> {
+    let b = r.read_one_bit()?;
+    if b == 0 {
+        return Ok(1);
+    }
+    let n = r.read_bits(3)?; // 0..=7
+    let e = if n == 0 { 0 } else { r.read_bits(n as u8)? };
+    let value = (1u32 << n)
+        .checked_add(1)
+        .ok_or(BrotliError::UnexpectedEof)?
+        .checked_add(e)
+        .ok_or(BrotliError::UnexpectedEof)?;
+    Ok(value)
+}
+
+/// Parsed distance-code parameters per RFC 7932 §4.
+///
+/// `NPOSTFIX` (0..=3) is read as 2 bits directly.
+/// `NDIRECT` is read as a 4-bit "high nibble" value that is then
+/// LEFT-SHIFTED by NPOSTFIX bits to give the final NDIRECT (0..=120).
+///
+/// V1 scope: read and surface the values; the caller decides whether
+/// to reject non-default (non-zero) combinations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DistanceParams {
+    /// Postfix-bits count, 0..=3.
+    pub(crate) npostfix: u8,
+    /// Direct-distance-code count, 0..=120 (= 15 << 3 for NPOSTFIX=3).
+    pub(crate) ndirect: u8,
+}
+
+/// Decode the (NPOSTFIX, NDIRECT) pair from the bit stream per RFC 7932 §4.
+///
+/// 2 bits NPOSTFIX → 0..=3
+/// 4 bits NDIRECT_HIGH → NDIRECT = NDIRECT_HIGH << NPOSTFIX (max 120 when
+///   NDIRECT_HIGH=15 and NPOSTFIX=3).
+pub(crate) fn decode_distance_params(r: &mut BitReader) -> Result<DistanceParams, BrotliError> {
+    let npostfix = r.read_bits(2)? as u8; // 0..=3
+    let ndirect_high = r.read_bits(4)? as u8; // 0..=15
+    let ndirect = ndirect_high << npostfix; // 0..=120
+    Ok(DistanceParams { npostfix, ndirect })
+}
+
 /// Decompress a Brotli stream to bytes.
 ///
 /// V1 scope (SP154 layers 1-5): handles streams composed of ONLY
@@ -653,6 +718,119 @@ mod tests {
             matches!(err, BrotliError::BitReader(BitReaderError::UnexpectedEof)),
             "expected BitReader(UnexpectedEof), got {err:?}"
         );
+    }
+
+    // -------------------------- L6 KATs --------------------------
+    //
+    // L6 NBLTYPES variable-length code per RFC 7932 §9.2. The listed
+    // codes are parsed right-to-left, so e.g. listed "0001" → stream
+    // bits "1, 0, 0, 0".
+
+    /// L6 KAT-1: a single '0' bit → NBLTYPES = 1 (the common-case
+    /// "no block-type partitioning" encoding for pyarrow-shape pages).
+    #[test]
+    fn nbltypes_single_zero_means_one() {
+        let bytes = [0x00u8];
+        let mut r = BitReader::new(&bytes);
+        let n = decode_nbltypes(&mut r).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(r.bit_pos(), 1);
+    }
+
+    /// L6 KAT-2: stream "1,0,0,0" (= listed "0001") → NBLTYPES = 2.
+    /// Byte 0 LSB-first: bit 0 = 1, bits 1..3 = 0 → 0x01.
+    #[test]
+    fn nbltypes_two_via_1_then_000() {
+        let bytes = [0x01u8];
+        let mut r = BitReader::new(&bytes);
+        let n = decode_nbltypes(&mut r).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(r.bit_pos(), 4);
+    }
+
+    /// L6 KAT-3: stream "1,1,1,0,1,1,0" (= listed "0110111") → NBLTYPES = 12.
+    /// Worked example from RFC 7932 §9.2: "0110111 has the value 12".
+    ///
+    /// Stream bits 0..6: 1, 1, 1, 0, 1, 1, 0
+    /// Byte 0 LSB-first: bits 0=1, 1=1, 2=1, 3=0, 4=1, 5=1, 6=0
+    /// → 1 + 2 + 4 + 16 + 32 = 55 = 0x37
+    #[test]
+    fn nbltypes_twelve_via_rfc_example() {
+        let bytes = [0x37u8];
+        let mut r = BitReader::new(&bytes);
+        let n = decode_nbltypes(&mut r).unwrap();
+        assert_eq!(n, 12);
+        assert_eq!(r.bit_pos(), 7);
+    }
+
+    /// L6 KAT-4: NBLTYPES = 16 (max of n=3 bucket).
+    /// Stream: "1,1,1,0" (prefix n=3) + "1,1,1" (3 extras = 7).
+    /// Value = (1<<3) + 1 + 7 = 16.
+    /// Byte 0 bits 0..6: 1,1,1,0,1,1,1 → 1+2+4+16+32+64 = 119 → 0x77.
+    #[test]
+    fn nbltypes_sixteen_max_of_third_bucket() {
+        let bytes = [0x77u8];
+        let mut r = BitReader::new(&bytes);
+        let n = decode_nbltypes(&mut r).unwrap();
+        assert_eq!(n, 16);
+        assert_eq!(r.bit_pos(), 7);
+    }
+
+    /// L6 KAT-5: NBLTYPES = 256 (max possible — bucket n=7).
+    /// Stream: "1,1,1,1" (prefix n=7) + 7 extras all 1 = 127.
+    /// Value = (1<<7) + 1 + 127 = 256.
+    /// Stream 11 bits all 1; byte 0 = 0xFF, byte 1 bits 0..2 = 1,1,1 → 0x07.
+    #[test]
+    fn nbltypes_max_value_256() {
+        let bytes = [0xFFu8, 0x07];
+        let mut r = BitReader::new(&bytes);
+        let n = decode_nbltypes(&mut r).unwrap();
+        assert_eq!(n, 256);
+        assert_eq!(r.bit_pos(), 11);
+    }
+
+    // -------------------------- L7 KATs --------------------------
+    //
+    // L7 distance-code parameters per RFC 7932 §4 / §9.2.
+
+    /// L7 KAT-1: NPOSTFIX=0, NDIRECT=0 (the default that pyarrow files
+    /// virtually always use). Stream: 2 bits 0 + 4 bits 0 = 6 zero bits.
+    /// Byte 0 = 0x00.
+    #[test]
+    fn distance_params_default_zero_zero() {
+        let bytes = [0x00u8];
+        let mut r = BitReader::new(&bytes);
+        let dp = decode_distance_params(&mut r).unwrap();
+        assert_eq!(dp.npostfix, 0);
+        assert_eq!(dp.ndirect, 0);
+        assert_eq!(r.bit_pos(), 6);
+    }
+
+    /// L7 KAT-2: NPOSTFIX=3, NDIRECT_HIGH=15 → NDIRECT = 15 << 3 = 120.
+    /// Stream: 2 bits 3 (=1,1) + 4 bits 15 (=1,1,1,1) = 6 ones.
+    /// Byte 0 LSB-first bits 0..5 = 1 → 1+2+4+8+16+32 = 63 = 0x3F.
+    #[test]
+    fn distance_params_max_npostfix_max_ndirect() {
+        let bytes = [0x3Fu8];
+        let mut r = BitReader::new(&bytes);
+        let dp = decode_distance_params(&mut r).unwrap();
+        assert_eq!(dp.npostfix, 3);
+        assert_eq!(dp.ndirect, 120);
+        assert_eq!(r.bit_pos(), 6);
+    }
+
+    /// L7 KAT-3: NPOSTFIX=1, NDIRECT_HIGH=4 → NDIRECT = 4 << 1 = 8.
+    /// Stream: 2 bits 1 (=1,0) + 4 bits 4 (=0,0,1,0).
+    /// Byte 0 LSB-first: bit 0=1, bit 1=0, bit 2=0, bit 3=0, bit 4=1,
+    /// bit 5=0, bits 6..=7=0 → 1 + 16 = 17 = 0x11.
+    #[test]
+    fn distance_params_mid_values() {
+        let bytes = [0x11u8];
+        let mut r = BitReader::new(&bytes);
+        let dp = decode_distance_params(&mut r).unwrap();
+        assert_eq!(dp.npostfix, 1);
+        assert_eq!(dp.ndirect, 8);
+        assert_eq!(r.bit_pos(), 6);
     }
 
     /// Pentest: a stream whose declared expected_size is gigantic but

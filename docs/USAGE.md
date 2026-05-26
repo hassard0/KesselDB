@@ -860,7 +860,7 @@ CREATE EXTERNAL SOURCE readings (
 | Parquet property | OBJ-2a → OBJ-2c-5 SP145 |
 |---|---|
 | Encoding | `PLAIN` and dictionary (`PLAIN_DICTIONARY`/`RLE_DICTIONARY`); RLE/bit-packing hybrid for dictionary indices |
-| Compression codec | `UNCOMPRESSED`, `SNAPPY` (raw block; pages ≤ 64 MiB decompressed), `GZIP` (RFC 1952; pages ≤ 64 MiB decompressed), or `ZSTD` (RFC 8478) |
+| Compression codec | `UNCOMPRESSED`, `SNAPPY` (raw block; pages ≤ 64 MiB decompressed), `GZIP` (RFC 1952; pages ≤ 64 MiB decompressed), `ZSTD` (RFC 8478), or `LZ4_RAW` (SP149; codec id 7 — the modern raw LZ4 block format pyarrow emits for `compression='lz4'` since v8). Legacy LZ4 (codec id 5, deprecated Hadoop framing) and `BROTLI` (codec id 4) still rejected with named `Unsupported` errors. |
 | Column repetition | `REQUIRED` or `OPTIONAL` flat columns (nullable; V1 and V2 definition levels) |
 | Schema shape | flat (REQUIRED + OPTIONAL), `LIST<primitive>` (SP143), `MAP<K, V>` (SP144), `struct<...>` (SP144), `List<List<T>>` / `List<struct<...>>` / `Map<K, struct<...>>` / `Map<K, List<T>>` / `struct<List/Map/struct>` (SP145) |
 | Nested LIST (SP143/SP145) | `List<T>` for primitive T (SP143; 4-shape matrix REQ-REP-REQ/REQ-REP-OPT/OPT-REP-REQ/OPT-REP-OPT); `List<List<T>>` for primitive T (SP145; max_rep_level=2 generalized assembler); `List<struct<primitives>>` (SP145; field-zip per item slot) |
@@ -929,10 +929,14 @@ as every other format):
   the next slice. `struct<List<struct<...>>>` and similar compositions
   do work via the recursive `StructField.nested` chain since each
   recursion level adds at most 1 layer of additional nesting.
-- **Zstd / lz4 / brotli compression** — rejected with
-  `Unsupported("compression codec (zstd/lz4/brotli): OBJ-2c")`. GZIP is
-  now supported (OBJ-2c-1); V2 pages with these codecs remain
-  Unsupported pending OBJ-2c-2.
+- **Brotli compression (codec id 4)** — rejected with
+  `Unsupported("compression codec (brotli): OBJ-2c")`. GZIP (OBJ-2c-1),
+  ZSTD (OBJ-2c-2 SP125-SP140), and LZ4_RAW (SP149) are now supported;
+  only brotli remains open in the OBJ-2c-2 codec matrix.
+- **Legacy LZ4 compression (codec id 5, deprecated Hadoop framing)** —
+  rejected with `Unsupported("LZ4 (deprecated Hadoop framing) — use
+  LZ4_RAW; SP149 follow-up if needed")`. Pyarrow stopped writing this
+  variant in v8; the modern LZ4_RAW (codec id 7) is fully supported.
 - **Snappy pages above 64 MiB decompressed** — rejected with
   `Unsupported("Snappy decompressed page too large: OBJ-2c")`.
 - **DECIMAL precision > 38** — rejected with

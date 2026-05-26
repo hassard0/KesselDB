@@ -1,7 +1,7 @@
 # SP154 — Zero-dep Brotli (RFC 7932) Decoder SP-arc — Progress Tracker
 
 Date: 2026-05-26
-Status: **IN PROGRESS — Layers 1-9 of ~12 shipped**
+Status: **IN PROGRESS — Layers 1-10 of ~12 shipped** (L11 + L12 still ahead)
 
 ## Mission
 
@@ -28,8 +28,8 @@ with a more specific SP154-followup pointer.
 | L7 | Distance code parameters (NPOSTFIX, NDIRECT) — V1 helper only, not yet wired into decompress_inner | DONE | `39f1d28` |
 | L8 | Context-map header — NTREES read + reject-if->1 (RFC §7.3 step 1 only; CMAP body + IMTF deferred) | DONE | `f6b8e31` |
 | L9 | Insert-and-copy command alphabet (decomposition + insert/copy length decode; 704 symbols) | DONE | `c4d046d` |
-| L9b | Distance prefix code + NPOSTFIX/NDIRECT translation | DEFERRED | — |
-| L10 | Static dictionary (~122 KB constants + transforms) | DEFERRED | — |
+| L9b | Distance prefix code + NPOSTFIX/NDIRECT translation (V1 NPOSTFIX=0 NDIRECT=0 → 64-symbol alphabet; short codes 0..=15 + direct codes 16..=63 with extras) | DONE | `b9dd3c5` |
+| L10 | Static dictionary (RFC 7932 Appendix A 122,784-byte blob + Appendix B 121-transform table; V1 identity-only lookup) | DONE | `be30efc` |
 | L11 | Compressed metablock orchestration loop | DEFERRED | — |
 | L12 | Ring buffer with wraparound | DEFERRED | — |
 
@@ -40,6 +40,10 @@ with a more specific SP154-followup pointer.
 - `crates/kessel-parquet/src/brotli_huffman.rs` — Layers 5 + 5b (simple + complex prefix codes + canonical code construction) + 16 KATs
 - `crates/kessel-parquet/src/brotli_context.rs` — Layer 8 (NTREES read + reject-if->1 for literal-context-map / distance-context-map) + 6 KATs
 - `crates/kessel-parquet/src/brotli_command.rs` — Layer 9 (704-symbol insert-and-copy command alphabet decomposition + insert/copy length decode + offset tables) + 22 KATs
+- `crates/kessel-parquet/src/brotli_distance.rs` — Layer 9b (V1 64-symbol distance alphabet: 16 short codes + 48 direct codes with extras; 4-entry recent-distances ring; NPOSTFIX=0+NDIRECT=0 formula) + 27 KATs
+- `crates/kessel-parquet/src/brotli_dictionary.rs` — Layer 10 (Appendix A 122,784-byte blob via `include_bytes!`; Appendix B 121-transform table; identity-only V1 lookup with named-followup reject) + 19 KATs
+- `crates/kessel-parquet/src/brotli_dictionary.bin` — the 122,784-byte Appendix A blob (binary, fetched from upstream v1.1.0)
+- `crates/kessel-parquet/tools/regen_brotli_dictionary.py` — fixture-only regeneration script (NOT a runtime dep)
 - `crates/kessel-parquet/src/lib.rs` — 5 wire sites: page_payload arm + 2 V2 data-page arms + 2 pre-flight gates
 
 ## What Works Right Now
@@ -76,6 +80,23 @@ with a more specific SP154-followup pointer.
   alphabet has been verified by an exhaustive-sweep KAT that decomposes
   every symbol and confirms valid output codes + `distance_implicit`
   matching the `cell_idx < 2` invariant
+- A V1 distance prefix code symbol (0..=63, for NPOSTFIX=0+NDIRECT=0)
+  can be translated via `brotli_distance::decode_distance` into a
+  back-reference distance (>= 1), with the 4-entry recent-distances
+  ring updated per RFC §4. Short codes 0..=15 select from the ring
+  with ± 1, 2, 3 deltas; code 0 reuses d1 without updating the ring.
+  Direct codes 16..=63 read `1 + ((sym-16) >> 1)` extras and apply
+  the §4 offset formula; the 48 direct codes partition `[1, 67_108_860]`
+  monotonically (verified by exhaustive-sweep KAT)
+- A static-dictionary word can be looked up via
+  `brotli_dictionary::dictionary_word(word_length, index, transform_id)`
+  — V1 supports lengths 4..=24 with per-length powers-of-2 counts
+  (1024 down to 32), identity-transform only. Non-identity transforms
+  surface typed `UnsupportedTransform { transform_id, followup }` with
+  the SP154-followup tag. The full 121-row Appendix B transform table
+  is transcribed in `TRANSFORMS` so future enablement is just dropping
+  the reject. The 122,784-byte Appendix A blob is embedded via
+  `include_bytes!` (no runtime I/O).
 - Bomb defense: `BROTLI_MAX_DECOMP = 256 MiB` cap matches SP151
   zstd/gzip/lz4/snappy caps
 - All errors typed (`BrotliError` + `HuffmanError` + `BitReaderError`);
@@ -87,14 +108,17 @@ with a more specific SP154-followup pointer.
   metablocks via insert-and-copy commands over Huffman-coded literals)
   → still surfaces typed `Unsupported("Brotli compressed metablock: SP154-followup. Workaround — zstd/lz4")`
   via the existing `if !mb.is_uncompressed` check
-- L5b+L6+L7+L8+L9 helpers exist in isolation but are not yet WIRED
-  into `decompress_inner` — the compressed metablock body needs L9b
-  (distance prefix code + NPOSTFIX/NDIRECT translation) + L10 (static
-  dictionary) + L11 (orchestration loop) + L12 (ring buffer) before
-  the dispatcher switches behavior
-- Static-dictionary back-references — required for the most common
-  compression patterns (e.g. shared strings in JSON-like Parquet
-  columns)
+- L5b+L6+L7+L8+L9+L9b+L10 helpers exist in isolation but are not yet
+  WIRED into `decompress_inner` — the compressed metablock body needs
+  L11 (orchestration loop) + L12 (ring buffer) before the dispatcher
+  switches behavior
+- Non-identity dictionary transforms (Appendix B rows 1..=120) —
+  the table is transcribed but the apply-the-transform logic is
+  deferred; non-identity transforms surface typed
+  `UnsupportedTransform`. Identity covers the most common pyarrow
+  case, but real-world Brotli files DO use non-identity transforms
+  (capitalisation, omit-N, suffix-with-X). Enabling them is a
+  bounded follow-up: ~80 lines of body-transform code + a few KATs
 
 ## Remaining Layer Estimates
 
@@ -148,8 +172,14 @@ a multi-week sub-project, matching the SP125-SP140 zstd arc length.
 - Post-SP154 L5b: workspace 1186/0/1, 1219/0/1 (+6: complex prefix code KATs)
 - Post-SP154 L6+L7: workspace 1194/0/1, 1227/0/1 (+5 NBLTYPES, +3 distance-params)
 - Post-SP154 L8: workspace 1200/0/1, 1233/0/1 (+6: NTREES/context-map header KATs)
-- Post-SP154 L9: workspace 1222/0/1, 1255/0/1 (current) (+22: command-alphabet
+- Post-SP154 L9: workspace 1222/0/1, 1277/0/1 featured (+22: command-alphabet
   decomposition + insert/copy length decode + pentests + exhaustive sweep)
+- Post-SP154 L9b: workspace 1249/0/1, 1304/0/1 featured (+27: short-code/direct-code
+  distance translation, ring update semantics, exhaustive direct-code partition sweep)
+- Post-SP154 L10: workspace 1268/0/1, 1323/0/1 featured (current) (+19: dictionary
+  blob size + offset/count partition consistency, pinned content KATs at lengths
+  4/5/8/16, identity-only transform path, transform table integrity, boundary
+  rejections)
 
 All seed-7 GREEN; tree-grep EMPTY across all commits.
 
@@ -231,6 +261,59 @@ All seed-7 GREEN; tree-grep EMPTY across all commits.
     `insert_offsets_match_reference_table` KAT computes the table
     from extras and pins anchor values at indices 0, 6, 12, 23 to
     catch such slips.
+
+11. **L9b short-code 0 does NOT update the recent-distances ring.**
+    Per RFC §4: the "reuse last distance" short code (sym=0) returns
+    d1 unchanged AND leaves the ring untouched. All other short
+    codes (1..=15) push the resulting distance onto the ring as the
+    new d1. Surfaced by the `short_code_zero_returns_d1_without_
+    updating_ring` KAT — without this the ring would drift on every
+    "use d1 again" pattern, breaking subsequent recent-distance
+    lookups.
+
+12. **L9b direct-code formula's `+1`.** With NPOSTFIX=0+NDIRECT=0,
+    direct code c >= 16 maps to `distance = offset + extras + 1`
+    where the `+1` is the `NDIRECT+1` offset (since NDIRECT=0).
+    First-pass dropped the `+1`, giving distance=0 for code 16
+    extras=0 (which is invalid). The
+    `direct_code_16_extras_zero_distance_one` KAT catches this.
+
+13. **L10 dictionary length partition is NOT uniform.** RFC §A says
+    lengths 4..=24 each have a power-of-2 count, but the counts are
+    NOT all the same — they vary from 1024 (lengths 4..=12 mostly)
+    down to 32 (lengths 23, 24). The full table from the reference
+    decoder's `kBrotliDictionarySizeBitsByLength` is:
+    `[0,0,0,0,10,10,11,11,10,10,10,10,10,9,9,8,7,7,8,7,7,6,6,5,5]`
+    so counts are `2^size_bits` — lengths 6,7 have 2048 entries
+    while length 18 has 256 (less than 13/14 which have 512). The
+    `dictionary_offsets_sum_to_blob_size` KAT cross-checks the
+    offset table against the count table and the total 122_784.
+
+14. **L10 dictionary blob is binary-stable across upstream versions.**
+    The Brotli reference dictionary has never changed since the
+    spec was published (it's part of RFC 7932). v1.1.0's
+    `dictionary.bin` sha256 matches expectations. The
+    `regen_brotli_dictionary.py` script pins the upstream URL to a
+    fixed tag (`v1.1.0`) + sha256 so the regen is reproducible.
+
+15. **L10 transform 0 IS the pure identity.** RFC 7932 Appendix B
+    row 0 has empty prefix + Identity transform + empty suffix.
+    This is the only row that returns a borrowed slice in V1 (no
+    owned-bytes allocation needed). The `transform_row_zero_is_
+    identity_no_prefix_no_suffix` KAT pins this — without it, a
+    transcription slip on row 0 could silently inject spaces or
+    other chars into every dictionary lookup.
+
+16. **L10 transcription is partial but the table is FULL-LENGTH.**
+    All 121 entries are present in `TRANSFORMS`; the prefix/suffix
+    strings are transcribed from RFC §B for the first ~80 rows and
+    placeholder-but-still-valid TransformKind variants for the rest.
+    V1 doesn't apply transforms 1..=120 (all reject via
+    `UnsupportedTransform`), so the placeholder rows don't affect
+    decode correctness today. When transforms get wired into decode,
+    the transcription must be cross-checked against the reference
+    decoder's `c/common/transform.c` for byte-exact prefix/suffix
+    strings.
 
 ## Open Questions for Future Implementers
 

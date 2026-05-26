@@ -7119,3 +7119,499 @@ mod sp143_pentest {
         // namespace (sp143_pentest::pt13_…) for traceability.
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────
+// SP144 T8: adversarial pentest matrix for Map+struct nested decode.
+//
+// Mirrors SP143 T10 discipline for the Map+struct code paths added in
+// T3 (assemble_map_kv), T4 (assemble_struct), and T5 (classify_map_plan
+// + classify_struct_plan dispatch). Every test below is wrapped in
+// `std::panic::catch_unwind` and asserts:
+//   (1) NO panic / NO OOM-abort on hostile input
+//   (2) returns a TYPED `PqError` (Bad or Unsupported), not Ok
+//
+// Spec reference: docs/superpowers/specs/2026-05-25-kesseldb-parquet-
+// map-struct-design.md §4 (pentest matrix).
+//
+// Two layers, mirroring T10:
+//   * Unit layer (pt1..pt11): call `assemble_map_kv` / `assemble_struct`
+//     directly with hand-built level + value vectors. Isolates the
+//     assembler from the full-file pipeline.
+//   * Integration layer (pt12..pt15): build a hand-crafted
+//     `meta::SchemaNode` and call `classify_column_plan` directly.
+//     Proves the malformed-schema gate fires upstream of any decode.
+// ────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod sp144_pentest {
+    use super::*;
+    use crate::assembly::{assemble_map_kv, assemble_struct};
+    use std::panic::catch_unwind;
+
+    /// Asserts a closure does not panic AND returns Err of any typed
+    /// PqError variant. Mirrors `sp143_pentest::assert_well_behaved_err`.
+    fn assert_well_behaved_err<F, T>(name: &str, f: F)
+    where
+        F: FnOnce() -> Result<T, PqError> + std::panic::UnwindSafe,
+    {
+        let r = catch_unwind(f);
+        match r {
+            Ok(Ok(_)) => panic!("{name}: expected Err, got Ok"),
+            Ok(Err(_)) => { /* OK — typed error */ }
+            Err(_) => panic!("{name}: PANICKED on adversarial input"),
+        }
+    }
+
+    // ── Row 1: assemble_map_kv with rep/def length mismatch ──────────
+    // First-line invariant in assemble_map_kv (line 405).
+    #[test]
+    fn sp144_pt1_map_rep_def_length_mismatch() {
+        assert_well_behaved_err("map rep/def len mismatch", || {
+            assemble_map_kv(
+                &[0u32, 1, 0],
+                &[1u32, 1],
+                &[PqValue::Bytes(b"a".to_vec())],
+                &[PqValue::I64(1)],
+                1,
+                false,
+                false,
+            )
+        });
+    }
+
+    // ── Row 2: key stream truncated (k_cursor exhausted mid-loop) ────
+    // REQ-REP-REQ-REQ: max_def=1, rep=[0,1], def=[1,1] → both
+    // ItemPresent. Empty keys vec → "key stream exhausted at
+    // position 0" Bad.
+    #[test]
+    fn sp144_pt2_map_key_stream_truncated() {
+        assert_well_behaved_err("map key truncated", || {
+            assemble_map_kv(
+                &[0u32, 1],
+                &[1u32, 1],
+                &[],
+                &[PqValue::I64(1), PqValue::I64(2)],
+                1,
+                false,
+                false,
+            )
+        });
+    }
+
+    // ── Row 3: value stream truncated ────────────────────────────────
+    // Same shape as pt2 but values vec empty. assemble_map_kv consumes
+    // key first, then value → "value stream exhausted at position 0".
+    #[test]
+    fn sp144_pt3_map_value_stream_truncated() {
+        assert_well_behaved_err("map value truncated", || {
+            assemble_map_kv(
+                &[0u32, 1],
+                &[1u32, 1],
+                &[PqValue::Bytes(b"a".to_vec()), PqValue::Bytes(b"b".to_vec())],
+                &[],
+                1,
+                false,
+                false,
+            )
+        });
+    }
+
+    // ── Row 4: keys over-provisioned (cursor < keys.len() at end) ────
+    // REQ-REP-REQ-REQ: rep=[0], def=[1] implies exactly 1 key + 1
+    // value, but we pass 2 keys. End-of-loop check fires
+    // "keys not fully consumed".
+    #[test]
+    fn sp144_pt4_map_keys_unconsumed_overflow() {
+        assert_well_behaved_err("map keys overflow", || {
+            assemble_map_kv(
+                &[0u32],
+                &[1u32],
+                &[PqValue::Bytes(b"a".to_vec()), PqValue::Bytes(b"b".to_vec())],
+                &[PqValue::I64(1)],
+                1,
+                false,
+                false,
+            )
+        });
+    }
+
+    // ── Row 5: rep level overflow (rep > 1) ──────────────────────────
+    // Per-position guard at line 467: rep > 1 for a Map is always Bad.
+    #[test]
+    fn sp144_pt5_map_rep_level_overflow() {
+        assert_well_behaved_err("map rep overflow", || {
+            assemble_map_kv(
+                &[0u32, 2],
+                &[1u32, 1],
+                &[PqValue::Bytes(b"a".to_vec()), PqValue::Bytes(b"b".to_vec())],
+                &[PqValue::I64(1), PqValue::I64(2)],
+                1,
+                false,
+                false,
+            )
+        });
+    }
+
+    // ── Row 6: def level overflow (def > max_def_level) ──────────────
+    // classify() first guard at line 434: def > max → Bad.
+    #[test]
+    fn sp144_pt6_map_def_level_overflow() {
+        assert_well_behaved_err("map def overflow", || {
+            assemble_map_kv(
+                &[0u32],
+                &[5u32],
+                &[PqValue::Bytes(b"a".to_vec())],
+                &[PqValue::I64(1)],
+                2,
+                true,
+                false,
+            )
+        });
+    }
+
+    // ── Row 7: def implies value-null but value is REQUIRED ──────────
+    // Hostile combination: outer_optional=true, value_optional=false,
+    // max_def=3. def=2 is strictly between empty_list_threshold (1)
+    // and max_def (3) → classify routes to ValueNull → guard at line
+    // 449 fires Bad("def 2 implies value null but value is REQUIRED").
+    #[test]
+    fn sp144_pt7_map_value_null_with_required_value() {
+        assert_well_behaved_err("map value null with REQ value", || {
+            assemble_map_kv(
+                &[0u32],
+                &[2u32],
+                &[],
+                &[],
+                3,
+                true,
+                false,
+            )
+        });
+    }
+
+    // ── Row 8: struct field_names vs field_columns length mismatch ───
+    // First-line invariant in assemble_struct (line 700).
+    #[test]
+    fn sp144_pt8_struct_names_columns_mismatch() {
+        assert_well_behaved_err("struct names/cols mismatch", || {
+            assemble_struct(
+                &["a".to_string(), "b".to_string(), "c".to_string()],
+                &[
+                    vec![PqValue::I64(1)],
+                    vec![PqValue::Bool(true)],
+                ],
+                false,
+            )
+        });
+    }
+
+    // ── Row 9: struct field column lengths differ across columns ─────
+    // Row-count invariant in assemble_struct (line 711).
+    #[test]
+    fn sp144_pt9_struct_field_length_mismatch() {
+        assert_well_behaved_err("struct field len mismatch", || {
+            assemble_struct(
+                &["a".to_string(), "b".to_string()],
+                &[
+                    vec![PqValue::I64(1), PqValue::I64(2)],
+                    vec![PqValue::Bool(true)],
+                ],
+                false,
+            )
+        });
+    }
+
+    // ── Row 10: struct with empty fields ─────────────────────────────
+    // Schema-shape invariant in assemble_struct (line 706).
+    #[test]
+    fn sp144_pt10_struct_empty_fields() {
+        assert_well_behaved_err("struct empty fields", || {
+            assemble_struct(&[], &[], false)
+        });
+    }
+
+    // ── Row 11: empty rep stream + non-empty keys (Map n==0 lock) ────
+    // n==0 fast path at line 413 must validate keys + values are also
+    // empty — otherwise hostile callers could slip un-decoded values
+    // past the assembler.
+    #[test]
+    fn sp144_pt11_map_empty_streams_with_values() {
+        assert_well_behaved_err("map empty streams with values", || {
+            assemble_map_kv(
+                &[],
+                &[],
+                &[PqValue::Bytes(b"a".to_vec())],
+                &[],
+                1,
+                false,
+                false,
+            )
+        });
+    }
+
+    // ====================================================================
+    // Integration-level: malformed schemas rejected by classify_column_plan
+    // BEFORE any decode runs. Build hand-crafted SchemaNode trees and
+    // call classify_column_plan directly (it's crate-private but the
+    // sp144_pentest module sits inside the crate via `use super::*`).
+    //
+    // The leaves list can be empty in every pt12..pt15 case because each
+    // rejection fires upstream of the `leaves.iter().find(...)` step.
+    // ====================================================================
+
+    // ── Row 12: MAP with REPEATED middle that has 1 child (not 2) ────
+    // classify_map_plan line 1488: "non-canonical MAP (key_value
+    // children != 2): SP145 follow-up". Reject before decode.
+    #[test]
+    fn sp144_pt12_malformed_map_one_child() {
+        let root = meta::SchemaNode::Group {
+            name: "root".into(),
+            repetition: meta::Repetition::Required,
+            children: vec![meta::SchemaNode::Group {
+                name: "my_map".into(),
+                repetition: meta::Repetition::Required,
+                children: vec![meta::SchemaNode::Group {
+                    name: "key_value".into(),
+                    repetition: meta::Repetition::Repeated,
+                    children: vec![meta::SchemaNode::Leaf {
+                        name: "element".into(),
+                        repetition: meta::Repetition::Required,
+                        ptype: meta::Type::Int64,
+                        max_def_level: 1,
+                        max_rep_level: 1,
+                        path: vec![
+                            "root".into(),
+                            "my_map".into(),
+                            "key_value".into(),
+                            "element".into(),
+                        ],
+                    }],
+                    logical_type: None,
+                }],
+                logical_type: Some(meta::LogicalType::Map),
+            }],
+            logical_type: None,
+        };
+        let result = classify_column_plan(&root, "my_map", &[]);
+        match result {
+            Err(PqError::Unsupported(msg))
+                if msg.contains("non-canonical MAP") =>
+            {
+                /* OK */
+            }
+            Err(other) => panic!(
+                "pt12: expected Unsupported(non-canonical MAP), got Err({other:?})"
+            ),
+            Ok(_) => panic!(
+                "pt12: expected Unsupported(non-canonical MAP), got Ok(_)"
+            ),
+        }
+    }
+
+    // ── Row 13: MAP with OPTIONAL key (spec violation) ───────────────
+    // classify_map_plan line 1498-1500: "MAP key `…` must be
+    // REQUIRED per Parquet spec".
+    #[test]
+    fn sp144_pt13_map_optional_key_rejected() {
+        let root = meta::SchemaNode::Group {
+            name: "root".into(),
+            repetition: meta::Repetition::Required,
+            children: vec![meta::SchemaNode::Group {
+                name: "my_map".into(),
+                repetition: meta::Repetition::Required,
+                children: vec![meta::SchemaNode::Group {
+                    name: "key_value".into(),
+                    repetition: meta::Repetition::Repeated,
+                    children: vec![
+                        meta::SchemaNode::Leaf {
+                            name: "key".into(),
+                            repetition: meta::Repetition::Optional, // VIOLATION
+                            ptype: meta::Type::ByteArray,
+                            max_def_level: 2,
+                            max_rep_level: 1,
+                            path: vec![
+                                "root".into(),
+                                "my_map".into(),
+                                "key_value".into(),
+                                "key".into(),
+                            ],
+                        },
+                        meta::SchemaNode::Leaf {
+                            name: "value".into(),
+                            repetition: meta::Repetition::Required,
+                            ptype: meta::Type::Int64,
+                            max_def_level: 1,
+                            max_rep_level: 1,
+                            path: vec![
+                                "root".into(),
+                                "my_map".into(),
+                                "key_value".into(),
+                                "value".into(),
+                            ],
+                        },
+                    ],
+                    logical_type: None,
+                }],
+                logical_type: Some(meta::LogicalType::Map),
+            }],
+            logical_type: None,
+        };
+        let result = classify_column_plan(&root, "my_map", &[]);
+        match result {
+            Err(PqError::Bad(msg))
+                if msg.contains("MAP key") && msg.contains("REQUIRED") =>
+            {
+                /* OK */
+            }
+            Err(other) => panic!(
+                "pt13: expected Bad(MAP key must be REQUIRED), got Err({other:?})"
+            ),
+            Ok(_) => panic!(
+                "pt13: expected Bad(MAP key must be REQUIRED), got Ok(_)"
+            ),
+        }
+    }
+
+    // ── Row 14: MAP key is a group (struct-as-key, deep nesting) ─────
+    // classify_map_plan line 1505: "MAP<group, _> (key is a group):
+    // SP145 follow-up".
+    #[test]
+    fn sp144_pt14_map_group_key_rejected() {
+        let root = meta::SchemaNode::Group {
+            name: "root".into(),
+            repetition: meta::Repetition::Required,
+            children: vec![meta::SchemaNode::Group {
+                name: "my_map".into(),
+                repetition: meta::Repetition::Required,
+                children: vec![meta::SchemaNode::Group {
+                    name: "key_value".into(),
+                    repetition: meta::Repetition::Repeated,
+                    children: vec![
+                        // Key is a Group, not a Leaf → SP145
+                        meta::SchemaNode::Group {
+                            name: "key".into(),
+                            repetition: meta::Repetition::Required,
+                            children: vec![meta::SchemaNode::Leaf {
+                                name: "inner".into(),
+                                repetition: meta::Repetition::Required,
+                                ptype: meta::Type::Int64,
+                                max_def_level: 1,
+                                max_rep_level: 1,
+                                path: vec![
+                                    "root".into(),
+                                    "my_map".into(),
+                                    "key_value".into(),
+                                    "key".into(),
+                                    "inner".into(),
+                                ],
+                            }],
+                            logical_type: None,
+                        },
+                        meta::SchemaNode::Leaf {
+                            name: "value".into(),
+                            repetition: meta::Repetition::Required,
+                            ptype: meta::Type::Int64,
+                            max_def_level: 1,
+                            max_rep_level: 1,
+                            path: vec![
+                                "root".into(),
+                                "my_map".into(),
+                                "key_value".into(),
+                                "value".into(),
+                            ],
+                        },
+                    ],
+                    logical_type: None,
+                }],
+                logical_type: Some(meta::LogicalType::Map),
+            }],
+            logical_type: None,
+        };
+        let result = classify_column_plan(&root, "my_map", &[]);
+        match result {
+            Err(PqError::Unsupported(msg)) if msg.contains("SP145") => {
+                /* OK */
+            }
+            Err(other) => panic!(
+                "pt14: expected Unsupported(SP145), got Err({other:?})"
+            ),
+            Ok(_) => panic!(
+                "pt14: expected Unsupported(SP145), got Ok(_)"
+            ),
+        }
+    }
+
+    // ── Row 15: struct with nested-LIST child rejected ───────────────
+    // classify_struct_plan line 1700-1704: "struct `…` contains nested
+    // group `…`: SP145 follow-up". The struct outer has logical_type
+    // None, so the dispatch in classify_column_plan routes to
+    // classify_struct_plan; the nested LIST group child triggers
+    // SP145 rejection before any leaf find.
+    #[test]
+    fn sp144_pt15_struct_with_nested_list_rejected() {
+        let root = meta::SchemaNode::Group {
+            name: "root".into(),
+            repetition: meta::Repetition::Required,
+            children: vec![meta::SchemaNode::Group {
+                name: "my_struct".into(),
+                repetition: meta::Repetition::Required,
+                children: vec![
+                    // Nested LIST inside struct → SP145.
+                    // Placed first so classify_struct_plan's in-order
+                    // child walk hits this group BEFORE the trailing
+                    // `id` leaf (which would otherwise fail an earlier
+                    // flat-leaves lookup masking the structural reject).
+                    meta::SchemaNode::Group {
+                        name: "tags".into(),
+                        repetition: meta::Repetition::Required,
+                        children: vec![meta::SchemaNode::Group {
+                            name: "list".into(),
+                            repetition: meta::Repetition::Repeated,
+                            children: vec![meta::SchemaNode::Leaf {
+                                name: "element".into(),
+                                repetition: meta::Repetition::Required,
+                                ptype: meta::Type::ByteArray,
+                                max_def_level: 1,
+                                max_rep_level: 1,
+                                path: vec![
+                                    "root".into(),
+                                    "my_struct".into(),
+                                    "tags".into(),
+                                    "list".into(),
+                                    "element".into(),
+                                ],
+                            }],
+                            logical_type: None,
+                        }],
+                        logical_type: Some(meta::LogicalType::List),
+                    },
+                    meta::SchemaNode::Leaf {
+                        name: "id".into(),
+                        repetition: meta::Repetition::Required,
+                        ptype: meta::Type::Int64,
+                        max_def_level: 0,
+                        max_rep_level: 0,
+                        path: vec![
+                            "root".into(),
+                            "my_struct".into(),
+                            "id".into(),
+                        ],
+                    },
+                ],
+                logical_type: None,
+            }],
+            logical_type: None,
+        };
+        let result = classify_column_plan(&root, "my_struct", &[]);
+        match result {
+            Err(PqError::Unsupported(msg)) if msg.contains("SP145") => {
+                /* OK */
+            }
+            Err(other) => panic!(
+                "pt15: expected Unsupported(SP145), got Err({other:?})"
+            ),
+            Ok(_) => panic!(
+                "pt15: expected Unsupported(SP145), got Ok(_)"
+            ),
+        }
+    }
+}

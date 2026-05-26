@@ -312,9 +312,11 @@ pub(crate) fn decode_compressed_metablock(
 
         // (f) Resolve distance: implicit (= recent d1) OR decode + ring update.
         let distance = if components.distance_implicit {
-            // Implicit: use the most-recent distance from the ring.
-            // (Per RFC §4 the ring is initialised to [16,15,11,4] —
-            // the very first implicit distance returns 16.)
+            // Implicit: use the most-recent distance (d1) from the ring.
+            // Per RFC §4 the initial ring values "16, 15, 11, 4" read
+            // fourth-to-last → ... → last-distance, so initial d1 = 4
+            // (NOT 16). Cross-referenced against Google c/dec/decode.c
+            // `TakeDistanceFromRingBuffer` for implicit-distance commands.
             ring.slots[0]
         } else {
             let dsym = distance_code.decode_symbol(r)?;

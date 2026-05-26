@@ -107,13 +107,23 @@ pub(crate) const NUM_SHORT_DISTANCE_CODES: u32 = 16;
 /// 16 short codes + 48 direct-code-with-extras = 64.
 pub(crate) const NUM_DISTANCE_CODES_V1: u32 = 64;
 
-/// Brotli initial state of the recent-distances ring per RFC 7932 §4:
-/// "Initially the four entries of the ring buffer are 16, 15, 11, 4."
+/// Brotli initial state of the recent-distances ring per RFC 7932 §4.
 ///
-/// `RING_INIT[0]` is `d1` (most-recent semantically — although the
-/// "first" distance the decoder reads will *replace* d1; until then,
-/// short-code 0 = 16 is the documented Brotli starting distance).
-pub(crate) const RING_INIT: [u32; 4] = [16, 15, 11, 4];
+/// The RFC text reads: "The ring buffer of the four last distances is
+/// initialized by the values 16, 15, 11, and 4 (i.e., the
+/// fourth-to-last is set to 16, the third-to-last to 15, the
+/// second-to-last to 11, and the last distance to 4) at the beginning
+/// of the stream." So **d1 (most-recent) = 4, d2 = 11, d3 = 15,
+/// d4 = 16** — the LITERAL ordering of "16, 15, 11, 4" in the RFC
+/// is fourth-to-last → ... → last-distance, NOT last → ... → fourth.
+///
+/// `RING_INIT[0]` is `d1` (most-recent semantically). This matches the
+/// Google reference C decoder (c/dec/state.c lines 90-93 + c/dec/decode.c
+/// `TakeDistanceFromRingBuffer`), where short-code 0 at stream start
+/// produces distance=4 (not 16). The previous L9b convention had this
+/// reversed, surfacing as a 1-byte discrepancy in pyarrow byte_array
+/// column decoding; corrected per RFC §4 + cross-check vs c/dec.
+pub(crate) const RING_INIT: [u32; 4] = [4, 11, 15, 16];
 
 /// Per-short-code recent-distance ring SLOT INDEX. 0 = d1 (most-recent),
 /// 1 = d2, 2 = d3, 3 = d4. Indexed by the short-code symbol 0..=15.
@@ -346,12 +356,16 @@ mod tests {
         assert_eq!(SHORT_CODE_VALUE_OFFSET[15], 3);
     }
 
-    /// L9b KAT-3: ring `new()` returns the RFC 7932 §4 initial values
-    /// `[16, 15, 11, 4]`.
+    /// L9b KAT-3: ring `new()` returns the RFC 7932 §4 initial values.
+    /// Per RFC §4 text "the fourth-to-last is set to 16, the
+    /// third-to-last to 15, the second-to-last to 11, and the last
+    /// distance to 4" — so `slots[0]=d1=4, slots[1]=d2=11,
+    /// slots[2]=d3=15, slots[3]=d4=16`. Cross-checked against Google's
+    /// c/dec/decode.c `TakeDistanceFromRingBuffer` semantics.
     #[test]
     fn ring_new_uses_rfc_initial_values() {
         let r = DistanceRing::new();
-        assert_eq!(r.slots, [16, 15, 11, 4]);
+        assert_eq!(r.slots, [4, 11, 15, 16]);
     }
 
     /// L9b KAT-4: ring `push(D)` shifts: d1 ← D, d2 ← old_d1, etc.;
@@ -360,65 +374,68 @@ mod tests {
     fn ring_push_shifts_in_correct_order() {
         let mut r = DistanceRing::new();
         r.push(100);
-        assert_eq!(r.slots, [100, 16, 15, 11]);
+        assert_eq!(r.slots, [100, 4, 11, 15]);
         r.push(200);
-        assert_eq!(r.slots, [200, 100, 16, 15]);
+        assert_eq!(r.slots, [200, 100, 4, 11]);
     }
 
     /// L9b KAT-5: short-code 0 → d1 unchanged; does NOT update the ring.
     /// (Per RFC §4 the "reuse d1" path is the ONLY short code that
-    /// preserves the ring contents.)
+    /// preserves the ring contents.) With the RFC-correct initial ring,
+    /// d1 = 4 (NOT 16 — the literal "16, 15, 11, 4" in the RFC reads
+    /// fourth-to-last → ... → last-distance).
     #[test]
     fn short_code_zero_returns_d1_without_updating_ring() {
         let ring = DistanceRing::new();
         let (d, update) = translate_short_distance(0, &ring).unwrap();
-        assert_eq!(d, 16, "code 0 → d1 = 16 (initial)");
+        assert_eq!(d, 4, "code 0 → d1 = 4 (initial last-distance per RFC §4)");
         assert!(!update, "code 0 must NOT update the ring");
     }
 
-    /// L9b KAT-6: short-code 1 → d2 = 15; updates the ring.
-    /// Short-code 2 → d3 = 11; updates the ring.
-    /// Short-code 3 → d4 = 4; updates the ring.
+    /// L9b KAT-6: short-code 1 → d2 = 11; updates the ring.
+    /// Short-code 2 → d3 = 15; updates the ring.
+    /// Short-code 3 → d4 = 16; updates the ring.
+    /// Per RFC §4 + initial values (d1,d2,d3,d4) = (4, 11, 15, 16).
     #[test]
     fn short_codes_1_2_3_select_d2_d3_d4() {
         let ring = DistanceRing::new();
         let (d, u) = translate_short_distance(1, &ring).unwrap();
-        assert_eq!((d, u), (15, true));
-        let (d, u) = translate_short_distance(2, &ring).unwrap();
         assert_eq!((d, u), (11, true));
+        let (d, u) = translate_short_distance(2, &ring).unwrap();
+        assert_eq!((d, u), (15, true));
         let (d, u) = translate_short_distance(3, &ring).unwrap();
-        assert_eq!((d, u), (4, true));
+        assert_eq!((d, u), (16, true));
     }
 
-    /// L9b KAT-7: short-code 4 → d1 - 1 = 15 (with initial d1=16);
+    /// L9b KAT-7: short-code 4 → d1 - 1 = 3 (with initial d1=4);
     /// updates the ring. (Verifies the ± delta arithmetic.)
     #[test]
     fn short_code_four_returns_d1_minus_one() {
         let ring = DistanceRing::new();
         let (d, u) = translate_short_distance(4, &ring).unwrap();
-        assert_eq!((d, u), (15, true));
+        assert_eq!((d, u), (3, true));
     }
 
-    /// L9b KAT-8: short-code 5 → d1 + 1 = 17.
-    /// Short-code 9 → d1 + 3 = 19. (d1 group max-delta.)
+    /// L9b KAT-8: short-code 5 → d1 + 1 = 5.
+    /// Short-code 9 → d1 + 3 = 7. (d1 group max-delta.)
     #[test]
     fn short_code_d1_plus_deltas() {
         let ring = DistanceRing::new();
         let (d, _) = translate_short_distance(5, &ring).unwrap();
-        assert_eq!(d, 17, "d1 + 1 = 17");
+        assert_eq!(d, 5, "d1 + 1 = 5");
         let (d, _) = translate_short_distance(9, &ring).unwrap();
-        assert_eq!(d, 19, "d1 + 3 = 19");
+        assert_eq!(d, 7, "d1 + 3 = 7");
     }
 
-    /// L9b KAT-9: short-code 10 → d2 - 1 = 14 (d2=15).
-    /// Short-code 15 → d2 + 3 = 18.
+    /// L9b KAT-9: short-code 10 → d2 - 1 = 10 (d2=11).
+    /// Short-code 15 → d2 + 3 = 14.
     #[test]
     fn short_code_d2_deltas() {
         let ring = DistanceRing::new();
         let (d, _) = translate_short_distance(10, &ring).unwrap();
-        assert_eq!(d, 14, "d2 - 1 = 14");
+        assert_eq!(d, 10, "d2 - 1 = 10");
         let (d, _) = translate_short_distance(15, &ring).unwrap();
-        assert_eq!(d, 18, "d2 + 3 = 18");
+        assert_eq!(d, 14, "d2 + 3 = 14");
     }
 
     /// L9b KAT-10: short code that would yield distance <= 0 surfaces
@@ -426,7 +443,7 @@ mod tests {
     /// d1 = 1 and then asking for code 8 (= d1 - 3 = -2).
     #[test]
     fn short_code_invalid_negative_distance_rejects() {
-        let ring = DistanceRing { slots: [1, 15, 11, 4] };
+        let ring = DistanceRing { slots: [1, 11, 15, 16] };
         let err = translate_short_distance(8, &ring).unwrap_err();
         match err {
             BrotliDistanceError::InvalidShortDistance { sym, computed } => {
@@ -569,16 +586,16 @@ mod tests {
     }
 
     /// L9b KAT-21: `decode_distance` dispatches on short range:
-    /// sym=1 → d2 = 15 with ring update.
+    /// sym=1 → d2 = 11 with ring update.
     #[test]
     fn decode_distance_dispatches_short_path() {
         let mut ring = DistanceRing::new();
         let bytes = [0x00u8]; // unused for short codes
         let mut r = BitReader::new(&bytes);
         let d = decode_distance(&mut r, 1, &mut ring).unwrap();
-        assert_eq!(d, 15);
-        // Ring should have shifted: d1 = 15, d2 = old d1 = 16, etc.
-        assert_eq!(ring.slots, [15, 16, 15, 11]);
+        assert_eq!(d, 11);
+        // Ring should have shifted: d1 = 11, d2 = old d1 = 4, etc.
+        assert_eq!(ring.slots, [11, 4, 11, 15]);
         // No bits consumed for short codes.
         assert_eq!(r.bit_pos(), 0);
     }
@@ -591,8 +608,8 @@ mod tests {
         let bytes = [0x00u8];
         let mut r = BitReader::new(&bytes);
         let d = decode_distance(&mut r, 0, &mut ring).unwrap();
-        assert_eq!(d, 16);
-        assert_eq!(ring.slots, [16, 15, 11, 4], "ring must be unchanged");
+        assert_eq!(d, 4);
+        assert_eq!(ring.slots, [4, 11, 15, 16], "ring must be unchanged");
         assert_eq!(r.bit_pos(), 0);
     }
 
@@ -605,7 +622,7 @@ mod tests {
         let mut r = BitReader::new(&bytes);
         let d = decode_distance(&mut r, 16, &mut ring).unwrap();
         assert_eq!(d, 1);
-        assert_eq!(ring.slots, [1, 16, 15, 11], "ring must shift in the new distance");
+        assert_eq!(ring.slots, [1, 4, 11, 15], "ring must shift in the new distance");
         assert_eq!(r.bit_pos(), 1);
     }
 
@@ -692,5 +709,74 @@ mod tests {
         let mut r2 = BitReader::new(&bytes2);
         let d2 = decode_distance(&mut r2, 0, &mut ring).unwrap();
         assert_eq!(d2, 20, "short-code 0 must return the most-recent distance");
+    }
+
+    /// Diagnostic KAT: every short code 0..=15 at stream-start (= initial
+    /// ring) produces the byte-exact distance that Google's reference C
+    /// decoder produces, via `c/dec/decode.c TakeDistanceFromRingBuffer`
+    /// applied to initial state `dist_rb = {16, 15, 11, 4}, dist_rb_idx
+    /// = 0`. The C-reference values were derived by hand-tracing the
+    /// reference function:
+    ///   - For codes 0..=3 (= "use d_k unchanged"):
+    ///       offset = code - 3; ring_idx = (0 - offset) & 3
+    ///   - For codes 4..=9 (= "d1 + delta"):
+    ///       index_delta = 3; ring_idx = (0 + 3) & 3 = 3 (= d1 = 4)
+    ///       delta from packed-LUT: code 4→-1, 5→+1, 6→-2, 7→+2, 8→-3, 9→+3
+    ///   - For codes 10..=15 (= "d2 + delta"):
+    ///       index_delta = 2; ring_idx = (0 + 2) & 3 = 2 (= d2 = 11)
+    ///       delta: code 10→-1, 11→+1, 12→-2, 13→+2, 14→-3, 15→+3
+    /// Per RFC 7932 §4: d1=4 (last), d2=11, d3=15, d4=16 (fourth-to-last).
+    /// This KAT pins the table alignment against the Google C reference
+    /// — failure here means the SHORT_CODE_* tables or RING_INIT have
+    /// drifted from the RFC + reference.
+    #[test]
+    fn diagnostic_short_codes_match_google_reference() {
+        let ring = DistanceRing::new();
+        // (sym, expected_distance) per Google's c/dec/decode.c +
+        // c/dec/state.c initial dist_rb = {16, 15, 11, 4}, idx=0.
+        let cases: [(u8, u32); 16] = [
+            (0, 4),       // d1 = 4
+            (1, 11),      // d2 = 11
+            (2, 15),      // d3 = 15
+            (3, 16),      // d4 = 16
+            (4, 3),       // d1 - 1 = 3
+            (5, 5),       // d1 + 1 = 5
+            (6, 2),       // d1 - 2 = 2
+            (7, 6),       // d1 + 2 = 6
+            (8, 1),       // d1 - 3 = 1
+            (9, 7),       // d1 + 3 = 7
+            (10, 10),     // d2 - 1 = 10
+            (11, 12),     // d2 + 1 = 12
+            (12, 9),      // d2 - 2 = 9
+            (13, 13),     // d2 + 2 = 13
+            (14, 8),      // d2 - 3 = 8
+            (15, 14),     // d2 + 3 = 14
+        ];
+        for (sym, expected) in cases {
+            let (d, _update) = translate_short_distance(sym, &ring)
+                .unwrap_or_else(|e| panic!("sym={sym} unexpectedly failed: {e:?}"));
+            assert_eq!(
+                d, expected,
+                "sym={sym} expected distance={expected} (Google reference), got {d}"
+            );
+        }
+    }
+
+    /// Diagnostic KAT: ring-update semantics — after a short code 1..=15
+    /// or any direct code, the new distance becomes d1 and the older
+    /// d1 becomes d2, etc. Specifically, after short-code 3 at stream
+    /// start (= 16 per RFC), the next short-code 0 should return 16
+    /// (the new d1).
+    #[test]
+    fn diagnostic_ring_update_after_short_code_three() {
+        let mut ring = DistanceRing::new();
+        let bytes = [0x00u8];
+        let mut r = BitReader::new(&bytes);
+        let d = decode_distance(&mut r, 3, &mut ring).unwrap();
+        assert_eq!(d, 16, "short-code 3 at start → d4 = 16 (per RFC §4)");
+        // Now ring d1 = 16. Use short-code 0 (= reuse d1) and check.
+        let mut r2 = BitReader::new(&[0u8]);
+        let d2 = decode_distance(&mut r2, 0, &mut ring).unwrap();
+        assert_eq!(d2, 16, "after pushing 16 to ring, short-code 0 returns 16");
     }
 }

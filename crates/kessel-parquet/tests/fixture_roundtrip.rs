@@ -1139,16 +1139,15 @@ fn pyarrow_lz4_raw_flat() {
     assert_eq!(rows[4], vec![I64(5), Bytes(b"eve".to_vec())]);
 }
 
-/// SP150: pyarrow BROTLI round-trip — INTENTIONALLY `#[ignore]`'d until
-/// a zero-dep Brotli decoder ships in its own dedicated SP-arc (~10-15
-/// task slices, comparable to SP125-SP140 zstd). The fixture is checked
-/// in so that arc, when it starts, has the real-data validation target
-/// ready: 2 columns (id INT64 + name STRING), 5 rows, single row group,
-/// V1 data pages, no dictionary, codec id 4 (BROTLI — confirmed by
-/// pyarrow's `col.compression == 'BROTLI'` post-write report).
+/// SP154 final lock: pyarrow BROTLI fixture decodes end-to-end via the
+/// zero-dep RFC 7932 decoder. The fixture has 2 columns (id INT64 +
+/// name STRING), 5 rows, single row group, V1 data pages, no dictionary,
+/// codec id 4. Both data pages (id i64 column + name BYTE_ARRAY column)
+/// decode byte-identical to pyarrow's encoder input. This closes the
+/// SP154 SP-arc and CLOSES OBJ-2c-2 codec matrix at 6/7 codecs supported
+/// (LZO remains deprecated).
 #[test]
-#[ignore = "SP150 V1 only recognizes Codec::Brotli — full decoder is a dedicated multi-week SP-arc"]
-fn pyarrow_brotli_flat_ignored_until_decoder_ships() {
+fn pyarrow_brotli_flat() {
     let rows = extract(BROTLI_FLAT, &["id", "name"]).expect("extract brotli fixture");
     assert_eq!(rows.len(), 5);
     assert_eq!(rows[0], vec![I64(1), Bytes(b"alice".to_vec())]);
@@ -1156,42 +1155,6 @@ fn pyarrow_brotli_flat_ignored_until_decoder_ships() {
     assert_eq!(rows[2], vec![I64(3), Bytes(b"carol".to_vec())]);
     assert_eq!(rows[3], vec![I64(4), Bytes(b"dave".to_vec())]);
     assert_eq!(rows[4], vec![I64(5), Bytes(b"eve".to_vec())]);
-}
-
-/// SP154 L11 boundary lock: post-SP154-L11, the pyarrow Brotli fixture
-/// has TWO data pages — the i64 id-column page decodes byte-identical
-/// via the V1 orchestrator, the BYTE_ARRAY name-column page tickles a
-/// V1-decoder subtle-discrepancy (the produced bytes differ in a way
-/// that downstream byte_array length-prefix parsing surfaces as a
-/// `byte_array data truncated` error). Either of those failure shapes
-/// proves `extract()` doesn't silently succeed on a pyarrow-shape
-/// Brotli file in V1; this test PINS the rejection contract.
-///
-/// Pre-SP154-L11 the contract was "rejection mentions Brotli + names
-/// the zstd/lz4 workaround"; post-L11 the byte_array path errors
-/// before reaching the codec name (Brotli decode IS already succeeding
-/// for the id column), so we relax the message contract to "any
-/// rejection — Brotli-named OR downstream parquet decode failure".
-/// Once L11 reaches full pyarrow parity, this test gets flipped to
-/// the positive `pyarrow_brotli_flat_ignored_until_decoder_ships` round-
-/// trip below.
-#[test]
-fn pyarrow_brotli_flat_rejects_with_named_followup() {
-    let err = extract(BROTLI_FLAT, &["id", "name"])
-        .expect_err("brotli flat fixture must reject in V1 (id column decodes but \
-                     byte_array name column tickles a known V1-decoder discrepancy)");
-    let msg = format!("{err:?}");
-    // Post-L11 contract: rejection can be either a Brotli-named error
-    // OR a downstream parquet error (byte_array truncation, etc.). The
-    // key invariant is `extract()` doesn't silently return wrong data.
-    assert!(
-        msg.contains("Brotli")
-            || msg.contains("brotli")
-            || msg.contains("byte_array")
-            || msg.contains("data truncated"),
-        "rejection should surface a typed error (Brotli decoder or downstream \
-         parquet structural mismatch): {msg}"
-    );
 }
 
 // ════════════════════════════════════════════════════════════════════════════

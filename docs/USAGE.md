@@ -747,7 +747,7 @@ messages.
 > matrix; pyarrow zstd output decodes for all tested fixtures including
 > a 2000‑row stress fixture exercising the FseCompressed mode for all
 > three LL/OF/ML codes simultaneously. Still typed‑Unsupported: LZ4 /
-> Brotli (OBJ‑2c‑2 follow‑ons), REPEATED / nested groups / V2 rep‑levels
+> Brotli (OBJ‑2c‑2 follow‑ons), 3+ deep nested groups (SP146)
 > (OBJ‑2c‑5), DECIMAL precision > 38, per‑page > 64 MiB.
 >
 > The slice‑by‑slice history below records how the capability grew —
@@ -855,18 +855,18 @@ CREATE EXTERNAL SOURCE readings (
   `KEY`) are identical to §7e.
 - `REFRESH` and `DROP EXTERNAL SOURCE` work identically to §7e.
 
-### Parquet scope: what is currently supported (OBJ-2a → OBJ-2c-5 SP143)
+### Parquet scope: what is currently supported (OBJ-2a → OBJ-2c-5 SP145 — arc CLOSED)
 
-| Parquet property | OBJ-2a → OBJ-2c-5 SP143 |
+| Parquet property | OBJ-2a → OBJ-2c-5 SP145 |
 |---|---|
 | Encoding | `PLAIN` and dictionary (`PLAIN_DICTIONARY`/`RLE_DICTIONARY`); RLE/bit-packing hybrid for dictionary indices |
-| Compression codec | `UNCOMPRESSED`, `SNAPPY` (raw block; pages ≤ 64 MiB decompressed), or `GZIP` (RFC 1952; pages ≤ 64 MiB decompressed) |
+| Compression codec | `UNCOMPRESSED`, `SNAPPY` (raw block; pages ≤ 64 MiB decompressed), `GZIP` (RFC 1952; pages ≤ 64 MiB decompressed), or `ZSTD` (RFC 8478) |
 | Column repetition | `REQUIRED` or `OPTIONAL` flat columns (nullable; V1 and V2 definition levels) |
-| Schema shape | flat (REQUIRED + OPTIONAL), `LIST<primitive>` (SP143), `MAP<K, V>` (SP144), `struct<...>` (SP144) |
-| Nested LIST (SP143) | `List<i64>`, `List<f64>`, `List<bool>`, `List<String>`, `List<Optional<T>>`, `Optional<List<T>>` — 4-shape matrix supported (REQ-REP-REQ, REQ-REP-OPT, OPT-REP-REQ, OPT-REP-OPT) |
-| Nested MAP (SP144) | `Map<String, i64>`, `Map<String, String>`, `Map<K, Optional<V>>`, `Optional<Map<K, V>>` — 4-shape matrix; canonical 3-node encoding (`MAP { repeated key_value { REQUIRED key; key|OPTIONAL value }}`); REQUIRED key enforced (group/OPTIONAL keys rejected `Bad`) |
-| Nested struct (SP144) | struct of primitives, REQUIRED or OPTIONAL outer; OPT outer-null detected via all-fields-Null heuristic |
-| Deferred nesting | nested `List<List<T>>`, `List<Map>`, `List<struct>`, `Map<K, struct>`, `Map<K, List<T>>`, struct containing nested groups (SP145) |
+| Schema shape | flat (REQUIRED + OPTIONAL), `LIST<primitive>` (SP143), `MAP<K, V>` (SP144), `struct<...>` (SP144), `List<List<T>>` / `List<struct<...>>` / `Map<K, struct<...>>` / `Map<K, List<T>>` / `struct<List/Map/struct>` (SP145) |
+| Nested LIST (SP143/SP145) | `List<T>` for primitive T (SP143; 4-shape matrix REQ-REP-REQ/REQ-REP-OPT/OPT-REP-REQ/OPT-REP-OPT); `List<List<T>>` for primitive T (SP145; max_rep_level=2 generalized assembler); `List<struct<primitives>>` (SP145; field-zip per item slot) |
+| Nested MAP (SP144/SP145) | `Map<K, V>` for primitive K and V (SP144; 4-shape matrix; canonical 3-node encoding `MAP { repeated key_value { REQUIRED key; REQ\|OPTIONAL value }}`; REQUIRED key enforced); `Map<K, struct<...>>` (SP145; field-zip per value slot); `Map<K, List<T>>` (SP145 BOLD cross-product; V leaf max_rep_level=2) |
+| Nested struct (SP144/SP145) | struct of primitives (SP144); struct of `List<T>` / `struct<...>` / `Map<K,V>` fields (SP145; recursive composition via `StructField.nested: Option<Box<ColumnKind>>`) |
+| Deferred nesting (named SP146 in error messages) | `List<List<List<T>>>` (3-deep), `List<Map<K,V>>`, `Map<_, Map<...>>` — explicitly rejected with `Unsupported("...: SP146 follow-up")`. Composition of "3 layers deep" cross-products is what the SP145 V1 BOLD per-shape composition design defers. |
 | Data page version | V1 and V2 (`DATA_PAGE_V2`) |
 | Row groups | Multi-row-group files are fully supported |
 | Column subset | Only the recipe-mapped columns are decoded; unmapped columns are skipped |
@@ -891,9 +891,25 @@ CREATE EXTERNAL SOURCE readings (
 > field columns. Map keys MUST be REQUIRED per Parquet spec (rejected as
 > `Bad` otherwise). 5 pyarrow 24.0.0 fixtures roundtrip-tested
 > (`map_string_i64`, `optional_map_string_i64`, `map_string_string`,
-> `struct_i64_string`, `optional_struct`). The remaining cross-nesting
-> (`List<struct>`, `Map<K, struct>`, `struct<List>`, etc.) is explicitly
-> rejected with `Unsupported(...)` errors naming SP145.
+> `struct_i64_string`, `optional_struct`).
+>
+> **SP145 deep nesting**: SP145 closes the OBJ-2c-5 arc. The 4 SP145
+> rejections in `classify_column_plan` are LIFTED via per-shape composition
+> (BOLD V1 — no full Dremel automaton needed for the shapes Parquet writers
+> actually produce). 4 new `ColumnKind` variants + a recursive
+> `StructField.nested: Option<Box<ColumnKind>>` enable: (a) `List<List<T>>`
+> via `assemble_list_of_list_primitive` (max_rep_level=2 generalized
+> assembler); (b) `List<struct<...>>` via `assemble_list_of_struct`
+> (field-zip per item slot using the shared REPEATED-ancestor rep stream);
+> (c) `Map<K, struct<...>>` via `assemble_map_of_struct`; (d)
+> `Map<K, List<T>>` (BOLD cross-product) via `assemble_map_of_list`;
+> (e) `struct<List/Map/struct>` via recursive `classify_nested_group_child`
+> + `decode_field_by_kind` dispatch. 7 pyarrow 24.0.0 fixtures
+> roundtrip-tested (`list_of_list_i64`, `list_of_struct`,
+> `map_string_struct`, `struct_with_list_field`, `struct_with_struct_field`,
+> `struct_with_map_field`, `map_string_list_string`). 3-deep nesting
+> (`List<List<List<T>>>`, `List<Map<K,V>>`, `Map<_, Map<...>>`) explicitly
+> rejected with named SP146 follow-up errors. **OBJ-2c-5 arc CLOSED**.
 
 ### What is NOT supported (rejected at REFRESH with a precise error)
 
@@ -902,13 +918,17 @@ failure; prior materialized data is left intact — all-or-nothing, same
 as every other format):
 
 - **REPEATED columns / repetition levels** outside the canonical
-  `LIST<primitive>` (SP143) or `MAP<K, V>` (SP144) 3-node patterns —
-  rejected with `Unsupported(...)`.
-- **Non-flat schema beyond `LIST<primitive>`, `MAP<K, V>`, and bare
-  struct-of-primitives** (deep cross-nesting) — rejected with
-  `Unsupported("...: SP145")` (`List<List<T>>`, `List<Map>`,
-  `List<struct>`, `Map<K, struct>`, `Map<K, List<T>>`, struct containing
-  nested groups — i.e. any column with `max_rep_level >= 2`).
+  `LIST<primitive>` (SP143), `MAP<K, V>` (SP144), `List<List<T>>` /
+  `List<struct>` / `Map<K, struct>` / `Map<K, List<T>>` /
+  `struct<List/Map/struct>` (SP145) shapes — rejected with
+  `Unsupported(...)`.
+- **3-layer-deep cross-nested schemas** (`List<List<List<T>>>`,
+  `List<Map<K,V>>`, `Map<_, Map<...>>`) — rejected with
+  `Unsupported("...: SP146 follow-up")`. SP145 V1 ships the per-shape
+  composition for 2-deep nested + cross-products; 3+ deep recursion is
+  the next slice. `struct<List<struct<...>>>` and similar compositions
+  do work via the recursive `StructField.nested` chain since each
+  recursion level adds at most 1 layer of additional nesting.
 - **Zstd / lz4 / brotli compression** — rejected with
   `Unsupported("compression codec (zstd/lz4/brotli): OBJ-2c")`. GZIP is
   now supported (OBJ-2c-1); V2 pages with these codecs remain

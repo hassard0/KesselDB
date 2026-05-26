@@ -32,10 +32,14 @@ zero external (non-workspace) deps) ·
 `kessel-objstore` (S3 SigV4 + Azure Shared-Key signers) ·
 `kessel-parquet` (zero-dep Parquet reader — Snappy/GZIP/zstd + V1/V2 +
 PLAIN/dict + REQUIRED/OPTIONAL + INT96/DECIMAL/FLBA + **`LIST<primitive>`
-(SP143)** + **`MAP<K, V>` + struct of primitives (SP144)** + sub-modules
-`snappy.rs` / `gzip.rs` / `zstd*.rs` / `assembly.rs` (Dremel record
-assemblers: `assemble_list_primitive` / `assemble_map_kv` /
-`assemble_struct`)).
+(SP143)** + **`MAP<K, V>` + struct of primitives (SP144)** +
+**`List<List<T>>` + `List<struct<...>>` + `Map<K, struct<...>>` +
+`Map<K, List<T>>` + `struct<List/Map/struct>` (SP145 — OBJ-2c-5 CLOSED)** +
+sub-modules `snappy.rs` / `gzip.rs` / `zstd*.rs` / `assembly.rs` (Dremel
+record assemblers: `assemble_list_primitive` / `assemble_map_kv` /
+`assemble_struct` / `assemble_list_of_list_primitive` /
+`assemble_list_of_struct` / `assemble_map_of_struct` /
+`assemble_map_of_list`)).
 
 SP143 extends kessel-parquet with `SchemaTree` (recursive nested schema
 model alongside the flat `leaves` list), multi-bit rep/def level decoders
@@ -58,10 +62,26 @@ annotation or the structural pattern `REPEATED middle with 2 children,
 first REQUIRED`) and the bare struct-of-primitives pattern. The
 `read_chunk_levels_and_values` page-loop helper was factored out of the
 SP143 List path so List + Map share the V1/V2 + dict/codec dispatch.
-Deep cross-nesting (`List<struct>`, `List<Map>`, `List<List<T>>`,
-`Map<K, struct>`, `Map<K, List<T>>`, `struct<group>`, any column with
-`max_rep_level >= 2`) is rejected with typed `Unsupported("…: SP145")`
-errors.
+
+SP145 closes the OBJ-2c-5 arc via BOLD per-shape composition (no full
+Dremel automaton — see spec `docs/superpowers/specs/2026-05-26-kesseldb-parquet-deep-nesting-design.md`
+§3.3). Four new `ColumnKind` variants (`NestedListOfListPrimitive`,
+`NestedListOfStruct`, `NestedMapOfStruct`, `NestedMapOfList`) +
+`StructField.nested: Option<Box<ColumnKind>>` enable recursive
+composition. Four new assemblers in `assembly.rs` handle the new shapes:
+`assemble_list_of_list_primitive` (generalized to max_rep_level=2 via
+rep=0/1/2 dispatch into outer/inner/item accumulators);
+`assemble_list_of_struct` (field-zip per item slot using the shared
+REPEATED-ancestor rep stream); `assemble_map_of_struct` (analogous to
+list_of_struct but with K+struct V); `assemble_map_of_list` (BOLD
+cross-product: V leaf has max_rep_level=2 since both MAP middle and
+LIST middle are REPEATED ancestors). Five new decode helpers in
+`lib.rs` (`decode_field_by_kind` is the recursive entry point for
+struct fields that are themselves nested shapes; the per-shape helpers
+match on chunk-path filtering via `path.last() == "element"` for nested
+LIST leaves). Three-deep nesting (`List<List<List<T>>>`,
+`List<Map<K,V>>`, `Map<_, Map<...>>`) is rejected with typed
+`Unsupported("...: SP146 follow-up")` errors.
 
 **Mechanically-checked artifacts:**
 `kesseldb-tla/` — seven layered TLA+ specs

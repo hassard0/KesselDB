@@ -82,9 +82,11 @@ feature, not an aspiration.
   GZIP + zstd × PLAIN + dictionary × V1 + V2 data pages × INT64 + INT32 +
   INT96 (timestamps) + DECIMAL (INT32 / INT64 / FLBA, precision ≤ 38) +
   FLBA + BYTE_ARRAY** out of the box. Map keys MUST be REQUIRED per
-  Parquet spec; deep cross‑nesting (`List<struct>`, `Map<K, struct>`,
-  `struct<List>`) is rejected with a precise error naming SP145. See
-  [Parquet capability matrix](#parquet-capability-matrix) below.
+  Parquet spec. SP145 closes OBJ‑2c‑5: `List<List<T>>`, `List<struct>`,
+  `Map<K, struct>`, `Map<K, List<T>>`, `struct<List/Map/struct>` all decode
+  via per‑shape composition + recursive `StructField.nested`. 3‑deep
+  (`List<List<List<T>>>`, `List<Map>`, `Map<_, Map>`) is rejected naming
+  SP146. See [Parquet capability matrix](#parquet-capability-matrix) below.
   (`--features external-sources`, default off; `--features
   external-sources-objstore` for S3/Azure + Parquet; deterministic kernel
   unaffected when off.)
@@ -218,7 +220,7 @@ round‑trip fixtures**:
 | **Page version** | V1 + **V2** | V2 raw‑level‑split path (def/rep levels uncompressed, values section compressed) |
 | **Compression** | UNCOMPRESSED, **Snappy**, **GZIP**, **zstd** | All decompressors are zero‑dep hand‑written (`snappy.rs` 338 LOC / `gzip.rs` RFC 1951 inflate / `zstd*.rs` full RFC 8478 pipeline: frame + block + literals (Raw/RLE/Compressed/Treeless) + Huffman (direct + FSE‑weight × 1‑stream + 4‑stream) + sequences (Predefined/RLE/FseCompressed × LL/OF/ML) + 3‑slot repeat‑offset LZ77 execution). All real pyarrow zstd fixtures pass end‑to‑end through `extract()` incl. a 2000‑row stress fixture exercising FseCompressed mode for all three LL/OF/ML codes simultaneously. |
 | **Encoding** | PLAIN, **PLAIN_DICTIONARY / RLE_DICTIONARY** | Dictionary page + data‑page index resolve |
-| **Repetition** | flat REQUIRED + **flat OPTIONAL (nullable)** + **`LIST<primitive>` (SP143)** + **`MAP<K, V>` and `struct` (SP144)** | OPTIONAL via RLE‑hybrid def‑level decode + null‑scatter; SP143 adds Dremel‑style record assembly for the canonical 3‑node `LIST<primitive>` pattern (`List<i64>`, `List<f64>`, `List<bool>`, `List<String>`, `List<Optional<T>>`, `Optional<List<T>>` — 4‑shape matrix); SP144 adds `Map<K, V>` via `assemble_map_kv` (4‑shape matrix; REQUIRED key enforced) and `struct` via `assemble_struct` (zip of N field columns; OPT outer‑null via all‑fields‑Null heuristic); deep cross‑nesting (`List<struct>`, `Map<K, struct>`, `struct<List>`) deferred to SP145 |
+| **Repetition** | flat REQUIRED + **flat OPTIONAL (nullable)** + **`LIST<primitive>` (SP143)** + **`MAP<K, V>` and `struct` (SP144)** + **`List<List<T>>`, `List<struct>`, `Map<K, struct>`, `Map<K, List<T>>`, `struct<List/Map/struct>` (SP145 — OBJ-2c-5 CLOSED)** | OPTIONAL via RLE‑hybrid def‑level decode + null‑scatter; SP143 adds Dremel‑style record assembly for canonical 3‑node `LIST<primitive>` (4‑shape matrix); SP144 adds `Map<K, V>` via `assemble_map_kv` (REQUIRED key enforced) and `struct` via `assemble_struct`; SP145 adds 4 new variants via per‑shape composition: `assemble_list_of_list_primitive` (max_rep=2), `assemble_list_of_struct` (field‑zip per item slot), `assemble_map_of_struct`, `assemble_map_of_list` (BOLD cross‑product) + recursive `StructField.nested` for struct‑containing‑nested |
 | **Physical types** | INT32, **INT64**, **INT96 (timestamp)**, **FLBA**, **BYTE_ARRAY** | INT96 → `PqValue::Timestamp(i64 ns)` via checked Julian‑day arithmetic |
 | **Logical types** | **DECIMAL (INT32/INT64/FLBA, precision 1..=38)**, **FLBA‑UUID** | DECIMAL → `PqValue::Decimal { unscaled: i128, scale: i32 }` |
 | **Multi‑row‑group** | yes | Cross‑row‑group column concatenation |
@@ -227,7 +229,7 @@ round‑trip fixtures**:
 **Still deferred** (typed `Unsupported` at `REFRESH` with a precise
 error naming the follow‑on slice):
 - LZ4 / Brotli compression (OBJ‑2c‑2 follow‑ons)
-- Deep cross‑nesting: `List<List<T>>`, `List<Map>`, `List<struct>`, `Map<K, struct>`, `Map<K, List<T>>`, `struct<List>`/`struct<Map>` (SP145 — any column with `max_rep_level >= 2`)
+- 3‑deep cross‑nesting: `List<List<List<T>>>`, `List<Map<K,V>>`, `Map<_, Map<...>>` (SP146 follow‑up — SP145 V1 ships 2‑deep + cross‑products via per‑shape composition; 3+ deep needs another recursion layer)
 - DECIMAL precision > 38 (would need i256)
 - Per‑page decompressed size > 64 MiB
 

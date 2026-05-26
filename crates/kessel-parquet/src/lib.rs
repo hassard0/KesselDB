@@ -17,6 +17,7 @@ mod gzip;
 mod zstd;
 mod lz4;
 mod brotli_bit_reader;
+mod brotli_huffman;
 mod brotli;
 mod zstd_fse;
 mod zstd_literals;

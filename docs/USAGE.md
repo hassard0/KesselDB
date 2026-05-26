@@ -862,9 +862,11 @@ CREATE EXTERNAL SOURCE readings (
 | Encoding | `PLAIN` and dictionary (`PLAIN_DICTIONARY`/`RLE_DICTIONARY`); RLE/bit-packing hybrid for dictionary indices |
 | Compression codec | `UNCOMPRESSED`, `SNAPPY` (raw block; pages ≤ 64 MiB decompressed), or `GZIP` (RFC 1952; pages ≤ 64 MiB decompressed) |
 | Column repetition | `REQUIRED` or `OPTIONAL` flat columns (nullable; V1 and V2 definition levels) |
-| Schema shape | flat (REQUIRED + OPTIONAL), and `LIST<primitive>` (SP143) |
+| Schema shape | flat (REQUIRED + OPTIONAL), `LIST<primitive>` (SP143), `MAP<K, V>` (SP144), `struct<...>` (SP144) |
 | Nested LIST (SP143) | `List<i64>`, `List<f64>`, `List<bool>`, `List<String>`, `List<Optional<T>>`, `Optional<List<T>>` — 4-shape matrix supported (REQ-REP-REQ, REQ-REP-OPT, OPT-REP-REQ, OPT-REP-OPT) |
-| Deferred nesting | `Map<K,V>` (SP144), `struct<...>` (SP144), nested `List<List<T>>` (SP145), `List<Map>`/`List<struct>` (SP145) |
+| Nested MAP (SP144) | `Map<String, i64>`, `Map<String, String>`, `Map<K, Optional<V>>`, `Optional<Map<K, V>>` — 4-shape matrix; canonical 3-node encoding (`MAP { repeated key_value { REQUIRED key; key|OPTIONAL value }}`); REQUIRED key enforced (group/OPTIONAL keys rejected `Bad`) |
+| Nested struct (SP144) | struct of primitives, REQUIRED or OPTIONAL outer; OPT outer-null detected via all-fields-Null heuristic |
+| Deferred nesting | nested `List<List<T>>`, `List<Map>`, `List<struct>`, `Map<K, struct>`, `Map<K, List<T>>`, struct containing nested groups (SP145) |
 | Data page version | V1 and V2 (`DATA_PAGE_V2`) |
 | Row groups | Multi-row-group files are fully supported |
 | Column subset | Only the recipe-mapped columns are decoded; unmapped columns are skipped |
@@ -879,9 +881,19 @@ CREATE EXTERNAL SOURCE readings (
 > assembly using the canonical 3-node LIST encoding pattern (outer group
 > `LIST { repeated middle group { primitive element }}`). 5 pyarrow 24.0.0
 > fixtures roundtrip-tested (`list_i64_required`, `list_i64_optional`,
-> `list_string`, `optional_list_i64`, `list_with_null_items`). Map, struct,
-> and deep nesting (`List<List<T>>` etc.) are explicitly rejected with
-> `Unsupported(...)` errors naming the future slice (SP144 / SP145).
+> `list_string`, `optional_list_i64`, `list_with_null_items`).
+>
+> **SP144 nested decode**: SP144 lifts the OBJ-2c-5 nested rejection for
+> canonical `Map<K, V>` and struct-of-primitives columns. Map values decode
+> as `PqValue::Map(Vec<(PqValue, PqValue)>)` via `assemble_map_kv` over
+> parallel key+value streams; struct values decode as
+> `PqValue::Struct(Vec<(String, PqValue)>)` via `assemble_struct` zipping N
+> field columns. Map keys MUST be REQUIRED per Parquet spec (rejected as
+> `Bad` otherwise). 5 pyarrow 24.0.0 fixtures roundtrip-tested
+> (`map_string_i64`, `optional_map_string_i64`, `map_string_string`,
+> `struct_i64_string`, `optional_struct`). The remaining cross-nesting
+> (`List<struct>`, `Map<K, struct>`, `struct<List>`, etc.) is explicitly
+> rejected with `Unsupported(...)` errors naming SP145.
 
 ### What is NOT supported (rejected at REFRESH with a precise error)
 
@@ -890,14 +902,13 @@ failure; prior materialized data is left intact — all-or-nothing, same
 as every other format):
 
 - **REPEATED columns / repetition levels** outside the canonical
-  `LIST<primitive>` 3-node pattern — rejected with
-  `Unsupported(...)`. SP143 supports the canonical `LIST<primitive>`
-  shape only.
-- **Non-flat schema beyond `LIST<primitive>`** (Map / struct / deep
-  nesting) — rejected with `Unsupported("...: SP144")` or
-  `Unsupported("...: SP145")` (Map and struct deferred to SP144;
-  `List<List<T>>`, `List<Map>`, `List<struct>` and other deep nesting
-  deferred to SP145).
+  `LIST<primitive>` (SP143) or `MAP<K, V>` (SP144) 3-node patterns —
+  rejected with `Unsupported(...)`.
+- **Non-flat schema beyond `LIST<primitive>`, `MAP<K, V>`, and bare
+  struct-of-primitives** (deep cross-nesting) — rejected with
+  `Unsupported("...: SP145")` (`List<List<T>>`, `List<Map>`,
+  `List<struct>`, `Map<K, struct>`, `Map<K, List<T>>`, struct containing
+  nested groups — i.e. any column with `max_rep_level >= 2`).
 - **Zstd / lz4 / brotli compression** — rejected with
   `Unsupported("compression codec (zstd/lz4/brotli): OBJ-2c")`. GZIP is
   now supported (OBJ-2c-1); V2 pages with these codecs remain

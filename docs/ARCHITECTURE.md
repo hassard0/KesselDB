@@ -32,8 +32,10 @@ zero external (non-workspace) deps) ·
 `kessel-objstore` (S3 SigV4 + Azure Shared-Key signers) ·
 `kessel-parquet` (zero-dep Parquet reader — Snappy/GZIP/zstd + V1/V2 +
 PLAIN/dict + REQUIRED/OPTIONAL + INT96/DECIMAL/FLBA + **`LIST<primitive>`
-(SP143)** + sub-modules `snappy.rs` / `gzip.rs` / `zstd*.rs` /
-`assembly.rs` (Dremel record assembler)).
+(SP143)** + **`MAP<K, V>` + struct of primitives (SP144)** + sub-modules
+`snappy.rs` / `gzip.rs` / `zstd*.rs` / `assembly.rs` (Dremel record
+assemblers: `assemble_list_primitive` / `assemble_map_kv` /
+`assemble_struct`)).
 
 SP143 extends kessel-parquet with `SchemaTree` (recursive nested schema
 model alongside the flat `leaves` list), multi-bit rep/def level decoders
@@ -41,9 +43,25 @@ model alongside the flat `leaves` list), multi-bit rep/def level decoders
 Dremel-style `assemble_list_primitive` record assembler. The `extract`
 entry-point dispatches flat vs nested via `FileMetaData.flat_schema` —
 flat-schema files take the byte-identical pre-SP143 path; nested files
-route through `extract_nested` which currently supports canonical
-3-node `LIST<primitive>` patterns and rejects Map/struct/deep-nesting
-with typed errors naming SP144 / SP145.
+route through `extract_nested`.
+
+SP144 adds `Map<K, V>` decode via `assemble_map_kv` (Dremel-style:
+consumes from parallel key + value streams at every `def == max_def`
+slot; classifies into 4 cases per outer/value optionality with
+REQUIRED-key enforcement) and struct decode via `assemble_struct` (zip
+of N flat-decoded field columns into `PqValue::Struct(Vec<(String,
+PqValue)>)`, with an all-fields-Null heuristic that surfaces OPT struct
+nulls as `PqValue::Null` rather than a struct of all-Null fields). The
+`classify_column_plan` dispatcher recognises the canonical 3-node MAP
+encoding (via either `converted_type=MAP(1)` / `MAP_KEY_VALUE(2)`
+annotation or the structural pattern `REPEATED middle with 2 children,
+first REQUIRED`) and the bare struct-of-primitives pattern. The
+`read_chunk_levels_and_values` page-loop helper was factored out of the
+SP143 List path so List + Map share the V1/V2 + dict/codec dispatch.
+Deep cross-nesting (`List<struct>`, `List<Map>`, `List<List<T>>`,
+`Map<K, struct>`, `Map<K, List<T>>`, `struct<group>`, any column with
+`max_rep_level >= 2`) is rejected with typed `Unsupported("…: SP145")`
+errors.
 
 **Mechanically-checked artifacts:**
 `kesseldb-tla/` — seven layered TLA+ specs

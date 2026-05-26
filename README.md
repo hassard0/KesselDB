@@ -6,7 +6,7 @@
 
 *"It's the database that made the Kessel Run in 12 parsecs."*
 
-`976 default tests green / 1003 with --features kessel-http-gateway/test-server` · `0 external dependencies in the kernel` · `Rust 1.95+` · single‑binary
+`1023 default tests green / 1052 with --features kessel-http-gateway/test-server` · `0 external dependencies in the kernel` · `Rust 1.95+` · single‑binary
 
 </div>
 
@@ -77,10 +77,13 @@ feature, not an aspiration.
 - **External sources & Parquet** — register and `REFRESH`
   JSON/NDJSON/CSV/Parquet from HTTP/HTTPS endpoints or directly from
   S3‑compatible and Azure Blob object storage. The pure‑Rust zero‑dep
-  Parquet reader (`kessel-parquet`) supports **flat REQUIRED + OPTIONAL ×
-  UNCOMPRESSED + Snappy + GZIP + (most) zstd × PLAIN + dictionary × V1 +
-  V2 data pages × INT64 + INT32 + INT96 (timestamps) + DECIMAL (INT32 /
-  INT64 / FLBA, precision ≤ 38) + FLBA + BYTE_ARRAY** out of the box. See
+  Parquet reader (`kessel-parquet`) supports **flat REQUIRED + OPTIONAL +
+  `LIST<primitive>` + `MAP<K, V>` + `struct` × UNCOMPRESSED + Snappy +
+  GZIP + zstd × PLAIN + dictionary × V1 + V2 data pages × INT64 + INT32 +
+  INT96 (timestamps) + DECIMAL (INT32 / INT64 / FLBA, precision ≤ 38) +
+  FLBA + BYTE_ARRAY** out of the box. Map keys MUST be REQUIRED per
+  Parquet spec; deep cross‑nesting (`List<struct>`, `Map<K, struct>`,
+  `struct<List>`) is rejected with a precise error naming SP145. See
   [Parquet capability matrix](#parquet-capability-matrix) below.
   (`--features external-sources`, default off; `--features
   external-sources-objstore` for S3/Azure + Parquet; deterministic kernel
@@ -95,7 +98,7 @@ feature, not an aspiration.
   byte‑untouched; zero external (non‑workspace) deps on the gateway
   crate. See `docs/USAGE.md` §HTTP gateway.
 - **Deterministic & verifiable** — the whole engine is a seedable state machine;
-  the test suite (976 default tests / 1003 with `--features kessel-http-gateway/test-server`, 0 ignored) includes seeded partition/fault
+  the test suite (1023 default tests / 1052 with `--features kessel-http-gateway/test-server`, 0 ignored) includes seeded partition/fault
   simulation, multi‑replica Jepsen, hand‑derived KATs against published
   spec text for every codec, and adversarial pentests for every public input
   surface.
@@ -110,7 +113,7 @@ cargo build --release
 
 # start a node:  kesseldb [LISTEN_ADDR] [DATA_DIR]
 cargo run --release --bin kesseldb -- 127.0.0.1:7878 ./data
-# Workspace gate: 931 default tests, 0 ignored (958 with --features kessel-http-gateway/test-server)
+# Workspace gate: 1023 default tests, 0 ignored (1052 with --features kessel-http-gateway/test-server)
 cargo test --workspace --release
 ```
 
@@ -215,7 +218,7 @@ round‑trip fixtures**:
 | **Page version** | V1 + **V2** | V2 raw‑level‑split path (def/rep levels uncompressed, values section compressed) |
 | **Compression** | UNCOMPRESSED, **Snappy**, **GZIP**, **zstd** | All decompressors are zero‑dep hand‑written (`snappy.rs` 338 LOC / `gzip.rs` RFC 1951 inflate / `zstd*.rs` full RFC 8478 pipeline: frame + block + literals (Raw/RLE/Compressed/Treeless) + Huffman (direct + FSE‑weight × 1‑stream + 4‑stream) + sequences (Predefined/RLE/FseCompressed × LL/OF/ML) + 3‑slot repeat‑offset LZ77 execution). All real pyarrow zstd fixtures pass end‑to‑end through `extract()` incl. a 2000‑row stress fixture exercising FseCompressed mode for all three LL/OF/ML codes simultaneously. |
 | **Encoding** | PLAIN, **PLAIN_DICTIONARY / RLE_DICTIONARY** | Dictionary page + data‑page index resolve |
-| **Repetition** | flat REQUIRED + **flat OPTIONAL (nullable)** + **`LIST<primitive>` (SP143)** | OPTIONAL via RLE‑hybrid def‑level decode + null‑scatter; SP143 adds Dremel‑style record assembly for the canonical 3‑node `LIST<primitive>` pattern (`List<i64>`, `List<f64>`, `List<bool>`, `List<String>`, `List<Optional<T>>`, `Optional<List<T>>` — 4‑shape matrix); Map / struct / deep nesting deferred to SP144 / SP145 |
+| **Repetition** | flat REQUIRED + **flat OPTIONAL (nullable)** + **`LIST<primitive>` (SP143)** + **`MAP<K, V>` and `struct` (SP144)** | OPTIONAL via RLE‑hybrid def‑level decode + null‑scatter; SP143 adds Dremel‑style record assembly for the canonical 3‑node `LIST<primitive>` pattern (`List<i64>`, `List<f64>`, `List<bool>`, `List<String>`, `List<Optional<T>>`, `Optional<List<T>>` — 4‑shape matrix); SP144 adds `Map<K, V>` via `assemble_map_kv` (4‑shape matrix; REQUIRED key enforced) and `struct` via `assemble_struct` (zip of N field columns; OPT outer‑null via all‑fields‑Null heuristic); deep cross‑nesting (`List<struct>`, `Map<K, struct>`, `struct<List>`) deferred to SP145 |
 | **Physical types** | INT32, **INT64**, **INT96 (timestamp)**, **FLBA**, **BYTE_ARRAY** | INT96 → `PqValue::Timestamp(i64 ns)` via checked Julian‑day arithmetic |
 | **Logical types** | **DECIMAL (INT32/INT64/FLBA, precision 1..=38)**, **FLBA‑UUID** | DECIMAL → `PqValue::Decimal { unscaled: i128, scale: i32 }` |
 | **Multi‑row‑group** | yes | Cross‑row‑group column concatenation |
@@ -224,8 +227,7 @@ round‑trip fixtures**:
 **Still deferred** (typed `Unsupported` at `REFRESH` with a precise
 error naming the follow‑on slice):
 - LZ4 / Brotli compression (OBJ‑2c‑2 follow‑ons)
-- `Map<K, V>` columns and `struct<...>` columns (SP144)
-- Deep nesting: `List<List<T>>`, `List<Map>`, `List<struct>`, `Map<K, struct>`, etc. (SP145)
+- Deep cross‑nesting: `List<List<T>>`, `List<Map>`, `List<struct>`, `Map<K, struct>`, `Map<K, List<T>>`, `struct<List>`/`struct<Map>` (SP145 — any column with `max_rep_level >= 2`)
 - DECIMAL precision > 38 (would need i256)
 - Per‑page decompressed size > 64 MiB
 
@@ -295,7 +297,7 @@ Honest boundaries (documented, not hidden):
   `Delete`); cross‑shard scatter‑gather *reads*/SQL text routing is a
   separate, later concern from cross‑shard *transactions*.
 
-Every claim in this repository is backed by the test suite (`931 default tests / 958 with --features kessel-http-gateway/test-server, 0 ignored`); the
+Every claim in this repository is backed by the test suite (`1023 default tests / 1052 with --features kessel-http-gateway/test-server, 0 ignored`); the
 docs call out exactly what is proven versus roadmap. The four
 **strategic‑tier items S1–S4** (TLA+/model‑checked safety, serializable
 MVCC/SI, Jepsen linearizability under partition, deterministic WASM
@@ -322,7 +324,7 @@ records (SP109 / SP110‑SP116 / SP117 / SP118).
 
 ```bash
 cargo build                 # all kernel crates, zero external deps
-cargo test --workspace      # 931 default tests / 958 with --features kessel-http-gateway/test-server (incl. seeded partition/fault sim,
+cargo test --workspace      # 1023 default tests / 1052 with --features kessel-http-gateway/test-server (incl. seeded partition/fault sim,
                             # Jepsen linearizability, MVCC TLA+ refinement,
                             # pyarrow Parquet round-trips, WASM-MVP KATs)
 cargo run -p kessel-bench --release -- --help   # benchmarks

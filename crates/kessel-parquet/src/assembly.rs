@@ -2941,17 +2941,382 @@ mod lom_tests {
 }
 
 /// SP146: assemble `Map<K1, Map<K2, V>>` records (outer Map whose V is
-/// an inner Map with primitive K2 and V). T4 stub — full impl in next commit.
+/// an inner Map with primitive K2 and V).
+///
+/// The inner V leaf has max_rep_level = 2 (outer MAP REP + inner MAP REP).
+/// Inner K shares the SAME REPEATED ancestors as inner V, so it has the
+/// same rep stream at max_rep=2. Outer K has max_rep_level = 1.
+///
+/// We drive assembly off the inner V leaf's (rep, def) stream. Outer K
+/// is consumed one-per-outer-entry-boundary; inner K is consumed
+/// one-per-inner-map-entry slot in parallel with V.
+///
+/// Rep semantics:
+///   rep == 0 → new outer record (flush prev outer Map of inner Maps)
+///   rep == 1 → new outer-Map entry (= new outer K + new inner Map; flush prev inner Map)
+///   rep == 2 → continue current inner Map (append (inner_K, V) pair)
+///
+/// Def classification (max_def = outer_opt + 1 + 1 + inner_v_opt):
+///   d == 0 && outer_opt              → OuterMapNull
+///   d == outer_opt                   → EmptyOuterMap
+///   d == outer_opt + 1               → EmptyInnerMap (outer-entry present but inner-map empty)
+///   d == max_def - 1 (when inner_v_opt) → InnerValueNull
+///   d == max_def                     → InnerValuePresent
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_map_of_map_kv(
-    _inner_rep_levels: &[u32],
-    _inner_def_levels: &[u32],
-    _outer_keys: &[PqValue],
-    _inner_keys: &[PqValue],
-    _inner_values: &[PqValue],
-    _max_def_level: u32,
-    _outer_optional: bool,
-    _inner_value_optional: bool,
+    inner_rep_levels: &[u32],
+    inner_def_levels: &[u32],
+    outer_keys: &[PqValue],
+    inner_keys: &[PqValue],
+    inner_values: &[PqValue],
+    max_def_level: u32,
+    outer_optional: bool,
+    inner_value_optional: bool,
 ) -> Result<Vec<PqValue>, PqError> {
-    Err(PqError::Bad("assemble_map_of_map_kv: SP146 T4 not yet implemented".into()))
+    if inner_rep_levels.len() != inner_def_levels.len() {
+        return Err(PqError::Bad(format!(
+            "rep/def length mismatch: rep={} def={}",
+            inner_rep_levels.len(), inner_def_levels.len()
+        )));
+    }
+    let n = inner_rep_levels.len();
+    if n == 0 {
+        if !outer_keys.is_empty() || !inner_keys.is_empty() || !inner_values.is_empty() {
+            return Err(PqError::Bad(format!(
+                "map_of_map: no levels but {}+{}+{} keys/values",
+                outer_keys.len(), inner_keys.len(), inner_values.len()
+            )));
+        }
+        return Ok(Vec::new());
+    }
+
+    let empty_outer_thr: u32 = outer_optional as u32;
+    let empty_inner_thr: u32 = (outer_optional as u32) + 1;
+    let inner_value_null_thr: u32 = if max_def_level > 0 { max_def_level - 1 } else { 0 };
+
+    #[derive(Copy, Clone, Debug)]
+    enum MomCase {
+        OuterMapNull,
+        EmptyOuterMap,
+        EmptyInnerMap,
+        InnerValueNull,
+        InnerValuePresent,
+    }
+
+    let classify = |def: u32, pos: usize| -> Result<MomCase, PqError> {
+        if def > max_def_level {
+            return Err(PqError::Bad(format!(
+                "def level {def} > max {max_def_level} (position {pos})"
+            )));
+        }
+        if def == max_def_level {
+            return Ok(MomCase::InnerValuePresent);
+        }
+        if outer_optional && def == 0 {
+            return Ok(MomCase::OuterMapNull);
+        }
+        if def == empty_outer_thr {
+            return Ok(MomCase::EmptyOuterMap);
+        }
+        if def == empty_inner_thr {
+            return Ok(MomCase::EmptyInnerMap);
+        }
+        if inner_value_optional && def == inner_value_null_thr {
+            return Ok(MomCase::InnerValueNull);
+        }
+        Err(PqError::Bad(format!(
+            "map_of_map: unclassified def {def} (max={max_def_level}, \
+             outer_opt={outer_optional}, inner_v_opt={inner_value_optional}) at position {pos}"
+        )))
+    };
+
+    let mut out: Vec<PqValue> = Vec::new();
+    // Outer accumulator: Vec of (outer_K, inner_Map).
+    let mut current_outer: Option<Vec<(PqValue, PqValue)>> = None;
+    let mut current_outer_is_null: bool = false;
+    // Inner accumulator: in-flight inner Map<K2, V>.
+    let mut current_inner: Option<Vec<(PqValue, PqValue)>> = None;
+    let mut current_outer_k: Option<PqValue> = None;
+    let mut ok_cursor = 0usize;
+    let mut ik_cursor = 0usize;
+    let mut iv_cursor = 0usize;
+
+    let flush_inner = |outer: &mut Option<Vec<(PqValue, PqValue)>>,
+                       outer_k: &mut Option<PqValue>,
+                       inner: &mut Option<Vec<(PqValue, PqValue)>>|
+     -> Result<(), PqError> {
+        if let Some(im) = inner.take() {
+            let ok = outer_k.take().ok_or_else(||
+                PqError::Bad("map_of_map: flush_inner with no active outer K".into()))?;
+            outer.as_mut()
+                .ok_or_else(|| PqError::Bad(
+                    "map_of_map: flush_inner with no active outer".into()))?
+                .push((ok, PqValue::Map(im)));
+        }
+        Ok(())
+    };
+
+    for i in 0..n {
+        let rep = inner_rep_levels[i];
+        let def = inner_def_levels[i];
+        if rep > 2 {
+            return Err(PqError::Bad(format!(
+                "rep level {rep} > max 2 for map_of_map (position {i})"
+            )));
+        }
+        let dc = classify(def, i)?;
+
+        if rep == 0 {
+            // Flush previous inner + outer.
+            flush_inner(&mut current_outer, &mut current_outer_k, &mut current_inner)?;
+            if let Some(o) = current_outer.take() {
+                out.push(PqValue::Map(o));
+            } else if current_outer_is_null {
+                out.push(PqValue::Null);
+                current_outer_is_null = false;
+            }
+
+            match dc {
+                MomCase::OuterMapNull => {
+                    current_outer = None;
+                    current_outer_is_null = true;
+                    current_inner = None;
+                    current_outer_k = None;
+                }
+                MomCase::EmptyOuterMap => {
+                    current_outer = Some(Vec::new());
+                    current_inner = None;
+                    current_outer_k = None;
+                }
+                MomCase::EmptyInnerMap => {
+                    let ok = outer_keys.get(ok_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("map_of_map: outer-key exhausted at {i}")))?;
+                    ok_cursor += 1;
+                    current_outer = Some(Vec::new());
+                    current_outer_k = Some(ok);
+                    current_inner = Some(Vec::new());
+                }
+                MomCase::InnerValueNull => {
+                    let ok = outer_keys.get(ok_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("map_of_map: outer-key exhausted at {i}")))?;
+                    ok_cursor += 1;
+                    let ik = inner_keys.get(ik_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("map_of_map: inner-key exhausted at {i}")))?;
+                    ik_cursor += 1;
+                    current_outer = Some(Vec::new());
+                    current_outer_k = Some(ok);
+                    current_inner = Some(vec![(ik, PqValue::Null)]);
+                }
+                MomCase::InnerValuePresent => {
+                    let ok = outer_keys.get(ok_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("map_of_map: outer-key exhausted at {i}")))?;
+                    ok_cursor += 1;
+                    let ik = inner_keys.get(ik_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("map_of_map: inner-key exhausted at {i}")))?;
+                    ik_cursor += 1;
+                    let iv = inner_values.get(iv_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("map_of_map: inner-value exhausted at {i}")))?;
+                    iv_cursor += 1;
+                    current_outer = Some(Vec::new());
+                    current_outer_k = Some(ok);
+                    current_inner = Some(vec![(ik, iv)]);
+                }
+            }
+        } else if rep == 1 {
+            // New outer-Map entry. Flush previous inner.
+            if current_outer.is_none() {
+                return Err(PqError::Bad(format!(
+                    "rep=1 without active outer map (position {i})"
+                )));
+            }
+            flush_inner(&mut current_outer, &mut current_outer_k, &mut current_inner)?;
+            match dc {
+                MomCase::EmptyInnerMap => {
+                    let ok = outer_keys.get(ok_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("map_of_map: outer-key exhausted at {i}")))?;
+                    ok_cursor += 1;
+                    current_outer_k = Some(ok);
+                    current_inner = Some(Vec::new());
+                }
+                MomCase::InnerValueNull => {
+                    let ok = outer_keys.get(ok_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("map_of_map: outer-key exhausted at {i}")))?;
+                    ok_cursor += 1;
+                    let ik = inner_keys.get(ik_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("map_of_map: inner-key exhausted at {i}")))?;
+                    ik_cursor += 1;
+                    current_outer_k = Some(ok);
+                    current_inner = Some(vec![(ik, PqValue::Null)]);
+                }
+                MomCase::InnerValuePresent => {
+                    let ok = outer_keys.get(ok_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("map_of_map: outer-key exhausted at {i}")))?;
+                    ok_cursor += 1;
+                    let ik = inner_keys.get(ik_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("map_of_map: inner-key exhausted at {i}")))?;
+                    ik_cursor += 1;
+                    let iv = inner_values.get(iv_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("map_of_map: inner-value exhausted at {i}")))?;
+                    iv_cursor += 1;
+                    current_outer_k = Some(ok);
+                    current_inner = Some(vec![(ik, iv)]);
+                }
+                _ => {
+                    return Err(PqError::Bad(format!(
+                        "map_of_map: rep=1 with non-entry def {dc:?} (position {i})"
+                    )));
+                }
+            }
+        } else {
+            // rep == 2: continue inner Map.
+            let inner = current_inner.as_mut().ok_or_else(||
+                PqError::Bad(format!("rep=2 without active inner map (position {i})")))?;
+            match dc {
+                MomCase::InnerValueNull => {
+                    let ik = inner_keys.get(ik_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("map_of_map: inner-key exhausted at {i}")))?;
+                    ik_cursor += 1;
+                    inner.push((ik, PqValue::Null));
+                }
+                MomCase::InnerValuePresent => {
+                    let ik = inner_keys.get(ik_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("map_of_map: inner-key exhausted at {i}")))?;
+                    ik_cursor += 1;
+                    let iv = inner_values.get(iv_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("map_of_map: inner-value exhausted at {i}")))?;
+                    iv_cursor += 1;
+                    inner.push((ik, iv));
+                }
+                _ => {
+                    return Err(PqError::Bad(format!(
+                        "map_of_map: rep=2 with non-item def {dc:?} (position {i})"
+                    )));
+                }
+            }
+        }
+    }
+
+    // Final flush.
+    flush_inner(&mut current_outer, &mut current_outer_k, &mut current_inner)?;
+    if let Some(o) = current_outer.take() {
+        out.push(PqValue::Map(o));
+    } else if current_outer_is_null {
+        out.push(PqValue::Null);
+    }
+
+    if ok_cursor != outer_keys.len() {
+        return Err(PqError::Bad(format!(
+            "map_of_map: outer keys not fully consumed: cursor={ok_cursor} len={}",
+            outer_keys.len()
+        )));
+    }
+    if ik_cursor != inner_keys.len() {
+        return Err(PqError::Bad(format!(
+            "map_of_map: inner keys not fully consumed: cursor={ik_cursor} len={}",
+            inner_keys.len()
+        )));
+    }
+    if iv_cursor != inner_values.len() {
+        return Err(PqError::Bad(format!(
+            "map_of_map: inner values not fully consumed: cursor={iv_cursor} len={}",
+            inner_values.len()
+        )));
+    }
+
+    Ok(out)
+}
+
+#[cfg(test)]
+mod mom_tests {
+    use super::*;
+
+    /// REQ outer Map, REQ inner Map, REQ V. max_def = 0+1+1+0 = 2; max_rep = 2.
+    /// Record: {"a": {"x": 1, "y": 2}, "b": {"z": 3}}
+    /// Levels (driven off inner V leaf):
+    ///   (rep=0, def=2, ok="a", ik="x", iv=1)  → new outer; new inner Map; first pair
+    ///   (rep=2, def=2,           ik="y", iv=2)  → continue inner Map; append (y,2)
+    ///   (rep=1, def=2, ok="b", ik="z", iv=3)  → new outer entry; new inner Map; pair (z,3)
+    #[test]
+    fn req_req_req_two_outer_entries() {
+        let r = vec![0u32, 2, 1];
+        let d = vec![2u32, 2, 2];
+        let oks = vec![PqValue::Bytes(b"a".to_vec()), PqValue::Bytes(b"b".to_vec())];
+        let iks = vec![
+            PqValue::Bytes(b"x".to_vec()),
+            PqValue::Bytes(b"y".to_vec()),
+            PqValue::Bytes(b"z".to_vec()),
+        ];
+        let ivs = vec![PqValue::I64(1), PqValue::I64(2), PqValue::I64(3)];
+        let out = assemble_map_of_map_kv(&r, &d, &oks, &iks, &ivs, 2, false, false).unwrap();
+        assert_eq!(out, vec![PqValue::Map(vec![
+            (PqValue::Bytes(b"a".to_vec()), PqValue::Map(vec![
+                (PqValue::Bytes(b"x".to_vec()), PqValue::I64(1)),
+                (PqValue::Bytes(b"y".to_vec()), PqValue::I64(2)),
+            ])),
+            (PqValue::Bytes(b"b".to_vec()), PqValue::Map(vec![
+                (PqValue::Bytes(b"z".to_vec()), PqValue::I64(3)),
+            ])),
+        ])]);
+    }
+
+    /// REQ outer, empty outer map. max_def=2. rep=0, def=0.
+    #[test]
+    fn empty_outer_map() {
+        let r = vec![0u32];
+        let d = vec![0u32];
+        let oks: Vec<PqValue> = vec![];
+        let iks: Vec<PqValue> = vec![];
+        let ivs: Vec<PqValue> = vec![];
+        let out = assemble_map_of_map_kv(&r, &d, &oks, &iks, &ivs, 2, false, false).unwrap();
+        assert_eq!(out, vec![PqValue::Map(vec![])]);
+    }
+
+    /// REQ outer, REQ inner-empty. {"k": {}}.
+    /// max_def = 2. rep=0, def=1, ok="k".
+    #[test]
+    fn outer_entry_with_empty_inner_map() {
+        let r = vec![0u32];
+        let d = vec![1u32];
+        let oks = vec![PqValue::Bytes(b"k".to_vec())];
+        let iks: Vec<PqValue> = vec![];
+        let ivs: Vec<PqValue> = vec![];
+        let out = assemble_map_of_map_kv(&r, &d, &oks, &iks, &ivs, 2, false, false).unwrap();
+        assert_eq!(out, vec![PqValue::Map(vec![
+            (PqValue::Bytes(b"k".to_vec()), PqValue::Map(vec![])),
+        ])]);
+    }
+
+    /// OPT outer null. max_def = 1+1+1+0 = 3. rep=0, def=0 → null record.
+    #[test]
+    fn opt_outer_null_record() {
+        let r = vec![0u32];
+        let d = vec![0u32];
+        let oks: Vec<PqValue> = vec![];
+        let iks: Vec<PqValue> = vec![];
+        let ivs: Vec<PqValue> = vec![];
+        let out = assemble_map_of_map_kv(&r, &d, &oks, &iks, &ivs, 3, true, false).unwrap();
+        assert_eq!(out, vec![PqValue::Null]);
+    }
+
+    #[test]
+    fn rejects_rep_overflow() {
+        let r = vec![0u32, 5];
+        let d = vec![2u32, 2];
+        let oks = vec![PqValue::Bytes(b"a".to_vec())];
+        let iks = vec![PqValue::Bytes(b"x".to_vec()), PqValue::Bytes(b"y".to_vec())];
+        let ivs = vec![PqValue::I64(1), PqValue::I64(2)];
+        let err = assemble_map_of_map_kv(&r, &d, &oks, &iks, &ivs, 2, false, false).unwrap_err();
+        assert!(format!("{err:?}").contains("rep level 5"), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_inner_value_underflow() {
+        let r = vec![0u32, 2];
+        let d = vec![2u32, 2];
+        let oks = vec![PqValue::Bytes(b"a".to_vec())];
+        let iks = vec![PqValue::Bytes(b"x".to_vec()), PqValue::Bytes(b"y".to_vec())];
+        let ivs = vec![PqValue::I64(1)]; // need 2
+        let err = assemble_map_of_map_kv(&r, &d, &oks, &iks, &ivs, 2, false, false).unwrap_err();
+        assert!(format!("{err:?}").contains("inner-value exhausted"), "got {err:?}");
+    }
 }

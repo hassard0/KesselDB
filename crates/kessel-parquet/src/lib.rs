@@ -2531,11 +2531,111 @@ fn classify_map_of_group(
                 },
             })
         }
-        // Map<K, Map<...>> — defer.
+        // Map<K, Map<...>> — SP146 T4 lifts.
         Some(meta::LogicalType::Map) => {
-            Err(PqError::Unsupported(format!(
-                "MAP<_, Map> `{map_name}`: SP146 follow-up"
-            )))
+            // Value is the inner MAP outer group. Its child[0] is the
+            // inner REPEATED middle (key_value), which has 2 leaves.
+            if value_children.len() != 1 {
+                return Err(PqError::Unsupported(format!(
+                    "MAP<_, Map> `{map_name}` inner-map outer children != 1: non-canonical"
+                )));
+            }
+            let inner_middle = match &value_children[0] {
+                meta::SchemaNode::Group {
+                    repetition: meta::Repetition::Repeated, children: gc, ..
+                } => gc,
+                _ => return Err(PqError::Unsupported(format!(
+                    "MAP<_, Map> `{map_name}` inner-map middle not REPEATED"
+                ))),
+            };
+            if inner_middle.len() != 2 {
+                return Err(PqError::Unsupported(format!(
+                    "MAP<_, Map> `{map_name}` inner-map middle children != 2"
+                )));
+            }
+            let (ik_name, ik_ptype, ik_rep, ik_max_def, ik_max_rep, ik_path) = match &inner_middle[0] {
+                meta::SchemaNode::Leaf {
+                    name, ptype, repetition, max_def_level, max_rep_level, path,
+                } => (name.clone(), *ptype, *repetition, *max_def_level, *max_rep_level, path.clone()),
+                _ => return Err(PqError::Unsupported(format!(
+                    "MAP<_, Map<group, _>> `{map_name}`: non-primitive inner key, SP147 follow-up"
+                ))),
+            };
+            let (iv_name, iv_ptype, iv_rep, iv_max_def, iv_max_rep, iv_path) = match &inner_middle[1] {
+                meta::SchemaNode::Leaf {
+                    name, ptype, repetition, max_def_level, max_rep_level, path,
+                } => (name.clone(), *ptype, *repetition, *max_def_level, *max_rep_level, path.clone()),
+                _ => return Err(PqError::Unsupported(format!(
+                    "MAP<_, Map<_, group>> `{map_name}`: non-primitive inner value, SP147 follow-up"
+                ))),
+            };
+            if !matches!(ik_rep, meta::Repetition::Required) {
+                return Err(PqError::Unsupported(format!(
+                    "MAP<_, Map<_>> `{map_name}` inner key `{ik_name}` not REQUIRED"
+                )));
+            }
+            let inner_value_optional = matches!(iv_rep, meta::Repetition::Optional);
+            for (label, t) in [("inner key", ik_ptype), ("inner value", iv_ptype)] {
+                match t {
+                    meta::Type::Boolean | meta::Type::Int32 | meta::Type::Int64
+                    | meta::Type::Float | meta::Type::Double | meta::Type::ByteArray
+                    | meta::Type::Int96 | meta::Type::FixedLenByteArray => {}
+                    other => return Err(PqError::Unsupported(format!(
+                        "MAP<_, Map<>> `{map_name}` {label} physical type {other:?}: OBJ-2c"
+                    ))),
+                }
+            }
+            // Expected max_def_levels:
+            //   inner K: outer_optional + 1 (outer MAP REP) + 1 (inner MAP REP) = outer_optional + 2
+            //   inner V: outer_optional + 1 + 1 + inner_value_optional
+            let expected_ik_max_def = (outer_optional as u32) + 2;
+            let expected_iv_max_def = (outer_optional as u32) + 2 + (inner_value_optional as u32);
+            if ik_max_def != expected_ik_max_def {
+                return Err(PqError::Bad(format!(
+                    "MAP<_, Map> `{map_name}` inner K max_def_level={ik_max_def} \
+                     disagrees with expected {expected_ik_max_def}"
+                )));
+            }
+            if iv_max_def != expected_iv_max_def {
+                return Err(PqError::Bad(format!(
+                    "MAP<_, Map> `{map_name}` inner V max_def_level={iv_max_def} \
+                     disagrees with expected {expected_iv_max_def}"
+                )));
+            }
+            if ik_max_rep != 2 || iv_max_rep != 2 {
+                return Err(PqError::Bad(format!(
+                    "MAP<_, Map> `{map_name}` inner K/V max_rep_level={ik_max_rep}/{iv_max_rep} != 2"
+                )));
+            }
+            let ik_struct = leaves.iter().find(|l| l.name == ik_name)
+                .ok_or_else(|| PqError::Bad(format!(
+                    "MAP<_, Map> `{map_name}` inner key leaf `{ik_name}` missing from flat leaves"
+                )))?;
+            let iv_struct = leaves.iter().find(|l| l.name == iv_name)
+                .ok_or_else(|| PqError::Bad(format!(
+                    "MAP<_, Map> `{map_name}` inner value leaf `{iv_name}` missing from flat leaves"
+                )))?;
+            let ik_spec = build_plain_spec(ik_struct)?;
+            let iv_spec = build_plain_spec(iv_struct)?;
+            let ik_chunk_path: Vec<String> = ik_path.iter().skip(1).cloned().collect();
+            let iv_chunk_path: Vec<String> = iv_path.iter().skip(1).cloned().collect();
+            Ok(ColumnPlan {
+                chunk_path: iv_chunk_path.clone(),
+                kind: ColumnKind::NestedMapOfMap {
+                    outer_optional,
+                    outer_key_spec: key_spec,
+                    outer_key_ptype: key_ptype,
+                    outer_key_chunk_path: key_chunk_path,
+                    inner_key_spec: ik_spec,
+                    inner_key_ptype: ik_ptype,
+                    inner_key_chunk_path: ik_chunk_path,
+                    inner_value_spec: iv_spec,
+                    inner_value_ptype: iv_ptype,
+                    inner_value_chunk_path: iv_chunk_path,
+                    max_def_level: iv_max_def,
+                    inner_value_optional,
+                },
+            })
         }
     }
 }
@@ -9518,14 +9618,12 @@ mod sp145_pentest {
         }
     }
 
-    // ── Row 13: classify rejects Map<_, Map<...>> ───────────────────
-    //
-    // The classify_map_of_group helper validates K first (find by
-    // name in flat leaves list), THEN dispatches on V's LogicalType.
-    // Provide the K leaf in `leaves` so we exercise the Map-V
-    // rejection rather than tripping the K-missing path early.
+    // ── Row 13: SP146 LIFTS the Map<_, Map<...>> reject ────────────
+    // Originally pinned "MAP<_, Map>: SP146 follow-up". SP146 T4
+    // lifts; classify_map_of_group's LogicalType::Map arm now classifies
+    // into NestedMapOfMap. Test the secondary leaf-lookup Bad surface.
     #[test]
-    fn sp145_pt13_classify_rejects_map_of_map() {
+    fn sp146_pt13_classify_accepts_map_of_map() {
         // The K leaf the classify lookup will need:
         let outer_key_leaf = meta::SchemaLeaf {
             name: "key".into(),
@@ -9599,12 +9697,13 @@ mod sp145_pentest {
             }],
             logical_type: None,
         };
+        // Outer K is provided; inner K/V leaves are NOT in flat list →
+        // classify reaches inner-leaf lookup and surfaces Bad("missing").
         let r = classify_column_plan(&root, "mom", &leaves_for_test);
         match r {
-            Err(PqError::Unsupported(msg)) if msg.contains("SP146")
-                || msg.contains("MAP<_, Map") => { /* OK */ }
-            Err(other) => panic!("pt13: expected Unsupported(Map<_,Map>), got Err({other:?})"),
-            Ok(_) => panic!("pt13: expected Unsupported, got Ok(_)"),
+            Err(PqError::Bad(msg)) if msg.contains("missing from flat leaves") => { /* OK */ }
+            Err(other) => panic!("pt13: expected Bad(inner-leaf-missing), got Err({other:?})"),
+            Ok(_) => panic!("pt13: classified to Ok but inner leaves were not provided"),
         }
     }
 

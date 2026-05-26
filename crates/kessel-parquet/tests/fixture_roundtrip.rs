@@ -41,6 +41,16 @@ const NULLABLE_PLAIN: &[u8] = include_bytes!("fixtures/nullable_plain.parquet");
 // = value 7 = LZ4_RAW.
 const LZ4_RAW_FLAT: &[u8] = include_bytes!("fixtures/lz4_raw_flat.parquet");
 
+// ── SP150: BROTLI codec fixture ─────────────────────────────────────────────
+// pyarrow 24.0.0 with `compression='brotli'` writes codec id 4 (BROTLI).
+// SP150 V1 only recognizes the codec at meta-decode time (`Codec::Brotli`);
+// decompression returns a typed `Unsupported` naming the dedicated SP-arc
+// follow-up — a zero-dep RFC 7932 Brotli decoder is multi-week scope
+// (~10-15 tasks like SP125-SP140 zstd). The `#[ignore]`'d round-trip below
+// is ready to flip live the moment a Brotli decoder ships; the active
+// rejection-lock test pins the named-follow-up message until then.
+const BROTLI_FLAT: &[u8] = include_bytes!("fixtures/brotli_flat.parquet");
+
 #[test]
 fn fixture_flat_required_decodes_expected_rows() {
     let rows = extract(FLAT, &["id", "name"]).unwrap();
@@ -1127,4 +1137,50 @@ fn pyarrow_lz4_raw_flat() {
     assert_eq!(rows[2], vec![I64(3), Bytes(b"carol".to_vec())]);
     assert_eq!(rows[3], vec![I64(4), Bytes(b"dave".to_vec())]);
     assert_eq!(rows[4], vec![I64(5), Bytes(b"eve".to_vec())]);
+}
+
+/// SP150: pyarrow BROTLI round-trip — INTENTIONALLY `#[ignore]`'d until
+/// a zero-dep Brotli decoder ships in its own dedicated SP-arc (~10-15
+/// task slices, comparable to SP125-SP140 zstd). The fixture is checked
+/// in so that arc, when it starts, has the real-data validation target
+/// ready: 2 columns (id INT64 + name STRING), 5 rows, single row group,
+/// V1 data pages, no dictionary, codec id 4 (BROTLI — confirmed by
+/// pyarrow's `col.compression == 'BROTLI'` post-write report).
+#[test]
+#[ignore = "SP150 V1 only recognizes Codec::Brotli — full decoder is a dedicated multi-week SP-arc"]
+fn pyarrow_brotli_flat_ignored_until_decoder_ships() {
+    let rows = extract(BROTLI_FLAT, &["id", "name"]).expect("extract brotli fixture");
+    assert_eq!(rows.len(), 5);
+    assert_eq!(rows[0], vec![I64(1), Bytes(b"alice".to_vec())]);
+    assert_eq!(rows[1], vec![I64(2), Bytes(b"bob".to_vec())]);
+    assert_eq!(rows[2], vec![I64(3), Bytes(b"carol".to_vec())]);
+    assert_eq!(rows[3], vec![I64(4), Bytes(b"dave".to_vec())]);
+    assert_eq!(rows[4], vec![I64(5), Bytes(b"eve".to_vec())]);
+}
+
+/// SP150 rejection lock: SP150 V1 ships meta-decode recognition only;
+/// `extract()` over a real pyarrow-emitted Brotli parquet MUST return a
+/// typed `Unsupported` error naming the dedicated SP-arc follow-up
+/// (zero-dep RFC 7932 decoder is multi-week scope) and pointing users
+/// at the shipped workarounds (`compression='zstd'` or `'lz4'`). This
+/// test PINS that rejection contract until the Brotli decoder lands and
+/// the `#[ignore]`'d round-trip above is flipped live — at which point
+/// this test gets deleted as part of the same arc.
+#[test]
+fn pyarrow_brotli_flat_rejects_with_named_followup() {
+    let err = extract(BROTLI_FLAT, &["id", "name"])
+        .expect_err("brotli decompression must be rejected pre-decoder-arc");
+    let msg = format!("{err:?}");
+    // Named-follow-up contract: error must mention Brotli (the codec) AND
+    // either the SP-arc follow-up OR one of the shipped workarounds, so
+    // the user sees both WHY it failed and WHAT to do instead.
+    assert!(
+        msg.contains("Brotli") || msg.contains("brotli"),
+        "rejection should name 'Brotli' so users understand the codec: {msg}"
+    );
+    assert!(
+        msg.contains("zstd") || msg.contains("lz4") || msg.contains("SP-arc"),
+        "rejection should name the workaround (zstd/lz4) or the SP-arc \
+         follow-up so users have a path forward: {msg}"
+    );
 }

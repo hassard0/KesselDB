@@ -13,6 +13,12 @@ env:
   # NOTE: not enforcing -D warnings (kessel-sm has 3 pre-existing
   # untouched warnings; let cargo warn but not fail).
 
+# SP154 follow-up: removed dependency on dtolnay/rust-toolchain action
+# after the 2026-05-26 GitHub Actions outage took down codeload.github.com,
+# which broke every job. ubuntu-24.04 runner images ship with a recent
+# stable Rust pre-installed (`/usr/share/rust` + `~/.cargo` on the runner),
+# so we use that directly and skip the third-party action entirely.
+
 jobs:
   test:
     name: cargo test (workspace, release)
@@ -20,8 +26,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Verify pre-installed Rust toolchain
+        run: |
+          rustc --version
+          cargo --version
       - name: Cache cargo registry + target
         uses: actions/cache@v4
         with:
@@ -50,8 +58,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Verify pre-installed Rust toolchain
+        run: |
+          rustc --version
+          cargo --version
       - name: Cache cargo registry + target
         uses: actions/cache@v4
         with:
@@ -76,8 +86,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Verify pre-installed Rust toolchain
+        run: |
+          rustc --version
+          cargo --version
       - name: Verify default kesseldb-server links no HTTP/gateway crates
         run: |
           OUT=$(cargo tree -p kesseldb-server --no-default-features 2>&1 | grep -E "hyper|httparse|h2|tokio|mio|socket2|axum|actix|warp|kessel-http-gateway" || true)
@@ -94,9 +106,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Install stable toolchain with rustfmt
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - name: rustfmt
-        run: cargo fmt --all -- --check || (echo "::warning::cargo fmt would change files (non-blocking)" && exit 0)
+      - name: rustfmt check (warn-only)
+        run: |
+          # rustfmt is part of the default ubuntu-latest Rust install.
+          cargo fmt --all -- --check || (echo "::warning::cargo fmt would change files (non-blocking)" && exit 0)

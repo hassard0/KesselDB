@@ -1934,4 +1934,197 @@ mod tests {
             ));
         }
     }
+
+    /// SP-A T2 (SP155 §7.1): the headline multi-shard correctness
+    /// test. Spin up two deployments — a K=4 cluster behind a router
+    /// and a K=1 cluster also behind a router — populate BOTH with
+    /// the SAME 16 codec-encoded rows (so the per-shard placement
+    /// differs but the global row set is identical), then issue
+    /// `Op::SelectSorted` against both routers and assert the
+    /// returned bytes are byte-identical.
+    ///
+    /// This locks the spec's acceptance criterion #1 + the K=1
+    /// degenerate property: a scatter over K=4 produces the same
+    /// answer as a single fat shard, modulo the per-row encoding
+    /// (which is identical because the per-shard SMs are
+    /// deterministic and the merge is byte-equivalent to a sort of
+    /// the union).
+    ///
+    /// Test shape:
+    ///   - Type `t` has one U64 column `v` (field_id=0).
+    ///   - 16 rows with id=i (1..=16) and v=i (1..=16).
+    ///   - The ascending `SelectSorted` over the full set yields rows
+    ///     in `v` order — and since v=id here, the ids 1..=16 each.
+    ///   - Both K=1 and K=4 routers must return the identical
+    ///     `OpResult::Got(bytes)`.
+    ///
+    /// The K=1-vs-K=4 byte-identical property is the killer SP-A
+    /// correctness check (spec §7.2 property test parameterized over
+    /// K; T5 widens this to random data + K∈{1,2,4,8,16}).
+    #[test]
+    fn scatter_select_sorted_k4_matches_k1_byte_identical() {
+        use kessel_catalog::{decode_type_def, ObjectType};
+        use kessel_codec::{encode, Value};
+        use kessel_expr::Program;
+
+        // ---- helper: build a router with K shards over real sockets ----
+        fn spawn_k_router(k: usize, tag: &str) -> (SocketAddr, Arc<Router>) {
+            let mut shards: Vec<Vec<String>> = Vec::with_capacity(k);
+            for i in 0..k {
+                shards.push(spawn_shard(&format!("{tag}-{i}")));
+            }
+            let router = Arc::new(Router::new(shards));
+            let rl = TcpListener::bind("127.0.0.1:0").unwrap();
+            let raddr = rl.local_addr().unwrap();
+            {
+                let r = router.clone();
+                std::thread::spawn(move || serve_router(rl, r));
+            }
+            (raddr, router)
+        }
+
+        let (k1_addr, _k1_router) = spawn_k_router(1, "sp-a-k1");
+        let (k4_addr, _k4_router) = spawn_k_router(4, "sp-a-k4");
+
+        // Both deployments have 1×3 + 4×3 = 15 VSR nodes; let them
+        // settle their leadership.
+        std::thread::sleep(Duration::from_millis(2400));
+
+        // ---- create the same type on both deployments ----
+        let mut c_k1 = Client::connect(k1_addr).unwrap();
+        let mut c_k4 = Client::connect(k4_addr).unwrap();
+        let type_def_bytes = encode_type_def(
+            "t",
+            &[Field {
+                field_id: 0,
+                name: "v".into(),
+                kind: FieldKind::U64,
+                nullable: false,
+            }],
+        );
+        for c in [&mut c_k1, &mut c_k4] {
+            assert_eq!(
+                c.call(&Op::CreateType { def: type_def_bytes.clone() })
+                    .unwrap(),
+                OpResult::TypeCreated(1)
+            );
+        }
+
+        // ---- build the codec-shaped record for v=i ----
+        // `ObjectType::from_def` is the canonical "minimal type for
+        // codec encode/decode" — enough for record encoding, no
+        // index/constraint state. `schema_ver` defaults to 1, which
+        // matches the freshly-created type on shard 0 (the SM
+        // increments it on each CreateType, starting from 1).
+        let (name, fields) = decode_type_def(&type_def_bytes).unwrap();
+        let ot = ObjectType::from_def(name, fields);
+        let make_record = |v: u64| -> Vec<u8> {
+            encode(&ot, &[Value::Uint(v as u128)]).unwrap()
+        };
+
+        // ---- insert the same 16 rows into both deployments ----
+        let n: u128 = 16;
+        for i in 1..=n {
+            let id = ObjectId::from_u128(i);
+            let rec = make_record(i as u64);
+            for c in [&mut c_k1, &mut c_k4] {
+                assert_eq!(
+                    c.call(&Op::Create {
+                        type_id: 1,
+                        id,
+                        record: rec.clone(),
+                    })
+                    .unwrap(),
+                    OpResult::Ok,
+                    "Create row {i} via the router must Ok"
+                );
+            }
+        }
+
+        // ---- the scatter: SelectSorted ascending by `v` ----
+        // NB: the SM reassigns field_ids 1..=n at CreateType time
+        // (deterministic); the wire request side passes field_id=0
+        // but the catalog stores it as field_id=1. SelectSorted's
+        // sort_field references the assigned id.
+        let always_true = Program::new().push_int(1).bytes();
+        let sorted_op = Op::SelectSorted {
+            type_id: 1,
+            program: always_true.clone(),
+            sort_field: 1,
+            desc: false,
+            offset: 0,
+            limit: 0, // all rows
+        };
+        let r_k1 = c_k1.call(&sorted_op).unwrap();
+        let r_k4 = c_k4.call(&sorted_op).unwrap();
+
+        // ---- assert byte-identical ----
+        let bytes_k1 = match &r_k1 {
+            OpResult::Got(b) => b,
+            other => panic!("K=1 SelectSorted must Got, got {other:?}"),
+        };
+        let bytes_k4 = match &r_k4 {
+            OpResult::Got(b) => b,
+            other => panic!("K=4 SelectSorted must Got, got {other:?}"),
+        };
+        assert_eq!(
+            bytes_k1, bytes_k4,
+            "SP-A: SelectSorted over K=4 must be byte-identical to K=1; \
+             K=1 len={} K=4 len={}",
+            bytes_k1.len(),
+            bytes_k4.len(),
+        );
+
+        // ---- spot-check: the result has all 16 rows ----
+        // The output is `[u32 rowlen][record]*`. Count rows by walking
+        // length prefixes; assert the v=i ascending order is preserved.
+        let mut pos = 0usize;
+        let mut count = 0u64;
+        let mut last_v: i128 = -1; // -1 because v starts at 1
+        while pos < bytes_k4.len() {
+            let len = u32::from_le_bytes(
+                bytes_k4[pos..pos + 4].try_into().unwrap(),
+            ) as usize;
+            pos += 4;
+            let rec = &bytes_k4[pos..pos + len];
+            pos += len;
+            // Field 0 (U64 v) lives at HEADER_BYTES offset, 8 bytes wide.
+            let v = u64::from_le_bytes(
+                rec[kessel_catalog::HEADER_BYTES
+                    ..kessel_catalog::HEADER_BYTES + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            assert!(
+                (v as i128) > last_v,
+                "ascending sort violated at row {count}: v={v} ≤ \
+                 last_v={last_v}"
+            );
+            last_v = v as i128;
+            count += 1;
+        }
+        assert_eq!(count, n as u64, "expected {n} rows, saw {count}");
+
+        // ---- and the unordered scan also works across shards ----
+        // `Op::Select` lowers to ScatterKind::Unordered. The result
+        // length must equal the K=1 single-shard length; concrete
+        // bytes may differ from K=4 (per-shard concat order vs single
+        // shard order), so just lock count + total length.
+        let select_op = Op::Select {
+            type_id: 1,
+            program: always_true,
+            limit: 0,
+        };
+        let s_k1 = c_k1.call(&select_op).unwrap();
+        let s_k4 = c_k4.call(&select_op).unwrap();
+        let (s_k1_b, s_k4_b) = match (&s_k1, &s_k4) {
+            (OpResult::Got(a), OpResult::Got(b)) => (a, b),
+            other => panic!("Select must Got on both, got {other:?}"),
+        };
+        assert_eq!(
+            s_k1_b.len(),
+            s_k4_b.len(),
+            "Select over K=4 must return the same total bytes as K=1"
+        );
+    }
 }

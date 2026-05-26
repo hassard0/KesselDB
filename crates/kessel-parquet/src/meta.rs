@@ -174,6 +174,15 @@ pub enum LogicalType {
     /// a single primitive leaf (SP143). SP144/SP145 may extend this to
     /// List<group> and other shapes.
     List,
+    /// SP144: Parquet MAP / MAP_KEY_VALUE annotation OR the equivalent
+    /// structural 3-node pattern (outer group → REPEATED middle group
+    /// with exactly two children where the FIRST is REQUIRED — the
+    /// key — and the second is the value). Per parquet-format
+    /// LogicalTypes.md, the canonical `converted_type` is `MAP=1`; the
+    /// older `MAP_KEY_VALUE=2` is the deprecated legacy alias and is
+    /// treated as a synonym. Recognition only — the nested-decode path
+    /// (`assemble_map_kv`) consumes this in a later T.
+    Map,
 }
 
 /// SP143: full schema tree node. Produced alongside the legacy flat
@@ -449,28 +458,47 @@ fn build_schema_node(
     Ok(node)
 }
 
-/// SP143: recognize the LIST logical-type annotation on a group node.
-///   1. Explicit `converted_type == 3` (ConvertedType::LIST) wins.
-///   2. Structural fallback: the canonical 3-node LIST pattern is
-///      `outer { repeated middle { primitive_leaf } }` — a group with
-///      exactly one REPEATED child group that itself has exactly one
-///      primitive-leaf child. The middle group's name is conventionally
-///      "list" / "array" / "bag" but we accept any name (the structural
-///      pattern is what matters, per parquet-format LogicalTypes.md
-///      "Backward-compatible rules").
+/// SP143/SP144: recognize the LIST or MAP logical-type annotation on a
+/// group node.
+///
+/// Annotation precedence (parquet-format LogicalTypes.md
+/// "Backward-compatible rules"):
+///   1. Explicit `converted_type` wins:
+///        * `LIST=3`                 → `LogicalType::List`
+///        * `MAP=1` / `MAP_KEY_VALUE=2` → `LogicalType::Map`
+///          (MAP_KEY_VALUE is the deprecated legacy alias and is
+///          treated as a synonym.)
+///   2. Structural fallback (outer group with a single REPEATED middle
+///      group child):
+///        * MAP shape:  middle has EXACTLY 2 children where the FIRST
+///          is REQUIRED (the key). Both may be leaves or groups; this
+///          slice only acts on the structural fingerprint, not the
+///          value's physical shape. Checked BEFORE the LIST fallback
+///          because a MAP's middle group always has 2 children whereas
+///          a LIST's middle group always has 1, so the patterns are
+///          mutually exclusive.
+///        * LIST shape: middle has EXACTLY 1 leaf child (the SP143
+///          List<primitive> pattern). SP145 may broaden this to
+///          List<group>.
+///
 /// Returns `None` when neither rule matches — the group is a plain
-/// nested struct, not a LIST.
+/// nested struct.
 fn recognize_logical_type(
     elem: &RawSchemaElement,
     children: &[SchemaNode],
 ) -> Option<LogicalType> {
-    // Rule 1: explicit ConvertedType::LIST(3) annotation.
-    if elem.converted_type == Some(3) {
-        return Some(LogicalType::List);
+    // Rule 1: explicit ConvertedType annotation.
+    if let Some(ct) = elem.converted_type {
+        match ct {
+            3 => return Some(LogicalType::List),
+            // MAP=1 (canonical) or MAP_KEY_VALUE=2 (deprecated alias).
+            1 | 2 => return Some(LogicalType::Map),
+            _ => {}
+        }
     }
-    // Rule 2: structural 3-node LIST shape (outer → repeated middle →
-    // primitive leaf). Only triggered for the SP143 List<primitive>
-    // recognition — SP144/SP145 will broaden this.
+    // Rule 2: structural fallback — outer group with a single REPEATED
+    // middle group child. Both LIST and MAP share this outer shape;
+    // the middle group's child-count + key repetition disambiguates.
     if children.len() == 1 {
         if let SchemaNode::Group {
             repetition: Repetition::Repeated,
@@ -478,6 +506,21 @@ fn recognize_logical_type(
             ..
         } = &children[0]
         {
+            // Structural MAP: REPEATED middle with EXACTLY 2 children
+            // where the FIRST is REQUIRED (the key). Per the spec the
+            // key must be a primitive leaf, but we only fingerprint
+            // on the REQUIRED repetition here — the assembly path
+            // validates the physical-type constraint later.
+            if middle_children.len() == 2 {
+                if let SchemaNode::Leaf {
+                    repetition: Repetition::Required,
+                    ..
+                } = &middle_children[0]
+                {
+                    return Some(LogicalType::Map);
+                }
+            }
+            // Structural LIST (SP143): EXACTLY one primitive-leaf child.
             if middle_children.len() == 1
                 && matches!(middle_children[0], SchemaNode::Leaf { .. })
             {
@@ -1596,5 +1639,253 @@ mod tests {
             }
             _ => panic!("root must be a Group"),
         }
+    }
+
+    /// Walks the schema tree DFS to find a group node by its group name.
+    /// Returns `None` if no such group exists. Companion to
+    /// `find_leaf_by_name`; introduced for the SP144 T2 MAP KATs.
+    fn find_group_by_name<'a>(
+        node: &'a SchemaNode,
+        target: &str,
+    ) -> Option<&'a SchemaNode> {
+        match node {
+            SchemaNode::Group { name, children, .. } => {
+                if name == target {
+                    return Some(node);
+                }
+                for child in children {
+                    if let Some(found) = find_group_by_name(child, target) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn schema_tree_recognizes_map_string_i64_via_converted_type() {
+        // SP144 T2 KAT (annotation path): prove that decode recognizes
+        // the canonical Parquet MAP encoding when the outer group
+        // carries `converted_type=MAP(1)`.
+        //
+        // Schema (DFS preorder, 5 SchemaElements):
+        //   [0] root: GROUP {name="schema", num_children=1}
+        //   [1] prefs: GROUP {name="prefs", repetition=OPTIONAL,
+        //                     converted_type=MAP(1), num_children=1}
+        //   [2] key_value: GROUP {name="key_value",
+        //                     repetition=REPEATED, num_children=2}
+        //   [3] key:   LEAF {f1 type=BYTE_ARRAY, f3 repetition=REQUIRED,
+        //                     f4 name="key"}
+        //   [4] value: LEAF {f1 type=INT64, f3 repetition=OPTIONAL,
+        //                     f4 name="value"}
+        //
+        // Compact-thrift encoding conventions (mirror the SP143 LIST
+        // KAT above):
+        //   field header = (field_delta << 4) | ctype
+        //   ctype: i32=5, binary=8, struct=12, list=9
+        //   i32/i64 values are zigzag uvariants; field IDs reset to 0
+        //   at every nested-struct boundary.
+        let mut m = Vec::new();
+        // FileMetaData f1 version=1: (1<<4)|5=0x15 ; zz(1)=2
+        m.push(0x15); uv(&mut m, zz(1));
+        // FileMetaData f2 list<SchemaElement> 5 elements:
+        //   delta 1->2=1 -> (1<<4)|9=0x19 ; list (5<<4)|12=0x5c
+        m.push(0x19); m.push(0x5c);
+
+        // schema[0] root GROUP: f4 name="schema", f5 num_children=1.
+        // No f1 type, no f3 repetition (defaults to REQUIRED).
+        // f4 name: delta 0->4=4, binary=8 -> 0x48; len=6
+        m.push(0x48); uv(&mut m, 6); m.extend_from_slice(b"schema");
+        // f5 num_children=1: delta 4->5=1, i32=5 -> 0x15; zz(1)=2
+        m.push(0x15); uv(&mut m, zz(1));
+        m.push(0x00); // stop schema[0]
+
+        // schema[1] "prefs" GROUP: f3 OPTIONAL(1), f4 name="prefs",
+        //   f5 num_children=1, f6 converted_type=MAP(1).
+        // f3 repetition=OPTIONAL(1): delta 0->3=3, i32=5 -> 0x35; zz(1)=2
+        m.push(0x35); uv(&mut m, zz(1));
+        // f4 name="prefs": delta 3->4=1, binary=8 -> 0x18; len=5
+        m.push(0x18); uv(&mut m, 5); m.extend_from_slice(b"prefs");
+        // f5 num_children=1: delta 4->5=1, i32=5 -> 0x15; zz(1)=2
+        m.push(0x15); uv(&mut m, zz(1));
+        // f6 converted_type=MAP(1): delta 5->6=1, i32=5 -> 0x15; zz(1)=2
+        m.push(0x15); uv(&mut m, zz(1));
+        m.push(0x00); // stop schema[1]
+
+        // schema[2] "key_value" GROUP: f3 REPEATED(2), f4 name="key_value",
+        //   f5 num_children=2.
+        // f3 repetition=REPEATED(2): delta 0->3=3, i32=5 -> 0x35; zz(2)=4
+        m.push(0x35); uv(&mut m, zz(2));
+        // f4 name="key_value": delta 3->4=1, binary=8 -> 0x18; len=9
+        m.push(0x18); uv(&mut m, 9); m.extend_from_slice(b"key_value");
+        // f5 num_children=2: delta 4->5=1, i32=5 -> 0x15; zz(2)=4
+        m.push(0x15); uv(&mut m, zz(2));
+        m.push(0x00); // stop schema[2]
+
+        // schema[3] "key" LEAF: f1 type=BYTE_ARRAY(6),
+        //   f3 repetition=REQUIRED(0), f4 name="key".
+        // f1 type=BYTE_ARRAY(6): delta 0->1=1, i32=5 -> 0x15; zz(6)=12
+        m.push(0x15); uv(&mut m, zz(6));
+        // f3 repetition=REQUIRED(0): delta 1->3=2, i32=5 -> 0x25; zz(0)=0
+        m.push(0x25); uv(&mut m, zz(0));
+        // f4 name="key": delta 3->4=1, binary=8 -> 0x18; len=3
+        m.push(0x18); uv(&mut m, 3); m.extend_from_slice(b"key");
+        m.push(0x00); // stop schema[3]
+
+        // schema[4] "value" LEAF: f1 type=INT64(2),
+        //   f3 repetition=OPTIONAL(1), f4 name="value".
+        // f1 type=INT64(2): delta 0->1=1, i32=5 -> 0x15; zz(2)=4
+        m.push(0x15); uv(&mut m, zz(2));
+        // f3 repetition=OPTIONAL(1): delta 1->3=2, i32=5 -> 0x25; zz(1)=2
+        m.push(0x25); uv(&mut m, zz(1));
+        // f4 name="value": delta 3->4=1, binary=8 -> 0x18; len=5
+        m.push(0x18); uv(&mut m, 5); m.extend_from_slice(b"value");
+        m.push(0x00); // stop schema[4]
+
+        // FileMetaData f3 num_rows=0: delta 2->3=1, i64=6 -> 0x16; zz(0)=0
+        m.push(0x16); uv(&mut m, zz(0));
+        // Omit f4 row_groups (loop tolerates absence).
+        m.push(0x00); // stop FileMetaData
+
+        let md = FileMetaData::decode(&m).expect("MAP schema decodes");
+
+        // MAP wraps an intermediate group ⇒ not flat (preserves the
+        // OBJ-2b flat-decode gate).
+        assert!(!md.flat_schema, "MAP schema ⇒ not flat");
+
+        // Two true leaves (key + value).
+        assert_eq!(md.leaves.len(), 2, "MAP exposes 2 leaves: key + value");
+        assert_eq!(md.leaves[0].name, "key");
+        assert_eq!(md.leaves[0].ptype, Type::ByteArray);
+        assert_eq!(md.leaves[0].repetition, Repetition::Required);
+        assert_eq!(md.leaves[1].name, "value");
+        assert_eq!(md.leaves[1].ptype, Type::Int64);
+        assert_eq!(md.leaves[1].repetition, Repetition::Optional);
+
+        // The MAP annotation must land on the outer "prefs" group via
+        // the explicit converted_type=MAP(1) rule.
+        let prefs = find_group_by_name(&md.schema_tree.root, "prefs")
+            .expect("prefs group present in tree");
+        if let SchemaNode::Group {
+            name,
+            repetition,
+            logical_type,
+            ..
+        } = prefs {
+            assert_eq!(name, "prefs");
+            assert_eq!(*repetition, Repetition::Optional);
+            assert_eq!(
+                logical_type.as_ref(),
+                Some(&LogicalType::Map),
+                "prefs group recognized as MAP (converted_type=1)",
+            );
+        } else {
+            panic!("expected Group for 'prefs', got {:?}", prefs);
+        }
+
+        // Dremel levels: key under [prefs OPT, key_value REP,
+        // key REQ] ⇒ max_def=1+1+0=2, max_rep=1. value under
+        // [prefs OPT, key_value REP, value OPT] ⇒ max_def=3, max_rep=1.
+        let key = find_leaf_by_name(&md.schema_tree.root, "key")
+            .expect("key leaf present");
+        if let SchemaNode::Leaf { max_def_level, max_rep_level, .. } = key {
+            assert_eq!(*max_def_level, 2,
+                "key max_def_level: OPT + REP + REQ = 2");
+            assert_eq!(*max_rep_level, 1,
+                "key max_rep_level: one REPEATED ancestor = 1");
+        } else {
+            panic!("expected Leaf for 'key'");
+        }
+        let value = find_leaf_by_name(&md.schema_tree.root, "value")
+            .expect("value leaf present");
+        if let SchemaNode::Leaf { max_def_level, max_rep_level, .. } = value {
+            assert_eq!(*max_def_level, 3,
+                "value max_def_level: OPT + REP + OPT = 3");
+            assert_eq!(*max_rep_level, 1,
+                "value max_rep_level: one REPEATED ancestor = 1");
+        } else {
+            panic!("expected Leaf for 'value'");
+        }
+    }
+
+    #[test]
+    fn schema_tree_recognizes_map_structural_without_converted_type() {
+        // SP144 T2 KAT (structural fallback): same schema as the
+        // converted_type=MAP(1) KAT above but with f6 OMITTED on the
+        // outer "prefs" group. The structural fingerprint alone — outer
+        // group with one REPEATED middle that has exactly 2 children
+        // where the FIRST is REQUIRED — must still trigger
+        // `LogicalType::Map`. Per parquet-format LogicalTypes.md
+        // "Backward-compatible rules", legacy writers omit the
+        // annotation entirely and consumers fall back to the shape.
+        //
+        // Byte layout is identical to the annotation KAT except the
+        // single `0x15 ; zz(1)=2` pair encoding f6=MAP(1) on schema[1]
+        // is dropped, and num_children's f5 field-id remains the last
+        // ID before the stop marker on that struct.
+        let mut m = Vec::new();
+        // FileMetaData f1 version=1
+        m.push(0x15); uv(&mut m, zz(1));
+        // FileMetaData f2 list<SchemaElement> 5 elements
+        m.push(0x19); m.push(0x5c);
+
+        // schema[0] root GROUP
+        m.push(0x48); uv(&mut m, 6); m.extend_from_slice(b"schema");
+        m.push(0x15); uv(&mut m, zz(1));
+        m.push(0x00);
+
+        // schema[1] "prefs" GROUP: f3 OPTIONAL, f4 name, f5 nc=1.
+        //   NOTE: NO f6 converted_type — structural recognition only.
+        m.push(0x35); uv(&mut m, zz(1));                         // f3 OPTIONAL
+        m.push(0x18); uv(&mut m, 5); m.extend_from_slice(b"prefs"); // f4 name
+        m.push(0x15); uv(&mut m, zz(1));                         // f5 num_children=1
+        m.push(0x00);
+
+        // schema[2] "key_value" GROUP: f3 REPEATED, f4 name, f5 nc=2.
+        m.push(0x35); uv(&mut m, zz(2));
+        m.push(0x18); uv(&mut m, 9); m.extend_from_slice(b"key_value");
+        m.push(0x15); uv(&mut m, zz(2));
+        m.push(0x00);
+
+        // schema[3] "key" LEAF: BYTE_ARRAY, REQUIRED, name="key".
+        m.push(0x15); uv(&mut m, zz(6));
+        m.push(0x25); uv(&mut m, zz(0));
+        m.push(0x18); uv(&mut m, 3); m.extend_from_slice(b"key");
+        m.push(0x00);
+
+        // schema[4] "value" LEAF: INT64, OPTIONAL, name="value".
+        m.push(0x15); uv(&mut m, zz(2));
+        m.push(0x25); uv(&mut m, zz(1));
+        m.push(0x18); uv(&mut m, 5); m.extend_from_slice(b"value");
+        m.push(0x00);
+
+        // FileMetaData f3 num_rows=0
+        m.push(0x16); uv(&mut m, zz(0));
+        m.push(0x00);
+
+        let md = FileMetaData::decode(&m).expect("structural MAP decodes");
+        assert!(!md.flat_schema);
+
+        // Outer "prefs" must still be recognized as MAP via the
+        // structural fallback even though no converted_type is present.
+        let prefs = find_group_by_name(&md.schema_tree.root, "prefs")
+            .expect("prefs group present");
+        if let SchemaNode::Group { logical_type, .. } = prefs {
+            assert_eq!(
+                logical_type.as_ref(),
+                Some(&LogicalType::Map),
+                "structural MAP must be recognized without converted_type",
+            );
+        } else {
+            panic!("expected Group for 'prefs'");
+        }
+
+        // Sanity: the underlying SchemaLeaf entries did NOT pick up a
+        // converted_type because we omitted f6 on the outer group AND
+        // never set f6 on the leaves themselves.
+        assert_eq!(md.leaves[0].converted_type, None);
+        assert_eq!(md.leaves[1].converted_type, None);
     }
 }

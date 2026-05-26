@@ -358,3 +358,319 @@ mod tests {
         assert!(format!("{err:?}").contains("values not fully consumed"), "got {err:?}");
     }
 }
+
+/// SP144 T3: Dremel-style record assembly for Map<K, V> columns.
+///
+/// Canonical 3-node Map encoding (parquet-format LogicalTypes.md):
+///
+///   [OPT|REQ] group <name> (MAP) {
+///     REPEATED group key_value {
+///       REQUIRED <PRIMITIVE> key;
+///       [OPT|REQ] <PRIMITIVE> value;
+///     }
+///   }
+///
+/// Schema-derived levels (for the V column-chunk, which carries the
+/// authoritative rep/def streams used here):
+///   max_def_level = (outer_optional as u32) + 1 /*REP middle*/ + (value_optional as u32)
+///   max_rep_level = 1
+///
+/// The K column-chunk shares the same ancestor path (OPT outer + REP middle),
+/// so its rep_levels are byte-identical to V's. Its def stream differs only
+/// when V is OPTIONAL: K's max_def = V's max_def - 1 because the K leaf is
+/// REQUIRED. Callers supply the already-decoded `keys` and `values` slices;
+/// this assembler consumes them in parallel per the V-stream's def-level
+/// classification.
+///
+/// Def value classification (V's def, since the V stream is authoritative):
+///   - outer_optional && def == 0   → outer null (whole map is null)
+///   - def == empty_list_threshold  → empty map (middle group absent)
+///         where threshold = outer_optional as u32
+///   - def == max_def_level         → item present (consume K and V)
+///   - else (strictly between)      → value null (consume K only, push V_null);
+///         only valid when value_optional
+///
+/// Within a continuation (rep == 1), the outer is by construction present;
+/// the def value is either max_def_level (item present) or the value-null
+/// level.
+pub fn assemble_map_kv(
+    rep_levels: &[u32],
+    def_levels: &[u32],
+    keys: &[PqValue],
+    values: &[PqValue],
+    max_def_level: u32,
+    outer_optional: bool,
+    value_optional: bool,
+) -> Result<Vec<PqValue>, PqError> {
+    if rep_levels.len() != def_levels.len() {
+        return Err(PqError::Bad(format!(
+            "rep/def length mismatch: rep={} def={}",
+            rep_levels.len(), def_levels.len()
+        )));
+    }
+
+    let n = rep_levels.len();
+    if n == 0 {
+        if !keys.is_empty() || !values.is_empty() {
+            return Err(PqError::Bad(format!(
+                "no levels but {} keys and {} values supplied",
+                keys.len(), values.len()
+            )));
+        }
+        return Ok(Vec::new());
+    }
+
+    let empty_list_threshold: u32 = if outer_optional { 1 } else { 0 };
+
+    #[derive(Copy, Clone, Debug)]
+    enum MapDefCase {
+        OuterNull,
+        EmptyMap,
+        ValueNull,
+        ItemPresent,
+    }
+
+    let classify = |def: u32, pos: usize| -> Result<MapDefCase, PqError> {
+        if def > max_def_level {
+            return Err(PqError::Bad(format!(
+                "def level {def} > max {max_def_level} (position {pos})"
+            )));
+        }
+        if outer_optional && def == 0 {
+            Ok(MapDefCase::OuterNull)
+        } else if def == max_def_level {
+            // Item present wins when max == threshold (defensive ordering,
+            // mirrors assemble_list_primitive::classify).
+            Ok(MapDefCase::ItemPresent)
+        } else if def == empty_list_threshold {
+            Ok(MapDefCase::EmptyMap)
+        } else {
+            // def strictly between threshold and max → value null.
+            if !value_optional {
+                return Err(PqError::Bad(format!(
+                    "def {def} implies value null but value is REQUIRED (position {pos})"
+                )));
+            }
+            Ok(MapDefCase::ValueNull)
+        }
+    };
+
+    let mut out: Vec<PqValue> = Vec::new();
+    let mut current_map: Option<Vec<(PqValue, PqValue)>> = None;
+    let mut current_is_null: bool = false;
+    let mut k_cursor = 0usize;
+    let mut v_cursor = 0usize;
+
+    for i in 0..n {
+        let rep = rep_levels[i];
+        let def = def_levels[i];
+        if rep > 1 {
+            return Err(PqError::Bad(format!(
+                "rep level {rep} > max 1 for Map (position {i})"
+            )));
+        }
+        let dc = classify(def, i)?;
+
+        if rep == 0 {
+            // Flush previous record (if any).
+            if let Some(map) = current_map.take() {
+                out.push(PqValue::Map(map));
+            } else if i > 0 && current_is_null {
+                out.push(PqValue::Null);
+            }
+            current_is_null = false;
+
+            match dc {
+                MapDefCase::OuterNull => {
+                    current_map = None;
+                    current_is_null = true;
+                }
+                MapDefCase::EmptyMap => {
+                    current_map = Some(Vec::new());
+                }
+                MapDefCase::ValueNull => {
+                    let k = keys.get(k_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("key stream exhausted at position {i}")))?;
+                    k_cursor += 1;
+                    current_map = Some(vec![(k, PqValue::Null)]);
+                }
+                MapDefCase::ItemPresent => {
+                    let k = keys.get(k_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("key stream exhausted at position {i}")))?;
+                    k_cursor += 1;
+                    let v = values.get(v_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("value stream exhausted at position {i}")))?;
+                    v_cursor += 1;
+                    current_map = Some(vec![(k, v)]);
+                }
+            }
+        } else {
+            // rep == 1: continuing the current map.
+            let map = current_map.as_mut().ok_or_else(||
+                PqError::Bad(format!("rep=1 without active map (position {i})")))?;
+            match dc {
+                MapDefCase::OuterNull => {
+                    return Err(PqError::Bad(format!(
+                        "rep=1 with outer-null def (position {i})"
+                    )));
+                }
+                MapDefCase::EmptyMap => {
+                    return Err(PqError::Bad(format!(
+                        "rep=1 with empty-map def — implies map both empty and continuing (position {i})"
+                    )));
+                }
+                MapDefCase::ValueNull => {
+                    let k = keys.get(k_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("key stream exhausted at position {i}")))?;
+                    k_cursor += 1;
+                    map.push((k, PqValue::Null));
+                }
+                MapDefCase::ItemPresent => {
+                    let k = keys.get(k_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("key stream exhausted at position {i}")))?;
+                    k_cursor += 1;
+                    let v = values.get(v_cursor).cloned().ok_or_else(||
+                        PqError::Bad(format!("value stream exhausted at position {i}")))?;
+                    v_cursor += 1;
+                    map.push((k, v));
+                }
+            }
+        }
+    }
+
+    // Flush trailing record.
+    if let Some(map) = current_map.take() {
+        out.push(PqValue::Map(map));
+    } else if current_is_null {
+        out.push(PqValue::Null);
+    }
+
+    if k_cursor != keys.len() {
+        return Err(PqError::Bad(format!(
+            "keys not fully consumed: cursor={k_cursor} len={}", keys.len()
+        )));
+    }
+    if v_cursor != values.len() {
+        return Err(PqError::Bad(format!(
+            "values not fully consumed: cursor={v_cursor} len={}", values.len()
+        )));
+    }
+
+    Ok(out)
+}
+
+#[cfg(test)]
+mod map_tests {
+    use super::*;
+
+    #[test]
+    fn req_map_of_req_req_one_record_two_items() {
+        // REQ-REP-REQ-REQ: max_def=1
+        // Map {"a"->1, "b"->2}: rep=[0,1], def=[1,1], keys=["a","b"], values=[1,2]
+        let r = vec![0u32, 1];
+        let d = vec![1u32, 1];
+        let k = vec![PqValue::Bytes(b"a".to_vec()), PqValue::Bytes(b"b".to_vec())];
+        let v = vec![PqValue::I64(1), PqValue::I64(2)];
+        let out = assemble_map_kv(&r, &d, &k, &v, 1, false, false).unwrap();
+        assert_eq!(out, vec![PqValue::Map(vec![
+            (PqValue::Bytes(b"a".to_vec()), PqValue::I64(1)),
+            (PqValue::Bytes(b"b".to_vec()), PqValue::I64(2)),
+        ])]);
+    }
+
+    #[test]
+    fn req_map_of_req_opt_one_value_null() {
+        // REQ-REP-REQ-OPT: max_def=2
+        // Map {"a"->1, "b"->null}: rep=[0,1], def=[2,1], keys=["a","b"], values=[1]
+        let r = vec![0u32, 1];
+        let d = vec![2u32, 1];
+        let k = vec![PqValue::Bytes(b"a".to_vec()), PqValue::Bytes(b"b".to_vec())];
+        let v = vec![PqValue::I64(1)];
+        let out = assemble_map_kv(&r, &d, &k, &v, 2, false, true).unwrap();
+        assert_eq!(out, vec![PqValue::Map(vec![
+            (PqValue::Bytes(b"a".to_vec()), PqValue::I64(1)),
+            (PqValue::Bytes(b"b".to_vec()), PqValue::Null),
+        ])]);
+    }
+
+    #[test]
+    fn opt_map_of_req_req_two_records_first_null() {
+        // OPT-REP-REQ-REQ: max_def=2
+        // [null, {"x"->7}]: rep=[0,0], def=[0,2], keys=["x"], values=[7]
+        let r = vec![0u32, 0];
+        let d = vec![0u32, 2];
+        let k = vec![PqValue::Bytes(b"x".to_vec())];
+        let v = vec![PqValue::I64(7)];
+        let out = assemble_map_kv(&r, &d, &k, &v, 2, true, false).unwrap();
+        assert_eq!(out, vec![
+            PqValue::Null,
+            PqValue::Map(vec![(PqValue::Bytes(b"x".to_vec()), PqValue::I64(7))]),
+        ]);
+    }
+
+    #[test]
+    fn opt_map_of_req_opt_full_matrix() {
+        // OPT-REP-REQ-OPT: max_def=3
+        // R0 null              → def=0
+        // R1 {}                → def=1
+        // R2 {"a"->1}          → def=3 (item present)
+        // R3 {"b"->null, "c"->9} → def=2 (value null) then rep=1 def=3 (item present)
+        // rep=[0,0,0,0,1], def=[0,1,3,2,3]
+        // keys=["a","b","c"] (3 middle-present slots)
+        // values=[1, 9] (2 V-present slots — R3's "b"->null does NOT consume V)
+        let r = vec![0u32, 0, 0, 0, 1];
+        let d = vec![0u32, 1, 3, 2, 3];
+        let k = vec![
+            PqValue::Bytes(b"a".to_vec()),
+            PqValue::Bytes(b"b".to_vec()),
+            PqValue::Bytes(b"c".to_vec()),
+        ];
+        let v = vec![PqValue::I64(1), PqValue::I64(9)];
+        let out = assemble_map_kv(&r, &d, &k, &v, 3, true, true).unwrap();
+        assert_eq!(out, vec![
+            PqValue::Null,
+            PqValue::Map(Vec::new()),
+            PqValue::Map(vec![(PqValue::Bytes(b"a".to_vec()), PqValue::I64(1))]),
+            PqValue::Map(vec![
+                (PqValue::Bytes(b"b".to_vec()), PqValue::Null),
+                (PqValue::Bytes(b"c".to_vec()), PqValue::I64(9)),
+            ]),
+        ]);
+    }
+
+    #[test]
+    fn empty_input() {
+        let out = assemble_map_kv(&[], &[], &[], &[], 1, true, false).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn rejects_key_stream_truncated() {
+        let r = vec![0u32, 1];
+        let d = vec![1u32, 1];
+        let k = vec![PqValue::Bytes(b"a".to_vec())]; // only 1, need 2
+        let v = vec![PqValue::I64(1), PqValue::I64(2)];
+        let err = assemble_map_kv(&r, &d, &k, &v, 1, false, false).unwrap_err();
+        assert!(format!("{err:?}").contains("key stream exhausted"), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_value_stream_truncated() {
+        let r = vec![0u32, 1];
+        let d = vec![1u32, 1];
+        let k = vec![PqValue::Bytes(b"a".to_vec()), PqValue::Bytes(b"b".to_vec())];
+        let v = vec![PqValue::I64(1)]; // only 1, need 2
+        let err = assemble_map_kv(&r, &d, &k, &v, 1, false, false).unwrap_err();
+        assert!(format!("{err:?}").contains("value stream exhausted"), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_keys_not_fully_consumed() {
+        let r = vec![0u32];
+        let d = vec![1u32];
+        let k = vec![PqValue::Bytes(b"a".to_vec()), PqValue::Bytes(b"b".to_vec())]; // extra
+        let v = vec![PqValue::I64(1)];
+        let err = assemble_map_kv(&r, &d, &k, &v, 1, false, false).unwrap_err();
+        assert!(format!("{err:?}").contains("keys not fully consumed"), "got {err:?}");
+    }
+}

@@ -1,13 +1,19 @@
 //! SP-WS — WebSocket support for the KesselDB HTTP gateway (RFC 6455).
 //!
-//! **T2 status (current):** the handshake parser ships. `handle_upgrade`
-//! validates the upgrade request per RFC 6455 §4 (path, method, version,
-//! key, optional subprotocol, optional Bearer auth) and writes a
-//! `HTTP/1.1 101 Switching Protocols` response — OR a 400/401/405
-//! error response — straight to the TcpStream. After 101 is sent, the
-//! stream now carries WebSocket frames; the per-connection HTTP loop
-//! MUST close (T2's `routes::handle` arm returns `close_after = true`).
-//! Frame encoding/decoding + the session loop are still T3/T4/T5.
+//! **T2 / T3 / T4 status (current):** handshake parser + frame encoder
+//! + frame decoder ship. `handle_upgrade` validates the upgrade request
+//! per RFC 6455 §4 (path, method, version, key, optional subprotocol,
+//! optional Bearer auth) and writes a `HTTP/1.1 101 Switching Protocols`
+//! response — OR a 400/401/405 error response — straight to the
+//! TcpStream. After 101 is sent, the stream now carries WebSocket
+//! frames; the per-connection HTTP loop MUST close (T2's
+//! `routes::handle` arm returns `close_after = true`). The `frame`
+//! submodule (T3 + T4) provides `encode_server_frame` /
+//! `encode_close_frame` / `encode_ping_frame` / `encode_pong_frame`
+//! (server-side, never masked per RFC 6455 §5.3) and
+//! `decode_client_frame` (rejects unmasked client frames, reserved bits,
+//! reserved opcodes, oversized payloads). Wiring into a per-connection
+//! session loop is still T5.
 //!
 //! Companion design spec:
 //! `docs/superpowers/specs/2026-05-26-kesseldb-spws-websocket-design.md`
@@ -41,6 +47,8 @@
 
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
+
+pub mod frame;
 
 use crate::crypto::sec_websocket_accept;
 use crate::engine::EngineApply;

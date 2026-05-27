@@ -30,11 +30,11 @@ cross-shard `Join`, cross-shard consistent snapshot. See spec §11.
 | **T6** | LIMIT cancellation correctness + cancel flag | **DONE** | `cba3eea` |
 | **T7** | Skew defense + bounded buffers (`SHARD_BACKPRESSURE_BOUND=4`, `sync_channel(bound)`); 5 KATs. | **DONE** | `afc1690` |
 | **T8** | Pentest sweep (10 pentests from spec §7.5) — timeout / oversized / malformed / partial-then-close / mid-scan death / router-drop-under-limit / cancel-atomic-visibility / zero-shards / one-shard / determinism-replay. 10 KATs. | **DONE** | `8f6b17f` |
-| T9 | Error-path completeness + partial-result guard | OPEN | — |
-| T10 | Documentation: ARCHITECTURE.md sub-section + STATUS.md row update | OPEN | — |
-| T11 | (Follow-up) Extend to `FindBy` / `FindByComposite` | OPEN | — |
-| T12 | (Optional perf) Thread-pool the workers | OPEN | — |
-| T13 | (Optional perf) Adaptive per-shard LIMIT | OPEN | — |
+| **T9** | Partial-result opt-in flag (`ScatterContext::partial_on_timeout`) — V1 default stays hard-fail; opt-in best-effort mode omits failed shards from the merge and returns `Vec<u32>` of failed shard ids; 8 KATs cover regression-lock + 1/N/all-fail + LIMIT-still-cancels + determinism + Sorted variant + malformed-not-swallowed. | **DONE** | `515628a` |
+| **T10** | Documentation: ARCHITECTURE.md §Sharding gains "Cross-shard reads (SP-A)" sub-section; STATUS.md "What this is NOT yet" updated (scatter-gather reads removed; SP-A SHIPPED noted; SP-B/C/D/E + FindBy follow-up listed); USAGE.md §7b gains operator-facing scatter-reads paragraph. | **DONE** | `6f23384` |
+| **T11** | FindBy / FindByComposite via `ScatterKind::OidConcat` — new variant + merge function (shard-id-ordered concat of `[16-byte oid]*` payloads, multiple-of-16 validation), router wires Op::FindBy/FindByComposite to `Route::Scatter(OidConcat)`, end-to-end K=4 integration test locks single-match + 3-match-multiset cases. 8 KATs + 1 real-socket integration. Unlocks FindBy on K>1 deployments. | **DONE** | `e576c4e` |
+| T12 | (Optional perf) Thread-pool the workers | DEFERRED (post-V1) | — |
+| T13 | (Optional perf) Adaptive per-shard LIMIT | DEFERRED (post-V1) | — |
 
 ## T1 — what landed (2026-05-26, commit `195ecd6`)
 
@@ -540,30 +540,188 @@ EMPTY; `#![forbid(unsafe_code)]` honored.
   - **Documentation** (T10 — ARCHITECTURE.md §Sharding sub-section +
     STATUS.md "What this is NOT yet" update).
 
+## T9 — what landed (2026-05-26, commit `515628a`)
+
+**One surface (~575 LoC tests + impl), single commit:** `scatter_scan.rs`
+adds the partial-result opt-in flag per SP155 §3.6 / §6 / OQ2.
+
+**Public surface (new):**
+
+```rust
+pub struct ScatterContext {
+    pub partial_on_timeout: bool,  // default false (V1 hard-fail)
+}
+impl ScatterContext {
+    pub fn hard_fail() -> Self;
+    pub fn partial() -> Self;
+    pub fn with_partial_on_timeout(mut self, on: bool) -> Self;
+}
+
+pub fn scatter_and_merge_ctx<C: ShardCaller>(
+    shards: Vec<C>,
+    op: &Op,
+    per_shard_timeout: Duration,
+    kind: &ScatterKind,
+    cancel: Arc<AtomicBool>,
+    ctx: ScatterContext,
+) -> (OpResult, Vec<u32>);  // tuple: merged result + failed shard ids
+```
+
+`scatter_and_merge` (T6 entry point) stays as a thin back-compat
+wrapper that calls `scatter_and_merge_ctx(..., ScatterContext::hard_fail())`
+and discards the failed-shards list — every T1-T8 call site + KAT
+keeps working unchanged.
+
+**Behaviour switch (`partial_on_timeout == true`):**
+
+  - Per-shard non-Got slot (Unavailable / SchemaError / etc.) is
+    OMITTED from the merge, the shard_id is recorded in
+    `failed_shards`, the other shards' Got rows merge per ScatterKind
+    as usual.
+  - LIMIT cancellation (T6) STILL fires on LIMIT-hit; late shards
+    still see cancel pre-call.
+  - Sorted heap merge: failed slot substituted with empty Got payload
+    → heap naturally skips it; remaining shards merge through the
+    heap.
+  - Malformed-Got framing (a `Got(garbage)` rejected by `iter_rows`)
+    STILL surfaces clean as SchemaError — partial mode does NOT
+    silently drop garbage bytes from a shard (per spec doc-comment).
+
+**Router stays on V1 hard-fail default** — a future T-slice or SQL
+hint can surface the opt-in to clients.
+
+**8 new T9 KATs:**
+
+| KAT | Asserts |
+|---|---|
+| `t9_default_is_hard_fail_v1_regression_lock` | Regression-lock against accidental flip of the V1 default |
+| `t9_partial_one_shard_fails_returns_others_plus_failed_marker` | 1/3 fail → 2 survivors merged + failed_shards = [1] |
+| `t9_partial_no_shards_fail_equals_v1_default` | 0 failures: byte-identical to hard-fail mode |
+| `t9_partial_all_shards_fail_returns_empty_plus_full_failed_list` | All-fail → empty Got + failed_shards = 0..K |
+| `t9_partial_mode_limit_still_cancels_pending_shards` | LIMIT-cancellation still fires + cancelled shards are "unread" not "failed" (honest distinction) |
+| `t9_partial_mode_is_deterministic_replay_safe` | Same failure pattern × 20 runs ⇒ byte-identical |
+| `t9_partial_sorted_failed_shards_omitted_others_merge_correctly` | Sorted heap merge with failed slots substituted as empty |
+| `t9_partial_mode_does_not_swallow_malformed_payload_framing` | Malformed Got still surfaces SchemaError |
+
+**Test counts:** workspace 1349 → 1357 default / 1404 → 1412 featured
+(+8 each). seed-7 GREEN; tree-grep EMPTY; `#![forbid(unsafe_code)]`
+honored.
+
+## T10 — what landed (2026-05-26, commit `6f23384`)
+
+**Three docs files (+~130 LoC), single commit:**
+
+  - `docs/ARCHITECTURE.md` — §Sharding gains a new "Cross-shard
+    reads (SP-A)" sub-section covering: scatter-scan fan-out model
+    (router-side, std::thread, `sync_channel(SHARD_BACKPRESSURE_BOUND=4)`
+    bound); sorted vs unordered merge semantics; LIMIT cancellation
+    via `Arc<AtomicBool>`; partial-result vs hard-fail mode (T9
+    opt-in flag); K-invariance property (byte-identical to K=1 across
+    K ∈ {1,2,4,8,16}); sort-key tie-break by shard_id (V1 limitation,
+    SP155 §5.4); cross-shard snapshot non-property; out-of-arc
+    deferral list (SP-B/C/D/E + Join + cross-shard consistent
+    snapshot non-goals + FindBy/FindByComposite future T-slice).
+  - `docs/STATUS.md` — "What this is NOT yet" paragraph updated:
+    the open-limitation paragraph that listed cross-shard
+    scatter-gather reads is updated to note SP-A SHIPPED; only SP-B
+    aggregate + SP-C streamed sorted merge + SP-D GroupAggregate +
+    SP-E SQL-text routing + FindBy scatter remain in the out-of-arc
+    list.
+  - `docs/USAGE.md` — §7b "Sharded deployment & cross-shard
+    transactions" gains a "Cross-shard reads (SP-A)" paragraph for
+    operator-facing guidance.
+
+No code / no test changes.
+
+## T11 — what landed (2026-05-26, commit `e576c4e`)
+
+**Two surfaces (~580 LoC), single commit:** `scatter_scan.rs` adds
+the `ScatterKind::OidConcat` variant + `merge_oid_concat` helper +
+8 T11 KATs; `router.rs` routes `Op::FindBy` / `Op::FindByComposite`
+to `Route::Scatter(OidConcat)` + 1 real-socket integration test
+(`scatter_findby_k4_returns_same_oid_as_k1`).
+
+**Why fan-out (not single-shard "degenerate" scatter as the original
+task description suggested):** each shard's secondary index only
+holds entries for rows OWNED by that shard. A `field = value` lookup
+that returns N matches across the cluster needs every shard's local
+index consulted; the merged result is the union of every shard's
+`[16-byte oid]*` reply. The spec §2.2 says this explicitly: "the
+index is per-shard, so fan-out is still required". The user's
+"degenerate scatter" framing in the task notes was wrong; the spec
+is right; T11 IS a real fan-out.
+
+**Public surface (new):**
+
+```rust
+pub enum ScatterKind {
+    Unordered { limit: u32 },
+    Sorted { /* T2 */ },
+    OidConcat,  // NEW: T11
+}
+```
+
+**Merge shape:** shard-id-ordered concat of every shard's raw
+`[16-byte oid]*` payload (NO `[u32 rowlen]` framing — matches the
+kessel-sm FindBy contract). No LIMIT (the SM contract returns the
+full match set). Defense: payload length not a multiple of 16
+surfaces SchemaError. Cross-shard oid sets are disjoint by
+construction (rendezvous mapping puts each oid on exactly one
+shard) → no dedup needed.
+
+**Pre-T11 vs post-T11:** before T11, FindBy / FindByComposite routed
+to `Route::Unsupported` and returned `SchemaError` on any K>1
+deployment — i.e. K>1 deployments were FindBy-locked-out. T11
+unlocks them.
+
+**8 new T11 KATs** in scatter_scan + **1 new T11 real-socket
+integration test** in router. Single-match + 3-match-multiset both
+locked end-to-end.
+
+**Test counts:** workspace 1357 → 1366 default / 1412 → 1421
+featured (+9 each: 8 KATs + 1 integration). seed-7 GREEN;
+tree-grep EMPTY; `#![forbid(unsafe_code)]` honored.
+
+## SP-A arc closure (2026-05-26, post-T11)
+
+**T1-T11 all DONE.** T12 + T13 are explicit perf-only post-V1
+follow-ups (thread-pool the workers + adaptive per-shard LIMIT) —
+ship only if a benchmark proves the per-request thread-spawn
+overhead is measurable at K=8 + high QPS. The SP155 §8 acceptance
+criteria #1 (K-invariance, T3 — locked), #3 (all 10 pentests pass,
+T8 — locked), #6 (memory bound under skew, T7 — locked), #7
+(STATUS.md updated, T10 — done), and #8 (ARCHITECTURE.md updated,
+T10 — done) are all MET.
+
+**Outstanding** (each a separate SP-arc, not blocking SP-A closure):
+SP-B aggregate combine, SP-C streamed sorted merge over indexes,
+SP-D `GroupAggregate` cross-shard combine, SP-E SQL-text routing.
+Cross-shard `Join` and cross-shard consistent snapshot remain
+explicit non-goals at the arc level.
+
+**TaskList ticket #75 ("SP-A: cross-shard scatter scan/filter reads
+(fan-out + ordered merge)") is now COMPLETE-READY** — every MUST
+acceptance criterion shipped; T12+T13 perf optionals are
+documented-deferred.
+
 ## Pickup hint for the next session
 
-Start at **T9 / T10**. T7+T8 closed skew defense + the pentest sweep;
-the SP155 §8 acceptance criterion #3 ("all 10 pentests pass") is
-now MET. Remaining task slices T9..T13:
+SP-A is shippable. Next arcs (each a separate spec):
 
-- **T9 (~150 LoC):** error-path completeness + the
-  `scatter_partial_on_timeout` flag — flips the V1 hard-fail default
-  to "return partial result + a per-slot non-Got marker" when the
-  caller opts in.
-- **T10 (~80 LoC):** documentation — ARCHITECTURE.md §Sharding
-  sub-section "Cross-shard reads (SP-A)" + STATUS.md "What this is
-  NOT yet" paragraph update (the open-limitation paragraph at line
-  363 in STATUS.md still lists scatter-gather *reads* as open; T10
-  removes it).
-- **T11 (~100 LoC):** extend to FindBy / FindByComposite (degenerate
-  scatter, no merge — concat-only).
-- **T12-T13:** optional perf (thread-pool the workers + adaptive
-  per-shard LIMIT). Only ship if a benchmark shows the per-request
-  thread-spawn overhead is measurable at K=8 + high QPS.
+- **SP-B Aggregate combine** (~200 LoC) — `Op::Aggregate { COUNT /
+  SUM / MIN / MAX }` cross-shard. Reuses SP-A's fan-out 1:1; only
+  the merge function differs (sum partials / min-of-partials /
+  max-of-partials). Trivial after SP-A.
+- **SP-D GroupAggregate** (~300 LoC) — builds on SP-B's combine
+  functions + a hash-merge across shards by group key.
+- **SP-E SQL-text routing** (~200 LoC) — perf optimization for
+  queries that COULD route to one shard by a key-equality WHERE
+  (currently they fan out — correct but wasteful).
+- **SP-A T12 / T13** — only if a benchmark proves they're worth it.
 
-Estimated effort per slice: 0.3-1 session. Per spec §8 acceptance:
-T9+T10 close all remaining MUSTs; T11 closes the documented FindBy
-follow-up; T12+T13 are perf-only.
+Per spec §11, after SP-A through SP-E ship, the STATUS.md
+out-of-arc list collapses to just cross-shard `Join` and cross-shard
+consistent snapshot — both explicit non-goals.
 
 ## References
 

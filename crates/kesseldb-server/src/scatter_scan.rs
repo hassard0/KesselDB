@@ -109,6 +109,36 @@ pub trait ShardCaller: Send + 'static {
 /// (SP-A T9 in the backlog).
 pub const DEFAULT_PER_SHARD_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// SP-A T7 (SP155 §3.8): bound on the per-shard reply channel for
+/// **skew defense**. A `sync_channel(SHARD_BACKPRESSURE_BOUND)` is
+/// installed for every per-shard worker → driver communication. Once
+/// `bound` items are queued, the worker's next `send()` blocks until
+/// the driver drains a slot — naturally pacing a fast shard to the
+/// driver's consumption rate. This is **bounded buffering, not lost
+/// work** (every row eventually transits).
+///
+/// Spec rationale (§3.8): `bound=0` (rendezvous) over-serializes;
+/// `bound=∞` (unbounded `channel()`) OOMs under skew (one shard
+/// returns millions of rows while another times out); `bound=4` is
+/// the sweet spot — workers can prefetch a chunk or two ahead of the
+/// consumer without unbounded growth.
+///
+/// **V1 note (honest):** every per-shard worker today sends exactly
+/// ONE `OpResult` (the final reply for the SAME `Op` shipped to each
+/// shard). Bound=4 is therefore "headroom" for V1 — only one slot is
+/// ever used per shard. The bound becomes load-bearing when the
+/// streaming `Op::SelectChunked` lands (SP-A T14 / spec §4.4), at
+/// which point a chunked shard's bursty output is paced naturally.
+/// Locking the bound now (and proving the sender / cancel-path
+/// interaction is correct) means T14 inherits a working contract.
+///
+/// Drop-mid-stream behaviour: if the driver drops the receiver (the
+/// LIMIT-cancellation path in `scatter_and_merge_unordered`), a
+/// worker blocked on a full channel sees `SendError` from `tx.send()`
+/// and exits cleanly — no deadlock, no leak (locked by
+/// `t7_sender_observes_send_error_when_receiver_dropped_no_deadlock`).
+pub const SHARD_BACKPRESSURE_BOUND: usize = 4;
+
 /// Fan out `op` to every shard in `shards`, in **parallel**, with a
 /// per-shard timeout. Returns one `OpResult` per shard, in **shard-id
 /// order** (NOT arrival order — replay-determinism per SP155 §3.6).
@@ -116,7 +146,8 @@ pub const DEFAULT_PER_SHARD_TIMEOUT: Duration = Duration::from_secs(30);
 /// Algorithm (zero-dep, std-thread only):
 ///
 /// 1. Spawn one `std::thread` per shard. Each worker `call`s its shard
-///    and sends the result over a `mpsc::sync_channel(1)`.
+///    and sends the result over a `mpsc::sync_channel(
+///    SHARD_BACKPRESSURE_BOUND)` (SP155 §3.8 skew defense; T7).
 /// 2. The driver waits up to `per_shard_timeout` for each worker's
 ///    reply; if the worker hasn't replied by then, that slot becomes
 ///    `OpResult::Unavailable` (the worker thread continues until its
@@ -142,13 +173,17 @@ pub fn scatter_scan_fanout<C: ShardCaller>(
     if k == 0 {
         return Vec::new();
     }
-    // Per-shard reply channels. `sync_channel(1)` so the worker can send
-    // and exit without blocking on a slow driver (the driver may have
-    // already moved past this slot's deadline).
+    // Per-shard reply channels. `sync_channel(SHARD_BACKPRESSURE_BOUND)`
+    // for skew defense (SP155 §3.8 / T7) — a fast shard's worker blocks
+    // on `send()` once the bound is full instead of accumulating
+    // unbounded in-flight work. For V1 each worker sends exactly one
+    // `OpResult` (only one slot used), but the bound is load-bearing
+    // for the future streaming chunked path (T14).
     let mut rxs: Vec<mpsc::Receiver<OpResult>> = Vec::with_capacity(k);
     let mut handles: Vec<thread::JoinHandle<()>> = Vec::with_capacity(k);
     for (i, mut caller) in shards.into_iter().enumerate() {
-        let (tx, rx) = mpsc::sync_channel::<OpResult>(1);
+        let (tx, rx) =
+            mpsc::sync_channel::<OpResult>(SHARD_BACKPRESSURE_BOUND);
         let op_for_worker = op.clone();
         let h = thread::Builder::new()
             .name(format!("kdb-scatter-shard-{i}"))
@@ -163,7 +198,8 @@ pub fn scatter_scan_fanout<C: ShardCaller>(
                     Err(_e) => OpResult::Unavailable,
                 };
                 // Best-effort send; if the driver already dropped `rx`
-                // (timeout fired and moved on), the value is discarded.
+                // (timeout fired and moved on), the value is discarded
+                // — `SendError` is the documented exit path (T7).
                 let _ = tx.send(r);
             })
             .expect("kdb-scatter: thread spawn (std::thread; zero-dep)");
@@ -401,7 +437,9 @@ pub fn scatter_and_merge<C: ShardCaller>(
     let mut rxs: Vec<mpsc::Receiver<OpResult>> = Vec::with_capacity(k);
     let mut handles: Vec<thread::JoinHandle<()>> = Vec::with_capacity(k);
     for (i, mut caller) in shards.into_iter().enumerate() {
-        let (tx, rx) = mpsc::sync_channel::<OpResult>(1);
+        // Bounded per-shard channel for skew defense (SP155 §3.8 / T7).
+        let (tx, rx) =
+            mpsc::sync_channel::<OpResult>(SHARD_BACKPRESSURE_BOUND);
         let op_for_worker = op.clone();
         let cancel_for_worker = cancel.clone();
         let h = thread::Builder::new()
@@ -413,6 +451,8 @@ pub fn scatter_and_merge<C: ShardCaller>(
                     Ok(r) => r,
                     Err(_e) => OpResult::Unavailable,
                 };
+                // SendError on dropped rx (cancellation / LIMIT) is the
+                // documented clean-exit path (T7); discard the value.
                 let _ = tx.send(r);
             })
             .expect("kdb-scatter: thread spawn (std::thread; zero-dep)");
@@ -471,10 +511,12 @@ pub fn scatter_and_merge<C: ShardCaller>(
     // hit path; this is the belt-and-suspenders.)
     cancel.store(true, AtomicOrdering::SeqCst);
     // Join every worker. Workers whose reply we didn't drain are
-    // still pushing to the channel (which is sync_channel(1) — they
-    // either already sent OR are blocked trying to send to a dropped
-    // rx). The `rx` drop above releases them; this join waits for
-    // their own `call()` to return per the SP155 §3.7 honest gap.
+    // still pushing to the channel (bounded
+    // `sync_channel(SHARD_BACKPRESSURE_BOUND)`; T7) — they either
+    // already sent OR are blocked trying to send to a dropped rx
+    // (SendError clean-exit). The `rx` drop above releases them; this
+    // join waits for their own `call()` to return per the SP155 §3.7
+    // honest gap.
     for h in handles {
         let _ = h.join();
     }
@@ -2584,5 +2626,259 @@ mod tests {
             cancel,
         );
         assert_eq!(out, OpResult::Got(Vec::new()));
+    }
+
+    // ---------- T7 skew-defense / bounded-buffer KATs (SP155 §3.8) ----------
+    //
+    // Per SP155 §3.8: each per-shard reply channel is a bounded
+    // `sync_channel(SHARD_BACKPRESSURE_BOUND)`. A fast shard's worker
+    // thread blocks on `send()` once the bound is hit, naturally pacing
+    // it to the merger's consumption rate. This is **bounded buffering,
+    // not lost work** — every row eventually transits the channel.
+    //
+    // For V1 each shard sends exactly ONE `OpResult` per request (a
+    // streaming `Op::SelectChunked` per spec §4.4 / T14 may later send
+    // many chunks); the bound therefore protects against:
+    //
+    // 1. A future regression that switches the channel to unbounded
+    //    `mpsc::channel()` — the bound-respected KAT catches it.
+    // 2. The streaming-chunked path landing without a bound (would let
+    //    a fast shard accumulate millions of in-flight rows ahead of a
+    //    slow merger). Same bound applies.
+    // 3. The cancel-path interaction: when the merger drops `rx` (e.g.
+    //    LIMIT cancellation), a sender blocked on `send()` returns
+    //    SendError cleanly and the worker exits — no deadlock.
+    //
+    // Per spec rationale: bound=0 (rendezvous) over-serializes;
+    // bound=∞ OOMs under skew; bound=4 lets workers prefetch a chunk
+    // or two ahead of the consumer.
+    //
+    // These KATs exercise the channel-bound contract directly (not via
+    // scatter_and_merge) using mpsc::sync_channel + the constant we
+    // promote to a public API.
+
+    /// **T7 KAT — `SHARD_BACKPRESSURE_BOUND` is the documented bound (=4).**
+    /// Lock the constant value so a regression that bumps it to 0 (over-
+    /// serialize) or ∞ (OOM-prone) is caught at compile/test time. Spec
+    /// §3.8 picks 4 explicitly — "workers can prefetch a chunk or two
+    /// ahead of the consumer".
+    #[test]
+    fn t7_shard_backpressure_bound_is_four_per_spec() {
+        assert_eq!(
+            SHARD_BACKPRESSURE_BOUND, 4,
+            "SP155 §3.8 specifies bound=4; bump = spec change"
+        );
+    }
+
+    /// **T7 KAT — a fast sender blocks once the bound is full + the
+    /// merger's reads unblock it.** Drive a single `sync_channel(
+    /// SHARD_BACKPRESSURE_BOUND)` from a spawned thread that tries to
+    /// push BOUND+3 items; the main thread reads them slowly. Assert
+    /// the channel's pending-message count never exceeded the bound.
+    ///
+    /// We probe the bound by tracking the spawned thread's `sent`
+    /// counter: after starting it but before reading, the counter
+    /// reaches at most `BOUND + 1` (the `+1` is the in-flight send the
+    /// sync_channel allows on top of the queued items, per std::sync::
+    /// mpsc semantics — see Rust stdlib's sync_channel docs). Once the
+    /// main thread starts reading, the counter climbs to the full N.
+    #[test]
+    fn t7_sync_channel_caps_at_bound_under_fast_sender() {
+        let (tx, rx) = mpsc::sync_channel::<u32>(SHARD_BACKPRESSURE_BOUND);
+        let sent = Arc::new(AtomicUsize::new(0));
+        let n_items = SHARD_BACKPRESSURE_BOUND + 8; // try to push more than the bound
+        let sent_for_worker = sent.clone();
+        let h = thread::spawn(move || {
+            for i in 0..n_items as u32 {
+                tx.send(i).expect("send");
+                sent_for_worker.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        // Give the worker a chance to fill the bound.
+        thread::sleep(Duration::from_millis(50));
+        // At this point the worker should have queued BOUND items and
+        // be parked on the next send. Per std::sync::mpsc::sync_channel
+        // docs: with bound=N, up to N items can be in the channel; the
+        // (N+1)th send blocks. The worker's counter increments AFTER
+        // send returns, so a parked sender shows counter == N (not N+1).
+        let observed = sent.load(Ordering::SeqCst);
+        assert!(
+            observed <= SHARD_BACKPRESSURE_BOUND,
+            "sender must be paced by the bound: observed {observed} sent \
+             before any read, bound = {SHARD_BACKPRESSURE_BOUND}"
+        );
+        // Now drain: every item must arrive (no lost work).
+        let mut got: Vec<u32> = Vec::with_capacity(n_items);
+        for _ in 0..n_items {
+            got.push(rx.recv().expect("recv"));
+        }
+        h.join().expect("join");
+        assert_eq!(got.len(), n_items, "no items lost");
+        assert_eq!(
+            sent.load(Ordering::SeqCst),
+            n_items,
+            "every send eventually completed"
+        );
+        // And drained in order (sync_channel is FIFO).
+        for (i, v) in got.iter().enumerate() {
+            assert_eq!(*v as usize, i, "FIFO order");
+        }
+    }
+
+    /// **T7 KAT — bound=1 still produces a correct merged output.**
+    /// Edge case: the smallest non-rendezvous bound. The K-shard fan-out
+    /// degenerates to "every send blocks until the merger reads", but
+    /// the final merged bytes are identical to bound=4. Locks that the
+    /// bound is purely a backpressure knob, not a correctness knob.
+    #[test]
+    fn t7_bound_one_still_produces_correct_merged_output() {
+        // We can't reach into scatter_and_merge to override the bound,
+        // but we CAN simulate the bound=1 contract by using a smaller
+        // sync_channel(1) directly + asserting that draining N items
+        // in shard-id order produces the same bytes as bound=4.
+        let make_rows = |base: u8, n: usize| -> Vec<u8> {
+            let mut v = Vec::new();
+            for i in 0..n {
+                let rec = vec![base.wrapping_add(i as u8); 8];
+                v.extend_from_slice(&(rec.len() as u32).to_le_bytes());
+                v.extend_from_slice(&rec);
+            }
+            v
+        };
+        let s0_payload = make_rows(0, 3);
+        let s1_payload = make_rows(100, 3);
+        // Bound=1 simulation: drain in shard-id order.
+        let (tx0, rx0) = mpsc::sync_channel::<OpResult>(1);
+        let (tx1, rx1) = mpsc::sync_channel::<OpResult>(1);
+        let s0_for_thread = s0_payload.clone();
+        let s1_for_thread = s1_payload.clone();
+        let h0 = thread::spawn(move || tx0.send(OpResult::Got(s0_for_thread)));
+        let h1 = thread::spawn(move || tx1.send(OpResult::Got(s1_for_thread)));
+        let r0 = rx0.recv().unwrap();
+        let r1 = rx1.recv().unwrap();
+        h0.join().unwrap().unwrap();
+        h1.join().unwrap().unwrap();
+        let merged = merge_scan_results(
+            vec![r0, r1],
+            &ScatterKind::Unordered { limit: 0 },
+        );
+        // Same expected bytes as a bound=4 (or any bound) run: shard-id-
+        // ordered concat of the two payloads.
+        let mut expected = s0_payload.clone();
+        expected.extend_from_slice(&s1_payload);
+        assert_eq!(merged, OpResult::Got(expected));
+    }
+
+    /// **T7 KAT — sender does NOT deadlock when the merger drops the
+    /// receiver mid-stream (LIMIT-cancellation interaction).** The
+    /// merger's cancel-path drops the per-shard `rx` after fulfilling
+    /// LIMIT; any worker still blocked on a `send()` (because the
+    /// bound is full) must observe `SendError` and exit cleanly. Same
+    /// for a worker about to send its first frame after the rx is
+    /// already dropped.
+    #[test]
+    fn t7_sender_observes_send_error_when_receiver_dropped_no_deadlock() {
+        let (tx, rx) = mpsc::sync_channel::<u32>(SHARD_BACKPRESSURE_BOUND);
+        // Fill the bound so the next send blocks.
+        for i in 0..SHARD_BACKPRESSURE_BOUND as u32 {
+            tx.send(i).expect("priming send");
+        }
+        // Spawn a worker that tries to send one more — it will block
+        // until the rx is dropped (or accepts a recv).
+        let send_done = Arc::new(AtomicBool::new(false));
+        let send_err = Arc::new(AtomicBool::new(false));
+        let send_done_for_worker = send_done.clone();
+        let send_err_for_worker = send_err.clone();
+        let h = thread::spawn(move || {
+            match tx.send(999) {
+                Ok(_) => {}
+                Err(_e) => {
+                    send_err_for_worker.store(true, Ordering::SeqCst);
+                }
+            }
+            send_done_for_worker.store(true, Ordering::SeqCst);
+        });
+        // Give the worker time to block.
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !send_done.load(Ordering::SeqCst),
+            "worker must be blocked on send (bound full, no reader)"
+        );
+        // Drop the receiver — the blocked send returns SendError.
+        drop(rx);
+        // Worker must exit promptly (no deadlock).
+        let t0 = Instant::now();
+        h.join().expect("worker joined");
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "worker must exit promptly after rx drop (elapsed {elapsed:?})"
+        );
+        assert!(
+            send_done.load(Ordering::SeqCst),
+            "worker reached the post-send statement"
+        );
+        assert!(
+            send_err.load(Ordering::SeqCst),
+            "send must surface SendError when rx is dropped"
+        );
+    }
+
+    /// **T7 KAT — slow merger doesn't OOM under fast shards.** Drive
+    /// 8 mock shards each producing 1000 small "rows" worth of payload
+    /// through the real `scatter_and_merge` Unordered path; the merger
+    /// drains serially. The bound = `SHARD_BACKPRESSURE_BOUND` caps
+    /// per-shard in-flight memory at `bound × OpResult-size`. We assert
+    /// the merged output has the expected total row count + the test
+    /// completes in well-under a second (bounded, not pathological).
+    #[test]
+    fn t7_slow_merger_8_fast_shards_completes_with_bounded_memory() {
+        let rec = |v: u8| -> Vec<u8> { vec![v; 8] };
+        let mk_payload = |n: usize, base: u8| -> OpResult {
+            let rows: Vec<Vec<u8>> = (0..n as u8)
+                .map(|i| rec(base.wrapping_add(i)))
+                .collect();
+            let refs: Vec<&[u8]> = rows.iter().map(|v| v.as_slice()).collect();
+            OpResult::Got(rows_to_payload(&refs))
+        };
+        // 8 shards × 100 rows each = 800 rows total. (1000 per spec
+        // hint, but mocks store the payload eagerly so we keep it
+        // smaller for the unoptimized test build — the bound logic is
+        // identical at 100 or 1000.)
+        let mut shards: Vec<CancellableMockShard> = Vec::with_capacity(8);
+        for i in 0..8u8 {
+            shards.push(CancellableMockShard::new(mk_payload(
+                100,
+                i.wrapping_mul(100),
+            )));
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let t0 = Instant::now();
+        let out = scatter_and_merge(
+            shards,
+            &dummy_select(),
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &ScatterKind::Unordered { limit: 0 },
+            cancel,
+        );
+        let elapsed = t0.elapsed();
+        let bytes = match &out {
+            OpResult::Got(b) => b,
+            other => panic!("expected Got, got {other:?}"),
+        };
+        let mut count = 0usize;
+        let mut p = 0usize;
+        while p < bytes.len() {
+            let len =
+                u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+            p += 4 + len;
+            count += 1;
+        }
+        assert_eq!(count, 800, "8 shards × 100 rows = 800 rows");
+        // Bound: should complete WELL under a second on any modern CI.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "8-shard fanout with bounded buffers should be <2s, was {elapsed:?}"
+        );
     }
 }

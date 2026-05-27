@@ -63,6 +63,7 @@
 
 pub mod proto;
 pub mod server;
+pub mod startup;
 
 pub use server::{accept, PgError};
 

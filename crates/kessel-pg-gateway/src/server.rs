@@ -473,7 +473,7 @@ fn pid_and_secret_from_nonce(nonce: &str, token: &[u8]) -> (u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::{encode_authentication_sasl_challenge, parse_sasl_initial_response};
+    use crate::auth::encode_authentication_sasl_challenge;
     use kessel_crypto::{base64_encode, hmac_sha256, pbkdf2_hmac_sha256, sha256};
     use std::io::Cursor;
 

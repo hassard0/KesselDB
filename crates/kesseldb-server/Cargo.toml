@@ -38,6 +38,12 @@ kessel-objstore = { path = "../kessel-objstore", optional = true }
 # extra crate. Enable with `cargo build --features http-gateway`.
 kessel-http-gateway = { path = "../kessel-http-gateway", optional = true }
 
+# SP-PG T12 opt-in PostgreSQL Frontend/Backend v3.0 wire gateway. OFF by
+# default — default build links no extra crate, `cargo tree -p
+# kesseldb-server --no-default-features` does NOT include
+# `kessel-pg-gateway`. Enable with `cargo build --features pg-gateway`.
+kessel-pg-gateway = { path = "../kessel-pg-gateway", optional = true }
+
 [features]
 default = []
 tls = ["dep:rustls", "dep:rustls-pemfile"]
@@ -45,9 +51,16 @@ external-sources = ["dep:kessel-fetch", "dep:kessel-crypto"]
 external-sources-tls = ["external-sources", "kessel-fetch/tls", "dep:rustls", "dep:rustls-pemfile"]
 external-sources-objstore = ["external-sources", "kessel-fetch/object-store", "dep:kessel-objstore", "dep:rustls", "dep:rustls-pemfile"]
 http-gateway = ["dep:kessel-http-gateway"]
+pg-gateway = ["dep:kessel-pg-gateway"]
 
 [dev-dependencies]
 kessel-expr = { path = "../kessel-expr" }
+# SP-PG T12: integration tests for the `pg-gateway` feature build a
+# hand-crafted PG client in-process. They need PBKDF2 + HMAC for the
+# SCRAM round-trip; the production crypto path goes through
+# `kessel-pg-gateway` (which has the same dep transitively). Listed
+# as a dev-dep so the default build stays unchanged.
+kessel-crypto = { path = "../kessel-crypto" }
 
 [lib]
 path = "src/lib.rs"

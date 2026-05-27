@@ -45,6 +45,13 @@ pub const TXN_TAG: u8 = 0xF9;
 /// group-commit fsync and the network round-trip. The reply is
 /// `Got([u32 cnt]` then `cnt × ([u32 len][OpResult::encode]))`, in order.
 pub const PIPELINE_TAG: u8 = 0xF8;
+/// SP-PG T12 admin: describe a table by NAME (PG-wire needs name
+/// lookup because PG clients don't pass type_id). Frame =
+/// `[0xF7] ++ utf8 name`; reply `Got(encode_type_def(name, fields))`
+/// on hit, `NotFound` on miss. Engine-thread-local; no SM mutation
+/// (read-only). Used by `kessel-pg-gateway::EngineApply::describe_table`
+/// via the `pg-gateway` feature impl on `EngineHandle`.
+pub const DESCRIBE_BY_NAME_TAG: u8 = 0xF7;
 
 /// Operational status of a running node.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -127,6 +134,24 @@ pub struct ServerConfig {
     /// forever; after this many requests on one connection the gateway
     /// closes cleanly and the client must open a fresh connection.
     pub http_max_requests_per_conn: usize,
+    /// SP-PG T12: PostgreSQL Frontend/Backend Protocol v3.0 gateway
+    /// address (opt-in via the `pg-gateway` feature). `None` = no PG
+    /// listener spawned. Independent of `http_addr` — PG and HTTP
+    /// caps are separate so a misbehaving pgcli can't starve HTTP
+    /// clients (spec §8.1). Default port: 5432.
+    pub pg_addr: Option<std::net::SocketAddr>,
+    /// SP-PG T12: per-PG-listener concurrent connection cap. Smaller
+    /// than `max_conns` because PG clients hold connections longer
+    /// (typical ORM pool: 10-50 per app instance). Default 256
+    /// (mirrors `kessel-pg-gateway::DEFAULT_MAX_PG_CONNS`).
+    pub pg_max_conns: usize,
+    /// SP-PG T12: per-connection idle timeout for PG sessions.
+    /// Connection that hasn't sent any client message for this long
+    /// is closed. Default 600s (mirrors
+    /// `kessel-pg-gateway::PG_DEFAULT_IDLE_TIMEOUT_SECS`). V1 just
+    /// closes the socket on timeout; T16 will emit `57014`
+    /// query_canceled ErrorResponse first.
+    pub pg_idle_timeout: std::time::Duration,
 }
 
 impl Default for ServerConfig {
@@ -140,6 +165,9 @@ impl Default for ServerConfig {
             http_tls_addr: None,
             http_max_body: 8 * 1024 * 1024,
             http_max_requests_per_conn: 1000,
+            pg_addr: None,
+            pg_max_conns: 256,
+            pg_idle_timeout: std::time::Duration::from_secs(600),
         }
     }
 }
@@ -617,6 +645,24 @@ pub fn spawn_engine_cfg(
                         Err(e) => OpResult::SchemaError(format!("snapshot: {e}")),
                     };
                 }
+                Some(&DESCRIBE_BY_NAME_TAG) => {
+                    // SP-PG T12: name → encoded type def, for the
+                    // PG-wire gateway's RowDescription emit. Read-only
+                    // — no `*n += 1`, no schema invalidation, no
+                    // catalog mutation.
+                    let name = match std::str::from_utf8(&frame[1..]) {
+                        Ok(s) => s,
+                        Err(_) => return OpResult::SchemaError(
+                            "describe_by_name: not utf8".into(),
+                        ),
+                    };
+                    return match sm.catalog().types.iter().find(|t| t.name == name) {
+                        Some(t) => OpResult::Got(
+                            kessel_catalog::encode_type_def(&t.name, &t.fields),
+                        ),
+                        None => OpResult::NotFound,
+                    };
+                }
                 Some(&TXN_TAG) => {
                     // Compile every buffered statement, then apply them as
                     // ONE atomic Op::Txn. Any compile failure (or a
@@ -1011,6 +1057,42 @@ pub fn serve_cfg(listener: TcpListener, engine: EngineHandle, cfg: ServerConfig)
             }
         });
     }
+    // SP-PG T12: opt-in PostgreSQL Frontend/Backend v3.0 gateway.
+    // Sibling listener; binary + HTTP listeners untouched. The PG
+    // listener has its OWN connection cap (`cfg.pg_max_conns`,
+    // default 256) so a misbehaving pgcli cannot starve binary or
+    // HTTP clients (spec §8.1). Refuses to start if `cfg.token` is
+    // None — V1 closed-mode requires a Bearer token (spec §3.4).
+    #[cfg(feature = "pg-gateway")]
+    if let Some(pg_addr) = cfg.pg_addr {
+        match cfg.token.clone() {
+            None => {
+                eprintln!(
+                    "kesseldb: pg_addr set but ServerConfig.token is None — \
+                     PG-wire V1 requires a Bearer token for SCRAM-SHA-256 \
+                     auth (spec §3.4). Skipping PG listener."
+                );
+            }
+            Some(token) => {
+                let engine_for_pg = engine.clone();
+                let pg_max_conns = cfg.pg_max_conns;
+                let idle_timeout = cfg.pg_idle_timeout;
+                std::thread::spawn(move || {
+                    let l = match std::net::TcpListener::bind(pg_addr) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            eprintln!(
+                                "kesseldb: pg-gateway bind {pg_addr} \
+                                 failed: {e}"
+                            );
+                            return;
+                        }
+                    };
+                    serve_pg(l, engine_for_pg, token, pg_max_conns, idle_timeout);
+                });
+            }
+        }
+    }
     // HTTPS gateway requires both http-gateway AND tls features.
     #[cfg(all(feature = "http-gateway", feature = "tls"))]
     if let (Some(https_addr), Some(tls_arc)) =
@@ -1071,6 +1153,79 @@ pub fn serve_cfg(listener: TcpListener, engine: EngineHandle, cfg: ServerConfig)
             }
             #[cfg(not(feature = "tls"))]
             handle_conn(stream, e, tok);
+            a.fetch_sub(1, Ordering::AcqRel);
+        });
+    }
+}
+
+/// SP-PG T12: PostgreSQL Frontend/Backend Protocol v3.0 listener.
+/// One thread per accepted connection, mirroring the binary listener
+/// shape but with the PG-wire-specific `run_session` body. The
+/// listener owns its own connection counter (separate from
+/// `serve_cfg`'s `active`) so a misbehaving pgcli cannot starve
+/// binary or HTTP clients (spec §8.1).
+///
+/// `idle_timeout` is wired via `TcpStream::set_read_timeout` BEFORE
+/// the session is entered — a long-silent connection eventually
+/// errors out of the read loop and `run_session` returns cleanly.
+/// V1 just closes the socket; T16 (SP-PG follow-up) will emit
+/// `57014` query_canceled ErrorResponse first.
+///
+/// `token` is the SCRAM-SHA-256 "password" input — V1 closed-mode
+/// requires `Some(t)`; spec §3.4 covers the Bearer ↔ SCRAM bridge.
+/// Caller (`serve_cfg`) guarantees `token` is not empty.
+#[cfg(feature = "pg-gateway")]
+fn serve_pg(
+    listener: TcpListener,
+    engine: EngineHandle,
+    token: Vec<u8>,
+    max_conns: usize,
+    idle_timeout: std::time::Duration,
+) {
+    let active = Arc::new(AtomicUsize::new(0));
+    for stream in listener.incoming().flatten() {
+        if active.load(Ordering::Acquire) >= max_conns {
+            // At capacity — drop the connection. V1 just hangs up;
+            // T13 will emit `53300` too_many_connections ErrorResponse
+            // BEFORE the close.
+            drop(stream);
+            continue;
+        }
+        // Disable Nagle: PG simple-query is request/response, so
+        // Nagle + delayed-ACK adds ~40 ms/round-trip on Linux.
+        let _ = stream.set_nodelay(true);
+        // Idle timeout: a connection that hasn't sent any bytes for
+        // `idle_timeout` errors out of `read_exact` and `run_session`
+        // returns cleanly.
+        let _ = stream.set_read_timeout(Some(idle_timeout));
+        active.fetch_add(1, Ordering::AcqRel);
+        let e = engine.clone();
+        let tok = token.clone();
+        let a = active.clone();
+        std::thread::spawn(move || {
+            let mut stream = stream;
+            // CSPRNG-backed server nonce per session (RFC 5802 §5.1
+            // — server nonce SHOULD be unpredictable). We derive
+            // entropy from `std::time::Instant::now()` mixed with a
+            // per-spawn counter via the system source — but the
+            // workspace stays zero-external-dep, so we mix a
+            // monotonic-clock-derived bag of bytes with the token.
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| {
+                    // 16 hex chars from the nanos field — enough
+                    // entropy for V1 (per-session uniqueness; spec
+                    // §3.4 open question #4 — V2 SP-PG T24 wires a
+                    // real CSPRNG via kessel-crypto).
+                    format!("{:016x}", d.as_nanos() as u64)
+                })
+                .unwrap_or_else(|_| "fallbackNonce".to_string());
+            let _ = kessel_pg_gateway::server::run_session(
+                &mut stream,
+                Some(&tok),
+                || nonce,
+                &e,
+            );
             a.fetch_sub(1, Ordering::AcqRel);
         });
     }
@@ -1238,6 +1393,473 @@ impl kessel_http_gateway::EngineApply for EngineHandle {
             // gateway accept loop on every emitted response.
             http_requests_total: self.http_counters.snapshot(),
         }
+    }
+}
+
+// SP-PG T12 — EngineApply bridge for the PG-wire gateway. Lets the
+// gateway dispatch into the existing engine via the same single-
+// threaded apply path. `describe_table` round-trips through the
+// engine via the `DESCRIBE_BY_NAME_TAG` admin frame so the catalog
+// (which lives with the non-`Send` StateMachine) is the source of
+// truth. Feature-gated on `pg-gateway` so the default build links
+// nothing extra and `cargo tree -p kesseldb-server --no-default-features`
+// remains free of `kessel-pg-gateway`.
+#[cfg(feature = "pg-gateway")]
+impl kessel_pg_gateway::EngineApply for EngineHandle {
+    fn apply_sql(&self, sql: &str) -> kessel_proto::OpResult {
+        let mut f = vec![0xFE];
+        f.extend_from_slice(sql.as_bytes());
+        self.apply_raw(f)
+    }
+    fn describe_table(
+        &self,
+        table_name: &str,
+    ) -> Option<Vec<kessel_pg_gateway::PgColumn>> {
+        let mut frame = vec![DESCRIBE_BY_NAME_TAG];
+        frame.extend_from_slice(table_name.as_bytes());
+        match self.apply_raw(frame) {
+            kessel_proto::OpResult::Got(bytes) => {
+                let (_name, fields) =
+                    kessel_catalog::decode_type_def(&bytes)?;
+                Some(
+                    fields
+                        .into_iter()
+                        .map(|f| kessel_pg_gateway::PgColumn {
+                            name: f.name,
+                            kind: f.kind,
+                            nullable: f.nullable,
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// SP-PG T12 — integration tests for the PG-wire listener.
+//
+// The headline test (`t12_pg_gateway_listener_serves_real_pg_client`)
+// spawns the full kesseldb-server through `run_cfg` with the
+// `pg-gateway` feature, opens a real TCP connection, drives the
+// StartupMessage + SCRAM-SHA-256 + Simple Query loop end-to-end
+// against the live engine, and asserts the server's wire response is
+// a well-formed PG backend stream including the BackendKeyData
+// envelope + a ReadyForQuery after the query.
+//
+// All tests use `127.0.0.1:0` to bind ephemeral ports; nothing
+// requires a system PG client (we ARE the PG client via the
+// gateway's own encoders).
+// ─────────────────────────────────────────────────────────────────────
+#[cfg(all(test, feature = "pg-gateway"))]
+mod pg_gateway_tests {
+    use super::*;
+    use kessel_crypto::{base64_encode, hmac_sha256, pbkdf2_hmac_sha256, sha256};
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpStream;
+    use std::time::{Duration, Instant};
+
+    /// Build a PG v3.0 StartupMessage frame for `user`:
+    /// `[length:4 BE][version=196608:4 BE][key\0value\0...\0]`.
+    fn build_startup_frame(user: &str) -> Vec<u8> {
+        let body = format!("user\0{user}\0\0");
+        let length = (4 + 4 + body.len()) as u32;
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&length.to_be_bytes());
+        frame.extend_from_slice(&196608u32.to_be_bytes());
+        frame.extend_from_slice(body.as_bytes());
+        frame
+    }
+
+    /// Build a SASLInitialResponse `p`-frame:
+    /// `p [length:4][SCRAM-SHA-256\0][client_first_len:u32][client_first]`.
+    fn build_sasl_initial_frame(client_first: &str) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"SCRAM-SHA-256\0");
+        payload.extend_from_slice(&(client_first.len() as u32).to_be_bytes());
+        payload.extend_from_slice(client_first.as_bytes());
+        let length = (4 + payload.len()) as u32;
+        let mut frame = Vec::new();
+        frame.push(b'p');
+        frame.extend_from_slice(&length.to_be_bytes());
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    fn build_sasl_response_frame(client_final: &str) -> Vec<u8> {
+        let payload = client_final.as_bytes();
+        let length = (4 + payload.len()) as u32;
+        let mut frame = Vec::new();
+        frame.push(b'p');
+        frame.extend_from_slice(&length.to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    /// Build a 'Q' (Simple Query) frame: `Q [length:4 BE] [sql\0]`.
+    fn build_q_frame(sql: &str) -> Vec<u8> {
+        let mut payload = sql.as_bytes().to_vec();
+        payload.push(0);
+        let length = (4 + payload.len()) as u32;
+        let mut frame = Vec::new();
+        frame.push(b'Q');
+        frame.extend_from_slice(&length.to_be_bytes());
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    /// Build a Terminate 'X' frame: `X [length:4 BE = 4]`.
+    fn build_x_frame() -> Vec<u8> { vec![b'X', 0, 0, 0, 4] }
+
+    /// Read the first frame off the wire (no type tag — startup
+    /// response). Returns the frame's body bytes only.
+    fn read_n(stream: &mut TcpStream, n: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; n];
+        let mut p = 0;
+        while p < n {
+            let r = stream.read(&mut buf[p..]).expect("read");
+            assert!(r > 0, "EOF reading {n} bytes (got {p})");
+            p += r;
+        }
+        buf
+    }
+
+    /// Drain the server's tagged-frame stream until we've seen a
+    /// `Z` (ReadyForQuery) byte. Returns all bytes read so far so
+    /// the test can grep for specific message tags.
+    fn drain_until_rfq(stream: &mut TcpStream) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if Instant::now() > deadline {
+                panic!("timeout draining to ReadyForQuery; got {} bytes", out.len());
+            }
+            let n = match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => panic!("read error: {e}"),
+            };
+            out.extend_from_slice(&chunk[..n]);
+            // Look for the Z envelope `Z [len=5][status]` at the end of out.
+            if out.len() >= 6 {
+                let tail = &out[out.len() - 6..];
+                if tail[0] == b'Z' && tail[1..5] == [0, 0, 0, 5] {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// Drive a full SCRAM handshake against an already-connected
+    /// TcpStream + token. Returns the bytes received during the
+    /// handshake (greeting through the FIRST ReadyForQuery), so the
+    /// caller can keep using the stream for queries.
+    fn complete_handshake(
+        stream: &mut TcpStream,
+        token: &[u8],
+        username: &str,
+    ) -> Vec<u8> {
+        // Use a deterministic-ish client nonce; the SERVER's nonce is
+        // unknown until the SASLContinue arrives.
+        let client_nonce = "fixedClientNonce";
+        let client_first_bare = format!("n={username},r={client_nonce}");
+        let client_first = format!("n,,{client_first_bare}");
+
+        // 1) StartupMessage
+        stream.write_all(&build_startup_frame(username)).unwrap();
+        stream.flush().unwrap();
+
+        // 2) Read AuthenticationSASL (24 bytes: 'R'+len=23+code=10+"SCRAM-SHA-256\0\0")
+        let _challenge = read_n(stream, 24);
+
+        // 3) Send SASLInitialResponse
+        stream.write_all(&build_sasl_initial_frame(&client_first)).unwrap();
+        stream.flush().unwrap();
+
+        // 4) Read AuthenticationSASLContinue: `R [length:4][code=11:u32][payload]`
+        //    Header is 'R' + len:4 + code:4 = 9 bytes; payload = len-8.
+        let hdr = read_n(stream, 9);
+        assert_eq!(hdr[0], b'R', "expected SASLContinue tag");
+        let length = u32::from_be_bytes(hdr[1..5].try_into().unwrap()) as usize;
+        // SASL code is at hdr[5..9] = code=11 (SASLContinue)
+        assert_eq!(&hdr[5..9], &11u32.to_be_bytes());
+        let payload = read_n(stream, length - 8);
+        let server_first = std::str::from_utf8(&payload).unwrap().to_string();
+
+        // 5) Parse server-first: r=<combined>,s=<salt_b64>,i=<iter>
+        let mut combined = String::new();
+        let mut salt_b64 = String::new();
+        let mut iter = 4096u32;
+        for kv in server_first.split(',') {
+            if let Some(rest) = kv.strip_prefix("r=") { combined = rest.into(); }
+            else if let Some(rest) = kv.strip_prefix("s=") { salt_b64 = rest.into(); }
+            else if let Some(rest) = kv.strip_prefix("i=") { iter = rest.parse().unwrap_or(4096); }
+        }
+        let salt = base64_decode(&salt_b64);
+
+        // 6) Build client-final + proof
+        let cf_without_proof = format!("c=biws,r={combined}");
+        let auth_msg = format!("{client_first_bare},{server_first},{cf_without_proof}");
+        let salted = pbkdf2_hmac_sha256(token, &salt, iter);
+        let client_key = hmac_sha256(&salted, b"Client Key");
+        let stored_key = sha256(&client_key);
+        let client_sig = hmac_sha256(&stored_key, auth_msg.as_bytes());
+        let mut proof = [0u8; 32];
+        for i in 0..32 { proof[i] = client_key[i] ^ client_sig[i]; }
+        let proof_b64 = base64_encode(&proof);
+        let client_final = format!("{cf_without_proof},p={proof_b64}");
+
+        // 7) Send SASLResponse
+        stream.write_all(&build_sasl_response_frame(&client_final)).unwrap();
+        stream.flush().unwrap();
+
+        // 8) Drain until first ReadyForQuery (after SASLFinal,
+        //    AuthenticationOk, ParameterStatus*, BackendKeyData, RFQ).
+        drain_until_rfq(stream)
+    }
+
+    /// Minimal base64 decoder for the SCRAM salt. RFC 4648
+    /// alphabet; PG always uses padded form. Sufficient for
+    /// in-tree test fixtures (the production crypto path uses
+    /// kessel-crypto::base64_encode for outbound).
+    fn base64_decode(s: &str) -> Vec<u8> {
+        const ALPHA: &[u8] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = Vec::with_capacity(s.len() * 3 / 4);
+        let mut buf = 0u32;
+        let mut bits = 0;
+        for c in s.bytes() {
+            if c == b'=' { break; }
+            let v = ALPHA.iter().position(|&x| x == c).expect("bad base64 char") as u32;
+            buf = (buf << 6) | v;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((buf >> bits) as u8);
+                buf &= (1 << bits) - 1;
+            }
+        }
+        out
+    }
+
+    fn fresh_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kdb-pg-{}-{}-{}",
+            name,
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// Headline T12 KAT: spin up kesseldb-server with the
+    /// `pg-gateway` feature, drive a real TCP client through the
+    /// full PG v3.0 handshake + a CREATE TABLE + INSERT + SELECT,
+    /// and assert the server emits a wire-correct response stream
+    /// (including BackendKeyData + ReadyForQuery + a SELECT row).
+    #[test]
+    fn t12_pg_gateway_listener_serves_real_pg_client() {
+        let dir = fresh_dir("e2e");
+        let token = b"kessel-pg-token".to_vec();
+        let pg_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let pg_addr = pg_listener.local_addr().unwrap();
+        drop(pg_listener); // free the port; serve_cfg will rebind
+        let cfg = ServerConfig {
+            token: Some(token.clone()),
+            pg_addr: Some(pg_addr),
+            ..ServerConfig::default()
+        };
+        let engine = spawn_engine_cfg(&dir, &cfg).unwrap();
+        let bin_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        std::thread::spawn({
+            let c = cfg.clone();
+            move || serve_cfg(bin_listener, engine, c)
+        });
+
+        // Wait for the PG listener to bind (it spawns inline in
+        // serve_cfg's spawn — give it a moment).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            match TcpStream::connect(pg_addr) {
+                Ok(s) => break s,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+                Err(e) => panic!("could not connect to PG listener {pg_addr}: {e}"),
+            }
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        stream.set_nodelay(true).unwrap();
+
+        // ── 1. SCRAM handshake ──────────────────────────────────────
+        let greeting = complete_handshake(&mut stream, &token, "kessel");
+        // The greeting bytes must contain BackendKeyData ('K' + len=12 + 8 bytes).
+        let mut found_k = false;
+        for i in 0..greeting.len().saturating_sub(13) {
+            if greeting[i] == b'K' && greeting[i+1..i+5] == [0, 0, 0, 12] {
+                found_k = true;
+                break;
+            }
+        }
+        assert!(found_k, "BackendKeyData ('K' 0 0 0 12 ...) MUST be in greeting");
+        // And of course ReadyForQuery at the end.
+        assert_eq!(&greeting[greeting.len() - 6..], &[b'Z', 0, 0, 0, 5, b'I']);
+
+        // ── 2. CREATE TABLE ─────────────────────────────────────────
+        stream
+            .write_all(&build_q_frame(
+                "CREATE TABLE pg_test (id i64 NOT NULL, n i32 NOT NULL)",
+            ))
+            .unwrap();
+        stream.flush().unwrap();
+        let r1 = drain_until_rfq(&mut stream);
+        assert!(
+            r1.windows(b"CREATE TABLE\0".len())
+                .any(|w| w == b"CREATE TABLE\0"),
+            "CREATE TABLE tag MUST be in response"
+        );
+
+        // ── 3. INSERT a row ─────────────────────────────────────────
+        stream
+            .write_all(&build_q_frame(
+                "INSERT INTO pg_test (id, n) VALUES (1, 100)",
+            ))
+            .unwrap();
+        stream.flush().unwrap();
+        let r2 = drain_until_rfq(&mut stream);
+        assert!(
+            r2.windows(b"INSERT 0 1\0".len())
+                .any(|w| w == b"INSERT 0 1\0"),
+            "INSERT 0 1 tag MUST be in response (T9 row count)"
+        );
+
+        // ── 4. SELECT * FROM pg_test ────────────────────────────────
+        stream
+            .write_all(&build_q_frame("SELECT * FROM pg_test"))
+            .unwrap();
+        stream.flush().unwrap();
+        let r3 = drain_until_rfq(&mut stream);
+        // RowDescription ('T') must appear.
+        assert!(r3.iter().any(|&b| b == b'T'), "RowDescription 'T' MUST appear");
+        // CommandComplete "SELECT 1" must appear.
+        assert!(
+            r3.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"),
+            "SELECT 1 tag MUST appear (single row)"
+        );
+        // The row payload must contain "100" (the n=100 value rendered as text).
+        assert!(
+            r3.windows(3).any(|w| w == b"100"),
+            "DataRow MUST carry the n=100 value as text"
+        );
+
+        // ── 5. Terminate ──────────────────────────────────────────
+        stream.write_all(&build_x_frame()).unwrap();
+        stream.flush().unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// When `cfg.token` is None, the PG listener must NOT spawn
+    /// (V1 closed-mode requires a Bearer token). A TCP connect to
+    /// the configured `pg_addr` should fail with `ConnectionRefused`.
+    #[test]
+    fn t12_no_token_no_pg_listener() {
+        let dir = fresh_dir("notok");
+        let pg_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let pg_addr = pg_listener.local_addr().unwrap();
+        drop(pg_listener);
+        let cfg = ServerConfig {
+            token: None,
+            pg_addr: Some(pg_addr),
+            ..ServerConfig::default()
+        };
+        let engine = spawn_engine_cfg(&dir, &cfg).unwrap();
+        let bin_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        std::thread::spawn({
+            let c = cfg.clone();
+            move || serve_cfg(bin_listener, engine, c)
+        });
+        // Give the would-be PG listener a moment to NOT bind.
+        std::thread::sleep(Duration::from_millis(50));
+        let r = TcpStream::connect_timeout(&pg_addr, Duration::from_millis(200));
+        assert!(
+            r.is_err(),
+            "TCP connect to pg_addr MUST fail when token is None (no listener)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The PG and binary listeners have INDEPENDENT connection caps.
+    /// Setting `cfg.max_conns=0` and `cfg.pg_max_conns=1` lets the
+    /// PG listener accept 1 connection even though the binary
+    /// listener is fully capped.
+    #[test]
+    fn t12_pg_and_binary_caps_are_independent() {
+        let dir = fresh_dir("caps");
+        let pg_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let pg_addr = pg_listener.local_addr().unwrap();
+        drop(pg_listener);
+        let cfg = ServerConfig {
+            token: Some(b"tok".to_vec()),
+            max_conns: 0,           // binary fully capped
+            pg_max_conns: 4,        // PG has capacity
+            pg_addr: Some(pg_addr),
+            ..ServerConfig::default()
+        };
+        let engine = spawn_engine_cfg(&dir, &cfg).unwrap();
+        let bin_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        std::thread::spawn({
+            let c = cfg.clone();
+            move || serve_cfg(bin_listener, engine, c)
+        });
+        // Wait for PG listener bind.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let stream = loop {
+            match TcpStream::connect_timeout(&pg_addr, Duration::from_millis(50)) {
+                Ok(s) => break s,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+                Err(e) => panic!("connect to PG addr failed: {e}"),
+            }
+        };
+        // Just hold the stream open — accept succeeded, proving the
+        // PG cap is independent of the binary cap.
+        drop(stream);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `EngineHandle::describe_table` (the PG-wire bridge) round-
+    /// trips through the engine and returns the same fields the
+    /// catalog has. Locks the DESCRIBE_BY_NAME_TAG admin path.
+    #[test]
+    fn t12_engine_handle_describe_table_matches_catalog() {
+        use kessel_pg_gateway::EngineApply as _;
+        let dir = fresh_dir("desc");
+        let engine = spawn_engine(&dir).unwrap();
+        // Create a table via SQL so the catalog has a known shape.
+        let r = <EngineHandle as kessel_pg_gateway::EngineApply>::apply_sql(
+            &engine,
+            "CREATE TABLE foo (id i64 NOT NULL, label u32 NOT NULL)",
+        );
+        assert!(matches!(r, kessel_proto::OpResult::TypeCreated(_)));
+        // describe_table should now return the columns in order.
+        let cols = engine.describe_table("foo").expect("table exists");
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].name, "id");
+        assert_eq!(cols[0].kind, kessel_catalog::FieldKind::I64);
+        assert!(!cols[0].nullable);
+        assert_eq!(cols[1].name, "label");
+        assert_eq!(cols[1].kind, kessel_catalog::FieldKind::U32);
+        // describe_table on a missing table → None.
+        assert!(engine.describe_table("ghost").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

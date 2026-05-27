@@ -8,6 +8,10 @@
 //!   KESSELDB_HTTP_ADDR      — enable opt-in HTTP/1.1 gateway on the given addr
 //!                              (requires --features http-gateway build)
 //!   KESSELDB_HTTP_TLS_ADDR  — enable HTTPS gateway (requires --features http-gateway,tls)
+//!   KESSELDB_PG_ADDR        — enable opt-in PostgreSQL Frontend/Backend
+//!                              v3.0 wire gateway (default port 5432;
+//!                              requires --features pg-gateway build +
+//!                              KESSELDB_TOKEN for SCRAM-SHA-256 auth)
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -34,11 +38,19 @@ fn main() {
             eprintln!("kesseldb: bad KESSELDB_HTTP_TLS_ADDR {a:?} — ignoring");
         }
     }
+    if let Ok(a) = std::env::var("KESSELDB_PG_ADDR") {
+        if let Ok(parsed) = a.parse() {
+            cfg.pg_addr = Some(parsed);
+        } else {
+            eprintln!("kesseldb: bad KESSELDB_PG_ADDR {a:?} — ignoring");
+        }
+    }
 
     println!(
-        "KesselDB listening on {addr}, data dir {dir}{}{}",
+        "KesselDB listening on {addr}, data dir {dir}{}{}{}",
         cfg.http_addr.map(|a| format!(", http={a}")).unwrap_or_default(),
         cfg.http_tls_addr.map(|a| format!(", https={a}")).unwrap_or_default(),
+        cfg.pg_addr.map(|a| format!(", pg={a}")).unwrap_or_default(),
     );
     if let Err(e) = kesseldb_server::run_cfg(&addr, &dir, cfg) {
         eprintln!("kesseldb: fatal: {e}");

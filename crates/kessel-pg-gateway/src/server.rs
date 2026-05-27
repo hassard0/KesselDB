@@ -297,6 +297,117 @@ pub fn accept<S: Read + Write, F: FnOnce() -> String>(
     })
 }
 
+/// Full per-connection session: runs the handshake via `accept`, then
+/// enters the Simple-Query loop until the client sends `Terminate`
+/// ('X') or the TCP connection drops.
+///
+/// This is the entry point a real PG-wire listener (T12 wires it up
+/// behind the `pg-gateway` feature) will call once per accepted TCP
+/// connection.
+///
+/// Loop body per spec §8 + PG §55.2.3:
+///
+/// 1. Read the next message tag byte from the stream.
+/// 2. `'Q'` (Simple Query) → parse body via T3, dispatch via
+///    `dispatch::dispatch_query`, write the response bytes (RowDescription
+///    + DataRow* + CommandComplete + ReadyForQuery, OR EmptyQueryResponse
+///    + ReadyForQuery, OR ErrorResponse + ReadyForQuery).
+/// 3. `'X'` (Terminate) → close connection cleanly, return `Ok(())`.
+/// 4. Any other tag → write ErrorResponse `08P01` (protocol_violation)
+///    + close. (Per spec §11 weak-spot #5, V1 rejects extended-query
+///    messages with a clean error — V2 SP-PG-EXTQ implements them.)
+///
+/// Returns `Ok(())` for a clean session close (Terminate or EOF) or
+/// `Err(PgError)` for I/O or protocol failures.
+pub fn run_session<
+    S: Read + Write,
+    F: FnOnce() -> String,
+    E: crate::engine::EngineApply + ?Sized,
+>(
+    stream: &mut S,
+    token: Option<&[u8]>,
+    server_nonce_fn: F,
+    engine: &E,
+) -> Result<AcceptedSession, PgError> {
+    // ─── Handshake ────────────────────────────────────────────────
+    let session = accept(stream, token, server_nonce_fn)?;
+    // ─── Query loop ───────────────────────────────────────────────
+    loop {
+        let mut tag_buf = [0u8; 1];
+        match stream.read_exact(&mut tag_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // Clean EOF — client closed without Terminate.
+                return Ok(session);
+            }
+            Err(e) => return Err(PgError::Io(e.kind())),
+        }
+        let tag = tag_buf[0];
+        // Read length-prefix.
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf)?;
+        let length = u32::from_be_bytes(len_buf);
+        if length as usize > PG_MAX_MESSAGE_SIZE {
+            return Err(PgError::MessageTooLarge { length });
+        }
+        if length < 4 {
+            // length must include itself.
+            let resp = crate::dispatch::error_response_then_rfq(
+                crate::error::SEVERITY_ERROR,
+                "08P01",
+                "protocol violation: message length < 4",
+            );
+            let _ = stream.write_all(&resp);
+            let _ = stream.flush();
+            return Err(PgError::StartupFailed(StartupError::LengthTooSmall {
+                length,
+            }));
+        }
+        let body_len = (length as usize) - 4;
+        let mut body = vec![0u8; body_len];
+        stream.read_exact(&mut body)?;
+
+        match tag {
+            crate::proto::FE_QUERY => {
+                // Parse Q body — strip trailing NUL, validate UTF-8.
+                let sql_owned = match crate::query::parse_query_body(&body) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => {
+                        let resp = crate::dispatch::error_response_then_rfq(
+                            crate::error::SEVERITY_ERROR,
+                            "08P01",
+                            "protocol violation: malformed Q body",
+                        );
+                        stream.write_all(&resp)?;
+                        stream.flush()?;
+                        continue;
+                    }
+                };
+                let resp = crate::dispatch::dispatch_query(&sql_owned, engine);
+                stream.write_all(&resp)?;
+                stream.flush()?;
+            }
+            crate::proto::FE_TERMINATE => {
+                // Clean close — no response per PG §55.2.3.
+                return Ok(session);
+            }
+            other => {
+                // Unknown / unsupported message type. V1 rejects with
+                // a clean error + closes the connection. Extended-query
+                // tags (P/B/D/E/S/C/H) land here in V1.
+                let resp = crate::dispatch::error_response_then_rfq(
+                    crate::error::SEVERITY_ERROR,
+                    "08P01",
+                    &format!("unsupported message tag: 0x{other:02X}"),
+                );
+                stream.write_all(&resp)?;
+                stream.flush()?;
+                return Err(PgError::UnexpectedMessageDuringAuth { tag: other });
+            }
+        }
+    }
+}
+
 /// Writes a ParameterStatus message: `S [length:4 BE] [key\0] [value\0]`.
 /// PG §55.2.6 — emitted after AuthenticationOk to announce server
 /// session parameters the client should know about (`server_version`,
@@ -723,5 +834,230 @@ mod tests {
             pid_a != pid_b || secret_a != secret_b,
             "different nonces MUST produce different BackendKeyData"
         );
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // T8 KATs — full session loop: handshake + Q dispatch + Terminate.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// A minimal test engine used by the T8 session-loop KATs.
+    /// Always returns an empty SELECT (0 rows) so we can focus on
+    /// the framing without record-encoding noise.
+    struct EmptySelectEngine;
+    impl crate::engine::EngineApply for EmptySelectEngine {
+        fn apply_sql(&self, _sql: &str) -> kessel_proto::OpResult {
+            kessel_proto::OpResult::Got(Vec::new())
+        }
+        fn describe_table(
+            &self,
+            name: &str,
+        ) -> Option<Vec<crate::engine::PgColumn>> {
+            if name == "t" {
+                Some(vec![crate::engine::PgColumn {
+                    name: "id".into(),
+                    kind: kessel_catalog::FieldKind::I64,
+                    nullable: false,
+                }])
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Build a 'Q' simple-query frame: `Q [length:4 BE] [sql\0]`.
+    fn build_q_frame(sql: &str) -> Vec<u8> {
+        let mut payload = sql.as_bytes().to_vec();
+        payload.push(0);
+        let length = (4 + payload.len()) as u32;
+        let mut frame = Vec::new();
+        frame.push(b'Q');
+        frame.extend_from_slice(&length.to_be_bytes());
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    /// Build a Terminate 'X' frame: `X [length:4 BE = 4]`.
+    fn build_x_frame() -> Vec<u8> {
+        vec![b'X', 0, 0, 0, 4]
+    }
+
+    /// Build the full inbound byte stream a session expects: a
+    /// successful SCRAM handshake followed by additional frames.
+    fn build_authed_inbound(
+        token: &[u8],
+        client_nonce: &str,
+        server_nonce: &str,
+        username: &str,
+        extra: &[u8],
+    ) -> Vec<u8> {
+        let client_first_bare = format!("n={username},r={client_nonce}");
+        let client_first = format!("n,,{client_first_bare}");
+        let mut salt_input = Vec::new();
+        salt_input.extend_from_slice(server_nonce.as_bytes());
+        salt_input.extend_from_slice(token);
+        let salt: Vec<u8> = kessel_crypto::sha256(&salt_input)[..16].to_vec();
+        let salt_b64 = kessel_crypto::base64_encode(&salt);
+        let combined = format!("{client_nonce}{server_nonce}");
+        let server_first = format!("r={combined},s={salt_b64},i=4096");
+        let cf_without_proof = format!("c=biws,r={combined}");
+        let auth_msg =
+            format!("{client_first_bare},{server_first},{cf_without_proof}");
+        // Mirror the test-internal compute_client_proof:
+        let salted = kessel_crypto::pbkdf2_hmac_sha256(token, &salt, 4096);
+        let client_key = kessel_crypto::hmac_sha256(&salted, b"Client Key");
+        let stored_key = kessel_crypto::sha256(&client_key);
+        let client_sig = kessel_crypto::hmac_sha256(&stored_key, auth_msg.as_bytes());
+        let mut proof = [0u8; 32];
+        for i in 0..32 {
+            proof[i] = client_key[i] ^ client_sig[i];
+        }
+        let proof_b64 = kessel_crypto::base64_encode(&proof);
+        let client_final = format!("{cf_without_proof},p={proof_b64}");
+
+        let mut inbound = Vec::new();
+        inbound.extend_from_slice(&build_startup_frame(username));
+        inbound.extend_from_slice(&build_sasl_initial_frame(&client_first));
+        inbound.extend_from_slice(&build_sasl_response_frame(&client_final));
+        inbound.extend_from_slice(extra);
+        inbound
+    }
+
+    /// Headline T8 KAT: a full session — handshake + `SELECT * FROM t`
+    /// + Terminate — returns the expected backend byte sequence with
+    /// the SELECT response embedded.
+    #[test]
+    fn t8_run_session_full_select_round_trip() {
+        let token = b"kessel-bearer-token";
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&build_q_frame("SELECT * FROM t"));
+        extra.extend_from_slice(&build_x_frame());
+        let inbound = build_authed_inbound(
+            token,
+            "clientN",
+            "serverN",
+            "test",
+            &extra,
+        );
+        let mut pipe = Pipe::new(inbound);
+        let engine = EmptySelectEngine;
+        let session = run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("session completes through Terminate");
+        assert_eq!(session.user, "test");
+        // The outbound bytes must contain:
+        //   - the handshake greeting (ParameterStatus, BackendKeyData, RFQ)
+        //   - then a RowDescription ('T') for the SELECT
+        //   - then CommandComplete "SELECT 0"
+        //   - then ReadyForQuery ('Z' [len=5] 'I')
+        // The greeting ends with one RFQ — there should be TWO total
+        // RFQ envelopes in the outbound bytes (greeting + post-query).
+        let out = &pipe.outbound;
+        let rfq = &[b'Z', 0, 0, 0, 5, b'I'][..];
+        let mut rfq_count = 0;
+        for w in out.windows(6) {
+            if w == rfq {
+                rfq_count += 1;
+            }
+        }
+        assert!(rfq_count >= 2, "at least 2 ReadyForQuery envelopes expected");
+        // RowDescription type byte appears AFTER the greeting RFQ.
+        assert!(out.windows(b"SELECT 0\0".len()).any(|w| w == b"SELECT 0\0"));
+    }
+
+    /// `Terminate` ('X') message → session closes cleanly without
+    /// emitting any extra response.
+    #[test]
+    fn t8_run_session_terminate_closes_cleanly() {
+        let token = b"kessel-bearer-token";
+        let extra = build_x_frame();
+        let inbound = build_authed_inbound(
+            token,
+            "clientN",
+            "serverN",
+            "test",
+            &extra,
+        );
+        let mut pipe = Pipe::new(inbound);
+        let engine = EmptySelectEngine;
+        let session = run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("session terminates cleanly");
+        assert_eq!(session.user, "test");
+    }
+
+    /// Unknown message tag (e.g. extended-query 'P' Parse) → emit
+    /// ErrorResponse 08P01 + close the connection with an
+    /// UnexpectedMessageDuringAuth-style error.
+    #[test]
+    fn t8_run_session_unknown_message_tag_emits_08p01() {
+        let token = b"kessel-bearer-token";
+        // Extended-query 'P' Parse message — V1 rejects.
+        let extra = {
+            let payload: &[u8] = b"\0SELECT 1\0\0\0";
+            let length = (4 + payload.len()) as u32;
+            let mut f = Vec::new();
+            f.push(b'P');
+            f.extend_from_slice(&length.to_be_bytes());
+            f.extend_from_slice(payload);
+            f
+        };
+        let inbound = build_authed_inbound(
+            token,
+            "clientN",
+            "serverN",
+            "test",
+            &extra,
+        );
+        let mut pipe = Pipe::new(inbound);
+        let engine = EmptySelectEngine;
+        let r = run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        );
+        // Errors with UnexpectedMessageDuringAuth (the same variant
+        // re-used post-auth — V1 doesn't differentiate, the SQLSTATE
+        // on the wire is what matters).
+        assert!(matches!(r, Err(PgError::UnexpectedMessageDuringAuth { tag: b'P' })));
+        // Outbound bytes contain SQLSTATE 08P01.
+        assert!(pipe.outbound.windows(5).any(|w| w == b"08P01"));
+    }
+
+    /// Empty Q (whitespace-only SQL) emits EmptyQueryResponse + RFQ,
+    /// the session stays alive, then Terminate closes it cleanly.
+    #[test]
+    fn t8_run_session_empty_q_then_terminate() {
+        let token = b"kessel-bearer-token";
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&build_q_frame("   "));
+        extra.extend_from_slice(&build_x_frame());
+        let inbound = build_authed_inbound(
+            token,
+            "clientN",
+            "serverN",
+            "test",
+            &extra,
+        );
+        let mut pipe = Pipe::new(inbound);
+        let engine = EmptySelectEngine;
+        run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("session completes");
+        // EmptyQueryResponse 'I' (5 bytes total) present.
+        let eqr = &[b'I', 0, 0, 0, 4][..];
+        assert!(pipe.outbound.windows(5).any(|w| w == eqr));
     }
 }

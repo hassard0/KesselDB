@@ -62,6 +62,8 @@
 #![allow(dead_code)]
 
 pub mod auth;
+pub mod dispatch;
+pub mod engine;
 pub mod error;
 pub mod proto;
 pub mod query;
@@ -70,6 +72,7 @@ pub mod server;
 pub mod startup;
 pub mod types;
 
+pub use engine::{EngineApply, PgColumn};
 pub use server::{accept, AcceptedSession, PgError};
 
 /// Spec §8.1: default TCP port for the PostgreSQL Frontend/Backend

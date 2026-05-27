@@ -23,6 +23,17 @@ kessel-catalog = { path = "../kessel-catalog" }
 # SigV4 + SP-WS handshake) and add PBKDF2-HMAC-SHA-256 for the
 # SCRAM-SHA-256 auth path (RFC 5802 + RFC 7677 + RFC 8018 §5.2).
 kessel-crypto = { path = "../kessel-crypto" }
+# T8 uses kessel-codec::{value_from_raw, Value} + ObjectType layout
+# to decode `OpResult::Got(rows)` from `Op::Select` (the row-bytes
+# format is `[u32 LE len][record]*`) into PG-text-format DataRow
+# columns. kessel-codec is workspace-internal — no new external deps.
+kessel-codec = { path = "../kessel-codec" }
+# T8 uses kessel-sql::select_star_table to detect the V1-supported
+# whole-row SELECT shape (`SELECT * FROM <table>`) at the gateway
+# layer — `kessel-sql`'s real lexer, no string heuristics. Already
+# transitively present via kessel-client; pull it directly so the
+# dependency contract is explicit.
+kessel-sql = { path = "../kessel-sql" }
 
 [lib]
 path = "src/lib.rs"

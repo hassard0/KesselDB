@@ -63,6 +63,7 @@
 
 pub mod auth;
 pub mod proto;
+pub mod query;
 pub mod server;
 pub mod startup;
 

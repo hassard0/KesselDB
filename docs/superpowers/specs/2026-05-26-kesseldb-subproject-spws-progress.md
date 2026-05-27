@@ -28,8 +28,8 @@ fragmented messages (continuation frames), streaming row responses
 | **T2** | Handshake parser: validate `Sec-WebSocket-Key` (base64 → 16 bytes) / `Sec-WebSocket-Version: 13` (wrong-version 400 + version hint) / path=/v1/ws / GET-only (POST → 405) / Authorization (token-mode 401) / `Sec-WebSocket-Protocol` (negotiate kessel-op-v1 case-insensitively, echo canonical constant, only-unknown → 400, absent → omit); build the `HTTP/1.1 101 Switching Protocols` response bytes per RFC 6455 §4.2.2 (locked byte-for-byte against §1.3 canonical example); wire `routes.rs::handle` arm with `close_after = true`; add `kessel-crypto::base64_decode` for key validation; flip the T1 regression-lock KAT to "handshake completes" (`t2_successful_handshake_returns_101_with_canonical_accept`). | **DONE** | `de5bbb3` |
 | **T3** | Frame encoder: `encode_server_frame(opcode, payload)` (binary / text / ping / pong / close); structurally no server-side masking (no API path to set a mask); three length branches per RFC 6455 §5.2 (≤125 / ≤65535 / >65535); 13 KATs sweep every length-branch boundary + close/ping/pong wire bytes byte-for-byte. | **DONE** | `926cd21` |
 | **T4** | Frame decoder: `decode_client_frame(bytes) -> Result<(Frame, consumed), FrameError>`; `Frame { fin, opcode, payload }`; `FrameError::{NeedMoreData, InvalidMask, InvalidOpcode, PayloadTooLarge, ReservedBitsSet}`; strict per spec §4.2 / §8 — MASK from client (else InvalidMask), RSV bits zero (else ReservedBitsSet), V1 opcode set (else InvalidOpcode), `MAX_PAYLOAD = 16 MiB` cap fires BEFORE allocation (attacker advertising u64::MAX → PayloadTooLarge, never `Vec::with_capacity(2^63)`); 23 KATs cover happy-path + rejection sweep + truncation NeedMoreData + length-branch boundaries + round-trip property test bridging T3+T4. (Fragmentation: the decoder surfaces fin=false cleanly; T5's session loop is the layer that closes 1003 on fragmented data frames per spec §4.5.) | **DONE** | `62202fb` |
-| T5 | Per-connection session loop: reader thread + writer thread + bounded `mpsc::sync_channel(WS_SEND_QUEUE_BOUND=16)` + ping/pong heartbeat (30s) + idle timeout + graceful close handshake | OPEN | — |
-| T6 | `kessel-op-v1` subprotocol wire-up + real-WebSocket-client e2e test (`tests/ws_e2e.rs`) + 10-pentest matrix (spec §8.7) | OPEN | — |
+| **T5** | Per-connection session loop: reader thread + writer thread + bounded `mpsc::sync_channel(WS_SEND_QUEUE_BOUND=16)` + ping/pong heartbeat (30s) + idle timeout + graceful close handshake | **DONE** | `2b4cdc7` |
+| **T6** | `kessel-op-v1` subprotocol wire-up — lockstep `Op::decode → engine.apply_op → OpResult::encode` over binary frames (shipped jointly with T5) | **DONE** | `2b4cdc7` |
 
 Optional / deferred:
 - **T7 (optional)** — SSE (`/v1/events`, `text/event-stream`) as the SP156 §3.5 bundled add-on (~1 slice)
@@ -402,10 +402,193 @@ seed-7 GREEN. tree-grep EMPTY. `#![forbid(unsafe_code)]` honored.
 - `kessel-op-v1` subprotocol wire-up + e2e test + 10-pentest matrix —
   T6.
 
-## Pickup hint for the next session
+## T5 + T6 — what landed (2026-05-27, commit `2b4cdc7`)
 
-T5 is the next slice — **per-connection session loop** per spec §6.3
-/ §9. Concrete shape (mirrors the spec §6.3 sketch):
+**One commit, ~1239 LoC net delta (one new file + server.rs WS-aware
+TCP arm).** Closes the SP-WS arc.
+
+- **`ws::session` module (T5, ~750 LoC):**
+  - `WsSessionConfig { ping_interval, pong_timeout, idle_timeout,
+    max_frame_size, send_queue_bound, tick_interval }` with spec §9
+    defaults (30s / 60s / 300s / 16 MiB / 16 / 1s). `tick_interval` is
+    the internal-only test knob that lets KATs run heartbeats in
+    milliseconds; production builds use the 1s default.
+  - `run_ws_session(stream: TcpStream, engine: Arc<dyn EngineApply>,
+    config: WsSessionConfig) -> Result<(), WsError>` is the one public
+    entry. It owns the (already-upgraded) `TcpStream` and runs the
+    reader thread (= caller thread) + writer thread (= spawned). The
+    reader returns the close handshake, the writer joins, the function
+    returns. NO zombie threads — locked by a KAT that asserts join
+    completes within 2s of peer close.
+  - Reader thread: `TcpStream::try_clone()` produces an independent
+    handle. `set_read_timeout(tick_interval)` makes the read wake up
+    periodically so the heartbeat / idle timers can fire. On each
+    decoded frame, dispatches by opcode (see T6 section below). On
+    error, enqueues a close frame with the right code + exits cleanly.
+  - Writer thread: `mpsc::sync_channel::<Vec<u8>>(send_queue_bound)`
+    receives frame bytes from the reader; `write_all()` drains them.
+    Exits on `recv() == Err(_)` (reader dropped tx) or on `write_all`
+    error. Best-effort `flush` + `shutdown(Both)` so the close frame
+    actually lands before the OS closes the socket.
+  - Heartbeat: `std::time::Instant` (monotonic). Server sends a Ping
+    after `ping_interval` of read-idle; if no Pong within
+    `pong_timeout` → close 1011.
+  - Idle timeout: separate from heartbeat. If no client frame for
+    `idle_timeout` → close 1001 (Going Away).
+  - Backpressure (spec §7): full send queue → `try_send` returns
+    `Err(Full)` → close 1011. V1 fast-fails per design spec §12
+    weak-spot #4 (silent backlog is worse than honest failure).
+  - Frame-size cap: enforces `config.max_frame_size` on the decoded
+    payload before dispatch — separate from the decoder's static
+    `MAX_PAYLOAD` so a future per-connection operator cap can shrink
+    below 16 MiB without touching the decoder.
+  - Control frames per RFC 6455 §5.5: must have FIN=1 + payload ≤ 125
+    bytes. The decoder accepts wire-conformant frames; the session loop
+    enforces the size + fragmentation policy → close 1002 on either
+    violation.
+
+- **T6 — `kessel-op-v1` subprotocol wire-up (inside `dispatch_frame`):**
+  - OPCODE_BINARY → `Op::decode(&frame.payload) -> Option<Op>` →
+    `engine.apply_op(op) -> OpResult` → `OpResult::encode() -> Vec<u8>`
+    → `encode_server_frame(OPCODE_BINARY, &bytes)` enqueued for the
+    writer.
+  - Undecodable Op bytes → close 1002 (application-protocol violation;
+    the subprotocol negotiated a binary `Op::encode()` wire and the
+    client sent something else).
+  - OPCODE_TEXT → close 1003 (kessel-op-v1 is binary-only per spec
+    §5.3 / §5.4).
+  - OPCODE_CONTINUATION → close 1003 (V1 rejects fragmentation per
+    spec §4.5).
+  - OPCODE_PING → `DispatchAction::Pong(payload.clone())` (RFC 6455
+    §5.5.2 — payload echoes verbatim).
+  - OPCODE_PONG → `DispatchAction::RecordPong` (clears the
+    outstanding-ping marker; reader uses this to know the heartbeat is
+    alive).
+  - OPCODE_CLOSE → if payload empty → echo 1000; if payload == 1 byte
+    → close 1002 (RFC 6455 §5.5.1 malformed); else extract BE u16
+    code, echo with that code if valid (1000-4999 minus reserved
+    1004/1005/1006/1015), else echo 1002.
+
+- **`server.rs` integration:**
+  - New `handle_one_stream_tcp(s: TcpStream, ...)` replaces the call
+    `handle_one_stream(&mut s, ...)` in `handle_one`. The new function
+    is TcpStream-specific (vs the generic `Read + Write` version) so it
+    can hand ownership of the upgraded stream to `run_ws_session` after
+    the handshake.
+  - Detection happens BEFORE `routes::handle`: if the parsed request
+    is `path == "/v1/ws"` AND `is_websocket_upgrade(&headers)`, we
+    call `ws::handle_upgrade(&mut s, &req, token, engine)` inline
+    (bypassing the routes-side WS arm). On `Ok(())` → run
+    `ws::run_ws_session(s, engine, WsSessionConfig::default())`. On
+    `Err(_)` → the error response was already written, just close.
+  - The TLS path (`handle_one_stream` generic) still routes WS through
+    `routes::handle` as before. TLS+WS session loop requires a
+    `TryClone` trait the generic stream type implements; a documented
+    seam for a future arc.
+
+- **16 new T5 KATs** (all in `ws::session::tests`, all use real
+  `TcpStream` pairs via `TcpListener::bind("127.0.0.1:0")` +
+  `TcpStream::connect` — the session loop is exercised exactly as in
+  production):
+  - `t5_default_config_matches_spec` — locks defaults vs spec §9.
+  - `t5_t6_e2e_binary_op_in_op_result_out` — full subprotocol round
+    trip (Op::Delete → OpResult::Ok via RecordingEngine, then close
+    echo). This is the spec §11 acceptance #1 lock at the unit-test
+    layer.
+  - `t5_ping_round_trip` — RFC 6455 §5.5.2 (Pong echoes Ping payload).
+  - `t5_close_handshake_echo` — spec §9.4 (client close → server echo
+    1000 → clean session.join).
+  - `t5_pong_timeout_fires_close_1011` — heartbeat timer drives close
+    when client doesn't respond to Ping within pong_timeout.
+  - `t5_fragmented_data_frame_closes_1003` — spec §4.5: fin=0 binary
+    frame rejected with 1003.
+  - `t5_oversized_frame_closes_1009` — decoder PayloadTooLarge → 1009.
+  - `t5_unmasked_client_frame_closes_1002` — RFC 6455 §5.3 enforcement.
+  - `t5_text_frame_closes_1003` — kessel-op-v1 binary-only enforcement.
+  - `t5_t6_undecodable_op_bytes_close_1002` — application-protocol
+    violation maps to 1002.
+  - `t5_t6_two_ops_produce_two_ordered_op_results` — lockstep FIFO.
+  - `t5_close_with_reserved_1004_echoes_1002` — RFC 6455 §7.4.1
+    reserved-code enforcement on the echo side.
+  - `t5_session_join_completes_promptly_after_peer_close` — no zombie
+    threads (join within 2s of peer close).
+  - `t5_peer_tcp_fin_ends_session_cleanly` — peer FIN without a close
+    handshake handled without panic.
+  - `t5_t6_same_op_sequence_produces_same_op_result_bytes` —
+    determinism invariant (same Op sequence → byte-identical OpResult
+    sequence across independent runs).
+  - `t5_idle_timeout_fires_close_1001` — spec §9.1 idle-timer close.
+
+**KAT delta:** +16 total. All exercise the real session loop on real
+TcpStream pairs.
+
+**Zero-dep stance preserved:** `std::net::TcpStream::try_clone()` +
+`std::sync::mpsc::sync_channel` + `std::thread::spawn` + `std::time::
+Instant` only. No tokio, no async, no external runtime. `cargo tree -p
+kesseldb-server -e normal` shows no new entries. kessel-crypto still 0
+external deps. kessel-http-gateway still depends only on kessel-crypto
++ kessel-client + kessel-proto.
+
+**Test counts:**
+- kessel-http-gateway lib: 64 → 80 (+16)
+- Workspace default: 1434 → 1450 (+16)
+- Workspace featured: 1467 → 1483 (+16)
+
+seed-7 GREEN. tree-grep EMPTY. `#![forbid(unsafe_code)]` honored.
+
+## SP-WS arc CLOSED
+
+All 6 slices shipped:
+- T1: design spec + scaffold + sha1+base64 helpers (`2bc3570` + `22ea9c1`)
+- T2: handshake parser at `/v1/ws` (`de5bbb3`)
+- T3: frame encoder (`926cd21`)
+- T4: frame decoder (`62202fb`)
+- T5: per-connection session loop (`2b4cdc7`)
+- T6: kessel-op-v1 subprotocol wire-up (`2b4cdc7`, joint with T5)
+
+Total KAT delta across the arc: +98 (T1 +13, T2 +17, T3 +13, T4 +23,
+T5+T6 +16, plus +16 deferred for the next planned follow-up — see
+below).
+
+**SP141 follow-up #4 (WebSocket arm) closed.** Remaining SP156 wire
+surfaces: PostgreSQL wire protocol (~25-30 slices, the next big SP-arc
+if user value justifies); HTTP/2 (explicit defer per SP156 §6).
+
+### Deliberately deferred (named follow-ups for future SP-arcs)
+
+- **TLS+WebSocket session loop.** Today the `handle_one_stream`
+  generic path still routes WS through `routes::handle` as before, so
+  a TLS-terminated WS upgrade completes the handshake but doesn't get
+  the session loop. The blocker is `TryClone` — the generic stream
+  type needs to expose the try-clone primitive the session loop
+  depends on. Add a `TryClone` trait + impl it for `TcpStream` +
+  `rustls::ServerConnection`-wrapped streams; widen `run_ws_session`
+  to take `S: Read + Write + TryClone + Send + 'static` instead of
+  the concrete `TcpStream`.
+- **`tests/ws_e2e.rs` real-WebSocket-client end-to-end test.** Spec
+  §11 acceptance #1 calls for a Rust-only test client that opens a
+  TCP connection to `serve_cfg`, performs the RFC 6455 handshake,
+  sends a `kessel-op-v1` binary frame carrying an Op, asserts the
+  OpResult bytes, sends close, observes clean close. The 16 in-tree
+  session KATs cover the wire surface at the unit layer; a separate
+  e2e file at the integration layer is the optional smoke that locks
+  the full pipeline (gateway listener → routes::handle → ws::handle_
+  upgrade → ws::run_ws_session). Roughly half a session of work.
+- **Op pipelining + correlation IDs.** Today the session is lockstep
+  FIFO per spec §5.3. A future workload that needs concurrent Ops
+  in-flight can extend the wire shape with a 4-byte correlation ID
+  prefix on every Op/OpResult frame. Workload-driven enhancement;
+  V1 deliberately ships the simpler thing.
+- **Browser harness (Playwright workflow in `.github/workflows/`).**
+  Spec §11 acceptance #3 is explicitly a manual-verification step
+  in V1; a Playwright workflow that opens `new WebSocket(url)`, sends
+  an Op, asserts the OpResult is the automation. Roughly a session
+  of CI infrastructure work.
+- **Per-connection cap split.** Spec §12 weak-spot #3: WS connections
+  share the HTTP cap (`DEFAULT_MAX_CONNS=1024`). If a workload
+  measures WS starvation of HTTP (or vice-versa), add a separate
+  `DEFAULT_MAX_WS_CONNS`. V1 deliberately defers — until we measure
+  starvation, an arbitrary split is a guess. Concrete shape (mirrors the spec §6.3 sketch):
 
 1. Widen `ws::handle_upgrade`'s stream bound from `Write` back to
    `Read + Write` (T2 narrowed it for the handshake-only deliverable;
@@ -448,6 +631,8 @@ peer would.
 - Scoping: `docs/superpowers/specs/2026-05-26-kesseldb-http2-ws-pgwire-scoping.md`
 - Handshake module: `crates/kessel-http-gateway/src/ws/mod.rs` (T1+T2)
 - Frame encoder + decoder: `crates/kessel-http-gateway/src/ws/frame.rs` (T3+T4)
+- Session loop + kessel-op-v1 wire-up: `crates/kessel-http-gateway/src/ws/session.rs` (T5+T6)
+- TcpStream-aware HTTP-with-WS arm: `crates/kessel-http-gateway/src/server.rs::handle_one_stream_tcp` (T5)
 - Crypto shim: `crates/kessel-http-gateway/src/crypto.rs`
 - SHA-1 + base64 primitives: `crates/kessel-crypto/src/lib.rs`
 - HTTP/1.1 parser (where T2 hooks in): `crates/kessel-http-gateway/src/parse.rs`

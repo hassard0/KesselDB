@@ -145,8 +145,104 @@ plus over-sockets atomicity/exactly-once/recovery/concurrency tests.
 Documented boundary: the router serializes cross-shard commits to drive
 the global order (an async per-shard pull-drive is an efficiency
 follow-up, not a correctness change); cross-shard transactions are
-point-op batches, and cross-shard scatter-gather *reads*/SQL routing is
-a separate later concern from cross-shard *transactions*.
+point-op batches; SQL-text routing is a separate later concern from
+cross-shard *transactions*.
+
+### Cross-shard reads (SP-A)
+
+`Op::Select` / `Op::QueryRows` / `Op::SelectFields` / `Op::SelectSorted`
+fan out across every shard via the router-side
+`crate::scatter_scan` helper (`crates/kesseldb-server/src/scatter_scan.rs`).
+The client wire stays unchanged — clients keep sending the same `Op`;
+the router translates each scan into K parallel per-shard calls and
+merges the per-shard `OpResult::Got([u32 rowlen][record]*)` payloads
+into a single byte-shaped result.
+
+**Fan-out (zero-dep, std-thread only):** one `std::thread` per shard,
+each driving a per-shard `ClusterClient` (the `ShardCaller` trait) at
+SP-A's only entry point `scatter_and_merge`. Per-shard reply channels
+are bounded `sync_channel(SHARD_BACKPRESSURE_BOUND=4)` for skew
+defense (one shard returning millions of rows cannot OOM the router
+while another times out). NO tokio / NO rayon / NO new external
+dependencies.
+
+**Merge semantics, two strategies** — discriminated by the router's
+internal `ScatterKind`:
+
+  - **Unordered** (`Select` / `QueryRows` / `SelectFields`): the merged
+    output is the shard-id-ordered concatenation of every shard's
+    `[u32 rowlen][record]*` payload, truncated to `LIMIT` rows
+    (`LIMIT 0` = no cap). Order is shard-id deterministic, NOT
+    arrival-order, so the merged bytes are replay-safe.
+  - **Sorted** (`SelectSorted`): a `BinaryHeap` k-way merge of the
+    per-shard already-sorted streams. The catalog-derived
+    `(FieldKind, byte_offset, byte_width)` for the sort field is
+    resolved once via shard 0's `Op::Describe` reply (per-shard
+    catalogs are identical because DDL is broadcast). `OFFSET` +
+    `LIMIT` are applied in the merge loop, NOT shard-side (per-shard
+    `OFFSET m` is wrong for a cross-shard sort because rows interleave).
+
+**LIMIT cancellation:** the Unordered merge fires a shared
+`Arc<AtomicBool>` cancel flag the instant `output.len() == LIMIT` so
+late shards see it pre-call and don't keep the router pinned waiting.
+Worker thread join discipline is preserved: every spawned worker is
+joined before `scatter_and_merge` returns; cancel-path interactions
+with the bounded channel (worker blocked on `send()` after the rx is
+dropped) surface as `SendError` clean-exit. Honest gap: an in-flight
+`ShardCaller::call` cannot be interrupted (`std::net::TcpStream` has
+no cancellable read), so a shard mid-reply continues until its own
+`call` returns; per-shard `read_timeout` (default 30s) is the upper
+bound.
+
+**Partial-result vs hard-fail mode (T9):** the V1 default is hard-fail
+— a single per-shard non-`Got` slot (Unavailable / SchemaError / ...)
+poisons the merged result with that slot's typed error. An opt-in
+`ScatterContext::partial_on_timeout: bool` lets callers select
+best-effort mode via `scatter_and_merge_ctx`: failed shards are
+omitted, surviving shards merge normally, the caller receives a
+`Vec<u32>` of failed shard ids and is responsible for surfacing
+"partial result" to the user. The router's public scan path defaults
+to hard-fail for safety; a future T-slice or SQL hint surfaces the
+opt-in to clients. Malformed-Got framing bugs (a `Got(garbage)` that
+the merger's `iter_rows` rejects) STILL surface clean — partial mode
+does not silently drop garbage bytes from a shard.
+
+**K-invariance** (the killer correctness property, SP155 §5.4 / T3):
+for `SelectSorted` with unique sort values, the merged output is
+**byte-identical to a K=1 baseline** for K ∈ {1, 2, 4, 8, 16}. The
+T3 property sweep locks this across 85 seeds × 5 K values = 425
+fixture runs at the merge layer, plus a real-socket K=1↔K=4
+byte-identical integration test. Unordered scatter is multiset-equal
+to K=1 (byte order naturally differs because rows distribute
+differently across shards).
+
+**Sort-key tie-break (V1 limitation):** ties in the sort field are
+broken by `(value, shard_id)`, NOT `(value, object_id)`. Deterministic
+for fixed K + reproducible, but cross-K with sort-value ties may
+order tied rows differently. Per-shard records don't carry the
+object_id (it's the storage key, not the record), so an oid-based
+tie-break would require a new `Op::SelectSortedWithKey` (spec OQ8) —
+deferred until a workload needs it. The 85-seed K-invariance sweep
+confirmed this is acceptable for V1 because unique sort values are
+the common user-facing case.
+
+**Cross-shard snapshot is NOT consistent:** a scatter read can see
+rows committed on shard A at opnum_a=100 and rows on shard B at
+opnum_b=200 (independent counters). The per-shard MVCC SI work (S2
+arc) is per-shard; SP-A inherits per-shard MVCC and reports the
+row-set as the union of per-shard snapshots taken at request-arrival
+on each shard. A cross-shard consistent snapshot is an explicit
+non-goal.
+
+**Out of arc** (named, deferred): SP-B aggregate combine
+(`Aggregate { COUNT/SUM/MIN/MAX }` partial-then-final), SP-C streamed
+sorted merge over indexes, SP-D `GroupAggregate` cross-shard combine,
+SP-E SQL-text routing, cross-shard `Join` (non-goal), cross-shard
+consistent snapshot (non-goal). `FindBy` / `FindByComposite` still
+route via the existing per-shard path (an indexed-equality lookup is
+per-shard but the per-shard secondary index doesn't carry the
+matching rows from other shards; a future T-slice can extend the
+scatter machinery to FindBy if/when a workload needs it).
 
 ## Caching (M4)
 

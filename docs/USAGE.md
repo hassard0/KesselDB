@@ -375,8 +375,35 @@ under client retry (use session‑framed clients for true exactly‑once),
 and **recoverable** (`recover()` re‑drives the ordered log
 idempotently after a router restart). This is deterministic
 (Calvin‑style), not blocking 2PC. Cross‑shard transactions are
-point‑op batches (`Create`/`Update`/`Delete`); routing cross‑shard
-*scatter‑gather reads*/SQL text is a separate later concern.
+point‑op batches (`Create`/`Update`/`Delete`); SQL‑text routing is a
+separate later concern.
+
+**Cross‑shard reads (SP‑A).** `Op::Select` / `Op::QueryRows` /
+`Op::SelectFields` / `Op::SelectSorted` automatically scatter to every
+shard and merge at the router. Clients send the same `Op` they would
+send to a K=1 deployment — the router does the fan‑out, the wire
+contract stays unchanged. When you scale shard count: parallel
+scatter latency is ≈ `max(per‑shard scan latency) + merge overhead`,
+so adding more shards keeps per‑query latency roughly flat while
+throughput scales linearly with K. `SelectSorted` produces
+**byte‑identical** output to a K=1 deployment for the same dataset
+(K‑invariance is locked across K ∈ {1, 2, 4, 8, 16} by a 425‑run
+property sweep at the merge layer + a real‑socket K=1↔K=4 byte‑
+identical integration test). LIMIT cancellation propagates a shared
+cancel flag the instant the output buffer fills, so late shards don't
+keep the router pinned. **V1 limitations** (each a later spec):
+cross‑shard `Aggregate` / `GroupAggregate` reject with a clear error
+(SP‑B / SP‑D); SQL‑text routing for queries that COULD route to one
+shard by a key‑equality WHERE still fans out (SP‑E); `FindBy` /
+`FindByComposite` still route via per‑shard secondary indexes
+(extension to scatter is a follow‑up); sort‑key tie‑break is by
+`(value, shard_id)` not `(value, object_id)` (documented edge); a
+scatter read sees per‑shard snapshots taken at request‑arrival, NOT
+a cross‑shard consistent snapshot. The default failure mode is hard‑
+fail (a single unavailable shard surfaces a clean error to the
+caller, never a silently partial result); a `ScatterContext`
+opt‑in for partial‑on‑timeout best‑effort mode exists at the
+`scatter_and_merge_ctx` API level for embeddable use.
 
 ## 7c. External sources (JSON/CSV over HTTP)
 

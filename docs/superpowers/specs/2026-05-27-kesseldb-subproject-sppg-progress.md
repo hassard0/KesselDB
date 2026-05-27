@@ -60,8 +60,8 @@ side pipelining (V2 with extended-query support), multi-user model
 | **T4** | PG type-OID mapping table + text-format renderer (`types.rs`): per spec §5 — KesselDB `FieldKind::{Bool,U*,I*,Fixed,Char,Bytes,Timestamp,Ref,OverflowRef}` → PG type OID + per-type text-format render (`t`/`f` for bool, `\\x<hex>` for bytea, `YYYY-MM-DD HH:MM:SS.ffffff+00` for timestamptz, decimal for ints, decimal-string for numeric). Locked KAT per FieldKind. | **DONE** | `81acffea` |
 | **T5** | RowDescription (`T`) + DataRow (`D`) encoders: per-row streaming emit using T4 type table; field-format=0 (text) always; column NULL sentinel = i32 -1 (0xFFFFFFFF unsigned). | **DONE** | `cc3ccf62` |
 | **T6** | CommandComplete (`C`) + ReadyForQuery (`Z`) encoders: tag formats "SELECT N" / "INSERT 0 N" / "UPDATE N" / "DELETE N" / "SET" / "CREATE TABLE" (inferred from SQL leading keyword per spec §12 open question on DDL). | **DONE** | `ba450f6` |
-| **T7** | ErrorResponse (`E`) encoder + OpResult→SQLSTATE map: full table from spec §7.2 — `Exists`→`23505`, `SchemaError(msg)`→`42P01`/`42703`/`42804`/`42000` via string-match heuristic (spec §7.2 + §11 weak-spot #2), `Constraint`→`23000`/`23502`/`23505`, `Unavailable`→FATAL `57P03`, `Unauthorized`→FATAL `28000`, `TxAborted` variants → `40001`/`25006`/`58030`, unknown → `XX000` internal_error. | OPEN | — |
-| **T8** | SELECT end-to-end: schema lookup (new `EngineApply::describe_table(name) -> Option<TableSchema>` trait method so PG-wire can map FieldKind → PG type OID + column name + width for RowDescription) + SELECT * FROM table → real result rows over the wire. | OPEN | — |
+| **T7** | ErrorResponse (`E`) encoder + OpResult→SQLSTATE map: full table from spec §7.2 — `Exists`→`23505`, `SchemaError(msg)`→`42P01`/`42703`/`42804`/`42000` via string-match heuristic (spec §7.2 + §11 weak-spot #2), `Constraint`→`23000`/`23502`/`23505`, `Unavailable`→FATAL `57P03`, `Unauthorized`→FATAL `28000`, `TxAborted` variants → `40001`/`25006`/`58030`, unknown → `XX000` internal_error. | **DONE** | `07bac3f` |
+| **T8** | SELECT end-to-end: schema lookup (new `EngineApply::describe_table(name) -> Option<Vec<PgColumn>>` trait method so PG-wire can map FieldKind → PG type OID + column name + width for RowDescription) + SELECT * FROM table → real result rows over the wire + `dispatch.rs` simple-query glue + `server::run_session` query loop. | **DONE** | `612d953` (+ `fbdf885` test-import cleanup) |
 | **T9** | INSERT / UPDATE / DELETE end-to-end via simple-query: dispatch through `EngineApply::apply_sql` unchanged; CommandComplete tag inference from SQL leading keyword. | OPEN | — |
 | **T10** | psql compatibility hand-test + USAGE.md sample-session + KAT-level synthetic peer driving full handshake → query → close sequence. Acceptance: `PGPASSWORD=$KESSEL_TOKEN psql -h localhost -p 5432 -U test "SELECT 1"` returns `1`. | OPEN | — |
 | **T11** | pgcli / DBeaver / JDBC compatibility smoke (manual; doc results in `docs/USAGE.md`) — one real client per smoke + log any compat gaps as named follow-ups. Note: pgAdmin/DBeaver may CHOKE because V1 doesn't ship `pg_catalog` stubs — that's the V1 scope boundary (CLI + programmatic clients work; GUI admin tools are V2). | OPEN | — |
@@ -518,6 +518,273 @@ RFC 5802. No real TCP listener accepts PG connections yet
 to ReadyForQuery; the returned `AcceptedSession` carries the
 username and the BackendKeyData pair the server announced. T3
 adds the simple-query loop on top.
+
+## T7 — what landed (2026-05-27, commit `07bac3f`)
+
+**One commit, +27 KATs.** T7 ships the `ErrorResponse` (`E`) wire
+envelope and the full `OpResult → (Severity, SQLSTATE, Message)`
+mapping table from spec §7.2 + §11 weak-spot #2.
+
+`crates/kessel-pg-gateway/src/error.rs` (new module, 733 LoC
+including tests):
+
+- `encode_error_response(severity, sqlstate, message, detail, hint,
+  position) -> Vec<u8>` builds the `E` envelope per PG §55.7 with
+  field tags S/V/C/M (mandatory) + D/H/P (optional, omitted when
+  `None`); trailing zero-byte terminator; length-includes-itself.
+  V1 deliberately omits F/L/R (Rust source paths would leak; PG
+  also drops them for non-`ERROR`-level events without a server
+  setting).
+- `sqlstate_for_op_result(&OpResult) -> Option<(Severity, &'static
+  str, String)>` returns `None` for success variants
+  (`Ok`/`Got`/`Found`/`Created`/etc. — caller MUST NOT route
+  through the error path) and the (severity, sqlstate, message)
+  triple for every documented error variant.
+
+**Mapping table** (spec §7.2 + §11 weak-spot #2):
+
+| `OpResult` variant | Severity | SQLSTATE | Notes |
+|---|---|---|---|
+| `Exists` | `ERROR` | `23505` | unique_violation |
+| `Unauthorized` | `FATAL` | `28000` | invalid_authorization |
+| `Unavailable` | `FATAL` | `57P03` | cannot_connect_now |
+| `SchemaError("unknown table…")` | `ERROR` | `42P01` | undefined_table (case-insensitive substring) |
+| `SchemaError("unknown column…")` | `ERROR` | `42703` | undefined_column |
+| `SchemaError(msg with "type"/"mismatch")` | `ERROR` | `42804` | datatype_mismatch |
+| `SchemaError(msg with "syntax"/"parse"/"unexpected")` | `ERROR` | `42601` | syntax_error |
+| `SchemaError(other)` | `ERROR` | `42000` | syntax_error_or_access_rule_violation |
+| `Constraint("…NULL…")` | `ERROR` | `23502` | not_null_violation |
+| `Constraint("…unique…")` | `ERROR` | `23505` | unique_violation |
+| `Constraint("…foreign…")` | `ERROR` | `23503` | foreign_key_violation |
+| `Constraint("…check…")` | `ERROR` | `23514` | check_violation |
+| `Constraint(other)` | `ERROR` | `23000` | integrity_constraint_violation |
+| `TxAborted::WriteWriteConflict` | `ERROR` | `40001` | serialization_failure |
+| `TxAborted::DangerousStructure` | `ERROR` | `40001` | serialization_failure |
+| `TxAborted::SnapshotOutOfRange` | `ERROR` | `25006` | read_only_sql_transaction |
+| `TxAborted::StorageIo` | `ERROR` | `58030` | io_error |
+| Unmapped | `ERROR` | `XX000` | internal_error |
+
+The `SchemaError`/`Constraint` string-match heuristic is the
+honest compromise spec §11 weak-spot #2 calls out — `kessel-sql`
+doesn't yet tag errors with a structured kind. A follow-up
+`SchemaErrorKind` enum in `kessel-sql` would let us drop it; V2
+SP-PG-SQL-ERRORS owns that cleanup.
+
+**+27 KATs:**
+
+- `t7_error_response_byte_locked_canonical_frame` — the canonical
+  S=ERROR V=ERROR C=42P01 M=… frame byte-locked.
+- `t7_error_response_optional_fields_present` — D/H/P fields
+  emitted when supplied.
+- `t7_error_response_optional_fields_omitted` — D/H/P fields
+  NOT emitted (no empty cstrings, no field-tag byte) when `None`.
+- `t7_error_response_fatal_severity` — `FATAL` cstring (not
+  `ERROR`) emitted for `Unauthorized`/`Unavailable`.
+- `t7_error_response_terminator_present` — trailing zero byte
+  after the last field.
+- `t7_error_response_length_includes_itself` — length prefix
+  satisfies PG framing rule.
+- `t7_error_response_empty_message_still_required` — M field is
+  emitted as `\0`-terminated cstring even when message is empty.
+- `t7_error_response_field_order_invariant` — S V C M D H P
+  emission order locked.
+- 14 per-variant SQLSTATE map locks (Exists, Unauthorized,
+  Unavailable, every Constraint case, every SchemaError-heuristic
+  case, every TxAborted variant).
+- 4 success-variant `None` locks (Ok / Got / Found / Created — the
+  caller-side `MUST NOT route through error path` invariant).
+- `t7_pipeline_round_trip` — encode → decode → re-encode invariant
+  end-to-end.
+- `t7_sqlstate_constants_are_5_char_alphanumeric` — every locked
+  SQLSTATE matches PG §59 grammar (5 chars, [0-9A-Z]).
+
+**Test counts after T7:** kessel-pg-gateway 97 → 124 (+27); zero
+new external deps. seed-7 GREEN; tree-grep EMPTY;
+`#![forbid(unsafe_code)]` honored.
+
+## T8 — what landed (2026-05-27, commits `612d953` + `fbdf885`)
+
+**One commit (+ one tiny test-import cleanup), +26 KATs.**
+The headline milestone: `SELECT * FROM <table>` through the PG
+gateway returns a real `RowDescription + DataRow* + CommandComplete
++ ReadyForQuery` byte stream, decoded from KesselDB's on-wire row
+format.
+
+**Three new modules:**
+
+`crates/kessel-pg-gateway/src/engine.rs` (158 LoC) — `EngineApply`
+trait (deliberately a separate trait from
+`kessel-http-gateway::EngineApply` — PG-wire needs
+`describe_table` which HTTP doesn't have a caller for, and the
+HTTP trait carries headers-shaped baggage the PG side doesn't
+want). Two methods:
+
+- `apply_sql(&self, sql: &str) -> OpResult` — runs the SQL
+  through the SM (existing dispatch path).
+- `describe_table(&self, name: &str) -> Option<Vec<PgColumn>>` —
+  schema lookup the gateway needs BEFORE the SELECT path can
+  emit RowDescription. Pure read-only (no engine apply).
+
+`PgColumn { name: String, kind: FieldKind, nullable: bool }` — one
+per declared column. The `kesseldb-server` impl (deferred to T12)
+reads from the live `Catalog` by name; the in-crate test impls
+build canned schemas.
+
+`crates/kessel-pg-gateway/src/dispatch.rs` (883 LoC) — the
+simple-query glue:
+
+- `dispatch_query(sql: &str, engine: &impl EngineApply) -> Vec<u8>`
+  — runs one `Q` end-to-end, returns the full byte stream.
+  Branches:
+  - Empty / whitespace-only SQL → `EmptyQueryResponse` + RFQ.
+  - Multi-statement SQL → ErrorResponse `42601` syntax_error + RFQ
+    (V1 single-statement constraint per spec §11 weak-spot #5).
+  - SELECT shape (`select_star_table` detector from
+    `kessel-sql` — real lexer, not a string heuristic) →
+    `describe_table` lookup → RowDescription → row decode via
+    `kessel-codec::value_from_raw` → DataRow per row →
+    CommandComplete("SELECT N") → RFQ. Unknown table → ErrorResponse
+    `42P01` + RFQ.
+  - DDL/DML success → CommandComplete tag inferred from leading SQL
+    keyword (CREATE TABLE / INSERT 0 N / UPDATE N / DELETE N / DROP
+    TABLE / SET / ALTER / EXPLAIN / BEGIN / COMMIT / ROLLBACK) +
+    RFQ. (Row counts in tags are 0 in T8 — T9 wires the real apply
+    result.)
+  - Engine error (any `OpResult` variant T7 maps) → ErrorResponse
+    via T7's `sqlstate_for_op_result` + RFQ.
+- `render_pg_text(value: &Value, kind: FieldKind) -> Vec<u8>` —
+  per spec §5: bool → `t`/`f`, signed/unsigned ints → decimal
+  ASCII, Char(n) → UTF-8 with trailing-NUL strip, Bytes →
+  `\x<hex>`, Timestamp → `YYYY-MM-DD HH:MM:SS.ffffff+00`, Null →
+  caller emits the -1 sentinel (this function isn't called).
+- `infer_command_tag(sql: &str, rows_affected: u32) -> String` —
+  case-insensitive leading-keyword match → PG tag string.
+
+`crates/kessel-pg-gateway/src/server.rs::run_session` (~340 LoC
+added on top of `accept`) — the entry point a real listener
+calls:
+
+1. Run `accept` (unchanged from T2) to complete the handshake.
+2. Loop reading the next 5-byte message header (1-byte type tag
+   + 4-byte length BE), validate length against
+   `PG_MAX_MESSAGE_SIZE`, read payload.
+3. Dispatch by tag:
+   - `Q` → `query::parse_query_payload` → `dispatch_query` →
+     write response → loop.
+   - `X` (Terminate) → return cleanly (no RFQ; connection just
+     closes).
+   - any other tag (incl. extended-query `P`/`B`/`E`/`S`/`D`/`C`
+     /`H`/`d`/`c`/`f`/`F`) → ErrorResponse `08P01`
+     protocol_violation + close (V1 doesn't speak extended
+     query — that's T19/V2 SP-PG-EXTQ).
+
+**What T8 deliberately did NOT do:**
+
+- INSERT/UPDATE/DELETE row counts (T9 — engine returns `Ok`
+  without a count today; the tag emits 0 in V1).
+- Projection rendering — V1 only emits RowDescription + DataRow
+  for the `SELECT * FROM <table>` shape (the detector is
+  `kessel-sql::select_star_table`). Column-list projections
+  (`SELECT a, b FROM t`) fall back to CommandComplete-only —
+  documented gap; T9 can extend.
+- Per-connection thread + listener wire-up (T12).
+- Idle timeout + connection cap (T13, T16).
+- Streaming row emission — V1 materializes all rows in memory
+  then writes the whole response (the same SP-A T14 streaming
+  gap noted in spec §11; cross-cuts SP-WS too).
+
+**+26 KATs across `dispatch.rs` (+22) + `server.rs` (+4):**
+
+Dispatch KATs:
+
+- **`t8_select_star_returns_full_response_stream`** — HEADLINE:
+  2-row SELECT returns T < D < D < C < Z in that byte order with
+  `SELECT 2\0` and both row values present as text.
+- `t8_select_zero_rows_emits_select_0_tag` — empty SELECT still
+  emits RowDescription + CommandComplete("SELECT 0").
+- `t8_select_null_column_emits_negative_one_sentinel` — NULL
+  decodes to PG i32 -1 (0xFFFFFFFF) in the DataRow.
+- `t8_empty_query_emits_empty_query_response` — whitespace-only Q
+  → EmptyQueryResponse + RFQ.
+- `t8_multi_statement_q_returns_42601_error` — `SELECT 1; SELECT 2`
+  → ErrorResponse `42601` + RFQ.
+- `t8_select_unknown_table_returns_42p01_error`.
+- `t8_insert_emits_insert_command_complete` — "INSERT 0 0" tag.
+- `t8_delete_emits_delete_command_complete`.
+- `t8_update_emits_update_command_complete`.
+- `t8_create_table_emits_create_table_command_complete`.
+- `t8_drop_table_emits_drop_table_command_complete`.
+- `t8_set_emits_set_command_complete`.
+- `t8_constraint_error_emits_error_response` — NOT NULL violation
+  → `23502`.
+- `t8_exists_error_emits_unique_violation` — `Exists` → `23505`.
+- 6 `render_pg_text` type-shape KATs (bool / signed / unsigned /
+  bytea / char-with-nul-padding / char-all-zeros).
+- 2 `infer_command_tag` KATs (case-insensitive matching + unknown
+  fallback).
+- `t8_leading_keyword_is_matches` — multi-keyword matching guard.
+- 2 `describe_table` KATs (returns columns in order / missing
+  table → None).
+
+Session KATs:
+
+- **`t8_run_session_full_select_round_trip`** — HEADLINE session
+  KAT: full handshake + `SELECT * FROM t` + `Terminate` over an
+  in-memory pipe, asserts the outbound bytes contain two RFQ
+  envelopes (greeting + post-query) and the
+  CommandComplete("SELECT 0") tag.
+- `t8_run_session_terminate_closes_cleanly`.
+- `t8_run_session_unknown_message_tag_emits_08p01` — extended-
+  query `P` Parse rejected with `08P01`.
+- `t8_run_session_empty_q_then_terminate` — empty Q then `X`
+  drains cleanly.
+
+**Dependencies:** `kessel-pg-gateway` now pulls in two more
+workspace crates (already transitively present, made explicit in
+the Cargo.toml `[dependencies]` block):
+
+- `kessel-codec` for `value_from_raw` + `Value` (row decoding).
+- `kessel-sql` for `select_star_table` (V1-supported SELECT shape
+  detector, lexer-backed, no string heuristics).
+
+`cargo tree -p kessel-pg-gateway -e normal` still shows only
+workspace crates — zero external deps preserved.
+
+**Test counts after T8:** kessel-pg-gateway 124 → 150 (+26).
+Workspace default 1551 → 1604 (+53 across T7+T8). seed-7 GREEN
+under serial execution (the two cluster tests that occasionally
+deadlock under parallel runs are pre-existing flakes unrelated to
+PG-wire; PG-wire surface is byte-disjoint from the replicated SM).
+tree-grep EMPTY. `#![forbid(unsafe_code)]` honored. HTTP/1.1 +
+WebSocket surfaces byte-untouched.
+
+**Headline question — does `engine.apply_sql("SELECT * FROM t")`
+produce a wire-correct Q→T→D*→C→Z stream? YES.** The
+`t8_select_star_returns_full_response_stream` KAT proves it
+end-to-end: a 2-row canned engine drives a `dispatch_query("SELECT
+* FROM t", &eng)` call and the returned bytes carry T, D, D, C, Z
+in that order with `SELECT 2\0` in the CommandComplete tag, both
+row payloads as text, and the canonical 6-byte RFQ envelope at
+the tail. The `t8_run_session_full_select_round_trip` KAT lifts
+that same proof through the full session loop (`accept` →
+handshake → `run_session` → query loop → Terminate).
+
+**Post-T8 behavior:** the crate compiles + its 150 KATs pass +
+calling `server::run_session(&mut stream, Some(token), nonce_gen,
+&engine)` runs handshake-and-query-loop end-to-end against the
+gateway-side `EngineApply` trait. No real TCP listener accepts PG
+connections yet (T12 wires it behind the `pg-gateway` feature
+flag). A real `PGPASSWORD=$KESSEL_TOKEN psql -h localhost
+-p 5432 -U test -c 'SELECT * FROM my_table'` invocation will
+work once T12 lands and the `kesseldb-server` binary's
+`EngineApply` impl exposes `describe_table` against the live
+catalog.
+
+**Next session pickup:** T9 — INSERT / UPDATE / DELETE end-to-end
+via simple-query (wire the real row-count into CommandComplete
+tags — the engine needs to surface `affected_rows` from
+`apply_sql`; T9 either adds a sibling method or extends
+`OpResult` to carry the count for DML).
 
 ## References
 

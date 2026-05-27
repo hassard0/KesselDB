@@ -155,6 +155,49 @@ pub const SQLSTATE_INTERNAL_ERROR: &str = "XX000";
 /// listed here so the constants live in one place.
 pub const SQLSTATE_PROTOCOL_VIOLATION: &str = "08P01";
 
+/// Class 0A — `0A000` feature_not_supported. Emitted when a client
+/// requests something V1 doesn't implement (e.g. PG v2 / v4 protocol
+/// version in StartupMessage, extended-query messages). Spec §3.2 +
+/// §11 weak-spot #5. Listed here so the constant lives in one place.
+pub const SQLSTATE_FEATURE_NOT_SUPPORTED: &str = "0A000";
+
+/// Class 53 — `53300` too_many_connections. T13 — emitted by the
+/// `kesseldb-server::serve_pg` accept loop when `pg_max_conns` is
+/// exceeded; spec §8.2. The canonical PG message text is
+/// "sorry, too many clients already" — every libpq-derived client
+/// recognizes that phrasing.
+pub const SQLSTATE_TOO_MANY_CONNECTIONS: &str = "53300";
+
+/// PG's canonical message text for `53300` too_many_connections. Used
+/// by `encode_too_many_connections_error` so the listener and any
+/// future caller emit the same string libpq's `pgstrerror.c` does.
+/// Locked so a future refactor can't drift.
+pub const TOO_MANY_CONNECTIONS_MESSAGE: &str = "sorry, too many clients already";
+
+/// T13: build the `ErrorResponse('S=FATAL', 'C=53300', 'M=sorry, too
+/// many clients already')` frame the cap-overflow listener writes
+/// before closing the connection. Helper wrapper around
+/// `encode_error_response` so callers don't have to know the canonical
+/// PG message text — the listener just calls this and writes the
+/// bytes verbatim.
+///
+/// Wire bytes (always):
+/// ```text
+/// E [length:4 BE] SFATAL\0 VFATAL\0 C53300\0 Msorry, too many clients already\0 \0
+/// ```
+///
+/// Per spec §8.2 + PG `postgres.c` BackendStartup: this message MUST
+/// be written BEFORE the socket is closed so the client sees a
+/// wire-level rejection instead of a bare connection-refused. libpq
+/// surfaces the SQLSTATE + message verbatim in `PQerrorMessage()`.
+pub fn encode_too_many_connections_error() -> Vec<u8> {
+    encode_error_response(
+        SEVERITY_FATAL,
+        SQLSTATE_TOO_MANY_CONNECTIONS,
+        TOO_MANY_CONNECTIONS_MESSAGE,
+    )
+}
+
 /// Encodes a `ErrorResponse` ('E') message with the four mandatory
 /// V1 fields (S, V, C, M). Wire shape per PG §55.7:
 ///
@@ -721,6 +764,8 @@ mod tests {
             SQLSTATE_IO_ERROR,
             SQLSTATE_INTERNAL_ERROR,
             SQLSTATE_PROTOCOL_VIOLATION,
+            SQLSTATE_FEATURE_NOT_SUPPORTED,
+            SQLSTATE_TOO_MANY_CONNECTIONS,
         ];
         for c in codes {
             assert_eq!(c.len(), 5, "SQLSTATE {c} not 5 chars");
@@ -729,5 +774,80 @@ mod tests {
                 "SQLSTATE {c} has non-alphanumeric"
             );
         }
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // T13 KATs — cap-overflow `53300` ErrorResponse helper. The
+    // headline invariant is that the canonical PG text "sorry, too
+    // many clients already" appears verbatim on the wire, along with
+    // FATAL severity (so libpq closes the connection rather than
+    // re-trying the query) and SQLSTATE 53300 (so structured logging
+    // can switch on it).
+    // ───────────────────────────────────────────────────────────────────
+
+    /// `encode_too_many_connections_error` emits the canonical PG
+    /// "sorry, too many clients already" message. Locks the spec §8.2
+    /// requirement that the cap-overflow listener emits a wire-level
+    /// rejection clients can recognize, not a bare TCP close.
+    #[test]
+    fn t13_too_many_connections_error_carries_canonical_message() {
+        let frame = encode_too_many_connections_error();
+        // First byte is the ErrorResponse type tag.
+        assert_eq!(frame[0], b'E');
+        // SQLSTATE 53300 visible on the wire (in the C field).
+        assert!(
+            frame.windows(b"C53300\0".len()).any(|w| w == b"C53300\0"),
+            "SQLSTATE 53300 field MUST be present on the wire"
+        );
+        // FATAL severity in both S and V fields (PG 9.6+ duplicates).
+        assert!(
+            frame.windows(b"SFATAL\0".len()).any(|w| w == b"SFATAL\0"),
+            "S field MUST carry FATAL severity"
+        );
+        assert!(
+            frame.windows(b"VFATAL\0".len()).any(|w| w == b"VFATAL\0"),
+            "V field MUST carry FATAL severity"
+        );
+        // Canonical PG message text — every libpq-derived client
+        // recognizes the EXACT phrasing.
+        assert!(
+            frame.windows(TOO_MANY_CONNECTIONS_MESSAGE.len())
+                .any(|w| w == TOO_MANY_CONNECTIONS_MESSAGE.as_bytes()),
+            "canonical PG message 'sorry, too many clients already' MUST be present"
+        );
+    }
+
+    /// `encode_too_many_connections_error` byte-locks the FATAL +
+    /// 53300 + canonical-message frame end-to-end. Prevents a refactor
+    /// from drifting away from the libpq-recognized wire text.
+    #[test]
+    fn t13_too_many_connections_error_byte_locked() {
+        let frame = encode_too_many_connections_error();
+        let expected = encode_error_response(
+            SEVERITY_FATAL,
+            "53300",
+            TOO_MANY_CONNECTIONS_MESSAGE,
+        );
+        assert_eq!(frame, expected);
+    }
+
+    /// `TOO_MANY_CONNECTIONS_MESSAGE` matches PG's hard-coded
+    /// `postmaster.c` text exactly. A future refactor that drifts
+    /// the message (e.g. "sorry, too many connections") would break
+    /// every libpq client that string-matches on the canonical text.
+    #[test]
+    fn t13_too_many_connections_message_matches_pg_canonical() {
+        assert_eq!(
+            TOO_MANY_CONNECTIONS_MESSAGE,
+            "sorry, too many clients already"
+        );
+    }
+
+    /// `SQLSTATE_TOO_MANY_CONNECTIONS` is the exact PG §59 class-53
+    /// code: 53300. Locked so a typo (53301 / 53003 etc.) is caught
+    /// at compile time of the constant + here at run time.
+    #[test]
+    fn t13_sqlstate_too_many_connections_is_53300() {
+        assert_eq!(SQLSTATE_TOO_MANY_CONNECTIONS, "53300");
     }
 }

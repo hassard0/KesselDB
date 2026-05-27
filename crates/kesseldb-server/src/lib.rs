@@ -1182,13 +1182,31 @@ fn serve_pg(
     max_conns: usize,
     idle_timeout: std::time::Duration,
 ) {
+    use std::io::Write as _;
     let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming().flatten() {
         if active.load(Ordering::Acquire) >= max_conns {
-            // At capacity — drop the connection. V1 just hangs up;
-            // T13 will emit `53300` too_many_connections ErrorResponse
-            // BEFORE the close.
-            drop(stream);
+            // T13: at capacity — emit a wire-level rejection BEFORE
+            // closing the connection so PG clients get a structured
+            // error (`53300` too_many_connections + canonical message
+            // "sorry, too many clients already") instead of a bare
+            // TCP close. Spec §8.2 + PG `postmaster.c` BackendStartup.
+            //
+            // The client hasn't sent StartupMessage yet, so we write
+            // the ErrorResponse straight onto the raw TCP stream with
+            // no auth / no length-prefix framing prelude. The frame
+            // is its own complete PG-wire message (type byte + length
+            // prefix + field-tagged payload + terminator).
+            //
+            // Best-effort: any write error here is silently absorbed
+            // because we're about to drop the connection anyway. The
+            // important thing is that the client either sees the
+            // ErrorResponse or sees the close — never a hang.
+            let mut s = stream;
+            let frame = kessel_pg_gateway::error::encode_too_many_connections_error();
+            let _ = s.write_all(&frame);
+            let _ = s.flush();
+            drop(s);
             continue;
         }
         // Disable Nagle: PG simple-query is request/response, so
@@ -1859,6 +1877,240 @@ mod pg_gateway_tests {
         assert_eq!(cols[1].kind, kessel_catalog::FieldKind::U32);
         // describe_table on a missing table → None.
         assert!(engine.describe_table("ghost").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // T13 KATs — cap-overflow `53300` ErrorResponse on the live PG
+    // listener. The headline invariant is that a connection past
+    // `pg_max_conns` receives a wire-level `ErrorResponse('S=FATAL',
+    // 'C=53300', 'M=sorry, too many clients already')` BEFORE the
+    // TCP close — not a bare hang-up — so libpq clients can surface
+    // the structured error in `PQerrorMessage()`.
+    //
+    // These tests share `spawn_pg_listener_with_max_conns` so the
+    // accept loop is identical to production but cap-tightened to
+    // make the overflow path easy to drive.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// Spawn the PG listener via `serve_cfg` with a tightened
+    /// `pg_max_conns`. Returns (pg_addr, data_dir) — keep `dir`
+    /// alive until the test ends so the engine doesn't tear down
+    /// mid-test on Windows.
+    ///
+    /// The "wait for listener bind" probe deliberately uses a
+    /// fixed short sleep instead of a probe-connect, because a
+    /// probe-connect with a tightened `pg_max_conns` (e.g. 0 or 1)
+    /// would itself consume a slot — and the test then can't tell
+    /// whether the cap-overflow it observes belongs to the probe or
+    /// to the test's own connections. 200ms is enough on every
+    /// platform we run CI on; if CI flakes, bump it.
+    fn spawn_pg_listener_with_max_conns(
+        name: &str,
+        pg_max_conns: usize,
+    ) -> (std::net::SocketAddr, std::path::PathBuf) {
+        let dir = fresh_dir(name);
+        let token = b"kessel-pg-token".to_vec();
+        let pg_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let pg_addr = pg_listener.local_addr().unwrap();
+        drop(pg_listener);
+        let cfg = ServerConfig {
+            token: Some(token),
+            pg_addr: Some(pg_addr),
+            pg_max_conns,
+            ..ServerConfig::default()
+        };
+        let engine = spawn_engine_cfg(&dir, &cfg).unwrap();
+        let bin_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        std::thread::spawn({
+            let c = cfg.clone();
+            move || serve_cfg(bin_listener, engine, c)
+        });
+        // Give the PG listener time to bind without a probe-connect
+        // (which would consume a slot under tightened caps).
+        std::thread::sleep(Duration::from_millis(200));
+        (pg_addr, dir)
+    }
+
+    /// Read all bytes off `stream` until EOF or `read_to_end` errs.
+    /// Used by T13 to drain the cap-overflow ErrorResponse + the
+    /// subsequent connection close. Bounded by the stream's
+    /// read-timeout so a hung server fails the test quickly.
+    fn read_to_eof(stream: &mut TcpStream) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if Instant::now() > deadline {
+                break;
+            }
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+        }
+        buf
+    }
+
+    /// HEADLINE T13 KAT: with `pg_max_conns=1`, the SECOND TCP
+    /// connection to the PG listener receives the canonical PG
+    /// "sorry, too many clients already" ErrorResponse (FATAL +
+    /// 53300) BEFORE the close. The FIRST connection is accepted
+    /// normally and held open while we drive the cap-overflow path.
+    #[test]
+    fn t13_pg_listener_emits_53300_error_response_on_cap_overflow() {
+        let (pg_addr, dir) =
+            spawn_pg_listener_with_max_conns("cap1", 1);
+        // 1. First connection — accepted, held open. We do NOT
+        //    complete the handshake (we don't need to; the listener
+        //    bumped `active` to 1 the moment it spawned the thread).
+        let first = TcpStream::connect(pg_addr).expect("first connects");
+        first.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        first.set_nodelay(true).unwrap();
+        // Give the listener thread a moment to bump `active`.
+        std::thread::sleep(Duration::from_millis(50));
+        // 2. Second connection — listener should accept it but
+        //    immediately write the 53300 ErrorResponse + close.
+        let mut second = TcpStream::connect(pg_addr).expect("second connects");
+        second.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let response = read_to_eof(&mut second);
+        // The response is a single ErrorResponse frame.
+        assert_eq!(response[0], b'E', "expected ErrorResponse type byte");
+        // FATAL severity in S field.
+        assert!(
+            response.windows(b"SFATAL\0".len()).any(|w| w == b"SFATAL\0"),
+            "expected S=FATAL field, got bytes: {:?}",
+            response,
+        );
+        // SQLSTATE 53300 in C field.
+        assert!(
+            response.windows(b"C53300\0".len()).any(|w| w == b"C53300\0"),
+            "expected C=53300 field, got bytes: {:?}",
+            response,
+        );
+        // Canonical PG message text in M field.
+        let msg = b"sorry, too many clients already";
+        assert!(
+            response.windows(msg.len()).any(|w| w == msg),
+            "expected canonical 'sorry, too many clients already' message, got: {:?}",
+            String::from_utf8_lossy(&response),
+        );
+        // Server closed (read_to_eof returned). Best-effort: keep
+        // `first` alive to the end of the function so the engine
+        // doesn't tear down before we finish.
+        drop(first);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// After the FIRST connection closes, a subsequent connection
+    /// is accepted normally (active count dropped back below the
+    /// cap). Locks that the cap is dynamic — not a one-shot trip.
+    #[test]
+    fn t13_pg_listener_accepts_new_connection_after_slot_freed() {
+        let (pg_addr, dir) =
+            spawn_pg_listener_with_max_conns("cap-free", 1);
+        // Hold + drop the first connection.
+        {
+            let _first = TcpStream::connect(pg_addr).expect("first connects");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // The dropped TCP stream may take a tick to surface as a
+        // FIN on the server's read loop and decrement the active
+        // counter. Poll for up to 2s.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            // Probe with a fresh connection — if accepted (not 53300),
+            // the cap recovered.
+            let mut probe = match TcpStream::connect_timeout(
+                &pg_addr,
+                Duration::from_millis(50),
+            ) {
+                Ok(s) => s,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                Err(e) => panic!("could not connect: {e}"),
+            };
+            probe.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+            // Read a small amount — if we get an ErrorResponse, the
+            // cap is still tripped; if we get 0 bytes (timeout), the
+            // server is waiting for us to send StartupMessage = OK.
+            let mut buf = [0u8; 1];
+            match probe.read(&mut buf) {
+                Ok(0) => {
+                    // EOF — server closed. Could be cap-overflow or
+                    // a race; keep retrying.
+                    if Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(50));
+                        continue;
+                    }
+                    panic!("listener kept closing — slot never freed");
+                }
+                Ok(_) if buf[0] == b'E' => {
+                    // Still cap-locked — retry.
+                    if Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(50));
+                        continue;
+                    }
+                    panic!("listener still emits 53300 after slot freed");
+                }
+                Ok(_) => {
+                    // Unexpected byte but NOT 'E' — listener is in a
+                    // post-handshake state, which means accept worked.
+                    break;
+                }
+                Err(_) => {
+                    // Timeout — server accepted and is waiting for
+                    // StartupMessage. That's the success path.
+                    break;
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With `pg_max_conns=0`, EVERY connection trips the cap and
+    /// receives 53300. Locks the cap arithmetic against off-by-one
+    /// (a `>` vs `>=` flip would let zero through).
+    #[test]
+    fn t13_pg_listener_zero_max_conns_rejects_first_connection() {
+        let (pg_addr, dir) =
+            spawn_pg_listener_with_max_conns("cap0", 0);
+        let mut s = TcpStream::connect(pg_addr).expect("connects");
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let response = read_to_eof(&mut s);
+        assert_eq!(response[0], b'E');
+        assert!(
+            response.windows(b"C53300\0".len()).any(|w| w == b"C53300\0"),
+            "even cap=0 must emit 53300 instead of bare close",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The 53300 ErrorResponse the listener writes on cap overflow
+    /// is byte-identical to `kessel_pg_gateway::error::
+    /// encode_too_many_connections_error()`. Locks the listener and
+    /// the encoder against drift (a future refactor that hand-rolls
+    /// the bytes in the listener would silently break libpq clients).
+    #[test]
+    fn t13_pg_listener_cap_overflow_bytes_match_encoder() {
+        let (pg_addr, dir) =
+            spawn_pg_listener_with_max_conns("cap-bytes", 0);
+        let mut s = TcpStream::connect(pg_addr).expect("connects");
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let response = read_to_eof(&mut s);
+        let expected =
+            kessel_pg_gateway::error::encode_too_many_connections_error();
+        // The listener might write the frame in one go or with
+        // additional zeros if it flushes — strict-equality the
+        // first `expected.len()` bytes.
+        assert_eq!(
+            &response[..expected.len()],
+            &expected[..],
+            "cap-overflow wire bytes MUST match `encode_too_many_connections_error()`",
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

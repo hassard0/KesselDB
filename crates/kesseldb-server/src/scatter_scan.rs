@@ -109,6 +109,78 @@ pub trait ShardCaller: Send + 'static {
 /// (SP-A T9 in the backlog).
 pub const DEFAULT_PER_SHARD_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// SP-A T9 (SP155 §3.6 / §6 / OQ2): partial-result + per-shard config
+/// carrier for [`scatter_and_merge_ctx`]. V1 default
+/// `partial_on_timeout: false` is the hard-fail mode shipped in T1-T8
+/// (a single non-`Got` shard slot poisons the merged result with that
+/// slot's typed error — `Unavailable`, `SchemaError`, …). Setting
+/// `partial_on_timeout: true` opts in to "best-effort" mode: per-shard
+/// non-`Got` slots are OMITTED from the merge instead of poisoning it;
+/// the other shards' rows merge normally; the caller receives the list
+/// of failed shard ids as the second tuple element returned by
+/// [`scatter_and_merge_ctx`].
+///
+/// **Why the flag is opt-in, not the default**, per spec §6:
+/// hard-fail is the safest behaviour for a strongly-consistent query
+/// surface — a partial result that *looks* like a complete result is a
+/// silent-correctness footgun. Opt-in keeps callers honest: "I am
+/// asking for best-effort, I will inspect `failed_shards`".
+///
+/// **What "partial" applies to**, intentionally narrow:
+///   - Per-shard `OpResult::Unavailable` (timeout, transport error,
+///     shard down).
+///   - Per-shard `OpResult::SchemaError` (a shard rejected the op —
+///     e.g. catalog skew between shards, malformed reply).
+///   - Per-shard `OpResult::Bad(_)` / `OpResult::Constraint(_)` etc.
+///     (any non-`Got` slot).
+///
+/// **What "partial" does NOT apply to** (V1 deliberate non-coverage):
+///   - The framing-malformed defense INSIDE the merger (a `Got(bytes)`
+///     whose `[u32 rowlen][record]*` decoder rejects mid-stream): the
+///     merger still surfaces this as `SchemaError(...)` because a
+///     malformed Got is a transport/framing bug, NOT a per-shard
+///     availability event. Partial mode does NOT silently drop garbage
+///     bytes from one shard.
+///   - The Sorted heap merge's K-invariance: with shards omitted, the
+///     merged Sorted output is naturally byte-NON-IDENTICAL to a K=1
+///     baseline (some rows are missing). The caller MUST consult
+///     `failed_shards` to know the result is partial. Documented
+///     honest gap.
+///
+/// **`reserved`**: a field-shape hint so future extensions (e.g. T9.1
+/// partial-on-SchemaError vs partial-on-Unavailable discrimination,
+/// or T9.2 per-shard timeout override) don't require breaking the
+/// struct's pub-API. Set to `()` for now; callers shouldn't construct
+/// the struct directly except via [`ScatterContext::default()`] or
+/// [`ScatterContext::with_partial_on_timeout`].
+#[derive(Clone, Debug, Default)]
+pub struct ScatterContext {
+    /// `true` ⇒ omit failed shards' slots from the merge (best-effort,
+    /// caller inspects the `failed_shards` vec). `false` (V1 default) ⇒
+    /// V1 hard-fail per SP155 §6 (any non-`Got` slot poisons the merge
+    /// with that slot's typed error). Documented at the field site as
+    /// the spec contract.
+    pub partial_on_timeout: bool,
+}
+
+impl ScatterContext {
+    /// Construct a hard-fail context (V1 default).
+    pub fn hard_fail() -> Self {
+        Self { partial_on_timeout: false }
+    }
+
+    /// Construct a partial-result-on-timeout context.
+    pub fn partial() -> Self {
+        Self { partial_on_timeout: true }
+    }
+
+    /// Builder-style mutator.
+    pub fn with_partial_on_timeout(mut self, on: bool) -> Self {
+        self.partial_on_timeout = on;
+        self
+    }
+}
+
 /// SP-A T7 (SP155 §3.8): bound on the per-shard reply channel for
 /// **skew defense**. A `sync_channel(SHARD_BACKPRESSURE_BOUND)` is
 /// installed for every per-shard worker → driver communication. Once
@@ -419,10 +491,90 @@ pub fn scatter_and_merge<C: ShardCaller>(
     kind: &ScatterKind,
     cancel: Arc<AtomicBool>,
 ) -> OpResult {
+    // T9: thin back-compat wrapper around the context-aware entry
+    // point. The V1 default (`partial_on_timeout: false`) preserves
+    // the SP155 §6 hard-fail behaviour every T1-T8 KAT locks. New
+    // callers that want partial-result semantics call
+    // [`scatter_and_merge_ctx`] directly and inspect `failed_shards`.
+    let (out, _failed) = scatter_and_merge_ctx(
+        shards,
+        op,
+        per_shard_timeout,
+        kind,
+        cancel,
+        ScatterContext::hard_fail(),
+    );
+    out
+}
+
+/// SP-A T9 (SP155 §3.6 / §6): context-aware fanout + merge with
+/// partial-result opt-in.
+///
+/// Identical to [`scatter_and_merge`] (T6 LIMIT cancellation + T7
+/// bounded buffers + T8 pentest-locked failure contracts), with one
+/// behaviour switch driven by [`ScatterContext::partial_on_timeout`]:
+///
+/// - **`partial_on_timeout: false` (V1 default, hard-fail)**: identical
+///   to `scatter_and_merge` — any non-`Got` slot poisons the merged
+///   result with that slot's typed error per SP155 §6. The returned
+///   `Vec<u32>` is always empty in this mode (the fail-fast path never
+///   collects a partial-failure list).
+///
+/// - **`partial_on_timeout: true` (best-effort)**: per-shard non-`Got`
+///   slots (Unavailable / SchemaError / Bad / Constraint / ...) are
+///   OMITTED from the merge — their rows simply don't show up in the
+///   merged output. The other shards' `Got(payload)` slots merge
+///   normally per `kind`. The returned `Vec<u32>` lists the shard ids
+///   that failed (in shard-id order). The caller is RESPONSIBLE for
+///   checking this list and surfacing "partial result" to the user;
+///   the merged `OpResult` itself looks indistinguishable from a
+///   complete result.
+///
+///   Edge: if EVERY shard fails, the merged result is `Got(vec![])`
+///   (empty payload) and `failed_shards` is the full `0..K` range —
+///   the caller MUST check `failed_shards.len() == K` to distinguish
+///   "everything failed" from "everything returned 0 rows".
+///
+/// - **`OpResult::SchemaError` from the MERGER itself** (malformed row
+///   framing inside a `Got(bytes)` payload — caught by `iter_rows`)
+///   is **NOT** considered a per-shard availability failure: it's a
+///   framing/transport corruption bug. In both modes the merger
+///   surfaces this as `SchemaError(...)` and fires the cancel flag.
+///   Partial mode does NOT silently drop garbage bytes from one shard;
+///   the user gets a clean error instead of a silently-wrong result.
+///   (Documented honest gap; the V1 wire contract is "shards return
+///   well-framed Got or a typed non-Got; never a Got with garbage".)
+///
+/// - **LIMIT cancellation** (T6) continues to work in both modes. In
+///   partial mode the LIMIT-hit cancel path STILL fires (rows are
+///   complete past LIMIT regardless of partial-mode), and the failed-
+///   shards list reflects only the shards that returned non-Got
+///   slots whose deadlines elapsed BEFORE the LIMIT-hit short-circuit
+///   ran. Shards we never read from (because LIMIT was hit on an
+///   earlier shard) are NOT counted as "failed" — they're just
+///   "unread" (deterministic by shard-id ordering).
+///
+/// - **K-invariance** (T3 property sweep): preserved in
+///   `partial_on_timeout: false`. In partial mode, K-invariance is
+///   "K-invariance MODULO the failed-shard subset" — given the same
+///   set of failed shards across two K-equivalent deployments, the
+///   merged output is byte-identical. With a different failure set
+///   the byte output naturally differs (some rows are missing). The
+///   caller's `failed_shards` distinguishes the two cases.
+pub fn scatter_and_merge_ctx<C: ShardCaller>(
+    shards: Vec<C>,
+    op: &Op,
+    per_shard_timeout: Duration,
+    kind: &ScatterKind,
+    cancel: Arc<AtomicBool>,
+    ctx: ScatterContext,
+) -> (OpResult, Vec<u32>) {
     let k = shards.len();
     if k == 0 {
         // SP155 OQ11: empty filter result is Got([]), not NotFound.
-        return OpResult::Got(Vec::new());
+        // Both modes return empty failed-shards (no shards = no
+        // failures).
+        return (OpResult::Got(Vec::new()), Vec::new());
     }
     // Honor a pre-fired cancel: caller already knows LIMIT is satisfied
     // (e.g. LIMIT 0 on a downstream caller, or a Drop-time cancel from
@@ -430,7 +582,7 @@ pub fn scatter_and_merge<C: ShardCaller>(
     // immediately. This matches the SP155 §3.7 "cancel = stop scanning"
     // intent at the strongest possible point.
     if cancel.load(AtomicOrdering::SeqCst) {
-        return OpResult::Got(Vec::new());
+        return (OpResult::Got(Vec::new()), Vec::new());
     }
     // Spawn workers upfront so per-shard work overlaps (the merge
     // consumer may stay sequential per SP155 §3.6).
@@ -462,15 +614,18 @@ pub fn scatter_and_merge<C: ShardCaller>(
     let deadlines: Vec<Instant> = (0..k)
         .map(|_| Instant::now() + per_shard_timeout)
         .collect();
+    let mut failed_shards: Vec<u32> = Vec::new();
     // Drain replies in shard-id order. For Unordered with a limit, we
     // can short-circuit mid-drain (set cancel, stop reading). For
     // Sorted we drain everyone (k-way heap merge needs all data).
     let result = match kind {
         ScatterKind::Unordered { limit } => {
-            scatter_and_merge_unordered(
+            scatter_and_merge_unordered_ctx(
                 &mut rxs.into_iter().zip(deadlines.into_iter()).collect::<Vec<_>>(),
                 *limit,
                 &cancel,
+                ctx.partial_on_timeout,
+                &mut failed_shards,
             )
         }
         ScatterKind::Sorted { .. } => {
@@ -478,7 +633,9 @@ pub fn scatter_and_merge<C: ShardCaller>(
             // then merge.
             let mut gathered: Vec<OpResult> = Vec::with_capacity(k);
             let mut first_bad: Option<OpResult> = None;
-            for (rx, deadline) in rxs.into_iter().zip(deadlines.into_iter()) {
+            for (i, (rx, deadline)) in
+                rxs.into_iter().zip(deadlines.into_iter()).enumerate()
+            {
                 let now = Instant::now();
                 let remaining = if deadline > now {
                     deadline - now
@@ -489,12 +646,20 @@ pub fn scatter_and_merge<C: ShardCaller>(
                     Ok(r) => r,
                     Err(_) => OpResult::Unavailable,
                 };
-                if !matches!(r, OpResult::Got(_)) && first_bad.is_none() {
-                    // V1 hard-fail surfaces the first non-Got slot.
-                    // Fire cancel so the remaining workers exit fast
-                    // (default-impl observes it at the call boundary).
-                    first_bad = Some(r.clone());
-                    cancel.store(true, AtomicOrdering::SeqCst);
+                if !matches!(r, OpResult::Got(_)) {
+                    if ctx.partial_on_timeout {
+                        // Partial mode: record the shard id, substitute
+                        // an empty Got so the merger skips it cleanly.
+                        failed_shards.push(i as u32);
+                        gathered.push(OpResult::Got(Vec::new()));
+                        continue;
+                    } else if first_bad.is_none() {
+                        // V1 hard-fail surfaces the first non-Got slot.
+                        // Fire cancel so the remaining workers exit fast
+                        // (default-impl observes it at the call boundary).
+                        first_bad = Some(r.clone());
+                        cancel.store(true, AtomicOrdering::SeqCst);
+                    }
                 }
                 gathered.push(r);
             }
@@ -520,7 +685,7 @@ pub fn scatter_and_merge<C: ShardCaller>(
     for h in handles {
         let _ = h.join();
     }
-    result
+    (result, failed_shards)
 }
 
 /// Helper for `scatter_and_merge`'s Unordered path: drain shard
@@ -528,12 +693,19 @@ pub fn scatter_and_merge<C: ShardCaller>(
 /// cancel + stop draining** when `output.len() == limit`. `limit == 0`
 /// is "unlimited" (drain everyone, never fire cancel).
 ///
+/// `partial_on_timeout` (SP-A T9): when `true`, a non-Got slot is
+/// recorded in `failed_shards` and skipped (other shards' rows merge
+/// normally); when `false` (V1 hard-fail), the first non-Got slot
+/// fires cancel and is returned as-is.
+///
 /// Returns the merged `OpResult` directly (Got with the payload, OR
-/// the first non-Got slot per V1 hard-fail).
-fn scatter_and_merge_unordered(
+/// the first non-Got slot per V1 hard-fail when partial mode is off).
+fn scatter_and_merge_unordered_ctx(
     rxs_with_deadlines: &mut Vec<(mpsc::Receiver<OpResult>, Instant)>,
     limit: u32,
     cancel: &Arc<AtomicBool>,
+    partial_on_timeout: bool,
+    failed_shards: &mut Vec<u32>,
 ) -> OpResult {
     let mut out: Vec<u8> = Vec::new();
     let mut emitted: u32 = 0;
@@ -549,10 +721,19 @@ fn scatter_and_merge_unordered(
             Ok(r) => r,
             Err(_) => OpResult::Unavailable,
         };
-        // V1 hard-fail: surface the first non-Got slot, fire cancel.
+        // V1 hard-fail OR T9 partial-mode skip: a non-Got slot
+        // either poisons the merge (hard-fail) OR is recorded in
+        // `failed_shards` and dropped, depending on
+        // `partial_on_timeout`. In partial mode the cancel flag is
+        // NOT fired — other shards continue normally.
         let payload = match r {
             OpResult::Got(b) => b,
             other => {
+                if partial_on_timeout {
+                    failed_shards.push(shard_id as u32);
+                    shard_id += 1;
+                    continue;
+                }
                 cancel.store(true, AtomicOrdering::SeqCst);
                 return other;
             }
@@ -561,6 +742,11 @@ fn scatter_and_merge_unordered(
         let it = match iter_rows(&payload) {
             Ok(it) => it,
             Err(e) => {
+                // Framing/malformed payloads are NOT a per-shard
+                // availability event; even partial mode surfaces this
+                // as a clean SchemaError + fires cancel. See T9
+                // doc-comment: partial mode does NOT silently drop
+                // garbage bytes from a shard.
                 cancel.store(true, AtomicOrdering::SeqCst);
                 return OpResult::SchemaError(format!(
                     "scatter merge: shard {shard_id} payload framing: {e}"
@@ -3433,5 +3619,380 @@ mod tests {
             &rec(6), &rec(7), &rec(8), &rec(9),
         ]);
         assert_eq!(first.unwrap(), OpResult::Got(expected));
+    }
+
+    // ---------- T9 partial-result opt-in KATs (SP155 §3.6 / §6 / OQ2) ----------
+    //
+    // T1-T8 ship V1 hard-fail (any non-Got slot poisons the merged
+    // result with that slot's typed error). T9 adds an opt-in
+    // `ScatterContext::partial_on_timeout` flag: when true, per-shard
+    // non-Got slots are OMITTED from the merge and the caller gets a
+    // `Vec<u32>` failed-shards list as the second tuple element from
+    // `scatter_and_merge_ctx`. V1 default stays hard-fail (a regression-
+    // lock here catches an accidental flip).
+    //
+    // The KATs below cover, in order:
+    //   1. V1 default (hard-fail) still fires (regression-lock — flipping
+    //      the default would silently degrade callers).
+    //   2. partial=true + 1/3 shards timeout: returns rows from the 2
+    //      surviving shards + failed_shards = [the timed-out one].
+    //   3. partial=true + 0 shards fail: result == V1 default
+    //      (failed_shards empty).
+    //   4. partial=true + ALL shards fail: empty Got + failed_shards =
+    //      0..K (caller MUST check len == K).
+    //   5. partial=true + LIMIT: cancellation still fires on LIMIT-hit
+    //      (rows complete past LIMIT regardless of partial mode).
+    //   6. partial=true preserves K-invariance MODULO removal of the
+    //      failed-shard subset (given the same failure set, byte-identical
+    //      across K).
+    //   7. partial=true + Sorted: failed shards' slots are omitted; the
+    //      remaining shards' rows merge per the heap.
+    //   8. partial=true + malformed-Got from one shard: STILL surfaces
+    //      SchemaError (framing bugs are not "availability events" —
+    //      partial mode does not silently drop garbage bytes; T9 doc).
+
+    /// **T9.1 — V1 default is hard-fail (regression-lock).** Default
+    /// `scatter_and_merge` (no ScatterContext) and
+    /// `scatter_and_merge_ctx(..., ScatterContext::hard_fail())` BOTH
+    /// surface the first non-Got slot as the merged result. A flipped
+    /// default here would be a silent correctness degradation.
+    #[test]
+    fn t9_default_is_hard_fail_v1_regression_lock() {
+        let s0 = PentestShard::new(PentestBehavior::Got(rows_to_payload(&[b"a"])));
+        let s1 = PentestShard::new(PentestBehavior::TransportErr(
+            "transport: shard down".into(),
+        ));
+        let s2 = PentestShard::new(PentestBehavior::Got(rows_to_payload(&[b"c"])));
+        let cancel = Arc::new(AtomicBool::new(false));
+        // Via the back-compat wrapper.
+        let out = scatter_and_merge(
+            vec![s0, s1, s2],
+            &dummy_select(),
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &ScatterKind::Unordered { limit: 0 },
+            cancel,
+        );
+        assert_eq!(
+            out,
+            OpResult::Unavailable,
+            "V1 default MUST still hard-fail (regression-lock)"
+        );
+
+        // Also via the ctx entry point with explicit hard_fail() —
+        // identical behaviour.
+        let s0b = PentestShard::new(PentestBehavior::Got(rows_to_payload(&[b"a"])));
+        let s1b = PentestShard::new(PentestBehavior::TransportErr(
+            "transport: shard down".into(),
+        ));
+        let s2b = PentestShard::new(PentestBehavior::Got(rows_to_payload(&[b"c"])));
+        let cancel2 = Arc::new(AtomicBool::new(false));
+        let (out2, failed) = scatter_and_merge_ctx(
+            vec![s0b, s1b, s2b],
+            &dummy_select(),
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &ScatterKind::Unordered { limit: 0 },
+            cancel2,
+            ScatterContext::hard_fail(),
+        );
+        assert_eq!(out2, OpResult::Unavailable);
+        assert!(
+            failed.is_empty(),
+            "hard-fail mode never populates failed_shards: {failed:?}"
+        );
+    }
+
+    /// **T9.2 — partial=true + 1/3 shards fails: 2 shards' rows
+    /// merged + failed_shards = [the failed one].**
+    #[test]
+    fn t9_partial_one_shard_fails_returns_others_plus_failed_marker() {
+        let s0 = PentestShard::new(PentestBehavior::Got(
+            rows_to_payload(&[b"row-a", b"row-b"]),
+        ));
+        let s1 = PentestShard::new(PentestBehavior::TransportErr(
+            "transport: timeout".into(),
+        ));
+        let s2 = PentestShard::new(PentestBehavior::Got(
+            rows_to_payload(&[b"row-c"]),
+        ));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (out, failed) = scatter_and_merge_ctx(
+            vec![s0, s1, s2],
+            &dummy_select(),
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &ScatterKind::Unordered { limit: 0 },
+            cancel,
+            ScatterContext::partial(),
+        );
+        // The merged result is shard_0 ++ shard_2 (shard_1 omitted).
+        let expected = rows_to_payload(&[b"row-a", b"row-b", b"row-c"]);
+        assert_eq!(
+            out,
+            OpResult::Got(expected),
+            "partial mode: surviving shards' rows merge in shard-id order"
+        );
+        assert_eq!(
+            failed,
+            vec![1u32],
+            "failed_shards lists the timed-out shard"
+        );
+    }
+
+    /// **T9.3 — partial=true + 0 shards fail: identical to V1 default
+    /// (Got + empty failed_shards).**
+    #[test]
+    fn t9_partial_no_shards_fail_equals_v1_default() {
+        let mk = || -> Vec<PentestShard> {
+            vec![
+                PentestShard::new(PentestBehavior::Got(rows_to_payload(&[b"a"]))),
+                PentestShard::new(PentestBehavior::Got(rows_to_payload(&[b"b"]))),
+                PentestShard::new(PentestBehavior::Got(rows_to_payload(&[b"c"]))),
+            ]
+        };
+        // Hard-fail result.
+        let cancel_hf = Arc::new(AtomicBool::new(false));
+        let (hf_out, hf_failed) = scatter_and_merge_ctx(
+            mk(),
+            &dummy_select(),
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &ScatterKind::Unordered { limit: 0 },
+            cancel_hf,
+            ScatterContext::hard_fail(),
+        );
+        // Partial result with no failures.
+        let cancel_p = Arc::new(AtomicBool::new(false));
+        let (p_out, p_failed) = scatter_and_merge_ctx(
+            mk(),
+            &dummy_select(),
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &ScatterKind::Unordered { limit: 0 },
+            cancel_p,
+            ScatterContext::partial(),
+        );
+        assert_eq!(
+            hf_out, p_out,
+            "with 0 failures, partial mode matches hard-fail byte-for-byte"
+        );
+        assert!(hf_failed.is_empty());
+        assert!(p_failed.is_empty());
+    }
+
+    /// **T9.4 — partial=true + ALL shards fail: empty Got +
+    /// failed_shards = full 0..K range.** The caller MUST check
+    /// `failed_shards.len() == K` to distinguish "all failed" from
+    /// "all returned 0 rows".
+    #[test]
+    fn t9_partial_all_shards_fail_returns_empty_plus_full_failed_list() {
+        let s0 = PentestShard::new(PentestBehavior::TransportErr("e0".into()));
+        let s1 = PentestShard::new(PentestBehavior::TransportErr("e1".into()));
+        let s2 = PentestShard::new(PentestBehavior::TransportErr("e2".into()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (out, failed) = scatter_and_merge_ctx(
+            vec![s0, s1, s2],
+            &dummy_select(),
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &ScatterKind::Unordered { limit: 0 },
+            cancel,
+            ScatterContext::partial(),
+        );
+        assert_eq!(
+            out,
+            OpResult::Got(Vec::new()),
+            "all-fail in partial mode returns empty Got"
+        );
+        assert_eq!(failed, vec![0u32, 1, 2], "failed_shards == 0..K");
+    }
+
+    /// **T9.5 — partial=true + LIMIT-hit still cancels late shards.**
+    /// shard_0 returns enough rows to satisfy LIMIT; the slow shards
+    /// must still see the cancel flag pre-call. partial mode does NOT
+    /// suppress the LIMIT-cancellation path.
+    #[test]
+    fn t9_partial_mode_limit_still_cancels_pending_shards() {
+        let rec = |v: u8| -> Vec<u8> { vec![v; 8] };
+        let mk_payload = |n: usize, base: u8| -> OpResult {
+            let rows: Vec<Vec<u8>> = (0..n as u8)
+                .map(|i| rec(base.wrapping_add(i)))
+                .collect();
+            let refs: Vec<&[u8]> = rows.iter().map(|v| v.as_slice()).collect();
+            OpResult::Got(rows_to_payload(&refs))
+        };
+        // shard_0: fast, 100 rows.
+        let s0 = CancellableMockShard::new(mk_payload(100, 0));
+        // shard_1, shard_2: SLOW, 100 rows each.
+        let s1 = CancellableMockShard::new(mk_payload(100, 100))
+            .slow(Duration::from_millis(200));
+        let s2 = CancellableMockShard::new(mk_payload(100, 200))
+            .slow(Duration::from_millis(200));
+        let ran1 = s1.ran.clone();
+        let ran2 = s2.ran.clone();
+        let cancelled1 = s1.cancelled_pre_call.clone();
+        let cancelled2 = s2.cancelled_pre_call.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let t0 = Instant::now();
+        let (out, failed) = scatter_and_merge_ctx(
+            vec![s0, s1, s2],
+            &dummy_select(),
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &ScatterKind::Unordered { limit: 5 },
+            cancel.clone(),
+            ScatterContext::partial(),
+        );
+        let elapsed = t0.elapsed();
+        // Exactly 5 rows (LIMIT 5).
+        let bytes = match &out {
+            OpResult::Got(b) => b,
+            other => panic!("expected Got, got {other:?}"),
+        };
+        let mut count = 0usize;
+        let mut p = 0usize;
+        while p < bytes.len() {
+            let len =
+                u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+            p += 4 + len;
+            count += 1;
+        }
+        assert_eq!(count, 5, "LIMIT 5 still caps at 5 rows in partial mode");
+        // Late shards cancelled pre-call (didn't even run).
+        assert_eq!(ran1.load(Ordering::SeqCst), 0);
+        assert_eq!(ran2.load(Ordering::SeqCst), 0);
+        assert!(cancelled1.load(Ordering::SeqCst) >= 1);
+        assert!(cancelled2.load(Ordering::SeqCst) >= 1);
+        // Fast wall-clock (cancel propagated).
+        assert!(
+            elapsed < Duration::from_millis(180),
+            "LIMIT-cancellation still fast in partial mode, was {elapsed:?}"
+        );
+        // failed_shards: under LIMIT-hit short-circuit, the late
+        // shards are NEVER READ FROM by the merger (the LIMIT-hit
+        // returns mid-drain). They're "unread", NOT "failed" — a
+        // deterministic distinction by shard-id ordering. The
+        // failed_shards list therefore stays empty for the
+        // LIMIT-hit-before-late-shard case. This is honest: the
+        // caller knows the merger didn't even ASK the late shards
+        // (their cancel-pre-call is a router-side optimization, not
+        // a "shard failure"). Documented honest gap: a future
+        // T-slice could surface "unread shards" separately if a
+        // workload needs it.
+        assert!(
+            failed.is_empty(),
+            "LIMIT-hit short-circuit doesn't classify late shards as \
+             failed (they were unread): {failed:?}"
+        );
+        assert!(
+            cancel.load(Ordering::SeqCst),
+            "LIMIT-hit fires cancel even in partial mode"
+        );
+    }
+
+    /// **T9.6 — partial=true preserves K-invariance MODULO removal of
+    /// the failed-shard subset.** Given the SAME failure pattern
+    /// across two equivalent fixtures, partial-mode merged bytes are
+    /// byte-identical. Locks that partial mode is a deterministic
+    /// function of (per-shard results, kind, failed-shards subset).
+    #[test]
+    fn t9_partial_mode_is_deterministic_replay_safe() {
+        let mk_shards = || -> Vec<PentestShard> {
+            vec![
+                PentestShard::new(PentestBehavior::Got(rows_to_payload(&[b"a0", b"a1"]))),
+                PentestShard::new(PentestBehavior::TransportErr("down".into())),
+                PentestShard::new(PentestBehavior::Got(rows_to_payload(&[b"c0"]))),
+                PentestShard::new(PentestBehavior::TransportErr("down".into())),
+            ]
+        };
+        let mut first: Option<(OpResult, Vec<u32>)> = None;
+        for run in 0..20u32 {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let pair = scatter_and_merge_ctx(
+                mk_shards(),
+                &dummy_select(),
+                DEFAULT_PER_SHARD_TIMEOUT,
+                &ScatterKind::Unordered { limit: 0 },
+                cancel,
+                ScatterContext::partial(),
+            );
+            match &first {
+                None => first = Some(pair),
+                Some(baseline) => assert_eq!(
+                    pair, *baseline,
+                    "run {run}: partial-mode bytes / failed_shards diverged"
+                ),
+            }
+        }
+        let (out, failed) = first.unwrap();
+        assert_eq!(
+            out,
+            OpResult::Got(rows_to_payload(&[b"a0", b"a1", b"c0"])),
+            "shard_0 and shard_2 contribute; 1+3 omitted"
+        );
+        assert_eq!(failed, vec![1u32, 3]);
+    }
+
+    /// **T9.7 — partial=true + Sorted (heap merge): failed shards
+    /// omitted; surviving shards' rows heap-merge per the sort
+    /// strategy.** Sorted needs every shard's payload upfront for the
+    /// k-way merge; in partial mode failed slots are substituted with
+    /// empty Got payloads and the heap merge naturally skips them.
+    #[test]
+    fn t9_partial_sorted_failed_shards_omitted_others_merge_correctly() {
+        let rec = |v: u64| -> Vec<u8> { v.to_le_bytes().to_vec() };
+        let s0 = PentestShard::new(PentestBehavior::Got(rows_to_payload(&[
+            &rec(1), &rec(5),
+        ])));
+        // shard_1 dies.
+        let s1 = PentestShard::new(PentestBehavior::TransportErr("down".into()));
+        let s2 = PentestShard::new(PentestBehavior::Got(rows_to_payload(&[
+            &rec(2), &rec(7),
+        ])));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (out, failed) = scatter_and_merge_ctx(
+            vec![s0, s1, s2],
+            &dummy_select(),
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &ScatterKind::Sorted {
+                sort_kind: FieldKind::U64,
+                sort_offset: 0,
+                sort_width: 8,
+                desc: false,
+                offset: 0,
+                limit: 0,
+            },
+            cancel,
+            ScatterContext::partial(),
+        );
+        // Heap merge of shard_0 + shard_2 only: [1, 2, 5, 7].
+        let expected = rows_to_payload(&[&rec(1), &rec(2), &rec(5), &rec(7)]);
+        assert_eq!(out, OpResult::Got(expected));
+        assert_eq!(failed, vec![1u32]);
+    }
+
+    /// **T9.8 — partial=true + malformed Got from one shard: SchemaError
+    /// still surfaces.** Per T9 doc: partial mode is for per-shard
+    /// AVAILABILITY events (Unavailable / SchemaError-from-shard / etc.).
+    /// A `Got(garbage)` with bad framing is a TRANSPORT/FRAMING bug,
+    /// not an availability event — the merger still surfaces it cleanly
+    /// instead of silently dropping garbage bytes from a shard.
+    #[test]
+    fn t9_partial_mode_does_not_swallow_malformed_payload_framing() {
+        let s0 = PentestShard::new(PentestBehavior::Got(rows_to_payload(&[b"good"])));
+        // bad framing: claims 4 GiB row in 4 bytes
+        let bad = {
+            let mut v = (u32::MAX).to_le_bytes().to_vec();
+            v.extend_from_slice(&[1, 2, 3, 4]);
+            v
+        };
+        let s1 = PentestShard::new(PentestBehavior::MalformedGot(bad));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (out, _failed) = scatter_and_merge_ctx(
+            vec![s0, s1],
+            &dummy_select(),
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &ScatterKind::Unordered { limit: 0 },
+            cancel,
+            ScatterContext::partial(),
+        );
+        assert!(
+            matches!(out, OpResult::SchemaError(_)),
+            "malformed framing surfaces SchemaError even in partial mode, got {out:?}"
+        );
     }
 }

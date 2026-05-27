@@ -71,15 +71,105 @@ pub fn serve(
 }
 
 fn handle_one(
-    mut s: TcpStream,
+    s: TcpStream,
     engine: &Arc<dyn EngineApply>,
     token: Option<&[u8]>,
     max_body: usize,
     http_counters: &Arc<HttpRequestCountersStatic>,
     max_requests_per_conn: usize,
 ) {
-    let _ = handle_one_stream(&mut s, engine, token, max_body, http_counters,
+    // SP-WS T5: TcpStream-specific HTTP loop that, on a successful
+    // WebSocket upgrade, hands the (now-WebSocket) stream off to the
+    // per-connection session loop. The TLS path
+    // (`handle_one_stream`) still runs HTTP-only — a future arc can
+    // generalize the session loop over `Read + Write + TryClone`.
+    let _ = handle_one_stream_tcp(s, engine, token, max_body, http_counters,
         max_requests_per_conn);
+}
+
+/// TcpStream-specific HTTP loop. Mirrors `handle_one_stream` but, when a
+/// successful WebSocket upgrade response is written, takes ownership of
+/// the stream and runs the per-connection session loop (T5 + T6) instead
+/// of looping back for the next HTTP request.
+fn handle_one_stream_tcp(
+    mut s: TcpStream,
+    engine: &Arc<dyn EngineApply>,
+    token: Option<&[u8]>,
+    max_body: usize,
+    http_counters: &Arc<HttpRequestCountersStatic>,
+    max_requests_per_conn: usize,
+) -> std::io::Result<()> {
+    let mut raw: Vec<u8> = Vec::with_capacity(8 * 1024);
+    let mut chunk = [0u8; 8192];
+    let mut requests_served: usize = 0;
+    loop {
+        if requests_served >= max_requests_per_conn {
+            return Ok(());
+        }
+        match parse_request(&raw, max_body) {
+            Ok(req) => {
+                // SP-WS T5: detect WS upgrade BEFORE calling routes::handle
+                // so we own the post-handshake stream. The routes::handle
+                // WS arm is bypassed when we take this path; both call
+                // `ws::handle_upgrade` once. The bypass avoids the
+                // double-handshake bug a naive "call routes then run
+                // session" would create.
+                let is_ws_upgrade = req.path == crate::ws::WEBSOCKET_PATH
+                    && crate::ws::is_websocket_upgrade(&req.headers);
+                if is_ws_upgrade {
+                    // Auth + handshake run inline so we can keep ownership
+                    // of the TcpStream for the session loop. On 101
+                    // success → run the session loop on the stream. On
+                    // 4xx → drop the stream (Connection: close was
+                    // written in the error response).
+                    match crate::ws::handle_upgrade(&mut s, &req, token, engine) {
+                        Ok(()) => {
+                            let cfg = crate::ws::WsSessionConfig::default();
+                            let _ = crate::ws::run_ws_session(s, engine.clone(), cfg);
+                        }
+                        Err(_) => {
+                            // Error response was written; close.
+                        }
+                    }
+                    return Ok(());
+                }
+                let consumed = req.consumed;
+                let close_after = match routes::handle(&mut s, &req, token, engine,
+                    http_counters)
+                {
+                    Ok(c) => c,
+                    Err(_) => return Ok(()),
+                };
+                requests_served += 1;
+                if close_after {
+                    return Ok(());
+                }
+                if consumed <= raw.len() {
+                    raw.drain(..consumed);
+                } else {
+                    raw.clear();
+                }
+                continue;
+            }
+            Err(ParseError::NoHeaderTerminator) | Err(ParseError::ShortBody) => {}
+            Err(e) => {
+                let _ = write_parse_error(&mut s, &e, http_counters, /*keep_alive=*/ false);
+                return Ok(());
+            }
+        }
+        let n = match s.read(&mut chunk) {
+            Ok(0) => return Ok(()),
+            Ok(n) => n,
+            Err(_) => return Ok(()),
+        };
+        raw.extend_from_slice(&chunk[..n]);
+        if raw.len() > MAX_HEADER_BYTES + max_body {
+            let _ = write_error_json_counted(&mut s, (413, "Payload Too Large"),
+                "error", "payload too large",
+                http_counters, "/v1/sql", /*keep_alive=*/ false);
+            return Ok(());
+        }
+    }
 }
 
 fn handle_one_stream<S: Read + Write>(

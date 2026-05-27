@@ -49,6 +49,9 @@
 #![allow(dead_code)]
 
 pub mod frame;
+pub mod session;
+
+pub use session::{run_ws_session, WsSessionConfig};
 
 use crate::crypto::sec_websocket_accept;
 use crate::engine::EngineApply;

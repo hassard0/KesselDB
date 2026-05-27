@@ -85,6 +85,35 @@ pub trait EngineApply: Send + Sync + 'static {
     ///   sensitive even though PG normally folds unquoted identifiers
     ///   to lowercase). V2 follow-up.
     fn describe_table(&self, table_name: &str) -> Option<Vec<PgColumn>>;
+
+    /// T9 — Apply SQL and ALSO surface the number of affected rows.
+    /// Default impl returns count=1 for any `Ok`-shaped success and
+    /// count=0 for any error / `NotFound`, which is accurate for
+    /// single-row INSERT / UPDATE / DELETE on the ID-fast-path (the
+    /// V1 grammar's hot DML shape — `INSERT INTO t (id, ...) VALUES
+    /// (...)`, `UPDATE t ID <n> SET ...`, `DELETE FROM t ID <n>`).
+    ///
+    /// **Lossy edge** (acknowledged): multi-row INSERT VALUES tuples
+    /// compile into one atomic `Op::Txn` whose `OpResult::Ok` doesn't
+    /// carry a count — the gateway recovers N by counting top-level
+    /// `(...)` tuples in the SQL text via `dispatch::count_insert_values`.
+    /// WHERE-clause UPDATE/DELETE (V2 SP-SQL extension) would land
+    /// here lossy at count=1 until either a real `affected_rows` field
+    /// lands on `OpResult::Ok` (V2 enhancement) or the engine routes
+    /// such ops through `Op::Txn`.
+    ///
+    /// Default impl is provided so existing `EngineApply` impls don't
+    /// have to change at the T9 commit boundary — the
+    /// `kesseldb-server::EngineHandle` impl (T12) can override for the
+    /// `Op::Txn`-returns-`TxCommitted` path.
+    fn apply_sql_with_count(&self, sql: &str) -> (OpResult, u64) {
+        let r = self.apply_sql(sql);
+        let count = match &r {
+            OpResult::Ok | OpResult::TxCommitted { .. } => 1,
+            _ => 0,
+        };
+        (r, count)
+    }
 }
 
 #[cfg(test)]

@@ -14,6 +14,11 @@
 //! - INSERT / UPDATE / DELETE / CREATE TABLE / DROP TABLE — opaque
 //!   pass-through (CommandComplete tag inferred from the leading SQL
 //!   keyword)
+//! - **T9**: INSERT / UPDATE / DELETE now surface real affected-row
+//!   counts in the CommandComplete tag (`INSERT 0 N`, `UPDATE N`,
+//!   `DELETE N`) via `EngineApply::apply_sql_with_count`; multi-row
+//!   INSERT VALUES tuples are counted in the SQL text via
+//!   `count_insert_values` (a tiny VALUES-tuple counter).
 //! - Anything else `apply_sql` returns → ErrorResponse via the T7
 //!   SQLSTATE map
 //!
@@ -25,6 +30,15 @@
 //! - `infer_command_tag(sql, rows) -> String` — picks the
 //!   CommandComplete tag from the SQL leading keyword + the row
 //!   count.
+//! - `cmd_complete_tag_for_sql(sql, count) -> String` — T9 polish on
+//!   top of `infer_command_tag`: handles DDL/transaction-control
+//!   keywords (CREATE INDEX, ALTER TABLE, BEGIN, COMMIT, ROLLBACK)
+//!   and strips leading `--` line comments + whitespace before the
+//!   keyword test.
+//! - `count_insert_values(sql) -> u64` — counts top-level `(...)`
+//!   VALUES tuples in an `INSERT INTO t (...) VALUES (...)[, (...)]*`
+//!   so the gateway can emit `INSERT 0 N` for multi-row INSERT even
+//!   though the engine's `OpResult::Ok` doesn't carry the count.
 //! - `render_pg_text(value, kind) -> Vec<u8>` — renders a single
 //!   column value to PG text format.
 //!
@@ -83,7 +97,16 @@ pub fn dispatch_query<E: EngineApply + ?Sized>(sql: &str, engine: &E) -> Vec<u8>
     // V1-supported whole-row shape (no projection list, no JOIN).
     let select_table = kessel_sql::select_star_table(sql_trimmed);
 
-    let result = engine.apply_sql(sql_trimmed);
+    // T9 — route DML through `apply_sql_with_count` so INSERT/UPDATE/
+    // DELETE can surface a real row count in CommandComplete. SELECT
+    // and DDL still go through `apply_sql` because their count is
+    // computed elsewhere (SELECT: emit_data_rows; DDL: not part of
+    // PG's CommandComplete tag — `CREATE TABLE` has no count).
+    let (result, affected_rows) = if is_dml_keyword(sql_trimmed) {
+        engine.apply_sql_with_count(sql_trimmed)
+    } else {
+        (engine.apply_sql(sql_trimmed), 0)
+    };
     match result {
         OpResult::Got(row_bytes) => {
             // SELECT path — emit RowDescription + DataRow* +
@@ -152,12 +175,22 @@ pub fn dispatch_query<E: EngineApply + ?Sized>(sql: &str, engine: &E) -> Vec<u8>
             out
         }
         OpResult::Ok | OpResult::TypeCreated(_) | OpResult::TxCommitted { .. } => {
-            // Non-SELECT success. Pick the CommandComplete tag by
-            // inspecting the SQL's leading keyword. V1 doesn't yet
-            // surface row counts for INSERT/UPDATE/DELETE because
-            // `apply_sql` returns `Ok` without a count — the tag
-            // emits 0 rows. T9 will polish this.
-            let tag = infer_command_tag(sql_trimmed, 0);
+            // Non-SELECT success. T9: pick the CommandComplete tag
+            // via `cmd_complete_tag_for_sql` — handles DDL +
+            // transaction-control keywords + leading-comment stripping
+            // beyond what `infer_command_tag` covers. For INSERT
+            // specifically, `affected_rows` may understate when the
+            // engine collapses a multi-row VALUES into a single
+            // `Op::Txn`-returns-`Ok` (count=1 in the default impl);
+            // fall back to counting VALUES tuples in the SQL text.
+            let count = if leading_keyword_is(sql_trimmed, "INSERT") {
+                let from_engine = affected_rows;
+                let from_sql = count_insert_values(sql_trimmed);
+                from_engine.max(from_sql)
+            } else {
+                affected_rows
+            };
+            let tag = cmd_complete_tag_for_sql(sql_trimmed, count);
             out.extend_from_slice(&encode_command_complete(&tag));
             out.extend_from_slice(&encode_ready_for_query(b'I'));
             out
@@ -408,6 +441,231 @@ pub fn render_pg_text(v: &Value, kind: FieldKind) -> Vec<u8> {
             }
         }
     }
+}
+
+/// T9 — extracts the leading SQL keyword (case-insensitive, leading
+/// whitespace + `-- ...` line comments + `/* ... */` block comments
+/// stripped). Returns the uppercased keyword or the empty string if
+/// no keyword is present. Used by `cmd_complete_tag_for_sql` and the
+/// DML-routing branch of `dispatch_query`.
+pub fn leading_keyword(sql: &str) -> String {
+    let stripped = strip_leading_comments_and_whitespace(sql);
+    stripped
+        .split(|c: char| c.is_whitespace() || c == '(' || c == ';')
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase()
+}
+
+/// Strip leading whitespace + SQL line comments (`-- ...\n`) + block
+/// comments (`/* ... */`, non-nesting) so the first meaningful token
+/// is exposed for keyword extraction. Mirrors libpq's tolerance for
+/// the leading-comment shapes a real client (ORMs especially) emits.
+fn strip_leading_comments_and_whitespace(sql: &str) -> &str {
+    let mut s = sql;
+    loop {
+        let trimmed = s.trim_start();
+        if trimmed.starts_with("--") {
+            // Line comment — skip to end of line (LF or end-of-string).
+            match trimmed.find('\n') {
+                Some(p) => s = &trimmed[p + 1..],
+                None => return "",
+            }
+            continue;
+        }
+        if trimmed.starts_with("/*") {
+            // Block comment — non-nesting, scan for `*/`.
+            match trimmed[2..].find("*/") {
+                Some(p) => s = &trimmed[2 + p + 2..],
+                None => return "", // unterminated comment — no keyword
+            }
+            continue;
+        }
+        return trimmed;
+    }
+}
+
+/// True iff the SQL is one of the DML keywords that should route
+/// through `apply_sql_with_count` (so the CommandComplete tag carries
+/// a real row count). SELECT is NOT here — its count is the result-
+/// row count, computed at decode time in `emit_data_rows`.
+fn is_dml_keyword(sql: &str) -> bool {
+    matches!(leading_keyword(sql).as_str(), "INSERT" | "UPDATE" | "DELETE")
+}
+
+/// Count top-level `(...)` VALUES tuples in an `INSERT INTO t (...)
+/// VALUES (...)[, (...)]*` so `dispatch_query` can emit `INSERT 0 N`
+/// for a multi-row INSERT even though the engine's `OpResult::Ok`
+/// (returned by the underlying `Op::Txn`) doesn't carry the count.
+///
+/// V1 implementation: lex the SQL into tokens with a tiny pass —
+/// strings (single-quoted, doubled-quote escape) + line/block comments
+/// are honored so a quoted `(` doesn't trigger a false count. Counts
+/// the top-level `(...)` groups AFTER the `VALUES` keyword.
+///
+/// Returns 0 if the shape doesn't match (no `VALUES`, no tuples) —
+/// callers fall back to the engine-supplied count in that case.
+pub fn count_insert_values(sql: &str) -> u64 {
+    // Find the VALUES keyword (case-insensitive). Use the
+    // comment-stripped, lower-cased view to locate it; track byte
+    // positions in the original so a `'values'` literal doesn't trip
+    // the search.
+    let s = sql;
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 0i32;
+    let mut found_values = false;
+    let mut tuples: u64 = 0;
+    let mut in_str = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if b == b'\'' {
+                // doubled '' → escaped quote (still in string)
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                in_str = false;
+                i += 1;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        // line comment
+        if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            match bytes[i..].iter().position(|&x| x == b'\n') {
+                Some(p) => i += p + 1,
+                None => break,
+            }
+            continue;
+        }
+        // block comment
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            let rest = &bytes[i + 2..];
+            match rest.windows(2).position(|w| w == b"*/") {
+                Some(p) => i += 2 + p + 2,
+                None => break,
+            }
+            continue;
+        }
+        if b == b'\'' {
+            in_str = true;
+            i += 1;
+            continue;
+        }
+        // Check for VALUES keyword at this position (word-aligned).
+        if !found_values
+            && (b == b'V' || b == b'v')
+            && i + 6 <= bytes.len()
+            && bytes[i..i + 6].eq_ignore_ascii_case(b"VALUES")
+            && (i == 0 || !is_ident_byte(bytes[i - 1]))
+            && (i + 6 == bytes.len() || !is_ident_byte(bytes[i + 6]))
+        {
+            found_values = true;
+            i += 6;
+            continue;
+        }
+        if found_values {
+            if b == b'(' {
+                if depth == 0 {
+                    tuples += 1;
+                }
+                depth += 1;
+            } else if b == b')' {
+                depth -= 1;
+            }
+        }
+        i += 1;
+    }
+    tuples
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// T9 — pick the canonical PG CommandComplete tag string for the
+/// given SQL + affected-row count. Builds on `infer_command_tag` but
+/// adds:
+///
+/// - Leading `-- ...` and `/* ... */` comments + whitespace stripped
+///   before the keyword test (ORMs/JDBC routinely prepend such
+///   comments).
+/// - DDL: `CREATE INDEX` / `CREATE UNIQUE INDEX` / `CREATE RANGE
+///   INDEX` → `CREATE INDEX`; `DROP TABLE`, `DROP INDEX`, `ALTER
+///   TABLE` mapped to their canonical tag strings.
+/// - Transaction control: `BEGIN` / `START TRANSACTION` → `BEGIN`,
+///   `COMMIT` / `END` → `COMMIT`, `ROLLBACK` / `ABORT` → `ROLLBACK`.
+/// - Unknown DDL: emit just the leading keyword (uppercased). PG's
+///   spec allows tag-emit-as-keyword for unrecognized server-side
+///   verbs (preferable to lying with a SELECT 0).
+///
+/// The output is suitable for `encode_command_complete(&tag)`.
+pub fn cmd_complete_tag_for_sql(sql: &str, count: u64) -> String {
+    let stripped = strip_leading_comments_and_whitespace(sql);
+    let kw = leading_keyword(stripped);
+    match kw.as_str() {
+        "SELECT" => select_tag(count),
+        "INSERT" => insert_tag(count),
+        "UPDATE" => update_tag(count),
+        "DELETE" => delete_tag(count),
+        "CREATE" => {
+            // CREATE TABLE / CREATE INDEX / CREATE UNIQUE INDEX /
+            // CREATE RANGE INDEX → canonical tag from the second
+            // keyword.
+            let second = second_keyword(stripped);
+            match second.as_str() {
+                "TABLE" => "CREATE TABLE".to_string(),
+                "INDEX" => "CREATE INDEX".to_string(),
+                "UNIQUE" | "RANGE" => "CREATE INDEX".to_string(),
+                "VIEW" => "CREATE VIEW".to_string(),
+                "SCHEMA" => "CREATE SCHEMA".to_string(),
+                _ => format!("CREATE {second}"),
+            }
+        }
+        "DROP" => {
+            let second = second_keyword(stripped);
+            match second.as_str() {
+                "TABLE" => "DROP TABLE".to_string(),
+                "INDEX" => "DROP INDEX".to_string(),
+                "VIEW" => "DROP VIEW".to_string(),
+                "SCHEMA" => "DROP SCHEMA".to_string(),
+                _ => format!("DROP {second}"),
+            }
+        }
+        "ALTER" => {
+            let second = second_keyword(stripped);
+            match second.as_str() {
+                "TABLE" => "ALTER TABLE".to_string(),
+                "INDEX" => "ALTER INDEX".to_string(),
+                _ => format!("ALTER {second}"),
+            }
+        }
+        "SET" => "SET".to_string(),
+        "EXPLAIN" => "EXPLAIN".to_string(),
+        "BEGIN" | "START" => "BEGIN".to_string(),
+        "COMMIT" | "END" => "COMMIT".to_string(),
+        "ROLLBACK" | "ABORT" => "ROLLBACK".to_string(),
+        "VACUUM" => "VACUUM".to_string(),
+        "ANALYZE" => "ANALYZE".to_string(),
+        "TRUNCATE" => "TRUNCATE TABLE".to_string(),
+        "" => select_tag(0), // empty after comment strip — defensive
+        other => other.to_string(),
+    }
+}
+
+/// Second keyword in a SQL statement (case-insensitive, uppercased),
+/// e.g. for `CREATE INDEX idx ON t (x)` returns `"INDEX"`. Returns
+/// the empty string if there's no second token.
+fn second_keyword(sql: &str) -> String {
+    let stripped = strip_leading_comments_and_whitespace(sql);
+    let mut iter = stripped.split(|c: char| c.is_whitespace() || c == '(' || c == ';');
+    iter.next(); // first keyword
+    iter.find(|s| !s.is_empty())
+        .unwrap_or("")
+        .to_ascii_uppercase()
 }
 
 /// Pick the canonical CommandComplete tag from the SQL leading
@@ -695,8 +953,10 @@ mod tests {
         assert!(bytes.windows(5).any(|w| w == b"42P01"));
     }
 
-    /// INSERT INTO ... → CommandComplete("INSERT 0 0") + RFQ. V1
-    /// reports 0 rows (T9 polish).
+    /// INSERT INTO ... → CommandComplete("INSERT 0 1") + RFQ. T9
+    /// wires `apply_sql_with_count` (default impl returns 1 for
+    /// `OpResult::Ok` on a single-row INSERT) + `count_insert_values`
+    /// as a cross-check from the SQL text.
     #[test]
     fn t8_insert_emits_insert_command_complete() {
         let cols = vec![PgColumn {
@@ -712,12 +972,13 @@ mod tests {
             no_schema: false,
         };
         let bytes = dispatch_query("INSERT INTO t (id) VALUES (1)", &eng);
-        assert!(bytes.windows(b"INSERT 0 0\0".len()).any(|w| w == b"INSERT 0 0\0"));
+        assert!(bytes.windows(b"INSERT 0 1\0".len()).any(|w| w == b"INSERT 0 1\0"));
         // Last 6 bytes are RFQ.
         assert_eq!(&bytes[bytes.len() - 6..], &[b'Z', 0, 0, 0, 5, b'I']);
     }
 
-    /// DELETE FROM ... → CommandComplete("DELETE 0") + RFQ.
+    /// DELETE FROM ... → CommandComplete("DELETE 1") + RFQ. T9: row
+    /// count surfaced via `apply_sql_with_count`.
     #[test]
     fn t8_delete_emits_delete_command_complete() {
         let cols = vec![PgColumn {
@@ -733,7 +994,7 @@ mod tests {
             no_schema: false,
         };
         let bytes = dispatch_query("DELETE FROM t WHERE id = 1", &eng);
-        assert!(bytes.windows(b"DELETE 0\0".len()).any(|w| w == b"DELETE 0\0"));
+        assert!(bytes.windows(b"DELETE 1\0".len()).any(|w| w == b"DELETE 1\0"));
     }
 
     /// CREATE TABLE → CommandComplete("CREATE TABLE") + RFQ.
@@ -879,5 +1140,280 @@ mod tests {
         assert!(leading_keyword_is("UPDATE t", "update"));
         assert!(!leading_keyword_is("SELECT 1", "INSERT"));
         assert!(!leading_keyword_is("", "SELECT"));
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // T9 KATs — INSERT/UPDATE/DELETE row counts + DDL/txn-control tags.
+    // Headline: an INSERT with N tuples produces `INSERT 0 N` in the
+    // CommandComplete tag (not 0 — the V1 default impl returns 1 for
+    // single-row, and `count_insert_values` lifts multi-row to N).
+    // ───────────────────────────────────────────────────────────────────
+
+    /// `cmd_complete_tag_for_sql` returns the canonical tag for DML.
+    #[test]
+    fn t9_cmd_complete_tag_for_dml() {
+        assert_eq!(cmd_complete_tag_for_sql("INSERT INTO t (id) VALUES (1)", 1), "INSERT 0 1");
+        assert_eq!(cmd_complete_tag_for_sql("UPDATE t SET v = 1 WHERE id = 2", 3), "UPDATE 3");
+        assert_eq!(cmd_complete_tag_for_sql("DELETE FROM t WHERE id = 1", 2), "DELETE 2");
+        assert_eq!(cmd_complete_tag_for_sql("SELECT * FROM t", 5), "SELECT 5");
+    }
+
+    /// `cmd_complete_tag_for_sql` returns the canonical tag for DDL.
+    #[test]
+    fn t9_cmd_complete_tag_for_ddl() {
+        assert_eq!(cmd_complete_tag_for_sql("CREATE TABLE t (id i64)", 0), "CREATE TABLE");
+        assert_eq!(cmd_complete_tag_for_sql("CREATE INDEX idx ON t (x)", 0), "CREATE INDEX");
+        assert_eq!(cmd_complete_tag_for_sql("CREATE UNIQUE INDEX idx ON t (x)", 0), "CREATE INDEX");
+        assert_eq!(cmd_complete_tag_for_sql("CREATE RANGE INDEX idx ON t (x)", 0), "CREATE INDEX");
+        assert_eq!(cmd_complete_tag_for_sql("DROP TABLE t", 0), "DROP TABLE");
+        assert_eq!(cmd_complete_tag_for_sql("DROP INDEX idx", 0), "DROP INDEX");
+        assert_eq!(cmd_complete_tag_for_sql("ALTER TABLE t ADD COLUMN v i64", 0), "ALTER TABLE");
+        assert_eq!(cmd_complete_tag_for_sql("TRUNCATE t", 0), "TRUNCATE TABLE");
+    }
+
+    /// `cmd_complete_tag_for_sql` returns the canonical tag for txn
+    /// control.
+    #[test]
+    fn t9_cmd_complete_tag_for_transaction_control() {
+        assert_eq!(cmd_complete_tag_for_sql("BEGIN", 0), "BEGIN");
+        assert_eq!(cmd_complete_tag_for_sql("START TRANSACTION", 0), "BEGIN");
+        assert_eq!(cmd_complete_tag_for_sql("COMMIT", 0), "COMMIT");
+        assert_eq!(cmd_complete_tag_for_sql("END", 0), "COMMIT");
+        assert_eq!(cmd_complete_tag_for_sql("ROLLBACK", 0), "ROLLBACK");
+        assert_eq!(cmd_complete_tag_for_sql("ABORT", 0), "ROLLBACK");
+    }
+
+    /// `cmd_complete_tag_for_sql` is case-insensitive on the leading
+    /// keyword — "insert"/"InSeRt"/"INSERT" all map to INSERT.
+    #[test]
+    fn t9_cmd_complete_tag_case_insensitive() {
+        assert_eq!(cmd_complete_tag_for_sql("insert into t (id) values (1)", 1), "INSERT 0 1");
+        assert_eq!(cmd_complete_tag_for_sql("InSeRt INTO t VALUES (1)", 1), "INSERT 0 1");
+        assert_eq!(cmd_complete_tag_for_sql("update t set x=1", 7), "UPDATE 7");
+        assert_eq!(cmd_complete_tag_for_sql("CREATE table t (id i64)", 0), "CREATE TABLE");
+    }
+
+    /// `cmd_complete_tag_for_sql` strips leading line + block comments
+    /// and whitespace before testing the keyword. ORMs/JDBC do this.
+    #[test]
+    fn t9_cmd_complete_tag_strips_leading_comments() {
+        assert_eq!(
+            cmd_complete_tag_for_sql("  -- foo\n INSERT INTO t (id) VALUES (1)", 1),
+            "INSERT 0 1"
+        );
+        assert_eq!(
+            cmd_complete_tag_for_sql("/* leading block */ UPDATE t SET x = 1", 4),
+            "UPDATE 4"
+        );
+        assert_eq!(
+            cmd_complete_tag_for_sql("   \n\t-- one\n\t-- two\nSELECT * FROM t", 0),
+            "SELECT 0"
+        );
+    }
+
+    /// `count_insert_values` counts top-level `(...)` VALUES tuples,
+    /// not parens inside strings.
+    #[test]
+    fn t9_count_insert_values_single_row() {
+        assert_eq!(count_insert_values("INSERT INTO t (id) VALUES (1)"), 1);
+        assert_eq!(count_insert_values("insert into t (id, name) values (1, 'a')"), 1);
+    }
+
+    /// `count_insert_values` for multi-row INSERT VALUES returns N.
+    #[test]
+    fn t9_count_insert_values_multi_row() {
+        assert_eq!(
+            count_insert_values("INSERT INTO t (id) VALUES (1), (2), (3)"),
+            3
+        );
+        assert_eq!(
+            count_insert_values(
+                "INSERT INTO t (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')"
+            ),
+            4
+        );
+    }
+
+    /// `count_insert_values` ignores parens inside single-quoted
+    /// string literals (a quoted `(` doesn't bump the tuple count).
+    #[test]
+    fn t9_count_insert_values_ignores_quoted_parens() {
+        assert_eq!(
+            count_insert_values("INSERT INTO t (id, n) VALUES (1, 'has ( in it')"),
+            1
+        );
+        // Doubled '' = escaped quote, still inside the string.
+        assert_eq!(
+            count_insert_values(
+                "INSERT INTO t (id, n) VALUES (1, 'it''s a (test)')"
+            ),
+            1
+        );
+    }
+
+    /// `count_insert_values` ignores parens inside comments.
+    #[test]
+    fn t9_count_insert_values_ignores_commented_parens() {
+        assert_eq!(
+            count_insert_values(
+                "INSERT INTO t (id) VALUES (1) -- (would be ignored)"
+            ),
+            1
+        );
+        assert_eq!(
+            count_insert_values(
+                "INSERT INTO t (id) VALUES /* (also ignored) */ (1), (2)"
+            ),
+            2
+        );
+    }
+
+    /// `count_insert_values` returns 0 when there's no VALUES clause.
+    #[test]
+    fn t9_count_insert_values_zero_when_no_values() {
+        assert_eq!(count_insert_values("UPDATE t SET x = 1"), 0);
+        assert_eq!(count_insert_values("SELECT * FROM t"), 0);
+        assert_eq!(count_insert_values(""), 0);
+    }
+
+    /// E2E: dispatch_query routes a single-row INSERT through
+    /// `apply_sql_with_count` (default impl) and emits "INSERT 0 1".
+    #[test]
+    fn t9_dispatch_insert_single_row_emits_insert_0_1() {
+        let cols = vec![PgColumn {
+            name: "id".into(),
+            kind: FieldKind::I64,
+            nullable: false,
+        }];
+        let eng = CannedEngine {
+            cols,
+            row_bytes: Vec::new(),
+            result: std::sync::Mutex::new(Some(OpResult::Ok)),
+            table_name: "t".into(),
+            no_schema: false,
+        };
+        let bytes = dispatch_query("INSERT INTO t (id) VALUES (42)", &eng);
+        assert!(
+            bytes.windows(b"INSERT 0 1\0".len()).any(|w| w == b"INSERT 0 1\0"),
+            "expected CommandComplete tag 'INSERT 0 1' in outbound bytes"
+        );
+        assert_eq!(&bytes[bytes.len() - 6..], &[b'Z', 0, 0, 0, 5, b'I']);
+    }
+
+    /// E2E: dispatch_query routes a multi-row INSERT and emits
+    /// "INSERT 0 N" where N is the VALUES-tuple count. The engine's
+    /// `OpResult::Ok` (from the underlying `Op::Txn`) doesn't carry
+    /// the count; the gateway's `count_insert_values` rescues N.
+    #[test]
+    fn t9_dispatch_insert_multi_row_emits_insert_0_n() {
+        let cols = vec![PgColumn {
+            name: "id".into(),
+            kind: FieldKind::I64,
+            nullable: false,
+        }];
+        let eng = CannedEngine {
+            cols,
+            row_bytes: Vec::new(),
+            // Multi-row INSERT compiles to Op::Txn → returns Ok.
+            result: std::sync::Mutex::new(Some(OpResult::Ok)),
+            table_name: "t".into(),
+            no_schema: false,
+        };
+        let bytes = dispatch_query(
+            "INSERT INTO t (id) VALUES (1), (2), (3), (4), (5)",
+            &eng,
+        );
+        assert!(
+            bytes.windows(b"INSERT 0 5\0".len()).any(|w| w == b"INSERT 0 5\0"),
+            "expected CommandComplete tag 'INSERT 0 5' in outbound bytes (got: {:?})",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    /// E2E: dispatch_query routes an UPDATE through
+    /// `apply_sql_with_count` and emits "UPDATE 1" (default impl
+    /// reports 1 for Ok). WHERE-clause UPDATE that affects more rows
+    /// is documented as lossy (V2 SP-PG enhancement on OpResult).
+    #[test]
+    fn t9_dispatch_update_emits_update_count() {
+        let cols = vec![PgColumn {
+            name: "id".into(),
+            kind: FieldKind::I64,
+            nullable: false,
+        }];
+        let eng = CannedEngine {
+            cols,
+            row_bytes: Vec::new(),
+            result: std::sync::Mutex::new(Some(OpResult::Ok)),
+            table_name: "t".into(),
+            no_schema: false,
+        };
+        let bytes = dispatch_query("UPDATE t SET v = 100 WHERE id = 7", &eng);
+        assert!(
+            bytes.windows(b"UPDATE 1\0".len()).any(|w| w == b"UPDATE 1\0"),
+            "expected CommandComplete tag 'UPDATE 1' in outbound bytes"
+        );
+    }
+
+    /// E2E: dispatch_query routes a DELETE through
+    /// `apply_sql_with_count` and emits "DELETE 1".
+    #[test]
+    fn t9_dispatch_delete_emits_delete_count() {
+        let cols = vec![PgColumn {
+            name: "id".into(),
+            kind: FieldKind::I64,
+            nullable: false,
+        }];
+        let eng = CannedEngine {
+            cols,
+            row_bytes: Vec::new(),
+            result: std::sync::Mutex::new(Some(OpResult::Ok)),
+            table_name: "t".into(),
+            no_schema: false,
+        };
+        let bytes = dispatch_query("DELETE FROM t WHERE id = 7", &eng);
+        assert!(
+            bytes.windows(b"DELETE 1\0".len()).any(|w| w == b"DELETE 1\0"),
+            "expected CommandComplete tag 'DELETE 1' in outbound bytes"
+        );
+    }
+
+    /// E2E: dispatch_query routes a CREATE INDEX through and emits
+    /// "CREATE INDEX" (no row count).
+    #[test]
+    fn t9_dispatch_create_index_emits_canonical_tag() {
+        let cols = vec![PgColumn {
+            name: "id".into(),
+            kind: FieldKind::I64,
+            nullable: false,
+        }];
+        let eng = CannedEngine {
+            cols,
+            row_bytes: Vec::new(),
+            result: std::sync::Mutex::new(Some(OpResult::Ok)),
+            table_name: "t".into(),
+            no_schema: false,
+        };
+        let bytes = dispatch_query("CREATE INDEX idx ON t (id)", &eng);
+        assert!(
+            bytes.windows(b"CREATE INDEX\0".len())
+                .any(|w| w == b"CREATE INDEX\0"),
+            "expected CommandComplete tag 'CREATE INDEX' in outbound bytes"
+        );
+    }
+
+    /// `leading_keyword` strips comments + whitespace before
+    /// extracting the keyword.
+    #[test]
+    fn t9_leading_keyword_strips_comments() {
+        assert_eq!(leading_keyword("  -- a\n INSERT INTO t"), "INSERT");
+        assert_eq!(leading_keyword("/* x */SELECT 1"), "SELECT");
+        assert_eq!(leading_keyword("\t\nUPDATE t"), "UPDATE");
+        // Multiple comments stacked.
+        assert_eq!(
+            leading_keyword("-- one\n-- two\n/* three */ DELETE FROM t"),
+            "DELETE"
+        );
+        assert_eq!(leading_keyword("   "), "");
     }
 }

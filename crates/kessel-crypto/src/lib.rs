@@ -242,6 +242,68 @@ pub fn base64_encode(input: &[u8]) -> String {
     out
 }
 
+/// RFC 4648 §4 standard-alphabet base64 decode. Returns `None` if
+/// `input` is not a valid base64 string (wrong length, illegal char,
+/// internal `=` pad). Pad characters are required — non-padded base64
+/// is rejected. Used by SP-WS T2 to validate that the client's
+/// `Sec-WebSocket-Key` header decodes to exactly 16 bytes (RFC 6455
+/// §4.1).
+///
+/// This is a strict decoder: any deviation from the standard alphabet
+/// (e.g. URL-safe `-_`, whitespace, non-pad-trailing chars) → `None`.
+pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    // Strict: input length must be a multiple of 4 (per RFC 4648 §3.2
+    // padding rules). Empty input decodes to empty.
+    let bytes = input.as_bytes();
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    if bytes.is_empty() {
+        return Some(Vec::new());
+    }
+    let val = |b: u8| -> Option<u32> {
+        Some(match b {
+            b'A'..=b'Z' => (b - b'A') as u32,
+            b'a'..=b'z' => (b - b'a' + 26) as u32,
+            b'0'..=b'9' => (b - b'0' + 52) as u32,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        })
+    };
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len() / 4 * 3);
+    let chunks = bytes.chunks_exact(4);
+    let last_chunk_start = bytes.len() - 4;
+    for (i, chunk) in chunks.enumerate() {
+        let is_last = i * 4 == last_chunk_start;
+        // Pads ONLY allowed in the final chunk, ONLY at positions 2 or 3,
+        // and the pad-at-position-2 case forces position 3 to also be pad.
+        let pad2 = chunk[2] == b'=';
+        let pad3 = chunk[3] == b'=';
+        if (pad2 || pad3) && !is_last {
+            return None;
+        }
+        if pad2 && !pad3 {
+            // `xx=y` is invalid — a pad at position 2 mandates a pad at
+            // position 3 too (RFC 4648 §3.2).
+            return None;
+        }
+        let v0 = val(chunk[0])?;
+        let v1 = val(chunk[1])?;
+        let v2 = if pad2 { 0 } else { val(chunk[2])? };
+        let v3 = if pad3 { 0 } else { val(chunk[3])? };
+        let n = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3;
+        out.push((n >> 16) as u8);
+        if !pad2 {
+            out.push((n >> 8) as u8);
+        }
+        if !pad3 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,5 +402,64 @@ mod tests {
         assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
         assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    /// RFC 4648 §10 published base64 round-trip vectors. The decoder is
+    /// the encoder's inverse for every well-formed input.
+    #[test]
+    fn base64_decode_rfc4648_vectors_round_trip() {
+        for (encoded, want) in [
+            ("", &b""[..]),
+            ("Zg==", b"f"),
+            ("Zm8=", b"fo"),
+            ("Zm9v", b"foo"),
+            ("Zm9vYg==", b"foob"),
+            ("Zm9vYmE=", b"fooba"),
+            ("Zm9vYmFy", b"foobar"),
+        ] {
+            let decoded = base64_decode(encoded).expect("RFC vector decodes");
+            assert_eq!(decoded.as_slice(), want,
+                "RFC 4648 §10 vector {encoded:?} → {want:?}");
+        }
+    }
+
+    /// Strict-decode rejection cases: non-multiple-of-4 length, illegal
+    /// chars, misplaced pad, URL-safe alphabet, embedded whitespace. The
+    /// SP-WS T2 handshake parser depends on these all returning `None` so
+    /// the 16-byte-key validation can trust a successful decode.
+    #[test]
+    fn base64_decode_rejects_malformed_inputs() {
+        // Wrong length (not multiple of 4)
+        assert!(base64_decode("Zg=").is_none(), "length-3 must be rejected");
+        assert!(base64_decode("Zg").is_none(), "length-2 must be rejected");
+        assert!(base64_decode("Zm9vY").is_none(), "length-5 must be rejected");
+        // Illegal characters
+        assert!(base64_decode("Zg!=").is_none(), "`!` not in alphabet");
+        assert!(base64_decode("Zg @").is_none(), "whitespace not allowed");
+        // URL-safe alphabet (RFC 4648 §5) is NOT accepted
+        assert!(base64_decode("Zm-=").is_none(), "URL-safe `-` not accepted");
+        assert!(base64_decode("Zm_=").is_none(), "URL-safe `_` not accepted");
+        // Misplaced pad (pad at position 0 or 1 of any chunk)
+        assert!(base64_decode("====").is_none());
+        assert!(base64_decode("Z===").is_none(),
+            "pad at position 1 must be rejected");
+        // Pad-only-at-pos-2 (xx=y shape): the decoder rejects because a
+        // pad at position 2 implies position 3 is also pad.
+        assert!(base64_decode("Zg=A").is_none(),
+            "pad-only-at-pos-2 must force pos-3 pad too");
+    }
+
+    /// SP-WS T2 lock: a valid 16-byte `Sec-WebSocket-Key` decodes to
+    /// exactly 16 bytes. The decoder's contract is what the handshake
+    /// parser depends on; lock it here so a future decoder refactor that
+    /// truncates by 1 byte surfaces at the kessel-crypto layer.
+    #[test]
+    fn base64_decode_rfc6455_sample_key_is_16_bytes() {
+        // RFC 6455 §1.3 canonical client key
+        let decoded = base64_decode("dGhlIHNhbXBsZSBub25jZQ==")
+            .expect("canonical key decodes");
+        assert_eq!(decoded.len(), 16,
+            "Sec-WebSocket-Key per RFC 6455 §4.1 decodes to 16 bytes");
+        assert_eq!(decoded.as_slice(), b"the sample nonce");
     }
 }

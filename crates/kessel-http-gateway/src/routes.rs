@@ -74,6 +74,36 @@ pub fn handle<W: Write>(
         }
     }
 
+    // SP-WS T2: WebSocket upgrade arm. `is_websocket_upgrade` checks both
+    // `Upgrade: websocket` AND `Connection: upgrade` (RFC 6455 §4.1 + RFC
+    // 9110 §7.6.1/§7.8); when both are present we hijack the stream and
+    // hand it to `ws::handle_upgrade`, which writes the 101 (or a 400/
+    // 401/405 error response) directly. After this returns — success or
+    // failure — the HTTP/1.1 keep-alive loop MUST exit: success means
+    // the next bytes on the wire are WebSocket frames (NOT HTTP); failure
+    // means we wrote a defensive `Connection: close` error response. We
+    // signal both by returning `close_after = true`.
+    //
+    // CRITICAL: this arm intentionally precedes the generic `match
+    // req.path` table so that an `Upgrade: websocket` request on a path
+    // *other* than `/v1/ws` still falls through to the path table (the
+    // catch-all 404 there is the right behavior for a misdirected
+    // upgrade attempt). We gate on `req.path == WEBSOCKET_PATH &&
+    // is_websocket_upgrade` so the arm only fires on the exact upgrade
+    // shape.
+    if req.path == crate::ws::WEBSOCKET_PATH
+        && crate::ws::is_websocket_upgrade(&req.headers)
+    {
+        // T2 ships the handshake only; T5 will spawn the per-connection
+        // session loop. Until T5, success means the handshake completed
+        // and the stream is now WebSocket (no further frames flow in T2).
+        // Both success and failure paths require the HTTP loop to close
+        // — success because the bytes are no longer HTTP, failure
+        // because the error response carried `Connection: close`.
+        let _ = crate::ws::handle_upgrade(w, req, token, engine);
+        return Ok(true);
+    }
+
     match req.path {
         "/v1/sql" => handle_sql(w, req, engine, http_counters, keep_alive)?,
         "/v1/op" => handle_op(w, req, engine, http_counters, keep_alive)?,

@@ -277,7 +277,15 @@ fn parse_request_line(line: &str) -> Result<(Method, &str), ParseError> {
 }
 
 fn is_known_path(p: &str) -> bool {
-    matches!(p, "/v1/sql" | "/v1/op" | "/v1/health" | "/v1/metrics")
+    // SP-WS T2: `/v1/ws` is the dedicated WebSocket upgrade path per
+    // spec §6.1. Listed here so `GET /v1/ws` parses through the route
+    // table instead of surfacing as a 404. The actual upgrade arm in
+    // `routes::handle` gates on `ws::is_websocket_upgrade(&headers)` so
+    // a plain `GET /v1/ws` (no Upgrade header) still routes through
+    // `handle()` and falls through to the catch-all 404 — only a true
+    // upgrade request reaches `ws::handle_upgrade`.
+    matches!(p, "/v1/sql" | "/v1/op" | "/v1/health" | "/v1/metrics"
+        | "/v1/ws")
 }
 
 /// Decode the body slice according to framing headers. Returns the decoded

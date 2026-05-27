@@ -25,7 +25,7 @@ fragmented messages (continuation frames), streaming row responses
 | T# | Scope | Status | Commit |
 |---|---|---|---|
 | **T1** | Design spec (~707 lines, 8 weak-spots + 4 open questions) + scaffold module (`ws.rs` with placeholder `handle_upgrade` returning `Err(WsError::NotYetImplemented)`) + `crypto.rs` shim + `kessel-crypto::sha1` + `kessel-crypto::base64_encode` + RFC 6455 §1.3 canonical handshake KAT + RFC 3174 §A.5 SHA-1 KATs + RFC 4648 §10 base64 KATs + WS predicate (`is_websocket_upgrade`) + locked constants (WEBSOCKET_PATH, SUBPROTOCOL_V1, WS_SEND_QUEUE_BOUND). | **DONE** | `2bc3570` (spec) + `22ea9c1` (scaffold) |
-| T2 | Handshake parser: validate `Sec-WebSocket-Key` / `Sec-WebSocket-Version: 13` / path=/v1/ws / Authorization; build the `HTTP/1.1 101 Switching Protocols` response bytes; wire `routes.rs::handle` arm; flip the T1 regression-lock KAT to "handshake completes" | OPEN | — |
+| **T2** | Handshake parser: validate `Sec-WebSocket-Key` (base64 → 16 bytes) / `Sec-WebSocket-Version: 13` (wrong-version 400 + version hint) / path=/v1/ws / GET-only (POST → 405) / Authorization (token-mode 401) / `Sec-WebSocket-Protocol` (negotiate kessel-op-v1 case-insensitively, echo canonical constant, only-unknown → 400, absent → omit); build the `HTTP/1.1 101 Switching Protocols` response bytes per RFC 6455 §4.2.2 (locked byte-for-byte against §1.3 canonical example); wire `routes.rs::handle` arm with `close_after = true`; add `kessel-crypto::base64_decode` for key validation; flip the T1 regression-lock KAT to "handshake completes" (`t2_successful_handshake_returns_101_with_canonical_accept`). | **DONE** | `de5bbb3` |
 | T3 | Frame encoder: `encode_server_frame(opcode, payload)` (binary / ping / pong / close); structurally no server-side masking | OPEN | — |
 | T4 | Frame decoder: strict per spec §4.2 / §8 — MASK from client, RSV bits zero, control frames ≤ 125 bytes + FIN=1, no fragmentation, oversize → 1009 | OPEN | — |
 | T5 | Per-connection session loop: reader thread + writer thread + bounded `mpsc::sync_channel(WS_SEND_QUEUE_BOUND=16)` + ping/pong heartbeat (30s) + idle timeout + graceful close handshake | OPEN | — |
@@ -119,36 +119,156 @@ throughout the new code. All prior tests pass.
 - No browser harness (acceptance #3 — manual verification per spec
   §11).
 
+## T2 — what landed (2026-05-26, commit `de5bbb3`)
+
+**One commit, ~615 LoC net delta across 4 files:**
+
+- **kessel-crypto (+3 KATs, ~70 LoC):**
+  - `base64_decode()` per RFC 4648 — strict standard-alphabet decoder
+    that returns `None` for any malformed input (wrong length, URL-safe
+    `-_` chars, embedded whitespace, misplaced pads). Used by the
+    handshake parser to validate that `Sec-WebSocket-Key` base64-
+    decodes to exactly 16 bytes per RFC 6455 §4.1.
+  - +3 KATs: `base64_decode_rfc4648_vectors_round_trip` (every §10
+    encode vector decodes back to the original), `base64_decode_rejects_malformed_inputs`
+    (8 distinct rejection shapes locked), `base64_decode_rfc6455_sample_key_is_16_bytes`
+    (the canonical handshake key `dGhlIHNhbXBsZSBub25jZQ==` decodes
+    to `the sample nonce` = 16 bytes).
+- **kessel-http-gateway parse.rs (~10 LoC):**
+  - `is_known_path` now recognizes `/v1/ws` (was 404 before). With
+    a defense-in-depth comment explaining that the upgrade arm in
+    `routes::handle` gates on `is_websocket_upgrade(&headers)`, so a
+    plain `GET /v1/ws` (no Upgrade header) still falls through to the
+    catch-all 404 — only a true upgrade attempt reaches the WS handler.
+- **kessel-http-gateway routes.rs (~30 LoC):**
+  - New upgrade arm BEFORE the path table: `if req.path ==
+    ws::WEBSOCKET_PATH && ws::is_websocket_upgrade(&req.headers)` →
+    call `ws::handle_upgrade(w, req, token, engine)` and return
+    `Ok(true)` (`close_after = true`). Both the success path (stream
+    is no longer HTTP) AND the failure path (error response carried
+    `Connection: close`) require the HTTP keep-alive loop to exit.
+- **kessel-http-gateway ws.rs (+14 KATs, ~430 LoC):**
+  - **Real `handle_upgrade` implementation** replaces the T1 placeholder:
+    - GET-only (POST/PUT/DELETE → 405)
+    - Auth FIRST per `routes::handle` parity — token mode: Bearer
+      mismatch / missing → 401 with `Connection: close` body
+    - Defense-in-depth re-validation of `Upgrade: websocket` +
+      `Connection: upgrade` (the routes-side `is_websocket_upgrade` is
+      the fast gate; this is the slow gate that produces a clean 400
+      if the routes-side gate is bypassed by a future refactor)
+    - `Sec-WebSocket-Version: 13` validation — wrong/absent → 400 with
+      `Sec-WebSocket-Version: 13` response header so the client knows
+      which version we speak (RFC 6455 §4.4)
+    - `Sec-WebSocket-Key` present + `kessel_crypto::base64_decode`
+      yields exactly 16 bytes → else 400
+    - `Sec-WebSocket-Protocol` negotiation per spec §5.1 / §5.2: header
+      absent → omit from response (default kessel-op-v1 semantics);
+      header present + contains kessel-op-v1 (case-insensitive match)
+      → echo the LOCKED canonical constant (NOT the client's raw
+      casing); header present + offers exist + none known → 400
+  - **101 response is byte-correct vs RFC 6455 §4.2.2 canonical
+    example**: status line + `Upgrade: websocket` + `Connection:
+    Upgrade` + `Sec-WebSocket-Accept` (via the existing T1
+    `sec_websocket_accept(key)`) + optional `Sec-WebSocket-Protocol`
+    + bare CRLF terminator. NO `Content-Length`, NO `Server` header —
+    those bytes would be interpreted as the first WebSocket frame
+    payload by a strict client.
+  - `WsError` enum widened: `HandshakeFailed(u16)` + `Io(ErrorKind)`
+    replace the T1 `NotYetImplemented` sentinel. The T1 stub
+    regression-lock is REMOVED and replaced by
+    `t2_successful_handshake_returns_101_with_canonical_accept` which
+    locks the response byte-for-byte against the RFC §1.3 canonical
+    example (client key `dGhlIHNhbXBsZSBub25jZQ==` → accept
+    `s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`).
+  - Stream-type bound relaxed from `Read + Write` to `Write` (T2 only
+    writes; doc-comment notes T5 will widen back for the session loop).
+  - +14 KATs:
+    - +1 constant lock: `websocket_version_constant_is_13_per_rfc6455`
+    - +12 T2 handshake KATs: successful canonical handshake (locks
+      status line + headers + canonical accept + no Content-Length +
+      bare CRLF terminator + no Sec-WebSocket-Protocol when none
+      offered); missing key → 400; non-16-byte key → 400; wrong
+      version → 400 + version hint header; missing Upgrade → 400;
+      missing Connection: upgrade → 400; Bearer mismatch → 401;
+      missing Bearer → 401; matching Bearer → 101; subprotocol
+      offered + accepted → echoed canonical constant; subprotocol
+      header present + only-unknown → 400; subprotocol match is
+      case-insensitive; POST method → 405
+    - +1 explicit negative invariant: `t2_no_subprotocol_offered_response_omits_header`
+
+**KAT delta:** +17 total (+3 kessel-crypto + +14 gateway/ws). All
+RFC-derived (RFC 6455 §1.3 + §4.1 + §4.2.2 + RFC 4648 §10),
+locking the wire-protocol contract that T3-T5 build on.
+
+**Zero-dep stance preserved:** no new external deps. kessel-crypto
+stays at 0 external deps. kessel-http-gateway still depends only on
+kessel-crypto + kessel-client + kessel-proto. `cargo tree -p
+kesseldb-server -e normal` shows no new entries.
+
+**Test counts:**
+- kessel-crypto: 6 → 9 (+3)
+- kessel-http-gateway: 14 → 28 (+14)
+- Workspace default: 1381 → 1398 (+17)
+- Workspace featured: 1414 → 1431 (+17)
+
+seed-7 GREEN. tree-grep EMPTY. `#![forbid(unsafe_code)]` honored
+throughout the new code. All prior tests pass.
+
+**What T2 deliberately did NOT do:**
+- Frame encoder — T3.
+- Frame decoder — T4.
+- Per-connection session loop (reader thread + writer thread + ping/
+  pong heartbeat + idle timeout + close handshake) — T5.
+- `kessel-op-v1` subprotocol wire-up + e2e test + 10-pentest matrix
+  — T6.
+
+**Post-T2 behavior:** a WebSocket client can connect to `/v1/ws` and
+receive a correct 101 response. After 101 the server writes nothing
+further — the stream is open but blocks on read (no session loop
+yet). The client either gets a clean close when the gateway drops
+the connection, or its first frame send is ignored. That's T2's
+intended deliverable per the design spec §10 row "T2: YES — handshake
+completes".
+
 ## Pickup hint for the next session
 
-T2 is the next slice. Concrete shape:
+T3 is the next slice — **frame encoder** per RFC 6455 §5. Concrete
+shape (mirrors the spec §4.3 target API):
 
-1. Add `WEBSOCKET_PATH` to `parse::is_known_path` so `GET /v1/ws`
-   parses as a known route (currently rejected with 404).
-2. Add the upgrade arm to `routes::handle`:
+1. New `ws::frame` module (~150 LoC). Public surface:
    ```rust
-   match req.path {
-       ws::WEBSOCKET_PATH if ws::is_websocket_upgrade(&req.headers) => {
-           ws::handle_upgrade(s, &req, token, engine)?;
-           return Ok(true); // close HTTP loop; WS owns the socket
-       }
-       …
-   }
+   pub enum Opcode { Continuation, Text, Binary, Close, Ping, Pong }
+   pub fn encode_server_frame(opcode: Opcode, payload: &[u8]) -> Vec<u8>;
+   pub fn encode_close_frame(code: u16, reason: &str) -> Vec<u8>;
+   pub fn encode_ping_frame(payload: &[u8]) -> Vec<u8>;
+   pub fn encode_pong_frame(payload: &[u8]) -> Vec<u8>;
    ```
-3. In `ws.rs::handle_upgrade`: validate `Sec-WebSocket-Version: 13`
-   (else 426 + `Sec-WebSocket-Version: 13` header), extract
-   `Sec-WebSocket-Key`, optionally read `Sec-WebSocket-Protocol`, ct-eq
-   the Bearer token. Build the 101 response bytes (using
-   `crypto::sec_websocket_accept(client_key)` for the accept header).
-   Write the response. For T2: return after sending the response
-   (session loop is T5). Flip the
-   `t1_handle_upgrade_returns_not_yet_implemented_stub` regression-
-   lock test to the T2 "handshake completes" version.
-4. New KATs for T2: handshake response bytes (3-5 byte-equality
-   locks against hand-derived RFC 6455 §1.3 examples), missing-key →
-   400, wrong-version → 426 + correct header, missing-bearer → 401.
+   Server-side frames MUST NOT be masked (spec §4.3 / RFC 6455 §5.3):
+   the encoder structurally enforces this — no masked variant exists
+   for server-side encoding.
+2. Frame header per spec §4.1 RFC 6455 §5.2: FIN=1, RSV1/2/3=0, 4-bit
+   opcode, MASK=0, 7-bit length OR 7+16-bit OR 7+64-bit extended
+   length, payload. Three length branches:
+   - payload.len() ≤ 125: 1-byte length
+   - 126 ≤ payload.len() ≤ 65535: 0x7E + 2-byte BE length
+   - payload.len() > 65535: 0x7F + 8-byte BE length
+3. KATs (target +6-8):
+   - Empty binary frame: `[0x82, 0x00]` (FIN | binary, length 0)
+   - 5-byte binary frame: `[0x82, 0x05, ...payload]`
+   - 200-byte binary frame: `[0x82, 0x7E, 0x00, 0xC8, ...payload]`
+     (16-bit length branch)
+   - 70000-byte binary frame: `[0x82, 0x7F, 0x00, 0x00, 0x00, 0x00,
+     0x00, 0x01, 0x11, 0x70, ...payload]` (64-bit length branch)
+   - Ping frame with empty payload: `[0x89, 0x00]`
+   - Pong frame echoes payload: `[0x8A, len, ...payload]`
+   - Close frame with code 1000 (Normal): `[0x88, 0x02, 0x03, 0xE8]`
+   - Close frame with code + reason: `[0x88, len, 0xMM, 0xNN, ...utf8]`
 
-Target KAT delta for T2: +6-10.
+Target KAT delta for T3: +6-8.
+
+Frame encoding is structurally simpler than the handshake (no header
+parsing, just byte layout) but the length-branch boundaries are the
+load-bearing surface; the KATs above sweep each one.
 
 ## References
 

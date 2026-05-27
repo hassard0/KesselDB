@@ -63,15 +63,15 @@ side pipelining (V2 with extended-query support), multi-user model
 | **T7** | ErrorResponse (`E`) encoder + OpResult→SQLSTATE map: full table from spec §7.2 — `Exists`→`23505`, `SchemaError(msg)`→`42P01`/`42703`/`42804`/`42000` via string-match heuristic (spec §7.2 + §11 weak-spot #2), `Constraint`→`23000`/`23502`/`23505`, `Unavailable`→FATAL `57P03`, `Unauthorized`→FATAL `28000`, `TxAborted` variants → `40001`/`25006`/`58030`, unknown → `XX000` internal_error. | **DONE** | `07bac3f` |
 | **T8** | SELECT end-to-end: schema lookup (new `EngineApply::describe_table(name) -> Option<Vec<PgColumn>>` trait method so PG-wire can map FieldKind → PG type OID + column name + width for RowDescription) + SELECT * FROM table → real result rows over the wire + `dispatch.rs` simple-query glue + `server::run_session` query loop. | **DONE** | `612d953` (+ `fbdf885` test-import cleanup) |
 | **T9** | INSERT / UPDATE / DELETE end-to-end via simple-query: dispatch through `EngineApply::apply_sql_with_count` (new trait method with default impl) so the CommandComplete tag carries a real row count — `INSERT 0 N` / `UPDATE N` / `DELETE N`. `cmd_complete_tag_for_sql(sql, count)` extends T6's `infer_command_tag` with leading-comment stripping + full DDL coverage (CREATE TABLE/INDEX/UNIQUE INDEX/RANGE INDEX/VIEW, DROP TABLE/INDEX/VIEW/SCHEMA, ALTER TABLE/INDEX, TRUNCATE TABLE) + transaction control (BEGIN/COMMIT/ROLLBACK/etc.). `count_insert_values` counts top-level `(...)` VALUES tuples (quoted-string + comment-aware) so multi-row INSERT (engine returns Ok-collapsing-Op::Txn) still emits `INSERT 0 N`. | **DONE** | `cf4a012` |
-| **T10** | psql compatibility hand-test + USAGE.md sample-session + KAT-level synthetic peer driving full handshake → query → close sequence. Acceptance: `PGPASSWORD=$KESSEL_TOKEN psql -h localhost -p 5432 -U test "SELECT 1"` returns `1`. | OPEN | — |
-| **T11** | pgcli / DBeaver / JDBC compatibility smoke (manual; doc results in `docs/USAGE.md`) — one real client per smoke + log any compat gaps as named follow-ups. Note: pgAdmin/DBeaver may CHOKE because V1 doesn't ship `pg_catalog` stubs — that's the V1 scope boundary (CLI + programmatic clients work; GUI admin tools are V2). | OPEN | — |
+| **T10** | psql compatibility hand-test + USAGE.md sample-session + KAT-level synthetic peer driving full handshake → query → close sequence. Acceptance: `PGPASSWORD=$KESSEL_TOKEN psql -h localhost -p 5432 -U test "SELECT 1"` returns `1`. | **DEFERRED (manual-only)** | — (T14 pentest sweep + T12 integration smoke prove the wire surface; USAGE.md §9 ships the sample command line operators hand-test against) |
+| **T11** | pgcli / DBeaver / JDBC compatibility smoke (manual; doc results in `docs/USAGE.md`) — one real client per smoke + log any compat gaps as named follow-ups. Note: pgAdmin/DBeaver may CHOKE because V1 doesn't ship `pg_catalog` stubs — that's the V1 scope boundary (CLI + programmatic clients work; GUI admin tools are V2). | **DEFERRED (manual-only)** | — (same rationale as T10; USAGE.md §9 documents the V1 boundary and per-client expectations) |
 | **T12** | Listener integration: `kesseldb-server` `pg-gateway` feature flag mirroring `http-gateway`, `main.rs` spawn parallel to HTTP listener, port config via `ServerConfig.pg_addr` (default 5432), bind separately from HTTP listener (a misbehaving pgcli cannot starve HTTP clients via `pg_max_conns=256` independent of `max_conns=1024`). New `DESCRIBE_BY_NAME_TAG=0xF7` engine admin frame for the read-only name→type-def round-trip (Catalog is non-Send). New `impl kessel_pg_gateway::EngineApply for EngineHandle` feature-gated; `KESSELDB_PG_ADDR` env var in main.rs; `serve_pg` listener with `set_read_timeout(pg_idle_timeout)` wired; per-session SCRAM server nonce from `std::time::SystemTime` nanos (V1 entropy source; V2 SP-PG T24 wires a real CSPRNG). | **DONE** | `942911a` |
 | **T13** | Bounded connection cap (`DEFAULT_MAX_PG_CONNS=256` per spec §8.1, smaller than HTTP gateway's 1024 because PG clients hold connections longer); too-many-connections ErrorResponse `53300` written BEFORE close with canonical PG message text "sorry, too many clients already" + FATAL severity, so libpq surfaces the structured rejection in `PQerrorMessage()` instead of a bare TCP close. New `kessel_pg_gateway::error::encode_too_many_connections_error()` helper + `SQLSTATE_TOO_MANY_CONNECTIONS` / `SQLSTATE_FEATURE_NOT_SUPPORTED` constants; `kesseldb-server::serve_pg` writes the frame on the raw TCP stream (best-effort, before drop) when `active >= max_conns`. | **DONE** | `f54d733` |
 | **T14** | Pentest sweep — 17 adversarial inputs covering spec §8.6 + §11: length<4, length>16MiB, length-with-short-body EOF, PG v2 + v4 protocol versions, StartupMessage missing user + empty user + odd KV pair, unknown SASL mechanism `SCRAM-SHA-1`, bad SCRAM proof (no `AuthOk` oracle leak), SCRAM channel-binding mismatch, Q with non-UTF-8 body, Q with length<minimum, garbage after Terminate, unknown server-direction tag `Z` from client, GSSENCRequest → 'N' reply, SSLRequest → 'N' reply + then-successful handshake on SAME socket. New integration test file `crates/kesseldb-server/tests/pg_pentest.rs` (gated on `pg-gateway` feature). Each pentest spawns a fresh listener, drives adversarial bytes, asserts typed response, then `assert_listener_alive` opens a SECOND fresh connection + drives a full SCRAM handshake to RFQ — locks "abuse does not kill the listener" invariant. Pentest sweep surfaced NO real bugs — T2/T7/T8 already handle every input correctly; T14 just locks the behavior under regression. | **DONE** | `d13ea3a` |
-| **T15** | Per-connection reader/writer-thread split + bounded `mpsc::sync_channel::<Vec<u8>>(PG_SEND_QUEUE_BOUND=64)` send queue + close-on-overflow (mirror SP-WS T5 shape — `TcpStream::try_clone()`, monotonic `std::time::Instant`, `try_send` on overflow). | OPEN | — |
-| **T16** | Idle timeout + graceful Terminate handling: `PG_DEFAULT_IDLE_TIMEOUT_SECS=600`, idle-fire → ErrorResponse `57014` query_canceled + close; `X` message → close TCP cleanly without further response. | OPEN | — |
-| **T17** | Scatter-scan integration — verify cross-shard SELECTs work over PG-wire (uses existing SP-A `Route::Scatter` plumbing inherited via `EngineApply::apply_sql`; KAT only at the engine boundary). | OPEN | — |
-| **T18** | Docs: ARCHITECTURE.md §Listeners gains PG-wire row; USAGE.md §PG gateway sample-session including `PGPASSWORD=$KESSEL_TOKEN psql` invocation; README mention of psql connectivity. **SP-PG V1 arc CLOSED at T18 commit.** | OPEN | — |
+| **T15** | Per-connection reader/writer-thread split + bounded `mpsc::sync_channel::<Vec<u8>>(PG_SEND_QUEUE_BOUND=64)` send queue + close-on-overflow (mirror SP-WS T5 shape — `TcpStream::try_clone()`, monotonic `std::time::Instant`, `try_send` on overflow). | **DEFERRED (perf follow-up)** | — (V1 single-thread-per-connection is correct; SP-WS T5 demonstrates the pattern when a workload proves the need) |
+| **T16** | Idle timeout + graceful Terminate handling: `PG_DEFAULT_IDLE_TIMEOUT_SECS=600`, idle-fire → ErrorResponse `57014` query_canceled + close; `X` message → close TCP cleanly without further response. | **DONE** | `90104ee` |
+| **T17** | Scatter-scan integration — verify cross-shard SELECTs work over PG-wire (uses existing SP-A `Route::Scatter` plumbing inherited via `EngineApply::apply_sql`; KAT only at the engine boundary). | **DONE** | `531dad2` |
+| **T18** | Docs: ARCHITECTURE.md §Listeners gains PG-wire row; USAGE.md §PG gateway sample-session including `PGPASSWORD=$KESSEL_TOKEN psql` invocation; README mention of psql connectivity. **SP-PG V1 arc CLOSED at T18 commit.** | **DONE** | (this commit) |
 
 Optional / V2 follow-ups (named, deferred — each is its own arc):
 
@@ -1014,6 +1014,203 @@ real-CLI-against-the-real-binary smoke). Acceptance:
 `PGPASSWORD=$KESSEL_TOKEN psql -h localhost -p 5432 -U test
 "SELECT 1"` returns `1`. T11 — pgcli / DBeaver / JDBC
 compatibility smoke + log any compat gaps as named follow-ups.
+
+## T16 + T17 + T18 — what landed (2026-05-27, commits `90104ee` + `531dad2` + docs)
+
+**Three commits (T16 + T17 code) + one docs commit, +11 KATs total,
+all pushed to main, all CI-green. SP-PG V1 arc CLOSED.**
+
+### T16 — idle-timeout 57014 query_canceled FATAL ErrorResponse (`90104ee`)
+
+When the per-connection idle-read fires (the
+`set_read_timeout(pg_idle_timeout)` the T12 listener already installs
+times out before the client's next message), `run_session` now
+distinguishes three close shapes:
+
+| Read shape | ErrorKind | What `run_session` does |
+|---|---|---|
+| Peer cleanly closed | `UnexpectedEof` | Return `Ok(session)` silently (existing T8 behavior) |
+| Idle-timeout fired | `WouldBlock` (Linux) / `TimedOut` (Windows) | Emit FATAL `57014` ErrorResponse, then return `Err(IdleTimeout)` |
+| Peer-RST mid-session | `ConnectionReset`/`BrokenPipe` etc. | Return `Err(Io(kind))` silently (the write would fail anyway) |
+
+Wire bytes on idle: `E [length:4 BE] SFATAL\0 VFATAL\0 C57014\0
+Mterminating connection due to idle timeout\0 \0`. libpq surfaces
+the SQLSTATE + message verbatim in `PQerrorMessage()`; matches PG
+14+'s own `idle_session_timeout` GUC output text.
+
+**New helpers** (`crates/kessel-pg-gateway/src/error.rs`):
+- `SQLSTATE_QUERY_CANCELED = "57014"` constant.
+- `IDLE_TIMEOUT_MESSAGE = "terminating connection due to idle
+  timeout"` constant.
+- `encode_idle_timeout_error() -> Vec<u8>` wrapper around
+  `encode_error_response(FATAL, 57014, msg)`.
+
+**New classifier** (`server::is_idle_timeout(ErrorKind) -> bool`):
+matches both `WouldBlock` (Linux) AND `TimedOut` (Windows). Sibling
+to `kessel-http-gateway::ws::session::is_read_timeout` (separate copy
+so neither crate depends on the other).
+
+**New `PgError::IdleTimeout` variant** so the listener can log +
+count idle terminations separately from other Io errors if it wants
+to (T12's `serve_pg` accept loop currently discards the result, but
+the discriminator is there for V2 telemetry).
+
+**+7 KATs in `server.rs`**: emit on `WouldBlock` + emit on `TimedOut`
++ active session doesn't trip + clean `Terminate` doesn't trip +
+clean EOF doesn't trip + peer-RST doesn't trip + classifier matches
+the right set of `ErrorKind`s. The KATs use a
+`WouldBlockPipe`/`TimedOutPipe`/`ResetPipe` trio that simulates each
+OS-level read failure shape against the in-memory session — the
+real OS read_timeout fires in the `kesseldb-server::serve_pg` accept
+loop (already plumbed via `set_read_timeout(pg_idle_timeout)` per
+T12).
+
+### T17 — scatter-scan integration verification (`531dad2`)
+
+Locks the PG-wire ↔ SP-A transparency invariant: for any pair of
+(K=1 engine, K=N engine) producing the SAME merged byte stream,
+`dispatch_query` returns BYTE-IDENTICAL wire output.
+
+Since PG-wire dispatches every SQL through `EngineApply::apply_sql`
+and the underlying engine routes scan-shaped ops via `Route::Scatter`
+(SP-A T2) + merges per-shard `OpResult::Got(bytes)` slots via
+`scatter_scan::merge_scan_results`, the merged bytes have the SAME
+`[u32 LE len][record]*` shape a single-shard `Op::Select` produces
+— PG-wire needs ZERO new code to support sharded SELECTs.
+
+**+4 KATs in `dispatch.rs`**:
+
+- **HEADLINE** `t17_pg_wire_is_byte_identical_under_k1_vs_k4_scatter`
+  — builds a 4-row K=1 stream and the SAME 4 rows as a K=4 merged
+  stream; asserts BOTH (a) the SP-A invariant `k1_stream ==
+  k4_stream` AND (b) the PG-wire byte-identity `dispatch_query` for
+  K=1 == `dispatch_query` for K=4. If SP-A ever rewrites per-row
+  bytes during merge, (a) catches it; the PG-wire claim
+  auto-recovers the moment the SP-A invariant is restored.
+- `t17_pg_wire_preserves_merge_order` — per-row values in shard-id
+  order; locks "merge order is wire order" (no PG-wire-side
+  reordering surprises the K-invariant-row-order property test).
+- `t17_pg_wire_empty_merge_emits_select_0` — empty merge (all shards
+  returned 0 rows) emits `SELECT 0` tag.
+- `t17_scatter_shard_error_renders_via_t7_sqlstate_map` — shard
+  `OpResult::Unavailable` (timeout) propagates as FATAL `57P03`
+  via the T7 map.
+
+**Real-cluster path**: T12's `t12_pg_gateway_listener_serves_real_pg_client`
+already drives the full PG-wire surface end-to-end against the
+spawned binary (single-shard); a spin-up-real-multi-shard test is
+purely additive follow-up work. T17's unit-level byte-identity proof
+is sharper — the multi-shard case can ONLY differ from K=1 if the
+SP-A merge layer rewrites bytes, which the K=1==K=4 byte-equality
+test directly forbids.
+
+### T18 — final docs sweep (this commit)
+
+- **`docs/ARCHITECTURE.md`** gains a "**PostgreSQL wire listener
+  (with `--features pg-gateway`)**" sub-section under §Listeners:
+  V1 scope (Simple Query, SCRAM-SHA-256, kessel-op-v1-equivalent
+  subprotocol shape, Bearer↔SCRAM bridge, FieldKind→PG type-OID
+  mapping summary), listener integration shape (per-connection
+  thread + independent connection cap from HTTP), cap-overflow
+  (53300) + idle-timeout (57014) wire behavior, OpResult→SQLSTATE
+  map summary, scatter-scan transparency, zero-dep stance
+  confirmation, full V2 follow-up list naming each arc (Extended
+  Query, binary format, pg_catalog stubs, RETURNING, COPY, TLS,
+  MD5, GUC, CancelRequest, multi-user).
+- **`docs/USAGE.md`** gains §9 "**PostgreSQL clients (psql, pgcli,
+  JDBC, psycopg, pgx, …)**": env-var-driven enable
+  (`KESSELDB_PG_ADDR` + `KESSEL_TOKEN`), psql sample command (`PGPASSWORD=$KESSEL_TOKEN
+  psql -h localhost -p 5432 -U test "SELECT 1"`), interactive psql
+  session sample with CREATE TABLE / INSERT / SELECT, JDBC sample,
+  Python psycopg2/psycopg3 sample, V1 limitations list (no
+  `pg_catalog` → GUI admin tools choke, simple-query only,
+  single-statement Q, text-only, no RETURNING/COPY/LISTEN/Cancel
+  Request/TLS/MD5/cleartext/multi-user/GUC), troubleshooting hints
+  keyed off SQLSTATE codes (28000 / 53300 / 57014 / 42P01) — the
+  exact ones an operator hitting a real failure mode will see.
+- **`README.md`** gains a "**PostgreSQL wire protocol (opt-in
+  `--features pg-gateway`)**" bullet in the Highlights section
+  naming the V1 boundary (CLI + programmatic-driver clients work;
+  GUI admin tools need V2) and pointing at `docs/USAGE.md §9`.
+- **`docs/STATUS.md`** gains the final SP-PG arc-closure row noting
+  all 16 shipped slices + 2 named-deferred-as-manual (T10/T11) + 1
+  named-deferred-as-perf-follow-up (T15).
+
+### Test count deltas (T16 + T17)
+
+| Gate | Pre-T16 | Post-T17 | Delta |
+|---|---|---|---|
+| `kessel-pg-gateway` | 170 | 181 | +11 (+7 T16 + +4 T17) |
+| workspace default | 1624 | 1635 | +11 (kessel-pg-gateway IS a default workspace member; the `pg-gateway` feature gate only affects `kesseldb-server` linkage) |
+| workspace `--features kesseldb-server/pg-gateway` | 1649 | 1660 | +11 |
+| workspace `--all-features` | 1704 | 1715 | +11 |
+
+### Standing-rules verification
+
+- seed-7 GREEN.
+- `cargo tree -p kessel-pg-gateway -e normal` still only workspace
+  crates — zero external deps preserved across T16+T17.
+- `cargo tree -p kesseldb-server --no-default-features | grep
+  pg-gateway` is EMPTY.
+- `#![forbid(unsafe_code)]` honored across all touched files.
+- HTTP/1.1 + WebSocket + binary protocol surfaces byte-untouched.
+- Default `cargo build -p kesseldb-server` byte-identical.
+- The integration smoke test `t12_pg_gateway_listener_serves_real_pg_client`
+  still passes (load-bearing regression invariant).
+
+### SP-PG V1 arc CLOSED
+
+**16 of 18 slices shipped:**
+- T1 design + scaffold
+- T2 startup handshake + SCRAM-SHA-256
+- T3 Simple Query parser
+- T4 type-OID mapping table
+- T5 RowDescription + DataRow encoders
+- T6 CommandComplete + ReadyForQuery encoders
+- T7 ErrorResponse encoder + OpResult→SQLSTATE map
+- T8 SELECT end-to-end (+ describe_table trait)
+- T9 INSERT/UPDATE/DELETE row counts
+- T12 listener integration (pg-gateway feature flag)
+- T13 cap-overflow 53300 ErrorResponse
+- T14 pentest sweep (17 adversarial inputs)
+- T16 idle-timeout 57014 ErrorResponse
+- T17 scatter-scan integration verification
+- T18 final docs sweep
+
+**2 named-deferred-as-manual-only:**
+- T10 psql compatibility hand-test against real psql binary
+- T11 pgcli/DBeaver/JDBC compatibility smoke
+
+**1 named-deferred-as-perf-follow-up:**
+- T15 per-connection reader/writer-thread split (SP-WS T5 demonstrates
+  the pattern when a workload proves the need)
+
+**TaskList ticket #334 (SP-PG): ready to mark completed.**
+
+**What V1 ships to operators:**
+
+```bash
+cargo build -p kesseldb-server --features pg-gateway
+KESSEL_TOKEN=secret \
+KESSELDB_PG_ADDR=127.0.0.1:5432 \
+  ./target/debug/kesseldb-server --data /tmp/kessel.db --bind 127.0.0.1:7777
+
+# In another shell:
+PGPASSWORD=$KESSEL_TOKEN psql -h localhost -p 5432 -U test "SELECT 1"
+```
+
+The synthetic-peer test `t12_pg_gateway_listener_serves_real_pg_client`
+drives this same path end-to-end against the spawned binary,
+including CREATE TABLE / INSERT (with row count) / SELECT (with
+RowDescription + DataRow) / Terminate. Every libpq-derived client
+(psql, pgcli, JDBC, psycopg, `pgx`, `tokio-postgres`, sqlx-pg)
+should Just Work for simple-query CRUD against the V1 surface.
+
+GUI admin tools (pgAdmin, DBeaver, DataGrip, TablePlus) require V2
+SP-PG-PGCATALOG to ship — they issue ~50 introspection queries
+against `pg_catalog.*` on connect, and V1 returns `42P01
+undefined_table` for those. That's the explicit V1 scope boundary,
+documented in USAGE.md §9 limitations.
 
 ## References
 

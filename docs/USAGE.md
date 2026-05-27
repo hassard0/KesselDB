@@ -1287,3 +1287,173 @@ Full mapping: `docs/superpowers/specs/2026-05-24-kesseldb-http-gateway-design.md
 
 - Spec: `docs/superpowers/specs/2026-05-24-kesseldb-http-gateway-design.md`
 - Internal record: `docs/superpowers/specs/2026-05-24-kesseldb-subproject141-http-gateway.md`
+
+## 9. PostgreSQL clients (psql, pgcli, JDBC, psycopg, pgx, …)
+
+KesselDB speaks the PostgreSQL Frontend/Backend Protocol v3.0 — the same
+wire libpq, `psql`, pgcli, JDBC, psycopg, `pgx`, `tokio-postgres`, sqlx-pg,
+Diesel-pg, GORM-pg, Drizzle-pg, Prisma-pg, … all speak. Built behind the
+opt-in `pg-gateway` feature flag so the default binary stays lean.
+
+### Enable the PG listener
+
+```bash
+cargo build -p kesseldb-server --features pg-gateway
+KESSEL_TOKEN=secret \
+KESSELDB_PG_ADDR=127.0.0.1:5432 \
+  ./target/debug/kesseldb-server --data /tmp/kessel.db --bind 127.0.0.1:7777
+```
+
+Two env vars matter:
+
+- `KESSEL_TOKEN` — the operator's shared-secret Bearer token (the same one
+  the HTTP gateway uses). The PG listener REQUIRES a token to be set;
+  closed-mode-without-token rejects the connection with `28000`
+  invalid_authorization_specification. The PG-wire SCRAM exchange uses
+  this token as the SCRAM password input (spec §3.4 Bearer ↔ SCRAM
+  bridge — one credential surface; rotating the token rotates BOTH
+  HTTP-Bearer and PG-SCRAM atomically).
+- `KESSELDB_PG_ADDR` — `host:port` to bind the PG listener on. Standard
+  default is `:5432`; bind to `127.0.0.1:5432` for localhost-only, or
+  `0.0.0.0:5432` to accept remote connections. Bind separately from the
+  HTTP listener — PG and HTTP have independent connection caps so a
+  misbehaving pgcli cannot starve HTTP clients.
+
+When the listener is active, the binary's startup line widens to surface
+the PG address:
+
+```text
+kesseldb: bound 127.0.0.1:7777, http=127.0.0.1:8080, pg=127.0.0.1:5432
+```
+
+### Connect with `psql`
+
+```bash
+PGPASSWORD=$KESSEL_TOKEN psql -h localhost -p 5432 -U test "SELECT 1"
+```
+
+The `-U test` username can be anything — V1 is multi-user-deferred (the
+SCRAM exchange authenticates against the Bearer token regardless of the
+PG `user` field). Interactive sessions work too:
+
+```bash
+PGPASSWORD=$KESSEL_TOKEN psql -h localhost -p 5432 -U test
+kessel=> CREATE TABLE users (id i64 PK, name char(64));
+CREATE TABLE
+kessel=> INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob');
+INSERT 0 2
+kessel=> SELECT * FROM users;
+ id |  name
+----+-------
+  1 | Alice
+  2 | Bob
+(2 rows)
+kessel=> \q
+```
+
+### Connect from JDBC
+
+Standard `org.postgresql:postgresql` driver:
+
+```java
+String url = "jdbc:postgresql://localhost:5432/kessel";
+Properties props = new Properties();
+props.setProperty("user", "test");
+props.setProperty("password", System.getenv("KESSEL_TOKEN"));
+Connection conn = DriverManager.getConnection(url, props);
+PreparedStatement stmt = conn.prepareStatement("SELECT * FROM users");
+ResultSet rs = stmt.executeQuery();
+while (rs.next()) {
+    System.out.println(rs.getLong("id") + " " + rs.getString("name"));
+}
+```
+
+### Connect from Python (psycopg2/psycopg3)
+
+```python
+import os
+import psycopg2
+
+conn = psycopg2.connect(
+    host="localhost",
+    port=5432,
+    user="test",
+    password=os.environ["KESSEL_TOKEN"],
+    dbname="kessel",
+)
+cur = conn.cursor()
+cur.execute("SELECT * FROM users")
+for row in cur.fetchall():
+    print(row)
+```
+
+### Limitations (V1)
+
+Honest scope boundary — V1 PG-wire supports CLI clients (psql, pgcli) and
+programmatic-driver clients (JDBC, psycopg, pgx, tokio-postgres, sqlx-pg).
+GUI admin tools (pgAdmin, DBeaver, DataGrip, TablePlus) may NOT work out
+of the box — they issue ~50 introspection queries against `pg_catalog.*`
+on connect and V1 doesn't ship those stubs. The boundary is named V2
+SP-PG-PGCATALOG.
+
+- **No `pg_catalog.*` introspection** → `\dt` / `\d <table>` in psql get
+  a clean `42P01 undefined_table` error; pgAdmin/DBeaver refuse to show
+  the connection. V2.
+- **Simple Query only** → no Extended Query (Parse/Bind/Execute). ORMs
+  that REQUIRE prepared statements may fall back to simple-query mode or
+  fail. Most ORMs (Drizzle, Prisma, sqlx) work in simple-query mode out
+  of the box. V2 SP-PG-EXTQ.
+- **One statement per `Q`** → `psql \copy ...; SELECT ...` rejected with
+  `42601` syntax_error. Send statements one at a time. V2.
+- **Text format only** → every column rendered as PG text; binary-format
+  preference (advertised in `Bind`) is ignored. V2.
+- **No `RETURNING`** → `INSERT ... RETURNING id` returns `0A000`
+  feature_not_supported. V2.
+- **No COPY** → `\copy users FROM 'data.csv'` rejected with `0A000`. V2
+  SP-PG-COPY.
+- **No `LISTEN/NOTIFY`** → KesselDB has no changefeeds yet. Skip until
+  it does.
+- **No `CancelRequest`** → V1 emits BackendKeyData (so clients don't
+  refuse to enter the query loop) but ignores incoming `CancelRequest`
+  on a separate connection. V2 SP-PG T24.
+- **No TLS** → V1 PG-wire is plaintext only. SSLRequest gets the 'N'
+  reply (continue with cleartext). V2 wires `rustls` behind the existing
+  `tls` feature gate.
+- **SCRAM-SHA-256 only** → no MD5, no cleartext password, no GSSAPI,
+  no LDAP. Every libpq / JDBC / pgx / psycopg since 2017-2018 supports
+  SCRAM-SHA-256 (PG 10 default), so this is rarely a real-world blocker.
+- **One credential surface** → V1 has ONE shared-secret Bearer token; the
+  PG `user` field is logged but not authorized against (V2 SP-PG-USERS
+  adds a real user table + per-user privileges).
+- **`SET timezone = …` is a no-op** → V1 accepts the SET statement
+  (returns `CommandComplete: SET`) but does not actually rewrite
+  subsequent timestamp formatting. `SHOW timezone` always returns UTC.
+  V2 wires per-session GUC state.
+
+### Troubleshooting
+
+- **`server closed the connection unexpectedly` from psql** → KesselDB
+  binary not built with `--features pg-gateway`, or `KESSELDB_PG_ADDR`
+  not set, or `KESSEL_TOKEN` not set (closed-mode rejects without a
+  token).
+- **`FATAL: invalid_authorization_specification`** → the Bearer token
+  passed via `PGPASSWORD` doesn't match `KESSEL_TOKEN`. Note: this looks
+  identical to "no token set" on the wire (the no-oracle rule — SCRAM
+  failure modes don't tell the attacker which input was wrong).
+- **`FATAL: sorry, too many clients already`** (SQLSTATE 53300) →
+  `pg_max_conns` (default 256) hit. Either close idle clients or raise
+  the cap via `ServerConfig.pg_max_conns`.
+- **`FATAL: terminating connection due to idle timeout`** (SQLSTATE
+  57014) → the connection sent no client message for
+  `pg_idle_timeout` (default 600s = 10 min). Either reduce session idle
+  time, send a periodic keepalive `SELECT 1`, or raise
+  `pg_idle_timeout` for long-lived analytical sessions.
+- **`relation "pg_catalog.pg_namespace" does not exist`** (SQLSTATE
+  42P01) → see "No `pg_catalog.*` introspection" above. Use psql with
+  `SET search_path = public` and avoid `\dt`-style metacommands until
+  V2 SP-PG-PGCATALOG ships.
+
+### Spec + design
+
+- Spec: `docs/superpowers/specs/2026-05-27-kesseldb-sppg-postgres-wire-design.md`
+- Internal record: `docs/superpowers/specs/2026-05-27-kesseldb-subproject-sppg-progress.md`

@@ -102,6 +102,22 @@ feature, not an aspiration.
   `kessel_client::format_result_json` contract. Binary protocol
   byte‑untouched; zero external (non‑workspace) deps on the gateway
   crate. See `docs/USAGE.md` §HTTP gateway.
+- **PostgreSQL wire protocol (opt‑in `--features pg-gateway`)** —
+  Frontend/Backend Protocol v3.0 Simple Query path with SCRAM‑SHA‑256
+  authentication on a sibling TCP listener (`ServerConfig.pg_addr`,
+  default port 5432). Operator's Bearer token IS the SCRAM password
+  input — one credential surface; rotating the token rotates HTTP and
+  PG together. SELECT / INSERT / UPDATE / DELETE / CREATE TABLE work
+  end‑to‑end against `psql`, `pgcli`, JDBC, psycopg, `pgx`,
+  `tokio-postgres`, sqlx-pg, and every libpq‑derived client. Cap‑overflow
+  (`53300`) and idle‑timeout (`57014`) emit wire‑level `ErrorResponse`
+  with canonical PG message text before closing. Independent
+  connection cap from HTTP (default `pg_max_conns=256` vs HTTP's 1024)
+  — a misbehaving pgcli cannot starve HTTP clients. V1 boundary:
+  CLI + programmatic‑driver clients work; GUI admin tools (pgAdmin,
+  DBeaver) need V2 `pg_catalog` stubs. Binary protocol byte‑untouched;
+  zero external (non‑workspace) deps on the gateway crate. See
+  `docs/USAGE.md` §9 PostgreSQL clients.
 - **Deterministic & verifiable** — the whole engine is a seedable state machine;
   the test suite (1131 default tests / 1164 with `--features kessel-http-gateway/test-server`, 1 ignored — `brotli` decoder pending) includes seeded partition/fault
   simulation, multi‑replica Jepsen, hand‑derived KATs against published

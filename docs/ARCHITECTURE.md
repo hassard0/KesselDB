@@ -426,3 +426,86 @@ The gateway crate `kessel-http-gateway` has zero external (non-workspace)
 runtime dependencies. The default `cargo build -p kesseldb-server` (without
 `--features http-gateway`) does not link the gateway crate — `cargo tree`
 verifies the binary stays untouched.
+
+### WebSocket listener (with `--features ws-gateway`)
+
+The WebSocket arm of the HTTP gateway exposes a long-lived `/v1/ws` upgrade
+that frames raw `Op::encode()` payloads under the `kessel-op-v1`
+subprotocol. RFC 6455 strict handshake + binary frames only + bounded send
+queue + 30s ping/pong heartbeat. Shipped under the SP-WS arc (separate from
+the HTTP gateway because the session model is fundamentally different —
+long-lived reader/writer-thread split vs request/response).
+
+### PostgreSQL wire listener (with `--features pg-gateway`)
+
+When `kesseldb-server` is built with the opt-in `pg-gateway` feature, it
+spawns an additional listener that speaks the **PostgreSQL Frontend/Backend
+Protocol v3.0** — the same wire libpq / `psql` / pgcli / JDBC / psycopg /
+`pgx` / `tokio-postgres` / sqlx-pg all speak. Shipped under the SP-PG arc
+(`docs/superpowers/specs/2026-05-27-kesseldb-sppg-postgres-wire-design.md`,
+936 lines).
+
+**V1 scope (T1-T18):**
+
+- **Simple Query protocol** (`Q` message): single statement per `Q`,
+  multi-statement rejected with `42601` syntax_error. Streaming
+  `RowDescription` → `DataRow`* → `CommandComplete` → `ReadyForQuery`
+  per query.
+- **SCRAM-SHA-256 auth** (RFC 5802 + RFC 7677), 4096 PBKDF2 iterations,
+  with the **Bearer ↔ SCRAM bridge** — the operator's `ServerConfig.token`
+  IS the SCRAM password input. One credential surface; rotating the
+  Bearer token rotates BOTH HTTP-Bearer and PG-SCRAM atomically. SCRAM
+  channel binding (`SCRAM-SHA-256-PLUS`) is V2.
+- **Type-OID mapping** for KesselDB `FieldKind` → PG type catalog (Bool=16,
+  int2/int4/int8 for signed/unsigned ints, text=25 for Char(n), bytea=17
+  for Bytes/Ref/OverflowRef, timestamptz=1184 for Timestamp, numeric=1700
+  for U128/I128/Fixed). Text-format wire encoding only in V1; binary
+  format is V2.
+- **Listener integration** behind the `pg-gateway` feature flag. Bind on
+  `ServerConfig.pg_addr` (default port 5432; env `KESSELDB_PG_ADDR`).
+  Per-connection `std::thread`. Connection cap defaults to
+  `DEFAULT_MAX_PG_CONNS=256` (smaller than HTTP's 1024 — PG clients hold
+  connections longer). The PG and HTTP caps are **INDEPENDENT** — a
+  misbehaving pgcli cannot starve HTTP clients.
+- **Cap-overflow rejection**: `pg_max_conns` exceeded → wire-level
+  `ErrorResponse('S=FATAL','C=53300','M=sorry, too many clients already')`
+  emitted BEFORE the close, so libpq's `PQerrorMessage()` surfaces the
+  structured rejection instead of seeing a bare TCP close.
+- **Idle timeout**: `pg_idle_timeout` (default 600s) plumbs through
+  `TcpStream::set_read_timeout`. On fire → wire-level `ErrorResponse(
+  'S=FATAL','C=57014','M=terminating connection due to idle timeout')`
+  emitted BEFORE the close. Distinguished from peer-EOF (silent return)
+  and peer-RST (no emit — the write would fail anyway).
+- **OpResult → SQLSTATE** mapping: `Exists`→23505, `Unauthorized`→FATAL
+  28000, `Unavailable`→FATAL 57P03, `SchemaError(msg)`→42P01/42703/
+  42804/42601/42000 (string-match heuristic per spec §11 weak-spot #2;
+  V2 SP-PG-SQL-ERRORS adds a structured `kessel-sql::SchemaErrorKind`),
+  `Constraint`→23502/23505/23503/23514/23000, `TxAborted`→40001/25006/
+  58030.
+- **Scatter-scan transparency**: PG-wire dispatches every SQL through
+  `EngineApply::apply_sql`; the underlying engine routes scan-shaped
+  ops via `Route::Scatter` (SP-A T2) and merges per-shard
+  `OpResult::Got(bytes)` slots. Merged bytes have the SAME `[u32 LE
+  len][record]*` shape a single-shard `Op::Select` produces — PG-wire
+  is byte-identical between K=1 and K=N.
+
+**V2 follow-ups (each its own arc):** Extended Query (`P`/`B`/`D`/`E`/
+`S`/`C`/`H` — mandatory for ORMs and prepared statements; SP-PG-EXTQ);
+binary-format wire encoding (per-column negotiated in `Bind`);
+`pg_catalog.*` introspection stubs (pg_type, pg_class, pg_attribute,
+pg_namespace — enough for psql `\dt` / `\d <table>` not to crash;
+SP-PG-PGCATALOG; the V1 boundary is "CLI + programmatic clients work;
+GUI admin tools like pgAdmin / DBeaver choke on connect"); `current_
+setting()` / `version()` / `current_schema()` / `current_database()`;
+`RETURNING`; `CancelRequest` (V1 generates BackendKeyData but takes no
+action); GUC plumbing for `SET timezone`; COPY FROM STDIN / COPY TO
+STDOUT; TLS via SSLRequest 'S' reply + rustls (V1 plaintext only);
+MD5 auth fallback for legacy clients (PG 14+ deprecated). See SP-PG
+design spec §2.2 for the full deferred list.
+
+The gateway crate `kessel-pg-gateway` has zero external (non-workspace)
+runtime dependencies (only `kessel-proto`, `kessel-client`, `kessel-
+crypto`, `kessel-codec`, `kessel-sql`, `kessel-catalog`). The default
+`cargo build -p kesseldb-server` (without `--features pg-gateway`) does
+not link the gateway crate — `cargo tree -p kesseldb-server --no-default
+-features` shows no `kessel-pg-gateway` entry.

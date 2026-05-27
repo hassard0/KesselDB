@@ -1,25 +1,47 @@
-//! SP-WS T3 — WebSocket frame encoder per RFC 6455 §5.
+//! SP-WS T3 + T4 — WebSocket frame encoder + decoder per RFC 6455 §5.
 //!
-//! This module implements the byte-level WebSocket frame encoder that
-//! sits between the handshake (T2, `super::handle_upgrade`) and the
-//! session loop (T5 — not yet shipped). T3 covers the server-side
-//! encoder only; the matching client-side decoder is T4 (added in the
-//! next slice).
+//! This module implements the byte-level WebSocket frame layer that sits
+//! between the handshake (T2, `super::handle_upgrade`) and the session
+//! loop (T5 — not yet shipped). It is deliberately split into two
+//! halves:
 //!
-//! - **Encoder (T3, this slice)** — `encode_server_frame` +
-//!   `encode_close_frame` + `encode_ping_frame` + `encode_pong_frame`.
-//!   Server-side frames per RFC 6455 §5.3 MUST NOT carry a mask; the
-//!   encoder structurally enforces this — no API path exists to
-//!   produce a masked server frame.
+//! - **Encoder (T3)** — `encode_server_frame` + `encode_close_frame` +
+//!   `encode_ping_frame` + `encode_pong_frame`. Server-side frames per
+//!   RFC 6455 §5.3 MUST NOT carry a mask; the encoder structurally
+//!   enforces this — no API path exists to produce a masked server
+//!   frame.
+//! - **Decoder (T4)** — `decode_client_frame` reverses the encoding and
+//!   validates the strict V1 invariants: client frames MUST be masked
+//!   (RFC 6455 §5.3, else `FrameError::InvalidMask`), reserved bits
+//!   RSV1/2/3 MUST be zero (no extensions negotiated, else
+//!   `FrameError::ReservedBitsSet`), the opcode must be one of the six
+//!   V1-supported values (else `FrameError::InvalidOpcode`), the
+//!   declared payload length must not exceed `MAX_PAYLOAD` (16 MiB,
+//!   matching the gateway's `max_body`, else
+//!   `FrameError::PayloadTooLarge`).
+//!
+//! The decoder is stream-oriented: when the supplied byte slice is
+//! shorter than the frame would need (header + length + masking key +
+//! payload), it returns `FrameError::NeedMoreData` so the caller can
+//! read more bytes from the socket and retry. On success it returns
+//! `(Frame, usize)` where the `usize` is the number of bytes consumed —
+//! the caller can shift its read buffer left by that many bytes and
+//! attempt another decode.
 //!
 //! ## What this module deliberately does NOT do
 //!
-//! - **Frame decoder** — T4 (next slice).
 //! - **Session loop** — T5. This module is just byte-level encode +
 //!   decode; the reader-thread / writer-thread / send-queue / ping
 //!   heartbeat / idle timeout / close handshake all live in T5.
-//! - **Subprotocol semantics** — T6. The encoder doesn't know what
-//!   `Op::encode()` looks like; it just moves bytes.
+//! - **Fragmentation reassembly** — V1 rejects continuation frames at
+//!   the session-loop level (per spec §4.5). The decoder still returns
+//!   `fin = false` frames if the wire has them; the session loop
+//!   surfaces those as a 1003 close. (Per spec §4.2: continuation
+//!   opcode 0x0 is a valid wire-level opcode the decoder accepts —
+//!   "this is a continuation frame", not "this is malformed". The
+//!   session loop is the layer that rejects them.)
+//! - **Subprotocol semantics** — T6. The encoder/decoder don't know
+//!   what `Op::encode()` looks like; they just move bytes.
 //! - **Per-frame auth** — never. Auth is handshake-only per spec §8.1.
 //!
 //! ## Zero-dep stance
@@ -160,6 +182,184 @@ pub fn encode_ping_frame(payload: &[u8]) -> Vec<u8> {
 /// here.
 pub fn encode_pong_frame(payload: &[u8]) -> Vec<u8> {
     encode_server_frame(OPCODE_PONG, payload)
+}
+
+// --- Decoder API (T4) -------------------------------------------------
+
+/// A decoded WebSocket frame. The `payload` is already unmasked (the
+/// decoder applies the XOR using the 4-byte masking key from the wire).
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct Frame {
+    /// FIN bit. For V1 the session loop expects FIN=1 on data frames;
+    /// a FIN=0 frame is the leading edge of a fragmented message and
+    /// the session loop rejects with close 1003.
+    pub fin: bool,
+    /// Wire-level 4-bit opcode (one of `OPCODE_*`). Validated to be in
+    /// the V1 set: continuation/text/binary/close/ping/pong.
+    pub opcode: u8,
+    /// Unmasked payload bytes. The decoder already XOR'd off the
+    /// masking key from the wire.
+    pub payload: Vec<u8>,
+}
+
+/// Failure modes the decoder may report.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum FrameError {
+    /// The supplied byte slice is too short to fully decode a frame.
+    /// The caller should read more bytes from the socket and retry.
+    /// (V1 doesn't tell the caller HOW MANY more bytes; a refinement
+    /// for T5 could return the byte-count hint so the caller can pre-
+    /// size its read.)
+    NeedMoreData,
+    /// The MASK bit on the byte-1 of the frame is 0. RFC 6455 §5.3
+    /// requires client→server frames to be masked; an unmasked frame
+    /// from a client is a protocol violation. The session loop must
+    /// close with code 1002.
+    InvalidMask,
+    /// The 4-bit opcode is not in the V1 set. Reserved opcodes
+    /// (0x3..=0x7 for data, 0xB..=0xF for control) per RFC 6455 §5.2
+    /// surface here. The session loop must close with code 1002.
+    InvalidOpcode,
+    /// The declared payload length exceeds `MAX_PAYLOAD` (16 MiB). The
+    /// check fires BEFORE any allocation — an attacker advertising
+    /// `u64::MAX` cannot OOM the server. The session loop must close
+    /// with code 1009 (Message Too Big).
+    PayloadTooLarge,
+    /// At least one of RSV1/2/3 is set on the frame header. V1
+    /// negotiates no extensions, so a peer setting any RSV bit is
+    /// signaling an extension we didn't negotiate. The session loop
+    /// must close with code 1002.
+    ReservedBitsSet,
+}
+
+/// Decode a single WebSocket frame from a client (the only direction
+/// V1 reads from). Returns `(Frame, consumed)` where `consumed` is the
+/// number of bytes the caller should advance past in its read buffer
+/// before attempting another decode.
+///
+/// Validation order (matters — earlier checks short-circuit cheaper):
+///
+/// 1. Header byte 0 present.
+/// 2. RSV1/2/3 zero — else `ReservedBitsSet`.
+/// 3. Opcode in V1 set — else `InvalidOpcode`.
+/// 4. Header byte 1 present.
+/// 5. MASK=1 — else `InvalidMask`.
+/// 6. Extended length bytes present (if 7-bit length is 126/127).
+/// 7. Declared payload length ≤ `MAX_PAYLOAD` — else `PayloadTooLarge`.
+/// 8. Masking key + payload bytes all present in the buffer — else
+///    `NeedMoreData`.
+/// 9. Unmask payload via XOR with the 4-byte key.
+///
+/// The check ordering puts cheap structural failures (reserved bits,
+/// invalid opcode, missing mask) before expensive ones (waiting on the
+/// full payload to arrive). An attacker can't waste server memory by
+/// sending a malformed header with a giant claimed length — we reject
+/// the length-too-large case at step 7, BEFORE allocating any payload
+/// buffer (step 8 only validates the buffer slice has enough bytes; we
+/// don't allocate until step 9).
+pub fn decode_client_frame(bytes: &[u8]) -> Result<(Frame, usize), FrameError> {
+    // Step 1: header byte 0 must be present.
+    if bytes.is_empty() {
+        return Err(FrameError::NeedMoreData);
+    }
+    let b0 = bytes[0];
+    // Step 2: RSV1/2/3 (bits 0x40 | 0x20 | 0x10) must all be zero. V1
+    // negotiated no extensions.
+    if b0 & 0x70 != 0 {
+        return Err(FrameError::ReservedBitsSet);
+    }
+    let fin = (b0 & 0x80) != 0;
+    let opcode = b0 & 0x0F;
+    // Step 3: opcode must be in the V1 set. RFC 6455 §5.2:
+    //   0x0 = continuation, 0x1 = text, 0x2 = binary,
+    //   0x3..=0x7 = reserved data, 0x8 = close, 0x9 = ping,
+    //   0xA = pong, 0xB..=0xF = reserved control.
+    match opcode {
+        OPCODE_CONTINUATION | OPCODE_TEXT | OPCODE_BINARY |
+        OPCODE_CLOSE | OPCODE_PING | OPCODE_PONG => {}
+        _ => return Err(FrameError::InvalidOpcode),
+    }
+    // Step 4: header byte 1 must be present.
+    if bytes.len() < 2 {
+        return Err(FrameError::NeedMoreData);
+    }
+    let b1 = bytes[1];
+    // Step 5: MASK bit must be 1 for client frames per RFC 6455 §5.3.
+    if b1 & 0x80 == 0 {
+        return Err(FrameError::InvalidMask);
+    }
+    let len7 = b1 & 0x7F;
+    let mut offset = 2usize;
+    // Step 6: parse extended length per the 7-bit length sentinel.
+    let payload_len: usize = match len7 {
+        126 => {
+            // 16-bit BE extended length.
+            if bytes.len() < offset + 2 {
+                return Err(FrameError::NeedMoreData);
+            }
+            let l = ((bytes[offset] as usize) << 8) | (bytes[offset + 1] as usize);
+            offset += 2;
+            l
+        }
+        127 => {
+            // 64-bit BE extended length. Validate it fits in usize (on
+            // 32-bit platforms `u64` may exceed `usize::MAX`).
+            if bytes.len() < offset + 8 {
+                return Err(FrameError::NeedMoreData);
+            }
+            let mut l: u64 = 0;
+            for i in 0..8 {
+                l = (l << 8) | (bytes[offset + i] as u64);
+            }
+            offset += 8;
+            // Step 7 (early): if the declared length exceeds the
+            // platform's usize OR our payload cap, reject BEFORE any
+            // allocation. RFC 6455 §5.2 says the high bit of the 64-bit
+            // length MUST be 0; we also check usize-fit + MAX_PAYLOAD.
+            if l > MAX_PAYLOAD as u64 {
+                return Err(FrameError::PayloadTooLarge);
+            }
+            l as usize
+        }
+        n => n as usize,
+    };
+    // Step 7: enforce the payload cap. (The 64-bit branch above already
+    // checks; the 7-bit + 16-bit branches stay under 65535 < MAX_PAYLOAD
+    // so this is structurally redundant for those, but kept for the
+    // explicit invariant the test sweep locks.)
+    if payload_len > MAX_PAYLOAD {
+        return Err(FrameError::PayloadTooLarge);
+    }
+    // Step 8: masking key (4 bytes) + payload (payload_len bytes) must
+    // all be present in the buffer. Use checked arithmetic so a future
+    // refactor that forgets to clamp len at step 7 doesn't overflow
+    // into a small-positive offset.
+    let mask_start = offset;
+    let payload_start = match mask_start.checked_add(4) {
+        Some(v) => v,
+        None => return Err(FrameError::PayloadTooLarge),
+    };
+    let frame_end = match payload_start.checked_add(payload_len) {
+        Some(v) => v,
+        None => return Err(FrameError::PayloadTooLarge),
+    };
+    if bytes.len() < frame_end {
+        return Err(FrameError::NeedMoreData);
+    }
+    let mask = [
+        bytes[mask_start],
+        bytes[mask_start + 1],
+        bytes[mask_start + 2],
+        bytes[mask_start + 3],
+    ];
+    // Step 9: unmask the payload. RFC 6455 §5.3: `unmasked[i] =
+    // masked[i] XOR mask[i % 4]`. Allocate the payload vec exactly
+    // (we've already validated payload_len ≤ MAX_PAYLOAD).
+    let mut payload = Vec::with_capacity(payload_len);
+    for i in 0..payload_len {
+        payload.push(bytes[payload_start + i] ^ mask[i & 0x03]);
+    }
+    Ok((Frame { fin, opcode, payload }, frame_end))
 }
 
 // --- Tests ------------------------------------------------------------
@@ -337,5 +537,321 @@ mod tests {
     fn t3_max_payload_constant_is_16_mib() {
         assert_eq!(MAX_PAYLOAD, 16 * 1024 * 1024);
         assert_eq!(MAX_PAYLOAD, 16_777_216);
+    }
+
+    // -------------------- T4 decoder KATs ---------------------------
+
+    /// Helper: build a masked client frame on the wire from a server-
+    /// encoded frame + a 4-byte mask key. The header byte 1 has its
+    /// MASK bit (0x80) set; the mask key is inserted after the length
+    /// bytes; the payload is XOR'd with the mask key. This lets us
+    /// build wire bytes a real client would have produced.
+    fn add_client_mask(server_encoded: &[u8], mask: [u8; 4]) -> Vec<u8> {
+        assert!(server_encoded.len() >= 2);
+        let b0 = server_encoded[0];
+        let b1 = server_encoded[1];
+        let len7 = b1 & 0x7F;
+        let header_extra = match len7 {
+            126 => 2,
+            127 => 8,
+            _ => 0,
+        };
+        let payload_start = 2 + header_extra;
+        let payload = &server_encoded[payload_start..];
+        let mut out = Vec::with_capacity(server_encoded.len() + 4);
+        out.push(b0);
+        out.push(b1 | 0x80);
+        out.extend_from_slice(&server_encoded[2..payload_start]);
+        out.extend_from_slice(&mask);
+        for (i, b) in payload.iter().enumerate() {
+            out.push(b ^ mask[i & 3]);
+        }
+        out
+    }
+
+    /// Decode a masked client text frame "Hello" — the worked example
+    /// shape from RFC 6455 §5.7.
+    #[test]
+    fn t4_decode_masked_client_text_frame_hello() {
+        // Build the wire bytes a client would send: 0x81 (FIN|text),
+        // 0x85 (MASK|5), mask=0x37,0xFA,0x21,0x3D, payload XOR'd.
+        let mask = [0x37, 0xFA, 0x21, 0x3D];
+        let server = encode_server_frame(OPCODE_TEXT, b"Hello");
+        let wire = add_client_mask(&server, mask);
+        let (frame, consumed) = decode_client_frame(&wire).expect("decode ok");
+        assert!(frame.fin, "FIN bit must decode to true");
+        assert_eq!(frame.opcode, OPCODE_TEXT);
+        assert_eq!(frame.payload, b"Hello",
+            "decoded payload must equal original after unmask");
+        assert_eq!(consumed, wire.len(),
+            "consumed = full frame length");
+    }
+
+    /// Decode a small (10-byte) masked binary frame.
+    #[test]
+    fn t4_decode_masked_client_small_binary_frame() {
+        let payload: [u8; 10] = [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0xFF, 0x12, 0x34, 0x56, 0x78];
+        let server = encode_server_frame(OPCODE_BINARY, &payload);
+        let wire = add_client_mask(&server, [0xAA, 0xBB, 0xCC, 0xDD]);
+        let (frame, consumed) = decode_client_frame(&wire).expect("decode ok");
+        assert!(frame.fin);
+        assert_eq!(frame.opcode, OPCODE_BINARY);
+        assert_eq!(frame.payload, payload);
+        assert_eq!(consumed, wire.len());
+    }
+
+    /// RFC 6455 §5.3: an unmasked client frame is a protocol violation.
+    /// The decoder must reject with `InvalidMask` BEFORE allocating
+    /// any payload buffer.
+    #[test]
+    fn t4_decode_rejects_unmasked_client_frame() {
+        // Use a server-encoded frame as-is (no mask bit set) — this is
+        // exactly what an attacker would send.
+        let wire = encode_server_frame(OPCODE_BINARY, b"unmasked");
+        let result = decode_client_frame(&wire);
+        assert_eq!(result, Err(FrameError::InvalidMask),
+            "client frame without MASK bit must be rejected per RFC 6455 §5.3");
+    }
+
+    /// RFC 6455 §5.2: if RSV1 (0x40) is set, the peer is signaling an
+    /// extension we didn't negotiate. V1 advertises no extensions →
+    /// reject.
+    #[test]
+    fn t4_decode_rejects_rsv1_set() {
+        // 0xC2 = FIN | RSV1 | binary. b1 = 0x80 (MASK|len=0). 4-byte
+        // mask key follows. No payload.
+        let wire = vec![0xC2, 0x80, 0x00, 0x00, 0x00, 0x00];
+        let result = decode_client_frame(&wire);
+        assert_eq!(result, Err(FrameError::ReservedBitsSet));
+    }
+
+    /// RFC 6455 §5.2: RSV2 (0x20) set → reject.
+    #[test]
+    fn t4_decode_rejects_rsv2_set() {
+        let wire = vec![0xA2, 0x80, 0x00, 0x00, 0x00, 0x00];
+        let result = decode_client_frame(&wire);
+        assert_eq!(result, Err(FrameError::ReservedBitsSet));
+    }
+
+    /// RFC 6455 §5.2: RSV3 (0x10) set → reject.
+    #[test]
+    fn t4_decode_rejects_rsv3_set() {
+        let wire = vec![0x92, 0x80, 0x00, 0x00, 0x00, 0x00];
+        let result = decode_client_frame(&wire);
+        assert_eq!(result, Err(FrameError::ReservedBitsSet));
+    }
+
+    /// RFC 6455 §5.2: opcode 0x3 is reserved-data; reject.
+    #[test]
+    fn t4_decode_rejects_reserved_data_opcode_0x3() {
+        let wire = vec![0x83, 0x80, 0x00, 0x00, 0x00, 0x00];
+        let result = decode_client_frame(&wire);
+        assert_eq!(result, Err(FrameError::InvalidOpcode));
+    }
+
+    /// RFC 6455 §5.2: opcode 0xB is reserved-control; reject.
+    #[test]
+    fn t4_decode_rejects_reserved_control_opcode_0xb() {
+        let wire = vec![0x8B, 0x80, 0x00, 0x00, 0x00, 0x00];
+        let result = decode_client_frame(&wire);
+        assert_eq!(result, Err(FrameError::InvalidOpcode));
+    }
+
+    /// Adversarial: an attacker advertises a 9-byte (~16 EiB) payload
+    /// length via the 64-bit branch. The decoder must reject BEFORE
+    /// allocating — `Vec::with_capacity(2^63)` would OOM the server.
+    #[test]
+    fn t4_decode_rejects_payload_above_cap_via_64bit_length() {
+        // 0x82 = FIN|binary. 0xFF = MASK|127 (64-bit length sentinel).
+        // 8-byte BE length = u64::MAX. Mask + payload absent (we never
+        // get that far).
+        let wire = vec![
+            0x82, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        ];
+        let result = decode_client_frame(&wire);
+        assert_eq!(result, Err(FrameError::PayloadTooLarge),
+            "huge declared length must be rejected pre-allocation");
+    }
+
+    /// Adversarial: 64-bit length exactly at MAX_PAYLOAD + 1.
+    #[test]
+    fn t4_decode_rejects_payload_one_byte_above_cap() {
+        let too_big = (MAX_PAYLOAD as u64) + 1;
+        let wire = vec![
+            0x82, 0xFF,
+            (too_big >> 56) as u8, (too_big >> 48) as u8,
+            (too_big >> 40) as u8, (too_big >> 32) as u8,
+            (too_big >> 24) as u8, (too_big >> 16) as u8,
+            (too_big >> 8) as u8, (too_big & 0xFF) as u8,
+        ];
+        let result = decode_client_frame(&wire);
+        assert_eq!(result, Err(FrameError::PayloadTooLarge));
+    }
+
+    /// Decoder returns `NeedMoreData` when the buffer is empty.
+    #[test]
+    fn t4_decode_empty_buffer_needs_more_data() {
+        let result = decode_client_frame(&[]);
+        assert_eq!(result, Err(FrameError::NeedMoreData));
+    }
+
+    /// Decoder returns `NeedMoreData` when only byte 0 is present (the
+    /// length byte is missing).
+    #[test]
+    fn t4_decode_truncated_at_byte_1_needs_more_data() {
+        let result = decode_client_frame(&[0x82]);
+        assert_eq!(result, Err(FrameError::NeedMoreData));
+    }
+
+    /// Decoder returns `NeedMoreData` when the 16-bit extended length
+    /// is truncated.
+    #[test]
+    fn t4_decode_truncated_16bit_length_needs_more_data() {
+        // 0x82|0xFE (len=126 = 16-bit ext) + only 1 of 2 length bytes.
+        let result = decode_client_frame(&[0x82, 0xFE, 0x00]);
+        assert_eq!(result, Err(FrameError::NeedMoreData));
+    }
+
+    /// Decoder returns `NeedMoreData` when the 64-bit extended length
+    /// is truncated.
+    #[test]
+    fn t4_decode_truncated_64bit_length_needs_more_data() {
+        let result = decode_client_frame(&[0x82, 0xFF, 0x00, 0x00, 0x00]);
+        assert_eq!(result, Err(FrameError::NeedMoreData));
+    }
+
+    /// Decoder returns `NeedMoreData` when the masking key is
+    /// truncated.
+    #[test]
+    fn t4_decode_truncated_masking_key_needs_more_data() {
+        // 0x82|0x80 (MASK|len=0) + only 2 of 4 mask bytes.
+        let result = decode_client_frame(&[0x82, 0x80, 0xAA, 0xBB]);
+        assert_eq!(result, Err(FrameError::NeedMoreData));
+    }
+
+    /// Decoder returns `NeedMoreData` when the payload is truncated.
+    #[test]
+    fn t4_decode_truncated_payload_needs_more_data() {
+        // 0x82|0x85 (MASK|len=5) + 4-byte mask + only 3 of 5 payload bytes.
+        let wire = vec![0x82, 0x85, 0x00, 0x00, 0x00, 0x00, 0xAA, 0xBB, 0xCC];
+        let result = decode_client_frame(&wire);
+        assert_eq!(result, Err(FrameError::NeedMoreData));
+    }
+
+    /// 126-byte payload uses the 2-byte extended length branch on
+    /// decode. Locks the lower boundary of the 16-bit branch.
+    #[test]
+    fn t4_decode_126_byte_frame_uses_2byte_length() {
+        let payload = vec![0x42; 126];
+        let server = encode_server_frame(OPCODE_BINARY, &payload);
+        let wire = add_client_mask(&server, [0x11, 0x22, 0x33, 0x44]);
+        let (frame, consumed) = decode_client_frame(&wire).expect("decode ok");
+        assert_eq!(frame.opcode, OPCODE_BINARY);
+        assert_eq!(frame.payload, payload);
+        assert_eq!(consumed, wire.len());
+    }
+
+    /// 65536-byte payload uses the 8-byte extended length branch on
+    /// decode. Locks the lower boundary of the 64-bit branch.
+    #[test]
+    fn t4_decode_65536_byte_frame_uses_8byte_length() {
+        let payload = vec![0x77; 65536];
+        let server = encode_server_frame(OPCODE_BINARY, &payload);
+        let wire = add_client_mask(&server, [0xDE, 0xAD, 0xBE, 0xEF]);
+        let (frame, consumed) = decode_client_frame(&wire).expect("decode ok");
+        assert_eq!(frame.opcode, OPCODE_BINARY);
+        assert_eq!(frame.payload.len(), 65536);
+        assert_eq!(frame.payload, payload);
+        assert_eq!(consumed, wire.len());
+    }
+
+    /// `consumed` reports the right number of bytes when the buffer
+    /// contains MORE than one frame's worth — caller can shift left
+    /// by `consumed` and decode the next frame.
+    #[test]
+    fn t4_decode_returns_consumed_byte_count_for_buffer_with_trailing_bytes() {
+        let server = encode_server_frame(OPCODE_BINARY, b"abc");
+        let wire = add_client_mask(&server, [0x01, 0x02, 0x03, 0x04]);
+        let mut buf = wire.clone();
+        buf.extend_from_slice(&[0xFF, 0xFF, 0xFF]); // bytes from next frame
+        let (frame, consumed) = decode_client_frame(&buf).expect("decode ok");
+        assert_eq!(frame.payload, b"abc");
+        assert_eq!(consumed, wire.len(),
+            "consumed must point at end of THIS frame, leaving trailing bytes");
+        assert!(consumed < buf.len(),
+            "trailing bytes must remain for the next decode call");
+    }
+
+    /// FIN=0 (fragment) is a structurally valid frame; the decoder
+    /// returns it cleanly. The session loop (T5) is the layer that
+    /// closes 1003 on fragmented data frames per spec §4.5; the decoder
+    /// MUST surface `fin = false` so the session can make that decision.
+    #[test]
+    fn t4_decode_fin_zero_fragment_returns_clean_frame_with_fin_false() {
+        // b0 = 0x02 (FIN=0, opcode=binary). b1 = 0x80 (MASK, len=0).
+        let wire = vec![0x02, 0x80, 0x00, 0x00, 0x00, 0x00];
+        let (frame, _consumed) = decode_client_frame(&wire).expect("decode ok");
+        assert!(!frame.fin, "FIN=0 must decode to fin=false");
+        assert_eq!(frame.opcode, OPCODE_BINARY);
+        assert_eq!(frame.payload, &[] as &[u8]);
+    }
+
+    /// Decode a Close frame the encoder produced (round-trip control
+    /// frame).
+    #[test]
+    fn t4_decode_close_frame_with_code_and_reason() {
+        let server = encode_close_frame(1011, "internal");
+        let wire = add_client_mask(&server, [0xA0, 0xB0, 0xC0, 0xD0]);
+        let (frame, _consumed) = decode_client_frame(&wire).expect("decode ok");
+        assert_eq!(frame.opcode, OPCODE_CLOSE);
+        // Payload = 2-byte BE code + reason bytes.
+        assert_eq!(frame.payload[0], 0x03);
+        assert_eq!(frame.payload[1], 0xF3, "1011 = 0x03F3");
+        assert_eq!(&frame.payload[2..], b"internal");
+    }
+
+    /// Decode a Ping frame; locks Ping opcode round-trip.
+    #[test]
+    fn t4_decode_ping_frame_with_payload() {
+        let server = encode_ping_frame(b"keepalive");
+        let wire = add_client_mask(&server, [0xCA, 0xFE, 0xBA, 0xBE]);
+        let (frame, _consumed) = decode_client_frame(&wire).expect("decode ok");
+        assert_eq!(frame.opcode, OPCODE_PING);
+        assert_eq!(frame.payload, b"keepalive");
+    }
+
+    /// Property: encode_server_frame + add_client_mask + decode_client_frame
+    /// yields the original payload. Sweeps every length-branch boundary
+    /// + a handful of opcodes; locks the encoder + decoder agree on the
+    /// wire format. This is the round-trip test the design spec calls
+    /// out as the load-bearing contract between T3 and T4.
+    #[test]
+    fn t4_round_trip_encode_then_mask_then_decode_returns_original_payload() {
+        let mask = [0x37, 0xFA, 0x21, 0x3D];
+        let cases: Vec<(u8, Vec<u8>)> = vec![
+            (OPCODE_BINARY, vec![]),
+            (OPCODE_BINARY, vec![0x42; 1]),
+            (OPCODE_BINARY, vec![0x42; 125]),     // 7-bit upper boundary
+            (OPCODE_TEXT, vec![0xAB; 126]),       // 16-bit lower boundary
+            (OPCODE_BINARY, vec![0xCD; 65535]),   // 16-bit upper boundary
+            (OPCODE_BINARY, vec![0xEF; 65536]),   // 64-bit lower boundary
+            (OPCODE_PING, b"ping-data".to_vec()),
+            (OPCODE_PONG, b"pong-data".to_vec()),
+        ];
+        for (opcode, payload) in cases {
+            let server = encode_server_frame(opcode, &payload);
+            let wire = add_client_mask(&server, mask);
+            let (frame, consumed) = decode_client_frame(&wire)
+                .unwrap_or_else(|e| panic!("decode failed for opcode {opcode:#x}, \
+                    payload.len()={}: {e:?}", payload.len()));
+            assert!(frame.fin, "encode always sets FIN");
+            assert_eq!(frame.opcode, opcode, "opcode round-trip");
+            assert_eq!(frame.payload, payload,
+                "payload round-trip for opcode {opcode:#x}, len={}",
+                payload.len());
+            assert_eq!(consumed, wire.len(),
+                "consumed must equal wire length for opcode {opcode:#x}");
+        }
     }
 }

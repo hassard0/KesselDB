@@ -1,0 +1,26 @@
+[package]
+name = "kessel-pg-gateway"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+# Zero external (non-workspace) deps — the deterministic-kernel zero-dep
+# invariant. Workspace members only. SP-PG mirrors `kessel-http-gateway`'s
+# zero-dep stance: hand-rolled Postgres Frontend/Backend protocol parser
+# and encoder, no `tokio-postgres`, no `pgwire` crate, no async runtime.
+#
+# Companion design spec:
+# `docs/superpowers/specs/2026-05-27-kesseldb-sppg-postgres-wire-design.md`
+kessel-proto = { path = "../kessel-proto" }
+kessel-client = { path = "../kessel-client" }
+# T2 will pull SHA-256 + HMAC-SHA-256 (already in kessel-crypto from
+# SigV4 + SP-WS handshake) and add PBKDF2-HMAC-SHA-256 for the
+# SCRAM-SHA-256 auth path (RFC 5802 + RFC 7677 + RFC 8018 §5.2).
+kessel-crypto = { path = "../kessel-crypto" }
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []

@@ -18,6 +18,7 @@ members = [
     "crates/kessel-client",
     "crates/kessel-fetch",
     "crates/kessel-http-gateway",
+    "crates/kessel-pg-gateway",
     "crates/kessel-sim",
     "crates/kessel-objstore",
     "crates/kessel-parquet",

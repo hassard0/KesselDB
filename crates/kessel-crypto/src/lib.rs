@@ -197,6 +197,55 @@ pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
     sha256(&outer)
 }
 
+/// PBKDF2-HMAC-SHA-256(password, salt, iterations) → 32-byte derived key.
+///
+/// RFC 8018 §5.2. Locked to the SHA-256 PRF + a 32-byte output length —
+/// the only shape SP-PG's SCRAM-SHA-256 needs (`SaltedPassword =
+/// PBKDF2(password, salt, i, 32)` per RFC 5802 §3 / RFC 7677). The
+/// hash-output length (hLen = 32 for SHA-256) equals our requested
+/// dkLen, so the PBKDF2 outer loop reduces to a single block — we
+/// compute U_1 = HMAC(P, S || INT(1)), then iterate U_{i+1} = HMAC(P,
+/// U_i) for `iterations - 1` rounds, XOR-folding into the running
+/// output.
+///
+/// The PG/SCRAM default iteration count is 4096 (since PG 10, 2017);
+/// `PG_DEFAULT_SCRAM_ITERATIONS` in `kessel-pg-gateway` is the
+/// canonical caller. Pinning that count plus the RFC 7677 §3 published
+/// vector here keeps the PG-wire SCRAM handshake byte-identical to
+/// every libpq / JDBC / pgx client.
+///
+/// This function panics if `iterations == 0` (RFC 8018: c MUST be a
+/// positive integer; a zero-iteration key derivation is meaningless
+/// and almost certainly a programmer bug — fail loudly).
+pub fn pbkdf2_hmac_sha256(
+    password: &[u8],
+    salt: &[u8],
+    iterations: u32,
+) -> [u8; 32] {
+    assert!(
+        iterations > 0,
+        "PBKDF2 iteration count must be positive (RFC 8018 §5.2)"
+    );
+    // INT(1) per RFC 8018 §5.2 — the 32-bit BE block index. With
+    // dkLen == hLen == 32 we only ever compute T_1, so the index is
+    // always 1.
+    let mut salt_with_index: Vec<u8> = Vec::with_capacity(salt.len() + 4);
+    salt_with_index.extend_from_slice(salt);
+    salt_with_index.extend_from_slice(&1u32.to_be_bytes());
+
+    // U_1 = HMAC(P, S || INT(1))
+    let mut u = hmac_sha256(password, &salt_with_index);
+    let mut t = u;
+    // U_2..U_c = HMAC(P, U_{prev}); XOR-fold into T
+    for _ in 1..iterations {
+        u = hmac_sha256(password, &u);
+        for (a, b) in t.iter_mut().zip(u.iter()) {
+            *a ^= *b;
+        }
+    }
+    t
+}
+
 /// Lowercase hex of bytes (for `digest(...)`-style text output).
 pub fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -447,6 +496,82 @@ mod tests {
         // pad at position 2 implies position 3 is also pad.
         assert!(base64_decode("Zg=A").is_none(),
             "pad-only-at-pos-2 must force pos-3 pad too");
+    }
+
+    /// PBKDF2-HMAC-SHA-256 known-answer vectors. The three
+    /// `(P, S, c)` triples below are the canonical PBKDF2-HMAC-SHA-256
+    /// test set widely reproduced from the original RFC 6070 SHA-1
+    /// vectors (which RFC 6070 §2 specifies for HMAC-SHA-1 only) and
+    /// re-keyed against HMAC-SHA-256; the digests are reproducible
+    /// against any conforming PBKDF2-HMAC-SHA-256 implementation
+    /// (Python `hashlib.pbkdf2_hmac`, OpenSSL `EVP_PBKDF2_HMAC`, the
+    /// Crypto++ TestVectors/pbkdf2_sha256.txt file, etc.).
+    ///
+    /// Locked here so the SP-PG SCRAM-SHA-256 handshake (which uses
+    /// `PBKDF2(password, salt, 4096, 32)` per RFC 5802 §3 + RFC 7677)
+    /// is byte-identical to every libpq / JDBC / pgx client.
+    #[test]
+    fn pbkdf2_hmac_sha256_canonical_vectors() {
+        // c=1 — smallest iteration count; exercises the single-call
+        // U_1 path with no XOR-fold loop iterations.
+        assert_eq!(
+            hx(&pbkdf2_hmac_sha256(b"password", b"salt", 1)),
+            "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"
+        );
+        // c=2 — exercises the XOR-fold (one iteration past the base
+        // case; catches an off-by-one in the loop bound).
+        assert_eq!(
+            hx(&pbkdf2_hmac_sha256(b"password", b"salt", 2)),
+            "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43"
+        );
+        // c=4096 — the PG/SCRAM default iteration count (PG_DEFAULT_
+        // SCRAM_ITERATIONS in kessel-pg-gateway). The SP-PG SCRAM
+        // handshake is byte-identical to libpq IFF this digest matches.
+        assert_eq!(
+            hx(&pbkdf2_hmac_sha256(b"password", b"salt", 4096)),
+            "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a"
+        );
+    }
+
+    /// RFC 7914 (scrypt) Appendix B PBKDF2-HMAC-SHA-256 reference
+    /// vector — independent confirmation source. RFC 7914 §11 gives
+    /// the dkLen=64 output; the first 32 bytes are PBKDF2's T_1 block,
+    /// which equals `pbkdf2_hmac_sha256(P, S, c)` when dkLen == hLen
+    /// == 32 (our locked output length).
+    #[test]
+    fn pbkdf2_hmac_sha256_rfc7914_appendix_b_t1_block() {
+        // RFC 7914 §11: P="passwd", S="salt", c=1, dkLen=64 →
+        //   55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc
+        //   49ca9cccf179b645991664b39d77ef317c71b845b1e30bd509112041d3a19783
+        // T_1 (first 32 bytes) IS our 32-byte output.
+        assert_eq!(
+            hx(&pbkdf2_hmac_sha256(b"passwd", b"salt", 1)),
+            "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc"
+        );
+    }
+
+    /// PBKDF2 is deterministic — same inputs → same output, every
+    /// invocation. Lock so a future "fast path" refactor that caches
+    /// across calls (and gets the cache key wrong) surfaces here.
+    #[test]
+    fn pbkdf2_hmac_sha256_is_deterministic() {
+        let a = pbkdf2_hmac_sha256(b"kessel", b"salt", 100);
+        let b = pbkdf2_hmac_sha256(b"kessel", b"salt", 100);
+        assert_eq!(a, b);
+        // Iteration count matters — a 99-iter call must NOT match a
+        // 100-iter call (catches a `iterations + 1` / `- 1` off-by-one).
+        let c = pbkdf2_hmac_sha256(b"kessel", b"salt", 99);
+        assert_ne!(a, c);
+    }
+
+    /// PBKDF2 with `iterations == 0` panics — RFC 8018 §5.2 specifies
+    /// `c` MUST be a positive integer; a zero-iter derivation is
+    /// programmatically meaningless. The panic protects callers from
+    /// silently shipping a never-iterated HMAC as a "salted password".
+    #[test]
+    #[should_panic(expected = "iteration count must be positive")]
+    fn pbkdf2_hmac_sha256_rejects_zero_iterations() {
+        let _ = pbkdf2_hmac_sha256(b"password", b"salt", 0);
     }
 
     /// SP-WS T2 lock: a valid 16-byte `Sec-WebSocket-Key` decodes to

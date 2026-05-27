@@ -62,6 +62,7 @@
 #![allow(dead_code)]
 
 pub mod auth;
+pub mod error;
 pub mod proto;
 pub mod query;
 pub mod response;

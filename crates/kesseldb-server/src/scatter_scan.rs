@@ -351,6 +351,36 @@ pub enum ScatterKind {
         offset: u32,
         limit: u32,
     },
+    /// SP-A T11: secondary-index equality lookup (`Op::FindBy` /
+    /// `Op::FindByComposite`). The per-shard reply is a *raw* concat
+    /// of 16-byte object ids (NO `[u32 rowlen]` framing — see
+    /// `kessel-sm` `Op::FindBy` arm). Each shard's secondary index is
+    /// per-shard (a row's oid → field-value entry lives on the same
+    /// shard as the row), so fan-out is required: a `field = value`
+    /// lookup that returns N matches across the cluster needs every
+    /// shard's local index to be consulted, and the merged result is
+    /// the **union** of every shard's oid list.
+    ///
+    /// Merge shape: shard-id-ordered concat of every shard's
+    /// `[16-byte oid]*` payload. NO LIMIT — equality lookups return
+    /// their full match set per the underlying SM contract; the
+    /// caller filters / paginates client-side if needed (a future
+    /// T-slice could surface a LIMIT shape on FindBy if a workload
+    /// motivates it). The oid sets across shards are disjoint by
+    /// construction (a given oid lives on exactly one shard via the
+    /// rendezvous map), so the union is a simple concatenation; no
+    /// dedup pass is needed.
+    ///
+    /// Determinism: shard-id-ordered concat is replay-safe (same
+    /// across any K choice for the same dataset distribution — the
+    /// caller MAY get oids in a different order than K=1 would,
+    /// because each shard's own index returns its slice in
+    /// per-shard-index order, which mirrors per-shard insertion
+    /// order, NOT the cross-shard order). Documented honest gap:
+    /// FindBy's output is multiset-equal to K=1 (every matching oid
+    /// is present exactly once); byte-identical to K=1 only when
+    /// every match lives on a single shard.
+    OidConcat,
 }
 
 /// Merge per-shard results into a single `OpResult` per the strategy
@@ -425,7 +455,46 @@ pub fn merge_scan_results(
             *offset,
             *limit,
         ),
+        ScatterKind::OidConcat => merge_oid_concat(&payloads),
     }
+}
+
+/// SP-A T11 (SP155 §2.2 / §8): raw 16-byte oid concat across shards.
+///
+/// FindBy / FindByComposite return `OpResult::Got([16-byte oid]*)`
+/// from each shard — a row's secondary-index entry lives on the
+/// shard that owns the row, so the per-shard reply is the SHARD's
+/// matching-oid list (raw, no framing). The cross-shard merge is the
+/// shard-id-ordered concat of every shard's payload — the union of
+/// matching oids across the cluster.
+///
+/// Validation: each per-shard payload's length must be a multiple of
+/// 16 (the oid width). A malformed payload (length not divisible by
+/// 16) surfaces `SchemaError`, never a panic.
+///
+/// Zero-copy: a single `Vec<u8>` is allocated for the concatenated
+/// output. The per-shard byte-slices are appended directly.
+fn merge_oid_concat(payloads: &[&[u8]]) -> OpResult {
+    // Total output length: sum of per-shard payload lengths. Defense:
+    // if any shard returned a payload whose length isn't a multiple
+    // of 16, surface SchemaError (the SM contract is "16-byte oid
+    // concat"; any other shape is a corrupt reply).
+    let mut total = 0usize;
+    for (i, p) in payloads.iter().enumerate() {
+        if p.len() % 16 != 0 {
+            return OpResult::SchemaError(format!(
+                "scatter FindBy merge: shard {i} returned {} bytes \
+                 (not a multiple of 16-byte oid width)",
+                p.len()
+            ));
+        }
+        total = total.saturating_add(p.len());
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(total);
+    for p in payloads {
+        out.extend_from_slice(p);
+    }
+    OpResult::Got(out)
 }
 
 /// SP-A T6 (SP155 §3.7): fanout + merge with LIMIT cancellation.
@@ -617,7 +686,8 @@ pub fn scatter_and_merge_ctx<C: ShardCaller>(
     let mut failed_shards: Vec<u32> = Vec::new();
     // Drain replies in shard-id order. For Unordered with a limit, we
     // can short-circuit mid-drain (set cancel, stop reading). For
-    // Sorted we drain everyone (k-way heap merge needs all data).
+    // Sorted + OidConcat we drain everyone (k-way heap merge needs
+    // all data; FindBy needs every shard's match set).
     let result = match kind {
         ScatterKind::Unordered { limit } => {
             scatter_and_merge_unordered_ctx(
@@ -627,6 +697,45 @@ pub fn scatter_and_merge_ctx<C: ShardCaller>(
                 ctx.partial_on_timeout,
                 &mut failed_shards,
             )
+        }
+        ScatterKind::OidConcat => {
+            // Gather every shard's `[16-byte oid]*` reply (no LIMIT
+            // shape, no early-out — equality lookups always return
+            // the full match set). Partial mode skips failed slots
+            // (recorded in failed_shards); hard-fail propagates the
+            // first non-Got.
+            let mut gathered: Vec<OpResult> = Vec::with_capacity(k);
+            let mut first_bad: Option<OpResult> = None;
+            for (i, (rx, deadline)) in
+                rxs.into_iter().zip(deadlines.into_iter()).enumerate()
+            {
+                let now = Instant::now();
+                let remaining = if deadline > now {
+                    deadline - now
+                } else {
+                    Duration::from_millis(0)
+                };
+                let r = match rx.recv_timeout(remaining) {
+                    Ok(r) => r,
+                    Err(_) => OpResult::Unavailable,
+                };
+                if !matches!(r, OpResult::Got(_)) {
+                    if ctx.partial_on_timeout {
+                        failed_shards.push(i as u32);
+                        gathered.push(OpResult::Got(Vec::new()));
+                        continue;
+                    } else if first_bad.is_none() {
+                        first_bad = Some(r.clone());
+                        cancel.store(true, AtomicOrdering::SeqCst);
+                    }
+                }
+                gathered.push(r);
+            }
+            if let Some(bad) = first_bad {
+                bad
+            } else {
+                merge_scan_results(gathered, kind)
+            }
         }
         ScatterKind::Sorted { .. } => {
             // Sorted needs every shard's payload first; gather all,
@@ -3993,6 +4102,207 @@ mod tests {
         assert!(
             matches!(out, OpResult::SchemaError(_)),
             "malformed framing surfaces SchemaError even in partial mode, got {out:?}"
+        );
+    }
+
+    // ---------- T11 OidConcat (FindBy / FindByComposite) KATs ----------
+    //
+    // FindBy / FindByComposite return `OpResult::Got([16-byte oid]*)` —
+    // a row's secondary-index entry lives on the shard owning the row,
+    // so cross-shard fan-out is required. The merge is shard-id-ordered
+    // concat of every shard's 16-byte oid payload (the oid sets across
+    // shards are disjoint by construction — every oid lives on exactly
+    // one shard via rendezvous mapping — so no dedup is needed).
+    //
+    // These KATs exercise the new `ScatterKind::OidConcat` merge path:
+    //   1. Single-shard K=1 case is byte-identical to the shard's payload
+    //      (regression-lock for the Route::Direct → Route::Scatter
+    //      transition; same shape as the SP155 §10 K=1 invariant).
+    //   2. Two shards' replies merge in shard-id order.
+    //   3. Empty-shard mixed with non-empty: empty contributes nothing.
+    //   4. K=0 returns empty Got (matches other ScatterKind variants).
+    //   5. Malformed payload (length not multiple of 16) surfaces
+    //      SchemaError, never panic.
+    //   6. V1 hard-fail: one shard returning Unavailable poisons the
+    //      whole merge (other shards' replies discarded).
+    //   7. Partial mode: failed shard omitted; failed_shards records it.
+
+    fn oid(b: u8) -> [u8; 16] {
+        let mut o = [0u8; 16];
+        o[0] = b;
+        o
+    }
+
+    fn oids_payload(oids: &[[u8; 16]]) -> Vec<u8> {
+        let mut p = Vec::with_capacity(oids.len() * 16);
+        for o in oids {
+            p.extend_from_slice(o);
+        }
+        p
+    }
+
+    /// **T11.1 — K=1 OidConcat is byte-identical to the shard's
+    /// payload.** Regression-lock: the new Route::Scatter path for
+    /// FindBy must not change the wire shape vs the pre-T11 direct-
+    /// shard path on a single-shard deployment.
+    #[test]
+    fn t11_oid_concat_k1_byte_identical_to_single_shard() {
+        let payload = oids_payload(&[oid(1), oid(2), oid(3)]);
+        let r = merge_scan_results(
+            vec![OpResult::Got(payload.clone())],
+            &ScatterKind::OidConcat,
+        );
+        assert_eq!(r, OpResult::Got(payload));
+    }
+
+    /// **T11.2 — Two-shard merge concatenates in shard-id order.**
+    /// shard_0 returns oids [1, 2]; shard_1 returns oid [9]. The
+    /// merged payload is the concat: [1, 2, 9] (16-byte each).
+    #[test]
+    fn t11_oid_concat_two_shards_merges_in_shard_id_order() {
+        let s0 = oids_payload(&[oid(1), oid(2)]);
+        let s1 = oids_payload(&[oid(9)]);
+        let r = merge_scan_results(
+            vec![OpResult::Got(s0), OpResult::Got(s1)],
+            &ScatterKind::OidConcat,
+        );
+        let expected = oids_payload(&[oid(1), oid(2), oid(9)]);
+        assert_eq!(r, OpResult::Got(expected));
+    }
+
+    /// **T11.3 — Empty shard contributes nothing.** A shard with no
+    /// matching oids returns `Got([])`; the merge skips it cleanly.
+    #[test]
+    fn t11_oid_concat_with_one_empty_shard() {
+        let s0 = oids_payload(&[oid(1)]);
+        let s1 = oids_payload(&[]); // empty middle shard
+        let s2 = oids_payload(&[oid(5), oid(7)]);
+        let r = merge_scan_results(
+            vec![
+                OpResult::Got(s0),
+                OpResult::Got(s1),
+                OpResult::Got(s2),
+            ],
+            &ScatterKind::OidConcat,
+        );
+        let expected = oids_payload(&[oid(1), oid(5), oid(7)]);
+        assert_eq!(r, OpResult::Got(expected));
+    }
+
+    /// **T11.4 — K=0 returns empty Got (matches the
+    /// `merge_scan_results(empty, ...)` shape for all variants).**
+    #[test]
+    fn t11_oid_concat_empty_input_is_empty_got() {
+        let r = merge_scan_results(Vec::new(), &ScatterKind::OidConcat);
+        assert_eq!(r, OpResult::Got(Vec::new()));
+    }
+
+    /// **T11.5 — Malformed payload (length not a multiple of 16)
+    /// surfaces SchemaError, never panic.** Defense against a
+    /// corrupted reply from a shard.
+    #[test]
+    fn t11_oid_concat_rejects_non_16_byte_aligned_payload() {
+        // 17 bytes — claims one 16-byte oid + a stray trailing byte.
+        let bad = vec![0xAAu8; 17];
+        let r = merge_scan_results(
+            vec![OpResult::Got(bad)],
+            &ScatterKind::OidConcat,
+        );
+        assert!(
+            matches!(r, OpResult::SchemaError(_)),
+            "malformed oid payload must surface SchemaError, got {r:?}"
+        );
+    }
+
+    /// **T11.6 — V1 hard-fail propagates the first non-Got slot.**
+    /// One shard returns Unavailable; the merged result is
+    /// Unavailable (the other shards' replies are NOT mixed in).
+    #[test]
+    fn t11_oid_concat_propagates_first_non_got_slot() {
+        let r = merge_scan_results(
+            vec![
+                OpResult::Got(oids_payload(&[oid(1)])),
+                OpResult::Unavailable,
+                OpResult::Got(oids_payload(&[oid(3)])),
+            ],
+            &ScatterKind::OidConcat,
+        );
+        assert_eq!(r, OpResult::Unavailable);
+    }
+
+    /// **T11.7 — End-to-end OidConcat via scatter_and_merge_ctx +
+    /// partial mode.** Two shards' oid lists merge in shard-id order;
+    /// a third shard fails; partial mode omits the failed slot and
+    /// records it in failed_shards.
+    #[test]
+    fn t11_oid_concat_partial_mode_omits_failed_shard() {
+        let s0 = PentestShard::new(PentestBehavior::Got(
+            oids_payload(&[oid(1), oid(2)]),
+        ));
+        let s1 = PentestShard::new(PentestBehavior::TransportErr("down".into()));
+        let s2 = PentestShard::new(PentestBehavior::Got(
+            oids_payload(&[oid(9)]),
+        ));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (out, failed) = scatter_and_merge_ctx(
+            vec![s0, s1, s2],
+            // FindBy op (the actual op flowing through; any FindBy
+            // works since the mock returns its canned payload).
+            &Op::FindBy {
+                type_id: 1,
+                field_id: 2,
+                value: vec![0xAA, 0xBB],
+            },
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &ScatterKind::OidConcat,
+            cancel,
+            ScatterContext::partial(),
+        );
+        let expected = oids_payload(&[oid(1), oid(2), oid(9)]);
+        assert_eq!(out, OpResult::Got(expected));
+        assert_eq!(failed, vec![1u32]);
+    }
+
+    /// **T11.8 — End-to-end OidConcat hard-fail propagates and fires
+    /// cancel.** The combined fan-out + merge entry point preserves
+    /// the V1 hard-fail contract for OidConcat as well as the
+    /// Unordered / Sorted variants.
+    #[test]
+    fn t11_oid_concat_hard_fail_propagates_unavailable() {
+        let s0 = PentestShard::new(PentestBehavior::Got(
+            oids_payload(&[oid(1)]),
+        ));
+        let s1 = PentestShard::new(PentestBehavior::TransportErr("down".into()));
+        // shard_2 is slow + comes AFTER the Unavailable shard — must
+        // observe cancel pre-call (its `ran` stays 0).
+        let s2 = PentestShard::new(PentestBehavior::SleepThenGot(
+            Duration::from_millis(200),
+            oids_payload(&[oid(7)]),
+        ));
+        let ran2 = s2.ran.clone();
+        let cancelled2 = s2.cancelled_pre_call.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let out = scatter_and_merge(
+            vec![s0, s1, s2],
+            &Op::FindBy {
+                type_id: 1,
+                field_id: 2,
+                value: vec![0xAA],
+            },
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &ScatterKind::OidConcat,
+            cancel.clone(),
+        );
+        assert_eq!(out, OpResult::Unavailable, "V1 hard-fail propagates");
+        assert!(cancel.load(Ordering::SeqCst), "cancel fires on non-Got");
+        assert_eq!(
+            ran2.load(Ordering::SeqCst),
+            0,
+            "shard_2 must NOT have completed its call"
+        );
+        assert!(
+            cancelled2.load(Ordering::SeqCst) >= 1,
+            "shard_2 observed cancel pre-call"
         );
     }
 }

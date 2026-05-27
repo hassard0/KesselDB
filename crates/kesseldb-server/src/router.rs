@@ -252,13 +252,28 @@ impl Router {
                     limit: *limit,
                 })
             }
+            // SP-A T11 (SP155 §2.2 / §8): `FindBy` / `FindByComposite`
+            // are equality lookups against per-shard secondary
+            // indexes. A row's index entry lives on the shard that
+            // owns the row, so every shard's local index must be
+            // consulted; the merged result is the union of every
+            // shard's `[16-byte oid]*` reply (shard-id-ordered
+            // concat — see `ScatterKind::OidConcat` doc). No catalog
+            // lookup required (the per-shard SM validates field /
+            // index existence itself); no LIMIT shape on FindBy's
+            // wire. This unlocks FindBy on K>1 deployments — pre-T11
+            // these ops routed to `Route::Unsupported` and returned a
+            // SchemaError to any sharded caller.
+            Op::FindBy { .. } | Op::FindByComposite { .. } => {
+                Route::Scatter(ScatterKind::OidConcat)
+            }
             _ => Route::Unsupported(
                 "router (multi-shard, this slice) handles point ops, DDL, \
-                 single/rejected-cross transactions, and scatter-gather \
-                 reads for Select/QueryRows/SelectFields/SelectSorted; \
-                 Aggregate/GroupAggregate (SP-B/SP-D), FindBy/FindByComposite \
-                 (T11 follow-up), Join (non-goal), and SQL text (SP-E) are \
-                 still later slices",
+                 single/rejected-cross transactions, scatter-gather \
+                 reads for Select/QueryRows/SelectFields/SelectSorted, \
+                 and FindBy/FindByComposite via scatter (T11); \
+                 Aggregate/GroupAggregate (SP-B/SP-D), Join (non-goal), \
+                 and SQL text (SP-E) are still later slices",
             ),
         }
     }
@@ -443,6 +458,11 @@ impl<'a> Conn<'a> {
         // 1. Resolve catalog-dependent merge parameters (Sorted only).
         let resolved_kind = match kind {
             ScatterKind::Unordered { .. } => kind,
+            // SP-A T11: FindBy / FindByComposite (oid concat) needs no
+            // catalog lookup at the router — the per-shard SM validates
+            // the field / index existence and surfaces SchemaError if
+            // missing (V1 hard-fail propagates the first such slot).
+            ScatterKind::OidConcat => kind,
             ScatterKind::Sorted {
                 sort_offset,
                 sort_width,
@@ -1597,8 +1617,8 @@ mod tests {
             }
             other => panic!("SelectSorted must scatter, got {other:?}"),
         }
-        // Aggregate / GroupAggregate / Join / FindBy stay
-        // `Unsupported` — SP-B/SP-D/T11/non-goal per spec.
+        // Aggregate / GroupAggregate / Join stay `Unsupported` —
+        // SP-B / SP-D / non-goal per spec.
         assert!(matches!(
             r.route(&Op::Aggregate {
                 type_id: 1,
@@ -1607,6 +1627,26 @@ mod tests {
                 field_id: 0,
             }),
             Route::Unsupported(_)
+        ));
+        // SP-A T11: FindBy / FindByComposite now route to scatter
+        // (OidConcat). Pre-T11 these were `Unsupported`; T11 unlocks
+        // them on K>1 deployments via per-shard secondary-index
+        // fan-out + 16-byte oid concat.
+        assert!(matches!(
+            r.route(&Op::FindBy {
+                type_id: 1,
+                field_id: 2,
+                value: vec![1u8, 2, 3, 4],
+            }),
+            Route::Scatter(ScatterKind::OidConcat)
+        ));
+        assert!(matches!(
+            r.route(&Op::FindByComposite {
+                type_id: 1,
+                fields: vec![1, 3],
+                values: vec![vec![1u8, 2, 3, 4], vec![5, 6, 7, 8]],
+            }),
+            Route::Scatter(ScatterKind::OidConcat)
         ));
         assert_eq!(
             r.route(&Op::RefreshExternalSource { name: "s".into() }),
@@ -2364,6 +2404,216 @@ mod tests {
                 row.len(),
                 8,
                 "SelectFields projection: each row is the 8-byte U64 v"
+            );
+        }
+    }
+
+    /// SP-A T11 integration test: `Op::FindBy` over K=4 returns the
+    /// union of every shard's per-shard secondary-index match set
+    /// (16-byte oid concat). Pre-T11 the router rejected FindBy on
+    /// K>1 with a SchemaError; T11 wires it through the
+    /// `ScatterKind::OidConcat` scatter merge.
+    ///
+    /// Setup: same 16-row `(v: U64)` type as the SelectSorted test;
+    /// create a SECONDARY INDEX on `v`; insert 16 distinct values;
+    /// run `FindBy(v=7)` against both K=1 + K=4 deployments.
+    ///
+    /// Assertion: both deployments return a single 16-byte oid (the
+    /// row with v=7). The K=1 and K=4 results are byte-identical for
+    /// the single-match case (every shard returns at most 1 oid; the
+    /// concat is the one shard that had the match). Locks the
+    /// "FindBy now works on K>1" end-to-end contract.
+    #[test]
+    fn scatter_findby_k4_returns_same_oid_as_k1() {
+        use kessel_catalog::{decode_type_def, ObjectType};
+        use kessel_codec::{encode, Value};
+        use std::collections::BTreeSet;
+
+        // ---- helper: build a router with K shards over real sockets ----
+        fn spawn_k_router(k: usize, tag: &str) -> SocketAddr {
+            let mut shards: Vec<Vec<String>> = Vec::with_capacity(k);
+            for i in 0..k {
+                shards.push(spawn_shard(&format!("{tag}-{i}")));
+            }
+            let router = Arc::new(Router::new(shards));
+            let rl = TcpListener::bind("127.0.0.1:0").unwrap();
+            let raddr = rl.local_addr().unwrap();
+            {
+                let r = router.clone();
+                std::thread::spawn(move || serve_router(rl, r));
+            }
+            raddr
+        }
+
+        let k1_addr = spawn_k_router(1, "sp-a-t11-k1");
+        let k4_addr = spawn_k_router(4, "sp-a-t11-k4");
+
+        // 1×3 + 4×3 = 15 VSR nodes; let them settle.
+        std::thread::sleep(Duration::from_millis(2400));
+
+        // ---- create the type + secondary index on both deployments ----
+        let mut c_k1 = Client::connect(k1_addr).unwrap();
+        let mut c_k4 = Client::connect(k4_addr).unwrap();
+        let type_def_bytes = encode_type_def(
+            "t",
+            &[Field {
+                field_id: 0,
+                name: "v".into(),
+                kind: FieldKind::U64,
+                nullable: false,
+            }],
+        );
+        for c in [&mut c_k1, &mut c_k4] {
+            assert_eq!(
+                c.call(&Op::CreateType { def: type_def_bytes.clone() })
+                    .unwrap(),
+                OpResult::TypeCreated(1)
+            );
+            // Index on field_id=1 (SM-side assignment of the 0th field
+            // — same as the SelectSorted test above).
+            assert_eq!(
+                c.call(&Op::CreateIndex {
+                    type_id: 1,
+                    field_id: 1,
+                })
+                .unwrap(),
+                OpResult::Ok,
+                "CreateIndex on v must Ok"
+            );
+        }
+
+        // ---- insert 16 rows with distinct v=1..=16 ----
+        let (name, fields) = decode_type_def(&type_def_bytes).unwrap();
+        let ot = ObjectType::from_def(name, fields);
+        let make_record =
+            |v: u64| -> Vec<u8> { encode(&ot, &[Value::Uint(v as u128)]).unwrap() };
+        let n: u128 = 16;
+        for i in 1..=n {
+            let id = ObjectId::from_u128(i);
+            let rec = make_record(i as u64);
+            for c in [&mut c_k1, &mut c_k4] {
+                assert_eq!(
+                    c.call(&Op::Create {
+                        type_id: 1,
+                        id,
+                        record: rec.clone(),
+                    })
+                    .unwrap(),
+                    OpResult::Ok,
+                );
+            }
+        }
+
+        // ---- FindBy(v=7): expect a single 16-byte oid in both K=1, K=4 ----
+        let target: u64 = 7;
+        let find_op = Op::FindBy {
+            type_id: 1,
+            field_id: 1,
+            value: target.to_le_bytes().to_vec(),
+        };
+        let r_k1 = c_k1.call(&find_op).unwrap();
+        let r_k4 = c_k4.call(&find_op).unwrap();
+        let (b_k1, b_k4) = match (&r_k1, &r_k4) {
+            (OpResult::Got(a), OpResult::Got(b)) => (a, b),
+            other => panic!("FindBy must Got on both, got {other:?}"),
+        };
+        // Each result is exactly one 16-byte oid (the row with v=7
+        // has a unique value, so the secondary-index lookup returns
+        // one match).
+        assert_eq!(
+            b_k1.len(),
+            16,
+            "K=1 FindBy(v=7) must return 1 oid (16 bytes); got {}",
+            b_k1.len()
+        );
+        assert_eq!(
+            b_k4.len(),
+            16,
+            "K=4 FindBy(v=7) must return 1 oid (16 bytes); got {}",
+            b_k4.len()
+        );
+        // The oid is the same regardless of K (the rendezvous map
+        // routes Create by oid; both deployments hold the same row
+        // under the same oid).
+        assert_eq!(
+            b_k1, b_k4,
+            "K=4 FindBy returns the same oid as K=1 for the same query"
+        );
+        // Cross-check: the returned oid is the one we inserted.
+        assert_eq!(
+            &b_k4[..],
+            &ObjectId::from_u128(target as u128).0[..],
+            "FindBy(v=7) returns the oid we inserted under id=7"
+        );
+
+        // ---- multi-match: insert duplicates with v=42 on different
+        //      oids, then FindBy(v=42) returns the multiset of all
+        //      matches (union across shards on K=4). ----
+        let dup_v: u64 = 42;
+        let dup_rec = make_record(dup_v);
+        let dup_ids = [100u128, 200, 300];
+        for id_v in &dup_ids {
+            let id = ObjectId::from_u128(*id_v);
+            for c in [&mut c_k1, &mut c_k4] {
+                assert_eq!(
+                    c.call(&Op::Create {
+                        type_id: 1,
+                        id,
+                        record: dup_rec.clone(),
+                    })
+                    .unwrap(),
+                    OpResult::Ok,
+                );
+            }
+        }
+        let dup_find = Op::FindBy {
+            type_id: 1,
+            field_id: 1,
+            value: dup_v.to_le_bytes().to_vec(),
+        };
+        let r_k1 = c_k1.call(&dup_find).unwrap();
+        let r_k4 = c_k4.call(&dup_find).unwrap();
+        let (b_k1, b_k4) = match (&r_k1, &r_k4) {
+            (OpResult::Got(a), OpResult::Got(b)) => (a, b),
+            other => panic!("FindBy must Got on both, got {other:?}"),
+        };
+        assert_eq!(
+            b_k1.len(),
+            3 * 16,
+            "K=1 FindBy(v=42) must return 3 oids; got {} bytes",
+            b_k1.len()
+        );
+        assert_eq!(
+            b_k4.len(),
+            3 * 16,
+            "K=4 FindBy(v=42) must return 3 oids; got {} bytes",
+            b_k4.len()
+        );
+        // Multiset equality: the K=4 result may have a different
+        // shard-id-ordered byte sequence than K=1, but the same set
+        // of 3 oids.
+        let to_oid_set = |b: &[u8]| -> BTreeSet<[u8; 16]> {
+            let mut s = BTreeSet::new();
+            let mut p = 0;
+            while p + 16 <= b.len() {
+                let mut o = [0u8; 16];
+                o.copy_from_slice(&b[p..p + 16]);
+                s.insert(o);
+                p += 16;
+            }
+            s
+        };
+        let set_k1 = to_oid_set(b_k1);
+        let set_k4 = to_oid_set(b_k4);
+        assert_eq!(
+            set_k1, set_k4,
+            "K=4 FindBy multiset must equal K=1's"
+        );
+        assert_eq!(set_k4.len(), 3, "exactly 3 unique oids");
+        for id_v in &dup_ids {
+            assert!(
+                set_k4.contains(&ObjectId::from_u128(*id_v).0),
+                "K=4 FindBy result missing oid {id_v}"
             );
         }
     }

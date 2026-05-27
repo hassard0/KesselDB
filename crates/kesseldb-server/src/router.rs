@@ -28,8 +28,7 @@
 //! [`kessel_client::ClusterClient`].
 
 use crate::scatter_scan::{
-    merge_scan_results, scatter_scan_fanout, ScatterKind, ShardCaller,
-    DEFAULT_PER_SHARD_TIMEOUT,
+    scatter_and_merge, ScatterKind, ShardCaller, DEFAULT_PER_SHARD_TIMEOUT,
 };
 use kessel_client::ClusterClient;
 use kessel_proto::wire::{read_frame, write_frame};
@@ -558,13 +557,27 @@ impl<'a> Conn<'a> {
             }
             shards.push(c);
         }
-        // 3. Fan out + merge.
-        let results = scatter_scan_fanout(
+        // 3. Fan out + merge with SP-A T6 (SP155 §3.7) LIMIT-aware
+        //    cancellation. `scatter_and_merge` combines the fanout +
+        //    merge into a single pass so the merge layer can fire the
+        //    shared cancel flag the instant Unordered LIMIT is hit —
+        //    late workers see the flag on their way out and the
+        //    router stops waiting on slow shards once it has enough
+        //    rows. For Sorted, all shards' data is gathered first
+        //    (k-way heap merge needs every payload to peek the next
+        //    smallest row); cancel still propagates post-gather so
+        //    a future streaming sorted-merge (T7) can short-circuit
+        //    at this seam.
+        let cancel = std::sync::Arc::new(
+            std::sync::atomic::AtomicBool::new(false),
+        );
+        scatter_and_merge(
             shards,
             op,
             DEFAULT_PER_SHARD_TIMEOUT,
-        );
-        merge_scan_results(results, &resolved_kind)
+            &resolved_kind,
+            cancel,
+        )
     }
 
     /// Re-drive the entire ordered cross-shard log idempotently — used

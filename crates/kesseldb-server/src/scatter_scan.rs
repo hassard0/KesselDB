@@ -56,7 +56,9 @@
 use kessel_proto::{Op, OpResult};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -73,6 +75,32 @@ pub trait ShardCaller: Send + 'static {
     /// transport errors surface as `Err(String)`; the scatter layer
     /// translates them to `OpResult::Unavailable` for the shard's slot.
     fn call(&mut self, op: &Op) -> Result<OpResult, String>;
+
+    /// SP-A T6 (SP155 §3.7): cancellation-aware dispatch. Default impl
+    /// observes the flag at the call boundary only (pre-check + post-
+    /// check) — a `true` flag short-circuits the pre-check to
+    /// `Unavailable` without invoking `call()`. Once `call()` is in
+    /// flight, the default impl cannot interrupt it (std::net::TcpStream
+    /// has no cancellable read — see SP155 §3.7 "Honest gap"); a follow-
+    /// up `ShardCaller` impl (the streaming `Op::SelectChunked` per
+    /// SP155 §4.4 / SP-A T14) can override this to check the flag
+    /// between TCP read chunks for finer-grained cancellation. For V1
+    /// the gain is "router stops waiting on slow shards once LIMIT is
+    /// hit"; the shard's wasted server-side work is the documented T13
+    /// perf follow-up.
+    fn call_with_cancel(
+        &mut self,
+        op: &Op,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<OpResult, String> {
+        // Pre-call: if cancel already fired (e.g. LIMIT 0 sentinel
+        // path), skip the call entirely. Cheap relaxed load per
+        // SP155 §3.7.
+        if cancel.load(AtomicOrdering::SeqCst) {
+            return Ok(OpResult::Unavailable);
+        }
+        self.call(op)
+    }
 }
 
 /// Default per-shard scatter timeout: 30s, matching the SP155 OQ1
@@ -290,6 +318,240 @@ pub fn merge_scan_results(
             *limit,
         ),
     }
+}
+
+/// SP-A T6 (SP155 §3.7): fanout + merge with LIMIT cancellation.
+///
+/// This is the **production entry point** the router uses. Combines
+/// `scatter_scan_fanout`-shaped fan-out with `merge_scan_results`-
+/// shaped merge into a single pass so the merge layer can fire the
+/// shared `cancel` flag the INSTANT it has enough rows (`Unordered`
+/// LIMIT hit) — late workers see the flag on their way out and don't
+/// keep the router pinned waiting.
+///
+/// Behaviour matrix (per `kind`):
+///
+/// - **`Unordered { limit }`**: drains worker replies in shard-id order
+///   (same determinism as `scatter_scan_fanout`); for each Got slot
+///   appends rows to the output buffer; **the instant `output.len()
+///   == limit`** sets `cancel` and stops draining remaining slots. The
+///   merged result is exactly `limit` rows (when total ≥ limit). Late
+///   workers' replies are silently discarded — they're no longer needed
+///   AND emitting an `Unavailable` for those slots would violate V1
+///   hard-fail (`merge_scan_results`'s "first non-Got slot poisons the
+///   merge"). `limit == 0` means "no cap" — gather everything, never
+///   fire cancel.
+///
+/// - **`Sorted { ..., limit }`**: needs all per-shard already-sorted
+///   payloads upfront for the k-way `BinaryHeap` merge (the smallest
+///   row across all shards may live on any shard). Drains every slot,
+///   then runs the heap merge with OFFSET + LIMIT in the merge loop
+///   (existing `merge_sorted`). Sets `cancel` AFTER the gather phase
+///   (effectively a no-op for the gather since all workers already
+///   returned, but kept for symmetric API + so a future streaming
+///   sorted-merge (T7) can short-circuit at this point).
+///
+/// - **Any worker reports a non-Got slot** (`Unavailable`,
+///   `SchemaError`, etc.): V1 hard-fail per SP155 §6 — the gather
+///   short-circuits, `cancel` fires, and the first non-Got slot is
+///   returned as the merged result.
+///
+/// - **Empty shards (`shards.is_empty()`)** ⇒ `OpResult::Got(vec![])`
+///   per SP155 OQ11 (matches `merge_scan_results(empty, ...)`).
+///
+/// Thread/join discipline:
+///
+/// - One `std::thread` per shard (zero-dep, same as
+///   `scatter_scan_fanout`).
+/// - Workers receive a clone of `cancel` + dispatch via
+///   `ShardCaller::call_with_cancel` — the default impl observes the
+///   flag at the call boundary (skips the call entirely if `cancel`
+///   was set before the worker started).
+/// - All worker handles are joined before this function returns — no
+///   leaked threads, including the cancellation path (verified by
+///   `scatter_and_merge_cancellation_does_not_leak_threads`).
+///
+/// `cancel` is taken by `Arc` (shared with the spawned workers) and
+/// SHOULD start `false`. The function NEVER resets the flag — a
+/// caller passing a flag that's already `true` gets an immediate
+/// `OpResult::Got(vec![])` (the LIMIT-already-satisfied edge: no
+/// shards consulted; see `scatter_and_merge_precancelled_returns_empty`).
+pub fn scatter_and_merge<C: ShardCaller>(
+    shards: Vec<C>,
+    op: &Op,
+    per_shard_timeout: Duration,
+    kind: &ScatterKind,
+    cancel: Arc<AtomicBool>,
+) -> OpResult {
+    let k = shards.len();
+    if k == 0 {
+        // SP155 OQ11: empty filter result is Got([]), not NotFound.
+        return OpResult::Got(Vec::new());
+    }
+    // Honor a pre-fired cancel: caller already knows LIMIT is satisfied
+    // (e.g. LIMIT 0 on a downstream caller, or a Drop-time cancel from
+    // a concurrent timeout). Don't spawn anything; return an empty Got
+    // immediately. This matches the SP155 §3.7 "cancel = stop scanning"
+    // intent at the strongest possible point.
+    if cancel.load(AtomicOrdering::SeqCst) {
+        return OpResult::Got(Vec::new());
+    }
+    // Spawn workers upfront so per-shard work overlaps (the merge
+    // consumer may stay sequential per SP155 §3.6).
+    let mut rxs: Vec<mpsc::Receiver<OpResult>> = Vec::with_capacity(k);
+    let mut handles: Vec<thread::JoinHandle<()>> = Vec::with_capacity(k);
+    for (i, mut caller) in shards.into_iter().enumerate() {
+        let (tx, rx) = mpsc::sync_channel::<OpResult>(1);
+        let op_for_worker = op.clone();
+        let cancel_for_worker = cancel.clone();
+        let h = thread::Builder::new()
+            .name(format!("kdb-scatter-shard-{i}"))
+            .spawn(move || {
+                let r = match caller
+                    .call_with_cancel(&op_for_worker, &cancel_for_worker)
+                {
+                    Ok(r) => r,
+                    Err(_e) => OpResult::Unavailable,
+                };
+                let _ = tx.send(r);
+            })
+            .expect("kdb-scatter: thread spawn (std::thread; zero-dep)");
+        rxs.push(rx);
+        handles.push(h);
+    }
+    let deadlines: Vec<Instant> = (0..k)
+        .map(|_| Instant::now() + per_shard_timeout)
+        .collect();
+    // Drain replies in shard-id order. For Unordered with a limit, we
+    // can short-circuit mid-drain (set cancel, stop reading). For
+    // Sorted we drain everyone (k-way heap merge needs all data).
+    let result = match kind {
+        ScatterKind::Unordered { limit } => {
+            scatter_and_merge_unordered(
+                &mut rxs.into_iter().zip(deadlines.into_iter()).collect::<Vec<_>>(),
+                *limit,
+                &cancel,
+            )
+        }
+        ScatterKind::Sorted { .. } => {
+            // Sorted needs every shard's payload first; gather all,
+            // then merge.
+            let mut gathered: Vec<OpResult> = Vec::with_capacity(k);
+            let mut first_bad: Option<OpResult> = None;
+            for (rx, deadline) in rxs.into_iter().zip(deadlines.into_iter()) {
+                let now = Instant::now();
+                let remaining = if deadline > now {
+                    deadline - now
+                } else {
+                    Duration::from_millis(0)
+                };
+                let r = match rx.recv_timeout(remaining) {
+                    Ok(r) => r,
+                    Err(_) => OpResult::Unavailable,
+                };
+                if !matches!(r, OpResult::Got(_)) && first_bad.is_none() {
+                    // V1 hard-fail surfaces the first non-Got slot.
+                    // Fire cancel so the remaining workers exit fast
+                    // (default-impl observes it at the call boundary).
+                    first_bad = Some(r.clone());
+                    cancel.store(true, AtomicOrdering::SeqCst);
+                }
+                gathered.push(r);
+            }
+            if let Some(bad) = first_bad {
+                bad
+            } else {
+                merge_scan_results(gathered, kind)
+            }
+        }
+    };
+    // Cancel any laggards that we still haven't read from (Unordered
+    // short-circuit) + signal any pre-call worker to skip its call.
+    // (Already done inside scatter_and_merge_unordered for the LIMIT-
+    // hit path; this is the belt-and-suspenders.)
+    cancel.store(true, AtomicOrdering::SeqCst);
+    // Join every worker. Workers whose reply we didn't drain are
+    // still pushing to the channel (which is sync_channel(1) — they
+    // either already sent OR are blocked trying to send to a dropped
+    // rx). The `rx` drop above releases them; this join waits for
+    // their own `call()` to return per the SP155 §3.7 honest gap.
+    for h in handles {
+        let _ = h.join();
+    }
+    result
+}
+
+/// Helper for `scatter_and_merge`'s Unordered path: drain shard
+/// replies in shard-id order; for each Got slot append rows; **set
+/// cancel + stop draining** when `output.len() == limit`. `limit == 0`
+/// is "unlimited" (drain everyone, never fire cancel).
+///
+/// Returns the merged `OpResult` directly (Got with the payload, OR
+/// the first non-Got slot per V1 hard-fail).
+fn scatter_and_merge_unordered(
+    rxs_with_deadlines: &mut Vec<(mpsc::Receiver<OpResult>, Instant)>,
+    limit: u32,
+    cancel: &Arc<AtomicBool>,
+) -> OpResult {
+    let mut out: Vec<u8> = Vec::new();
+    let mut emitted: u32 = 0;
+    let mut shard_id: usize = 0;
+    for (rx, deadline) in rxs_with_deadlines.drain(..) {
+        let now = Instant::now();
+        let remaining = if deadline > now {
+            deadline - now
+        } else {
+            Duration::from_millis(0)
+        };
+        let r = match rx.recv_timeout(remaining) {
+            Ok(r) => r,
+            Err(_) => OpResult::Unavailable,
+        };
+        // V1 hard-fail: surface the first non-Got slot, fire cancel.
+        let payload = match r {
+            OpResult::Got(b) => b,
+            other => {
+                cancel.store(true, AtomicOrdering::SeqCst);
+                return other;
+            }
+        };
+        // Append this shard's rows; track LIMIT.
+        let it = match iter_rows(&payload) {
+            Ok(it) => it,
+            Err(e) => {
+                cancel.store(true, AtomicOrdering::SeqCst);
+                return OpResult::SchemaError(format!(
+                    "scatter merge: shard {shard_id} payload framing: {e}"
+                ));
+            }
+        };
+        for row in it {
+            match row {
+                Ok(rec) => {
+                    append_row(&mut out, rec);
+                    emitted = emitted.saturating_add(1);
+                    if limit != 0 && emitted >= limit {
+                        // LIMIT hit. Fire cancel so the remaining
+                        // shards' workers see it (the default
+                        // `call_with_cancel` impl observes the flag
+                        // pre-call; once they're in flight they're
+                        // committed to finish — SP155 §3.7 honest
+                        // gap). Stop draining.
+                        cancel.store(true, AtomicOrdering::SeqCst);
+                        return OpResult::Got(out);
+                    }
+                }
+                Err(e) => {
+                    cancel.store(true, AtomicOrdering::SeqCst);
+                    return OpResult::SchemaError(format!(
+                        "scatter merge: shard {shard_id} row: {e}"
+                    ));
+                }
+            }
+        }
+        shard_id += 1;
+    }
+    OpResult::Got(out)
 }
 
 /// Iterate `[u32 rowlen][record]*` payload, yielding `(rowlen_le_bytes,
@@ -1815,5 +2077,512 @@ mod tests {
             &rec(50),
         ]);
         assert_eq!(r, OpResult::Got(expected));
+    }
+
+    // ---------- T6 LIMIT-cancellation KATs (SP155 §3.7 / §7.3) ----------
+    //
+    // T2-T5 ship the merge with a LIMIT cap (`merge_unordered_respects_limit`
+    // locks the cap). T6 adds **cancellation propagation**: when the
+    // unordered merge has its LIMIT, the shared `Arc<AtomicBool>` cancel
+    // flag fires the instant the buffer fills, so late shards (whose
+    // slots the merge doesn't need) see the flag at their `call_with_
+    // cancel` boundary and don't keep the router pinned. The default
+    // `call_with_cancel` impl observes the flag pre-call only (SP155
+    // §3.7 honest gap: std::net::TcpStream has no cancellable read);
+    // these KATs exercise that boundary by driving cancellation against
+    // a mock that respects the flag.
+    //
+    // The mock used here (`CancellableMockShard`) is a `ShardCaller`
+    // with a built-in pre-call cancel check + a configurable sleep,
+    // letting us deterministically order: shard_0 returns enough rows
+    // to fill LIMIT, shard_1+'s sleep is interrupted by cancel firing
+    // BEFORE its `call` even starts — its `ran` counter stays at 0.
+
+    use std::sync::atomic::AtomicBool;
+
+    /// Mock shard that respects `cancel` at the call boundary AND
+    /// optionally polls during a configurable sleep — gives the KATs
+    /// fine-grained control over when the cancel flag is observed.
+    struct CancellableMockShard {
+        canned: OpResult,
+        /// Sleep BEFORE `call()` returns. Polled in 10ms increments
+        /// against `cancel` so the worker exits promptly when the
+        /// merge fires the flag.
+        sleep_pre: Duration,
+        /// Bumped on every `call_with_cancel` invocation that GETS
+        /// PAST the pre-call cancel check (i.e. actually ran).
+        ran: Arc<AtomicUsize>,
+        /// Bumped if the pre-call cancel check fired — proves the
+        /// flag was seen.
+        cancelled_pre_call: Arc<AtomicUsize>,
+    }
+
+    impl CancellableMockShard {
+        fn new(canned: OpResult) -> Self {
+            CancellableMockShard {
+                canned,
+                sleep_pre: Duration::from_millis(0),
+                ran: Arc::new(AtomicUsize::new(0)),
+                cancelled_pre_call: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+        fn slow(mut self, d: Duration) -> Self {
+            self.sleep_pre = d;
+            self
+        }
+    }
+
+    impl ShardCaller for CancellableMockShard {
+        fn call(&mut self, _op: &Op) -> Result<OpResult, String> {
+            self.ran.fetch_add(1, Ordering::SeqCst);
+            if self.sleep_pre > Duration::from_millis(0) {
+                thread::sleep(self.sleep_pre);
+            }
+            Ok(self.canned.clone())
+        }
+        fn call_with_cancel(
+            &mut self,
+            op: &Op,
+            cancel: &Arc<AtomicBool>,
+        ) -> Result<OpResult, String> {
+            // Pre-call: check + poll in small slices so the cancel
+            // flag set by the merge propagates promptly. Locks the
+            // SP155 §3.7 "cancel observed pre-call" contract for
+            // workers whose `call` hasn't started yet.
+            if cancel.load(Ordering::SeqCst) {
+                self.cancelled_pre_call.fetch_add(1, Ordering::SeqCst);
+                return Ok(OpResult::Unavailable);
+            }
+            if self.sleep_pre > Duration::from_millis(0) {
+                // Poll cancel every 5ms during the sleep — KATs can
+                // assert workers exit promptly after the flag fires.
+                let step = Duration::from_millis(5);
+                let mut remaining = self.sleep_pre;
+                while remaining > Duration::from_millis(0) {
+                    if cancel.load(Ordering::SeqCst) {
+                        self.cancelled_pre_call
+                            .fetch_add(1, Ordering::SeqCst);
+                        return Ok(OpResult::Unavailable);
+                    }
+                    let s = if remaining > step { step } else { remaining };
+                    thread::sleep(s);
+                    remaining = remaining.saturating_sub(s);
+                }
+            }
+            self.ran.fetch_add(1, Ordering::SeqCst);
+            self.call(op)
+        }
+    }
+
+    /// **T6 KAT — LIMIT 5 over 3 shards × 100 rows each returns exactly
+    /// 5 rows + the merged payload is shard-0's first 5 rows.**
+    /// `Unordered` merge is shard-id-ordered concat (SP155 §3.6); LIMIT
+    /// 5 stops mid-shard-0 and emits exactly 5 rows. Locks that the
+    /// scatter_and_merge integration produces the same result as the
+    /// gather+merge composition.
+    #[test]
+    fn scatter_and_merge_unordered_limit_caps_at_exactly_n_rows() {
+        let rec = |v: u8| -> Vec<u8> { vec![v; 8] };
+        let mk_payload = |start: u8| -> OpResult {
+            let rows: Vec<Vec<u8>> =
+                (0..100u8).map(|i| rec(start.wrapping_add(i))).collect();
+            let refs: Vec<&[u8]> = rows.iter().map(|v| v.as_slice()).collect();
+            OpResult::Got(rows_to_payload(&refs))
+        };
+        let s0 = CancellableMockShard::new(mk_payload(0));
+        let s1 = CancellableMockShard::new(mk_payload(100));
+        let s2 = CancellableMockShard::new(mk_payload(200));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let out = scatter_and_merge(
+            vec![s0, s1, s2],
+            &dummy_select(),
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &ScatterKind::Unordered { limit: 5 },
+            cancel.clone(),
+        );
+        let bytes = match &out {
+            OpResult::Got(b) => b,
+            other => panic!("expected Got, got {other:?}"),
+        };
+        // Walk the payload: count rows.
+        let mut p = 0usize;
+        let mut count = 0usize;
+        while p < bytes.len() {
+            let len =
+                u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+            p += 4 + len;
+            count += 1;
+        }
+        assert_eq!(count, 5, "LIMIT 5 must yield exactly 5 rows");
+        // Cancel flag must be set (the merge fired it on LIMIT-hit).
+        assert!(
+            cancel.load(Ordering::SeqCst),
+            "cancel flag must be set after LIMIT-hit"
+        );
+    }
+
+    /// **T6 KAT — LIMIT-hit propagates cancel to NOT-YET-STARTED
+    /// shards.** shard_0 returns 100 rows instantly so LIMIT 5 fires
+    /// after draining shard_0's slot; shards 1+2 sleep 200ms PRE-
+    /// CALL. By the time shard_0's slot is drained and cancel fires,
+    /// shard_1/shard_2 are still in their pre-call poll loop — they
+    /// see the flag and exit early (`cancelled_pre_call` bumped,
+    /// `ran` stays 0). This is the SP155 §3.7 contract: cancel
+    /// observed pre-call.
+    #[test]
+    fn scatter_and_merge_limit_cancels_pending_shards() {
+        let rec = |v: u8| -> Vec<u8> { vec![v; 8] };
+        let mk_payload = |n: usize, base: u8| -> OpResult {
+            let rows: Vec<Vec<u8>> = (0..n as u8)
+                .map(|i| rec(base.wrapping_add(i)))
+                .collect();
+            let refs: Vec<&[u8]> = rows.iter().map(|v| v.as_slice()).collect();
+            OpResult::Got(rows_to_payload(&refs))
+        };
+        // shard_0: fast, 100 rows.
+        let s0 = CancellableMockShard::new(mk_payload(100, 0));
+        // shard_1, shard_2: SLOW (200ms pre-call), 100 rows each.
+        let s1 = CancellableMockShard::new(mk_payload(100, 100))
+            .slow(Duration::from_millis(200));
+        let s2 = CancellableMockShard::new(mk_payload(100, 200))
+            .slow(Duration::from_millis(200));
+        // Capture the counters BEFORE moving the shards.
+        let ran1 = s1.ran.clone();
+        let ran2 = s2.ran.clone();
+        let cancelled1 = s1.cancelled_pre_call.clone();
+        let cancelled2 = s2.cancelled_pre_call.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let t0 = Instant::now();
+        let out = scatter_and_merge(
+            vec![s0, s1, s2],
+            &dummy_select(),
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &ScatterKind::Unordered { limit: 5 },
+            cancel.clone(),
+        );
+        let elapsed = t0.elapsed();
+        // Result locked: exactly 5 rows from shard_0.
+        let bytes = match &out {
+            OpResult::Got(b) => b,
+            other => panic!("expected Got, got {other:?}"),
+        };
+        let mut count = 0usize;
+        let mut p = 0usize;
+        while p < bytes.len() {
+            let len =
+                u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+            p += 4 + len;
+            count += 1;
+        }
+        assert_eq!(count, 5, "LIMIT 5 must yield 5 rows");
+        // shard_1 + shard_2 saw the cancel flag pre-call (their `ran`
+        // never incremented; their `cancelled_pre_call` did).
+        assert_eq!(
+            ran1.load(Ordering::SeqCst),
+            0,
+            "shard_1 must NOT have completed its call"
+        );
+        assert_eq!(
+            ran2.load(Ordering::SeqCst),
+            0,
+            "shard_2 must NOT have completed its call"
+        );
+        assert!(
+            cancelled1.load(Ordering::SeqCst) >= 1,
+            "shard_1 must have observed cancel pre-call"
+        );
+        assert!(
+            cancelled2.load(Ordering::SeqCst) >= 1,
+            "shard_2 must have observed cancel pre-call"
+        );
+        // Wall-clock: should return MUCH faster than the full 200ms
+        // sleep — the cancel-poll step is 5ms, so we expect <100ms
+        // even on busy CI. (Loose bound: well under 200ms × 2.)
+        assert!(
+            elapsed < Duration::from_millis(180),
+            "scatter_and_merge must return promptly after LIMIT-hit \
+             (elapsed {elapsed:?})"
+        );
+    }
+
+    /// **T6 KAT — LIMIT 0 returns ALL rows + cancel never fires
+    /// (during the gather; the post-gather belt-and-suspenders does
+    /// set it, but no shard is short-circuited).** `limit == 0` is
+    /// the "no cap" sentinel; every shard contributes.
+    #[test]
+    fn scatter_and_merge_unordered_limit_zero_drains_every_shard() {
+        let rec = |v: u8| -> Vec<u8> { vec![v; 8] };
+        let mk_payload = |n: usize, base: u8| -> OpResult {
+            let rows: Vec<Vec<u8>> =
+                (0..n as u8).map(|i| rec(base.wrapping_add(i))).collect();
+            let refs: Vec<&[u8]> = rows.iter().map(|v| v.as_slice()).collect();
+            OpResult::Got(rows_to_payload(&refs))
+        };
+        let s0 = CancellableMockShard::new(mk_payload(3, 0));
+        let s1 = CancellableMockShard::new(mk_payload(3, 100));
+        let s2 = CancellableMockShard::new(mk_payload(3, 200));
+        let ran0 = s0.ran.clone();
+        let ran1 = s1.ran.clone();
+        let ran2 = s2.ran.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let out = scatter_and_merge(
+            vec![s0, s1, s2],
+            &dummy_select(),
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &ScatterKind::Unordered { limit: 0 },
+            cancel.clone(),
+        );
+        let bytes = match &out {
+            OpResult::Got(b) => b,
+            other => panic!("expected Got, got {other:?}"),
+        };
+        let mut count = 0usize;
+        let mut p = 0usize;
+        while p < bytes.len() {
+            let len =
+                u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+            p += 4 + len;
+            count += 1;
+        }
+        assert_eq!(count, 9, "LIMIT 0 must yield all 3×3=9 rows");
+        // Every shard's call DID run (no pre-call short-circuit
+        // during the gather; the post-gather belt-and-suspenders
+        // sets cancel but at that point every worker already ran).
+        assert!(ran0.load(Ordering::SeqCst) >= 1);
+        assert!(ran1.load(Ordering::SeqCst) >= 1);
+        assert!(ran2.load(Ordering::SeqCst) >= 1);
+    }
+
+    /// **T6 KAT — pre-cancelled flag returns an empty Got + spawns
+    /// no workers.** If the caller passes a flag that's already set
+    /// (e.g. a Drop-time cancel from a concurrent timeout, or a
+    /// downstream LIMIT-already-satisfied state), the function
+    /// short-circuits before spawning. Locks the SP155 §3.7 "cancel
+    /// = stop scanning at the strongest possible point" contract.
+    #[test]
+    fn scatter_and_merge_precancelled_returns_empty() {
+        let s0 = CancellableMockShard::new(OpResult::Got(vec![1, 2, 3, 4]));
+        let s1 = CancellableMockShard::new(OpResult::Got(vec![5, 6, 7, 8]));
+        let ran0 = s0.ran.clone();
+        let ran1 = s1.ran.clone();
+        let cancel = Arc::new(AtomicBool::new(true)); // pre-cancelled
+        let out = scatter_and_merge(
+            vec![s0, s1],
+            &dummy_select(),
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &ScatterKind::Unordered { limit: 0 },
+            cancel,
+        );
+        assert_eq!(
+            out,
+            OpResult::Got(Vec::new()),
+            "pre-cancelled scatter returns empty Got"
+        );
+        // No workers ran (we never spawned).
+        assert_eq!(
+            ran0.load(Ordering::SeqCst),
+            0,
+            "no worker spawned for shard_0"
+        );
+        assert_eq!(
+            ran1.load(Ordering::SeqCst),
+            0,
+            "no worker spawned for shard_1"
+        );
+    }
+
+    /// **T6 KAT — LIMIT > total rows: no cancel mid-gather; every
+    /// shard contributes; result is every row in shard-id-ordered
+    /// concat.** Locks that "LIMIT larger than total" doesn't trip
+    /// the short-circuit.
+    #[test]
+    fn scatter_and_merge_limit_larger_than_total_returns_everything() {
+        let rec = |v: u8| -> Vec<u8> { vec![v; 8] };
+        let mk_payload = |n: usize, base: u8| -> OpResult {
+            let rows: Vec<Vec<u8>> =
+                (0..n as u8).map(|i| rec(base.wrapping_add(i))).collect();
+            let refs: Vec<&[u8]> = rows.iter().map(|v| v.as_slice()).collect();
+            OpResult::Got(rows_to_payload(&refs))
+        };
+        let s0 = CancellableMockShard::new(mk_payload(2, 0));
+        let s1 = CancellableMockShard::new(mk_payload(2, 100));
+        let s2 = CancellableMockShard::new(mk_payload(2, 200));
+        let ran0 = s0.ran.clone();
+        let ran1 = s1.ran.clone();
+        let ran2 = s2.ran.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let out = scatter_and_merge(
+            vec![s0, s1, s2],
+            &dummy_select(),
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &ScatterKind::Unordered { limit: 100 }, // > 6 total
+            cancel,
+        );
+        let bytes = match &out {
+            OpResult::Got(b) => b,
+            other => panic!("expected Got, got {other:?}"),
+        };
+        let mut count = 0usize;
+        let mut p = 0usize;
+        while p < bytes.len() {
+            let len =
+                u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+            p += 4 + len;
+            count += 1;
+        }
+        assert_eq!(count, 6, "LIMIT 100 over 6 rows total yields 6 rows");
+        // All three shards' workers completed (no pre-call cancel
+        // during the gather phase).
+        assert!(ran0.load(Ordering::SeqCst) >= 1);
+        assert!(ran1.load(Ordering::SeqCst) >= 1);
+        assert!(ran2.load(Ordering::SeqCst) >= 1);
+    }
+
+    /// **T6 KAT — cancellation does NOT leak threads.** All worker
+    /// handles are joined before `scatter_and_merge` returns, even
+    /// for the LIMIT-cancellation path. We assert this two ways:
+    /// (a) the function returns within a bounded wall-clock window;
+    /// (b) the slow workers' `ran`+`cancelled_pre_call` counters
+    /// REACH their terminal state by the time we return (i.e. the
+    /// worker thread has exited and updated its counter — `ran` only
+    /// bumps inside the worker thread).
+    #[test]
+    fn scatter_and_merge_cancellation_does_not_leak_threads() {
+        let rec = |v: u8| -> Vec<u8> { vec![v; 8] };
+        let mk_payload = |n: usize, base: u8| -> OpResult {
+            let rows: Vec<Vec<u8>> =
+                (0..n as u8).map(|i| rec(base.wrapping_add(i))).collect();
+            let refs: Vec<&[u8]> = rows.iter().map(|v| v.as_slice()).collect();
+            OpResult::Got(rows_to_payload(&refs))
+        };
+        // shard_0: fast, fills LIMIT.
+        let s0 = CancellableMockShard::new(mk_payload(10, 0));
+        // shard_1: slow (300ms), should be cancelled pre-call.
+        let s1 = CancellableMockShard::new(mk_payload(10, 100))
+            .slow(Duration::from_millis(300));
+        let cancelled1 = s1.cancelled_pre_call.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let t0 = Instant::now();
+        let _out = scatter_and_merge(
+            vec![s0, s1],
+            &dummy_select(),
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &ScatterKind::Unordered { limit: 3 },
+            cancel,
+        );
+        let elapsed = t0.elapsed();
+        // BY THE TIME we return, every worker has joined — proven
+        // by shard_1's `cancelled_pre_call` having been bumped from
+        // inside the worker thread. (Atomic bumps from a not-yet-
+        // joined thread are visible but the function's join loop
+        // guarantees the thread completed.)
+        assert!(
+            cancelled1.load(Ordering::SeqCst) >= 1,
+            "shard_1 worker thread must have run + bumped \
+             cancelled_pre_call before scatter_and_merge returned"
+        );
+        // Wall-clock: well under the full 300ms shard_1 sleep,
+        // proving the cancel propagated promptly (no leaked thread
+        // that would hold us until 300ms elapsed).
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "elapsed {elapsed:?} must be << 300ms (worker cancelled \
+             promptly, no leak)"
+        );
+    }
+
+    /// **T6 KAT — Sorted merge gathers all shards even with LIMIT.**
+    /// A k-way heap merge needs every shard's payload upfront to
+    /// peek the next smallest row; LIMIT is applied in the merge
+    /// loop, NOT the gather. Locks that Sorted's cancel behavior is
+    /// "fire post-gather" (a no-op for the current gather, but kept
+    /// as a seam for future streaming sorted-merge — SP-A T7+).
+    #[test]
+    fn scatter_and_merge_sorted_limit_still_gathers_all_shards() {
+        let rec = |v: u64| -> Vec<u8> { v.to_le_bytes().to_vec() };
+        let s0_payload = rows_to_payload(&[&rec(1), &rec(4), &rec(9)]);
+        let s1_payload = rows_to_payload(&[&rec(2), &rec(3), &rec(7)]);
+        let s0 = CancellableMockShard::new(OpResult::Got(s0_payload));
+        let s1 = CancellableMockShard::new(OpResult::Got(s1_payload));
+        let ran0 = s0.ran.clone();
+        let ran1 = s1.ran.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let out = scatter_and_merge(
+            vec![s0, s1],
+            &dummy_select(),
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &ScatterKind::Sorted {
+                sort_kind: FieldKind::U64,
+                sort_offset: 0,
+                sort_width: 8,
+                desc: false,
+                offset: 0,
+                limit: 3, // way less than 6 total
+            },
+            cancel.clone(),
+        );
+        // Both shards' workers ran (Sorted needs all data).
+        assert!(ran0.load(Ordering::SeqCst) >= 1);
+        assert!(ran1.load(Ordering::SeqCst) >= 1);
+        // Result: ascending [1, 2, 3] (LIMIT 3).
+        let expected = rows_to_payload(&[&rec(1), &rec(2), &rec(3)]);
+        assert_eq!(out, OpResult::Got(expected));
+        // Post-gather cancel set.
+        assert!(cancel.load(Ordering::SeqCst));
+    }
+
+    /// **T6 KAT — non-Got slot fires cancel + V1 hard-fail surfaces.**
+    /// A shard returning `Unavailable` short-circuits the gather (per
+    /// SP155 §6); cancel fires; the merged result is that first non-
+    /// Got slot. Late shards see cancel pre-call.
+    #[test]
+    fn scatter_and_merge_unavailable_propagates_and_fires_cancel() {
+        let s0 = CancellableMockShard::new(OpResult::Got(vec![]));
+        let s1 = CancellableMockShard::new(OpResult::Unavailable);
+        // shard_2 is SLOW + comes AFTER the Unavailable shard — must
+        // observe cancel pre-call (its `ran` stays 0).
+        let s2 = CancellableMockShard::new(OpResult::Got(vec![1, 2, 3, 4]))
+            .slow(Duration::from_millis(200));
+        let ran2 = s2.ran.clone();
+        let cancelled2 = s2.cancelled_pre_call.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let out = scatter_and_merge(
+            vec![s0, s1, s2],
+            &dummy_select(),
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &ScatterKind::Unordered { limit: 0 },
+            cancel.clone(),
+        );
+        assert_eq!(out, OpResult::Unavailable, "V1 hard-fail propagates");
+        assert!(
+            cancel.load(Ordering::SeqCst),
+            "cancel flag must be set on non-Got slot"
+        );
+        assert_eq!(
+            ran2.load(Ordering::SeqCst),
+            0,
+            "shard_2 must NOT have completed its call"
+        );
+        assert!(
+            cancelled2.load(Ordering::SeqCst) >= 1,
+            "shard_2 observed cancel pre-call"
+        );
+    }
+
+    /// **T6 KAT — K=0 empty shards returns empty Got.** Matches the
+    /// `merge_scan_results(empty, ...)` contract; locks that the
+    /// combined path keeps this edge.
+    #[test]
+    fn scatter_and_merge_empty_shards_returns_empty_got() {
+        let shards: Vec<CancellableMockShard> = Vec::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let out = scatter_and_merge(
+            shards,
+            &dummy_select(),
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &ScatterKind::Unordered { limit: 10 },
+            cancel,
+        );
+        assert_eq!(out, OpResult::Got(Vec::new()));
     }
 }

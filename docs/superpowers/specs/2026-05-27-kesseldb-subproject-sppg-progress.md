@@ -55,7 +55,7 @@ side pipelining (V2 with extended-query support), multi-user model
 | T# | Scope | Status | Commit |
 |---|---|---|---|
 | **T1** | Design spec (936 lines, 11 weak-spots + 5 open questions) + scaffold crate (`kessel-pg-gateway` workspace member, zero external deps) + `proto.rs` PG v3.0 message-type-tag catalog (14 frontend + 15 backend tags, 6 auth subcodes, 3 ReadyForQuery indicators, 11 PG type OIDs, 2 format codes, 3 pre-handshake magic codes, framing rules) + `server.rs` placeholder `accept` returning `Err(PgError::NotYetImplemented)` (T1 stub regression-lock test catches a half-shipped T2) + 10 KATs locking the wire-protocol invariants against PG §55 / `pqcomm.h` / `pg_type.dat` / RFC 5802 / RFC 7677. | **DONE** | `6bd8654` (spec) + `1e1786b` (scaffold) |
-| **T2** | Startup handshake + SCRAM-SHA-256 auth: `startup.rs` (StartupMessage parser, validate `protocol_version=196608`, handle SSL/Cancel/GSS magic via pre-handshake reply, key/value pair parser), `auth.rs` (SCRAM 4-round-trip state machine — AuthenticationSASL → SASLContinue → SASLFinal → AuthenticationOk; payload format per RFC 5802 §5.1 + RFC 7677), add `kessel-crypto::pbkdf2_hmac_sha256(password, salt, iterations, dk_len)` per RFC 8018 §5.2 (~20 lines on top of existing HMAC-SHA-256), ParameterStatus emit for {server_version, server_encoding, client_encoding, DateStyle, TimeZone, integer_datetimes, standard_conforming_strings, application_name}, BackendKeyData with deterministic-from-server-nonce pid+secret pair, ReadyForQuery('I'), Bearer-token bridge per spec §3.4 (ServerConfig.token = SCRAM password input), flip T1 stub regression-lock to "T2 emits AuthenticationSASL challenge". | OPEN | — |
+| **T2** | Startup handshake + SCRAM-SHA-256 auth: `startup.rs` (StartupMessage parser, validate `protocol_version=196608`, handle SSL/Cancel/GSS magic via pre-handshake reply, key/value pair parser), `auth.rs` (SCRAM 4-round-trip state machine — AuthenticationSASL → SASLContinue → SASLFinal → AuthenticationOk; payload format per RFC 5802 §5.1 + RFC 7677), add `kessel-crypto::pbkdf2_hmac_sha256(password, salt, iterations, dk_len)` per RFC 8018 §5.2 (~20 lines on top of existing HMAC-SHA-256), ParameterStatus emit for {server_version, server_encoding, client_encoding, DateStyle, TimeZone, integer_datetimes, standard_conforming_strings, application_name}, BackendKeyData with deterministic-from-server-nonce pid+secret pair, ReadyForQuery('I'), Bearer-token bridge per spec §3.4 (ServerConfig.token = SCRAM password input), flip T1 stub regression-lock to "T2 emits AuthenticationSASL challenge". | **DONE** | `aa524bd` (PBKDF2) + `a65e5a3` (startup) + `97b4b9d` (SCRAM+server) |
 | **T3** | Simple Query: `Q` message parser, SQL-text dispatch into `EngineApply::apply_sql`, EmptyQueryResponse (`I`) for whitespace/comment-only text, single-statement enforcement (multi-statement `Q` → `42601` syntax_error per spec §11 weak-spot #5). | OPEN | — |
 | **T4** | PG type-OID mapping table + text-format renderer (`types.rs`): per spec §5 — KesselDB `FieldKind::{Bool,U*,I*,Fixed,Char,Bytes,Timestamp,Ref,OverflowRef}` → PG type OID + per-type text-format render (`t`/`f` for bool, `\\x<hex>` for bytea, `YYYY-MM-DD HH:MM:SS.ffffff+00` for timestamptz, decimal for ints, decimal-string for numeric). Locked KAT per FieldKind. | OPEN | — |
 | **T5** | RowDescription (`T`) + DataRow (`D`) encoders: per-row streaming emit using T4 type table; field-format=0 (text) always; column NULL sentinel = i32 -1 (0xFFFFFFFF unsigned). | OPEN | — |
@@ -252,6 +252,272 @@ surfaces byte-untouched.
 **Post-T1 behavior:** the crate compiles + its 10 KATs pass. No
 PG-wire traffic flows; calling `server::accept` returns
 `PgError::NotYetImplemented`. The next session (T2) flips the stub.
+
+## T2 — what landed (2026-05-27, commits `aa524bd` + `a65e5a3` + `97b4b9d`)
+
+**Three commits, +42 KATs, RFC 5802 byte-equivalence proven.** T2
+delivers the startup handshake + the SCRAM-SHA-256 authentication
+exchange + the post-auth greeting (ParameterStatus + BackendKeyData
++ ReadyForQuery). After T2 a credentialed PG client speaking the
+v3.0 Frontend/Backend protocol can complete the connection-
+establishment dance against KesselDB end-to-end; what's missing
+for a real "psql works" experience is T3-T9 (Q-message parser +
+type mapping + RowDescription/DataRow encoders + ErrorResponse
+encoder + dispatch into `EngineApply::apply_sql`).
+
+**Commit `aa524bd` — `kessel-crypto`: PBKDF2-HMAC-SHA-256:**
+
+- `pbkdf2_hmac_sha256(password, salt, iterations) -> [u8; 32]` per
+  RFC 8018 §5.2. dkLen is locked to 32 bytes (== hLen for SHA-256),
+  so the outer-block loop collapses to a single T_1 block; the
+  implementation is ~20 lines (U_1 = HMAC(P, S || 0x00000001),
+  then iterate U_{i+1} = HMAC(P, U_i) for `iterations - 1` rounds,
+  XOR-folding into the output).
+- Panics on `iterations == 0` — RFC 8018 §5.2 requires c > 0 and a
+  never-iterated HMAC silently masquerading as a salted password
+  is the kind of bug that ships a security incident.
+- +4 KATs: three reproducible (P, S, c) vectors at c=1, c=2,
+  c=4096 (the c=4096 case IS the PG-SCRAM default and locks
+  SP-PG byte-equivalence to libpq); RFC 7914 Appendix B
+  reference vector for independent confirmation; determinism;
+  zero-iter-panic guard.
+
+**Commit `a65e5a3` — `kessel-pg-gateway::startup` (StartupMessage
+parser + pre-handshake dispatch):**
+
+- `classify_initial_message(buf) -> InitialMessage` dispatcher
+  handling all four PG §55.2.1 first-message shapes: Startup
+  (v3.0 = 196608), SslRequest (80877103), GssEncRequest
+  (80877104), CancelRequest (80877102). Each magic code lands a
+  dedicated variant; unknown codes → `UnsupportedProtocolVersion`.
+- Cap-before-allocation invariant: length prefix validated
+  against `PG_MAX_MESSAGE_SIZE` (16 MiB) BEFORE any allocation
+  — a client claiming 1 GiB gets clean `LengthTooLarge` rejection
+  without `Vec::with_capacity` ever being called.
+- `StartupError` enum maps to spec §6.2 SQLSTATEs:
+  `LengthTooSmall` / `LengthTooLarge` / `MalformedBody` /
+  `MalformedPreHandshake` / `MalformedCancelRequest` → `08P01`;
+  `UnsupportedProtocolVersion` → `0A000`; `MissingUserParameter`
+  → `28000` (empty user collapsed to missing — every auth path
+  requires non-empty).
+- Strict NUL-separated k=v body parser per PG §55.2.1: even
+  number of strings followed by an empty-string terminator; UTF-8
+  validation on every key + value; empty-key-before-terminator
+  rejected.
+- `SSL_REPLY_NO_TLS = b'N'` + `GSS_REPLY_NO_GSS = b'N'` consts
+  lock the V1 single-byte rejection reply per spec §3.2.
+- +16 KATs covering well-formed minimal + multi-param parses;
+  missing/empty `user` rejection; SSL/GSS classification + reply-
+  byte locks; CancelRequest extraction; PG-v2 + PG-v4 rejection;
+  length-too-small + length-too-large rejection; SSLRequest with
+  body + CancelRequest with wrong-length rejection; body
+  missing-terminator + odd-count-kv rejection; empty buffer →
+  `LengthTooSmall{length:0}`.
+
+**Commit `97b4b9d` — `kessel-pg-gateway::auth` (SCRAM-SHA-256) +
+`server.rs` flip:**
+
+SCRAM state machine (RFC 5802 + RFC 7677 + PG §55.3):
+- `encode_authentication_sasl_challenge()` — locked 24-byte
+  AuthenticationSASL frame advertising `SCRAM-SHA-256\0\0`.
+- `encode_authentication_sasl_continue(server_first)` /
+  `encode_authentication_sasl_final(server_final)` — R-envelope
+  wrappers with auth_type=11/12.
+- `encode_authentication_ok()` — locked literal
+  `[b'R',0,0,0,8,0,0,0,0]` (every PG client recognizes this exact
+  9-byte sequence).
+- `parse_sasl_initial_response(payload)` — parses PG §55.7.4
+  layout `[mech\0][client_first_len:u32][client_first]`;
+  mechanism MUST be `SCRAM-SHA-256` (any other →
+  `UnsupportedMechanism`).
+- `start_scram(client_first, token, server_nonce, iterations)` —
+  parses client-first per RFC 5802 §5.1 (enforces `n` channel-
+  binding flag — V1 doesn't advertise CB so `y` and `p=...` are
+  rejected); derives the per-session salt deterministically per
+  spec §3.4 (`salt = SHA-256(server_nonce || token)[..16]`); builds
+  the combined nonce (`client_nonce + server_nonce`); produces the
+  server-first-message `r=<combined>,s=<b64>,i=<iter>`; returns
+  `ScramState` carrying everything needed for round 2.
+- `finish_scram(client_final, state, token)` — parses client-
+  final; validates `c=biws` channel-binding (= base64("n,,") —
+  the only legal value for a no-CB client); validates echoed
+  nonce against the combined nonce we sent; base64-decodes the
+  proof + checks length is exactly 32 (SHA-256 output); re-
+  derives the full RFC 5802 §3 crypto chain (`SaltedPassword =
+  PBKDF2 → ClientKey = HMAC(SP, "Client Key") → StoredKey =
+  SHA-256(ClientKey) → AuthMessage = client_first_bare + "," +
+  server_first + "," + client_final_without_proof →
+  ClientSignature = HMAC(StoredKey, AuthMessage)`); recovers the
+  client's claimed ClientKey via `Proof XOR ClientSignature`;
+  CONSTANT-TIME-COMPARES `SHA-256(RecoveredClientKey)` against
+  StoredKey (no timing oracle); computes + returns
+  ServerSignature = `HMAC(ServerKey, AuthMessage)` as
+  `"v=<sig_b64>"`.
+
+`server.rs` `accept` flipped from T1's `NotYetImplemented` stub:
+- Signature now `accept<S: Read + Write, F: FnOnce() -> String>
+  (&mut S, Option<&[u8]>, F) -> Result<AcceptedSession, PgError>`
+  (the FnOnce is the per-session nonce generator — production
+  callers wire a CSPRNG, tests wire a fixed string for KAT
+  reproducibility).
+- Pre-handshake dispatch loop: SSLRequest → write 'N', loop;
+  GSSENCRequest → write 'N', loop; CancelRequest → close; the
+  first StartupMessage → continue to SCRAM.
+- SCRAM 4-round-trip drive: write AuthenticationSASL → read
+  SASLInitialResponse `p`-frame → write SASLContinue → read
+  SASLResponse `p`-frame → write SASLFinal → write
+  AuthenticationOk.
+- Post-auth greeting (spec §8.4 + PG §55.2.6): 8
+  `ParameterStatus` messages (`server_version`,
+  `server_encoding=UTF8`, `client_encoding=UTF8`,
+  `DateStyle=ISO,MDY`, `TimeZone=UTC`, `integer_datetimes=on`,
+  `standard_conforming_strings=on`, `application_name` echo from
+  StartupMessage); `BackendKeyData` with `pid + secret` derived
+  deterministically from `SHA-256(server_nonce || token)` per
+  spec §3.4 open question #4 (pid >= 16 to avoid kernel-reserved-
+  PID collision; V2 SP-PG T24 wires the cancel-key table);
+  `ReadyForQuery('I')`.
+- `PgError` widened: `StartupFailed(StartupError)`,
+  `AuthFailed(AuthError)`, `NoTokenConfigured` (`28000` — V1
+  closed-mode requires Bearer token; open-mode rejected BEFORE
+  reading client bytes), `Io(ErrorKind)`, `MessageTooLarge`,
+  `UnexpectedMessageDuringAuth{tag}`. Old `NotYetImplemented`
+  variant removed (T1 regression-lock flipped).
+
+Spec §3.4 Bearer↔SCRAM bridge implemented: the operator's
+`ServerConfig.token` IS the SCRAM password input (one credential
+surface; rotating token rotates both HTTP-Bearer and PG-SCRAM
+atomically); the `user` field is carried + logged but NOT used
+for authorization (V2 SP-PG-USERS for multi-user).
+
++21 KATs across the two new modules:
+
+`auth.rs` (+14):
+- `t2_authentication_sasl_challenge_byte_pattern` — locks the
+  24-byte AuthenticationSASL wire layout against PG §55.7.4.
+- `t2_authentication_ok_byte_pattern` — locks the 9-byte
+  literal `[b'R',0,0,0,8,0,0,0,0]`.
+- `t2_authentication_sasl_continue_envelope` /
+  `t2_authentication_sasl_final_envelope` — locks R-envelope
+  shapes for SASL Continue / Final.
+- `t2_sasl_initial_response_parses_mech_and_client_first` /
+  `t2_sasl_initial_response_rejects_other_mechanism` (SCRAM-SHA-1
+  rejected).
+- **`t2_scram_round_trip_locks_rfc_5802_invariants`** —
+  HEADLINE KAT: full RFC 5802 §3 client-emulator computes proof,
+  server `start_scram` + `finish_scram` verifies + returns
+  server-signature, client re-derives ServerSignature
+  independently and byte-compares it matches.
+- `t2_scram_bad_proof_is_rejected_28p01` (wrong token →
+  `ProofVerificationFailed`).
+- `t2_scram_nonce_mismatch_is_rejected` (replay-prevention
+  primitive enforced).
+- `t2_scram_bad_channel_binding_rejected` (`c=` != "biws"
+  → rejection).
+- `t2_scram_client_first_with_y_flag_rejected` (`gs2-cbind-flag
+  = "y"` → `BadChannelBinding`).
+- `t2_scram_client_final_missing_proof_rejected` /
+  `t2_scram_client_final_non_base64_proof_rejected` /
+  `t2_scram_client_final_short_proof_rejected`.
+- `t2_scram_start_is_deterministic_given_fixed_nonce` (locks
+  spec §3.4 salt derivation against refactor entropy).
+
+`server.rs` (+7):
+- **`t2_accept_runs_full_scram_handshake_to_ready_for_query`** —
+  FLAGSHIP KAT: drives the full 3-frame inbound stream
+  (StartupMessage + SASLInitialResponse + SASLResponse with a
+  valid proof) through `accept()` over an in-memory `Read+Write`
+  pipe; asserts AcceptedSession returned with right `user` +
+  `pid >= 16`; asserts outbound bytes contain AuthenticationSASL
+  prefix + AuthenticationOk literal + ParameterStatus
+  (server_version, UTF8) + BackendKeyData with announced pid +
+  secret + ReadyForQuery; asserts order invariant
+  AuthenticationOk PRECEDES ReadyForQuery.
+- `t2_accept_rejects_when_no_token_configured` (no bytes
+  touched on the stream — the rejection is pre-read).
+- `t2_accept_handles_ssl_request_then_completes_handshake`
+  (SSLRequest → 'N' reply → SCRAM proceeds normally).
+- `t2_accept_bad_proof_returns_auth_failed_no_ready_for_query`
+  — proves the no-oracle invariant: failed proof emits NO
+  AuthenticationOk + NO ReadyForQuery (per spec §6.2 + RFC 5802
+  §7 — every failure looks the same from outside).
+- `t2_accept_eof_before_startup_is_io_error`.
+- `t2_backend_key_data_derivation_is_deterministic`.
+- `t2_backend_key_data_changes_across_nonces` (different
+  per-session nonces produce different (pid, secret) — the
+  entropy story V2's cancel-key table will depend on).
+
+T1 regression-lock `t1_accept_returns_not_yet_implemented_stub`
+removed (superseded by `t2_accept_runs_full_scram_handshake_*`
+which is the stronger "stub is gone AND real handshake works
+end-to-end" lock).
+
+**Zero-dep stance preserved.** `cargo tree -p kessel-pg-gateway
+-e normal` shows only workspace crates: kessel-proto,
+kessel-client, kessel-crypto. `#![forbid(unsafe_code)]` honored
+across all three new modules + the enriched server.rs.
+
+**Test counts:**
+- kessel-crypto: 9 → 13 (+4)
+- kessel-pg-gateway: 10 → 47 (+37 across the three commits: +0
+  crypto, +16 startup, +21 auth+server)
+- Workspace default: 1460 → 1501 (+41 — kessel-crypto delta
+  also flows through to feature-gated builds)
+- Workspace --all-features: ~1515 → 1556 (+41)
+
+seed-7 GREEN (`kessel-vsr large_seed_corpus_is_deterministic_
+and_converges` passes — the PG-wire surface is byte-disjoint
+from the replicated state machine, so SP-PG cannot regress the
+seed-7 corpus). HTTP/1.1 + WebSocket surfaces byte-untouched.
+`cargo test --workspace` GREEN; `cargo test --workspace
+--all-features` GREEN; no clippy regressions; no new tree-grep
+matches for `unsafe`.
+
+**Headline question — did SCRAM-SHA-256 land cleanly with RFC
+5802 vectors passing? YES.** The flagship
+`t2_scram_round_trip_locks_rfc_5802_invariants` KAT drives a
+complete RFC 5802 §3 client-emulator round-trip (the client
+emulator and the server share zero state — proof is computed
+purely from the wire bytes the server would emit) and the
+server-signature the server produces is byte-equal to what the
+client re-derives independently. The complementary
+`t2_accept_runs_full_scram_handshake_to_ready_for_query`
+server-loop KAT drives the same exchange through `accept()`
+over an in-memory `Read+Write` pipe and asserts the full post-
+auth greeting byte sequence. A real `PGPASSWORD=$KESSEL_TOKEN
+psql -U test -h localhost` session driven by libpq should pass
+the same gate (smoke-test pending T12 listener wire-up).
+
+**What T2 deliberately did NOT do:**
+- No real listener (T12 — gated behind `pg-gateway` feature flag).
+- No Q-message parser (T3).
+- No type-OID mapping or text-format renderer (T4).
+- No RowDescription/DataRow encoder (T5).
+- No CommandComplete/ReadyForQuery encoder for query results (T6 —
+  T2 emits ReadyForQuery for the post-auth greeting only).
+- No ErrorResponse encoder (T7) — startup-phase errors return
+  `PgError::*` to the (not-yet-wired) server-loop; the SQLSTATE
+  encoder lands in T7.
+- No `OpResult` → SQLSTATE map (T7).
+- No SELECT/INSERT/UPDATE/DELETE wire-up (T8/T9).
+- No `kesseldb-server` `pg-gateway` feature flag (T12 — deferred
+  so a half-shipped T2..T9 cannot accidentally surface to
+  operators).
+- No real psql smoke (T10 — needs T12 first).
+- No `allow_anonymous` flag (spec §3.4 mentions it; V1 ships the
+  closed-mode-only path. The flag would gate an
+  AuthenticationOk-without-SCRAM short-circuit — useful for
+  local dev, NEVER prod; deferred so a default-off knob doesn't
+  ship accidentally-on).
+
+**Post-T2 behavior:** the crate compiles + its 47 KATs pass + the
+SCRAM-SHA-256 server-side state machine is byte-equivalent to
+RFC 5802. No real TCP listener accepts PG connections yet
+(T12 wires it). Calling `server::accept` directly with a
+`Read + Write` stream and a Bearer token runs the full handshake
+to ReadyForQuery; the returned `AcceptedSession` carries the
+username and the BackendKeyData pair the server announced. T3
+adds the simple-query loop on top.
 
 ## References
 

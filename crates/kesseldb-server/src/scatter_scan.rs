@@ -2881,4 +2881,557 @@ mod tests {
             "8-shard fanout with bounded buffers should be <2s, was {elapsed:?}"
         );
     }
+
+    // ---------- T8 pentest sweep (SP155 §7.5 — 10 adversarial cases) ----------
+    //
+    // Each pentest:
+    //   1. Constructs an adversarial `ShardCaller` (returns oversized,
+    //      malformed, timing-out, error-on-call, etc.).
+    //   2. Drives `scatter_and_merge` (or `scatter_scan_fanout` where
+    //      appropriate).
+    //   3. Asserts the typed response — `Got` / `Unavailable` /
+    //      `SchemaError` per the spec's expected column.
+    //   4. Where relevant, asserts post-conditions:
+    //        - merger doesn't OOM (test still completes)
+    //        - no panic (test reaches its end)
+    //        - merger thread doesn't leak (the next scatter call works
+    //          + bounded wall-clock)
+    //
+    // This is the SP155 §7.5 acceptance criterion #3 ("all 10 pentests
+    // pass"). Per spec rationale: each pentest stays under ~1s so the
+    // sweep doesn't bloat CI.
+
+    /// `PentestShard` — a flexible adversarial mock used across the
+    /// 10 pentests. The variants cover: sleep > timeout, oversized
+    /// payload, malformed framing, transport error (Err(string)),
+    /// instant-error, and a normal Got reply.
+    enum PentestBehavior {
+        /// Sleep for `d` then return `canned`. Used to drive timeout-
+        /// expiry pentests.
+        SleepThenGot(Duration, Vec<u8>),
+        /// Return an oversized `Got(payload)` (still well-formed; the
+        /// merger's `iter_rows` walks the whole frame — assert no OOM).
+        OversizedGot(Vec<u8>),
+        /// Return `Got(bytes)` where bytes are a malformed `[u32
+        /// rowlen][record]*` frame (claims a row larger than payload).
+        MalformedGot(Vec<u8>),
+        /// Return `Err(transport_error_string)` — simulates a partial-
+        /// frame-then-close OR a TCP RST mid-stream (the `ShardCaller`
+        /// abstraction surfaces both as `Err(String)` per its contract;
+        /// the scatter layer translates to `Unavailable`).
+        TransportErr(String),
+        /// Plain `Got(canned)` after no sleep.
+        Got(Vec<u8>),
+    }
+
+    struct PentestShard {
+        behavior: PentestBehavior,
+        ran: Arc<AtomicUsize>,
+        cancelled_pre_call: Arc<AtomicUsize>,
+    }
+
+    impl PentestShard {
+        fn new(behavior: PentestBehavior) -> Self {
+            PentestShard {
+                behavior,
+                ran: Arc::new(AtomicUsize::new(0)),
+                cancelled_pre_call: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl ShardCaller for PentestShard {
+        fn call(&mut self, _op: &Op) -> Result<OpResult, String> {
+            self.ran.fetch_add(1, Ordering::SeqCst);
+            match &self.behavior {
+                PentestBehavior::SleepThenGot(d, payload) => {
+                    thread::sleep(*d);
+                    Ok(OpResult::Got(payload.clone()))
+                }
+                PentestBehavior::OversizedGot(p) => Ok(OpResult::Got(p.clone())),
+                PentestBehavior::MalformedGot(p) => Ok(OpResult::Got(p.clone())),
+                PentestBehavior::TransportErr(e) => Err(e.clone()),
+                PentestBehavior::Got(p) => Ok(OpResult::Got(p.clone())),
+            }
+        }
+        fn call_with_cancel(
+            &mut self,
+            op: &Op,
+            cancel: &Arc<AtomicBool>,
+        ) -> Result<OpResult, String> {
+            if cancel.load(Ordering::SeqCst) {
+                self.cancelled_pre_call.fetch_add(1, Ordering::SeqCst);
+                return Ok(OpResult::Unavailable);
+            }
+            // For SleepThenGot we poll cancel in 5ms slices (lets
+            // pentest 6 / 7 observe cancel mid-sleep without unbound
+            // wait).
+            if let PentestBehavior::SleepThenGot(d, payload) = &self.behavior {
+                let step = Duration::from_millis(5);
+                let mut remaining = *d;
+                while remaining > Duration::from_millis(0) {
+                    if cancel.load(Ordering::SeqCst) {
+                        self.cancelled_pre_call
+                            .fetch_add(1, Ordering::SeqCst);
+                        return Ok(OpResult::Unavailable);
+                    }
+                    let s = if remaining > step { step } else { remaining };
+                    thread::sleep(s);
+                    remaining = remaining.saturating_sub(s);
+                }
+                self.ran.fetch_add(1, Ordering::SeqCst);
+                return Ok(OpResult::Got(payload.clone()));
+            }
+            self.call(op)
+        }
+    }
+
+    // -- Pentest 1: shard_times_out --
+
+    /// **PT1 — `shard_times_out`**: one shard sleeps PAST the per-
+    /// shard timeout; merger returns the partial/short slot as
+    /// `Unavailable` for that shard (per `scatter_scan_fanout`'s T1
+    /// contract). The other shards' replies are unaffected.
+    ///
+    /// We use `scatter_scan_fanout` (not `scatter_and_merge`) because
+    /// the fanout is where the per-shard deadline lives; merging is a
+    /// separate concern. `scatter_and_merge` would V1-hard-fail on
+    /// the first `Unavailable`, which is also documented behavior.
+    #[test]
+    fn pentest_1_shard_times_out_yields_unavailable_slot_for_that_shard() {
+        let s0 = PentestShard::new(PentestBehavior::Got(b"fast-0".to_vec()));
+        let s1 = PentestShard::new(PentestBehavior::SleepThenGot(
+            Duration::from_millis(500),
+            b"too-slow".to_vec(),
+        ));
+        let s2 = PentestShard::new(PentestBehavior::Got(b"fast-2".to_vec()));
+        let out = scatter_scan_fanout(
+            vec![s0, s1, s2],
+            &dummy_select(),
+            Duration::from_millis(80),
+        );
+        assert_eq!(out.len(), 3, "every shard has a slot");
+        assert_eq!(out[0], OpResult::Got(b"fast-0".to_vec()));
+        assert_eq!(
+            out[1],
+            OpResult::Unavailable,
+            "the timed-out shard contributes Unavailable"
+        );
+        // shard_2 may be Got OR Unavailable depending on whether its
+        // deadline window already elapsed waiting for shard_1; both
+        // outcomes are valid per the existing T1 KAT contract.
+        match &out[2] {
+            OpResult::Got(b) => assert_eq!(b, b"fast-2"),
+            OpResult::Unavailable => {} // acceptable
+            other => panic!("shard 2 unexpected slot: {other:?}"),
+        }
+    }
+
+    // -- Pentest 2: shard_returns_oversized_payload --
+
+    /// **PT2 — `shard_returns_oversized_payload`**: one shard returns
+    /// a (well-formed) ~1 MiB payload. Merger walks the rows, doesn't
+    /// OOM, completes promptly. The spec's "1 GiB" attack is mirrored
+    /// at 1 MiB here for CI speed — same logic, smaller magnitude.
+    /// The merger has NO router-side size cap today (V1 documented
+    /// honest gap; spec §3.8 mentions a 64 MiB cap as a follow-up),
+    /// so this pentest documents the V1 reality: it accepts the
+    /// payload AS LONG AS it's well-formed framing. The defense
+    /// against the actual 1 GiB attack is bounded by per-`Op` wire
+    /// size cap in `kessel-proto` (a separate layer); the scatter
+    /// merger inherits that cap implicitly.
+    #[test]
+    fn pentest_2_shard_returns_oversized_payload_no_oom_completes_promptly() {
+        // 1 MiB payload, 1024 rows × 1024 bytes each.
+        let row_count = 1024usize;
+        let row_size = 1024usize;
+        let one_row = vec![0xABu8; row_size];
+        let mut big_payload = Vec::with_capacity(row_count * (4 + row_size));
+        for _ in 0..row_count {
+            big_payload.extend_from_slice(&(row_size as u32).to_le_bytes());
+            big_payload.extend_from_slice(&one_row);
+        }
+        let s0 = PentestShard::new(PentestBehavior::OversizedGot(big_payload));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let t0 = Instant::now();
+        let out = scatter_and_merge(
+            vec![s0],
+            &dummy_select(),
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &ScatterKind::Unordered { limit: 0 },
+            cancel,
+        );
+        let elapsed = t0.elapsed();
+        // Bytes are well-formed → merger emits them as-is.
+        let bytes = match &out {
+            OpResult::Got(b) => b,
+            other => panic!("expected Got, got {other:?}"),
+        };
+        // Walk the merged payload — count rows; row count should match.
+        let mut count = 0usize;
+        let mut p = 0usize;
+        while p < bytes.len() {
+            let len =
+                u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+            p += 4 + len;
+            count += 1;
+        }
+        assert_eq!(count, row_count, "every row passed through");
+        // No OOM + completes within a generous CI bound.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "1 MiB oversized payload must merge in <2s (no OOM, no \
+             pathological behavior), was {elapsed:?}"
+        );
+    }
+
+    // -- Pentest 3: shard_returns_malformed_bytes --
+
+    /// **PT3 — `shard_returns_malformed_bytes`**: one shard returns
+    /// a `Got(bytes)` whose `[u32 rowlen][record]*` framing is broken
+    /// (claims a row larger than the remaining payload). Merger must
+    /// surface `SchemaError`, NEVER panic.
+    #[test]
+    fn pentest_3_shard_returns_malformed_bytes_yields_schema_error_no_panic() {
+        // Claim a 4 GiB row; provide only 4 bytes of body. iter_rows
+        // detects body_end overflow → "row body exceeds payload" →
+        // merger surfaces SchemaError.
+        let bad = {
+            let mut v = (u32::MAX).to_le_bytes().to_vec();
+            v.extend_from_slice(&[1, 2, 3, 4]);
+            v
+        };
+        let s0 = PentestShard::new(PentestBehavior::MalformedGot(bad));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let out = scatter_and_merge(
+            vec![s0],
+            &dummy_select(),
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &ScatterKind::Unordered { limit: 0 },
+            cancel,
+        );
+        match out {
+            OpResult::SchemaError(msg) => {
+                assert!(
+                    msg.contains("scatter merge") || msg.contains("framing")
+                        || msg.contains("payload"),
+                    "SchemaError message must mention merger/framing: {msg}"
+                );
+            }
+            other => panic!("expected SchemaError, got {other:?}"),
+        }
+    }
+
+    // -- Pentest 4: shard_returns_partial_then_closes --
+
+    /// **PT4 — `shard_returns_partial_then_closes`**: simulates a
+    /// half-frame + EOF — the transport layer (`ClusterClient::call`)
+    /// would surface this as `Err(String)` (a read error). Scatter
+    /// translates `Err(_)` → `OpResult::Unavailable` per its T1
+    /// contract. Merger then V1-hard-fails the whole result to
+    /// `Unavailable` per SP155 §6.
+    #[test]
+    fn pentest_4_shard_returns_partial_then_closes_surfaces_unavailable() {
+        let s0 = PentestShard::new(PentestBehavior::Got(
+            rows_to_payload(&[b"good"]),
+        ));
+        let s1 = PentestShard::new(PentestBehavior::TransportErr(
+            "transport: read 4 bytes, peer closed".into(),
+        ));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let out = scatter_and_merge(
+            vec![s0, s1],
+            &dummy_select(),
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &ScatterKind::Unordered { limit: 0 },
+            cancel,
+        );
+        assert_eq!(
+            out,
+            OpResult::Unavailable,
+            "transport-err shard surfaces as Unavailable per V1 hard-fail"
+        );
+    }
+
+    // -- Pentest 5: shard_dies_mid_scan --
+
+    /// **PT5 — `shard_dies_mid_scan`**: same shape as PT4 but more
+    /// violent — TCP RST mid-stream surfaces as `Err(...)` from
+    /// `ShardCaller::call`. Scatter translates → `Unavailable`, merger
+    /// V1-hard-fails. Additionally: we lock that ALL OTHER worker
+    /// threads JOIN cleanly (no leak) — `scatter_and_merge` returns
+    /// promptly + the next call works.
+    #[test]
+    fn pentest_5_shard_dies_mid_scan_unavailable_no_thread_leak() {
+        let s0 = PentestShard::new(PentestBehavior::Got(
+            rows_to_payload(&[b"alive"]),
+        ));
+        let s1 = PentestShard::new(PentestBehavior::TransportErr(
+            "transport: connection reset by peer".into(),
+        ));
+        let s2 = PentestShard::new(PentestBehavior::Got(
+            rows_to_payload(&[b"also-alive"]),
+        ));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let t0 = Instant::now();
+        let out = scatter_and_merge(
+            vec![s0, s1, s2],
+            &dummy_select(),
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &ScatterKind::Unordered { limit: 0 },
+            cancel,
+        );
+        let elapsed = t0.elapsed();
+        assert_eq!(out, OpResult::Unavailable);
+        // Bounded wall-clock + a follow-up call works (no leaked
+        // threads holding state).
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "mid-scan death must surface promptly, was {elapsed:?}"
+        );
+        // Follow-up call works — listener/scatter machinery still alive.
+        let s_follow = PentestShard::new(PentestBehavior::Got(
+            rows_to_payload(&[b"follow-up"]),
+        ));
+        let cancel2 = Arc::new(AtomicBool::new(false));
+        let out2 = scatter_and_merge(
+            vec![s_follow],
+            &dummy_select(),
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &ScatterKind::Unordered { limit: 0 },
+            cancel2,
+        );
+        assert_eq!(
+            out2,
+            OpResult::Got(rows_to_payload(&[b"follow-up"])),
+            "scatter still works after a mid-scan death"
+        );
+    }
+
+    // -- Pentest 6: router_drops_receiver_under_limit --
+
+    /// **PT6 — `router_drops_receiver_under_limit`**: LIMIT-cancellation
+    /// — fast shard fulfills LIMIT, slow shards see cancel pre-call,
+    /// senders observe SendError if they were already past their pre-
+    /// call check. No panic, no leak. (This is the inside-out view of
+    /// the T6 cancel KATs, framed as a pentest.)
+    #[test]
+    fn pentest_6_router_drops_receiver_under_limit_no_panic_no_leak() {
+        let s0 = PentestShard::new(PentestBehavior::Got(rows_to_payload(&[
+            b"r0", b"r1", b"r2", b"r3", b"r4", b"r5",
+        ])));
+        let s1 = PentestShard::new(PentestBehavior::SleepThenGot(
+            Duration::from_millis(200),
+            rows_to_payload(&[b"x", b"y", b"z"]),
+        ));
+        let s2 = PentestShard::new(PentestBehavior::SleepThenGot(
+            Duration::from_millis(200),
+            rows_to_payload(&[b"p", b"q", b"r"]),
+        ));
+        let cancelled1 = s1.cancelled_pre_call.clone();
+        let cancelled2 = s2.cancelled_pre_call.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let t0 = Instant::now();
+        let out = scatter_and_merge(
+            vec![s0, s1, s2],
+            &dummy_select(),
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &ScatterKind::Unordered { limit: 3 },
+            cancel.clone(),
+        );
+        let elapsed = t0.elapsed();
+        // LIMIT 3 satisfied from shard_0 alone.
+        let bytes = match &out {
+            OpResult::Got(b) => b,
+            other => panic!("expected Got, got {other:?}"),
+        };
+        let mut count = 0usize;
+        let mut p = 0usize;
+        while p < bytes.len() {
+            let len =
+                u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+            p += 4 + len;
+            count += 1;
+        }
+        assert_eq!(count, 3);
+        // Late shards observed cancel + bailed cleanly.
+        assert!(cancelled1.load(Ordering::SeqCst) >= 1);
+        assert!(cancelled2.load(Ordering::SeqCst) >= 1);
+        // No leak / no deadlock — function returns inside a tight
+        // window despite 200ms sleeps.
+        assert!(
+            elapsed < Duration::from_millis(180),
+            "router-drop-under-limit must return promptly, was {elapsed:?}"
+        );
+        assert!(cancel.load(Ordering::SeqCst));
+    }
+
+    // -- Pentest 7: cancel_atomic_visibility --
+
+    /// **PT7 — `cancel_atomic_visibility`**: set cancel from main
+    /// thread (via the pre-fired flag); verify EVERY worker observes
+    /// it. We pre-cancel before calling `scatter_and_merge` — the
+    /// function short-circuits BEFORE spawning workers (per the SP155
+    /// §3.7 "stop scanning at the strongest possible point"
+    /// contract). Result: empty Got; zero workers ran.
+    ///
+    /// For a stress test of cancel propagation MID-fanout, see PT6.
+    #[test]
+    fn pentest_7_cancel_atomic_visibility_every_worker_observes() {
+        // Stress: 8 shards, 100 iterations, each iteration creates a
+        // fresh cancel flag set BEFORE the call. Every worker must see
+        // the flag at its pre-call check (or the scatter must short-
+        // circuit before spawning).
+        for iter in 0..100u32 {
+            let shards: Vec<PentestShard> = (0..8u8)
+                .map(|i| {
+                    PentestShard::new(PentestBehavior::Got(rows_to_payload(
+                        &[&[i; 4]],
+                    )))
+                })
+                .collect();
+            let rans: Vec<Arc<AtomicUsize>> =
+                shards.iter().map(|s| s.ran.clone()).collect();
+            let cancel = Arc::new(AtomicBool::new(true)); // pre-fired
+            let out = scatter_and_merge(
+                shards,
+                &dummy_select(),
+                DEFAULT_PER_SHARD_TIMEOUT,
+                &ScatterKind::Unordered { limit: 0 },
+                cancel,
+            );
+            assert_eq!(
+                out,
+                OpResult::Got(Vec::new()),
+                "iter {iter}: pre-cancelled scatter must return empty Got"
+            );
+            for (i, ran) in rans.iter().enumerate() {
+                assert_eq!(
+                    ran.load(Ordering::SeqCst),
+                    0,
+                    "iter {iter} shard {i}: worker must NOT have run \
+                     (cancel observed at the top of scatter_and_merge)"
+                );
+            }
+        }
+    }
+
+    // -- Pentest 8: zero_shards --
+
+    /// **PT8 — `zero_shards`**: fan-out to empty shard list returns
+    /// empty result, no thread spawned. (The spec column says
+    /// "caught at Router::new"; for the scatter layer the
+    /// `shards.is_empty()` early-return is the equivalent shield.)
+    #[test]
+    fn pentest_8_zero_shards_returns_empty_got_no_thread_spawned() {
+        let shards: Vec<PentestShard> = Vec::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        // Bound the wall-clock: zero shards must short-circuit at the
+        // top of the function (no thread creation / no channel
+        // operations / no per-shard deadline window).
+        let t0 = Instant::now();
+        let out = scatter_and_merge(
+            shards,
+            &dummy_select(),
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &ScatterKind::Unordered { limit: 100 },
+            cancel,
+        );
+        let elapsed = t0.elapsed();
+        assert_eq!(out, OpResult::Got(Vec::new()));
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "K=0 must short-circuit instantly, was {elapsed:?}"
+        );
+        // Also verify scatter_scan_fanout has the same short-circuit.
+        let shards2: Vec<PentestShard> = Vec::new();
+        let out2 = scatter_scan_fanout(
+            shards2,
+            &dummy_select(),
+            DEFAULT_PER_SHARD_TIMEOUT,
+        );
+        assert_eq!(out2, Vec::<OpResult>::new());
+    }
+
+    // -- Pentest 9: one_shard --
+
+    /// **PT9 — `one_shard`**: K=1 case is byte-identical to the
+    /// non-scatter direct call. (Regression-lock for the T2
+    /// `merge_unordered_k1_byte_identical_to_single_shard` invariant,
+    /// re-stated through the full scatter_and_merge pipeline.)
+    #[test]
+    fn pentest_9_one_shard_byte_identical_to_non_scatter_path() {
+        let payload = rows_to_payload(&[
+            b"only-shard-row-0",
+            b"only-shard-row-1",
+            b"only-shard-row-2",
+        ]);
+        let s0 = PentestShard::new(PentestBehavior::Got(payload.clone()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let out = scatter_and_merge(
+            vec![s0],
+            &dummy_select(),
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &ScatterKind::Unordered { limit: 0 },
+            cancel,
+        );
+        assert_eq!(
+            out,
+            OpResult::Got(payload),
+            "K=1 scatter must be byte-identical to a direct shard call"
+        );
+    }
+
+    // -- Pentest 10: determinism_replay --
+
+    /// **PT10 — `determinism_replay`**: same input × 100 runs ⇒ same
+    /// merged bytes every time. Locks: no HashMap iteration order
+    /// leak, no time-based decisions, no per-run shard_id reassignment.
+    #[test]
+    fn pentest_10_determinism_replay_same_input_100_runs_byte_identical() {
+        // Build deterministic per-shard payloads (Sorted to exercise
+        // the heap merge — the most likely vector for non-determinism).
+        let rec = |v: u64| -> Vec<u8> { v.to_le_bytes().to_vec() };
+        let s0_payload = rows_to_payload(&[&rec(1), &rec(4), &rec(9)]);
+        let s1_payload = rows_to_payload(&[&rec(2), &rec(3), &rec(7)]);
+        let s2_payload = rows_to_payload(&[&rec(5), &rec(6), &rec(8)]);
+        let mut first: Option<OpResult> = None;
+        for run in 0..100u32 {
+            let s0 = PentestShard::new(PentestBehavior::Got(s0_payload.clone()));
+            let s1 = PentestShard::new(PentestBehavior::Got(s1_payload.clone()));
+            let s2 = PentestShard::new(PentestBehavior::Got(s2_payload.clone()));
+            let cancel = Arc::new(AtomicBool::new(false));
+            let out = scatter_and_merge(
+                vec![s0, s1, s2],
+                &dummy_select(),
+                DEFAULT_PER_SHARD_TIMEOUT,
+                &ScatterKind::Sorted {
+                    sort_kind: FieldKind::U64,
+                    sort_offset: 0,
+                    sort_width: 8,
+                    desc: false,
+                    offset: 0,
+                    limit: 0,
+                },
+                cancel,
+            );
+            match &first {
+                None => first = Some(out),
+                Some(baseline) => {
+                    assert_eq!(
+                        &out, baseline,
+                        "run {run}: determinism violated — merged bytes \
+                         differ from run 0"
+                    );
+                }
+            }
+        }
+        // Cross-check: the deterministic merged bytes are the ascending
+        // sequence [1, 2, 3, 4, 5, 6, 7, 8, 9].
+        let expected = rows_to_payload(&[
+            &rec(1), &rec(2), &rec(3), &rec(4), &rec(5),
+            &rec(6), &rec(7), &rec(8), &rec(9),
+        ]);
+        assert_eq!(first.unwrap(), OpResult::Got(expected));
+    }
 }

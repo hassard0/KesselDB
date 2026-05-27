@@ -62,10 +62,10 @@ side pipelining (V2 with extended-query support), multi-user model
 | **T6** | CommandComplete (`C`) + ReadyForQuery (`Z`) encoders: tag formats "SELECT N" / "INSERT 0 N" / "UPDATE N" / "DELETE N" / "SET" / "CREATE TABLE" (inferred from SQL leading keyword per spec §12 open question on DDL). | **DONE** | `ba450f6` |
 | **T7** | ErrorResponse (`E`) encoder + OpResult→SQLSTATE map: full table from spec §7.2 — `Exists`→`23505`, `SchemaError(msg)`→`42P01`/`42703`/`42804`/`42000` via string-match heuristic (spec §7.2 + §11 weak-spot #2), `Constraint`→`23000`/`23502`/`23505`, `Unavailable`→FATAL `57P03`, `Unauthorized`→FATAL `28000`, `TxAborted` variants → `40001`/`25006`/`58030`, unknown → `XX000` internal_error. | **DONE** | `07bac3f` |
 | **T8** | SELECT end-to-end: schema lookup (new `EngineApply::describe_table(name) -> Option<Vec<PgColumn>>` trait method so PG-wire can map FieldKind → PG type OID + column name + width for RowDescription) + SELECT * FROM table → real result rows over the wire + `dispatch.rs` simple-query glue + `server::run_session` query loop. | **DONE** | `612d953` (+ `fbdf885` test-import cleanup) |
-| **T9** | INSERT / UPDATE / DELETE end-to-end via simple-query: dispatch through `EngineApply::apply_sql` unchanged; CommandComplete tag inference from SQL leading keyword. | OPEN | — |
+| **T9** | INSERT / UPDATE / DELETE end-to-end via simple-query: dispatch through `EngineApply::apply_sql_with_count` (new trait method with default impl) so the CommandComplete tag carries a real row count — `INSERT 0 N` / `UPDATE N` / `DELETE N`. `cmd_complete_tag_for_sql(sql, count)` extends T6's `infer_command_tag` with leading-comment stripping + full DDL coverage (CREATE TABLE/INDEX/UNIQUE INDEX/RANGE INDEX/VIEW, DROP TABLE/INDEX/VIEW/SCHEMA, ALTER TABLE/INDEX, TRUNCATE TABLE) + transaction control (BEGIN/COMMIT/ROLLBACK/etc.). `count_insert_values` counts top-level `(...)` VALUES tuples (quoted-string + comment-aware) so multi-row INSERT (engine returns Ok-collapsing-Op::Txn) still emits `INSERT 0 N`. | **DONE** | `cf4a012` |
 | **T10** | psql compatibility hand-test + USAGE.md sample-session + KAT-level synthetic peer driving full handshake → query → close sequence. Acceptance: `PGPASSWORD=$KESSEL_TOKEN psql -h localhost -p 5432 -U test "SELECT 1"` returns `1`. | OPEN | — |
 | **T11** | pgcli / DBeaver / JDBC compatibility smoke (manual; doc results in `docs/USAGE.md`) — one real client per smoke + log any compat gaps as named follow-ups. Note: pgAdmin/DBeaver may CHOKE because V1 doesn't ship `pg_catalog` stubs — that's the V1 scope boundary (CLI + programmatic clients work; GUI admin tools are V2). | OPEN | — |
-| **T12** | Listener integration: `kesseldb-server` `pg-gateway` feature flag mirroring `http-gateway`, `main.rs` spawn parallel to HTTP listener, port config via `PgGatewayConfig.listen_addr` (default 5432), bind separately from HTTP listener (a misbehaving pgcli cannot starve HTTP clients). | OPEN | — |
+| **T12** | Listener integration: `kesseldb-server` `pg-gateway` feature flag mirroring `http-gateway`, `main.rs` spawn parallel to HTTP listener, port config via `ServerConfig.pg_addr` (default 5432), bind separately from HTTP listener (a misbehaving pgcli cannot starve HTTP clients via `pg_max_conns=256` independent of `max_conns=1024`). New `DESCRIBE_BY_NAME_TAG=0xF7` engine admin frame for the read-only name→type-def round-trip (Catalog is non-Send). New `impl kessel_pg_gateway::EngineApply for EngineHandle` feature-gated; `KESSELDB_PG_ADDR` env var in main.rs; `serve_pg` listener with `set_read_timeout(pg_idle_timeout)` wired; per-session SCRAM server nonce from `std::time::SystemTime` nanos (V1 entropy source; V2 SP-PG T24 wires a real CSPRNG). | **DONE** | `942911a` |
 | **T13** | Bounded connection cap (`DEFAULT_MAX_PG_CONNS=256` per spec §8.1, smaller than HTTP gateway's 1024 because PG clients hold connections longer); too-many-connections ErrorResponse `53300`. | OPEN | — |
 | **T14** | Pentest sweep — 10+ adversarial inputs: truncated startup, oversized message length (claim 1 GiB → clean `08P01` BEFORE allocation), malformed SCRAM client_first / client_final, auth replay, SQLi in `user` field, version 0/1/2/4/65535, NUL in payload, U+0000 in SQL, extended-query message in V1 (→`0A000`), repeated handshake on already-authed connection. | OPEN | — |
 | **T15** | Per-connection reader/writer-thread split + bounded `mpsc::sync_channel::<Vec<u8>>(PG_SEND_QUEUE_BOUND=64)` send queue + close-on-overflow (mirror SP-WS T5 shape — `TcpStream::try_clone()`, monotonic `std::time::Instant`, `try_send` on overflow). | OPEN | — |
@@ -785,6 +785,235 @@ via simple-query (wire the real row-count into CommandComplete
 tags — the engine needs to surface `affected_rows` from
 `apply_sql`; T9 either adds a sibling method or extends
 `OpResult` to carry the count for DML).
+
+## T9 + T12 — what landed (2026-05-27, commits `cf4a012` + `942911a`)
+
+**Two commits, +20 KATs total, all pushed to main, all CI-green.**
+
+### T9 — INSERT/UPDATE/DELETE row counts in CommandComplete (`cf4a012`)
+
+Adds the DML-row-count polish on top of T8's tag-inference. The
+engine boundary stays minimal: a new `EngineApply::apply_sql_with_count`
+default method returns `(OpResult, u64)` — count=1 for any
+`Ok`-shaped success, count=0 for errors. This is accurate for
+single-row INSERT/UPDATE/DELETE on the V1 grammar's ID-fast-path
+(the hot path: `INSERT INTO t (id, ...) VALUES (...)`, `UPDATE t
+ID <n> SET ...`, `DELETE FROM t ID <n>`).
+
+**The two real-world honest edges:**
+
+1. **WHERE-clause UPDATE/DELETE** (V2 SP-SQL grammar extension)
+   would land here lossy at count=1 until either a real
+   `affected_rows` field lands on `OpResult::Ok` (V2 enhancement)
+   or the engine routes such ops through a count-bearing Op.
+
+2. **Multi-row INSERT VALUES** compiles to one atomic `Op::Txn`
+   whose `OpResult::Ok` doesn't carry the count. T9 recovers N
+   via `dispatch::count_insert_values(sql)` — a tiny lexer that
+   counts top-level `(...)` VALUES tuples while honouring quoted
+   single-quote strings (with doubled-`''` escapes) + line + block
+   comments. So `INSERT INTO t (id, n) VALUES (1, 'has ( in it'),
+   (2, 'b')` correctly returns 2, not 3.
+
+The `dispatch_query` glue routes DML through
+`apply_sql_with_count` and uses `max(engine_count, sql_text_count)`
+for INSERT specifically (engine knows about single-row INSERT;
+sql-text knows about multi-row). SELECT keeps the existing T8
+emit_data_rows count.
+
+**`dispatch::cmd_complete_tag_for_sql(sql, count) -> String`**
+extends T6's `infer_command_tag` with:
+
+- Leading whitespace + `-- ...` line comments + `/* ... */` block
+  comments stripped (ORMs and JDBC routinely prepend these).
+- Full DDL canonicalization: `CREATE TABLE`, `CREATE INDEX` (also
+  matches `CREATE UNIQUE INDEX`, `CREATE RANGE INDEX`), `CREATE
+  VIEW`, `CREATE SCHEMA`, `DROP TABLE`, `DROP INDEX`, `DROP VIEW`,
+  `DROP SCHEMA`, `ALTER TABLE`, `ALTER INDEX`, `TRUNCATE TABLE`.
+- Transaction control: `BEGIN` / `START TRANSACTION` → `BEGIN`,
+  `COMMIT` / `END` → `COMMIT`, `ROLLBACK` / `ABORT` → `ROLLBACK`.
+- Other verbs: `VACUUM` → `VACUUM`, `ANALYZE` → `ANALYZE`, `SET`
+  → `SET`, `EXPLAIN` → `EXPLAIN`.
+- Unknown DDL: emit the leading keyword (uppercased). PG's spec
+  allows tag-emit-as-keyword for unrecognized server-side verbs
+  — preferable to lying with a SELECT 0.
+
+**+16 KATs**: `t9_cmd_complete_tag_for_dml`,
+`t9_cmd_complete_tag_for_ddl`,
+`t9_cmd_complete_tag_for_transaction_control`,
+`t9_cmd_complete_tag_case_insensitive`,
+`t9_cmd_complete_tag_strips_leading_comments`,
+`t9_count_insert_values_single_row`,
+`t9_count_insert_values_multi_row`,
+`t9_count_insert_values_ignores_quoted_parens`,
+`t9_count_insert_values_ignores_commented_parens`,
+`t9_count_insert_values_zero_when_no_values`,
+`t9_dispatch_insert_single_row_emits_insert_0_1`,
+`t9_dispatch_insert_multi_row_emits_insert_0_n` (5 rows → "INSERT
+0 5"), `t9_dispatch_update_emits_update_count`,
+`t9_dispatch_delete_emits_delete_count`,
+`t9_dispatch_create_index_emits_canonical_tag`,
+`t9_leading_keyword_strips_comments`. Plus two T8 KATs flipped
+from `INSERT 0 0` / `DELETE 0` to `INSERT 0 1` / `DELETE 1` to
+reflect the T9 polish.
+
+### T12 — pg-gateway feature flag + listener wire-up (`942911a`)
+
+The integration slice that makes a real `psql` invocation work.
+
+**`crates/kesseldb-server/Cargo.toml`** — adds `pg-gateway` feature
+mirroring `http-gateway`:
+
+```toml
+pg-gateway = ["dep:kessel-pg-gateway"]
+
+[dependencies]
+kessel-pg-gateway = { path = "../kessel-pg-gateway", optional = true }
+
+[dev-dependencies]
+kessel-crypto = { path = "../kessel-crypto" }  # for integration tests' SCRAM client
+```
+
+**`ServerConfig`** — gains three new fields:
+
+- `pg_addr: Option<SocketAddr>` (None = no PG listener; default
+  port 5432 when set; convention follows the http_addr shape).
+- `pg_max_conns: usize` (default 256 — smaller than
+  `http_gateway`'s 1024 because PG clients hold connections
+  longer; spec §8.1).
+- `pg_idle_timeout: Duration` (default 600s; wired via
+  `TcpStream::set_read_timeout` BEFORE entering `run_session`).
+
+These caps are INDEPENDENT of binary `max_conns` and HTTP
+listener caps — a misbehaving pgcli cannot starve binary or HTTP
+clients. The KAT
+`t12_pg_and_binary_caps_are_independent` locks this with
+`max_conns=0 + pg_max_conns=4` (binary fully capped but PG
+accepts).
+
+**New `DESCRIBE_BY_NAME_TAG = 0xF7`** engine admin frame: `[0xF7]
+++ utf8 name` → `Got(encode_type_def(name, fields))` on hit,
+`NotFound` on miss. Read-only — no op-number bump, no schema
+invalidation, no catalog mutation. Solves the name-lookup problem
+(`Op::Describe` is keyed by `type_id`, but PG clients pass names)
+without a SchemaError-shaped wedge.
+
+**New `impl kessel_pg_gateway::EngineApply for EngineHandle`**
+(gated on `pg-gateway`):
+
+- `apply_sql(sql)` — routes `[0xFE] ++ sql` through
+  `apply_raw` (the same path the binary listener uses for SQL
+  frames).
+- `describe_table(name)` — round-trips the new admin tag and
+  decodes the catalog's `encode_type_def` blob back into a
+  `Vec<PgColumn>`. Catalog lives with the non-`Send`
+  `StateMachine` on the engine thread, so this round-trip is
+  unavoidable; the cost is one engine-message round-trip per
+  RowDescription emit, which is fine for the V1 perf budget
+  (PG clients typically reuse connections and rarely describe
+  the same table twice in quick succession).
+
+**New `serve_pg` listener** (gated on `pg-gateway`): one
+`std::thread` per accepted TCP connection, mirrors the binary
+listener shape. `set_read_timeout(pg_idle_timeout)` is wired
+BEFORE the session is entered. Refuses to start if `cfg.token`
+is None (V1 closed-mode requires a Bearer token for
+SCRAM-SHA-256 per spec §3.4 — logs a warning and skips the spawn
+rather than serving anonymous). Per-session SCRAM server nonce
+is derived from `std::time::SystemTime::now()` nanos (V1 entropy
+source; V2 SP-PG T24 wires a real CSPRNG via `kessel-crypto`'s
+RNG primitive).
+
+**`main.rs`** — gains the `KESSELDB_PG_ADDR` env var. Print line
+widened to surface `, pg=ADDR` when set.
+
+**`kessel-pg-gateway/src/lib.rs`** — re-exports `run_session` so
+`kesseldb-server::serve_pg` can call it through the same crate
+root as the other public items (cleaner than reaching into the
+`server` submodule).
+
+**+4 T12 KATs in a feature-gated `pg_gateway_tests` module:**
+
+- **HEADLINE** `t12_pg_gateway_listener_serves_real_pg_client`
+  — spawns the full kesseldb-server through `serve_cfg`, opens a
+  real `TcpStream`, drives:
+  1. StartupMessage v3.0
+  2. AuthenticationSASL → SASLInitialResponse →
+     AuthenticationSASLContinue → SASLResponse →
+     AuthenticationSASLFinal → AuthenticationOk (real
+     SCRAM-SHA-256 round-trip; the test computes the
+     client proof using `kessel-crypto::pbkdf2_hmac_sha256` +
+     `hmac_sha256` + `sha256` against a base64-decoded salt)
+  3. CREATE TABLE → asserts `CREATE TABLE\0` tag
+  4. INSERT INTO → asserts `INSERT 0 1\0` tag (T9 row count)
+  5. SELECT \* FROM → asserts `T` (RowDescription), `SELECT 1\0`
+     tag, and a DataRow carrying the value `100` rendered as PG
+     text
+  6. Terminate
+
+  The test also asserts the BackendKeyData envelope (`K` + len=12
+  + 8 bytes pid+secret) is present in the post-auth greeting and
+  that the greeting terminates with `ReadyForQuery('I')`.
+
+- `t12_no_token_no_pg_listener` — `cfg.token = None` ⇒ no PG
+  listener bind; TCP connect fails with ConnectionRefused. Locks
+  the spec §3.4 closed-mode-requires-Bearer invariant.
+
+- `t12_pg_and_binary_caps_are_independent` — `max_conns=0
+  + pg_max_conns=4` ⇒ binary listener accepts nothing but PG
+  listener accepts. Locks the spec §8.1 independent-cap invariant.
+
+- `t12_engine_handle_describe_table_matches_catalog` — `CREATE
+  TABLE foo (id i64, label u32)` via the EngineApply impl, then
+  `describe_table("foo")` returns the same fields the catalog has
+  (in declared order, with the right `FieldKind`s); `describe_table
+  ("ghost")` returns None.
+
+### Test count deltas
+
+| Gate | Pre-T9 | Post-T12 | Delta |
+|---|---|---|---|
+| `kessel-pg-gateway` | 150 | 166 | +16 (T9) |
+| `kesseldb-server` default | 104 | 104 | 0 (T12 tests gated) |
+| `kesseldb-server --features pg-gateway` | n/a | 108 | +4 (T12 KATs) |
+| workspace default | 1604 | 1620 | +16 |
+| workspace `--features kesseldb-server/pg-gateway` (new third gate) | n/a | 1624 | +20 from default |
+| workspace `--all-features` | 1659 | 1679 | +20 |
+
+### Standing-rules verification
+
+- seed-7 GREEN under `cargo test -- --test-threads=1` (default + all-features).
+- `cargo tree -p kesseldb-server --no-default-features | grep
+  pg-gateway` is EMPTY.
+- `cargo tree -p kesseldb-server --features pg-gateway` shows
+  `├── kessel-pg-gateway v0.0.1`.
+- `cargo tree -p kessel-pg-gateway -e normal` still only shows
+  workspace crates — zero external deps on the gateway crate.
+- `#![forbid(unsafe_code)]` honored across all touched files.
+- HTTP/1.1 + WebSocket + binary protocol surfaces byte-untouched.
+- Default `cargo build -p kesseldb-server` byte-identical (no
+  new deps in default build).
+- The integration smoke test passes both in local `cargo test`
+  and CI (commit `942911a` is on main and CI is green).
+
+### Headline question — does a real PG client over TCP work?
+
+**YES.** The `t12_pg_gateway_listener_serves_real_pg_client` KAT
+proves it end-to-end: a real `TcpStream` completes the full
+SCRAM-SHA-256 handshake against the spawned kesseldb-server
+binary path, drives CREATE TABLE / INSERT / SELECT through the
+PG-wire gateway, and the server emits the expected backend
+response stream including BackendKeyData, the T9 row counts in
+the `INSERT 0 1` tag, the RowDescription + DataRow + `SELECT 1`
+tag for the SELECT, and a clean ReadyForQuery after each query.
+
+**Next session pickup:** T10 — psql compatibility hand-test
+against a real `psql` binary + USAGE.md sample-session (the
+KAT-level synthetic peer is now T12; T10 narrows to the
+real-CLI-against-the-real-binary smoke). Acceptance:
+`PGPASSWORD=$KESSEL_TOKEN psql -h localhost -p 5432 -U test
+"SELECT 1"` returns `1`. T11 — pgcli / DBeaver / JDBC
+compatibility smoke + log any compat gaps as named follow-ups.
 
 ## References
 

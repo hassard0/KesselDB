@@ -9,6 +9,10 @@ license.workspace = true
 # invariant. Workspace members only.
 kessel-proto = { path = "../kessel-proto" }
 kessel-client = { path = "../kessel-client" }
+# SP-WS T1: SHA-1 + base64 (kessel-crypto) for the RFC 6455 §4.2.2
+# `Sec-WebSocket-Accept` handshake-completion proof. kessel-crypto is a
+# workspace member with zero external deps.
+kessel-crypto = { path = "../kessel-crypto" }
 
 [lib]
 path = "src/lib.rs"

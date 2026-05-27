@@ -12,12 +12,14 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
 
+pub mod crypto;
 pub mod engine;
 pub mod metrics_writer;
 pub mod parse;
 pub mod response;
 pub mod routes;
 pub mod server;
+pub mod ws;
 
 pub use engine::{EngineApply, HealthSnapshot, HttpRequestCounter, HttpRequestCountersStatic, MetricsSnapshot, OpKindCounter};
 pub use server::{serve, serve_tls, TlsAccept, DEFAULT_MAX_CONNS};

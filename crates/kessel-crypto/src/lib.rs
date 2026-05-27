@@ -1,13 +1,20 @@
 //! kessel-crypto: a tiny, **zero-dependency**, deterministic crypto core
 //! — the pgcrypto-equivalent subset KesselDB can implement responsibly.
 //!
-//! Scope, stated honestly: **SHA-256** (FIPS 180-4) and **HMAC-SHA256**
-//! (RFC 2104), verified against published NIST/RFC 4231 test vectors.
-//! These are well-specified, allocation-light, deterministic primitives
-//! that fit KesselDB's replicated state machine (a hash is a pure
-//! function of its input — identical on every replica). We deliberately
-//! do **not** hand-roll symmetric encryption or a TLS stack here;
-//! transport encryption is the opt-in `tls` feature on the server.
+//! Scope, stated honestly: **SHA-256** (FIPS 180-4), **HMAC-SHA256**
+//! (RFC 2104), and **SHA-1** (RFC 3174 / FIPS 180-1), verified against
+//! published NIST/RFC 4231/RFC 3174 test vectors. These are
+//! well-specified, allocation-light, deterministic primitives that fit
+//! KesselDB's replicated state machine (a hash is a pure function of
+//! its input — identical on every replica). We deliberately do **not**
+//! hand-roll symmetric encryption or a TLS stack here; transport
+//! encryption is the opt-in `tls` feature on the server.
+//!
+//! **SHA-1 is collision-broken** for adversarial inputs and is provided
+//! ONLY for the RFC 6455 §4.2.2 `Sec-WebSocket-Accept` handshake-
+//! completion proof (a non-security primitive — the value is a
+//! correctness oracle, not a confidentiality / integrity protection).
+//! No new uses of SHA-1 should land in this workspace.
 
 #![forbid(unsafe_code)]
 
@@ -94,6 +101,79 @@ pub fn sha256(msg: &[u8]) -> [u8; 32] {
     out
 }
 
+/// SHA-1 of `msg`. Returns the 20-byte digest. RFC 3174 / FIPS 180-1.
+///
+/// **SHA-1 is collision-broken for adversarial inputs.** This function
+/// exists ONLY for the RFC 6455 §4.2.2 `Sec-WebSocket-Accept` value
+/// (`base64(sha1(client_key || magic_guid))`), where the digest is a
+/// handshake-completion proof — NOT a security primitive. The WebSocket
+/// RFC mandates SHA-1 precisely because the value isn't security-
+/// sensitive; "broken" collisions don't enable any attack on the
+/// handshake.
+///
+/// **Do not** add new callers outside the WebSocket handshake.
+pub fn sha1(msg: &[u8]) -> [u8; 20] {
+    // Initial hash values H0..H4 per FIPS 180-1 §5.3.1.
+    let mut h: [u32; 5] = [
+        0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0,
+    ];
+    // Padding: 0x80, then zeros, then the 64-bit BE bit length, padding
+    // to a multiple of 64 bytes. Same shape as sha256 above.
+    let bitlen = (msg.len() as u64).wrapping_mul(8);
+    let mut data = msg.to_vec();
+    data.push(0x80);
+    while data.len() % 64 != 56 {
+        data.push(0);
+    }
+    data.extend_from_slice(&bitlen.to_be_bytes());
+
+    for chunk in data.chunks_exact(64) {
+        let mut w: [u32; 80] = [0; 80];
+        for (i, word) in chunk.chunks_exact(4).enumerate() {
+            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16])
+                .rotate_left(1);
+        }
+        let mut a = h[0];
+        let mut b = h[1];
+        let mut c = h[2];
+        let mut d = h[3];
+        let mut e = h[4];
+        for (i, &wi) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5A827999u32),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1u32),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDCu32),
+                _ => (b ^ c ^ d, 0xCA62C1D6u32),
+            };
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(wi);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+    }
+
+    let mut out = [0u8; 20];
+    for (i, word) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
 /// HMAC-SHA256(key, msg) → 32 bytes. RFC 2104.
 pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
     const BLOCK: usize = 64;
@@ -124,6 +204,42 @@ pub fn hex(bytes: &[u8]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+/// RFC 4648 §4 standard-alphabet base64 encode. Padded output
+/// (`=`-trailers per the standard). Used by SP-WS T1+ for the
+/// `Sec-WebSocket-Accept` value (`base64(sha1(client_key || guid))`);
+/// duplicates the implementation in `kessel-objstore::b64` to avoid
+/// pulling the feature-gated objstore crate into default builds.
+///
+/// A future workspace cleanup may consolidate the two implementations
+/// in this module; until then this is the canonical default-build
+/// base64.
+pub fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -180,5 +296,49 @@ mod tests {
     fn sha256_is_deterministic() {
         assert_eq!(sha256(b"kessel"), sha256(b"kessel"));
         assert_ne!(sha256(b"kessel"), sha256(b"Kessel"));
+    }
+
+    /// RFC 3174 §A.5 / FIPS 180-1 §A — published SHA-1 KATs. Every
+    /// conforming SHA-1 implementation produces these digests for these
+    /// inputs. Locks the SHA-1 implementation against the RFC's own
+    /// reference vectors.
+    #[test]
+    fn sha1_rfc3174_known_answer_vectors() {
+        // RFC 3174 §A.5 vector #1: "abc"
+        assert_eq!(
+            hx(&sha1(b"abc")),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+        // RFC 3174 §A.5 vector #2: multi-block boundary
+        assert_eq!(
+            hx(&sha1(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")),
+            "84983e441c3bd26ebaae4aa1f95129e5e54670f1"
+        );
+        // Conventional empty-input sanity vector
+        assert_eq!(
+            hx(&sha1(b"")),
+            "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+        );
+    }
+
+    /// SHA-1 is deterministic and case-sensitive (sanity).
+    #[test]
+    fn sha1_is_deterministic() {
+        assert_eq!(sha1(b"kessel"), sha1(b"kessel"));
+        assert_ne!(sha1(b"kessel"), sha1(b"Kessel"));
+    }
+
+    /// RFC 4648 §10 published base64 test vectors. Same locked behaviour
+    /// as `kessel-objstore::b64::encode` so the two implementations agree
+    /// pending the consolidation in the module-level comment.
+    #[test]
+    fn base64_encode_rfc4648_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
     }
 }

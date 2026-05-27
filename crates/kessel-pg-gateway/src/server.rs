@@ -99,6 +99,32 @@ pub enum PgError {
     /// different message type during the auth phase. SQLSTATE `08P01`
     /// protocol_violation.
     UnexpectedMessageDuringAuth { tag: u8 },
+    /// T16 (spec §9.3): the per-connection idle-read timeout fired
+    /// before the client sent its next message. `run_session` emits
+    /// a FATAL `57014` query_canceled ErrorResponse on the wire
+    /// immediately BEFORE returning this variant — the caller (the
+    /// `serve_pg` accept loop in `kesseldb-server`) just drops the
+    /// thread. Distinguished from `Io(UnexpectedEof)` (peer-clean-
+    /// close) and `Io(ConnectionReset)` (peer-RST) so the listener
+    /// can log + count idle terminations separately if it wants to.
+    IdleTimeout,
+}
+
+/// T16: classify the `std::io::ErrorKind` from a per-connection
+/// `read_exact` against the timeout the caller installed via
+/// `TcpStream::set_read_timeout(Some(pg_idle_timeout))`. On Linux
+/// the timeout surfaces as `WouldBlock`; on Windows it surfaces as
+/// `TimedOut`; the platform difference is locked in `std::io`'s
+/// `TcpStream::set_read_timeout` documentation. We accept either so
+/// the same code path fires across platforms.
+///
+/// Sibling helper to `kessel_http_gateway::ws::session::is_read_timeout`
+/// — same shape, separate copy so neither crate depends on the other.
+pub(crate) fn is_idle_timeout(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
 }
 
 impl From<StartupError> for PgError {
@@ -339,6 +365,26 @@ pub fn run_session<
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 // Clean EOF — client closed without Terminate.
                 return Ok(session);
+            }
+            Err(e) if is_idle_timeout(e.kind()) => {
+                // T16 (spec §9.3): the caller-installed
+                // `set_read_timeout(pg_idle_timeout)` on the stream
+                // fired BEFORE the client sent its next message tag.
+                // Distinguish this from a peer-clean-close (EOF, above)
+                // or a peer-RST (Io::ConnectionReset/BrokenPipe, below)
+                // — only this case gets a typed FATAL 57014 frame
+                // before the close, because only here is the SOCKET
+                // STILL HEALTHY enough to receive a final write. EOF
+                // means the peer already closed the read half; RST
+                // means the kernel will swallow any further write.
+                let frame = crate::error::encode_idle_timeout_error();
+                // Best-effort: any write error here is silently
+                // absorbed because we're about to drop the connection
+                // anyway. The important thing is libpq either sees
+                // the FATAL frame or sees the close — never a hang.
+                let _ = stream.write_all(&frame);
+                let _ = stream.flush();
+                return Err(PgError::IdleTimeout);
             }
             Err(e) => return Err(PgError::Io(e.kind())),
         }
@@ -1059,5 +1105,315 @@ mod tests {
         // EmptyQueryResponse 'I' (5 bytes total) present.
         let eqr = &[b'I', 0, 0, 0, 4][..];
         assert!(pipe.outbound.windows(5).any(|w| w == eqr));
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // T16 KATs — idle timeout 57014 query_canceled.
+    //
+    // We can't drive a real OS read-timeout in an in-memory pipe, so we
+    // use a `Pipe`-like type that returns `WouldBlock` on the FIRST
+    // post-handshake read. That's the same `std::io::ErrorKind` a real
+    // `TcpStream::set_read_timeout` would surface on Linux; on Windows
+    // it would surface as `TimedOut`. The `is_idle_timeout` classifier
+    // matches BOTH per the platform-difference note in `std::io`.
+    //
+    // Integration tests (kesseldb-server pg_idle.rs) drive a real
+    // `TcpListener` with `pg_idle_timeout` set to 100ms.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// Test pipe that returns `WouldBlock` once the canned inbound
+    /// stream is exhausted. Models the OS-level timeout a real
+    /// `TcpStream::set_read_timeout` would surface.
+    struct WouldBlockPipe {
+        inbound: Cursor<Vec<u8>>,
+        outbound: Vec<u8>,
+    }
+    impl Read for WouldBlockPipe {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inbound.read(buf)?;
+            if n == 0 {
+                // Once the canned bytes are drained, every read returns
+                // WouldBlock — simulates the OS-level read_timeout firing.
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "simulated idle read-timeout",
+                ))
+            } else {
+                Ok(n)
+            }
+        }
+    }
+    impl Write for WouldBlockPipe {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.outbound.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    /// Test pipe that returns `TimedOut` once exhausted — the Windows-
+    /// platform equivalent of `WouldBlock`. Locks the cross-platform
+    /// classifier `is_idle_timeout` against drift.
+    struct TimedOutPipe {
+        inbound: Cursor<Vec<u8>>,
+        outbound: Vec<u8>,
+    }
+    impl Read for TimedOutPipe {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inbound.read(buf)?;
+            if n == 0 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "simulated Windows-platform idle read-timeout",
+                ))
+            } else {
+                Ok(n)
+            }
+        }
+    }
+    impl Write for TimedOutPipe {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.outbound.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    /// Test pipe that returns `ConnectionReset` once exhausted — the
+    /// peer-RST shape. Locks that the timeout-vs-RST classification
+    /// does NOT emit a 57014 frame on peer-reset (the write would
+    /// fail anyway — emitting against a RST'd socket is wasted I/O
+    /// and may flag a noisy log).
+    struct ResetPipe {
+        inbound: Cursor<Vec<u8>>,
+        outbound: Vec<u8>,
+    }
+    impl Read for ResetPipe {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inbound.read(buf)?;
+            if n == 0 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "simulated peer RST",
+                ))
+            } else {
+                Ok(n)
+            }
+        }
+    }
+    impl Write for ResetPipe {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.outbound.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    /// HEADLINE T16 KAT: a successful handshake followed by an idle
+    /// read returns `PgError::IdleTimeout` and the outbound bytes
+    /// contain the FATAL `57014` query_canceled ErrorResponse before
+    /// the session loop exits. libpq surfaces the SQLSTATE +
+    /// message verbatim in `PQerrorMessage()`.
+    #[test]
+    fn t16_idle_timeout_emits_57014_fatal_before_close() {
+        let token = b"kessel-bearer-token";
+        // Only the handshake bytes — no Q/X after. Next read returns
+        // WouldBlock (simulated OS-level read_timeout firing).
+        let inbound = build_authed_inbound(
+            token, "clientN", "serverN", "test", &[],
+        );
+        let mut pipe = WouldBlockPipe {
+            inbound: Cursor::new(inbound),
+            outbound: Vec::new(),
+        };
+        let engine = EmptySelectEngine;
+        let r = run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        );
+        assert!(
+            matches!(r, Err(PgError::IdleTimeout)),
+            "expected Err(IdleTimeout), got {r:?}"
+        );
+        // Outbound bytes contain SQLSTATE 57014.
+        assert!(
+            pipe.outbound.windows(5).any(|w| w == b"57014"),
+            "outbound must contain SQLSTATE 57014"
+        );
+        // Outbound bytes contain FATAL severity.
+        assert!(
+            pipe.outbound.windows(b"FATAL".len()).any(|w| w == b"FATAL"),
+            "outbound must contain FATAL severity"
+        );
+        // Outbound bytes contain the canonical PG message text.
+        assert!(
+            pipe.outbound
+                .windows(crate::error::IDLE_TIMEOUT_MESSAGE.len())
+                .any(|w| w == crate::error::IDLE_TIMEOUT_MESSAGE.as_bytes()),
+            "outbound must contain canonical idle-timeout message text"
+        );
+    }
+
+    /// T16: TimedOut (Windows-platform equivalent of WouldBlock)
+    /// triggers the SAME 57014 emit path. Locks the cross-platform
+    /// `is_idle_timeout` classifier against drift.
+    #[test]
+    fn t16_timed_out_kind_also_triggers_57014() {
+        let token = b"kessel-bearer-token";
+        let inbound = build_authed_inbound(
+            token, "clientN", "serverN", "test", &[],
+        );
+        let mut pipe = TimedOutPipe {
+            inbound: Cursor::new(inbound),
+            outbound: Vec::new(),
+        };
+        let engine = EmptySelectEngine;
+        let r = run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        );
+        assert!(matches!(r, Err(PgError::IdleTimeout)));
+        assert!(pipe.outbound.windows(5).any(|w| w == b"57014"));
+    }
+
+    /// T16: an active session (handshake + Q + Terminate before any
+    /// idle read returns WouldBlock) does NOT emit a 57014 frame.
+    /// Locks the "active connection doesn't trip the timeout" invariant.
+    #[test]
+    fn t16_active_session_does_not_emit_57014() {
+        let token = b"kessel-bearer-token";
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&build_q_frame("SELECT * FROM t"));
+        extra.extend_from_slice(&build_x_frame());
+        let inbound = build_authed_inbound(
+            token, "clientN", "serverN", "test", &extra,
+        );
+        // WouldBlockPipe will return WouldBlock only AFTER the Terminate
+        // — but Terminate causes a clean return BEFORE that, so the
+        // session never observes the simulated timeout.
+        let mut pipe = WouldBlockPipe {
+            inbound: Cursor::new(inbound),
+            outbound: Vec::new(),
+        };
+        let engine = EmptySelectEngine;
+        let session = run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("active session terminates cleanly");
+        assert_eq!(session.user, "test");
+        assert!(
+            !pipe.outbound.windows(5).any(|w| w == b"57014"),
+            "active session MUST NOT emit 57014 ErrorResponse"
+        );
+        assert!(
+            !pipe.outbound.windows(b"FATAL".len()).any(|w| w == b"FATAL"),
+            "active session MUST NOT emit FATAL severity"
+        );
+    }
+
+    /// T16: a clean `Terminate` ('X') message followed by EOF (no more
+    /// bytes) does NOT emit a 57014 frame — Terminate returns the
+    /// session BEFORE the read-loop observes EOF or timeout. Locks
+    /// the "clean Terminate is silent" invariant per PG §55.2.3.
+    #[test]
+    fn t16_clean_terminate_does_not_emit_57014() {
+        let token = b"kessel-bearer-token";
+        let inbound = build_authed_inbound(
+            token, "clientN", "serverN", "test", &build_x_frame(),
+        );
+        let mut pipe = WouldBlockPipe {
+            inbound: Cursor::new(inbound),
+            outbound: Vec::new(),
+        };
+        let engine = EmptySelectEngine;
+        let session = run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("clean Terminate returns Ok");
+        assert_eq!(session.user, "test");
+        assert!(!pipe.outbound.windows(5).any(|w| w == b"57014"));
+        // Reaching here proves clean return — no 57014 emit, no IdleTimeout.
+    }
+
+    /// T16: peer-RST mid-session does NOT emit a 57014 frame (the
+    /// write would fail anyway — emitting against a RST'd socket is
+    /// wasted I/O and would surface a misleading "FATAL 57014" log
+    /// for a peer-crash case where the real cause is the peer). The
+    /// session returns `Err(Io(ConnectionReset))` instead.
+    #[test]
+    fn t16_peer_reset_does_not_emit_57014() {
+        let token = b"kessel-bearer-token";
+        let inbound = build_authed_inbound(
+            token, "clientN", "serverN", "test", &[],
+        );
+        let mut pipe = ResetPipe {
+            inbound: Cursor::new(inbound),
+            outbound: Vec::new(),
+        };
+        let engine = EmptySelectEngine;
+        let r = run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        );
+        match r {
+            Err(PgError::Io(std::io::ErrorKind::ConnectionReset)) => {}
+            other => panic!("expected Io(ConnectionReset), got {other:?}"),
+        }
+        assert!(
+            !pipe.outbound.windows(5).any(|w| w == b"57014"),
+            "peer-RST MUST NOT emit 57014 ErrorResponse"
+        );
+    }
+
+    /// T16: clean EOF (peer cleanly closed the read half before
+    /// sending the next message) does NOT emit a 57014 frame. The
+    /// session returns `Ok(session)` per the existing T8 contract;
+    /// 57014 is only for idle-timeout, not for peer-close.
+    #[test]
+    fn t16_clean_eof_does_not_emit_57014() {
+        let token = b"kessel-bearer-token";
+        // Only handshake — next read returns EOF (default Cursor
+        // behavior — not WouldBlock).
+        let inbound = build_authed_inbound(
+            token, "clientN", "serverN", "test", &[],
+        );
+        let mut pipe = Pipe::new(inbound);
+        let engine = EmptySelectEngine;
+        let session = run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("clean EOF returns Ok(session)");
+        assert_eq!(session.user, "test");
+        assert!(
+            !pipe.outbound.windows(5).any(|w| w == b"57014"),
+            "clean EOF MUST NOT emit 57014 ErrorResponse"
+        );
+    }
+
+    /// T16: `is_idle_timeout` classifier matches both WouldBlock and
+    /// TimedOut. Locks the cross-platform invariant explicitly so a
+    /// future refactor of the classifier can't drift.
+    #[test]
+    fn t16_is_idle_timeout_classifier() {
+        assert!(is_idle_timeout(std::io::ErrorKind::WouldBlock));
+        assert!(is_idle_timeout(std::io::ErrorKind::TimedOut));
+        // Negative cases — these MUST NOT trigger the idle-timeout path.
+        assert!(!is_idle_timeout(std::io::ErrorKind::UnexpectedEof));
+        assert!(!is_idle_timeout(std::io::ErrorKind::ConnectionReset));
+        assert!(!is_idle_timeout(std::io::ErrorKind::BrokenPipe));
+        assert!(!is_idle_timeout(std::io::ErrorKind::ConnectionAborted));
+        assert!(!is_idle_timeout(std::io::ErrorKind::Other));
     }
 }

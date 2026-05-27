@@ -168,6 +168,24 @@ pub const SQLSTATE_FEATURE_NOT_SUPPORTED: &str = "0A000";
 /// recognizes that phrasing.
 pub const SQLSTATE_TOO_MANY_CONNECTIONS: &str = "53300";
 
+/// Class 57 — `57014` query_canceled. T16 — emitted by
+/// `run_session` when the per-connection idle-read times out before
+/// the next client message arrives. Spec §9.3 — PG uses `57014`
+/// for both explicit-cancel and server-initiated session
+/// termination on idle (more specific than `08006`
+/// connection_failure for this case). The canonical PG message text
+/// is "terminating connection due to idle timeout" — matches what
+/// `postgres.c::ProcessInterrupts` would emit if PG's own
+/// `idle_session_timeout` GUC fires.
+pub const SQLSTATE_QUERY_CANCELED: &str = "57014";
+
+/// PG's canonical message text for `57014` query_canceled when fired
+/// by the server's idle-session-timeout path. Matches the phrasing
+/// PG 14+ emits when `idle_session_timeout` elapses so libpq's
+/// `PQerrorMessage()` text is indistinguishable from a real PG
+/// origin. Used by `encode_idle_timeout_error`.
+pub const IDLE_TIMEOUT_MESSAGE: &str = "terminating connection due to idle timeout";
+
 /// PG's canonical message text for `53300` too_many_connections. Used
 /// by `encode_too_many_connections_error` so the listener and any
 /// future caller emit the same string libpq's `pgstrerror.c` does.
@@ -195,6 +213,32 @@ pub fn encode_too_many_connections_error() -> Vec<u8> {
         SEVERITY_FATAL,
         SQLSTATE_TOO_MANY_CONNECTIONS,
         TOO_MANY_CONNECTIONS_MESSAGE,
+    )
+}
+
+/// T16: build the `ErrorResponse('S=FATAL', 'C=57014', 'M=terminating
+/// connection due to idle timeout')` frame that `run_session` writes
+/// immediately before closing the connection on idle-read timeout.
+/// Helper wrapper around `encode_error_response` so the timeout path
+/// doesn't need to know the canonical PG message text — the session
+/// loop calls this and writes the bytes verbatim.
+///
+/// Wire bytes (always):
+/// ```text
+/// E [length:4 BE] SFATAL\0 VFATAL\0 C57014\0 Mterminating connection due to idle timeout\0 \0
+/// ```
+///
+/// Per spec §9.3 + PG `postgres.c::ProcessInterrupts`: this message
+/// MUST be written BEFORE the socket is closed so the client sees a
+/// wire-level rejection (with the SQLSTATE libpq's `PQerrorMessage()`
+/// surfaces verbatim) instead of a bare read-EOF that some clients
+/// misclassify as a transient network failure. Distinguishes a
+/// server-initiated termination from a peer-RST.
+pub fn encode_idle_timeout_error() -> Vec<u8> {
+    encode_error_response(
+        SEVERITY_FATAL,
+        SQLSTATE_QUERY_CANCELED,
+        IDLE_TIMEOUT_MESSAGE,
     )
 }
 

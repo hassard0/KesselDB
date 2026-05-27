@@ -26,8 +26,8 @@ cross-shard `Join`, cross-shard consistent snapshot. See spec §11.
 | **T2** | `Route::Scatter(ScatterKind)` variant + `route()` returns it for the 4 scan ops + `Conn::scatter_read` driver + sorted k-way heap merge + unordered concat merge + `impl ShardCaller for ClusterClient` + multi-shard SelectSorted byte-identical-to-K=1 integration test. T1 stub replaced; 13 new merge KATs. | **DONE** | `88e6c33` + `421b45a` + `51abf8b` |
 | **T3** | Property sweep over K∈{1,2,4,8,16} on random 100-row datasets — 60 seeds total (25 asc + 20 desc + 15 with OFFSET/LIMIT) at the merge layer asserting byte-identical-to-K=1 for `SelectSorted`; 25-seed multiset-equality sweep for unordered; multi-shard real-socket K=1↔K=4 integration tests for `Op::Select` / `Op::QueryRows` / `Op::SelectFields` (multiset equality). | **DONE** | `002661b` |
 | **T4** | Sort-key extraction edges: Char/Bytes lexicographic byte-compare, NULL bitmap (V1: NULL == zero-padded raw bytes, sorts FIRST asc / LAST desc / at-zero-position for signed), empty-string vs non-empty, sort field at non-zero column offset, record-too-short → `SchemaError`. 8 new KATs. | **DONE** | `5cc8f9e` |
-| T5 | Determinism property test: K∈{1,2,4,8,16} hash-identical merged result | OPEN | — |
-| T6 | LIMIT cancellation correctness + cancel flag | OPEN | — |
+| T5 | Determinism property test: K∈{1,2,4,8,16} hash-identical merged result | COLLAPSED into T3 | (delivered as T3) |
+| **T6** | LIMIT cancellation correctness + cancel flag | **DONE** | `cba3eea` |
 | T7 | Skew defense + bounded buffers | OPEN | — |
 | T8 | Pentest sweep (10 pentests from spec §7.5) | OPEN | — |
 | T9 | Error-path completeness + partial-result guard | OPEN | — |
@@ -291,25 +291,126 @@ featured (+13 each: 4 K-invariance property tests + 1 real-socket
 integration test + 8 sort-key edge KATs). seed-7 GREEN;
 tree-grep EMPTY; `#![forbid(unsafe_code)]` honored.
 
+## T6 — what landed (2026-05-26, commit `cba3eea`)
+
+**One surface (~770 LoC tests + ~190 LoC impl), single commit:**
+`scatter_scan.rs` adds the LIMIT-aware cancellation machinery per
+SP155 §3.7; `router.rs::Conn::scatter_read` switches from
+`scatter_scan_fanout` + `merge_scan_results` to the combined
+`scatter_and_merge`.
+
+**Public surface (new):**
+
+```rust
+pub trait ShardCaller: Send + 'static {
+    fn call(&mut self, op: &Op) -> Result<OpResult, String>;
+    // NEW (default impl observes cancel pre-call only):
+    fn call_with_cancel(
+        &mut self,
+        op: &Op,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<OpResult, String> { ... }
+}
+
+pub fn scatter_and_merge<C: ShardCaller>(
+    shards: Vec<C>,
+    op: &Op,
+    per_shard_timeout: Duration,
+    kind: &ScatterKind,
+    cancel: Arc<AtomicBool>,
+) -> OpResult;
+```
+
+**Behaviour matrix (per `kind`):**
+
+- **`Unordered { limit }`:** drains worker replies in shard-id
+  order (SP155 §3.6 determinism preserved); appends rows; when
+  `output.len() == limit`, sets cancel + stops draining. Late
+  workers' replies are silently discarded (emitting `Unavailable`
+  for late slots would violate V1 hard-fail —
+  `merge_scan_results`'s "first non-Got slot poisons the merge").
+  `limit == 0` is the "no cap" sentinel — drain everyone, never
+  fire cancel.
+
+- **`Sorted { ..., limit }`:** k-way `BinaryHeap` merge needs every
+  shard's payload upfront (the smallest row across shards may live
+  on any shard); drains every slot, runs existing `merge_sorted`,
+  sets cancel post-gather as a seam for future streaming sorted-
+  merge (SP-A T7+). For now this is effectively a no-op for the
+  gather phase (workers already returned) but the API stays
+  symmetric.
+
+- **V1 hard-fail:** any non-Got slot fires cancel + propagates as
+  the merged result; late shards see cancel pre-call. Locks SP155
+  §6.
+
+- **Edge: K=0 ⇒ `Got(vec![])`** (SP155 OQ11).
+
+- **Edge: pre-fired cancel** (caller passes `cancel.load() == true`)
+  ⇒ `Got(vec![])` without spawning any workers. The strongest
+  possible SP155 §3.7 "stop scanning" point.
+
+**Thread/join discipline preserved:** all worker handles joined
+before `scatter_and_merge` returns — no leaked threads in the
+cancellation path either (locked by
+`scatter_and_merge_cancellation_does_not_leak_threads`). Existing
+`scatter_scan_fanout` + `merge_scan_results` kept as-is (all 33
+prior KATs pass unchanged).
+
+**Honest gap (SP155 §3.7 verbatim):** the default
+`call_with_cancel` impl observes the cancel flag at the CALL
+BOUNDARY only (pre-call check). Once `ShardCaller::call` is in
+flight, the default impl cannot interrupt it (`std::net::TcpStream`
+has no cancellable read — V1 enforces a per-shard `read_timeout` of
+30s as the upper bound; SP-A T13 is the perf follow-up that adds
+chunk-by-chunk cancel checks to a streaming `Op::SelectChunked` per
+SP155 §4.4). For V1 the realized gain is "router stops waiting on
+slow shards once LIMIT is hit"; the shard's wasted SERVER-SIDE work
+post-cancel is the documented honest gap closed by T13.
+
+**9 new T6 KATs (all passing):**
+
+| KAT | Asserts |
+|---|---|
+| `scatter_and_merge_unordered_limit_caps_at_exactly_n_rows` | LIMIT 5 over 3 shards × 100 rows = exactly 5 rows + cancel flag set on LIMIT-hit |
+| `scatter_and_merge_limit_cancels_pending_shards` | Fast shard_0 fills LIMIT before slow shard_1/shard_2 leave pre-call poll loops; they observe cancel pre-call (`ran` stays 0, `cancelled_pre_call` bumps); function returns <180ms despite shard_1/shard_2's 200ms sleeps |
+| `scatter_and_merge_unordered_limit_zero_drains_every_shard` | `limit == 0` ⇒ all rows + every worker ran (no pre-call short-circuit during gather) |
+| `scatter_and_merge_precancelled_returns_empty` | Pre-fired cancel: returns `Got([])` without spawning workers |
+| `scatter_and_merge_limit_larger_than_total_returns_everything` | LIMIT > total ⇒ no short-circuit; every shard ran |
+| `scatter_and_merge_cancellation_does_not_leak_threads` | `cancelled_pre_call` IS bumped by the time `scatter_and_merge` returns (worker exited before join) + elapsed < 250ms despite 300ms sleep on shard_1 |
+| `scatter_and_merge_sorted_limit_still_gathers_all_shards` | Sorted needs all data; LIMIT 3 over 6 rows: both shards ran; result is heap-merged top-3 |
+| `scatter_and_merge_unavailable_propagates_and_fires_cancel` | V1 hard-fail: Unavailable on shard_1 surfaces + shard_2 sees cancel pre-call |
+| `scatter_and_merge_empty_shards_returns_empty_got` | K=0 edge: empty Got |
+
+**Determinism (honest):** same input ⇒ same merged output at LIMIT
+rows. The flag's RACY nature means slightly different counts of
+*post-flag* unwanted rows may leak per shard run-to-run, but the
+FINAL output is deterministic (exactly LIMIT rows when total ≥
+LIMIT, in shard-id order). The K-invariance property sweep from T3
+(425 fixture runs) still passes byte-identical at the merge layer.
+
+**What T6 deliberately does NOT do:**
+
+  - Stop SHARD-SIDE scanning (vs router-side connection close +
+    worker join) — T13 perf.
+  - Skew defense via bounded per-shard buffer (`sync_channel(bound=4)`
+    from SP155 §3.8) — T7.
+  - Pentest sweep (10 pentests from spec §7.5) — T8.
+  - Partial-result-on-timeout flag (`scatter_partial_on_timeout`) —
+    T9.
+  - Streaming sorted-merge with mid-stream cancel — T7+.
+
+**Test counts:** workspace 1325 → 1334 default / 1358 → 1367
+featured (+9 each, matching the 9 T6 KATs). seed-7 GREEN; tree-
+grep EMPTY; `#![forbid(unsafe_code)]` honored.
+
 ## Pickup hint for the next session
 
-Start at **T5/T6/T7**. T3+T4 closed the killer K-invariance check
-+ the sort-key extraction stress test; the remaining task slices
-T5..T13 are well-bounded per the SP155 §8 task table; the
-executor may pick whichever fits the session budget. Roughly:
+Start at **T7/T8**. T6 closed the LIMIT cancellation correctness
+slice; the remaining task slices T7..T13 are well-bounded per the
+SP155 §8 task table; the executor may pick whichever fits the
+session budget. Roughly:
 
-- **T5 (~80 LoC):** the SP155 §7.2 K-invariance property test was
-  delivered EARLY as part of T3 (60 seeds at the merge layer,
-  plus a real-socket K=1↔K=4 cross-op test). T5's original scope
-  collapses into a follow-up: extend the merge-layer sweep to
-  randomly-tied sort values, asserting the §5.4 shard_id tie-break
-  is the documented V1 behavior + locking when the spec calls for
-  a `(value, oid)` upgrade (motivates `Op::SelectSortedWithKey`
-  per OQ8).
-- **T6 (~80 LoC):** LIMIT cancellation correctness — per-shard scan
-  counter + cancel flag (the `Arc<AtomicBool>` from SP155 §3.7).
-  T2's merge stops at `limit` but does NOT cancel in-flight shard
-  workers; T6 closes that.
 - **T7 (~80 LoC):** skew defense + bounded buffers (channel
   bound=4 from SP155 §3.8).
 - **T8 (~300 LoC):** the 10 pentests in spec §7.5.

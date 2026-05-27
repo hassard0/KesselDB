@@ -14,6 +14,11 @@ license.workspace = true
 # `docs/superpowers/specs/2026-05-27-kesseldb-sppg-postgres-wire-design.md`
 kessel-proto = { path = "../kessel-proto" }
 kessel-client = { path = "../kessel-client" }
+# T4 maps KesselDB FieldKind ↔ PG type OID for RowDescription (T5) and
+# the text-format renderer (T5/T8). kessel-catalog is the authoritative
+# FieldKind source; pulling it directly avoids re-exporting through
+# kessel-client.
+kessel-catalog = { path = "../kessel-catalog" }
 # T2 will pull SHA-256 + HMAC-SHA-256 (already in kessel-crypto from
 # SigV4 + SP-WS handshake) and add PBKDF2-HMAC-SHA-256 for the
 # SCRAM-SHA-256 auth path (RFC 5802 + RFC 7677 + RFC 8018 §5.2).

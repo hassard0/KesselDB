@@ -66,6 +66,7 @@ pub mod proto;
 pub mod query;
 pub mod server;
 pub mod startup;
+pub mod types;
 
 pub use server::{accept, AcceptedSession, PgError};
 

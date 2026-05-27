@@ -28,8 +28,8 @@ cross-shard `Join`, cross-shard consistent snapshot. See spec §11.
 | **T4** | Sort-key extraction edges: Char/Bytes lexicographic byte-compare, NULL bitmap (V1: NULL == zero-padded raw bytes, sorts FIRST asc / LAST desc / at-zero-position for signed), empty-string vs non-empty, sort field at non-zero column offset, record-too-short → `SchemaError`. 8 new KATs. | **DONE** | `5cc8f9e` |
 | T5 | Determinism property test: K∈{1,2,4,8,16} hash-identical merged result | COLLAPSED into T3 | (delivered as T3) |
 | **T6** | LIMIT cancellation correctness + cancel flag | **DONE** | `cba3eea` |
-| T7 | Skew defense + bounded buffers | OPEN | — |
-| T8 | Pentest sweep (10 pentests from spec §7.5) | OPEN | — |
+| **T7** | Skew defense + bounded buffers (`SHARD_BACKPRESSURE_BOUND=4`, `sync_channel(bound)`); 5 KATs. | **DONE** | `afc1690` |
+| **T8** | Pentest sweep (10 pentests from spec §7.5) — timeout / oversized / malformed / partial-then-close / mid-scan death / router-drop-under-limit / cancel-atomic-visibility / zero-shards / one-shard / determinism-replay. 10 KATs. | **DONE** | `8f6b17f` |
 | T9 | Error-path completeness + partial-result guard | OPEN | — |
 | T10 | Documentation: ARCHITECTURE.md sub-section + STATUS.md row update | OPEN | — |
 | T11 | (Follow-up) Extend to `FindBy` / `FindByComposite` | OPEN | — |
@@ -404,26 +404,166 @@ LIMIT, in shard-id order). The K-invariance property sweep from T3
 featured (+9 each, matching the 9 T6 KATs). seed-7 GREEN; tree-
 grep EMPTY; `#![forbid(unsafe_code)]` honored.
 
+## T7 — what landed (2026-05-26, commit `afc1690`)
+
+**One surface (~310 LoC tests + ~40 LoC impl/doc), single commit:**
+`scatter_scan.rs` promotes the per-shard reply-channel bound to a
+documented public constant per SP155 §3.8.
+
+**Public surface (new):**
+
+```rust
+pub const SHARD_BACKPRESSURE_BOUND: usize = 4;
+```
+
+**Behaviour change:**
+
+Both `scatter_scan_fanout` and `scatter_and_merge` switch from
+`mpsc::sync_channel(1)` (hardcoded since T1/T6) to
+`mpsc::sync_channel(SHARD_BACKPRESSURE_BOUND)`. Same `sync_channel`
+shape, configurable bound. Per spec §3.8 rationale:
+
+  - **bound=0** (rendezvous channel) **over-serializes** — every send
+    must wait for a consumer read; the worker can't even queue its
+    one V1 reply without blocking on the driver's first `recv`.
+  - **bound=∞** (unbounded `mpsc::channel()`) **OOMs under skew** —
+    one shard returns millions of rows while another times out; the
+    merger's pull rate caps router memory at `K × bound × per-frame-
+    size`, but bound=∞ removes the cap.
+  - **bound=4** is the documented sweet spot — lets a worker prefetch
+    a chunk or two ahead of the consumer without unbounded growth.
+
+**V1 honest note (locked in the constant's doc-comment):** every
+per-shard worker today sends exactly ONE `OpResult` per request (only
+one slot used). The bound becomes load-bearing when the streaming
+`Op::SelectChunked` lands (T14, spec §4.4); locking the bound now
+means T14 inherits a working contract + the SendError-on-dropped-rx
+clean-exit path is already proven by the T7 KATs below.
+
+**Drop-mid-stream contract:** if the driver drops the receiver (the
+LIMIT-cancellation path in `scatter_and_merge_unordered`), a worker
+blocked on a full channel sees `SendError` from `tx.send()` and exits
+cleanly — no deadlock, no leak (locked by
+`t7_sender_observes_send_error_when_receiver_dropped_no_deadlock`).
+
+**5 new T7 KATs (all passing):**
+
+| KAT | Asserts |
+|---|---|
+| `t7_shard_backpressure_bound_is_four_per_spec` | Lock the constant value =4 (spec change otherwise) |
+| `t7_sync_channel_caps_at_bound_under_fast_sender` | Fast sender paced by bound; nothing lost; FIFO |
+| `t7_bound_one_still_produces_correct_merged_output` | Edge bound=1: merged bytes identical to bound=4 (correctness orthogonal to bound) |
+| `t7_sender_observes_send_error_when_receiver_dropped_no_deadlock` | Cancel-path: blocked sender sees SendError, exits cleanly, no deadlock |
+| `t7_slow_merger_8_fast_shards_completes_with_bounded_memory` | 8 shards × 100 rows via `scatter_and_merge` completes <2s with bounded memory |
+
+**What T7 deliberately does NOT do:**
+
+  - Streaming chunked per-shard sends (T14 / `Op::SelectChunked`).
+    V1 still sends ONE `OpResult` per shard; bound = headroom.
+  - Pentest sweep (T8 — next commit).
+  - Partial-result-on-timeout flag (T9).
+  - Router-side total-size cap (`max_response_size = 64 MiB` per
+    spec §3.8) — inherited from `kessel-proto`'s wire frame cap, no
+    separate scatter cap added in V1.
+
+**Test counts:** workspace 1334 → 1339 default / 1389 → 1394 featured
+(+5 each, matching the 5 T7 KATs). seed-7 GREEN; tree-grep EMPTY;
+`#![forbid(unsafe_code)]` honored.
+
+## T8 — what landed (2026-05-26, commit `8f6b17f`)
+
+**One surface (~550 LoC tests, NO production-code change), single
+commit:** `scatter_scan.rs` adds the 10-pentest sweep per SP155 §7.5.
+
+**`PentestShard` mock** — a flexible `ShardCaller` with 5 behaviour
+variants covering the adversarial spectrum:
+
+```rust
+enum PentestBehavior {
+    SleepThenGot(Duration, Vec<u8>),  // sleep > timeout pentest
+    OversizedGot(Vec<u8>),            // big but well-formed payload
+    MalformedGot(Vec<u8>),            // bad row-length framing
+    TransportErr(String),             // Err(transport) → Unavailable
+    Got(Vec<u8>),                     // canned reply
+}
+```
+
+`call_with_cancel` polls cancel in 5ms slices during sleep so
+pentests 6/7 can observe cancel mid-sleep.
+
+**10 new T8 pentests (all passing):**
+
+| # | Pentest | Attack | Asserts |
+|---|---|---|---|
+| 1 | `pentest_1_shard_times_out_yields_unavailable_slot_for_that_shard` | One shard sleeps 500ms; timeout=80ms | Unavailable slot for that shard; others' slots unaffected |
+| 2 | `pentest_2_shard_returns_oversized_payload_no_oom_completes_promptly` | 1 MiB well-formed Got | Merger walks all rows, no OOM, <2s |
+| 3 | `pentest_3_shard_returns_malformed_bytes_yields_schema_error_no_panic` | Claims u32::MAX row in 4 bytes | `OpResult::SchemaError`, never panic |
+| 4 | `pentest_4_shard_returns_partial_then_closes_surfaces_unavailable` | `Err(transport: read 4 bytes, peer closed)` | V1 hard-fail to `Unavailable` |
+| 5 | `pentest_5_shard_dies_mid_scan_unavailable_no_thread_leak` | `Err(transport: connection reset)` | `Unavailable` + bounded wall-clock + follow-up call works |
+| 6 | `pentest_6_router_drops_receiver_under_limit_no_panic_no_leak` | LIMIT 3 + 2 slow shards | Late shards see cancel pre-call; no panic; <180ms |
+| 7 | `pentest_7_cancel_atomic_visibility_every_worker_observes` | Pre-fired cancel × 100 iter × 8 shards | Every worker observes; empty Got; ran=0 |
+| 8 | `pentest_8_zero_shards_returns_empty_got_no_thread_spawned` | K=0 | Empty Got; <50ms short-circuit |
+| 9 | `pentest_9_one_shard_byte_identical_to_non_scatter_path` | K=1 | Byte-identical to direct shard call (regression-lock T2 invariant) |
+| 10 | `pentest_10_determinism_replay_same_input_100_runs_byte_identical` | Same input × 100 runs Sorted | Byte-identical merged result every time (no HashMap iter / no time decisions) |
+
+**Did any pentest surface a real production bug?** **NO — every
+pentest passed against the existing T1-T7 scatter machinery.** That's
+the point of a pentest sweep: documents the security/robustness
+contracts the layer ALREADY meets, locks them against regression, and
+exercises adversarial code paths (malformed framing, transport err,
+mass pre-cancel, oversized payloads, replay determinism) that the
+happy-path KATs don't touch.
+
+**One drafting bug surfaced + fixed in TDD red→green:** PT4/PT5's
+"other shard" payloads were initially `b"good"` / `b"alive"` (raw
+bytes, no framing); the merger correctly produced "row body exceeds
+payload" `SchemaError` from interpreting `b"good"[..4]` as a
+`[u32 rowlen]` claiming ~1.7 GiB. Fixed by wrapping in
+`rows_to_payload(&[...])`. The pentest-as-documentation value: the
+merger's framing defense IS the first line of defense and fired even
+on a test-author error.
+
+**Test counts:** workspace 1339 → 1349 default / 1394 → 1404 featured
+(+10 each, matching the 10 T8 pentests). seed-7 GREEN; tree-grep
+EMPTY; `#![forbid(unsafe_code)]` honored.
+
+**What T8 deliberately does NOT do:**
+
+  - **Real-TCP** pentests (spec OQ9 suggests "localhost TCP with a
+    hostile-shard test-double process"). T8 uses in-process mocks; a
+    follow-up could promote the pentests to real-TCP via the existing
+    `serve_router` + a custom adversarial shard, but the in-process
+    mock proves the contract at the `ShardCaller` boundary, which is
+    where the scatter layer's defense lives.
+  - **Partial-result-on-timeout** flag (T9) — currently V1 hard-fail
+    only; PT1 / PT4 / PT5 lock the hard-fail shape.
+  - **Documentation** (T10 — ARCHITECTURE.md §Sharding sub-section +
+    STATUS.md "What this is NOT yet" update).
+
 ## Pickup hint for the next session
 
-Start at **T7/T8**. T6 closed the LIMIT cancellation correctness
-slice; the remaining task slices T7..T13 are well-bounded per the
-SP155 §8 task table; the executor may pick whichever fits the
-session budget. Roughly:
+Start at **T9 / T10**. T7+T8 closed skew defense + the pentest sweep;
+the SP155 §8 acceptance criterion #3 ("all 10 pentests pass") is
+now MET. Remaining task slices T9..T13:
 
-- **T7 (~80 LoC):** skew defense + bounded buffers (channel
-  bound=4 from SP155 §3.8).
-- **T8 (~300 LoC):** the 10 pentests in spec §7.5.
 - **T9 (~150 LoC):** error-path completeness + the
-  `scatter_partial_on_timeout` flag.
+  `scatter_partial_on_timeout` flag — flips the V1 hard-fail default
+  to "return partial result + a per-slot non-Got marker" when the
+  caller opts in.
 - **T10 (~80 LoC):** documentation — ARCHITECTURE.md §Sharding
-  sub-section + STATUS.md "What this is NOT yet" update.
-- **T11 (~100 LoC):** extend to FindBy/FindByComposite (degenerate
-  scatter, no merge).
+  sub-section "Cross-shard reads (SP-A)" + STATUS.md "What this is
+  NOT yet" paragraph update (the open-limitation paragraph at line
+  363 in STATUS.md still lists scatter-gather *reads* as open; T10
+  removes it).
+- **T11 (~100 LoC):** extend to FindBy / FindByComposite (degenerate
+  scatter, no merge — concat-only).
 - **T12-T13:** optional perf (thread-pool the workers + adaptive
-  per-shard LIMIT).
+  per-shard LIMIT). Only ship if a benchmark shows the per-request
+  thread-spawn overhead is measurable at K=8 + high QPS.
 
-Estimated effort per slice: 0.3-1 session.
+Estimated effort per slice: 0.3-1 session. Per spec §8 acceptance:
+T9+T10 close all remaining MUSTs; T11 closes the documented FindBy
+follow-up; T12+T13 are perf-only.
 
 ## References
 

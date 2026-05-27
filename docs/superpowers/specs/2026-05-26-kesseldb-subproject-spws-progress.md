@@ -26,8 +26,8 @@ fragmented messages (continuation frames), streaming row responses
 |---|---|---|---|
 | **T1** | Design spec (~707 lines, 8 weak-spots + 4 open questions) + scaffold module (`ws.rs` with placeholder `handle_upgrade` returning `Err(WsError::NotYetImplemented)`) + `crypto.rs` shim + `kessel-crypto::sha1` + `kessel-crypto::base64_encode` + RFC 6455 §1.3 canonical handshake KAT + RFC 3174 §A.5 SHA-1 KATs + RFC 4648 §10 base64 KATs + WS predicate (`is_websocket_upgrade`) + locked constants (WEBSOCKET_PATH, SUBPROTOCOL_V1, WS_SEND_QUEUE_BOUND). | **DONE** | `2bc3570` (spec) + `22ea9c1` (scaffold) |
 | **T2** | Handshake parser: validate `Sec-WebSocket-Key` (base64 → 16 bytes) / `Sec-WebSocket-Version: 13` (wrong-version 400 + version hint) / path=/v1/ws / GET-only (POST → 405) / Authorization (token-mode 401) / `Sec-WebSocket-Protocol` (negotiate kessel-op-v1 case-insensitively, echo canonical constant, only-unknown → 400, absent → omit); build the `HTTP/1.1 101 Switching Protocols` response bytes per RFC 6455 §4.2.2 (locked byte-for-byte against §1.3 canonical example); wire `routes.rs::handle` arm with `close_after = true`; add `kessel-crypto::base64_decode` for key validation; flip the T1 regression-lock KAT to "handshake completes" (`t2_successful_handshake_returns_101_with_canonical_accept`). | **DONE** | `de5bbb3` |
-| T3 | Frame encoder: `encode_server_frame(opcode, payload)` (binary / ping / pong / close); structurally no server-side masking | OPEN | — |
-| T4 | Frame decoder: strict per spec §4.2 / §8 — MASK from client, RSV bits zero, control frames ≤ 125 bytes + FIN=1, no fragmentation, oversize → 1009 | OPEN | — |
+| **T3** | Frame encoder: `encode_server_frame(opcode, payload)` (binary / text / ping / pong / close); structurally no server-side masking (no API path to set a mask); three length branches per RFC 6455 §5.2 (≤125 / ≤65535 / >65535); 13 KATs sweep every length-branch boundary + close/ping/pong wire bytes byte-for-byte. | **DONE** | `926cd21` |
+| **T4** | Frame decoder: `decode_client_frame(bytes) -> Result<(Frame, consumed), FrameError>`; `Frame { fin, opcode, payload }`; `FrameError::{NeedMoreData, InvalidMask, InvalidOpcode, PayloadTooLarge, ReservedBitsSet}`; strict per spec §4.2 / §8 — MASK from client (else InvalidMask), RSV bits zero (else ReservedBitsSet), V1 opcode set (else InvalidOpcode), `MAX_PAYLOAD = 16 MiB` cap fires BEFORE allocation (attacker advertising u64::MAX → PayloadTooLarge, never `Vec::with_capacity(2^63)`); 23 KATs cover happy-path + rejection sweep + truncation NeedMoreData + length-branch boundaries + round-trip property test bridging T3+T4. (Fragmentation: the decoder surfaces fin=false cleanly; T5's session loop is the layer that closes 1003 on fragmented data frames per spec §4.5.) | **DONE** | `62202fb` |
 | T5 | Per-connection session loop: reader thread + writer thread + bounded `mpsc::sync_channel(WS_SEND_QUEUE_BOUND=16)` + ping/pong heartbeat (30s) + idle timeout + graceful close handshake | OPEN | — |
 | T6 | `kessel-op-v1` subprotocol wire-up + real-WebSocket-client e2e test (`tests/ws_e2e.rs`) + 10-pentest matrix (spec §8.7) | OPEN | — |
 
@@ -230,51 +230,224 @@ the connection, or its first frame send is ignored. That's T2's
 intended deliverable per the design spec §10 row "T2: YES — handshake
 completes".
 
+## T3 — what landed (2026-05-26, commit `926cd21`)
+
+**One commit, ~349 LoC net delta (one new file + one ws-module
+restructure):**
+
+- **kessel-http-gateway ws/ module split:** `ws.rs` (T1+T2's handshake
+  parser, 776 lines) → `ws/mod.rs` (same content) + new sibling
+  `ws/frame.rs` (T3's encoder; T4's decoder added in the next slice).
+  Pure code move; the handshake code is byte-identical.
+- **`ws::frame` module (T3 — encoder, ~350 LoC including KATs):**
+  - `encode_server_frame(opcode: u8, payload: &[u8]) -> Vec<u8>`
+    builds the 2..10-byte header + payload per RFC 6455 §5.2. FIN=1
+    forced on; RSV1-3 forced off; MASK=0 (server frames MUST NOT be
+    masked per RFC 6455 §5.3 — no API path exists to set a mask).
+    The opcode argument is masked to 4 bits so callers can't smuggle
+    in FIN/RSV bits via the opcode byte.
+  - `encode_close_frame(code: u16, reason: &str)` prepends the 2-byte
+    BE code to the UTF-8 reason and forwards to `encode_server_frame`.
+  - `encode_ping_frame` / `encode_pong_frame` thin wrappers around
+    the binary control opcodes.
+  - Locked constants: `OPCODE_CONTINUATION/TEXT/BINARY/CLOSE/PING/PONG`,
+    `MAX_PAYLOAD = 16 * 1024 * 1024` (16 MiB; T4's decoder uses this
+    cap so encoder + decoder agree on the boundary).
+- **13 new T3 KATs:**
+  - `t3_encode_empty_binary_frame_is_two_bytes` — `[0x82, 0x00]`
+  - `t3_encode_text_frame_hello_locks_wire_bytes` — `[0x81, 0x05,
+    'H', 'e', 'l', 'l', 'o']`
+  - `t3_encode_binary_frame_at_125_byte_boundary_uses_one_byte_length`
+    — upper boundary of 7-bit branch (0x7D)
+  - `t3_encode_binary_frame_at_126_crosses_into_16bit_length_branch`
+    — lower boundary of 16-bit branch (0x7E + 0x00 0x7E)
+  - `t3_encode_binary_frame_at_65535_uses_16bit_length_max` — upper
+    boundary of 16-bit branch (0x7E + 0xFF 0xFF)
+  - `t3_encode_binary_frame_at_65536_crosses_into_64bit_length_branch`
+    — lower boundary of 64-bit branch (0x7F + 8-byte BE)
+  - `t3_encode_close_frame_normal_no_reason_locks_wire_bytes` —
+    `[0x88, 0x02, 0x03, 0xE8]` (1000)
+  - `t3_encode_close_frame_with_reason_includes_utf8_bytes` — 1011 +
+    "internal"
+  - `t3_encode_ping_frame_empty_locks_wire_bytes` — `[0x89, 0x00]`
+  - `t3_encode_pong_frame_echoes_payload_locks_wire_bytes` — `[0x8A,
+    0x04, p, i, n, g]`
+  - `t3_encode_masks_opcode_to_four_bits` — defense-in-depth: caller
+    passes 0xFF → byte 0 = 0x8F (FIN forced on, RSV forced off, opcode
+    masked to 4 bits)
+  - `t3_invariant_all_encoded_server_frames_have_mask_bit_clear` —
+    structural sweep of all six opcodes; locks the "server frames are
+    never masked" promise (RFC 6455 §5.3)
+  - `t3_max_payload_constant_is_16_mib` — locks the cap so a future
+    tweak in one place can't silently desync encoder/decoder
+
+**KAT delta:** +13. All RFC-derived (RFC 6455 §5.2 / §5.5.1 / §5.5.2
+/ §5.5.3), locking the wire-protocol contract that T4 builds on.
+
+**Zero-dep stance preserved:** std::vec::Vec only; no `byteorder` (BE
+splits are 2 lines each, hand-rolled inline). `cargo tree -p
+kesseldb-server -e normal` shows no new entries.
+
+**Test counts:**
+- kessel-http-gateway lib: 28 → 41 (+13)
+- Workspace default: 1398 → 1411 (+13)
+- Workspace featured: 1431 → 1444 (+13)
+
+seed-7 GREEN. tree-grep EMPTY. `#![forbid(unsafe_code)]` honored.
+
+## T4 — what landed (2026-05-26, commit `62202fb`)
+
+**One commit, ~516 LoC net delta (decoder + 23 KATs added to
+`ws/frame.rs`):**
+
+- **`ws::frame` module (T4 — decoder, ~530 LoC added):**
+  - `Frame { fin: bool, opcode: u8, payload: Vec<u8> }` — the decoded
+    frame with payload already unmasked.
+  - `FrameError` — 5 variants:
+    - `NeedMoreData` — buffer too short; caller reads more bytes from
+      the socket and retries.
+    - `InvalidMask` — client frame missing the MASK bit. RFC 6455 §5.3
+      requires client→server frames to be masked. T5's session loop
+      translates this to close 1002.
+    - `InvalidOpcode` — opcode in `0x3..=0x7` (reserved data) or
+      `0xB..=0xF` (reserved control). Session loop → close 1002.
+    - `PayloadTooLarge` — declared length > `MAX_PAYLOAD` (16 MiB).
+      Fires BEFORE allocation; an attacker advertising u64::MAX
+      cannot OOM the server. Session loop → close 1009 (Message Too
+      Big).
+    - `ReservedBitsSet` — RSV1/2/3 set; peer is signaling an extension
+      we didn't negotiate. Session loop → close 1002.
+  - `decode_client_frame(bytes: &[u8]) -> Result<(Frame, usize),
+    FrameError>` walks the 9-step validation order (RSV → opcode →
+    MASK → extended length → cap → buffer-has-bytes → unmask) and
+    returns the bytes-consumed count so the caller can shift its read
+    buffer left and decode the next frame.
+
+**Security invariants encoded by the validation order:**
+- Cap check fires BEFORE allocation. The 64-bit length branch validates
+  against `MAX_PAYLOAD as u64` immediately after reading the 8-byte BE
+  length; we never reach `Vec::with_capacity(2^63)`.
+- Checked arithmetic on `offset + 4` (mask key) and `offset +
+  payload_len` (payload end). A future refactor that misses the
+  explicit cap check can't overflow into a small-positive offset.
+- Unmasked client frame → `InvalidMask` at step 5, before the extended
+  length is even parsed.
+- Reserved bits → `ReservedBitsSet` at step 2, the cheapest possible
+  rejection (one byte of input, one bitmask AND).
+
+**23 new T4 KATs:**
+- Decode happy-path: `t4_decode_masked_client_text_frame_hello` (RFC
+  6455 §5.7 worked example shape), `t4_decode_masked_client_small_
+  binary_frame`
+- Rejection sweep: `t4_decode_rejects_unmasked_client_frame`,
+  `t4_decode_rejects_rsv1_set`, `t4_decode_rejects_rsv2_set`,
+  `t4_decode_rejects_rsv3_set`,
+  `t4_decode_rejects_reserved_data_opcode_0x3`,
+  `t4_decode_rejects_reserved_control_opcode_0xb`
+- Adversarial cap: `t4_decode_rejects_payload_above_cap_via_64bit_
+  length` (u64::MAX), `t4_decode_rejects_payload_one_byte_above_cap`
+  (MAX_PAYLOAD + 1)
+- Truncation NeedMoreData: empty buffer, byte-1 missing, 16-bit
+  length truncated, 64-bit length truncated, masking key truncated,
+  payload truncated (6 KATs)
+- Length-branch boundaries on decode: `t4_decode_126_byte_frame_uses_
+  2byte_length` (16-bit lower), `t4_decode_65536_byte_frame_uses_
+  8byte_length` (64-bit lower)
+- Stream-mode: `t4_decode_returns_consumed_byte_count_for_buffer_
+  with_trailing_bytes` (caller can shift left by `consumed` and
+  decode the next frame)
+- Surface FIN=0 cleanly: `t4_decode_fin_zero_fragment_returns_clean_
+  frame_with_fin_false` (decoder doesn't reject; T5's session loop
+  is the layer that closes 1003 on fragmented data frames per spec
+  §4.5 — the decoder MUST surface fin=false so the session can make
+  that decision)
+- Control-frame round-trip: `t4_decode_close_frame_with_code_and_
+  reason` (1011 + "internal"), `t4_decode_ping_frame_with_payload`
+- **Round-trip property test (load-bearing T3+T4 contract):**
+  `t4_round_trip_encode_then_mask_then_decode_returns_original_
+  payload` — sweeps every length-branch boundary (empty, 1, 125, 126,
+  65535, 65536) × 4 opcodes (binary, text, ping, pong) = 8 round-trip
+  cases. Locks that the encoder + decoder agree on the wire format.
+
+**KAT delta:** +23 total. All RFC-derived (RFC 6455 §5.2 / §5.3 /
+§5.5 / §5.7), locking the strict V1 validation that T5's session
+loop will surface as close codes.
+
+**Zero-dep stance preserved:** std::vec::Vec only; no new external
+deps. kessel-crypto still 0 external deps. kessel-http-gateway still
+depends only on kessel-crypto + kessel-client + kessel-proto.
+
+**Test counts:**
+- kessel-http-gateway lib: 41 → 64 (+23)
+- Workspace default: 1411 → 1434 (+23)
+- Workspace featured: 1444 → 1467 (+23)
+
+seed-7 GREEN. tree-grep EMPTY. `#![forbid(unsafe_code)]` honored.
+
+**What T3+T4 deliberately did NOT do:**
+- Per-connection session loop (reader thread + writer thread + send
+  queue + ping/pong heartbeat + idle timeout + close handshake) — T5.
+- `routes.rs` wiring beyond what T2 already shipped — `handle_upgrade`
+  still returns success but no frames flow yet; T5 wires the session
+  loop into the post-handshake hijacked TcpStream.
+- Fragmentation reassembly — V1 rejects continuation frames at the
+  session-loop level (per spec §4.5). The decoder surfaces FIN=0
+  cleanly; T5 closes 1003 on them.
+- Per-opcode session-level rejection (text → 1003 because kessel-op-v1
+  is binary-only; reserved opcodes already rejected by the decoder
+  with `InvalidOpcode`) — that policy layer lives in T5/T6.
+- Control-frame discipline (≤125-byte payload, FIN=1) — the decoder
+  accepts wire-conformant frames; T5 is the layer that enforces "a
+  ping frame with 200 bytes is a protocol violation".
+- `kessel-op-v1` subprotocol wire-up + e2e test + 10-pentest matrix —
+  T6.
+
 ## Pickup hint for the next session
 
-T3 is the next slice — **frame encoder** per RFC 6455 §5. Concrete
-shape (mirrors the spec §4.3 target API):
+T5 is the next slice — **per-connection session loop** per spec §6.3
+/ §9. Concrete shape (mirrors the spec §6.3 sketch):
 
-1. New `ws::frame` module (~150 LoC). Public surface:
-   ```rust
-   pub enum Opcode { Continuation, Text, Binary, Close, Ping, Pong }
-   pub fn encode_server_frame(opcode: Opcode, payload: &[u8]) -> Vec<u8>;
-   pub fn encode_close_frame(code: u16, reason: &str) -> Vec<u8>;
-   pub fn encode_ping_frame(payload: &[u8]) -> Vec<u8>;
-   pub fn encode_pong_frame(payload: &[u8]) -> Vec<u8>;
-   ```
-   Server-side frames MUST NOT be masked (spec §4.3 / RFC 6455 §5.3):
-   the encoder structurally enforces this — no masked variant exists
-   for server-side encoding.
-2. Frame header per spec §4.1 RFC 6455 §5.2: FIN=1, RSV1/2/3=0, 4-bit
-   opcode, MASK=0, 7-bit length OR 7+16-bit OR 7+64-bit extended
-   length, payload. Three length branches:
-   - payload.len() ≤ 125: 1-byte length
-   - 126 ≤ payload.len() ≤ 65535: 0x7E + 2-byte BE length
-   - payload.len() > 65535: 0x7F + 8-byte BE length
-3. KATs (target +6-8):
-   - Empty binary frame: `[0x82, 0x00]` (FIN | binary, length 0)
-   - 5-byte binary frame: `[0x82, 0x05, ...payload]`
-   - 200-byte binary frame: `[0x82, 0x7E, 0x00, 0xC8, ...payload]`
-     (16-bit length branch)
-   - 70000-byte binary frame: `[0x82, 0x7F, 0x00, 0x00, 0x00, 0x00,
-     0x00, 0x01, 0x11, 0x70, ...payload]` (64-bit length branch)
-   - Ping frame with empty payload: `[0x89, 0x00]`
-   - Pong frame echoes payload: `[0x8A, len, ...payload]`
-   - Close frame with code 1000 (Normal): `[0x88, 0x02, 0x03, 0xE8]`
-   - Close frame with code + reason: `[0x88, len, 0xMM, 0xNN, ...utf8]`
+1. Widen `ws::handle_upgrade`'s stream bound from `Write` back to
+   `Read + Write` (T2 narrowed it for the handshake-only deliverable;
+   the session loop needs both).
+2. After the 101 response is written, spawn the reader/writer thread
+   pair on `TcpStream::try_clone()` per spec §6.4:
+   - **Reader thread**: read bytes from the socket into a growable
+     buffer; repeatedly call `frame::decode_client_frame`; on
+     `NeedMoreData` read more from the socket; on success dispatch
+     by opcode (close → echo close + exit; ping → enqueue pong;
+     pong → discard; binary → enqueue OpResult via engine.apply_op;
+     text → enqueue close 1003; FIN=0 → enqueue close 1003;
+     `FrameError::*` → enqueue close 1002/1009).
+   - **Writer thread**: drain `mpsc::sync_channel::<Vec<u8>>
+     (WS_SEND_QUEUE_BOUND)` and `stream.write_all(&bytes)` each frame.
+3. Ping/pong heartbeat: server sends a ping every 30s of read-idle;
+   no pong within another 30s → close 1011.
+4. Idle timeout: `TcpStream::set_read_timeout(30s)` inherited from
+   `serve()`; the read loop translates `ErrorKind::WouldBlock` into
+   close 1001 (Going Away).
+5. Backpressure-on-full-queue: if `tx.send(frame)` returns SendError
+   the connection closes 1011 (V1 fast-fail policy per spec §7).
+6. Graceful close handshake: either side may initiate; on peer Close
+   frame, echo close frame with the same code if valid (1000-4999
+   excluding 1004/1005/1006), else 1000; then close TCP.
 
-Target KAT delta for T3: +6-8.
+Target KAT delta for T5: +6-10 (session-loop unit tests via a stub
+TcpStream that hands the loop a sequence of pre-built client frames
+and asserts the response frames + close-handshake byte sequence).
 
-Frame encoding is structurally simpler than the handshake (no header
-parsing, just byte layout) but the length-branch boundaries are the
-load-bearing surface; the KATs above sweep each one.
+Frame-level encode/decode is locked by T3+T4; T5 is the policy +
+threading layer above. The session-loop tests should NOT re-derive
+frame bytes by hand — they should use `frame::encode_server_frame`
+and `frame::decode_client_frame` so the test asserts behave as a real
+peer would.
 
 ## References
 
 - Design: `docs/superpowers/specs/2026-05-26-kesseldb-spws-websocket-design.md` (707 lines)
 - Scoping: `docs/superpowers/specs/2026-05-26-kesseldb-http2-ws-pgwire-scoping.md`
-- Scaffold module: `crates/kessel-http-gateway/src/ws.rs`
+- Handshake module: `crates/kessel-http-gateway/src/ws/mod.rs` (T1+T2)
+- Frame encoder + decoder: `crates/kessel-http-gateway/src/ws/frame.rs` (T3+T4)
 - Crypto shim: `crates/kessel-http-gateway/src/crypto.rs`
 - SHA-1 + base64 primitives: `crates/kessel-crypto/src/lib.rs`
 - HTTP/1.1 parser (where T2 hooks in): `crates/kessel-http-gateway/src/parse.rs`

@@ -1,12 +1,51 @@
-//! PG-gateway listener + per-connection accept stub.
+//! PG-gateway listener + per-connection accept loop.
 //!
-//! **T1 status (current):** scaffold only. `accept()` returns
-//! `Err(PgError::NotYetImplemented)` without touching the stream. This
-//! locks the surface area + signature so T2's startup-handshake
-//! implementation can flip the stub in-place without churning the
-//! caller (mirrors the SP-WS T1 → T2 pattern where
-//! `ws::handle_upgrade` started as a placeholder and T2 replaced its
-//! body with a real handshake).
+//! **T2 status (this commit):** real startup-handshake + SCRAM-SHA-256
+//! auth + post-auth greeting (ParameterStatus + BackendKeyData +
+//! ReadyForQuery). `accept` returns `Ok(AcceptedSession)` after the
+//! client passes SCRAM and the greeting is sent; T3 will use the
+//! returned session to enter the Simple Query loop.
+//!
+//! Wire shape (spec §3.2 + §3.3 + §3.4 + §6):
+//!
+//! ```text
+//! TCP accept
+//!   ↓
+//! read first message (length-prefix → body)
+//!   ↓
+//! pre-handshake?
+//!   ├─ SSLRequest      → write 'N' (no TLS), read next message
+//!   ├─ GSSENCRequest   → write 'N' (no GSSAPI), read next message
+//!   └─ CancelRequest   → drop connection (V1 takes no action)
+//!   ↓
+//! StartupMessage v3.0?
+//!   ↓ (extract `user`, ignore others)
+//! write AuthenticationSASL ("SCRAM-SHA-256\0\0")
+//!   ↓
+//! read SASLInitialResponse (p-tag, mech + client-first)
+//!   ↓ (validate mech; parse client-first)
+//! write AuthenticationSASLContinue (server-first)
+//!   ↓
+//! read SASLResponse (p-tag, client-final)
+//!   ↓ (validate channel binding + nonce + proof)
+//! write AuthenticationSASLFinal (server-signature)
+//!   ↓
+//! write AuthenticationOk
+//!   ↓
+//! write ParameterStatus * N (server_version, server_encoding, ...)
+//!   ↓
+//! write BackendKeyData (pid + secret)
+//!   ↓
+//! write ReadyForQuery ('I' = idle)
+//!   ↓
+//! return Ok(AcceptedSession { user })
+//! ```
+//!
+//! T1 regression-lock — `t1_accept_returns_not_yet_implemented_stub` — is
+//! flipped to T2 acceptance tests that drive the WHOLE handshake against
+//! a fixed-nonce SCRAM client emulator and assert the post-auth
+//! byte-sequence (AuthenticationOk + ParameterStatus + BackendKeyData
+//! + ReadyForQuery) is correct.
 //!
 //! Companion design spec:
 //! `docs/superpowers/specs/2026-05-27-kesseldb-sppg-postgres-wire-design.md`
@@ -14,69 +53,675 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
 
-use std::io::Write;
+use crate::auth::{
+    self, encode_authentication_ok, encode_authentication_sasl_challenge,
+    encode_authentication_sasl_continue, encode_authentication_sasl_final, AuthError,
+};
+use crate::proto::{
+    BE_BACKEND_KEY_DATA, BE_PARAMETER_STATUS, BE_READY_FOR_QUERY, FE_PASSWORD,
+    READY_FOR_QUERY_IDLE,
+};
+use crate::startup::{
+    classify_initial_message, InitialMessage, StartupError, GSS_REPLY_NO_GSS, SSL_REPLY_NO_TLS,
+};
+use crate::{PG_DEFAULT_SCRAM_ITERATIONS, PG_MAX_MESSAGE_SIZE};
+use std::io::{Read, Write};
 
-/// Errors a PG-wire session can return at any phase.
-///
-/// **T1 status:** only `NotYetImplemented` exists. T2 widens this with
-/// `StartupFailed(SqlState)`, `AuthFailed`, `ProtocolViolation(SqlState)`,
-/// `Io(ErrorKind)`. Until T2 flips the stub, ANY call to `accept()`
-/// returns `NotYetImplemented`; the T1 KAT below locks that surface.
+/// Errors a PG-wire session can return at any phase. T2 widens the
+/// T1 placeholder enum into the real auth/protocol/io variants.
 #[derive(Debug)]
 pub enum PgError {
-    /// T1 placeholder. T2 removes this in favor of real error
-    /// variants. The associated KAT in this module is the
-    /// regression-lock — flipping the stub MUST update that test.
-    NotYetImplemented,
+    /// Pre-auth protocol violation (StartupMessage parse failure,
+    /// length-cap violation, unsupported protocol version). Spec
+    /// §3.2 / §6.2 SQLSTATE mapping happens at the server-loop
+    /// boundary; the variant carries the precise `StartupError` so
+    /// the caller can render the right ErrorResponse.
+    StartupFailed(StartupError),
+    /// SCRAM-SHA-256 authentication failure (bad proof, nonce
+    /// mismatch, malformed payload, etc.). Spec §6.2 — server sends
+    /// ErrorResponse `28P01` invalid_password + closes TCP. No
+    /// oracle for credential probing.
+    AuthFailed(AuthError),
+    /// `ServerConfig.token` is unset and `allow_anonymous` is false
+    /// (spec §3.4). The accept loop closes the connection with
+    /// `28000` invalid_authorization_specification BEFORE entering
+    /// SCRAM.
+    NoTokenConfigured,
+    /// I/O error reading or writing the TCP stream — propagates the
+    /// `std::io::ErrorKind` so the server loop can distinguish EOF
+    /// (clean close) from connection-reset (client crashed).
+    Io(std::io::ErrorKind),
+    /// Inbound frame's length-prefix violated `PG_MAX_MESSAGE_SIZE`.
+    /// Spec §3.1's cap-before-allocation invariant — a client claiming
+    /// 1 GiB never reaches `Vec::with_capacity`. SQLSTATE `08P01`.
+    MessageTooLarge { length: u32 },
+    /// Expected a `p`-tag SASL response frame but the client sent a
+    /// different message type during the auth phase. SQLSTATE `08P01`
+    /// protocol_violation.
+    UnexpectedMessageDuringAuth { tag: u8 },
 }
 
-/// Per-connection accept entry point. Called by the listener after
-/// `TcpStream::accept()` succeeds; owns the stream for the lifetime
-/// of the connection.
+impl From<StartupError> for PgError {
+    fn from(e: StartupError) -> Self { PgError::StartupFailed(e) }
+}
+
+impl From<AuthError> for PgError {
+    fn from(e: AuthError) -> Self { PgError::AuthFailed(e) }
+}
+
+impl From<std::io::Error> for PgError {
+    fn from(e: std::io::Error) -> Self { PgError::Io(e.kind()) }
+}
+
+/// Outcome of a successful `accept` call. T3+ will use the
+/// `user`/`pid`/`secret` fields to enter the Simple Query loop and
+/// to wire BackendKeyData/CancelRequest pairing. T2 just constructs
+/// it and returns.
+#[derive(Debug, Clone)]
+pub struct AcceptedSession {
+    /// Username from the client's StartupMessage. V1 logs but
+    /// doesn't use for authorization (spec §3.4 — one credential
+    /// surface; SCRAM happens against the Bearer token).
+    pub user: String,
+    /// PID we sent in BackendKeyData. V1 deterministic-from-nonce
+    /// per spec §3.4 (open question #4); preserved here for the
+    /// post-T2 cancel-key table.
+    pub pid: u32,
+    /// Cancel secret we sent in BackendKeyData. Same notes as `pid`.
+    pub secret: u32,
+}
+
+/// Reads ONE inbound message frame from the stream. Generic over
+/// `tag_present`: pre-auth/StartupMessage frames have NO type tag
+/// (only `[length:4][body]`); post-StartupMessage frames have a
+/// 1-byte type tag prefix (`[tag:1][length:4][body]`).
 ///
-/// **T1 stub:** returns `Err(PgError::NotYetImplemented)` without
-/// reading or writing the stream. T2 replaces with the real startup-
-/// handshake + SCRAM-SHA-256 auth + ReadyForQuery emit. T3+ extends
-/// to the simple-query loop. The `_stream` argument is held by name
-/// so the signature is stable across T1 → T2 → T3+ transitions.
+/// Returns `(tag_or_zero, full_frame_bytes)` — for tagless frames
+/// `tag_or_zero` is 0 and `full_frame_bytes` includes the length
+/// prefix. For tagged frames the tag is returned separately and
+/// `full_frame_bytes` starts at the length prefix.
+fn read_message<R: Read>(
+    r: &mut R,
+    tag_present: bool,
+) -> Result<(u8, Vec<u8>), PgError> {
+    let tag = if tag_present {
+        let mut t = [0u8; 1];
+        r.read_exact(&mut t)?;
+        t[0]
+    } else {
+        0
+    };
+    let mut len_buf = [0u8; 4];
+    r.read_exact(&mut len_buf)?;
+    let length = u32::from_be_bytes(len_buf);
+    // Cap-before-allocation invariant (spec §3.1).
+    if length as usize > PG_MAX_MESSAGE_SIZE {
+        return Err(PgError::MessageTooLarge { length });
+    }
+    if length < 4 {
+        return Err(PgError::StartupFailed(StartupError::LengthTooSmall { length }));
+    }
+    // Body is `length - 4` bytes (length-includes-itself).
+    let body_len = (length as usize) - 4;
+    let mut frame = Vec::with_capacity(length as usize);
+    frame.extend_from_slice(&len_buf);
+    let mut body = vec![0u8; body_len];
+    r.read_exact(&mut body)?;
+    frame.extend_from_slice(&body);
+    Ok((tag, frame))
+}
+
+/// Per-connection accept entry point. Drives the full startup +
+/// SCRAM-SHA-256 + post-auth-greeting handshake against the stream.
 ///
-/// Generic over `Write` (the loosest bound T2 needs — T2 only writes
-/// the auth challenge + error responses). T5+ session loop widens
-/// back to `Read + Write` per spec §8.5 (mirror SP-WS T2's "narrow,
-/// then widen at the session-loop slice" pattern).
-pub fn accept<S: Write>(_stream: &mut S) -> Result<(), PgError> {
-    Err(PgError::NotYetImplemented)
+/// Generic over `Read + Write` so tests can drive it with an
+/// in-memory pair; production callers wire it to a `TcpStream` (the
+/// `Cursor`-based shim makes that trivial).
+///
+/// **Operator contract (spec §3.4):** `token` MUST be `Some(_)` —
+/// V1 closed-mode requires a Bearer token. Open mode (no token)
+/// returns `PgError::NoTokenConfigured` BEFORE reading any client
+/// bytes; the server.rs listener should not even spawn a thread
+/// for the connection if `ServerConfig.token` is unset (mirrors
+/// HTTP gateway's auth-on-startup posture).
+///
+/// **Deterministic-nonce knob:** `server_nonce_fn` is invoked once
+/// to produce the per-session SCRAM server nonce. Production callers
+/// pass a CSPRNG-backed closure; tests pass a constant-string
+/// closure for KAT reproducibility.
+pub fn accept<S: Read + Write, F: FnOnce() -> String>(
+    stream: &mut S,
+    token: Option<&[u8]>,
+    server_nonce_fn: F,
+) -> Result<AcceptedSession, PgError> {
+    // Spec §3.4: V1 closed-mode requires a Bearer token. Reject
+    // connections BEFORE reading any client bytes.
+    let token = token.ok_or(PgError::NoTokenConfigured)?;
+
+    // ─── Startup phase ────────────────────────────────────────────
+    // PG §55.2.1: the first message has NO type tag (just length).
+    // The client may send SSLRequest / GSSENCRequest pre-handshake
+    // BEFORE the real StartupMessage; in that case we reply 'N' and
+    // loop back to read the actual StartupMessage.
+    let startup = loop {
+        let (_tag, frame) = read_message(stream, false)?;
+        match classify_initial_message(&frame)? {
+            InitialMessage::SslRequest => {
+                stream.write_all(&[SSL_REPLY_NO_TLS])?;
+                stream.flush()?;
+                continue;
+            }
+            InitialMessage::GssEncRequest => {
+                stream.write_all(&[GSS_REPLY_NO_GSS])?;
+                stream.flush()?;
+                continue;
+            }
+            InitialMessage::CancelRequest { .. } => {
+                // V1 takes no action on CancelRequest (V2 SP-PG T24
+                // wires the cancel-key table). PG §55.2.1 — the
+                // canonical response is to drop the connection
+                // without further reply.
+                return Err(PgError::StartupFailed(
+                    StartupError::MalformedBody {
+                        reason: "CancelRequest — V1 does not action; closing",
+                    },
+                ));
+            }
+            InitialMessage::Startup(sm) => break sm,
+        }
+    };
+
+    // ─── Auth phase: SCRAM-SHA-256 ─────────────────────────────────
+    // Spec §3.3: send AuthenticationSASL challenge → read
+    // SASLInitialResponse → send SASLContinue → read SASLResponse →
+    // send SASLFinal → send AuthenticationOk.
+    stream.write_all(&encode_authentication_sasl_challenge())?;
+    stream.flush()?;
+
+    // SASLInitialResponse (p-tag frame; payload = mech\0 + len:u32 + client_first)
+    let (tag, frame) = read_message(stream, true)?;
+    if tag != FE_PASSWORD {
+        return Err(PgError::UnexpectedMessageDuringAuth { tag });
+    }
+    // frame = [length:4][body]; payload = body
+    let payload = &frame[4..];
+    let (_mech, client_first) = auth::parse_sasl_initial_response(payload)?;
+
+    let server_nonce = server_nonce_fn();
+    let (server_first, state) = auth::start_scram(
+        &client_first, token, &server_nonce, PG_DEFAULT_SCRAM_ITERATIONS,
+    )?;
+    stream.write_all(&encode_authentication_sasl_continue(&server_first))?;
+    stream.flush()?;
+
+    // SASLResponse (p-tag frame; payload = client_final bytes verbatim)
+    let (tag, frame) = read_message(stream, true)?;
+    if tag != FE_PASSWORD {
+        return Err(PgError::UnexpectedMessageDuringAuth { tag });
+    }
+    let payload = &frame[4..];
+    let client_final = std::str::from_utf8(payload)
+        .map_err(|_| PgError::AuthFailed(AuthError::MalformedClientFinal))?;
+    let server_final = auth::finish_scram(client_final, &state, token)?;
+    stream.write_all(&encode_authentication_sasl_final(&server_final))?;
+    stream.write_all(&encode_authentication_ok())?;
+
+    // ─── Post-auth greeting (spec §8.4 / PG §55.2.6) ───────────────
+    write_parameter_status(stream, "server_version", "14.0 (KesselDB SP-PG V1)")?;
+    write_parameter_status(stream, "server_encoding", "UTF8")?;
+    write_parameter_status(stream, "client_encoding", "UTF8")?;
+    write_parameter_status(stream, "DateStyle", "ISO, MDY")?;
+    write_parameter_status(stream, "TimeZone", "UTC")?;
+    write_parameter_status(stream, "integer_datetimes", "on")?;
+    write_parameter_status(stream, "standard_conforming_strings", "on")?;
+    if let Some(app) = startup.get_param("application_name") {
+        write_parameter_status(stream, "application_name", app)?;
+    } else {
+        write_parameter_status(stream, "application_name", "")?;
+    }
+
+    // BackendKeyData — per spec §3.4 open question #4, V1 derives
+    // pid + secret deterministically from the server nonce + token
+    // (no global cancel-key table yet). T2 ships the wire bytes; T24
+    // (V2) wires the actual table.
+    let pid_secret = pid_and_secret_from_nonce(&server_nonce, token);
+    let (pid, secret) = pid_secret;
+    write_backend_key_data(stream, pid, secret)?;
+    write_ready_for_query(stream, READY_FOR_QUERY_IDLE)?;
+    stream.flush()?;
+
+    Ok(AcceptedSession {
+        user: startup.user,
+        pid,
+        secret,
+    })
+}
+
+/// Writes a ParameterStatus message: `S [length:4 BE] [key\0] [value\0]`.
+/// PG §55.2.6 — emitted after AuthenticationOk to announce server
+/// session parameters the client should know about (`server_version`,
+/// `server_encoding`, etc.).
+fn write_parameter_status<W: Write>(w: &mut W, key: &str, value: &str) -> Result<(), PgError> {
+    let payload_len = key.len() + 1 + value.len() + 1;
+    let length = (4 + payload_len) as u32;
+    w.write_all(&[BE_PARAMETER_STATUS])?;
+    w.write_all(&length.to_be_bytes())?;
+    w.write_all(key.as_bytes())?;
+    w.write_all(&[0])?;
+    w.write_all(value.as_bytes())?;
+    w.write_all(&[0])?;
+    Ok(())
+}
+
+/// Writes a BackendKeyData message: `K [length:4 BE = 12] [pid:u32 BE]
+/// [secret:u32 BE]`. PG §55.2.6 / §55.2.10. V1 emits it but does NOT
+/// action a subsequent CancelRequest (V2 SP-PG T24).
+fn write_backend_key_data<W: Write>(w: &mut W, pid: u32, secret: u32) -> Result<(), PgError> {
+    w.write_all(&[BE_BACKEND_KEY_DATA])?;
+    w.write_all(&12u32.to_be_bytes())?;
+    w.write_all(&pid.to_be_bytes())?;
+    w.write_all(&secret.to_be_bytes())?;
+    Ok(())
+}
+
+/// Writes a ReadyForQuery message: `Z [length:4 BE = 5] [status:1]`.
+/// V1 always emits status='I' (idle — no transaction in progress);
+/// V2 would emit 'T'/'E' once BEGIN/COMMIT/ROLLBACK awareness lands.
+fn write_ready_for_query<W: Write>(w: &mut W, status: u8) -> Result<(), PgError> {
+    w.write_all(&[BE_READY_FOR_QUERY])?;
+    w.write_all(&5u32.to_be_bytes())?;
+    w.write_all(&[status])?;
+    Ok(())
+}
+
+/// Derives BackendKeyData (pid, secret) deterministically from the
+/// per-session SCRAM server nonce + the operator's Bearer token.
+/// Spec §3.4 open question #4 — V1 doesn't have a global cancel-key
+/// table, so we surface SOMETHING in BackendKeyData (clients log
+/// it; some clients refuse a connection that doesn't send one) but
+/// take no action on a subsequent CancelRequest. V2 SP-PG T24 wires
+/// the real table and replaces this function.
+///
+/// The derivation: `digest = SHA-256(server_nonce || token)`;
+/// `pid = u32(digest[..4])`; `secret = u32(digest[4..8])`. PIDs
+/// less than 16 are bumped to avoid colliding with kernel-reserved
+/// PIDs that some old psql versions special-case.
+fn pid_and_secret_from_nonce(nonce: &str, token: &[u8]) -> (u32, u32) {
+    let mut input: Vec<u8> = Vec::with_capacity(nonce.len() + token.len());
+    input.extend_from_slice(nonce.as_bytes());
+    input.extend_from_slice(token);
+    let digest = kessel_crypto::sha256(&input);
+    let mut pid = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
+    if pid < 16 {
+        pid = pid.wrapping_add(16);
+    }
+    let secret = u32::from_be_bytes([digest[4], digest[5], digest[6], digest[7]]);
+    (pid, secret)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::{encode_authentication_sasl_challenge, parse_sasl_initial_response};
+    use kessel_crypto::{base64_encode, hmac_sha256, pbkdf2_hmac_sha256, sha256};
+    use std::io::Cursor;
 
-    /// T1 stub regression-lock. Mirrors the SP-WS T1
-    /// `t1_handle_upgrade_returns_not_yet_implemented_stub` shape:
-    /// T2 MUST update this test alongside the real handshake response
-    /// — flipping the stub is the gate that catches a half-shipped T2.
-    #[test]
-    fn t1_accept_returns_not_yet_implemented_stub() {
-        let mut sink: Vec<u8> = Vec::new();
-        match accept(&mut sink) {
-            Err(PgError::NotYetImplemented) => {}
-            other => panic!(
-                "expected PgError::NotYetImplemented; got {:?}; \
-                 if T2 has flipped the stub, update this regression-lock \
-                 alongside the new behavior",
-                other
-            ),
+    /// In-memory duplex stream: reads pull from `inbound`, writes
+    /// push to `outbound`. Test SCRAM clients build a stream of
+    /// pre-canned inbound bytes + drive `accept` then inspect the
+    /// outbound buffer for the expected response bytes.
+    struct Pipe {
+        inbound: Cursor<Vec<u8>>,
+        outbound: Vec<u8>,
+    }
+
+    impl Pipe {
+        fn new(inbound: Vec<u8>) -> Self {
+            Self { inbound: Cursor::new(inbound), outbound: Vec::new() }
         }
-        // The stub MUST NOT write anything to the stream before
-        // returning. T2's real implementation WILL write — the new
-        // test will assert against the expected bytes (e.g.
-        // AuthenticationSASL challenge).
-        assert_eq!(
-            sink.len(),
-            0,
-            "T1 stub must not touch the stream; T2 will write the \
-             AuthenticationSASL challenge"
+    }
+
+    impl Read for Pipe {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inbound.read(buf)
+        }
+    }
+
+    impl Write for Pipe {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.outbound.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    /// Build a StartupMessage frame matching what libpq sends for
+    /// `psql -U test`.
+    fn build_startup_frame(user: &str) -> Vec<u8> {
+        let body = format!("user\0{user}\0\0");
+        let length = (4 + 4 + body.len()) as u32;
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&length.to_be_bytes());
+        frame.extend_from_slice(&196608u32.to_be_bytes());
+        frame.extend_from_slice(body.as_bytes());
+        frame
+    }
+
+    /// Build a SASLInitialResponse `p`-frame.
+    /// Wire: `p [length:4][SCRAM-SHA-256\0][client_first_len:u32][client_first]`
+    fn build_sasl_initial_frame(client_first: &str) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"SCRAM-SHA-256\0");
+        payload.extend_from_slice(&(client_first.len() as u32).to_be_bytes());
+        payload.extend_from_slice(client_first.as_bytes());
+        let length = (4 + payload.len()) as u32;
+        let mut frame = Vec::new();
+        frame.push(b'p');
+        frame.extend_from_slice(&length.to_be_bytes());
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    /// Build a SASLResponse `p`-frame containing the client-final.
+    fn build_sasl_response_frame(client_final: &str) -> Vec<u8> {
+        let payload = client_final.as_bytes();
+        let length = (4 + payload.len()) as u32;
+        let mut frame = Vec::new();
+        frame.push(b'p');
+        frame.extend_from_slice(&length.to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    /// Client-side SCRAM proof construction for tests. Mirrors what
+    /// libpq does internally during a `PGPASSWORD=...` connection.
+    fn compute_client_proof(
+        token: &[u8],
+        salt: &[u8],
+        iterations: u32,
+        auth_message: &str,
+    ) -> (String, [u8; 32]) {
+        let salted = pbkdf2_hmac_sha256(token, salt, iterations);
+        let client_key = hmac_sha256(&salted, b"Client Key");
+        let stored_key = sha256(&client_key);
+        let client_sig = hmac_sha256(&stored_key, auth_message.as_bytes());
+        let mut proof = [0u8; 32];
+        for i in 0..32 {
+            proof[i] = client_key[i] ^ client_sig[i];
+        }
+        (base64_encode(&proof), client_key)
+    }
+
+    // ─── Headline KAT: full successful SCRAM round-trip via accept ──
+
+    /// T2 flips the T1 stub. The original
+    /// `t1_accept_returns_not_yet_implemented_stub` is replaced by
+    /// this test: a successful SCRAM-SHA-256 round-trip over an
+    /// in-memory pipe, asserting that `accept` returns
+    /// `Ok(AcceptedSession)` with the right user and a non-zero
+    /// (pid, secret) pair, and that the outbound bytes contain the
+    /// expected post-auth greeting sequence.
+    #[test]
+    fn t2_accept_runs_full_scram_handshake_to_ready_for_query() {
+        let token = b"kessel-bearer-token";
+        let client_nonce = "fixedClientNonce";
+        let server_nonce = "fixedServerNonce";
+        let username = "test";
+
+        // Pre-compute the client side of SCRAM so we can build a
+        // canned inbound byte stream.
+        let client_first_bare = format!("n={username},r={client_nonce}");
+        let client_first = format!("n,,{client_first_bare}");
+
+        // The server will derive:
+        //   salt = SHA-256(server_nonce || token)[..16]
+        //   server_first = "r={client_nonce}{server_nonce},s={salt_b64},i=4096"
+        let mut salt_input = Vec::new();
+        salt_input.extend_from_slice(server_nonce.as_bytes());
+        salt_input.extend_from_slice(token);
+        let salt: Vec<u8> = sha256(&salt_input)[..16].to_vec();
+        let salt_b64 = base64_encode(&salt);
+        let combined = format!("{client_nonce}{server_nonce}");
+        let server_first = format!("r={combined},s={salt_b64},i=4096");
+        let cf_without_proof = format!("c=biws,r={combined}");
+        let auth_msg =
+            format!("{client_first_bare},{server_first},{cf_without_proof}");
+        let (proof_b64, _client_key) = compute_client_proof(token, &salt, 4096, &auth_msg);
+        let client_final = format!("{cf_without_proof},p={proof_b64}");
+
+        // Build the inbound byte stream the server will read in order:
+        //   1. StartupMessage
+        //   2. SASLInitialResponse (p-tag)
+        //   3. SASLResponse (p-tag)
+        let mut inbound = Vec::new();
+        inbound.extend_from_slice(&build_startup_frame(username));
+        inbound.extend_from_slice(&build_sasl_initial_frame(&client_first));
+        inbound.extend_from_slice(&build_sasl_response_frame(&client_final));
+
+        let mut pipe = Pipe::new(inbound);
+        let session = accept(&mut pipe, Some(token), || server_nonce.to_string())
+            .expect("SCRAM handshake completes against the in-memory pipe");
+        assert_eq!(session.user, username);
+        assert_ne!(session.pid, 0);
+        // pid >= 16 per the kernel-PID-collision avoidance rule
+        assert!(session.pid >= 16);
+
+        // Outbound bytes (in order):
+        //  - AuthenticationSASL challenge (24 bytes)
+        //  - AuthenticationSASLContinue (R-envelope wrapping server-first)
+        //  - AuthenticationSASLFinal (R-envelope wrapping "v=...")
+        //  - AuthenticationOk (9 bytes)
+        //  - 8 ParameterStatus messages
+        //  - BackendKeyData (13 bytes: 'K' + length=12 + pid + secret)
+        //  - ReadyForQuery (6 bytes: 'Z' + length=5 + 'I')
+        let out = &pipe.outbound;
+
+        // First 24 bytes are the AuthenticationSASL challenge
+        let expected_challenge = encode_authentication_sasl_challenge();
+        assert_eq!(&out[..24], &expected_challenge[..]);
+
+        // Find the AuthenticationOk byte sequence (R, 0,0,0,8, 0,0,0,0).
+        let auth_ok = &[b'R', 0, 0, 0, 8, 0, 0, 0, 0][..];
+        assert!(
+            out.windows(9).any(|w| w == auth_ok),
+            "AuthenticationOk byte sequence MUST appear in outbound bytes"
+        );
+
+        // Find ReadyForQuery: 'Z', 0,0,0,5, 'I'
+        let rfq = &[b'Z', 0, 0, 0, 5, b'I'][..];
+        assert!(
+            out.windows(6).any(|w| w == rfq),
+            "ReadyForQuery ('Z' [len=5] 'I') MUST appear in outbound bytes"
+        );
+
+        // ParameterStatus server_version + UTF8 encoding present
+        assert!(
+            out.windows(b"server_version".len()).any(|w| w == b"server_version"),
+            "ParameterStatus(server_version=...) MUST appear in outbound bytes"
+        );
+        assert!(
+            out.windows(b"UTF8".len()).any(|w| w == b"UTF8"),
+            "server_encoding=UTF8 MUST appear in outbound bytes"
+        );
+
+        // BackendKeyData: 'K' + length=12 + 8 bytes
+        let pid_be = session.pid.to_be_bytes();
+        let secret_be = session.secret.to_be_bytes();
+        let mut bkd = vec![b'K', 0, 0, 0, 12];
+        bkd.extend_from_slice(&pid_be);
+        bkd.extend_from_slice(&secret_be);
+        assert!(
+            out.windows(13).any(|w| w == bkd.as_slice()),
+            "BackendKeyData with the announced (pid, secret) MUST appear in outbound bytes"
+        );
+
+        // Order invariant: AuthenticationOk comes BEFORE ReadyForQuery.
+        let ok_pos = out
+            .windows(9)
+            .position(|w| w == auth_ok)
+            .expect("AuthenticationOk present");
+        let rfq_pos = out
+            .windows(6)
+            .position(|w| w == rfq)
+            .expect("ReadyForQuery present");
+        assert!(
+            ok_pos < rfq_pos,
+            "AuthenticationOk MUST precede ReadyForQuery in outbound bytes"
+        );
+    }
+
+    /// `accept` rejects connections when `token` is `None` BEFORE
+    /// reading any client bytes. Spec §3.4: V1 closed-mode requires
+    /// a Bearer token; open mode returns `NoTokenConfigured` (the
+    /// listener should not even spawn a thread for the connection).
+    #[test]
+    fn t2_accept_rejects_when_no_token_configured() {
+        let mut pipe = Pipe::new(Vec::new());
+        match accept(&mut pipe, None, || "irrelevant".to_string()) {
+            Err(PgError::NoTokenConfigured) => {}
+            other => panic!("expected NoTokenConfigured, got {other:?}"),
+        }
+        // No bytes touched on the stream — the rejection is pre-read.
+        assert_eq!(pipe.outbound.len(), 0);
+    }
+
+    /// SSLRequest pre-handshake → server replies 'N' and loops back
+    /// to read the real StartupMessage; the SCRAM exchange proceeds
+    /// normally. Locks the §3.2 SSL-redirect-then-handshake invariant.
+    #[test]
+    fn t2_accept_handles_ssl_request_then_completes_handshake() {
+        let token = b"kessel-bearer-token";
+        let client_nonce = "fixedClientNonce";
+        let server_nonce = "fixedServerNonce";
+        let username = "test";
+
+        // Pre-build the SCRAM bytes
+        let client_first_bare = format!("n={username},r={client_nonce}");
+        let client_first = format!("n,,{client_first_bare}");
+        let mut salt_input = Vec::new();
+        salt_input.extend_from_slice(server_nonce.as_bytes());
+        salt_input.extend_from_slice(token);
+        let salt: Vec<u8> = sha256(&salt_input)[..16].to_vec();
+        let salt_b64 = base64_encode(&salt);
+        let combined = format!("{client_nonce}{server_nonce}");
+        let server_first = format!("r={combined},s={salt_b64},i=4096");
+        let cf_without_proof = format!("c=biws,r={combined}");
+        let auth_msg =
+            format!("{client_first_bare},{server_first},{cf_without_proof}");
+        let (proof_b64, _) = compute_client_proof(token, &salt, 4096, &auth_msg);
+        let client_final = format!("{cf_without_proof},p={proof_b64}");
+
+        // Inbound stream: SSLRequest first, THEN StartupMessage + SCRAM.
+        let mut inbound = Vec::new();
+        // SSLRequest: length=8, code=80877103
+        inbound.extend_from_slice(&8u32.to_be_bytes());
+        inbound.extend_from_slice(&80877103u32.to_be_bytes());
+        inbound.extend_from_slice(&build_startup_frame(username));
+        inbound.extend_from_slice(&build_sasl_initial_frame(&client_first));
+        inbound.extend_from_slice(&build_sasl_response_frame(&client_final));
+
+        let mut pipe = Pipe::new(inbound);
+        let session = accept(&mut pipe, Some(token), || server_nonce.to_string())
+            .expect("SSLRequest then SCRAM handshake completes");
+        assert_eq!(session.user, username);
+
+        // The first outbound byte MUST be 'N' (no TLS).
+        assert_eq!(pipe.outbound[0], b'N');
+        // Followed by the AuthenticationSASL challenge starting at byte 1.
+        let expected = encode_authentication_sasl_challenge();
+        assert_eq!(&pipe.outbound[1..1 + expected.len()], &expected[..]);
+    }
+
+    /// Bad client proof (wrong token) → `PgError::AuthFailed
+    /// (ProofVerificationFailed)`. Server should NOT have sent
+    /// AuthenticationOk (no false positive); should NOT have sent
+    /// ReadyForQuery (no oracle).
+    #[test]
+    fn t2_accept_bad_proof_returns_auth_failed_no_ready_for_query() {
+        let real_token = b"real-token";
+        let wrong_token = b"WRONG-token";
+        let client_nonce = "clientN";
+        let server_nonce = "serverN";
+        let username = "test";
+
+        let client_first_bare = format!("n={username},r={client_nonce}");
+        let client_first = format!("n,,{client_first_bare}");
+        // Compute proof against the WRONG token — server will reject.
+        let mut salt_input = Vec::new();
+        salt_input.extend_from_slice(server_nonce.as_bytes());
+        salt_input.extend_from_slice(real_token);
+        let salt: Vec<u8> = sha256(&salt_input)[..16].to_vec();
+        let salt_b64 = base64_encode(&salt);
+        let combined = format!("{client_nonce}{server_nonce}");
+        let server_first = format!("r={combined},s={salt_b64},i=4096");
+        let cf_without_proof = format!("c=biws,r={combined}");
+        let auth_msg =
+            format!("{client_first_bare},{server_first},{cf_without_proof}");
+        let (proof_b64, _) =
+            compute_client_proof(wrong_token, &salt, 4096, &auth_msg);
+        let client_final = format!("{cf_without_proof},p={proof_b64}");
+
+        let mut inbound = Vec::new();
+        inbound.extend_from_slice(&build_startup_frame(username));
+        inbound.extend_from_slice(&build_sasl_initial_frame(&client_first));
+        inbound.extend_from_slice(&build_sasl_response_frame(&client_final));
+
+        let mut pipe = Pipe::new(inbound);
+        match accept(&mut pipe, Some(real_token), || server_nonce.to_string()) {
+            Err(PgError::AuthFailed(AuthError::ProofVerificationFailed)) => {}
+            other => panic!("expected AuthFailed(ProofVerificationFailed), got {other:?}"),
+        }
+        // No AuthenticationOk in the outbound (server rejected before emitting it).
+        let auth_ok = &[b'R', 0, 0, 0, 8, 0, 0, 0, 0][..];
+        assert!(
+            !pipe.outbound.windows(9).any(|w| w == auth_ok),
+            "AuthenticationOk MUST NOT appear after a failed proof"
+        );
+        // No ReadyForQuery either.
+        let rfq = &[b'Z', 0, 0, 0, 5, b'I'][..];
+        assert!(
+            !pipe.outbound.windows(6).any(|w| w == rfq),
+            "ReadyForQuery MUST NOT appear after a failed proof"
+        );
+    }
+
+    /// EOF before StartupMessage → `PgError::Io(UnexpectedEof)`.
+    /// Locked behavior — the connection died before the client
+    /// could send the first byte; server-loop drops the thread.
+    #[test]
+    fn t2_accept_eof_before_startup_is_io_error() {
+        let mut pipe = Pipe::new(Vec::new());
+        match accept(&mut pipe, Some(b"token"), || "nonce".to_string()) {
+            Err(PgError::Io(std::io::ErrorKind::UnexpectedEof)) => {}
+            other => panic!("expected Io(UnexpectedEof), got {other:?}"),
+        }
+    }
+
+    /// `pid_and_secret_from_nonce` is deterministic — same inputs
+    /// produce same (pid, secret) — and bumps pids < 16. Locks the
+    /// spec §3.4 derivation rule against a refactor.
+    #[test]
+    fn t2_backend_key_data_derivation_is_deterministic() {
+        let token = b"some-token";
+        let nonce = "some-nonce";
+        let (pid_a, secret_a) = pid_and_secret_from_nonce(nonce, token);
+        let (pid_b, secret_b) = pid_and_secret_from_nonce(nonce, token);
+        assert_eq!(pid_a, pid_b);
+        assert_eq!(secret_a, secret_b);
+        assert!(pid_a >= 16, "kernel-reserved PIDs avoided");
+    }
+
+    /// `pid_and_secret_from_nonce` produces DIFFERENT pairs for
+    /// different nonces (entropy from the per-session nonce).
+    /// Locked because a constant pair across sessions would defeat
+    /// the cancel-key replay-prevention story V2 will rely on.
+    #[test]
+    fn t2_backend_key_data_changes_across_nonces() {
+        let token = b"some-token";
+        let (pid_a, secret_a) = pid_and_secret_from_nonce("nonce-A", token);
+        let (pid_b, secret_b) = pid_and_secret_from_nonce("nonce-B", token);
+        assert!(
+            pid_a != pid_b || secret_a != secret_b,
+            "different nonces MUST produce different BackendKeyData"
         );
     }
 }

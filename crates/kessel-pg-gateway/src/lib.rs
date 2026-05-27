@@ -61,11 +61,12 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
 
+pub mod auth;
 pub mod proto;
 pub mod server;
 pub mod startup;
 
-pub use server::{accept, PgError};
+pub use server::{accept, AcceptedSession, PgError};
 
 /// Spec §8.1: default TCP port for the PostgreSQL Frontend/Backend
 /// protocol. Standard libpq/psql/JDBC default. Operators MAY override

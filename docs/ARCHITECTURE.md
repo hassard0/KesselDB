@@ -431,7 +431,17 @@ MVCC stack under partition + message loss. `Cluster::drive_until_digests_converg
 extends the simulation past replies-complete so isolated minority replicas
 finish state-transfer + catch up.
 
-### Listeners (with `--features http-gateway`)
+## Wire protocol gateways
+
+KesselDB exposes the same `Op` apply path through four wire surfaces. The
+binary protocol is the default + the deterministic fast path; every other
+listener is opt-in via a cargo feature, runs on a sibling TCP socket, and
+is byte-untouched by the binary protocol. See
+[`docs/USAGE.md`](USAGE.md) §9 (PostgreSQL) and §10 (HTTP + WebSocket) for
+the operator-side configuration; this section covers the engine-side
+plumbing.
+
+### HTTP listener (with `--features http-gateway`)
 
 When `kesseldb-server` is built with the opt-in `http-gateway` feature, it
 runs TWO sibling listener threads (or three with `--features http-gateway,tls`):
@@ -456,14 +466,17 @@ runtime dependencies. The default `cargo build -p kesseldb-server` (without
 `--features http-gateway`) does not link the gateway crate — `cargo tree`
 verifies the binary stays untouched.
 
-### WebSocket listener (with `--features ws-gateway`)
+### WebSocket listener (with `--features http-gateway`)
 
 The WebSocket arm of the HTTP gateway exposes a long-lived `/v1/ws` upgrade
 that frames raw `Op::encode()` payloads under the `kessel-op-v1`
 subprotocol. RFC 6455 strict handshake + binary frames only + bounded send
-queue + 30s ping/pong heartbeat. Shipped under the SP-WS arc (separate from
-the HTTP gateway because the session model is fundamentally different —
-long-lived reader/writer-thread split vs request/response).
+queue (16 messages) + 30s ping/pong heartbeat. Shipped under the SP-WS
+arc inside the same `kessel-http-gateway` crate (there is no separate
+`ws-gateway` feature flag); the session model is fundamentally different
+from `/v1/sql` and `/v1/op` (long-lived reader/writer-thread split vs
+request/response) but the crate, the Bearer auth surface, and the
+`EngineApply` trait are shared.
 
 ### PostgreSQL wire listener (with `--features pg-gateway`)
 

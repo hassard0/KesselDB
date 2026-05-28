@@ -2,6 +2,86 @@
 
 Honest milestone tracker. Updated every milestone. "Done" means code + tests committed and passing.
 
+## Current capabilities (2026-05-28)
+
+What a node running on today's `main` actually does. Every line below is
+covered by the workspace test suite (1779 default / 1807 with
+`--features pg-gateway` / 1862 with all gateway features).
+
+**Wire surfaces** (all opt-in via cargo features except the binary protocol):
+- **Binary** — length-prefixed `Op::encode()` over TCP; the deterministic fast
+  path, default `cargo build`. SQL frames (`0xFE`), session frames (`0xFD`,
+  exactly-once), token auth (`0xFC`), stats (`0xFB`), snapshot (`0xFA`).
+- **HTTP/1.1** — `--features http-gateway`. Routes: `/v1/sql`, `/v1/op`,
+  `/v1/health`, `/v1/metrics` (Prometheus text v0.0.4). `Authorization: Bearer`
+  constant-time auth, optional `X-Kessel-Client-Id` + `X-Kessel-Req-Seq`
+  exactly-once headers.
+- **WebSocket** — same `--features http-gateway`, `/v1/ws` upgrade.
+  RFC 6455 strict handshake, binary frames only, `kessel-op-v1`
+  subprotocol, bounded send queue (16 msgs), 30 s ping/pong heartbeat.
+- **PostgreSQL Frontend/Backend v3.0** — `--features pg-gateway`. Simple
+  Query path + SCRAM-SHA-256 + Bearer↔SCRAM bridge (the operator token IS
+  the SCRAM password). `pg_catalog` + `information_schema` stubs (SP-PG-CAT)
+  so pgAdmin/DBeaver/DataGrip/Metabase/Tableau connect + browse out of the
+  box. Independent connection cap from HTTP (default 256 vs HTTP's 1024).
+- **HTTPS / TLS** — `--features http-gateway,tls` for the HTTP gateway;
+  `--features tls` for the binary protocol; rustls.
+
+**SQL surface**: `CREATE TABLE` / `ALTER TABLE … ADD COLUMN` (online, no
+lock) / `DROP TABLE`, `INSERT` (incl. multi-row `VALUES (…),(…)` as one
+atomic op), `SELECT` with `WHERE` (incl. `IN` / `BETWEEN` / `LIKE` /
+`IS [NOT] NULL` / `AND`/`OR`/`NOT`), `JOIN`, `GROUP BY`, `ORDER BY`,
+`LIMIT/OFFSET`, projections, `COUNT/SUM/MIN/MAX/AVG`, `UPDATE`, `DELETE`,
+`CREATE [UNIQUE|RANGE] INDEX`, `DROP INDEX`, `DESCRIBE`, `EXPLAIN`,
+`BEGIN`/`COMMIT`/`ROLLBACK`.
+
+**Constraints + logic**: `NOT NULL`, `UNIQUE`, foreign keys with
+`ON DELETE RESTRICT/CASCADE/SET NULL`, `CHECK` (deterministic expression
+VM), balance-guard helpers, deterministic triggers, deterministic
+WASM-MVP UDFs (S4), pgcrypto-subset (SHA-256 / HMAC-SHA-256) usable in
+CHECK / triggers.
+
+**Storage + recovery**: LSM + WAL + per-SSTable bloom filters + bounded
+compaction; per-record `schema_ver` + null bitmap; crash recovery with
+torn-tail handling; hot consistent snapshot backup; orphan-blob GC.
+
+**Clustering**: Viewstamped Replication over real TCP sockets; safety
+hardened (no committed-op loss across view change); liveness tested
+under adversarial partition corpus; exactly-once clients via
+`ClusterClient` with automatic failover; rendezvous-hashed K-shard router
+with deterministic Calvin-style cross-shard transactions
+(`Op::XshardApply` + global sequencer + `XshardDecide`/`XshardCommit`,
+no 2PC, no coordinator-failure hole).
+
+**Cross-shard scatter scan (SP-A)**: `Select` / `QueryRows` /
+`SelectFields` / `SelectSorted` fan out across K shard groups via
+`scatter_scan`. Unordered = shard-id-deterministic concatenation;
+sorted = `BinaryHeap` k-way merge. K-invariance locked by 85-seed × 5-K
+property sweep. Opt-in `partial_on_timeout` for best-effort mode beside
+the safe hard-fail default.
+
+**Auth + ops**: shared-secret Bearer token (timing-safe compared);
+per-listener connection caps; engine-wide `max_inflight` backpressure;
+Prometheus metrics (bounded cardinality); `ServerStats { applied_ops,
+digest, uptime_secs }`.
+
+**External sources**: `REGISTER` + `REFRESH` JSON/NDJSON/CSV/Parquet
+from HTTP/HTTPS endpoints or S3-compatible/Azure Blob object storage.
+Parquet reader (zero-dep): UNCOMPRESSED + Snappy + GZIP + zstd +
+LZ4_RAW + Brotli × PLAIN + dictionary × V1 + V2 pages × flat REQUIRED +
+OPTIONAL + LIST<primitive> + MAP<K,V> + struct (+ 3-deep cross-products,
+OBJ-2c-5 closed) × INT32/INT64/INT96/DECIMAL(≤38)/FLBA/BYTE_ARRAY.
+
+**Determinism + verification**: TLA+ (S1, Replication.tla TLC across
+528M states / depth 21 / 0 violations) over 7 layered modules (Replication
+→ MVCCStorage → MVCCTx → MVCCSi → MVCCSsi → MVCCGc → MVCCCutover);
+serializable MVCC + Cahill SSI (S2); Jepsen-style linearizability under
+partition (S3, 5 hand-derived tests); deterministic WASM-MVP UDFs (S4).
+Every replicated op is a pure function of seeded inputs; replicas reach
+byte-identical state at every committed log position.
+
+---
+
 | Milestone | State | Notes |
 |---|---|---|
 | M0 — workspace + determinism seam | **done** | proto/io/sim crates; 13 tests green; determinism gate = 100 seeds × 2 runs identical |

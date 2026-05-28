@@ -17,21 +17,50 @@ KesselDB. Every feature described here is covered by the test suite.
 - [7e. Object-store sources (S3 / Azure Blob)](#7e-object-store-sources-s3--azure-blob)
 - [7f. FORMAT PARQUET for object-store sources](#7f-format-parquet-for-object-store-sources)
 - [8. Authentication, quotas & backpressure](#8-authentication-quotas--backpressure)
-- [9. Backup & monitoring](#9-backup--monitoring)
-- [10. Wire protocol](#10-wire-protocol)
-- [11. Troubleshooting](#11-troubleshooting)
+- [9. PostgreSQL clients (psql, pgcli, JDBC, psycopg, pgx, …)](#9-postgresql-clients-psql-pgcli-jdbc-psycopg-pgx-)
+- [10. HTTP gateway (and WebSocket)](#10-http-gateway)
+- [11. Backup & monitoring](#11-backup--monitoring)
+- [12. Wire protocol](#12-wire-protocol)
+- [13. Troubleshooting](#13-troubleshooting)
 
 ---
 
 ## 1. Install & build
 
-KesselDB is pure Rust with **no external dependencies** and no native build
-steps.
+### Option A — download a prebuilt binary (Linux x86_64)
+
+KesselDB ships prebuilt server (`kesseldb`) and CLI (`kessel`) binaries for
+`x86_64-unknown-linux-gnu` on the [GitHub Releases page](https://github.com/hassard0/KesselDB/releases).
+Each release is built from `cargo build --release --features
+pg-gateway,http-gateway`, so the PostgreSQL, HTTP/1.1, and WebSocket
+gateways are wired in.
+
+```bash
+VER=v1.0.0   # see the releases page for the latest
+curl -L https://github.com/hassard0/KesselDB/releases/download/$VER/kesseldb-$VER-x86_64-unknown-linux-gnu \
+  -o kesseldb && chmod +x kesseldb
+curl -L https://github.com/hassard0/KesselDB/releases/download/$VER/kessel-$VER-x86_64-unknown-linux-gnu \
+  -o kessel    && chmod +x kessel
+
+# or grab the bundle (server + CLI + README + USAGE + LICENSE):
+curl -L https://github.com/hassard0/KesselDB/releases/download/$VER/kesseldb-$VER-x86_64-unknown-linux-gnu.tar.gz \
+  | tar xz
+
+# SHA-256 checksums are published alongside the binaries:
+curl -L https://github.com/hassard0/KesselDB/releases/download/$VER/SHA256SUMS -o SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing
+```
+
+### Option B — build from source
+
+KesselDB is pure Rust with **no external dependencies** in the kernel and
+no native build steps.
 
 ```bash
 git clone https://github.com/hassard0/KesselDB && cd KesselDB
-cargo build --release        # builds every crate
-cargo test --workspace       # full suite, incl. seeded partition simulation
+cargo build --release                                # default — binary protocol only, no gateway code linked
+cargo build --release --features pg-gateway,http-gateway   # all wire surfaces
+cargo test --workspace                               # 1779 default tests
 ```
 
 Requires Rust stable **1.95+**.
@@ -1131,163 +1160,6 @@ behind a TLS‑terminating reverse proxy, or on a private/encrypted network
 Or build with `--features http-gateway,tls` to terminate HTTPS in-process on
 `ServerConfig.http_tls_addr` — see §HTTP gateway below.
 
-## 9. Backup & monitoring
-
-Both are handled on the engine thread, so a snapshot is crash‑consistent and
-metrics are exact. Using the embedded engine handle:
-
-```rust
-let engine = kesseldb_server::spawn_engine("./data")?;
-
-// Hot, consistent snapshot — recovers to the exact live state digest:
-engine.snapshot("./backup-2026-05-17")?;
-
-// Live metrics:
-let s = engine.stats();   // ServerStats { applied_ops, digest, uptime_secs }
-```
-
-`StateMachine::open("./backup-...")` recovers an identical state. The `digest`
-field matches `Replica::digest`, so comparing stats across a cluster detects
-replica divergence. In a cluster, `Node::probe()` returns
-`(digest, op_number, commit)` for the same purpose.
-
-Restore = point a fresh node at a snapshot directory and start it.
-
-## 10. Wire protocol
-
-Each message is length‑prefixed: `[u32 little‑endian length][payload]`.
-
-| First byte | Meaning |
-|---|---|
-| (none / op bytes) | `Op::encode()` request → `OpResult::encode()` reply |
-| `0xFE` | `0xFE ++ utf8 SQL` → compiled server‑side, `OpResult` reply |
-| `0xFD` | session frame: `0xFD ++ client(u128 LE) ++ req(u64 LE) ++ Op::encode()` (exactly‑once) |
-| `0xFC` | auth handshake: `0xFC ++ token` → `Ok` / `Unauthorized` |
-| `0xFB` | admin: request `ServerStats` |
-| `0xFA` | admin: `0xFA ++ dest_dir` → snapshot |
-
-This is intentionally tiny — any language can speak it with a socket and the
-length framing. `kessel-client` implements all of it.
-
-## 11. Troubleshooting
-
-| Symptom | Cause / fix |
-|---|---|
-| `OpResult::Unavailable` | The node is not the active primary, or it is shedding load. Use `ClusterClient` (auto‑rotates), or retry. |
-| `OpResult::Unauthorized` | Missing/incorrect token. Use `connect_authed` / `with_token` with the server's `ServerConfig.token`. |
-| `OpResult::Constraint(msg)` | A `NOT NULL` / `UNIQUE` / FK / `CHECK` rejected the write. This *is* a committed, deterministic result. |
-| `OpResult::SchemaError(msg)` | Bad SQL, unknown table/column, or malformed frame. The message says which. |
-| Client hangs on a fresh request to a backup | Connect to the primary, or use `ClusterClient` — backups answer cached results but relay new work to the primary. |
-| Slow point reads as data grows | Expected only on the raw `Storage` primitive; the product (`StateMachine`) caps segment fan‑out (bounded compaction). |
-
-For internals see [`docs/ARCHITECTURE.md`](ARCHITECTURE.md); for exactly what is
-proven vs. roadmap and the performance log see [`docs/STATUS.md`](STATUS.md).
-
-## HTTP gateway
-
-Opt-in HTTP/1.1 surface for operators, browsers, and tools that prefer
-HTTP/JSON over the binary wire protocol. Built with
-`cargo build --release -p kesseldb-server --features http-gateway` (add
-`,tls` for HTTPS). The binary wire protocol is byte-untouched and remains
-the default + fast path; the gateway runs on a sibling TCP listener.
-
-### Configuration
-
-```rust
-let cfg = kesseldb_server::ServerConfig {
-    http_addr: Some("127.0.0.1:6789".parse().unwrap()),
-    http_tls_addr: Some("127.0.0.1:6790".parse().unwrap()), // requires `tls`
-    tls: Some((cert_pem.into(), key_pem.into())),           // requires `tls`
-    token: Some(b"my-token".to_vec()),                      // optional Bearer
-    ..Default::default()
-};
-```
-
-### Routes
-
-| Method | Path | Body | Response |
-|---|---|---|---|
-| POST | `/v1/sql` | `text/plain` SQL | JSON `OpResult` |
-| POST | `/v1/op` | `application/x-kessel-op` binary `Op::encode()` | JSON `OpResult` |
-| GET | `/v1/health` | — | JSON liveness |
-| GET | `/v1/metrics` | — | Prometheus text v0.0.4 |
-
-### Auth
-
-In token mode (`ServerConfig.token == Some(...)`), every request must carry
-`Authorization: Bearer <token>` (constant-time compared, RFC 6750 §2.1
-case-insensitive scheme). In open mode the header is ignored. Mismatched
-or missing in token mode → HTTP `401` with `{"status":"unauthorized"}`.
-
-### Exactly-once (optional)
-
-Add the headers `X-Kessel-Client-Id: <32-char lowercase hex u128>` and
-`X-Kessel-Req-Seq: <decimal u64>` together to bind the request to the
-engine's per-client dedup map — retrying the same `(client_id, req_seq)`
-returns the cached `OpResult`. Both-or-neither (one alone → `400`).
-Duplicate `Authorization` / `X-Kessel-Client-Id` / `X-Kessel-Req-Seq`
-headers are rejected at parse-time per the exactly-once contract.
-
-### curl examples
-
-```bash
-# Health
-curl -s http://127.0.0.1:6789/v1/health
-# → {"status":"ok","primary":true,"view":0,"op_number":42,"role":"primary"}
-
-# SQL
-curl -s -X POST --data-binary 'CREATE TABLE t (v U64 NOT NULL)' \
-  -H 'Content-Type: text/plain' \
-  http://127.0.0.1:6789/v1/sql
-# → {"status":"ok"}
-
-# Metrics (for Prometheus scrape)
-curl -s http://127.0.0.1:6789/v1/metrics
-# → # HELP kesseldb_ops_total Number of Ops applied since process start.
-#   # TYPE kesseldb_ops_total counter
-#   kesseldb_ops_total{kind="applied"} 1234
-#   ...
-
-# Token mode
-curl -s -H 'Authorization: Bearer my-token' \
-  http://127.0.0.1:6789/v1/health
-```
-
-### Error mapping (excerpt — full table in spec §4.4)
-
-| Body / situation | HTTP status |
-|---|---|
-| `OpResult::Ok` and most variants | 200 |
-| `OpResult::Unauthorized` (engine denied) | 401 |
-| `OpResult::Unavailable` (engine in-flight cap) | 429 |
-| `OpResult::Unavailable` (cluster — no primary) | 503 |
-| Body > 8 MiB (default cap; configurable via `http_max_body`) | 413 |
-| Request line / headers > 64 KiB | 414 |
-| Missing `Content-Length` on POST | 411 |
-| Wrong `Content-Type` | 415 |
-| `Expect: 100-continue` with body (V1 unsupported) | 417 |
-| Conflicting `Content-Length` + `Transfer-Encoding` | 400 |
-| Duplicate `Host` header | 400 |
-| Differing `Content-Length` headers | 400 |
-| Malformed chunked encoding | 400 |
-| Unsupported `Transfer-Encoding` (V1 supports only `chunked`) | 400 |
-
-Full mapping: `docs/superpowers/specs/2026-05-24-kesseldb-http-gateway-design.md` §4.4.
-
-### Prometheus metrics (bounded cardinality)
-
-- `kesseldb_ops_total{kind="applied"}` — counter
-- `kesseldb_inflight` — gauge
-- `kesseldb_last_op_number` — gauge
-- `kesseldb_view_number` — gauge
-- `kesseldb_is_primary` — gauge (0 or 1)
-- `kesseldb_http_requests_total{path,status}` — counter (V1: empty; wiring in follow-up)
-
-### Spec + design
-
-- Spec: `docs/superpowers/specs/2026-05-24-kesseldb-http-gateway-design.md`
-- Internal record: `docs/superpowers/specs/2026-05-24-kesseldb-subproject141-http-gateway.md`
-
 ## 9. PostgreSQL clients (psql, pgcli, JDBC, psycopg, pgx, …)
 
 KesselDB speaks the PostgreSQL Frontend/Backend Protocol v3.0 — the same
@@ -1298,38 +1170,41 @@ opt-in `pg-gateway` feature flag so the default binary stays lean.
 ### Enable the PG listener
 
 ```bash
-cargo build -p kesseldb-server --features pg-gateway
-KESSEL_TOKEN=secret \
+# Build (or download the release binary, which already includes pg-gateway):
+cargo build --release -p kesseldb-server --features pg-gateway
+
+# Start kesseldb with the PG listener bound:
+KESSELDB_TOKEN=secret \
 KESSELDB_PG_ADDR=127.0.0.1:5432 \
-  ./target/debug/kesseldb-server --data /tmp/kessel.db --bind 127.0.0.1:7777
+  ./target/release/kesseldb 127.0.0.1:7878 /tmp/kessel.db
+# => KesselDB listening on 127.0.0.1:7878, data dir /tmp/kessel.db, pg=127.0.0.1:5432
 ```
 
 Two env vars matter:
 
-- `KESSEL_TOKEN` — the operator's shared-secret Bearer token (the same one
+- `KESSELDB_TOKEN` — the operator's shared-secret Bearer token (the same one
   the HTTP gateway uses). The PG listener REQUIRES a token to be set;
   closed-mode-without-token rejects the connection with `28000`
   invalid_authorization_specification. The PG-wire SCRAM exchange uses
-  this token as the SCRAM password input (spec §3.4 Bearer ↔ SCRAM
-  bridge — one credential surface; rotating the token rotates BOTH
-  HTTP-Bearer and PG-SCRAM atomically).
+  this token as the SCRAM password input (one credential surface; rotating
+  the token rotates HTTP-Bearer, WS, and PG-SCRAM atomically).
 - `KESSELDB_PG_ADDR` — `host:port` to bind the PG listener on. Standard
   default is `:5432`; bind to `127.0.0.1:5432` for localhost-only, or
-  `0.0.0.0:5432` to accept remote connections. Bind separately from the
-  HTTP listener — PG and HTTP have independent connection caps so a
-  misbehaving pgcli cannot starve HTTP clients.
+  `0.0.0.0:5432` to accept remote connections. PG and HTTP have
+  independent connection caps so a misbehaving pgcli cannot starve HTTP
+  clients.
 
-When the listener is active, the binary's startup line widens to surface
-the PG address:
+When all three listeners are active (binary + HTTP + PG), the startup line
+surfaces every bound address:
 
 ```text
-kesseldb: bound 127.0.0.1:7777, http=127.0.0.1:8080, pg=127.0.0.1:5432
+KesselDB listening on 127.0.0.1:7878, data dir ./data, http=127.0.0.1:8080, pg=127.0.0.1:5432
 ```
 
 ### Connect with `psql`
 
 ```bash
-PGPASSWORD=$KESSEL_TOKEN psql -h localhost -p 5432 -U test "SELECT 1"
+PGPASSWORD=$KESSELDB_TOKEN psql -h localhost -p 5432 -U test "SELECT 1"
 ```
 
 The `-U test` username can be anything — V1 is multi-user-deferred (the
@@ -1337,7 +1212,7 @@ SCRAM exchange authenticates against the Bearer token regardless of the
 PG `user` field). Interactive sessions work too:
 
 ```bash
-PGPASSWORD=$KESSEL_TOKEN psql -h localhost -p 5432 -U test
+PGPASSWORD=$KESSELDB_TOKEN psql -h localhost -p 5432 -U test
 kessel=> CREATE TABLE users (id i64 PK, name char(64));
 CREATE TABLE
 kessel=> INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob');
@@ -1359,7 +1234,7 @@ Standard `org.postgresql:postgresql` driver:
 String url = "jdbc:postgresql://localhost:5432/kessel";
 Properties props = new Properties();
 props.setProperty("user", "test");
-props.setProperty("password", System.getenv("KESSEL_TOKEN"));
+props.setProperty("password", System.getenv("KESSELDB_TOKEN"));
 Connection conn = DriverManager.getConnection(url, props);
 PreparedStatement stmt = conn.prepareStatement("SELECT * FROM users");
 ResultSet rs = stmt.executeQuery();
@@ -1378,7 +1253,7 @@ conn = psycopg2.connect(
     host="localhost",
     port=5432,
     user="test",
-    password=os.environ["KESSEL_TOKEN"],
+    password=os.environ["KESSELDB_TOKEN"],
     dbname="kessel",
 )
 cur = conn.cursor()
@@ -1410,7 +1285,7 @@ catalog hook:
 Sample interactive session through `psql`:
 
 ```text
-$ PGPASSWORD=$KESSEL_TOKEN psql -h localhost -p 5432 -U test kessel
+$ PGPASSWORD=$KESSELDB_TOKEN psql -h localhost -p 5432 -U test kessel
 psql (14.10, server PostgreSQL 14.0 (KesselDB 1.0))
 kessel=> CREATE TABLE users (id I64 NOT NULL, email CHAR(64) NOT NULL);
 CREATE TABLE
@@ -1509,10 +1384,10 @@ above). Some advanced introspection paths remain V2-deferred:
 
 - **`server closed the connection unexpectedly` from psql** → KesselDB
   binary not built with `--features pg-gateway`, or `KESSELDB_PG_ADDR`
-  not set, or `KESSEL_TOKEN` not set (closed-mode rejects without a
+  not set, or `KESSELDB_TOKEN` not set (closed-mode rejects without a
   token).
 - **`FATAL: invalid_authorization_specification`** → the Bearer token
-  passed via `PGPASSWORD` doesn't match `KESSEL_TOKEN`. Note: this looks
+  passed via `PGPASSWORD` doesn't match `KESSELDB_TOKEN`. Note: this looks
   identical to "no token set" on the wire (the no-oracle rule — SCRAM
   failure modes don't tell the attacker which input was wrong).
 - **`FATAL: sorry, too many clients already`** (SQLSTATE 53300) →
@@ -1538,3 +1413,221 @@ above). Some advanced introspection paths remain V2-deferred:
 - SP-PG progress (closed): `docs/superpowers/specs/2026-05-27-kesseldb-subproject-sppg-progress.md`
 - SP-PG-CAT pg_catalog stubs spec: `docs/superpowers/specs/2026-05-27-kesseldb-sppgcat-pg-catalog-design.md`
 - SP-PG-CAT progress (closed at T8): `docs/superpowers/specs/2026-05-27-kesseldb-subproject-sppgcat-progress.md`
+
+## 10. HTTP gateway
+
+Opt-in HTTP/1.1 surface (plus a WebSocket upgrade — see §10.5 below) for
+operators, browsers, and tools that prefer HTTP/JSON over the binary wire
+protocol. Built with
+`cargo build --release -p kesseldb-server --features http-gateway` (add
+`,tls` for HTTPS). The binary wire protocol is byte-untouched and remains
+the default + fast path; the gateway runs on a sibling TCP listener.
+
+### Configuration
+
+```rust
+let cfg = kesseldb_server::ServerConfig {
+    http_addr: Some("127.0.0.1:6789".parse().unwrap()),
+    http_tls_addr: Some("127.0.0.1:6790".parse().unwrap()), // requires `tls`
+    tls: Some((cert_pem.into(), key_pem.into())),           // requires `tls`
+    token: Some(b"my-token".to_vec()),                      // optional Bearer
+    ..Default::default()
+};
+```
+
+### Routes
+
+| Method | Path | Body | Response |
+|---|---|---|---|
+| POST | `/v1/sql` | `text/plain` SQL | JSON `OpResult` |
+| POST | `/v1/op` | `application/x-kessel-op` binary `Op::encode()` | JSON `OpResult` |
+| GET | `/v1/health` | — | JSON liveness |
+| GET | `/v1/metrics` | — | Prometheus text v0.0.4 |
+
+### Auth
+
+In token mode (`ServerConfig.token == Some(...)`), every request must carry
+`Authorization: Bearer <token>` (constant-time compared, RFC 6750 §2.1
+case-insensitive scheme). In open mode the header is ignored. Mismatched
+or missing in token mode → HTTP `401` with `{"status":"unauthorized"}`.
+
+### Exactly-once (optional)
+
+Add the headers `X-Kessel-Client-Id: <32-char lowercase hex u128>` and
+`X-Kessel-Req-Seq: <decimal u64>` together to bind the request to the
+engine's per-client dedup map — retrying the same `(client_id, req_seq)`
+returns the cached `OpResult`. Both-or-neither (one alone → `400`).
+Duplicate `Authorization` / `X-Kessel-Client-Id` / `X-Kessel-Req-Seq`
+headers are rejected at parse-time per the exactly-once contract.
+
+### curl examples
+
+```bash
+# Health
+curl -s http://127.0.0.1:6789/v1/health
+# → {"status":"ok","primary":true,"view":0,"op_number":42,"role":"primary"}
+
+# SQL
+curl -s -X POST --data-binary 'CREATE TABLE t (v U64 NOT NULL)' \
+  -H 'Content-Type: text/plain' \
+  http://127.0.0.1:6789/v1/sql
+# → {"status":"ok"}
+
+# Metrics (for Prometheus scrape)
+curl -s http://127.0.0.1:6789/v1/metrics
+# → # HELP kesseldb_ops_total Number of Ops applied since process start.
+#   # TYPE kesseldb_ops_total counter
+#   kesseldb_ops_total{kind="applied"} 1234
+#   ...
+
+# Token mode
+curl -s -H 'Authorization: Bearer my-token' \
+  http://127.0.0.1:6789/v1/health
+```
+
+### Error mapping (excerpt — full table in spec §4.4)
+
+| Body / situation | HTTP status |
+|---|---|
+| `OpResult::Ok` and most variants | 200 |
+| `OpResult::Unauthorized` (engine denied) | 401 |
+| `OpResult::Unavailable` (engine in-flight cap) | 429 |
+| `OpResult::Unavailable` (cluster — no primary) | 503 |
+| Body > 8 MiB (default cap; configurable via `http_max_body`) | 413 |
+| Request line / headers > 64 KiB | 414 |
+| Missing `Content-Length` on POST | 411 |
+| Wrong `Content-Type` | 415 |
+| `Expect: 100-continue` with body (V1 unsupported) | 417 |
+| Conflicting `Content-Length` + `Transfer-Encoding` | 400 |
+| Duplicate `Host` header | 400 |
+| Differing `Content-Length` headers | 400 |
+| Malformed chunked encoding | 400 |
+| Unsupported `Transfer-Encoding` (V1 supports only `chunked`) | 400 |
+
+Full mapping: `docs/superpowers/specs/2026-05-24-kesseldb-http-gateway-design.md` §4.4.
+
+### Prometheus metrics (bounded cardinality)
+
+- `kesseldb_ops_total{kind="applied"}` — counter
+- `kesseldb_inflight` — gauge
+- `kesseldb_last_op_number` — gauge
+- `kesseldb_view_number` — gauge
+- `kesseldb_is_primary` — gauge (0 or 1)
+- `kesseldb_http_requests_total{path,status}` — counter (V1: empty; wiring in follow-up)
+
+### WebSocket gateway (SP-WS)
+
+The HTTP gateway includes a WebSocket arm at `GET /v1/ws` for long-lived
+push/streaming clients that don't want a per-request HTTP round trip.
+Shipped under SP-WS, lives in the same `kessel-http-gateway` crate, enabled
+automatically by `--features http-gateway`. There is no separate
+`ws-gateway` feature flag.
+
+**Wire shape**
+
+- RFC 6455 strict handshake. Required headers: `Upgrade: websocket`,
+  `Connection: Upgrade`, `Sec-WebSocket-Version: 13`, `Sec-WebSocket-Key`,
+  and `Sec-WebSocket-Protocol: kessel-op-v1`. Server replies with the
+  matching `Sec-WebSocket-Accept` (RFC 6455 §4.2.2 SHA-1 / base64) and
+  echoes `Sec-WebSocket-Protocol: kessel-op-v1`.
+- Binary frames only. Each frame payload is one `Op::encode()` request;
+  the server replies with one `OpResult::encode()` per request.
+- Bounded send queue (16 messages). A slow client cannot grow the server
+  send buffer unbounded — the session closes if the queue is full at
+  enqueue time.
+- 30 s ping/pong heartbeat. If the peer fails to respond to a `Ping`
+  within the deadline the session closes with a `1011 internal error`.
+- Idle timeout (default 30 s with no inbound message) → graceful
+  close handshake (`Close 1000`).
+- Subprotocol `kessel-op-v1` is required; clients that omit it are
+  rejected with `HTTP 426 upgrade_required`. JSON-over-WS is a V2
+  follow-up.
+
+**Auth**
+
+Same Bearer token as HTTP, checked **once at handshake** via the standard
+`Authorization: Bearer <token>` header. After the upgrade succeeds the
+session is trusted for its lifetime — there is no per-frame auth replay.
+Rotating `ServerConfig.token` invalidates every future handshake (existing
+WS sessions keep running until they close).
+
+**Backpressure & limits**
+
+WS sessions share the engine's `max_inflight` cap with HTTP and the binary
+protocol. Per-session bounds: 16-message send queue, max frame payload =
+`http_max_body` (default 8 MiB), strict RFC 6455 framing (rejects RSV1-3
+bits, masked server-to-client frames, fragmented control frames).
+
+**Browser example**
+
+```js
+const ws = new WebSocket('ws://127.0.0.1:8080/v1/ws', 'kessel-op-v1');
+ws.binaryType = 'arraybuffer';
+ws.onopen = () => {
+  // Send a binary Op::encode() frame
+  ws.send(encodeOp({ kind: 'Select', table: 't' }));
+};
+ws.onmessage = ev => {
+  const result = decodeOpResult(new Uint8Array(ev.data));
+  console.log(result);
+};
+```
+
+### HTTP + WS spec + design
+
+- HTTP gateway spec: `docs/superpowers/specs/2026-05-24-kesseldb-http-gateway-design.md`
+- SP-WS WebSocket spec: `docs/superpowers/specs/2026-05-26-kesseldb-spws-websocket-design.md`
+- Internal record: `docs/superpowers/specs/2026-05-24-kesseldb-subproject141-http-gateway.md`
+
+## 11. Backup & monitoring
+
+Both are handled on the engine thread, so a snapshot is crash‑consistent and
+metrics are exact. Using the embedded engine handle:
+
+```rust
+let engine = kesseldb_server::spawn_engine("./data")?;
+
+// Hot, consistent snapshot — recovers to the exact live state digest:
+engine.snapshot("./backup-2026-05-17")?;
+
+// Live metrics:
+let s = engine.stats();   // ServerStats { applied_ops, digest, uptime_secs }
+```
+
+`StateMachine::open("./backup-...")` recovers an identical state. The `digest`
+field matches `Replica::digest`, so comparing stats across a cluster detects
+replica divergence. In a cluster, `Node::probe()` returns
+`(digest, op_number, commit)` for the same purpose.
+
+Restore = point a fresh node at a snapshot directory and start it.
+
+## 12. Wire protocol
+
+Each message is length‑prefixed: `[u32 little‑endian length][payload]`.
+
+| First byte | Meaning |
+|---|---|
+| (none / op bytes) | `Op::encode()` request → `OpResult::encode()` reply |
+| `0xFE` | `0xFE ++ utf8 SQL` → compiled server‑side, `OpResult` reply |
+| `0xFD` | session frame: `0xFD ++ client(u128 LE) ++ req(u64 LE) ++ Op::encode()` (exactly‑once) |
+| `0xFC` | auth handshake: `0xFC ++ token` → `Ok` / `Unauthorized` |
+| `0xFB` | admin: request `ServerStats` |
+| `0xFA` | admin: `0xFA ++ dest_dir` → snapshot |
+
+This is intentionally tiny — any language can speak it with a socket and the
+length framing. `kessel-client` implements all of it.
+
+## 13. Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `OpResult::Unavailable` | The node is not the active primary, or it is shedding load. Use `ClusterClient` (auto‑rotates), or retry. |
+| `OpResult::Unauthorized` | Missing/incorrect token. Use `connect_authed` / `with_token` with the server's `ServerConfig.token`. |
+| `OpResult::Constraint(msg)` | A `NOT NULL` / `UNIQUE` / FK / `CHECK` rejected the write. This *is* a committed, deterministic result. |
+| `OpResult::SchemaError(msg)` | Bad SQL, unknown table/column, or malformed frame. The message says which. |
+| Client hangs on a fresh request to a backup | Connect to the primary, or use `ClusterClient` — backups answer cached results but relay new work to the primary. |
+| Slow point reads as data grows | Expected only on the raw `Storage` primitive; the product (`StateMachine`) caps segment fan‑out (bounded compaction). |
+
+For internals see [`docs/ARCHITECTURE.md`](ARCHITECTURE.md); for exactly what is
+proven vs. roadmap and the performance log see [`docs/STATUS.md`](STATUS.md).
+

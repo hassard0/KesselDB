@@ -77,9 +77,9 @@ See spec §2.2 for the full list of named follow-ups.
 | **T2** | Query corpus capture — minimal-pragmatic capture from psql/pgcli/pgJDBC/DBeaver public source code (NOT real-tool wireshark — that was overkill for V1). `crates/kessel-pg-gateway/src/pg_catalog/queries.md` (698 lines) lists ~20 canonical queries spanning psql describe-commands (`\dn`, `\dt`, `\d`, `\d <name>` 3-step, `\dT`, `\du`, `\db`), pgcli auto-completion (`tables`, `schemata`, `databases`, `columns`, `functions`), DBeaver schema/table/column introspection, pgJDBC `getTables`/`getColumns`/`getIndexInfo`, information_schema view queries (Metabase/Tableau/Looker/Hex), and the 10 SQL helper functions T7 ships. Each entry annotated with issuing tool + hits (per-table cross-ref to T# slice) + pattern shape (exact / prefix / JOIN / regex) + V1-in-scope vs V1-out-of-scope flag. Documented capture methodology (`log_statement = 'all'` driven against real PG) for the future SP-PG-CAT-CORPUS-EXPAND slices. T2 ships ZERO KATs — it's the contract for T3-T7. | **DONE** | `5b90dc5` |
 | **T3** | `EngineApply::list_tables() -> Vec<TableMetadata>` trait extension (default impl returns empty Vec so existing impls don't break at the T3 boundary; `TableMetadata { name, type_id, kind, field_count }` carries enough to fill V1's `pg_class` rows; `TableKind::{Ordinary,Index,View,Sequence}::pg_relkind() -> u8` maps to canonical PG `relkind` chars per `pg_class.h`) + `kesseldb-server::EngineHandle` impl routing through new `LIST_TABLES_TAG=0xF6` admin frame (mirrors the `DESCRIBE_BY_NAME_TAG=0xF7` pattern — read-only, engine-thread-local, no SM mutation; wire shape `[u32 count][repeat: u32 name_len, name, u32 type_id, u16 field_count]`) + FNV-1a `oid_for_table_name(name) -> u32` deterministic OID generator (clamped to user-allocated `[FIRST_USER_OID=16384, u32::MAX]` range per PG `transam.h`) + `pg_class` synthesizer (33-column RowDescription per PG 14 `pg_class.h`; per-row builder fills oid/relname/relnamespace=2200/relowner=10/relam=2/relfilenode/relkind/relnatts from `TableMetadata` + cans the remaining 27 columns per PG defaults; relacl/reloptions/relpartbound = NULL) + psql `\dt` joined-result intercept (canned canonical match — design §3.4 strategy A — synthesizes the joined pg_class+pg_namespace result directly without running real SQL JOIN; 4 output columns Schema/Name/Type/Owner, every row = public/table/kesseldb) + dispatcher entries for `SELECT * FROM pg_catalog.pg_class` (qualified + unqualified) and the psql `\dt` canonical query (tolerant of both PG 12 and PG 13/14 relkind-filter forms via leading + core + trailing fixture matching). | **DONE** | `1079c9a` (T3a trait+EngineHandle) + `777a3f1` (T3b/c synthesizer+hook) |
 | **T4** | `pg_attribute` synthesizer (one row per (table × column); attrelid = the table's pg_class.oid; atttypid = `field_kind_to_oid(kind)` from V1 type-OID map; attnum = 1-based; attnotnull = `!nullable`; attlen = `type_size_for_oid(atttypid)`) + dispatcher entries for the ~6 canonical patterns with the `attrelid = N` filter. Plus `pg_type` synthesizer with the ~12 type rows V1 actually emits (bool=16, bytea=17, int8=20, int2=21, int4=23, text=25, oid=26, varchar=1043, timestamptz=1184, numeric=1700, plus name=19 + char=18 + oidvector=30 for the catalog-row-shaped columns) + the ~3 canonical patterns (`SELECT oid, typname FROM pg_type` + the per-OID lookup form). KAT-locked OID values vs `pg_type.dat`. | **DONE** | `8f0a49a` |
-| **T5** | `pg_index` synthesizer (one row per KesselDB index; indrelid = table pg_class.oid; indexrelid = stable hash of index name; indkey = column attnums as packed int2vector; indisunique = per kind) + `pg_constraint` synthesizer (one row per UNIQUE/FK/CHECK; contype = 'u'/'f'/'c'; synthetic constraint name `<table>_<col>_key` / `<table>_<col>_fkey` / `<table>_check_N`) + dispatcher entries. | OPEN | — |
+| **T5** | `pg_index` synthesizer (one row per KesselDB index; indrelid = table pg_class.oid; indexrelid = stable hash of index name; indkey = column attnums as packed int2vector; indisunique = per kind) + `pg_constraint` synthesizer (one row per UNIQUE/FK/CHECK; contype = 'u'/'f'/'c'; synthetic constraint name `<table>_<col>_key` / `<table>_<col>_fkey` / `<table>_check_N`) + dispatcher entries. | **DONE** | `1004c2f` (with T7) |
 | **T6** | `information_schema.tables` + `information_schema.columns` view synthesizers + dispatcher entries for the ~4 canonical patterns (Metabase, Tableau, Looker, Hex). `information_schema.tables` has 4 columns (table_catalog/schema/name/type); `information_schema.columns` has 6 (table_catalog/schema/name + column_name + ordinal_position + data_type via PG-text type name like `bigint`/`text`/`boolean`). | OPEN | — |
-| **T7** | SQL helper functions: version(), current_database(), current_schema(), current_user, session_user, pg_my_temp_schema(), pg_is_other_temp_schema(oid), obj_description(...)/(oid), pg_get_constraintdef(oid), pg_get_indexdef(oid), pg_table_is_visible(oid), pg_encoding_to_char(enc), plus the `SHOW <guc>` pattern for canned GUCs (server_version, server_encoding, client_encoding, TimeZone, DateStyle, etc. — matching the V1 ParameterStatus emit). Each is a dispatcher entry + a tiny synthesizer. Multi-function shape `SELECT version(), current_database()` (pgAdmin uses this) handled with a separate dispatcher pattern. | OPEN | — |
+| **T7** | SQL helper functions: version(), current_database(), current_schema(), current_user, session_user, pg_my_temp_schema(), pg_is_other_temp_schema(oid), obj_description(...)/(oid), pg_get_constraintdef(oid), pg_get_indexdef(oid), pg_table_is_visible(oid), pg_encoding_to_char(enc), plus the `SHOW <guc>` pattern for canned GUCs (server_version, server_encoding, client_encoding, TimeZone, DateStyle, etc. — matching the V1 ParameterStatus emit). Each is a dispatcher entry + a tiny synthesizer. Multi-function shape `SELECT version(), current_database()` (pgAdmin uses this) handled with a separate dispatcher pattern. | **DONE** | `1004c2f` (with T5) |
 | **T8** | Real-client smoke — manual hand-test against psql `\dt` / `\d` / `\dn` / pgcli tab-completion / pgAdmin 4 "Add Server" wizard / DBeaver "Connect to PostgreSQL" wizard / Metabase "Add Database" + document gaps as named V2 follow-up slices in this tracker. Update `docs/USAGE.md §9` to remove the "GUI admin tools don't work" line. Update STATUS.md row. **SP-PG-CAT V1 arc CLOSED at T8 commit.** | OPEN | — |
 
 Estimated V1 total: **~50-80 KATs across 8 slices** (T1 +15 / T2
@@ -821,7 +821,232 @@ synthesizer already shipped, a real psql session can now list
 tables (`\dt`) AND describe a table's columns (`\d users`)
 end-to-end against KesselDB.
 
-## Next session pickup: T5 — pg_index + pg_constraint
+## T5 + T7 — what landed (2026-05-27, commit `1004c2f`)
+
+Single commit, ~2,144 LoC net delta across engine.rs + lib.rs +
+pg_catalog/{mod.rs, synthesize.rs}. T5 + T7 bundled because they
+share the same dispatcher hook integration site and the helper-
+function recognizer interleaves with the table-pattern table in
+`catalog_query_hook`.
+
+**T5a — `pg_index` synthesizer + trait extension:**
+
+- `crates/kessel-pg-gateway/src/engine.rs`:
+  - `IndexMetadata { name, fields: Vec<u32>, is_unique, kind }` +
+    `IndexKind::{Equality,Range,Composite}` (maps from
+    `ObjectType.indexes` / `ordered` / `composite`).
+  - `EngineApply::list_indexes_for_table(name) -> Vec<IndexMetadata>`
+    — default returns empty Vec so existing impls (`MockEngine`,
+    the in-tree `EngineHandle`) don't break at the T5 commit
+    boundary. Read-only invariant preserved (immutable `&self`).
+- `crates/kessel-pg-gateway/src/pg_catalog/synthesize.rs`:
+  - `PG_INDEX_COLUMN_COUNT = 19` constant (locked vs PG 14
+    `src/include/catalog/pg_index.h`).
+  - `pg_index_fields()` 19-column RowDesc builder (indexrelid /
+    indrelid / indnatts / indnkeyatts / indisunique / indisprimary
+    / indisexclusion / indimmediate / indisclustered / indisvalid
+    / indcheckxmin / indisready / indislive / indisreplident /
+    indkey / indcollation / indclass / indoption / indpred).
+  - `oid_for_index_name(name)` — reuses `oid_for_table_name`
+    FNV-1a strategy (same determinism + collision profile).
+  - `render_int2vector(fields)` — space-separated attnums per
+    PG `int2vector` text format ("1 2 3").
+  - `render_zero_vector(n)` — oidvector of zeros (V1 doesn't
+    model per-column collation/opclass/option).
+  - `encode_pg_index_row(indexrelid, indrelid, idx)` — per-row
+    builder. Modeled: indnatts/indnkeyatts from field count
+    (V1 no INCLUDE so they match), indisunique per kind,
+    indkey as int2vector text. Canned: indisprimary=false (V1
+    no PK distinct from id-PK), indisexclusion=false,
+    indimmediate=true, indisvalid=true, indisready=true,
+    indislive=true, indisclustered=false, indisreplident=false,
+    indcheckxmin=false, indpred=NULL.
+  - `synthesize_pg_index(engine, indrelid_filter: Option<u32>)`
+    walks `engine.list_tables() + engine.list_indexes_for_table`.
+    Filter=None emits all indexes; Some(oid) filters to matching
+    table.
+  - `pgjdbc_getindexinfo_joined_rows(engine, table_name)` —
+    joined-result intercept for the pgJDBC `getIndexInfo` query
+    (queries.md §4.3). 13-column projection (TABLE_CAT=NULL /
+    TABLE_SCHEM=public / TABLE_NAME / NON_UNIQUE / INDEX_QUALIFIER
+    =NULL / INDEX_NAME / TYPE=3=btree / ORDINAL_POSITION /
+    COLUMN_NAME / ASC_OR_DESC=NULL / CARDINALITY=0 / PAGES=0 /
+    FILTER_CONDITION=NULL) — one row per (index × column).
+
+**T5b — `pg_constraint` synthesizer + trait extension:**
+
+- `crates/kessel-pg-gateway/src/engine.rs`:
+  - `ConstraintMetadata { name, kind, columns: Vec<u32>,
+    references: Option<(String, Vec<u32>)> }`.
+  - `ConstraintKind::{Check,ForeignKey { on_delete: FkAction },
+    Unique}::pg_contype() -> u8` returns 'c'/'f'/'u' locked vs
+    PG 14 `src/include/catalog/pg_constraint.h`.
+  - `FkAction::{NoAction,Restrict,Cascade,SetNull,SetDefault}::
+    pg_action_char() -> u8` returns 'a'/'r'/'c'/'n'/'d' per
+    canonical `confdeltype`.
+  - `EngineApply::list_constraints_for_table(name) ->
+    Vec<ConstraintMetadata>` — default empty Vec.
+- `crates/kessel-pg-gateway/src/pg_catalog/synthesize.rs`:
+  - `PG_CONSTRAINT_COLUMN_COUNT = 25` constant (locked vs PG 14
+    `pg_constraint.h`).
+  - `pg_constraint_fields()` 25-column RowDesc builder
+    (oid/conname/connamespace/contype/condeferrable/condeferred/
+    convalidated/conrelid/contypid/conindid/conparentid/confrelid/
+    confupdtype/confdeltype/confmatchtype/conislocal/coninhcount/
+    connoinherit/conkey/confkey/conpfeqop/conppeqop/conffeqop/
+    conexclop/conbin).
+  - `render_int_array(fields)` — PG `int2[]` array literal
+    format `{1,2,3}`.
+  - `encode_pg_constraint_row(conrelid, c)` — per-row builder.
+    OID computed via FNV-1a of synthetic `__con__<name>` so
+    constraint OIDs don't collide with table OIDs. contype byte
+    from `kind.pg_contype()`. confrelid populated for FK only
+    (via `oid_for_table_name(referenced_table)`). confupdtype
+    canned 'a' (NoAction default). confdeltype byte from
+    `on_delete.pg_action_char()`. confmatchtype='s' (simple).
+    conkey/confkey rendered as int2[] literals.
+  - `synthesize_pg_constraint(engine, conrelid_filter:
+    Option<u32>)` mirrors the pg_index walk.
+
+**T5 pattern hooks (`pg_catalog::mod`):**
+
+- `matches_pg_index_select_star` (qualified + unqualified).
+- `extract_indrelid_filter` parsing `pg_catalog.pg_index WHERE
+  indrelid = N` (qualified + unqualified + `i.indrelid =` aliased).
+- `extract_psql_d_index_step_oid` anchoring on the distinctive
+  `pg_catalog.pg_class c, pg_catalog.pg_class c2, pg_catalog
+  .pg_index i` triple-table FROM + `c.oid = '<oid>'` filter.
+- `extract_pgjdbc_getindexinfo_relname` anchored on the
+  distinctive `information_schema._pg_expandarray(i.indkey)`
+  fixture + capturing `ct.relname = '<name>'` or
+  `ct.relname like '<name>'`.
+- `matches_pg_constraint_select_star` (qualified + unqualified).
+- `extract_conrelid_filter` (qualified + unqualified + aliased
+  4 variants).
+
+**T7 — SQL helper functions + SHOW handler:**
+
+- `crates/kessel-pg-gateway/src/pg_catalog/synthesize.rs`:
+  - `KESSELDB_VERSION_STRING = "PostgreSQL 14.0 (KesselDB 1.0)"`
+    + `KESSELDB_DATABASE_NAME = "kesseldb"` +
+    `KESSELDB_SCHEMA_NAME = "public"` +
+    `KESSELDB_USER_NAME = "kesseldb"` constants. The version
+    string matches the V1 ParameterStatus emit so clients see a
+    coherent view of the server (locked because tools may
+    fingerprint the version).
+  - `single_text_row(name, value)` / `single_bool_row(name, val)`
+    / `single_int_row(name, oid, val)` — frame-builders for the
+    single-call helper response shape (T + 1 DataRow + C "SELECT 1"
+    + Z).
+  - `show_value_for(name)` maps GUC name → canned value
+    (server_version=14.0, server_encoding=UTF8, client_encoding
+    =UTF8, DateStyle="ISO, MDY", timezone=UTC,
+    standard_conforming_strings=on, integer_datetimes=on,
+    is_superuser=on, search_path="$user, public",
+    default_transaction_isolation="read committed",
+    in_hot_standby=off, …); unknown name → "" (PG behavior).
+  - `synthesize_helper_function(normalized) -> Option<Vec<u8>>`
+    — single-call recognizer covering version() /
+    current_database() / current_schema()(/) / current_user /
+    session_user / user / current_catalog / pg_backend_pid() /
+    pg_my_temp_schema() / pg_postmaster_start_time() + per-OID
+    pg_table_is_visible / pg_type_is_visible /
+    pg_function_is_visible / pg_is_other_temp_schema /
+    pg_get_userbyid / pg_get_indexdef / pg_get_constraintdef /
+    pg_get_expr / obj_description / format_type /
+    current_setting / SHOW + the pgAdmin multi-function probe.
+    Trailing `AS alias` stripped via `strip_select_alias`.
+  - `synthesize_pgadmin_multi_helper(normalized)` recognizes
+    the canonical 2-/3-/4-function pgAdmin connect probe
+    (queries.md §6.3) — multi-column single-row response with
+    all values populated.
+  - `extract_quoted_arg(s)` — extracts the first single-quoted
+    argument from a function call (used by `current_setting`
+    argument parsing).
+- `crates/kessel-pg-gateway/src/pg_catalog/mod.rs`:
+  - SHOW <name> handler routed BEFORE the SELECT fast-reject
+    (SHOW isn't a SELECT — PG treats it specially).
+  - `synthesize_helper_function` checked BEFORE the table-pattern
+    matchers (helpers are simpler shapes + tools issue them as
+    the first probe on connect).
+
+**+63 KATs** total (+6 engine + +21 mod hook + +36 synth).
+Headline KATs:
+
+- `t5_pg_index_select_star_pattern_fires` (HEADLINE)
+- `t5_psql_d_table_step3_pattern_fires` (HEADLINE — verbatim
+  psql 14 `\d <table>` step 3 routes through hook)
+- `t5_pgjdbc_getindexinfo_pattern_fires` (HEADLINE — verbatim
+  pgJDBC `getIndexInfo` emits column rows)
+- `t5_pg_constraint_synthesizer_emits_all_constraints` (HEADLINE
+  — 1 + 2 = 3 constraints across 2 tables)
+- `t5_pg_constraint_contype_byte_per_kind` ('c'/'f'/'u' all
+  appear in the synthesized stream)
+- `t7_version_returns_kesseldb_version` (HEADLINE — canned
+  "PostgreSQL 14.0 (KesselDB 1.0)" appears)
+- `t7_pgadmin_multi_function_probe` (HEADLINE — 4-column
+  single-row response with all 4 values)
+- `t7_show_dispatches_through_hook` (HEADLINE)
+- `t5_t7_pre_existing_patterns_still_match` (regression lock).
+
+**Zero-dep stance preserved**: `cargo tree -p kessel-pg-gateway -e
+normal` shows ONLY workspace crates; `#![forbid(unsafe_code)]`
+honored. HTTP/1.1 + WebSocket + binary protocol surfaces
+byte-untouched. Default `cargo build -p kesseldb-server`
+byte-identical (pg-gateway opt-in feature; T5+T7 additions are
+entirely inside the existing crate).
+
+**Test counts** (validated 2026-05-27):
+- kessel-pg-gateway lib: 244 → 301 (+57)
+- workspace default: 1694 → 1755 (+61)
+- workspace `--features kesseldb-server/pg-gateway`: 1706 → 1781 (+75)
+- workspace `--all-features`: ≥1750 → 1836
+
+seed-7 GREEN. tree-grep EMPTY.
+
+**Headline question — does `psql -h localhost "\d <table>"` show
+indexes + constraints AND `SELECT version()` return the canned
+KesselDB version? YES (via the synthesizer dispatch hook).** The
+`t5_psql_d_table_step3_pattern_fires` KAT drives the verbatim
+canonical psql 14 `\d <table>` step 3 query through
+`catalog_query_hook` against a 1-table mock engine (1 UNIQUE
+index on users.email) and asserts the well-framed wire response
+carries `SELECT 1`; `t5_pgjdbc_getindexinfo_pattern_fires` drives
+the verbatim pgJDBC query through the hook and asserts the
+column-row projection. `t7_select_version_dispatches_through_hook`
+asserts the canned "PostgreSQL 14.0 (KesselDB 1.0)" text appears
+in the wire response. `t7_pgadmin_multi_function_probe` asserts
+the pgAdmin connect-probe 4-function shape returns the 4-column
+single-row response that completes pgAdmin/DBeaver's connect
+wizard.
+
+**What T5+T7 deliberately did NOT do**:
+- No `information_schema` views (T6 — next; queries.md §5
+  already captures the canonical shapes).
+- No engine-side wiring of `LIST_INDEXES_TAG` /
+  `LIST_CONSTRAINTS_TAG` admin frames (V1 `EngineHandle` still
+  falls back to the default empty-Vec impl; pgJDBC's
+  `getIndexInfo` against a real KesselDB instance returns 0
+  rows until the in-tree EngineHandle override ships —
+  acceptable V1: pgJDBC shows "no indexes" cleanly).
+- No real-client smoke against psql `\d` step 3 / DBeaver /
+  pgAdmin (T8 — the final hand-test + arc closure).
+- No `USAGE.md §9` boundary-line removal (T8).
+
+## Next session pickup: T6 (information_schema views) + T8 (real-client smoke + arc closure)
+
+T6 closes the Metabase / Tableau / Looker / Hex entry point —
+those tools query `information_schema.tables` +
+`information_schema.columns` + `information_schema.schemata`
+instead of the pg_catalog tables that JDBC tools use (canonical
+queries already captured in queries.md §5). After T6 lands, the
+Metabase "Add Database" wizard + Tableau / Looker connect wizards
+complete. T8 is the final hand-test + USAGE.md §9 update +
+SP-PG-CAT V1 arc closure.
+
+(See sections above for prior T1..T4 records.)
+
+## Prior pickup: T5 — pg_index + pg_constraint (DONE in commit `1004c2f`)
 
 T5 closes the "introspect this schema fully" picture — every PG
 GUI tool issues an index + constraint query as part of the

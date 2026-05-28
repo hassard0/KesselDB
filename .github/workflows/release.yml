@@ -129,27 +129,33 @@ jobs:
           # Keep the named bare binaries un-stripped so backtrace text
           # stays useful for ops; we ship the stripped pair only inside
           # the tarball.
+          #
+          # The bundle directory name MUST differ from the bare binary
+          # filename to avoid a `mkdir -p` collision (the bare binary
+          # `kesseldb-$VER-$TARGET` is already staged at $STAGE/, so the
+          # bundle dir lives in a tmpdir outside $STAGE until the tarball
+          # is produced).
           BUNDLE="kesseldb-$VER-$TARGET"
-          mkdir -p "$STAGE/$BUNDLE"
-          cp target/release/kesseldb "$STAGE/$BUNDLE/kesseldb"
-          cp target/release/kessel   "$STAGE/$BUNDLE/kessel"
-          strip "$STAGE/$BUNDLE/kesseldb" || true
-          strip "$STAGE/$BUNDLE/kessel"   || true
-          cp README.md          "$STAGE/$BUNDLE/" || true
-          cp docs/USAGE.md      "$STAGE/$BUNDLE/" || true
-          cp docs/ARCHITECTURE.md "$STAGE/$BUNDLE/" || true
-          # No top-level LICENSE today (project is private / UNLICENSED);
-          # synthesise a placeholder so the bundle is self-describing.
+          BUNDLE_TMP="$RUNNER_TEMP/bundle"
+          mkdir -p "$BUNDLE_TMP/$BUNDLE"
+          cp target/release/kesseldb "$BUNDLE_TMP/$BUNDLE/kesseldb"
+          cp target/release/kessel   "$BUNDLE_TMP/$BUNDLE/kessel"
+          strip "$BUNDLE_TMP/$BUNDLE/kesseldb" || true
+          strip "$BUNDLE_TMP/$BUNDLE/kessel"   || true
+          cp README.md          "$BUNDLE_TMP/$BUNDLE/" || true
+          cp docs/USAGE.md      "$BUNDLE_TMP/$BUNDLE/" || true
+          cp docs/ARCHITECTURE.md "$BUNDLE_TMP/$BUNDLE/" || true
+          cp CHANGELOG.md       "$BUNDLE_TMP/$BUNDLE/" || true
           if [ -f LICENSE ]; then
-            cp LICENSE "$STAGE/$BUNDLE/"
+            cp LICENSE "$BUNDLE_TMP/$BUNDLE/"
           else
             {
               echo 'KesselDB - Unlicensed / private. (c) 2026.'
               echo 'Re-licensing for public open-source release is tracked separately.'
-            } > "$STAGE/$BUNDLE/LICENSE.txt"
+            } > "$BUNDLE_TMP/$BUNDLE/LICENSE.txt"
           fi
-          ( cd "$STAGE" && tar czf "$BUNDLE.tar.gz" "$BUNDLE" )
-          rm -rf "$STAGE/$BUNDLE"
+          ( cd "$BUNDLE_TMP" && tar czf "$STAGE/$BUNDLE.tar.gz" "$BUNDLE" )
+          rm -rf "$BUNDLE_TMP"
 
           ( cd "$STAGE" && sha256sum * > SHA256SUMS.linux )
           ls -la "$STAGE"

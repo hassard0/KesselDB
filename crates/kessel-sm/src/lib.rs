@@ -1365,6 +1365,1009 @@ impl<V: Vfs> StateMachine<V> {
             .collect()
     }
 
+    /// SP-Perf-A T2: bypass-safe execution of a read-only `Op` against
+    /// committed state. `&self` so it can run in parallel under an
+    /// `Arc<RwLock<StateMachine>>` read guard while the apply thread
+    /// holds the write guard between writes. The body mirrors the
+    /// read arms of `apply` exactly with two differences:
+    ///
+    /// 1. The cache (which is `&mut`) is NOT consulted on the parallel
+    ///    path — readers go straight to `storage.get`. The cache hit on
+    ///    the writer's hot path is preserved (SP50 win unchanged).
+    /// 2. There is no `op_number` argument — reads never bump it, and
+    ///    they never write to storage (no replay/recovery guard either).
+    ///
+    /// Mutating ops MUST NOT be passed in. The classifier
+    /// `kesseldb_server::read_pool::is_read_only` enforces this on the
+    /// server side; mis-routed write Ops here return `SchemaError`. This
+    /// is a defence-in-depth gate; the dispatcher never builds a frame
+    /// for a write Op.
+    ///
+    /// Determinism: reads are pure functions of committed state. The T3
+    /// oracle compares parallel vs serial results byte-for-byte.
+    pub fn read_only_op(&self, op: Op) -> OpResult {
+        match op {
+            Op::GetById { type_id, id } => {
+                let key = make_key(type_id, &id.0);
+                // SP-Perf-A T2: cache NOT consulted on the parallel
+                // path (it is `&mut`). The committed-storage lookup is
+                // the source of truth; the cache is only a writer-side
+                // accelerator.
+                match self.storage.get(&key) {
+                    Some(b) => OpResult::Got(b),
+                    None => OpResult::NotFound,
+                }
+            }
+            Op::Describe { type_id } => match self.catalog.get(type_id) {
+                Some(t) => OpResult::Got(encode_type_def(&t.name, &t.fields)),
+                None => OpResult::NotFound,
+            },
+            Op::GetBlob { handle } => match self.storage.get(&handle_key(handle)) {
+                Some(b) => OpResult::Got(b),
+                None => OpResult::NotFound,
+            },
+            Op::SeqRead { from, limit } => {
+                let lo = seq_entry_key(from.max(1));
+                let hi = seq_entry_key(u64::MAX);
+                let mut out = Vec::new();
+                let mut n = 0u32;
+                for (k, v) in self.storage.scan_range(&lo, &hi) {
+                    if limit != 0 && n >= limit {
+                        break;
+                    }
+                    let seq = k
+                        .get(12..20)
+                        .map(|b| u64::from_be_bytes(b.try_into().unwrap()))
+                        .unwrap_or(0);
+                    out.extend_from_slice(&seq.to_le_bytes());
+                    out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&v);
+                    n += 1;
+                }
+                OpResult::Got(out)
+            }
+            Op::FindBy { type_id, field_id, value } => {
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                let (_, w) = match Self::idx_field_pos(&ot, field_id) {
+                    Some(p) => p,
+                    None => return OpResult::SchemaError("field not indexable".into()),
+                };
+                if !ot.indexes.contains(&field_id) {
+                    return OpResult::SchemaError("field is not indexed".into());
+                }
+                let mut v = value;
+                v.resize(w, 0);
+                let ids = self.idx_lookup(type_id, field_id, &v);
+                let mut out = Vec::with_capacity(ids.len() * 16);
+                for id in ids {
+                    out.extend_from_slice(&id);
+                }
+                OpResult::Got(out)
+            }
+            Op::FindByComposite { type_id, fields, values } => {
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                let ci_no = match ot.composite.iter().position(|c| *c == fields) {
+                    Some(n) => n,
+                    None => {
+                        return OpResult::SchemaError("no such composite index".into())
+                    }
+                };
+                if values.len() != fields.len() {
+                    return OpResult::SchemaError("values/fields arity mismatch".into());
+                }
+                let layout = ot.compute_layout();
+                let mut concat = Vec::new();
+                for (fid, val) in fields.iter().zip(&values) {
+                    let i = match ot.fields.iter().position(|f| f.field_id == *fid) {
+                        Some(i) => i,
+                        None => return OpResult::SchemaError(format!("no field {fid}")),
+                    };
+                    let w = ot.fields[i].kind.width() as usize;
+                    let _ = layout.offsets[i];
+                    let mut v = val.clone();
+                    v.resize(w, 0);
+                    concat.extend_from_slice(&v);
+                }
+                let ids = self.idx_lookup(type_id, Self::composite_fid(ci_no), &concat);
+                let mut out = Vec::with_capacity(ids.len() * 16);
+                for id in ids {
+                    out.extend_from_slice(&id);
+                }
+                OpResult::Got(out)
+            }
+            Op::Query { type_id, preds } => {
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                let layout = ot.compute_layout();
+                struct P {
+                    off: usize,
+                    w: usize,
+                    kind: kessel_catalog::FieldKind,
+                    fid: u16,
+                    op: u8,
+                    val: Vec<u8>,
+                    indexed: bool,
+                }
+                let mut plan: Vec<P> = Vec::with_capacity(preds.len());
+                for pr in &preds {
+                    let i = match ot.fields.iter().position(|f| f.field_id == pr.field_id) {
+                        Some(i) => i,
+                        None => {
+                            return OpResult::SchemaError(format!("no field {}", pr.field_id))
+                        }
+                    };
+                    if pr.op > 2 {
+                        return OpResult::SchemaError("bad predicate op".into());
+                    }
+                    let w = ot.fields[i].kind.width() as usize;
+                    plan.push(P {
+                        off: layout.offsets[i],
+                        w,
+                        kind: ot.fields[i].kind,
+                        fid: pr.field_id,
+                        op: pr.op,
+                        val: Self::norm(&pr.value, w),
+                        indexed: ot.indexes.contains(&pr.field_id)
+                            && Self::idx_field_pos(&ot, pr.field_id).is_some(),
+                    });
+                }
+                let row_ok = |rec: &[u8], p: &P| -> bool {
+                    match rec.get(p.off..p.off + p.w) {
+                        Some(fv) => {
+                            let c = Self::cmp_field(p.kind, fv, &p.val);
+                            match p.op {
+                                0 => c == std::cmp::Ordering::Equal,
+                                1 => c != std::cmp::Ordering::Less,
+                                _ => c != std::cmp::Ordering::Greater,
+                            }
+                        }
+                        None => false,
+                    }
+                };
+                let mut cand: Option<Vec<[u8; 16]>> = None;
+                for p in plan.iter().filter(|p| p.op == 0 && p.indexed) {
+                    let ids = self.idx_lookup(type_id, p.fid, &p.val);
+                    cand = Some(match cand {
+                        None => ids,
+                        Some(prev) => {
+                            let s: std::collections::BTreeSet<_> = ids.into_iter().collect();
+                            prev.into_iter().filter(|i| s.contains(i)).collect()
+                        }
+                    });
+                }
+                let mut matched: Vec<[u8; 16]> = Vec::new();
+                match cand {
+                    Some(ids) => {
+                        for id in ids {
+                            if let Some(rec) = self.storage.get(&make_key(type_id, &id)) {
+                                if plan.iter().all(|p| row_ok(&rec, p)) {
+                                    matched.push(id);
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        let lo = make_key(type_id, &[0u8; 16]);
+                        let hi = make_key(type_id, &[0xFFu8; 16]);
+                        for (k, rec) in self.storage.scan_range(&lo, &hi) {
+                            if plan.iter().all(|p| row_ok(&rec, p)) {
+                                let mut id = [0u8; 16];
+                                id.copy_from_slice(&k[4..20]);
+                                matched.push(id);
+                            }
+                        }
+                    }
+                }
+                matched.sort_unstable();
+                let mut out = Vec::with_capacity(matched.len() * 16);
+                for id in matched {
+                    out.extend_from_slice(&id);
+                }
+                OpResult::Got(out)
+            }
+            Op::QueryExpr { type_id, program } => {
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                let lo = make_key(type_id, &[0u8; 16]);
+                let hi = make_key(type_id, &[0xFFu8; 16]);
+                let mut matched: Vec<[u8; 16]> = Vec::new();
+                for (k, rec) in self.storage.scan_range(&lo, &hi) {
+                    match kessel_expr::eval(&program, &ot, &rec) {
+                        Ok(true) => {
+                            let mut id = [0u8; 16];
+                            id.copy_from_slice(&k[4..20]);
+                            matched.push(id);
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            return OpResult::SchemaError(format!("query program: {e:?}"))
+                        }
+                    }
+                }
+                matched.sort_unstable();
+                let mut out = Vec::with_capacity(matched.len() * 16);
+                for id in matched {
+                    out.extend_from_slice(&id);
+                }
+                OpResult::Got(out)
+            }
+            Op::Select { type_id, program, limit } => {
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                let lo = make_key(type_id, &[0u8; 16]);
+                let hi = make_key(type_id, &[0xFFu8; 16]);
+                let mut out = Vec::new();
+                let mut n = 0u32;
+                for (_, rec) in self.storage.scan_range(&lo, &hi) {
+                    if limit != 0 && n >= limit {
+                        break;
+                    }
+                    match kessel_expr::eval(&program, &ot, &rec) {
+                        Ok(true) => {
+                            out.extend_from_slice(&(rec.len() as u32).to_le_bytes());
+                            out.extend_from_slice(&rec);
+                            n += 1;
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            return OpResult::SchemaError(format!("select program: {e:?}"))
+                        }
+                    }
+                }
+                OpResult::Got(out)
+            }
+            Op::QueryRows { type_id, eq_preds, program, limit, range_preds } => {
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                let mut cand: Option<std::collections::BTreeSet<[u8; 16]>> = None;
+                for (fid, val) in &eq_preds {
+                    let fi = match ot.fields.iter().position(|f| f.field_id == *fid) {
+                        Some(i) => i,
+                        None => continue,
+                    };
+                    if !ot.indexes.contains(fid) {
+                        continue;
+                    }
+                    let w = ot.fields[fi].kind.width() as usize;
+                    let mut v = val.clone();
+                    v.resize(w, 0);
+                    let ids: std::collections::BTreeSet<[u8; 16]> =
+                        self.idx_lookup(type_id, *fid, &v).into_iter().collect();
+                    cand = Some(match cand {
+                        None => ids,
+                        Some(prev) => prev.intersection(&ids).copied().collect(),
+                    });
+                }
+                if !eq_preds.is_empty() {
+                    let qfields: std::collections::BTreeSet<u16> =
+                        eq_preds.iter().map(|(f, _)| *f).collect();
+                    let ci = ot.composite.iter().position(|c| {
+                        c.len() == qfields.len()
+                            && c.iter().collect::<std::collections::BTreeSet<_>>()
+                                == qfields.iter().collect()
+                    });
+                    if let Some(ci_no) = ci {
+                        let mut concat = Vec::new();
+                        let mut ok = true;
+                        for fid in &ot.composite[ci_no] {
+                            let (val, fi) = match (
+                                eq_preds.iter().find(|(f, _)| f == fid),
+                                ot.fields.iter().position(|f| f.field_id == *fid),
+                            ) {
+                                (Some((_, v)), Some(i)) => (v, i),
+                                _ => {
+                                    ok = false;
+                                    break;
+                                }
+                            };
+                            let w = ot.fields[fi].kind.width() as usize;
+                            let mut v = val.clone();
+                            v.resize(w, 0);
+                            concat.extend_from_slice(&v);
+                        }
+                        if ok {
+                            let cfid = Self::composite_fid(ci_no);
+                            let ids: std::collections::BTreeSet<[u8; 16]> = self
+                                .idx_lookup(type_id, cfid, &concat)
+                                .into_iter()
+                                .collect();
+                            cand = Some(match cand {
+                                None => ids,
+                                Some(prev) => {
+                                    prev.intersection(&ids).copied().collect()
+                                }
+                            });
+                        }
+                    }
+                }
+                let rfields: std::collections::BTreeSet<u16> =
+                    range_preds.iter().map(|(f, _, _)| *f).collect();
+                for fid in rfields {
+                    if !ot.ordered.contains(&fid) {
+                        continue;
+                    }
+                    let (klo, khi) = if let Some((_, w, kind)) =
+                        Self::ord_field_pos(&ot, fid)
+                    {
+                        let mut lo_ok = [0u8; 8];
+                        let mut hi_ok = [0xFFu8; 8];
+                        let mut usable = false;
+                        for (f, rop, val) in &range_preds {
+                            if *f != fid {
+                                continue;
+                            }
+                            let vk = match Self::order_key(
+                                kind,
+                                &Self::norm(val, w),
+                            ) {
+                                Some(k) => k,
+                                None => continue,
+                            };
+                            match *rop {
+                                0 | 1 if vk > lo_ok => lo_ok = vk,
+                                2 | 3 if vk < hi_ok => hi_ok = vk,
+                                0..=3 => {}
+                                _ => continue,
+                            }
+                            usable = true;
+                        }
+                        if !usable {
+                            continue;
+                        }
+                        let idxt = 0xFFFD_0000 | (type_id & 0xFFFF);
+                        let mut a = [0u8; 16];
+                        a[..2].copy_from_slice(&fid.to_le_bytes());
+                        a[2..10].copy_from_slice(&lo_ok);
+                        let mut b = [0u8; 16];
+                        b[..2].copy_from_slice(&fid.to_le_bytes());
+                        b[2..10].copy_from_slice(&hi_ok);
+                        b[10..].copy_from_slice(&[0xFFu8; 6]);
+                        (make_key(idxt, &a), make_key(idxt, &b))
+                    } else if let Some((_, w, k)) =
+                        Self::vord_field_pos(&ot, fid)
+                    {
+                        let mut lo_v = vec![0u8; w];
+                        let mut hi_v = vec![0xFFu8; w];
+                        let mut usable = false;
+                        for (f, rop, val) in &range_preds {
+                            if *f != fid {
+                                continue;
+                            }
+                            let vk = Self::vorder_key(k, val, w);
+                            match *rop {
+                                0 | 1 if vk > lo_v => lo_v = vk,
+                                2 | 3 if vk < hi_v => hi_v = vk,
+                                0..=3 => {}
+                                _ => continue,
+                            }
+                            usable = true;
+                        }
+                        if !usable {
+                            continue;
+                        }
+                        (
+                            Self::voidx_key(type_id, fid, &lo_v),
+                            Self::voidx_key(type_id, fid, &hi_v),
+                        )
+                    } else {
+                        continue;
+                    };
+                    let mut ids: std::collections::BTreeSet<[u8; 16]> =
+                        std::collections::BTreeSet::new();
+                    for (_, entry) in self.storage.scan_range(&klo, &khi) {
+                        for ch in entry.chunks(16) {
+                            if ch.len() == 16 {
+                                let mut a = [0u8; 16];
+                                a.copy_from_slice(ch);
+                                ids.insert(a);
+                            }
+                        }
+                    }
+                    cand = Some(match cand {
+                        None => ids,
+                        Some(prev) => {
+                            prev.intersection(&ids).copied().collect()
+                        }
+                    });
+                }
+                let mut out = Vec::new();
+                let mut n = 0u32;
+                let mut emit = |rec: &[u8], n: &mut u32, out: &mut Vec<u8>| {
+                    out.extend_from_slice(&(rec.len() as u32).to_le_bytes());
+                    out.extend_from_slice(rec);
+                    *n += 1;
+                };
+                match cand {
+                    Some(ids) => {
+                        for id in ids {
+                            if limit != 0 && n >= limit {
+                                break;
+                            }
+                            let rec = match self.storage.get(&make_key(type_id, &id)) {
+                                Some(r) => r,
+                                None => continue,
+                            };
+                            match kessel_expr::eval(&program, &ot, &rec) {
+                                Ok(true) => emit(&rec, &mut n, &mut out),
+                                Ok(false) => {}
+                                Err(e) => {
+                                    return OpResult::SchemaError(format!(
+                                        "query program: {e:?}"
+                                    ))
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        let lo = make_key(type_id, &[0u8; 16]);
+                        let hi = make_key(type_id, &[0xFFu8; 16]);
+                        for (_, rec) in self.storage.scan_range(&lo, &hi) {
+                            if limit != 0 && n >= limit {
+                                break;
+                            }
+                            match kessel_expr::eval(&program, &ot, &rec) {
+                                Ok(true) => emit(&rec, &mut n, &mut out),
+                                Ok(false) => {}
+                                Err(e) => {
+                                    return OpResult::SchemaError(format!(
+                                        "query program: {e:?}"
+                                    ))
+                                }
+                            }
+                        }
+                    }
+                }
+                OpResult::Got(out)
+            }
+            Op::SelectFields { type_id, program, fields, limit } => {
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                let layout = ot.compute_layout();
+                let mut cols: Vec<(usize, usize)> = Vec::with_capacity(fields.len());
+                for fid in &fields {
+                    match ot.fields.iter().position(|f| f.field_id == *fid) {
+                        Some(i) => cols.push((layout.offsets[i], ot.fields[i].kind.width() as usize)),
+                        None => return OpResult::SchemaError(format!("no field {fid}")),
+                    }
+                }
+                let lo = make_key(type_id, &[0u8; 16]);
+                let hi = make_key(type_id, &[0xFFu8; 16]);
+                let mut out = Vec::new();
+                let mut n = 0u32;
+                for (_, rec) in self.storage.scan_range(&lo, &hi) {
+                    if limit != 0 && n >= limit {
+                        break;
+                    }
+                    match kessel_expr::eval(&program, &ot, &rec) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(e) => {
+                            return OpResult::SchemaError(format!("project program: {e:?}"))
+                        }
+                    }
+                    let mut row = Vec::new();
+                    for (off, w) in &cols {
+                        match rec.get(*off..*off + *w) {
+                            Some(b) => row.extend_from_slice(b),
+                            None => row.extend(std::iter::repeat(0u8).take(*w)),
+                        }
+                    }
+                    out.extend_from_slice(&(row.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&row);
+                    n += 1;
+                }
+                OpResult::Got(out)
+            }
+            Op::Aggregate { type_id, program, kind, field_id } => {
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                if (kind == 2 || kind == 3)
+                    && Self::ord_field_pos(&ot, field_id).is_none()
+                {
+                    let (off, w, fk) = match Self::vord_field_pos(&ot, field_id)
+                    {
+                        Some(p) => p,
+                        None => {
+                            return OpResult::SchemaError(
+                                "Aggregate MIN/MAX field must be numeric \
+                                 ≤8B, CHAR/BYTES, or U128/I128"
+                                    .into(),
+                            )
+                        }
+                    };
+                    let uncond = program
+                        == kessel_expr::Program::new()
+                            .push_int(1)
+                            .bytes()
+                            .as_slice();
+                    if uncond && ot.ordered.contains(&field_id) {
+                        return match self.agg_extreme_var(
+                            type_id,
+                            field_id,
+                            off,
+                            w,
+                            kind == 3,
+                        ) {
+                            Some(raw) => OpResult::Got(raw),
+                            None => OpResult::Got(Vec::new()),
+                        };
+                    }
+                    let lo = make_key(type_id, &[0u8; 16]);
+                    let hi = make_key(type_id, &[0xFFu8; 16]);
+                    let mut best: Option<Vec<u8>> = None;
+                    for (_, rec) in self.storage.scan_range(&lo, &hi) {
+                        if !uncond {
+                            match kessel_expr::eval(&program, &ot, &rec) {
+                                Ok(true) => {}
+                                Ok(false) => continue,
+                                Err(e) => {
+                                    return OpResult::SchemaError(format!(
+                                        "agg program: {e:?}"
+                                    ))
+                                }
+                            }
+                        }
+                        if let Some(raw) = rec.get(off..off + w) {
+                            best = Some(match best {
+                                None => raw.to_vec(),
+                                Some(b) => {
+                                    let ord = Self::cmp_field(fk, raw, &b);
+                                    let take = if kind == 3 {
+                                        ord == std::cmp::Ordering::Greater
+                                    } else {
+                                        ord == std::cmp::Ordering::Less
+                                    };
+                                    if take { raw.to_vec() } else { b }
+                                }
+                            });
+                        }
+                    }
+                    return OpResult::Got(best.unwrap_or_default());
+                }
+                let fpos = if kind == 0 {
+                    None
+                } else {
+                    match Self::ord_field_pos(&ot, field_id) {
+                        Some((off, w, fk)) => Some((off, w, fk)),
+                        None => {
+                            return OpResult::SchemaError(
+                                "Aggregate field must be numeric ≤8B".into(),
+                            )
+                        }
+                    }
+                };
+                let decode_i128 = |raw: &[u8], w: usize, signed: bool| -> i128 {
+                    let mut le = [0u8; 16];
+                    le[..w.min(16)].copy_from_slice(&raw[..w.min(16)]);
+                    if signed && w < 16 && raw[w - 1] & 0x80 != 0 {
+                        for b in le.iter_mut().skip(w) {
+                            *b = 0xFF;
+                        }
+                    }
+                    i128::from_le_bytes(le)
+                };
+                let uncond = program
+                    == kessel_expr::Program::new().push_int(1).bytes().as_slice();
+                if uncond {
+                    if let (Some((off, w, fk)), true) =
+                        (fpos, kind == 2 || kind == 3)
+                    {
+                        use kessel_catalog::FieldKind::*;
+                        let signed =
+                            matches!(fk, I8 | I16 | I32 | I64 | Fixed { .. });
+                        if ot.ordered.contains(&field_id) {
+                            let r = self
+                                .agg_extreme(type_id, field_id, off, w, kind == 3)
+                                .map(|raw| decode_i128(&raw, w, signed))
+                                .unwrap_or(0);
+                            return OpResult::Got(r.to_le_bytes().to_vec());
+                        }
+                    }
+                }
+                let lo = make_key(type_id, &[0u8; 16]);
+                let hi = make_key(type_id, &[0xFFu8; 16]);
+                let mut count: i128 = 0;
+                let mut sum: i128 = 0;
+                let mut mn: Option<i128> = None;
+                let mut mx: Option<i128> = None;
+                for (_, rec) in self.storage.scan_range(&lo, &hi) {
+                    if !uncond {
+                        match kessel_expr::eval(&program, &ot, &rec) {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(e) => {
+                                return OpResult::SchemaError(format!(
+                                    "agg program: {e:?}"
+                                ))
+                            }
+                        }
+                    }
+                    count += 1;
+                    if let Some((off, w, fk)) = fpos {
+                        if let Some(raw) = rec.get(off..off + w) {
+                            use kessel_catalog::FieldKind::*;
+                            let signed = matches!(fk, I8 | I16 | I32 | I64 | Fixed { .. });
+                            let v = decode_i128(raw, w, signed);
+                            sum = sum.wrapping_add(v);
+                            mn = Some(mn.map_or(v, |m| m.min(v)));
+                            mx = Some(mx.map_or(v, |m| m.max(v)));
+                        }
+                    }
+                }
+                let result: i128 = match kind {
+                    0 => count,
+                    1 => sum,
+                    2 => mn.unwrap_or(0),
+                    3 => mx.unwrap_or(0),
+                    4 => {
+                        if count == 0 {
+                            0
+                        } else {
+                            sum / count
+                        }
+                    }
+                    _ => {
+                        return OpResult::SchemaError(
+                            "agg kind must be 0|1|2|3|4".into(),
+                        )
+                    }
+                };
+                OpResult::Got(result.to_le_bytes().to_vec())
+            }
+            Op::SelectSorted { type_id, program, sort_field, desc, offset, limit } => {
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                let layout = ot.compute_layout();
+                let (soff, sw, skind) = match ot.fields.iter().position(|f| f.field_id == sort_field) {
+                    Some(i) => (
+                        layout.offsets[i],
+                        ot.fields[i].kind.width() as usize,
+                        ot.fields[i].kind,
+                    ),
+                    None => return OpResult::SchemaError(format!("no sort field {sort_field}")),
+                };
+                let lo = make_key(type_id, &[0u8; 16]);
+                let hi = make_key(type_id, &[0xFFu8; 16]);
+                let mut rows: Vec<(Vec<u8>, [u8; 16], Vec<u8>)> = Vec::new();
+                for (k, rec) in self.storage.scan_range(&lo, &hi) {
+                    match kessel_expr::eval(&program, &ot, &rec) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(e) => {
+                            return OpResult::SchemaError(format!("sort program: {e:?}"))
+                        }
+                    }
+                    let sk = rec.get(soff..soff + sw).map(|b| b.to_vec()).unwrap_or_default();
+                    let mut oid = [0u8; 16];
+                    oid.copy_from_slice(&k[4..20]);
+                    rows.push((sk, oid, rec));
+                }
+                rows.sort_by(|a, b| {
+                    Self::cmp_field(skind, &a.0, &b.0).then(a.1.cmp(&b.1))
+                });
+                if desc {
+                    rows.reverse();
+                }
+                let mut out = Vec::new();
+                let mut emitted = 0u32;
+                for (_, _, rec) in rows.into_iter().skip(offset as usize) {
+                    if limit != 0 && emitted >= limit {
+                        break;
+                    }
+                    out.extend_from_slice(&(rec.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&rec);
+                    emitted += 1;
+                }
+                OpResult::Got(out)
+            }
+            Op::GroupAggregate { type_id, program, group_field, kind, agg_field } => {
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                let layout = ot.compute_layout();
+                let gpos = match ot.fields.iter().position(|f| f.field_id == group_field) {
+                    Some(i) => (layout.offsets[i], ot.fields[i].kind.width() as usize),
+                    None => return OpResult::SchemaError(format!("no group field {group_field}")),
+                };
+                let apos = if kind == 0 {
+                    None
+                } else {
+                    match Self::ord_field_pos(&ot, agg_field) {
+                        Some(p) => Some(p),
+                        None => {
+                            return OpResult::SchemaError(
+                                "GroupAggregate agg field must be numeric ≤8B".into(),
+                            )
+                        }
+                    }
+                };
+                let dec = |raw: &[u8], w: usize, signed: bool| -> i128 {
+                    let mut le = [0u8; 16];
+                    le[..w.min(16)].copy_from_slice(&raw[..w.min(16)]);
+                    if signed && w < 16 && raw[w - 1] & 0x80 != 0 {
+                        for b in le.iter_mut().skip(w) {
+                            *b = 0xFF;
+                        }
+                    }
+                    i128::from_le_bytes(le)
+                };
+                let mut groups: std::collections::BTreeMap<
+                    Vec<u8>,
+                    (i128, i128, Option<i128>, Option<i128>),
+                > = std::collections::BTreeMap::new();
+                let uncond = program
+                    == kessel_expr::Program::new().push_int(1).bytes().as_slice();
+                let lo = make_key(type_id, &[0u8; 16]);
+                let hi = make_key(type_id, &[0xFFu8; 16]);
+                for (_, rec) in self.storage.scan_range(&lo, &hi) {
+                    if !uncond {
+                        match kessel_expr::eval(&program, &ot, &rec) {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(e) => {
+                                return OpResult::SchemaError(format!(
+                                    "group program: {e:?}"
+                                ))
+                            }
+                        }
+                    }
+                    let gkey = match rec.get(gpos.0..gpos.0 + gpos.1) {
+                        Some(b) => b.to_vec(),
+                        None => continue,
+                    };
+                    let e = groups.entry(gkey).or_insert((0, 0, None, None));
+                    e.0 += 1;
+                    if let Some((off, w, fk)) = apos {
+                        if let Some(raw) = rec.get(off..off + w) {
+                            use kessel_catalog::FieldKind::*;
+                            let signed = matches!(fk, I8 | I16 | I32 | I64 | Fixed { .. });
+                            let v = dec(raw, w, signed);
+                            e.1 = e.1.wrapping_add(v);
+                            e.2 = Some(e.2.map_or(v, |m| m.min(v)));
+                            e.3 = Some(e.3.map_or(v, |m| m.max(v)));
+                        }
+                    }
+                }
+                let mut out = Vec::new();
+                out.extend_from_slice(&(groups.len() as u32).to_le_bytes());
+                for (k, (cnt, sum, mn, mx)) in groups {
+                    let res: i128 = match kind {
+                        0 => cnt,
+                        1 => sum,
+                        2 => mn.unwrap_or(0),
+                        3 => mx.unwrap_or(0),
+                        4 => {
+                            if cnt == 0 {
+                                0
+                            } else {
+                                sum / cnt
+                            }
+                        }
+                        _ => {
+                            return OpResult::SchemaError(
+                                "agg kind must be 0|1|2|3|4".into(),
+                            )
+                        }
+                    };
+                    out.extend_from_slice(&(k.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&k);
+                    out.extend_from_slice(&res.to_le_bytes());
+                }
+                OpResult::Got(out)
+            }
+            Op::FindRange { type_id, field_id, lo, hi } => {
+                let ot = match self.catalog.get(type_id) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {type_id}")),
+                };
+                if !ot.ordered.contains(&field_id) {
+                    return OpResult::SchemaError("field is not range-indexed".into());
+                }
+                let (klo, khi) = if let Some((_, w, kind)) =
+                    Self::ord_field_pos(&ot, field_id)
+                {
+                    let lo_ok = match Self::order_key(kind, &Self::norm(&lo, w)) {
+                        Some(k) => k,
+                        None => {
+                            return OpResult::SchemaError("bad range lo".into())
+                        }
+                    };
+                    let hi_ok = match Self::order_key(kind, &Self::norm(&hi, w)) {
+                        Some(k) => k,
+                        None => {
+                            return OpResult::SchemaError("bad range hi".into())
+                        }
+                    };
+                    let idxt = 0xFFFD_0000 | (type_id & 0xFFFF);
+                    let mut a = [0u8; 16];
+                    a[..2].copy_from_slice(&field_id.to_le_bytes());
+                    a[2..10].copy_from_slice(&lo_ok);
+                    let mut b = [0u8; 16];
+                    b[..2].copy_from_slice(&field_id.to_le_bytes());
+                    b[2..10].copy_from_slice(&hi_ok);
+                    b[10..].copy_from_slice(&[0xFFu8; 6]);
+                    (make_key(idxt, &a), make_key(idxt, &b))
+                } else if let Some((_, w, k)) =
+                    Self::vord_field_pos(&ot, field_id)
+                {
+                    (
+                        Self::voidx_key(
+                            type_id,
+                            field_id,
+                            &Self::vorder_key(k, &lo, w),
+                        ),
+                        Self::voidx_key(
+                            type_id,
+                            field_id,
+                            &Self::vorder_key(k, &hi, w),
+                        ),
+                    )
+                } else {
+                    return OpResult::SchemaError(
+                        "field not range-indexable".into(),
+                    );
+                };
+                let mut ids: Vec<[u8; 16]> = Vec::new();
+                for (_, entry) in self.storage.scan_range(&klo, &khi) {
+                    for c in entry.chunks(16) {
+                        if c.len() == 16 {
+                            let mut a = [0u8; 16];
+                            a.copy_from_slice(c);
+                            ids.push(a);
+                        }
+                    }
+                }
+                ids.sort_unstable();
+                ids.dedup();
+                let mut out = Vec::with_capacity(ids.len() * 16);
+                for id in ids {
+                    out.extend_from_slice(&id);
+                }
+                OpResult::Got(out)
+            }
+            Op::Join { left_type, right_type, left_field, right_field, limit } => {
+                let lt = match self.catalog.get(left_type) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {left_type}")),
+                };
+                let rt = match self.catalog.get(right_type) {
+                    Some(t) => t.clone(),
+                    None => return OpResult::SchemaError(format!("no type {right_type}")),
+                };
+                let pos = |ot: &kessel_catalog::ObjectType, fid: u16| {
+                    ot.fields.iter().position(|f| f.field_id == fid).map(|i| {
+                        (ot.compute_layout().offsets[i], ot.fields[i].kind.width() as usize)
+                    })
+                };
+                let (loff, lw) = match pos(&lt, left_field) {
+                    Some(p) => p,
+                    None => return OpResult::SchemaError("no left join field".into()),
+                };
+                let (roff, rw) = match pos(&rt, right_field) {
+                    Some(p) => p,
+                    None => return OpResult::SchemaError("no right join field".into()),
+                };
+                if lw != rw {
+                    return OpResult::SchemaError(
+                        "join fields must have equal width".into(),
+                    );
+                }
+                let mut map: std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>> =
+                    std::collections::HashMap::new();
+                let rlo = make_key(right_type, &[0u8; 16]);
+                let rhi = make_key(right_type, &[0xFFu8; 16]);
+                for (_, rr) in self.storage.scan_range(&rlo, &rhi) {
+                    if let Some(k) = rr.get(roff..roff + rw) {
+                        map.entry(k.to_vec()).or_default().push(rr);
+                    }
+                }
+                let mut combined: Vec<kessel_catalog::Field> =
+                    Vec::with_capacity(lt.fields.len() + rt.fields.len());
+                let mut fid: u16 = 0;
+                for (src, f) in lt
+                    .fields
+                    .iter()
+                    .map(|f| (&lt.name, f))
+                    .chain(rt.fields.iter().map(|f| (&rt.name, f)))
+                {
+                    combined.push(kessel_catalog::Field {
+                        field_id: fid,
+                        name: format!("{src}.{}", f.name),
+                        kind: f.kind,
+                        nullable: f.nullable,
+                    });
+                    fid += 1;
+                }
+                let jname = format!("{}+{}", lt.name, rt.name);
+                let typedef =
+                    kessel_catalog::encode_type_def(&jname, &combined);
+                let cot = kessel_catalog::ObjectType::from_def(
+                    jname,
+                    combined.clone(),
+                );
+                let mut out = Vec::with_capacity(64 + typedef.len());
+                out.extend_from_slice(b"KTR1");
+                out.extend_from_slice(&(typedef.len() as u32).to_le_bytes());
+                out.extend_from_slice(&typedef);
+                let llo = make_key(left_type, &[0u8; 16]);
+                let lhi = make_key(left_type, &[0xFFu8; 16]);
+                let mut n = 0u32;
+                'outer: for (_, lr) in self.storage.scan_range(&llo, &lhi) {
+                    let k = match lr.get(loff..loff + lw) {
+                        Some(k) => k,
+                        None => continue,
+                    };
+                    if let Some(rs) = map.get(k) {
+                        let lv = match kessel_codec::decode(&lt, &lr) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                return OpResult::SchemaError(format!(
+                                    "join decode left: {e:?}"
+                                ))
+                            }
+                        };
+                        for rr in rs {
+                            if limit != 0 && n >= limit {
+                                break 'outer;
+                            }
+                            let rv = match kessel_codec::decode(&rt, rr) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    return OpResult::SchemaError(format!(
+                                        "join decode right: {e:?}"
+                                    ))
+                                }
+                            };
+                            let mut row = lv.clone();
+                            row.extend(rv);
+                            let rec = match kessel_codec::encode(&cot, &row) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    return OpResult::SchemaError(format!(
+                                        "join encode: {e:?}"
+                                    ))
+                                }
+                            };
+                            out.extend_from_slice(
+                                &(rec.len() as u32).to_le_bytes(),
+                            );
+                            out.extend_from_slice(&rec);
+                            n += 1;
+                        }
+                    }
+                }
+                OpResult::Got(out)
+            }
+            // Any non-read op routed here is a server-side bug — the
+            // dispatcher should have refused it. Return SchemaError as
+            // defence-in-depth.
+            _ => OpResult::SchemaError(
+                "read_only_op: non-read Op routed to read path".into(),
+            ),
+        }
+    }
+
     pub fn apply(&mut self, op_number: u64, op: Op) -> OpResult {
         // SP94 replay/recovery guard. When a VSR primary re-feeds the
         // committed log to a crash-recovered replica, every op at or

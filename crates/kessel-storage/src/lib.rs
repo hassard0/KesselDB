@@ -160,8 +160,17 @@ fn decode_entry(p: &[u8]) -> Option<Entry> {
 }
 
 /// Append-only log. Frame = `u32 payload_len ++ u32 crc32c(payload) ++ payload`.
+/// SP-Perf-A T2: the `+ Send` bound on the trait object lets the
+/// `Arc<RwLock<StateMachine>>` shared between the engine thread and
+/// read-pool workers be `Send` (the engine thread spawns with the SM
+/// already moved in; readers race against the writer through the
+/// rwlock). Every existing concrete `Disk` impl (`FileDisk`,
+/// `MemDisk`, `FaultDisk`, `MemVfsDisk`) is already `Send` — adding
+/// the bound is a no-op at runtime. NOT `Sync` (FileDisk uses
+/// `RefCell<File>` internally for the shared seek-cursor); concurrent
+/// access is serialised at the SM level.
 struct Wal {
-    disk: Box<dyn Disk>,
+    disk: Box<dyn Disk + Send + Sync>,
     end: u64,
 }
 
@@ -1168,7 +1177,7 @@ mod tests {
             }
             // Reopen from the SAME disk (disarm so replay/compaction
             // writes are clean).
-            fv.plan().borrow_mut().kind = None;
+            fv.plan().lock().unwrap().kind = None;
             let s2 = Storage::open(fv.clone()).unwrap();
             let present: Vec<bool> =
                 (1..=20u64).map(|i| s2.get(&k(i as u128)).is_some()).collect();

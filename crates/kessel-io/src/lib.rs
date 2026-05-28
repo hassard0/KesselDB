@@ -13,6 +13,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Monotonic-ish time source. The state machine never calls this; only the
@@ -57,8 +58,17 @@ impl Clock for SystemClock {
 
 /// File-backed disk. `read_at`/`write_at` seek explicitly; `sync` is a real
 /// `fsync` so durability claims are honest.
+///
+/// SP-Perf-A T2: `Mutex<File>` (not `RefCell<File>`) so `FileDisk` is
+/// `Sync` — required for `Arc<RwLock<StateMachine>>` to be `Send` across
+/// the engine + read-pool threads. Mutex acquisitions are uncontended on
+/// the engine's serial-apply hot path (one writer holds the per-batch
+/// RwLock write guard), and on the parallel-read path the file's seek
+/// cursor is shared — the Mutex is the correct synchroniser. The cost
+/// is a single uncontended atomic CAS per disk op vs. RefCell's runtime
+/// check.
 pub struct FileDisk {
-    file: RefCell<File>,
+    file: Mutex<File>,
 }
 
 impl FileDisk {
@@ -69,19 +79,19 @@ impl FileDisk {
             .write(true)
             .open(path)?;
         Ok(FileDisk {
-            file: RefCell::new(file),
+            file: Mutex::new(file),
         })
     }
 }
 
 impl Disk for FileDisk {
     fn write_at(&mut self, off: u64, buf: &[u8]) -> io::Result<()> {
-        let mut f = self.file.borrow_mut();
+        let mut f = self.file.lock().unwrap();
         f.seek(SeekFrom::Start(off))?;
         f.write_all(buf)
     }
     fn read_at(&self, off: u64, buf: &mut [u8]) -> io::Result<usize> {
-        let mut f = self.file.borrow_mut();
+        let mut f = self.file.lock().unwrap();
         f.seek(SeekFrom::Start(off))?;
         let mut read = 0;
         while read < buf.len() {
@@ -95,11 +105,12 @@ impl Disk for FileDisk {
         Ok(read)
     }
     fn sync(&mut self) -> io::Result<()> {
-        self.file.borrow_mut().sync_all()
+        self.file.lock().unwrap().sync_all()
     }
     fn len(&self) -> u64 {
         self.file
-            .borrow()
+            .lock()
+            .unwrap()
             .metadata()
             .map(|m| m.len())
             .unwrap_or(0)
@@ -254,7 +265,7 @@ impl Net for SimNetHandle {
 // ----------------------------------------------------------------------------
 
 pub trait Vfs {
-    fn open(&self, name: &str) -> io::Result<Box<dyn Disk>>;
+    fn open(&self, name: &str) -> io::Result<Box<dyn Disk + Send + Sync>>;
     fn exists(&self, name: &str) -> bool;
     fn remove(&self, name: &str) -> io::Result<()>;
     fn list(&self) -> Vec<String>;
@@ -275,7 +286,7 @@ impl DirVfs {
 }
 
 impl Vfs for DirVfs {
-    fn open(&self, name: &str) -> io::Result<Box<dyn Disk>> {
+    fn open(&self, name: &str) -> io::Result<Box<dyn Disk + Send + Sync>> {
         Ok(Box::new(FileDisk::open(self.root.join(name))?))
     }
     fn exists(&self, name: &str) -> bool {
@@ -299,12 +310,20 @@ impl Vfs for DirVfs {
     }
 }
 
+// SP-Perf-A T2: MemVfs shares blobs across handles for the "reopen
+// recovers the same bytes" semantic the storage tests rely on. We use
+// `Arc<Mutex<>>` (not `Rc<RefCell<>>`) so MemVfsDisk is `Send`, which
+// lets the storage layer's `Wal { disk: Box<dyn Disk + Send> }` accept
+// the in-memory disk too — required for the shared-SM bypass on the
+// production path. Determinism is preserved: the simulator drives this
+// VFS single-threaded; mutex acquisitions are uncontended at the SM
+// apply boundary, identical to the old RefCell borrows.
 #[derive(Clone, Default)]
 struct MemBlob {
     /// All bytes ever written.
-    data: Rc<RefCell<Vec<u8>>>,
+    data: Arc<Mutex<Vec<u8>>>,
     /// Length known durable as of the last `sync` (torn-tail model).
-    synced_len: Rc<RefCell<u64>>,
+    synced_len: Arc<Mutex<u64>>,
 }
 
 /// Deterministic in-memory VFS (simulator). Models crash by discarding any
@@ -312,7 +331,7 @@ struct MemBlob {
 /// tail is not durable" failure — enough for a meaningful recovery test).
 #[derive(Clone, Default)]
 pub struct MemVfs {
-    blobs: Rc<RefCell<std::collections::BTreeMap<String, MemBlob>>>,
+    blobs: Arc<Mutex<std::collections::BTreeMap<String, MemBlob>>>,
 }
 
 impl MemVfs {
@@ -321,9 +340,9 @@ impl MemVfs {
     }
     /// Simulate a crash: every blob loses anything past its last sync point.
     pub fn crash(&self) {
-        for blob in self.blobs.borrow().values() {
-            let keep = *blob.synced_len.borrow() as usize;
-            blob.data.borrow_mut().truncate(keep);
+        for blob in self.blobs.lock().unwrap().values() {
+            let keep = *blob.synced_len.lock().unwrap() as usize;
+            blob.data.lock().unwrap().truncate(keep);
         }
     }
 }
@@ -333,30 +352,31 @@ struct MemVfsDisk {
 }
 
 impl Vfs for MemVfs {
-    fn open(&self, name: &str) -> io::Result<Box<dyn Disk>> {
+    fn open(&self, name: &str) -> io::Result<Box<dyn Disk + Send + Sync>> {
         let blob = self
             .blobs
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .entry(name.to_string())
             .or_default()
             .clone();
         Ok(Box::new(MemVfsDisk { blob }))
     }
     fn exists(&self, name: &str) -> bool {
-        self.blobs.borrow().contains_key(name)
+        self.blobs.lock().unwrap().contains_key(name)
     }
     fn remove(&self, name: &str) -> io::Result<()> {
-        self.blobs.borrow_mut().remove(name);
+        self.blobs.lock().unwrap().remove(name);
         Ok(())
     }
     fn list(&self) -> Vec<String> {
-        self.blobs.borrow().keys().cloned().collect()
+        self.blobs.lock().unwrap().keys().cloned().collect()
     }
 }
 
 impl Disk for MemVfsDisk {
     fn write_at(&mut self, off: u64, buf: &[u8]) -> io::Result<()> {
-        let mut d = self.blob.data.borrow_mut();
+        let mut d = self.blob.data.lock().unwrap();
         let end = off as usize + buf.len();
         if end > d.len() {
             d.resize(end, 0);
@@ -365,7 +385,7 @@ impl Disk for MemVfsDisk {
         Ok(())
     }
     fn read_at(&self, off: u64, buf: &mut [u8]) -> io::Result<usize> {
-        let d = self.blob.data.borrow();
+        let d = self.blob.data.lock().unwrap();
         let off = off as usize;
         if off >= d.len() {
             return Ok(0);
@@ -375,12 +395,12 @@ impl Disk for MemVfsDisk {
         Ok(n)
     }
     fn sync(&mut self) -> io::Result<()> {
-        let len = self.blob.data.borrow().len() as u64;
-        *self.blob.synced_len.borrow_mut() = len;
+        let len = self.blob.data.lock().unwrap().len() as u64;
+        *self.blob.synced_len.lock().unwrap() = len;
         Ok(())
     }
     fn len(&self) -> u64 {
-        self.blob.data.borrow().len() as u64
+        self.blob.data.lock().unwrap().len() as u64
     }
 }
 
@@ -420,24 +440,26 @@ pub struct FaultPlan {
 /// A VFS wrapper that injects one deterministic disk fault. `inner` is
 /// any real VFS (typically `MemVfs`); the plan is shared by clone so a
 /// test holds one handle and every disk the cluster opens obeys it.
+/// SP-Perf-A T2: shared plan via `Arc<Mutex<>>` so the wrapped disk is
+/// `Send`-compatible with the production WAL's `Box<dyn Disk + Send>`.
 #[derive(Clone)]
 pub struct FaultVfs<V: Vfs> {
     inner: V,
-    plan: Rc<RefCell<FaultPlan>>,
+    plan: Arc<Mutex<FaultPlan>>,
 }
 
 impl<V: Vfs> FaultVfs<V> {
     pub fn new(inner: V) -> Self {
-        FaultVfs { inner, plan: Rc::new(RefCell::new(FaultPlan::default())) }
+        FaultVfs { inner, plan: Arc::new(Mutex::new(FaultPlan::default())) }
     }
-    /// Shared plan handle (clone-cheap; same `RefCell` as every disk).
-    pub fn plan(&self) -> Rc<RefCell<FaultPlan>> {
-        Rc::clone(&self.plan)
+    /// Shared plan handle (clone-cheap; same `Mutex` as every disk).
+    pub fn plan(&self) -> Arc<Mutex<FaultPlan>> {
+        Arc::clone(&self.plan)
     }
     /// Arm the fault: hit the `nth` (1-based) write to a file whose name
     /// contains `target`, with `kind`. Resets the counter.
     pub fn arm(&self, target: &str, nth: u32, kind: FaultKind) {
-        let mut p = self.plan.borrow_mut();
+        let mut p = self.plan.lock().unwrap();
         p.target = target.to_string();
         p.at_write = nth;
         p.kind = Some(kind);
@@ -445,7 +467,7 @@ impl<V: Vfs> FaultVfs<V> {
         p.fired = false;
     }
     pub fn fired(&self) -> bool {
-        self.plan.borrow().fired
+        self.plan.lock().unwrap().fired
     }
     pub fn inner(&self) -> &V {
         &self.inner
@@ -453,11 +475,11 @@ impl<V: Vfs> FaultVfs<V> {
 }
 
 impl<V: Vfs> Vfs for FaultVfs<V> {
-    fn open(&self, name: &str) -> io::Result<Box<dyn Disk>> {
+    fn open(&self, name: &str) -> io::Result<Box<dyn Disk + Send + Sync>> {
         Ok(Box::new(FaultDisk {
             inner: self.inner.open(name)?,
             name: name.to_string(),
-            plan: Rc::clone(&self.plan),
+            plan: Arc::clone(&self.plan),
         }))
     }
     fn exists(&self, name: &str) -> bool {
@@ -472,17 +494,17 @@ impl<V: Vfs> Vfs for FaultVfs<V> {
 }
 
 struct FaultDisk {
-    inner: Box<dyn Disk>,
+    inner: Box<dyn Disk + Send + Sync>,
     name: String,
-    plan: Rc<RefCell<FaultPlan>>,
+    plan: Arc<Mutex<FaultPlan>>,
 }
 
 impl Disk for FaultDisk {
     fn write_at(&mut self, off: u64, buf: &[u8]) -> io::Result<()> {
-        // Decide under the borrow, act after it (don't hold it across
+        // Decide under the lock, act after it (don't hold it across
         // the inner I/O call).
         let action = {
-            let mut p = self.plan.borrow_mut();
+            let mut p = self.plan.lock().unwrap();
             if p.kind.is_some()
                 && p.at_write > 0
                 && self.name.contains(&p.target)

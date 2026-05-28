@@ -2075,7 +2075,7 @@ pub mod sim {
             fn crash_recover(&mut self, i: usize) {
                 // The fault modelled the crash that already happened;
                 // recovery I/O itself is clean.
-                self.vfs[i].plan().borrow_mut().kind = None;
+                self.vfs[i].plan().lock().unwrap().kind = None;
                 self.vfs[i].inner().crash(); // lose the unsynced tail
                 let sm = StateMachine::open(self.vfs[i].clone()).unwrap();
                 self.rs[i] = Replica::new(i, self.n, sm);

@@ -2,11 +2,11 @@
 
 # KesselDB
 
-**A deterministic, replicated SQL database with PostgreSQL-style flexibility on a TigerBeetle-style core.**
+**A deterministic, replicated SQL database. Speaks PostgreSQL, HTTP, WebSocket, and a fast binary wire. Zero‑dependency Rust kernel.**
 
 *"It's the database that made the Kessel Run in 12 parsecs."*
 
-`1131 default tests green / 1164 with --features kessel-http-gateway/test-server` · `0 external dependencies in the kernel` · `Rust 1.95+` · single‑binary
+`1779 default tests green / 1807 with --features pg-gateway / 1862 with all gateway features` · `0 external dependencies in the kernel` · `Rust 1.95+` · single‑binary
 
 </div>
 
@@ -14,19 +14,27 @@
 
 ## What is KesselDB?
 
-KesselDB is a from‑scratch Rust database that takes the engineering ideas behind
-[TigerBeetle](https://github.com/tigerbeetle/tigerbeetle) — a deterministic state
-machine, an LSM storage engine, a write‑ahead log, Viewstamped Replication, and
-simulation‑driven testing — and lifts them to a **general, schema‑flexible SQL
+KesselDB is a from‑scratch Rust database with the engineering rigor of
+[TigerBeetle](https://github.com/tigerbeetle/tigerbeetle) — deterministic state
+machine, LSM storage, write‑ahead log, Viewstamped Replication,
+simulation‑driven testing — applied to a **general, schema‑flexible SQL
 database** instead of a single hard‑coded domain.
 
 You get runtime‑defined tables and online DDL, real SQL (joins, aggregates,
-indexes, constraints, triggers, transactions), and a replicated multi‑node
-cluster with exactly‑once client semantics — while the core stays a single
-deterministic state machine that can be replayed bit‑for‑bit from a seed.
+indexes, constraints, triggers, transactions), exactly‑once client semantics
+across a replicated multi‑node cluster, and **four wire protocols on the same
+engine**:
 
-It is written in **pure Rust with zero external dependencies** — determinism is a
-feature, not an aspiration.
+- **Binary** — the deterministic fast path (`Op::encode()` length‑prefixed frames)
+- **HTTP/1.1 + JSON** — `/v1/sql`, `/v1/op`, `/v1/health`, `/v1/metrics` (Prometheus)
+- **WebSocket** — long‑lived `/v1/ws` upgrade, framed `Op::encode()` payloads
+- **PostgreSQL Frontend/Backend v3.0** — `psql`, `pgcli`, JDBC, psycopg, `pgx`,
+  `tokio-postgres`, sqlx-pg + GUI tools (pgAdmin, DBeaver, DataGrip, Metabase,
+  Tableau) connect straight in
+
+The kernel is **pure Rust with zero external dependencies**. Every wire surface
+is opt‑in via cargo features — `cargo build --release` links no gateway code at
+all. Determinism is a feature, not an aspiration.
 
 ## Highlights
 
@@ -78,85 +86,138 @@ feature, not an aspiration.
   JSON/NDJSON/CSV/Parquet from HTTP/HTTPS endpoints or directly from
   S3‑compatible and Azure Blob object storage. The pure‑Rust zero‑dep
   Parquet reader (`kessel-parquet`) supports **flat REQUIRED + OPTIONAL +
-  `LIST<primitive>` + `MAP<K, V>` + `struct` × UNCOMPRESSED + Snappy +
-  GZIP + zstd × PLAIN + dictionary × V1 + V2 data pages × INT64 + INT32 +
-  INT96 (timestamps) + DECIMAL (INT32 / INT64 / FLBA, precision ≤ 38) +
-  FLBA + BYTE_ARRAY** out of the box. Map keys MUST be REQUIRED per
-  Parquet spec. **SP146 FULLY closes OBJ‑2c‑5**: SP145 added 2‑deep
-  cross‑products (`List<List<T>>`, `List<struct>`, `Map<K, struct>`,
-  `Map<K, List<T>>`, `struct<List/Map/struct>`); SP146 closes the 3
-  cross‑products SP145 V1 deferred (`List<List<List<T>>>` 3‑deep,
-  `List<Map<K,V>>`, `Map<K1, Map<K2,V>>`) via the same per‑shape
-  composition pattern extended one more recursion layer. **All Parquet
-  nested types up to 3‑deep nesting now supported** — every shape
-  pyarrow writes decodes. See [Parquet capability matrix](#parquet-capability-matrix) below.
-  (`--features external-sources`, default off; `--features
+  `LIST<primitive>` + `MAP<K, V>` + `struct` (+ 3‑deep cross‑products,
+  OBJ‑2c‑5 fully closed at SP146) × UNCOMPRESSED + Snappy + GZIP + zstd
+  + LZ4_RAW + Brotli (SP154 closed the 5‑codec matrix) × PLAIN +
+  dictionary × V1 + V2 data pages × INT64 + INT32 + INT96 (timestamps) +
+  DECIMAL (INT32 / INT64 / FLBA, precision ≤ 38) + FLBA + BYTE_ARRAY**
+  out of the box. Every nested Parquet shape pyarrow writes up to 3‑deep
+  nesting decodes. See [Parquet capability matrix](#parquet-capability-matrix)
+  below. (`--features external-sources`, default off; `--features
   external-sources-objstore` for S3/Azure + Parquet; deterministic kernel
   unaffected when off.)
-- **HTTP/1.1 gateway (opt‑in `--features http-gateway`)** — full Op
-  surface + SQL + `/v1/health` + `/v1/metrics` (Prometheus text v0.0.4)
-  on a sibling TCP listener (`ServerConfig.http_addr`; HTTPS on
-  `http_tls_addr` with the `tls` feature). `Authorization: Bearer`
-  constant‑time, optional `X-Kessel-Client-Id` + `X-Kessel-Req-Seq`
-  exactly‑once headers. JSON responses via the existing
-  `kessel_client::format_result_json` contract. Binary protocol
-  byte‑untouched; zero external (non‑workspace) deps on the gateway
-  crate. See `docs/USAGE.md` §HTTP gateway.
-- **PostgreSQL wire protocol (opt‑in `--features pg-gateway`)** —
+- **Cross‑shard scatter scan (SP‑A)** — `SELECT` / `SELECT … ORDER BY` /
+  projection / row‑filter ops fan out across K independent VSR shard groups
+  via a zero‑dep std‑thread scatter‑gather with bounded per‑shard channels.
+  Unordered scan is shard‑id deterministic; sorted scan is a `BinaryHeap`
+  k‑way merge of per‑shard already‑sorted streams. **K‑invariance** locked
+  by an 85‑seed × 5‑K property sweep: with unique sort values, merged
+  output is byte‑identical to the K=1 baseline for K ∈ {1, 2, 4, 8, 16}.
+  Per‑shard MVCC snapshot per request; opt‑in best‑effort `partial_on_timeout`
+  mode beside the safe hard‑fail default.
+- **HTTP/1.1 gateway (opt‑in `--features http-gateway`)** — full Op surface
+  + SQL + `/v1/health` + `/v1/metrics` (Prometheus text v0.0.4) on a
+  sibling TCP listener (`ServerConfig.http_addr`; HTTPS on `http_tls_addr`
+  with the `tls` feature). `Authorization: Bearer` constant‑time, optional
+  `X-Kessel-Client-Id` + `X-Kessel-Req-Seq` exactly‑once headers. JSON
+  responses via the existing `kessel_client::format_result_json` contract.
+  Binary protocol byte‑untouched; zero external (non‑workspace) deps on the
+  gateway crate. See `docs/USAGE.md` §HTTP gateway.
+- **WebSocket gateway (SP‑WS, shipped under the HTTP gateway crate)** —
+  long‑lived `/v1/ws` upgrade carrying raw `Op::encode()` payloads under the
+  `kessel-op-v1` subprotocol. RFC 6455 strict handshake, binary frames only,
+  bounded send queue (16 messages), 30 s ping/pong heartbeat. Same Bearer
+  auth as HTTP, checked once at handshake. Useful for browser‑direct
+  push/streaming clients that don't want a per‑request HTTP round trip.
+  Enabled automatically with `--features http-gateway`. See `docs/USAGE.md`
+  §HTTP gateway → WebSocket.
+- **PostgreSQL wire protocol (opt‑in `--features pg-gateway`, SP‑PG + SP‑PG‑CAT)** —
   Frontend/Backend Protocol v3.0 Simple Query path with SCRAM‑SHA‑256
   authentication on a sibling TCP listener (`ServerConfig.pg_addr`,
   default port 5432). Operator's Bearer token IS the SCRAM password
-  input — one credential surface; rotating the token rotates HTTP and
-  PG together. SELECT / INSERT / UPDATE / DELETE / CREATE TABLE work
+  input — one credential surface; rotating the token rotates HTTP, WS
+  and PG together. SELECT / INSERT / UPDATE / DELETE / CREATE TABLE work
   end‑to‑end against `psql`, `pgcli`, JDBC, psycopg, `pgx`,
-  `tokio-postgres`, sqlx-pg, and every libpq‑derived client. Cap‑overflow
-  (`53300`) and idle‑timeout (`57014`) emit wire‑level `ErrorResponse`
-  with canonical PG message text before closing. Independent
-  connection cap from HTTP (default `pg_max_conns=256` vs HTTP's 1024)
-  — a misbehaving pgcli cannot starve HTTP clients. V1 boundary:
-  CLI + programmatic‑driver clients work; GUI admin tools (pgAdmin,
-  DBeaver) need V2 `pg_catalog` stubs. Binary protocol byte‑untouched;
-  zero external (non‑workspace) deps on the gateway crate. See
-  `docs/USAGE.md` §9 PostgreSQL clients.
-- **Deterministic & verifiable** — the whole engine is a seedable state machine;
-  the test suite (1131 default tests / 1164 with `--features kessel-http-gateway/test-server`, 1 ignored — `brotli` decoder pending) includes seeded partition/fault
+  `tokio-postgres`, sqlx-pg, Diesel‑pg, GORM‑pg, Drizzle‑pg, Prisma‑pg,
+  and every libpq‑derived client. **SP‑PG‑CAT (V1) ships `pg_catalog` +
+  `information_schema` stubs** so pgAdmin 4, DBeaver, DataGrip, Metabase,
+  Tableau, Looker, dbt and pgJDBC `getTables` all connect + browse out of
+  the box. Cap‑overflow (`53300`) and idle‑timeout (`57014`) emit
+  wire‑level `ErrorResponse` with canonical PG message text before closing.
+  Independent connection cap from HTTP (default `pg_max_conns=256` vs
+  HTTP's 1024) — a misbehaving pgcli cannot starve HTTP clients. Binary
+  protocol byte‑untouched; zero external (non‑workspace) deps on the
+  gateway crate. See `docs/USAGE.md` §9 PostgreSQL clients.
+- **Deterministic & verifiable** — the whole engine is a seedable state
+  machine; the test suite (1779 default / 1807 with `--features pg-gateway`
+  / 1862 with all gateway features) includes seeded partition/fault
   simulation, multi‑replica Jepsen, hand‑derived KATs against published
-  spec text for every codec, and adversarial pentests for every public input
+  spec text for every codec, the SP‑A 85‑seed K‑invariance sweep, the
+  SP‑PG‑CAT synthetic‑peer suite verifying each GUI tool's verbatim
+  introspection SQL, and adversarial pentests for every public input
   surface.
 
 ## Quick start
 
-### Build & run a server
+### Download a prebuilt Linux binary
+
+```bash
+# x86_64 Linux (glibc):
+VER=v1.0.0       # see https://github.com/hassard0/KesselDB/releases for the latest
+curl -L https://github.com/hassard0/KesselDB/releases/download/$VER/kesseldb-$VER-x86_64-unknown-linux-gnu \
+  -o kesseldb && chmod +x kesseldb
+curl -L https://github.com/hassard0/KesselDB/releases/download/$VER/kessel-$VER-x86_64-unknown-linux-gnu \
+  -o kessel    && chmod +x kessel
+
+# Or grab the bundle (server + CLI + README + USAGE + LICENSE):
+curl -L https://github.com/hassard0/KesselDB/releases/download/$VER/kesseldb-$VER-x86_64-unknown-linux-gnu.tar.gz \
+  | tar xz
+```
+
+The release workflow builds these as part of `cargo build --release
+--features pg-gateway,http-gateway` so the binaries you download include the
+PostgreSQL and HTTP gateways out of the box; the binary protocol is the
+default + fast path either way.
+
+### Or build from source
 
 ```bash
 git clone https://github.com/hassard0/KesselDB && cd KesselDB
-cargo build --release
-
-# start a node:  kesseldb [LISTEN_ADDR] [DATA_DIR]
-cargo run --release --bin kesseldb -- 127.0.0.1:7878 ./data
-# Workspace gate: 1131 default tests, 1 ignored (1164 with --features kessel-http-gateway/test-server)
-cargo test --workspace --release
+cargo build --release                                # default — binary protocol only
+cargo build --release --features pg-gateway,http-gateway   # all wire surfaces
+cargo test  --workspace --release                    # workspace gate: 1779 default tests
 ```
 
-### Query it in one command — no code required
+### Start a node
 
 ```bash
-kessel "CREATE TABLE acct (owner U32 NOT NULL, bal I64 NOT NULL)"
-kessel "INSERT INTO acct ID 1 (owner, bal) VALUES (100, 50)"
-kessel "SELECT SUM(bal) FROM acct WHERE owner = 100"     # => = 50
-kessel "SELECT * FROM acct"                              # aligned table
-kessel "DESCRIBE acct"                                   # readable schema
-kessel --json "SELECT * FROM acct"                       # {"status":"ok","rows":[…]}
+# kesseldb [LISTEN_ADDR] [DATA_DIR]
+./kesseldb 127.0.0.1:7878 ./data
 
-echo "SELECT * FROM acct ID 1" | kessel                  # pipe a .sql file
-kessel                                                   # interactive shell (\? for commands)
+# Or enable the HTTP + PG listeners alongside the binary protocol:
+KESSELDB_TOKEN=mysecret \
+KESSELDB_HTTP_ADDR=127.0.0.1:8080 \
+KESSELDB_PG_ADDR=127.0.0.1:5432 \
+  ./kesseldb 127.0.0.1:7878 ./data
+# => KesselDB listening on 127.0.0.1:7878, data dir ./data, http=127.0.0.1:8080, pg=127.0.0.1:5432
 ```
 
-The `kessel` CLI (`cargo run -p kessel-client --bin kessel -- …`, or
-`target/release/kessel` after a release build) is one-shot, pipe, and
-interactive, with reliable exit codes and a `--json` mode — ideal for
-scripts, ops, and agents. In the shell, `\?` lists commands, `\d <table>`
-describes a table, `\timing` toggles query timing.
+### Connect
+
+```bash
+# Binary protocol via the kessel CLI (one-shot, pipe, interactive):
+./kessel "CREATE TABLE acct (owner U32 NOT NULL, bal I64 NOT NULL)"
+./kessel "INSERT INTO acct ID 1 (owner, bal) VALUES (100, 50)"
+./kessel "SELECT SUM(bal) FROM acct WHERE owner = 100"     # => = 50
+./kessel "SELECT * FROM acct"                              # aligned table
+./kessel --json "SELECT * FROM acct"                       # {"status":"ok","rows":[…]}
+echo "SELECT * FROM acct ID 1" | ./kessel                  # pipe a .sql file
+./kessel                                                   # interactive shell (\? for commands)
+
+# HTTP/1.1 + JSON:
+curl -s -X POST --data-binary 'SELECT * FROM acct' \
+  -H 'Content-Type: text/plain' \
+  -H 'Authorization: Bearer mysecret' \
+  http://127.0.0.1:8080/v1/sql
+
+# PostgreSQL wire — any libpq-derived client:
+PGPASSWORD=mysecret psql -h 127.0.0.1 -p 5432 -U test "SELECT SUM(bal) FROM acct"
+PGPASSWORD=mysecret pgcli -h 127.0.0.1 -p 5432 -u test
+```
+
+The `kessel` CLI is one-shot, pipe, and interactive, with reliable exit codes
+and a `--json` mode — ideal for scripts, ops, and agents. In the shell, `\?`
+lists commands, `\d <table>` describes a table, `\timing` toggles query timing.
 
 ### Or from Rust
 
@@ -174,11 +235,35 @@ db.sql("UPDATE acct ID 1 SET bal = 500")?;
 let row   = db.sql("SELECT * FROM acct ID 2")?;
 ```
 
-That's the whole loop: connect, run SQL, get results — over a single TCP socket,
-no drivers, no dependencies.
-
 → Full instructions, SQL reference, cluster setup, auth and operations are in
 **[`docs/USAGE.md`](docs/USAGE.md)**.
+
+## PostgreSQL client compatibility
+
+KesselDB speaks the PostgreSQL Frontend/Backend Protocol v3.0 Simple Query
+path with SCRAM‑SHA‑256 auth. After SP‑PG‑CAT (the `pg_catalog` /
+`information_schema` stubs arc), the following PG ecosystem tools connect
+and browse out of the box (verified by synthetic‑peer KATs driving each
+tool's verbatim connect / introspection SQL):
+
+| Tool | Connect | Introspect / browse | Notes |
+|---|---|---|---|
+| `psql` | ✓ | ✓ `\dt`, `\d <t>`, `\dn`, `\di` | `\dt+` row count = `-1` (V1 doesn't track) |
+| `pgcli` | ✓ | ✓ tab‑completion | populated from `pg_class` enumeration |
+| pgAdmin 4 | ✓ | ✓ browse tables/columns/indexes/constraints | Functions / triggers / extensions panels empty (V2) |
+| DBeaver | ✓ | ✓ navigator tree | tables + columns + indexes + UNIQUE constraints |
+| DataGrip / IntelliJ | ✓ | ✓ tables/columns | Functions panel empty (V1 returns empty `routines`) |
+| Metabase | ✓ | ✓ schema discovery via `information_schema.{tables,columns,schemata}` | |
+| Tableau / Looker / Hex / Superset | ✓ | ✓ ODBC wizards complete | schema discoverable |
+| JDBC `org.postgresql:postgresql` | ✓ | ✓ `getTables` / `getColumns` / `getIndexInfo` | |
+| psycopg2 / psycopg3 / `pgx` / `tokio-postgres` / sqlx-pg | ✓ | n/a | programmatic drivers |
+| Drizzle / Prisma / GORM / Diesel | ✓ | n/a | simple‑query mode; Extended Query (Parse/Bind/Execute) is V2 |
+
+**V2 follow‑ups** (each named): Extended Query / prepared statements
+(SP‑PG‑EXTQ), `RETURNING`, COPY, binary‑format wire encoding, `pg_proc`
+real function listing, `pg_stat_*` runtime stats, TLS via SSLRequest, MD5
+auth fallback, per‑user privileges. Full list in
+[`docs/USAGE.md`](docs/USAGE.md) §9 → Limitations.
 
 ## Running a cluster
 
@@ -318,13 +403,13 @@ Honest boundaries (documented, not hidden):
   `Delete`); cross‑shard scatter‑gather *reads*/SQL text routing is a
   separate, later concern from cross‑shard *transactions*.
 
-Every claim in this repository is backed by the test suite (`1131 default tests / 1164 with --features kessel-http-gateway/test-server, 1 ignored — brotli decoder pending`); the
-docs call out exactly what is proven versus roadmap. The four
-**strategic‑tier items S1–S4** (TLA+/model‑checked safety, serializable
-MVCC/SI, Jepsen linearizability under partition, deterministic WASM
-UDFs) are all **shipped** — see [`docs/THESIS.md`](docs/THESIS.md) for
-the framing, and [`docs/STATUS.md`](docs/STATUS.md) for per‑slice
-records (SP109 / SP110‑SP116 / SP117 / SP118).
+Every claim in this repository is backed by the test suite (1779 default /
+1807 with `--features pg-gateway` / 1862 with all gateway features); the docs
+call out exactly what is proven versus roadmap. The four **strategic‑tier
+items S1–S4** (TLA+/model‑checked safety, serializable MVCC/SI, Jepsen
+linearizability under partition, deterministic WASM UDFs) are all **shipped**
+— see [`docs/THESIS.md`](docs/THESIS.md) for the framing, and
+[`docs/STATUS.md`](docs/STATUS.md) for per‑slice records.
 
 ## Documentation
 
@@ -345,13 +430,16 @@ records (SP109 / SP110‑SP116 / SP117 / SP118).
 
 ```bash
 cargo build                 # all kernel crates, zero external deps
-cargo test --workspace      # 1131 default tests / 1164 with --features kessel-http-gateway/test-server (incl. seeded partition/fault sim,
+cargo test --workspace      # 1779 default tests (seeded partition/fault sim,
                             # Jepsen linearizability, MVCC TLA+ refinement,
-                            # pyarrow Parquet round-trips, WASM-MVP KATs)
-cargo run -p kessel-bench --release -- --help   # benchmarks
+                            # pyarrow Parquet round-trips, WASM-MVP KATs,
+                            # SP-A 85-seed K-invariance sweep)
+cargo test --workspace --features pg-gateway                # 1807 (adds SP-PG + SP-PG-CAT)
+cargo test --workspace --features pg-gateway,http-gateway,kessel-http-gateway/test-server   # 1862 — full matrix
+cargo run -p kessel-bench --release -- --help               # benchmarks
 
 # Strategic-tier rigor artifacts:
-cd kesseldb-tla/ && tlc -workers auto Replication.tla   # ≥528M states / depth 21 / 0 violations
+cd kesseldb-tla/ && tlc -workers auto Replication.tla       # ≥528M states / depth 21 / 0 violations
 ```
 
 Requires Rust stable 1.95+. No system libraries, no native build steps.

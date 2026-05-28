@@ -6,7 +6,7 @@
 
 *"It's the database that made the Kessel Run in 12 parsecs."*
 
-`1779 default tests green / 1807 with --features pg-gateway / 1862 with all gateway features` · `0 external dependencies in the kernel` · `Rust 1.95+` · single‑binary
+`1792 default tests green / 1820 with --features pg-gateway / 1875 with all gateway features` · `0 external dependencies in the kernel` · `Rust 1.95+` · single‑binary
 
 </div>
 
@@ -139,8 +139,8 @@ all. Determinism is a feature, not an aspiration.
   protocol byte‑untouched; zero external (non‑workspace) deps on the
   gateway crate. See `docs/USAGE.md` §9 PostgreSQL clients.
 - **Deterministic & verifiable** — the whole engine is a seedable state
-  machine; the test suite (1779 default / 1807 with `--features pg-gateway`
-  / 1862 with all gateway features) includes seeded partition/fault
+  machine; the test suite (1792 default / 1820 with `--features pg-gateway`
+  / 1875 with all gateway features) includes seeded partition/fault
   simulation, multi‑replica Jepsen, hand‑derived KATs against published
   spec text for every codec, the SP‑A 85‑seed K‑invariance sweep, the
   SP‑PG‑CAT synthetic‑peer suite verifying each GUI tool's verbatim
@@ -175,7 +175,7 @@ default + fast path either way.
 git clone https://github.com/hassard0/KesselDB && cd KesselDB
 cargo build --release                                # default — binary protocol only
 cargo build --release --features pg-gateway,http-gateway   # all wire surfaces
-cargo test  --workspace --release                    # workspace gate: 1779 default tests
+cargo test  --workspace --release                    # workspace gate: 1792 default tests
 ```
 
 ### Start a node
@@ -403,8 +403,8 @@ Honest boundaries (documented, not hidden):
   `Delete`); cross‑shard scatter‑gather *reads*/SQL text routing is a
   separate, later concern from cross‑shard *transactions*.
 
-Every claim in this repository is backed by the test suite (1779 default /
-1807 with `--features pg-gateway` / 1862 with all gateway features); the docs
+Every claim in this repository is backed by the test suite (1792 default /
+1820 with `--features pg-gateway` / 1875 with all gateway features); the docs
 call out exactly what is proven versus roadmap. The four **strategic‑tier
 items S1–S4** (TLA+/model‑checked safety, serializable MVCC/SI, Jepsen
 linearizability under partition, deterministic WASM UDFs) are all **shipped**
@@ -430,12 +430,12 @@ linearizability under partition, deterministic WASM UDFs) are all **shipped**
 
 ```bash
 cargo build                 # all kernel crates, zero external deps
-cargo test --workspace      # 1779 default tests (seeded partition/fault sim,
+cargo test --workspace      # 1792 default tests (seeded partition/fault sim,
                             # Jepsen linearizability, MVCC TLA+ refinement,
                             # pyarrow Parquet round-trips, WASM-MVP KATs,
                             # SP-A 85-seed K-invariance sweep)
-cargo test --workspace --features pg-gateway                # 1807 (adds SP-PG + SP-PG-CAT)
-cargo test --workspace --features pg-gateway,http-gateway,kessel-http-gateway/test-server   # 1862 — full matrix
+cargo test --workspace --features pg-gateway                # 1820 (adds SP-PG + SP-PG-CAT)
+cargo test --workspace --features pg-gateway,http-gateway,kessel-http-gateway/test-server   # 1875 — full matrix
 cargo run -p kessel-bench --release -- --help               # benchmarks
 
 # Strategic-tier rigor artifacts:

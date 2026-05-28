@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cluster;
+pub mod read_pool;
 pub mod router;
 pub mod scatter_scan;
 
@@ -194,6 +195,18 @@ pub struct ServerConfig {
     /// closes the socket on timeout; T16 will emit `57014`
     /// query_canceled ErrorResponse first.
     pub pg_idle_timeout: std::time::Duration,
+    /// SP-Perf-A T1: optional read-worker pool size. `None` =
+    /// pre-Perf-A behaviour (no pool spawned, every op routes through
+    /// the single owning engine thread). `Some(n)` = spawn an
+    /// `n`-worker `ReadPool` at server start; the connection-accept
+    /// path dispatches bare-Op read-only frames to the pool while
+    /// writes + SQL + admin tags still go to the engine queue.
+    /// `Some(0)` is supported as a graceful "wire-only" mode that
+    /// constructs the pool's plumbing but spawns no workers — the
+    /// pool falls back to the submitting-thread engine call.
+    ///
+    /// See `docs/superpowers/specs/2026-05-28-kesseldb-perf-a-parallel-reads-design.md`.
+    pub read_workers: Option<usize>,
 }
 
 impl Default for ServerConfig {
@@ -210,6 +223,7 @@ impl Default for ServerConfig {
             pg_addr: None,
             pg_max_conns: 256,
             pg_idle_timeout: std::time::Duration::from_secs(600),
+            read_workers: None,
         }
     }
 }

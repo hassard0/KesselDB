@@ -199,6 +199,55 @@ pub fn catalog_query_hook<E: EngineApply + ?Sized>(
     if let Some(oid) = extract_conrelid_filter(&normalized) {
         return Some(synthesize::synthesize_pg_constraint(engine, Some(oid)));
     }
+    // T6: `information_schema.tables` (Metabase / Tableau / Looker
+    // connect-database wizard).
+    if matches_information_schema_tables(&normalized) {
+        return Some(synthesize::synthesize_information_schema_tables(engine));
+    }
+    // T6: `information_schema.columns` — with optional `table_name =
+    // '<name>'` filter (Metabase / Tableau per-table introspection
+    // hot path).
+    if matches_information_schema_columns(&normalized) {
+        let filter = extract_information_schema_columns_table_filter(&normalized);
+        return Some(synthesize::synthesize_information_schema_columns(
+            engine,
+            filter.as_deref(),
+        ));
+    }
+    // T6: `information_schema.schemata` (Metabase / Tableau /
+    // dbt-postgres schema-list).
+    if matches_information_schema_schemata(&normalized) {
+        return Some(synthesize::synthesize_information_schema_schemata());
+    }
+    // T6: `information_schema.key_column_usage` (PK + FK column
+    // discovery).
+    if matches_information_schema_key_column_usage(&normalized) {
+        let filter = extract_information_schema_table_name_filter(&normalized);
+        return Some(synthesize::synthesize_information_schema_key_column_usage(
+            engine,
+            filter.as_deref(),
+        ));
+    }
+    // T6: `information_schema.table_constraints` (PK / FK / UNIQUE /
+    // CHECK enumeration).
+    if matches_information_schema_table_constraints(&normalized) {
+        let filter = extract_information_schema_table_name_filter(&normalized);
+        return Some(synthesize::synthesize_information_schema_table_constraints(
+            engine,
+            filter.as_deref(),
+        ));
+    }
+    // T6: `information_schema.views` (well-framed empty — KesselDB
+    // V1 has no views).
+    if matches_information_schema_views(&normalized) {
+        return Some(synthesize::synthesize_information_schema_views());
+    }
+    // T6: `information_schema.routines` (well-framed empty — V1 has
+    // no stored procedures; DataGrip / JetBrains query this on
+    // connect).
+    if matches_information_schema_routines(&normalized) {
+        return Some(synthesize::synthesize_information_schema_routines());
+    }
     None
 }
 
@@ -544,6 +593,117 @@ fn extract_conrelid_filter(normalized: &str) -> Option<u32> {
         }
     }
     None
+}
+
+// ─── SP-PG-CAT T6 — information_schema matchers ─────────────────────────────
+//
+// information_schema is the SQL-standard catalog. Tools issue
+// SELECTs against it instead of pg_catalog when they want to be
+// vendor-neutral (Metabase, Tableau, Looker, Hex, Superset,
+// dbt-postgres, sqlmesh). The matcher style mirrors the pg_catalog
+// shape — fast-reject on a starting fixture, then match a small
+// table of canonical patterns.
+//
+// All matchers below assume normalized SQL (lowercase + collapsed
+// whitespace + leading-comment-stripped + trailing-semi-stripped).
+// The matcher functions return `bool` for "table-name" matches
+// (the synthesizer fires unconditionally) or `Option<String>` for
+// extract-table-name shapes (the synthesizer filters to the named
+// table).
+
+/// SP-PG-CAT T6 — recognize `SELECT ... FROM information_schema
+/// .tables ...`. The projection is variable (Metabase emits 4
+/// columns, Tableau emits 2, Looker emits a custom set); we anchor
+/// on the FROM clause + ignore the projection differences.
+fn matches_information_schema_tables(normalized: &str) -> bool {
+    has_information_schema_relation(normalized, "tables")
+}
+
+/// SP-PG-CAT T6 — recognize `SELECT ... FROM information_schema
+/// .columns ...`.
+fn matches_information_schema_columns(normalized: &str) -> bool {
+    has_information_schema_relation(normalized, "columns")
+}
+
+/// SP-PG-CAT T6 — recognize `SELECT ... FROM information_schema
+/// .schemata ...`.
+fn matches_information_schema_schemata(normalized: &str) -> bool {
+    has_information_schema_relation(normalized, "schemata")
+}
+
+/// SP-PG-CAT T6 — recognize `SELECT ... FROM information_schema
+/// .key_column_usage ...`.
+fn matches_information_schema_key_column_usage(normalized: &str) -> bool {
+    has_information_schema_relation(normalized, "key_column_usage")
+}
+
+/// SP-PG-CAT T6 — recognize `SELECT ... FROM information_schema
+/// .table_constraints ...`.
+fn matches_information_schema_table_constraints(normalized: &str) -> bool {
+    has_information_schema_relation(normalized, "table_constraints")
+}
+
+/// SP-PG-CAT T6 — recognize `SELECT ... FROM information_schema
+/// .views ...`.
+fn matches_information_schema_views(normalized: &str) -> bool {
+    has_information_schema_relation(normalized, "views")
+}
+
+/// SP-PG-CAT T6 — recognize `SELECT ... FROM information_schema
+/// .routines ...`.
+fn matches_information_schema_routines(normalized: &str) -> bool {
+    has_information_schema_relation(normalized, "routines")
+}
+
+/// Internal helper — true iff the normalized SQL contains
+/// `from information_schema.<relation>` as a token sequence.
+/// Tolerates trailing `,` / `where` / `order` / `;` / end-of-string
+/// so we don't over-match on a longer relation name (e.g.
+/// `tables_with_extras` would NOT match `tables`).
+fn has_information_schema_relation(normalized: &str, relation: &str) -> bool {
+    let needle = format!("from information_schema.{relation}");
+    let Some(pos) = normalized.find(&needle) else {
+        return false;
+    };
+    // Char after needle must be word-boundary (space, ; , end-of-string).
+    let after = &normalized[pos + needle.len()..];
+    after.is_empty()
+        || after.starts_with(' ')
+        || after.starts_with(',')
+        || after.starts_with(';')
+}
+
+/// SP-PG-CAT T6 — extract the table-name filter from
+/// `information_schema.columns` queries.
+///
+/// Recognizes both standalone clauses (Metabase, queries.md §5.2):
+/// - `where table_name = '<name>'`
+/// - `where ... and table_name = '<name>'`
+///
+/// Returns `None` if no `table_name = '<name>'` literal clause
+/// appears (the synthesizer then emits all columns of all tables).
+/// Wildcards (`LIKE`, `%`, `_`) are not unwrapped — a wildcard
+/// pattern falls through to all-tables since V1 doesn't model
+/// LIKE-pattern matching here.
+fn extract_information_schema_columns_table_filter(normalized: &str) -> Option<String> {
+    extract_quoted_after(normalized, "table_name = '")
+}
+
+/// SP-PG-CAT T6 — extract the table-name filter shared by
+/// `key_column_usage` / `table_constraints`. Same shape as
+/// `extract_information_schema_columns_table_filter`.
+fn extract_information_schema_table_name_filter(normalized: &str) -> Option<String> {
+    extract_quoted_after(normalized, "table_name = '")
+}
+
+/// Internal helper — find `needle` (which must end with `'`), then
+/// scan to the next `'` and return the substring between as the
+/// captured literal.
+fn extract_quoted_after(normalized: &str, needle: &str) -> Option<String> {
+    let pos = normalized.find(needle)?;
+    let after = &normalized[pos + needle.len()..];
+    let end = after.find('\'')?;
+    Some(after[..end].to_string())
 }
 
 /// Parse a leading decimal u32 from `s` — used by the
@@ -1403,6 +1563,218 @@ mod tests {
         // Non-SELECT still fast-rejected even if mentioning pg_attribute.
         assert!(catalog_query_hook(
             "DELETE FROM pg_catalog.pg_attribute WHERE attrelid = 16385",
+            &eng).is_none());
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-CAT T6 KATs — information_schema pattern matchers + the
+    // end-to-end dispatch through catalog_query_hook.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// Build an InfoSchemaEngine-shaped helper here (mod.rs tests can't
+    /// import the helper from synthesize::tests).
+    struct T6Engine {
+        tables: Vec<TableMetadata>,
+        schemas: std::collections::BTreeMap<String, Vec<PgColumn>>,
+    }
+    impl EngineApply for T6Engine {
+        fn apply_sql(&self, _sql: &str) -> OpResult {
+            OpResult::SchemaError("T6Engine: apply_sql should not be reached".into())
+        }
+        fn describe_table(&self, name: &str) -> Option<Vec<PgColumn>> {
+            self.schemas.get(name).cloned()
+        }
+        fn list_tables(&self) -> Vec<TableMetadata> {
+            self.tables.clone()
+        }
+    }
+    fn t6_engine() -> T6Engine {
+        let mut schemas = std::collections::BTreeMap::new();
+        schemas.insert("users".to_string(), vec![
+            PgColumn { name: "id".into(),   kind: FieldKind::I64, nullable: false },
+            PgColumn { name: "name".into(), kind: FieldKind::Char(64), nullable: false },
+        ]);
+        T6Engine {
+            tables: vec![
+                TableMetadata { name: "users".into(),  type_id: 1, kind: TableKind::Ordinary, field_count: 2 },
+                TableMetadata { name: "orders".into(), type_id: 2, kind: TableKind::Ordinary, field_count: 3 },
+            ],
+            schemas,
+        }
+    }
+
+    /// **HEADLINE — information_schema.tables canonical Metabase
+    /// query hits the hook + synthesizer fires.** The Metabase
+    /// connect-database wizard issues this verbatim
+    /// (queries.md §5.1).
+    #[test]
+    fn t6_information_schema_tables_metabase_query_fires() {
+        let eng = t6_engine();
+        let metabase_query = "SELECT table_catalog, table_schema, table_name, table_type \
+                              FROM information_schema.tables \
+                              WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
+                              ORDER BY table_schema, table_name;";
+        let res = catalog_query_hook(metabase_query, &eng);
+        assert!(res.is_some(), "Metabase info_schema.tables query MUST hit hook");
+        let bytes = res.unwrap();
+        assert_eq!(bytes[0], b'T');
+        assert!(bytes.windows(b"users".len()).any(|w| w == b"users"));
+        assert!(bytes.windows(b"orders".len()).any(|w| w == b"orders"));
+        assert!(bytes.windows(b"BASE TABLE".len()).any(|w| w == b"BASE TABLE"));
+    }
+
+    /// **HEADLINE — information_schema.columns canonical Metabase
+    /// per-table query hits the hook AND filters to the named
+    /// table.** queries.md §5.2.
+    #[test]
+    fn t6_information_schema_columns_metabase_per_table_query_fires() {
+        let eng = t6_engine();
+        let metabase_query = "SELECT table_catalog, table_schema, table_name, column_name, \
+                              ordinal_position, data_type, character_maximum_length, \
+                              numeric_precision, numeric_scale, is_nullable \
+                              FROM information_schema.columns \
+                              WHERE table_schema = 'public' AND table_name = 'users' \
+                              ORDER BY ordinal_position;";
+        let res = catalog_query_hook(metabase_query, &eng);
+        assert!(res.is_some(), "Metabase info_schema.columns query MUST hit hook");
+        let bytes = res.unwrap();
+        // Only the 2 users columns (filter to 'users' worked).
+        assert!(bytes.windows(b"SELECT 2\0".len()).any(|w| w == b"SELECT 2\0"),
+            "filter MUST restrict to users table");
+        assert!(bytes.windows(b"bigint".len()).any(|w| w == b"bigint"));
+        assert!(bytes.windows(b"text".len()).any(|w| w == b"text"));
+    }
+
+    /// **HEADLINE — information_schema.schemata canonical query
+    /// returns the 3 schemas.** queries.md §5.3.
+    #[test]
+    fn t6_information_schema_schemata_canonical_query_fires() {
+        let eng = t6_engine();
+        let query = "SELECT schema_name FROM information_schema.schemata \
+                     WHERE schema_name NOT IN ('pg_catalog', 'information_schema') \
+                     ORDER BY schema_name;";
+        let res = catalog_query_hook(query, &eng);
+        assert!(res.is_some());
+        let bytes = res.unwrap();
+        assert!(bytes.windows(b"SELECT 3\0".len()).any(|w| w == b"SELECT 3\0"));
+        assert!(bytes.windows(b"public".len()).any(|w| w == b"public"));
+    }
+
+    /// **information_schema.tables / .columns / .schemata matching is
+    /// case-insensitive.** Mixed-case SQL from JDBC drivers MUST match.
+    #[test]
+    fn t6_information_schema_pattern_is_case_insensitive() {
+        let eng = t6_engine();
+        let upper = catalog_query_hook(
+            "SELECT * FROM INFORMATION_SCHEMA.TABLES",
+            &eng,
+        );
+        let mixed = catalog_query_hook(
+            "SELECT * From Information_Schema.Tables",
+            &eng,
+        );
+        assert!(upper.is_some(), "upper-case info_schema MUST match");
+        assert!(mixed.is_some(), "mixed-case info_schema MUST match");
+    }
+
+    /// **information_schema.views returns empty (0 rows) via hook.**
+    /// Tools probing for views see a graceful empty result.
+    #[test]
+    fn t6_information_schema_views_hook_returns_empty() {
+        let eng = t6_engine();
+        let res = catalog_query_hook(
+            "SELECT * FROM information_schema.views",
+            &eng,
+        );
+        assert!(res.is_some());
+        let bytes = res.unwrap();
+        assert!(bytes.windows(b"SELECT 0\0".len()).any(|w| w == b"SELECT 0\0"));
+    }
+
+    /// **information_schema.routines returns empty (0 rows) via hook.**
+    /// DataGrip queries this on connect; well-framed empty per spec.
+    #[test]
+    fn t6_information_schema_routines_hook_returns_empty() {
+        let eng = t6_engine();
+        let res = catalog_query_hook(
+            "SELECT * FROM information_schema.routines",
+            &eng,
+        );
+        assert!(res.is_some());
+        let bytes = res.unwrap();
+        assert!(bytes.windows(b"SELECT 0\0".len()).any(|w| w == b"SELECT 0\0"));
+    }
+
+    /// **information_schema.key_column_usage canonical query hits
+    /// the hook.** Used by Metabase relationship inference.
+    #[test]
+    fn t6_information_schema_key_column_usage_hook_fires() {
+        let eng = t6_engine();
+        let res = catalog_query_hook(
+            "SELECT * FROM information_schema.key_column_usage",
+            &eng,
+        );
+        assert!(res.is_some(), "info_schema.key_column_usage MUST hit hook");
+        let bytes = res.unwrap();
+        // No constraints in the default fixture → 0 rows.
+        assert!(bytes.windows(b"SELECT 0\0".len()).any(|w| w == b"SELECT 0\0"));
+    }
+
+    /// **information_schema.table_constraints canonical query hits
+    /// the hook.** Used by Schemaspy / ER diagram tools.
+    #[test]
+    fn t6_information_schema_table_constraints_hook_fires() {
+        let eng = t6_engine();
+        let res = catalog_query_hook(
+            "SELECT * FROM information_schema.table_constraints",
+            &eng,
+        );
+        assert!(res.is_some());
+        let bytes = res.unwrap();
+        assert!(bytes.windows(b"SELECT 0\0".len()).any(|w| w == b"SELECT 0\0"));
+    }
+
+    /// **has_information_schema_relation has proper word-boundary
+    /// behaviour** — a longer relation name (e.g.
+    /// `tables_with_extras`) does NOT match `tables`. Locks the
+    /// over-match prevention.
+    #[test]
+    fn t6_information_schema_matcher_word_boundary() {
+        // The hook matches `from information_schema.tables` exactly,
+        // not `tables_with_extras`. We don't have a real such table,
+        // but the matcher MUST reject the substring match.
+        assert!(!has_information_schema_relation(
+            "select * from information_schema.tables_with_extras", "tables"));
+        // Trailing whitespace / where / ; / end-of-string all valid.
+        assert!(has_information_schema_relation(
+            "select * from information_schema.tables", "tables"));
+        assert!(has_information_schema_relation(
+            "select * from information_schema.tables where x = 1", "tables"));
+        assert!(has_information_schema_relation(
+            "select * from information_schema.tables, foo", "tables"));
+    }
+
+    /// **Regression lock — T6 additions don't break T1-T5+T7.**
+    #[test]
+    fn t6_pre_existing_patterns_still_match() {
+        let eng = t6_engine();
+        // T1
+        assert!(catalog_query_hook("SELECT * FROM pg_catalog.pg_namespace", &eng).is_some());
+        // T3
+        assert!(catalog_query_hook("SELECT * FROM pg_catalog.pg_class", &eng).is_some());
+        // T4
+        assert!(catalog_query_hook("SELECT * FROM pg_catalog.pg_attribute", &eng).is_some());
+        assert!(catalog_query_hook("SELECT * FROM pg_catalog.pg_type", &eng).is_some());
+        // T5
+        assert!(catalog_query_hook("SELECT * FROM pg_catalog.pg_index", &eng).is_some());
+        assert!(catalog_query_hook("SELECT * FROM pg_catalog.pg_constraint", &eng).is_some());
+        // T7
+        assert!(catalog_query_hook("SELECT version()", &eng).is_some());
+        // Unrelated SELECT still misses.
+        assert!(catalog_query_hook("SELECT id FROM users", &eng).is_none());
+        // Non-SELECT still fast-rejected.
+        assert!(catalog_query_hook(
+            "DELETE FROM information_schema.tables",
             &eng).is_none());
     }
 }

@@ -1397,6 +1397,462 @@ pub fn synthesize_pg_constraint<E: EngineApply + ?Sized>(
     out
 }
 
+// ─── SP-PG-CAT T6 — information_schema view synthesizers ──────────────────
+//
+// The SQL-standard `information_schema.*` namespace is the
+// portable, vendor-neutral catalog. While JDBC / pgcli / psql go
+// through `pg_catalog`, the BI / metadata-discovery layer
+// (Metabase, Tableau, Looker, Hex, Superset, dbt-postgres, sqlmesh)
+// prefers `information_schema` because the same queries port across
+// Postgres / MySQL / SQL Server.
+//
+// V1 of this slice ships the 5 most-queried views (per queries.md
+// §5 + the wider BI corpus): tables, columns, schemata,
+// key_column_usage, table_constraints. Two additional shapes return
+// well-framed empty results: views (KesselDB has no views) and
+// routines (V1 has no stored procedures — V2 SP-PG-CAT-PROC).
+//
+// Each synthesizer REUSES the existing engine.list_tables /
+// describe_table / list_indexes_for_table / list_constraints_for_table
+// data sources — the information_schema views are projections /
+// re-shapings of the same underlying KesselDB catalog data, NOT a
+// separate metadata source. That means: every fix to a pg_catalog
+// row propagates to its information_schema mirror for free.
+
+/// Canonical SQL-standard catalog name V1 emits in every
+/// information_schema row's `*_catalog` column. Matches
+/// `KESSELDB_DATABASE_NAME` so a tool that JOINs across
+/// `pg_database` + `information_schema.tables` sees consistent
+/// values.
+pub const INFORMATION_SCHEMA_CATALOG: &str = "kesseldb";
+
+/// SQL-standard `information_schema.tables.table_type` value for an
+/// ordinary base table. KesselDB has no views or system-catalog
+/// table objects in V1 — every entry from `engine.list_tables` is
+/// 'BASE TABLE'.
+pub const INFORMATION_SCHEMA_BASE_TABLE: &str = "BASE TABLE";
+
+/// Map a PG type OID to the canonical SQL-standard
+/// `information_schema.columns.data_type` name. SQL-standard names
+/// (`bigint`, `smallint`, `integer`, `text`, `boolean`, `timestamp
+/// with time zone`, `numeric`, `bytea`) differ from PG's internal
+/// `pg_type.typname` (`int8`, `int2`, `int4`, `text`, `bool`,
+/// `timestamptz`, `numeric`, `bytea`) on a few common types.
+/// BI tools key feature support off this column, so the mapping
+/// MUST match what real Postgres returns.
+pub fn information_schema_data_type_for_oid(oid: u32) -> &'static str {
+    match oid {
+        PG_TYPE_BOOL => "boolean",
+        PG_TYPE_BYTEA => "bytea",
+        PG_TYPE_INT2 => "smallint",
+        PG_TYPE_INT4 => "integer",
+        PG_TYPE_INT8 => "bigint",
+        PG_TYPE_TEXT => "text",
+        PG_TYPE_VARCHAR => "character varying",
+        PG_TYPE_NUMERIC => "numeric",
+        PG_TYPE_TIMESTAMPTZ => "timestamp with time zone",
+        PG_TYPE_OID => "oid",
+        _ => "USER-DEFINED",
+    }
+}
+
+/// SP-PG-CAT T6 — `information_schema.tables` synthesizer.
+///
+/// Emits one row per KesselDB user table. The view has 12 columns
+/// per the SQL standard; V1 fills the 4 essential columns
+/// (table_catalog / table_schema / table_name / table_type) +
+/// emits NULL for the rest (typed-table / commit-action /
+/// reference-generation / self-referencing-column-name are all
+/// PG-extension fields tools rarely touch).
+///
+/// Used by Metabase / Tableau / Looker / Hex / Superset /
+/// dbt-postgres connect-database wizards. queries.md §5.1.
+pub fn synthesize_information_schema_tables<E: EngineApply + ?Sized>(
+    engine: &E,
+) -> Vec<u8> {
+    let fields = vec![
+        FieldMeta { name: "table_catalog".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "table_schema".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "table_name".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "table_type".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "self_referencing_column_name".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "reference_generation".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "user_defined_type_catalog".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "user_defined_type_schema".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "user_defined_type_name".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "is_insertable_into".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "is_typed".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "commit_action".to_string(), type_oid: PG_TYPE_TEXT },
+    ];
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    let tables = engine.list_tables();
+    let mut n: u64 = 0;
+    let table_schema = b"public".as_ref();
+    let catalog = INFORMATION_SCHEMA_CATALOG.as_bytes();
+    let base_table = INFORMATION_SCHEMA_BASE_TABLE.as_bytes();
+    let yes = b"YES".as_ref();
+    let no = b"NO".as_ref();
+    for t in &tables {
+        if !matches!(t.kind, TableKind::Ordinary) {
+            continue;
+        }
+        out.extend_from_slice(&encode_data_row(&[
+            Some(catalog),               // table_catalog
+            Some(table_schema),          // table_schema
+            Some(t.name.as_bytes()),     // table_name
+            Some(base_table),            // table_type = 'BASE TABLE'
+            None,                        // self_referencing_column_name
+            None,                        // reference_generation
+            None,                        // user_defined_type_catalog
+            None,                        // user_defined_type_schema
+            None,                        // user_defined_type_name
+            Some(yes),                   // is_insertable_into = 'YES'
+            Some(no),                    // is_typed = 'NO'
+            None,                        // commit_action
+        ]));
+        n += 1;
+    }
+    out.extend_from_slice(&encode_command_complete(&select_tag(n)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
+/// SP-PG-CAT T6 — `information_schema.columns` synthesizer.
+///
+/// Emits one row per (table × column) of every KesselDB user
+/// table. If `table_filter = Some(name)`, restricts to that one
+/// table (the common Metabase / Tableau per-table introspection
+/// shape, queries.md §5.2). The view has ~30 columns per the SQL
+/// standard; V1 fills the 10 essential columns BI tools actually
+/// read (table_catalog / table_schema / table_name / column_name /
+/// ordinal_position / column_default / is_nullable / data_type /
+/// character_maximum_length / numeric_precision / numeric_scale /
+/// datetime_precision) + emits NULL for the rest.
+pub fn synthesize_information_schema_columns<E: EngineApply + ?Sized>(
+    engine: &E,
+    table_filter: Option<&str>,
+) -> Vec<u8> {
+    let fields = vec![
+        FieldMeta { name: "table_catalog".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "table_schema".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "table_name".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "column_name".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "ordinal_position".to_string(), type_oid: PG_TYPE_INT4 },
+        FieldMeta { name: "column_default".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "is_nullable".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "data_type".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "character_maximum_length".to_string(), type_oid: PG_TYPE_INT4 },
+        FieldMeta { name: "numeric_precision".to_string(), type_oid: PG_TYPE_INT4 },
+        FieldMeta { name: "numeric_scale".to_string(), type_oid: PG_TYPE_INT4 },
+        FieldMeta { name: "datetime_precision".to_string(), type_oid: PG_TYPE_INT4 },
+    ];
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    let tables = engine.list_tables();
+    let mut n: u64 = 0;
+    let table_schema = b"public".as_ref();
+    let catalog = INFORMATION_SCHEMA_CATALOG.as_bytes();
+    let yes = b"YES".as_ref();
+    let no = b"NO".as_ref();
+    for t in &tables {
+        if let Some(want) = table_filter {
+            if t.name != want {
+                continue;
+            }
+        }
+        if !matches!(t.kind, TableKind::Ordinary) {
+            continue;
+        }
+        let cols = match engine.describe_table(&t.name) {
+            Some(c) => c,
+            None => continue,
+        };
+        for (idx, col) in cols.iter().enumerate() {
+            let ordinal = (idx + 1).to_string();
+            let atttypid = field_kind_to_oid(col.kind);
+            let data_type = information_schema_data_type_for_oid(atttypid);
+            let is_nullable: &[u8] = if col.nullable { yes } else { no };
+            // numeric_precision per SQL standard: bigint=64, int=32,
+            // smallint=16, numeric=NULL (variable). NULL for non-
+            // numeric types.
+            let numeric_precision: Option<Vec<u8>> = match atttypid {
+                PG_TYPE_INT2 => Some(b"16".to_vec()),
+                PG_TYPE_INT4 => Some(b"32".to_vec()),
+                PG_TYPE_INT8 => Some(b"64".to_vec()),
+                _ => None,
+            };
+            // numeric_scale: 0 for integers, NULL for non-numeric.
+            let numeric_scale: Option<Vec<u8>> = match atttypid {
+                PG_TYPE_INT2 | PG_TYPE_INT4 | PG_TYPE_INT8 => Some(b"0".to_vec()),
+                _ => None,
+            };
+            // datetime_precision: 6 for timestamptz (microseconds),
+            // NULL for non-datetime.
+            let datetime_precision: Option<&[u8]> = match atttypid {
+                PG_TYPE_TIMESTAMPTZ => Some(b"6"),
+                _ => None,
+            };
+            out.extend_from_slice(&encode_data_row(&[
+                Some(catalog),                       // table_catalog
+                Some(table_schema),                  // table_schema
+                Some(t.name.as_bytes()),             // table_name
+                Some(col.name.as_bytes()),           // column_name
+                Some(ordinal.as_bytes()),            // ordinal_position
+                None,                                // column_default (V1: NULL)
+                Some(is_nullable),                   // is_nullable
+                Some(data_type.as_bytes()),          // data_type
+                None,                                // character_maximum_length (V1: NULL — variable)
+                numeric_precision.as_deref(),        // numeric_precision
+                numeric_scale.as_deref(),            // numeric_scale
+                datetime_precision,                  // datetime_precision
+            ]));
+            n += 1;
+        }
+    }
+    out.extend_from_slice(&encode_command_complete(&select_tag(n)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
+/// SP-PG-CAT T6 — `information_schema.schemata` synthesizer.
+///
+/// Emits the 3 canonical schemas KesselDB exposes: `public` (user
+/// tables), `pg_catalog` (PG system catalog), `information_schema`
+/// (SQL-standard catalog). Matches the `pg_namespace` 3-row stub
+/// (T1) but with the SQL-standard column shape.
+///
+/// Used by Metabase / Tableau / Looker / dbt-postgres schema-list
+/// queries (queries.md §5.3).
+pub fn synthesize_information_schema_schemata() -> Vec<u8> {
+    let fields = vec![
+        FieldMeta { name: "catalog_name".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "schema_name".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "schema_owner".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "default_character_set_catalog".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "default_character_set_schema".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "default_character_set_name".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "sql_path".to_string(), type_oid: PG_TYPE_TEXT },
+    ];
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    let catalog = INFORMATION_SCHEMA_CATALOG.as_bytes();
+    let owner = KESSELDB_USER_NAME.as_bytes();
+    for schema_name in ["pg_catalog", "public", "information_schema"] {
+        out.extend_from_slice(&encode_data_row(&[
+            Some(catalog),
+            Some(schema_name.as_bytes()),
+            Some(owner),
+            None, // default_character_set_catalog
+            None, // default_character_set_schema
+            None, // default_character_set_name
+            None, // sql_path
+        ]));
+    }
+    out.extend_from_slice(&encode_command_complete(&select_tag(3)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
+/// SP-PG-CAT T6 — `information_schema.key_column_usage` synthesizer.
+///
+/// Emits one row per (constraint × column) for primary keys + foreign
+/// keys + unique constraints. The view is keyed on
+/// (constraint_catalog, constraint_schema, constraint_name) +
+/// (table_catalog, table_schema, table_name, column_name) +
+/// `ordinal_position` (1-based within the constraint).
+///
+/// V1 sources data from `engine.list_constraints_for_table` —
+/// CHECK constraints are skipped (they don't apply to columns;
+/// they apply to expressions, so they don't have a key_column_usage
+/// entry per the SQL standard).
+pub fn synthesize_information_schema_key_column_usage<E: EngineApply + ?Sized>(
+    engine: &E,
+    table_filter: Option<&str>,
+) -> Vec<u8> {
+    let fields = vec![
+        FieldMeta { name: "constraint_catalog".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "constraint_schema".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "constraint_name".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "table_catalog".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "table_schema".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "table_name".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "column_name".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "ordinal_position".to_string(), type_oid: PG_TYPE_INT4 },
+        FieldMeta { name: "position_in_unique_constraint".to_string(), type_oid: PG_TYPE_INT4 },
+    ];
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    let tables = engine.list_tables();
+    let mut n: u64 = 0;
+    let catalog = INFORMATION_SCHEMA_CATALOG.as_bytes();
+    let schema = b"public".as_ref();
+    for t in &tables {
+        if let Some(want) = table_filter {
+            if t.name != want {
+                continue;
+            }
+        }
+        let cols = engine.describe_table(&t.name);
+        for c in engine.list_constraints_for_table(&t.name) {
+            // CHECK constraints have no key_column_usage rows per
+            // SQL standard — they apply to expressions, not columns.
+            if matches!(c.kind, ConstraintKind::Check) {
+                continue;
+            }
+            for (idx, attnum) in c.columns.iter().enumerate() {
+                let ord = (idx + 1).to_string();
+                let column_name = match &cols {
+                    Some(cs) => {
+                        let attn = *attnum as usize;
+                        if attn >= 1 && attn <= cs.len() {
+                            cs[attn - 1].name.clone()
+                        } else {
+                            String::new()
+                        }
+                    }
+                    None => String::new(),
+                };
+                // position_in_unique_constraint: NULL for non-FK
+                // (per SQL standard); for FK, position is the index
+                // in the referenced unique constraint (V1 emits ord).
+                let position_in_unique: Option<Vec<u8>> =
+                    if matches!(c.kind, ConstraintKind::ForeignKey { .. }) {
+                        Some(ord.clone().into_bytes())
+                    } else {
+                        None
+                    };
+                out.extend_from_slice(&encode_data_row(&[
+                    Some(catalog),                   // constraint_catalog
+                    Some(schema),                    // constraint_schema
+                    Some(c.name.as_bytes()),         // constraint_name
+                    Some(catalog),                   // table_catalog
+                    Some(schema),                    // table_schema
+                    Some(t.name.as_bytes()),         // table_name
+                    Some(column_name.as_bytes()),    // column_name
+                    Some(ord.as_bytes()),            // ordinal_position
+                    position_in_unique.as_deref(),   // position_in_unique_constraint
+                ]));
+                n += 1;
+            }
+        }
+    }
+    out.extend_from_slice(&encode_command_complete(&select_tag(n)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
+/// SP-PG-CAT T6 — `information_schema.table_constraints` synthesizer.
+///
+/// Emits one row per constraint (PK / FK / UNIQUE / CHECK) across
+/// the KesselDB catalog. Used by BI tools (Metabase referential
+/// integrity discovery; Tableau "Edit Relationships" wizard) +
+/// schema-introspection tools (Schemaspy, ER diagram generators).
+pub fn synthesize_information_schema_table_constraints<E: EngineApply + ?Sized>(
+    engine: &E,
+    table_filter: Option<&str>,
+) -> Vec<u8> {
+    let fields = vec![
+        FieldMeta { name: "constraint_catalog".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "constraint_schema".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "constraint_name".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "table_catalog".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "table_schema".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "table_name".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "constraint_type".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "is_deferrable".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "initially_deferred".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "enforced".to_string(), type_oid: PG_TYPE_TEXT },
+    ];
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    let tables = engine.list_tables();
+    let mut n: u64 = 0;
+    let catalog = INFORMATION_SCHEMA_CATALOG.as_bytes();
+    let schema = b"public".as_ref();
+    let no = b"NO".as_ref();
+    let yes = b"YES".as_ref();
+    for t in &tables {
+        if let Some(want) = table_filter {
+            if t.name != want {
+                continue;
+            }
+        }
+        for c in engine.list_constraints_for_table(&t.name) {
+            let constraint_type: &[u8] = match c.kind {
+                ConstraintKind::Check => b"CHECK",
+                ConstraintKind::ForeignKey { .. } => b"FOREIGN KEY",
+                ConstraintKind::Unique => b"UNIQUE",
+            };
+            out.extend_from_slice(&encode_data_row(&[
+                Some(catalog),                   // constraint_catalog
+                Some(schema),                    // constraint_schema
+                Some(c.name.as_bytes()),         // constraint_name
+                Some(catalog),                   // table_catalog
+                Some(schema),                    // table_schema
+                Some(t.name.as_bytes()),         // table_name
+                Some(constraint_type),           // constraint_type
+                Some(no),                        // is_deferrable
+                Some(no),                        // initially_deferred
+                Some(yes),                       // enforced
+            ]));
+            n += 1;
+        }
+    }
+    out.extend_from_slice(&encode_command_complete(&select_tag(n)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
+/// SP-PG-CAT T6 — `information_schema.views` synthesizer.
+///
+/// Returns a well-framed empty result (RowDescription + 0 rows +
+/// CommandComplete + ReadyForQuery). KesselDB V1 has no views;
+/// V2 SP-VIEW would populate.
+pub fn synthesize_information_schema_views() -> Vec<u8> {
+    let fields = vec![
+        FieldMeta { name: "table_catalog".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "table_schema".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "table_name".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "view_definition".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "check_option".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "is_updatable".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "is_insertable_into".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "is_trigger_updatable".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "is_trigger_deletable".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "is_trigger_insertable_into".to_string(), type_oid: PG_TYPE_TEXT },
+    ];
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    out.extend_from_slice(&encode_command_complete(&select_tag(0)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
+/// SP-PG-CAT T6 — `information_schema.routines` synthesizer.
+///
+/// Returns a well-framed empty result. KesselDB V1 has no
+/// user-defined routines (stored procedures / functions); V2
+/// SP-PG-CAT-PROC would populate. DataGrip + JetBrains tooling
+/// query this on connect.
+pub fn synthesize_information_schema_routines() -> Vec<u8> {
+    let fields = vec![
+        FieldMeta { name: "specific_catalog".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "specific_schema".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "specific_name".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "routine_catalog".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "routine_schema".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "routine_name".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "routine_type".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "data_type".to_string(), type_oid: PG_TYPE_TEXT },
+    ];
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    out.extend_from_slice(&encode_command_complete(&select_tag(0)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
 // ─── SP-PG-CAT T7 — SQL helper functions ──────────────────────────────────
 
 /// Canonical version string V1 emits for `SELECT version()`. Matches
@@ -3061,5 +3517,349 @@ mod tests {
         // RowDescription has 3 columns (name / setting / description).
         let fc = u16::from_be_bytes([bytes[5], bytes[6]]);
         assert_eq!(fc, 3);
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-CAT T6 KATs — information_schema view synthesizers. Reuse
+    // ListEngine + IndexEngine + ConstraintEngine helpers above.
+    // ───────────────────────────────────────────────────────────────────
+
+    use crate::engine::{
+        ConstraintKind as CK, ConstraintMetadata as CM, FkAction,
+    };
+    use kessel_catalog::FieldKind as FK;
+
+    /// EngineApply that drives information_schema.{tables,columns}
+    /// — overrides list_tables + describe_table + list_constraints
+    /// so all 5 information_schema synthesizers can be driven from
+    /// one fixture.
+    struct InfoSchemaEngine {
+        tables: Vec<TableMetadata>,
+        schemas: std::collections::BTreeMap<String, Vec<PgColumn>>,
+        constraints: std::collections::BTreeMap<String, Vec<CM>>,
+    }
+
+    impl EngineApply for InfoSchemaEngine {
+        fn apply_sql(&self, _sql: &str) -> OpResult {
+            OpResult::SchemaError("InfoSchemaEngine: apply_sql should not be reached".into())
+        }
+        fn describe_table(&self, name: &str) -> Option<Vec<PgColumn>> {
+            self.schemas.get(name).cloned()
+        }
+        fn list_tables(&self) -> Vec<TableMetadata> {
+            self.tables.clone()
+        }
+        fn list_constraints_for_table(&self, name: &str) -> Vec<CM> {
+            self.constraints.get(name).cloned().unwrap_or_default()
+        }
+    }
+
+    fn info_schema_engine() -> InfoSchemaEngine {
+        let mut schemas = std::collections::BTreeMap::new();
+        schemas.insert(
+            "users".to_string(),
+            vec![
+                PgColumn { name: "id".into(),    kind: FK::I64,      nullable: false },
+                PgColumn { name: "email".into(), kind: FK::Char(64), nullable: false },
+                PgColumn { name: "age".into(),   kind: FK::I32,      nullable: true  },
+            ],
+        );
+        schemas.insert(
+            "orders".to_string(),
+            vec![
+                PgColumn { name: "id".into(),     kind: FK::I64,         nullable: false },
+                PgColumn { name: "user_id".into(),kind: FK::I64,         nullable: false },
+                PgColumn { name: "ts".into(),     kind: FK::Timestamp,   nullable: false },
+            ],
+        );
+        let mut constraints = std::collections::BTreeMap::new();
+        constraints.insert(
+            "users".to_string(),
+            vec![CM {
+                name: "users_email_key".into(),
+                kind: CK::Unique,
+                columns: vec![2],
+                references: None,
+            }],
+        );
+        constraints.insert(
+            "orders".to_string(),
+            vec![
+                CM {
+                    name: "orders_user_id_fkey".into(),
+                    kind: CK::ForeignKey { on_delete: FkAction::Cascade },
+                    columns: vec![2],
+                    references: Some(("users".to_string(), vec![1])),
+                },
+                CM {
+                    name: "orders_check_ts".into(),
+                    kind: CK::Check,
+                    columns: vec![3],
+                    references: None,
+                },
+            ],
+        );
+        InfoSchemaEngine {
+            tables: vec![
+                TableMetadata { name: "users".into(),  type_id: 1, kind: TableKind::Ordinary, field_count: 3 },
+                TableMetadata { name: "orders".into(), type_id: 2, kind: TableKind::Ordinary, field_count: 3 },
+            ],
+            schemas,
+            constraints,
+        }
+    }
+
+    /// **HEADLINE — information_schema.tables emits one row per
+    /// KesselDB table with 'BASE TABLE' type.** Acceptance-criterion
+    /// for the Metabase / Tableau / Looker connect-database wizard.
+    #[test]
+    fn t6_information_schema_tables_lists_all_kesseldb_tables() {
+        let eng = info_schema_engine();
+        let bytes = synthesize_information_schema_tables(&eng);
+        // Well-framed.
+        assert_eq!(bytes[0], b'T');
+        assert_eq!(&bytes[bytes.len() - 6..], &[b'Z', 0, 0, 0, 5, b'I']);
+        // 2 rows = 2 KesselDB tables (Ordinary kind).
+        assert!(bytes.windows(b"SELECT 2\0".len()).any(|w| w == b"SELECT 2\0"));
+        // Each table name appears once.
+        assert!(bytes.windows(b"users".len()).any(|w| w == b"users"));
+        assert!(bytes.windows(b"orders".len()).any(|w| w == b"orders"));
+        // table_type = 'BASE TABLE' present.
+        assert!(bytes.windows(b"BASE TABLE".len()).any(|w| w == b"BASE TABLE"));
+        // Catalog stamp.
+        assert!(bytes.windows(b"kesseldb".len()).any(|w| w == b"kesseldb"));
+        // Schema stamp.
+        assert!(bytes.windows(b"public".len()).any(|w| w == b"public"));
+    }
+
+    /// **information_schema.tables RowDescription has 12 canonical
+    /// columns per the SQL standard.** Locked because BI tools that
+    /// iterate by column index break silently if the count drifts.
+    #[test]
+    fn t6_information_schema_tables_row_description_has_12_columns() {
+        let eng = info_schema_engine();
+        let bytes = synthesize_information_schema_tables(&eng);
+        let fc = u16::from_be_bytes([bytes[5], bytes[6]]);
+        assert_eq!(fc, 12, "information_schema.tables MUST have 12 columns");
+        for canonical in [
+            "table_catalog\0", "table_schema\0", "table_name\0", "table_type\0",
+            "is_insertable_into\0", "is_typed\0",
+        ] {
+            let needle = canonical.as_bytes();
+            assert!(bytes.windows(needle.len()).any(|w| w == needle),
+                "column {canonical:?} MUST appear in RowDescription");
+        }
+    }
+
+    /// **HEADLINE — information_schema.columns lists every column
+    /// with the canonical SQL-standard data_type name.** The names
+    /// are NOT the pg_type internal names (`int8`, `bool`,
+    /// `timestamptz`); they're the SQL-standard names (`bigint`,
+    /// `boolean`, `timestamp with time zone`) — BI tools key feature
+    /// support off this column.
+    #[test]
+    fn t6_information_schema_columns_emits_sql_standard_data_types() {
+        let eng = info_schema_engine();
+        let bytes = synthesize_information_schema_columns(&eng, None);
+        assert_eq!(bytes[0], b'T');
+        assert_eq!(&bytes[bytes.len() - 6..], &[b'Z', 0, 0, 0, 5, b'I']);
+        // 6 columns total: users(id/email/age) + orders(id/user_id/ts).
+        assert!(bytes.windows(b"SELECT 6\0".len()).any(|w| w == b"SELECT 6\0"));
+        // Canonical SQL-standard names.
+        assert!(bytes.windows(b"bigint".len()).any(|w| w == b"bigint"),
+            "I64 → 'bigint' per SQL standard");
+        assert!(bytes.windows(b"text".len()).any(|w| w == b"text"),
+            "Char(64) → 'text' per SQL standard");
+        assert!(bytes.windows(b"integer".len()).any(|w| w == b"integer"),
+            "I32 → 'integer' per SQL standard");
+        assert!(
+            bytes.windows(b"timestamp with time zone".len())
+                .any(|w| w == b"timestamp with time zone"),
+            "Timestamp → 'timestamp with time zone' per SQL standard",
+        );
+    }
+
+    /// **information_schema.columns filter by table_name works.** A
+    /// Metabase per-table introspection query (queries.md §5.2)
+    /// passes the table name as a literal; the synthesizer filters
+    /// to the matching table.
+    #[test]
+    fn t6_information_schema_columns_filter_by_table_name() {
+        let eng = info_schema_engine();
+        let bytes = synthesize_information_schema_columns(&eng, Some("users"));
+        // Only the 3 users columns.
+        assert!(bytes.windows(b"SELECT 3\0".len()).any(|w| w == b"SELECT 3\0"));
+        // users columns appear.
+        assert!(bytes.windows(b"email".len()).any(|w| w == b"email"));
+        assert!(bytes.windows(b"age".len()).any(|w| w == b"age"));
+        // orders-only column 'user_id' does NOT appear (the byte
+        // sequence wouldn't be in the response either).
+        assert!(!bytes.windows(b"user_id".len()).any(|w| w == b"user_id"));
+    }
+
+    /// **information_schema.columns ordinal_position is 1-based
+    /// sequential.** The SQL standard requires this; BI tools sort
+    /// by it to render the column list in declaration order.
+    #[test]
+    fn t6_information_schema_columns_ordinal_is_1_based() {
+        let eng = info_schema_engine();
+        let bytes = synthesize_information_schema_columns(&eng, Some("users"));
+        // Ordinals 1, 2, 3 appear in the response (as their decimal
+        // text forms). Cheap byte-substring check.
+        assert!(bytes.windows(b"1".len()).any(|w| w == b"1"));
+        assert!(bytes.windows(b"2".len()).any(|w| w == b"2"));
+        assert!(bytes.windows(b"3".len()).any(|w| w == b"3"));
+    }
+
+    /// **information_schema.columns is_nullable maps from
+    /// PgColumn.nullable.** users.age is nullable → 'YES'; users.id
+    /// is NOT NULL → 'NO'. Both literals MUST appear.
+    #[test]
+    fn t6_information_schema_columns_nullable_yes_no() {
+        let eng = info_schema_engine();
+        let bytes = synthesize_information_schema_columns(&eng, Some("users"));
+        // YES appears (for age) AND NO appears (for id + email).
+        assert!(bytes.windows(b"YES".len()).any(|w| w == b"YES"));
+        assert!(bytes.windows(b"NO".len()).any(|w| w == b"NO"));
+    }
+
+    /// **HEADLINE — information_schema.schemata returns 3 canonical
+    /// schemas (pg_catalog / public / information_schema).** Matches
+    /// the pg_namespace 3-row stub (T1) but with the SQL-standard
+    /// column shape.
+    #[test]
+    fn t6_information_schema_schemata_returns_three_schemas() {
+        let bytes = synthesize_information_schema_schemata();
+        assert_eq!(bytes[0], b'T');
+        assert_eq!(&bytes[bytes.len() - 6..], &[b'Z', 0, 0, 0, 5, b'I']);
+        assert!(bytes.windows(b"SELECT 3\0".len()).any(|w| w == b"SELECT 3\0"));
+        assert!(bytes.windows(b"pg_catalog".len()).any(|w| w == b"pg_catalog"));
+        assert!(bytes.windows(b"public".len()).any(|w| w == b"public"));
+        assert!(bytes.windows(b"information_schema".len())
+            .any(|w| w == b"information_schema"));
+        // 7-column RowDescription per SQL standard.
+        let fc = u16::from_be_bytes([bytes[5], bytes[6]]);
+        assert_eq!(fc, 7, "information_schema.schemata MUST have 7 columns");
+    }
+
+    /// **HEADLINE — information_schema.key_column_usage lists FK
+    /// columns + their parent table.** orders.user_id (column 2) →
+    /// FK to users(id). CHECK constraints are skipped per the SQL
+    /// standard (they don't apply to columns).
+    #[test]
+    fn t6_information_schema_key_column_usage_lists_fk_columns() {
+        let eng = info_schema_engine();
+        let bytes = synthesize_information_schema_key_column_usage(&eng, None);
+        assert_eq!(bytes[0], b'T');
+        assert_eq!(&bytes[bytes.len() - 6..], &[b'Z', 0, 0, 0, 5, b'I']);
+        // 2 rows: orders.user_id (FK), users.email (UNIQUE).
+        // CHECK (orders_check_ts) is skipped per SQL standard.
+        assert!(bytes.windows(b"SELECT 2\0".len()).any(|w| w == b"SELECT 2\0"));
+        assert!(bytes.windows(b"orders_user_id_fkey".len())
+            .any(|w| w == b"orders_user_id_fkey"));
+        assert!(bytes.windows(b"users_email_key".len())
+            .any(|w| w == b"users_email_key"));
+        // Column names attached to the constraints.
+        assert!(bytes.windows(b"user_id".len()).any(|w| w == b"user_id"));
+        assert!(bytes.windows(b"email".len()).any(|w| w == b"email"));
+    }
+
+    /// **information_schema.key_column_usage filter by table_name
+    /// works.** Per-table per-FK discovery (Metabase relationship
+    /// inference hot path).
+    #[test]
+    fn t6_information_schema_key_column_usage_filter_by_table() {
+        let eng = info_schema_engine();
+        let bytes = synthesize_information_schema_key_column_usage(&eng, Some("orders"));
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+        assert!(bytes.windows(b"orders_user_id_fkey".len())
+            .any(|w| w == b"orders_user_id_fkey"));
+    }
+
+    /// **HEADLINE — information_schema.table_constraints lists every
+    /// constraint with the SQL-standard `constraint_type` literal
+    /// ('CHECK' / 'UNIQUE' / 'FOREIGN KEY' / 'PRIMARY KEY').**
+    #[test]
+    fn t6_information_schema_table_constraints_lists_all_with_type() {
+        let eng = info_schema_engine();
+        let bytes = synthesize_information_schema_table_constraints(&eng, None);
+        assert_eq!(bytes[0], b'T');
+        assert_eq!(&bytes[bytes.len() - 6..], &[b'Z', 0, 0, 0, 5, b'I']);
+        // 3 constraints: users.email UNIQUE, orders.user_id FK,
+        // orders.ts CHECK.
+        assert!(bytes.windows(b"SELECT 3\0".len()).any(|w| w == b"SELECT 3\0"));
+        // All three SQL-standard type literals present.
+        assert!(bytes.windows(b"UNIQUE".len()).any(|w| w == b"UNIQUE"));
+        assert!(bytes.windows(b"FOREIGN KEY".len()).any(|w| w == b"FOREIGN KEY"));
+        assert!(bytes.windows(b"CHECK".len()).any(|w| w == b"CHECK"));
+    }
+
+    /// **information_schema.views returns empty (V1 has no views).**
+    /// Well-framed 0-row response per design — tools that probe
+    /// for views see "no views" cleanly.
+    #[test]
+    fn t6_information_schema_views_returns_empty() {
+        let bytes = synthesize_information_schema_views();
+        assert_eq!(bytes[0], b'T');
+        assert_eq!(&bytes[bytes.len() - 6..], &[b'Z', 0, 0, 0, 5, b'I']);
+        assert!(bytes.windows(b"SELECT 0\0".len()).any(|w| w == b"SELECT 0\0"));
+        // 10 canonical columns per SQL standard.
+        let fc = u16::from_be_bytes([bytes[5], bytes[6]]);
+        assert_eq!(fc, 10, "information_schema.views MUST have 10 columns");
+    }
+
+    /// **information_schema.routines returns empty (V1 has no
+    /// stored procedures).** DataGrip / JetBrains query this on
+    /// connect and tolerate empty.
+    #[test]
+    fn t6_information_schema_routines_returns_empty() {
+        let bytes = synthesize_information_schema_routines();
+        assert_eq!(bytes[0], b'T');
+        assert_eq!(&bytes[bytes.len() - 6..], &[b'Z', 0, 0, 0, 5, b'I']);
+        assert!(bytes.windows(b"SELECT 0\0".len()).any(|w| w == b"SELECT 0\0"));
+        let fc = u16::from_be_bytes([bytes[5], bytes[6]]);
+        assert_eq!(fc, 8, "information_schema.routines MUST have 8 columns");
+    }
+
+    /// **information_schema_data_type_for_oid maps canonical PG OIDs
+    /// to SQL-standard names.** Locked because the BI-tool data-type
+    /// fingerprint depends on these names.
+    #[test]
+    fn t6_information_schema_data_type_for_oid_canonical_names() {
+        assert_eq!(information_schema_data_type_for_oid(PG_TYPE_BOOL), "boolean");
+        assert_eq!(information_schema_data_type_for_oid(PG_TYPE_INT2), "smallint");
+        assert_eq!(information_schema_data_type_for_oid(PG_TYPE_INT4), "integer");
+        assert_eq!(information_schema_data_type_for_oid(PG_TYPE_INT8), "bigint");
+        assert_eq!(information_schema_data_type_for_oid(PG_TYPE_TEXT), "text");
+        assert_eq!(information_schema_data_type_for_oid(PG_TYPE_NUMERIC), "numeric");
+        assert_eq!(
+            information_schema_data_type_for_oid(PG_TYPE_TIMESTAMPTZ),
+            "timestamp with time zone",
+        );
+        assert_eq!(information_schema_data_type_for_oid(PG_TYPE_BYTEA), "bytea");
+        // Unknown OID → 'USER-DEFINED' per SQL standard fallback.
+        assert_eq!(information_schema_data_type_for_oid(99999), "USER-DEFINED");
+    }
+
+    /// **information_schema synthesizers handle empty engines
+    /// gracefully** — well-framed 0-row responses.
+    #[test]
+    fn t6_information_schema_synthesizers_empty_engine() {
+        struct EmptyEngine;
+        impl EngineApply for EmptyEngine {
+            fn apply_sql(&self, _sql: &str) -> OpResult { OpResult::Ok }
+            fn describe_table(&self, _name: &str) -> Option<Vec<PgColumn>> { None }
+        }
+        let eng = EmptyEngine;
+        for bytes in [
+            synthesize_information_schema_tables(&eng),
+            synthesize_information_schema_columns(&eng, None),
+            synthesize_information_schema_key_column_usage(&eng, None),
+            synthesize_information_schema_table_constraints(&eng, None),
+        ] {
+            assert_eq!(bytes[0], b'T', "well-framed start");
+            assert_eq!(&bytes[bytes.len() - 6..], &[b'Z', 0, 0, 0, 5, b'I']);
+            assert!(bytes.windows(b"SELECT 0\0".len()).any(|w| w == b"SELECT 0\0"));
+        }
     }
 }

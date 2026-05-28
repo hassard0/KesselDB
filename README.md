@@ -453,5 +453,4 @@ own spec under `docs/superpowers/specs/`.
 
 ## License
 
-Unlicensed / private. © 2026. (Re‑licensing for public open‑source release is
-tracked separately.)
+MIT License — see [`LICENSE`](LICENSE). © 2026 Ian Hassard.

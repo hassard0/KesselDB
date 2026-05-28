@@ -1321,6 +1321,103 @@ kessel=> SELECT * FROM information_schema.tables
 (1 row)
 ```
 
+### Real psql session (verified 2026-05-28)
+
+Captured from a real `psql 16.14` libpq client driving the
+`kesseldb-server` binary (built with `--features pg-gateway,http-gateway`)
+on a Linux reference server. The server was started with:
+
+```bash
+KESSELDB_TOKEN=admin KESSELDB_PG_ADDR=127.0.0.1:5532 \
+  ./target/release/kesseldb 127.0.0.1:6532 /tmp/kdb-data
+# => KesselDB listening on 127.0.0.1:6532, data dir /tmp/kdb-data, pg=127.0.0.1:5532
+```
+
+Every command and its actual response are shown below. The session
+exercises authentication, the `version()` helper, `\dt` empty +
+populated, `CREATE TABLE` with the canonical PG `BIGINT` type
+(NOT KesselDB's `I64` spelling), `INSERT` (single + multi-row),
+`SELECT *`, `\d <table>`, and `\dn` schema-list.
+
+```text
+$ PGPASSWORD=admin psql -h 127.0.0.1 -p 5532 -U test -d kesseldb -c "SELECT version();"
+            version
+--------------------------------
+ PostgreSQL 14.0 (KesselDB 1.0)
+(1 row)
+
+$ PGPASSWORD=admin psql -h 127.0.0.1 -p 5532 -U test -d kesseldb -c "\dt"
+Did not find any relations.
+
+$ PGPASSWORD=admin psql -h 127.0.0.1 -p 5532 -U test -d kesseldb -c \
+    "CREATE TABLE smoke (id BIGINT, n CHAR(16));"
+CREATE TABLE
+
+$ PGPASSWORD=admin psql -h 127.0.0.1 -p 5532 -U test -d kesseldb -c \
+    "INSERT INTO smoke (id, n) VALUES (1, 'hello');"
+INSERT 0 1
+
+$ PGPASSWORD=admin psql -h 127.0.0.1 -p 5532 -U test -d kesseldb -c "SELECT * FROM smoke;"
+ id |   n
+----+-------
+  1 | hello
+(1 row)
+
+$ PGPASSWORD=admin psql -h 127.0.0.1 -p 5532 -U test -d kesseldb -c "\dt"
+         List of relations
+ Schema | Name  | Type  |  Owner
+--------+-------+-------+----------
+ public | smoke | table | kesseldb
+(1 row)
+
+$ PGPASSWORD=admin psql -h 127.0.0.1 -p 5532 -U test -d kesseldb -c "\d smoke"
+              Table "public.smoke"
+ Column | Type | Collation | Nullable | Default
+--------+------+-----------+----------+---------
+ id     | int8 |           |          |
+ n      | text |           |          |
+
+$ PGPASSWORD=admin psql -h 127.0.0.1 -p 5532 -U test -d kesseldb -c \
+    "INSERT INTO smoke (id, n) VALUES (2, 'world'), (3, 'kessel');"
+INSERT 0 2
+
+$ PGPASSWORD=admin psql -h 127.0.0.1 -p 5532 -U test -d kesseldb -c "\dn"
+  List of schemas
+  Name  |  Owner
+--------+----------
+ public | kesseldb
+(1 row)
+```
+
+What the real-client smoke caught (and SP-PG-CAT-T8 fixed inline):
+
+- **`BIGINT` / `INTEGER` / `SMALLINT` / `BOOLEAN` are now accepted as
+  pure aliases** for `I64` / `I32` / `I16` / `Bool` in `CREATE TABLE`.
+  Previously a real psql `CREATE TABLE foo (id BIGINT)` would error
+  with `sql: unknown type "BIGINT"`. `INT8` / `INT4` / `INT2` are NOT
+  aliased because KesselDB's own `I8` / `I16` / `I32` already use
+  those spellings for narrow widths.
+- **`\d <name>` is fully supported.** psql ships a 5-query catalog
+  walk (OID lookup with `OPERATOR(pg_catalog.~)` + `pg_class`
+  relsummary + `pg_attribute` column list + `pg_policy` /
+  `pg_inherits` / `pg_trigger` / `pg_statistic_ext` / `pg_publication`
+  / `pg_foreign_table` polls); the catalog hook now recognizes every
+  shape, synthesizing the live table description for the column-list
+  and well-framed empties for the V1-absent surfaces (RLS,
+  partitioning, triggers, extended statistics, logical replication,
+  foreign data).
+- **`\dn` schema-list is fully supported.** Returns the canonical
+  single-row `public/kesseldb` table.
+
+What the real-client smoke flagged as a known V1 limitation (NOT a
+catalog bug — these are documented PG-wire query-shape boundaries):
+
+- **`SELECT n FROM smoke WHERE id = 1;`** → `V1 PG-wire only renders
+  SELECT * FROM <table>`. Same for `SELECT COUNT(*) FROM smoke`.
+  The V1 SELECT-rendering path supports `SELECT *` from a single
+  table; projected columns + `WHERE` + aggregates go through the
+  engine SQL layer in V2 SP-PG-EXEC.
+
 ### Limitations (V1)
 
 Honest scope boundary — V1 PG-wire supports CLI clients (psql,

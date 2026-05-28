@@ -1,0 +1,360 @@
+name: Release
+
+# Build kesseldb + kessel binaries for x86_64-unknown-linux-gnu (primary
+# target) plus best-effort Windows + macOS binaries, then publish them
+# as GitHub Release assets when a `v*` tag is pushed.
+#
+# Tagging flow:
+#   git tag v1.0.0
+#   git push origin v1.0.0
+# That kicks this workflow; the release page populates automatically.
+#
+# Per the SP146 lesson learned (codified in .github/workflows/ci.yml), we
+# do NOT use `dtolnay/rust-toolchain` — the runner images ship with a
+# recent stable Rust pre-installed, and depending on the action broke
+# every job during the 2026-05-26 codeload.github.com outage. Use the
+# pre-installed toolchain directly.
+#
+# The Linux job is REQUIRED (the public Linux binary is the primary
+# deliverable). Windows + macOS are best-effort and won't block the
+# release if they fail; the SHA256SUMS asset is built from whatever
+# binaries succeed.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g. v1.0.0) — workflow_dispatch only'
+        required: true
+        type: string
+
+permissions:
+  contents: write   # softprops/action-gh-release needs this to upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────
+  # Resolve the version string used in asset filenames.
+  # ─────────────────────────────────────────────────────────────────────
+  meta:
+    name: resolve release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            VER="${{ github.event.inputs.tag }}"
+          else
+            VER="${GITHUB_REF#refs/tags/}"
+          fi
+          # Allow `v1.0.0` or bare `1.0.0`; normalise to include the leading `v`.
+          case "$VER" in
+            v*) ;;
+            *)  VER="v$VER" ;;
+          esac
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "Resolved release version: $VER"
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Linux x86_64 — the primary deliverable.
+  # ─────────────────────────────────────────────────────────────────────
+  build-linux:
+    name: build (x86_64-unknown-linux-gnu)
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      VER: ${{ needs.meta.outputs.version }}
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify pre-installed Rust toolchain
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-release-
+
+      - name: Build kesseldb (server) with pg-gateway + http-gateway
+        run: cargo build --release --bin kesseldb -p kesseldb-server --features pg-gateway,http-gateway
+
+      - name: Build kessel (CLI)
+        run: cargo build --release --bin kessel -p kessel-client
+
+      - name: Smoke-test the server binary boots
+        # We can't run --help (the binary has no --help flag — it takes
+        # positional args), so smoke-boot it against an ephemeral port,
+        # ensure the bind succeeds, then SIGTERM.
+        run: |
+          mkdir -p /tmp/kessel-smoke-data
+          ./target/release/kesseldb 127.0.0.1:17878 /tmp/kessel-smoke-data &
+          SVR_PID=$!
+          sleep 1
+          if ! kill -0 $SVR_PID 2>/dev/null; then
+            echo "::error::kesseldb binary failed to start"
+            exit 1
+          fi
+          ./target/release/kessel --addr 127.0.0.1:17878 'CREATE TABLE t (v U64 NOT NULL)'
+          ./target/release/kessel --addr 127.0.0.1:17878 'INSERT INTO t ID 1 (v) VALUES (42)'
+          ./target/release/kessel --addr 127.0.0.1:17878 'SELECT SUM(v) FROM t'
+          kill $SVR_PID
+          wait $SVR_PID 2>/dev/null || true
+
+      - name: Stage release artifacts
+        run: |
+          STAGE="$RUNNER_TEMP/stage"
+          mkdir -p "$STAGE"
+          install -m 0755 target/release/kesseldb "$STAGE/kesseldb-$VER-$TARGET"
+          install -m 0755 target/release/kessel   "$STAGE/kessel-$VER-$TARGET"
+
+          # Strip a copy for the bundle to keep download size down.
+          # Keep the named bare binaries un-stripped so backtrace text
+          # stays useful for ops; we ship the stripped pair only inside
+          # the tarball.
+          BUNDLE="kesseldb-$VER-$TARGET"
+          mkdir -p "$STAGE/$BUNDLE"
+          cp target/release/kesseldb "$STAGE/$BUNDLE/kesseldb"
+          cp target/release/kessel   "$STAGE/$BUNDLE/kessel"
+          strip "$STAGE/$BUNDLE/kesseldb" || true
+          strip "$STAGE/$BUNDLE/kessel"   || true
+          cp README.md          "$STAGE/$BUNDLE/" || true
+          cp docs/USAGE.md      "$STAGE/$BUNDLE/" || true
+          cp docs/ARCHITECTURE.md "$STAGE/$BUNDLE/" || true
+          # No top-level LICENSE today (project is private / UNLICENSED);
+          # synthesise a placeholder so the bundle is self-describing.
+          if [ -f LICENSE ]; then
+            cp LICENSE "$STAGE/$BUNDLE/"
+          else
+            {
+              echo 'KesselDB - Unlicensed / private. (c) 2026.'
+              echo 'Re-licensing for public open-source release is tracked separately.'
+            } > "$STAGE/$BUNDLE/LICENSE.txt"
+          fi
+          ( cd "$STAGE" && tar czf "$BUNDLE.tar.gz" "$BUNDLE" )
+          rm -rf "$STAGE/$BUNDLE"
+
+          ( cd "$STAGE" && sha256sum * > SHA256SUMS.linux )
+          ls -la "$STAGE"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: ${{ runner.temp }}/stage/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Windows x86_64 — best effort (no native build steps required).
+  # ─────────────────────────────────────────────────────────────────────
+  build-windows:
+    name: build (x86_64-pc-windows-msvc) — best effort
+    needs: meta
+    runs-on: windows-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    env:
+      VER: ${{ needs.meta.outputs.version }}
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify pre-installed Rust toolchain
+        shell: pwsh
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-release-
+
+      - name: Build kesseldb + kessel
+        shell: pwsh
+        run: |
+          cargo build --release --bin kesseldb -p kesseldb-server --features pg-gateway,http-gateway
+          cargo build --release --bin kessel -p kessel-client
+
+      - name: Stage release artifacts
+        shell: pwsh
+        run: |
+          $stage = "$env:RUNNER_TEMP\stage"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target\release\kesseldb.exe "$stage\kesseldb-$env:VER-$env:TARGET.exe"
+          Copy-Item target\release\kessel.exe   "$stage\kessel-$env:VER-$env:TARGET.exe"
+          Get-ChildItem $stage | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($_.Name)"
+          } | Set-Content "$stage\SHA256SUMS.windows" -Encoding ASCII
+          Get-ChildItem $stage
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: ${{ runner.temp }}\stage\*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ─────────────────────────────────────────────────────────────────────
+  # macOS x86_64 + aarch64 — best effort. Two matrix entries so we ship
+  # both Intel and Apple Silicon binaries.
+  # ─────────────────────────────────────────────────────────────────────
+  build-macos:
+    name: build (${{ matrix.target }}) — best effort
+    needs: meta
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            runner: macos-13       # Intel runner
+          - target: aarch64-apple-darwin
+            runner: macos-14       # Apple Silicon runner
+    env:
+      VER: ${{ needs.meta.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify pre-installed Rust toolchain
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.target }}-cargo-release-
+
+      - name: Build kesseldb + kessel
+        run: |
+          cargo build --release --bin kesseldb -p kesseldb-server --features pg-gateway,http-gateway
+          cargo build --release --bin kessel -p kessel-client
+
+      - name: Stage release artifacts
+        run: |
+          STAGE="$RUNNER_TEMP/stage"
+          mkdir -p "$STAGE"
+          install -m 0755 target/release/kesseldb "$STAGE/kesseldb-$VER-$TARGET"
+          install -m 0755 target/release/kessel   "$STAGE/kessel-$VER-$TARGET"
+          ( cd "$STAGE" && shasum -a 256 * > "SHA256SUMS.$TARGET" )
+          ls -la "$STAGE"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.target }}
+          path: ${{ runner.temp }}/stage/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Publish: gather every artifact, build a combined SHA256SUMS, and
+  # create / update the GitHub Release.
+  # ─────────────────────────────────────────────────────────────────────
+  publish:
+    name: publish GitHub Release
+    needs: [meta, build-linux, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    # Don't block the release if Windows / macOS failed; only block if
+    # the required Linux build failed.
+    if: ${{ always() && needs.build-linux.result == 'success' }}
+    env:
+      VER: ${{ needs.meta.outputs.version }}
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten + checksum
+        run: |
+          mkdir -p out
+          find artifacts -type f -not -name 'SHA256SUMS*' -exec cp -v {} out/ \;
+          ( cd out && sha256sum * > SHA256SUMS )
+          ls -la out
+          echo "---SHA256SUMS---"
+          cat out/SHA256SUMS
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VER }}
+          name: KesselDB ${{ env.VER }}
+          draft: false
+          prerelease: ${{ contains(env.VER, '-') }}
+          generate_release_notes: true
+          body: |
+            ## KesselDB ${{ env.VER }}
+
+            Prebuilt binaries for the `kesseldb` server (with `pg-gateway`
+            and `http-gateway` features enabled) and the `kessel` CLI
+            client.
+
+            ### Linux (x86_64)
+
+            ```bash
+            VER=${{ env.VER }}
+            curl -L https://github.com/${{ github.repository }}/releases/download/$VER/kesseldb-$VER-x86_64-unknown-linux-gnu \
+              -o kesseldb && chmod +x kesseldb
+            curl -L https://github.com/${{ github.repository }}/releases/download/$VER/kessel-$VER-x86_64-unknown-linux-gnu \
+              -o kessel    && chmod +x kessel
+            ```
+
+            ### Bundle (Linux x86_64 — both binaries + README + USAGE + LICENSE):
+
+            ```bash
+            curl -L https://github.com/${{ github.repository }}/releases/download/$VER/kesseldb-$VER-x86_64-unknown-linux-gnu.tar.gz | tar xz
+            ```
+
+            ### Checksums
+
+            `SHA256SUMS` contains SHA-256 hashes for every published asset.
+
+            ```bash
+            curl -L https://github.com/${{ github.repository }}/releases/download/$VER/SHA256SUMS -o SHA256SUMS
+            sha256sum -c SHA256SUMS --ignore-missing
+            ```
+
+            ### Documentation
+
+            - [README](https://github.com/${{ github.repository }}/blob/main/README.md)
+            - [USAGE](https://github.com/${{ github.repository }}/blob/main/docs/USAGE.md)
+            - [ARCHITECTURE](https://github.com/${{ github.repository }}/blob/main/docs/ARCHITECTURE.md)
+            - [STATUS](https://github.com/${{ github.repository }}/blob/main/docs/STATUS.md)
+          files: out/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

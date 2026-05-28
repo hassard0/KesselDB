@@ -178,6 +178,11 @@ pub const BE_PARSE_COMPLETE: u8 = b'1';
 /// emit. V2.
 pub const BE_BIND_COMPLETE: u8 = b'2';
 
+/// CloseComplete: `3 [length=4]`. Extended Query reply to a `C`
+/// Close message that successfully dropped a statement or portal.
+/// V1 doesn't emit. V2 SP-PG-EXTQ T8 emits.
+pub const BE_CLOSE_COMPLETE: u8 = b'3';
+
 /// NoData: `n [length=4]`. Extended Query reply when a statement
 /// returns no rows. V1 doesn't emit. V2.
 pub const BE_NO_DATA: u8 = b'n';
@@ -395,6 +400,7 @@ mod tests {
         assert_eq!(BE_PARAMETER_DESCRIPTION, b't');
         assert_eq!(BE_PARSE_COMPLETE, b'1');
         assert_eq!(BE_BIND_COMPLETE, b'2');
+        assert_eq!(BE_CLOSE_COMPLETE, b'3');
         assert_eq!(BE_NO_DATA, b'n');
         assert_eq!(BE_PORTAL_SUSPENDED, b's');
     }

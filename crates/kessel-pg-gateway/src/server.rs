@@ -437,10 +437,38 @@ pub fn run_session<
                 // Clean close — no response per PG §55.2.3.
                 return Ok(session);
             }
+            other if crate::extq::recognize_extq_tag(other) => {
+                // SP-PG-EXTQ T1 — Extended-Query message tag
+                // recognized. Route into the placeholder dispatcher;
+                // T1 always returns
+                // `ExtqOutcome::Failed(NotYetImplemented)` which
+                // we render as a `0A000 feature_not_supported`
+                // ErrorResponse + ReadyForQuery (NOT close — the
+                // session stays alive so the client can retry with
+                // Simple Query). T2..T12 widens the dispatcher into
+                // real Parse / Bind / Describe / Execute / Sync /
+                // Close / Flush handling per the SP-PG-EXTQ design
+                // spec §10 task decomposition.
+                //
+                // V1 contract: do NOT close the connection on an
+                // extq tag — V1's pre-SP-PG-EXTQ behavior closed,
+                // which broke clients that probe with one extq
+                // message (e.g. SQLAlchemy's `engine.connect()`
+                // probe) and then fall back to Simple Query if the
+                // probe is rejected. Emit + continue.
+                let _ = body; // T1 doesn't yet decode the body
+                let resp = crate::dispatch::error_response_then_rfq(
+                    crate::error::SEVERITY_ERROR,
+                    "0A000",
+                    "Extended Query protocol not yet implemented (SP-PG-EXTQ in progress)",
+                );
+                stream.write_all(&resp)?;
+                stream.flush()?;
+                continue;
+            }
             other => {
                 // Unknown / unsupported message type. V1 rejects with
-                // a clean error + closes the connection. Extended-query
-                // tags (P/B/D/E/S/C/H) land here in V1.
+                // a clean error + closes the connection.
                 let resp = crate::dispatch::error_response_then_rfq(
                     crate::error::SEVERITY_ERROR,
                     "08P01",
@@ -1039,18 +1067,74 @@ mod tests {
         assert_eq!(session.user, "test");
     }
 
-    /// Unknown message tag (e.g. extended-query 'P' Parse) → emit
-    /// ErrorResponse 08P01 + close the connection with an
-    /// UnexpectedMessageDuringAuth-style error.
+    /// SP-PG-EXTQ T1 — extended-query 'P' Parse message is now
+    /// recognized as an extq tag, dispatched to the placeholder
+    /// `try_dispatch_extq`, and rendered as a `0A000
+    /// feature_not_supported` ErrorResponse + ReadyForQuery — the
+    /// SESSION STAYS ALIVE so clients that probe with one extq
+    /// message can fall back to Simple Query. Pre-SP-PG-EXTQ V1
+    /// closed the connection here with `08P01`; this test flips to
+    /// lock the new "tolerant" behavior. T2..T12 widens the
+    /// dispatcher into real Parse handling.
     #[test]
-    fn t8_run_session_unknown_message_tag_emits_08p01() {
+    fn t1_extq_run_session_parse_tag_emits_0a000_and_stays_alive() {
         let token = b"kessel-bearer-token";
-        // Extended-query 'P' Parse message — V1 rejects.
-        let extra = {
+        // Extended-query 'P' Parse message — extq T1 reject with 0A000.
+        // Follow it with a Terminate so the session closes cleanly.
+        let mut extra = {
             let payload: &[u8] = b"\0SELECT 1\0\0\0";
             let length = (4 + payload.len()) as u32;
             let mut f = Vec::new();
             f.push(b'P');
+            f.extend_from_slice(&length.to_be_bytes());
+            f.extend_from_slice(payload);
+            f
+        };
+        extra.extend_from_slice(&build_x_frame());
+        let inbound = build_authed_inbound(
+            token,
+            "clientN",
+            "serverN",
+            "test",
+            &extra,
+        );
+        let mut pipe = Pipe::new(inbound);
+        let engine = EmptySelectEngine;
+        let session = run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("session stays alive across extq rejection then Terminate");
+        assert_eq!(session.user, "test");
+        // Outbound bytes contain SQLSTATE 0A000 (feature_not_supported).
+        assert!(
+            pipe.outbound.windows(5).any(|w| w == b"0A000"),
+            "outbound must contain SQLSTATE 0A000 for the extq rejection"
+        );
+        // 0A000 must NOT be `08P01` (the pre-SP-PG-EXTQ V1 behavior).
+        assert!(
+            !pipe.outbound.windows(5).any(|w| w == b"08P01"),
+            "outbound MUST NOT carry the pre-SP-PG-EXTQ 08P01 for an extq tag"
+        );
+    }
+
+    /// SP-PG-EXTQ T1 — an UNRECOGNIZED message tag (neither Q, X, nor
+    /// one of the seven extq tags) still closes the connection with
+    /// `08P01 protocol_violation`. Locks the existing "true protocol
+    /// violation = close" invariant against the new "extq tag = stay
+    /// alive" branch.
+    #[test]
+    fn t1_run_session_genuinely_unknown_tag_still_closes_with_08p01() {
+        let token = b"kessel-bearer-token";
+        // 'Z' is a backend-only tag — a client sending it is a real
+        // protocol violation (not just an unsupported feature).
+        let extra = {
+            let payload: &[u8] = &[];
+            let length = (4 + payload.len()) as u32;
+            let mut f = Vec::new();
+            f.push(b'Z');
             f.extend_from_slice(&length.to_be_bytes());
             f.extend_from_slice(payload);
             f
@@ -1070,11 +1154,7 @@ mod tests {
             || "serverN".to_string(),
             &engine,
         );
-        // Errors with UnexpectedMessageDuringAuth (the same variant
-        // re-used post-auth — V1 doesn't differentiate, the SQLSTATE
-        // on the wire is what matters).
-        assert!(matches!(r, Err(PgError::UnexpectedMessageDuringAuth { tag: b'P' })));
-        // Outbound bytes contain SQLSTATE 08P01.
+        assert!(matches!(r, Err(PgError::UnexpectedMessageDuringAuth { tag: b'Z' })));
         assert!(pipe.outbound.windows(5).any(|w| w == b"08P01"));
     }
 

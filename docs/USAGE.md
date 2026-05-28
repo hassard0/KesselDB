@@ -60,7 +60,9 @@ no native build steps.
 git clone https://github.com/hassard0/KesselDB && cd KesselDB
 cargo build --release                                # default — binary protocol only, no gateway code linked
 cargo build --release --features pg-gateway,http-gateway   # all wire surfaces
-cargo test --workspace                               # 1779 default tests
+cargo test --workspace                               # 1792 default tests
+cargo test --workspace --features pg-gateway         # 1820 (adds SP-PG + SP-PG-CAT)
+cargo test --workspace --features pg-gateway,http-gateway,kessel-http-gateway/test-server   # 1875 — full matrix
 ```
 
 Requires Rust stable **1.95+**.
@@ -794,20 +796,20 @@ messages.
 
 ## 7f. FORMAT PARQUET for object-store sources
 
-> **Current capability (SP125‑SP140, OBJ‑2c‑2 zstd arc CLOSED):**
+> **Current capability (SP125‑SP154, OBJ‑2c‑2 codec arc CLOSED at 6/7 codecs):**
 > `FORMAT PARQUET` reads real `pyarrow 24.0.0` Parquet files end‑to‑end
 > across the **flat REQUIRED + OPTIONAL × UNCOMPRESSED + Snappy + GZIP + zstd
-> × PLAIN + dictionary × V1 + V2 data pages × INT32 + INT64 + INT96 +
-> FLBA + BYTE_ARRAY + DECIMAL (precision ≤ 38)** matrix.
+> + LZ4_RAW + Brotli × PLAIN + dictionary × V1 + V2 data pages × INT32 +
+> INT64 + INT96 + FLBA + BYTE_ARRAY + DECIMAL (precision ≤ 38)** matrix.
 > Vanilla `pq.write_table(df)` works zero‑flags for everything in that
-> matrix; pyarrow zstd output decodes for all tested fixtures including
-> a 2000‑row stress fixture exercising the FseCompressed mode for all
-> three LL/OF/ML codes simultaneously. Still typed‑Unsupported:
-> Brotli (recognized at meta-decode time per SP150 but decompression is a
-> dedicated multi-week SP-arc — workaround: re-encode with zstd or lz4),
-> 4+ deep nested
-> groups (would be SP147), DECIMAL precision > 38, per‑page > 256 MiB
-> (SP151 raised the historical 64 MiB cap to a 256 MiB default + added
+> matrix; pyarrow output for every supported codec decodes for all tested
+> fixtures including a 2000‑row zstd stress fixture exercising FseCompressed
+> mode for all three LL/OF/ML codes simultaneously and pyarrow
+> `compression='brotli'` round-trips via the SP154 zero-dep RFC 7932
+> decoder. Still typed‑Unsupported: legacy LZ4 framing (codec id 5;
+> modern LZ4_RAW codec id 7 IS supported), 4+ deep nested groups (would
+> be SP147), DECIMAL precision > 38, per‑page > 256 MiB (SP151 raised the
+> historical 64 MiB cap to a 256 MiB default + added
 > `kessel_parquet::extract_with_cap` for operators with known-trusted
 > producers or memory-constrained ingest).
 > **All Parquet nested types supported (LIST, MAP, struct + arbitrary

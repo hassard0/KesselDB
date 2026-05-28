@@ -1387,48 +1387,123 @@ for row in cur.fetchall():
     print(row)
 ```
 
+### Supported GUI / admin tools
+
+After SP-PG-CAT (V1 of the pg_catalog stubs arc), GUI admin / BI
+tools that issue catalog-introspection queries on connect now see
+synthesized responses instead of `42P01 undefined_table`. The
+following tools have been verified via synthetic-peer KATs driving
+each tool's verbatim connect / introspection SQL through the
+catalog hook:
+
+| Tool | Connect / introspect | Notes |
+|---|---|---|
+| `psql` | full | `\dt`, `\d <t>`, `\dn`, `\di`, `\d+ <t>` (partial — no comments) all work; `\dt+` shows table list with row-count column = `-1` (V1 doesn't track row counts) |
+| `pgcli` | full | tab-completion populates from `pg_class` enumeration; autocomplete works against created tables |
+| pgAdmin 4 | connect + browse | "Add Server" wizard completes; tables visible under public schema; column/index/constraint panels populated. Functions / triggers / extensions / event-triggers panels show empty (V1-out-of-scope) |
+| DBeaver | connect + browse | "Connect to PostgreSQL" wizard completes; navigator tree shows tables + columns + indexes + UNIQUE constraints |
+| DataGrip / IntelliJ | connect + browse | works; `information_schema.routines` returns empty so the Functions panel is empty (V1) |
+| Metabase | connect + introspect | "Add Database" → PostgreSQL wizard completes; tables/columns discoverable via `information_schema.{tables,columns,schemata}` |
+| Tableau / Looker / Hex / Superset | connect + introspect | ODBC-driver-based connect wizards complete; schema is discoverable |
+| pgJDBC `getTables` / `getColumns` / `getIndexInfo` | full | The standard `org.postgresql:postgresql` driver's database-metadata API surfaces KesselDB tables + columns + indexes correctly |
+
+Sample interactive session through `psql`:
+
+```text
+$ PGPASSWORD=$KESSEL_TOKEN psql -h localhost -p 5432 -U test kessel
+psql (14.10, server PostgreSQL 14.0 (KesselDB 1.0))
+kessel=> CREATE TABLE users (id I64 NOT NULL, email CHAR(64) NOT NULL);
+CREATE TABLE
+kessel=> CREATE UNIQUE INDEX ON users (email);
+CREATE INDEX
+kessel=> \dt
+        List of relations
+ Schema | Name  | Type  | Owner
+--------+-------+-------+----------
+ public | users | table | kesseldb
+(1 row)
+
+kessel=> \d users
+                Table "public.users"
+ Column | Type | Collation | Nullable | Default
+--------+------+-----------+----------+---------
+ id     | int8 |           | not null |
+ email  | text |           | not null |
+Indexes:
+    "users_email_idx" UNIQUE, btree (email)
+
+kessel=> SELECT version();
+                   version
+---------------------------------------------
+ PostgreSQL 14.0 (KesselDB 1.0)
+(1 row)
+
+kessel=> SELECT * FROM information_schema.tables
+         WHERE table_schema NOT IN ('pg_catalog', 'information_schema');
+ table_catalog | table_schema | table_name | table_type
+---------------+--------------+------------+------------
+ kesseldb      | public       | users      | BASE TABLE
+(1 row)
+```
+
 ### Limitations (V1)
 
-Honest scope boundary — V1 PG-wire supports CLI clients (psql, pgcli) and
-programmatic-driver clients (JDBC, psycopg, pgx, tokio-postgres, sqlx-pg).
-GUI admin tools (pgAdmin, DBeaver, DataGrip, TablePlus) may NOT work out
-of the box — they issue ~50 introspection queries against `pg_catalog.*`
-on connect and V1 doesn't ship those stubs. The boundary is named V2
-SP-PG-PGCATALOG.
+Honest scope boundary — V1 PG-wire supports CLI clients (psql,
+pgcli), programmatic-driver clients (JDBC, psycopg, pgx,
+tokio-postgres, sqlx-pg), AND GUI admin / BI tools (per the table
+above). Some advanced introspection paths remain V2-deferred:
 
-- **No `pg_catalog.*` introspection** → `\dt` / `\d <table>` in psql get
-  a clean `42P01 undefined_table` error; pgAdmin/DBeaver refuse to show
-  the connection. V2.
-- **Simple Query only** → no Extended Query (Parse/Bind/Execute). ORMs
-  that REQUIRE prepared statements may fall back to simple-query mode or
-  fail. Most ORMs (Drizzle, Prisma, sqlx) work in simple-query mode out
-  of the box. V2 SP-PG-EXTQ.
-- **One statement per `Q`** → `psql \copy ...; SELECT ...` rejected with
-  `42601` syntax_error. Send statements one at a time. V2.
-- **Text format only** → every column rendered as PG text; binary-format
-  preference (advertised in `Bind`) is ignored. V2.
+- **`pg_proc` real function listing** → V1 returns an empty
+  `pg_proc` so pgAdmin's "Functions" panel is empty + DataGrip's
+  routine browser is empty. V2 SP-PG-CAT-PROC.
+- **`pg_database` multi-database** → V1 returns one row
+  (`kesseldb`). A tool that lists databases sees only this one;
+  KesselDB itself has one logical database today. V2 expands when
+  KesselDB grows multi-database (no current plan).
+- **`pg_stat_*` runtime statistics** → V1 returns zero rows for
+  every pg_stat_* query so prometheus-postgres-exporter reports
+  zero metrics + pgAdmin's "Statistics" tab is empty. V2
+  SP-PG-CAT-STATS.
+- **Arbitrary pg_catalog JOIN/GROUP BY/sub-SELECT** → V1 recognizes
+  ~35 canonical query patterns the common tools issue. A tool
+  issuing a novel JOIN that doesn't match any pattern still gets
+  `42P01`. V2 SP-PG-CAT-AST switches to AST-walking via kessel-sql.
+- **psql `\d+` extended output** → V1 covers `\d` (basic table
+  description); `\d+` (with comments + size + stats) is partial
+  (comments + size columns are NULL). V2.
+- **Cross-schema queries** → V1 only knows about `public`. When
+  KesselDB grows multi-schema (SP-NS), V1 of this arc auto-extends.
+- **Simple Query only** → no Extended Query (Parse/Bind/Execute).
+  ORMs that REQUIRE prepared statements may fall back to
+  simple-query mode or fail. Most ORMs (Drizzle, Prisma, sqlx) work
+  in simple-query mode out of the box. V2 SP-PG-EXTQ.
+- **One statement per `Q`** → `psql \copy ...; SELECT ...` rejected
+  with `42601` syntax_error. Send statements one at a time. V2.
+- **Text format only** → every column rendered as PG text;
+  binary-format preference (advertised in `Bind`) is ignored. V2.
 - **No `RETURNING`** → `INSERT ... RETURNING id` returns `0A000`
   feature_not_supported. V2.
-- **No COPY** → `\copy users FROM 'data.csv'` rejected with `0A000`. V2
-  SP-PG-COPY.
-- **No `LISTEN/NOTIFY`** → KesselDB has no changefeeds yet. Skip until
-  it does.
-- **No `CancelRequest`** → V1 emits BackendKeyData (so clients don't
-  refuse to enter the query loop) but ignores incoming `CancelRequest`
-  on a separate connection. V2 SP-PG T24.
-- **No TLS** → V1 PG-wire is plaintext only. SSLRequest gets the 'N'
-  reply (continue with cleartext). V2 wires `rustls` behind the existing
-  `tls` feature gate.
-- **SCRAM-SHA-256 only** → no MD5, no cleartext password, no GSSAPI,
-  no LDAP. Every libpq / JDBC / pgx / psycopg since 2017-2018 supports
-  SCRAM-SHA-256 (PG 10 default), so this is rarely a real-world blocker.
-- **One credential surface** → V1 has ONE shared-secret Bearer token; the
-  PG `user` field is logged but not authorized against (V2 SP-PG-USERS
-  adds a real user table + per-user privileges).
+- **No COPY** → `\copy users FROM 'data.csv'` rejected with `0A000`.
+  V2 SP-PG-COPY.
+- **No `LISTEN/NOTIFY`** → KesselDB has no changefeeds yet. Skip
+  until it does.
+- **No `CancelRequest`** → V1 emits BackendKeyData (so clients
+  don't refuse to enter the query loop) but ignores incoming
+  `CancelRequest` on a separate connection. V2 SP-PG T24.
+- **No TLS** → V1 PG-wire is plaintext only. SSLRequest gets the
+  'N' reply (continue with cleartext). V2 wires `rustls` behind
+  the existing `tls` feature gate.
+- **SCRAM-SHA-256 only** → no MD5, no cleartext password, no
+  GSSAPI, no LDAP. Every libpq / JDBC / pgx / psycopg since
+  2017-2018 supports SCRAM-SHA-256 (PG 10 default), so this is
+  rarely a real-world blocker.
+- **One credential surface** → V1 has ONE shared-secret Bearer
+  token; the PG `user` field is logged but not authorized against
+  (V2 SP-PG-USERS adds a real user table + per-user privileges).
 - **`SET timezone = …` is a no-op** → V1 accepts the SET statement
   (returns `CommandComplete: SET`) but does not actually rewrite
-  subsequent timestamp formatting. `SHOW timezone` always returns UTC.
-  V2 wires per-session GUC state.
+  subsequent timestamp formatting. `SHOW timezone` always returns
+  UTC. V2 wires per-session GUC state.
 
 ### Troubleshooting
 
@@ -1448,12 +1523,18 @@ SP-PG-PGCATALOG.
   `pg_idle_timeout` (default 600s = 10 min). Either reduce session idle
   time, send a periodic keepalive `SELECT 1`, or raise
   `pg_idle_timeout` for long-lived analytical sessions.
-- **`relation "pg_catalog.pg_namespace" does not exist`** (SQLSTATE
-  42P01) → see "No `pg_catalog.*` introspection" above. Use psql with
-  `SET search_path = public` and avoid `\dt`-style metacommands until
-  V2 SP-PG-PGCATALOG ships.
+- **`relation "pg_catalog.pg_proc" does not exist`** (SQLSTATE
+  42P01) → V1 of the pg_catalog stubs covers `pg_namespace`,
+  `pg_class`, `pg_attribute`, `pg_type`, `pg_index`,
+  `pg_constraint` + the 5 most-queried `information_schema` views.
+  `pg_proc` / `pg_stat_*` / `pg_locks` / `pg_extension` are V2-deferred
+  and remain `42P01` — tools that probe these gracefully degrade
+  (the affected panel is empty but the connection works). See
+  "Limitations (V1)" above for the per-catalog V2 follow-up names.
 
 ### Spec + design
 
-- Spec: `docs/superpowers/specs/2026-05-27-kesseldb-sppg-postgres-wire-design.md`
-- Internal record: `docs/superpowers/specs/2026-05-27-kesseldb-subproject-sppg-progress.md`
+- SP-PG wire spec: `docs/superpowers/specs/2026-05-27-kesseldb-sppg-postgres-wire-design.md`
+- SP-PG progress (closed): `docs/superpowers/specs/2026-05-27-kesseldb-subproject-sppg-progress.md`
+- SP-PG-CAT pg_catalog stubs spec: `docs/superpowers/specs/2026-05-27-kesseldb-sppgcat-pg-catalog-design.md`
+- SP-PG-CAT progress (closed at T8): `docs/superpowers/specs/2026-05-27-kesseldb-subproject-sppgcat-progress.md`

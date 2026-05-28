@@ -492,16 +492,76 @@ Protocol v3.0** — the same wire libpq / `psql` / pgcli / JDBC / psycopg /
 **V2 follow-ups (each its own arc):** Extended Query (`P`/`B`/`D`/`E`/
 `S`/`C`/`H` — mandatory for ORMs and prepared statements; SP-PG-EXTQ);
 binary-format wire encoding (per-column negotiated in `Bind`);
-`pg_catalog.*` introspection stubs (pg_type, pg_class, pg_attribute,
-pg_namespace — enough for psql `\dt` / `\d <table>` not to crash;
-SP-PG-PGCATALOG; the V1 boundary is "CLI + programmatic clients work;
-GUI admin tools like pgAdmin / DBeaver choke on connect"); `current_
-setting()` / `version()` / `current_schema()` / `current_database()`;
 `RETURNING`; `CancelRequest` (V1 generates BackendKeyData but takes no
 action); GUC plumbing for `SET timezone`; COPY FROM STDIN / COPY TO
 STDOUT; TLS via SSLRequest 'S' reply + rustls (V1 plaintext only);
 MD5 auth fallback for legacy clients (PG 14+ deprecated). See SP-PG
 design spec §2.2 for the full deferred list.
+
+#### pg_catalog stubs (SP-PG-CAT — V1 closed)
+
+When pgAdmin / DBeaver / DataGrip / Metabase / Tableau / Looker
+open a connection, they don't just run `SELECT 1` — they issue
+~5-50 introspection queries against `pg_catalog.*` and
+`information_schema.*` to populate their UI tree (databases →
+schemas → tables → columns → indexes → constraints). V1 of the
+SP-PG arc returned `42P01 undefined_table` for every such query,
+so GUI tools refused to display the connection. The SP-PG-CAT
+arc closes that boundary by intercepting the query at the
+dispatch layer (`kessel_pg_gateway::pg_catalog::catalog_query_hook`)
+BEFORE the engine apply path and synthesizing a wire-coherent
+response from the live KesselDB catalog.
+
+Synthesized catalogs (each one row per the matching KesselDB
+entity, with PG-canonical column shapes locked vs the upstream
+`src/include/catalog/pg_*.dat` + `pg_*.h` files):
+
+- `pg_namespace` — 3 canned schemas (pg_catalog OID 11, public
+  OID 2200, information_schema OID 2202)
+- `pg_class` — one row per KesselDB user table; relkind='r'
+- `pg_attribute` — one row per (table × column) with the V1
+  type-OID map
+- `pg_type` — 13 canned rows for the OIDs V1 actually emits
+- `pg_index` — one row per KesselDB index (Equality / Range /
+  Composite); `indisunique` per the index kind
+- `pg_constraint` — one row per UNIQUE / FK / CHECK with
+  synthetic constraint names (`<table>_<col>_key` /
+  `_fkey` / `_check_N`)
+- `information_schema.tables` / `.columns` / `.schemata` /
+  `.key_column_usage` / `.table_constraints` — the SQL-standard
+  catalog mirror with SQL-standard type names (`bigint`,
+  `boolean`, `timestamp with time zone`, ...) — preferred by
+  Metabase / Tableau / Looker / dbt over pg_catalog
+- `information_schema.views` / `.routines` — well-framed empty
+  (KesselDB V1 has no views / stored procedures)
+- SQL helper functions: `version()` → `'PostgreSQL 14.0
+  (KesselDB 1.0)'`, `current_database()` → `'kesseldb'`,
+  `current_schema()` → `'public'`, `current_user` /
+  `session_user` → `'kesseldb'`, `pg_table_is_visible(oid)`
+  → `true`, `pg_get_userbyid(oid)` → `'kesseldb'`,
+  `format_type(oid, typmod)` → canonical type name,
+  `current_setting('<guc>')` / `SHOW <guc>` → canned values
+  matching the V1 ParameterStatus emit
+
+The intercept is purely additive: every SP-PG V1 KAT continues
+to pass because the hook returns `None` for non-pg_catalog SQL
+and the existing `engine.apply_sql` path runs unchanged. Indexes
++ constraints round-trip through new admin frames
+(`LIST_INDEXES_TAG`=0xF5, `LIST_CONSTRAINTS_TAG`=0xF4) that read
+`StateMachine::catalog()` engine-thread-local with no SM mutation
+(mirrors the existing `DESCRIBE_BY_NAME_TAG`=0xF7 /
+`LIST_TABLES_TAG`=0xF6 admin pattern).
+
+V2-deferred (each named): `pg_proc` real function listing
+(SP-PG-CAT-PROC); `pg_stat_*` runtime stats (SP-PG-CAT-STATS);
+arbitrary pg_catalog SQL via AST walker (SP-PG-CAT-AST);
+psql `\d+` extended output; multi-database `pg_database`
+(blocks on KesselDB multi-database support); per-query catalog
+cache invalidated on DDL (SP-PG-CAT-CACHE — matters at ≥1000
+tables); cross-schema queries (blocks on SP-NS).
+
+See `docs/superpowers/specs/2026-05-27-kesseldb-sppgcat-pg-catalog-design.md`
++ `docs/superpowers/specs/2026-05-27-kesseldb-subproject-sppgcat-progress.md`.
 
 The gateway crate `kessel-pg-gateway` has zero external (non-workspace)
 runtime dependencies (only `kessel-proto`, `kessel-client`, `kessel-

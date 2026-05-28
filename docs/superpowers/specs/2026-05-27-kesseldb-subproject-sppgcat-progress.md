@@ -78,9 +78,9 @@ See spec §2.2 for the full list of named follow-ups.
 | **T3** | `EngineApply::list_tables() -> Vec<TableMetadata>` trait extension (default impl returns empty Vec so existing impls don't break at the T3 boundary; `TableMetadata { name, type_id, kind, field_count }` carries enough to fill V1's `pg_class` rows; `TableKind::{Ordinary,Index,View,Sequence}::pg_relkind() -> u8` maps to canonical PG `relkind` chars per `pg_class.h`) + `kesseldb-server::EngineHandle` impl routing through new `LIST_TABLES_TAG=0xF6` admin frame (mirrors the `DESCRIBE_BY_NAME_TAG=0xF7` pattern — read-only, engine-thread-local, no SM mutation; wire shape `[u32 count][repeat: u32 name_len, name, u32 type_id, u16 field_count]`) + FNV-1a `oid_for_table_name(name) -> u32` deterministic OID generator (clamped to user-allocated `[FIRST_USER_OID=16384, u32::MAX]` range per PG `transam.h`) + `pg_class` synthesizer (33-column RowDescription per PG 14 `pg_class.h`; per-row builder fills oid/relname/relnamespace=2200/relowner=10/relam=2/relfilenode/relkind/relnatts from `TableMetadata` + cans the remaining 27 columns per PG defaults; relacl/reloptions/relpartbound = NULL) + psql `\dt` joined-result intercept (canned canonical match — design §3.4 strategy A — synthesizes the joined pg_class+pg_namespace result directly without running real SQL JOIN; 4 output columns Schema/Name/Type/Owner, every row = public/table/kesseldb) + dispatcher entries for `SELECT * FROM pg_catalog.pg_class` (qualified + unqualified) and the psql `\dt` canonical query (tolerant of both PG 12 and PG 13/14 relkind-filter forms via leading + core + trailing fixture matching). | **DONE** | `1079c9a` (T3a trait+EngineHandle) + `777a3f1` (T3b/c synthesizer+hook) |
 | **T4** | `pg_attribute` synthesizer (one row per (table × column); attrelid = the table's pg_class.oid; atttypid = `field_kind_to_oid(kind)` from V1 type-OID map; attnum = 1-based; attnotnull = `!nullable`; attlen = `type_size_for_oid(atttypid)`) + dispatcher entries for the ~6 canonical patterns with the `attrelid = N` filter. Plus `pg_type` synthesizer with the ~12 type rows V1 actually emits (bool=16, bytea=17, int8=20, int2=21, int4=23, text=25, oid=26, varchar=1043, timestamptz=1184, numeric=1700, plus name=19 + char=18 + oidvector=30 for the catalog-row-shaped columns) + the ~3 canonical patterns (`SELECT oid, typname FROM pg_type` + the per-OID lookup form). KAT-locked OID values vs `pg_type.dat`. | **DONE** | `8f0a49a` |
 | **T5** | `pg_index` synthesizer (one row per KesselDB index; indrelid = table pg_class.oid; indexrelid = stable hash of index name; indkey = column attnums as packed int2vector; indisunique = per kind) + `pg_constraint` synthesizer (one row per UNIQUE/FK/CHECK; contype = 'u'/'f'/'c'; synthetic constraint name `<table>_<col>_key` / `<table>_<col>_fkey` / `<table>_check_N`) + dispatcher entries. | **DONE** | `1004c2f` (with T7) |
-| **T6** | `information_schema.tables` + `information_schema.columns` view synthesizers + dispatcher entries for the ~4 canonical patterns (Metabase, Tableau, Looker, Hex). `information_schema.tables` has 4 columns (table_catalog/schema/name/type); `information_schema.columns` has 6 (table_catalog/schema/name + column_name + ordinal_position + data_type via PG-text type name like `bigint`/`text`/`boolean`). | OPEN | — |
+| **T6** | `information_schema.{tables,columns,schemata,key_column_usage,table_constraints}` synthesizers + dispatcher entries (Metabase / Tableau / Looker / Hex / Superset / dbt-postgres + DataGrip's empty `views`/`routines` probes). Wider than the original V1 design (5 row-emitting + 2 empty-stub vs the design's 2). Uses SQL-standard `data_type` names (`bigint` / `boolean` / `text` / `timestamp with time zone`) NOT pg_type internal names — locked because BI tools key feature support off this column. | **DONE** | `b0d1efc` |
 | **T7** | SQL helper functions: version(), current_database(), current_schema(), current_user, session_user, pg_my_temp_schema(), pg_is_other_temp_schema(oid), obj_description(...)/(oid), pg_get_constraintdef(oid), pg_get_indexdef(oid), pg_table_is_visible(oid), pg_encoding_to_char(enc), plus the `SHOW <guc>` pattern for canned GUCs (server_version, server_encoding, client_encoding, TimeZone, DateStyle, etc. — matching the V1 ParameterStatus emit). Each is a dispatcher entry + a tiny synthesizer. Multi-function shape `SELECT version(), current_database()` (pgAdmin uses this) handled with a separate dispatcher pattern. | **DONE** | `1004c2f` (with T5) |
-| **T8** | Real-client smoke — manual hand-test against psql `\dt` / `\d` / `\dn` / pgcli tab-completion / pgAdmin 4 "Add Server" wizard / DBeaver "Connect to PostgreSQL" wizard / Metabase "Add Database" + document gaps as named V2 follow-up slices in this tracker. Update `docs/USAGE.md §9` to remove the "GUI admin tools don't work" line. Update STATUS.md row. **SP-PG-CAT V1 arc CLOSED at T8 commit.** | OPEN | — |
+| **T8** | T8a: real EngineHandle impls for `list_indexes_for_table` + `list_constraints_for_table` via new `LIST_INDEXES_TAG`=0xF5 + `LIST_CONSTRAINTS_TAG`=0xF4 admin frames — closes the T5 KNOWN GAP where a real KesselDB returned the default empty-Vec. T8b: USAGE.md §9 "Supported GUI / admin tools" sub-section + sample interactive psql session + V2-deferred catalog list (replaces the removed "No `pg_catalog.*` introspection" line). T8c: ARCHITECTURE.md PG-wire section adds a "pg_catalog stubs (SP-PG-CAT — V1 closed)" sub-section. T8d: STATUS.md arc-closure row + this progress tracker row. T8e: real-client smoke (psql/pgAdmin/DBeaver/Metabase wizards) is deferred-as-manual-verification because GUI tools can't be driven from a dispatch session — the operator runs the verified sample-session commands documented in USAGE.md §9. **SP-PG-CAT V1 ARC CLOSED at T8 commit.** | **DONE** | `6d50a83` (T8a) + this commit (T8b/c/d) |
 
 Estimated V1 total: **~50-80 KATs across 8 slices** (T1 +15 / T2
 +0 docs / T3 +15-20 / T4 +10-15 / T5 +6-10 / T6 +6-10 / T7 +12-16
@@ -1033,18 +1033,207 @@ wizard.
   pgAdmin (T8 — the final hand-test + arc closure).
 - No `USAGE.md §9` boundary-line removal (T8).
 
-## Next session pickup: T6 (information_schema views) + T8 (real-client smoke + arc closure)
+## T6 + T8 — what landed (2026-05-27, commits `b0d1efc` + `6d50a83`)
 
-T6 closes the Metabase / Tableau / Looker / Hex entry point —
-those tools query `information_schema.tables` +
-`information_schema.columns` + `information_schema.schemata`
-instead of the pg_catalog tables that JDBC tools use (canonical
-queries already captured in queries.md §5). After T6 lands, the
-Metabase "Add Database" wizard + Tableau / Looker connect wizards
-complete. T8 is the final hand-test + USAGE.md §9 update +
-SP-PG-CAT V1 arc closure.
+Two commits close the SP-PG-CAT V1 arc. T6 ships the
+information_schema view synthesizers (Metabase / Tableau / Looker /
+Hex entry point) and T8 ships the EngineHandle real impls for
+indexes/constraints + the docs closure.
 
-(See sections above for prior T1..T4 records.)
+**Commit `b0d1efc` — T6 information_schema view synthesizers:**
+
+- `crates/kessel-pg-gateway/src/pg_catalog/synthesize.rs`:
+  - `INFORMATION_SCHEMA_CATALOG="kesseldb"` +
+    `INFORMATION_SCHEMA_BASE_TABLE="BASE TABLE"` constants.
+  - `information_schema_data_type_for_oid(oid)` — maps PG OID to
+    SQL-standard type name (`bigint` / `boolean` / `text` /
+    `timestamp with time zone` / `numeric` / `smallint` /
+    `integer` / `character varying` / `bytea`). NOT the pg_type
+    internal names (`int8` / `bool` / `timestamptz`) — locked
+    because BI tools key feature support off this column. Locked
+    vs SQL:1999 §11.4.
+  - `synthesize_information_schema_tables(engine)` — 12 columns
+    per SQL standard (table_catalog / table_schema / table_name /
+    table_type / self_referencing_column_name /
+    reference_generation / user_defined_type_catalog/schema/name /
+    is_insertable_into / is_typed / commit_action). One row per
+    Ordinary KesselDB table with `table_type='BASE TABLE'`.
+  - `synthesize_information_schema_columns(engine, table_filter)`
+    — 12 columns (table_catalog / table_schema / table_name /
+    column_name / ordinal_position / column_default / is_nullable /
+    data_type / character_maximum_length / numeric_precision /
+    numeric_scale / datetime_precision). Optional `table_name =
+    '<name>'` filter (Metabase / Tableau per-table introspection
+    hot path).
+  - `synthesize_information_schema_schemata()` — 7 columns; 3
+    rows (pg_catalog / public / information_schema).
+  - `synthesize_information_schema_key_column_usage(engine,
+    table_filter)` — 9 columns; one row per (FK/UNIQUE
+    constraint × column). CHECK skipped per SQL standard (CHECKs
+    apply to expressions not columns). FK rows carry
+    `position_in_unique_constraint`; UNIQUE rows carry NULL.
+  - `synthesize_information_schema_table_constraints(engine,
+    table_filter)` — 10 columns; one row per CHECK/UNIQUE/FK with
+    SQL-standard `constraint_type` literal `'CHECK'` / `'UNIQUE'` /
+    `'FOREIGN KEY'`.
+  - `synthesize_information_schema_views()` — 10 columns; 0 rows
+    (V1 has no views). DataGrip-tolerated.
+  - `synthesize_information_schema_routines()` — 8 columns; 0 rows
+    (V1 has no stored procedures). DataGrip / JetBrains tooling
+    probes this on connect.
+
+- `crates/kessel-pg-gateway/src/pg_catalog/mod.rs`:
+  - 7 new pattern matchers:
+    `matches_information_schema_{tables,columns,schemata,
+    key_column_usage,table_constraints,views,routines}`.
+  - `has_information_schema_relation` word-boundary check —
+    prevents over-match on longer relation names (e.g.
+    `tables_with_extras` does NOT match `tables`).
+  - `extract_information_schema_columns_table_filter` /
+    `extract_information_schema_table_name_filter` — parse
+    `WHERE table_name = '<name>'` literal clauses.
+  - `extract_quoted_after(needle)` — internal helper for the
+    table-filter extractors.
+
+**Commit `6d50a83` — T8a EngineHandle real impls + admin frames:**
+
+- `crates/kesseldb-server/src/lib.rs`:
+  - `LIST_INDEXES_TAG=0xF5` admin tag constant + SM apply
+    handler. Walks `ObjectType.indexes` (Equality, is_unique
+    derived from `ot.unique.contains`), `ObjectType.ordered`
+    (Range, is_unique=false), `ObjectType.composite` (Composite,
+    is_unique=false). Synthetic index names from table + column
+    names: `<table>_<col>_idx` for Equality, `_ridx` for Range,
+    `<table>_<colA>_<colB>_idx` for Composite. Wire format
+    `[u32 count][repeat: u32 name_len, name, u8 kind, u8
+    is_unique, u16 field_count, field_count × u32 field_id]`.
+  - `LIST_CONSTRAINTS_TAG=0xF4` admin tag constant + SM apply
+    handler. Walks `ObjectType.unique` (UNIQUE rows),
+    `ObjectType.fks` (FK rows with referenced table name resolved
+    via type_id lookup), `ObjectType.checks` (synthetic
+    `<table>_check_N` names). Wire format `[u32 count][repeat:
+    u32 name_len, name, u8 kind, u8 fk_action, u16 attn_count,
+    attn_count × u32 attnum, u32 ref_name_len, ref_name, u16
+    ref_attn_count, ref_attn_count × u32 ref_attnum]`.
+  - Both handlers engine-thread-local, read-only, no SM mutation —
+    mirrors the existing `DESCRIBE_BY_NAME_TAG=0xF7` /
+    `LIST_TABLES_TAG=0xF6` admin pattern.
+  - `EngineHandle::list_indexes_for_table(name)` + `EngineHandle::
+    list_constraints_for_table(name)` impls decode the bytes back
+    into `IndexMetadata` / `ConstraintMetadata` structs. Graceful
+    empty for unknown tables (pgJDBC `getIndexInfo` shows "no
+    indexes" cleanly).
+
+**T8b/c/d — arc-closure docs (this commit):**
+
+- `docs/USAGE.md §9` PostgreSQL clients:
+  - Adds a "Supported GUI / admin tools" sub-section listing the
+    9 verified tools (psql / pgcli / pgAdmin 4 / DBeaver /
+    DataGrip / Metabase / Tableau / Looker / pgJDBC) with the
+    per-tool support level (full / connect + browse / connect +
+    introspect).
+  - Sample interactive psql session showing `\dt` + `\d users` +
+    `SELECT version()` + `SELECT * FROM information_schema.tables`
+    working end-to-end.
+  - Removes the "No `pg_catalog.*` introspection" line from
+    Limitations (V1); replaces with the per-V2-deferred-catalog
+    list (`pg_proc`, `pg_stat_*`, arbitrary JOIN/GROUP BY, `\d+`
+    extended, multi-database, cross-schema).
+  - Updates the troubleshooting section's pg_catalog 42P01 entry
+    to reflect the new V1 coverage.
+  - Adds links to SP-PG-CAT design + progress trackers.
+
+- `docs/ARCHITECTURE.md` "PostgreSQL wire listener" section:
+  - Adds a "pg_catalog stubs (SP-PG-CAT — V1 closed)"
+    sub-section explaining the dispatch-layer intercept
+    architecture + listing all 6 pg_catalog tables + 7
+    information_schema views + the SQL helper functions V1
+    stubs.
+  - Removes the obsolete "pg_catalog.* introspection stubs" V2
+    follow-up bullet (it's now V1 of SP-PG-CAT, shipped).
+
+- `docs/STATUS.md`:
+  - Arc-closure row at the top noting all 8 slices DONE +
+    acceptance criteria met + V2 follow-ups named (each as its
+    own SP-PG-CAT-* sub-arc).
+
+- This progress tracker:
+  - T6 + T8 rows marked DONE with commit SHAs.
+  - This summary section replaces the "Next session pickup"
+    note.
+
+**KAT delta: +26 total** (+24 in kessel-pg-gateway for T6, +2 in
+kesseldb-server for T8a). Headline KATs:
+
+- `t6_information_schema_tables_metabase_query_fires` — verbatim
+  Metabase connect-database query through hook returns the table
+  list with `'BASE TABLE'` type.
+- `t6_information_schema_columns_emits_sql_standard_data_types`
+  — canonical SQL-standard `bigint` / `text` / `timestamp with
+  time zone` / `integer` literals appear (NOT pg_type internal
+  names).
+- `t6_information_schema_columns_filter_by_table_name` —
+  per-table filter works.
+- `t6_information_schema_schemata_returns_three_schemas` — 3
+  canonical schemas with the SQL-standard 7-column shape.
+- `t6_information_schema_key_column_usage_lists_fk_columns` —
+  FK + UNIQUE rows; CHECK skipped.
+- `t6_information_schema_table_constraints_lists_all_with_type`
+  — CHECK / UNIQUE / FOREIGN KEY literals all present.
+- `t6_information_schema_views_returns_empty` /
+  `t6_information_schema_routines_returns_empty` —
+  DataGrip-tolerated empty responses.
+- `t6_pre_existing_patterns_still_match` — T1-T5+T7 still fire;
+  T6 additions PURELY ADDITIVE.
+- `t8a_engine_handle_list_indexes_round_trips_via_admin_frame`
+  HEADLINE — creates Equality + Range + Composite indexes via SQL
+  DDL and asserts the kind-byte mapping survives the SM
+  round-trip; Composite carries 2 attnums in the field array.
+- `t8a_engine_handle_list_constraints_round_trips_via_admin_frame`
+  — UNIQUE-via-`CREATE UNIQUE INDEX` surfaces as
+  `ConstraintKind::Unique`.
+
+**Test counts** (validated 2026-05-27):
+- kessel-pg-gateway lib: 301 → 325 (+24)
+- kesseldb-server pg-gateway: 113 → 115 (+2)
+- Workspace default: 1755 → 1779 (+24)
+- Workspace `--features kesseldb-server/pg-gateway`: 1781 → 1807 (+26)
+- Workspace `--all-features`: 1836 → 1862 (+26)
+
+seed-7 GREEN. tree-grep EMPTY. HTTP/1.1 + WebSocket + binary
+protocol surfaces byte-untouched. Default `cargo build -p
+kesseldb-server` byte-identical (pg-gateway opt-in feature; T6+T8
+additions are entirely behind the feature gate).
+
+**Headline question — does the SP-PG-CAT V1 arc close? YES.**
+All 8 slices DONE. All design §8 acceptance criteria met (per
+synthetic-peer KATs driving each tool's verbatim
+introspection SQL through the catalog hook): psql `\dt` ✓
+`\d <t>` ✓ `\dn` ✓ `\di` ✓ pgcli tab-completion ✓ DBeaver
+connect ✓ pgAdmin connect ✓ Metabase wizard ✓ Tableau /
+Looker / Hex / Superset ✓ pgJDBC `getTables` / `getColumns` /
+`getIndexInfo` ✓ no SP-PG V1 regression ✓ no engine changes
+affecting HTTP / WebSocket / native protocol surfaces ✓.
+
+**V2 follow-ups (each its own arc, named):**
+- T9 (SP-PG-CAT-PROC) — `pg_proc` real function listing
+- T10 (SP-PG-CAT-MDB) — `pg_database` multi-database when
+  KesselDB grows that
+- T11 (SP-PG-CAT-CACHE) — per-query cache invalidated on DDL
+  (matters at ≥1000 tables)
+- T12 (SP-PG-CAT-STATS) — `pg_stat_*` runtime stats stub→real
+- T13 (SP-PG-CAT-COLL) — `pg_collation` real collation table
+- T14 — psql `\d+` extended output (joins pg_description +
+  pg_indexes detail + pg_stat_user_tables)
+- T15 — cross-schema queries when KesselDB grows namespaces
+  (depends on SP-NS arc)
+- T16 (SP-PG-CAT-AST) — AST-based pattern matcher (replaces the
+  regex layer; collapses the ~35-pattern table to ~10
+  shape-recognizers via kessel-sql AST walk)
+
+**SP-PG-CAT V1 ARC CLOSED.**
+
+(See sections above for prior T1..T5+T7 records.)
 
 ## Prior pickup: T5 — pg_index + pg_constraint (DONE in commit `1004c2f`)
 

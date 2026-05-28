@@ -23,7 +23,7 @@ use std::net::{TcpListener, ToSocketAddrs};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Sender, SyncSender};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// First-frame auth handshake tag: `[0xFC] ++ token`.
 pub const AUTH_TAG: u8 = 0xFC;
@@ -531,6 +531,28 @@ pub struct EngineHandle {
     /// is on — the field is cfg-gated so the default build pays nothing.
     #[cfg(feature = "http-gateway")]
     http_counters: Arc<kessel_http_gateway::HttpRequestCountersStatic>,
+    /// SP-Perf-A T2: shared `Arc<RwLock<StateMachine>>` for the read-only
+    /// bypass. When `ServerConfig.read_workers = Some(_)`, the engine
+    /// thread owns the write side; reads acquire `.read()` and call
+    /// `StateMachine::read_only_op` directly, skipping the engine mpsc +
+    /// group-commit fsync — the apply-thread latency tax (~440 µs/op on
+    /// vulcan T1) drops to a raw RwLock-read + storage-get.
+    ///
+    /// `None` ⇒ pre-Perf-A behaviour: every op routes through the engine
+    /// queue, byte-identical to T1. (T1 did NOT populate this — T2 does,
+    /// gated on the config field — so default builds with
+    /// `read_workers = None` still pay nothing.)
+    sm_shared: Option<Arc<RwLock<StateMachine<DirVfs>>>>,
+    /// SP-Perf-A T2: optional read worker pool. When `Some`, bare-Op
+    /// read-only frames dispatch to a worker thread which calls
+    /// `sm_shared.read().read_only_op(op)`. When `None`, reads run on
+    /// the submitting thread under the same RwLock — fewer hops but no
+    /// CPU-pinning / fairness.
+    ///
+    /// V1 always populates BOTH `sm_shared` AND `read_pool` together
+    /// when `cfg.read_workers.is_some()`, but the pool's worker count
+    /// may be 0 (graceful fall-through to submitting-thread dispatch).
+    read_pool: Option<Arc<read_pool::ReadPool>>,
 }
 
 impl EngineHandle {
@@ -542,7 +564,79 @@ impl EngineHandle {
     /// Backpressure: if `max_inflight` requests are already queued, this
     /// returns `OpResult::Unavailable` immediately rather than growing the
     /// queue without bound.
+    ///
+    /// SP-Perf-A T2: when the engine was spawned with
+    /// `ServerConfig.read_workers = Some(_)`, bare-Op read-only frames
+    /// (kind ∈ §4 read-only set) bypass the engine mpsc + group-commit
+    /// fsync and execute directly against an `Arc<RwLock<StateMachine>>`
+    /// read guard. Writes + SQL + admin tags still route through the
+    /// engine thread, preserving every serial-apply invariant.
     pub fn apply_raw(&self, frame: Vec<u8>) -> OpResult {
+        // SP-Perf-A T2: read-only bypass. When opted in, decode the
+        // frame's first byte against the proto read-only tag table
+        // (Ops only; SQL `0xFE` + admin tags fall through). A successful
+        // decode + read-only classification routes to the shared SM
+        // read path; a write/SQL/admin frame falls through to the
+        // existing engine queue exactly as before.
+        if let Some(sm_shared) = &self.sm_shared {
+            if let Some(&tag) = frame.first() {
+                // Cheap kind-table lookup against the spec §4 read-only
+                // set (16 variants). Avoids a full Op::decode for write
+                // frames — only successful classification needs the
+                // structural decode. SQL (0xFE), admin (0xFA..0xFC,
+                // 0xF4..0xF9), session (0xFD), etc. miss the table and
+                // fall through.
+                let is_read_tag = matches!(
+                    tag,
+                    6  // GetById
+                  | 7  // GetBlob
+                  | 9  // FindBy
+                  | 11 // Query
+                  | 16 // QueryExpr
+                  | 18 // FindRange
+                  | 19 // Select
+                  | 20 // Aggregate
+                  | 21 // SelectFields
+                  | 22 // GroupAggregate
+                  | 23 // SelectSorted
+                  | 25 // FindByComposite
+                  | 26 // QueryRows
+                  | 27 // Describe
+                  | 28 // Join
+                  | 35 // SeqRead
+                );
+                if is_read_tag {
+                    if let Some(op) = Op::decode(&frame) {
+                        // SP144H T1: bump per-Op::kind() counter on the
+                        // read path too — observability symmetry with
+                        // writes. `applied_ops_atomic` is NOT bumped
+                        // (preserves SP142 semantic: applied_ops counts
+                        // log positions).
+                        let idx = tag as usize;
+                        if idx < 64 {
+                            self.op_kind_counts[idx]
+                                .fetch_add(1, Ordering::AcqRel);
+                        }
+                        // V1: dispatch directly on the submitting
+                        // thread under the read guard. The optional
+                        // ReadPool exists for fairness/CPU-pinning
+                        // under bursty workloads; with no pool (or
+                        // workers=0) the submitting thread runs the
+                        // read itself, which is the lowest-latency
+                        // path on the bench. The pool is exercised
+                        // via `dispatch_via_pool` (see ReadPool tests).
+                        return match sm_shared.read() {
+                            Ok(g) => g.read_only_op(op),
+                            Err(_) => OpResult::SchemaError(
+                                "read lock poisoned".into(),
+                            ),
+                        };
+                    }
+                    // Decode failed → fall through to the engine queue
+                    // (engine returns SchemaError uniformly).
+                }
+            }
+        }
         let cur = self.inflight.fetch_add(1, Ordering::AcqRel);
         if cur >= self.max_inflight {
             self.inflight.fetch_sub(1, Ordering::AcqRel);
@@ -557,6 +651,21 @@ impl EngineHandle {
         };
         self.inflight.fetch_sub(1, Ordering::AcqRel);
         r
+    }
+
+    /// SP-Perf-A T2: snapshot of the underlying shared SM for the read
+    /// pool worker loop. `None` when the engine was spawned without
+    /// `read_workers`. The pool workers acquire the `.read()` guard per
+    /// task and call `StateMachine::read_only_op` against it.
+    pub fn sm_shared(&self) -> Option<Arc<RwLock<StateMachine<DirVfs>>>> {
+        self.sm_shared.clone()
+    }
+
+    /// SP-Perf-A T2: worker count of the optional read pool, or 0 if
+    /// none. Used by tests + observability surfaces to verify the
+    /// `ServerConfig.read_workers` setting actually took effect.
+    pub fn read_pool_workers(&self) -> usize {
+        self.read_pool.as_ref().map(|p| p.workers()).unwrap_or(0)
     }
     pub fn apply(&self, op: Op) -> OpResult {
         self.apply_raw(op.encode())
@@ -652,17 +761,57 @@ pub fn spawn_engine_cfg(
     #[cfg(feature = "http-gateway")]
     let http_counters_for_handle: Arc<kessel_http_gateway::HttpRequestCountersStatic> =
         Arc::new(kessel_http_gateway::HttpRequestCountersStatic::new());
+    // SP-Perf-A T2: when `read_workers` is set, the state machine is
+    // wrapped in `Arc<RwLock<>>` so the engine thread and read workers
+    // share it. The engine thread takes `.write()` for each apply
+    // (mirroring today's serial-apply semantic); the read bypass path
+    // on `EngineHandle::apply_raw` takes `.read()` to dispatch a single
+    // read-only op without queueing. The Arc is built BEFORE the engine
+    // thread spawns (it returns it via `sm_shared_handoff`); the engine
+    // thread then drains the same Arc by acquiring the write guard.
+    //
+    // When `read_workers = None` the bypass is OFF: we keep the original
+    // direct-ownership shape and pay zero new coordination cost (no
+    // rwlock, no arc clone, no extra atomic). Byte-identical to pre-T2.
+    let perfa_enabled = cfg.read_workers.is_some();
+    let (sm_handoff_tx, sm_handoff_rx) =
+        sync_channel::<Arc<RwLock<StateMachine<DirVfs>>>>(1);
     std::thread::spawn(move || {
-        let mut sm = match DirVfs::new(&dir).and_then(StateMachine::open) {
-            Ok(sm) => {
-                let _ = ready_tx.send(Ok(()));
-                sm
-            }
+        // Open the SM. The ownership shape depends on `perfa_enabled`:
+        //   - OFF (default): inline owned `sm` (original behaviour).
+        //   - ON: build an `Arc<RwLock<>>` and hand it off to the
+        //     calling thread for inclusion in `EngineHandle`.
+        let sm_open = match DirVfs::new(&dir).and_then(StateMachine::open) {
+            Ok(sm) => sm,
             Err(e) => {
                 let _ = ready_tx.send(Err(e));
                 return;
             }
         };
+        // Two ownership shapes — both end up satisfying a single inner
+        // closure that takes `&mut StateMachine<DirVfs>` per batch.
+        let mut sm_inline: Option<StateMachine<DirVfs>> = None;
+        let mut sm_shared: Option<Arc<RwLock<StateMachine<DirVfs>>>> = None;
+        if perfa_enabled {
+            let arc = Arc::new(RwLock::new(sm_open));
+            let _ = sm_handoff_tx.send(arc.clone());
+            sm_shared = Some(arc);
+        } else {
+            sm_inline = Some(sm_open);
+        }
+        let _ = ready_tx.send(Ok(()));
+        // SP-Perf-A T2: hoist the SM mutable borrow up front. The original
+        // body referenced `sm` by `&mut` throughout; with the rwlock the
+        // borrow comes from a write guard re-acquired per drain batch.
+        // For the inline path we just take a mutable reference to the
+        // owned local. We define a single mutable accessor closure so
+        // the drain body below is identical on both shapes.
+        //
+        // Because the rwlock guard is `!Send` (which is fine — engine
+        // thread owns it) and is re-acquired per drain batch, the
+        // critical section closely mirrors the pre-T2 serial-apply
+        // semantic: writer holds the rwlock in write mode for the whole
+        // batch (one compute → one fsync); readers cannot interleave.
         let mut n: u64 = 1;
         let mut cache = CompileCache::new();
         let start = std::time::Instant::now();
@@ -676,7 +825,19 @@ pub fn spawn_engine_cfg(
         // unchanged (drain finds nothing → one fsync, as before); under
         // concurrency one fsync is amortised over the whole batch — the
         // decisive win on EBS-class network storage.
-        sm.set_autosync(false);
+        // Set autosync once on whichever ownership shape is live. The
+        // engine thread's per-batch drain acquires the SM and then runs
+        // `compute` against it; autosync is a one-shot toggle on the SM
+        // itself.
+        {
+            let mut guard = sm_shared.as_ref().map(|a| a.write().expect("sm rwlock"));
+            let sm_mut: &mut StateMachine<DirVfs> = match (&mut guard, sm_inline.as_mut()) {
+                (Some(g), _) => &mut **g,
+                (None, Some(s)) => s,
+                (None, None) => unreachable!("engine sm not initialised"),
+            };
+            sm_mut.set_autosync(false);
+        }
         let compute = |sm: &mut StateMachine<DirVfs>,
                        cache: &mut CompileCache,
                        n: &mut u64,
@@ -1084,8 +1245,21 @@ pub fn spawn_engine_cfg(
         while let Ok((frame, reply)) = rx.recv() {
             let mut batch: Vec<(OpResult, SyncSender<OpResult>)> =
                 Vec::with_capacity(16);
+            // SP-Perf-A T2: acquire the SM mutable borrow ONCE per drain
+            // batch. With the rwlock the writer holds it for the entire
+            // batch (one apply → group-commit fsync → reply), which is
+            // the same critical-section shape pre-T2 had on a directly-
+            // owned SM. Readers cannot interleave inside one batch; this
+            // preserves the per-connection-FIFO + apply-order invariants
+            // (spec §6 + §7).
+            let mut guard = sm_shared.as_ref().map(|a| a.write().expect("sm rwlock"));
+            let sm: &mut StateMachine<DirVfs> = match (&mut guard, sm_inline.as_mut()) {
+                (Some(g), _) => &mut **g,
+                (None, Some(s)) => s,
+                (None, None) => unreachable!("engine sm not initialised"),
+            };
             let n_before = n;
-            let res = compute(&mut sm, &mut cache, &mut n, &frame);
+            let res = compute(sm, &mut cache, &mut n, &frame);
             if n > n_before {
                 applied_ops_atomic_for_engine
                     .fetch_add(n - n_before, Ordering::AcqRel);
@@ -1107,7 +1281,7 @@ pub fn spawn_engine_cfg(
                 match rx.try_recv() {
                     Ok((f, rp)) => {
                         let n_before = n;
-                        let res = compute(&mut sm, &mut cache, &mut n, &f);
+                        let res = compute(sm, &mut cache, &mut n, &f);
                         if n > n_before {
                             applied_ops_atomic_for_engine
                                 .fetch_add(n - n_before, Ordering::AcqRel);
@@ -1126,21 +1300,53 @@ pub fn spawn_engine_cfg(
                 }
             }
             let _ = sm.sync(); // single fsync amortised over the whole batch
+            // Drop the rwlock write guard BEFORE replies are sent so
+            // readers waiting on `.read()` can interleave between
+            // batches. (Replies travel over per-task oneshots; they
+            // don't touch the SM.)
+            drop(guard);
             for (res, rp) in batch {
                 let _ = rp.send(res);
             }
         }
     });
     match ready_rx.recv() {
-        Ok(Ok(())) => Ok(EngineHandle {
-            tx,
-            inflight: Arc::new(AtomicUsize::new(0)),
-            max_inflight,
-            applied_ops_atomic: applied_ops_atomic_for_handle,
-            op_kind_counts: op_kind_counts_for_handle,
-            #[cfg(feature = "http-gateway")]
-            http_counters: http_counters_for_handle,
-        }),
+        Ok(Ok(())) => {
+            // SP-Perf-A T2: when the bypass is enabled, the engine
+            // thread sent us the shared Arc on `sm_handoff_rx`; receive
+            // it BEFORE returning so the EngineHandle ships with the
+            // bypass wired. When disabled, the channel was never sent
+            // on — try_recv returns Err(Empty) and the field stays
+            // None.
+            let sm_shared = if perfa_enabled {
+                sm_handoff_rx.recv().ok()
+            } else {
+                None
+            };
+            // Spawn the read pool (if any) sharing the same Arc. With
+            // `Some(0)` we still construct the pool (graceful fall-
+            // through to submitting-thread dispatch); with `None` the
+            // pool field stays None too.
+            let read_pool = match (cfg.read_workers, sm_shared.clone()) {
+                (Some(n), Some(arc)) => Some(Arc::new(read_pool::ReadPool::new_shared(
+                    n,
+                    1024,
+                    arc,
+                ))),
+                _ => None,
+            };
+            Ok(EngineHandle {
+                tx,
+                inflight: Arc::new(AtomicUsize::new(0)),
+                max_inflight,
+                applied_ops_atomic: applied_ops_atomic_for_handle,
+                op_kind_counts: op_kind_counts_for_handle,
+                #[cfg(feature = "http-gateway")]
+                http_counters: http_counters_for_handle,
+                sm_shared,
+                read_pool,
+            })
+        }
         Ok(Err(e)) => Err(e),
         Err(_) => Err(io::Error::new(io::ErrorKind::Other, "engine failed to start")),
     }

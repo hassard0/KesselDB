@@ -132,6 +132,30 @@ pub fn catalog_query_hook<E: EngineApply + ?Sized>(
     if matches_psql_dt_canonical(&normalized) {
         return Some(synthesize::psql_dt_joined_rows(engine));
     }
+    // T4: `SELECT * FROM pg_catalog.pg_attribute` (all columns).
+    if matches_pg_attribute_select_star(&normalized) {
+        return Some(synthesize::synthesize_pg_attribute(engine, None));
+    }
+    // T4: `SELECT * FROM pg_catalog.pg_attribute WHERE attrelid = N`.
+    if let Some(oid) = extract_attrelid_filter(&normalized) {
+        return Some(synthesize::synthesize_pg_attribute(engine, Some(oid)));
+    }
+    // T4: psql `\d <table>` step-2 column-list query (queries.md §1.5).
+    if let Some(oid) = extract_psql_d_table_oid(&normalized) {
+        return Some(synthesize::psql_d_table_joined_rows(engine, oid));
+    }
+    // T4: `SELECT * FROM pg_catalog.pg_type` (all canned rows).
+    if matches_pg_type_select_star(&normalized) {
+        return Some(synthesize::synthesize_pg_type());
+    }
+    // T4: `SELECT ... FROM pg_catalog.pg_type WHERE oid = N` (per-OID).
+    if let Some(oid) = extract_pg_type_oid_filter(&normalized) {
+        return Some(synthesize::synthesize_pg_type_by_oid(oid));
+    }
+    // T4: pgJDBC `getColumns` (queries.md §4.2 — large JOIN).
+    if let Some(name) = extract_pgjdbc_getcolumns_relname(&normalized) {
+        return Some(synthesize::pgjdbc_getcolumns_joined_rows(engine, &name));
+    }
     None
 }
 
@@ -248,6 +272,151 @@ fn matches_psql_dt_canonical(normalized: &str) -> bool {
     normalized.starts_with(leading)
         && normalized.contains(core)
         && normalized.contains(trailing_filter)
+}
+
+/// SP-PG-CAT T4 — recognize `SELECT * FROM pg_catalog.pg_attribute`
+/// (and the unqualified `pg_attribute` form). Tolerates a trailing
+/// `WHERE` clause that DOESN'T look like the parameterized
+/// `attrelid = <oid>` form (that one's handled by
+/// `extract_attrelid_filter` instead).
+fn matches_pg_attribute_select_star(normalized: &str) -> bool {
+    normalized == "select * from pg_catalog.pg_attribute"
+        || normalized == "select * from pg_attribute"
+}
+
+/// SP-PG-CAT T4 — recognize the parameterized `SELECT * FROM
+/// pg_catalog.pg_attribute WHERE attrelid = N` shape (and the
+/// unqualified form). Returns the OID if matched. The common psql
+/// `\d <table>` step / pgJDBC `getColumns` cases come here.
+fn extract_attrelid_filter(normalized: &str) -> Option<u32> {
+    let prefixes = [
+        "select * from pg_catalog.pg_attribute where attrelid = ",
+        "select * from pg_attribute where attrelid = ",
+        "select * from pg_catalog.pg_attribute where a.attrelid = ",
+        "select * from pg_attribute where a.attrelid = ",
+    ];
+    for p in prefixes {
+        if let Some(rest) = normalized.strip_prefix(p) {
+            return parse_leading_u32(rest);
+        }
+    }
+    None
+}
+
+/// SP-PG-CAT T4 — recognize the canonical psql `\d <table>` step-2
+/// column-list query (queries.md §1.5). The query SELECTs from
+/// `pg_attribute` with a `WHERE a.attrelid = '<oid>'` clause (the
+/// OID is quoted in psql because PG's parser accepts the literal
+/// either way). Returns the extracted OID if the query matches the
+/// canonical shape.
+fn extract_psql_d_table_oid(normalized: &str) -> Option<u32> {
+    // Anchor on the leading fixture psql emits for `\d <table>`
+    // step 2: `SELECT a.attname,` then later `FROM pg_catalog.
+    // pg_attribute a WHERE a.attrelid = '<oid>'`.
+    let leading = "select a.attname,";
+    let core = "from pg_catalog.pg_attribute a where a.attrelid = ";
+    if !normalized.starts_with(leading) {
+        return None;
+    }
+    let pos = normalized.find(core)?;
+    let after = &normalized[pos + core.len()..];
+    // OID may be quoted (`'16385'`) or unquoted (`16385`); psql ships
+    // the quoted form per `describe.c::describeOneTableDetails`.
+    let after = after.strip_prefix('\'').unwrap_or(after);
+    parse_leading_u32(after)
+}
+
+/// SP-PG-CAT T4 — recognize `SELECT * FROM pg_catalog.pg_type`
+/// (and the unqualified form).
+fn matches_pg_type_select_star(normalized: &str) -> bool {
+    normalized == "select * from pg_catalog.pg_type"
+        || normalized == "select * from pg_type"
+}
+
+/// SP-PG-CAT T4 — recognize `SELECT ... FROM pg_catalog.pg_type
+/// WHERE oid = N` (the per-OID lookup form used by JDBC's column-
+/// type resolution path). Returns the OID. Tolerates a few projection
+/// shapes (`*`, `typname`, `typname, typlen, typbyval` etc.).
+fn extract_pg_type_oid_filter(normalized: &str) -> Option<u32> {
+    // Anchor on `from pg_catalog.pg_type` (qualified or unqualified)
+    // followed by ` where oid = N`. The projection between SELECT and
+    // FROM is variable, so we substring-match.
+    let from_qualified = " from pg_catalog.pg_type where oid = ";
+    let from_unqualified = " from pg_type where oid = ";
+    let from_qualified_aliased = " from pg_catalog.pg_type t where t.oid = ";
+    let from_unqualified_aliased = " from pg_type t where t.oid = ";
+    if !normalized.starts_with("select ") {
+        return None;
+    }
+    for marker in [
+        from_qualified,
+        from_unqualified,
+        from_qualified_aliased,
+        from_unqualified_aliased,
+    ] {
+        if let Some(pos) = normalized.find(marker) {
+            let after = &normalized[pos + marker.len()..];
+            return parse_leading_u32(after);
+        }
+    }
+    None
+}
+
+/// SP-PG-CAT T4 — recognize the pgJDBC `getColumns` canonical query
+/// (queries.md §4.2). The query is a large JOIN that ends with
+/// `c.relname LIKE '<table>'`. Returns the extracted table name on
+/// match.
+///
+/// The pgJDBC query body is too long to byte-match; we anchor on
+/// the canonical fixture (the `row_number() OVER (PARTITION BY
+/// a.attrelid` projection, distinctive to pgJDBC), then scan for
+/// `c.relname like '<name>'` and extract the name.
+fn extract_pgjdbc_getcolumns_relname(normalized: &str) -> Option<String> {
+    // The pgJDBC getColumns query carries the distinctive
+    // `row_number() over (partition by a.attrelid` fixture. The
+    // canonical SELECT starts with `select * from ( select`.
+    if !normalized.contains("row_number() over (partition by a.attrelid")
+        && !normalized.contains("row_number() over(partition by a.attrelid")
+    {
+        return None;
+    }
+    // The `c.relname like '<table>'` clause is the table-name
+    // extraction point. Match LIKE / = (both common).
+    let needles = ["c.relname like '", "c.relname = '"];
+    for needle in needles {
+        if let Some(pos) = normalized.find(needle) {
+            let after = &normalized[pos + needle.len()..];
+            // The name ends at the next `'`.
+            if let Some(end) = after.find('\'') {
+                return Some(after[..end].to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Parse a leading decimal u32 from `s` — used by the
+/// `WHERE oid = N` / `WHERE attrelid = N` extractors. Stops at the
+/// first non-digit; returns None if no digits.
+fn parse_leading_u32(s: &str) -> Option<u32> {
+    let mut acc: u64 = 0;
+    let mut any = false;
+    for c in s.chars() {
+        if let Some(d) = c.to_digit(10) {
+            acc = acc.checked_mul(10)?.checked_add(d as u64)?;
+            if acc > u32::MAX as u64 {
+                return None;
+            }
+            any = true;
+        } else {
+            break;
+        }
+    }
+    if any {
+        Some(acc as u32)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -594,5 +763,182 @@ mod tests {
         assert!(catalog_query_hook("INSERT INTO t (id) VALUES (1)", &eng).is_none());
         assert!(catalog_query_hook("UPDATE t SET v = 1 WHERE id = 2", &eng).is_none());
         assert!(catalog_query_hook("CREATE TABLE t (id i64)", &eng).is_none());
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-CAT T4 KATs — pg_attribute + pg_type patterns + the psql
+    // `\d <table>` step-2 / pgJDBC `getColumns` joined-result intercepts.
+    // ───────────────────────────────────────────────────────────────────
+
+    use crate::pg_catalog::synthesize::oid_for_table_name;
+
+    /// Engine that combines list_tables + describe_table for T4
+    /// pattern-hook tests (the parameterized `attrelid = N` /
+    /// `\d <table>` / pgJDBC-getColumns paths all need real
+    /// describe_table data, not just the metadata).
+    struct PatternHookEngine {
+        tables: Vec<TableMetadata>,
+        schemas: std::collections::BTreeMap<String, Vec<PgColumn>>,
+    }
+    impl EngineApply for PatternHookEngine {
+        fn apply_sql(&self, _sql: &str) -> OpResult {
+            OpResult::SchemaError("PatternHookEngine: apply_sql should not be reached".into())
+        }
+        fn describe_table(&self, name: &str) -> Option<Vec<PgColumn>> {
+            self.schemas.get(name).cloned()
+        }
+        fn list_tables(&self) -> Vec<TableMetadata> {
+            self.tables.clone()
+        }
+    }
+
+    fn t4_test_engine() -> PatternHookEngine {
+        let mut schemas = std::collections::BTreeMap::new();
+        schemas.insert("users".to_string(), vec![
+            PgColumn { name: "id".into(), kind: FieldKind::I64, nullable: false },
+            PgColumn { name: "name".into(), kind: FieldKind::Char(64), nullable: false },
+        ]);
+        PatternHookEngine {
+            tables: vec![
+                TableMetadata { name: "users".into(), type_id: 1, kind: TableKind::Ordinary, field_count: 2 },
+            ],
+            schemas,
+        }
+    }
+
+    /// **Pattern match:** `SELECT * FROM pg_catalog.pg_attribute` hits
+    /// the hook + synthesizer fires.
+    #[test]
+    fn t4_pg_attribute_select_star_pattern_fires() {
+        let eng = t4_test_engine();
+        let res = catalog_query_hook("SELECT * FROM pg_catalog.pg_attribute", &eng);
+        assert!(res.is_some(), "pg_attribute SELECT * MUST hit the hook");
+        let bytes = res.unwrap();
+        assert_eq!(bytes[0], b'T');
+        assert_eq!(&bytes[bytes.len() - 6..], &[b'Z', 0, 0, 0, 5, b'I']);
+    }
+
+    /// **Pattern match — unqualified pg_attribute** also fires.
+    #[test]
+    fn t4_pg_attribute_select_star_unqualified() {
+        let eng = t4_test_engine();
+        assert!(catalog_query_hook("SELECT * FROM pg_attribute", &eng).is_some());
+    }
+
+    /// **Pattern match — `WHERE attrelid = N` extracts the OID and
+    /// filters to that table.** Headline for the psql `\d <table>`
+    /// / pgJDBC `getColumns` path.
+    #[test]
+    fn t4_pg_attribute_attrelid_filter_pattern_fires() {
+        let eng = t4_test_engine();
+        let users_oid = oid_for_table_name("users");
+        let sql = format!("SELECT * FROM pg_catalog.pg_attribute WHERE attrelid = {}", users_oid);
+        let res = catalog_query_hook(&sql, &eng);
+        assert!(res.is_some(), "attrelid-filtered query MUST hit the hook");
+        let bytes = res.unwrap();
+        // Filtered to users (2 columns).
+        assert!(bytes.windows(b"SELECT 2\0".len()).any(|w| w == b"SELECT 2\0"),
+            "filtered to users MUST emit SELECT 2");
+    }
+
+    /// **Pattern match — `pg_catalog.pg_attribute WHERE attrelid = N`
+    /// with an unknown OID returns 0 rows (well-framed).**
+    #[test]
+    fn t4_pg_attribute_attrelid_filter_unknown_oid_zero_rows() {
+        let eng = t4_test_engine();
+        let res = catalog_query_hook(
+            "SELECT * FROM pg_catalog.pg_attribute WHERE attrelid = 99999",
+            &eng,
+        );
+        assert!(res.is_some(), "any attrelid = N MUST hit the hook");
+        let bytes = res.unwrap();
+        assert!(bytes.windows(b"SELECT 0\0".len()).any(|w| w == b"SELECT 0\0"));
+    }
+
+    /// **Pattern match — psql `\d <table>` step-2 column-list query**
+    /// (queries.md §1.5) extracts the OID from the quoted form and
+    /// fires the joined-result synthesizer.
+    #[test]
+    fn t4_psql_d_table_step2_pattern_fires() {
+        let eng = t4_test_engine();
+        let users_oid = oid_for_table_name("users");
+        // Mirror the canonical psql `\d <table>` step-2 SQL from
+        // queries.md §1.5 — the OID is quoted (PG accepts it either way).
+        let sql = format!(
+            "SELECT a.attname,\n  \
+             pg_catalog.format_type(a.atttypid, a.atttypmod),\n  \
+             (SELECT pg_catalog.pg_get_expr(d.adbin, d.adrelid, true) \
+              FROM pg_catalog.pg_attrdef d WHERE d.adrelid = a.attrelid \
+              AND d.adnum = a.attnum AND a.atthasdef),\n  \
+             a.attnotnull,\n  \
+             NULL AS attcollation,\n  \
+             a.attidentity,\n  \
+             a.attgenerated\n\
+             FROM pg_catalog.pg_attribute a\n\
+             WHERE a.attrelid = '{users_oid}' AND a.attnum > 0 AND NOT a.attisdropped\n\
+             ORDER BY a.attnum",
+        );
+        let res = catalog_query_hook(&sql, &eng);
+        assert!(res.is_some(), "psql \\d <table> step-2 MUST hit the hook");
+        let bytes = res.unwrap();
+        // The synthesizer emitted 2 column rows for `users`.
+        assert!(bytes.windows(b"SELECT 2\0".len()).any(|w| w == b"SELECT 2\0"));
+        // PG type name `int8` for I64 appears.
+        assert!(bytes.windows(b"int8".len()).any(|w| w == b"int8"));
+        // Column names appear.
+        assert!(bytes.windows(b"name".len()).any(|w| w == b"name"));
+    }
+
+    /// **Pattern match — `SELECT * FROM pg_catalog.pg_type`** hits.
+    #[test]
+    fn t4_pg_type_select_star_pattern_fires() {
+        let eng = t4_test_engine();
+        let res = catalog_query_hook("SELECT * FROM pg_catalog.pg_type", &eng);
+        assert!(res.is_some(), "pg_type SELECT * MUST hit the hook");
+        let bytes = res.unwrap();
+        assert_eq!(bytes[0], b'T');
+        // The canned `int8` type name appears.
+        assert!(bytes.windows(b"int8".len()).any(|w| w == b"int8"));
+    }
+
+    /// **Pattern match — unqualified pg_type** also fires.
+    #[test]
+    fn t4_pg_type_select_star_unqualified() {
+        let eng = t4_test_engine();
+        assert!(catalog_query_hook("SELECT * FROM pg_type", &eng).is_some());
+    }
+
+    /// **Pattern match — `SELECT typname, typlen FROM pg_catalog.pg_type
+    /// WHERE oid = N` extracts the OID.** Used by JDBC's column-type
+    /// resolution path.
+    #[test]
+    fn t4_pg_type_per_oid_lookup_pattern_fires() {
+        let eng = t4_test_engine();
+        // Match against INT8 (20).
+        let res = catalog_query_hook(
+            "SELECT typname, typlen, typbyval FROM pg_catalog.pg_type WHERE oid = 20",
+            &eng,
+        );
+        assert!(res.is_some(), "pg_type per-OID lookup MUST hit the hook");
+        let bytes = res.unwrap();
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+        assert!(bytes.windows(b"int8".len()).any(|w| w == b"int8"));
+    }
+
+    /// **Regression lock — T1+T3 patterns still match + non-pg_catalog
+    /// SQL still misses.** T4 added patterns are PURELY ADDITIVE.
+    #[test]
+    fn t4_pre_existing_t1_t3_patterns_still_match() {
+        let eng = t4_test_engine();
+        // T1
+        assert!(catalog_query_hook("SELECT * FROM pg_catalog.pg_namespace", &eng).is_some());
+        // T3
+        assert!(catalog_query_hook("SELECT * FROM pg_catalog.pg_class", &eng).is_some());
+        // Unrelated SELECT still misses.
+        assert!(catalog_query_hook("SELECT * FROM users", &eng).is_none());
+        // Non-SELECT still fast-rejected even if mentioning pg_attribute.
+        assert!(catalog_query_hook(
+            "DELETE FROM pg_catalog.pg_attribute WHERE attrelid = 16385",
+            &eng).is_none());
     }
 }

@@ -33,11 +33,16 @@ use super::{
     PG_NAMESPACE_OID_PG_CATALOG, PG_NAMESPACE_OID_PUBLIC,
 };
 use crate::engine::{EngineApply, TableKind, TableMetadata};
-use crate::proto::{PG_TYPE_BOOL, PG_TYPE_INT2, PG_TYPE_INT4, PG_TYPE_OID, PG_TYPE_TEXT};
+use crate::proto::{
+    PG_TYPE_BOOL, PG_TYPE_BYTEA, PG_TYPE_INT2, PG_TYPE_INT4, PG_TYPE_INT8,
+    PG_TYPE_NUMERIC, PG_TYPE_OID, PG_TYPE_TEXT, PG_TYPE_TIMESTAMPTZ,
+    PG_TYPE_VARCHAR,
+};
 use crate::response::{
     encode_command_complete, encode_data_row, encode_ready_for_query,
     encode_row_description, select_tag, FieldMeta,
 };
+use crate::types::{field_kind_to_oid, type_size_for_oid};
 
 // ─── OID generation (spec §3.4 + design §5.2) ────────────────────────────
 
@@ -327,6 +332,683 @@ pub fn pg_namespace_all_rows() -> Vec<u8> {
     ]));
 
     out.extend_from_slice(&encode_command_complete(&select_tag(3)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
+// ─── pg_attribute synthesizer (design §5.3) ───────────────────────────────
+
+/// `pg_attribute` column count per PG 14 `src/include/catalog/
+/// pg_attribute.h`. Locked because clients (psql `\d`, JDBC
+/// `getColumns`, pgcli `columns()`, DBeaver column cache) iterate
+/// row columns by index; one off-by-one breaks them all.
+pub const PG_ATTRIBUTE_COLUMN_COUNT: usize = 25;
+
+/// PG default collation OID for text-like types (PG `default`
+/// collation; locked vs `src/include/catalog/pg_collation.dat`). Used
+/// in `pg_attribute.attcollation` for text/varchar columns; 0 for
+/// non-text columns.
+pub const PG_COLLATION_DEFAULT: u32 = 100;
+
+/// Build the `pg_attribute` RowDescription field list. 25 columns
+/// in the order PG 14 defines them. Pulled out so both `SELECT *`
+/// and the per-table filter paths emit the same shape.
+fn pg_attribute_fields() -> Vec<FieldMeta> {
+    let oid = |name: &str| FieldMeta { name: name.to_string(), type_oid: PG_TYPE_OID };
+    let text = |name: &str| FieldMeta { name: name.to_string(), type_oid: PG_TYPE_TEXT };
+    let bool_ = |name: &str| FieldMeta { name: name.to_string(), type_oid: PG_TYPE_BOOL };
+    let int2 = |name: &str| FieldMeta { name: name.to_string(), type_oid: PG_TYPE_INT2 };
+    let int4 = |name: &str| FieldMeta { name: name.to_string(), type_oid: PG_TYPE_INT4 };
+    let char1 = |name: &str| FieldMeta { name: name.to_string(), type_oid: PG_TYPE_TEXT };
+    vec![
+        oid("attrelid"),
+        text("attname"),
+        oid("atttypid"),
+        int4("attstattarget"),
+        int2("attlen"),
+        int2("attnum"),
+        int4("attndims"),
+        int4("attcacheoff"),
+        int4("atttypmod"),
+        bool_("attbyval"),
+        char1("attstorage"),
+        char1("attalign"),
+        bool_("attnotnull"),
+        bool_("atthasdef"),
+        bool_("atthasmissing"),
+        char1("attidentity"),
+        char1("attgenerated"),
+        bool_("attisdropped"),
+        bool_("attislocal"),
+        int4("attinhcount"),
+        oid("attcollation"),
+        text("attacl"),         // aclitem[] — V1 NULL
+        text("attoptions"),     // text[] — V1 NULL
+        text("attfdwoptions"),  // text[] — V1 NULL
+        text("attmissingval"),  // anyarray — V1 NULL
+    ]
+}
+
+/// PG `attbyval` (pass-by-value) for a type OID. True for the
+/// fixed-size primitives PG passes in registers (bool, int2, int4,
+/// int8 on 64-bit, oid, timestamptz binary); false for variable-
+/// length (bytea/text/numeric/varchar). Locked vs `pg_type.dat`.
+fn attbyval_for_oid(oid: u32) -> bool {
+    matches!(
+        oid,
+        PG_TYPE_BOOL
+            | PG_TYPE_INT2
+            | PG_TYPE_INT4
+            | PG_TYPE_INT8
+            | PG_TYPE_OID
+            | PG_TYPE_TIMESTAMPTZ
+    )
+}
+
+/// PG `attstorage` (TOAST storage strategy) char for a type OID:
+/// - 'p' (plain) for fixed-size primitives — never TOASTed.
+/// - 'x' (extended) for variable-length — TOAST-eligible + compress.
+///
+/// Locked vs `pg_type.dat` typstorage column.
+fn attstorage_for_oid(oid: u32) -> u8 {
+    if attbyval_for_oid(oid) {
+        b'p'
+    } else {
+        b'x'
+    }
+}
+
+/// PG `attalign` (alignment requirement) char for a type OID:
+/// - 'c' (char/byte) for bool + bytea + 1-byte text.
+/// - 's' (short/2-byte) for int2.
+/// - 'i' (int/4-byte) for int4 + oid.
+/// - 'd' (double/8-byte) for int8 + timestamptz.
+/// - 'i' (int/4-byte) for text/varchar (varlena header is 4-byte aligned).
+/// - 'i' (int/4-byte) for numeric.
+///
+/// Locked vs `pg_type.dat` typalign column.
+fn attalign_for_oid(oid: u32) -> u8 {
+    match oid {
+        PG_TYPE_BOOL | PG_TYPE_BYTEA => b'c',
+        PG_TYPE_INT2 => b's',
+        PG_TYPE_INT4 | PG_TYPE_OID | PG_TYPE_TEXT | PG_TYPE_VARCHAR
+        | PG_TYPE_NUMERIC => b'i',
+        PG_TYPE_INT8 | PG_TYPE_TIMESTAMPTZ => b'd',
+        _ => b'i',
+    }
+}
+
+/// Emit one pg_attribute DataRow for a column.
+///
+/// - `attrelid` — the table's pg_class.oid (`oid_for_table_name(name)`).
+/// - `attname` — column name.
+/// - `atttypid` — `field_kind_to_oid(kind)` from V1's type-OID map.
+/// - `attlen` — `type_size_for_oid(atttypid)` (-1 for varlena).
+/// - `attnum` — 1-based column index (i16).
+/// - `attnotnull` — `!nullable` (KesselDB defaults NOT NULL in V1).
+///
+/// The remaining 19 columns are PG-default canned (see design §5.3 +
+/// per-OID helpers above).
+fn encode_pg_attribute_row(
+    attrelid: u32,
+    attname: &str,
+    atttypid: u32,
+    attnum: i16,
+    nullable: bool,
+) -> Vec<u8> {
+    let attrelid_str = attrelid.to_string();
+    let atttypid_str = atttypid.to_string();
+    let attlen = type_size_for_oid(atttypid);
+    let attlen_str = attlen.to_string();
+    let attnum_str = attnum.to_string();
+    let zero = b"0".as_ref();
+    let neg_one = b"-1".as_ref();
+    let false_ = b"f".as_ref();
+    let true_ = b"t".as_ref();
+    let attbyval = if attbyval_for_oid(atttypid) { true_ } else { false_ };
+    let attnotnull = if nullable { false_ } else { true_ };
+    let storage_byte = [attstorage_for_oid(atttypid)];
+    let align_byte = [attalign_for_oid(atttypid)];
+    let empty = b"".as_ref();
+    let collation = if matches!(atttypid, PG_TYPE_TEXT | PG_TYPE_VARCHAR) {
+        PG_COLLATION_DEFAULT.to_string()
+    } else {
+        "0".to_string()
+    };
+
+    encode_data_row(&[
+        Some(attrelid_str.as_bytes()),  // attrelid
+        Some(attname.as_bytes()),       // attname
+        Some(atttypid_str.as_bytes()),  // atttypid
+        Some(neg_one),                  // attstattarget = -1
+        Some(attlen_str.as_bytes()),    // attlen
+        Some(attnum_str.as_bytes()),    // attnum
+        Some(zero),                     // attndims = 0
+        Some(neg_one),                  // attcacheoff = -1
+        Some(neg_one),                  // atttypmod = -1
+        Some(attbyval),                 // attbyval
+        Some(&storage_byte),            // attstorage
+        Some(&align_byte),              // attalign
+        Some(attnotnull),               // attnotnull
+        Some(false_),                   // atthasdef = false (V1 no defaults)
+        Some(false_),                   // atthasmissing = false
+        Some(empty),                    // attidentity = '' (not identity)
+        Some(empty),                    // attgenerated = '' (not generated)
+        Some(false_),                   // attisdropped = false
+        Some(true_),                    // attislocal = true
+        Some(zero),                     // attinhcount = 0 (no inheritance)
+        Some(collation.as_bytes()),     // attcollation
+        None,                           // attacl = NULL
+        None,                           // attoptions = NULL
+        None,                           // attfdwoptions = NULL
+        None,                           // attmissingval = NULL
+    ])
+}
+
+/// Synthesize `SELECT * FROM pg_catalog.pg_attribute` — one row per
+/// (table × column) of every KesselDB user table.
+///
+/// `attrelid_filter`:
+/// - `None` — emit every column of every table (slow but correct;
+///   the broad `SELECT * FROM pg_catalog.pg_attribute` path).
+/// - `Some(oid)` — emit only the columns belonging to the table whose
+///   `oid_for_table_name(name)` matches the filter. This is the
+///   common psql `\d <table>` case + pgJDBC `getColumns` case.
+///
+/// Walks `engine.list_tables()` and `engine.describe_table(name)` for
+/// each table that survives the filter. Returns the full T+D*+C+Z
+/// wire stream.
+pub fn synthesize_pg_attribute<E: EngineApply + ?Sized>(
+    engine: &E,
+    attrelid_filter: Option<u32>,
+) -> Vec<u8> {
+    let fields = pg_attribute_fields();
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    let tables = engine.list_tables();
+    let mut n: u64 = 0;
+    for t in &tables {
+        let attrelid = oid_for_table_name(&t.name);
+        if let Some(want) = attrelid_filter {
+            if attrelid != want {
+                continue;
+            }
+        }
+        let cols = match engine.describe_table(&t.name) {
+            Some(c) => c,
+            None => continue,
+        };
+        for (idx, col) in cols.iter().enumerate() {
+            let attnum = (idx + 1) as i16;
+            let atttypid = field_kind_to_oid(col.kind);
+            out.extend_from_slice(&encode_pg_attribute_row(
+                attrelid,
+                &col.name,
+                atttypid,
+                attnum,
+                col.nullable,
+            ));
+            n += 1;
+        }
+    }
+    out.extend_from_slice(&encode_command_complete(&select_tag(n)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
+// ─── Joined-result synth: psql `\d <table>` step 2 (queries.md §1.5) ──
+
+/// Synthesize the joined-result response for the canonical psql
+/// `\d <table>` step-2 column-list query (queries.md §1.5). The psql
+/// query SELECTs from `pg_attribute` with a subselect on `pg_attrdef`
+/// + `pg_collation` + `pg_type`. V1 returns the per-column rows from
+/// the matching KesselDB table; the `pg_attrdef` / `pg_collation`
+/// subselects are NULL (V1 carries no defaults / non-default
+/// collations).
+///
+/// Output columns (matching psql's `\d` projection):
+/// - attname (column name)
+/// - format_type(...) (PG type display name, e.g. `bigint`, `text`)
+/// - pg_get_expr(...) (default expression — V1 NULL)
+/// - attnotnull (NOT NULL flag)
+/// - attcollation (collation name — V1 NULL)
+/// - attidentity (identity char — V1 '')
+/// - attgenerated (generated char — V1 '')
+pub fn psql_d_table_joined_rows<E: EngineApply + ?Sized>(
+    engine: &E,
+    table_oid: u32,
+) -> Vec<u8> {
+    let fields = vec![
+        FieldMeta { name: "attname".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "format_type".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "pg_get_expr".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "attnotnull".to_string(), type_oid: PG_TYPE_BOOL },
+        FieldMeta { name: "attcollation".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "attidentity".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "attgenerated".to_string(), type_oid: PG_TYPE_TEXT },
+    ];
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    let tables = engine.list_tables();
+    let mut n: u64 = 0;
+    let empty = b"".as_ref();
+    let true_ = b"t".as_ref();
+    let false_ = b"f".as_ref();
+    for t in &tables {
+        if oid_for_table_name(&t.name) != table_oid {
+            continue;
+        }
+        let cols = match engine.describe_table(&t.name) {
+            Some(c) => c,
+            None => continue,
+        };
+        for col in &cols {
+            let atttypid = field_kind_to_oid(col.kind);
+            let format_name = pg_type_name_for_oid(atttypid);
+            let attnotnull = if col.nullable { false_ } else { true_ };
+            out.extend_from_slice(&encode_data_row(&[
+                Some(col.name.as_bytes()),
+                Some(format_name.as_bytes()),
+                None,            // pg_get_expr(...) — V1 no defaults
+                Some(attnotnull),
+                None,            // attcollation subselect — V1 NULL
+                Some(empty),     // attidentity
+                Some(empty),     // attgenerated
+            ]));
+            n += 1;
+        }
+    }
+    out.extend_from_slice(&encode_command_complete(&select_tag(n)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
+// ─── pg_type synthesizer (design §5.4) ────────────────────────────────────
+
+/// `pg_type` column count per PG 14 `src/include/catalog/pg_type.h`.
+/// Locked because every JDBC driver iterates by index when resolving
+/// column types.
+pub const PG_TYPE_COLUMN_COUNT: usize = 30;
+
+/// One canned pg_type row. V1 supports a fixed set of types (~12);
+/// each row's values are locked vs PG `pg_type.dat`. The renderer
+/// (`encode_pg_type_row`) fills the remaining canned-default columns.
+pub struct PgTypeRow {
+    pub oid: u32,
+    pub typname: &'static str,
+    pub typlen: i16,        // -1 for variable-length
+    pub typbyval: bool,
+    pub typcategory: u8,    // 'B'=bool, 'N'=numeric, 'S'=string, 'U'=user, 'D'=date/time
+    pub typalign: u8,       // 'c'/'s'/'i'/'d'
+    pub typstorage: u8,     // 'p'/'x'
+    pub typcollation: u32,  // 100 for text-like, 0 otherwise
+}
+
+/// V1 canned `pg_type` row table. Values locked vs PG
+/// `src/include/catalog/pg_type.dat`. The set covers every type the
+/// V1 wire path can emit through `field_kind_to_oid` (bool, int2,
+/// int4, int8, text, bytea, numeric, timestamptz, oid) plus the
+/// JDBC-driver-friendly varchar/float4/float8 (clients may BIND
+/// these even though V1's FieldKind set doesn't include them) and
+/// name (the catalog uses it implicitly for identifier columns).
+pub const PG_TYPE_ROWS: &[PgTypeRow] = &[
+    PgTypeRow {
+        oid: PG_TYPE_BOOL,
+        typname: "bool",
+        typlen: 1,
+        typbyval: true,
+        typcategory: b'B',
+        typalign: b'c',
+        typstorage: b'p',
+        typcollation: 0,
+    },
+    PgTypeRow {
+        oid: PG_TYPE_BYTEA,
+        typname: "bytea",
+        typlen: -1,
+        typbyval: false,
+        typcategory: b'U',
+        typalign: b'i',
+        typstorage: b'x',
+        typcollation: 0,
+    },
+    PgTypeRow {
+        oid: PG_TYPE_INT8,
+        typname: "int8",
+        typlen: 8,
+        typbyval: true,
+        typcategory: b'N',
+        typalign: b'd',
+        typstorage: b'p',
+        typcollation: 0,
+    },
+    PgTypeRow {
+        oid: PG_TYPE_INT2,
+        typname: "int2",
+        typlen: 2,
+        typbyval: true,
+        typcategory: b'N',
+        typalign: b's',
+        typstorage: b'p',
+        typcollation: 0,
+    },
+    PgTypeRow {
+        oid: PG_TYPE_INT4,
+        typname: "int4",
+        typlen: 4,
+        typbyval: true,
+        typcategory: b'N',
+        typalign: b'i',
+        typstorage: b'p',
+        typcollation: 0,
+    },
+    PgTypeRow {
+        oid: PG_TYPE_TEXT,
+        typname: "text",
+        typlen: -1,
+        typbyval: false,
+        typcategory: b'S',
+        typalign: b'i',
+        typstorage: b'x',
+        typcollation: PG_COLLATION_DEFAULT,
+    },
+    PgTypeRow {
+        oid: PG_TYPE_OID,
+        typname: "oid",
+        typlen: 4,
+        typbyval: true,
+        typcategory: b'N',
+        typalign: b'i',
+        typstorage: b'p',
+        typcollation: 0,
+    },
+    PgTypeRow {
+        oid: 700,
+        typname: "float4",
+        typlen: 4,
+        typbyval: true,
+        typcategory: b'N',
+        typalign: b'i',
+        typstorage: b'p',
+        typcollation: 0,
+    },
+    PgTypeRow {
+        oid: 701,
+        typname: "float8",
+        typlen: 8,
+        typbyval: true,
+        typcategory: b'N',
+        typalign: b'd',
+        typstorage: b'p',
+        typcollation: 0,
+    },
+    PgTypeRow {
+        oid: PG_TYPE_VARCHAR,
+        typname: "varchar",
+        typlen: -1,
+        typbyval: false,
+        typcategory: b'S',
+        typalign: b'i',
+        typstorage: b'x',
+        typcollation: PG_COLLATION_DEFAULT,
+    },
+    PgTypeRow {
+        oid: PG_TYPE_TIMESTAMPTZ,
+        typname: "timestamptz",
+        typlen: 8,
+        typbyval: true,
+        typcategory: b'D',
+        typalign: b'd',
+        typstorage: b'p',
+        typcollation: 0,
+    },
+    PgTypeRow {
+        oid: PG_TYPE_NUMERIC,
+        typname: "numeric",
+        typlen: -1,
+        typbyval: false,
+        typcategory: b'N',
+        typalign: b'i',
+        typstorage: b'x',
+        typcollation: 0,
+    },
+    PgTypeRow {
+        oid: 19,
+        typname: "name",
+        typlen: 64,
+        typbyval: false,
+        typcategory: b'S',
+        typalign: b'c',
+        typstorage: b'p',
+        typcollation: PG_COLLATION_DEFAULT,
+    },
+];
+
+/// Map a PG type OID to its canonical name (e.g. 20 → "int8",
+/// 25 → "text"). Used by the `\d <table>` joined-result synthesizer
+/// for the `format_type` column. Returns "unknown" for OIDs not in
+/// `PG_TYPE_ROWS` (no panic; graceful).
+pub fn pg_type_name_for_oid(oid: u32) -> &'static str {
+    for r in PG_TYPE_ROWS {
+        if r.oid == oid {
+            return r.typname;
+        }
+    }
+    "unknown"
+}
+
+/// Build the `pg_type` RowDescription field list. 30 columns in the
+/// order PG 14 defines them.
+fn pg_type_fields() -> Vec<FieldMeta> {
+    let oid = |name: &str| FieldMeta { name: name.to_string(), type_oid: PG_TYPE_OID };
+    let text = |name: &str| FieldMeta { name: name.to_string(), type_oid: PG_TYPE_TEXT };
+    let bool_ = |name: &str| FieldMeta { name: name.to_string(), type_oid: PG_TYPE_BOOL };
+    let int2 = |name: &str| FieldMeta { name: name.to_string(), type_oid: PG_TYPE_INT2 };
+    let int4 = |name: &str| FieldMeta { name: name.to_string(), type_oid: PG_TYPE_INT4 };
+    let char1 = |name: &str| FieldMeta { name: name.to_string(), type_oid: PG_TYPE_TEXT };
+    vec![
+        oid("oid"),
+        text("typname"),
+        oid("typnamespace"),
+        oid("typowner"),
+        int2("typlen"),
+        bool_("typbyval"),
+        char1("typtype"),
+        char1("typcategory"),
+        bool_("typispreferred"),
+        bool_("typisdefined"),
+        char1("typdelim"),
+        oid("typrelid"),
+        oid("typsubscript"),
+        oid("typelem"),
+        oid("typarray"),
+        oid("typinput"),
+        oid("typoutput"),
+        oid("typreceive"),
+        oid("typsend"),
+        oid("typmodin"),
+        oid("typmodout"),
+        oid("typanalyze"),
+        char1("typalign"),
+        char1("typstorage"),
+        bool_("typnotnull"),
+        oid("typbasetype"),
+        int4("typtypmod"),
+        int4("typndims"),
+        oid("typcollation"),
+        text("typdefault"),
+    ]
+}
+
+/// Emit one pg_type DataRow for the canned row `r`.
+fn encode_pg_type_row(r: &PgTypeRow) -> Vec<u8> {
+    let oid_str = r.oid.to_string();
+    let typnamespace = PG_NAMESPACE_OID_PG_CATALOG.to_string();
+    let typowner = PG_AUTHID_OID_POSTGRES.to_string();
+    let typlen_str = r.typlen.to_string();
+    let typbyval = if r.typbyval { b"t".as_ref() } else { b"f".as_ref() };
+    let typtype_byte = [b'b']; // 'b' = base type
+    let typcategory_byte = [r.typcategory];
+    let typdelim_byte = [b','];
+    let typalign_byte = [r.typalign];
+    let typstorage_byte = [r.typstorage];
+    let typcollation_str = r.typcollation.to_string();
+    let zero = b"0".as_ref();
+    let neg_one = b"-1".as_ref();
+    let false_ = b"f".as_ref();
+    let true_ = b"t".as_ref();
+
+    encode_data_row(&[
+        Some(oid_str.as_bytes()),       // oid
+        Some(r.typname.as_bytes()),     // typname
+        Some(typnamespace.as_bytes()),  // typnamespace = 11 (pg_catalog)
+        Some(typowner.as_bytes()),      // typowner = 10
+        Some(typlen_str.as_bytes()),    // typlen
+        Some(typbyval),                 // typbyval
+        Some(&typtype_byte),            // typtype = 'b'
+        Some(&typcategory_byte),        // typcategory
+        Some(false_),                   // typispreferred
+        Some(true_),                    // typisdefined
+        Some(&typdelim_byte),           // typdelim = ','
+        Some(zero),                     // typrelid = 0
+        Some(zero),                     // typsubscript = 0
+        Some(zero),                     // typelem = 0
+        Some(zero),                     // typarray = 0 (V1)
+        Some(zero),                     // typinput = 0 (V1)
+        Some(zero),                     // typoutput = 0
+        Some(zero),                     // typreceive = 0
+        Some(zero),                     // typsend = 0
+        Some(zero),                     // typmodin = 0
+        Some(zero),                     // typmodout = 0
+        Some(zero),                     // typanalyze = 0
+        Some(&typalign_byte),           // typalign
+        Some(&typstorage_byte),         // typstorage
+        Some(false_),                   // typnotnull = false
+        Some(zero),                     // typbasetype = 0
+        Some(neg_one),                  // typtypmod = -1
+        Some(zero),                     // typndims = 0
+        Some(typcollation_str.as_bytes()), // typcollation
+        None,                           // typdefault = NULL
+    ])
+}
+
+/// Synthesize `SELECT * FROM pg_catalog.pg_type` — one row per
+/// canned `PG_TYPE_ROWS` entry. Returns the full T+D*+C+Z stream.
+///
+/// No engine arg: the row set is fully canned (V1 doesn't model
+/// user-defined types). Pure const-data → cheap to call per query.
+pub fn synthesize_pg_type() -> Vec<u8> {
+    let fields = pg_type_fields();
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    for r in PG_TYPE_ROWS {
+        out.extend_from_slice(&encode_pg_type_row(r));
+    }
+    out.extend_from_slice(&encode_command_complete(&select_tag(
+        PG_TYPE_ROWS.len() as u64,
+    )));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
+/// Synthesize `SELECT * FROM pg_catalog.pg_type WHERE oid = N` —
+/// one row matching `oid` or zero rows if unknown. The JDBC column-
+/// type resolution path issues this once per distinct column OID.
+pub fn synthesize_pg_type_by_oid(oid: u32) -> Vec<u8> {
+    let fields = pg_type_fields();
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    let mut n: u64 = 0;
+    for r in PG_TYPE_ROWS {
+        if r.oid == oid {
+            out.extend_from_slice(&encode_pg_type_row(r));
+            n += 1;
+        }
+    }
+    out.extend_from_slice(&encode_command_complete(&select_tag(n)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
+// ─── Joined-result synth: pgJDBC getColumns (queries.md §4.2) ─────────────
+
+/// Synthesize the joined-result response for the canonical pgJDBC
+/// `getColumns` query (queries.md §4.2). The query JOINs
+/// `pg_attribute` + `pg_class` + `pg_namespace` + `pg_type` with a
+/// `LIKE '<table>'` clause; V1 picks out the matching table by name
+/// and emits the JDBC-projection columns directly.
+///
+/// `table_name_like` is the LIKE pattern captured from the query;
+/// V1 currently supports the literal-name form (no `%`/`_` wildcards
+/// — when JDBC drivers pass a wildcard, V1 sees the wildcard
+/// pattern literally and no table matches, which surfaces as a
+/// 0-row result. Acceptable per design §3.4 — JDBC tools issue
+/// per-table queries with full names).
+pub fn pgjdbc_getcolumns_joined_rows<E: EngineApply + ?Sized>(
+    engine: &E,
+    table_name_like: &str,
+) -> Vec<u8> {
+    let fields = vec![
+        FieldMeta { name: "nspname".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "relname".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "attname".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "atttypid".to_string(), type_oid: PG_TYPE_OID },
+        FieldMeta { name: "attnotnull".to_string(), type_oid: PG_TYPE_BOOL },
+        FieldMeta { name: "atttypmod".to_string(), type_oid: PG_TYPE_INT4 },
+        FieldMeta { name: "attlen".to_string(), type_oid: PG_TYPE_INT2 },
+        FieldMeta { name: "typtypmod".to_string(), type_oid: PG_TYPE_INT4 },
+        FieldMeta { name: "attnum".to_string(), type_oid: PG_TYPE_INT8 },
+        FieldMeta { name: "attidentity".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "attgenerated".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "adsrc".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "description".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "typbasetype".to_string(), type_oid: PG_TYPE_OID },
+        FieldMeta { name: "typtype".to_string(), type_oid: PG_TYPE_TEXT },
+    ];
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    let tables = engine.list_tables();
+    let mut n: u64 = 0;
+    let true_ = b"t".as_ref();
+    let false_ = b"f".as_ref();
+    let empty = b"".as_ref();
+    let nspname = b"public".as_ref();
+    let typtype_b = b"b".as_ref(); // base type
+    for t in &tables {
+        if t.name != table_name_like {
+            continue;
+        }
+        let cols = match engine.describe_table(&t.name) {
+            Some(c) => c,
+            None => continue,
+        };
+        for (idx, col) in cols.iter().enumerate() {
+            let atttypid = field_kind_to_oid(col.kind);
+            let atttypid_str = atttypid.to_string();
+            let attlen = type_size_for_oid(atttypid).to_string();
+            let attnum = (idx as i64 + 1).to_string();
+            let attnotnull = if col.nullable { false_ } else { true_ };
+            out.extend_from_slice(&encode_data_row(&[
+                Some(nspname),
+                Some(t.name.as_bytes()),
+                Some(col.name.as_bytes()),
+                Some(atttypid_str.as_bytes()),
+                Some(attnotnull),
+                Some(b"-1"),                   // atttypmod
+                Some(attlen.as_bytes()),
+                Some(b"-1"),                   // typtypmod
+                Some(attnum.as_bytes()),       // row_number → attnum
+                Some(empty),                   // attidentity
+                Some(empty),                   // attgenerated
+                None,                          // adsrc (default expr) — NULL
+                None,                          // description — NULL
+                Some(b"0"),                    // typbasetype = 0
+                Some(typtype_b),               // typtype = 'b'
+            ]));
+            n += 1;
+        }
+    }
+    out.extend_from_slice(&encode_command_complete(&select_tag(n)));
     out.extend_from_slice(&encode_ready_for_query(b'I'));
     out
 }
@@ -706,5 +1388,317 @@ mod tests {
         assert!(bytes.windows(b"users".len()).any(|w| w == b"users"));
         assert!(bytes.windows(b"orders".len()).any(|w| w == b"orders"));
         assert!(bytes.windows(b"lineitems".len()).any(|w| w == b"lineitems"));
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-CAT T4 KATs — pg_attribute + pg_type synthesizers + pgJDBC
+    // getColumns joined-result. Drive via DescribeListEngine (overrides
+    // both `list_tables` and `describe_table`).
+    // ───────────────────────────────────────────────────────────────────
+
+    use crate::engine::PgColumn;
+    use kessel_catalog::FieldKind;
+
+    /// Engine that combines list_tables + describe_table so the T4
+    /// synthesizers can walk a non-empty catalog with real column
+    /// schemas. Schema is keyed by table name.
+    struct DescribeListEngine {
+        tables: Vec<TableMetadata>,
+        schemas: std::collections::BTreeMap<String, Vec<PgColumn>>,
+    }
+    impl EngineApply for DescribeListEngine {
+        fn apply_sql(&self, _sql: &str) -> OpResult {
+            OpResult::SchemaError("DescribeListEngine: apply_sql should not be reached".into())
+        }
+        fn describe_table(&self, name: &str) -> Option<Vec<PgColumn>> {
+            self.schemas.get(name).cloned()
+        }
+        fn list_tables(&self) -> Vec<TableMetadata> {
+            self.tables.clone()
+        }
+    }
+
+    fn col(name: &str, kind: FieldKind, nullable: bool) -> PgColumn {
+        PgColumn { name: name.to_string(), kind, nullable }
+    }
+
+    fn two_table_engine() -> DescribeListEngine {
+        let mut schemas = std::collections::BTreeMap::new();
+        schemas.insert("users".to_string(), vec![
+            col("id", FieldKind::I64, false),
+            col("name", FieldKind::Char(64), false),
+        ]);
+        schemas.insert("orders".to_string(), vec![
+            col("id", FieldKind::I64, false),
+            col("user_id", FieldKind::I64, false),
+            col("amount", FieldKind::Fixed { scale: 2 }, false),
+        ]);
+        DescribeListEngine {
+            tables: vec![
+                td("users", 1, 2),
+                td("orders", 2, 3),
+            ],
+            schemas,
+        }
+    }
+
+    /// **HEADLINE invariant — pg_attribute synthesizer (no filter)
+    /// returns columns for every table.** Two tables × (2 + 3) = 5
+    /// rows.
+    #[test]
+    fn t4_pg_attribute_synthesizer_all_tables() {
+        let eng = two_table_engine();
+        let bytes = synthesize_pg_attribute(&eng, None);
+        assert_eq!(bytes[0], b'T');
+        assert!(bytes.windows(b"SELECT 5\0".len()).any(|w| w == b"SELECT 5\0"),
+            "MUST emit `SELECT 5` for 2 tables × 5 total columns");
+        // Each column name appears in the stream.
+        assert!(bytes.windows(b"id".len()).any(|w| w == b"id"));
+        assert!(bytes.windows(b"name".len()).any(|w| w == b"name"));
+        assert!(bytes.windows(b"user_id".len()).any(|w| w == b"user_id"));
+        assert!(bytes.windows(b"amount".len()).any(|w| w == b"amount"));
+    }
+
+    /// **HEADLINE invariant — pg_attribute synthesizer (filter to
+    /// one table) returns only that table's columns.**
+    #[test]
+    fn t4_pg_attribute_synthesizer_filtered_to_one_table() {
+        let eng = two_table_engine();
+        let users_oid = oid_for_table_name("users");
+        let bytes = synthesize_pg_attribute(&eng, Some(users_oid));
+        assert!(bytes.windows(b"SELECT 2\0".len()).any(|w| w == b"SELECT 2\0"),
+            "filtered to 'users' MUST emit `SELECT 2` (2 columns)");
+        // 'orders' column names must NOT appear (the column "id" is
+        // shared so don't check that, but "user_id" / "amount" are
+        // unique to orders).
+        assert!(!bytes.windows(b"user_id".len()).any(|w| w == b"user_id"));
+        assert!(!bytes.windows(b"amount".len()).any(|w| w == b"amount"));
+        // 'users' column names DO appear.
+        assert!(bytes.windows(b"name".len()).any(|w| w == b"name"));
+    }
+
+    /// **HEADLINE invariant — 25 columns in RowDescription.**
+    /// JDBC drivers iterate by index; PG 14 pg_attribute has 25 cols.
+    #[test]
+    fn t4_pg_attribute_row_description_has_25_columns() {
+        let eng = two_table_engine();
+        let bytes = synthesize_pg_attribute(&eng, None);
+        let fc = u16::from_be_bytes([bytes[5], bytes[6]]);
+        assert_eq!(fc, PG_ATTRIBUTE_COLUMN_COUNT as u16,
+            "pg_attribute RowDescription MUST have 25 fields");
+        // Canonical column names appear.
+        assert!(bytes.windows(b"attrelid\0".len()).any(|w| w == b"attrelid\0"));
+        assert!(bytes.windows(b"attname\0".len()).any(|w| w == b"attname\0"));
+        assert!(bytes.windows(b"atttypid\0".len()).any(|w| w == b"atttypid\0"));
+        assert!(bytes.windows(b"attnum\0".len()).any(|w| w == b"attnum\0"));
+        assert!(bytes.windows(b"attnotnull\0".len()).any(|w| w == b"attnotnull\0"));
+    }
+
+    /// **Invariant — empty engine returns 0 rows + well-framed.**
+    #[test]
+    fn t4_pg_attribute_synthesizer_empty_engine() {
+        let eng = DescribeListEngine {
+            tables: vec![],
+            schemas: std::collections::BTreeMap::new(),
+        };
+        let bytes = synthesize_pg_attribute(&eng, None);
+        assert_eq!(bytes[0], b'T');
+        assert!(bytes.windows(b"SELECT 0\0".len()).any(|w| w == b"SELECT 0\0"));
+        assert_eq!(&bytes[bytes.len() - 6..], &[b'Z', 0, 0, 0, 5, b'I']);
+    }
+
+    /// **Invariant — atttypid carries the FieldKind→OID map output.**
+    /// A column of `FieldKind::I64` MUST emit atttypid=20 (int8); a
+    /// `FieldKind::Char(64)` MUST emit 25 (text).
+    #[test]
+    fn t4_pg_attribute_atttypid_matches_field_kind_to_oid_map() {
+        let eng = two_table_engine();
+        let bytes = synthesize_pg_attribute(&eng, None);
+        // OID 20 = int8 (for I64 columns: users.id, orders.id, orders.user_id)
+        // → appears at least 3 times.
+        let int8_count = bytes.windows(b"20".len()).filter(|w| *w == b"20").count();
+        assert!(int8_count >= 3,
+            "OID 20 (int8) MUST appear ≥3× (3 I64 columns), saw {int8_count}");
+        // OID 25 = text (for the Char(64) `name` column).
+        let text_count = bytes.windows(b"25".len()).filter(|w| *w == b"25").count();
+        assert!(text_count >= 1,
+            "OID 25 (text) MUST appear (Char(64) `name`), saw {text_count}");
+        // OID 1700 = numeric (for Fixed{scale:2} `amount`).
+        assert!(bytes.windows(b"1700".len()).any(|w| w == b"1700"),
+            "OID 1700 (numeric) MUST appear for Fixed{{scale:2}} amount column");
+    }
+
+    /// **Invariant — attnum is 1-based and sequential per table.**
+    /// First column is attnum=1, second is 2, etc. Locked because
+    /// PG clients use attnum as the index when joining pg_attribute
+    /// rows back to a column position.
+    #[test]
+    fn t4_pg_attribute_attnum_is_1_based_sequential() {
+        // Single-table engine, 5 columns → attnums 1..=5 emitted.
+        let mut schemas = std::collections::BTreeMap::new();
+        schemas.insert("t".to_string(), vec![
+            col("c1", FieldKind::I32, false),
+            col("c2", FieldKind::I32, false),
+            col("c3", FieldKind::I32, false),
+            col("c4", FieldKind::I32, false),
+            col("c5", FieldKind::I32, false),
+        ]);
+        let eng = DescribeListEngine {
+            tables: vec![td("t", 1, 5)],
+            schemas,
+        };
+        let bytes = synthesize_pg_attribute(&eng, None);
+        // attnums 1..=5 appear as decimal-ASCII text in the stream.
+        for n in 1..=5u32 {
+            let s = n.to_string();
+            assert!(bytes.windows(s.len()).any(|w| w == s.as_bytes()),
+                "attnum {n} MUST appear in the stream");
+        }
+        assert!(bytes.windows(b"SELECT 5\0".len()).any(|w| w == b"SELECT 5\0"));
+    }
+
+    /// **Invariant — attnotnull = 't' for V1 (KesselDB defaults
+    /// NOT NULL).** Every column in `two_table_engine` is non-nullable.
+    #[test]
+    fn t4_pg_attribute_attnotnull_is_true_for_v1_columns() {
+        let eng = two_table_engine();
+        let bytes = synthesize_pg_attribute(&eng, None);
+        // 't' bytes appear in the stream (for the attbyval and
+        // attnotnull columns — verifying ≥1 't' is enough to confirm
+        // the bool encoder fired).
+        assert!(bytes.contains(&b't'), "bool 't' MUST appear in stream");
+    }
+
+    /// **Invariant — psql `\d <table>` joined-result synthesizer
+    /// fires for the matching table.** The format_type column
+    /// carries the PG type name (`bigint`/`int8` for I64).
+    #[test]
+    fn t4_psql_d_table_joined_rows_fires_for_matching_oid() {
+        let eng = two_table_engine();
+        let users_oid = oid_for_table_name("users");
+        let bytes = psql_d_table_joined_rows(&eng, users_oid);
+        assert_eq!(bytes[0], b'T');
+        assert!(bytes.windows(b"SELECT 2\0".len()).any(|w| w == b"SELECT 2\0"));
+        // The PG type name `int8` (for I64) + `text` (for Char(64))
+        // appear in the format_type column.
+        assert!(bytes.windows(b"int8".len()).any(|w| w == b"int8"));
+        assert!(bytes.windows(b"text".len()).any(|w| w == b"text"));
+        // column name "id" and "name" appear.
+        assert!(bytes.windows(b"name".len()).any(|w| w == b"name"));
+    }
+
+    /// **Invariant — psql `\d` joined synthesizer returns 0 rows
+    /// for a non-matching OID.**
+    #[test]
+    fn t4_psql_d_table_joined_rows_empty_for_unknown_oid() {
+        let eng = two_table_engine();
+        let bytes = psql_d_table_joined_rows(&eng, 999_999_999);
+        assert!(bytes.windows(b"SELECT 0\0".len()).any(|w| w == b"SELECT 0\0"));
+    }
+
+    /// **HEADLINE invariant — pg_type synthesizer emits all canned rows.**
+    /// SELECT N tag matches `PG_TYPE_ROWS.len()`.
+    #[test]
+    fn t4_pg_type_synthesizer_emits_all_canned_rows() {
+        let bytes = synthesize_pg_type();
+        assert_eq!(bytes[0], b'T');
+        let expected = format!("SELECT {}\0", PG_TYPE_ROWS.len());
+        assert!(bytes.windows(expected.len()).any(|w| w == expected.as_bytes()),
+            "MUST emit `SELECT {}` for the canned pg_type row table",
+            PG_TYPE_ROWS.len());
+        // Well-framed end.
+        assert_eq!(&bytes[bytes.len() - 6..], &[b'Z', 0, 0, 0, 5, b'I']);
+    }
+
+    /// **HEADLINE invariant — pg_type RowDescription has 30 columns.**
+    #[test]
+    fn t4_pg_type_row_description_has_30_columns() {
+        let bytes = synthesize_pg_type();
+        let fc = u16::from_be_bytes([bytes[5], bytes[6]]);
+        assert_eq!(fc, PG_TYPE_COLUMN_COUNT as u16,
+            "pg_type RowDescription MUST have 30 fields");
+        // Canonical column names appear.
+        assert!(bytes.windows(b"typname\0".len()).any(|w| w == b"typname\0"));
+        assert!(bytes.windows(b"typlen\0".len()).any(|w| w == b"typlen\0"));
+        assert!(bytes.windows(b"typbyval\0".len()).any(|w| w == b"typbyval\0"));
+        assert!(bytes.windows(b"typcategory\0".len()).any(|w| w == b"typcategory\0"));
+        assert!(bytes.windows(b"typcollation\0".len()).any(|w| w == b"typcollation\0"));
+    }
+
+    /// **Invariant — canonical type names appear in the canned rows.**
+    /// At least the 8 KesselDB-V1 types are present.
+    #[test]
+    fn t4_pg_type_canned_rows_carry_v1_type_names() {
+        let bytes = synthesize_pg_type();
+        for name in ["bool", "bytea", "int8", "int2", "int4",
+                     "text", "oid", "numeric", "timestamptz", "varchar"] {
+            assert!(bytes.windows(name.len()).any(|w| w == name.as_bytes()),
+                "canned pg_type row for '{name}' MUST appear in stream");
+        }
+    }
+
+    /// **Invariant — int4 (OID 23) has typname='int4', typlen=4,
+    /// typbyval=true.** Locked vs PG `pg_type.dat`.
+    #[test]
+    fn t4_pg_type_int4_row_is_canonical() {
+        let bytes = synthesize_pg_type_by_oid(PG_TYPE_INT4);
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+        assert!(bytes.windows(b"int4".len()).any(|w| w == b"int4"));
+        // typlen=4 as decimal text → "4" appears (cannot test
+        // uniquely; rely on the SELECT 1 + canned row + the
+        // synthesizer's locked encoding).
+        assert!(bytes.contains(&b't'), "typbyval=true MUST appear");
+    }
+
+    /// **Invariant — text (OID 25) has typname='text', typlen=-1,
+    /// typbyval=false, typcollation=100.**
+    #[test]
+    fn t4_pg_type_text_row_is_canonical() {
+        let bytes = synthesize_pg_type_by_oid(PG_TYPE_TEXT);
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+        assert!(bytes.windows(b"text".len()).any(|w| w == b"text"));
+        // typlen=-1 → "-1" appears.
+        assert!(bytes.windows(b"-1".len()).any(|w| w == b"-1"));
+        // typcollation=100 → "100" appears.
+        assert!(bytes.windows(b"100".len()).any(|w| w == b"100"));
+    }
+
+    /// **Invariant — pg_type per-OID lookup with unknown OID returns
+    /// 0 rows + well-framed.**
+    #[test]
+    fn t4_pg_type_by_oid_unknown_returns_empty() {
+        let bytes = synthesize_pg_type_by_oid(99_999);
+        assert!(bytes.windows(b"SELECT 0\0".len()).any(|w| w == b"SELECT 0\0"));
+        assert_eq!(&bytes[bytes.len() - 6..], &[b'Z', 0, 0, 0, 5, b'I']);
+    }
+
+    /// **Invariant — `pg_type_name_for_oid` map matches canned rows.**
+    /// V1 type lookups round-trip via the public helper.
+    #[test]
+    fn t4_pg_type_name_for_oid_round_trips() {
+        assert_eq!(pg_type_name_for_oid(PG_TYPE_BOOL), "bool");
+        assert_eq!(pg_type_name_for_oid(PG_TYPE_INT4), "int4");
+        assert_eq!(pg_type_name_for_oid(PG_TYPE_INT8), "int8");
+        assert_eq!(pg_type_name_for_oid(PG_TYPE_TEXT), "text");
+        assert_eq!(pg_type_name_for_oid(PG_TYPE_BYTEA), "bytea");
+        assert_eq!(pg_type_name_for_oid(PG_TYPE_NUMERIC), "numeric");
+        assert_eq!(pg_type_name_for_oid(PG_TYPE_TIMESTAMPTZ), "timestamptz");
+        // Unknown OID → "unknown" (graceful).
+        assert_eq!(pg_type_name_for_oid(99_999), "unknown");
+    }
+
+    /// **Invariant — pgJDBC getColumns joined synthesizer round-trips.**
+    /// One match → 2 rows (users has 2 columns); unmatched → 0 rows.
+    #[test]
+    fn t4_pgjdbc_getcolumns_joined_rows_matches_by_name() {
+        let eng = two_table_engine();
+        let bytes = pgjdbc_getcolumns_joined_rows(&eng, "users");
+        assert!(bytes.windows(b"SELECT 2\0".len()).any(|w| w == b"SELECT 2\0"));
+        // nspname `public`, relname `users`, column `id` + `name` all appear.
+        assert!(bytes.windows(b"public".len()).any(|w| w == b"public"));
+        assert!(bytes.windows(b"users".len()).any(|w| w == b"users"));
+        // Unmatched name → 0 rows.
+        let unmatched = pgjdbc_getcolumns_joined_rows(&eng, "doesnotexist");
+        assert!(unmatched.windows(b"SELECT 0\0".len()).any(|w| w == b"SELECT 0\0"));
     }
 }

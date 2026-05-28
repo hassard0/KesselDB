@@ -259,6 +259,18 @@ pub fn catalog_query_hook<E: EngineApply + ?Sized>(
     if let Some(name) = extract_psql_d_step1_relname(&normalized) {
         return Some(synthesize::psql_d_step1_oid_lookup(engine, &name));
     }
+    // T8 (real-psql): psql `\d <name>` STEP 2 — the per-OID relation
+    // attribute summary. psql ships a 15-column projection from
+    // `pg_class c LEFT JOIN pg_am am` filtered by `c.oid = '<oid>'`.
+    // The query contains `::pg_catalog.regtype::pg_catalog.text` cast
+    // syntax that KesselDB's SQL parser rejects with `unexpected char
+    // ':'`. Synthesizer emits one canned row of `pg_class` defaults
+    // (relchecks=0, relkind='r', relhasindex='f', etc.) — psql uses
+    // these to drive the "Table" header text, the "Indexes:" /
+    // "Foreign-key constraints:" section toggles, and so on.
+    if let Some(oid) = extract_psql_d_step2_oid(&normalized) {
+        return Some(synthesize::psql_d_step2_relsummary(engine, oid));
+    }
     // T8 (real-psql): psql `\dn` schema-list query. Uses the negated
     // regex operator `n.nspname !~ '^pg_'` — same parser-rejection
     // problem as `\d <name>`. Always returns the public schema (V1
@@ -756,6 +768,54 @@ fn extract_psql_d_step1_relname(normalized: &str) -> Option<String> {
         return None;
     }
     Some(raw_name.to_string())
+}
+
+/// SP-PG-CAT T8 (real-psql) — recognize psql `\d <name>` STEP 2.
+///
+/// After the OID lookup (step 1), psql ships a 15-column projection
+/// from `pg_class c LEFT JOIN pg_am am` filtered by `c.oid = '<oid>'`
+/// to drive the table-summary header (relkind / relpersistence /
+/// "Indexes:" toggle / etc.). The query body looks like:
+///
+/// ```text
+/// SELECT c.relchecks, c.relkind, c.relhasindex, c.relhasrules,
+///        c.relhastriggers, c.relrowsecurity, c.relforcerowsecurity,
+///        false AS relhasoids, c.relispartition, '',
+///        c.reltablespace,
+///        CASE WHEN c.reloftype = 0 THEN ''
+///             ELSE c.reloftype::pg_catalog.regtype::pg_catalog.text END,
+///        c.relpersistence, c.relreplident, am.amname
+///   FROM pg_catalog.pg_class c
+///        LEFT JOIN pg_catalog.pg_class tc ON (c.reltoastrelid = tc.oid)
+///        LEFT JOIN pg_catalog.pg_am am ON (c.relam = am.oid)
+///  WHERE c.oid = '<oid>';
+/// ```
+///
+/// The `::pg_catalog.regtype::pg_catalog.text` cast syntax KesselDB's
+/// SQL parser rejects with `unexpected char ':'`. Returns the OID if
+/// the matcher fires. Anchors on the distinctive 15-column projection
+/// + `from pg_catalog.pg_class c left join pg_catalog.pg_class tc`
+/// fixture to avoid false matches on other `c.oid = ...` queries.
+fn extract_psql_d_step2_oid(normalized: &str) -> Option<u32> {
+    // Required leading fixture (the 15-column projection's first 3
+    // canonical columns — psql ships them in this exact order across
+    // PG 12..16).
+    let leading = "select c.relchecks, c.relkind, c.relhasindex";
+    if !normalized.starts_with(leading) {
+        return None;
+    }
+    // Required JOIN fixture — the distinctive double LEFT JOIN
+    // against `pg_class tc` (the toast relation) + `pg_am am`.
+    let core = "from pg_catalog.pg_class c left join pg_catalog.pg_class tc";
+    if !normalized.contains(core) {
+        return None;
+    }
+    // OID lives in `where c.oid = '<oid>'` (quoted per psql).
+    let oid_marker = "where c.oid = '";
+    let pos = normalized.find(oid_marker)?;
+    let after = &normalized[pos + oid_marker.len()..];
+    let end = after.find('\'')?;
+    after[..end].parse::<u32>().ok()
 }
 
 /// SP-PG-CAT T8 (real-psql) — recognize the canonical psql `\dn`
@@ -1965,6 +2025,61 @@ mod tests {
             where c.relname operator(pg_catalog.~) '^(users)$' collate pg_catalog.default \
             and pg_catalog.pg_table_is_visible(c.oid) order by 2, 3";
         assert_eq!(extract_psql_d_step1_relname(bare).as_deref(), Some("users"));
+    }
+
+    /// **HEADLINE — psql `\d <name>` STEP 2 (pg_class summary) hits
+    /// the hook.** The 15-column projection includes
+    /// `c.reloftype::pg_catalog.regtype::pg_catalog.text` which
+    /// KesselDB's SQL parser rejects with `unexpected char ':'`.
+    #[test]
+    fn t8_psql_d_step2_query_fires() {
+        let eng = t6_engine();
+        // The exact wire SQL psql 16.14 ships for the per-OID step
+        // of `\d users`. The OID is the FNV-1a hash of "users" (the
+        // first table in t6_engine).
+        let users_oid = synthesize::oid_for_table_name("users");
+        let q = format!(
+            "SELECT c.relchecks, c.relkind, c.relhasindex, c.relhasrules, \
+             c.relhastriggers, c.relrowsecurity, c.relforcerowsecurity, \
+             false AS relhasoids, c.relispartition, '', c.reltablespace, \
+             CASE WHEN c.reloftype = 0 THEN '' \
+             ELSE c.reloftype::pg_catalog.regtype::pg_catalog.text END, \
+             c.relpersistence, c.relreplident, am.amname \
+             FROM pg_catalog.pg_class c \
+             LEFT JOIN pg_catalog.pg_class tc ON (c.reltoastrelid = tc.oid) \
+             LEFT JOIN pg_catalog.pg_am am ON (c.relam = am.oid) \
+             WHERE c.oid = '{users_oid}';",
+        );
+        let res = catalog_query_hook(&q, &eng);
+        assert!(res.is_some(),
+            "psql \\d <name> step-2 query MUST hit the hook (was: ':'-err)");
+        let bytes = res.unwrap();
+        assert_eq!(bytes[0], b'T');
+        // One row for the matched users table.
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"),
+            "step-2 MUST emit exactly one row for a valid OID");
+        // Locked: relkind='r', amname='heap' for an ordinary table.
+        assert!(bytes.windows(b"heap".len()).any(|w| w == b"heap"));
+    }
+
+    /// **`\d <name>` step-2 returns 0 rows for an unknown OID.** psql
+    /// then prints "No matching relations found." and exits.
+    #[test]
+    fn t8_psql_d_step2_query_zero_rows_for_unknown_oid() {
+        let eng = t6_engine();
+        let q = "SELECT c.relchecks, c.relkind, c.relhasindex, c.relhasrules, \
+             c.relhastriggers, c.relrowsecurity, c.relforcerowsecurity, \
+             false AS relhasoids, c.relispartition, '', c.reltablespace, \
+             CASE WHEN c.reloftype = 0 THEN '' \
+             ELSE c.reloftype::pg_catalog.regtype::pg_catalog.text END, \
+             c.relpersistence, c.relreplident, am.amname \
+             FROM pg_catalog.pg_class c \
+             LEFT JOIN pg_catalog.pg_class tc ON (c.reltoastrelid = tc.oid) \
+             LEFT JOIN pg_catalog.pg_am am ON (c.relam = am.oid) \
+             WHERE c.oid = '999999999';";
+        let res = catalog_query_hook(q, &eng).expect("matches");
+        assert_eq!(res[0], b'T');
+        assert!(res.windows(b"SELECT 0\0".len()).any(|w| w == b"SELECT 0\0"));
     }
 
     /// **HEADLINE — psql `\dn` schema-list query hits the hook.**

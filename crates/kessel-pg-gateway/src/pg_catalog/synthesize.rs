@@ -1903,6 +1903,94 @@ pub fn psql_d_step1_oid_lookup<E: EngineApply + ?Sized>(
     out
 }
 
+/// SP-PG-CAT T8 (real-psql) — psql `\d <name>` STEP 2.
+///
+/// Synthesize the 15-column relation-summary row psql expects for the
+/// per-OID `pg_class c LEFT JOIN pg_am am` query (mod.rs
+/// `extract_psql_d_step2_oid`). The output drives psql's "Table" /
+/// "Indexes:" / "Foreign-key constraints:" header text. V1 returns
+/// the canonical `pg_class` defaults for an ordinary KesselDB table
+/// — relkind='r', persistence='p', replication='d', amname='heap',
+/// no indexes / rules / triggers / row-security / partitions.
+///
+/// 0 rows if the OID doesn't match any live table — psql then prints
+/// "No matching relations found." and exits, matching real PG.
+///
+/// Columns (in projection order, matching psql's SELECT):
+/// 1.  relchecks       (int2)  — 0
+/// 2.  relkind         (char)  — 'r' (ordinary table)
+/// 3.  relhasindex     (bool)  — 'f'  (V1 doesn't track engine-side)
+/// 4.  relhasrules     (bool)  — 'f'
+/// 5.  relhastriggers  (bool)  — 'f'
+/// 6.  relrowsecurity  (bool)  — 'f'
+/// 7.  relforcerowsec  (bool)  — 'f'
+/// 8.  relhasoids      (bool)  — 'f'  (PG 12+ always false)
+/// 9.  relispartition  (bool)  — 'f'
+/// 10. ''                       — empty literal psql submits
+/// 11. reltablespace   (oid)   — 0
+/// 12. (CASE ...)               — '' (V1: no typed tables)
+/// 13. relpersistence  (char)  — 'p' (permanent)
+/// 14. relreplident    (char)  — 'd' (default)
+/// 15. amname          (text)  — 'heap'
+pub fn psql_d_step2_relsummary<E: EngineApply + ?Sized>(
+    engine: &E,
+    table_oid: u32,
+) -> Vec<u8> {
+    let fields = vec![
+        FieldMeta { name: "relchecks".to_string(), type_oid: PG_TYPE_INT2 },
+        FieldMeta { name: "relkind".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "relhasindex".to_string(), type_oid: PG_TYPE_BOOL },
+        FieldMeta { name: "relhasrules".to_string(), type_oid: PG_TYPE_BOOL },
+        FieldMeta { name: "relhastriggers".to_string(), type_oid: PG_TYPE_BOOL },
+        FieldMeta { name: "relrowsecurity".to_string(), type_oid: PG_TYPE_BOOL },
+        FieldMeta { name: "relforcerowsecurity".to_string(), type_oid: PG_TYPE_BOOL },
+        FieldMeta { name: "relhasoids".to_string(), type_oid: PG_TYPE_BOOL },
+        FieldMeta { name: "relispartition".to_string(), type_oid: PG_TYPE_BOOL },
+        FieldMeta { name: "?column?".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "reltablespace".to_string(), type_oid: PG_TYPE_OID },
+        FieldMeta { name: "?column?".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "relpersistence".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "relreplident".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "amname".to_string(), type_oid: PG_TYPE_TEXT },
+    ];
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    let tables = engine.list_tables();
+    let mut n: u64 = 0;
+    let empty = b"".as_ref();
+    let false_ = b"f".as_ref();
+    let zero = b"0".as_ref();
+    for t in &tables {
+        if oid_for_table_name(&t.name) != table_oid {
+            continue;
+        }
+        if !matches!(t.kind, TableKind::Ordinary) {
+            continue;
+        }
+        out.extend_from_slice(&encode_data_row(&[
+            Some(zero),         // relchecks = 0
+            Some(b"r"),         // relkind = 'r' (ordinary)
+            Some(false_),       // relhasindex
+            Some(false_),       // relhasrules
+            Some(false_),       // relhastriggers
+            Some(false_),       // relrowsecurity
+            Some(false_),       // relforcerowsecurity
+            Some(false_),       // relhasoids
+            Some(false_),       // relispartition
+            Some(empty),        // '' literal
+            Some(zero),         // reltablespace = 0
+            Some(empty),        // reloftype CASE = ''
+            Some(b"p"),         // relpersistence = 'p'
+            Some(b"d"),         // relreplident = 'd'
+            Some(b"heap"),      // amname = 'heap'
+        ]));
+        n += 1;
+    }
+    out.extend_from_slice(&encode_command_complete(&select_tag(n)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
 /// SP-PG-CAT T8 (real-psql) — psql `\dn` schema-list.
 ///
 /// Synthesize the canonical 2-column ("Name", "Owner") response for

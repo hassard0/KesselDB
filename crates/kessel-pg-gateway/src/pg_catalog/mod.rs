@@ -115,10 +115,23 @@ pub fn catalog_query_hook<E: EngineApply + ?Sized>(
     engine: &E,
 ) -> Option<Vec<u8>> {
     let normalized = normalize_for_match(sql);
+    // SP-PG-CAT T7 — `SHOW <name>` recognizer (separate top-level SQL
+    // statement, not a function call — PG treats it specially). Checked
+    // BEFORE the SELECT fast-reject because SHOW isn't a SELECT.
+    if normalized.starts_with("show ") || normalized == "show all" {
+        return synthesize::synthesize_helper_function(&normalized);
+    }
     // Fast reject — only SELECT statements hit pg_catalog. Saves us
     // from running the pattern table on every INSERT / UPDATE / DDL.
     if !normalized.starts_with("select") {
         return None;
+    }
+    // SP-PG-CAT T7 — single-call helper-function recognizer (version(),
+    // current_database(), pg_get_userbyid(N), …). Checked BEFORE the
+    // table-pattern matchers because helpers are simpler shapes and
+    // tools issue them as the first probe on connect (queries.md §6).
+    if let Some(bytes) = synthesize::synthesize_helper_function(&normalized) {
+        return Some(bytes);
     }
     // T1: `SELECT * FROM pg_catalog.pg_namespace` (canned 3-row).
     if matches_pg_namespace_select_star(&normalized) {
@@ -155,6 +168,36 @@ pub fn catalog_query_hook<E: EngineApply + ?Sized>(
     // T4: pgJDBC `getColumns` (queries.md §4.2 — large JOIN).
     if let Some(name) = extract_pgjdbc_getcolumns_relname(&normalized) {
         return Some(synthesize::pgjdbc_getcolumns_joined_rows(engine, &name));
+    }
+    // T5: `SELECT * FROM pg_catalog.pg_index` (all indexes).
+    if matches_pg_index_select_star(&normalized) {
+        return Some(synthesize::synthesize_pg_index(engine, None));
+    }
+    // T5: `SELECT * FROM pg_catalog.pg_index WHERE indrelid = N`
+    // (psql `\d <table>` step 3 + the per-table filter form).
+    if let Some(oid) = extract_indrelid_filter(&normalized) {
+        return Some(synthesize::synthesize_pg_index(engine, Some(oid)));
+    }
+    // T5: psql `\d <table>` step 3 — canonical JOIN against pg_class
+    // + pg_index + LEFT JOIN pg_constraint (queries.md §1.6). Anchors
+    // on the unique fixture and extracts the table OID from the
+    // `c.oid = '<oid>'` clause.
+    if let Some(oid) = extract_psql_d_index_step_oid(&normalized) {
+        return Some(synthesize::synthesize_pg_index(engine, Some(oid)));
+    }
+    // T5: pgJDBC `getIndexInfo` (queries.md §4.3 — large JOIN with
+    // `ct.relname = '<table>'`).
+    if let Some(name) = extract_pgjdbc_getindexinfo_relname(&normalized) {
+        return Some(synthesize::pgjdbc_getindexinfo_joined_rows(engine, &name));
+    }
+    // T5: `SELECT * FROM pg_catalog.pg_constraint` (all constraints).
+    if matches_pg_constraint_select_star(&normalized) {
+        return Some(synthesize::synthesize_pg_constraint(engine, None));
+    }
+    // T5: `SELECT * FROM pg_catalog.pg_constraint WHERE conrelid = N`
+    // (psql `\d <table>` constraint-section + per-table filter form).
+    if let Some(oid) = extract_conrelid_filter(&normalized) {
+        return Some(synthesize::synthesize_pg_constraint(engine, Some(oid)));
     }
     None
 }
@@ -390,6 +433,114 @@ fn extract_pgjdbc_getcolumns_relname(normalized: &str) -> Option<String> {
             if let Some(end) = after.find('\'') {
                 return Some(after[..end].to_string());
             }
+        }
+    }
+    None
+}
+
+/// SP-PG-CAT T5 — recognize `SELECT * FROM pg_catalog.pg_index`
+/// (qualified + unqualified). Tolerates a trailing WHERE clause that
+/// DOESN'T look like the parameterized `indrelid = N` form (that one
+/// is handled by `extract_indrelid_filter`).
+fn matches_pg_index_select_star(normalized: &str) -> bool {
+    normalized == "select * from pg_catalog.pg_index"
+        || normalized == "select * from pg_index"
+}
+
+/// SP-PG-CAT T5 — recognize the parameterized `SELECT * FROM
+/// pg_catalog.pg_index WHERE indrelid = N` shape. Returns the OID
+/// if matched. Common psql `\d <table>` step 3 + pgJDBC
+/// `getIndexInfo` paths come here.
+fn extract_indrelid_filter(normalized: &str) -> Option<u32> {
+    let prefixes = [
+        "select * from pg_catalog.pg_index where indrelid = ",
+        "select * from pg_index where indrelid = ",
+        "select * from pg_catalog.pg_index where i.indrelid = ",
+        "select * from pg_index where i.indrelid = ",
+    ];
+    for p in prefixes {
+        if let Some(rest) = normalized.strip_prefix(p) {
+            return parse_leading_u32(rest);
+        }
+    }
+    None
+}
+
+/// SP-PG-CAT T5 — recognize the canonical psql `\d <table>` step 3
+/// index-list query (queries.md §1.6). The query has the
+/// distinctive fixture `from pg_catalog.pg_class c, pg_catalog.
+/// pg_class c2, pg_catalog.pg_index i` with `c.oid = '<oid>'` as
+/// the table filter. Returns the OID if matched.
+fn extract_psql_d_index_step_oid(normalized: &str) -> Option<u32> {
+    // Anchor on the unique multi-pg_class FROM clause that distinguishes
+    // the step-3 query from step-1 / step-2.
+    let leading = "select c2.relname,";
+    let core = "from pg_catalog.pg_class c, pg_catalog.pg_class c2, pg_catalog.pg_index i";
+    if !normalized.starts_with(leading) {
+        return None;
+    }
+    if !normalized.contains(core) {
+        return None;
+    }
+    // Find `c.oid = '<oid>'`.
+    let needle = "c.oid = '";
+    if let Some(pos) = normalized.find(needle) {
+        let after = &normalized[pos + needle.len()..];
+        return parse_leading_u32(after);
+    }
+    // Unquoted form `c.oid = N`.
+    let unquoted = "c.oid = ";
+    if let Some(pos) = normalized.find(unquoted) {
+        let after = &normalized[pos + unquoted.len()..];
+        return parse_leading_u32(after);
+    }
+    None
+}
+
+/// SP-PG-CAT T5 — recognize the pgJDBC `getIndexInfo` canonical
+/// query (queries.md §4.3). The query JOINs pg_class+pg_namespace+
+/// pg_index+pg_class(idx)+pg_am with `ct.relname = '<table>'`.
+/// Returns the table name on match.
+fn extract_pgjdbc_getindexinfo_relname(normalized: &str) -> Option<String> {
+    // Anchor on a distinctive fixture: pgJDBC uses
+    // `information_schema._pg_expandarray(i.indkey)` to expand indkey.
+    if !normalized.contains("information_schema._pg_expandarray(i.indkey)") {
+        return None;
+    }
+    let needles = ["ct.relname = '", "ct.relname like '"];
+    for needle in needles {
+        if let Some(pos) = normalized.find(needle) {
+            let after = &normalized[pos + needle.len()..];
+            if let Some(end) = after.find('\'') {
+                return Some(after[..end].to_string());
+            }
+        }
+    }
+    None
+}
+
+/// SP-PG-CAT T5 — recognize `SELECT * FROM pg_catalog.pg_constraint`
+/// (qualified + unqualified).
+fn matches_pg_constraint_select_star(normalized: &str) -> bool {
+    normalized == "select * from pg_catalog.pg_constraint"
+        || normalized == "select * from pg_constraint"
+}
+
+/// SP-PG-CAT T5 — recognize the parameterized `SELECT * FROM
+/// pg_catalog.pg_constraint WHERE conrelid = N` shape. Returns the
+/// OID. Used by psql `\d <table>` constraint-section + JDBC's
+/// `getPrimaryKeys` paths.
+fn extract_conrelid_filter(normalized: &str) -> Option<u32> {
+    let prefixes = [
+        "select * from pg_catalog.pg_constraint where conrelid = ",
+        "select * from pg_constraint where conrelid = ",
+        "select * from pg_catalog.pg_constraint where c.conrelid = ",
+        "select * from pg_constraint where c.conrelid = ",
+        "select * from pg_catalog.pg_constraint where con.conrelid = ",
+    ];
+    for p in prefixes {
+        if let Some(rest) = normalized.strip_prefix(p) {
+            return parse_leading_u32(rest);
         }
     }
     None
@@ -923,6 +1074,319 @@ mod tests {
         let bytes = res.unwrap();
         assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
         assert!(bytes.windows(b"int8".len()).any(|w| w == b"int8"));
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-CAT T5 KATs — pg_index + pg_constraint pattern hooks + the
+    // pgJDBC `getIndexInfo` / psql `\d <table>` step-3 joined-result
+    // intercepts. Drive via T5IndexHookEngine (overrides list_indexes
+    // + list_constraints + describe_table for the resolution paths).
+    // ───────────────────────────────────────────────────────────────────
+
+    use crate::engine::{ConstraintKind, ConstraintMetadata, FkAction, IndexKind, IndexMetadata};
+
+    struct T5IndexHookEngine {
+        tables: Vec<TableMetadata>,
+        schemas: std::collections::BTreeMap<String, Vec<PgColumn>>,
+        indexes: std::collections::BTreeMap<String, Vec<IndexMetadata>>,
+        constraints: std::collections::BTreeMap<String, Vec<ConstraintMetadata>>,
+    }
+    impl EngineApply for T5IndexHookEngine {
+        fn apply_sql(&self, _sql: &str) -> OpResult {
+            OpResult::SchemaError("T5IndexHookEngine: apply_sql should not be reached".into())
+        }
+        fn describe_table(&self, name: &str) -> Option<Vec<PgColumn>> {
+            self.schemas.get(name).cloned()
+        }
+        fn list_tables(&self) -> Vec<TableMetadata> {
+            self.tables.clone()
+        }
+        fn list_indexes_for_table(&self, name: &str) -> Vec<IndexMetadata> {
+            self.indexes.get(name).cloned().unwrap_or_default()
+        }
+        fn list_constraints_for_table(&self, name: &str) -> Vec<ConstraintMetadata> {
+            self.constraints.get(name).cloned().unwrap_or_default()
+        }
+    }
+
+    fn t5_index_hook_engine() -> T5IndexHookEngine {
+        let mut schemas = std::collections::BTreeMap::new();
+        schemas.insert(
+            "users".to_string(),
+            vec![
+                PgColumn { name: "id".into(), kind: FieldKind::I64, nullable: false },
+                PgColumn { name: "email".into(), kind: FieldKind::Char(128), nullable: false },
+            ],
+        );
+        let mut indexes = std::collections::BTreeMap::new();
+        indexes.insert(
+            "users".to_string(),
+            vec![IndexMetadata {
+                name: "users_email_idx".into(),
+                fields: vec![2],
+                is_unique: true,
+                kind: IndexKind::Equality,
+            }],
+        );
+        let mut constraints = std::collections::BTreeMap::new();
+        constraints.insert(
+            "users".to_string(),
+            vec![ConstraintMetadata {
+                name: "users_email_key".into(),
+                kind: ConstraintKind::Unique,
+                columns: vec![2],
+                references: None,
+            }],
+        );
+        T5IndexHookEngine {
+            tables: vec![TableMetadata {
+                name: "users".into(),
+                type_id: 1,
+                kind: TableKind::Ordinary,
+                field_count: 2,
+            }],
+            schemas,
+            indexes,
+            constraints,
+        }
+    }
+
+    /// **HEADLINE — `SELECT * FROM pg_catalog.pg_index` hits hook +
+    /// synthesizer fires.** pg_index doesn't carry the index name
+    /// column (that's pg_class.relname); the indexrelid OID slot
+    /// carries the per-index identity.
+    #[test]
+    fn t5_pg_index_select_star_pattern_fires() {
+        let eng = t5_index_hook_engine();
+        let res = catalog_query_hook("SELECT * FROM pg_catalog.pg_index", &eng);
+        assert!(res.is_some(), "pg_index SELECT * MUST hit the hook");
+        let bytes = res.unwrap();
+        assert_eq!(bytes[0], b'T');
+        // users has 1 index → SELECT 1.
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+        // The synthetic indexrelid OID is present in the data row.
+        let idx_oid = crate::pg_catalog::synthesize::oid_for_index_name("users_email_idx")
+            .to_string();
+        assert!(bytes.windows(idx_oid.len()).any(|w| w == idx_oid.as_bytes()));
+    }
+
+    /// **Pattern match — unqualified pg_index** also fires.
+    #[test]
+    fn t5_pg_index_select_star_unqualified() {
+        let eng = t5_index_hook_engine();
+        assert!(catalog_query_hook("SELECT * FROM pg_index", &eng).is_some());
+    }
+
+    /// **Pattern match — `WHERE indrelid = N` extracts OID and
+    /// filters indexes to that table.**
+    #[test]
+    fn t5_pg_index_indrelid_filter_pattern_fires() {
+        let eng = t5_index_hook_engine();
+        let users_oid = crate::pg_catalog::synthesize::oid_for_table_name("users");
+        let sql = format!("SELECT * FROM pg_catalog.pg_index WHERE indrelid = {}", users_oid);
+        let res = catalog_query_hook(&sql, &eng);
+        assert!(res.is_some(), "indrelid-filtered query MUST hit the hook");
+        let bytes = res.unwrap();
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+        // Unknown OID → 0 rows.
+        let res2 = catalog_query_hook(
+            "SELECT * FROM pg_catalog.pg_index WHERE indrelid = 999999",
+            &eng,
+        );
+        assert!(res2.is_some());
+        let bytes2 = res2.unwrap();
+        assert!(bytes2.windows(b"SELECT 0\0".len()).any(|w| w == b"SELECT 0\0"));
+    }
+
+    /// **HEADLINE — psql `\d <table>` step 3 canonical query fires.**
+    #[test]
+    fn t5_psql_d_table_step3_pattern_fires() {
+        let eng = t5_index_hook_engine();
+        let users_oid = crate::pg_catalog::synthesize::oid_for_table_name("users");
+        // Verbatim psql 14 \d <table> step 3 (queries.md §1.6).
+        let sql = format!(
+            "SELECT c2.relname, i.indisprimary, i.indisunique, i.indisclustered,\n\
+                    i.indisvalid, pg_catalog.pg_get_indexdef(i.indexrelid, 0, true),\n\
+                    pg_catalog.pg_get_constraintdef(con.oid, true),\n\
+                    contype, condeferrable, condeferred, i.indisreplident, c2.reltablespace\n\
+             FROM pg_catalog.pg_class c, pg_catalog.pg_class c2,\n\
+                  pg_catalog.pg_index i\n\
+               LEFT JOIN pg_catalog.pg_constraint con ON (conrelid = i.indrelid \
+                 AND conindid = i.indexrelid AND contype IN ('p','u','x'))\n\
+             WHERE c.oid = '{users_oid}' AND c.oid = i.indrelid AND i.indexrelid = c2.oid\n\
+             ORDER BY i.indisprimary DESC, i.indisunique DESC, c2.relname"
+        );
+        let res = catalog_query_hook(&sql, &eng);
+        assert!(res.is_some(), "psql \\d <table> step 3 MUST hit the hook");
+        let bytes = res.unwrap();
+        // 1 index on users → SELECT 1.
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+    }
+
+    /// **HEADLINE — pgJDBC `getIndexInfo` canonical query fires.**
+    #[test]
+    fn t5_pgjdbc_getindexinfo_pattern_fires() {
+        let eng = t5_index_hook_engine();
+        let sql = "SELECT NULL AS TABLE_CAT, n.nspname AS TABLE_SCHEM, ct.relname AS TABLE_NAME, \
+                   NOT i.indisunique AS NON_UNIQUE, NULL AS INDEX_QUALIFIER, ci.relname AS INDEX_NAME, \
+                   CASE i.indisclustered WHEN true THEN 1 ELSE CASE am.amname WHEN 'hash' THEN 2 ELSE 3 END END AS TYPE, \
+                   (information_schema._pg_expandarray(i.indkey)).n AS ORDINAL_POSITION, \
+                   trim(both '\"' from pg_catalog.pg_get_indexdef(ci.oid, (information_schema._pg_expandarray(i.indkey)).n, false)) AS COLUMN_NAME, \
+                   NULL AS ASC_OR_DESC, ci.reltuples AS CARDINALITY, ci.relpages AS PAGES, \
+                   pg_catalog.pg_get_expr(i.indpred, i.indrelid) AS FILTER_CONDITION \
+                   FROM pg_catalog.pg_class ct \
+                   JOIN pg_catalog.pg_namespace n ON (ct.relnamespace = n.oid) \
+                   JOIN pg_catalog.pg_index i ON (ct.oid = i.indrelid) \
+                   JOIN pg_catalog.pg_class ci ON (ci.oid = i.indexrelid) \
+                   JOIN pg_catalog.pg_am am ON (ci.relam = am.oid) \
+                   WHERE true AND n.nspname = 'public' AND ct.relname = 'users' \
+                   ORDER BY NON_UNIQUE, TYPE, INDEX_NAME, ORDINAL_POSITION";
+        let res = catalog_query_hook(sql, &eng);
+        assert!(res.is_some(), "pgJDBC getIndexInfo MUST hit the hook");
+        let bytes = res.unwrap();
+        // 1 index × 1 column on users → SELECT 1.
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+        assert!(bytes.windows(b"users_email_idx".len()).any(|w| w == b"users_email_idx"));
+        assert!(bytes.windows(b"email".len()).any(|w| w == b"email"));
+    }
+
+    /// **Pattern match — `SELECT * FROM pg_catalog.pg_constraint`.**
+    #[test]
+    fn t5_pg_constraint_select_star_pattern_fires() {
+        let eng = t5_index_hook_engine();
+        let res = catalog_query_hook("SELECT * FROM pg_catalog.pg_constraint", &eng);
+        assert!(res.is_some(), "pg_constraint SELECT * MUST hit the hook");
+        let bytes = res.unwrap();
+        // users has 1 constraint → SELECT 1.
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+        assert!(bytes.windows(b"users_email_key".len()).any(|w| w == b"users_email_key"));
+    }
+
+    /// **Pattern match — unqualified pg_constraint.**
+    #[test]
+    fn t5_pg_constraint_select_star_unqualified() {
+        let eng = t5_index_hook_engine();
+        assert!(catalog_query_hook("SELECT * FROM pg_constraint", &eng).is_some());
+    }
+
+    /// **Pattern match — `WHERE conrelid = N` extracts OID and
+    /// filters constraints to that table.**
+    #[test]
+    fn t5_pg_constraint_conrelid_filter_pattern_fires() {
+        let eng = t5_index_hook_engine();
+        let users_oid = crate::pg_catalog::synthesize::oid_for_table_name("users");
+        let sql = format!(
+            "SELECT * FROM pg_catalog.pg_constraint WHERE conrelid = {}",
+            users_oid
+        );
+        let res = catalog_query_hook(&sql, &eng);
+        assert!(res.is_some());
+        let bytes = res.unwrap();
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-CAT T7 KATs — helper-function dispatch via catalog_query_hook
+    // (case-insensitive + whitespace-tolerant via normalize_for_match).
+    // ───────────────────────────────────────────────────────────────────
+
+    /// **HEADLINE — `SELECT version()` dispatches through the hook.**
+    #[test]
+    fn t7_select_version_dispatches_through_hook() {
+        let eng = t5_index_hook_engine();
+        let res = catalog_query_hook("SELECT version()", &eng);
+        assert!(res.is_some(), "SELECT version() MUST hit the hook");
+        let bytes = res.unwrap();
+        assert_eq!(bytes[0], b'T');
+        // The canonical version string appears.
+        assert!(bytes.windows(b"PostgreSQL 14.0 (KesselDB 1.0)".len())
+            .any(|w| w == b"PostgreSQL 14.0 (KesselDB 1.0)"));
+        // Last 6 bytes are ReadyForQuery('I').
+        assert_eq!(&bytes[bytes.len() - 6..], &[b'Z', 0, 0, 0, 5, b'I']);
+    }
+
+    /// **Case-insensitive helper function dispatch.** Upper-/mixed-case
+    /// all route through the hook.
+    #[test]
+    fn t7_helper_function_dispatch_is_case_insensitive() {
+        let eng = t5_index_hook_engine();
+        assert!(catalog_query_hook("SELECT VERSION()", &eng).is_some());
+        assert!(catalog_query_hook("Select Current_Database()", &eng).is_some());
+        assert!(catalog_query_hook("SELECT CURRENT_SCHEMA()", &eng).is_some());
+    }
+
+    /// **HEADLINE — `SHOW server_version` dispatches through the hook.**
+    #[test]
+    fn t7_show_dispatches_through_hook() {
+        let eng = t5_index_hook_engine();
+        let res = catalog_query_hook("SHOW server_version", &eng);
+        assert!(res.is_some(), "SHOW server_version MUST hit the hook");
+        let bytes = res.unwrap();
+        assert!(bytes.windows(b"14.0".len()).any(|w| w == b"14.0"));
+    }
+
+    /// **`SHOW timezone` returns 'UTC'.**
+    #[test]
+    fn t7_show_timezone_dispatch_returns_utc() {
+        let eng = t5_index_hook_engine();
+        let res = catalog_query_hook("SHOW timezone", &eng);
+        assert!(res.is_some());
+        let bytes = res.unwrap();
+        assert!(bytes.windows(b"UTC".len()).any(|w| w == b"UTC"));
+    }
+
+    /// **Helper functions tolerate trailing semicolons + extra
+    /// whitespace.** Locked because pgcli ships `SELECT version();`
+    /// and pgJDBC inserts newlines.
+    #[test]
+    fn t7_helper_pattern_tolerates_trailing_semicolon_and_whitespace() {
+        let eng = t5_index_hook_engine();
+        assert!(catalog_query_hook("SELECT version();", &eng).is_some());
+        assert!(catalog_query_hook("  SELECT  version()  ;  ", &eng).is_some());
+        assert!(catalog_query_hook("SELECT version()\n", &eng).is_some());
+    }
+
+    /// **Helper patterns checked BEFORE table-pattern matchers** —
+    /// `SELECT version()` doesn't fall through to a (nonexistent)
+    /// `SELECT * FROM ...` matcher.
+    #[test]
+    fn t7_helper_patterns_check_before_table_patterns() {
+        let eng = t5_index_hook_engine();
+        // version() returns a 1-row text result (helper synth), not
+        // a SELECT * FROM ... unimplemented path.
+        let res = catalog_query_hook("SELECT version()", &eng).expect("matches");
+        // The CommandComplete tag is `SELECT 1`, not anything else.
+        assert!(res.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+    }
+
+    /// **`SELECT version() AS v` matches with the alias suffix.**
+    #[test]
+    fn t7_helper_pattern_with_as_alias() {
+        let eng = t5_index_hook_engine();
+        let res = catalog_query_hook("SELECT version() AS v", &eng);
+        assert!(res.is_some(), "SELECT version() AS v MUST match");
+        let bytes = res.unwrap();
+        assert!(bytes.windows(b"PostgreSQL".len()).any(|w| w == b"PostgreSQL"));
+    }
+
+    /// **Regression lock — T5+T7 patterns don't break T1+T3+T4.**
+    #[test]
+    fn t5_t7_pre_existing_patterns_still_match() {
+        let eng = t5_index_hook_engine();
+        // T1
+        assert!(catalog_query_hook("SELECT * FROM pg_catalog.pg_namespace", &eng).is_some());
+        // T3
+        assert!(catalog_query_hook("SELECT * FROM pg_catalog.pg_class", &eng).is_some());
+        // T4
+        assert!(catalog_query_hook("SELECT * FROM pg_catalog.pg_attribute", &eng).is_some());
+        assert!(catalog_query_hook("SELECT * FROM pg_catalog.pg_type", &eng).is_some());
+        // Unrelated SELECT still misses (no helper-function match + no
+        // pg_catalog match).
+        assert!(catalog_query_hook("SELECT id FROM users", &eng).is_none());
+        // Non-SELECT non-SHOW still fast-rejected.
+        assert!(catalog_query_hook(
+            "DELETE FROM pg_catalog.pg_index WHERE indrelid = 16385",
+            &eng).is_none());
     }
 
     /// **Regression lock — T1+T3 patterns still match + non-pg_catalog

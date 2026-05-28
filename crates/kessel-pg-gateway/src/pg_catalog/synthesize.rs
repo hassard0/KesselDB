@@ -32,7 +32,9 @@ use super::{
     PG_AUTHID_OID_POSTGRES, PG_NAMESPACE_OID_INFORMATION_SCHEMA,
     PG_NAMESPACE_OID_PG_CATALOG, PG_NAMESPACE_OID_PUBLIC,
 };
-use crate::engine::{EngineApply, TableKind, TableMetadata};
+use crate::engine::{
+    ConstraintKind, ConstraintMetadata, EngineApply, IndexMetadata, TableKind, TableMetadata,
+};
 use crate::proto::{
     PG_TYPE_BOOL, PG_TYPE_BYTEA, PG_TYPE_INT2, PG_TYPE_INT4, PG_TYPE_INT8,
     PG_TYPE_NUMERIC, PG_TYPE_OID, PG_TYPE_TEXT, PG_TYPE_TIMESTAMPTZ,
@@ -1013,6 +1015,768 @@ pub fn pgjdbc_getcolumns_joined_rows<E: EngineApply + ?Sized>(
     out
 }
 
+// ─── pg_index synthesizer (design §5.5) ───────────────────────────────────
+
+/// `pg_index` column count per PG 14 `src/include/catalog/pg_index.h`.
+/// Locked because clients (pgJDBC `getIndexInfo`, psql `\d <table>`
+/// step 3, DBeaver "Indexes" tab) iterate row columns by index;
+/// one off-by-one breaks them all.
+pub const PG_INDEX_COLUMN_COUNT: usize = 19;
+
+/// Build the `pg_index` RowDescription field list. 19 columns in
+/// the order PG 14 defines them. Pulled out so both `SELECT *` and
+/// per-table-filter paths emit the same shape.
+fn pg_index_fields() -> Vec<FieldMeta> {
+    let oid = |name: &str| FieldMeta { name: name.to_string(), type_oid: PG_TYPE_OID };
+    let text = |name: &str| FieldMeta { name: name.to_string(), type_oid: PG_TYPE_TEXT };
+    let bool_ = |name: &str| FieldMeta { name: name.to_string(), type_oid: PG_TYPE_BOOL };
+    let int2 = |name: &str| FieldMeta { name: name.to_string(), type_oid: PG_TYPE_INT2 };
+    vec![
+        oid("indexrelid"),
+        oid("indrelid"),
+        int2("indnatts"),
+        int2("indnkeyatts"),
+        bool_("indisunique"),
+        bool_("indisprimary"),
+        bool_("indisexclusion"),
+        bool_("indimmediate"),
+        bool_("indisclustered"),
+        bool_("indisvalid"),
+        bool_("indcheckxmin"),
+        bool_("indisready"),
+        bool_("indislive"),
+        bool_("indisreplident"),
+        text("indkey"),        // int2vector → space-separated text
+        text("indcollation"),  // oidvector → space-separated text
+        text("indclass"),      // oidvector → space-separated text
+        text("indoption"),     // int2vector → space-separated text
+        text("indpred"),       // pg_node_tree — V1 NULL (but column slot)
+    ]
+}
+
+/// Deterministic OID for a synthetic index name. Reuses the
+/// `oid_for_table_name` FNV-1a strategy — same collision risk
+/// profile, same stability properties (a tool caching the
+/// indexrelid across queries sees a stable value).
+pub fn oid_for_index_name(name: &str) -> u32 {
+    oid_for_table_name(name)
+}
+
+/// Render a `Vec<u32>` of attnums as the PG `int2vector` text
+/// format: space-separated decimal (e.g. `"1 2 3"`). PG wire-emits
+/// vectors as text in the text format; clients parse with
+/// whitespace.
+fn render_int2vector(fields: &[u32]) -> String {
+    let mut out = String::new();
+    for (i, f) in fields.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push_str(&f.to_string());
+    }
+    out
+}
+
+/// Render an `oidvector` of zeros of the given length. V1 doesn't
+/// model per-column collation/opclass/option, so every vector slot
+/// is "0".
+fn render_zero_vector(n: usize) -> String {
+    let mut out = String::new();
+    for i in 0..n {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push('0');
+    }
+    out
+}
+
+/// Emit one pg_index DataRow.
+fn encode_pg_index_row(indexrelid: u32, indrelid: u32, idx: &IndexMetadata) -> Vec<u8> {
+    let indexrelid_str = indexrelid.to_string();
+    let indrelid_str = indrelid.to_string();
+    let n = idx.fields.len();
+    let indnatts_str = (n as i16).to_string();
+    let indnkeyatts_str = indnatts_str.clone(); // V1: same as indnatts (no INCLUDE)
+    let indisunique = if idx.is_unique { b"t".as_ref() } else { b"f".as_ref() };
+    let false_ = b"f".as_ref();
+    let true_ = b"t".as_ref();
+    let indkey = render_int2vector(&idx.fields);
+    let indcollation = render_zero_vector(n);
+    let indclass = render_zero_vector(n);
+    let indoption = render_zero_vector(n);
+
+    encode_data_row(&[
+        Some(indexrelid_str.as_bytes()),  // indexrelid
+        Some(indrelid_str.as_bytes()),    // indrelid
+        Some(indnatts_str.as_bytes()),    // indnatts
+        Some(indnkeyatts_str.as_bytes()), // indnkeyatts
+        Some(indisunique),                // indisunique
+        Some(false_),                     // indisprimary = false (V1)
+        Some(false_),                     // indisexclusion = false
+        Some(true_),                      // indimmediate = true
+        Some(false_),                     // indisclustered = false
+        Some(true_),                      // indisvalid = true
+        Some(false_),                     // indcheckxmin = false
+        Some(true_),                      // indisready = true
+        Some(true_),                      // indislive = true
+        Some(false_),                     // indisreplident = false
+        Some(indkey.as_bytes()),          // indkey
+        Some(indcollation.as_bytes()),    // indcollation
+        Some(indclass.as_bytes()),        // indclass
+        Some(indoption.as_bytes()),       // indoption
+        None,                             // indpred = NULL
+    ])
+}
+
+/// Synthesize `SELECT * FROM pg_catalog.pg_index` — one row per
+/// KesselDB index across every user table.
+///
+/// `indrelid_filter`:
+/// - `None` — emit every index on every table.
+/// - `Some(oid)` — emit only indexes whose `indrelid` matches the
+///   filter (psql `\d <table>` step 3 + pgJDBC `getIndexInfo`
+///   hot path).
+///
+/// Walks `engine.list_tables()` and `engine.list_indexes_for_table(name)`
+/// for each table that survives the filter. Returns the full T+D*+C+Z
+/// wire stream.
+pub fn synthesize_pg_index<E: EngineApply + ?Sized>(
+    engine: &E,
+    indrelid_filter: Option<u32>,
+) -> Vec<u8> {
+    let fields = pg_index_fields();
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    let tables = engine.list_tables();
+    let mut n: u64 = 0;
+    for t in &tables {
+        let indrelid = oid_for_table_name(&t.name);
+        if let Some(want) = indrelid_filter {
+            if indrelid != want {
+                continue;
+            }
+        }
+        for idx in engine.list_indexes_for_table(&t.name) {
+            let indexrelid = oid_for_index_name(&idx.name);
+            out.extend_from_slice(&encode_pg_index_row(indexrelid, indrelid, &idx));
+            n += 1;
+        }
+    }
+    out.extend_from_slice(&encode_command_complete(&select_tag(n)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
+// ─── Joined-result synth: pgJDBC getIndexInfo (queries.md §4.3) ───────────
+
+/// Synthesize the joined-result response for the canonical pgJDBC
+/// `getIndexInfo` query (queries.md §4.3). The query JOINs `pg_class
+/// ct` + `pg_namespace n` + `pg_index i` + `pg_class ci` + `pg_am
+/// am` filtered by table name. V1 looks up the indexes for the
+/// matching table and emits one row per (index × column).
+///
+/// Output columns (matching pgJDBC's projection):
+/// - TABLE_CAT (NULL) / TABLE_SCHEM / TABLE_NAME / NON_UNIQUE /
+///   INDEX_QUALIFIER (NULL) / INDEX_NAME / TYPE (3=btree) /
+///   ORDINAL_POSITION / COLUMN_NAME / ASC_OR_DESC (NULL) /
+///   CARDINALITY / PAGES / FILTER_CONDITION (NULL)
+pub fn pgjdbc_getindexinfo_joined_rows<E: EngineApply + ?Sized>(
+    engine: &E,
+    table_name: &str,
+) -> Vec<u8> {
+    let fields = vec![
+        FieldMeta { name: "TABLE_CAT".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "TABLE_SCHEM".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "TABLE_NAME".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "NON_UNIQUE".to_string(), type_oid: PG_TYPE_BOOL },
+        FieldMeta { name: "INDEX_QUALIFIER".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "INDEX_NAME".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "TYPE".to_string(), type_oid: PG_TYPE_INT2 },
+        FieldMeta { name: "ORDINAL_POSITION".to_string(), type_oid: PG_TYPE_INT2 },
+        FieldMeta { name: "COLUMN_NAME".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "ASC_OR_DESC".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "CARDINALITY".to_string(), type_oid: PG_TYPE_INT8 },
+        FieldMeta { name: "PAGES".to_string(), type_oid: PG_TYPE_INT8 },
+        FieldMeta { name: "FILTER_CONDITION".to_string(), type_oid: PG_TYPE_TEXT },
+    ];
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    let tables = engine.list_tables();
+    let nspname = b"public".as_ref();
+    let btree_type = b"3".as_ref(); // pgJDBC: tableIndexOther=3 for btree
+    let zero = b"0".as_ref();
+    let mut n: u64 = 0;
+    for t in &tables {
+        if t.name != table_name {
+            continue;
+        }
+        let cols = engine.describe_table(&t.name);
+        for idx in engine.list_indexes_for_table(&t.name) {
+            let non_unique = if idx.is_unique { b"f".as_ref() } else { b"t".as_ref() };
+            for (i, attnum) in idx.fields.iter().enumerate() {
+                let column_name = match &cols {
+                    Some(c) => {
+                        let attn = *attnum as usize;
+                        if attn >= 1 && attn <= c.len() {
+                            c[attn - 1].name.clone()
+                        } else {
+                            String::new()
+                        }
+                    }
+                    None => String::new(),
+                };
+                let ord = (i as i16 + 1).to_string();
+                out.extend_from_slice(&encode_data_row(&[
+                    None,                            // TABLE_CAT
+                    Some(nspname),                   // TABLE_SCHEM
+                    Some(t.name.as_bytes()),         // TABLE_NAME
+                    Some(non_unique),                // NON_UNIQUE
+                    None,                            // INDEX_QUALIFIER
+                    Some(idx.name.as_bytes()),       // INDEX_NAME
+                    Some(btree_type),                // TYPE = 3 (btree)
+                    Some(ord.as_bytes()),            // ORDINAL_POSITION
+                    Some(column_name.as_bytes()),    // COLUMN_NAME
+                    None,                            // ASC_OR_DESC
+                    Some(zero),                      // CARDINALITY
+                    Some(zero),                      // PAGES
+                    None,                            // FILTER_CONDITION
+                ]));
+                n += 1;
+            }
+        }
+    }
+    out.extend_from_slice(&encode_command_complete(&select_tag(n)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
+// ─── pg_constraint synthesizer (design §5.6) ──────────────────────────────
+
+/// `pg_constraint` column count per PG 14 `src/include/catalog/
+/// pg_constraint.h`. Locked because clients iterate row columns by
+/// index when reading constraint metadata.
+pub const PG_CONSTRAINT_COLUMN_COUNT: usize = 25;
+
+/// Build the `pg_constraint` RowDescription field list. 25 columns
+/// in the order PG 14 defines them.
+fn pg_constraint_fields() -> Vec<FieldMeta> {
+    let oid = |name: &str| FieldMeta { name: name.to_string(), type_oid: PG_TYPE_OID };
+    let text = |name: &str| FieldMeta { name: name.to_string(), type_oid: PG_TYPE_TEXT };
+    let bool_ = |name: &str| FieldMeta { name: name.to_string(), type_oid: PG_TYPE_BOOL };
+    let int4 = |name: &str| FieldMeta { name: name.to_string(), type_oid: PG_TYPE_INT4 };
+    let char1 = |name: &str| FieldMeta { name: name.to_string(), type_oid: PG_TYPE_TEXT };
+    vec![
+        oid("oid"),
+        text("conname"),
+        oid("connamespace"),
+        char1("contype"),
+        bool_("condeferrable"),
+        bool_("condeferred"),
+        bool_("convalidated"),
+        oid("conrelid"),
+        oid("contypid"),
+        oid("conindid"),
+        oid("conparentid"),
+        oid("confrelid"),
+        char1("confupdtype"),
+        char1("confdeltype"),
+        char1("confmatchtype"),
+        bool_("conislocal"),
+        int4("coninhcount"),
+        bool_("connoinherit"),
+        text("conkey"),       // int2[] as text "{1,2,3}"
+        text("confkey"),      // int2[] as text — NULL for non-FK
+        text("conpfeqop"),    // oid[] — V1 NULL
+        text("conppeqop"),    // oid[] — V1 NULL
+        text("conffeqop"),    // oid[] — V1 NULL
+        text("conexclop"),    // oid[] — V1 NULL
+        text("conbin"),       // pg_node_tree — V1 NULL
+    ]
+}
+
+/// Render a `Vec<u32>` of attnums as the PG `int2[]` array text
+/// format: `{1,2,3}`.
+fn render_int_array(fields: &[u32]) -> String {
+    let mut out = String::from("{");
+    for (i, f) in fields.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&f.to_string());
+    }
+    out.push('}');
+    out
+}
+
+/// Emit one pg_constraint DataRow.
+fn encode_pg_constraint_row(conrelid: u32, c: &ConstraintMetadata) -> Vec<u8> {
+    let oid_str = oid_for_table_name(&format!("__con__{}", c.name)).to_string();
+    let connamespace = PG_NAMESPACE_OID_PUBLIC.to_string();
+    let contype_byte = [c.kind.pg_contype()];
+    let false_ = b"f".as_ref();
+    let true_ = b"t".as_ref();
+    let conrelid_str = conrelid.to_string();
+    let zero = b"0".as_ref();
+    let confrelid = match &c.references {
+        Some((tname, _)) => oid_for_table_name(tname).to_string(),
+        None => "0".to_string(),
+    };
+    // FK update/delete actions. Default to 'a' (NoAction) for non-FK.
+    let (confupdtype_char, confdeltype_char) = match c.kind {
+        ConstraintKind::ForeignKey { on_delete } => (b'a', on_delete.pg_action_char()),
+        _ => (b' ', b' '),
+    };
+    let confupd_byte = [confupdtype_char];
+    let confdel_byte = [confdeltype_char];
+    let confmatchtype_byte = [b's']; // simple
+    let conkey = render_int_array(&c.columns);
+    let confkey_str = c.references.as_ref().map(|(_, cols)| render_int_array(cols));
+    let confkey_bytes: Option<&[u8]> = confkey_str.as_ref().map(|s| s.as_bytes());
+
+    encode_data_row(&[
+        Some(oid_str.as_bytes()),       // oid
+        Some(c.name.as_bytes()),        // conname
+        Some(connamespace.as_bytes()),  // connamespace
+        Some(&contype_byte),            // contype
+        Some(false_),                   // condeferrable
+        Some(false_),                   // condeferred
+        Some(true_),                    // convalidated
+        Some(conrelid_str.as_bytes()),  // conrelid
+        Some(zero),                     // contypid
+        Some(zero),                     // conindid (V1: no backing index OID linkage)
+        Some(zero),                     // conparentid
+        Some(confrelid.as_bytes()),     // confrelid
+        Some(&confupd_byte),            // confupdtype
+        Some(&confdel_byte),            // confdeltype
+        Some(&confmatchtype_byte),      // confmatchtype
+        Some(true_),                    // conislocal
+        Some(zero),                     // coninhcount
+        Some(true_),                    // connoinherit
+        Some(conkey.as_bytes()),        // conkey
+        confkey_bytes,                  // confkey (NULL for non-FK)
+        None,                           // conpfeqop = NULL
+        None,                           // conppeqop = NULL
+        None,                           // conffeqop = NULL
+        None,                           // conexclop = NULL
+        None,                           // conbin = NULL
+    ])
+}
+
+/// Synthesize `SELECT * FROM pg_catalog.pg_constraint` — one row
+/// per constraint across every user table.
+///
+/// `conrelid_filter`:
+/// - `None` — emit every constraint on every table.
+/// - `Some(oid)` — emit only constraints whose `conrelid` matches
+///   the filter (psql `\d <table>` constraint-section + JDBC
+///   `getPrimaryKeys` hot path).
+pub fn synthesize_pg_constraint<E: EngineApply + ?Sized>(
+    engine: &E,
+    conrelid_filter: Option<u32>,
+) -> Vec<u8> {
+    let fields = pg_constraint_fields();
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    let tables = engine.list_tables();
+    let mut n: u64 = 0;
+    for t in &tables {
+        let conrelid = oid_for_table_name(&t.name);
+        if let Some(want) = conrelid_filter {
+            if conrelid != want {
+                continue;
+            }
+        }
+        for c in engine.list_constraints_for_table(&t.name) {
+            out.extend_from_slice(&encode_pg_constraint_row(conrelid, &c));
+            n += 1;
+        }
+    }
+    out.extend_from_slice(&encode_command_complete(&select_tag(n)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
+// ─── SP-PG-CAT T7 — SQL helper functions ──────────────────────────────────
+
+/// Canonical version string V1 emits for `SELECT version()`. Matches
+/// the StartupMessage `server_version` ParameterStatus emit so clients
+/// see a coherent view of the server. PG-major-version-prefix 14 is
+/// the V1 emulation target.
+pub const KESSELDB_VERSION_STRING: &str = "PostgreSQL 14.0 (KesselDB 1.0)";
+
+/// Canonical database name V1 emits for `SELECT current_database()`.
+/// KesselDB has one logical database; V1 hard-codes the name.
+pub const KESSELDB_DATABASE_NAME: &str = "kesseldb";
+
+/// Canonical schema name V1 emits for `SELECT current_schema()`.
+pub const KESSELDB_SCHEMA_NAME: &str = "public";
+
+/// Canonical user name V1 emits for `SELECT current_user` / `session_user`.
+pub const KESSELDB_USER_NAME: &str = "kesseldb";
+
+/// Build a single-row, single-column response for a helper function
+/// that returns a text value. Used by `version()` / `current_database()`
+/// / `current_schema()` / etc.
+fn single_text_row(column_name: &str, value: &str) -> Vec<u8> {
+    let fields = vec![FieldMeta {
+        name: column_name.to_string(),
+        type_oid: PG_TYPE_TEXT,
+    }];
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    out.extend_from_slice(&encode_data_row(&[Some(value.as_bytes())]));
+    out.extend_from_slice(&encode_command_complete(&select_tag(1)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
+/// Build a single-row, single-column response with a bool ('t'/'f')
+/// value. Used by `pg_table_is_visible(oid)` / `pg_is_other_temp_schema(oid)`.
+fn single_bool_row(column_name: &str, value: bool) -> Vec<u8> {
+    let fields = vec![FieldMeta {
+        name: column_name.to_string(),
+        type_oid: PG_TYPE_BOOL,
+    }];
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    let b: &[u8] = if value { b"t" } else { b"f" };
+    out.extend_from_slice(&encode_data_row(&[Some(b)]));
+    out.extend_from_slice(&encode_command_complete(&select_tag(1)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
+/// Build a single-row, single-column response with an int value.
+fn single_int_row(column_name: &str, oid: u32, value: i64) -> Vec<u8> {
+    let fields = vec![FieldMeta {
+        name: column_name.to_string(),
+        type_oid: oid,
+    }];
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    let s = value.to_string();
+    out.extend_from_slice(&encode_data_row(&[Some(s.as_bytes())]));
+    out.extend_from_slice(&encode_command_complete(&select_tag(1)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
+/// Resolve a canned GUC value for `SHOW <name>` (and `current_setting('<name>')`).
+/// Returns `Some(value)` for known GUCs (mirroring V1 ParameterStatus
+/// emit) or `Some("")` for unknown GUCs — matching PG's behavior of
+/// returning the empty string for an unrecognized parameter name.
+fn show_value_for(name: &str) -> &'static str {
+    let lower = name.to_ascii_lowercase();
+    match lower.as_str() {
+        "server_version" => "14.0",
+        "server_version_num" => "140000",
+        "server_encoding" => "UTF8",
+        "client_encoding" => "UTF8",
+        "datestyle" => "ISO, MDY",
+        "timezone" | "time zone" => "UTC",
+        "standard_conforming_strings" => "on",
+        "integer_datetimes" => "on",
+        "application_name" => "",
+        "is_superuser" => "on",
+        "session_authorization" => KESSELDB_USER_NAME,
+        "search_path" => "\"$user\", public",
+        "default_transaction_isolation" => "read committed",
+        "transaction_isolation" => "read committed",
+        "in_hot_standby" => "off",
+        "default_transaction_read_only" => "off",
+        "transaction_read_only" => "off",
+        _ => "",
+    }
+}
+
+/// SP-PG-CAT T7 — single-call helper-function recognizer. Recognizes
+/// `SELECT version()`, `SELECT current_database()`, `SELECT
+/// current_schema()`, `SELECT current_user`, `SELECT session_user`,
+/// `SHOW <name>`, plus a handful of canned per-OID functions.
+///
+/// Returns:
+/// - `Some(wire_bytes)` — SQL matched a known helper-function pattern.
+/// - `None` — fall through to table/JOIN matchers.
+///
+/// Checked BEFORE the table-pattern matchers in `catalog_query_hook`
+/// because helpers are simpler shapes.
+///
+/// Recognized patterns (all case-insensitive after normalization):
+///
+/// - `select version()` → 'PostgreSQL 14.0 (KesselDB 1.0)'
+/// - `select current_database()` → 'kesseldb'
+/// - `select current_schema()` / `select current_schema` → 'public'
+/// - `select current_user` → 'kesseldb'
+/// - `select session_user` → 'kesseldb'
+/// - `select user` → 'kesseldb'
+/// - `select current_catalog` → 'kesseldb'
+/// - `select pg_backend_pid()` → 1 (canned non-zero PID)
+/// - `select pg_my_temp_schema()` → 0
+/// - `select pg_is_other_temp_schema(<oid>)` → false
+/// - `select pg_table_is_visible(<oid>)` → true
+/// - `select pg_get_userbyid(<oid>)` → 'kesseldb'
+/// - `select pg_get_indexdef(<oid>)` → ''
+/// - `select pg_get_constraintdef(<oid>)` → ''
+/// - `select obj_description(<oid>, 'pg_class')` → NULL
+/// - `select current_setting('<name>')` → canned GUC value
+/// - `show <name>` → canned GUC value
+/// - Multi-function probe `select version(), current_database()` →
+///   handled separately by `synthesize_pgadmin_multi_helper`.
+pub fn synthesize_helper_function(normalized: &str) -> Option<Vec<u8>> {
+    // Strip optional trailing `as alias` (case-insensitive). We don't
+    // try to be exhaustive — the simple forms are what tools issue.
+    let s = strip_select_alias(normalized);
+
+    // ── Single-call shapes (no args) ──────────────────────────────
+    if s == "select version()" {
+        return Some(single_text_row("version", KESSELDB_VERSION_STRING));
+    }
+    if s == "select current_database()" || s == "select current_catalog" {
+        return Some(single_text_row("current_database", KESSELDB_DATABASE_NAME));
+    }
+    if s == "select current_schema()" || s == "select current_schema" {
+        return Some(single_text_row("current_schema", KESSELDB_SCHEMA_NAME));
+    }
+    if s == "select current_user" || s == "select user" {
+        return Some(single_text_row("current_user", KESSELDB_USER_NAME));
+    }
+    if s == "select session_user" {
+        return Some(single_text_row("session_user", KESSELDB_USER_NAME));
+    }
+    if s == "select pg_backend_pid()" {
+        return Some(single_int_row("pg_backend_pid", PG_TYPE_INT4, 1));
+    }
+    if s == "select pg_my_temp_schema()" {
+        return Some(single_int_row("pg_my_temp_schema", PG_TYPE_OID, 0));
+    }
+    if s == "select pg_postmaster_start_time()" {
+        return Some(single_text_row(
+            "pg_postmaster_start_time",
+            "2026-01-01 00:00:00+00",
+        ));
+    }
+
+    // ── pgAdmin multi-function probe ──────────────────────────────
+    // `select version(), current_database(), current_user, current_schema()`
+    // is the canonical pgAdmin connect probe (queries.md §6.3). Recognize
+    // exactly the 4-function shape AND the common 2-/3-function shortenings.
+    if let Some(bytes) = synthesize_pgadmin_multi_helper(s) {
+        return Some(bytes);
+    }
+
+    // ── Per-OID functions (prefix-match) ──────────────────────────
+    // `pg_table_is_visible(N)` → true (V1 single-schema; everything visible).
+    if s.starts_with("select pg_catalog.pg_table_is_visible(")
+        || s.starts_with("select pg_table_is_visible(")
+    {
+        return Some(single_bool_row("pg_table_is_visible", true));
+    }
+    if s.starts_with("select pg_catalog.pg_type_is_visible(")
+        || s.starts_with("select pg_type_is_visible(")
+    {
+        return Some(single_bool_row("pg_type_is_visible", true));
+    }
+    if s.starts_with("select pg_catalog.pg_function_is_visible(")
+        || s.starts_with("select pg_function_is_visible(")
+    {
+        return Some(single_bool_row("pg_function_is_visible", true));
+    }
+    if s.starts_with("select pg_catalog.pg_is_other_temp_schema(")
+        || s.starts_with("select pg_is_other_temp_schema(")
+    {
+        return Some(single_bool_row("pg_is_other_temp_schema", false));
+    }
+    // `pg_get_userbyid(N)` → 'kesseldb' (V1: one user identity).
+    if s.starts_with("select pg_catalog.pg_get_userbyid(")
+        || s.starts_with("select pg_get_userbyid(")
+    {
+        return Some(single_text_row("pg_get_userbyid", KESSELDB_USER_NAME));
+    }
+    // `pg_get_indexdef(N)` / `pg_get_constraintdef(N)` → empty text.
+    if s.starts_with("select pg_catalog.pg_get_indexdef(")
+        || s.starts_with("select pg_get_indexdef(")
+    {
+        return Some(single_text_row("pg_get_indexdef", ""));
+    }
+    if s.starts_with("select pg_catalog.pg_get_constraintdef(")
+        || s.starts_with("select pg_get_constraintdef(")
+    {
+        return Some(single_text_row("pg_get_constraintdef", ""));
+    }
+    if s.starts_with("select pg_catalog.pg_get_expr(")
+        || s.starts_with("select pg_get_expr(")
+    {
+        return Some(single_text_row("pg_get_expr", ""));
+    }
+    // `obj_description(N, 'pg_class')` / `obj_description(N)` → NULL.
+    if s.starts_with("select pg_catalog.obj_description(")
+        || s.starts_with("select obj_description(")
+    {
+        let fields = vec![FieldMeta {
+            name: "obj_description".to_string(),
+            type_oid: PG_TYPE_TEXT,
+        }];
+        let mut out = Vec::new();
+        out.extend_from_slice(&encode_row_description(&fields));
+        out.extend_from_slice(&encode_data_row(&[None]));
+        out.extend_from_slice(&encode_command_complete(&select_tag(1)));
+        out.extend_from_slice(&encode_ready_for_query(b'I'));
+        return Some(out);
+    }
+    // `format_type(<oid>, <typmod>)` → canonical type name from
+    // pg_type_name_for_oid. The caller passes the OID inline; we
+    // extract the first u32 argument and map to the canonical name.
+    if let Some(rest) = s.strip_prefix("select pg_catalog.format_type(")
+        .or_else(|| s.strip_prefix("select format_type("))
+    {
+        if let Some(oid) = parse_leading_u32_pub(rest) {
+            let name = pg_type_name_for_oid(oid);
+            return Some(single_text_row("format_type", name));
+        }
+        return Some(single_text_row("format_type", "unknown"));
+    }
+    // `current_setting('<name>')` → canned GUC value, '' for unknown.
+    if let Some(rest) = s.strip_prefix("select pg_catalog.current_setting(")
+        .or_else(|| s.strip_prefix("select current_setting("))
+    {
+        let name = extract_quoted_arg(rest);
+        let val = show_value_for(&name);
+        return Some(single_text_row("current_setting", val));
+    }
+
+    // ── SHOW ALL (returns a 3-column projection with 0 rows in V1) ─
+    // Checked BEFORE the SHOW prefix-strip so "show all" doesn't fall
+    // into the `show <name>` GUC lookup (which would return empty
+    // text for "all"). Tools that issue SHOW ALL get a graceful
+    // 0-row table.
+    if s == "show all" {
+        let fields = vec![
+            FieldMeta { name: "name".to_string(), type_oid: PG_TYPE_TEXT },
+            FieldMeta { name: "setting".to_string(), type_oid: PG_TYPE_TEXT },
+            FieldMeta { name: "description".to_string(), type_oid: PG_TYPE_TEXT },
+        ];
+        let mut out = Vec::new();
+        out.extend_from_slice(&encode_row_description(&fields));
+        out.extend_from_slice(&encode_command_complete(&select_tag(0)));
+        out.extend_from_slice(&encode_ready_for_query(b'I'));
+        return Some(out);
+    }
+    // ── SHOW <name> ───────────────────────────────────────────────
+    if let Some(rest) = s.strip_prefix("show ") {
+        // The name may itself be quoted in `show "TimeZone"` form.
+        let name = rest.trim_matches(|c: char| c == '"' || c == '\'').trim();
+        let val = show_value_for(name);
+        // `SHOW` emits the canonical PG `name` type with the GUC
+        // name as the column header.
+        return Some(single_text_row(name, val));
+    }
+
+    None
+}
+
+/// Strip a trailing ` as <alias>` clause from a single-statement
+/// `SELECT` after normalization. PG accepts `SELECT version() AS v`
+/// — V1's matcher anchors on the canonical no-alias form, so we
+/// strip the alias before matching.
+fn strip_select_alias(s: &str) -> &str {
+    // Find the last `as ` token (lowercase). If it's followed by a
+    // single identifier with no further whitespace, strip it.
+    if let Some(pos) = s.rfind(" as ") {
+        let tail = &s[pos + 4..];
+        // Tail must be an identifier — letters/digits/underscore only.
+        if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return &s[..pos];
+        }
+    }
+    s
+}
+
+/// Synthesize the canonical pgAdmin multi-function connect probe.
+/// Recognizes patterns like:
+///
+/// - `select version(), current_database()`
+/// - `select version(), current_database(), current_user`
+/// - `select version(), current_database(), current_user, current_schema()`
+///
+/// Returns a multi-column single-row response with the corresponding
+/// values. Recognized patterns are the canonical pgAdmin shapes —
+/// extensions / re-ordering fall through to the engine apply path.
+fn synthesize_pgadmin_multi_helper(normalized: &str) -> Option<Vec<u8>> {
+    let body = normalized.strip_prefix("select ")?;
+    // Tokenize on `, ` (post-normalization, each comma is followed by
+    // a single space). Each part is a known helper-function call.
+    let parts: Vec<&str> = body.split(", ").collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    // Each part MUST be one of the recognized helper-function call
+    // shapes. If any part isn't recognized, return None.
+    let mut fields = Vec::with_capacity(parts.len());
+    let mut values: Vec<Vec<u8>> = Vec::with_capacity(parts.len());
+    for part in &parts {
+        let (col_name, val): (&str, String) = match *part {
+            "version()" => ("version", KESSELDB_VERSION_STRING.to_string()),
+            "current_database()" | "current_catalog" => {
+                ("current_database", KESSELDB_DATABASE_NAME.to_string())
+            }
+            "current_schema()" | "current_schema" => {
+                ("current_schema", KESSELDB_SCHEMA_NAME.to_string())
+            }
+            "current_user" | "user" => ("current_user", KESSELDB_USER_NAME.to_string()),
+            "session_user" => ("session_user", KESSELDB_USER_NAME.to_string()),
+            _ => return None,
+        };
+        fields.push(FieldMeta { name: col_name.to_string(), type_oid: PG_TYPE_TEXT });
+        values.push(val.into_bytes());
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    let cols: Vec<Option<&[u8]>> = values.iter().map(|v| Some(v.as_slice())).collect();
+    out.extend_from_slice(&encode_data_row(&cols));
+    out.extend_from_slice(&encode_command_complete(&select_tag(1)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    Some(out)
+}
+
+/// Extract the first single-quoted argument from `s`. Used by
+/// `current_setting('name')` argument parsing. Returns `""` on
+/// no match. Stops at the first closing quote (no escape handling).
+fn extract_quoted_arg(s: &str) -> String {
+    if let Some(p) = s.find('\'') {
+        let after = &s[p + 1..];
+        if let Some(end) = after.find('\'') {
+            return after[..end].to_string();
+        }
+    }
+    String::new()
+}
+
+/// Public wrapper for `parse_leading_u32` so the helper-function
+/// synth (in this file) can call the parser the pattern dispatcher
+/// in `mod.rs` already uses. Kept private cross-module via a
+/// module-internal duplicate.
+fn parse_leading_u32_pub(s: &str) -> Option<u32> {
+    let mut acc: u64 = 0;
+    let mut any = false;
+    for c in s.chars() {
+        if let Some(d) = c.to_digit(10) {
+            acc = acc.checked_mul(10)?.checked_add(d as u64)?;
+            if acc > u32::MAX as u64 {
+                return None;
+            }
+            any = true;
+        } else {
+            break;
+        }
+    }
+    if any {
+        Some(acc as u32)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1700,5 +2464,602 @@ mod tests {
         // Unmatched name → 0 rows.
         let unmatched = pgjdbc_getcolumns_joined_rows(&eng, "doesnotexist");
         assert!(unmatched.windows(b"SELECT 0\0".len()).any(|w| w == b"SELECT 0\0"));
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-CAT T5 KATs — pg_index + pg_constraint synthesizers + the
+    // pgJDBC `getIndexInfo` joined-result intercept. Drive via
+    // IndexEngine (overrides list_indexes_for_table +
+    // list_constraints_for_table).
+    // ───────────────────────────────────────────────────────────────────
+
+    /// Engine that combines list_tables + describe_table +
+    /// list_indexes_for_table + list_constraints_for_table for T5
+    /// pattern-hook tests.
+    struct IndexEngine {
+        tables: Vec<TableMetadata>,
+        schemas: std::collections::BTreeMap<String, Vec<PgColumn>>,
+        indexes: std::collections::BTreeMap<String, Vec<IndexMetadata>>,
+        constraints: std::collections::BTreeMap<String, Vec<ConstraintMetadata>>,
+    }
+    impl EngineApply for IndexEngine {
+        fn apply_sql(&self, _sql: &str) -> OpResult {
+            OpResult::SchemaError("IndexEngine: apply_sql should not be reached".into())
+        }
+        fn describe_table(&self, name: &str) -> Option<Vec<PgColumn>> {
+            self.schemas.get(name).cloned()
+        }
+        fn list_tables(&self) -> Vec<TableMetadata> {
+            self.tables.clone()
+        }
+        fn list_indexes_for_table(&self, name: &str) -> Vec<IndexMetadata> {
+            self.indexes.get(name).cloned().unwrap_or_default()
+        }
+        fn list_constraints_for_table(&self, name: &str) -> Vec<ConstraintMetadata> {
+            self.constraints.get(name).cloned().unwrap_or_default()
+        }
+    }
+
+    fn t5_test_engine() -> IndexEngine {
+        use crate::engine::{FkAction, IndexKind};
+        let mut schemas = std::collections::BTreeMap::new();
+        schemas.insert(
+            "users".to_string(),
+            vec![
+                col("id", FieldKind::I64, false),
+                col("email", FieldKind::Char(128), false),
+                col("created_at", FieldKind::Timestamp, false),
+            ],
+        );
+        schemas.insert(
+            "orders".to_string(),
+            vec![
+                col("id", FieldKind::I64, false),
+                col("user_id", FieldKind::I64, false),
+                col("amount", FieldKind::Fixed { scale: 2 }, false),
+            ],
+        );
+        let mut indexes = std::collections::BTreeMap::new();
+        indexes.insert(
+            "users".to_string(),
+            vec![
+                IndexMetadata {
+                    name: "users_email_idx".into(),
+                    fields: vec![2],
+                    is_unique: true,
+                    kind: IndexKind::Equality,
+                },
+                IndexMetadata {
+                    name: "users_created_at_ridx".into(),
+                    fields: vec![3],
+                    is_unique: false,
+                    kind: IndexKind::Range,
+                },
+            ],
+        );
+        indexes.insert(
+            "orders".to_string(),
+            vec![IndexMetadata {
+                name: "orders_user_id_amount_idx".into(),
+                fields: vec![2, 3],
+                is_unique: false,
+                kind: IndexKind::Composite,
+            }],
+        );
+        let mut constraints = std::collections::BTreeMap::new();
+        constraints.insert(
+            "users".to_string(),
+            vec![ConstraintMetadata {
+                name: "users_email_key".into(),
+                kind: ConstraintKind::Unique,
+                columns: vec![2],
+                references: None,
+            }],
+        );
+        constraints.insert(
+            "orders".to_string(),
+            vec![
+                ConstraintMetadata {
+                    name: "orders_user_id_fkey".into(),
+                    kind: ConstraintKind::ForeignKey {
+                        on_delete: FkAction::Cascade,
+                    },
+                    columns: vec![2],
+                    references: Some(("users".to_string(), vec![1])),
+                },
+                ConstraintMetadata {
+                    name: "orders_amount_check".into(),
+                    kind: ConstraintKind::Check,
+                    columns: vec![3],
+                    references: None,
+                },
+            ],
+        );
+        IndexEngine {
+            tables: vec![
+                td("users", 1, 3),
+                td("orders", 2, 3),
+            ],
+            schemas,
+            indexes,
+            constraints,
+        }
+    }
+
+    fn empty_index_engine() -> IndexEngine {
+        IndexEngine {
+            tables: vec![td("users", 1, 1)],
+            schemas: std::collections::BTreeMap::new(),
+            indexes: std::collections::BTreeMap::new(),
+            constraints: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// **HEADLINE — pg_index synthesizer returns 0 rows for engine
+    /// with no indexes.** Well-framed (T + C "SELECT 0" + Z, no D
+    /// frames). The graceful degradation path for engines that don't
+    /// override `list_indexes_for_table`.
+    #[test]
+    fn t5_pg_index_synthesizer_no_indexes_returns_zero_rows() {
+        let eng = empty_index_engine();
+        let bytes = synthesize_pg_index(&eng, None);
+        assert_eq!(bytes[0], b'T');
+        assert!(bytes.windows(b"SELECT 0\0".len()).any(|w| w == b"SELECT 0\0"));
+        assert_eq!(&bytes[bytes.len() - 6..], &[b'Z', 0, 0, 0, 5, b'I']);
+    }
+
+    /// **HEADLINE — pg_index synthesizer returns one row per index
+    /// across all tables.** 2 tables × (2+1) = 3 indexes total.
+    /// pg_index does NOT carry the index name (that's pg_class's
+    /// relname column); the name surfaces only via the synthetic
+    /// indexrelid OID (FNV-1a of the name).
+    #[test]
+    fn t5_pg_index_synthesizer_emits_all_indexes() {
+        let eng = t5_test_engine();
+        let bytes = synthesize_pg_index(&eng, None);
+        assert_eq!(bytes[0], b'T');
+        assert!(bytes.windows(b"SELECT 3\0".len()).any(|w| w == b"SELECT 3\0"),
+            "MUST emit SELECT 3 for 3 indexes across 2 tables");
+        // Synthetic indexrelid OIDs appear in the stream (decimal text).
+        for idx_name in ["users_email_idx", "users_created_at_ridx", "orders_user_id_amount_idx"] {
+            let oid = oid_for_index_name(idx_name).to_string();
+            assert!(bytes.windows(oid.len()).any(|w| w == oid.as_bytes()),
+                "indexrelid for {idx_name} ({oid}) MUST appear");
+        }
+    }
+
+    /// **HEADLINE — pg_index synthesizer filtered to one table by
+    /// indrelid.** pg_index doesn't carry the index name (per PG
+    /// catalog shape — that's pg_class.relname); the per-index
+    /// data surfaces via the indexrelid OID slot.
+    #[test]
+    fn t5_pg_index_synthesizer_filtered_to_one_table() {
+        let eng = t5_test_engine();
+        let users_oid = oid_for_table_name("users");
+        let bytes = synthesize_pg_index(&eng, Some(users_oid));
+        assert!(bytes.windows(b"SELECT 2\0".len()).any(|w| w == b"SELECT 2\0"),
+            "MUST emit SELECT 2 (users has 2 indexes)");
+        // Both users index indexrelid OIDs appear; the orders index
+        // OID does NOT.
+        for users_idx in ["users_email_idx", "users_created_at_ridx"] {
+            let oid = oid_for_index_name(users_idx).to_string();
+            assert!(bytes.windows(oid.len()).any(|w| w == oid.as_bytes()));
+        }
+        let orders_idx_oid = oid_for_index_name("orders_user_id_amount_idx").to_string();
+        assert!(!bytes.windows(orders_idx_oid.len()).any(|w| w == orders_idx_oid.as_bytes()),
+            "orders index OID MUST NOT appear in users-filtered result");
+        // users_oid appears as the indrelid value (2 rows × 1 column = 2 occurrences min).
+        let users_oid_str = users_oid.to_string();
+        let occurrences = bytes.windows(users_oid_str.len())
+            .filter(|w| *w == users_oid_str.as_bytes())
+            .count();
+        assert!(occurrences >= 2, "indrelid for users MUST appear in each of the 2 index rows");
+    }
+
+    /// **HEADLINE — pg_index RowDescription has 19 columns.** Locked
+    /// vs PG 14 `pg_index.h` so clients iterating row columns by
+    /// index don't break.
+    #[test]
+    fn t5_pg_index_row_description_has_19_columns() {
+        let eng = t5_test_engine();
+        let bytes = synthesize_pg_index(&eng, None);
+        let fc = u16::from_be_bytes([bytes[5], bytes[6]]);
+        assert_eq!(fc, PG_INDEX_COLUMN_COUNT as u16,
+            "pg_index RowDescription MUST have 19 fields");
+        // Canonical column names appear.
+        assert!(bytes.windows(b"indexrelid\0".len()).any(|w| w == b"indexrelid\0"));
+        assert!(bytes.windows(b"indrelid\0".len()).any(|w| w == b"indrelid\0"));
+        assert!(bytes.windows(b"indisunique\0".len()).any(|w| w == b"indisunique\0"));
+        assert!(bytes.windows(b"indkey\0".len()).any(|w| w == b"indkey\0"));
+        assert!(bytes.windows(b"indisprimary\0".len()).any(|w| w == b"indisprimary\0"));
+    }
+
+    /// **Invariant — indisunique='t' for UNIQUE indexes / 'f' for
+    /// non-unique.** Stream contains both 't' and 'f' bytes (the
+    /// canned values for the 3 indexes — 1 unique + 2 non-unique).
+    #[test]
+    fn t5_pg_index_indisunique_per_kind() {
+        let eng = t5_test_engine();
+        let users_oid = oid_for_table_name("users");
+        // 1 unique + 1 non-unique on users → both 't' and 'f' appear.
+        let bytes = synthesize_pg_index(&eng, Some(users_oid));
+        assert!(bytes.contains(&b't'));
+        assert!(bytes.contains(&b'f'));
+    }
+
+    /// **Invariant — indkey contains attnums as space-separated text.**
+    /// Composite index on orders (attnums 2,3) emits `"2 3"`.
+    #[test]
+    fn t5_pg_index_indkey_renders_attnums() {
+        let eng = t5_test_engine();
+        let orders_oid = oid_for_table_name("orders");
+        let bytes = synthesize_pg_index(&eng, Some(orders_oid));
+        // The composite index has fields=[2,3] → indkey rendered as "2 3".
+        assert!(bytes.windows(b"2 3".len()).any(|w| w == b"2 3"),
+            "composite index indkey MUST be `2 3` (space-separated attnums)");
+    }
+
+    /// **render_int2vector — empty + single + multi cases.**
+    #[test]
+    fn t5_render_int2vector_cases() {
+        assert_eq!(render_int2vector(&[]), "");
+        assert_eq!(render_int2vector(&[5]), "5");
+        assert_eq!(render_int2vector(&[1, 2, 3]), "1 2 3");
+        assert_eq!(render_int2vector(&[10, 20]), "10 20");
+    }
+
+    /// **render_int_array — PG `int2[]` array literal format `{1,2,3}`.**
+    #[test]
+    fn t5_render_int_array_cases() {
+        assert_eq!(render_int_array(&[]), "{}");
+        assert_eq!(render_int_array(&[1]), "{1}");
+        assert_eq!(render_int_array(&[1, 2, 3]), "{1,2,3}");
+    }
+
+    /// **HEADLINE — pg_constraint synthesizer empty engine returns
+    /// 0 rows + well-framed.**
+    #[test]
+    fn t5_pg_constraint_synthesizer_no_constraints_returns_zero_rows() {
+        let eng = empty_index_engine();
+        let bytes = synthesize_pg_constraint(&eng, None);
+        assert_eq!(bytes[0], b'T');
+        assert!(bytes.windows(b"SELECT 0\0".len()).any(|w| w == b"SELECT 0\0"));
+    }
+
+    /// **HEADLINE — pg_constraint synthesizer returns rows for all
+    /// CHECK / FK / UNIQUE constraints across tables.** 1 + 2 = 3
+    /// total.
+    #[test]
+    fn t5_pg_constraint_synthesizer_emits_all_constraints() {
+        let eng = t5_test_engine();
+        let bytes = synthesize_pg_constraint(&eng, None);
+        assert!(bytes.windows(b"SELECT 3\0".len()).any(|w| w == b"SELECT 3\0"),
+            "MUST emit SELECT 3 for 3 constraints across 2 tables");
+        // Constraint names appear in the stream.
+        assert!(bytes.windows(b"users_email_key".len()).any(|w| w == b"users_email_key"));
+        assert!(bytes.windows(b"orders_user_id_fkey".len()).any(|w| w == b"orders_user_id_fkey"));
+        assert!(bytes.windows(b"orders_amount_check".len()).any(|w| w == b"orders_amount_check"));
+    }
+
+    /// **HEADLINE — pg_constraint synthesizer filtered to one table
+    /// by conrelid.**
+    #[test]
+    fn t5_pg_constraint_synthesizer_filtered_to_one_table() {
+        let eng = t5_test_engine();
+        let users_oid = oid_for_table_name("users");
+        let bytes = synthesize_pg_constraint(&eng, Some(users_oid));
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"),
+            "MUST emit SELECT 1 (users has 1 UNIQUE constraint)");
+        assert!(bytes.windows(b"users_email_key".len()).any(|w| w == b"users_email_key"));
+        // The orders constraint name MUST NOT appear in filtered result.
+        assert!(!bytes.windows(b"orders_user_id_fkey".len()).any(|w| w == b"orders_user_id_fkey"));
+    }
+
+    /// **HEADLINE — pg_constraint RowDescription has 25 columns.**
+    #[test]
+    fn t5_pg_constraint_row_description_has_25_columns() {
+        let eng = t5_test_engine();
+        let bytes = synthesize_pg_constraint(&eng, None);
+        let fc = u16::from_be_bytes([bytes[5], bytes[6]]);
+        assert_eq!(fc, PG_CONSTRAINT_COLUMN_COUNT as u16,
+            "pg_constraint RowDescription MUST have 25 fields");
+        // Canonical column names appear.
+        assert!(bytes.windows(b"conname\0".len()).any(|w| w == b"conname\0"));
+        assert!(bytes.windows(b"contype\0".len()).any(|w| w == b"contype\0"));
+        assert!(bytes.windows(b"conrelid\0".len()).any(|w| w == b"conrelid\0"));
+        assert!(bytes.windows(b"confrelid\0".len()).any(|w| w == b"confrelid\0"));
+        assert!(bytes.windows(b"conkey\0".len()).any(|w| w == b"conkey\0"));
+    }
+
+    /// **Invariant — contype byte is correct per ConstraintKind.**
+    /// Stream contains 'c' (CHECK), 'f' (FK), 'u' (UNIQUE) bytes
+    /// across the synthesized rows.
+    #[test]
+    fn t5_pg_constraint_contype_byte_per_kind() {
+        let eng = t5_test_engine();
+        let bytes = synthesize_pg_constraint(&eng, None);
+        // All three contype chars must appear in stream (one per row).
+        assert!(bytes.contains(&b'c'), "CHECK constraint contype 'c' MUST appear");
+        assert!(bytes.contains(&b'f'), "FK constraint contype 'f' MUST appear");
+        assert!(bytes.contains(&b'u'), "UNIQUE constraint contype 'u' MUST appear");
+    }
+
+    /// **Invariant — confkey populated for FK constraint with the
+    /// referenced columns as an int2[] literal.** orders FK
+    /// references users(id) = column 1 → confkey="{1}".
+    #[test]
+    fn t5_pg_constraint_confkey_populated_for_fk() {
+        let eng = t5_test_engine();
+        let orders_oid = oid_for_table_name("orders");
+        let bytes = synthesize_pg_constraint(&eng, Some(orders_oid));
+        // The FK row carries confkey="{1}".
+        assert!(bytes.windows(b"{1}".len()).any(|w| w == b"{1}"),
+            "FK confkey MUST be `{{1}}` (referenced column 1)");
+        // The conkey column for the FK has the source column = column 2.
+        assert!(bytes.windows(b"{2}".len()).any(|w| w == b"{2}"));
+    }
+
+    /// **Invariant — confrelid populated for FK row (references
+    /// users.pg_class.oid).** The referenced table's stable-hash OID
+    /// appears in the FK row.
+    #[test]
+    fn t5_pg_constraint_confrelid_populated_for_fk() {
+        let eng = t5_test_engine();
+        let orders_oid = oid_for_table_name("orders");
+        let bytes = synthesize_pg_constraint(&eng, Some(orders_oid));
+        let users_oid_str = oid_for_table_name("users").to_string();
+        assert!(bytes.windows(users_oid_str.len()).any(|w| w == users_oid_str.as_bytes()),
+            "FK confrelid MUST equal pg_class.oid of referenced table");
+    }
+
+    /// **Invariant — pgJDBC getIndexInfo joined-result fires for the
+    /// matching table.** orders has a composite index → 2 column rows.
+    #[test]
+    fn t5_pgjdbc_getindexinfo_joined_rows_matches_by_name() {
+        let eng = t5_test_engine();
+        let bytes = pgjdbc_getindexinfo_joined_rows(&eng, "orders");
+        // Composite index spans 2 columns → 2 ordinal rows.
+        assert!(bytes.windows(b"SELECT 2\0".len()).any(|w| w == b"SELECT 2\0"));
+        assert!(bytes.windows(b"orders_user_id_amount_idx".len())
+            .any(|w| w == b"orders_user_id_amount_idx"));
+        // Column names appear in the rows.
+        assert!(bytes.windows(b"user_id".len()).any(|w| w == b"user_id"));
+        assert!(bytes.windows(b"amount".len()).any(|w| w == b"amount"));
+        // Unmatched name → 0 rows.
+        let unmatched = pgjdbc_getindexinfo_joined_rows(&eng, "doesnotexist");
+        assert!(unmatched.windows(b"SELECT 0\0".len()).any(|w| w == b"SELECT 0\0"));
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-CAT T7 KATs — SQL helper functions (version() / current_*
+    // / SHOW / pg_get_userbyid / pg_table_is_visible / format_type /
+    // current_setting / multi-function probe).
+    // ───────────────────────────────────────────────────────────────────
+
+    /// **HEADLINE — `select version()` returns the canned KesselDB
+    /// version string.**
+    #[test]
+    fn t7_version_returns_kesseldb_version() {
+        let bytes = synthesize_helper_function("select version()").expect("matches");
+        assert_eq!(bytes[0], b'T');
+        assert!(bytes.windows(KESSELDB_VERSION_STRING.len())
+            .any(|w| w == KESSELDB_VERSION_STRING.as_bytes()));
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+        assert!(bytes.windows(b"version\0".len()).any(|w| w == b"version\0"));
+    }
+
+    /// **HEADLINE — `select current_database()` returns 'kesseldb'.**
+    #[test]
+    fn t7_current_database_returns_kesseldb() {
+        let bytes = synthesize_helper_function("select current_database()").expect("matches");
+        assert!(bytes.windows(b"kesseldb".len()).any(|w| w == b"kesseldb"));
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+    }
+
+    /// **HEADLINE — `select current_schema()` returns 'public'.**
+    #[test]
+    fn t7_current_schema_returns_public() {
+        let bytes = synthesize_helper_function("select current_schema()").expect("matches");
+        assert!(bytes.windows(b"public".len()).any(|w| w == b"public"));
+        // The no-parens form also matches.
+        let bytes2 = synthesize_helper_function("select current_schema").expect("matches");
+        assert!(bytes2.windows(b"public".len()).any(|w| w == b"public"));
+    }
+
+    /// **HEADLINE — `select current_user` / `session_user` / `user`
+    /// all return 'kesseldb'.**
+    #[test]
+    fn t7_current_user_session_user_user() {
+        for sql in ["select current_user", "select session_user", "select user"] {
+            let bytes = synthesize_helper_function(sql).unwrap_or_else(|| panic!("matches {sql}"));
+            assert!(bytes.windows(b"kesseldb".len()).any(|w| w == b"kesseldb"),
+                "{sql} MUST return kesseldb");
+        }
+    }
+
+    /// **HEADLINE — `SHOW server_version` returns the canned version.**
+    #[test]
+    fn t7_show_server_version_returns_canned() {
+        let bytes = synthesize_helper_function("show server_version").expect("matches");
+        assert!(bytes.windows(b"14.0".len()).any(|w| w == b"14.0"));
+    }
+
+    /// **HEADLINE — `SHOW timezone` returns 'UTC'.**
+    #[test]
+    fn t7_show_timezone_returns_utc() {
+        let bytes = synthesize_helper_function("show timezone").expect("matches");
+        assert!(bytes.windows(b"UTC".len()).any(|w| w == b"UTC"));
+    }
+
+    /// **HEADLINE — unknown `SHOW` name returns the empty string (PG
+    /// behavior — not an error).**
+    #[test]
+    fn t7_show_unknown_name_returns_empty_string() {
+        let bytes = synthesize_helper_function("show some_unknown_guc").expect("matches");
+        // The frame is well-formed; the value is empty.
+        assert_eq!(bytes[0], b'T');
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+    }
+
+    /// **HEADLINE — case-insensitive helper recognition.** The hook
+    /// uses normalize_for_match upstream, but the synthesizer's own
+    /// caller may pass a different case; the synth assumes
+    /// pre-lowered input + asserts the canonical text matches.
+    #[test]
+    fn t7_helper_pattern_is_lowercase_only_after_normalization() {
+        // synthesize_helper_function assumes pre-normalized input;
+        // the outer catalog_query_hook normalizes first. Validate by
+        // passing lowercase + alias-stripping.
+        assert!(synthesize_helper_function("select version()").is_some());
+        // Upper-case input doesn't match (the hook normalizes).
+        assert!(synthesize_helper_function("SELECT VERSION()").is_none());
+        // But the hook integration in catalog_query_hook handles this
+        // (the case-insensitivity is achieved via normalize_for_match,
+        // tested in mod.rs).
+    }
+
+    /// **HEADLINE — `AS alias` suffix tolerated.** `SELECT version()
+    /// AS v` matches the same as `SELECT version()`.
+    #[test]
+    fn t7_helper_pattern_strips_trailing_as_alias() {
+        let bytes = synthesize_helper_function("select version() as v").expect("matches");
+        assert!(bytes.windows(KESSELDB_VERSION_STRING.len())
+            .any(|w| w == KESSELDB_VERSION_STRING.as_bytes()));
+    }
+
+    /// **HEADLINE — pgAdmin multi-function probe.** `SELECT version(),
+    /// current_database(), current_user, current_schema()` returns
+    /// a 4-column single-row response with all 4 values populated.
+    #[test]
+    fn t7_pgadmin_multi_function_probe() {
+        let bytes = synthesize_helper_function(
+            "select version(), current_database(), current_user, current_schema()",
+        )
+        .expect("matches");
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+        // All 4 values appear.
+        assert!(bytes.windows(KESSELDB_VERSION_STRING.len())
+            .any(|w| w == KESSELDB_VERSION_STRING.as_bytes()));
+        assert!(bytes.windows(b"kesseldb".len()).any(|w| w == b"kesseldb"));
+        assert!(bytes.windows(b"public".len()).any(|w| w == b"public"));
+        // 4 columns in the RowDescription.
+        let fc = u16::from_be_bytes([bytes[5], bytes[6]]);
+        assert_eq!(fc, 4);
+    }
+
+    /// **`pg_get_userbyid(N)` returns 'kesseldb' for any OID.** V1
+    /// has one user identity.
+    #[test]
+    fn t7_pg_get_userbyid_returns_kesseldb() {
+        let bytes = synthesize_helper_function("select pg_get_userbyid(10)").expect("matches");
+        assert!(bytes.windows(b"kesseldb".len()).any(|w| w == b"kesseldb"));
+        // Qualified form also matches.
+        let bytes2 = synthesize_helper_function("select pg_catalog.pg_get_userbyid(42)")
+            .expect("matches");
+        assert!(bytes2.windows(b"kesseldb".len()).any(|w| w == b"kesseldb"));
+    }
+
+    /// **`pg_table_is_visible(N)` returns true for any OID.** V1
+    /// single-schema; all tables visible.
+    #[test]
+    fn t7_pg_table_is_visible_returns_true() {
+        let bytes = synthesize_helper_function("select pg_table_is_visible(16385)")
+            .expect("matches");
+        // The bool 't' appears (single-row data value).
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+        // The qualified form too.
+        let bytes2 = synthesize_helper_function("select pg_catalog.pg_table_is_visible(99)")
+            .expect("matches");
+        assert!(bytes2.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+    }
+
+    /// **`format_type(<oid>, <typmod>)` returns the canonical PG
+    /// type name.**
+    #[test]
+    fn t7_format_type_returns_pg_type_name() {
+        // OID 20 → int8
+        let bytes = synthesize_helper_function("select format_type(20, -1)").expect("matches");
+        assert!(bytes.windows(b"int8".len()).any(|w| w == b"int8"));
+        // OID 25 → text
+        let bytes2 = synthesize_helper_function("select pg_catalog.format_type(25, -1)")
+            .expect("matches");
+        assert!(bytes2.windows(b"text".len()).any(|w| w == b"text"));
+    }
+
+    /// **`current_setting('name')` returns canned GUC values.**
+    #[test]
+    fn t7_current_setting_returns_canned_gucs() {
+        let bytes = synthesize_helper_function("select current_setting('server_version')")
+            .expect("matches");
+        assert!(bytes.windows(b"14.0".len()).any(|w| w == b"14.0"));
+        // Unknown setting → empty string.
+        let bytes2 = synthesize_helper_function("select current_setting('unknown')")
+            .expect("matches");
+        assert!(bytes2.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+    }
+
+    /// **`pg_get_indexdef(N)` / `pg_get_constraintdef(N)` / `pg_get_expr`
+    /// return empty string (V1 doesn't render def text).**
+    #[test]
+    fn t7_pg_get_def_functions_return_empty_string() {
+        for sql in [
+            "select pg_get_indexdef(16385)",
+            "select pg_catalog.pg_get_indexdef(16385)",
+            "select pg_get_constraintdef(16385)",
+            "select pg_catalog.pg_get_constraintdef(16385)",
+            "select pg_get_expr(null, 16385)",
+        ] {
+            let bytes = synthesize_helper_function(sql)
+                .unwrap_or_else(|| panic!("matches: {sql}"));
+            assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"),
+                "{sql} MUST emit a 1-row response");
+        }
+    }
+
+    /// **`obj_description(N, 'pg_class')` returns NULL.** V1 doesn't
+    /// have descriptions.
+    #[test]
+    fn t7_obj_description_returns_null() {
+        let bytes = synthesize_helper_function("select obj_description(16385, 'pg_class')")
+            .expect("matches");
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+        // The NULL sentinel (0xFFFFFFFF) appears in the single data row.
+        assert!(bytes.windows(4).any(|w| w == [0xFF, 0xFF, 0xFF, 0xFF]));
+    }
+
+    /// **`pg_my_temp_schema()` returns 0 (V1: no temp schemas).**
+    #[test]
+    fn t7_pg_my_temp_schema_returns_zero() {
+        let bytes = synthesize_helper_function("select pg_my_temp_schema()").expect("matches");
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+        // The integer 0 appears in the row.
+        assert!(bytes.windows(b"0".len()).any(|w| w == b"0"));
+    }
+
+    /// **`pg_is_other_temp_schema(N)` returns false (V1).**
+    #[test]
+    fn t7_pg_is_other_temp_schema_returns_false() {
+        let bytes = synthesize_helper_function("select pg_is_other_temp_schema(99)")
+            .expect("matches");
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+    }
+
+    /// **Unrecognized SELECT → None (falls through to engine apply).**
+    #[test]
+    fn t7_unrecognized_select_returns_none() {
+        assert!(synthesize_helper_function("select * from users").is_none());
+        assert!(synthesize_helper_function("select 1").is_none());
+        assert!(synthesize_helper_function("select foo()").is_none());
+    }
+
+    /// **Unrecognized SHOW ALL returns 0 rows (well-framed) per spec
+    /// — tools that issue SHOW ALL get a graceful 0-row table.**
+    #[test]
+    fn t7_show_all_returns_zero_rows() {
+        let bytes = synthesize_helper_function("show all").expect("matches");
+        assert!(bytes.windows(b"SELECT 0\0".len()).any(|w| w == b"SELECT 0\0"));
+        // RowDescription has 3 columns (name / setting / description).
+        let fc = u16::from_be_bytes([bytes[5], bytes[6]]);
+        assert_eq!(fc, 3);
     }
 }

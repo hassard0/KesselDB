@@ -73,6 +73,127 @@ pub struct TableMetadata {
     pub field_count: u16,
 }
 
+/// SP-PG-CAT T5 — metadata for one KesselDB index, surfaced via
+/// `EngineApply::list_indexes_for_table()` to the `pg_index`
+/// synthesizer.
+///
+/// Carries just enough to fill the V1 `pg_index` rows:
+///
+/// - `name` — synthetic index name (e.g. `users_email_idx`).
+///   The PG-side `pg_class` row for the index would carry this
+///   as `relname`, but V1 doesn't expose indexes through
+///   `list_tables()` (KesselDB has no first-class index catalog
+///   entries) — the name is derived synthetically from the
+///   indexed table + column.
+/// - `fields` — 1-based `attnum`s of the indexed columns. Packed
+///   into the `indkey` `int2vector` column at synthesis time
+///   (space-separated text per PG wire format).
+/// - `is_unique` — true for UNIQUE indexes (drives `indisunique`).
+/// - `kind` — discriminates `Equality` / `Range` / `Composite` for
+///   future opclass differentiation; V1 emits all three the same
+///   way (no opclass differentiation on the wire — V2 SP-PG-CAT-
+///   OPCLASS would add).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexMetadata {
+    pub name: String,
+    pub fields: Vec<u32>,
+    pub is_unique: bool,
+    pub kind: IndexKind,
+}
+
+/// SP-PG-CAT T5 — KesselDB index kind. Mapped from `ObjectType.
+/// indexes` (Equality) / `ordered` (Range) / `composite` (Composite).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexKind {
+    /// Single-column equality index (`ObjectType.indexes`).
+    Equality,
+    /// Single-column ordered/range index (`ObjectType.ordered`).
+    Range,
+    /// Multi-column equality index (`ObjectType.composite`).
+    Composite,
+}
+
+/// SP-PG-CAT T5 — metadata for one KesselDB constraint, surfaced
+/// via `EngineApply::list_constraints_for_table()` to the
+/// `pg_constraint` synthesizer.
+///
+/// Carries just enough to fill the V1 `pg_constraint` rows:
+///
+/// - `name` — synthetic constraint name (e.g. `users_email_key`
+///   for UNIQUE / `users_user_id_fkey` for FK / `users_check_0`
+///   for CHECK).
+/// - `kind` — Check / ForeignKey / Unique. Drives `contype`
+///   ('c' / 'f' / 'u' / 'p').
+/// - `columns` — 1-based `attnum`s of the constrained columns.
+/// - `references` — for FK only: `(referenced_table_name,
+///   referenced_attnums)`. None for non-FK kinds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstraintMetadata {
+    pub name: String,
+    pub kind: ConstraintKind,
+    pub columns: Vec<u32>,
+    pub references: Option<(String, Vec<u32>)>,
+}
+
+/// SP-PG-CAT T5 — KesselDB constraint kind. Maps to PG `pg_constraint
+/// .contype` per `src/include/catalog/pg_constraint.h`:
+///
+/// | ConstraintKind | contype | meaning |
+/// |---|---|---|
+/// | `Check` | 'c' | CHECK constraint |
+/// | `ForeignKey { .. }` | 'f' | FOREIGN KEY constraint |
+/// | `Unique` | 'u' | UNIQUE constraint |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstraintKind {
+    Check,
+    ForeignKey { on_delete: FkAction },
+    Unique,
+}
+
+/// SP-PG-CAT T5 — FK `ON DELETE` action. Maps to PG `pg_constraint.
+/// confdeltype` per `src/include/catalog/pg_constraint.h`:
+///
+/// | FkAction | confdeltype | meaning |
+/// |---|---|---|
+/// | `NoAction` | 'a' | NO ACTION (default) |
+/// | `Restrict` | 'r' | RESTRICT |
+/// | `Cascade` | 'c' | CASCADE |
+/// | `SetNull` | 'n' | SET NULL |
+/// | `SetDefault` | 'd' | SET DEFAULT |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FkAction {
+    NoAction,
+    Restrict,
+    Cascade,
+    SetNull,
+    SetDefault,
+}
+
+impl FkAction {
+    /// Map to canonical PG `confdeltype` / `confupdtype` char per
+    /// `pg_constraint.h`. Used by the `pg_constraint` synthesizer.
+    pub fn pg_action_char(self) -> u8 {
+        match self {
+            FkAction::NoAction => b'a',
+            FkAction::Restrict => b'r',
+            FkAction::Cascade => b'c',
+            FkAction::SetNull => b'n',
+            FkAction::SetDefault => b'd',
+        }
+    }
+}
+
+impl ConstraintKind {
+    /// Map to canonical PG `contype` char per `pg_constraint.h`.
+    pub fn pg_contype(self) -> u8 {
+        match self {
+            ConstraintKind::Check => b'c',
+            ConstraintKind::ForeignKey { .. } => b'f',
+            ConstraintKind::Unique => b'u',
+        }
+    }
+}
+
 /// SP-PG-CAT T3 — the V1 `pg_class.relkind` shape that maps to
 /// each KesselDB catalog entry. KesselDB V1 only has ordinary
 /// tables, so `list_tables()` always returns `Ordinary` today;
@@ -201,6 +322,47 @@ pub trait EngineApply: Send + Sync + 'static {
     /// stable wire output, but the trait MAKES NO ordering
     /// promise — V2 may sort by name for human-friendly output.
     fn list_tables(&self) -> Vec<TableMetadata> {
+        Vec::new()
+    }
+
+    /// SP-PG-CAT T5 — list every index on the given table for the
+    /// `pg_index` synthesizer. Returns one `IndexMetadata` per index
+    /// (equality / range / composite — distinguished by `IndexKind`).
+    ///
+    /// **Default impl returns empty `Vec`** — engines that don't
+    /// implement this gracefully fall back to a no-rows `pg_index`
+    /// response (pgJDBC `getIndexInfo` shows "no indexes" cleanly).
+    /// The default lets SP-PG-CAT T5 land before / independent of
+    /// any engine-side wiring — the in-tree `kesseldb-server::
+    /// EngineHandle` overrides per design §5.5 when an
+    /// `LIST_INDEXES_TAG` admin frame ships.
+    ///
+    /// **Read-only invariant** — same shape as `describe_table`:
+    /// this method MUST NOT mutate engine state, advance op-number,
+    /// or take a snapshot.
+    ///
+    /// **Listing order** — indexes are returned in declaration order
+    /// (`ObjectType.indexes` → `ordered` → `composite` is a reasonable
+    /// default for the in-tree impl). The synthesizer makes no
+    /// ordering promise on the wire.
+    fn list_indexes_for_table(&self, _table_name: &str) -> Vec<IndexMetadata> {
+        Vec::new()
+    }
+
+    /// SP-PG-CAT T5 — list every constraint on the given table for
+    /// the `pg_constraint` synthesizer. Returns one `ConstraintMetadata`
+    /// per CHECK / FK / UNIQUE constraint.
+    ///
+    /// **Default impl returns empty `Vec`** — engines that don't
+    /// implement this gracefully fall back to a no-rows `pg_constraint`
+    /// response. The default lets SP-PG-CAT T5 land before / independent
+    /// of any engine-side wiring — the in-tree `kesseldb-server::
+    /// EngineHandle` overrides per design §5.6 when an
+    /// `LIST_CONSTRAINTS_TAG` admin frame ships.
+    ///
+    /// **Read-only invariant** — same shape as `describe_table`:
+    /// this method MUST NOT mutate engine state.
+    fn list_constraints_for_table(&self, _table_name: &str) -> Vec<ConstraintMetadata> {
         Vec::new()
     }
 }
@@ -340,6 +502,158 @@ mod tests {
         // Clone + PartialEq round-trip — used by every KAT below.
         let md2 = md.clone();
         assert_eq!(md, md2);
+    }
+
+    /// **Default-impl invariant — list_indexes_for_table:** the
+    /// trait's default returns an empty Vec, so an engine that
+    /// doesn't override gets a graceful empty-pg_index response
+    /// (pgJDBC `getIndexInfo` shows "no indexes" cleanly). Locked
+    /// because any future change that drops the default would
+    /// silently break every existing `EngineApply` impl.
+    #[test]
+    fn t5_list_indexes_for_table_default_impl_returns_empty_vec() {
+        let eng = MockEngine {
+            schema: std::collections::BTreeMap::new(),
+            apply: std::sync::Mutex::new(Vec::new()),
+        };
+        let idx = eng.list_indexes_for_table("users");
+        assert!(
+            idx.is_empty(),
+            "default list_indexes_for_table() MUST return an empty Vec — got {} entries",
+            idx.len()
+        );
+        // Holds for any table name (graceful for unknown tables too).
+        assert!(eng.list_indexes_for_table("doesnotexist").is_empty());
+    }
+
+    /// **Default-impl invariant — list_constraints_for_table:** ditto
+    /// for the constraints accessor.
+    #[test]
+    fn t5_list_constraints_for_table_default_impl_returns_empty_vec() {
+        let eng = MockEngine {
+            schema: std::collections::BTreeMap::new(),
+            apply: std::sync::Mutex::new(Vec::new()),
+        };
+        let cons = eng.list_constraints_for_table("users");
+        assert!(
+            cons.is_empty(),
+            "default list_constraints_for_table() MUST return an empty Vec — got {} entries",
+            cons.len()
+        );
+        assert!(eng.list_constraints_for_table("doesnotexist").is_empty());
+    }
+
+    /// **IndexKind/ConstraintKind/FkAction → PG byte char locks:**
+    /// the canonical PG `contype` + `confdeltype` chars per
+    /// `src/include/catalog/pg_constraint.h`. Flipping any silently
+    /// breaks every PG client's CASE-on-contype logic.
+    #[test]
+    fn t5_constraint_kind_and_fk_action_pg_chars() {
+        assert_eq!(ConstraintKind::Check.pg_contype(), b'c');
+        assert_eq!(ConstraintKind::Unique.pg_contype(), b'u');
+        assert_eq!(
+            ConstraintKind::ForeignKey { on_delete: FkAction::NoAction }.pg_contype(),
+            b'f'
+        );
+        assert_eq!(FkAction::NoAction.pg_action_char(), b'a');
+        assert_eq!(FkAction::Restrict.pg_action_char(), b'r');
+        assert_eq!(FkAction::Cascade.pg_action_char(), b'c');
+        assert_eq!(FkAction::SetNull.pg_action_char(), b'n');
+        assert_eq!(FkAction::SetDefault.pg_action_char(), b'd');
+    }
+
+    /// **Engine can override list_indexes_for_table** — locks the
+    /// dispatch path the `kesseldb-server::EngineHandle` impl uses
+    /// (once a future LIST_INDEXES_TAG admin frame ships).
+    #[test]
+    fn t5_list_indexes_overridable_via_trait_impl() {
+        struct IndexEngine;
+        impl EngineApply for IndexEngine {
+            fn apply_sql(&self, _sql: &str) -> OpResult {
+                OpResult::SchemaError("not used".into())
+            }
+            fn describe_table(&self, _name: &str) -> Option<Vec<PgColumn>> {
+                None
+            }
+            fn list_indexes_for_table(&self, name: &str) -> Vec<IndexMetadata> {
+                if name == "users" {
+                    vec![
+                        IndexMetadata {
+                            name: "users_email_idx".into(),
+                            fields: vec![2],
+                            is_unique: true,
+                            kind: IndexKind::Equality,
+                        },
+                        IndexMetadata {
+                            name: "users_created_at_ridx".into(),
+                            fields: vec![3],
+                            is_unique: false,
+                            kind: IndexKind::Range,
+                        },
+                    ]
+                } else {
+                    vec![]
+                }
+            }
+        }
+        let eng = IndexEngine;
+        let idx = eng.list_indexes_for_table("users");
+        assert_eq!(idx.len(), 2);
+        assert_eq!(idx[0].name, "users_email_idx");
+        assert!(idx[0].is_unique);
+        assert_eq!(idx[0].kind, IndexKind::Equality);
+        assert_eq!(idx[1].kind, IndexKind::Range);
+        assert!(eng.list_indexes_for_table("other").is_empty());
+    }
+
+    /// **Engine can override list_constraints_for_table** — locks
+    /// the dispatch path.
+    #[test]
+    fn t5_list_constraints_overridable_via_trait_impl() {
+        struct ConstraintEngine;
+        impl EngineApply for ConstraintEngine {
+            fn apply_sql(&self, _sql: &str) -> OpResult {
+                OpResult::SchemaError("not used".into())
+            }
+            fn describe_table(&self, _name: &str) -> Option<Vec<PgColumn>> {
+                None
+            }
+            fn list_constraints_for_table(&self, name: &str) -> Vec<ConstraintMetadata> {
+                if name == "orders" {
+                    vec![
+                        ConstraintMetadata {
+                            name: "orders_user_id_fkey".into(),
+                            kind: ConstraintKind::ForeignKey {
+                                on_delete: FkAction::Cascade,
+                            },
+                            columns: vec![2],
+                            references: Some(("users".to_string(), vec![1])),
+                        },
+                        ConstraintMetadata {
+                            name: "orders_uniq_idem".into(),
+                            kind: ConstraintKind::Unique,
+                            columns: vec![3],
+                            references: None,
+                        },
+                    ]
+                } else {
+                    vec![]
+                }
+            }
+        }
+        let eng = ConstraintEngine;
+        let cons = eng.list_constraints_for_table("orders");
+        assert_eq!(cons.len(), 2);
+        assert_eq!(cons[0].name, "orders_user_id_fkey");
+        match cons[0].kind {
+            ConstraintKind::ForeignKey { on_delete } => {
+                assert_eq!(on_delete, FkAction::Cascade);
+            }
+            _ => panic!("expected ForeignKey kind"),
+        }
+        assert_eq!(cons[0].references.as_ref().unwrap().0, "users");
+        assert_eq!(cons[1].kind, ConstraintKind::Unique);
+        assert!(cons[1].references.is_none());
     }
 
     /// **Engine can override** — MockEngine doesn't override (the

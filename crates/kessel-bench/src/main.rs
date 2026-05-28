@@ -556,8 +556,163 @@ fn run_profile(n: usize) {
     }
 }
 
+/// SP-Perf-A T1: parallel-reads benchmark. Spawns one in-process
+/// kesseldb-server engine (the single-writer apply thread), inserts
+/// `rows` records, then runs `workers` client threads each doing
+/// random GetById against the seeded ids for `duration` seconds.
+///
+/// Goal at T1: lock the BASELINE number. T1 has shipped the read-pool
+/// scaffold + `is_read_only` classifier + `ServerConfig.read_workers`
+/// plumbing, but the bypass dispatch (`Arc<RwLock<StateMachine>>` +
+/// `apply_read_op_raw`) is T2 scope. So at T1, runs with N=1 and
+/// N=8 are expected to be ~equal (both bottlenecked on the engine
+/// thread). T2's bench will show the gap. This shape lets us
+/// commit T1 with a real baseline measurement and have T2 directly
+/// re-run the same bench harness for an apples-to-apples PRE/POST.
+///
+/// Args (positional after mode):
+///   workers (default num_cpus or 8)
+///   rows    (default 100_000)
+///   duration_secs (default 10)
+///   pool_workers (default = workers; pass 0 to disable; T1 routes
+///     either path through the engine queue, so this is a no-op
+///     until T2 — recorded here so the same bench command works
+///     unchanged across slices).
+fn run_parallel_reads(
+    workers: usize,
+    rows: usize,
+    duration_secs: u64,
+    _pool_workers: Option<usize>,
+) {
+    use kesseldb_server::{spawn_engine_cfg, ServerConfig};
+    let dir = std::env::temp_dir()
+        .join(format!("kesseldb-bench-parreads-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let cfg = ServerConfig {
+        // pool_workers is recorded for forward-compat; T1's serve_cfg
+        // doesn't yet spawn the pool, but reading the field exercises
+        // the field plumbing and the bench command is stable across
+        // slices.
+        read_workers: _pool_workers,
+        ..ServerConfig::default()
+    };
+    let engine = spawn_engine_cfg(&dir, &cfg).expect("engine open");
+
+    // Seed: one table + `rows` records. Tiny 8-byte payload so the
+    // bench measures the apply-thread bottleneck, not the record
+    // serializer.
+    let def = encode_type_def(
+        "row",
+        &[Field {
+            field_id: 0,
+            name: "v".into(),
+            kind: FieldKind::U64,
+            nullable: false,
+        }],
+    );
+    assert!(matches!(
+        engine.apply(Op::CreateType { def }),
+        OpResult::TypeCreated(_)
+    ));
+    for i in 0..rows {
+        let id = ObjectId::from_u128(i as u128);
+        let rec = (i as u64).to_le_bytes().to_vec();
+        let _ = engine.apply(Op::Create {
+            type_id: 1,
+            id,
+            record: rec,
+        });
+    }
+
+    // Workers race for `duration_secs`.
+    let engine_arc = std::sync::Arc::new(engine);
+    let stop_at = Instant::now() + std::time::Duration::from_secs(duration_secs);
+    let mut handles = Vec::with_capacity(workers);
+    for w in 0..workers {
+        let engine = engine_arc.clone();
+        let h = std::thread::spawn(move || {
+            // Deterministic per-worker RNG seeded by worker id so two
+            // runs with the same workers parameter are reproducible.
+            let mut rng = kessel_proto::Rng::new(0xC0FFEE + w as u64);
+            let mut ops: u64 = 0;
+            let mut lat_ns: Vec<u64> = Vec::with_capacity(1024 * 1024);
+            while Instant::now() < stop_at {
+                let i = rng.below(rows as u64);
+                let id = ObjectId::from_u128(i as u128);
+                let s = Instant::now();
+                let r = engine.apply(Op::GetById { type_id: 1, id });
+                lat_ns.push(s.elapsed().as_nanos() as u64);
+                debug_assert!(matches!(r, OpResult::Got(_) | OpResult::NotFound));
+                ops += 1;
+            }
+            (ops, lat_ns)
+        });
+        handles.push(h);
+    }
+
+    let mut total_ops: u64 = 0;
+    let mut lat_ns_all: Vec<u64> = Vec::with_capacity(workers * 1024 * 1024);
+    for h in handles {
+        let (ops, mut lat) = h.join().expect("worker join");
+        total_ops += ops;
+        lat_ns_all.append(&mut lat);
+    }
+    lat_ns_all.sort_unstable();
+    println!(
+        "parallel-reads workers={workers} rows={rows} duration={duration_secs}s \
+         pool_workers={:?}",
+        cfg.read_workers
+    );
+    println!(
+        "  total = {total_ops:>10} ops | {:.0} ops/sec | p50 {}us  p99 {}us  p99.99 {}us",
+        total_ops as f64 / duration_secs as f64,
+        pct(&lat_ns_all, 0.50) / 1000,
+        pct(&lat_ns_all, 0.99) / 1000,
+        pct(&lat_ns_all, 0.9999) / 1000,
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    // SP-Perf-A T1: spec-style `parallel-reads --workers N --rows R
+    // --duration D` mode. Parsed separately because the legacy
+    // positional CLI (`kessel-bench [N] [mem|file]`) is preserved
+    // verbatim for every other mode.
+    if args.get(1).map(|s| s.as_str()) == Some("parallel-reads") {
+        // Defaults from spec §9 step 3.
+        let mut workers: usize = 8;
+        let mut rows: usize = 100_000;
+        let mut duration: u64 = 10;
+        let mut pool_workers: Option<usize> = None;
+        let mut i = 2;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--workers" => {
+                    workers = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(workers);
+                    i += 2;
+                }
+                "--rows" => {
+                    rows = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(rows);
+                    i += 2;
+                }
+                "--duration" => {
+                    duration =
+                        args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(duration);
+                    i += 2;
+                }
+                "--pool-workers" => {
+                    pool_workers = args.get(i + 1).and_then(|s| s.parse().ok());
+                    i += 2;
+                }
+                _ => i += 1,
+            }
+        }
+        run_parallel_reads(workers, rows, duration, pool_workers);
+        return;
+    }
+
     let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(200_000);
     let vfs = args.get(2).map(|s| s.as_str()).unwrap_or("mem");
     let batch: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1);

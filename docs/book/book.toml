@@ -1,0 +1,19 @@
+[book]
+title = "KesselDB Documentation"
+authors = ["KesselDB contributors"]
+description = "A deterministic, replicated SQL database. Speaks PostgreSQL, HTTP, WebSocket, and a fast binary wire. Zero-dependency Rust kernel."
+language = "en"
+multilingual = false
+src = "src"
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/hassard0/KesselDB"
+edit-url-template = "https://github.com/hassard0/KesselDB/edit/main/docs/book/src/{path}"
+no-section-label = false
+copy-fonts = true
+
+[output.html.fold]
+enable = true
+level = 1

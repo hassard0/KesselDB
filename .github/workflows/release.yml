@@ -293,10 +293,17 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   publish:
     name: publish GitHub Release
-    needs: [meta, build-linux, build-windows, build-macos]
+    # Gate publish on Linux only — Windows + macOS are best-effort and
+    # MUST NOT block release. Earlier shape `needs: [..., build-windows,
+    # build-macos]` deadlocked v1.0.0 when the macOS-13 free-tier queue
+    # never serviced the Intel build (queued 25+ min, runner starvation).
+    # `always() && build-linux == success` was already in place, but
+    # `always()` only fires once ALL `needs:` jobs reach a terminal
+    # state — a still-queued matrix entry never gets there. Dropping
+    # the best-effort jobs from `needs:` removes the deadlock entirely;
+    # the download-artifact step gracefully skips absent artifacts.
+    needs: [meta, build-linux]
     runs-on: ubuntu-latest
-    # Don't block the release if Windows / macOS failed; only block if
-    # the required Linux build failed.
     if: ${{ always() && needs.build-linux.result == 'success' }}
     env:
       VER: ${{ needs.meta.outputs.version }}

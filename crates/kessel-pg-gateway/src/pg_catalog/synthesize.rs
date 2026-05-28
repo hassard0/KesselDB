@@ -1991,6 +1991,57 @@ pub fn psql_d_step2_relsummary<E: EngineApply + ?Sized>(
     out
 }
 
+/// SP-PG-CAT T8 (real-psql) — well-framed empty for psql's pg_policy
+/// poll on `\d <table>`. KesselDB V1 has no row-level security; the
+/// query is unconditional and would otherwise error with
+/// `expected FROM` (subselects in projection) and abort `\d <table>`
+/// rendering before psql gets to print the column list.
+pub fn psql_d_pg_policy_empty() -> Vec<u8> {
+    let fields = vec![
+        FieldMeta { name: "polname".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "polpermissive".to_string(), type_oid: PG_TYPE_BOOL },
+        FieldMeta { name: "?column?".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "pg_get_expr".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "pg_get_expr".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "cmd".to_string(), type_oid: PG_TYPE_TEXT },
+    ];
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    out.extend_from_slice(&encode_command_complete(&select_tag(0)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
+/// SP-PG-CAT T8 (real-psql) — well-framed empty for psql's pg_inherits
+/// poll. KesselDB V1 has no partitioning.
+pub fn psql_d_pg_inherits_empty() -> Vec<u8> {
+    let fields = vec![FieldMeta {
+        name: "oid".to_string(),
+        type_oid: PG_TYPE_OID,
+    }];
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    out.extend_from_slice(&encode_command_complete(&select_tag(0)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
+/// SP-PG-CAT T8 (real-psql) — well-framed empty for psql's pg_trigger
+/// poll. KesselDB V1's deterministic-expression triggers do not
+/// register in pg_trigger (they're engine-side, not PG-wire-visible).
+pub fn psql_d_pg_trigger_empty() -> Vec<u8> {
+    let fields = vec![
+        FieldMeta { name: "tgname".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "tgenabled".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "tgisinternal".to_string(), type_oid: PG_TYPE_BOOL },
+    ];
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    out.extend_from_slice(&encode_command_complete(&select_tag(0)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
 /// SP-PG-CAT T8 (real-psql) — psql `\dn` schema-list.
 ///
 /// Synthesize the canonical 2-column ("Name", "Owner") response for

@@ -271,6 +271,24 @@ pub fn catalog_query_hook<E: EngineApply + ?Sized>(
     if let Some(oid) = extract_psql_d_step2_oid(&normalized) {
         return Some(synthesize::psql_d_step2_relsummary(engine, oid));
     }
+    // T8 (real-psql): psql `\d <name>` policy-list (pg_policy). psql
+    // unconditionally polls for row-level-security policies on every
+    // table after the column list. KesselDB V1 has no RLS — return a
+    // well-framed empty response. Without this matcher the query
+    // would error with `expected FROM` (subselects in projection).
+    if matches_psql_d_pg_policy(&normalized) {
+        return Some(synthesize::psql_d_pg_policy_empty());
+    }
+    // T8 (real-psql): psql `\d <name>` inheritance-list (pg_inherits).
+    // Empty for non-partitioned V1 tables.
+    if matches_psql_d_pg_inherits(&normalized) {
+        return Some(synthesize::psql_d_pg_inherits_empty());
+    }
+    // T8 (real-psql): psql `\d <name>` trigger-list (pg_trigger).
+    // V1 has no engine-level triggers stored in pg_trigger.
+    if matches_psql_d_pg_trigger(&normalized) {
+        return Some(synthesize::psql_d_pg_trigger_empty());
+    }
     // T8 (real-psql): psql `\dn` schema-list query. Uses the negated
     // regex operator `n.nspname !~ '^pg_'` — same parser-rejection
     // problem as `\d <name>`. Always returns the public schema (V1
@@ -816,6 +834,41 @@ fn extract_psql_d_step2_oid(normalized: &str) -> Option<u32> {
     let after = &normalized[pos + oid_marker.len()..];
     let end = after.find('\'')?;
     after[..end].parse::<u32>().ok()
+}
+
+/// SP-PG-CAT T8 (real-psql) — recognize psql `\d <name>` pg_policy
+/// poll. psql polls for row-level-security policies after the column
+/// list; KesselDB V1 has no RLS so this is always empty. The query
+/// uses subselects + `array()` / `any (...)` shapes that KesselDB's
+/// SQL parser rejects with `expected FROM`, so a matcher here is
+/// what makes `\d <table>` actually render.
+fn matches_psql_d_pg_policy(normalized: &str) -> bool {
+    // Anchor on the distinctive `select pol.polname` projection +
+    // `from pg_catalog.pg_policy pol where pol.polrelid = '<n>'`.
+    normalized.starts_with("select pol.polname")
+        && normalized.contains("from pg_catalog.pg_policy pol")
+}
+
+/// SP-PG-CAT T8 (real-psql) — recognize psql `\d <name>` pg_inherits
+/// poll. Partitioning info; KesselDB V1 has none.
+fn matches_psql_d_pg_inherits(normalized: &str) -> bool {
+    // psql's inherits query: `SELECT c.oid::pg_catalog.regclass FROM
+    // pg_catalog.pg_class c, pg_catalog.pg_inherits i WHERE c.oid =
+    // inhparent AND inhrelid = '<n>' ORDER BY inhseqno;`
+    normalized.contains("from pg_catalog.pg_class c, pg_catalog.pg_inherits")
+        || (normalized.starts_with("select c.oid")
+            && normalized.contains("pg_catalog.pg_inherits")
+            && normalized.contains("inhparent"))
+}
+
+/// SP-PG-CAT T8 (real-psql) — recognize psql `\d <name>` pg_trigger
+/// poll. KesselDB V1 has no PG-wire triggers in pg_trigger.
+fn matches_psql_d_pg_trigger(normalized: &str) -> bool {
+    // psql's trigger query is a SELECT against `pg_catalog.pg_trigger`
+    // with various per-PG-version columns. The unambiguous anchor is
+    // `from pg_catalog.pg_trigger t where t.tgrelid = '<n>'`.
+    normalized.contains("from pg_catalog.pg_trigger")
+        && normalized.contains("tgrelid")
 }
 
 /// SP-PG-CAT T8 (real-psql) — recognize the canonical psql `\dn`
@@ -2100,6 +2153,58 @@ mod tests {
         // V1 single schema = public.
         assert!(bytes.windows(b"public".len()).any(|w| w == b"public"));
         assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+    }
+
+    /// **HEADLINE — psql `\d <name>` pg_policy poll hits the hook.**
+    /// Without this matcher, `\d <table>` always aborts after the
+    /// column-list with `expected FROM` (subselect rejection).
+    #[test]
+    fn t8_psql_d_pg_policy_poll_fires() {
+        let eng = t6_engine();
+        let q = "SELECT pol.polname, pol.polpermissive, \
+                 CASE WHEN pol.polroles = '{0}' THEN NULL ELSE \
+                 pg_catalog.array_to_string(array(select rolname from \
+                 pg_catalog.pg_roles where oid = any (pol.polroles) order by 1),',') END, \
+                 pg_catalog.pg_get_expr(pol.polqual, pol.polrelid), \
+                 pg_catalog.pg_get_expr(pol.polwithcheck, pol.polrelid), \
+                 CASE pol.polcmd WHEN 'r' THEN 'SELECT' WHEN 'a' THEN 'INSERT' \
+                 WHEN 'w' THEN 'UPDATE' WHEN 'd' THEN 'DELETE' END AS cmd \
+                 FROM pg_catalog.pg_policy pol \
+                 WHERE pol.polrelid = '1611034886' ORDER BY 1;";
+        let res = catalog_query_hook(q, &eng);
+        assert!(res.is_some(),
+            "psql \\d <name> pg_policy poll MUST hit the hook");
+        let bytes = res.unwrap();
+        assert_eq!(bytes[0], b'T');
+        // V1 always 0 rows — KesselDB has no RLS.
+        assert!(bytes.windows(b"SELECT 0\0".len()).any(|w| w == b"SELECT 0\0"));
+    }
+
+    /// **psql `\d <name>` pg_inherits poll** — well-framed empty for
+    /// non-partitioned V1 tables.
+    #[test]
+    fn t8_psql_d_pg_inherits_poll_fires() {
+        let eng = t6_engine();
+        let q = "SELECT c.oid::pg_catalog.regclass FROM pg_catalog.pg_class c, \
+                 pg_catalog.pg_inherits i WHERE c.oid = inhparent AND inhrelid = '1611034886' \
+                 ORDER BY inhseqno;";
+        // Note: this query contains `::` cast too, so even though the
+        // matcher fires for the canonical shape, the IMPORTANT thing
+        // is that the matcher returns Some(empty) — without it the
+        // engine would error on `::`.
+        let res = catalog_query_hook(q, &eng);
+        assert!(res.is_some(), "psql pg_inherits poll MUST hit the hook");
+    }
+
+    /// **psql `\d <name>` pg_trigger poll** — well-framed empty.
+    #[test]
+    fn t8_psql_d_pg_trigger_poll_fires() {
+        let eng = t6_engine();
+        let q = "SELECT t.tgname, t.tgenabled, t.tgisinternal \
+                 FROM pg_catalog.pg_trigger t WHERE t.tgrelid = '1611034886' \
+                 ORDER BY 1;";
+        let res = catalog_query_hook(q, &eng);
+        assert!(res.is_some(), "psql pg_trigger poll MUST hit the hook");
     }
 
     /// **T8 additions don't break existing T1-T7 patterns.** Lock the

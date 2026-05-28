@@ -260,6 +260,12 @@ pub const PG_TYPE_INT4: u32 = 23;
 /// `text` (varlena UTF-8) — KesselDB `FieldKind::Char` maps here.
 pub const PG_TYPE_TEXT: u32 = 25;
 
+/// `oid` (u32, 4-byte unsigned object identifier) — used by the
+/// SP-PG-CAT synthesizers (pg_class.oid, pg_namespace.oid,
+/// pg_attribute.attrelid, etc.) for the OID-shaped columns every
+/// pg_catalog table carries. Locked vs `pg_type.dat`.
+pub const PG_TYPE_OID: u32 = 26;
+
 /// `float4` (f32) — not yet used by V1 (KesselDB has no f32
 /// FieldKind); reserved for the eventual FLOAT4 / REAL FieldKind.
 pub const PG_TYPE_FLOAT4: u32 = 700;

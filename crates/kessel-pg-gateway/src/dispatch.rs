@@ -87,6 +87,17 @@ pub fn dispatch_query<E: EngineApply + ?Sized>(sql: &str, engine: &E) -> Vec<u8>
         out.extend_from_slice(&encode_ready_for_query(b'I'));
         return out;
     }
+    // SP-PG-CAT T1 — pg_catalog / information_schema interceptor hook.
+    // Sits BEFORE engine.apply_sql so a pg_catalog SELECT (which the
+    // engine doesn't know about) gets a synthesized response instead
+    // of the V1 `42P01 undefined_table` error. Returns `None` for
+    // non-pg_catalog SQL so the existing dispatch path is unchanged
+    // (locked by `t1_catalog_hook_returns_none_for_non_pg_catalog_sql`
+    // in `pg_catalog::tests`). Companion spec:
+    // `docs/superpowers/specs/2026-05-27-kesseldb-sppgcat-pg-catalog-design.md`.
+    if let Some(bytes) = crate::pg_catalog::catalog_query_hook(sql, engine) {
+        return bytes;
+    }
     // Strip a trailing `;` so the leading-keyword heuristic + the
     // SELECT * FROM table lookup don't trip over the terminator.
     let sql_trimmed = sql.trim().trim_end_matches(';').trim();

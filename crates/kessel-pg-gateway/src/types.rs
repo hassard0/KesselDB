@@ -126,6 +126,7 @@ pub fn type_size_for_oid(oid: u32) -> i16 {
         PG_TYPE_BOOL => 1,
         PG_TYPE_INT2 => 2,
         PG_TYPE_INT4 => 4,
+        crate::proto::PG_TYPE_OID => 4, // PG oid is a 4-byte unsigned int
         PG_TYPE_INT8 => 8,
         // PG `timestamptz` is 8 bytes in binary format (i64 µs since
         // 2000-01-01 00:00:00 UTC) — but V1 emits text format so the

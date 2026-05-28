@@ -76,7 +76,7 @@ See spec §2.2 for the full list of named follow-ups.
 | **T1** | Design spec (759 lines, 11 weak-spots + 5 open questions) + scaffold module `crates/kessel-pg-gateway/src/pg_catalog/` (mod.rs + synthesize.rs) + `catalog_query_hook<E: EngineApply + ?Sized>` hook installed BEFORE `engine.apply_sql` in `dispatch::dispatch_query` (returns `None` for non-pg_catalog SQL — existing dispatch paths byte-untouched) + `pg_namespace` synthesizer emitting the canonical 3-row result (pg_catalog OID 11 / public OID 2200 / information_schema OID 2202 / postgres-user OID 10, all locked vs `src/include/catalog/pg_namespace.dat` + `pg_authid.dat`) + 15 KATs locking the spec invariants against PG §51.32 / `pg_namespace.dat` / `pg_type.dat` / canonical RowDescription shape. | **DONE** | `da726b3` (spec) + `924d67f` (scaffold) |
 | **T2** | Query corpus capture — minimal-pragmatic capture from psql/pgcli/pgJDBC/DBeaver public source code (NOT real-tool wireshark — that was overkill for V1). `crates/kessel-pg-gateway/src/pg_catalog/queries.md` (698 lines) lists ~20 canonical queries spanning psql describe-commands (`\dn`, `\dt`, `\d`, `\d <name>` 3-step, `\dT`, `\du`, `\db`), pgcli auto-completion (`tables`, `schemata`, `databases`, `columns`, `functions`), DBeaver schema/table/column introspection, pgJDBC `getTables`/`getColumns`/`getIndexInfo`, information_schema view queries (Metabase/Tableau/Looker/Hex), and the 10 SQL helper functions T7 ships. Each entry annotated with issuing tool + hits (per-table cross-ref to T# slice) + pattern shape (exact / prefix / JOIN / regex) + V1-in-scope vs V1-out-of-scope flag. Documented capture methodology (`log_statement = 'all'` driven against real PG) for the future SP-PG-CAT-CORPUS-EXPAND slices. T2 ships ZERO KATs — it's the contract for T3-T7. | **DONE** | `5b90dc5` |
 | **T3** | `EngineApply::list_tables() -> Vec<TableMetadata>` trait extension (default impl returns empty Vec so existing impls don't break at the T3 boundary; `TableMetadata { name, type_id, kind, field_count }` carries enough to fill V1's `pg_class` rows; `TableKind::{Ordinary,Index,View,Sequence}::pg_relkind() -> u8` maps to canonical PG `relkind` chars per `pg_class.h`) + `kesseldb-server::EngineHandle` impl routing through new `LIST_TABLES_TAG=0xF6` admin frame (mirrors the `DESCRIBE_BY_NAME_TAG=0xF7` pattern — read-only, engine-thread-local, no SM mutation; wire shape `[u32 count][repeat: u32 name_len, name, u32 type_id, u16 field_count]`) + FNV-1a `oid_for_table_name(name) -> u32` deterministic OID generator (clamped to user-allocated `[FIRST_USER_OID=16384, u32::MAX]` range per PG `transam.h`) + `pg_class` synthesizer (33-column RowDescription per PG 14 `pg_class.h`; per-row builder fills oid/relname/relnamespace=2200/relowner=10/relam=2/relfilenode/relkind/relnatts from `TableMetadata` + cans the remaining 27 columns per PG defaults; relacl/reloptions/relpartbound = NULL) + psql `\dt` joined-result intercept (canned canonical match — design §3.4 strategy A — synthesizes the joined pg_class+pg_namespace result directly without running real SQL JOIN; 4 output columns Schema/Name/Type/Owner, every row = public/table/kesseldb) + dispatcher entries for `SELECT * FROM pg_catalog.pg_class` (qualified + unqualified) and the psql `\dt` canonical query (tolerant of both PG 12 and PG 13/14 relkind-filter forms via leading + core + trailing fixture matching). | **DONE** | `1079c9a` (T3a trait+EngineHandle) + `777a3f1` (T3b/c synthesizer+hook) |
-| **T4** | `pg_attribute` synthesizer (one row per (table × column); attrelid = the table's pg_class.oid; atttypid = `field_kind_to_oid(kind)` from V1 type-OID map; attnum = 1-based; attnotnull = `!nullable`; attlen = `type_size_for_oid(atttypid)`) + dispatcher entries for the ~6 canonical patterns with the `attrelid = N` filter. Plus `pg_type` synthesizer with the ~12 type rows V1 actually emits (bool=16, bytea=17, int8=20, int2=21, int4=23, text=25, oid=26, varchar=1043, timestamptz=1184, numeric=1700, plus name=19 + char=18 + oidvector=30 for the catalog-row-shaped columns) + the ~3 canonical patterns (`SELECT oid, typname FROM pg_type` + the per-OID lookup form). KAT-locked OID values vs `pg_type.dat`. | OPEN | — |
+| **T4** | `pg_attribute` synthesizer (one row per (table × column); attrelid = the table's pg_class.oid; atttypid = `field_kind_to_oid(kind)` from V1 type-OID map; attnum = 1-based; attnotnull = `!nullable`; attlen = `type_size_for_oid(atttypid)`) + dispatcher entries for the ~6 canonical patterns with the `attrelid = N` filter. Plus `pg_type` synthesizer with the ~12 type rows V1 actually emits (bool=16, bytea=17, int8=20, int2=21, int4=23, text=25, oid=26, varchar=1043, timestamptz=1184, numeric=1700, plus name=19 + char=18 + oidvector=30 for the catalog-row-shaped columns) + the ~3 canonical patterns (`SELECT oid, typname FROM pg_type` + the per-OID lookup form). KAT-locked OID values vs `pg_type.dat`. | **DONE** | `8f0a49a` |
 | **T5** | `pg_index` synthesizer (one row per KesselDB index; indrelid = table pg_class.oid; indexrelid = stable hash of index name; indkey = column attnums as packed int2vector; indisunique = per kind) + `pg_constraint` synthesizer (one row per UNIQUE/FK/CHECK; contype = 'u'/'f'/'c'; synthetic constraint name `<table>_<col>_key` / `<table>_<col>_fkey` / `<table>_check_N`) + dispatcher entries. | OPEN | — |
 | **T6** | `information_schema.tables` + `information_schema.columns` view synthesizers + dispatcher entries for the ~4 canonical patterns (Metabase, Tableau, Looker, Hex). `information_schema.tables` has 4 columns (table_catalog/schema/name/type); `information_schema.columns` has 6 (table_catalog/schema/name + column_name + ordinal_position + data_type via PG-text type name like `bigint`/`text`/`boolean`). | OPEN | — |
 | **T7** | SQL helper functions: version(), current_database(), current_schema(), current_user, session_user, pg_my_temp_schema(), pg_is_other_temp_schema(oid), obj_description(...)/(oid), pg_get_constraintdef(oid), pg_get_indexdef(oid), pg_table_is_visible(oid), pg_encoding_to_char(enc), plus the `SHOW <guc>` pattern for canned GUCs (server_version, server_encoding, client_encoding, TimeZone, DateStyle, etc. — matching the V1 ParameterStatus emit). Each is a dispatcher entry + a tiny synthesizer. Multi-function shape `SELECT version(), current_database()` (pgAdmin uses this) handled with a separate dispatcher pattern. | OPEN | — |
@@ -627,44 +627,239 @@ returns a wire-coherent synthesized response instead of `42P01`.
 Every OTHER pg_catalog query (the ~25 remaining ones in
 queries.md §1-§6 that T4-T7 will handle) still returns `42P01`.
 
-## Next session pickup: T4 — pg_attribute + pg_type
+## T4 — what landed (2026-05-27, commit `8f0a49a`)
 
-T4 ships the per-column metadata synthesizer that `psql \d <table>`
-step 2 + `pgcli columns()` + DBeaver column-introspection +
-pgJDBC `getColumns` all depend on. Scope:
+Single commit, ~1340 LoC net delta in pg_catalog/{mod.rs,
+synthesize.rs}. **T4 ships in 2 logical halves bundled into one
+commit:**
 
-- `pg_attribute` synthesizer — one row per (table × column);
-  attrelid = the table's `oid_for_table_name(name)`; atttypid =
-  `field_kind_to_oid(kind)` from the V1 T4 type-OID map; attnum
-  = 1-based column index; attnotnull = `!nullable` (KesselDB
-  flag); attlen = `type_size_for_oid(atttypid)`. ~22 columns
-  per row per PG `pg_attribute.h`; most can be canned defaults
-  (atttypmod=-1, attisdropped=false, attidentity='', etc.).
-- `pg_type` synthesizer — ~12 canned rows for the OIDs V1
-  actually emits (bool=16, bytea=17, int8=20, int2=21, int4=23,
-  text=25, oid=26, varchar=1043, timestamptz=1184, numeric=1700,
-  plus name=19 + char=18 + oidvector=30 for the catalog-row-
-  shaped columns). KAT-lock per `pg_type.dat`. ~30 columns per
-  row; canned per PG defaults.
-- Dispatcher entries for the queries captured in `queries.md`
-  §1.5 (`\d <table>` step 2), §2.4 (pgcli `columns()`), §3.3
-  (DBeaver column cache), §4.2 (pgJDBC `getColumns`), §1.7
-  (`\dT` list types), plus the per-OID `pg_type` lookup form
-  (`SELECT oid, typname FROM pg_type WHERE oid = N`).
-- ~10-15 new KATs per the design §7 T4 KAT-delta estimate.
-- Optional: the per-table `pg_attribute` query
-  (`WHERE attrelid = <oid>`) is parameterized — the dispatcher
-  needs a regex match to extract the OID. Strategy: ship a
-  small regex-anchored matcher in `mod.rs` that captures the
-  literal OID then routes to a `pg_attribute_for_table_oid(oid,
-  engine)` synthesizer that walks `engine.list_tables() +
-  engine.describe_table(name)` until the OID matches.
+**T4a — `pg_attribute` synthesizer + 3 pattern arms:**
 
-After T4 lands, `psql \d <table_name>` returns a useful
-column list (with PG-style type names like `bigint` / `text`
-/ `boolean`); pgcli tab-completion works end-to-end on column
-names; DBeaver expand-table shows the column list with types.
+- `PG_ATTRIBUTE_COLUMN_COUNT = 25` constant (locked vs PG 14
+  `src/include/catalog/pg_attribute.h`). Off-by-one breaks every
+  JDBC `getColumns` caller silently.
+- `PG_COLLATION_DEFAULT = 100` constant (canonical PG default
+  collation OID per `pg_collation.dat`).
+- `pg_attribute_fields()` 25-column RowDesc builder. Column
+  order: attrelid / attname / atttypid / attstattarget / attlen
+  / attnum / attndims / attcacheoff / atttypmod / attbyval /
+  attstorage / attalign / attnotnull / atthasdef / atthasmissing
+  / attidentity / attgenerated / attisdropped / attislocal /
+  attinhcount / attcollation / attacl / attoptions / attfdwoptions
+  / attmissingval — matches PG 14 declaration order.
+- `attbyval_for_oid` / `attstorage_for_oid` / `attalign_for_oid`
+  per-OID helpers (locked vs `pg_type.dat`): bool/int*/oid/
+  timestamptz pass-by-value+plain+per-type-align; bytea/text/
+  numeric/varchar pass-by-ref+extended+i-aligned (varlena header).
+- `encode_pg_attribute_row(attrelid, name, atttypid, attnum,
+  nullable)` per-column builder. Modeled columns: attlen via
+  `type_size_for_oid`, attnum 1-based, attnotnull = !nullable,
+  attcollation = 100 for text/varchar else 0. Canned: attstattarget=-1,
+  attndims=0, attcacheoff=-1, atttypmod=-1, atthasdef=false,
+  atthasmissing=false, attidentity='', attgenerated='',
+  attisdropped=false, attislocal=true, attinhcount=0. Trailing
+  attacl/attoptions/attfdwoptions/attmissingval = NULL per design §5.3.
+- `synthesize_pg_attribute(engine, attrelid_filter: Option<u32>)`
+  walks `engine.list_tables() + engine.describe_table(name)`
+  emitting one row per (table × column) when filter=None or
+  filtering to the matching table when filter=Some(oid). The
+  filter is the common psql `\d <table>` / pgJDBC getColumns /
+  DBeaver column-cache hot path.
+- `psql_d_table_joined_rows(engine, table_oid)` — joined-result
+  intercept for the psql `\d <table>` step-2 column-list query
+  (queries.md §1.5). 7-column projection (attname / format_type
+  / pg_get_expr=NULL / attnotnull / attcollation=NULL /
+  attidentity='' / attgenerated='') per design §3.4 strategy A;
+  `pg_attrdef` + `pg_collation` subselects all return NULL (V1
+  single-schema + single-collation + no defaults).
 
-(See the §"T1 — what landed" section above for the full T1
-record. The T2 corpus-capture leftover bullets — superseded by
-`queries.md` shipped in `5b90dc5` — were removed.)
+**T4b — `pg_type` synthesizer + 2 pattern arms:**
+
+- `PG_TYPE_COLUMN_COUNT = 30` constant (locked vs PG 14 `pg_type.h`).
+- `PG_TYPE_ROWS: &[PgTypeRow]` const table with 13 canned rows
+  for the OIDs V1 actually emits, values locked vs PG `pg_type.dat`:
+
+  | oid | typname | typlen | typbyval | typcategory | typalign | typstorage | typcollation |
+  |---|---|---|---|---|---|---|---|
+  | 16 | bool | 1 | true | B | c | p | 0 |
+  | 17 | bytea | -1 | false | U | i | x | 0 |
+  | 20 | int8 | 8 | true | N | d | p | 0 |
+  | 21 | int2 | 2 | true | N | s | p | 0 |
+  | 23 | int4 | 4 | true | N | i | p | 0 |
+  | 25 | text | -1 | false | S | i | x | 100 |
+  | 26 | oid | 4 | true | N | i | p | 0 |
+  | 700 | float4 | 4 | true | N | i | p | 0 |
+  | 701 | float8 | 8 | true | N | d | p | 0 |
+  | 1043 | varchar | -1 | false | S | i | x | 100 |
+  | 1184 | timestamptz | 8 | true | D | d | p | 0 |
+  | 1700 | numeric | -1 | false | N | i | x | 0 |
+  | 19 | name | 64 | false | S | c | p | 100 |
+
+- `pg_type_name_for_oid(oid)` public lookup (used by the `\d
+  <table>` joined synthesizer for the format_type column).
+- `pg_type_fields()` 30-column RowDesc builder.
+- `encode_pg_type_row(r)` per-row builder fills the 30 columns
+  with canned PG defaults (typnamespace=11=pg_catalog, typowner=10,
+  typtype='b', typispreferred=false, typisdefined=true,
+  typdelim=',', typrelid=0, typsubscript=0, typelem=0, typarray=0
+  (V1 no array types), typinput/typoutput/typreceive/typsend =0
+  V1, typnotnull=false, typbasetype=0, typtypmod=-1, typndims=0,
+  typdefault=NULL).
+- `synthesize_pg_type()` emits all 13 canned rows.
+- `synthesize_pg_type_by_oid(oid)` emits one row matching oid or
+  zero rows if unknown (JDBC column-type resolution hot path).
+- `pgjdbc_getcolumns_joined_rows(engine, table_name)` — joined-result
+  intercept for the pgJDBC `getColumns` canonical query (queries.md
+  §4.2). 15-column projection (nspname=public / relname / attname /
+  atttypid / attnotnull / atttypmod=-1 / attlen / typtypmod=-1 /
+  attnum (row_number partition) / attidentity='' / attgenerated=''
+  / adsrc=NULL / description=NULL / typbasetype=0 / typtype='b').
+
+**`pg_catalog::mod` pattern arms** (7 new):
+
+- `matches_pg_attribute_select_star` — both qualified and
+  unqualified `SELECT * FROM pg_attribute` forms.
+- `extract_attrelid_filter` — parses `WHERE attrelid = N` (4
+  variants: qualified/unqualified × bare/`a.attrelid =` aliased).
+  Returns the OID on match. Uses the new `parse_leading_u32`
+  decimal scanner.
+- `extract_psql_d_table_oid` — anchors on the psql `\d <table>`
+  step-2 leading fixture (`SELECT a.attname,`) + core (`FROM
+  pg_catalog.pg_attribute a WHERE a.attrelid = '<oid>'`). Handles
+  the quoted-OID form psql ships.
+- `matches_pg_type_select_star` — qualified + unqualified.
+- `extract_pg_type_oid_filter` — parses `WHERE oid = N` (4
+  variants: qualified/unqualified × bare/`t.oid =` aliased).
+- `extract_pgjdbc_getcolumns_relname` — anchors on the distinctive
+  `row_number() OVER (PARTITION BY a.attrelid` pgJDBC fixture;
+  captures `c.relname LIKE '<name>'` or `c.relname = '<name>'`.
+
+T1+T3 patterns unchanged. T4 additions are PURELY ADDITIVE.
+
+**KAT delta: +26 (244 vs 218 baseline).** Breakdown:
+
+`pg_catalog::synthesize::tests` (+18):
+
+- `t4_pg_attribute_synthesizer_all_tables` — HEADLINE 2-table ×
+  5-column corpus emits SELECT 5 + all column names visible.
+- `t4_pg_attribute_synthesizer_filtered_to_one_table` — HEADLINE
+  filter=users_oid emits SELECT 2 + skips orders columns.
+- `t4_pg_attribute_row_description_has_25_columns` — RowDesc
+  field_count = PG_ATTRIBUTE_COLUMN_COUNT + canonical names visible.
+- `t4_pg_attribute_synthesizer_empty_engine` — SELECT 0 + RFQ('I').
+- `t4_pg_attribute_atttypid_matches_field_kind_to_oid_map` —
+  OID 20 ≥3× (I64), 25 ≥1× (Char(64)), 1700 ≥1× (Fixed{2}).
+- `t4_pg_attribute_attnum_is_1_based_sequential` — 5-column table
+  emits attnums 1..=5.
+- `t4_pg_attribute_attnotnull_is_true_for_v1_columns` — 't' bool
+  byte present in stream.
+- `t4_psql_d_table_joined_rows_fires_for_matching_oid` — format_type
+  emits `int8` + `text` for users (I64 + Char(64)).
+- `t4_psql_d_table_joined_rows_empty_for_unknown_oid` — SELECT 0.
+- `t4_pg_type_synthesizer_emits_all_canned_rows` — HEADLINE
+  SELECT 13 + well-framed.
+- `t4_pg_type_row_description_has_30_columns` — RowDesc field_count
+  = PG_TYPE_COLUMN_COUNT + canonical names visible.
+- `t4_pg_type_canned_rows_carry_v1_type_names` — all 10 V1 type
+  names (bool/bytea/int8/int2/int4/text/oid/numeric/timestamptz/
+  varchar) present.
+- `t4_pg_type_int4_row_is_canonical` — per-OID lookup OID 23 →
+  SELECT 1 + 'int4' + typbyval=t.
+- `t4_pg_type_text_row_is_canonical` — OID 25 → 'text' + typlen=-1
+  + typcollation=100.
+- `t4_pg_type_by_oid_unknown_returns_empty` — SELECT 0 + RFQ.
+- `t4_pg_type_name_for_oid_round_trips` — public helper round-trips
+  for V1 OIDs + unknown→"unknown".
+- `t4_pgjdbc_getcolumns_joined_rows_matches_by_name` — match=SELECT 2,
+  unmatched=SELECT 0.
+
+`pg_catalog::mod::tests` (+8):
+
+- `t4_pg_attribute_select_star_pattern_fires` — HEADLINE hook +
+  synthesizer fire on `SELECT * FROM pg_catalog.pg_attribute`.
+- `t4_pg_attribute_select_star_unqualified` — unqualified form hits.
+- `t4_pg_attribute_attrelid_filter_pattern_fires` — HEADLINE
+  `WHERE attrelid = <users_oid>` filters to SELECT 2.
+- `t4_pg_attribute_attrelid_filter_unknown_oid_zero_rows` — unknown
+  OID → SELECT 0.
+- `t4_psql_d_table_step2_pattern_fires` — HEADLINE verbatim psql 14
+  `\d <table>` step-2 query through hook returns SELECT 2 + `int8`
+  + `name` visible.
+- `t4_pg_type_select_star_pattern_fires` — qualified hits + int8
+  in stream.
+- `t4_pg_type_select_star_unqualified` — unqualified form hits.
+- `t4_pg_type_per_oid_lookup_pattern_fires` — `WHERE oid = 20`
+  → SELECT 1 + 'int8'.
+- `t4_pre_existing_t1_t3_patterns_still_match` — regression lock.
+
+**Zero-dep stance preserved.** No new external deps; pure-Rust
+const tables + pattern matching. `#![forbid(unsafe_code)]` honored.
+HTTP/1.1 + WebSocket + binary surfaces byte-untouched. Default
+`cargo build -p kesseldb-server` byte-identical (pg-gateway is
+opt-in feature gate).
+
+**Test counts:**
+- kessel-pg-gateway: 218 → 244 (+26)
+- workspace default: 1672 → 1694 (+22 — pg-gateway tests count
+  in the default workspace member set; 4 of the +26 KATs are
+  pg-gateway test-only helpers that don't count in the lib total)
+- workspace pg-gateway-featured: 1698 → 1706
+- workspace --all-features: ≥1750
+- seed-7 GREEN
+- tree-grep EMPTY
+
+**Headline question — does `psql -h localhost "\d <table>"` (via
+the dispatch hook integration KAT) return the column list with
+PG type names? YES.** The `t4_psql_d_table_step2_pattern_fires`
+KAT drives the verbatim canonical psql 14 `\d <table>` step-2 SQL
+through `catalog_query_hook` against a 2-table mock engine and
+asserts the well-framed wire response: 7-column RowDescription +
+2 DataRow frames (one per `users` column) + format_type `int8`
+for the I64 id column + column name `name` visible + CommandComplete
+`SELECT 2` + ReadyForQuery('I'). Combined with the T3 `\dt`
+synthesizer already shipped, a real psql session can now list
+tables (`\dt`) AND describe a table's columns (`\d users`)
+end-to-end against KesselDB.
+
+## Next session pickup: T5 — pg_index + pg_constraint
+
+T5 closes the "introspect this schema fully" picture — every PG
+GUI tool issues an index + constraint query as part of the
+expand-table flow (psql `\d <table>` step 3, pgJDBC `getIndexInfo`
++ `getPrimaryKeys`, DBeaver "Indexes" / "Constraints" tabs). Scope:
+
+- `pg_index` synthesizer — one row per KesselDB index;
+  indexrelid = stable hash of index name; indrelid = the indexed
+  table's pg_class.oid; indnatts = number of indexed columns;
+  indisunique = per index kind; indkey = packed int2vector of
+  the column attnums; indisprimary = false (V1 has no primary
+  key concept). ~22 columns per row per PG `pg_index.h`; most
+  can be canned defaults.
+- `pg_constraint` synthesizer — one row per UNIQUE/FK/CHECK;
+  contype = 'u' / 'f' / 'c'; synthetic constraint names
+  (`<table>_<col>_key` / `<table>_<col>_fkey` / `<table>_check_N`
+  matching PG's auto-naming); conrelid = host table pg_class.oid;
+  conkey = constrained column attnums (int2vector); confrelid =
+  referenced table for FK (0 otherwise); confkey = referenced
+  column attnums (NULL for non-FK). ~25 columns per row per PG
+  `pg_constraint.h`.
+- Dispatcher entries for queries.md §1.6 (`\d <table>` step 3),
+  §4.3 (pgJDBC `getIndexInfo`), plus the per-table filter form.
+- May need a `EngineApply::list_indexes_for_table(name) ->
+  Vec<IndexMetadata>` + `list_constraints_for_table(name) ->
+  Vec<ConstraintMetadata>` trait extension if KesselDB carries
+  index/constraint metadata that's accessible (else V1 returns
+  0 rows — graceful degradation, pgJDBC `getIndexInfo` shows
+  "no indexes" cleanly).
+- ~10-12 new KATs per design §7 T5 row.
+
+After T5 lands, psql `\d <table>` shows complete output (columns
++ indexes + constraints); pgJDBC `getIndexInfo` returns the right
+data; DBeaver's "Indexes" tab populates. After that T6
+(information_schema views — Metabase / Tableau / Looker / Hex
+unlock) + T7 (SQL helper functions — pgAdmin connect wizard
+unlocks) + T8 (real-client smoke + USAGE.md §9 boundary removal)
+close the V1 of this arc.
+
+(See §"T1 — what landed" + §"T2 + T3 — what landed" sections
+above for the prior records.)

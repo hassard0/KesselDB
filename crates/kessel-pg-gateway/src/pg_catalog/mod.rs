@@ -120,15 +120,18 @@ pub fn catalog_query_hook<E: EngineApply + ?Sized>(
     if !normalized.starts_with("select") {
         return None;
     }
-    // T1 ships exactly ONE pattern: `SELECT * FROM pg_catalog.pg_namespace`
-    // (with optional whitespace + case-insensitive matching + tolerance
-    // for the unqualified `SELECT * FROM pg_namespace` form). T2+ grow
-    // the pattern table via a static `[(predicate, synthesizer)]` array.
+    // T1: `SELECT * FROM pg_catalog.pg_namespace` (canned 3-row).
     if matches_pg_namespace_select_star(&normalized) {
         return Some(synthesize::pg_namespace_all_rows());
     }
-    let _ = engine; // T1: the pg_namespace synthesizer is canned;
-                    // T3+ synthesizers will use the engine handle.
+    // T3: `SELECT * FROM pg_catalog.pg_class` (one row per live table).
+    if matches_pg_class_select_star(&normalized) {
+        return Some(synthesize::pg_class_all_rows(engine));
+    }
+    // T3: psql `\dt` (canonical JOIN — design §3.4 strategy A).
+    if matches_psql_dt_canonical(&normalized) {
+        return Some(synthesize::psql_dt_joined_rows(engine));
+    }
     None
 }
 
@@ -210,6 +213,41 @@ fn matches_pg_namespace_select_star(normalized: &str) -> bool {
         || normalized == "select * from pg_namespace"
         || normalized.starts_with("select * from pg_catalog.pg_namespace where ")
         || normalized.starts_with("select * from pg_namespace where ")
+}
+
+/// SP-PG-CAT T3 — recognize `SELECT * FROM pg_catalog.pg_class`
+/// (and the unqualified `pg_class` form clients also issue, since
+/// `pg_catalog` is in every connection's implicit search_path).
+/// Tolerates a trailing WHERE clause but emits the full table list
+/// regardless — clients filter client-side on the returned rows.
+fn matches_pg_class_select_star(normalized: &str) -> bool {
+    normalized == "select * from pg_catalog.pg_class"
+        || normalized == "select * from pg_class"
+        || normalized.starts_with("select * from pg_catalog.pg_class where ")
+        || normalized.starts_with("select * from pg_class where ")
+}
+
+/// SP-PG-CAT T3 — recognize the canonical psql `\dt` query (from
+/// `src/bin/psql/describe.c::listTables`). The query is a JOIN of
+/// `pg_class` + `pg_namespace` with a CASE on `relkind` and a
+/// `pg_table_is_visible(oid)` filter — V1 doesn't run arbitrary
+/// JOINs, so we match the canonical form byte-for-byte (after
+/// `normalize_for_match` lowercases + collapses whitespace) and
+/// synthesize the joined-result rows directly per design §3.4
+/// strategy A. The pattern is tolerant of the two `relkind` filter
+/// shapes psql ships across PG 12/13/14 (`('r','p','')` vs
+/// `('r','p','v','m','s','f','')`) — both are subsumed by checking
+/// only the leading + trailing fixtures.
+fn matches_psql_dt_canonical(normalized: &str) -> bool {
+    // Required leading fixture — the SELECT projection psql emits.
+    let leading = "select n.nspname as \"schema\", c.relname as \"name\",";
+    // Required core fixture — the FROM + JOIN clause shape.
+    let core = "from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace";
+    // Required trailing fixture — the visibility filter + ORDER BY.
+    let trailing_filter = "and pg_catalog.pg_table_is_visible(c.oid)";
+    normalized.starts_with(leading)
+        && normalized.contains(core)
+        && normalized.contains(trailing_filter)
 }
 
 #[cfg(test)]
@@ -402,5 +440,159 @@ mod tests {
         );
         assert_eq!(normalize_for_match(""), "");
         assert_eq!(normalize_for_match("   "), "");
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-CAT T3 KATs — pg_class pattern + psql \dt canonical
+    // joined-result intercept. Engines that override `list_tables()`
+    // (the `MockListEngine` below) drive the synthesizer; engines
+    // that don't (the `StubEngine` above) get an empty-result-set
+    // response.
+    // ───────────────────────────────────────────────────────────────────
+
+    use crate::engine::{TableKind, TableMetadata};
+
+    /// EngineApply that overrides `list_tables()` so the T3
+    /// synthesizers see a non-empty catalog without spinning up
+    /// the kesseldb-server EngineHandle (that's the
+    /// `pg_gateway_tests::t3_engine_handle_list_tables_round_trips_via_admin_frame`
+    /// integration KAT instead).
+    struct MockListEngine {
+        tables: Vec<TableMetadata>,
+    }
+    impl EngineApply for MockListEngine {
+        fn apply_sql(&self, _sql: &str) -> OpResult {
+            OpResult::SchemaError("MockListEngine: apply_sql should not be reached".into())
+        }
+        fn describe_table(&self, _name: &str) -> Option<Vec<PgColumn>> {
+            None
+        }
+        fn list_tables(&self) -> Vec<TableMetadata> {
+            self.tables.clone()
+        }
+    }
+
+    fn three_table_engine() -> MockListEngine {
+        MockListEngine {
+            tables: vec![
+                TableMetadata { name: "users".into(),  type_id: 1, kind: TableKind::Ordinary, field_count: 2 },
+                TableMetadata { name: "orders".into(), type_id: 2, kind: TableKind::Ordinary, field_count: 3 },
+                TableMetadata { name: "lineitems".into(), type_id: 3, kind: TableKind::Ordinary, field_count: 5 },
+            ],
+        }
+    }
+
+    /// **Pattern match:** `SELECT * FROM pg_catalog.pg_class` hits
+    /// the hook AND the synthesizer fires the well-framed response.
+    /// HEADLINE for the T3 dispatcher entry.
+    #[test]
+    fn t3_pg_class_select_star_pattern_fires() {
+        let eng = three_table_engine();
+        let res = catalog_query_hook("SELECT * FROM pg_catalog.pg_class", &eng);
+        assert!(res.is_some(), "pg_class SELECT * MUST hit the hook");
+        let bytes = res.unwrap();
+        assert!(!bytes.is_empty());
+        assert_eq!(bytes[0], b'T', "first frame is RowDescription");
+        assert_eq!(&bytes[bytes.len() - 6..], &[b'Z', 0, 0, 0, 5, b'I']);
+    }
+
+    /// **Pattern match — unqualified form:** `SELECT * FROM pg_class`
+    /// (no `pg_catalog.` prefix) also hits the hook because pg_catalog
+    /// is in every connection's implicit search_path.
+    #[test]
+    fn t3_pg_class_select_star_accepts_unqualified() {
+        let eng = three_table_engine();
+        let res = catalog_query_hook("SELECT * FROM pg_class", &eng);
+        assert!(res.is_some(), "unqualified pg_class MUST match");
+    }
+
+    /// **Case-insensitivity invariant preserved for T3 pattern:**
+    /// upper / lower / mixed all match (locked because pgAdmin
+    /// upper-cases and JDBC drivers mix case).
+    #[test]
+    fn t3_pg_class_pattern_is_case_insensitive() {
+        let eng = three_table_engine();
+        let upper = catalog_query_hook("SELECT * FROM PG_CATALOG.PG_CLASS", &eng);
+        let lower = catalog_query_hook("select * from pg_catalog.pg_class", &eng);
+        let mixed = catalog_query_hook("Select * From Pg_Catalog.Pg_Class", &eng);
+        assert!(upper.is_some());
+        assert!(lower.is_some());
+        assert!(mixed.is_some());
+    }
+
+    /// **Pattern match — psql `\dt` canonical query** hits the hook
+    /// and the joined-result synthesizer fires. HEADLINE for the
+    /// arc's primary acceptance criterion (design §8 #1).
+    #[test]
+    fn t3_psql_dt_canonical_pattern_fires() {
+        let eng = three_table_engine();
+        // The exact query psql 14 ships (from describe.c). Note the
+        // `\n` to mirror the multi-line form psql sends.
+        let psql_dt = "SELECT n.nspname as \"Schema\",\n\
+                       c.relname as \"Name\",\n\
+                       CASE c.relkind WHEN 'r' THEN 'table' END as \"Type\",\n\
+                       pg_catalog.pg_get_userbyid(c.relowner) as \"Owner\"\n\
+                       FROM pg_catalog.pg_class c\n\
+                       LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n\
+                       WHERE c.relkind IN ('r','p','')\n\
+                       AND n.nspname <> 'pg_catalog'\n\
+                       AND n.nspname <> 'information_schema'\n\
+                       AND n.nspname !~ '^pg_toast'\n\
+                       AND pg_catalog.pg_table_is_visible(c.oid)\n\
+                       ORDER BY 1,2;";
+        let res = catalog_query_hook(psql_dt, &eng);
+        assert!(res.is_some(), "psql \\dt canonical query MUST hit the hook");
+        let bytes = res.unwrap();
+        assert_eq!(bytes[0], b'T');
+        // The joined result includes "Schema" / "Name" / "Type" / "Owner"
+        // — these names appear verbatim in the RowDescription.
+        assert!(bytes.windows(b"Schema\0".len()).any(|w| w == b"Schema\0"));
+        assert!(bytes.windows(b"Name\0".len()).any(|w| w == b"Name\0"));
+        assert!(bytes.windows(b"Type\0".len()).any(|w| w == b"Type\0"));
+        assert!(bytes.windows(b"Owner\0".len()).any(|w| w == b"Owner\0"));
+        // Each table appears as `table` + `public` + `kesseldb`.
+        assert!(bytes.windows(b"users".len()).any(|w| w == b"users"));
+        assert!(bytes.windows(b"orders".len()).any(|w| w == b"orders"));
+        assert!(bytes.windows(b"lineitems".len()).any(|w| w == b"lineitems"));
+        // CommandComplete tag carries `SELECT 3` for the 3 tables.
+        assert!(bytes.windows(b"SELECT 3\0".len()).any(|w| w == b"SELECT 3\0"));
+    }
+
+    /// **Pattern match — `\dt` with an extra-strict relkind filter
+    /// (PG 13/14 form including views/materialized views/sequences)**
+    /// also hits because the matcher anchors on the leading +
+    /// trailing fixtures.
+    #[test]
+    fn t3_psql_dt_pattern_matches_v13_relkind_form() {
+        let eng = three_table_engine();
+        let psql_dt_v13 = "SELECT n.nspname as \"Schema\", c.relname as \"Name\", \
+                           CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view' END as \"Type\", \
+                           pg_catalog.pg_get_userbyid(c.relowner) as \"Owner\" \
+                           FROM pg_catalog.pg_class c \
+                           LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                           WHERE c.relkind IN ('r','p','v','m','S','f','') \
+                           AND n.nspname <> 'pg_catalog' \
+                           AND n.nspname <> 'information_schema' \
+                           AND n.nspname !~ '^pg_toast' \
+                           AND pg_catalog.pg_table_is_visible(c.oid) \
+                           ORDER BY 1,2;";
+        let res = catalog_query_hook(psql_dt_v13, &eng);
+        assert!(res.is_some(), "psql \\dt v13 form MUST also match");
+    }
+
+    /// **Regression-lock — T1 paths unchanged:** every pg_namespace
+    /// pattern from T1 still hits AND every non-pg_catalog SQL still
+    /// returns None. T3 added patterns are PURELY ADDITIVE.
+    #[test]
+    fn t3_pre_existing_t1_patterns_still_match_and_unrelated_sql_still_misses() {
+        let eng = three_table_engine();
+        // T1 still fires.
+        assert!(catalog_query_hook("SELECT * FROM pg_catalog.pg_namespace", &eng).is_some());
+        // Unrelated SELECT still misses.
+        assert!(catalog_query_hook("SELECT * FROM users", &eng).is_none());
+        // Non-SELECT still fast-rejected.
+        assert!(catalog_query_hook("INSERT INTO t (id) VALUES (1)", &eng).is_none());
+        assert!(catalog_query_hook("UPDATE t SET v = 1 WHERE id = 2", &eng).is_none());
+        assert!(catalog_query_hook("CREATE TABLE t (id i64)", &eng).is_none());
     }
 }

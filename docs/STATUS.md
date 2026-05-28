@@ -5,8 +5,8 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 ## Current capabilities (2026-05-28)
 
 What a node running on today's `main` actually does. Every line below is
-covered by the workspace test suite (1779 default / 1807 with
-`--features pg-gateway` / 1862 with all gateway features).
+covered by the workspace test suite (1792 default / 1820 with
+`--features pg-gateway` / 1875 with all gateway features).
 
 **Wire surfaces** (all opt-in via cargo features except the binary protocol):
 - **Binary** — length-prefixed `Op::encode()` over TCP; the deterministic fast
@@ -68,9 +68,10 @@ digest, uptime_secs }`.
 **External sources**: `REGISTER` + `REFRESH` JSON/NDJSON/CSV/Parquet
 from HTTP/HTTPS endpoints or S3-compatible/Azure Blob object storage.
 Parquet reader (zero-dep): UNCOMPRESSED + Snappy + GZIP + zstd +
-LZ4_RAW + Brotli × PLAIN + dictionary × V1 + V2 pages × flat REQUIRED +
-OPTIONAL + LIST<primitive> + MAP<K,V> + struct (+ 3-deep cross-products,
-OBJ-2c-5 closed) × INT32/INT64/INT96/DECIMAL(≤38)/FLBA/BYTE_ARRAY.
+LZ4_RAW + Brotli (6/7 codecs; OBJ-2c-2 closed at SP154) × PLAIN +
+dictionary × V1 + V2 pages × flat REQUIRED + OPTIONAL + LIST<primitive> +
+MAP<K,V> + struct (+ 3-deep cross-products, OBJ-2c-5 closed at SP146) ×
+INT32/INT64/INT96/DECIMAL(≤38)/FLBA/BYTE_ARRAY.
 
 **Determinism + verification**: TLA+ (S1, Replication.tla TLC across
 528M states / depth 21 / 0 violations) over 7 layered modules (Replication

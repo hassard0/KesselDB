@@ -68,6 +68,33 @@ pub const DESCRIBE_BY_NAME_TAG: u8 = 0xF7;
 /// table kinds.
 pub const LIST_TABLES_TAG: u8 = 0xF6;
 
+/// SP-PG-CAT T8a admin: enumerate indexes on a NAMED table for the
+/// `pg_index` synthesizer + the pgJDBC `getIndexInfo` joined path.
+/// Frame = `[0xF5] ++ utf8 name`; reply `Got(encoded)` where
+/// `encoded` is `[u32 LE count][repeat: u32 LE name_len, name bytes,
+/// u8 kind, u8 is_unique, u16 LE field_count, field_count × u32 LE
+/// field_id]`. `kind` is 0=Equality, 1=Range, 2=Composite per
+/// `kessel_pg_gateway::IndexKind`. Engine-thread-local; read-only.
+///
+/// The wire format mirrors `LIST_TABLES_TAG` — variable-length
+/// records prefixed with a u32 count — and uses fixed-width
+/// (u8/u16/u32) tags throughout for forward compatibility.
+pub const LIST_INDEXES_TAG: u8 = 0xF5;
+
+/// SP-PG-CAT T8a admin: enumerate constraints on a NAMED table for
+/// the `pg_constraint` synthesizer + the
+/// `information_schema.{table_constraints,key_column_usage}` views.
+/// Frame = `[0xF4] ++ utf8 name`; reply `Got(encoded)` where
+/// `encoded` is `[u32 LE count][repeat: u32 LE name_len, name bytes,
+/// u8 kind, u8 fk_action, u16 LE field_count, field_count × u32 LE
+/// field_id, u32 LE ref_name_len, ref_name bytes (only if kind=FK),
+/// u16 LE ref_field_count, ref_field_count × u32 LE field_id (only
+/// if kind=FK)]`. `kind` is 0=Check, 1=ForeignKey, 2=Unique. For
+/// non-FK rows the trailing referenced-table block is omitted
+/// (ref_name_len=0; ref_field_count=0). Engine-thread-local;
+/// read-only.
+pub const LIST_CONSTRAINTS_TAG: u8 = 0xF4;
+
 /// Operational status of a running node.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServerStats {
@@ -698,6 +725,177 @@ pub fn spawn_engine_cfg(
                         out.extend_from_slice(&t.type_id.to_le_bytes());
                         let fc = t.fields.len().min(u16::MAX as usize) as u16;
                         out.extend_from_slice(&fc.to_le_bytes());
+                    }
+                    return OpResult::Got(out);
+                }
+                Some(&LIST_INDEXES_TAG) => {
+                    // SP-PG-CAT T8a: enumerate indexes on the named
+                    // table for the pg_index synthesizer + pgJDBC
+                    // getIndexInfo joined path. Read-only — walks
+                    // ObjectType.indexes/ordered/composite and emits
+                    // one record per index with a synthetic name
+                    // (e.g. `<table>_<col>_idx` for Equality,
+                    // `<table>_<col>_ridx` for Range,
+                    // `<table>_<colA>_<colB>_idx` for Composite).
+                    let name = match std::str::from_utf8(&frame[1..]) {
+                        Ok(s) => s,
+                        Err(_) => return OpResult::SchemaError(
+                            "list_indexes: not utf8".into(),
+                        ),
+                    };
+                    let ot = match sm.catalog().types.iter().find(|t| t.name == name) {
+                        Some(t) => t,
+                        None => return OpResult::NotFound,
+                    };
+                    // Resolve field_id → column name for synthetic
+                    // index naming (the gateway decoder uses the
+                    // name directly without a second round-trip).
+                    let field_name_for = |fid: u16| -> String {
+                        ot.fields
+                            .iter()
+                            .find(|f| f.field_id == fid)
+                            .map(|f| f.name.clone())
+                            .unwrap_or_else(|| format!("f{fid}"))
+                    };
+                    // Walk indexes/ordered/composite into a uniform
+                    // record list. KIND bytes: 0=Equality, 1=Range,
+                    // 2=Composite per kessel_pg_gateway::IndexKind.
+                    let mut records: Vec<(String, u8, bool, Vec<u32>)> = Vec::new();
+                    for fid in &ot.indexes {
+                        let is_unique = ot.unique.iter().any(|u| u == fid);
+                        let name = format!("{}_{}_idx", ot.name, field_name_for(*fid));
+                        records.push((name, 0, is_unique, vec![*fid as u32]));
+                    }
+                    for fid in &ot.ordered {
+                        // Ordered/range indexes don't carry a UNIQUE
+                        // flag in KesselDB; the gateway emits
+                        // is_unique=false for these.
+                        let name = format!("{}_{}_ridx", ot.name, field_name_for(*fid));
+                        records.push((name, 1, false, vec![*fid as u32]));
+                    }
+                    for fids in &ot.composite {
+                        let mut parts = Vec::with_capacity(fids.len());
+                        for fid in fids {
+                            parts.push(field_name_for(*fid));
+                        }
+                        let name = format!("{}_{}_idx", ot.name, parts.join("_"));
+                        let cols: Vec<u32> = fids.iter().map(|f| *f as u32).collect();
+                        records.push((name, 2, false, cols));
+                    }
+                    let mut out: Vec<u8> = Vec::with_capacity(64 + records.len() * 32);
+                    out.extend_from_slice(&(records.len() as u32).to_le_bytes());
+                    for (rname, kind, is_unique, fields) in &records {
+                        let nb = rname.as_bytes();
+                        out.extend_from_slice(&(nb.len() as u32).to_le_bytes());
+                        out.extend_from_slice(nb);
+                        out.push(*kind);
+                        out.push(if *is_unique { 1 } else { 0 });
+                        let fc = fields.len().min(u16::MAX as usize) as u16;
+                        out.extend_from_slice(&fc.to_le_bytes());
+                        for f in fields {
+                            out.extend_from_slice(&f.to_le_bytes());
+                        }
+                    }
+                    return OpResult::Got(out);
+                }
+                Some(&LIST_CONSTRAINTS_TAG) => {
+                    // SP-PG-CAT T8a: enumerate constraints on the
+                    // named table for the pg_constraint synthesizer +
+                    // information_schema.{table_constraints,
+                    // key_column_usage} views. Read-only — walks
+                    // ObjectType.unique/fks/checks and emits one
+                    // record per constraint.
+                    let name = match std::str::from_utf8(&frame[1..]) {
+                        Ok(s) => s,
+                        Err(_) => return OpResult::SchemaError(
+                            "list_constraints: not utf8".into(),
+                        ),
+                    };
+                    let ot = match sm.catalog().types.iter().find(|t| t.name == name) {
+                        Some(t) => t,
+                        None => return OpResult::NotFound,
+                    };
+                    let field_name_for = |fid: u16| -> String {
+                        ot.fields
+                            .iter()
+                            .find(|f| f.field_id == fid)
+                            .map(|f| f.name.clone())
+                            .unwrap_or_else(|| format!("f{fid}"))
+                    };
+                    let attnum_for = |fid: u16| -> u32 {
+                        ot.fields
+                            .iter()
+                            .position(|f| f.field_id == fid)
+                            .map(|p| (p + 1) as u32)
+                            .unwrap_or(0)
+                    };
+                    let type_name_for = |tid: u32| -> String {
+                        sm.catalog()
+                            .types
+                            .iter()
+                            .find(|t| t.type_id == tid)
+                            .map(|t| t.name.clone())
+                            .unwrap_or_default()
+                    };
+                    // Records carry: (name, kind, fk_action, attnums,
+                    // ref_table_name, ref_attnums). kind=0=Check,
+                    // 1=ForeignKey, 2=Unique. fk_action follows
+                    // FkAction::pg_action_char (we send the catalog's
+                    // u8 directly — 0=NoAction, 1=Restrict, 2=Cascade
+                    // matching ObjectType.fks tuple).
+                    let mut records: Vec<(String, u8, u8, Vec<u32>, String, Vec<u32>)> = Vec::new();
+                    // UNIQUE constraints from ObjectType.unique.
+                    for fid in &ot.unique {
+                        let name = format!("{}_{}_key", ot.name, field_name_for(*fid));
+                        records.push((name, 2, 0, vec![attnum_for(*fid)], String::new(), Vec::new()));
+                    }
+                    // FK constraints from ObjectType.fks
+                    // (field_id, referenced_type_id, on_delete).
+                    for (fid, ref_tid, on_delete) in &ot.fks {
+                        let name = format!("{}_{}_fkey", ot.name, field_name_for(*fid));
+                        let ref_name = type_name_for(*ref_tid);
+                        // V1: FK always references the parent's
+                        // primary key (attnum 1 in KesselDB convention
+                        // — `id` is implicit). The wire format carries
+                        // a single-element ref_attnums.
+                        records.push((
+                            name,
+                            1,
+                            *on_delete,
+                            vec![attnum_for(*fid)],
+                            ref_name,
+                            vec![1],
+                        ));
+                    }
+                    // CHECK constraints — KesselDB stores them as
+                    // opaque compiled kessel-expr programs without
+                    // names; V1 synthesizes `<table>_check_N` per
+                    // queries.md §1 acceptable naming convention.
+                    for (idx, _bytes) in ot.checks.iter().enumerate() {
+                        let name = format!("{}_check_{}", ot.name, idx);
+                        records.push((name, 0, 0, Vec::new(), String::new(), Vec::new()));
+                    }
+                    let mut out: Vec<u8> = Vec::with_capacity(64 + records.len() * 64);
+                    out.extend_from_slice(&(records.len() as u32).to_le_bytes());
+                    for (rname, kind, fk_action, attnums, ref_name, ref_attnums) in &records {
+                        let nb = rname.as_bytes();
+                        out.extend_from_slice(&(nb.len() as u32).to_le_bytes());
+                        out.extend_from_slice(nb);
+                        out.push(*kind);
+                        out.push(*fk_action);
+                        let fc = attnums.len().min(u16::MAX as usize) as u16;
+                        out.extend_from_slice(&fc.to_le_bytes());
+                        for a in attnums {
+                            out.extend_from_slice(&a.to_le_bytes());
+                        }
+                        let rnb = ref_name.as_bytes();
+                        out.extend_from_slice(&(rnb.len() as u32).to_le_bytes());
+                        out.extend_from_slice(rnb);
+                        let rfc = ref_attnums.len().min(u16::MAX as usize) as u16;
+                        out.extend_from_slice(&rfc.to_le_bytes());
+                        for a in ref_attnums {
+                            out.extend_from_slice(&a.to_le_bytes());
+                        }
                     }
                     return OpResult::Got(out);
                 }
@@ -1548,6 +1746,207 @@ impl kessel_pg_gateway::EngineApply for EngineHandle {
         }
         out
     }
+
+    /// SP-PG-CAT T8a: enumerate indexes on the named table via the
+    /// `LIST_INDEXES_TAG` admin frame. Mirrors `list_tables` —
+    /// engine-thread reads `sm.catalog()` synthesizing the index
+    /// records, this gateway-side decoder maps each into the
+    /// `IndexMetadata` shape the pg_index synthesizer expects.
+    ///
+    /// Wire format (per `LIST_INDEXES_TAG` doc):
+    ///   `[u32 count][repeat: u32 name_len, name, u8 kind,
+    ///    u8 is_unique, u16 field_count, field_count × u32]`
+    fn list_indexes_for_table(
+        &self,
+        table_name: &str,
+    ) -> Vec<kessel_pg_gateway::IndexMetadata> {
+        let mut frame = vec![LIST_INDEXES_TAG];
+        frame.extend_from_slice(table_name.as_bytes());
+        let bytes = match self.apply_raw(frame) {
+            kessel_proto::OpResult::Got(b) => b,
+            _ => return Vec::new(),
+        };
+        let mut p = 0usize;
+        if bytes.len() < 4 {
+            return Vec::new();
+        }
+        let count = u32::from_le_bytes(
+            bytes[p..p + 4].try_into().expect("4-byte slice"),
+        ) as usize;
+        p += 4;
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            if bytes.len() < p + 4 {
+                break;
+            }
+            let name_len = u32::from_le_bytes(
+                bytes[p..p + 4].try_into().expect("4-byte slice"),
+            ) as usize;
+            p += 4;
+            if bytes.len() < p + name_len + 1 + 1 + 2 {
+                break;
+            }
+            let name = match std::str::from_utf8(&bytes[p..p + name_len]) {
+                Ok(s) => s.to_string(),
+                Err(_) => break,
+            };
+            p += name_len;
+            let kind_byte = bytes[p];
+            p += 1;
+            let is_unique = bytes[p] != 0;
+            p += 1;
+            let fc = u16::from_le_bytes(
+                bytes[p..p + 2].try_into().expect("2-byte slice"),
+            ) as usize;
+            p += 2;
+            if bytes.len() < p + fc * 4 {
+                break;
+            }
+            let mut fields = Vec::with_capacity(fc);
+            for _ in 0..fc {
+                let f = u32::from_le_bytes(
+                    bytes[p..p + 4].try_into().expect("4-byte slice"),
+                );
+                p += 4;
+                fields.push(f);
+            }
+            let kind = match kind_byte {
+                0 => kessel_pg_gateway::IndexKind::Equality,
+                1 => kessel_pg_gateway::IndexKind::Range,
+                2 => kessel_pg_gateway::IndexKind::Composite,
+                _ => kessel_pg_gateway::IndexKind::Equality,
+            };
+            out.push(kessel_pg_gateway::IndexMetadata {
+                name,
+                fields,
+                is_unique,
+                kind,
+            });
+        }
+        out
+    }
+
+    /// SP-PG-CAT T8a: enumerate constraints on the named table via
+    /// the `LIST_CONSTRAINTS_TAG` admin frame. Wire format per
+    /// `LIST_CONSTRAINTS_TAG` doc.
+    fn list_constraints_for_table(
+        &self,
+        table_name: &str,
+    ) -> Vec<kessel_pg_gateway::ConstraintMetadata> {
+        let mut frame = vec![LIST_CONSTRAINTS_TAG];
+        frame.extend_from_slice(table_name.as_bytes());
+        let bytes = match self.apply_raw(frame) {
+            kessel_proto::OpResult::Got(b) => b,
+            _ => return Vec::new(),
+        };
+        let mut p = 0usize;
+        if bytes.len() < 4 {
+            return Vec::new();
+        }
+        let count = u32::from_le_bytes(
+            bytes[p..p + 4].try_into().expect("4-byte slice"),
+        ) as usize;
+        p += 4;
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            // [u32 name_len][name][u8 kind][u8 fk_action]
+            // [u16 attn_count][attn_count × u32 attnum]
+            // [u32 ref_name_len][ref_name][u16 ref_attn_count]
+            // [ref_attn_count × u32 attnum]
+            if bytes.len() < p + 4 {
+                break;
+            }
+            let name_len = u32::from_le_bytes(
+                bytes[p..p + 4].try_into().expect("4-byte slice"),
+            ) as usize;
+            p += 4;
+            if bytes.len() < p + name_len + 1 + 1 + 2 {
+                break;
+            }
+            let name = match std::str::from_utf8(&bytes[p..p + name_len]) {
+                Ok(s) => s.to_string(),
+                Err(_) => break,
+            };
+            p += name_len;
+            let kind_byte = bytes[p];
+            p += 1;
+            let fk_action_byte = bytes[p];
+            p += 1;
+            let attn_count = u16::from_le_bytes(
+                bytes[p..p + 2].try_into().expect("2-byte slice"),
+            ) as usize;
+            p += 2;
+            if bytes.len() < p + attn_count * 4 {
+                break;
+            }
+            let mut columns = Vec::with_capacity(attn_count);
+            for _ in 0..attn_count {
+                let a = u32::from_le_bytes(
+                    bytes[p..p + 4].try_into().expect("4-byte slice"),
+                );
+                p += 4;
+                columns.push(a);
+            }
+            if bytes.len() < p + 4 {
+                break;
+            }
+            let ref_name_len = u32::from_le_bytes(
+                bytes[p..p + 4].try_into().expect("4-byte slice"),
+            ) as usize;
+            p += 4;
+            if bytes.len() < p + ref_name_len + 2 {
+                break;
+            }
+            let ref_name = match std::str::from_utf8(&bytes[p..p + ref_name_len]) {
+                Ok(s) => s.to_string(),
+                Err(_) => break,
+            };
+            p += ref_name_len;
+            let ref_attn_count = u16::from_le_bytes(
+                bytes[p..p + 2].try_into().expect("2-byte slice"),
+            ) as usize;
+            p += 2;
+            if bytes.len() < p + ref_attn_count * 4 {
+                break;
+            }
+            let mut ref_columns = Vec::with_capacity(ref_attn_count);
+            for _ in 0..ref_attn_count {
+                let a = u32::from_le_bytes(
+                    bytes[p..p + 4].try_into().expect("4-byte slice"),
+                );
+                p += 4;
+                ref_columns.push(a);
+            }
+            let kind = match kind_byte {
+                0 => kessel_pg_gateway::ConstraintKind::Check,
+                1 => {
+                    let on_delete = match fk_action_byte {
+                        // ObjectType.fks tuple uses 0=NoAction (SP6),
+                        // 1=Restrict, 2=Cascade (SP11).
+                        0 => kessel_pg_gateway::FkAction::NoAction,
+                        1 => kessel_pg_gateway::FkAction::Restrict,
+                        2 => kessel_pg_gateway::FkAction::Cascade,
+                        _ => kessel_pg_gateway::FkAction::NoAction,
+                    };
+                    kessel_pg_gateway::ConstraintKind::ForeignKey { on_delete }
+                }
+                2 => kessel_pg_gateway::ConstraintKind::Unique,
+                _ => kessel_pg_gateway::ConstraintKind::Unique,
+            };
+            let references = if ref_name.is_empty() {
+                None
+            } else {
+                Some((ref_name, ref_columns))
+            };
+            out.push(kessel_pg_gateway::ConstraintMetadata {
+                name,
+                kind,
+                columns,
+                references,
+            });
+        }
+        out
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1972,6 +2371,93 @@ mod pg_gateway_tests {
         assert_eq!(cols[1].kind, kessel_catalog::FieldKind::U32);
         // describe_table on a missing table → None.
         assert!(engine.describe_table("ghost").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SP-PG-CAT T8a — `EngineHandle::list_indexes_for_table`
+    /// round-trips through the `LIST_INDEXES_TAG` admin frame and
+    /// returns one `IndexMetadata` per KesselDB index on the named
+    /// table (equality / range / composite). Locks the wire shape +
+    /// the kind-byte mapping (0=Equality, 1=Range, 2=Composite)
+    /// the gateway-side pg_index + getIndexInfo synthesizers
+    /// depend on.
+    #[test]
+    fn t8a_engine_handle_list_indexes_round_trips_via_admin_frame() {
+        use kessel_pg_gateway::{EngineApply as _, IndexKind};
+        let dir = fresh_dir("list_indexes");
+        let engine = spawn_engine(&dir).unwrap();
+        // Unknown table → empty (graceful, never panics).
+        assert!(engine.list_indexes_for_table("nope").is_empty(),
+            "unknown table MUST surface empty Vec");
+        // CREATE TABLE + several indexes.
+        let r1 = <EngineHandle as kessel_pg_gateway::EngineApply>::apply_sql(
+            &engine,
+            "CREATE TABLE users (id I64 NOT NULL, email CHAR(64) NOT NULL, age I32 NOT NULL)",
+        );
+        assert!(matches!(r1, kessel_proto::OpResult::TypeCreated(_)));
+        // Equality index on email.
+        let r2 = <EngineHandle as kessel_pg_gateway::EngineApply>::apply_sql(
+            &engine,
+            "CREATE INDEX ON users (email)",
+        );
+        assert!(matches!(r2, kessel_proto::OpResult::Ok), "create equality index: {r2:?}");
+        // Range index on age.
+        let r3 = <EngineHandle as kessel_pg_gateway::EngineApply>::apply_sql(
+            &engine,
+            "CREATE RANGE INDEX ON users (age)",
+        );
+        assert!(matches!(r3, kessel_proto::OpResult::Ok), "create range index: {r3:?}");
+        // Composite index on (email, age).
+        let r4 = <EngineHandle as kessel_pg_gateway::EngineApply>::apply_sql(
+            &engine,
+            "CREATE INDEX ON users (email, age)",
+        );
+        assert!(matches!(r4, kessel_proto::OpResult::Ok), "create composite index: {r4:?}");
+        let idx = engine.list_indexes_for_table("users");
+        // 3 indexes total: 1 Equality + 1 Range + 1 Composite.
+        assert_eq!(idx.len(), 3, "MUST list 3 indexes — got {idx:?}");
+        let equality_count = idx.iter().filter(|i| i.kind == IndexKind::Equality).count();
+        let range_count = idx.iter().filter(|i| i.kind == IndexKind::Range).count();
+        let composite_count = idx.iter().filter(|i| i.kind == IndexKind::Composite).count();
+        assert_eq!(equality_count, 1, "MUST surface 1 Equality index");
+        assert_eq!(range_count, 1, "MUST surface 1 Range index");
+        assert_eq!(composite_count, 1, "MUST surface 1 Composite index");
+        // Composite index fields = [email, age] → attnums [2, 3].
+        let comp = idx.iter().find(|i| i.kind == IndexKind::Composite).unwrap();
+        assert_eq!(comp.fields.len(), 2, "Composite MUST carry 2 attnums");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SP-PG-CAT T8a — `EngineHandle::list_constraints_for_table`
+    /// round-trips through the `LIST_CONSTRAINTS_TAG` admin frame.
+    /// V1 KesselDB SQL has UNIQUE-via-index only (no CHECK / FK
+    /// DDL syntax yet); this KAT exercises the UNIQUE path and the
+    /// graceful-empty path for tables without constraints.
+    #[test]
+    fn t8a_engine_handle_list_constraints_round_trips_via_admin_frame() {
+        use kessel_pg_gateway::EngineApply as _;
+        let dir = fresh_dir("list_constraints");
+        let engine = spawn_engine(&dir).unwrap();
+        // Unknown table → empty.
+        assert!(engine.list_constraints_for_table("nope").is_empty());
+        // CREATE TABLE with no constraints → empty list.
+        let r1 = <EngineHandle as kessel_pg_gateway::EngineApply>::apply_sql(
+            &engine,
+            "CREATE TABLE users (id I64 NOT NULL, email CHAR(64) NOT NULL)",
+        );
+        assert!(matches!(r1, kessel_proto::OpResult::TypeCreated(_)));
+        assert!(engine.list_constraints_for_table("users").is_empty(),
+            "no UNIQUE/FK/CHECK declared → empty constraints list");
+        // Add a UNIQUE index → list_constraints surfaces it.
+        let r2 = <EngineHandle as kessel_pg_gateway::EngineApply>::apply_sql(
+            &engine,
+            "CREATE UNIQUE INDEX ON users (email)",
+        );
+        assert!(matches!(r2, kessel_proto::OpResult::Ok), "create unique: {r2:?}");
+        let cons = engine.list_constraints_for_table("users");
+        assert!(cons.iter().any(|c| matches!(
+            c.kind, kessel_pg_gateway::ConstraintKind::Unique
+        )), "UNIQUE index MUST surface as ConstraintKind::Unique");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

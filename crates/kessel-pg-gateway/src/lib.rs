@@ -73,7 +73,7 @@ pub mod server;
 pub mod startup;
 pub mod types;
 
-pub use engine::{EngineApply, PgColumn};
+pub use engine::{EngineApply, PgColumn, TableKind, TableMetadata};
 pub use server::{accept, run_session, AcceptedSession, PgError};
 
 /// Spec §8.1: default TCP port for the PostgreSQL Frontend/Backend

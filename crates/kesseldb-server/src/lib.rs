@@ -53,6 +53,21 @@ pub const PIPELINE_TAG: u8 = 0xF8;
 /// via the `pg-gateway` feature impl on `EngineHandle`.
 pub const DESCRIBE_BY_NAME_TAG: u8 = 0xF7;
 
+/// SP-PG-CAT T3 admin: enumerate every user-visible table in the
+/// live catalog for the `pg_class` synthesizer. Frame = `[0xF6]`
+/// (no body); reply `Got(encoded)` where `encoded` is
+/// `[u32 LE count][repeat: u32 LE name_len, name bytes, u32 LE
+/// type_id, u16 LE field_count]`. Engine-thread-local; read-only;
+/// no SM mutation. Used by `kessel-pg-gateway::EngineApply::
+/// list_tables` via the `pg-gateway` feature impl on `EngineHandle`.
+///
+/// V1 emits TableKind::Ordinary for every entry (KesselDB catalog
+/// has no view/sequence kind yet). The wire format intentionally
+/// does NOT carry the kind byte — it's implicit Ordinary today —
+/// keeping the admin frame minimal until KesselDB grows other
+/// table kinds.
+pub const LIST_TABLES_TAG: u8 = 0xF6;
+
 /// Operational status of a running node.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServerStats {
@@ -662,6 +677,29 @@ pub fn spawn_engine_cfg(
                         ),
                         None => OpResult::NotFound,
                     };
+                }
+                Some(&LIST_TABLES_TAG) => {
+                    // SP-PG-CAT T3: enumerate user tables for the
+                    // pg_class synthesizer. Read-only — no `*n += 1`,
+                    // no schema invalidation. Encoding:
+                    //   [u32 LE count]
+                    //     [u32 LE name_len][name bytes][u32 LE type_id][u16 LE field_count]
+                    // V1 emits TableKind::Ordinary for every entry
+                    // (the gateway-side decoder fills that in).
+                    let types = &sm.catalog().types;
+                    let mut out: Vec<u8> = Vec::with_capacity(64 + types.len() * 32);
+                    out.extend_from_slice(&(types.len() as u32).to_le_bytes());
+                    for t in types {
+                        let name_bytes = t.name.as_bytes();
+                        out.extend_from_slice(
+                            &(name_bytes.len() as u32).to_le_bytes(),
+                        );
+                        out.extend_from_slice(name_bytes);
+                        out.extend_from_slice(&t.type_id.to_le_bytes());
+                        let fc = t.fields.len().min(u16::MAX as usize) as u16;
+                        out.extend_from_slice(&fc.to_le_bytes());
+                    }
+                    return OpResult::Got(out);
                 }
                 Some(&TXN_TAG) => {
                     // Compile every buffered statement, then apply them as
@@ -1453,6 +1491,63 @@ impl kessel_pg_gateway::EngineApply for EngineHandle {
             _ => None,
         }
     }
+
+    /// SP-PG-CAT T3: enumerate user tables via the `LIST_TABLES_TAG`
+    /// admin frame so the catalog (which lives with the non-`Send`
+    /// StateMachine) is the source of truth. Engine-thread reads
+    /// `sm.catalog().types` and encodes
+    /// `[u32 count][repeat: u32 name_len, name, u32 type_id, u16 field_count]`.
+    /// The gateway decodes here and maps each entry to
+    /// `TableMetadata { kind: Ordinary }` (V1 KesselDB has no view
+    /// / sequence / index kinds).
+    fn list_tables(&self) -> Vec<kessel_pg_gateway::TableMetadata> {
+        let frame = vec![LIST_TABLES_TAG];
+        let bytes = match self.apply_raw(frame) {
+            kessel_proto::OpResult::Got(b) => b,
+            _ => return Vec::new(),
+        };
+        let mut p = 0usize;
+        if bytes.len() < 4 {
+            return Vec::new();
+        }
+        let count = u32::from_le_bytes(
+            bytes[p..p + 4].try_into().expect("4-byte slice"),
+        ) as usize;
+        p += 4;
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            if bytes.len() < p + 4 {
+                break;
+            }
+            let name_len = u32::from_le_bytes(
+                bytes[p..p + 4].try_into().expect("4-byte slice"),
+            ) as usize;
+            p += 4;
+            if bytes.len() < p + name_len + 4 + 2 {
+                break;
+            }
+            let name = match std::str::from_utf8(&bytes[p..p + name_len]) {
+                Ok(s) => s.to_string(),
+                Err(_) => break,
+            };
+            p += name_len;
+            let type_id = u32::from_le_bytes(
+                bytes[p..p + 4].try_into().expect("4-byte slice"),
+            );
+            p += 4;
+            let field_count = u16::from_le_bytes(
+                bytes[p..p + 2].try_into().expect("2-byte slice"),
+            );
+            p += 2;
+            out.push(kessel_pg_gateway::TableMetadata {
+                name,
+                type_id,
+                kind: kessel_pg_gateway::TableKind::Ordinary,
+                field_count,
+            });
+        }
+        out
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1877,6 +1972,45 @@ mod pg_gateway_tests {
         assert_eq!(cols[1].kind, kessel_catalog::FieldKind::U32);
         // describe_table on a missing table → None.
         assert!(engine.describe_table("ghost").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SP-PG-CAT T3 — `EngineHandle::list_tables` round-trips
+    /// through the `LIST_TABLES_TAG` admin frame and returns one
+    /// `TableMetadata` per KesselDB type. Locks the wire shape so
+    /// the gateway-side `pg_class` synthesizer can rely on it.
+    #[test]
+    fn t3_engine_handle_list_tables_round_trips_via_admin_frame() {
+        use kessel_pg_gateway::{EngineApply as _, TableKind};
+        let dir = fresh_dir("list_tables");
+        let engine = spawn_engine(&dir).unwrap();
+        // Empty catalog → zero rows.
+        assert!(engine.list_tables().is_empty(),
+            "fresh engine MUST list zero tables");
+        // Create two tables; both should appear.
+        let r1 = <EngineHandle as kessel_pg_gateway::EngineApply>::apply_sql(
+            &engine,
+            "CREATE TABLE users (id I64 NOT NULL, name CHAR(64) NOT NULL)",
+        );
+        assert!(matches!(r1, kessel_proto::OpResult::TypeCreated(_)),
+            "create users: {r1:?}");
+        let r2 = <EngineHandle as kessel_pg_gateway::EngineApply>::apply_sql(
+            &engine,
+            "CREATE TABLE orders (id I64 NOT NULL, amount I64 NOT NULL, label CHAR(16) NOT NULL)",
+        );
+        assert!(matches!(r2, kessel_proto::OpResult::TypeCreated(_)));
+        let tables = engine.list_tables();
+        assert_eq!(tables.len(), 2, "two tables MUST be listed");
+        // Catalog declaration order — users first (created first).
+        assert_eq!(tables[0].name, "users");
+        assert_eq!(tables[0].kind, TableKind::Ordinary);
+        assert_eq!(tables[0].field_count, 2);
+        assert_eq!(tables[1].name, "orders");
+        assert_eq!(tables[1].kind, TableKind::Ordinary);
+        assert_eq!(tables[1].field_count, 3);
+        // type_ids are positive (KesselDB allocates sequentially).
+        assert!(tables[0].type_id > 0);
+        assert!(tables[1].type_id > tables[0].type_id);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

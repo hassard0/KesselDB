@@ -48,6 +48,68 @@ pub struct PgColumn {
     pub nullable: bool,
 }
 
+/// SP-PG-CAT T3 — metadata for one KesselDB table, surfaced via
+/// `EngineApply::list_tables()` to the `pg_class` synthesizer.
+///
+/// Carries just enough to fill the V1 `pg_class` rows:
+///
+/// - `name` — `pg_class.relname` (also drives the stable-hash OID).
+/// - `type_id` — KesselDB's internal type identifier. Kept here for
+///   forward compatibility (T4 `pg_attribute` may JOIN on it to
+///   reduce engine round-trips); the V1 `pg_class` synthesizer
+///   ignores it (OIDs are name-derived per design spec §3.7).
+/// - `kind` — `pg_class.relkind` ('r' for ordinary tables, 'i' for
+///   indexes — V1 only emits 'r').
+/// - `field_count` — `pg_class.relnatts` (number of user columns).
+///
+/// The struct is deliberately minimal — anything else (column
+/// list, index list) round-trips through `describe_table` so this
+/// list is cheap to assemble and cheap to clone per query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableMetadata {
+    pub name: String,
+    pub type_id: u32,
+    pub kind: TableKind,
+    pub field_count: u16,
+}
+
+/// SP-PG-CAT T3 — the V1 `pg_class.relkind` shape that maps to
+/// each KesselDB catalog entry. KesselDB V1 only has ordinary
+/// tables, so `list_tables()` always returns `Ordinary` today;
+/// the other variants are listed so a later catalog evolution
+/// (materialized views, sequences) plugs in cleanly without a
+/// breaking `EngineApply` change.
+///
+/// Maps to PG canonical `relkind` chars per `src/include/catalog/
+/// pg_class.h`:
+///
+/// | TableKind | relkind | PG meaning |
+/// |---|---|---|
+/// | `Ordinary` | 'r' | ordinary table |
+/// | `Index` | 'i' | index (V1: not emitted via list_tables — indexes are not first-class catalog entries in KesselDB) |
+/// | `View` | 'v' | view (V1: KesselDB has no views) |
+/// | `Sequence` | 'S' | sequence (V1: KesselDB has no sequences) |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableKind {
+    Ordinary,
+    Index,
+    View,
+    Sequence,
+}
+
+impl TableKind {
+    /// Map to the canonical PG `pg_class.relkind` char per
+    /// `src/include/catalog/pg_class.h`. Used by `pg_class` synth.
+    pub fn pg_relkind(self) -> u8 {
+        match self {
+            TableKind::Ordinary => b'r',
+            TableKind::Index => b'i',
+            TableKind::View => b'v',
+            TableKind::Sequence => b'S',
+        }
+    }
+}
+
 /// Dispatch boundary the PG-wire gateway uses to talk to the engine.
 ///
 /// Implemented by `kesseldb-server::EngineHandle` under a future
@@ -113,6 +175,33 @@ pub trait EngineApply: Send + Sync + 'static {
             _ => 0,
         };
         (r, count)
+    }
+
+    /// SP-PG-CAT T3 — enumerate every user-visible table in the
+    /// live KesselDB catalog. Used by the `pg_class` synthesizer to
+    /// emit one `pg_class` row per table.
+    ///
+    /// **Default impl returns empty `Vec`** — engines that don't
+    /// implement this gracefully fall back to a no-rows `pg_class`
+    /// response (psql `\dt` prints "did not find any relations").
+    /// The default lets SP-PG-CAT T3 land before / independent of
+    /// any engine-side work — the in-tree `kesseldb-server::EngineHandle`
+    /// overrides per design §5.2.
+    ///
+    /// **Read-only invariant** — same shape as `describe_table`:
+    /// this method MUST NOT mutate engine state, advance op-number,
+    /// or take a snapshot. The `kesseldb-server` impl reads from the
+    /// live `Catalog` without going through the apply path (via
+    /// the `LIST_TABLES_TAG` admin frame, mirroring
+    /// `DESCRIBE_BY_NAME_TAG`).
+    ///
+    /// **Listing order** — tables are returned in catalog
+    /// declaration order (the same order `Catalog.types` carries
+    /// them). The `pg_class` synthesizer further orders rows for
+    /// stable wire output, but the trait MAKES NO ordering
+    /// promise — V2 may sort by name for human-friendly output.
+    fn list_tables(&self) -> Vec<TableMetadata> {
+        Vec::new()
     }
 }
 
@@ -183,5 +272,113 @@ mod tests {
             apply: std::sync::Mutex::new(Vec::new()),
         };
         assert!(eng.describe_table("nope").is_none());
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-CAT T3 KATs — `list_tables()` trait extension + the
+    // `TableMetadata` / `TableKind` shape.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// **Default-impl invariant:** the trait's default `list_tables()`
+    /// returns an empty Vec, so an engine that doesn't override gets
+    /// a graceful empty-pg_class response (psql `\dt` says
+    /// "did not find any relations" instead of crashing). Locked
+    /// because any future change that drops the default would
+    /// silently break every existing `EngineApply` impl outside the
+    /// in-tree `kesseldb-server` one.
+    #[test]
+    fn t3_list_tables_default_impl_returns_empty_vec() {
+        // MockEngine inherits the default — it does NOT override
+        // list_tables(). The empty result confirms the default fires.
+        let eng = MockEngine {
+            schema: std::collections::BTreeMap::new(),
+            apply: std::sync::Mutex::new(Vec::new()),
+        };
+        let tables = eng.list_tables();
+        assert!(
+            tables.is_empty(),
+            "default list_tables() MUST return an empty Vec — got {} entries",
+            tables.len()
+        );
+    }
+
+    /// **TableKind → relkind char lock:** the four V1 TableKind
+    /// variants map to the canonical PG `pg_class.relkind` chars per
+    /// `src/include/catalog/pg_class.h`. If a future refactor
+    /// renumbers these, every PG client's CASE-on-relkind logic
+    /// (psql `\dt`, JDBC `getTables`, pgcli `tables()`) silently
+    /// breaks because they switch on the literal byte.
+    #[test]
+    fn t3_table_kind_maps_to_canonical_pg_relkind_chars() {
+        assert_eq!(TableKind::Ordinary.pg_relkind(), b'r',
+            "ordinary table is 'r' per pg_class.h");
+        assert_eq!(TableKind::Index.pg_relkind(), b'i',
+            "index is 'i' per pg_class.h");
+        assert_eq!(TableKind::View.pg_relkind(), b'v',
+            "view is 'v' per pg_class.h");
+        assert_eq!(TableKind::Sequence.pg_relkind(), b'S',
+            "sequence is 'S' (capital!) per pg_class.h");
+    }
+
+    /// **TableMetadata shape lock:** all four fields are populated +
+    /// the struct is Clone + PartialEq for KAT-friendly assertions.
+    /// Locked because the `pg_class` synthesizer assumes this exact
+    /// shape (name → relname/OID; type_id → kept for forward
+    /// compat; kind → relkind; field_count → relnatts).
+    #[test]
+    fn t3_table_metadata_carries_v1_pg_class_columns() {
+        let md = TableMetadata {
+            name: "users".to_string(),
+            type_id: 7,
+            kind: TableKind::Ordinary,
+            field_count: 3,
+        };
+        assert_eq!(md.name, "users");
+        assert_eq!(md.type_id, 7);
+        assert_eq!(md.kind, TableKind::Ordinary);
+        assert_eq!(md.field_count, 3);
+        // Clone + PartialEq round-trip — used by every KAT below.
+        let md2 = md.clone();
+        assert_eq!(md, md2);
+    }
+
+    /// **Engine can override** — MockEngine doesn't override (the
+    /// default returns empty), but a wrapper that DOES override
+    /// surfaces its tables through the trait method. Locks the
+    /// dispatch path the `kesseldb-server::EngineHandle` impl uses.
+    #[test]
+    fn t3_list_tables_overridable_via_trait_impl() {
+        struct OverridingEngine;
+        impl EngineApply for OverridingEngine {
+            fn apply_sql(&self, _sql: &str) -> OpResult {
+                OpResult::SchemaError("not used".into())
+            }
+            fn describe_table(&self, _name: &str) -> Option<Vec<PgColumn>> {
+                None
+            }
+            fn list_tables(&self) -> Vec<TableMetadata> {
+                vec![
+                    TableMetadata {
+                        name: "users".to_string(),
+                        type_id: 1,
+                        kind: TableKind::Ordinary,
+                        field_count: 2,
+                    },
+                    TableMetadata {
+                        name: "orders".to_string(),
+                        type_id: 2,
+                        kind: TableKind::Ordinary,
+                        field_count: 5,
+                    },
+                ]
+            }
+        }
+        let eng = OverridingEngine;
+        let tables = eng.list_tables();
+        assert_eq!(tables.len(), 2);
+        assert_eq!(tables[0].name, "users");
+        assert_eq!(tables[1].name, "orders");
+        assert_eq!(tables[0].kind, TableKind::Ordinary);
+        assert_eq!(tables[1].field_count, 5);
     }
 }

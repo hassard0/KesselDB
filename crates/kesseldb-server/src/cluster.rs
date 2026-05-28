@@ -589,6 +589,34 @@ mod tests {
         false
     }
 
+    /// SP-CLUSTER-FLAKE — submit `op` to `node` and retry on
+    /// `OpResult::Unavailable` with a 5-second budget. This is the
+    /// test-side analog of what `ClusterClient` does in real client
+    /// code per SP42 (rotate address list on Unavailable). Cluster
+    /// tests historically opened with `std::thread::sleep(200ms)` to
+    /// "let dial/accept links establish" before the first submit; on
+    /// a loaded CI runner the per-peer TCP handshake occasionally
+    /// stretches past 200 ms and the first op then races a not-yet-
+    /// formed quorum. Rather than chase the right sleep duration
+    /// (band-aid), retry on the exact return value that means "I'm
+    /// not yet able to commit this" — which is the same Unavailable
+    /// signal ClusterClient retries against in production. Wrap only
+    /// the FIRST op of each cluster test; subsequent ops are already
+    /// guaranteed-good by `wait_converged`.
+    fn submit_with_retry(node: &Node, op: Op) -> OpResult {
+        let start = Instant::now();
+        loop {
+            let r = node.submit(op.clone());
+            if !matches!(r, OpResult::Unavailable) {
+                return r;
+            }
+            if start.elapsed() > Duration::from_secs(5) {
+                return r;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn three_nodes_replicate_over_real_tcp() {
         let n = 3;
@@ -612,9 +640,14 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
 
         // Client talks to the primary (node 0 is primary in view 0).
+        // Retry the FIRST op on Unavailable per SP-CLUSTER-FLAKE — the
+        // 200 ms link-establish sleep above is sometimes not enough on
+        // a loaded CI runner. Subsequent ops don't need the retry
+        // because the cluster is provably ready once the first one
+        // returns Ok.
         let primary = &nodes[0];
         assert_eq!(
-            primary.submit(Op::CreateType {
+            submit_with_retry(primary, Op::CreateType {
                 def: encode_type_def(
                     "acct",
                     &[Field {
@@ -783,8 +816,9 @@ mod tests {
         let primary = &nodes[0];
 
         // Setup schema via the bare path (irrelevant to the dedup proof).
+        // SP-CLUSTER-FLAKE — retry FIRST op on Unavailable.
         assert_eq!(
-            primary.submit(Op::CreateType {
+            submit_with_retry(primary, Op::CreateType {
                 def: encode_type_def(
                     "t",
                     &[Field {
@@ -836,9 +870,13 @@ mod tests {
             OpResult::Ok
         );
 
+        // Wait for the primary's full commit count, not just ">= 1".
+        // CI flake mitigation — same reasoning as
+        // `failover_retry_against_follower_returns_cached_reply`.
+        let primary_commit = nodes[0].probe().2;
         assert!(
-            wait_converged(&nodes, 1),
-            "nodes did not converge after session ops"
+            wait_converged(&nodes, primary_commit),
+            "nodes did not converge after session ops (primary commit = {primary_commit})",
         );
         for d in &dirs {
             let _ = std::fs::remove_dir_all(d);
@@ -864,8 +902,9 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(200));
 
+        // SP-CLUSTER-FLAKE — retry FIRST op on Unavailable.
         assert_eq!(
-            nodes[0].submit(Op::CreateType {
+            submit_with_retry(&nodes[0], Op::CreateType {
                 def: encode_type_def(
                     "t",
                     &[Field {
@@ -887,8 +926,22 @@ mod tests {
             s.submit_with_req(Op::Create { type_id: 1, id, record: vec![1] }, 1),
             OpResult::Ok
         );
-        // Wait until every node (incl. the follower) has applied it.
-        assert!(wait_converged(&nodes, 1), "did not converge before failover");
+        // Wait until every node (incl. the follower) has applied EVERY
+        // committed op so the follower's client_table has the cached
+        // reply for (cid, req=1). The primary's commit count is the
+        // target — `wait_converged(nodes, 1)` was too loose because
+        // the test setup already committed `CreateType` (op 1), so
+        // the follower could be at commit=1 (CreateType applied) but
+        // not yet at commit=2 (the Create whose reply we need cached).
+        // Witness: CI flake "left: Unavailable / right: Ok" at line 897
+        // — the follower hadn't received Commit for op 2 yet and the
+        // client_table lookup missed, so it fell through to the
+        // backup-redirect path that returns Unavailable.
+        let primary_commit = nodes[0].probe().2;
+        assert!(
+            wait_converged(&nodes, primary_commit),
+            "did not converge before failover (primary commit = {primary_commit})",
+        );
         let follower_digest = nodes[1].probe().0;
 
         // Primary "fails": the client reconnects to a FOLLOWER and retries

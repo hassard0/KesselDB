@@ -88,7 +88,7 @@ all. Determinism is a feature, not an aspiration.
   Parquet reader (`kessel-parquet`) supports **flat REQUIRED + OPTIONAL +
   `LIST<primitive>` + `MAP<K, V>` + `struct` (+ 3‑deep cross‑products,
   OBJ‑2c‑5 fully closed at SP146) × UNCOMPRESSED + Snappy + GZIP + zstd
-  + LZ4_RAW + Brotli (SP154 closed the 5‑codec matrix) × PLAIN +
+  + LZ4_RAW + Brotli (SP154 closed the 6‑codec matrix) × PLAIN +
   dictionary × V1 + V2 data pages × INT64 + INT32 + INT96 (timestamps) +
   DECIMAL (INT32 / INT64 / FLBA, precision ≤ 38) + FLBA + BYTE_ARRAY**
   out of the box. Every nested Parquet shape pyarrow writes up to 3‑deep
@@ -322,7 +322,7 @@ round‑trip fixtures**:
 | Axis | Supported | Notes |
 |---|---|---|
 | **Page version** | V1 + **V2** | V2 raw‑level‑split path (def/rep levels uncompressed, values section compressed) |
-| **Compression** | UNCOMPRESSED, **Snappy**, **GZIP**, **zstd**, **LZ4_RAW (SP149)** | All decompressors are zero‑dep hand‑written (`snappy.rs` 338 LOC / `gzip.rs` RFC 1951 inflate / `zstd*.rs` full RFC 8478 pipeline: frame + block + literals (Raw/RLE/Compressed/Treeless) + Huffman (direct + FSE‑weight × 1‑stream + 4‑stream) + sequences (Predefined/RLE/FseCompressed × LL/OF/ML) + 3‑slot repeat‑offset LZ77 execution / `lz4.rs` raw LZ4 block format per the lz4 spec (literal + match sequences, minmatch=4, 2-byte LE offset, LZ77 overlapping-copy)). All real pyarrow zstd fixtures pass end‑to‑end through `extract()` incl. a 2000‑row stress fixture exercising FseCompressed mode for all three LL/OF/ML codes simultaneously. Brotli (codec id 4) is recognized at meta-decode time (SP150) but decompression is a named follow-up — workaround: re-encode the file with `compression='zstd'` or `compression='lz4'`. |
+| **Compression** | UNCOMPRESSED, **Snappy**, **GZIP**, **zstd**, **LZ4_RAW (SP149)**, **Brotli (SP154)** | All decompressors are zero‑dep hand‑written: `snappy.rs` (338 LOC); `gzip.rs` (RFC 1951 inflate); `zstd*.rs` (full RFC 8478 pipeline — frame + block + literals (Raw/RLE/Compressed/Treeless) + Huffman (direct + FSE‑weight × 1‑stream + 4‑stream) + sequences (Predefined/RLE/FseCompressed × LL/OF/ML) + 3‑slot repeat‑offset LZ77 execution); `lz4.rs` (raw LZ4 block format — literal + match sequences, minmatch=4, 2-byte LE offset, LZ77 overlapping-copy); `brotli*.rs` (RFC 7932 — 12 layers: bit reader → stream/metablock framing → simple+complex prefix codes → NBLTYPES + NPOSTFIX/NDIRECT + context-map headers → 704-symbol insert-and-copy command alphabet → 64-symbol distance prefix code + recent-distance ring → 122,784-byte static dictionary blob + 121 Appendix B transforms → flat output buffer). All real pyarrow fixtures pass end‑to‑end through `extract()` incl. a 2000‑row zstd stress fixture exercising FseCompressed mode for all three LL/OF/ML codes simultaneously and pyarrow `compression='brotli'` round-trips for the standard flat-i64 + flat-BYTE_ARRAY shape. |
 | **Encoding** | PLAIN, **PLAIN_DICTIONARY / RLE_DICTIONARY** | Dictionary page + data‑page index resolve |
 | **Repetition** | flat REQUIRED + **flat OPTIONAL (nullable)** + **`LIST<primitive>` (SP143)** + **`MAP<K, V>` and `struct` (SP144)** + **`List<List<T>>`, `List<struct>`, `Map<K, struct>`, `Map<K, List<T>>`, `struct<List/Map/struct>` (SP145)** + **`List<List<List<T>>>` 3‑deep, `List<Map<K,V>>`, `Map<K1, Map<K2,V>>` (SP146 — OBJ-2c-5 FULLY CLOSED)** | OPTIONAL via RLE‑hybrid def‑level decode + null‑scatter; SP143 adds Dremel‑style record assembly for canonical 3‑node `LIST<primitive>` (4‑shape matrix); SP144 adds `Map<K, V>` via `assemble_map_kv` (REQUIRED key enforced) and `struct` via `assemble_struct`; SP145 adds 4 new variants via per‑shape composition; SP146 adds 3 more (`assemble_list_of_list_of_list_primitive` 3-level stack, `assemble_list_of_map_kv` outer-list-of-inner-maps, `assemble_map_of_map_kv` outer-map-of-inner-maps) — every nested Parquet shape pyarrow writes now decodes |
 | **Physical types** | INT32, **INT64**, **INT96 (timestamp)**, **FLBA**, **BYTE_ARRAY** | INT96 → `PqValue::Timestamp(i64 ns)` via checked Julian‑day arithmetic |
@@ -332,7 +332,7 @@ round‑trip fixtures**:
 
 **Still deferred** (typed `Unsupported` at `REFRESH` with a precise
 error naming the follow‑on slice):
-- Brotli compression (OBJ‑2c‑2 follow‑on; LZ4_RAW shipped in SP149)
+- Legacy LZ4 framing (codec id 5, deprecated Hadoop variant — modern LZ4_RAW codec id 7 is fully supported via SP149)
 - 4‑deep nesting (`List<List<List<List<T>>>>` etc.) — would be SP147 if a real fixture demands it; **all 3‑deep and below now supported (OBJ-2c-5 fully closed at SP146)**
 - DECIMAL precision > 38 (would need i256)
 - Per‑page decompressed size > 256 MiB (SP151 lifted the 64 MiB historical cap; operators with known-trusted producers can lower or raise the cap via `extract_with_cap` up to the per-codec module ceiling)
@@ -419,7 +419,8 @@ linearizability under partition, deterministic WASM UDFs) are all **shipped**
 | [`docs/THESIS.md`](docs/THESIS.md) | The 5 thesis pillars (deterministic / verifiable / replayable / zero‑dep / honest‑docs) + strategic‑tier backlog S1–S4 (all shipped) |
 | [`docs/USAGE.md`](docs/USAGE.md) | Install, run, **CLI**, client API, **SQL reference**, clustering, auth, backup & monitoring, external sources + Parquet matrix |
 | [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) | Methodology, measured numbers, scaling model, cloud projections |
-| [`docs/STATUS.md`](docs/STATUS.md) | Production‑readiness gate, per‑slice status (incl. SP109‑SP140 strategic‑tier + Parquet codec arc through SP151), performance log |
+| [`docs/STATUS.md`](docs/STATUS.md) | Current capabilities summary + production‑readiness gate + per‑slice status (incl. SP109‑SP140 strategic‑tier + the Parquet codec arc through SP154 / OBJ‑2c‑2 closed), performance log |
+| [`CHANGELOG.md`](CHANGELOG.md) | Keep-a-Changelog release notes, starting at v1.0.0 |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Storage, replication, sharding, caching, MVCC + WASM + Parquet internals |
 | [`kesseldb-tla/`](kesseldb-tla/) | Seven layered TLA+ specs (Replication / MVCCStorage / MVCCTx / MVCCSi / MVCCSsi / MVCCGc / MVCCCutover) + TLC baselines |
 | [`clients/python/kesseldb.py`](clients/python/kesseldb.py) | Dependency‑free Python reference client (stdlib‑only, single file) |

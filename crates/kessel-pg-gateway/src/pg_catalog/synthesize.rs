@@ -2042,6 +2042,55 @@ pub fn psql_d_pg_trigger_empty() -> Vec<u8> {
     out
 }
 
+/// SP-PG-CAT T8 (real-psql) — well-framed empty for psql's
+/// pg_statistic_ext poll. PG 16+ unconditionally polls this on
+/// every `\d <table>`; KesselDB V1 has no multi-column statistics.
+pub fn psql_d_pg_statistic_ext_empty() -> Vec<u8> {
+    let fields = vec![
+        FieldMeta { name: "oid".to_string(), type_oid: PG_TYPE_OID },
+        FieldMeta { name: "stxrelid".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "nsp".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "stxname".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "columns".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "ndist_enabled".to_string(), type_oid: PG_TYPE_BOOL },
+        FieldMeta { name: "deps_enabled".to_string(), type_oid: PG_TYPE_BOOL },
+        FieldMeta { name: "mcv_enabled".to_string(), type_oid: PG_TYPE_BOOL },
+        FieldMeta { name: "stxstattarget".to_string(), type_oid: PG_TYPE_INT4 },
+    ];
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    out.extend_from_slice(&encode_command_complete(&select_tag(0)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
+/// SP-PG-CAT T8 (real-psql) — well-framed empty for psql's
+/// pg_publication poll. PG 10+ logical-replication metadata.
+pub fn psql_d_pg_publication_empty() -> Vec<u8> {
+    let fields = vec![
+        FieldMeta { name: "pubname".to_string(), type_oid: PG_TYPE_TEXT },
+    ];
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    out.extend_from_slice(&encode_command_complete(&select_tag(0)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
+/// SP-PG-CAT T8 (real-psql) — well-framed empty for psql's
+/// pg_foreign_table poll. KesselDB V1 has no foreign-data wrappers.
+pub fn psql_d_pg_foreign_table_empty() -> Vec<u8> {
+    let fields = vec![
+        FieldMeta { name: "ftrelid".to_string(), type_oid: PG_TYPE_OID },
+        FieldMeta { name: "ftoptions".to_string(), type_oid: PG_TYPE_TEXT },
+    ];
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    out.extend_from_slice(&encode_command_complete(&select_tag(0)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
 /// SP-PG-CAT T8 (real-psql) — psql `\dn` schema-list.
 ///
 /// Synthesize the canonical 2-column ("Name", "Owner") response for

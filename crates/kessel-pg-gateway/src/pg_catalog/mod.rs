@@ -289,6 +289,23 @@ pub fn catalog_query_hook<E: EngineApply + ?Sized>(
     if matches_psql_d_pg_trigger(&normalized) {
         return Some(synthesize::psql_d_pg_trigger_empty());
     }
+    // T8 (real-psql): psql `\d <name>` extended-statistics
+    // (pg_statistic_ext). PG 16 added this poll. KesselDB V1 has no
+    // engine-level multi-column statistics.
+    if matches_psql_d_pg_statistic_ext(&normalized) {
+        return Some(synthesize::psql_d_pg_statistic_ext_empty());
+    }
+    // T8 (real-psql): psql `\d <name>` publication-list
+    // (pg_publication / pg_publication_rel). KesselDB V1 has no
+    // logical replication publications.
+    if matches_psql_d_pg_publication(&normalized) {
+        return Some(synthesize::psql_d_pg_publication_empty());
+    }
+    // T8 (real-psql): psql `\d <name>` foreign-table info
+    // (pg_foreign_table). KesselDB V1 has no foreign-data wrappers.
+    if matches_psql_d_pg_foreign_table(&normalized) {
+        return Some(synthesize::psql_d_pg_foreign_table_empty());
+    }
     // T8 (real-psql): psql `\dn` schema-list query. Uses the negated
     // regex operator `n.nspname !~ '^pg_'` — same parser-rejection
     // problem as `\d <name>`. Always returns the public schema (V1
@@ -869,6 +886,29 @@ fn matches_psql_d_pg_trigger(normalized: &str) -> bool {
     // `from pg_catalog.pg_trigger t where t.tgrelid = '<n>'`.
     normalized.contains("from pg_catalog.pg_trigger")
         && normalized.contains("tgrelid")
+}
+
+/// SP-PG-CAT T8 (real-psql) — recognize psql `\d <name>` extended-
+/// statistics poll (PG 16+). Uses `::pg_catalog.regclass` cast syntax
+/// that KesselDB's SQL parser rejects.
+fn matches_psql_d_pg_statistic_ext(normalized: &str) -> bool {
+    normalized.contains("from pg_catalog.pg_statistic_ext")
+        && normalized.contains("stxrelid")
+}
+
+/// SP-PG-CAT T8 (real-psql) — recognize psql `\d <name>` publication
+/// poll. PG 10+ logical-replication metadata; KesselDB V1 has none.
+fn matches_psql_d_pg_publication(normalized: &str) -> bool {
+    normalized.contains("from pg_catalog.pg_publication")
+        || (normalized.contains("pg_publication_rel")
+            && normalized.contains("prrelid"))
+}
+
+/// SP-PG-CAT T8 (real-psql) — recognize psql `\d <name>` foreign-table
+/// poll. KesselDB V1 has no foreign-data wrappers.
+fn matches_psql_d_pg_foreign_table(normalized: &str) -> bool {
+    normalized.contains("from pg_catalog.pg_foreign_table")
+        && normalized.contains("ftrelid")
 }
 
 /// SP-PG-CAT T8 (real-psql) — recognize the canonical psql `\dn`
@@ -2205,6 +2245,35 @@ mod tests {
                  ORDER BY 1;";
         let res = catalog_query_hook(q, &eng);
         assert!(res.is_some(), "psql pg_trigger poll MUST hit the hook");
+    }
+
+    /// **psql `\d <name>` pg_statistic_ext poll** (PG 16+). Without
+    /// this matcher the query errors with `unexpected char ':'`
+    /// (the `::pg_catalog.regclass` cast).
+    #[test]
+    fn t8_psql_d_pg_statistic_ext_poll_fires() {
+        let eng = t6_engine();
+        let q = "SELECT oid, stxrelid::pg_catalog.regclass, \
+                 stxnamespace::pg_catalog.regnamespace::pg_catalog.text AS nsp, stxname, \
+                 pg_catalog.pg_get_statisticsobjdef_columns(oid) AS columns, \
+                 'd' = any(stxkind) AS ndist_enabled, \
+                 'f' = any(stxkind) AS deps_enabled, \
+                 'm' = any(stxkind) AS mcv_enabled, \
+                 stxstattarget FROM pg_catalog.pg_statistic_ext \
+                 WHERE stxrelid = '1611034886' ORDER BY nsp, stxname;";
+        let res = catalog_query_hook(q, &eng);
+        assert!(res.is_some(), "pg_statistic_ext poll MUST hit the hook");
+    }
+
+    /// **psql `\d <name>` pg_publication poll.**
+    #[test]
+    fn t8_psql_d_pg_publication_poll_fires() {
+        let eng = t6_engine();
+        let q = "SELECT pubname FROM pg_catalog.pg_publication p, \
+                 pg_catalog.pg_publication_rel pr \
+                 WHERE p.oid = pr.prpubid AND pr.prrelid = '1611034886' ORDER BY 1;";
+        let res = catalog_query_hook(q, &eng);
+        assert!(res.is_some(), "pg_publication poll MUST hit the hook");
     }
 
     /// **T8 additions don't break existing T1-T7 patterns.** Lock the

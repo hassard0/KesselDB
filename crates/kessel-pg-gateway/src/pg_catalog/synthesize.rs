@@ -1853,6 +1853,81 @@ pub fn synthesize_information_schema_routines() -> Vec<u8> {
     out
 }
 
+// ─── SP-PG-CAT T8 (real-psql) — psql `\d <name>` step-1 + `\dn` ──────────
+
+/// SP-PG-CAT T8 (real-psql) — psql `\d <name>` STEP 1.
+///
+/// Synthesize the (oid, nspname, relname) row that psql expects from
+/// its OID-lookup regex query (mod.rs `extract_psql_d_step1_relname`).
+/// Walks `engine.list_tables()` for an exact-name match (case-insensitive
+/// — psql lowercases unquoted identifiers).
+///
+/// **Output columns** (matching the query's SELECT projection):
+/// - `oid` (PG_TYPE_OID) — `oid_for_table_name(name)` deterministic
+/// - `nspname` (PG_TYPE_TEXT) — `public` (V1 single user schema)
+/// - `relname` (PG_TYPE_TEXT) — the table name (verbatim from
+///   `list_tables`)
+///
+/// If no table matches, emits a 0-row well-framed response — psql then
+/// prints `Did not find any relation named "<name>".` and exits with
+/// code 1, matching real PG behavior.
+pub fn psql_d_step1_oid_lookup<E: EngineApply + ?Sized>(
+    engine: &E,
+    name: &str,
+) -> Vec<u8> {
+    let fields = vec![
+        FieldMeta { name: "oid".to_string(), type_oid: PG_TYPE_OID },
+        FieldMeta { name: "nspname".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "relname".to_string(), type_oid: PG_TYPE_TEXT },
+    ];
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    let tables = engine.list_tables();
+    let mut n: u64 = 0;
+    for t in &tables {
+        // psql `\d <name>` is case-insensitive for unquoted names.
+        if t.name.eq_ignore_ascii_case(name)
+            && matches!(t.kind, TableKind::Ordinary | TableKind::Index)
+        {
+            let oid_str = oid_for_table_name(&t.name).to_string();
+            out.extend_from_slice(&encode_data_row(&[
+                Some(oid_str.as_bytes()),
+                Some(b"public"),
+                Some(t.name.as_bytes()),
+            ]));
+            n += 1;
+        }
+    }
+    out.extend_from_slice(&encode_command_complete(&select_tag(n)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
+/// SP-PG-CAT T8 (real-psql) — psql `\dn` schema-list.
+///
+/// Synthesize the canonical 2-column ("Name", "Owner") response for
+/// psql's `\dn` schema-list query. V1 KesselDB has exactly one
+/// user-visible schema: `public`. `pg_catalog` and `information_schema`
+/// are filtered out by the query itself (`!~ '^pg_'` and `<> ...`).
+pub fn psql_dn_schema_list() -> Vec<u8> {
+    let fields = vec![
+        FieldMeta { name: "Name".to_string(), type_oid: PG_TYPE_TEXT },
+        FieldMeta { name: "Owner".to_string(), type_oid: PG_TYPE_TEXT },
+    ];
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    // One row — public schema owned by the canonical PG superuser
+    // (KESSELDB_USER_NAME below; we hard-code "kesseldb" here to avoid
+    // a forward reference to the T7 constant).
+    out.extend_from_slice(&encode_data_row(&[
+        Some(b"public"),
+        Some(b"kesseldb"),
+    ]));
+    out.extend_from_slice(&encode_command_complete(&select_tag(1)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
 // ─── SP-PG-CAT T7 — SQL helper functions ──────────────────────────────────
 
 /// Canonical version string V1 emits for `SELECT version()`. Matches

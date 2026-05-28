@@ -248,6 +248,24 @@ pub fn catalog_query_hook<E: EngineApply + ?Sized>(
     if matches_information_schema_routines(&normalized) {
         return Some(synthesize::synthesize_information_schema_routines());
     }
+    // T8 (real-psql): psql `\d <name>` STEP 1 — the table-OID lookup
+    // query. Uses the regex operator `OPERATOR(pg_catalog.~) '^(<n>)$'`,
+    // which KesselDB's SQL parser doesn't accept; without this matcher
+    // the user gets `ERROR: sql: unexpected char '~'` on every `\d <t>`
+    // invocation. Synthesizer emits (oid, nspname, relname) for the
+    // table whose name matches the regex anchor exactly (psql always
+    // submits `^(<exact>)$` for a simple `\d foo`). 0 rows if the name
+    // doesn't exist — psql then prints "Did not find any relation named ...".
+    if let Some(name) = extract_psql_d_step1_relname(&normalized) {
+        return Some(synthesize::psql_d_step1_oid_lookup(engine, &name));
+    }
+    // T8 (real-psql): psql `\dn` schema-list query. Uses the negated
+    // regex operator `n.nspname !~ '^pg_'` — same parser-rejection
+    // problem as `\d <name>`. Always returns the public schema (V1
+    // has no other user schemas).
+    if matches_psql_dn(&normalized) {
+        return Some(synthesize::psql_dn_schema_list());
+    }
     None
 }
 
@@ -671,6 +689,104 @@ fn has_information_schema_relation(normalized: &str, relation: &str) -> bool {
         || after.starts_with(' ')
         || after.starts_with(',')
         || after.starts_with(';')
+}
+
+/// SP-PG-CAT T8 (real-psql) — recognize the canonical psql `\d <name>`
+/// STEP 1 query.
+///
+/// The query (PG 14 `src/bin/psql/describe.c::describeOneTableDetails`)
+/// looks up the table OID by matching `c.relname` against a regex
+/// anchor:
+///
+/// ```text
+/// SELECT c.oid, n.nspname, c.relname
+/// FROM pg_catalog.pg_class c
+///   LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+/// WHERE c.relname OPERATOR(pg_catalog.~) '^(<name>)$' COLLATE pg_catalog.default
+///   AND pg_catalog.pg_table_is_visible(c.oid)
+/// ORDER BY 2, 3;
+/// ```
+///
+/// V1 KesselDB's SQL parser doesn't accept `OPERATOR(...)`, so without
+/// this matcher every `\d <name>` produces `ERROR: sql: unexpected
+/// char '~'`. The fix anchors on the unique fixture (the canonical
+/// `pg_class` + `pg_namespace` LEFT JOIN with the regex operator) and
+/// extracts the bare table name from `^(<name>)$`. Returns `None` if
+/// the regex is non-trivial (e.g. user typed `\d 'pattern.*'` — V2,
+/// not V1).
+///
+/// Returns the lowercase table name (psql already lowercases unquoted
+/// identifiers before sending; the `normalize_for_match` lowercase
+/// happens too).
+fn extract_psql_d_step1_relname(normalized: &str) -> Option<String> {
+    // Required leading fixture — the exact SELECT projection psql ships.
+    let leading = "select c.oid, n.nspname, c.relname";
+    if !normalized.starts_with(leading) {
+        return None;
+    }
+    // Required core fixture — the FROM + LEFT JOIN clause shape.
+    let core = "from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace";
+    if !normalized.contains(core) {
+        return None;
+    }
+    // Required visibility filter — distinguishes from less-related
+    // queries that might share the SELECT projection.
+    if !normalized.contains("and pg_catalog.pg_table_is_visible(c.oid)") {
+        return None;
+    }
+    // Extract the name from `c.relname operator(pg_catalog.~) '^(<name>)$'`.
+    // Two shapes psql emits (PG 12/13/14 vs PG 15+): the COLLATE clause
+    // is sometimes absent; the anchor regex is always `^(<name>)$` for
+    // a bare `\d foo`.
+    let regex_marker = "c.relname operator(pg_catalog.~) '^(";
+    let pos = normalized.find(regex_marker)?;
+    let after = &normalized[pos + regex_marker.len()..];
+    // The closing fixture is `)$'` — name ends there.
+    let end = after.find(")$'")?;
+    let raw_name = &after[..end];
+    // V1 only handles bare identifiers (no regex metacharacters). If
+    // the user types `\d 'foo.*'` psql escapes the regex specials
+    // differently; punt to engine path (which will error, matching
+    // real PG's behavior for non-existent objects).
+    if raw_name.is_empty()
+        || raw_name.chars().any(|c| {
+            !(c.is_ascii_alphanumeric() || c == '_')
+        })
+    {
+        return None;
+    }
+    Some(raw_name.to_string())
+}
+
+/// SP-PG-CAT T8 (real-psql) — recognize the canonical psql `\dn`
+/// schema-list query.
+///
+/// The query (PG 14 `src/bin/psql/describe.c::listSchemas`) uses
+/// the negated regex operator `!~`:
+///
+/// ```text
+/// SELECT n.nspname AS "Name",
+///   pg_catalog.pg_get_userbyid(n.nspowner) AS "Owner"
+/// FROM pg_catalog.pg_namespace n
+/// WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'
+/// ORDER BY 1;
+/// ```
+///
+/// Without this matcher psql `\dn` errors with `unexpected char '"'`
+/// (the quoted `"Name"` projection alias). Synthesizer emits one row
+/// — the `public` schema — because V1 KesselDB has no other
+/// user-visible schemas; pg_catalog + information_schema are filtered
+/// out by the query.
+fn matches_psql_dn(normalized: &str) -> bool {
+    // Anchor on the distinctive `pg_get_userbyid(n.nspowner)` fixture
+    // — only psql `\dn` ships this exact projection. Tolerates the
+    // PG 12/13/14/15 minor variations in the WHERE clause.
+    let leading = "select n.nspname as \"name\"";
+    let user_marker = "pg_catalog.pg_get_userbyid(n.nspowner)";
+    let from_marker = "from pg_catalog.pg_namespace n";
+    normalized.starts_with(leading)
+        && normalized.contains(user_marker)
+        && normalized.contains(from_marker)
 }
 
 /// SP-PG-CAT T6 — extract the table-name filter from
@@ -1776,5 +1892,110 @@ mod tests {
         assert!(catalog_query_hook(
             "DELETE FROM information_schema.tables",
             &eng).is_none());
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // T8 (real-psql) KATs — locked invariants for the `\d <name>` step-1
+    // OID-lookup recognizer and the `\dn` schema-list recognizer.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// **HEADLINE — psql `\d <table>` step-1 query (PG 14 / 16) hits
+    /// the hook.** Without this matcher the user gets
+    /// `ERROR: sql: unexpected char '~'`, the V1-boundary bug captured
+    /// during the 2026-05-28 real-libpq smoke on vulcan.
+    #[test]
+    fn t8_psql_d_step1_query_fires() {
+        let eng = t6_engine();
+        // The exact wire SQL psql 16.14 ships for `\d users`. Quoted
+        // OID '<oid>' and COLLATE are both in PG 14+; the matcher is
+        // tolerant of either being present.
+        let q = "SELECT c.oid,\n  n.nspname,\n  c.relname\n\
+                 FROM pg_catalog.pg_class c\n     \
+                 LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n\
+                 WHERE c.relname OPERATOR(pg_catalog.~) '^(users)$' COLLATE pg_catalog.default\n  \
+                 AND pg_catalog.pg_table_is_visible(c.oid)\n\
+                 ORDER BY 2, 3;";
+        let res = catalog_query_hook(q, &eng);
+        assert!(res.is_some(),
+            "psql \\d <name> step-1 query MUST hit the hook (was: parser-rejected)");
+        let bytes = res.unwrap();
+        // Well-framed response with at least one DataRow for `users`.
+        assert_eq!(bytes[0], b'T');
+        assert!(bytes.windows(b"users".len()).any(|w| w == b"users"),
+            "response MUST include the matched table name");
+        assert!(bytes.windows(b"public".len()).any(|w| w == b"public"),
+            "response MUST include the public schema name");
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+    }
+
+    /// **`\d <name>` step-1 returns 0 rows for a non-existent table.**
+    /// psql then prints "Did not find any relation named X." and exits.
+    #[test]
+    fn t8_psql_d_step1_query_zero_rows_for_unknown_name() {
+        let eng = t6_engine();
+        let q = "SELECT c.oid, n.nspname, c.relname \
+                 FROM pg_catalog.pg_class c \
+                 LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE c.relname OPERATOR(pg_catalog.~) '^(does_not_exist)$' COLLATE pg_catalog.default \
+                 AND pg_catalog.pg_table_is_visible(c.oid) \
+                 ORDER BY 2, 3;";
+        let res = catalog_query_hook(q, &eng).expect("matches");
+        // Empty rows, but well-framed.
+        assert_eq!(res[0], b'T');
+        assert!(res.windows(b"SELECT 0\0".len()).any(|w| w == b"SELECT 0\0"));
+    }
+
+    /// **`\d <name>` step-1 rejects regex metacharacters.** V1 only
+    /// supports bare identifier lookup; if psql ships a real pattern
+    /// (e.g. `\d t.*`), the matcher punts so the engine path errors
+    /// out the same way real PG would (no false synthetic answer).
+    #[test]
+    fn t8_psql_d_step1_query_punts_on_regex_metachars() {
+        // Direct test of the extractor — these would normalize down
+        // to forms with `.*` or `[ab]` inside the `^(...)$` capture.
+        let with_dot_star = "select c.oid, n.nspname, c.relname \
+            from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+            where c.relname operator(pg_catalog.~) '^(t.*)$' collate pg_catalog.default \
+            and pg_catalog.pg_table_is_visible(c.oid) order by 2, 3";
+        assert!(extract_psql_d_step1_relname(with_dot_star).is_none(),
+            "regex metachars MUST cause the matcher to punt (engine errors out)");
+        // Bare identifier MUST be extracted.
+        let bare = "select c.oid, n.nspname, c.relname \
+            from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid = c.relnamespace \
+            where c.relname operator(pg_catalog.~) '^(users)$' collate pg_catalog.default \
+            and pg_catalog.pg_table_is_visible(c.oid) order by 2, 3";
+        assert_eq!(extract_psql_d_step1_relname(bare).as_deref(), Some("users"));
+    }
+
+    /// **HEADLINE — psql `\dn` schema-list query hits the hook.**
+    /// Without this matcher psql `\dn` errors with
+    /// `ERROR: sql: unexpected char '"'` (the quoted `"Name"` alias).
+    #[test]
+    fn t8_psql_dn_query_fires() {
+        let eng = t6_engine();
+        let q = "SELECT n.nspname AS \"Name\",\n  \
+                 pg_catalog.pg_get_userbyid(n.nspowner) AS \"Owner\"\n\
+                 FROM pg_catalog.pg_namespace n\n\
+                 WHERE n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'\n\
+                 ORDER BY 1;";
+        let res = catalog_query_hook(q, &eng);
+        assert!(res.is_some(), "psql \\dn schema-list MUST hit the hook");
+        let bytes = res.unwrap();
+        assert_eq!(bytes[0], b'T');
+        // V1 single schema = public.
+        assert!(bytes.windows(b"public".len()).any(|w| w == b"public"));
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+    }
+
+    /// **T8 additions don't break existing T1-T7 patterns.** Lock the
+    /// regression boundary.
+    #[test]
+    fn t8_regression_lock_existing_patterns_still_match() {
+        let eng = t6_engine();
+        assert!(catalog_query_hook("SELECT * FROM pg_catalog.pg_namespace", &eng).is_some());
+        assert!(catalog_query_hook("SELECT * FROM pg_catalog.pg_class", &eng).is_some());
+        assert!(catalog_query_hook("SELECT version()", &eng).is_some());
+        // SELECTs that look like \d step-1 but lack the JOIN don't match.
+        assert!(catalog_query_hook("SELECT c.oid, n.nspname, c.relname FROM users", &eng).is_none());
     }
 }

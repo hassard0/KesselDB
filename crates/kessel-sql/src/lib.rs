@@ -189,6 +189,18 @@ fn kind_of(name: &str, arg: Option<i128>) -> Result<FieldKind, SqlError> {
         "REF" => FieldKind::Ref,
         "CHAR" => FieldKind::Char(arg.ok_or("CHAR needs (n)")? as u16),
         "BYTES" => FieldKind::Bytes(arg.ok_or("BYTES needs (n)")? as u16),
+        // SP-PG-CAT-T8 — canonical PostgreSQL type aliases. A real
+        // psql / pgcli / JDBC client sends `BIGINT` / `INTEGER` /
+        // `SMALLINT` / `BOOLEAN` (PG SQL-standard names) instead of
+        // KesselDB's narrow integer-width spellings. Pure alias: same
+        // FieldKind, same on-wire layout, same MVCC semantics.
+        // KesselDB's `I8`/`I16`/`I32` already use those spellings for
+        // their narrow widths, so PG's internal `INT8`/`INT4`/`INT2`
+        // names are NOT aliased here (would collide).
+        "BIGINT" => FieldKind::I64,
+        "INTEGER" | "INT" => FieldKind::I32,
+        "SMALLINT" => FieldKind::I16,
+        "BOOLEAN" => FieldKind::Bool,
         other => return Err(format!("unknown type `{other}`")),
     })
 }
@@ -1710,6 +1722,27 @@ mod tests {
     use kessel_io::MemVfs;
     use kessel_proto::OpResult;
     use kessel_sm::StateMachine;
+
+    /// SP-PG-CAT-T8 — canonical PG type names map to the right
+    /// KesselDB FieldKind. A real psql `CREATE TABLE foo (x BIGINT)`
+    /// session must compile; the V1 surface previously rejected
+    /// `BIGINT` / `INTEGER` / `SMALLINT` / `BOOLEAN` with
+    /// `sql: unknown type ...`.
+    #[test]
+    fn pg_type_aliases_map_to_kessel_fieldkinds() {
+        assert!(matches!(kind_of("BIGINT", None), Ok(FieldKind::I64)));
+        assert!(matches!(kind_of("bigint", None), Ok(FieldKind::I64)));
+        assert!(matches!(kind_of("INTEGER", None), Ok(FieldKind::I32)));
+        assert!(matches!(kind_of("integer", None), Ok(FieldKind::I32)));
+        assert!(matches!(kind_of("INT", None), Ok(FieldKind::I32)));
+        assert!(matches!(kind_of("SMALLINT", None), Ok(FieldKind::I16)));
+        assert!(matches!(kind_of("BOOLEAN", None), Ok(FieldKind::Bool)));
+        assert!(matches!(kind_of("boolean", None), Ok(FieldKind::Bool)));
+        // Existing KesselDB-native names still work — pure addition.
+        assert!(matches!(kind_of("I64", None), Ok(FieldKind::I64)));
+        assert!(matches!(kind_of("I32", None), Ok(FieldKind::I32)));
+        assert!(matches!(kind_of("BOOL", None), Ok(FieldKind::Bool)));
+    }
 
     #[test]
     fn parse_create_external_source() {

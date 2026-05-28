@@ -1,5 +1,30 @@
 # KesselDB Architecture
 
+## How to read this doc
+
+This document is the internals reference for KesselDB. It assumes you've
+read [`README.md`](../README.md) (the front door) and at least skimmed
+[`docs/USAGE.md`](USAGE.md) (operator + SQL reference).
+
+The structure goes inside-out:
+
+1. **Foundational seams** — determinism, crate layout, the IO injection
+   pattern that makes seeded simulation possible.
+2. **Replication & sharding** — Viewstamped Replication, scatter scan,
+   cross-shard transactions.
+3. **Storage & MVCC** — the LSM keyspace, versioned MVCC dispatch,
+   Cahill SSI, GC.
+4. **SQL + constraints + planner** — query planner, constraints, the
+   deterministic expression VM, the deterministic WASM-MVP UDF interpreter.
+5. **Wire surfaces** — binary protocol (the deterministic fast path),
+   HTTP/1.1 gateway, WebSocket arm, PostgreSQL Frontend/Backend v3.0
+   wire + pg_catalog stubs.
+6. **Rigor artifacts** — TLA+ specs and TLC baselines.
+
+Every named subsystem has a separate progress / design spec under
+`docs/superpowers/specs/`; this doc summarizes and links — it does not
+substitute for the per-slice spec when you're modifying a subsystem.
+
 ## The determinism seam (foundational)
 
 Everything above storage is a pure function over an **injected** clock, disk, and network
@@ -17,20 +42,24 @@ VSR reimplementation verifiable rather than hopeful.
 `kessel-catalog` (schema as object type 0) ·
 `kessel-codec` (record encode/decode) · `kessel-sm` (deterministic apply + heartbeat watermark) ·
 `kessel-vsr` (replication + 5 Jepsen-style multi-replica linearizability tests) ·
-`kessel-cache` (read cache) · `kessel-sim` (fault simulator) ·
+`kessel-cache` (read cache) · `kessel-shard` (rendezvous key→shard hashing) ·
+`kessel-sim` (fault simulator) ·
 `kessel-expr` (zero-dep gas-bounded expression VM for CHECK/triggers) ·
-`kessel-crypto` (zero-dep SHA-256 / HMAC-SHA256) ·
+`kessel-crypto` (zero-dep SHA-256 + HMAC-SHA256 + PBKDF2 + SHA-1 (RFC 6455 handshake only)) ·
 `kessel-wasm` (zero-dep deterministic WASM-MVP interpreter for UDFs — S4) ·
 `kessel-sql` (SQL parser + planner) ·
 `kessel-bench` (perf harness) · `kessel-client` (CLI + cluster client) ·
-`kesseldb-server` (node library) · `kesseldb` (node binary).
+`kesseldb-server` (node library + `scatter_scan` cross-shard fan-out) · `kesseldb` (node binary).
 
-**Optional (feature-gated, behind `--features external-sources*`):**
-`kessel-fetch` (HTTP/HTTPS/object-store reader) ·
-`kessel-http-gateway` (opt-in HTTP/1.1 surface, behind `--features http-gateway`;
-zero external (non-workspace) deps) ·
-`kessel-objstore` (S3 SigV4 + Azure Shared-Key signers) ·
-`kessel-parquet` (zero-dep Parquet reader — Snappy/GZIP/zstd/LZ4_RAW +
+**Optional (feature-gated):**
+`kessel-fetch` (HTTP/HTTPS/object-store reader, behind `--features external-sources*`) ·
+`kessel-objstore` (S3 SigV4 + Azure Shared-Key signers,
+behind `--features external-sources-objstore`) ·
+`kessel-http-gateway` (HTTP/1.1 + WebSocket surface,
+behind `--features http-gateway`; zero external (non-workspace) deps) ·
+`kessel-pg-gateway` (PostgreSQL Frontend/Backend v3.0 wire + `pg_catalog`
+synthesis, behind `--features pg-gateway`; zero external (non-workspace) deps) ·
+`kessel-parquet` (zero-dep Parquet reader — Snappy/GZIP/zstd/LZ4_RAW/Brotli +
 V1/V2 + PLAIN/dict + REQUIRED/OPTIONAL + INT96/DECIMAL/FLBA +
 **`LIST<primitive>` (SP143)** + **`MAP<K, V>` + struct of primitives
 (SP144)** + **`List<List<T>>` + `List<struct<...>>` + `Map<K, struct<...>>` +

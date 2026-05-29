@@ -76,18 +76,14 @@ mod real {
             if batch.is_empty() { break; }
             let c = Arc::clone(&client);
             let res = pollster::block_on(async move { c.create_accounts(batch).await });
-            // create_accounts returns Vec<CreateAccountsError> for per-row errors.
-            // We tolerate `Exists` errors on re-runs of the same trial.
-            match res {
-                Ok(errs) => {
-                    for e in errs {
-                        let s = format!("{e:?}");
-                        if !s.contains("Exists") {
-                            anyhow::bail!("tb create_accounts row-error: {s}");
-                        }
-                    }
+            // create_accounts returns Result<(), CreateAccountsError>. The error
+            // type aggregates send + api errors. We tolerate "Exists" (re-runs
+            // of the same trial against a persisted TB data file).
+            if let Err(e) = res {
+                let s = format!("{e:?}");
+                if !s.contains("Exists") {
+                    anyhow::bail!("tb create_accounts: {s}");
                 }
-                Err(e) => anyhow::bail!("tb create_accounts: {e:?}"),
             }
         }
 

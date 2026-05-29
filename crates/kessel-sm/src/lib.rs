@@ -326,7 +326,7 @@ impl<V: Vfs> StateMachine<V> {
             if matches!(f.kind, kessel_catalog::FieldKind::OverflowRef) {
                 if let Some(b) = rec.get(layout.offsets[i]..layout.offsets[i] + 8)
                 {
-                    let h = u64::from_le_bytes(b.try_into().unwrap());
+                    let h = u64::from_le_bytes(b[..].try_into().unwrap());
                     if h != 0 {
                         hs.push(h);
                     }
@@ -1394,16 +1394,16 @@ impl<V: Vfs> StateMachine<V> {
                 // the source of truth; the cache is only a writer-side
                 // accelerator.
                 match self.storage.get(&key) {
-                    Some(b) => OpResult::Got(b),
+                    Some(b) => OpResult::Got(b.into()),
                     None => OpResult::NotFound,
                 }
             }
             Op::Describe { type_id } => match self.catalog.get(type_id) {
-                Some(t) => OpResult::Got(encode_type_def(&t.name, &t.fields)),
+                Some(t) => OpResult::Got(encode_type_def(&t.name, &t.fields).into()),
                 None => OpResult::NotFound,
             },
             Op::GetBlob { handle } => match self.storage.get(&handle_key(handle)) {
-                Some(b) => OpResult::Got(b),
+                Some(b) => OpResult::Got(b.into()),
                 None => OpResult::NotFound,
             },
             Op::SeqRead { from, limit } => {
@@ -1417,14 +1417,14 @@ impl<V: Vfs> StateMachine<V> {
                     }
                     let seq = k
                         .get(12..20)
-                        .map(|b| u64::from_be_bytes(b.try_into().unwrap()))
+                        .map(|b| u64::from_be_bytes(b[..].try_into().unwrap()))
                         .unwrap_or(0);
                     out.extend_from_slice(&seq.to_le_bytes());
                     out.extend_from_slice(&(v.len() as u32).to_le_bytes());
                     out.extend_from_slice(&v);
                     n += 1;
                 }
-                OpResult::Got(out)
+                OpResult::Got(out.into())
             }
             Op::FindBy { type_id, field_id, value } => {
                 let ot = match self.catalog.get(type_id) {
@@ -1445,7 +1445,7 @@ impl<V: Vfs> StateMachine<V> {
                 for id in ids {
                     out.extend_from_slice(&id);
                 }
-                OpResult::Got(out)
+                OpResult::Got(out.into())
             }
             Op::FindByComposite { type_id, fields, values } => {
                 let ot = match self.catalog.get(type_id) {
@@ -1479,7 +1479,7 @@ impl<V: Vfs> StateMachine<V> {
                 for id in ids {
                     out.extend_from_slice(&id);
                 }
-                OpResult::Got(out)
+                OpResult::Got(out.into())
             }
             Op::Query { type_id, preds } => {
                 let ot = match self.catalog.get(type_id) {
@@ -1571,7 +1571,7 @@ impl<V: Vfs> StateMachine<V> {
                 for id in matched {
                     out.extend_from_slice(&id);
                 }
-                OpResult::Got(out)
+                OpResult::Got(out.into())
             }
             Op::QueryExpr { type_id, program } => {
                 let ot = match self.catalog.get(type_id) {
@@ -1599,7 +1599,7 @@ impl<V: Vfs> StateMachine<V> {
                 for id in matched {
                     out.extend_from_slice(&id);
                 }
-                OpResult::Got(out)
+                OpResult::Got(out.into())
             }
             Op::Select { type_id, program, limit } => {
                 let ot = match self.catalog.get(type_id) {
@@ -1626,7 +1626,7 @@ impl<V: Vfs> StateMachine<V> {
                         }
                     }
                 }
-                OpResult::Got(out)
+                OpResult::Got(out.into())
             }
             Op::QueryRows { type_id, eq_preds, program, limit, range_preds } => {
                 let ot = match self.catalog.get(type_id) {
@@ -1831,7 +1831,7 @@ impl<V: Vfs> StateMachine<V> {
                         }
                     }
                 }
-                OpResult::Got(out)
+                OpResult::Got(out.into())
             }
             Op::SelectFields { type_id, program, fields, limit } => {
                 let ot = match self.catalog.get(type_id) {
@@ -1872,7 +1872,7 @@ impl<V: Vfs> StateMachine<V> {
                     out.extend_from_slice(&row);
                     n += 1;
                 }
-                OpResult::Got(out)
+                OpResult::Got(out.into())
             }
             Op::Aggregate { type_id, program, kind, field_id } => {
                 let ot = match self.catalog.get(type_id) {
@@ -1906,8 +1906,8 @@ impl<V: Vfs> StateMachine<V> {
                             w,
                             kind == 3,
                         ) {
-                            Some(raw) => OpResult::Got(raw),
-                            None => OpResult::Got(Vec::new()),
+                            Some(raw) => OpResult::Got(raw.into()),
+                            None => OpResult::Got(Vec::<u8>::new().into()),
                         };
                     }
                     let lo = make_key(type_id, &[0u8; 16]);
@@ -1940,7 +1940,7 @@ impl<V: Vfs> StateMachine<V> {
                             });
                         }
                     }
-                    return OpResult::Got(best.unwrap_or_default());
+                    return OpResult::Got(best.unwrap_or_default().into());
                 }
                 let fpos = if kind == 0 {
                     None
@@ -1978,7 +1978,7 @@ impl<V: Vfs> StateMachine<V> {
                                 .agg_extreme(type_id, field_id, off, w, kind == 3)
                                 .map(|raw| decode_i128(&raw, w, signed))
                                 .unwrap_or(0);
-                            return OpResult::Got(r.to_le_bytes().to_vec());
+                            return OpResult::Got(r.to_le_bytes().to_vec().into());
                         }
                     }
                 }
@@ -2030,7 +2030,7 @@ impl<V: Vfs> StateMachine<V> {
                         )
                     }
                 };
-                OpResult::Got(result.to_le_bytes().to_vec())
+                OpResult::Got(result.to_le_bytes().to_vec().into())
             }
             Op::SelectSorted { type_id, program, sort_field, desc, offset, limit } => {
                 let ot = match self.catalog.get(type_id) {
@@ -2078,7 +2078,7 @@ impl<V: Vfs> StateMachine<V> {
                     out.extend_from_slice(&rec);
                     emitted += 1;
                 }
-                OpResult::Got(out)
+                OpResult::Got(out.into())
             }
             Op::GroupAggregate { type_id, program, group_field, kind, agg_field } => {
                 let ot = match self.catalog.get(type_id) {
@@ -2174,7 +2174,7 @@ impl<V: Vfs> StateMachine<V> {
                     out.extend_from_slice(&k);
                     out.extend_from_slice(&res.to_le_bytes());
                 }
-                OpResult::Got(out)
+                OpResult::Got(out.into())
             }
             Op::FindRange { type_id, field_id, lo, hi } => {
                 let ot = match self.catalog.get(type_id) {
@@ -2244,7 +2244,7 @@ impl<V: Vfs> StateMachine<V> {
                 for id in ids {
                     out.extend_from_slice(&id);
                 }
-                OpResult::Got(out)
+                OpResult::Got(out.into())
             }
             Op::Join { left_type, right_type, left_field, right_field, limit } => {
                 let lt = match self.catalog.get(left_type) {
@@ -2357,7 +2357,7 @@ impl<V: Vfs> StateMachine<V> {
                         }
                     }
                 }
-                OpResult::Got(out)
+                OpResult::Got(out.into())
             }
             // Any non-read op routed here is a server-side bug — the
             // dispatcher should have refused it. Return SchemaError as
@@ -2412,7 +2412,7 @@ impl<V: Vfs> StateMachine<V> {
                 ) {
                     return OpResult::SchemaError(format!("seq counter: {e}"));
                 }
-                OpResult::Got(s.to_le_bytes().to_vec())
+                OpResult::Got(s.to_le_bytes().to_vec().into())
             }
             Op::SeqRead { from, limit } => {
                 let lo = seq_entry_key(from.max(1));
@@ -2425,14 +2425,14 @@ impl<V: Vfs> StateMachine<V> {
                     }
                     let seq = k
                         .get(12..20)
-                        .map(|b| u64::from_be_bytes(b.try_into().unwrap()))
+                        .map(|b| u64::from_be_bytes(b[..].try_into().unwrap()))
                         .unwrap_or(0);
                     out.extend_from_slice(&seq.to_le_bytes());
                     out.extend_from_slice(&(v.len() as u32).to_le_bytes());
                     out.extend_from_slice(&v);
                     n += 1;
                 }
-                OpResult::Got(out)
+                OpResult::Got(out.into())
             }
             Op::XshardApply { seq, ops } => {
                 // SP80: apply this shard's slice of the cross-shard txn
@@ -2530,7 +2530,7 @@ impl<V: Vfs> StateMachine<V> {
                 let dk = seq_dedup_key(&key);
                 if let Some(v) = self.storage.get(&dk) {
                     if v.len() >= 8 && v.get(8..) == Some(key.as_slice()) {
-                        return OpResult::Got(v[..8].to_vec());
+                        return OpResult::Got(v[..8].to_vec().into());
                     }
                 }
                 let cur = self
@@ -2554,7 +2554,7 @@ impl<V: Vfs> StateMachine<V> {
                 let mut rec = s.to_le_bytes().to_vec();
                 rec.extend_from_slice(&key);
                 let _ = self.storage.put(op_number, dk, rec);
-                OpResult::Got(s.to_le_bytes().to_vec())
+                OpResult::Got(s.to_le_bytes().to_vec().into())
             }
 
             Op::XshardDecide { seq, ops } => {
@@ -2565,7 +2565,7 @@ impl<V: Vfs> StateMachine<V> {
                 // router re-derives the same global decision.
                 let vk = xvote_key(seq);
                 if let Some(v) = self.storage.get(&vk) {
-                    return OpResult::Got(v);
+                    return OpResult::Got(v.into());
                 }
                 for o in &ops {
                     if !matches!(
@@ -2603,7 +2603,7 @@ impl<V: Vfs> StateMachine<V> {
                 }
                 let verdict = vec![pass as u8];
                 let _ = self.storage.put(op_number, vk, verdict.clone());
-                OpResult::Got(verdict)
+                OpResult::Got(verdict.into())
             }
 
             Op::XshardCommit { seq, ops, commit } => {
@@ -3079,7 +3079,7 @@ impl<V: Vfs> StateMachine<V> {
                 let key = make_key(type_id, &id.0);
                 if let Some(c) = self.cache.as_mut() {
                     if let Some(v) = c.get(&key) {
-                        return OpResult::Got(v);
+                        return OpResult::Got(v.into());
                     }
                 }
                 match self.storage.get(&key) {
@@ -3087,14 +3087,14 @@ impl<V: Vfs> StateMachine<V> {
                         if let Some(c) = self.cache.as_mut() {
                             c.insert(key, b.clone());
                         }
-                        OpResult::Got(b)
+                        OpResult::Got(b.into())
                     }
                     None => OpResult::NotFound,
                 }
             }
 
             Op::Describe { type_id } => match self.catalog.get(type_id) {
-                Some(t) => OpResult::Got(encode_type_def(&t.name, &t.fields)),
+                Some(t) => OpResult::Got(encode_type_def(&t.name, &t.fields).into()),
                 None => OpResult::NotFound,
             },
 
@@ -3560,11 +3560,11 @@ impl<V: Vfs> StateMachine<V> {
                         }
                     }
                 }
-                OpResult::Got(out)
+                OpResult::Got(out.into())
             }
 
             Op::GetBlob { handle } => match self.storage.get(&handle_key(handle)) {
-                Some(b) => OpResult::Got(b),
+                Some(b) => OpResult::Got(b.into()),
                 None => OpResult::NotFound,
             },
 
@@ -3624,7 +3624,7 @@ impl<V: Vfs> StateMachine<V> {
                 for id in ids {
                     out.extend_from_slice(&id);
                 }
-                OpResult::Got(out)
+                OpResult::Got(out.into())
             }
 
             Op::AddCompositeIndex { type_id, fields } => {
@@ -3705,7 +3705,7 @@ impl<V: Vfs> StateMachine<V> {
                 for id in ids {
                     out.extend_from_slice(&id);
                 }
-                OpResult::Got(out)
+                OpResult::Got(out.into())
             }
 
             Op::AddUnique { type_id, field_id } => {
@@ -3862,7 +3862,7 @@ impl<V: Vfs> StateMachine<V> {
                 for id in matched {
                     out.extend_from_slice(&id);
                 }
-                OpResult::Got(out)
+                OpResult::Got(out.into())
             }
 
             Op::AddForeignKey { type_id, field_id, ref_type_id, on_delete } => {
@@ -4026,7 +4026,7 @@ impl<V: Vfs> StateMachine<V> {
                 for id in matched {
                     out.extend_from_slice(&id);
                 }
-                OpResult::Got(out)
+                OpResult::Got(out.into())
             }
 
             // SP116 / S2.7 (Decision 3): cutover scheduled for T2.B.
@@ -4061,7 +4061,7 @@ impl<V: Vfs> StateMachine<V> {
                         }
                     }
                 }
-                OpResult::Got(out)
+                OpResult::Got(out.into())
             }
 
             // SP116 / S2.7 (Decision 3): cutover scheduled for T2.B.
@@ -4307,7 +4307,7 @@ impl<V: Vfs> StateMachine<V> {
                         }
                     }
                 }
-                OpResult::Got(out)
+                OpResult::Got(out.into())
             }
 
             // SP116 / S2.7 (Decision 3): cutover scheduled for T2.B.
@@ -4354,7 +4354,7 @@ impl<V: Vfs> StateMachine<V> {
                     out.extend_from_slice(&row);
                     n += 1;
                 }
-                OpResult::Got(out)
+                OpResult::Got(out.into())
             }
 
             // SP116 / S2.7 (Decision 3): cutover scheduled for T2.C.
@@ -4399,8 +4399,8 @@ impl<V: Vfs> StateMachine<V> {
                             w,
                             kind == 3,
                         ) {
-                            Some(raw) => OpResult::Got(raw),
-                            None => OpResult::Got(Vec::new()), // empty
+                            Some(raw) => OpResult::Got(raw.into()),
+                            None => OpResult::Got(Vec::<u8>::new().into()), // empty
                         };
                     }
                     // Slow path (the oracle): scan + filter, track the
@@ -4435,7 +4435,7 @@ impl<V: Vfs> StateMachine<V> {
                             });
                         }
                     }
-                    return OpResult::Got(best.unwrap_or_default());
+                    return OpResult::Got(best.unwrap_or_default().into());
                 }
                 // COUNT needs no field; SUM/MIN/MAX need a numeric ≤8B field.
                 let fpos = if kind == 0 {
@@ -4481,7 +4481,7 @@ impl<V: Vfs> StateMachine<V> {
                                 .agg_extreme(type_id, field_id, off, w, kind == 3)
                                 .map(|raw| decode_i128(&raw, w, signed))
                                 .unwrap_or(0);
-                            return OpResult::Got(r.to_le_bytes().to_vec());
+                            return OpResult::Got(r.to_le_bytes().to_vec().into());
                         }
                     }
                 }
@@ -4533,7 +4533,7 @@ impl<V: Vfs> StateMachine<V> {
                         )
                     }
                 };
-                OpResult::Got(result.to_le_bytes().to_vec())
+                OpResult::Got(result.to_le_bytes().to_vec().into())
             }
 
             // SP116 / S2.7 (Decision 3): cutover scheduled for T2.C.
@@ -4588,7 +4588,7 @@ impl<V: Vfs> StateMachine<V> {
                     out.extend_from_slice(&rec);
                     emitted += 1;
                 }
-                OpResult::Got(out)
+                OpResult::Got(out.into())
             }
 
             // SP116 / S2.7 (Decision 3): cutover scheduled for T2.C.
@@ -4695,7 +4695,7 @@ impl<V: Vfs> StateMachine<V> {
                     out.extend_from_slice(&k);
                     out.extend_from_slice(&res.to_le_bytes());
                 }
-                OpResult::Got(out)
+                OpResult::Got(out.into())
             }
 
             Op::AddOrderedIndex { type_id, field_id } => {
@@ -4824,7 +4824,7 @@ impl<V: Vfs> StateMachine<V> {
                 for id in ids {
                     out.extend_from_slice(&id);
                 }
-                OpResult::Got(out)
+                OpResult::Got(out.into())
             }
 
             Op::Txn { ops } => {
@@ -5738,9 +5738,9 @@ mod tests {
         let id = ObjectId::from_u128(7);
         assert_eq!(sm.apply(2, Op::Create { type_id: 1, id, record: vec![1, 2, 3] }), OpResult::Ok);
         assert_eq!(sm.apply(3, Op::Create { type_id: 1, id, record: vec![9] }), OpResult::Exists);
-        assert_eq!(sm.apply(4, Op::GetById { type_id: 1, id }), OpResult::Got(vec![1, 2, 3]));
+        assert_eq!(sm.apply(4, Op::GetById { type_id: 1, id }), OpResult::Got(vec![1, 2, 3].into()));
         assert_eq!(sm.apply(5, Op::Update { type_id: 1, id, record: vec![4, 5] }), OpResult::Ok);
-        assert_eq!(sm.apply(6, Op::GetById { type_id: 1, id }), OpResult::Got(vec![4, 5]));
+        assert_eq!(sm.apply(6, Op::GetById { type_id: 1, id }), OpResult::Got(vec![4, 5].into()));
         assert_eq!(sm.apply(7, Op::Update { type_id: 1, id: ObjectId::from_u128(99), record: vec![] }), OpResult::NotFound);
         assert_eq!(sm.apply(8, Op::Delete { type_id: 1, id }), OpResult::Ok);
         assert_eq!(sm.apply(9, Op::Delete { type_id: 1, id }), OpResult::NotFound);
@@ -5769,7 +5769,7 @@ mod tests {
         for op in 3..8 {
             assert_eq!(
                 sm.apply(op, Op::GetById { type_id: 1, id }),
-                OpResult::Got(vec![1, 2, 3])
+                OpResult::Got(vec![1, 2, 3].into())
             );
         }
         assert!(
@@ -5784,7 +5784,7 @@ mod tests {
         );
         assert_eq!(
             sm.apply(9, Op::GetById { type_id: 1, id }),
-            OpResult::Got(vec![4, 5]),
+            OpResult::Got(vec![4, 5].into()),
             "read after write must see the new value, not a stale cache entry"
         );
 
@@ -5808,7 +5808,7 @@ mod tests {
         let id2 = ObjectId::from_u128(2);
         sm.apply(2, Op::Create { type_id: 1, id: id1, record: vec![1] });
         sm.apply(3, Op::Create { type_id: 1, id: id2, record: vec![2] });
-        assert_eq!(sm.apply(4, Op::GetById { type_id: 1, id: id1 }), OpResult::Got(vec![1]));
+        assert_eq!(sm.apply(4, Op::GetById { type_id: 1, id: id1 }), OpResult::Got(vec![1].into()));
 
         // Drop it. The type is gone from the catalog and Describe fails;
         // (a query against the dropped type now errors at the type check,
@@ -5880,7 +5880,7 @@ mod tests {
         assert!(sm.catalog().get(1).is_some(), "catalog survived restart");
         assert_eq!(
             sm.apply(3, Op::GetById { type_id: 1, id: ObjectId::from_u128(5) }),
-            OpResult::Got(vec![0xAA])
+            OpResult::Got(vec![0xAA].into())
         );
     }
 
@@ -5910,7 +5910,7 @@ mod tests {
         let mut sm = StateMachine::open(vfs).unwrap();
         assert_eq!(
             sm.apply(999, Op::GetById { type_id: 1, id: ObjectId::from_u128(73) }),
-            OpResult::Got(vec![73])
+            OpResult::Got(vec![73].into())
         );
     }
 
@@ -5995,7 +5995,7 @@ mod tests {
             }
             o => panic!("unexpected {o:?}"),
         }
-        assert_eq!(sm.apply(4, Op::GetBlob { handle }), OpResult::Got(blob));
+        assert_eq!(sm.apply(4, Op::GetBlob { handle }), OpResult::Got(blob.into()));
         assert_eq!(sm.apply(5, Op::GetBlob { handle: 999 }), OpResult::NotFound);
     }
 
@@ -6031,7 +6031,7 @@ mod tests {
             {
                 match sm.apply(10 + i as u64, Op::SeqAppend { payload: p.clone() }) {
                     OpResult::Got(b) => {
-                        seqs.push(u64::from_le_bytes(b.try_into().unwrap()))
+                        seqs.push(u64::from_le_bytes(b[..].try_into().unwrap()))
                     }
                     o => panic!("unexpected {o:?}"),
                 }
@@ -6042,7 +6042,8 @@ mod tests {
         assert_eq!(seqs, vec![1, 2, 3], "gap-free, monotonic, 1-based");
 
         // Full ordered log from 1.
-        let parse = |b: Vec<u8>| -> Vec<(u64, Vec<u8>)> {
+        // SP-Perf-A T6 Fix B: accept any slice-like (Vec<u8>, Arc<[u8]>) via &[u8].
+        let parse = |b: &[u8]| -> Vec<(u64, Vec<u8>)> {
             let mut out = Vec::new();
             let mut p = 0;
             while p + 12 <= b.len() {
@@ -6057,7 +6058,7 @@ mod tests {
         };
         match sm.apply(100, Op::SeqRead { from: 1, limit: 0 }) {
             OpResult::Got(b) => assert_eq!(
-                parse(b),
+                parse(&b),
                 vec![
                     (1, b"a".to_vec()),
                     (2, b"bb".to_vec()),
@@ -6069,14 +6070,14 @@ mod tests {
         // from/limit window.
         match sm.apply(101, Op::SeqRead { from: 2, limit: 1 }) {
             OpResult::Got(b) => {
-                assert_eq!(parse(b), vec![(2, b"bb".to_vec())])
+                assert_eq!(parse(&b), vec![(2, b"bb".to_vec())])
             }
             o => panic!("unexpected {o:?}"),
         }
         // Reading past the end is empty, not an error.
         assert_eq!(
             sm.apply(102, Op::SeqRead { from: 99, limit: 0 }),
-            OpResult::Got(vec![])
+            OpResult::Got(vec![].into())
         );
 
         // Deterministic: identical op stream ⇒ identical digest ⇒ every
@@ -6191,7 +6192,7 @@ mod tests {
             )
         };
         let seq_of = |r: OpResult| match r {
-            OpResult::Got(b) => u64::from_le_bytes(b.try_into().unwrap()),
+            OpResult::Got(b) => u64::from_le_bytes(b[..].try_into().unwrap()),
             o => panic!("{o:?}"),
         };
 
@@ -6218,20 +6219,20 @@ mod tests {
         sm.apply(20, Op::XshardApply { seq: 1, ops: vec![mk(5)] }); // cursor=1, id5 exists
         assert_eq!(
             sm.apply(21, Op::XshardDecide { seq: 2, ops: vec![mk(6)] }),
-            OpResult::Got(vec![1])
+            OpResult::Got(vec![1].into())
         );
         assert!(!present(&mut sm, 22, 6), "decide must not apply");
         // Re-decide is stable even though we now (separately) create 6.
         sm.apply(23, Op::XshardApply { seq: 2, ops: vec![mk(6)] }); // cursor=2
         assert_eq!(
             sm.apply(24, Op::XshardDecide { seq: 2, ops: vec![mk(6)] }),
-            OpResult::Got(vec![1]),
+            OpResult::Got(vec![1].into()),
             "verdict for a seq is stable once recorded"
         );
         // A would-fail slice (dup id 5) ⇒ verdict 0.
         assert_eq!(
             sm.apply(25, Op::XshardDecide { seq: 3, ops: vec![mk(5)] }),
-            OpResult::Got(vec![0])
+            OpResult::Got(vec![0].into())
         );
 
         // Commit gating: commit=false ⇒ skip (advance cursor, apply
@@ -6314,7 +6315,7 @@ mod tests {
                 n.get(),
                 Op::SeqAppendOnce { key: key.to_vec(), payload: vec![] },
             ) {
-                OpResult::Got(b) => u64::from_le_bytes(b.try_into().unwrap()),
+                OpResult::Got(b) => u64::from_le_bytes(b[..].try_into().unwrap()),
                 o => panic!("{o:?}"),
             }
         };
@@ -6332,7 +6333,7 @@ mod tests {
                     n.get(),
                     Op::XshardDecide { seq, ops: sl.clone() },
                 ) {
-                    if v == vec![0] {
+                    if v.as_ref() == &[0u8][..] {
                         decision = false;
                     }
                 }
@@ -6562,7 +6563,7 @@ mod tests {
         // New value readable; OLD blob reclaimed (was the documented leak).
         assert_eq!(
             sm.apply(4, Op::GetBlob { handle: h_new }),
-            OpResult::Got(b"new".to_vec())
+            OpResult::Got(b"new".to_vec().into())
         );
         assert_eq!(
             sm.apply(5, Op::GetBlob { handle: h_old }),
@@ -8048,7 +8049,7 @@ mod tests {
          -> Vec<u8> {
             match sm.apply(op, Op::Aggregate { type_id: 1, program: p, kind: k, field_id: fid })
             {
-                OpResult::Got(b) => b,
+                OpResult::Got(b) => b.to_vec(),
                 o => panic!("expected Got, got {o:?}"),
             }
         };
@@ -8128,7 +8129,7 @@ mod tests {
         }
         let agg = |sm: &mut StateMachine<MemVfs>, op, k, prog: Vec<u8>| -> i128 {
             match sm.apply(op, Op::Aggregate { type_id: 1, program: prog, kind: k, field_id: 3 }) {
-                OpResult::Got(b) => i128::from_le_bytes(b.try_into().unwrap()),
+                OpResult::Got(b) => i128::from_le_bytes(b[..].try_into().unwrap()),
                 o => panic!("expected Got, got {o:?}"),
             }
         };
@@ -8177,7 +8178,7 @@ mod tests {
         let agg = |sm: &mut StateMachine<MemVfs>, op: u64, k: u8, p: Vec<u8>| -> i128 {
             match sm.apply(op, Op::Aggregate { type_id: 1, program: p, kind: k, field_id: 3 })
             {
-                OpResult::Got(b) => i128::from_le_bytes(b.try_into().unwrap()),
+                OpResult::Got(b) => i128::from_le_bytes(b[..].try_into().unwrap()),
                 o => panic!("expected Got, got {o:?}"),
             }
         };
@@ -8245,7 +8246,7 @@ mod tests {
                 op,
                 Op::Aggregate { type_id: 1, program: p, kind: k, field_id: 3 },
             ) {
-                OpResult::Got(b) => i128::from_le_bytes(b.try_into().unwrap()),
+                OpResult::Got(b) => i128::from_le_bytes(b[..].try_into().unwrap()),
                 o => panic!("{o:?}"),
             };
             (r, t.elapsed().as_micros())
@@ -8281,7 +8282,7 @@ mod tests {
         }
         let avg = |sm: &mut StateMachine<MemVfs>, op, prog: Vec<u8>| -> i128 {
             match sm.apply(op, Op::Aggregate { type_id: 1, program: prog, kind: 4, field_id: 3 }) {
-                OpResult::Got(b) => i128::from_le_bytes(b.try_into().unwrap()),
+                OpResult::Got(b) => i128::from_le_bytes(b[..].try_into().unwrap()),
                 o => panic!("{o:?}"),
             }
         };
@@ -8310,7 +8311,7 @@ mod tests {
             let d0 = sm.digest();
             let prog = Program::new().push_int(1).bytes();
             let s = match sm.apply(99, Op::Aggregate { type_id: 1, program: prog, kind: 1, field_id: 3 }) {
-                OpResult::Got(b) => i128::from_le_bytes(b.try_into().unwrap()),
+                OpResult::Got(b) => i128::from_le_bytes(b[..].try_into().unwrap()),
                 o => panic!("{o:?}"),
             };
             (s, d0, sm.digest())
@@ -8404,7 +8405,8 @@ mod tests {
                 type_id: 1, id: ObjectId::from_u128(i as u128), record: qrec(*o, 0, *v),
             });
         }
-        let parse = |b: Vec<u8>| -> Vec<(u32, i128)> {
+        // SP-Perf-A T6 Fix B: parse via &[u8] so it accepts Arc<[u8]> directly.
+        let parse = |b: &[u8]| -> Vec<(u32, i128)> {
             let n = u32::from_le_bytes(b[0..4].try_into().unwrap()) as usize;
             let mut p = 4;
             let mut g = Vec::new();
@@ -8422,17 +8424,17 @@ mod tests {
         let all = Program::new().push_int(1).bytes();
         // SUM(v) GROUP BY owner -> {1:30, 2:20, 3:100} ascending key order
         match sm.apply(20, Op::GroupAggregate { type_id: 1, program: all.clone(), group_field: 1, kind: 1, agg_field: 3 }) {
-            OpResult::Got(b) => assert_eq!(parse(b), vec![(1, 30), (2, 20), (3, 100)]),
+            OpResult::Got(b) => assert_eq!(parse(&b), vec![(1, 30), (2, 20), (3, 100)]),
             o => panic!("{o:?}"),
         }
         // COUNT GROUP BY owner -> {1:2, 2:3, 3:1}
         match sm.apply(21, Op::GroupAggregate { type_id: 1, program: all.clone(), group_field: 1, kind: 0, agg_field: 0 }) {
-            OpResult::Got(b) => assert_eq!(parse(b), vec![(1, 2), (2, 3), (3, 1)]),
+            OpResult::Got(b) => assert_eq!(parse(&b), vec![(1, 2), (2, 3), (3, 1)]),
             o => panic!("{o:?}"),
         }
         // MAX(v) GROUP BY owner -> {1:20, 2:8, 3:100}
         match sm.apply(22, Op::GroupAggregate { type_id: 1, program: all, group_field: 1, kind: 3, agg_field: 3 }) {
-            OpResult::Got(b) => assert_eq!(parse(b), vec![(1, 20), (2, 8), (3, 100)]),
+            OpResult::Got(b) => assert_eq!(parse(&b), vec![(1, 20), (2, 8), (3, 100)]),
             o => panic!("{o:?}"),
         }
     }
@@ -8736,7 +8738,7 @@ mod tests {
                 _ => {
                     let r = sm.apply(op, Op::GetById { type_id: 1, id });
                     match model.get(&k) {
-                        Some(v) => assert_eq!(r, OpResult::Got(v.clone())),
+                        Some(v) => assert_eq!(r, OpResult::Got(v.clone().into())),
                         None => assert_eq!(r, OpResult::NotFound),
                     }
                 }
@@ -14984,7 +14986,7 @@ mod tests {
         let r2 = sm.apply(3, Op::GetById { type_id: tid, id });
         match r2 {
             OpResult::Got(v) => assert_eq!(
-                v, rec,
+                v.as_ref(), rec.as_slice(),
                 "SP116 T3 end-to-end: Op::GetById must return exactly the bytes Op::Create wrote"
             ),
             other => panic!(
@@ -15015,7 +15017,7 @@ mod tests {
         // Op 4: GetById sees v2 (latest committed at u64::MAX snapshot).
         let r = sm.apply(4, Op::GetById { type_id: tid, id });
         match r {
-            OpResult::Got(ref v) if v == &rec_v2 => {}
+            OpResult::Got(ref v) if v.as_ref() == rec_v2.as_slice() => {}
             other => panic!("SP116 T3 mixed: GetById after Update must see v2; got {other:?}"),
         }
 
@@ -15085,7 +15087,7 @@ mod tests {
             });
             match r {
                 OpResult::Got(v) => assert_eq!(
-                    &v, rec,
+                    v.as_ref(), rec.as_slice(),
                     "SP116 T4-1: row #{i} (oid={:?}) must round-trip through MVCC", id
                 ),
                 other => panic!("SP116 T4-1: row #{i} GetById must be Got(rec); got {other:?}"),
@@ -15120,7 +15122,7 @@ mod tests {
         });
         match r {
             OpResult::Got(b) => {
-                let count = i128::from_le_bytes(b.try_into().unwrap());
+                let count = i128::from_le_bytes(b[..].try_into().unwrap());
                 assert_eq!(
                     count, 8,
                     "SP116 T4-2: COUNT over 8 MVCC-written widget rows must be 8; got {count}"

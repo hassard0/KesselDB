@@ -387,7 +387,7 @@ pub enum ScatterKind {
 /// in `kind`. SP155 §3.5 / §3.6 implementation.
 ///
 /// Behaviour:
-/// - **Empty input** ⇒ `OpResult::Got(vec![])` (SP155 OQ11 — empty
+/// - **Empty input** ⇒ `OpResult::Got(vec![].into())` (SP155 OQ11 — empty
 ///   filter result is `Got([])`, not `NotFound`).
 /// - **Any non-`Got` slot** ⇒ the first non-`Got` slot, in shard-id
 ///   order. V1 hard-fail per SP155 §6 (`scatter_partial_on_timeout`
@@ -417,7 +417,7 @@ pub fn merge_scan_results(
     kind: &ScatterKind,
 ) -> OpResult {
     if results.is_empty() {
-        return OpResult::Got(Vec::new());
+        return OpResult::Got(Vec::<u8>::new().into());
     }
     // V1 hard-fail (SP155 §6): surface the first non-Got slot
     // (Unavailable / SchemaError / etc.) so the caller sees a clean
@@ -433,7 +433,8 @@ pub fn merge_scan_results(
     let payloads: Vec<&[u8]> = results
         .iter()
         .map(|r| match r {
-            OpResult::Got(b) => b.as_slice(),
+            // SP-Perf-A T6 Fix B: Arc<[u8]>::as_slice is unstable; deref + slice.
+            OpResult::Got(b) => &b[..],
             _ => unreachable!("non-Got slot was returned above"),
         })
         .collect();
@@ -494,7 +495,7 @@ fn merge_oid_concat(payloads: &[&[u8]]) -> OpResult {
     for p in payloads {
         out.extend_from_slice(p);
     }
-    OpResult::Got(out)
+    OpResult::Got(out.into())
 }
 
 /// SP-A T6 (SP155 §3.7): fanout + merge with LIMIT cancellation.
@@ -533,7 +534,7 @@ fn merge_oid_concat(payloads: &[&[u8]]) -> OpResult {
 ///   short-circuits, `cancel` fires, and the first non-Got slot is
 ///   returned as the merged result.
 ///
-/// - **Empty shards (`shards.is_empty()`)** ⇒ `OpResult::Got(vec![])`
+/// - **Empty shards (`shards.is_empty()`)** ⇒ `OpResult::Got(vec![].into())`
 ///   per SP155 OQ11 (matches `merge_scan_results(empty, ...)`).
 ///
 /// Thread/join discipline:
@@ -551,7 +552,7 @@ fn merge_oid_concat(payloads: &[&[u8]]) -> OpResult {
 /// `cancel` is taken by `Arc` (shared with the spawned workers) and
 /// SHOULD start `false`. The function NEVER resets the flag — a
 /// caller passing a flag that's already `true` gets an immediate
-/// `OpResult::Got(vec![])` (the LIMIT-already-satisfied edge: no
+/// `OpResult::Got(vec![].into())` (the LIMIT-already-satisfied edge: no
 /// shards consulted; see `scatter_and_merge_precancelled_returns_empty`).
 pub fn scatter_and_merge<C: ShardCaller>(
     shards: Vec<C>,
@@ -643,7 +644,7 @@ pub fn scatter_and_merge_ctx<C: ShardCaller>(
         // SP155 OQ11: empty filter result is Got([]), not NotFound.
         // Both modes return empty failed-shards (no shards = no
         // failures).
-        return (OpResult::Got(Vec::new()), Vec::new());
+        return (OpResult::Got(Vec::<u8>::new().into()), Vec::new());
     }
     // Honor a pre-fired cancel: caller already knows LIMIT is satisfied
     // (e.g. LIMIT 0 on a downstream caller, or a Drop-time cancel from
@@ -651,7 +652,7 @@ pub fn scatter_and_merge_ctx<C: ShardCaller>(
     // immediately. This matches the SP155 §3.7 "cancel = stop scanning"
     // intent at the strongest possible point.
     if cancel.load(AtomicOrdering::SeqCst) {
-        return (OpResult::Got(Vec::new()), Vec::new());
+        return (OpResult::Got(Vec::<u8>::new().into()), Vec::new());
     }
     // Spawn workers upfront so per-shard work overlaps (the merge
     // consumer may stay sequential per SP155 §3.6).
@@ -722,7 +723,7 @@ pub fn scatter_and_merge_ctx<C: ShardCaller>(
                 if !matches!(r, OpResult::Got(_)) {
                     if ctx.partial_on_timeout {
                         failed_shards.push(i as u32);
-                        gathered.push(OpResult::Got(Vec::new()));
+                        gathered.push(OpResult::Got(Vec::<u8>::new().into()));
                         continue;
                     } else if first_bad.is_none() {
                         first_bad = Some(r.clone());
@@ -760,7 +761,7 @@ pub fn scatter_and_merge_ctx<C: ShardCaller>(
                         // Partial mode: record the shard id, substitute
                         // an empty Got so the merger skips it cleanly.
                         failed_shards.push(i as u32);
-                        gathered.push(OpResult::Got(Vec::new()));
+                        gathered.push(OpResult::Got(Vec::<u8>::new().into()));
                         continue;
                     } else if first_bad.is_none() {
                         // V1 hard-fail surfaces the first non-Got slot.
@@ -875,7 +876,7 @@ fn scatter_and_merge_unordered_ctx(
                         // committed to finish — SP155 §3.7 honest
                         // gap). Stop draining.
                         cancel.store(true, AtomicOrdering::SeqCst);
-                        return OpResult::Got(out);
+                        return OpResult::Got(out.into());
                     }
                 }
                 Err(e) => {
@@ -888,7 +889,7 @@ fn scatter_and_merge_unordered_ctx(
         }
         shard_id += 1;
     }
-    OpResult::Got(out)
+    OpResult::Got(out.into())
 }
 
 /// Iterate `[u32 rowlen][record]*` payload, yielding `(rowlen_le_bytes,
@@ -960,7 +961,7 @@ fn merge_unordered(payloads: &[&[u8]], limit: u32) -> OpResult {
                     append_row(&mut out, rec);
                     emitted = emitted.saturating_add(1);
                     if limit != 0 && emitted >= limit {
-                        return OpResult::Got(out);
+                        return OpResult::Got(out.into());
                     }
                 }
                 Err(e) => {
@@ -971,7 +972,7 @@ fn merge_unordered(payloads: &[&[u8]], limit: u32) -> OpResult {
             }
         }
     }
-    OpResult::Got(out)
+    OpResult::Got(out.into())
 }
 
 /// Key-extraction helper: copy `width` bytes starting at `offset`
@@ -1176,7 +1177,7 @@ fn merge_sorted(
             });
         }
     }
-    OpResult::Got(out)
+    OpResult::Got(out.into())
 }
 
 #[cfg(test)]
@@ -1236,14 +1237,14 @@ mod tests {
     /// identical. The degenerate case the SP155 spec calls out (§10).
     #[test]
     fn fan_out_to_one_shard_returns_that_shards_result() {
-        let s = MockShard::new(OpResult::Got(vec![1, 2, 3, 4]));
+        let s = MockShard::new(OpResult::Got(vec![1, 2, 3, 4].into()));
         let out = scatter_scan_fanout(
             vec![s],
             &dummy_select(),
             DEFAULT_PER_SHARD_TIMEOUT,
         );
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0], OpResult::Got(vec![1, 2, 3, 4]));
+        assert_eq!(out[0], OpResult::Got(vec![1, 2, 3, 4].into()));
     }
 
     /// K=3: the result is in **shard-id order**, NOT arrival order, even
@@ -1251,19 +1252,19 @@ mod tests {
     /// SP155 §3.6 determinism property — replay-safe ordering.
     #[test]
     fn fan_out_to_three_shards_returns_three_results_in_shard_order() {
-        let s0 = MockShard::new(OpResult::Got(b"shard-0".to_vec()))
+        let s0 = MockShard::new(OpResult::Got(b"shard-0".to_vec().into()))
             .slow(Duration::from_millis(50));
-        let s1 = MockShard::new(OpResult::Got(b"shard-1".to_vec()));
-        let s2 = MockShard::new(OpResult::Got(b"shard-2".to_vec()));
+        let s1 = MockShard::new(OpResult::Got(b"shard-1".to_vec().into()));
+        let s2 = MockShard::new(OpResult::Got(b"shard-2".to_vec().into()));
         let out = scatter_scan_fanout(
             vec![s0, s1, s2],
             &dummy_select(),
             DEFAULT_PER_SHARD_TIMEOUT,
         );
         assert_eq!(out.len(), 3);
-        assert_eq!(out[0], OpResult::Got(b"shard-0".to_vec()));
-        assert_eq!(out[1], OpResult::Got(b"shard-1".to_vec()));
-        assert_eq!(out[2], OpResult::Got(b"shard-2".to_vec()));
+        assert_eq!(out[0], OpResult::Got(b"shard-0".to_vec().into()));
+        assert_eq!(out[1], OpResult::Got(b"shard-1".to_vec().into()));
+        assert_eq!(out[2], OpResult::Got(b"shard-2".to_vec().into()));
     }
 
     /// A shard that exceeds the per-shard timeout contributes
@@ -1271,17 +1272,17 @@ mod tests {
     /// Per SP155 §6 "Shard timeout" row (V1 hard-fail default).
     #[test]
     fn a_shard_that_times_out_returns_unavailable_for_that_slot() {
-        let s0 = MockShard::new(OpResult::Got(b"fast".to_vec()));
-        let s1 = MockShard::new(OpResult::Got(b"too-slow".to_vec()))
+        let s0 = MockShard::new(OpResult::Got(b"fast".to_vec().into()));
+        let s1 = MockShard::new(OpResult::Got(b"too-slow".to_vec().into()))
             .slow(Duration::from_millis(300));
-        let s2 = MockShard::new(OpResult::Got(b"also-fast".to_vec()));
+        let s2 = MockShard::new(OpResult::Got(b"also-fast".to_vec().into()));
         let out = scatter_scan_fanout(
             vec![s0, s1, s2],
             &dummy_select(),
             Duration::from_millis(80),
         );
         assert_eq!(out.len(), 3);
-        assert_eq!(out[0], OpResult::Got(b"fast".to_vec()));
+        assert_eq!(out[0], OpResult::Got(b"fast".to_vec().into()));
         assert_eq!(out[1], OpResult::Unavailable);
         // Even though shard 2 is fast, its deadline was set at spawn time
         // — by the time the driver gets to it, the shared timeout window
@@ -1292,7 +1293,7 @@ mod tests {
         // the contract that BOTH outcomes are valid (Got or Unavailable),
         // and that shard 2 is NEVER mis-attributed shard 1's payload.
         match &out[2] {
-            OpResult::Got(b) => assert_eq!(b, b"also-fast"),
+            OpResult::Got(b) => assert_eq!(&b[..], b"also-fast"),
             OpResult::Unavailable => {} // acceptable per per-shard deadline
             other => panic!("shard 2 unexpected slot: {other:?}"),
         }
@@ -1322,9 +1323,9 @@ mod tests {
     /// determinism is destroyed.
     #[test]
     fn fan_out_preserves_scan_filter_predicates() {
-        let s0 = MockShard::new(OpResult::Got(vec![]));
-        let s1 = MockShard::new(OpResult::Got(vec![]));
-        let s2 = MockShard::new(OpResult::Got(vec![]));
+        let s0 = MockShard::new(OpResult::Got(vec![].into()));
+        let s1 = MockShard::new(OpResult::Got(vec![].into()));
+        let s2 = MockShard::new(OpResult::Got(vec![].into()));
         let seen0 = s0.seen.clone();
         let seen1 = s1.seen.clone();
         let seen2 = s2.seen.clone();
@@ -1358,7 +1359,7 @@ mod tests {
     /// thread exits).
     #[test]
     fn threads_join_within_bounded_time_no_leak() {
-        let s = MockShard::new(OpResult::Got(b"ok".to_vec()))
+        let s = MockShard::new(OpResult::Got(b"ok".to_vec().into()))
             .slow(Duration::from_millis(40));
         let ran = s.ran.clone();
         let t0 = Instant::now();
@@ -1369,7 +1370,7 @@ mod tests {
         );
         let elapsed = t0.elapsed();
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0], OpResult::Got(b"ok".to_vec()));
+        assert_eq!(out[0], OpResult::Got(b"ok".to_vec().into()));
         // Worker did run before the function returned: `call` was
         // invoked at least once.
         assert!(
@@ -1414,7 +1415,7 @@ mod tests {
     fn merge_empty_results_is_empty_got() {
         let out =
             merge_scan_results(Vec::new(), &ScatterKind::Unordered { limit: 0 });
-        assert_eq!(out, OpResult::Got(Vec::new()));
+        assert_eq!(out, OpResult::Got(Vec::<u8>::new().into()));
     }
 
     /// V1 hard-fail per SP155 §6: any non-`Got` slot propagates — the
@@ -1424,9 +1425,9 @@ mod tests {
     fn merge_propagates_first_non_got_slot_unordered() {
         let r = merge_scan_results(
             vec![
-                OpResult::Got(b"a".to_vec()),
+                OpResult::Got(b"a".to_vec().into()),
                 OpResult::Unavailable,
-                OpResult::Got(b"c".to_vec()),
+                OpResult::Got(b"c".to_vec().into()),
             ],
             &ScatterKind::Unordered { limit: 0 },
         );
@@ -1439,7 +1440,7 @@ mod tests {
     fn merge_propagates_first_non_got_slot_sorted() {
         let r = merge_scan_results(
             vec![
-                OpResult::Got(rows_to_payload(&[&[1u8; 8]])),
+                OpResult::Got(rows_to_payload(&[&[1u8; 8]]).into()),
                 OpResult::SchemaError("oops".into()),
             ],
             &ScatterKind::Sorted {
@@ -1465,16 +1466,16 @@ mod tests {
         let s2 = rows_to_payload(&[b"row-d", b"row-e", b"row-f"]);
         let r = merge_scan_results(
             vec![
-                OpResult::Got(s0),
-                OpResult::Got(s1),
-                OpResult::Got(s2),
+                OpResult::Got(s0.into()),
+                OpResult::Got(s1.into()),
+                OpResult::Got(s2.into()),
             ],
             &ScatterKind::Unordered { limit: 0 },
         );
         let expected = rows_to_payload(&[
             b"row-a", b"row-b", b"row-c", b"row-d", b"row-e", b"row-f",
         ]);
-        assert_eq!(r, OpResult::Got(expected));
+        assert_eq!(r, OpResult::Got(expected.into()));
     }
 
     /// **Unordered LIMIT KAT**: `limit > 0` caps the merge to that
@@ -1488,14 +1489,14 @@ mod tests {
         let s2 = rows_to_payload(&[b"d", b"e", b"f"]);
         let r = merge_scan_results(
             vec![
-                OpResult::Got(s0),
-                OpResult::Got(s1),
-                OpResult::Got(s2),
+                OpResult::Got(s0.into()),
+                OpResult::Got(s1.into()),
+                OpResult::Got(s2.into()),
             ],
             &ScatterKind::Unordered { limit: 4 },
         );
         let expected = rows_to_payload(&[b"a", b"b", b"c", b"d"]);
-        assert_eq!(r, OpResult::Got(expected));
+        assert_eq!(r, OpResult::Got(expected.into()));
     }
 
     /// **K=1 byte-identical (unordered)**: a single-shard scatter is
@@ -1507,10 +1508,10 @@ mod tests {
         let payload =
             rows_to_payload(&[b"only-shard-row-0", b"only-shard-row-1"]);
         let r = merge_scan_results(
-            vec![OpResult::Got(payload.clone())],
+            vec![OpResult::Got(payload.clone().into())],
             &ScatterKind::Unordered { limit: 0 },
         );
-        assert_eq!(r, OpResult::Got(payload));
+        assert_eq!(r, OpResult::Got(payload.into()));
     }
 
     /// **Empty shards in unordered merge**: an "all-`Got([])`" input
@@ -1519,13 +1520,13 @@ mod tests {
     fn merge_unordered_all_empty_is_empty_got() {
         let r = merge_scan_results(
             vec![
-                OpResult::Got(Vec::new()),
-                OpResult::Got(Vec::new()),
-                OpResult::Got(Vec::new()),
+                OpResult::Got(Vec::<u8>::new().into()),
+                OpResult::Got(Vec::<u8>::new().into()),
+                OpResult::Got(Vec::<u8>::new().into()),
             ],
             &ScatterKind::Unordered { limit: 0 },
         );
-        assert_eq!(r, OpResult::Got(Vec::new()));
+        assert_eq!(r, OpResult::Got(Vec::<u8>::new().into()));
     }
 
     /// **Malformed payload (unordered)**: a truncated row-length
@@ -1542,7 +1543,7 @@ mod tests {
             v
         };
         let r = merge_scan_results(
-            vec![OpResult::Got(bad)],
+            vec![OpResult::Got(bad.into())],
             &ScatterKind::Unordered { limit: 0 },
         );
         assert!(
@@ -1562,7 +1563,7 @@ mod tests {
         let s0 = rows_to_payload(&[&rec(1), &rec(4), &rec(9)]);
         let s1 = rows_to_payload(&[&rec(2), &rec(3), &rec(7)]);
         let r = merge_scan_results(
-            vec![OpResult::Got(s0), OpResult::Got(s1)],
+            vec![OpResult::Got(s0.into()), OpResult::Got(s1.into())],
             &ScatterKind::Sorted {
                 sort_kind: FieldKind::U64,
                 sort_offset: 0,
@@ -1575,7 +1576,7 @@ mod tests {
         let expected = rows_to_payload(&[
             &rec(1), &rec(2), &rec(3), &rec(4), &rec(7), &rec(9),
         ]);
-        assert_eq!(r, OpResult::Got(expected));
+        assert_eq!(r, OpResult::Got(expected.into()));
     }
 
     /// **Sorted merge — descending**: same data, `desc=true` flips
@@ -1588,7 +1589,7 @@ mod tests {
         let s0 = rows_to_payload(&[&rec(9), &rec(4), &rec(1)]);
         let s1 = rows_to_payload(&[&rec(7), &rec(3), &rec(2)]);
         let r = merge_scan_results(
-            vec![OpResult::Got(s0), OpResult::Got(s1)],
+            vec![OpResult::Got(s0.into()), OpResult::Got(s1.into())],
             &ScatterKind::Sorted {
                 sort_kind: FieldKind::U64,
                 sort_offset: 0,
@@ -1601,7 +1602,7 @@ mod tests {
         let expected = rows_to_payload(&[
             &rec(9), &rec(7), &rec(4), &rec(3), &rec(2), &rec(1),
         ]);
-        assert_eq!(r, OpResult::Got(expected));
+        assert_eq!(r, OpResult::Got(expected.into()));
     }
 
     /// **Sorted merge — OFFSET + LIMIT**: OFFSET 2 LIMIT 3 over the
@@ -1614,7 +1615,7 @@ mod tests {
         let s0 = rows_to_payload(&[&rec(1), &rec(4), &rec(9)]);
         let s1 = rows_to_payload(&[&rec(2), &rec(3), &rec(7)]);
         let r = merge_scan_results(
-            vec![OpResult::Got(s0), OpResult::Got(s1)],
+            vec![OpResult::Got(s0.into()), OpResult::Got(s1.into())],
             &ScatterKind::Sorted {
                 sort_kind: FieldKind::U64,
                 sort_offset: 0,
@@ -1625,7 +1626,7 @@ mod tests {
             },
         );
         let expected = rows_to_payload(&[&rec(3), &rec(4), &rec(7)]);
-        assert_eq!(r, OpResult::Got(expected));
+        assert_eq!(r, OpResult::Got(expected.into()));
     }
 
     /// **Sorted merge — K=1 byte-identical**: with one shard, the
@@ -1638,7 +1639,7 @@ mod tests {
         let rec = |v: u64| -> Vec<u8> { v.to_le_bytes().to_vec() };
         let payload = rows_to_payload(&[&rec(2), &rec(5), &rec(11)]);
         let r = merge_scan_results(
-            vec![OpResult::Got(payload.clone())],
+            vec![OpResult::Got(payload.clone().into())],
             &ScatterKind::Sorted {
                 sort_kind: FieldKind::U64,
                 sort_offset: 0,
@@ -1648,7 +1649,7 @@ mod tests {
                 limit: 0,
             },
         );
-        assert_eq!(r, OpResult::Got(payload));
+        assert_eq!(r, OpResult::Got(payload.into()));
     }
 
     /// **Sorted merge — empty shard mixed with non-empty**: an empty
@@ -1662,9 +1663,9 @@ mod tests {
         let s2 = rows_to_payload(&[&rec(3), &rec(7)]);
         let r = merge_scan_results(
             vec![
-                OpResult::Got(s0),
-                OpResult::Got(s1),
-                OpResult::Got(s2),
+                OpResult::Got(s0.into()),
+                OpResult::Got(s1.into()),
+                OpResult::Got(s2.into()),
             ],
             &ScatterKind::Sorted {
                 sort_kind: FieldKind::U64,
@@ -1678,7 +1679,7 @@ mod tests {
         let expected = rows_to_payload(&[
             &rec(1), &rec(3), &rec(5), &rec(7),
         ]);
-        assert_eq!(r, OpResult::Got(expected));
+        assert_eq!(r, OpResult::Got(expected.into()));
     }
 
     /// **Sorted merge — signed (I32) negative ordering**: signed
@@ -1695,7 +1696,7 @@ mod tests {
         let s0 = rows_to_payload(&[&rec(-100), &rec(0), &rec(50)]);
         let s1 = rows_to_payload(&[&rec(-10), &rec(20)]);
         let r = merge_scan_results(
-            vec![OpResult::Got(s0), OpResult::Got(s1)],
+            vec![OpResult::Got(s0.into()), OpResult::Got(s1.into())],
             &ScatterKind::Sorted {
                 sort_kind: FieldKind::I32,
                 sort_offset: 0,
@@ -1708,7 +1709,7 @@ mod tests {
         let expected = rows_to_payload(&[
             &rec(-100), &rec(-10), &rec(0), &rec(20), &rec(50),
         ]);
-        assert_eq!(r, OpResult::Got(expected));
+        assert_eq!(r, OpResult::Got(expected.into()));
     }
 
     /// **Sorted merge — value tie tie-broken by shard_id**:
@@ -1727,7 +1728,7 @@ mod tests {
         let s0 = rows_to_payload(&[&rec(42, b'A')]);
         let s1 = rows_to_payload(&[&rec(42, b'B')]);
         let r = merge_scan_results(
-            vec![OpResult::Got(s0), OpResult::Got(s1)],
+            vec![OpResult::Got(s0.into()), OpResult::Got(s1.into())],
             &ScatterKind::Sorted {
                 sort_kind: FieldKind::U64,
                 sort_offset: 0,
@@ -1739,7 +1740,7 @@ mod tests {
         );
         // shard 0 first (tie-break: smaller shard_id wins).
         let expected = rows_to_payload(&[&rec(42, b'A'), &rec(42, b'B')]);
-        assert_eq!(r, OpResult::Got(expected));
+        assert_eq!(r, OpResult::Got(expected.into()));
     }
 
     // ---------- T3 K-invariance property sweep (SP155 §7.2 + acceptance #1) ----------
@@ -1871,7 +1872,7 @@ mod tests {
                     }
                     p
                 };
-                OpResult::Got(payload)
+                OpResult::Got(payload.into())
             })
             .collect()
     }
@@ -2071,7 +2072,7 @@ mod tests {
                             );
                             p.extend_from_slice(&r.record);
                         }
-                        OpResult::Got(p)
+                        OpResult::Got(p.into())
                     })
                     .collect();
                 merge_scan_results(
@@ -2140,7 +2141,7 @@ mod tests {
         let s0 = rows_to_payload(&[&s("apple"), &s("banana"), &s("zebra")]);
         let s1 = rows_to_payload(&[&s("aardvark"), &s("cat"), &s("yak")]);
         let r = merge_scan_results(
-            vec![OpResult::Got(s0), OpResult::Got(s1)],
+            vec![OpResult::Got(s0.into()), OpResult::Got(s1.into())],
             &ScatterKind::Sorted {
                 sort_kind: FieldKind::Char(8),
                 sort_offset: 0,
@@ -2158,7 +2159,7 @@ mod tests {
             &s("yak"),
             &s("zebra"),
         ]);
-        assert_eq!(r, OpResult::Got(expected));
+        assert_eq!(r, OpResult::Got(expected.into()));
     }
 
     /// **Bytes column sort key (raw bytes, no UTF-8 assumption)**. Same
@@ -2181,7 +2182,7 @@ mod tests {
             &b(&[0xFF, 0xFE, 0xFD, 0xFC]),
         ]);
         let r = merge_scan_results(
-            vec![OpResult::Got(s0), OpResult::Got(s1)],
+            vec![OpResult::Got(s0.into()), OpResult::Got(s1.into())],
             &ScatterKind::Sorted {
                 sort_kind: FieldKind::Bytes(4),
                 sort_offset: 0,
@@ -2197,7 +2198,7 @@ mod tests {
             &b(&[0x7F, 0xFF, 0x00, 0x00]),
             &b(&[0xFF, 0xFE, 0xFD, 0xFC]),
         ]);
-        assert_eq!(r, OpResult::Got(expected));
+        assert_eq!(r, OpResult::Got(expected.into()));
     }
 
     /// **NULL sort key handling (NULLs sort FIRST in ascending)**. The
@@ -2221,7 +2222,7 @@ mod tests {
         let s0 = rows_to_payload(&[&null_row, &rec(5), &rec(100)]);
         let s1 = rows_to_payload(&[&rec(2), &rec(50)]);
         let r = merge_scan_results(
-            vec![OpResult::Got(s0), OpResult::Got(s1)],
+            vec![OpResult::Got(s0.into()), OpResult::Got(s1.into())],
             &ScatterKind::Sorted {
                 sort_kind: FieldKind::U64,
                 sort_offset: 0,
@@ -2239,7 +2240,7 @@ mod tests {
             &rec(50),
             &rec(100),
         ]);
-        assert_eq!(r, OpResult::Got(expected));
+        assert_eq!(r, OpResult::Got(expected.into()));
     }
 
     /// **NULLs sort LAST descending** (the natural consequence of the
@@ -2254,7 +2255,7 @@ mod tests {
         let s0 = rows_to_payload(&[&rec(100), &rec(5), &null_row]);
         let s1 = rows_to_payload(&[&rec(50), &rec(2)]);
         let r = merge_scan_results(
-            vec![OpResult::Got(s0), OpResult::Got(s1)],
+            vec![OpResult::Got(s0.into()), OpResult::Got(s1.into())],
             &ScatterKind::Sorted {
                 sort_kind: FieldKind::U64,
                 sort_offset: 0,
@@ -2271,7 +2272,7 @@ mod tests {
             &rec(2),
             &null_row,
         ]);
-        assert_eq!(r, OpResult::Got(expected));
+        assert_eq!(r, OpResult::Got(expected.into()));
     }
 
     /// **Empty string vs non-empty Char(8)**. The empty string is
@@ -2291,7 +2292,7 @@ mod tests {
         let s0 = rows_to_payload(&[&empty, &s("a"), &s("z")]);
         let s1 = rows_to_payload(&[&s("b"), &s("m")]);
         let r = merge_scan_results(
-            vec![OpResult::Got(s0), OpResult::Got(s1)],
+            vec![OpResult::Got(s0.into()), OpResult::Got(s1.into())],
             &ScatterKind::Sorted {
                 sort_kind: FieldKind::Char(8),
                 sort_offset: 0,
@@ -2308,7 +2309,7 @@ mod tests {
             &s("m"),
             &s("z"),
         ]);
-        assert_eq!(r, OpResult::Got(expected));
+        assert_eq!(r, OpResult::Got(expected.into()));
     }
 
     /// **Sort field at a non-zero column offset**. Simulate a row with
@@ -2337,7 +2338,7 @@ mod tests {
             &rec(0xDD, 5, b'd'),
         ]);
         let r = merge_scan_results(
-            vec![OpResult::Got(s0), OpResult::Got(s1)],
+            vec![OpResult::Got(s0.into()), OpResult::Got(s1.into())],
             &ScatterKind::Sorted {
                 sort_kind: FieldKind::U64,
                 sort_offset: 16,
@@ -2354,7 +2355,7 @@ mod tests {
             &rec(0xDD, 5, b'd'),
             &rec(0xBB, 7, b'b'),
         ]);
-        assert_eq!(r, OpResult::Got(expected));
+        assert_eq!(r, OpResult::Got(expected.into()));
     }
 
     /// **Record shorter than sort field offset+width → SchemaError**.
@@ -2367,7 +2368,7 @@ mod tests {
         let short = vec![1u8, 2, 3, 4];
         let s0 = rows_to_payload(&[&short]);
         let r = merge_scan_results(
-            vec![OpResult::Got(s0)],
+            vec![OpResult::Got(s0.into())],
             &ScatterKind::Sorted {
                 sort_kind: FieldKind::U64,
                 sort_offset: 0,
@@ -2395,7 +2396,7 @@ mod tests {
         let s0 = rows_to_payload(&[&rec(-100), &null_row, &rec(50)]);
         let s1 = rows_to_payload(&[&rec(-10), &rec(20)]);
         let r = merge_scan_results(
-            vec![OpResult::Got(s0), OpResult::Got(s1)],
+            vec![OpResult::Got(s0.into()), OpResult::Got(s1.into())],
             &ScatterKind::Sorted {
                 sort_kind: FieldKind::I64,
                 sort_offset: 0,
@@ -2413,7 +2414,7 @@ mod tests {
             &rec(20),
             &rec(50),
         ]);
-        assert_eq!(r, OpResult::Got(expected));
+        assert_eq!(r, OpResult::Got(expected.into()));
     }
 
     // ---------- T6 LIMIT-cancellation KATs (SP155 §3.7 / §7.3) ----------
@@ -2524,7 +2525,7 @@ mod tests {
             let rows: Vec<Vec<u8>> =
                 (0..100u8).map(|i| rec(start.wrapping_add(i))).collect();
             let refs: Vec<&[u8]> = rows.iter().map(|v| v.as_slice()).collect();
-            OpResult::Got(rows_to_payload(&refs))
+            OpResult::Got(rows_to_payload(&refs).into())
         };
         let s0 = CancellableMockShard::new(mk_payload(0));
         let s1 = CancellableMockShard::new(mk_payload(100));
@@ -2574,7 +2575,7 @@ mod tests {
                 .map(|i| rec(base.wrapping_add(i)))
                 .collect();
             let refs: Vec<&[u8]> = rows.iter().map(|v| v.as_slice()).collect();
-            OpResult::Got(rows_to_payload(&refs))
+            OpResult::Got(rows_to_payload(&refs).into())
         };
         // shard_0: fast, 100 rows.
         let s0 = CancellableMockShard::new(mk_payload(100, 0));
@@ -2653,7 +2654,7 @@ mod tests {
             let rows: Vec<Vec<u8>> =
                 (0..n as u8).map(|i| rec(base.wrapping_add(i))).collect();
             let refs: Vec<&[u8]> = rows.iter().map(|v| v.as_slice()).collect();
-            OpResult::Got(rows_to_payload(&refs))
+            OpResult::Got(rows_to_payload(&refs).into())
         };
         let s0 = CancellableMockShard::new(mk_payload(3, 0));
         let s1 = CancellableMockShard::new(mk_payload(3, 100));
@@ -2698,8 +2699,8 @@ mod tests {
     /// = stop scanning at the strongest possible point" contract.
     #[test]
     fn scatter_and_merge_precancelled_returns_empty() {
-        let s0 = CancellableMockShard::new(OpResult::Got(vec![1, 2, 3, 4]));
-        let s1 = CancellableMockShard::new(OpResult::Got(vec![5, 6, 7, 8]));
+        let s0 = CancellableMockShard::new(OpResult::Got(vec![1, 2, 3, 4].into()));
+        let s1 = CancellableMockShard::new(OpResult::Got(vec![5, 6, 7, 8].into()));
         let ran0 = s0.ran.clone();
         let ran1 = s1.ran.clone();
         let cancel = Arc::new(AtomicBool::new(true)); // pre-cancelled
@@ -2712,7 +2713,7 @@ mod tests {
         );
         assert_eq!(
             out,
-            OpResult::Got(Vec::new()),
+            OpResult::Got(Vec::<u8>::new().into()),
             "pre-cancelled scatter returns empty Got"
         );
         // No workers ran (we never spawned).
@@ -2739,7 +2740,7 @@ mod tests {
             let rows: Vec<Vec<u8>> =
                 (0..n as u8).map(|i| rec(base.wrapping_add(i))).collect();
             let refs: Vec<&[u8]> = rows.iter().map(|v| v.as_slice()).collect();
-            OpResult::Got(rows_to_payload(&refs))
+            OpResult::Got(rows_to_payload(&refs).into())
         };
         let s0 = CancellableMockShard::new(mk_payload(2, 0));
         let s1 = CancellableMockShard::new(mk_payload(2, 100));
@@ -2790,7 +2791,7 @@ mod tests {
             let rows: Vec<Vec<u8>> =
                 (0..n as u8).map(|i| rec(base.wrapping_add(i))).collect();
             let refs: Vec<&[u8]> = rows.iter().map(|v| v.as_slice()).collect();
-            OpResult::Got(rows_to_payload(&refs))
+            OpResult::Got(rows_to_payload(&refs).into())
         };
         // shard_0: fast, fills LIMIT.
         let s0 = CancellableMockShard::new(mk_payload(10, 0));
@@ -2839,8 +2840,8 @@ mod tests {
         let rec = |v: u64| -> Vec<u8> { v.to_le_bytes().to_vec() };
         let s0_payload = rows_to_payload(&[&rec(1), &rec(4), &rec(9)]);
         let s1_payload = rows_to_payload(&[&rec(2), &rec(3), &rec(7)]);
-        let s0 = CancellableMockShard::new(OpResult::Got(s0_payload));
-        let s1 = CancellableMockShard::new(OpResult::Got(s1_payload));
+        let s0 = CancellableMockShard::new(OpResult::Got(s0_payload.into()));
+        let s1 = CancellableMockShard::new(OpResult::Got(s1_payload.into()));
         let ran0 = s0.ran.clone();
         let ran1 = s1.ran.clone();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -2863,7 +2864,7 @@ mod tests {
         assert!(ran1.load(Ordering::SeqCst) >= 1);
         // Result: ascending [1, 2, 3] (LIMIT 3).
         let expected = rows_to_payload(&[&rec(1), &rec(2), &rec(3)]);
-        assert_eq!(out, OpResult::Got(expected));
+        assert_eq!(out, OpResult::Got(expected.into()));
         // Post-gather cancel set.
         assert!(cancel.load(Ordering::SeqCst));
     }
@@ -2874,11 +2875,11 @@ mod tests {
     /// Got slot. Late shards see cancel pre-call.
     #[test]
     fn scatter_and_merge_unavailable_propagates_and_fires_cancel() {
-        let s0 = CancellableMockShard::new(OpResult::Got(vec![]));
+        let s0 = CancellableMockShard::new(OpResult::Got(vec![].into()));
         let s1 = CancellableMockShard::new(OpResult::Unavailable);
         // shard_2 is SLOW + comes AFTER the Unavailable shard — must
         // observe cancel pre-call (its `ran` stays 0).
-        let s2 = CancellableMockShard::new(OpResult::Got(vec![1, 2, 3, 4]))
+        let s2 = CancellableMockShard::new(OpResult::Got(vec![1, 2, 3, 4].into()))
             .slow(Duration::from_millis(200));
         let ran2 = s2.ran.clone();
         let cancelled2 = s2.cancelled_pre_call.clone();
@@ -2920,7 +2921,7 @@ mod tests {
             &ScatterKind::Unordered { limit: 10 },
             cancel,
         );
-        assert_eq!(out, OpResult::Got(Vec::new()));
+        assert_eq!(out, OpResult::Got(Vec::<u8>::new().into()));
     }
 
     // ---------- T7 skew-defense / bounded-buffer KATs (SP155 §3.8) ----------
@@ -3047,8 +3048,8 @@ mod tests {
         let (tx1, rx1) = mpsc::sync_channel::<OpResult>(1);
         let s0_for_thread = s0_payload.clone();
         let s1_for_thread = s1_payload.clone();
-        let h0 = thread::spawn(move || tx0.send(OpResult::Got(s0_for_thread)));
-        let h1 = thread::spawn(move || tx1.send(OpResult::Got(s1_for_thread)));
+        let h0 = thread::spawn(move || tx0.send(OpResult::Got(s0_for_thread.into())));
+        let h1 = thread::spawn(move || tx1.send(OpResult::Got(s1_for_thread.into())));
         let r0 = rx0.recv().unwrap();
         let r1 = rx1.recv().unwrap();
         h0.join().unwrap().unwrap();
@@ -3061,7 +3062,7 @@ mod tests {
         // ordered concat of the two payloads.
         let mut expected = s0_payload.clone();
         expected.extend_from_slice(&s1_payload);
-        assert_eq!(merged, OpResult::Got(expected));
+        assert_eq!(merged, OpResult::Got(expected.into()));
     }
 
     /// **T7 KAT — sender does NOT deadlock when the merger drops the
@@ -3134,7 +3135,7 @@ mod tests {
                 .map(|i| rec(base.wrapping_add(i)))
                 .collect();
             let refs: Vec<&[u8]> = rows.iter().map(|v| v.as_slice()).collect();
-            OpResult::Got(rows_to_payload(&refs))
+            OpResult::Got(rows_to_payload(&refs).into())
         };
         // 8 shards × 100 rows each = 800 rows total. (1000 per spec
         // hint, but mocks store the payload eagerly so we keep it
@@ -3241,12 +3242,12 @@ mod tests {
             match &self.behavior {
                 PentestBehavior::SleepThenGot(d, payload) => {
                     thread::sleep(*d);
-                    Ok(OpResult::Got(payload.clone()))
+                    Ok(OpResult::Got(payload.clone().into()))
                 }
-                PentestBehavior::OversizedGot(p) => Ok(OpResult::Got(p.clone())),
-                PentestBehavior::MalformedGot(p) => Ok(OpResult::Got(p.clone())),
+                PentestBehavior::OversizedGot(p) => Ok(OpResult::Got(p.clone().into())),
+                PentestBehavior::MalformedGot(p) => Ok(OpResult::Got(p.clone().into())),
                 PentestBehavior::TransportErr(e) => Err(e.clone()),
-                PentestBehavior::Got(p) => Ok(OpResult::Got(p.clone())),
+                PentestBehavior::Got(p) => Ok(OpResult::Got(p.clone().into())),
             }
         }
         fn call_with_cancel(
@@ -3275,7 +3276,7 @@ mod tests {
                     remaining = remaining.saturating_sub(s);
                 }
                 self.ran.fetch_add(1, Ordering::SeqCst);
-                return Ok(OpResult::Got(payload.clone()));
+                return Ok(OpResult::Got(payload.clone().into()));
             }
             self.call(op)
         }
@@ -3306,7 +3307,7 @@ mod tests {
             Duration::from_millis(80),
         );
         assert_eq!(out.len(), 3, "every shard has a slot");
-        assert_eq!(out[0], OpResult::Got(b"fast-0".to_vec()));
+        assert_eq!(out[0], OpResult::Got(b"fast-0".to_vec().into()));
         assert_eq!(
             out[1],
             OpResult::Unavailable,
@@ -3316,7 +3317,7 @@ mod tests {
         // deadline window already elapsed waiting for shard_1; both
         // outcomes are valid per the existing T1 KAT contract.
         match &out[2] {
-            OpResult::Got(b) => assert_eq!(b, b"fast-2"),
+            OpResult::Got(b) => assert_eq!(&b[..], b"fast-2"),
             OpResult::Unavailable => {} // acceptable
             other => panic!("shard 2 unexpected slot: {other:?}"),
         }
@@ -3498,7 +3499,7 @@ mod tests {
         );
         assert_eq!(
             out2,
-            OpResult::Got(rows_to_payload(&[b"follow-up"])),
+            OpResult::Got(rows_to_payload(&[b"follow-up"]).into()),
             "scatter still works after a mid-scan death"
         );
     }
@@ -3597,7 +3598,7 @@ mod tests {
             );
             assert_eq!(
                 out,
-                OpResult::Got(Vec::new()),
+                OpResult::Got(Vec::<u8>::new().into()),
                 "iter {iter}: pre-cancelled scatter must return empty Got"
             );
             for (i, ran) in rans.iter().enumerate() {
@@ -3633,7 +3634,7 @@ mod tests {
             cancel,
         );
         let elapsed = t0.elapsed();
-        assert_eq!(out, OpResult::Got(Vec::new()));
+        assert_eq!(out, OpResult::Got(Vec::<u8>::new().into()));
         assert!(
             elapsed < Duration::from_millis(50),
             "K=0 must short-circuit instantly, was {elapsed:?}"
@@ -3672,7 +3673,7 @@ mod tests {
         );
         assert_eq!(
             out,
-            OpResult::Got(payload),
+            OpResult::Got(payload.into()),
             "K=1 scatter must be byte-identical to a direct shard call"
         );
     }
@@ -3727,7 +3728,7 @@ mod tests {
             &rec(1), &rec(2), &rec(3), &rec(4), &rec(5),
             &rec(6), &rec(7), &rec(8), &rec(9),
         ]);
-        assert_eq!(first.unwrap(), OpResult::Got(expected));
+        assert_eq!(first.unwrap(), OpResult::Got(expected.into()));
     }
 
     // ---------- T9 partial-result opt-in KATs (SP155 §3.6 / §6 / OQ2) ----------
@@ -3836,7 +3837,7 @@ mod tests {
         let expected = rows_to_payload(&[b"row-a", b"row-b", b"row-c"]);
         assert_eq!(
             out,
-            OpResult::Got(expected),
+            OpResult::Got(expected.into()),
             "partial mode: surviving shards' rows merge in shard-id order"
         );
         assert_eq!(
@@ -3905,7 +3906,7 @@ mod tests {
         );
         assert_eq!(
             out,
-            OpResult::Got(Vec::new()),
+            OpResult::Got(Vec::<u8>::new().into()),
             "all-fail in partial mode returns empty Got"
         );
         assert_eq!(failed, vec![0u32, 1, 2], "failed_shards == 0..K");
@@ -3923,7 +3924,7 @@ mod tests {
                 .map(|i| rec(base.wrapping_add(i)))
                 .collect();
             let refs: Vec<&[u8]> = rows.iter().map(|v| v.as_slice()).collect();
-            OpResult::Got(rows_to_payload(&refs))
+            OpResult::Got(rows_to_payload(&refs).into())
         };
         // shard_0: fast, 100 rows.
         let s0 = CancellableMockShard::new(mk_payload(100, 0));
@@ -4030,7 +4031,7 @@ mod tests {
         let (out, failed) = first.unwrap();
         assert_eq!(
             out,
-            OpResult::Got(rows_to_payload(&[b"a0", b"a1", b"c0"])),
+            OpResult::Got(rows_to_payload(&[b"a0", b"a1", b"c0"]).into()),
             "shard_0 and shard_2 contribute; 1+3 omitted"
         );
         assert_eq!(failed, vec![1u32, 3]);
@@ -4070,7 +4071,7 @@ mod tests {
         );
         // Heap merge of shard_0 + shard_2 only: [1, 2, 5, 7].
         let expected = rows_to_payload(&[&rec(1), &rec(2), &rec(5), &rec(7)]);
-        assert_eq!(out, OpResult::Got(expected));
+        assert_eq!(out, OpResult::Got(expected.into()));
         assert_eq!(failed, vec![1u32]);
     }
 
@@ -4149,10 +4150,10 @@ mod tests {
     fn t11_oid_concat_k1_byte_identical_to_single_shard() {
         let payload = oids_payload(&[oid(1), oid(2), oid(3)]);
         let r = merge_scan_results(
-            vec![OpResult::Got(payload.clone())],
+            vec![OpResult::Got(payload.clone().into())],
             &ScatterKind::OidConcat,
         );
-        assert_eq!(r, OpResult::Got(payload));
+        assert_eq!(r, OpResult::Got(payload.into()));
     }
 
     /// **T11.2 — Two-shard merge concatenates in shard-id order.**
@@ -4163,11 +4164,11 @@ mod tests {
         let s0 = oids_payload(&[oid(1), oid(2)]);
         let s1 = oids_payload(&[oid(9)]);
         let r = merge_scan_results(
-            vec![OpResult::Got(s0), OpResult::Got(s1)],
+            vec![OpResult::Got(s0.into()), OpResult::Got(s1.into())],
             &ScatterKind::OidConcat,
         );
         let expected = oids_payload(&[oid(1), oid(2), oid(9)]);
-        assert_eq!(r, OpResult::Got(expected));
+        assert_eq!(r, OpResult::Got(expected.into()));
     }
 
     /// **T11.3 — Empty shard contributes nothing.** A shard with no
@@ -4179,14 +4180,14 @@ mod tests {
         let s2 = oids_payload(&[oid(5), oid(7)]);
         let r = merge_scan_results(
             vec![
-                OpResult::Got(s0),
-                OpResult::Got(s1),
-                OpResult::Got(s2),
+                OpResult::Got(s0.into()),
+                OpResult::Got(s1.into()),
+                OpResult::Got(s2.into()),
             ],
             &ScatterKind::OidConcat,
         );
         let expected = oids_payload(&[oid(1), oid(5), oid(7)]);
-        assert_eq!(r, OpResult::Got(expected));
+        assert_eq!(r, OpResult::Got(expected.into()));
     }
 
     /// **T11.4 — K=0 returns empty Got (matches the
@@ -4194,7 +4195,7 @@ mod tests {
     #[test]
     fn t11_oid_concat_empty_input_is_empty_got() {
         let r = merge_scan_results(Vec::new(), &ScatterKind::OidConcat);
-        assert_eq!(r, OpResult::Got(Vec::new()));
+        assert_eq!(r, OpResult::Got(Vec::<u8>::new().into()));
     }
 
     /// **T11.5 — Malformed payload (length not a multiple of 16)
@@ -4205,7 +4206,7 @@ mod tests {
         // 17 bytes — claims one 16-byte oid + a stray trailing byte.
         let bad = vec![0xAAu8; 17];
         let r = merge_scan_results(
-            vec![OpResult::Got(bad)],
+            vec![OpResult::Got(bad.into())],
             &ScatterKind::OidConcat,
         );
         assert!(
@@ -4221,9 +4222,9 @@ mod tests {
     fn t11_oid_concat_propagates_first_non_got_slot() {
         let r = merge_scan_results(
             vec![
-                OpResult::Got(oids_payload(&[oid(1)])),
+                OpResult::Got(oids_payload(&[oid(1)]).into()),
                 OpResult::Unavailable,
-                OpResult::Got(oids_payload(&[oid(3)])),
+                OpResult::Got(oids_payload(&[oid(3)]).into()),
             ],
             &ScatterKind::OidConcat,
         );
@@ -4259,7 +4260,7 @@ mod tests {
             ScatterContext::partial(),
         );
         let expected = oids_payload(&[oid(1), oid(2), oid(9)]);
-        assert_eq!(out, OpResult::Got(expected));
+        assert_eq!(out, OpResult::Got(expected.into()));
         assert_eq!(failed, vec![1u32]);
     }
 

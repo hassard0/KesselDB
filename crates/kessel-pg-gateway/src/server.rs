@@ -1076,7 +1076,7 @@ mod tests {
     struct EmptySelectEngine;
     impl crate::engine::EngineApply for EmptySelectEngine {
         fn apply_sql(&self, _sql: &str) -> kessel_proto::OpResult {
-            kessel_proto::OpResult::Got(Vec::new())
+            kessel_proto::OpResult::Got(Vec::<u8>::new().into())
         }
         fn describe_table(
             &self,

@@ -794,15 +794,15 @@ mod tests {
         assert!(format_result(&OpResult::Unavailable).contains("primary"));
         assert!(format_result(&OpResult::Unauthorized).contains("token"));
         // scalar reply (aggregate = 16-byte i128)
-        assert!(format_result(&OpResult::Got(1049i128.to_le_bytes().to_vec()))
+        assert!(format_result(&OpResult::Got(1049i128.to_le_bytes().to_vec().into()))
             .contains("= 1049"));
         // opaque rows
-        assert!(format_result(&OpResult::Got(vec![0u8; 40])).contains("40 bytes"));
+        assert!(format_result(&OpResult::Got(vec![0u8; 40].into())).contains("40 bytes"));
         // never panics, always non-empty
         for r in [
             OpResult::Ok,
-            OpResult::Got(vec![]),
-            OpResult::Got(vec![1, 2, 3]),
+            OpResult::Got(Vec::<u8>::new().into()),
+            OpResult::Got(vec![1, 2, 3].into()),
         ] {
             assert!(!format_result(&r).is_empty());
         }
@@ -821,7 +821,7 @@ mod tests {
             r#"{"status":"not_found"}"#
         );
         assert_eq!(
-            format_result_json(&OpResult::Got(1049i128.to_le_bytes().to_vec())),
+            format_result_json(&OpResult::Got(1049i128.to_le_bytes().to_vec().into())),
             r#"{"status":"ok","value":1049}"#
         );
         // Error messages are JSON-escaped, never raw.

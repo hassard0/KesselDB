@@ -570,7 +570,7 @@ pub fn spawn_node(
                             Ok(Stmt::Explain(plan)) => {
                                 // EXPLAIN: pure planner text, no consensus.
                                 let _ = reply
-                                    .send(OpResult::Got(plan.into_bytes()));
+                                    .send(OpResult::Got(plan.into_bytes().into()));
                             }
                             Err(e) => {
                                 let _ = reply
@@ -765,7 +765,7 @@ mod tests {
         // Linearized read through consensus returns the committed value.
         assert_eq!(
             primary.submit(Op::GetById { type_id: 1, id }),
-            OpResult::Got(vec![7, 7, 7])
+            OpResult::Got(vec![7, 7, 7].into())
         );
         // An atomic txn over the real cluster.
         assert_eq!(
@@ -850,7 +850,7 @@ mod tests {
         );
         match c.sql("SELECT SUM(bal) FROM acct WHERE owner = 100").unwrap() {
             OpResult::Got(b) => {
-                assert_eq!(i128::from_le_bytes(b.try_into().unwrap()), 1049)
+                assert_eq!(i128::from_le_bytes(<[u8;16]>::try_from(b.as_ref()).unwrap()), 1049)
             }
             o => panic!("unexpected {o:?}"),
         }
@@ -859,7 +859,7 @@ mod tests {
         assert_eq!(c.sql("UPDATE acct ID 1 SET bal = 500").unwrap(), OpResult::Ok);
         match c.sql("SELECT SUM(bal) FROM acct WHERE owner = 100").unwrap() {
             OpResult::Got(b) => {
-                assert_eq!(i128::from_le_bytes(b.try_into().unwrap()), 1499)
+                assert_eq!(i128::from_le_bytes(<[u8;16]>::try_from(b.as_ref()).unwrap()), 1499)
             }
             o => panic!("unexpected {o:?}"),
         }
@@ -1174,7 +1174,7 @@ mod tests {
         // Client still works for a fresh request after all the rotation.
         assert_eq!(
             c.call(&Op::GetById { type_id: 1, id }).unwrap(),
-            OpResult::Got(vec![3])
+            OpResult::Got(vec![3].into())
         );
 
         for d in &dirs {

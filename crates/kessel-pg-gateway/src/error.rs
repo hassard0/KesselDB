@@ -744,7 +744,7 @@ mod tests {
     #[test]
     fn t7_success_variants_return_none() {
         assert!(op_result_to_sqlstate(&OpResult::Ok).is_none());
-        assert!(op_result_to_sqlstate(&OpResult::Got(vec![1, 2, 3])).is_none());
+        assert!(op_result_to_sqlstate(&OpResult::Got(vec![1, 2, 3].into())).is_none());
         assert!(op_result_to_sqlstate(&OpResult::NotFound).is_none());
         assert!(op_result_to_sqlstate(&OpResult::TypeCreated(7)).is_none());
         assert!(op_result_to_sqlstate(&OpResult::TxCommitted {

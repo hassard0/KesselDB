@@ -421,7 +421,9 @@ impl<'a> Conn<'a> {
             payload: desc,
         }) {
             Ok(OpResult::Got(b)) if b.len() == 8 => {
-                u64::from_le_bytes(b.try_into().unwrap())
+                // SP-Perf-A T6 Fix B: Arc<[u8]> doesn't implement TryInto<[u8;N]>;
+                // use TryFrom against the deref'd slice.
+                u64::from_le_bytes(<[u8; 8]>::try_from(b.as_ref()).unwrap())
             }
             Ok(o) => {
                 return OpResult::SchemaError(format!(
@@ -1527,7 +1529,7 @@ mod tests {
         // partial write leaked.
         assert_eq!(
             d0.call(&Op::GetById { type_id: 1, id: ObjectId::from_u128(ida) }).unwrap(),
-            OpResult::Got(vec![1, 0, 0, 0, 0, 0, 0, 0])
+            OpResult::Got(vec![1, 0, 0, 0, 0, 0, 0, 0].into())
         );
     }
 
@@ -1849,7 +1851,7 @@ mod tests {
         );
         assert_eq!(
             d0.call(&Op::GetById { type_id: 1, id: ObjectId::from_u128(a_dup) }).unwrap(),
-            OpResult::Got(rec(1)),
+            OpResult::Got(rec(1).into()),
             "the pre-existing row is unchanged"
         );
 

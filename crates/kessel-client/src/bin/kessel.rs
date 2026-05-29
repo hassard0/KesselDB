@@ -206,7 +206,9 @@ fn run_one(client: &mut Client, sql: &str, opts: &Opts) -> i32 {
                 print_got_json(client, sql, &b, is_explain);
                 0
             } else {
-                print_got_text(client, sql, b, is_explain);
+                // SP-Perf-A T6 Fix B: `b` is `Arc<[u8]>`; deref to a slice
+                // for the print path (which only needs read-only bytes).
+                print_got_text(client, sql, &b, is_explain);
                 0
             }
         }
@@ -248,38 +250,38 @@ fn run_one(client: &mut Client, sql: &str, opts: &Opts) -> i32 {
 
 /// Text mode: decode whole-row / projection SELECTs into aligned tables,
 /// EXPLAIN into its plan text, everything else into a one-line summary.
-fn print_got_text(client: &mut Client, sql: &str, b: Vec<u8>, explain: bool) {
+fn print_got_text(client: &mut Client, sql: &str, b: &[u8], explain: bool) {
     if explain {
-        println!("{}", String::from_utf8_lossy(&b));
+        println!("{}", String::from_utf8_lossy(b));
         return;
     }
     if is_describe(sql) {
-        if let Some(s) = render_schema(&b) {
+        if let Some(s) = render_schema(b) {
             println!("{s}");
             return;
         }
     }
     // Self-describing typed result (JOINs, …) — renders generically.
-    if let Some(s) = render_typed_result(&b) {
+    if let Some(s) = render_typed_result(b) {
         println!("{s}");
         return;
     }
     if let Some(t) = kessel_sql::select_star_table(sql) {
         if let Ok(OpResult::Got(def)) = client.sql(&format!("DESCRIBE {t}")) {
-            if let Some(table) = render_rows(&def, &b) {
+            if let Some(table) = render_rows(&def, b) {
                 println!("{table}");
                 return;
             }
         }
     } else if let Some((t, cols)) = kessel_sql::select_columns(sql) {
         if let Ok(OpResult::Got(def)) = client.sql(&format!("DESCRIBE {t}")) {
-            if let Some(table) = render_projection(&def, &cols, &b) {
+            if let Some(table) = render_projection(&def, &cols, b) {
                 println!("{table}");
                 return;
             }
         }
     }
-    println!("{}", format_result(&OpResult::Got(b)));
+    println!("{}", format_result(&OpResult::Got(b.to_vec().into())));
 }
 
 /// JSON mode: a single object per statement. Whole-row SELECT* gets a
@@ -309,7 +311,7 @@ fn print_got_json(client: &mut Client, sql: &str, b: &[u8], explain: bool) {
             }
         }
     }
-    println!("{}", format_result_json(&OpResult::Got(b.to_vec())));
+    println!("{}", format_result_json(&OpResult::Got(b.to_vec().into())));
 }
 
 fn is_describe(sql: &str) -> bool {

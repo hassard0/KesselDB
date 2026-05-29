@@ -3,6 +3,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::sync::Arc;
+
 pub type TypeId = u32;
 pub type OpNumber = u64;
 pub type ClientId = u128;
@@ -374,7 +376,15 @@ pub enum AbortReason {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OpResult {
     Ok,
-    Got(Vec<u8>),
+    /// SP-Perf-A T6 Fix B: payload is `Arc<[u8]>` so the in-process read
+    /// fast path (`StateMachine::read_only_op` → `OpResult::Got`) can return
+    /// a refcount-bump clone of the storage-resident bytes instead of
+    /// allocating + memcpy'ing a fresh Vec on every read. The wire format
+    /// is unchanged: `encode()` writes the bytes via `as_ref()`, and
+    /// `decode()` allocates a Vec then wraps it once via `Arc::from(vec)`.
+    /// Subsequent in-process clones of `OpResult::Got` are then atomic
+    /// refcount bumps, not heap allocations.
+    Got(Arc<[u8]>),
     Exists,
     NotFound,
     TypeCreated(TypeId),
@@ -423,7 +433,9 @@ impl OpResult {
             OpResult::Ok => b.push(0),
             OpResult::Got(v) => {
                 b.push(1);
-                codec::put_bytes(&mut b, v);
+                // SP-Perf-A T6 Fix B: bytes via Arc<[u8]> auto-deref; wire
+                // encoding identical to the prior Vec<u8> shape.
+                codec::put_bytes(&mut b, v.as_ref());
             }
             OpResult::Exists => b.push(2),
             OpResult::NotFound => b.push(3),
@@ -520,7 +532,10 @@ impl OpResult {
         let mut c = codec::Cursor::new(buf);
         Some(match c.u8()? {
             0 => OpResult::Ok,
-            1 => OpResult::Got(c.bytes()?),
+            // SP-Perf-A T6 Fix B: decode wraps the freshly-read Vec into an
+            // Arc<[u8]> once at the wire boundary; downstream clones bump
+            // the refcount instead of allocating.
+            1 => OpResult::Got(Arc::from(c.bytes()?)),
             2 => OpResult::Exists,
             3 => OpResult::NotFound,
             4 => OpResult::TypeCreated(c.u32()?),
@@ -1685,8 +1700,8 @@ mod tests {
     fn opresult_roundtrip_all_variants() {
         for r in [
             OpResult::Ok,
-            OpResult::Got(vec![1, 2, 3, 250]),
-            OpResult::Got(vec![]),
+            OpResult::Got(Arc::from(vec![1, 2, 3, 250])),
+            OpResult::Got(Arc::from(Vec::<u8>::new())),
             OpResult::Exists,
             OpResult::NotFound,
             OpResult::TypeCreated(77),
@@ -1699,6 +1714,67 @@ mod tests {
         }
         assert_eq!(OpResult::decode(&[9]), None);
         assert_eq!(OpResult::decode(&[]), None);
+    }
+
+    // ========================================================================
+    // SP-Perf-A T6 Fix B — Arc<[u8]> migration regression-lock.
+    //
+    // The wire format of OpResult::Got MUST stay byte-identical to the
+    // pre-Fix-B Vec<u8> shape (length-prefix + bytes), regardless of
+    // whether the payload is materialised as Vec<u8> or Arc<[u8]>
+    // internally. Locks the invariant "Got encode is shape-stable".
+    // ========================================================================
+
+    /// Wire-compat regression-lock: encode(Got(Arc::from(b"hello"))) must
+    /// produce the exact byte sequence the pre-Fix-B Got(Vec<u8>) shape
+    /// produced. Hand-written reference bytes: tag 1, then put_bytes which
+    /// is u32 LE length (5), then the 5 ASCII bytes of "hello".
+    #[test]
+    fn t6_fix_b_got_wire_format_unchanged() {
+        let got = OpResult::Got(Arc::from(b"hello".as_slice()));
+        let encoded = got.encode();
+        // Reference: tag(1) + u32_le(5) + b"hello"
+        let mut expected = vec![1u8];
+        expected.extend_from_slice(&5u32.to_le_bytes());
+        expected.extend_from_slice(b"hello");
+        assert_eq!(
+            encoded, expected,
+            "Fix B Got wire format must match the pre-Fix-B Vec<u8> shape \
+             byte-for-byte"
+        );
+        // Roundtrip stays intact.
+        let decoded = OpResult::decode(&encoded).expect("decode");
+        assert_eq!(decoded, got);
+    }
+
+    /// Empty Got payload (Vec::new) wire-equivalent to Arc<[u8]>::from(&[]).
+    #[test]
+    fn t6_fix_b_got_empty_wire_format_unchanged() {
+        let got = OpResult::Got(Arc::from(Vec::<u8>::new()));
+        let encoded = got.encode();
+        // tag(1) + u32_le(0) — no payload bytes.
+        let expected = vec![1u8, 0, 0, 0, 0];
+        assert_eq!(encoded, expected);
+        assert_eq!(OpResult::decode(&encoded), Some(got));
+    }
+
+    /// `OpResult::Got` clones bump the Arc refcount instead of allocating.
+    /// Verifies the internal sharing invariant the perf path relies on:
+    /// two clones of the same `Got` point to the same heap slice.
+    #[test]
+    fn t6_fix_b_got_clone_shares_backing_buffer() {
+        let original = OpResult::Got(Arc::from(b"shared".as_slice()));
+        let dup = original.clone();
+        // Extract the Arcs and compare pointer identity. If the clone had
+        // allocated, the pointers would differ.
+        let (a, b) = match (&original, &dup) {
+            (OpResult::Got(a), OpResult::Got(b)) => (a, b),
+            _ => unreachable!(),
+        };
+        assert!(
+            Arc::ptr_eq(a, b),
+            "clone of OpResult::Got must be a refcount bump, not an alloc"
+        );
     }
 
     #[test]

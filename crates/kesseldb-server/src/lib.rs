@@ -480,7 +480,7 @@ fn apply_one_inner(
                 }
             }
             Ok(kessel_sql::Stmt::Explain(plan)) => {
-                return OpResult::Got(plan.into_bytes());
+                return OpResult::Got(plan.into_bytes().into());
             }
             Err(e) => {
                 return OpResult::SchemaError(format!("sql: {e}"));
@@ -915,7 +915,7 @@ pub fn spawn_engine_cfg(
                         digest: sm.digest(),
                         uptime_secs: start.elapsed().as_secs(),
                     };
-                    return OpResult::Got(st.encode());
+                    return OpResult::Got(st.encode().into());
                 }
                 Some(&SNAPSHOT_TAG) => {
                     let dest = String::from_utf8_lossy(&frame[1..]).into_owned();
@@ -940,7 +940,7 @@ pub fn spawn_engine_cfg(
                     };
                     return match sm.catalog().types.iter().find(|t| t.name == name) {
                         Some(t) => OpResult::Got(
-                            kessel_catalog::encode_type_def(&t.name, &t.fields),
+                            kessel_catalog::encode_type_def(&t.name, &t.fields).into(),
                         ),
                         None => OpResult::NotFound,
                     };
@@ -966,7 +966,7 @@ pub fn spawn_engine_cfg(
                         let fc = t.fields.len().min(u16::MAX as usize) as u16;
                         out.extend_from_slice(&fc.to_le_bytes());
                     }
-                    return OpResult::Got(out);
+                    return OpResult::Got(out.into());
                 }
                 Some(&LIST_INDEXES_TAG) => {
                     // SP-PG-CAT T8a: enumerate indexes on the named
@@ -1036,7 +1036,7 @@ pub fn spawn_engine_cfg(
                             out.extend_from_slice(&f.to_le_bytes());
                         }
                     }
-                    return OpResult::Got(out);
+                    return OpResult::Got(out.into());
                 }
                 Some(&LIST_CONSTRAINTS_TAG) => {
                     // SP-PG-CAT T8a: enumerate constraints on the
@@ -1137,7 +1137,7 @@ pub fn spawn_engine_cfg(
                             out.extend_from_slice(&a.to_le_bytes());
                         }
                     }
-                    return OpResult::Got(out);
+                    return OpResult::Got(out.into());
                 }
                 Some(&TXN_TAG) => {
                     // Compile every buffered statement, then apply them as
@@ -1286,7 +1286,7 @@ pub fn spawn_engine_cfg(
                                 );
                                 payload.extend_from_slice(&e);
                             }
-                            OpResult::Got(payload)
+                            OpResult::Got(payload.into())
                         }
                         None => OpResult::SchemaError(
                             "malformed pipeline frame".into(),
@@ -3075,7 +3075,7 @@ mod tests {
         );
         assert_eq!(
             c.call(&Op::GetById { type_id: 1, id }).unwrap(),
-            OpResult::Got(vec![7, 7, 7])
+            OpResult::Got(vec![7, 7, 7].into())
         );
         assert_eq!(
             c.call(&Op::Create { type_id: 1, id, record: vec![9] }).unwrap(),
@@ -3085,7 +3085,7 @@ mod tests {
         let mut c2 = Client::connect(addr).unwrap();
         assert_eq!(
             c2.call(&Op::GetById { type_id: 1, id }).unwrap(),
-            OpResult::Got(vec![7, 7, 7])
+            OpResult::Got(vec![7, 7, 7].into())
         );
         // an atomic txn over the wire
         assert_eq!(
@@ -3144,7 +3144,7 @@ mod tests {
         );
         match c.sql("SELECT SUM(bal) FROM acct WHERE owner = 100").unwrap() {
             OpResult::Got(b) => {
-                assert_eq!(i128::from_le_bytes(b.try_into().unwrap()), 1049)
+                assert_eq!(i128::from_le_bytes(<[u8;16]>::try_from(b.as_ref()).unwrap()), 1049)
             }
             o => panic!("unexpected {o:?}"),
         }
@@ -3155,7 +3155,7 @@ mod tests {
         );
         match c.sql("SELECT SUM(bal) FROM acct WHERE owner = 100").unwrap() {
             OpResult::Got(b) => {
-                assert_eq!(i128::from_le_bytes(b.try_into().unwrap()), 1499)
+                assert_eq!(i128::from_le_bytes(<[u8;16]>::try_from(b.as_ref()).unwrap()), 1499)
             }
             o => panic!("unexpected {o:?}"),
         }
@@ -3331,7 +3331,7 @@ mod tests {
         let mut rec = recovered;
         assert_eq!(
             rec.apply(1, Op::GetById { type_id: 1, id }),
-            OpResult::Got(vec![5, 0, 0, 0, 0, 0, 0, 0])
+            OpResult::Got(vec![5, 0, 0, 0, 0, 0, 0, 0].into())
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -3760,7 +3760,7 @@ mod tests {
         let mut c = Client::connect(addr).unwrap();
         match c.sql("SELECT COUNT(*) FROM t").unwrap() {
             OpResult::Got(b) => assert_eq!(
-                i128::from_le_bytes(b.try_into().unwrap()),
+                i128::from_le_bytes(<[u8;16]>::try_from(b.as_ref()).unwrap()),
                 total as i128,
                 "every committed row must be durable & present"
             ),
@@ -3814,7 +3814,7 @@ mod tests {
         assert!(matches!(c.sql("SELECT * FROM t ID 3").unwrap(), OpResult::Got(_)));
         match c.sql("SELECT COUNT(*) FROM t").unwrap() {
             OpResult::Got(b) => {
-                assert_eq!(i128::from_le_bytes(b.try_into().unwrap()), 3)
+                assert_eq!(i128::from_le_bytes(<[u8;16]>::try_from(b.as_ref()).unwrap()), 3)
             }
             o => panic!("unexpected {o:?}"),
         }
@@ -3864,7 +3864,7 @@ mod tests {
         let mut c2 = Client::connect(addr).unwrap();
         match c2.sql("SELECT COUNT(*) FROM t").unwrap() {
             OpResult::Got(b) => assert_eq!(
-                i128::from_le_bytes(b.try_into().unwrap()),
+                i128::from_le_bytes(<[u8;16]>::try_from(b.as_ref()).unwrap()),
                 (3 + total + 2000) as i128,
                 "all pipelined & serial rows must be durable"
             ),

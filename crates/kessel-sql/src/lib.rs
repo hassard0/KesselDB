@@ -2332,7 +2332,7 @@ mod tests {
         }
         let scalar = |sm: &mut StateMachine<MemVfs>, op: u64, q: &str| -> Vec<u8> {
             match run(sm, op, q) {
-                OpResult::Got(b) => b,
+                OpResult::Got(b) => b.to_vec(),
                 o => panic!("expected Got for `{q}`, got {o:?}"),
             }
         };
@@ -2724,7 +2724,7 @@ mod tests {
         };
         let scalar = |sm: &mut StateMachine<MemVfs>, op, q: &str| -> i128 {
             match run(sm, op, q) {
-                OpResult::Got(b) => i128::from_le_bytes(b.try_into().unwrap()),
+                OpResult::Got(b) => i128::from_le_bytes(<[u8;16]>::try_from(b.as_ref()).unwrap()),
                 o => panic!("{o:?}"),
             }
         };
@@ -2876,7 +2876,7 @@ mod tests {
                     id: kessel_proto::ObjectId::from_u128(1)
                 }
             ),
-            OpResult::Got(bal_rec(5))
+            OpResult::Got(bal_rec(5).into())
         );
 
         // Adding the guard when a current row already violates it fails
@@ -2943,12 +2943,12 @@ mod tests {
 
         // SELECT COUNT(*) WHERE owner = 100  -> 2
         match run(&mut sm, 5, "SELECT COUNT(*) FROM acct WHERE owner = 100") {
-            OpResult::Got(b) => assert_eq!(i128::from_le_bytes(b.try_into().unwrap()), 2),
+            OpResult::Got(b) => assert_eq!(i128::from_le_bytes(<[u8;16]>::try_from(b.as_ref()).unwrap()), 2),
             o => panic!("{o:?}"),
         }
         // SELECT SUM(bal) WHERE owner = 100  -> 1049
         match run(&mut sm, 6, "SELECT SUM(bal) FROM acct WHERE owner = 100") {
-            OpResult::Got(b) => assert_eq!(i128::from_le_bytes(b.try_into().unwrap()), 1049),
+            OpResult::Got(b) => assert_eq!(i128::from_le_bytes(<[u8;16]>::try_from(b.as_ref()).unwrap()), 1049),
             o => panic!("{o:?}"),
         }
         // SELECT * WHERE bal >= 50 AND owner = 100  -> 2 rows
@@ -2978,7 +2978,7 @@ mod tests {
         // DELETE then COUNT
         assert_eq!(run(&mut sm, 9, "DELETE FROM acct ID 3"), OpResult::Ok);
         match run(&mut sm, 10, "SELECT COUNT(*) FROM acct WHERE owner >= 0") {
-            OpResult::Got(b) => assert_eq!(i128::from_le_bytes(b.try_into().unwrap()), 2),
+            OpResult::Got(b) => assert_eq!(i128::from_le_bytes(<[u8;16]>::try_from(b.as_ref()).unwrap()), 2),
             o => panic!("{o:?}"),
         }
     }
@@ -3029,7 +3029,7 @@ mod tests {
         );
         let cnt = |sm: &mut StateMachine<MemVfs>, op, q: &str| -> i128 {
             match run(sm, op, q) {
-                OpResult::Got(b) => i128::from_le_bytes(b.try_into().unwrap()),
+                OpResult::Got(b) => i128::from_le_bytes(<[u8;16]>::try_from(b.as_ref()).unwrap()),
                 o => panic!("{q}: {o:?}"),
             }
         };
@@ -3117,7 +3117,7 @@ mod tests {
         );
         let cnt = |sm: &mut StateMachine<MemVfs>, op, q: &str| -> i128 {
             match run(sm, op, q) {
-                OpResult::Got(b) => i128::from_le_bytes(b.try_into().unwrap()),
+                OpResult::Got(b) => i128::from_le_bytes(<[u8;16]>::try_from(b.as_ref()).unwrap()),
                 o => panic!("{q}: {o:?}"),
             }
         };
@@ -3154,7 +3154,7 @@ mod tests {
         }
         let cnt = |sm: &mut StateMachine<MemVfs>, op, q: &str| -> i128 {
             match run(sm, op, q) {
-                OpResult::Got(b) => i128::from_le_bytes(b.try_into().unwrap()),
+                OpResult::Got(b) => i128::from_le_bytes(<[u8;16]>::try_from(b.as_ref()).unwrap()),
                 o => panic!("{q}: {o:?}"),
             }
         };
@@ -3196,7 +3196,7 @@ mod tests {
         );
         let cnt = |sm: &mut StateMachine<MemVfs>, op, q: &str| -> i128 {
             match run(sm, op, q) {
-                OpResult::Got(b) => i128::from_le_bytes(b.try_into().unwrap()),
+                OpResult::Got(b) => i128::from_le_bytes(<[u8;16]>::try_from(b.as_ref()).unwrap()),
                 o => panic!("{q}: {o:?}"),
             }
         };
@@ -3247,7 +3247,7 @@ mod tests {
         }
         let cnt = |sm: &mut StateMachine<MemVfs>, op, q: &str| -> i128 {
             match run(sm, op, q) {
-                OpResult::Got(b) => i128::from_le_bytes(b.try_into().unwrap()),
+                OpResult::Got(b) => i128::from_le_bytes(<[u8;16]>::try_from(b.as_ref()).unwrap()),
                 o => panic!("{q}: {o:?}"),
             }
         };
@@ -3507,12 +3507,12 @@ mod tests {
         }
         // a = 1 OR a >= 4  -> {1,4,5} = 3
         match run(&mut sm, 10, "SELECT COUNT(*) FROM t WHERE a = 1 OR a >= 4") {
-            OpResult::Got(b) => assert_eq!(i128::from_le_bytes(b.try_into().unwrap()), 3),
+            OpResult::Got(b) => assert_eq!(i128::from_le_bytes(<[u8;16]>::try_from(b.as_ref()).unwrap()), 3),
             o => panic!("{o:?}"),
         }
         // NOT (a = 3) -> 4
         match run(&mut sm, 11, "SELECT COUNT(*) FROM t WHERE NOT (a = 3)") {
-            OpResult::Got(b) => assert_eq!(i128::from_le_bytes(b.try_into().unwrap()), 4),
+            OpResult::Got(b) => assert_eq!(i128::from_le_bytes(<[u8;16]>::try_from(b.as_ref()).unwrap()), 4),
             o => panic!("{o:?}"),
         }
     }

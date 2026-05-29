@@ -755,7 +755,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .take()
-                .unwrap_or(OpResult::Got(self.row_bytes.clone()))
+                .unwrap_or(OpResult::Got(self.row_bytes.clone().into()))
         }
         fn describe_table(&self, name: &str) -> Option<Vec<PgColumn>> {
             if self.no_schema {

@@ -2458,7 +2458,7 @@ mod tests {
     }
     impl EngineApply for CannedRowsEngine {
         fn apply_sql(&self, _sql: &str) -> OpResult {
-            OpResult::Got(self.row_stream.clone())
+            OpResult::Got(self.row_stream.clone().into())
         }
         fn describe_table(&self, name: &str) -> Option<Vec<crate::engine::PgColumn>> {
             if name == self.table_name {
@@ -2783,7 +2783,7 @@ mod tests {
                 let trimmed = sql.trim().trim_end_matches(';').trim();
                 assert_eq!(trimmed, self.expected_sql.as_str(),
                     "engine should see param-substituted SQL");
-                OpResult::Got(Vec::new())
+                OpResult::Got(Vec::<u8>::new().into())
             }
             fn describe_table(&self, name: &str) -> Option<Vec<crate::engine::PgColumn>> {
                 if name == "t" { Some(self.cols.clone()) } else { None }
@@ -2826,7 +2826,7 @@ mod tests {
             fn apply_sql(&self, sql: &str) -> OpResult {
                 let trimmed = sql.trim().trim_end_matches(';').trim();
                 assert_eq!(trimmed, self.expected_sql.as_str());
-                OpResult::Got(Vec::new())
+                OpResult::Got(Vec::<u8>::new().into())
             }
             fn describe_table(&self, _name: &str) -> Option<Vec<crate::engine::PgColumn>> {
                 None

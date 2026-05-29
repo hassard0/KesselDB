@@ -238,6 +238,22 @@ it serializable and replica-identical. DDL / nested txns are rejected.
 SQL `BEGIN / COMMIT / ROLLBACK` (SP55) buffers statements connection-side
 and emits one `Op::Txn` at COMMIT.
 
+**Honest perf boundary (SP-Bench-Suite T3, 2026-05-28).** `Op::Txn`
+goes through `StateMachine::apply()` and takes the write lock for the
+whole transaction — *even when every inner op is read-only*. The
+Perf-A T2 parallel-read bypass (`read_only_op` dispatch) is `GetById`-only
+and does NOT compose with `Op::Txn`. Under sysbench OLTP read-only
+this surfaces as a regression N=1 → N=8 (1,241 → 641 tx/s) because
+N workers serialize on the apply lock instead of running their
+10-SELECT brackets in parallel. The KesselDB win on sysbench OLTP
+write-only is the symmetric story — apply-path is fast at the inner-op
+level (53K tx/s at N=8, 5.2× Postgres). Closing the RO/RW gap is the
+named follow-up arc **SP-Perf-A-SHARD** (sharded apply queues +
+per-shard read pools, OR routing read-only `Op::Txn` through the
+read-pool bypass when every inner op is statically detectable as
+read-only). See [`docs/BENCHMARKS.md`](BENCHMARKS.md) §3c–§3e for
+the full transaction-bracket table.
+
 ## Storage + MVCC
 
 LSM key layout has two shapes:
@@ -258,6 +274,18 @@ primitives at `u64::MAX` snapshot (reads) and `op_number` commit
 in `Storage::{get, put, delete, scan_range}` covering ~25-35 data-row
 I/O sites silently. Replicas reach byte-identical state at every
 committed log position (3-replica byte-identity tests gate this).
+
+**Read-fast-path zero-memcpy (SP-Perf-A T7, 2026-05-29).** The
+memtable + SSTable cached blocks + transaction overlay all store
+values as `Arc<[u8]>` rather than `Vec<u8>`; `Storage::get` returns
+the `Arc` clone directly so the engine's `read_only_op` bypass walks
+the byte slice without a heap copy. Combined with T2's parallel-read
+dispatch (`Arc<RwLock<StateMachine>>` reader bypass), this lifts
+point-read throughput to **~4.75M ops/sec at N=16 cores** on the
+vulcan reference server with p50 < 1 µs. The honest ceiling at
+~5M ops/sec is the `RwLock<StateMachine>` reader CAS ping-pong; the
+named follow-up **SP-Perf-A-SHARD** sharded apply queues + per-shard
+read pools is what unlocks the next order of magnitude.
 
 **Isolation**:
 
@@ -352,13 +380,39 @@ V1 scope:
   multi-statement rejected with `42601`. Streaming
   `RowDescription` → `DataRow`* → `CommandComplete` → `ReadyForQuery`
   per query.
+- **Extended Query (SP-PG-EXTQ V1, 2026-05-29)** — full V1 message set
+  `P` (Parse) / `B` (Bind) / `D` (Describe) / `E` (Execute) / `S` (Sync) /
+  `C` (Close) / `H` (Flush). Per-connection `SessionState` holds named +
+  unnamed prepared statements + portals up to
+  `MAX_PREPARED_STATEMENTS_PER_CONN = MAX_PORTALS_PER_CONN = 4096`.
+  Parse stores SQL VERBATIM (no parse, no AST cache — SQL parse errors
+  surface at Execute time so the engine catalog state governs the
+  message). Bind validates parameter format codes (V1 rejects binary
+  with `0A000` — V2 SP-PG-EXTQ-BIN), enforces parameter count vs Parse's
+  OID hints (mismatch → `08P02`), and stores text-format parameter
+  values into the portal. Describe 'S' emits ParameterDescription +
+  RowDescription/NoData; Describe 'P' emits RowDescription/NoData
+  (parameters frozen at Bind time per PG §55.2.3). Execute substitutes
+  `$N` text-format parameters into the SQL and dispatches through
+  `EngineApply::apply_sql`; `max_rows > 0` emits `PortalSuspended`
+  with buffered cursor state so a re-Execute resumes pagination.
+  Sync emits `ReadyForQuery('I')`, clears the per-connection
+  `error_state` (set on any prior dispatch error), and drops the
+  unnamed portal. Close drops the named statement or portal; CloseComplete
+  emitted on success even for missing-name no-ops per PG §55.2.3.
+  Flush triggers an outbound stream flush (no bytes, no state change).
+  **End-to-end verification**: a real `psycopg2.connect(...)` +
+  `cur.execute("SELECT * FROM pgtest WHERE id = %s", (42,))` returns
+  real rows on vulcan (SP-PG-EXTQ T5 / commit `cec17c4`). Full ORM-suite
+  smoke against SQLAlchemy + JDBC + Drizzle + Prisma is post-V1.1
+  (SP-PG-EXTQ T8 / T11 / T12 — still OPEN at the time of writing).
 - **SCRAM-SHA-256 auth** (RFC 5802 + RFC 7677, 4096 iterations) via the
   **Bearer ↔ SCRAM bridge**: the operator's `ServerConfig.token` IS the
   SCRAM password input. One credential surface; rotating the Bearer
   token rotates both HTTP-Bearer and PG-SCRAM atomically.
 - **Type-OID mapping** for KesselDB `FieldKind` → PG type catalog
   (Bool, int2/4/8, text, bytea, timestamptz, numeric). Text-format
-  wire encoding only.
+  wire encoding only — binary-format wire is V2 SP-PG-EXTQ-BIN.
 - **Cap-overflow rejection** as wire-level `ErrorResponse('S=FATAL',
   'C=53300', 'M=sorry, too many clients already')` emitted before the
   close, so libpq surfaces the structured rejection.
@@ -485,16 +539,16 @@ to every shard and unions the resulting oid sets.
 
 ### PostgreSQL wire
 
-V2 follow-ups (each its own arc):
+V2 follow-ups (each its own arc). **Extended Query has SHIPPED at V1.1
+(SP-PG-EXTQ); it is no longer on this list.** What remains:
 
-- **Extended Query** (`P` / `B` / `D` / `E` / `S` / `C` / `H` messages) —
-  mandatory for ORMs and prepared statements (SP-PG-EXTQ)
-- **Binary-format wire encoding** (per-column negotiated in `Bind`)
+- **Binary-format wire encoding** (per-column negotiated in `Bind`) —
+  SP-PG-EXTQ-BIN
 - **`RETURNING`** clause
 - **`CancelRequest`** action (V1 generates BackendKeyData but takes
   no action)
 - **GUC plumbing** for `SET timezone` etc.
-- **COPY FROM STDIN / COPY TO STDOUT**
+- **COPY FROM STDIN / COPY TO STDOUT** — SP-PG-COPY
 - **TLS** via SSLRequest 'S' reply + rustls (V1 plaintext only)
 - **MD5 auth fallback** for legacy clients (PG 14+ deprecated)
 - **SCRAM channel binding** (`SCRAM-SHA-256-PLUS`)

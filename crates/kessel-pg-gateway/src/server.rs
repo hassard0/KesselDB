@@ -357,6 +357,11 @@ pub fn run_session<
 ) -> Result<AcceptedSession, PgError> {
     // ─── Handshake ────────────────────────────────────────────────
     let session = accept(stream, token, server_nonce_fn)?;
+    // ─── Per-connection Extended Query state (SP-PG-EXTQ §3) ──────
+    // Created here, lives for the lifetime of the connection, drops
+    // cleanly on return/Terminate/EOF. The state owns its statements
+    // + portals — there is no global table to clean up.
+    let mut extq_state = crate::extq::SessionState::new();
     // ─── Query loop ───────────────────────────────────────────────
     loop {
         let mut tag_buf = [0u8; 1];
@@ -438,32 +443,148 @@ pub fn run_session<
                 return Ok(session);
             }
             other if crate::extq::recognize_extq_tag(other) => {
-                // SP-PG-EXTQ T1 — Extended-Query message tag
-                // recognized. Route into the placeholder dispatcher;
-                // T1 always returns
-                // `ExtqOutcome::Failed(NotYetImplemented)` which
-                // we render as a `0A000 feature_not_supported`
-                // ErrorResponse + ReadyForQuery (NOT close — the
-                // session stays alive so the client can retry with
-                // Simple Query). T2..T12 widens the dispatcher into
-                // real Parse / Bind / Describe / Execute / Sync /
-                // Close / Flush handling per the SP-PG-EXTQ design
-                // spec §10 task decomposition.
+                // SP-PG-EXTQ T2 — Extended-Query message tag
+                // recognized. Decode the body per the tag and route
+                // into `extq::try_dispatch_extq`. T2 implements the
+                // `P` Parse arm end-to-end (decode → dispatch →
+                // ParseComplete bytes on the wire). The other six
+                // tags (B/D/E/S/C/H) still render as `0A000`
+                // NotYetImplemented — T3..T8 widen them per the
+                // SP-PG-EXTQ §10 task decomposition.
                 //
-                // V1 contract: do NOT close the connection on an
-                // extq tag — V1's pre-SP-PG-EXTQ behavior closed,
-                // which broke clients that probe with one extq
-                // message (e.g. SQLAlchemy's `engine.connect()`
-                // probe) and then fall back to Simple Query if the
-                // probe is rejected. Emit + continue.
-                let _ = body; // T1 doesn't yet decode the body
-                let resp = crate::dispatch::error_response_then_rfq(
-                    crate::error::SEVERITY_ERROR,
-                    "0A000",
-                    "Extended Query protocol not yet implemented (SP-PG-EXTQ in progress)",
-                );
-                stream.write_all(&resp)?;
-                stream.flush()?;
+                // V1 contract preserved from T1: the connection
+                // STAYS ALIVE across an extq tag rejection so
+                // probe-then-fall-back clients (SQLAlchemy /
+                // psycopg / JDBC) can degrade to Simple Query. The
+                // V1 RFQ status byte is always `'I'` (no implicit-
+                // tx semantics inside a Sync block; that's V2
+                // SP-PG-TX).
+                let decoded = match other {
+                    crate::proto::FE_PARSE => crate::extq::proto::decode_parse(&body),
+                    crate::proto::FE_BIND => crate::extq::proto::decode_bind(&body),
+                    crate::proto::FE_DESCRIBE => crate::extq::proto::decode_describe(&body),
+                    crate::proto::FE_EXECUTE => crate::extq::proto::decode_execute(&body),
+                    crate::proto::FE_SYNC => crate::extq::proto::decode_sync(&body),
+                    crate::proto::FE_CLOSE => crate::extq::proto::decode_close(&body),
+                    crate::proto::FE_FLUSH => crate::extq::proto::decode_flush(&body),
+                    _ => unreachable!("recognize_extq_tag accepted a tag not in the seven-tag set"),
+                };
+                let message = match decoded {
+                    Ok(m) => m,
+                    Err(_) => {
+                        // Decoder rejected the body shape — `08P01
+                        // protocol_violation`. Per SP-PG-EXTQ §6
+                        // this should also set error_state so
+                        // subsequent extq messages get skipped
+                        // until Sync, but T7 owns the error-
+                        // recovery state machine — T2 emits the
+                        // single ErrorResponse + RFQ and lets the
+                        // connection continue. Decoder rejection
+                        // BEFORE the dispatcher runs means no
+                        // state mutation happened either way.
+                        let resp = crate::dispatch::error_response_then_rfq(
+                            crate::error::SEVERITY_ERROR,
+                            "08P01",
+                            "protocol violation: malformed extended-query message body",
+                        );
+                        stream.write_all(&resp)?;
+                        stream.flush()?;
+                        continue;
+                    }
+                };
+                let outcome = crate::extq::try_dispatch_extq(&mut extq_state, message);
+                match outcome {
+                    crate::extq::ExtqOutcome::Bytes(bytes) => {
+                        // Successful dispatch — emit the encoded
+                        // response frame verbatim. T2: only Parse
+                        // reaches this arm; the bytes are
+                        // ParseComplete (`1 [length=4]`). The
+                        // PG spec §55.2.3 says ReadyForQuery is
+                        // emitted only on Sync — but in V1 the
+                        // wider ORM ecosystem also tolerates a
+                        // RFQ after each extq message (eager-
+                        // flush mode per §5). For T2 we emit
+                        // ONLY the ParseComplete; the client's
+                        // subsequent Sync (T7) emits the RFQ.
+                        stream.write_all(&bytes)?;
+                        stream.flush()?;
+                    }
+                    crate::extq::ExtqOutcome::Failed(err) => {
+                        // Map the typed ExtqError → SQLSTATE per
+                        // spec §6 + §7.1.
+                        let (sqlstate, message) = match err {
+                            crate::extq::ExtqError::NotYetImplemented { tag } => (
+                                "0A000",
+                                format!(
+                                    "Extended Query message '{tag_char}' (0x{tag:02X}) not yet implemented (SP-PG-EXTQ in progress)",
+                                    tag_char = tag as char,
+                                ),
+                            ),
+                            crate::extq::ExtqError::Decode { reason } => (
+                                "08P01",
+                                format!("protocol violation: {reason}"),
+                            ),
+                            crate::extq::ExtqError::TooManyPreparedStatements => (
+                                "08P01",
+                                format!(
+                                    "too many prepared statements (max {} per connection)",
+                                    crate::extq::MAX_PREPARED_STATEMENTS_PER_CONN
+                                ),
+                            ),
+                            crate::extq::ExtqError::TooManyPortals => (
+                                "08P01",
+                                format!(
+                                    "too many portals (max {} per connection)",
+                                    crate::extq::MAX_PORTALS_PER_CONN
+                                ),
+                            ),
+                            crate::extq::ExtqError::BinaryFormatNotSupported { position } => (
+                                "0A000",
+                                format!(
+                                    "binary-format parameters not supported in V1 (position {position}); client must request text-format (format code 0)"
+                                ),
+                            ),
+                            crate::extq::ExtqError::UnknownStatement { name } => (
+                                "26000",
+                                format!("prepared statement \"{name}\" does not exist"),
+                            ),
+                            crate::extq::ExtqError::UnknownPortal { name } => (
+                                "34000",
+                                format!("portal \"{name}\" does not exist"),
+                            ),
+                            crate::extq::ExtqError::PreparedStatementAlreadyExists { name } => (
+                                "42P05",
+                                format!("prepared statement \"{name}\" already exists"),
+                            ),
+                        };
+                        // Same "stay alive" contract as the T1
+                        // branch — emit ErrorResponse + RFQ and
+                        // continue. T7 will refine this for the
+                        // skip-until-Sync semantics inside a
+                        // pipelined block.
+                        let resp = crate::dispatch::error_response_then_rfq(
+                            crate::error::SEVERITY_ERROR,
+                            sqlstate,
+                            &message,
+                        );
+                        stream.write_all(&resp)?;
+                        stream.flush()?;
+                    }
+                    crate::extq::ExtqOutcome::SyncCompleted => {
+                        // T7 wires the Sync handler. Until then,
+                        // Sync hits the NotYetImplemented arm
+                        // above, so this branch is unreachable in
+                        // T2 — but exhaustive `match` requires
+                        // it. Emit RFQ('I') defensively so a
+                        // future T7 refactor that switches `Sync`
+                        // to return `SyncCompleted` doesn't
+                        // silently break this call site.
+                        let mut rfq = Vec::with_capacity(6);
+                        rfq.extend_from_slice(&[crate::proto::BE_READY_FOR_QUERY, 0, 0, 0, 5, b'I']);
+                        stream.write_all(&rfq)?;
+                        stream.flush()?;
+                    }
+                }
                 continue;
             }
             other => {
@@ -1067,20 +1188,23 @@ mod tests {
         assert_eq!(session.user, "test");
     }
 
-    /// SP-PG-EXTQ T1 — extended-query 'P' Parse message is now
-    /// recognized as an extq tag, dispatched to the placeholder
-    /// `try_dispatch_extq`, and rendered as a `0A000
-    /// feature_not_supported` ErrorResponse + ReadyForQuery — the
-    /// SESSION STAYS ALIVE so clients that probe with one extq
-    /// message can fall back to Simple Query. Pre-SP-PG-EXTQ V1
-    /// closed the connection here with `08P01`; this test flips to
-    /// lock the new "tolerant" behavior. T2..T12 widens the
-    /// dispatcher into real Parse handling.
+    /// SP-PG-EXTQ T2 — extended-query 'P' Parse with a valid body
+    /// is now decoded + dispatched and produces the byte-locked
+    /// 5-byte ParseComplete envelope (`1 [length=4]`) on the wire.
+    /// No `0A000` (the T1 placeholder behavior) — Parse is now a
+    /// real handler. No `08P01` (the pre-SP-PG-EXTQ V1 close-on-
+    /// extq behavior). The session stays alive through the Parse
+    /// and the subsequent Terminate closes cleanly.
+    ///
+    /// Headline KAT — the SP-PG-EXTQ §13 acceptance criteria #2
+    /// (psql `\bind` extended-query path emits a parseable
+    /// response) depends on this byte sequence.
     #[test]
-    fn t1_extq_run_session_parse_tag_emits_0a000_and_stays_alive() {
+    fn t2_extq_run_session_parse_tag_emits_parse_complete() {
         let token = b"kessel-bearer-token";
-        // Extended-query 'P' Parse message — extq T1 reject with 0A000.
-        // Follow it with a Terminate so the session closes cleanly.
+        // Extended-query 'P' Parse body:
+        //   name="" + "\0" + sql="SELECT 1" + "\0" + param_count=0 (i16 BE)
+        // → 12 bytes payload total.
         let mut extra = {
             let payload: &[u8] = b"\0SELECT 1\0\0\0";
             let length = (4 + payload.len()) as u32;
@@ -1106,17 +1230,135 @@ mod tests {
             || "serverN".to_string(),
             &engine,
         )
-        .expect("session stays alive across extq rejection then Terminate");
+        .expect("session stays alive across Parse + Terminate");
         assert_eq!(session.user, "test");
-        // Outbound bytes contain SQLSTATE 0A000 (feature_not_supported).
+
+        let out = &pipe.outbound;
+        // ParseComplete must appear in the outbound stream — locked
+        // byte-for-byte against spec §9.
+        let parse_complete: &[u8] = &[b'1', 0, 0, 0, 4];
         assert!(
-            pipe.outbound.windows(5).any(|w| w == b"0A000"),
-            "outbound must contain SQLSTATE 0A000 for the extq rejection"
+            out.windows(parse_complete.len()).any(|w| w == parse_complete),
+            "outbound must carry the 5-byte ParseComplete envelope"
         );
-        // 0A000 must NOT be `08P01` (the pre-SP-PG-EXTQ V1 behavior).
+        // The pre-T2 0A000 NYI ErrorResponse must NOT appear.
         assert!(
-            !pipe.outbound.windows(5).any(|w| w == b"08P01"),
-            "outbound MUST NOT carry the pre-SP-PG-EXTQ 08P01 for an extq tag"
+            !out.windows(5).any(|w| w == b"0A000"),
+            "T2 Parse should NOT emit 0A000 — it's a real handler now"
+        );
+        // The pre-SP-PG-EXTQ 08P01 must NOT appear either.
+        assert!(
+            !out.windows(5).any(|w| w == b"08P01"),
+            "Parse on the extq path must NEVER emit 08P01"
+        );
+    }
+
+    /// SP-PG-EXTQ T2 — extended-query 'B' Bind message (one of the
+    /// six still-NYI tags) STILL renders `0A000 feature_not_supported`
+    /// + RFQ and keeps the session alive. Locks the "T2 hasn't
+    /// half-shipped T3" invariant — when T3 lands, this test flips
+    /// to assert BindComplete (`2 [length=4]`) instead. Mirror tests
+    /// for D/E/S/C/H land alongside their own slices.
+    #[test]
+    fn t2_extq_run_session_bind_tag_still_emits_0a000_and_stays_alive() {
+        let token = b"kessel-bearer-token";
+        // Minimal valid 'B' Bind body:
+        //   portal="" + NUL + stmt="" + NUL + pf_count=0 (i16 BE) +
+        //   pv_count=0 (i16 BE) + rf_count=0 (i16 BE)
+        // → 8 bytes payload.
+        let mut extra = {
+            let mut payload = Vec::new();
+            payload.push(0); // portal
+            payload.push(0); // stmt
+            payload.extend_from_slice(&0i16.to_be_bytes()); // pf_count
+            payload.extend_from_slice(&0i16.to_be_bytes()); // pv_count
+            payload.extend_from_slice(&0i16.to_be_bytes()); // rf_count
+            let length = (4 + payload.len()) as u32;
+            let mut f = Vec::new();
+            f.push(b'B');
+            f.extend_from_slice(&length.to_be_bytes());
+            f.extend_from_slice(&payload);
+            f
+        };
+        extra.extend_from_slice(&build_x_frame());
+        let inbound = build_authed_inbound(
+            token,
+            "clientN",
+            "serverN",
+            "test",
+            &extra,
+        );
+        let mut pipe = Pipe::new(inbound);
+        let engine = EmptySelectEngine;
+        let session = run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("session stays alive across Bind NYI + Terminate");
+        assert_eq!(session.user, "test");
+        let out = &pipe.outbound;
+        assert!(
+            out.windows(5).any(|w| w == b"0A000"),
+            "T2 Bind should still emit 0A000 NYI (until T3)"
+        );
+        // 0A000, not 08P01 — Bind is on the extq path so it must
+        // stay alive.
+        assert!(
+            !out.windows(5).any(|w| w == b"08P01"),
+            "Bind on the extq path must NOT emit 08P01"
+        );
+    }
+
+    /// SP-PG-EXTQ T2 — a Parse body that the decoder REJECTS (e.g.
+    /// missing-NUL in the name cstring) emits `08P01 protocol_
+    /// violation` + RFQ. The session STAYS ALIVE — a malformed
+    /// extq frame is still on the extq path; the connection isn't
+    /// closed. Locks the decoder-reject error path against future
+    /// drift to e.g. `0A000` or a connection close.
+    #[test]
+    fn t2_extq_run_session_parse_malformed_body_emits_08p01_and_stays_alive() {
+        let token = b"kessel-bearer-token";
+        // Malformed Parse body: 4 bytes "user" with NO NUL terminator
+        // — the cstring decoder rejects with MissingNul.
+        let mut extra = {
+            let payload: &[u8] = b"user";
+            let length = (4 + payload.len()) as u32;
+            let mut f = Vec::new();
+            f.push(b'P');
+            f.extend_from_slice(&length.to_be_bytes());
+            f.extend_from_slice(payload);
+            f
+        };
+        extra.extend_from_slice(&build_x_frame());
+        let inbound = build_authed_inbound(
+            token,
+            "clientN",
+            "serverN",
+            "test",
+            &extra,
+        );
+        let mut pipe = Pipe::new(inbound);
+        let engine = EmptySelectEngine;
+        let session = run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("session stays alive across malformed Parse + Terminate");
+        assert_eq!(session.user, "test");
+        assert!(
+            pipe.outbound.windows(5).any(|w| w == b"08P01"),
+            "outbound must contain SQLSTATE 08P01 for the decoder rejection"
+        );
+        // 5-byte ParseComplete must NOT appear (the dispatcher
+        // never ran on a malformed body).
+        let parse_complete: &[u8] = &[b'1', 0, 0, 0, 4];
+        assert!(
+            !pipe.outbound.windows(parse_complete.len()).any(|w| w == parse_complete),
+            "ParseComplete must NOT appear when decoder rejects"
         );
     }
 

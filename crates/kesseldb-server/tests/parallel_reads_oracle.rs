@@ -250,7 +250,7 @@ fn seed_data(engine: &EngineHandle) {
         let r = engine.apply(Op::SeqAppend {
             payload: i.to_le_bytes().to_vec(),
         });
-        assert!(matches!(r, OpResult::SeqAppended(_)), "seq seed at {i}: {r:?}");
+        assert!(matches!(r, OpResult::Got(_)), "seq seed at {i}: {r:?}");
     }
 }
 

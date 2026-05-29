@@ -18,6 +18,7 @@
 #![forbid(unsafe_code)]
 
 mod drivers;
+mod tpch;
 mod workloads;
 
 use clap::Parser;
@@ -59,6 +60,13 @@ struct Cli {
     /// Default matches upstream sysbench `--table_size=100000`.
     #[arg(long, default_value_t = 100_000)]
     rows_per_table: usize,
+
+    /// TPC-H scale factor (default 0.01 ≈ 60K `lineitem` rows). SF=1 →
+    /// ~6M rows; we ship SF=0.01 in V1 so all measured DBs complete the
+    /// query family in the bench window on vulcan without paging. Only
+    /// consulted for `--workload tpch-q1` / `tpch-q6`.
+    #[arg(long, default_value_t = 0.01)]
+    sf: f64,
 
     /// Trials per (db, workload, connections) — median reported.
     #[arg(long, default_value_t = 3)]
@@ -126,7 +134,7 @@ fn main() -> anyhow::Result<()> {
     let out_file = File::create(&cli.output)?;
     let mut out = BufWriter::new(out_file);
 
-    let workload = workloads::parse_workload(&cli.workload)?;
+    let workload = workloads::parse_workload(&cli.workload)?.with_tpch_sf(cli.sf);
 
     let started = Instant::now();
     let mut total_runs = 0usize;

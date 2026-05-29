@@ -23,6 +23,7 @@ kessel-proto = { path = "../../crates/kessel-proto" }
 kessel-io = { path = "../../crates/kessel-io" }
 kessel-catalog = { path = "../../crates/kessel-catalog" }
 kessel-codec = { path = "../../crates/kessel-codec" }
+kessel-expr = { path = "../../crates/kessel-expr" }
 kessel-sm = { path = "../../crates/kessel-sm" }
 
 # External DB drivers.

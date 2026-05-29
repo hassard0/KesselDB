@@ -84,6 +84,8 @@ pub fn run(
 ) -> anyhow::Result<BenchResult> {
     if workload.is_sysbench() {
         run_sysbench_oltp(*workload, n, trial, cli)
+    } else if workload.is_tpch() {
+        super::kesseldb_tpch::run_tpch(*workload, n, trial, cli)
     } else {
         run_ycsb_mixed(*workload, n, trial, cli)
     }

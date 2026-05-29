@@ -193,6 +193,14 @@ pub fn run(
              not map honestly onto TB's ledger model. We refuse to translate \
              — see drivers/tigerbeetle.rs header + BENCHMARKS.md §3c/§3d/§3e."
         }
+        Workload::TpchQ1 { .. } | Workload::TpchQ6 { .. } => {
+            "TigerBeetle has no SQL aggregate primitive. The TPC-H \
+             workloads (lineitem table + SUM/AVG/COUNT/GROUP BY) do not \
+             map onto TB's account/transfer ledger model — there is no \
+             arbitrary-WHERE filtered scan, no GROUP BY, no SUM-over- \
+             column aggregate. We refuse to translate. See \
+             drivers/tigerbeetle.rs header + BENCHMARKS.md §3f/§3g."
+        }
     };
     Ok(BenchResult {
         db: "tigerbeetle".into(),

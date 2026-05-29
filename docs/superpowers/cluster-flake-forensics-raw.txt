@@ -1,0 +1,87 @@
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:25:04.3799614Z [36;1mFAILED=$(grep -E "^test result:" test-default.log | awk '{p+=$6} END {print p+0}')[0m
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:25:04.3799943Z [36;1mecho "DEFAULT=$PASSED/$FAILED"[0m
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:25:04.3800246Z [36;1mif [ "$FAILED" != "0" ]; then echo "::error::default tests failed"; exit 1; fi[0m
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.5071521Z test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.5087513Z test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.5101028Z test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.5115843Z test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.5122628Z test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.5139548Z test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.5205758Z test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.5225931Z test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.5249437Z test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.5256889Z test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.5277402Z test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.5287900Z test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.5306239Z test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.5316485Z test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.7048790Z test result: ok. 80 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.7062873Z test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.7073661Z test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.7103823Z test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.7113525Z test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.7129182Z test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.7145121Z test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.7473836Z test result: ok. 624 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.7488620Z test sp151_thread_local_cap_restored_after_failed_extract ... ok
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.7494210Z test result: ok. 63 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.7558076Z test error::tests::t7_pipeline_unavailable_emits_fatal_severity_frame ... ok
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.7574180Z test error::tests::t7_unavailable_maps_to_57p03_fatal ... ok
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.7711849Z test response::tests::t6_ready_for_query_failed_tx_status ... ok
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.8239895Z test server::tests::t2_accept_bad_proof_returns_auth_failed_no_ready_for_query ... ok
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.8551547Z test result: ok. 374 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.8571374Z test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.9300816Z test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:45.9369167Z test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:46.1230239Z test result: ok. 148 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:46.1302157Z test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:46.2737791Z test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:46.5991997Z test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:46.6074227Z test result: ok. 98 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:46.6082288Z test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:46.6096945Z test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:46.6111185Z test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:46.6126159Z test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:46.7021242Z test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:46.7259222Z test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:46.8369067Z test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:46.8387062Z test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:46.9735613Z test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:46.9780799Z test result: ok. 60 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:47.3779485Z test cluster::tests::cluster_sql_cache_correct_across_ddl ... FAILED
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:47.4417615Z test cluster::tests::failover_retry_against_follower_returns_cached_reply ... ok
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:47.4780975Z test cluster::tests::cluster_client_finds_primary_and_is_exactly_once ... ok
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:48.2396312Z test cluster::tests::session_retry_is_exactly_once ... ok
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:48.2408904Z test cluster::tests::three_nodes_replicate_over_real_tcp ... FAILED
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:48.3844899Z test cluster::tests::sql_over_cluster_full_crud_and_rmw ... FAILED
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:50.2582528Z test scatter_scan::tests::a_shard_that_times_out_returns_unavailable_for_that_slot ... ok
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:50.8311121Z test scatter_scan::tests::pentest_1_shard_times_out_yields_unavailable_slot_for_that_shard ... ok
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:50.8331911Z test scatter_scan::tests::pentest_4_shard_returns_partial_then_closes_surfaces_unavailable ... ok
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:50.8334397Z test scatter_scan::tests::pentest_5_shard_dies_mid_scan_unavailable_no_thread_leak ... ok
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:50.8400916Z test scatter_scan::tests::scatter_and_merge_unavailable_propagates_and_fires_cancel ... ok
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:50.8406968Z test scatter_scan::tests::t11_oid_concat_hard_fail_propagates_unavailable ... ok
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:50.8411117Z test scatter_scan::tests::t11_oid_concat_partial_mode_omits_failed_shard ... ok
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:50.9432546Z test scatter_scan::tests::t9_partial_all_shards_fail_returns_empty_plus_full_failed_list ... ok
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:50.9513573Z test scatter_scan::tests::t9_partial_one_shard_fails_returns_others_plus_failed_marker ... ok
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:50.9515710Z test scatter_scan::tests::t9_partial_sorted_failed_shards_omitted_others_merge_correctly ... ok
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:59.2216415Z ---- cluster::tests::cluster_sql_cache_correct_across_ddl stdout ----
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:59.2217405Z thread 'cluster::tests::cluster_sql_cache_correct_across_ddl' (6611) panicked at crates/kesseldb-server/src/cluster.rs:1127:9:
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:59.2218116Z assertion `left == right` failed
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:59.2218341Z   left: Unavailable
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:59.2218570Z  right: Ok
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:59.2219602Z ---- cluster::tests::three_nodes_replicate_over_real_tcp stdout ----
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:59.2220448Z thread 'cluster::tests::three_nodes_replicate_over_real_tcp' (6723) panicked at crates/kesseldb-server/src/cluster.rs:664:9:
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:59.2220892Z assertion `left == right` failed
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:59.2221141Z   left: Unavailable
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:59.2221392Z  right: Ok
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:59.2221638Z ---- cluster::tests::sql_over_cluster_full_crud_and_rmw stdout ----
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:59.2222424Z thread 'cluster::tests::sql_over_cluster_full_crud_and_rmw' (6702) panicked at crates/kesseldb-server/src/cluster.rs:749:9:
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:59.2223096Z assertion `left == right` failed
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:59.2223302Z   left: Unavailable
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:59.2223588Z  right: Ok
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:59.2223937Z     cluster::tests::cluster_sql_cache_correct_across_ddl
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:59.2224230Z     cluster::tests::sql_over_cluster_full_crud_and_rmw
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:59.2224503Z     cluster::tests::three_nodes_replicate_over_real_tcp
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:59.2224882Z test result: FAILED. 114 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.24s
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:59.2331893Z [1m[91merror[0m: test failed, to rerun pass `-p kesseldb-server --lib`
+cargo test (workspace, release)	Default-feature test (expect 1023+/0/0)	2026-05-28T22:27:59.2423409Z ##[error]default tests failed

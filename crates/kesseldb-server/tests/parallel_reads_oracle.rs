@@ -118,18 +118,12 @@ fn build_schemas(engine: &EngineHandle) {
             Field { field_id: 2, name: "bytes".into(), kind: FieldKind::Bytes(8), nullable: false },
         ],
     );
-    assert!(matches!(
-        engine.apply(Op::CreateType { def: post_def }),
-        OpResult::TypeCreated(2)
-    ));
-    assert!(matches!(
-        engine.apply(Op::CreateIndex { type_id: 2, field_id: 0 }),
-        OpResult::Ok
-    ));
-    assert!(matches!(
-        engine.apply(Op::CreateIndex { type_id: 2, field_id: 1 }),
-        OpResult::Ok
-    ));
+    let r = engine.apply(Op::CreateType { def: post_def });
+    assert!(matches!(r, OpResult::TypeCreated(2)), "post create type: {r:?}");
+    let r = engine.apply(Op::CreateIndex { type_id: 2, field_id: 0 });
+    assert!(matches!(r, OpResult::Ok), "post eq-index field 0 (Ref): {r:?}");
+    let r = engine.apply(Op::CreateIndex { type_id: 2, field_id: 1 });
+    assert!(matches!(r, OpResult::Ok), "post eq-index field 1 (U16): {r:?}");
     // composite index on (user_id, kind)
     assert!(matches!(
         engine.apply(Op::AddCompositeIndex { type_id: 2, fields: vec![0, 1] }),

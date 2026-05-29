@@ -492,7 +492,8 @@ pub fn run_session<
                         continue;
                     }
                 };
-                let outcome = crate::extq::try_dispatch_extq(&mut extq_state, message);
+                let outcome =
+                    crate::extq::try_dispatch_extq(&mut extq_state, engine, message);
                 match outcome {
                     crate::extq::ExtqOutcome::Bytes(bytes) => {
                         // Successful dispatch — emit the encoded
@@ -567,6 +568,13 @@ pub fn run_session<
                                 "08P02",
                                 format!(
                                     "bind message supplies {actual} parameters, but prepared statement requires {expected}"
+                                ),
+                            ),
+                            crate::extq::ExtqError::BadDescribeTarget { target } => (
+                                "08P01",
+                                format!(
+                                    "Describe target byte 0x{target:02X} ({tag_char:?}) is neither 'S' (statement) nor 'P' (portal)",
+                                    tag_char = target as char,
                                 ),
                             ),
                         };

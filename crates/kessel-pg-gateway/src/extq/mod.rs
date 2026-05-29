@@ -52,7 +52,10 @@
 pub mod proto;
 pub mod response;
 
+use crate::engine::EngineApply;
 use crate::proto::{FE_BIND, FE_CLOSE, FE_DESCRIBE, FE_EXECUTE, FE_FLUSH, FE_PARSE, FE_SYNC};
+use crate::response::FieldMeta;
+use crate::types::field_kind_to_oid;
 use std::collections::HashMap;
 
 /// Spec §7.1 — per-connection cap on the number of named prepared
@@ -257,6 +260,17 @@ pub enum ExtqError {
     /// `PreparedStmt.param_oids.len()` count from Parse. Maps to
     /// SQLSTATE `08P02 protocol_violation_parameter_count`.
     ParameterCountMismatch { expected: usize, actual: usize },
+    /// SP-PG-EXTQ T4 — Describe arrived with a target byte that is
+    /// neither `'S'` (statement) nor `'P'` (portal). The decoder
+    /// catches this at decode time (`DecodeError::BadDescribeTarget`)
+    /// and the server.rs branch routes it to `08P01` via the Decode
+    /// path — but if it somehow slips through (e.g. a future direct
+    /// constructor of `ExtqMessage::Describe { target: ..., name: ...
+    /// }` that bypasses the decoder), the dispatcher rejects it here
+    /// with `08P01 protocol_violation` so the bad shape can't
+    /// silently corrupt state. Carries the offending byte for
+    /// operator diagnosis.
+    BadDescribeTarget { target: u8 },
 }
 
 /// Outcome of dispatching one extq message. T2+ widens the
@@ -306,18 +320,25 @@ pub fn recognize_extq_tag(tag: u8) -> bool {
 /// Per-message dispatcher entry point. T2+ widens each match arm.
 ///
 /// `state` carries the per-connection extq state across the whole
-/// session; `message` is the decoded frontend message (one variant
-/// per tag from `extq::proto::ExtqMessage`). The return value is the
-/// outcome the caller renders to wire bytes.
+/// session; `engine` is the dispatch boundary to the storage engine
+/// (used by Describe for `describe_table` lookups, and by Execute for
+/// SQL apply — see T6); `message` is the decoded frontend message
+/// (one variant per tag from `extq::proto::ExtqMessage`). The return
+/// value is the outcome the caller renders to wire bytes.
 ///
-/// T2 contract: the `Parse` arm is REAL — installs the prepared
-/// statement under `name` (empty="" volatile slot OR a named slot)
-/// and returns `ExtqOutcome::Bytes(ParseComplete)`. The other six
-/// arms (Bind / Describe / Execute / Sync / Close / Flush) STILL
-/// return `Failed(NotYetImplemented)` — T3..T8 widen them one at a
-/// time per the SP-PG-EXTQ §10 task decomposition.
-pub fn try_dispatch_extq(
+/// T4 contract: `Parse`, `Bind`, and `Describe` arms are REAL. The
+/// other four arms (Execute / Sync / Close / Flush) STILL return
+/// `Failed(NotYetImplemented)` — T5..T8 widen them one at a time per
+/// the SP-PG-EXTQ §10 task decomposition.
+///
+/// **Engine read-only invariant.** Describe (T4) only calls
+/// `engine.describe_table()` which is the catalog-read entry point;
+/// it does NOT call `apply_sql` and does NOT mutate engine state. T6
+/// (Execute) will use `apply_sql` — but that's mid-pipeline, after
+/// the client's Bind has stored the portal.
+pub fn try_dispatch_extq<E: EngineApply + ?Sized>(
     state: &mut SessionState,
+    engine: &E,
     message: proto::ExtqMessage,
 ) -> ExtqOutcome {
     use proto::ExtqMessage as M;
@@ -357,9 +378,7 @@ pub fn try_dispatch_extq(
             param_values,
             result_formats,
         ),
-        M::Describe { .. } => {
-            ExtqOutcome::Failed(ExtqError::NotYetImplemented { tag: FE_DESCRIBE })
-        }
+        M::Describe { target, name } => dispatch_describe(state, engine, target, name),
         M::Execute { .. } => {
             ExtqOutcome::Failed(ExtqError::NotYetImplemented { tag: FE_EXECUTE })
         }
@@ -590,10 +609,220 @@ fn dispatch_bind(
     ExtqOutcome::Bytes(response::encode_bind_complete())
 }
 
+/// SP-PG-EXTQ T4 — real handler for the `D` Describe message.
+///
+/// Describe asks the server "what's the parameter shape + result-row
+/// shape" of a stored statement or portal — clients issue it BEFORE
+/// Bind/Execute so they can pre-allocate row buffers + tell the
+/// application layer the column metadata. Spec §4 + PG §55.2.3.
+///
+/// **Target byte semantics:**
+///
+/// - `'S'` (statement) — resolve `name` against `state.statements`.
+///   Missing → `UnknownStatement` → `26000 invalid_sql_statement_name`.
+///   Emit `ParameterDescription` (`t`) carrying the OIDs from Parse,
+///   followed by EITHER `RowDescription` (`T`) if the SQL is a
+///   `SELECT * FROM <table>` we can introspect via `describe_table`,
+///   OR `NoData` (`n`) if the SQL is non-SELECT or the SELECT shape
+///   doesn't match V1's `select_star_table` detector (V1 only renders
+///   whole-row SELECT; spec §11 weak-spot — V2 SP-A T14 + projection).
+///
+/// - `'P'` (portal) — resolve `name` against `state.portals`. Missing
+///   → `UnknownPortal` → `34000 invalid_cursor_name`. Then resolve the
+///   portal's `stmt_name` against `state.statements` — a portal-
+///   without-stmt is defensively `UnknownStatement` → `26000` (T3's
+///   Bind validation prevents this in production, but the dispatcher
+///   locks the regression in case a future Close 'S' before a
+///   Describe 'P' on a portal that referenced that stmt got out of
+///   sync). Emit `RowDescription` / `NoData` per the same shape as
+///   `'S'`, **but NOT ParameterDescription** — portals have already
+///   absorbed the parameter values at Bind time (spec §4 + PG
+///   §55.2.3 explicitly: "Describe with a portal name returns only
+///   RowDescription/NoData; ParameterDescription is statement-only
+///   because the portal's parameters have been frozen by Bind").
+///
+/// - Anything else — `BadDescribeTarget { target }` → `08P01`. The
+///   `decode_describe` path catches this at decode time (returns
+///   `DecodeError::BadDescribeTarget`), but the dispatcher
+///   re-validates so a direct constructor of the message variant
+///   can't bypass.
+///
+/// **Error-recovery side-effect** (spec §6): on ANY error from this
+/// helper, set `state.error_state = true` BEFORE returning so
+/// subsequent pipelined messages until Sync hit the early-skip
+/// branch at the top of `try_dispatch_extq`. Same shape as
+/// `dispatch_bind` (T3).
+///
+/// **RowDescription detection.** V1 reuses the Simple Query path's
+/// detection: `kessel_sql::select_star_table(sql)` returns
+/// `Some(table_name)` iff the SQL is the V1-rendered shape `SELECT *
+/// FROM <table>` (no projection, no JOIN). If we get a table name,
+/// `engine.describe_table(&table)` gives us the columns; if EITHER
+/// returns `None`, we emit `NoData` (the client can still Execute —
+/// the SQL might be a CREATE/INSERT/UPDATE/DELETE/etc., which V1
+/// doesn't emit RowDescription for). Locked invariant: the
+/// RowDescription bytes here are byte-equal to what
+/// `dispatch_query` emits for the same `SELECT * FROM <table>` —
+/// guaranteed by sharing the encoder.
+fn dispatch_describe<E: EngineApply + ?Sized>(
+    state: &mut SessionState,
+    engine: &E,
+    target: u8,
+    name: String,
+) -> ExtqOutcome {
+    let set_err = |s: &mut SessionState, e: ExtqError| -> ExtqOutcome {
+        s.error_state = true;
+        ExtqOutcome::Failed(e)
+    };
+
+    match target {
+        crate::proto::DESCRIBE_TARGET_STATEMENT => {
+            // 'S' — describe the named statement directly.
+            // Resolve + extract what we need from the borrow before
+            // calling the engine (the engine call would have to share
+            // the &state borrow otherwise).
+            let (sql, param_oids) = match state.statements.get(&name) {
+                Some(prep) => (prep.sql.clone(), prep.param_oids.clone()),
+                None => return set_err(state, ExtqError::UnknownStatement { name }),
+            };
+            let mut out = response::encode_parameter_description(&param_oids);
+            out.extend_from_slice(&row_description_or_no_data_for_sql(engine, &sql));
+            ExtqOutcome::Bytes(out)
+        }
+        crate::proto::DESCRIBE_TARGET_PORTAL => {
+            // 'P' — describe the named portal's underlying statement.
+            let stmt_name = match state.portals.get(&name) {
+                Some(p) => p.stmt_name.clone(),
+                None => return set_err(state, ExtqError::UnknownPortal { name }),
+            };
+            // Defensive: a portal-without-stmt should NEVER happen
+            // because T3's `dispatch_bind` rejected on UnknownStatement
+            // before storing the portal. But locking the invariant
+            // here is cheap and catches a future regression where
+            // Close 'S' runs before Describe 'P' (planned for T8 —
+            // until then the lookup must succeed).
+            let sql = match state.statements.get(&stmt_name) {
+                Some(prep) => prep.sql.clone(),
+                None => return set_err(state, ExtqError::UnknownStatement { name: stmt_name }),
+            };
+            // Portals do NOT emit ParameterDescription — Bind froze
+            // the parameter values, so the client already knows them.
+            // Spec §4 + PG §55.2.3.
+            ExtqOutcome::Bytes(row_description_or_no_data_for_sql(engine, &sql))
+        }
+        other => set_err(state, ExtqError::BadDescribeTarget { target: other }),
+    }
+}
+
+/// SP-PG-EXTQ T4 helper — compute the RowDescription bytes for a
+/// stored SQL string (if the SQL is a V1-renderable `SELECT * FROM
+/// <table>` whose schema the engine can describe), or the NoData
+/// bytes otherwise.
+///
+/// V1 mirrors the Simple Query path EXACTLY:
+/// - `kessel_sql::select_star_table(sql)` returns `Some(table)` iff
+///   the SQL is the V1 whole-row SELECT shape.
+/// - `engine.describe_table(&table)` returns the column list for the
+///   PG OID conversion + FieldMeta build.
+///
+/// If either step yields `None`, the SQL doesn't produce a result
+/// set V1 can render — emit `NoData`. INSERT/UPDATE/DELETE/CREATE/
+/// DROP all flow here; so does a SELECT-with-projection that V1
+/// can't introspect (the client gets NoData, which is the correct
+/// "no row metadata available pre-Execute" answer; at Execute time
+/// V1 will emit ErrorResponse 0A000 for the projection — but that
+/// happens at Execute, NOT at Describe, so the Describe path stays
+/// honest about what it knows).
+///
+/// **Byte-equality invariant with Simple Query.** A
+/// `SELECT * FROM t` whose Describe RowDescription bytes here MUST
+/// equal the RowDescription bytes the Simple Query path emits for
+/// the same SQL — clients (especially asyncpg + JDBC) compare these
+/// across the Extended-Query Describe response and the Simple Query
+/// response to detect a server bug. We get this for free by sharing
+/// `response::encode_row_description` with the Simple Query path.
+fn row_description_or_no_data_for_sql<E: EngineApply + ?Sized>(
+    engine: &E,
+    sql: &str,
+) -> Vec<u8> {
+    // Same trim shape `dispatch_query` uses: strip a trailing `;` and
+    // surrounding whitespace so a client `SELECT * FROM t;` matches.
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let table_name = match kessel_sql::select_star_table(trimmed) {
+        Some(t) => t,
+        None => return response::encode_no_data(),
+    };
+    let cols = match engine.describe_table(&table_name) {
+        Some(c) => c,
+        None => return response::encode_no_data(),
+    };
+    let fields: Vec<FieldMeta> = cols
+        .iter()
+        .map(|c| FieldMeta {
+            name: c.name.clone(),
+            type_oid: field_kind_to_oid(c.kind),
+        })
+        .collect();
+    crate::response::encode_row_description(&fields)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::PgColumn;
     use crate::proto::*;
+    use kessel_catalog::FieldKind;
+    use kessel_proto::OpResult;
+
+    // ───────────────────────────────────────────────────────────────────
+    // Test engines.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// A minimal engine that returns `None` for every `describe_table`
+    /// lookup. Used by T1/T2/T3 dispatcher KATs that don't exercise the
+    /// engine boundary — Describe (T4) is the first dispatcher that
+    /// actually consults `describe_table`, so non-Describe KATs only
+    /// need the engine to satisfy the type signature.
+    struct NoSchemaEngine;
+    impl EngineApply for NoSchemaEngine {
+        fn apply_sql(&self, _sql: &str) -> OpResult {
+            OpResult::SchemaError("not used".into())
+        }
+        fn describe_table(&self, _name: &str) -> Option<Vec<PgColumn>> {
+            None
+        }
+    }
+
+    /// A canned-schema engine: returns a fixed two-column shape for
+    /// table "t" (id i64 NOT NULL + name char(64) NULL) — matches the
+    /// classic minimal SELECT-renderable shape — and `None` for every
+    /// other table name. Used by T4 KATs to verify the Describe 'S' /
+    /// 'P' RowDescription bytes match the Simple Query path's bytes
+    /// for `SELECT * FROM t`.
+    struct CannedTwoColEngine;
+    impl EngineApply for CannedTwoColEngine {
+        fn apply_sql(&self, _sql: &str) -> OpResult {
+            OpResult::SchemaError("not used".into())
+        }
+        fn describe_table(&self, name: &str) -> Option<Vec<PgColumn>> {
+            if name == "t" {
+                Some(vec![
+                    PgColumn {
+                        name: "id".into(),
+                        kind: FieldKind::I64,
+                        nullable: false,
+                    },
+                    PgColumn {
+                        name: "name".into(),
+                        kind: FieldKind::Char(64),
+                        nullable: true,
+                    },
+                ])
+            } else {
+                None
+            }
+        }
+    }
 
     // ───────────────────────────────────────────────────────────────────
     // T1 KATs — lock the scaffold invariants. Every constant + state
@@ -698,23 +927,17 @@ mod tests {
         assert!(matches!(e, ExecState::Pending));
     }
 
-    /// SP-PG-EXTQ T3 — the FIVE still-NYI tags (Describe / Execute /
-    /// Sync / Close / Flush) return `Failed(NotYetImplemented { tag })`.
-    /// Parse + Bind are NO LONGER on this list — T2 implements
-    /// Parse, T3 implements Bind. See `t3_dispatch_bind_unnamed_*`
-    /// for the Bind-success lock. As T4..T8 land each will flip the
-    /// corresponding arm of this test to its real outcome.
+    /// SP-PG-EXTQ T4 — the FOUR still-NYI tags (Execute / Sync /
+    /// Close / Flush) return `Failed(NotYetImplemented { tag })`.
+    /// Parse + Bind + Describe are NO LONGER on this list — T2
+    /// implements Parse, T3 implements Bind, T4 implements Describe.
+    /// See `t4_dispatch_describe_*` for the Describe-success locks.
+    /// As T5..T8 land each will flip the corresponding arm of this
+    /// test to its real outcome.
     #[test]
-    fn t3_try_dispatch_returns_not_yet_implemented_for_the_five_non_parse_non_bind_tags() {
+    fn t4_try_dispatch_returns_not_yet_implemented_for_the_four_remaining_tags() {
         let mut state = SessionState::new();
         let cases: Vec<(proto::ExtqMessage, u8)> = vec![
-            (
-                proto::ExtqMessage::Describe {
-                    target: b'S',
-                    name: String::new(),
-                },
-                FE_DESCRIBE,
-            ),
             (
                 proto::ExtqMessage::Execute {
                     portal: String::new(),
@@ -733,7 +956,7 @@ mod tests {
             (proto::ExtqMessage::Flush, FE_FLUSH),
         ];
         for (msg, expected_tag) in cases {
-            match try_dispatch_extq(&mut state, msg) {
+            match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
                 ExtqOutcome::Failed(ExtqError::NotYetImplemented { tag }) => {
                     assert_eq!(tag, expected_tag);
                 }
@@ -742,7 +965,7 @@ mod tests {
                 ),
             }
         }
-        // The five still-NYI dispatchers do NOT mutate state.
+        // The four still-NYI dispatchers do NOT mutate state.
         assert_eq!(state.statement_count(), 0);
         assert_eq!(state.portal_count(), 0);
         assert!(!state.in_error_state());
@@ -764,7 +987,7 @@ mod tests {
             sql: "SELECT 1".to_string(),
             param_oids: vec![],
         };
-        match try_dispatch_extq(&mut state, msg) {
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
             ExtqOutcome::Bytes(b) => {
                 // Byte-locked: spec §9 ParseComplete envelope.
                 assert_eq!(b, vec![b'1', 0, 0, 0, 4]);
@@ -792,7 +1015,7 @@ mod tests {
             sql: "SELECT $1::int".to_string(),
             param_oids: vec![23 /* PG_TYPE_INT4 */],
         };
-        match try_dispatch_extq(&mut state, msg) {
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
             ExtqOutcome::Bytes(b) => assert_eq!(b, vec![b'1', 0, 0, 0, 4]),
             other => panic!("expected Bytes(ParseComplete), got {other:?}"),
         }
@@ -816,7 +1039,7 @@ mod tests {
             sql: "SELECT 1".to_string(),
             param_oids: vec![],
         };
-        match try_dispatch_extq(&mut state, m1) {
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, m1) {
             ExtqOutcome::Bytes(_) => {}
             other => panic!("first Parse should succeed, got {other:?}"),
         }
@@ -826,7 +1049,7 @@ mod tests {
             sql: "SELECT 2".to_string(),
             param_oids: vec![],
         };
-        match try_dispatch_extq(&mut state, m2) {
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, m2) {
             ExtqOutcome::Failed(ExtqError::PreparedStatementAlreadyExists { name }) => {
                 assert_eq!(name, "pst1");
             }
@@ -850,7 +1073,7 @@ mod tests {
             param_oids: vec![],
         };
         assert!(matches!(
-            try_dispatch_extq(&mut state, m1),
+            try_dispatch_extq(&mut state, &NoSchemaEngine, m1),
             ExtqOutcome::Bytes(_)
         ));
         // Second Parse: SELECT 2 into "" — replaces silently.
@@ -859,7 +1082,7 @@ mod tests {
             sql: "SELECT 2".to_string(),
             param_oids: vec![25 /* PG_TYPE_TEXT */],
         };
-        match try_dispatch_extq(&mut state, m2) {
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, m2) {
             ExtqOutcome::Bytes(b) => assert_eq!(b, vec![b'1', 0, 0, 0, 4]),
             other => panic!("expected Bytes(ParseComplete), got {other:?}"),
         }
@@ -882,7 +1105,7 @@ mod tests {
             sql: String::new(),
             param_oids: vec![],
         };
-        match try_dispatch_extq(&mut state, msg) {
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
             ExtqOutcome::Bytes(b) => assert_eq!(b, vec![b'1', 0, 0, 0, 4]),
             other => panic!("expected Bytes(ParseComplete), got {other:?}"),
         }
@@ -904,7 +1127,7 @@ mod tests {
             sql: weird_sql.clone(),
             param_oids: vec![],
         };
-        match try_dispatch_extq(&mut state, msg) {
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
             ExtqOutcome::Bytes(_) => {}
             other => panic!("expected ParseComplete, got {other:?}"),
         }
@@ -948,7 +1171,7 @@ mod tests {
             sql: "SELECT 1".to_string(),
             param_oids: vec![],
         };
-        match try_dispatch_extq(&mut state, at_cap) {
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, at_cap) {
             ExtqOutcome::Bytes(b) => assert_eq!(b, vec![b'1', 0, 0, 0, 4]),
             other => panic!("at-cap Parse should succeed, got {other:?}"),
         }
@@ -960,7 +1183,7 @@ mod tests {
             sql: "SELECT 2".to_string(),
             param_oids: vec![],
         };
-        match try_dispatch_extq(&mut state, over_cap) {
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, over_cap) {
             ExtqOutcome::Failed(ExtqError::TooManyPreparedStatements) => {}
             other => panic!("over-cap Parse should be rejected, got {other:?}"),
         }
@@ -1002,7 +1225,7 @@ mod tests {
             sql: "NEW".to_string(),
             param_oids: vec![],
         };
-        match try_dispatch_extq(&mut state, overwrite) {
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, overwrite) {
             ExtqOutcome::Bytes(_) => {}
             other => panic!("at-cap unnamed overwrite should succeed, got {other:?}"),
         }
@@ -1019,12 +1242,30 @@ mod tests {
     /// Bind path can resolve it. Mirrors the production flow (Parse
     /// then Bind) without re-asserting Parse's KATs.
     fn seed_stmt(state: &mut SessionState, name: &str, param_oids: Vec<u32>) {
+        seed_stmt_with_sql(
+            state,
+            name,
+            &format!("SELECT 1 -- seeded under {name}"),
+            param_oids,
+        );
+    }
+
+    /// Like `seed_stmt` but the caller picks the SQL — used by T4
+    /// KATs that need a Parse-then-Describe round trip on a specific
+    /// SQL shape (e.g. `SELECT * FROM t` for the RowDescription path,
+    /// or `INSERT INTO t VALUES (1)` for the NoData path).
+    fn seed_stmt_with_sql(
+        state: &mut SessionState,
+        name: &str,
+        sql: &str,
+        param_oids: Vec<u32>,
+    ) {
         let msg = proto::ExtqMessage::Parse {
             name: name.to_string(),
-            sql: format!("SELECT 1 -- seeded under {name}"),
+            sql: sql.to_string(),
             param_oids,
         };
-        match try_dispatch_extq(state, msg) {
+        match try_dispatch_extq(state, &NoSchemaEngine, msg) {
             ExtqOutcome::Bytes(_) => {}
             other => panic!("seed Parse should succeed, got {other:?}"),
         }
@@ -1045,7 +1286,7 @@ mod tests {
             param_values: vec![],
             result_formats: vec![],
         };
-        match try_dispatch_extq(&mut state, msg) {
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
             ExtqOutcome::Bytes(b) => {
                 // Byte-locked: spec §9 BindComplete envelope.
                 assert_eq!(b, vec![b'2', 0, 0, 0, 4]);
@@ -1078,7 +1319,7 @@ mod tests {
             param_values: vec![Some(b"42".to_vec())],
             result_formats: vec![FORMAT_CODE_TEXT],
         };
-        match try_dispatch_extq(&mut state, msg) {
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
             ExtqOutcome::Bytes(b) => assert_eq!(b, vec![b'2', 0, 0, 0, 4]),
             other => panic!("expected Bytes(BindComplete), got {other:?}"),
         }
@@ -1105,7 +1346,7 @@ mod tests {
             param_values: vec![],
             result_formats: vec![],
         };
-        match try_dispatch_extq(&mut state, msg) {
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
             ExtqOutcome::Failed(ExtqError::UnknownStatement { name }) => {
                 assert_eq!(name, "does_not_exist");
             }
@@ -1133,7 +1374,7 @@ mod tests {
             param_values: vec![Some(b"1".to_vec())], // ONE value, not two
             result_formats: vec![],
         };
-        match try_dispatch_extq(&mut state, msg) {
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
             ExtqOutcome::Failed(ExtqError::ParameterCountMismatch { expected, actual }) => {
                 assert_eq!(expected, 2);
                 assert_eq!(actual, 1);
@@ -1166,7 +1407,7 @@ mod tests {
             ],
             result_formats: vec![],
         };
-        match try_dispatch_extq(&mut state, msg) {
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
             ExtqOutcome::Bytes(b) => assert_eq!(b, vec![b'2', 0, 0, 0, 4]),
             other => panic!("expected BindComplete, got {other:?}"),
         }
@@ -1188,7 +1429,7 @@ mod tests {
             param_values: vec![Some(b"a".to_vec()), Some(b"b".to_vec())],
             result_formats: vec![],
         };
-        match try_dispatch_extq(&mut state, msg) {
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
             ExtqOutcome::Failed(ExtqError::BinaryFormatNotSupported { position }) => {
                 assert_eq!(position, 1);
             }
@@ -1212,7 +1453,7 @@ mod tests {
             param_values: vec![Some(b"a".to_vec()), Some(b"b".to_vec())],
             result_formats: vec![],
         };
-        match try_dispatch_extq(&mut state, msg) {
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
             ExtqOutcome::Failed(ExtqError::BinaryFormatNotSupported { position }) => {
                 assert_eq!(position, 0);
             }
@@ -1235,7 +1476,7 @@ mod tests {
             param_values: vec![],
             result_formats: vec![],
         };
-        match try_dispatch_extq(&mut state, first) {
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, first) {
             ExtqOutcome::Bytes(_) => {}
             other => panic!("first Bind should succeed, got {other:?}"),
         }
@@ -1246,7 +1487,7 @@ mod tests {
             param_values: vec![],
             result_formats: vec![],
         };
-        match try_dispatch_extq(&mut state, second) {
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, second) {
             ExtqOutcome::Failed(ExtqError::DuplicateCursor { name }) => {
                 assert_eq!(name, "my_portal");
             }
@@ -1273,7 +1514,7 @@ mod tests {
             result_formats: vec![],
         };
         assert!(matches!(
-            try_dispatch_extq(&mut state, first),
+            try_dispatch_extq(&mut state, &NoSchemaEngine, first),
             ExtqOutcome::Bytes(_)
         ));
         // Second Bind targets stmt "pst1" through the unnamed
@@ -1285,7 +1526,7 @@ mod tests {
             param_values: vec![],
             result_formats: vec![],
         };
-        match try_dispatch_extq(&mut state, second) {
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, second) {
             ExtqOutcome::Bytes(b) => assert_eq!(b, vec![b'2', 0, 0, 0, 4]),
             other => panic!("expected BindComplete, got {other:?}"),
         }
@@ -1311,7 +1552,7 @@ mod tests {
             param_values: vec![],
             result_formats: vec![],
         };
-        match try_dispatch_extq(&mut state, msg) {
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
             ExtqOutcome::Skipped => {}
             other => panic!("expected Skipped, got {other:?}"),
         }
@@ -1352,7 +1593,7 @@ mod tests {
             param_values: vec![],
             result_formats: vec![],
         };
-        match try_dispatch_extq(&mut state, at_cap) {
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, at_cap) {
             ExtqOutcome::Bytes(b) => assert_eq!(b, vec![b'2', 0, 0, 0, 4]),
             other => panic!("at-cap Bind should succeed, got {other:?}"),
         }
@@ -1369,7 +1610,7 @@ mod tests {
             param_values: vec![],
             result_formats: vec![],
         };
-        match try_dispatch_extq(&mut state, over_cap) {
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, over_cap) {
             ExtqOutcome::Failed(ExtqError::TooManyPortals) => {}
             other => panic!("over-cap Bind should be rejected, got {other:?}"),
         }
@@ -1392,7 +1633,7 @@ mod tests {
             param_values: vec![None], // SQL NULL
             result_formats: vec![],
         };
-        match try_dispatch_extq(&mut state, msg) {
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
             ExtqOutcome::Bytes(b) => assert_eq!(b, vec![b'2', 0, 0, 0, 4]),
             other => panic!("expected BindComplete, got {other:?}"),
         }
@@ -1413,7 +1654,7 @@ mod tests {
             sql: "SELECT $1::int".to_string(),
             param_oids: vec![23],
         };
-        let pc = try_dispatch_extq(&mut state, parse);
+        let pc = try_dispatch_extq(&mut state, &NoSchemaEngine, parse);
         match pc {
             ExtqOutcome::Bytes(b) => assert_eq!(b, vec![b'1', 0, 0, 0, 4]),
             other => panic!("expected ParseComplete, got {other:?}"),
@@ -1427,7 +1668,7 @@ mod tests {
             param_values: vec![Some(b"42".to_vec())],
             result_formats: vec![FORMAT_CODE_TEXT],
         };
-        let bc = try_dispatch_extq(&mut state, bind);
+        let bc = try_dispatch_extq(&mut state, &NoSchemaEngine, bind);
         match bc {
             ExtqOutcome::Bytes(b) => assert_eq!(b, vec![b'2', 0, 0, 0, 4]),
             other => panic!("expected BindComplete, got {other:?}"),
@@ -1437,6 +1678,336 @@ mod tests {
         let p = state.get_portal("pt1").expect("portal");
         assert_eq!(p.stmt_name, "ps1");
         assert_eq!(p.param_values, vec![Some(b"42".to_vec())]);
+        assert!(!state.in_error_state());
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // T4 KATs — real Describe handler. Locks every spec §4 + §6 + §9
+    // invariant the run_session integration depends on.
+    //
+    // Two flavors:
+    //   - 'S' (statement) — emit ParameterDescription + RowDescription
+    //     or NoData.
+    //   - 'P' (portal) — emit RowDescription or NoData (NO ParameterDescription).
+    // ───────────────────────────────────────────────────────────────────
+
+    /// Spec §4 + §9: Describe 'S' on a SELECT * FROM <table> statement
+    /// emits ParameterDescription (echoing Parse's OID hints) followed
+    /// by RowDescription whose column metadata matches
+    /// `engine.describe_table` for that table. Byte-locked: the
+    /// RowDescription bytes here are identical to what the Simple
+    /// Query path emits for the same SQL — sharing the
+    /// `response::encode_row_description` encoder is what gives us
+    /// that equality.
+    #[test]
+    fn t4_dispatch_describe_statement_select_emits_param_desc_and_row_desc() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(&mut state, "ps1", "SELECT * FROM t", vec![23 /* int4 */]);
+        let msg = proto::ExtqMessage::Describe {
+            target: DESCRIBE_TARGET_STATEMENT,
+            name: "ps1".to_string(),
+        };
+        match try_dispatch_extq(&mut state, &CannedTwoColEngine, msg) {
+            ExtqOutcome::Bytes(bytes) => {
+                // ParameterDescription comes FIRST: `t [length] [count:i16] [oids:i32*]`.
+                assert_eq!(bytes[0], b't', "first byte is ParameterDescription tag");
+                // Echo of param_oids = [23] → 11 bytes total:
+                //   `t [length=10] [count=1] [oid=23]`.
+                let expected_pd = response::encode_parameter_description(&[23]);
+                assert!(
+                    bytes.starts_with(&expected_pd),
+                    "first {} bytes must be ParameterDescription({{23}})",
+                    expected_pd.len()
+                );
+                // RowDescription follows. Byte-equal to what the
+                // Simple Query path emits.
+                let rd_expected = crate::response::encode_row_description(&[
+                    FieldMeta {
+                        name: "id".into(),
+                        type_oid: field_kind_to_oid(FieldKind::I64),
+                    },
+                    FieldMeta {
+                        name: "name".into(),
+                        type_oid: field_kind_to_oid(FieldKind::Char(64)),
+                    },
+                ]);
+                assert_eq!(&bytes[expected_pd.len()..], rd_expected.as_slice());
+            }
+            other => panic!("expected Bytes(ParameterDescription + RowDescription), got {other:?}"),
+        }
+        // Describe is read-only — no state mutation, no error.
+        assert!(!state.in_error_state());
+        assert_eq!(state.statement_count(), 1);
+        assert_eq!(state.portal_count(), 0);
+    }
+
+    /// Spec §4: Describe 'S' on a NON-SELECT statement (INSERT here)
+    /// emits ParameterDescription + NoData (`n`). The PG client uses
+    /// NoData to short-circuit row-decoding setup.
+    #[test]
+    fn t4_dispatch_describe_statement_non_select_emits_param_desc_and_no_data() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(
+            &mut state,
+            "ins",
+            "INSERT INTO t (id) VALUES ($1)",
+            vec![23 /* int4 */],
+        );
+        let msg = proto::ExtqMessage::Describe {
+            target: DESCRIBE_TARGET_STATEMENT,
+            name: "ins".to_string(),
+        };
+        match try_dispatch_extq(&mut state, &CannedTwoColEngine, msg) {
+            ExtqOutcome::Bytes(bytes) => {
+                let expected_pd = response::encode_parameter_description(&[23]);
+                assert!(bytes.starts_with(&expected_pd));
+                // NoData envelope (`n [length=4]`) immediately follows.
+                let expected_nd = response::encode_no_data();
+                assert_eq!(&bytes[expected_pd.len()..], expected_nd.as_slice());
+            }
+            other => panic!("expected Bytes(PD + NoData), got {other:?}"),
+        }
+        assert!(!state.in_error_state());
+    }
+
+    /// Spec §4: Describe 'S' on a statement with NO Parse-time OID
+    /// hints emits ParameterDescription with count=0 (the 7-byte
+    /// envelope `t [length=6] [count=0]`).
+    #[test]
+    fn t4_dispatch_describe_statement_with_no_oid_hints_emits_empty_param_desc() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(&mut state, "ps_noo", "SELECT * FROM t", vec![]);
+        let msg = proto::ExtqMessage::Describe {
+            target: DESCRIBE_TARGET_STATEMENT,
+            name: "ps_noo".to_string(),
+        };
+        match try_dispatch_extq(&mut state, &CannedTwoColEngine, msg) {
+            ExtqOutcome::Bytes(bytes) => {
+                // ParameterDescription with count=0 — byte-locked
+                // 7-byte envelope.
+                let empty_pd = response::encode_parameter_description(&[]);
+                assert_eq!(empty_pd.len(), 7);
+                assert!(bytes.starts_with(&empty_pd));
+            }
+            other => panic!("expected Bytes, got {other:?}"),
+        }
+    }
+
+    /// Spec §4 / PG §55.2.3: Describe 'S' on a non-existent statement
+    /// returns `UnknownStatement` → `26000 invalid_sql_statement_name`.
+    /// Error_state is set so subsequent pipelined messages until Sync
+    /// are skipped (spec §6).
+    #[test]
+    fn t4_dispatch_describe_statement_missing_returns_26000() {
+        let mut state = SessionState::new();
+        let msg = proto::ExtqMessage::Describe {
+            target: DESCRIBE_TARGET_STATEMENT,
+            name: "ghost".to_string(),
+        };
+        match try_dispatch_extq(&mut state, &CannedTwoColEngine, msg) {
+            ExtqOutcome::Failed(ExtqError::UnknownStatement { name }) => {
+                assert_eq!(name, "ghost");
+            }
+            other => panic!("expected UnknownStatement, got {other:?}"),
+        }
+        assert!(state.in_error_state());
+    }
+
+    /// Spec §4: Describe 'P' on a SELECT portal emits ONLY
+    /// RowDescription — NO ParameterDescription (portals don't carry
+    /// parameter metadata because Bind has frozen the values). Locks
+    /// the spec §4 + PG §55.2.3 portal-vs-statement asymmetry.
+    #[test]
+    fn t4_dispatch_describe_portal_select_emits_row_desc_only() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(&mut state, "ps1", "SELECT * FROM t", vec![]);
+        // Bind a portal "pt1" → stmt "ps1".
+        let bind = proto::ExtqMessage::Bind {
+            portal: "pt1".to_string(),
+            stmt: "ps1".to_string(),
+            param_formats: vec![],
+            param_values: vec![],
+            result_formats: vec![],
+        };
+        match try_dispatch_extq(&mut state, &CannedTwoColEngine, bind) {
+            ExtqOutcome::Bytes(_) => {}
+            other => panic!("seed Bind should succeed, got {other:?}"),
+        }
+        // Describe 'P' "pt1".
+        let desc = proto::ExtqMessage::Describe {
+            target: DESCRIBE_TARGET_PORTAL,
+            name: "pt1".to_string(),
+        };
+        match try_dispatch_extq(&mut state, &CannedTwoColEngine, desc) {
+            ExtqOutcome::Bytes(bytes) => {
+                // First byte is RowDescription tag 'T' — NOT
+                // ParameterDescription 't'. PG protocol §55.2.3.
+                assert_eq!(
+                    bytes[0], b'T',
+                    "Describe 'P' must NOT emit ParameterDescription — first byte should be RowDescription 'T'"
+                );
+                // Byte-equal to the Simple-Query RowDescription for
+                // the same SQL.
+                let rd_expected = crate::response::encode_row_description(&[
+                    FieldMeta {
+                        name: "id".into(),
+                        type_oid: field_kind_to_oid(FieldKind::I64),
+                    },
+                    FieldMeta {
+                        name: "name".into(),
+                        type_oid: field_kind_to_oid(FieldKind::Char(64)),
+                    },
+                ]);
+                assert_eq!(bytes, rd_expected);
+            }
+            other => panic!("expected Bytes(RowDescription), got {other:?}"),
+        }
+        assert!(!state.in_error_state());
+    }
+
+    /// Spec §4: Describe 'P' on a non-SELECT portal emits NoData
+    /// (`n`) — NO ParameterDescription, NO RowDescription. 5-byte
+    /// envelope.
+    #[test]
+    fn t4_dispatch_describe_portal_non_select_emits_no_data() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(&mut state, "ins", "INSERT INTO t (id) VALUES ($1)", vec![]);
+        // Bind a portal "pi" → stmt "ins".
+        let bind = proto::ExtqMessage::Bind {
+            portal: "pi".to_string(),
+            stmt: "ins".to_string(),
+            param_formats: vec![],
+            param_values: vec![Some(b"1".to_vec())],
+            result_formats: vec![],
+        };
+        match try_dispatch_extq(&mut state, &CannedTwoColEngine, bind) {
+            ExtqOutcome::Bytes(_) => {}
+            other => panic!("seed Bind should succeed, got {other:?}"),
+        }
+        let desc = proto::ExtqMessage::Describe {
+            target: DESCRIBE_TARGET_PORTAL,
+            name: "pi".to_string(),
+        };
+        match try_dispatch_extq(&mut state, &CannedTwoColEngine, desc) {
+            ExtqOutcome::Bytes(bytes) => {
+                assert_eq!(bytes, response::encode_no_data());
+                assert_eq!(bytes.len(), 5);
+            }
+            other => panic!("expected Bytes(NoData), got {other:?}"),
+        }
+        assert!(!state.in_error_state());
+    }
+
+    /// Spec §4 / PG §55.2.3: Describe 'P' on a non-existent portal
+    /// returns `UnknownPortal` → `34000 invalid_cursor_name`.
+    /// Error_state is set per spec §6.
+    #[test]
+    fn t4_dispatch_describe_portal_missing_returns_34000() {
+        let mut state = SessionState::new();
+        let msg = proto::ExtqMessage::Describe {
+            target: DESCRIBE_TARGET_PORTAL,
+            name: "ghost".to_string(),
+        };
+        match try_dispatch_extq(&mut state, &CannedTwoColEngine, msg) {
+            ExtqOutcome::Failed(ExtqError::UnknownPortal { name }) => {
+                assert_eq!(name, "ghost");
+            }
+            other => panic!("expected UnknownPortal, got {other:?}"),
+        }
+        assert!(state.in_error_state());
+    }
+
+    /// Spec §6: when the dispatcher is in `error_state == true`, a
+    /// Describe message is silently dropped (`ExtqOutcome::Skipped`)
+    /// WITHOUT processing. The error_state flag is NOT cleared (only
+    /// Sync clears it — T7).
+    #[test]
+    fn t4_dispatch_describe_in_error_state_returns_skipped_without_processing() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(&mut state, "ps1", "SELECT * FROM t", vec![]);
+        state.set_error_state(true);
+        let msg = proto::ExtqMessage::Describe {
+            target: DESCRIBE_TARGET_STATEMENT,
+            name: "ps1".to_string(),
+        };
+        match try_dispatch_extq(&mut state, &CannedTwoColEngine, msg) {
+            ExtqOutcome::Skipped => {}
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+        assert!(state.in_error_state());
+    }
+
+    /// Spec §4: a Describe with an UNKNOWN target byte (decoder
+    /// catches this, but the dispatcher locks it as a defensive
+    /// rejection in case a future direct constructor of the variant
+    /// bypasses the decoder) → `BadDescribeTarget { target }` →
+    /// `08P01 protocol_violation`. Error_state is set per spec §6.
+    #[test]
+    fn t4_dispatch_describe_unknown_target_byte_returns_08p01_bad_target() {
+        let mut state = SessionState::new();
+        let msg = proto::ExtqMessage::Describe {
+            target: b'X', // neither 'S' nor 'P'
+            name: "irrelevant".to_string(),
+        };
+        match try_dispatch_extq(&mut state, &CannedTwoColEngine, msg) {
+            ExtqOutcome::Failed(ExtqError::BadDescribeTarget { target }) => {
+                assert_eq!(target, b'X');
+            }
+            other => panic!("expected BadDescribeTarget, got {other:?}"),
+        }
+        assert!(state.in_error_state());
+    }
+
+    /// HEADLINE T4 KAT: a Parse + Bind + Describe('S') round-trip
+    /// through the dispatcher composes correctly. Locks the T3 → T4
+    /// transition — Parse installs a stmt with OID hints, Bind stores
+    /// a portal referencing it, Describe('S') emits
+    /// ParameterDescription + RowDescription/NoData byte-correctly.
+    /// This is the closest in-dispatcher equivalent to the
+    /// `run_session` 4-message round trip (the final missing piece is
+    /// Sync's ReadyForQuery — T6/T7).
+    #[test]
+    fn t4_dispatch_parse_bind_describe_s_round_trip_composes() {
+        let mut state = SessionState::new();
+        // Parse: stmt "ps1" with one int4 param OID + SELECT * FROM t.
+        let parse = proto::ExtqMessage::Parse {
+            name: "ps1".to_string(),
+            sql: "SELECT * FROM t".to_string(),
+            param_oids: vec![23],
+        };
+        let pc = try_dispatch_extq(&mut state, &CannedTwoColEngine, parse);
+        match pc {
+            ExtqOutcome::Bytes(b) => assert_eq!(b, vec![b'1', 0, 0, 0, 4]),
+            other => panic!("expected ParseComplete, got {other:?}"),
+        }
+        // Bind: portal "pt1" → stmt "ps1" with one text value.
+        let bind = proto::ExtqMessage::Bind {
+            portal: "pt1".to_string(),
+            stmt: "ps1".to_string(),
+            param_formats: vec![FORMAT_CODE_TEXT],
+            param_values: vec![Some(b"42".to_vec())],
+            result_formats: vec![FORMAT_CODE_TEXT],
+        };
+        let bc = try_dispatch_extq(&mut state, &CannedTwoColEngine, bind);
+        match bc {
+            ExtqOutcome::Bytes(b) => assert_eq!(b, vec![b'2', 0, 0, 0, 4]),
+            other => panic!("expected BindComplete, got {other:?}"),
+        }
+        // Describe 'S' on "ps1".
+        let desc = proto::ExtqMessage::Describe {
+            target: DESCRIBE_TARGET_STATEMENT,
+            name: "ps1".to_string(),
+        };
+        let dc = try_dispatch_extq(&mut state, &CannedTwoColEngine, desc);
+        match dc {
+            ExtqOutcome::Bytes(bytes) => {
+                let pd = response::encode_parameter_description(&[23]);
+                assert!(bytes.starts_with(&pd));
+                // After PD, the next byte is RowDescription 'T'.
+                assert_eq!(bytes[pd.len()], b'T');
+            }
+            other => panic!("expected Bytes(PD + RD), got {other:?}"),
+        }
         assert!(!state.in_error_state());
     }
 }

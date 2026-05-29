@@ -304,6 +304,20 @@ pub const FORMAT_CODE_TEXT: u16 = 0;
 pub const FORMAT_CODE_BINARY: u16 = 1;
 
 // ───────────────────────────────────────────────────────────────────────
+// Describe / Close target bytes (PG §55.7)
+// ───────────────────────────────────────────────────────────────────────
+
+/// `S` — Describe / Close target byte for a PREPARED STATEMENT. Used
+/// by `extq::proto::decode_describe` / `decode_close` to discriminate
+/// statement-targeted from portal-targeted Describe/Close. PG §55.7.
+pub const DESCRIBE_TARGET_STATEMENT: u8 = b'S';
+
+/// `P` — Describe / Close target byte for a PORTAL. Used by
+/// `extq::proto::decode_describe` / `decode_close` to discriminate
+/// portal-targeted from statement-targeted Describe/Close. PG §55.7.
+pub const DESCRIBE_TARGET_PORTAL: u8 = b'P';
+
+// ───────────────────────────────────────────────────────────────────────
 // Length-field rules (PG §55.2.1)
 // ───────────────────────────────────────────────────────────────────────
 

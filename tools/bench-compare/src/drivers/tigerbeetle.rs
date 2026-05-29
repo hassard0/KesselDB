@@ -61,8 +61,10 @@ mod real {
         let client = Arc::new(client);
 
         // Batch size — TB accepts a hard max per batch defined by message size.
-        // Use 8K per batch, well under the limit.
-        const BATCH: usize = 8 * 1024;
+        // The 0.16.x default batch_size_limit is 8K accounts but the server
+        // enforces a tighter limit per submit; 1K is safely under the
+        // observed TooMuchData threshold on a fresh data file.
+        const BATCH: usize = 1024;
         let mut next_id: u128 = 1; // TB rejects id=0
         while (next_id as usize) <= rows {
             let mut batch = Vec::with_capacity(BATCH);

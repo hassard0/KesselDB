@@ -64,7 +64,7 @@ real streaming cursors (SP-A T14 streaming-rows). See design spec §2.2.
 | **T4** | Describe 'S' AND 'P' (both flavors in one slice — saves the T5 separation since they share the same row-shape encoder): schema lookup via existing `EngineApply::describe_table` + `kessel_sql::select_star_table`; 'S' emits ParameterDescription with the OID hints from Parse (or empty if Parse didn't provide) + RowDescription/NoData; 'P' emits RowDescription/NoData WITHOUT ParameterDescription (portals froze their parameter values at Bind time per PG §55.2.3); Missing stmt → `26000`; missing portal → `34000`; bad target byte → `08P01`. | **DONE** | `cd09784` (dispatcher + KATs) + `9e591ca` (server.rs integration KATs) |
 | **T5** | (FOLDED INTO T4) — Describe 'P' was originally a separate slice but shares the row-shape encoder with 'S'. T4 above ships both flavors together. Renumber the remaining slices in the SP-arc T6 → T5 etc. as bookkeeping, or keep the slot empty for a future Describe-related polish. | **CLOSED** | (folded into T4 `cd09784` + `9e591ca`) |
 | **T5 (was T6)** | Execute + parameter substitution + Sync + PortalSuspended pagination + result streaming — folded T7 (Sync state machine) AND T9 (max_rows + buffered cursor) into this slice because the Execute path already had to land them to be useful end-to-end. Text-format `$N` substitution via new `extq/substitute.rs` (18 KATs against the §4 edge corpus); first-Execute dispatches through `dispatch::dispatch_query` + splits the byte stream tag-by-tag; portal's `exec_state` buffers DataRow frames for re-Execute pagination; `max_rows > 0` emits `PortalSuspended` instead of `CommandComplete`; `row_description_sent` flag suppresses repeat T frames per PG §55.2.3; Sync emits RFQ('I'), clears error_state, drops unnamed portal. **HEADLINE — real psycopg2 round-trip verified on vulcan**: `cur.execute("SELECT * FROM pgtest WHERE id = %s", (42,))` returns `[(42,)]` end-to-end. | **DONE** | `61d3228` (substitute helper + 18 KATs) + `cec17c4` (Execute + Sync dispatchers + 18 KATs incl. server.rs) |
-| **T6** | Close ('S'/'P') + CloseComplete + Flush ('H'): drop stmt/portal from `SessionState`; CloseComplete emit (byte-locked T1 envelope); Flush is a no-op-emit that triggers a stream flush at the `server::run_session` boundary. Flips the T5 NYI lock for the remaining two tags. | **OPEN** | — |
+| **T6** | Close ('S'/'P') + CloseComplete + Flush ('H'): drop stmt/portal from `SessionState`; CloseComplete emit (byte-locked T1 envelope); Flush is a no-op-emit that triggers a stream flush at the `server::run_session` boundary. Flips the T5 NYI lock for the remaining two tags. **CLOSES the SP-PG-EXTQ V1 message set — all 7 frontend extq tags dispatched.** | **DONE** | `2eadd25` (dispatchers + KATs) + `63d8de3` (server.rs wire-up) |
 | **T7** | Sync state-machine hardening: V2-flavor failure-recovery (carrying transaction state out of failed Sync block — needs SP-PG-TX coupling); cross-Sync portal lifecycle audit; pipelined-error attribution improvements (spec §11 weak-spot #9). | **OPEN** | — |
 | **T8** | Real SQLAlchemy / pgx / JDBC ORM round-trip: connect via each driver; run a small CRUD suite (CREATE TABLE → INSERT × 5 → SELECT * → SELECT with param → UPDATE → DELETE); capture wire traces; log driver-specific behavior. | **OPEN** | — |
 | **T9** | Streaming-cursor (real, not buffered): when SP-A T14 streaming-rows lands, replace V1's buffer-then-page shape in `dispatch_execute` with a real streaming consumer from the engine. Per-portal RSS becomes O(batch) not O(total). | **OPEN** | — |
@@ -970,26 +970,212 @@ supported in V1` — but that's SIMPLE-QUERY-side (multiple
 invocations) DID work and returned the row through extended-query.
 The richer psycopg2 acceptance shape above is the real test.
 
-## Next session pickup — SP-PG-EXTQ T6
+## T6 — what landed (2026-05-29, commits `2eadd25` + `63d8de3`)
 
-**Slice scope**: Close ('S'/'P') + CloseComplete + Flush handlers.
+**Two commits, +15 KATs across `kessel-pg-gateway` lib + server**
+(10 mod-level + 5 server integration; net of 1 NYI-list flip), all
+pushed to main, all CI-green.
 
-- Implement `dispatch_close(state, target, name)`:
-  - `'S'` → drop the named statement (and the portals that
-    reference it, per PG semantics).
-  - `'P'` → drop the named portal.
-  - Missing name → silent no-op (PG semantics).
-  - Emit `CloseComplete` (5-byte `3 [length=4]`, byte-locked T1
-    encoder).
-- Implement `dispatch_flush(state)`:
-  - No state change; returns empty bytes (the Flush itself doesn't
-    emit a frame); the server.rs wire-up calls `stream.flush()`
-    after to honor the early-flush request.
-- Wire into server.rs Close + Flush branches.
-- Flip the T5 NYI lock to remove both → empty still-NYI list; the
-  lock becomes "every extq tag dispatches to a real handler".
+**SP-PG-EXTQ V1 MESSAGE SET COMPLETE.** Every one of the seven
+frontend Extended Query tags (Parse / Bind / Describe / Execute /
+Sync / Close / Flush) now dispatches through a REAL handler — zero
+`NotYetImplemented` arms remain in the V1 dispatcher.
 
-Estimated +6-8 lib KATs + 2-3 server KATs.
+### Commit `2eadd25` — Close + Flush dispatchers + 10 mod-level KATs
 
-After T6 lands, the SP-PG-EXTQ V1 message set is COMPLETE. T7+ ship
-hardening + real-driver compat smoke + arc closure.
+`crates/kessel-pg-gateway/src/extq/mod.rs` (+530 LoC incl. tests):
+
+- **`ExtqOutcome::Flush`** new variant — distinct from
+  `Bytes(Vec::new())` so the run_session loop can clearly see a
+  flush was requested even when no bytes are pending. Documented
+  reason: a future buffered-write rework cannot drift without
+  breaking the spec §4 / PG §55.2.3 flush-but-no-bytes contract.
+- **`dispatch_close(state, target, name)`** per spec §4 + PG
+  §55.2.3:
+  - `'S'` (statement) — drop from `state.statements`. **Silent
+    no-op** if the name doesn't exist (PG §55.2.3: "It is not an
+    error to issue Close against a nonexistent statement or portal
+    name"). Always emits `CloseComplete` (the byte-locked T1
+    encoder `response::encode_close_complete()` → 5-byte `3 00 00
+    00 04`) even on the no-op path — clients use CloseComplete as a
+    sync-point confirmation that the server saw the Close.
+  - `'P'` (portal) — drop from `state.portals` with the same silent
+    no-op + CloseComplete shape. Does NOT cascade-drop the parent
+    statement; PG preserves both lifecycles independently.
+  - Unknown target byte — `BadDescribeTarget { target }` → `08P01
+    protocol_violation` (same SQLSTATE Describe uses for bad target
+    bytes) + `state.error_state = true` (spec §6).
+- **`dispatch_flush()`** returns `ExtqOutcome::Flush` — no bytes,
+  no state mutation, no SessionState borrow. Flush does NOT touch
+  `error_state` — spec §6 explicitly: only Sync clears the flag.
+  The dispatcher's pre-skip check at the top of `try_dispatch_extq`
+  still routes Flush to `Skipped` when error_state is engaged (only
+  Sync escapes skip-until-Sync mode).
+- **T5 NYI list KAT FLIPPED → T6 "V1 complete" lock**:
+  `t5_try_dispatch_returns_not_yet_implemented_for_the_two_remaining_tags`
+  becomes `t6_try_dispatch_no_tag_returns_not_yet_implemented_v1_complete`
+  — pumps every reachable `ExtqMessage` variant through
+  `try_dispatch_extq` against a seeded state (stmt + portal +
+  state) and asserts NONE return `Failed(NotYetImplemented { tag })`.
+- **`try_dispatch_extq` contract docstring** updated: "T6 contract:
+  ALL SEVEN extq arms (Parse / Bind / Describe / Execute / Sync /
+  Close / Flush) are REAL. Zero `NotYetImplemented` returns.
+  SP-PG-EXTQ V1 message set is COMPLETE." Pre-skip-check docstring
+  updated to remove the obsolete "T7 wires that arm" comment.
+
+**+10 mod-level KATs**:
+
+1. `t6_dispatch_close_statement_drops_existing_and_emits_close_complete`
+   — happy path: pre-seed two stmts; Close('S','to_drop') drops
+   only the named one, sibling persists, CloseComplete envelope on
+   the byte-locked `[b'3', 0, 0, 0, 4]` output, no error_state.
+2. `t6_dispatch_close_statement_missing_is_silent_no_op_with_close_complete`
+   — PG §55.2.3 silent no-op: pre-seed one stmt; Close('S','ghost')
+   emits CloseComplete + leaves state untouched + no error_state.
+3. `t6_dispatch_close_portal_drops_existing_and_emits_close_complete`
+   — Close('P','drop_me') drops the named portal; sibling portal
+   persists; backing stmt persists (no cascade-drop).
+4. `t6_dispatch_close_portal_missing_is_silent_no_op_with_close_complete`
+   — silent no-op for portals mirrors statements.
+5. `t6_dispatch_close_unknown_target_byte_returns_08p01_bad_target`
+   — Close target='X' → `BadDescribeTarget { target: b'X' }` +
+   error_state engaged.
+6. `t6_dispatch_close_in_error_state_returns_skipped_without_processing`
+   — spec §6 skip-until-Sync invariant: in error_state, Close is
+   `Skipped`; statement still present; error_state still true.
+7. `t6_dispatch_flush_returns_flush_outcome_with_no_state_mutation`
+   — Flush → `ExtqOutcome::Flush`; statement_count + portal_count
+   + error_state all unchanged.
+8. `t6_dispatch_flush_in_error_state_returns_skipped` — error_state
+   pre-check catches Flush; returned as `Skipped` (Sync remains the
+   only way out).
+9. `t6_dispatch_parse_bind_execute_close_sync_full_round_trip` —
+   HEADLINE: concatenated byte stream from 5 dispatcher calls
+   carries ParseComplete + BindComplete + RowDescription + DataRow*
+   + CommandComplete + **CloseComplete** + RFQ('I'); portal
+   dropped, backing stmt persists, no SQLSTATE codes anywhere.
+10. `t6_dispatch_pipelined_close_multiple_stmts_in_one_sync_block`
+    — Close('S','a') + Close('S','b') + Sync emits the EXACT byte
+    sequence `3 00 00 00 04` × 2 + `Z 00 00 00 05 I` with NO inter-
+    frame padding; both stmts dropped.
+
+### Commit `63d8de3` — server.rs wire-up + 5 integration KATs
+
+`crates/kessel-pg-gateway/src/server.rs` (+304 LoC incl. tests):
+
+- New `match` arm `ExtqOutcome::Flush => stream.flush()?` — pushes
+  any pending pipelined output to the wire WITHOUT writing any new
+  bytes (V1 eager-flushes per message so the call is mostly a
+  no-op on the current stream shape, but the PG protocol contract
+  + asyncpg / JDBC clients require a definite flush-no-bytes call
+  here so the wiring locks the invariant against a future buffered-
+  write rework).
+- Close routes through the existing `Bytes` / `Failed(BadDescribeTarget)`
+  arms (T4 wired both); no additional Close-specific code needed
+  at the server boundary — the wire bytes flow through the
+  pre-existing T2 happy-path and T4 bad-target rejection paths.
+- New `build_close_frame(target, name)` + `build_flush_frame()`
+  test helpers byte-mirror libpq's PG §55.7 encoders.
+- New `FlushCountingPipe` Read+Write impl counts every `flush()`
+  call so the Flush KAT can verify the dispatcher's
+  `ExtqOutcome::Flush` is translated to a REAL `stream.flush()`
+  invocation. Uses `flush_calls >= 2` lower-bound assertion (Parse
+  + Flush + Sync all flush; exact count is implementation detail
+  but Flush must contribute).
+
+**+5 server integration KATs**:
+
+1. `t6_extq_run_session_parse_bind_close_p_sync_emits_close_complete_then_rfq`
+   — HEADLINE byte-locked KAT: locks the consecutive 15-byte
+   sequence `1 00 00 00 04 2 00 00 00 04 3 00 00 00 04` (PC + BC +
+   CC) + trailing 6-byte `Z 00 00 00 05 I` (RFQ from Sync) on the
+   wire + zero `0A000` in the stream.
+2. `t6_extq_run_session_close_s_missing_emits_close_complete_no_error`
+   — locks PG silent-no-op semantics: CloseComplete appears, NO
+   `26000`/`34000`/`0A000`/`08P01` SQLSTATE codes anywhere in the
+   outbound stream.
+3. `t6_extq_run_session_close_bad_target_emits_08p01_and_stays_alive`
+   — locks the decoder-rejection path: `08P01` on the wire, NO
+   CloseComplete envelope, session stays alive.
+4. `t6_extq_run_session_flush_triggers_real_flush_no_bytes_written`
+   — uses `FlushCountingPipe` to verify `flush_calls >= 2` + zero
+   `0A000` in the outbound bytes; preceding Parse's ParseComplete
+   envelope still appears.
+5. `t6_extq_run_session_pipelined_close_multiple_stmts_emits_two_close_complete`
+   — locks order-preserving pipelining: exactly 2 CloseComplete
+   envelopes in the outbound stream + they appear CONSECUTIVELY
+   (no inter-frame artifacts between them).
+
+### Test counts (release on vulcan, 2026-05-29)
+
+| Surface | Before T6 | After T6 | Delta |
+|---|---|---|---|
+| `kessel-pg-gateway` lib | 452 | 467 | +15 (10 mod + 5 server net of 1 NYI flip) |
+
+`kessel-sim` GREEN (3 / 3); default tree-grep EMPTY (zero new
+external deps — `cargo tree -p kessel-pg-gateway -e normal` is
+workspace-only); `#![forbid(unsafe_code)]` honored across all
+touched modules; HTTP/1.1 + WS + binary + PG-wire-Simple-Query
+surfaces byte-untouched. CI green at every commit.
+
+### Headline question — are ALL 7 extq frontend tags now real (not NYI)?
+
+**YES.** Parse + Bind + Describe + Execute + Sync + Close + Flush
+all route through real dispatchers. Zero `NotYetImplemented` arms
+remain in `try_dispatch_extq`. The
+`t6_try_dispatch_no_tag_returns_not_yet_implemented_v1_complete`
+KAT pumps every reachable `ExtqMessage` variant against a seeded
+session state and confirms none return `NotYetImplemented`. The
+V1 message set is COMPLETE.
+
+## Next session pickup — SP-PG-EXTQ T7 (hardening) or arc closure
+
+V1 message set is locked. Remaining slices (T7..T12) are HARDENING
+and ARC CLOSURE — they don't add new protocol surface, they verify
+the surface holds against real ORM traffic + close the SP-arc.
+
+**T7 — Sync state-machine hardening** (estimated +5-8 KATs):
+
+- V2-flavor failure-recovery (carrying transaction state out of a
+  failed Sync block — needs SP-PG-TX coupling).
+- Cross-Sync portal lifecycle audit: named portals that survive
+  Sync but DEPEND on a stmt that was Closed mid-Sync.
+- Pipelined-error attribution improvements (spec §11 weak-spot #9
+  — the silent skip-after-error makes it hard for clients to
+  attribute which message in a Sync block failed).
+- DISCARD ALL Simple-Query interception (spec §12 open question
+  #1) — clears all stmts + portals + emits CommandComplete instead
+  of routing to `apply_sql`.
+
+**T8 — Real SQLAlchemy / pgx / JDBC compat smoke** (estimated +6-10
+KATs + recorded fixtures):
+
+- Connect via each driver against a live `kesseldb-server` with
+  pg-gateway feature on vulcan.
+- Run a small CRUD suite per driver: CREATE TABLE → INSERT × 5 →
+  SELECT * → SELECT with param → UPDATE → DELETE.
+- Capture wire traces; log driver-specific behavior (e.g. JDBC's
+  `setApplicationName` GUC probe; SQLAlchemy's `DISCARD ALL` on
+  pool checkout).
+- Commit transcripts as fixture files.
+
+**T10 — Pipelining stress test** (estimated +4-6 KATs):
+
+- 100-message pipeline through one connection — ordering preserved
+  + output buffer correctness under interleaved P/B/D/E/C/H.
+- Manual psql verification of PREPARE/EXECUTE simple-query path
+  (regression check that SP-PG V1 didn't break).
+
+**T12 — Arc closure** (estimated +0-3 KATs):
+
+- USAGE.md update with the extq features.
+- Log compat gaps from T8 as named V2 follow-ups.
+- Mark this progress tracker → CLOSED.
+- Update STATUS.md row + bullet to indicate SP-PG-EXTQ V1 → CLOSED.
+
+The HEADLINE psycopg2 round-trip from T5 still holds end-to-end:
+`cur.execute("SELECT * FROM pgtest WHERE id = %s", (42,))` returns
+`[(42,)]` against the running binary, and now `cur.close()` +
+`conn.close()` also flow through real Close + Sync handlers
+(previously they hit 0A000 NYI; the client tolerated this but
+logged ugly warnings).

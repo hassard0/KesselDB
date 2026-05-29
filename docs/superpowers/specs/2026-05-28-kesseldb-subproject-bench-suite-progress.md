@@ -247,20 +247,163 @@ Raw JSON: vulcan:/tmp/bench-sysbench-{ro,wo,rw}.json (27 trial-rows each).
 
 ---
 
-## T4 — TPC-H Q1 / Q6 [PLANNED]
+## T4 — TPC-H Q1 / Q6 [DONE_WITH_CONCERNS]
 
-- lineitem table only, SF=0.01 (≈60K rows).
-- Q1: COUNT/SUM/AVG with WHERE + GROUP BY l_returnflag, l_linestatus.
-- Q6: SUM with WHERE filter only.
-- KesselDB target: Op::Aggregate / Op::GroupAggregate.
+Commits (in order):
+- `4b38363` feat(bench-compare) — TPC-H workload definitions + data
+  generator + per-driver Q1/Q6 paths. `tools/bench-compare/src/tpch.rs`
+  (data generator + field-id constants 1-based to match SM's
+  CreateType renumber). `workloads.rs` gains `Workload::TpchQ1 { sf } /
+  TpchQ6 { sf }` variants + `is_tpch()` + `tpch_sf()` + `with_tpch_sf()`
+  + `workloads::tpch_const` module (Q1/Q6 predicate constants).
+  `main.rs` --sf flag (default 0.01). Per-driver modules
+  `drivers/{kesseldb,postgres,sqlite}_tpch.rs` with KesselDB Q1
+  mapping as 4× Op::GroupAggregate (single-aggregate-per-call) +
+  client-side AVG; Q6 mapping as one Op::Aggregate{SUM,
+  field=l_q6_revenue} where l_q6_revenue is the precomputed
+  l_extendedprice * l_discount product (KesselDB has no SUM(expr)
+  primitive yet). Postgres + SQLite get the canonical SQL verbatim.
+  TigerBeetle refused honestly (no SQL aggregate primitive).
+- `a03d0bf` docs(benchmarks) — §3f Q1 + §3g Q6 result tables +
+  headline summary table rewrite + reproducibility block + §8
+  next-slices update.
+- `f840bec` docs(readme) — TPC-H Q1+Q6 rows added to the cross-DB
+  perf summary; analytics roadmap arc (SP-Analytic-Plan) named.
+- (this commit) docs(status + progress) — arc closure rows.
+
+Run shape on vulcan (3 trials × 30s × SF=0.01 ≈ 60K lineitem rows;
+load NOT included in the measured 30s; q/s = full Q1 or Q6
+executions/sec):
+
+```
+ssh admin@192.168.4.178
+cd /tmp/kdb-bench-wt/tools/bench-compare
+source ~/.cargo/env
+CARGO_TARGET_DIR=/tmp/kdb-target-bench cargo build --release
+/tmp/kdb-target-bench/release/bench-compare \
+  --db kesseldb,postgres,sqlite \
+  --workload tpch-q1 \
+  --connections 1,4 \
+  --duration 30 --sf 0.01 --trials 3 \
+  --output /tmp/bench-tpch-q1.json
+# Repeat with --workload tpch-q6.
+```
+
+(N=1,4 per the design spec — analytics doesn't benefit from very high
+concurrency the same way OLTP does; lock-acquire and context-switch
+costs aren't the bottleneck at this row-count.)
+
+TPC-H Q1 results (3-trial median, q/s):
+
+| DB | N=1 | N=4 | p50 (N=1) | p99 (N=1) |
+|---|---:|---:|---:|---:|
+| KesselDB | 2.38 | 8.84 | 417.8 ms | 476.0 ms |
+| Postgres | 46.58 | 185.95 | 21.2 ms | 23.3 ms |
+| SQLite | 23.23 | 22.19 | 42.9 ms | 45.0 ms |
+| TigerBeetle | — | — | — | — |
+
+TPC-H Q6 results (3-trial median, q/s):
+
+| DB | N=1 | N=4 | p50 (N=1) | p99 (N=1) |
+|---|---:|---:|---:|---:|
+| KesselDB | 3.53 | 13.74 | 282.6 ms | 311.6 ms |
+| Postgres | 435.59 | 1,685.22 | 2.3 ms | 2.5 ms |
+| SQLite | 253.03 | 84.65 | 3.9 ms | 4.2 ms |
+| TigerBeetle | — | — | — | — |
+
+Honest takeaways:
+- **Q1**: KesselDB LOSES at every N. Postgres wins 7.8× at N=4 (185.95
+  vs 8.84). SQLite N=4 regresses below N=1 — single-DB-file shared-
+  lock contention on multi-reader full-scan aggregates.
+- **Q6**: KesselDB LOSES at every N. Postgres wins 123× at N=4 (1,685
+  vs 13.74). SQLite N=4 regresses 3× below N=1 — same shared-lock
+  story but worse because the per-query cost is so low that lock
+  overhead dominates.
+- **KesselDB does scale linearly with N for both queries** (Q1
+  N=1→N=4 = 3.7×, Q6 N=1→N=4 = 3.9×). The read-pool bypass
+  (`read_only_op(&self)` on shared `RwLock`) means multiple workers
+  parallelize their full-scan aggregates without lock contention.
+  This is a genuine positive — analytics WILL scale on KesselDB; the
+  per-query cost is what's high.
+
+Root cause for the KesselDB losses:
+
+`Op::Aggregate` and `Op::GroupAggregate` walk the row set evaluating
+a kessel-expr WHERE program per row. Postgres' shipdate index
+narrows the candidate set; the planner picks a parallel-aware hash
+aggregate. KesselDB's range-pred narrowing already ships for
+`Op::QueryRows` (SP70 `range_preds`) but the aggregate arms don't
+consume it yet, so even with `Op::AddOrderedIndex` on `l_shipdate`
+they do the full 60K-row scan.
+
+KesselDB capability gaps recorded honestly (each is a clean roadmap
+target — no inaccurate measurement, just extra setup work at bench
+load time):
+
+- `Op::GroupAggregate` is single-aggregate-per-call. Q1 needs 4
+  separate calls (COUNT + SUM(quantity) + SUM(extprice) +
+  SUM(discount)) + client-side AVG fold. `Op::GroupAggregateMulti`
+  would collapse this to one scan.
+- `Op::Aggregate` sums a single column (no SUM(expr)). Q6 needs a
+  precomputed product column at load (`l_q6_revenue =
+  l_extendedprice * l_discount`). SUM-of-expression aggregate is the
+  same gap.
+- GROUP BY surface is single-field. Q1's two-column GROUP BY needs a
+  synthetic 2-byte composite key column.
+- `Op::Aggregate` / `Op::GroupAggregate` don't accept `range_preds`
+  so an `l_shipdate <= ?` predicate can't narrow the scan via the
+  existing `FindRange` machinery.
+
+Roadmap target named: **SP-Analytic-Plan** — teach `Op::Aggregate` +
+`Op::GroupAggregate` to consume `range_preds: Vec<(u16, u8, Vec<u8>)>`
+so range predicates prune the scan via the existing `FindRange` +
+`AddOrderedIndex` machinery; ship `Op::GroupAggregateMulti` so 4×
+scans collapse to 1×. Both close the published Q1+Q6 gaps; out of
+SP-Bench-Suite scope.
+
+Schema + data shape (recorded for reproducibility):
+- KesselDB: catalog type `lineitem` with 18 fields (16 canonical
+  TPC-H lineitem cols + `l_groupkey: Char(2)` synthetic composite
+  GROUP-BY key + `l_q6_revenue: I64` precomputed product). Numeric
+  cols stored as scale-2 raw integers. Bulk-load via one
+  `Op::Txn{ops}` of 60K Creates.
+- Postgres: `CREATE UNLOGGED TABLE lineitem (... 16 cols ...)` with
+  BYTEA for the char-string columns; idx on `l_shipdate`. Numeric
+  cols stored as scale-2 raw INTs / BIGINTs. Bulk-load via COPY
+  BINARY.
+- SQLite: same shape; idx on `l_shipdate`; journal_mode=MEMORY,
+  synchronous=OFF.
+- TigerBeetle: refused with explanatory note (no SQL aggregate
+  primitive — see drivers/tigerbeetle.rs).
+
+Numeric column representation (recorded for reproducibility):
+- l_quantity, l_extendedprice, l_discount, l_tax — all scale-2 raw
+  integers across all three DBs. e.g. l_quantity 23.50 -> raw 2350.
+  Q1+Q6 SQL queries use the raw-integer constants accordingly (e.g.
+  `l_quantity < 2400` instead of `l_quantity < 24.0`, `l_discount
+  BETWEEN 5 AND 7` instead of `BETWEEN 0.05 AND 0.07`). The SUM
+  result is the canonical revenue × constant scale factor — engine
+  throughput is what we measure, not human-readable revenue figures.
+
+Raw JSON: vulcan:/tmp/bench-tpch-q1.json (18 rows),
+vulcan:/tmp/bench-tpch-q6.json (18 rows).
 
 ---
 
-## T5 — JSON → markdown generator + arc-closure docs [PLANNED]
+## T5 — Arc closure docs [DONE]
 
-- `tools/bench-compare/scripts/render.{py,rs}` ingests the JSON output and
-  regenerates the BENCHMARKS.md tables (medians, stdevs, ratios).
-- Update README perf section + STATUS with the headline numbers.
+Status: BENCHMARKS.md headline summary table rewritten as the
+blog-quotable 'Summary of measured wins/losses' form per the spec.
+README perf section extended with TPC-H Q1+Q6 rows and the
+SP-Analytic-Plan roadmap arc. STATUS.md row updated (T4 + T5
+together). JSON→markdown generator script DEFERRED — manual table
+authoring covers V1; the generator is a nice-to-have for the next
+benchmark refresh and would have been net-extra-scope for this slice.
+
+Commits:
+- `a03d0bf` — BENCHMARKS.md (headline + §3f + §3g + §4/§7/§8)
+- `f840bec` — README perf section (TPC-H rows + SP-Analytic-Plan)
+- (this commit) — STATUS.md + this progress tracker row
 
 ---
 

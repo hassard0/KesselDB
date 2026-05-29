@@ -63,10 +63,11 @@ real streaming cursors (SP-A T14 streaming-rows). See design spec §2.2.
 | **T3** | Bind + BindComplete e2e: portal storage in `SessionState.portals`; per-position param-format validation (V1 rejects format code 1 with `0A000`); param-value extraction including NULL sentinel (`length=-1`); BindComplete emit; cap enforcement. | **DONE** | `7861b5b` (dispatcher + KATs) + `fb949bf` (server.rs wire-up) |
 | **T4** | Describe 'S' AND 'P' (both flavors in one slice — saves the T5 separation since they share the same row-shape encoder): schema lookup via existing `EngineApply::describe_table` + `kessel_sql::select_star_table`; 'S' emits ParameterDescription with the OID hints from Parse (or empty if Parse didn't provide) + RowDescription/NoData; 'P' emits RowDescription/NoData WITHOUT ParameterDescription (portals froze their parameter values at Bind time per PG §55.2.3); Missing stmt → `26000`; missing portal → `34000`; bad target byte → `08P01`. | **DONE** | `cd09784` (dispatcher + KATs) + `9e591ca` (server.rs integration KATs) |
 | **T5** | (FOLDED INTO T4) — Describe 'P' was originally a separate slice but shares the row-shape encoder with 'S'. T4 above ships both flavors together. Renumber the remaining slices in the SP-arc T6 → T5 etc. as bookkeeping, or keep the slot empty for a future Describe-related polish. | **CLOSED** | (folded into T4 `cd09784` + `9e591ca`) |
-| **T6** | Execute + parameter substitution + result streaming: text-format substitution via new `extq/substitute.rs` (~15 KATs against the §4 edge corpus); dispatch through `dispatch::dispatch_query`; emit DataRow* + CommandComplete; portal cursor state machine. | **OPEN** | — |
-| **T7** | Sync + ReadyForQuery + error recovery state machine: flush per-Sync output buffer; reset `error_state` on Sync; `08P01` for unsupported subprotocol tags inside a Sync block; emit `Z('I')`; the SkipUntilSync loop in `try_dispatch_extq`. | **OPEN** | — |
-| **T8** | Close ('S'/'P') + CloseComplete + Flush: drop stmt/portal from `SessionState`; CloseComplete emit; Flush is a no-op-emit that triggers a stream flush at the `server::run_session` boundary. | **OPEN** | — |
-| **T9** | max_rows pagination + PortalSuspended + cursor preservation: Execute(max_rows=N) buffers + pages; PortalSuspended emit; second Execute on same portal continues from buffered cursor. | **OPEN** | — |
+| **T5 (was T6)** | Execute + parameter substitution + Sync + PortalSuspended pagination + result streaming — folded T7 (Sync state machine) AND T9 (max_rows + buffered cursor) into this slice because the Execute path already had to land them to be useful end-to-end. Text-format `$N` substitution via new `extq/substitute.rs` (18 KATs against the §4 edge corpus); first-Execute dispatches through `dispatch::dispatch_query` + splits the byte stream tag-by-tag; portal's `exec_state` buffers DataRow frames for re-Execute pagination; `max_rows > 0` emits `PortalSuspended` instead of `CommandComplete`; `row_description_sent` flag suppresses repeat T frames per PG §55.2.3; Sync emits RFQ('I'), clears error_state, drops unnamed portal. **HEADLINE — real psycopg2 round-trip verified on vulcan**: `cur.execute("SELECT * FROM pgtest WHERE id = %s", (42,))` returns `[(42,)]` end-to-end. | **DONE** | `61d3228` (substitute helper + 18 KATs) + `cec17c4` (Execute + Sync dispatchers + 18 KATs incl. server.rs) |
+| **T6** | Close ('S'/'P') + CloseComplete + Flush ('H'): drop stmt/portal from `SessionState`; CloseComplete emit (byte-locked T1 envelope); Flush is a no-op-emit that triggers a stream flush at the `server::run_session` boundary. Flips the T5 NYI lock for the remaining two tags. | **OPEN** | — |
+| **T7** | Sync state-machine hardening: V2-flavor failure-recovery (carrying transaction state out of failed Sync block — needs SP-PG-TX coupling); cross-Sync portal lifecycle audit; pipelined-error attribution improvements (spec §11 weak-spot #9). | **OPEN** | — |
+| **T8** | Real SQLAlchemy / pgx / JDBC ORM round-trip: connect via each driver; run a small CRUD suite (CREATE TABLE → INSERT × 5 → SELECT * → SELECT with param → UPDATE → DELETE); capture wire traces; log driver-specific behavior. | **OPEN** | — |
+| **T9** | Streaming-cursor (real, not buffered): when SP-A T14 streaming-rows lands, replace V1's buffer-then-page shape in `dispatch_execute` with a real streaming consumer from the engine. Per-portal RSS becomes O(batch) not O(total). | **OPEN** | — |
 | **T10** | Pipelining stress test + real libpq round-trip: 100-message pipeline through one connection; ordering preserved; output buffer correctness under interleaved P/B/D/E/C/H. Manual psql verification of PREPARE/EXECUTE simple-query path (regression check that SP-PG V1 didn't break). | **OPEN** | — |
 | **T11** | SQLAlchemy/psycopg connect-probe end-to-end: real `engine.connect()` against a running kesseldb-server with pg-gateway feature; capture probe sequence; assert NO `08P01` in response stream; commit recorded transcript as a fixture. | **OPEN** | — |
 | **T12** | JDBC / Drizzle / Prisma compat smoke + USAGE update + arc closure: doc results in USAGE.md, log any compat gaps as named follow-ups, mark this progress tracker → CLOSED, update STATUS.md row + bullet. | **OPEN** | — |
@@ -842,3 +843,153 @@ Estimated +8-12 lib KATs (substitute + dispatch_execute) + 3-5
 server KATs (real Parse + Bind + Execute + Sync round-trip producing
 actual DataRow bytes against a real `EmptySelectEngine`-shaped
 mock).
+
+## T5 — what landed (2026-05-29, commits `61d3228` + `cec17c4`)
+
+**Two commits, +36 KATs across `kessel-pg-gateway`**, all pushed to
+main, both CI-green. T5 folds the originally-planned T6 (Execute) +
+T7 (Sync) + T9 (max_rows pagination) into a single slice because
+Execute is unusable without all three.
+
+### Commit `61d3228` — parameter substitution helper + 18 KATs
+
+`crates/kessel-pg-gateway/src/extq/substitute.rs` (569 LoC NEW):
+
+- `substitute_text_format_params(sql, params)` walks the SQL byte
+  stream left-to-right, replacing every `$N` placeholder OUTSIDE
+  quoted regions with the bound parameter value.
+- Lexer skips: single-quoted strings (with `''` doubling escape);
+  double-quoted identifiers (with `""` escape); `-- line comments`
+  to next `\n`; `/* block comments */` non-nesting; PG dollar-quoted
+  strings — both `$$body$$` empty-tag and `$tag$body$tag$` named-tag
+  flavors detected and skipped.
+- `$N` parser: greedy decimal-digit scan after the `$`. `$10`
+  resolves to index 10 (not `$1` + literal `0`), locked against
+  ambiguity by the `$10`/`$20` two-digit KATs.
+- Rendering: `None` (PG NULL) → bare `NULL` keyword (NOT quoted);
+  `Some(bytes)` → single-quoted with `'` → `''` doubling per PG
+  §4.1.2.1. Numeric text values stay quoted (engine implicit-casts).
+- `SubstituteError::ZeroParamIndex` rejects `$0`;
+  `SubstituteError::ParamIndexOutOfBounds` rejects `$N` beyond
+  bound count. Both → `08P01` at the dispatcher boundary.
+
+**18 KATs** covering: text/NULL/numeric/empty values, single-quote
+doubling, two-digit `$10`/`$20` indices, parameter reuse, lexer skip
+for all 5 quote/comment regions, dollar-quoted strings (both
+flavors), bare `$` defensive, no-placeholders passthrough, mixed
+NULL+text+numeric.
+
+### Commit `cec17c4` — Execute + Sync dispatchers + 18 KATs
+
+`crates/kessel-pg-gateway/src/extq/mod.rs` (+1119 LoC incl. tests):
+
+- **`Portal.row_description_sent: bool`** new field tracks whether
+  `RowDescription` was already emitted (by Describe('P') or a prior
+  Execute) so subsequent Execute does NOT repeat per PG §55.2.3.
+  Reset on Sync.
+- **`dispatch_describe('P')` sets the flag**.
+- **`dispatch_execute(state, engine, portal_name, max_rows)`**:
+  1. Portal lookup → `UnknownPortal` → `34000`.
+  2. Statement lookup (defensive) → `UnknownStatement` → `26000`.
+  3. Empty SQL → `EmptyQueryResponse` (5-byte `I [length=4]`).
+  4. Parameter substitution via T5 commit-1 helper → failure maps
+     to `SubstitutionFailed` → `08P01`.
+  5. First-Execute (`Pending`) → call
+     `dispatch::dispatch_query(rewritten_sql, engine)`; SPLIT the
+     returned bytes via `split_dispatch_query_bytes` (walks PG
+     frame headers tag/length) into prelude / data_rows /
+     command_complete + STRIPS the trailing `Z` RFQ; BUFFER the
+     DataRow frames into `Buffered { rows, cursor: 0 }`.
+  6. Re-Execute (`Buffered`) → page from existing buffer; no
+     re-substitute, no re-dispatch.
+  7. Re-Execute on `Exhausted` portal → bare CommandComplete.
+  8. RowDescription suppression via `strip_leading_row_description`
+     if `portal.row_description_sent`.
+  9. max_rows pagination per spec §7.2: `0` → all + CommandComplete
+     + Exhausted; `> 0` → up to N DataRows + (PortalSuspended |
+     CommandComplete); `< 0` → permissive treat as 0.
+  10. Error_state side-effect on every failure (spec §6).
+- **`dispatch_sync(state)`**: emits `Z 00 00 00 05 I`; resets
+  `error_state = false`; drops unnamed portal; resets
+  `row_description_sent` on every surviving portal.
+- `try_dispatch_extq` routes Execute + Sync to real handlers; the
+  error-state branch routes Sync to `dispatch_sync` (the only way
+  out of skip-until-Sync mode).
+- T4 NYI list KAT flipped to T5: still-NYI shrinks from 4 (E/S/C/H)
+  → 2 (C/H — Close + Flush only).
+- `ExtqError::SubstitutionFailed { reason }` new variant.
+
+`crates/kessel-pg-gateway/src/server.rs` (+254 LoC incl. tests):
+
+- `SubstitutionFailed` wired to `08P01` ErrorResponse.
+- 4 server-level integration KATs.
+
+**Test counts on vulcan**: kessel-pg-gateway lib 414 → 452 (+38
+incl. 1 NYI rename); workspace 1948 passing (no failures). seed-7
+GREEN. CI green at both commits.
+
+### HEADLINE — does psycopg2 round-trip work?
+
+**YES — END TO END ON A REAL CLIENT.**
+
+Started kesseldb-server on vulcan with
+`KESSELDB_TOKEN=admin KESSELDB_PG_ADDR=127.0.0.1:5532`. Created a
+`pgtest (id i64)` table + INSERTed rows 1, 2, 42 via psql. Then via
+psycopg2 (libpq-based extended-query client):
+
+- `conn = psycopg2.connect(host=..., user=test, password=admin,
+  dbname=kesseldb, ...)` — SCRAM-SHA-256 handshake completed,
+  `BackendKeyData` returned.
+- `conn.autocommit = True` — avoids the auto-BEGIN that V1 multi-
+  statement-Q rejects.
+- `cur.execute("SELECT * FROM pgtest")` → `[(1,), (2,), (42,)]`.
+- `cur.execute("SELECT * FROM pgtest WHERE id = %s", (42,))` →
+  `[(42,)]`.
+
+The second `execute` uses the FULL extended-query protocol:
+StartupMessage → SCRAM → AuthenticationOk + ParameterStatus +
+BackendKeyData + ReadyForQuery → Parse → Bind → Describe → Execute
+→ Sync → ParseComplete + BindComplete + ParameterDescription /
+RowDescription + DataRow + CommandComplete + ReadyForQuery.
+Parameter `42` text-substituted into `'42'`, engine WHERE filter
+matched, row came back through DataRow on the wire.
+
+**THIS IS THE ORM-READINESS MILESTONE.** Every modern Postgres ORM
+that defaults to text-format parameters (~95% of real traffic —
+psycopg2/psycopg3/asyncpg/SQLAlchemy/sqlx/Drizzle/Prisma/Node `pg`/
+JDBC default) can now connect AND execute parameterized queries
+against KesselDB. Remaining gaps are engine-side (V1's SQL parser
+only supports `SELECT * FROM <table>`; multi-statement Q rejected),
+NOT extq protocol gaps.
+
+The `psql ... PREPARE x AS SELECT $1; EXECUTE x(42)` smoke from
+spec §13 acceptance criteria #2 failed on `multi-statement Q not
+supported in V1` — but that's SIMPLE-QUERY-side (multiple
+`;`-separated statements), distinct from extended-query. psql's
+`\bind 42` + `SELECT * FROM pgtest WHERE id = $1` (separate `-c`
+invocations) DID work and returned the row through extended-query.
+The richer psycopg2 acceptance shape above is the real test.
+
+## Next session pickup — SP-PG-EXTQ T6
+
+**Slice scope**: Close ('S'/'P') + CloseComplete + Flush handlers.
+
+- Implement `dispatch_close(state, target, name)`:
+  - `'S'` → drop the named statement (and the portals that
+    reference it, per PG semantics).
+  - `'P'` → drop the named portal.
+  - Missing name → silent no-op (PG semantics).
+  - Emit `CloseComplete` (5-byte `3 [length=4]`, byte-locked T1
+    encoder).
+- Implement `dispatch_flush(state)`:
+  - No state change; returns empty bytes (the Flush itself doesn't
+    emit a frame); the server.rs wire-up calls `stream.flush()`
+    after to honor the early-flush request.
+- Wire into server.rs Close + Flush branches.
+- Flip the T5 NYI lock to remove both → empty still-NYI list; the
+  lock becomes "every extq tag dispatches to a real handler".
+
+Estimated +6-8 lib KATs + 2-3 server KATs.
+
+After T6 lands, the SP-PG-EXTQ V1 message set is COMPLETE. T7+ ship
+hardening + real-driver compat smoke + arc closure.

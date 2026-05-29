@@ -466,6 +466,7 @@ linearizability under partition, deterministic WASM UDFs) are all **shipped**
 | [`docs/THESIS.md`](docs/THESIS.md) | The 5 thesis pillars (deterministic / verifiable / replayable / zero‑dep / honest‑docs) + strategic‑tier backlog S1–S4 (all shipped) |
 | [`docs/USAGE.md`](docs/USAGE.md) | Install, run, **CLI**, client API, **SQL reference**, clustering, auth, backup & monitoring, external sources + Parquet matrix |
 | [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) | Methodology, measured numbers, scaling model, cloud projections |
+| [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | Cross-DB comparison (KesselDB vs Postgres / SQLite / TigerBeetle) — YCSB-A/B/C + sysbench OLTP RO/WO/RW, wins AND losses, full disclosure |
 | [`docs/STATUS.md`](docs/STATUS.md) | Current capabilities summary + production‑readiness gate + per‑slice status (incl. SP109‑SP140 strategic‑tier + the Parquet codec arc through SP154 / OBJ‑2c‑2 closed), performance log |
 | [`CHANGELOG.md`](CHANGELOG.md) | Keep-a-Changelog release notes, starting at v1.0.0 |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Storage, replication, sharding, caching, MVCC + WASM + Parquet internals |

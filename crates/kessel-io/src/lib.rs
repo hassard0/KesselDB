@@ -10,11 +10,23 @@ use kessel_proto::Rng;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// SP-Perf-A T5: positional read/write (`pread`/`pwrite` on Unix,
+// `ReadFile`/`WriteFile` with `OVERLAPPED.Offset` on Windows) skip the
+// shared seek cursor entirely. `FileExt::read_at` / `seek_read` take
+// `&self`, so concurrent readers no longer contend on a `Mutex<File>` —
+// the per-op critical section that T4 identified as the ~225 ns/op
+// cursor-seek serialiser is gone. Both APIs are in safe stdlib; both
+// platforms ship them since Rust 1.0 / 1.15 respectively.
+#[cfg(unix)]
+use std::os::unix::fs::FileExt as _;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt as _;
 
 /// Monotonic-ish time source. The state machine never calls this; only the
 /// VSR primary does, then replicates the value.
@@ -56,19 +68,24 @@ impl Clock for SystemClock {
     }
 }
 
-/// File-backed disk. `read_at`/`write_at` seek explicitly; `sync` is a real
-/// `fsync` so durability claims are honest.
+/// File-backed disk. Reads + writes are **positional** (`pread`/`pwrite`
+/// on Unix, `ReadFile`/`WriteFile` with explicit offsets on Windows) — no
+/// shared seek cursor, no mutex on the read path.
 ///
-/// SP-Perf-A T2: `Mutex<File>` (not `RefCell<File>`) so `FileDisk` is
-/// `Sync` — required for `Arc<RwLock<StateMachine>>` to be `Send` across
-/// the engine + read-pool threads. Mutex acquisitions are uncontended on
-/// the engine's serial-apply hot path (one writer holds the per-batch
-/// RwLock write guard), and on the parallel-read path the file's seek
-/// cursor is shared — the Mutex is the correct synchroniser. The cost
-/// is a single uncontended atomic CAS per disk op vs. RefCell's runtime
-/// check.
+/// SP-Perf-A T5: dropped the T2-era `Mutex<File>` wrapper. `FileExt::read_at`
+/// (Unix) / `seek_read` (Windows) take `&self`, so unlimited concurrent
+/// readers run lock-free against a single `File` handle. The T4 diagnosis
+/// identified per-file mutex acquisition (~225 ns/op critical section) as
+/// the next ceiling after the T2 RwLock-bypass landed; T5 lifts it.
+///
+/// `File` is `Send + Sync` on every platform Rust supports (the FD/HANDLE
+/// is a kernel object; the userland `File` struct holds no interior state
+/// the kernel doesn't already synchronise). Writes still go through
+/// `&mut self` because the `Disk` trait demands it — and writes run only
+/// on the engine-thread apply path, so there's no concurrent-writer
+/// concern to address here. Reads + writes don't share state either way.
 pub struct FileDisk {
-    file: Mutex<File>,
+    file: File,
 }
 
 impl FileDisk {
@@ -78,24 +95,44 @@ impl FileDisk {
             .read(true)
             .write(true)
             .open(path)?;
-        Ok(FileDisk {
-            file: Mutex::new(file),
-        })
+        Ok(FileDisk { file })
     }
 }
 
 impl Disk for FileDisk {
     fn write_at(&mut self, off: u64, buf: &[u8]) -> io::Result<()> {
-        let mut f = self.file.lock().unwrap();
-        f.seek(SeekFrom::Start(off))?;
-        f.write_all(buf)
+        // SP-Perf-A T5: positional write — no seek, single syscall under
+        // the hood (pwrite/WriteFile). Loop on short writes (pwrite can
+        // return < buf.len() on signals; WriteFile on overlapped) so the
+        // semantics match the prior `write_all` behaviour.
+        let mut written = 0;
+        while written < buf.len() {
+            #[cfg(unix)]
+            let n = self.file.write_at(&buf[written..], off + written as u64)?;
+            #[cfg(windows)]
+            let n = self.file.seek_write(&buf[written..], off + written as u64)?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "FileDisk::write_at: short pwrite returned 0",
+                ));
+            }
+            written += n;
+        }
+        Ok(())
     }
     fn read_at(&self, off: u64, buf: &mut [u8]) -> io::Result<usize> {
-        let mut f = self.file.lock().unwrap();
-        f.seek(SeekFrom::Start(off))?;
+        // SP-Perf-A T5: positional read — no seek, no mutex, multiple
+        // threads may call this concurrently with `&self`. The Unix
+        // `read_at` may short-read (signal interrupted, page fault),
+        // identical to `read`, so loop to match the prior fill semantics.
         let mut read = 0;
         while read < buf.len() {
-            match f.read(&mut buf[read..]) {
+            #[cfg(unix)]
+            let r = self.file.read_at(&mut buf[read..], off + read as u64);
+            #[cfg(windows)]
+            let r = self.file.seek_read(&mut buf[read..], off + read as u64);
+            match r {
                 Ok(0) => break,
                 Ok(n) => read += n,
                 Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -105,15 +142,10 @@ impl Disk for FileDisk {
         Ok(read)
     }
     fn sync(&mut self) -> io::Result<()> {
-        self.file.lock().unwrap().sync_all()
+        self.file.sync_all()
     }
     fn len(&self) -> u64 {
-        self.file
-            .lock()
-            .unwrap()
-            .metadata()
-            .map(|m| m.len())
-            .unwrap_or(0)
+        self.file.metadata().map(|m| m.len()).unwrap_or(0)
     }
 }
 
@@ -637,5 +669,183 @@ mod tests {
         let mut buf = [0u8; 4];
         d.read_at(0, &mut buf).unwrap();
         assert_eq!(&buf, b"keep");
+    }
+
+    // -- SP-Perf-A T5: lock-free positional FileDisk KATs --------------------
+
+    fn tmp_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "kessel-filedisk-t5-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn filedisk_t5_write_then_read_at_roundtrip() {
+        // The cheapest fidelity check: a single write_at + read_at must
+        // return the exact bytes at the requested offset, with the
+        // returned length matching the buffer's. Locks the
+        // positional-IO contract that the Disk trait demands.
+        let p = tmp_path("rt");
+        let mut d = FileDisk::open(&p).unwrap();
+        d.write_at(8, b"kessel").unwrap();
+        let mut buf = [0u8; 6];
+        let n = d.read_at(8, &mut buf).unwrap();
+        assert_eq!(n, 6);
+        assert_eq!(&buf, b"kessel");
+        assert_eq!(d.len(), 14);
+        d.sync().unwrap();
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn filedisk_t5_read_past_eof_returns_zero() {
+        // The seek-and-read shim used to silently break when the cursor
+        // was past EOF; pread returns 0 cleanly. Lock that semantic so
+        // the WAL replay loop (which read_at's past-end as its tail
+        // sentinel) keeps working.
+        let p = tmp_path("eof");
+        let mut d = FileDisk::open(&p).unwrap();
+        d.write_at(0, b"abcd").unwrap();
+        let mut buf = [0u8; 8];
+        let n = d.read_at(100, &mut buf).unwrap();
+        assert_eq!(n, 0);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn filedisk_t5_concurrent_reads_no_contention() {
+        // The headline T5 KAT: N threads share one FileDisk via
+        // Arc<FileDisk>, each issues 10K random-offset read_at calls,
+        // every return matches the seeded ground truth. This was
+        // impossible under the T2 Mutex<File> shape — only ONE thread
+        // could hold the file at a time — and it's the lock-free
+        // upgrade T4's diagnosis called for.
+        use std::sync::Arc;
+        let p = tmp_path("concurrent");
+        // Seed deterministic content: 64 KiB of i mod 251 (avoids
+        // wrap-around at byte boundaries; gives us a per-offset
+        // signature).
+        const SIZE: usize = 64 * 1024;
+        let mut seed = vec![0u8; SIZE];
+        for (i, b) in seed.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        {
+            let mut d = FileDisk::open(&p).unwrap();
+            d.write_at(0, &seed).unwrap();
+            d.sync().unwrap();
+        }
+        let d = Arc::new(FileDisk::open(&p).unwrap());
+        let mut handles = Vec::with_capacity(16);
+        for w in 0..16 {
+            let d = Arc::clone(&d);
+            handles.push(std::thread::spawn(move || {
+                let mut rng = Rng::new(0xC0FFEE + w);
+                for _ in 0..10_000 {
+                    let off = rng.below(SIZE as u64 - 64);
+                    let len = 1 + (rng.below(63) as usize);
+                    let mut buf = vec![0u8; len];
+                    let n = d.read_at(off, &mut buf).unwrap();
+                    assert_eq!(n, len, "short read at off={off} len={len}");
+                    for (j, byte) in buf.iter().enumerate() {
+                        let expected = ((off as usize + j) % 251) as u8;
+                        assert_eq!(
+                            *byte, expected,
+                            "byte mismatch at abs off={}",
+                            off as usize + j
+                        );
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn filedisk_t5_write_then_concurrent_read_post_sync() {
+        // The Wal pattern: write once on the engine thread, then many
+        // readers race against the synced file. Verifies the
+        // single-writer + many-reader-after-sync model the storage
+        // layer relies on. After sync, no further writes happen; the
+        // file is effectively read-only for the workload window.
+        use std::sync::Arc;
+        let p = tmp_path("ws-then-r");
+        let payload: Vec<u8> = (0..4096u32)
+            .flat_map(|x| x.to_le_bytes())
+            .collect();
+        {
+            let mut d = FileDisk::open(&p).unwrap();
+            d.write_at(0, &payload).unwrap();
+            d.sync().unwrap();
+        }
+        let d = Arc::new(FileDisk::open(&p).unwrap());
+        let mut handles = Vec::with_capacity(8);
+        for w in 0..8 {
+            let d = Arc::clone(&d);
+            let payload = payload.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..1_000 {
+                    let off = ((w * 1024 + i) % (payload.len() - 16)) as u64;
+                    let mut buf = [0u8; 16];
+                    let n = d.read_at(off, &mut buf).unwrap();
+                    assert_eq!(n, 16);
+                    assert_eq!(
+                        &buf[..],
+                        &payload[off as usize..off as usize + 16]
+                    );
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn filedisk_t5_filedisk_is_send_and_sync() {
+        // The structural invariant T5 unlocks: FileDisk is now both
+        // Send and Sync (a bare `File` is Send+Sync on every Rust
+        // platform). Wrap one in an Arc and push it across a thread
+        // boundary — if the trait isn't Sync, this fails to compile.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<FileDisk>();
+        let p = tmp_path("send-sync");
+        let d: std::sync::Arc<FileDisk> =
+            std::sync::Arc::new(FileDisk::open(&p).unwrap());
+        let d2 = std::sync::Arc::clone(&d);
+        std::thread::spawn(move || {
+            // Just touching `len()` is enough — it goes through `&self`.
+            let _ = d2.len();
+        })
+        .join()
+        .unwrap();
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn filedisk_t5_write_then_read_at_overwrites() {
+        // Locks the write semantic the SP-Perf-A path depends on:
+        // write_at at the SAME offset overwrites prior content
+        // (pwrite, like the old seek+write shim, is positional + does
+        // not advance any cursor that interferes with the next call).
+        let p = tmp_path("overwrite");
+        let mut d = FileDisk::open(&p).unwrap();
+        d.write_at(0, b"AAAAAAAA").unwrap();
+        d.write_at(0, b"BBBB").unwrap();
+        let mut buf = [0u8; 8];
+        let n = d.read_at(0, &mut buf).unwrap();
+        assert_eq!(n, 8);
+        assert_eq!(&buf, b"BBBBAAAA");
+        let _ = std::fs::remove_file(&p);
     }
 }

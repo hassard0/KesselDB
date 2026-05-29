@@ -160,15 +160,17 @@ fn decode_entry(p: &[u8]) -> Option<Entry> {
 }
 
 /// Append-only log. Frame = `u32 payload_len ++ u32 crc32c(payload) ++ payload`.
-/// SP-Perf-A T2: the `+ Send` bound on the trait object lets the
+/// SP-Perf-A T2: the `+ Send + Sync` bounds on the trait object let the
 /// `Arc<RwLock<StateMachine>>` shared between the engine thread and
-/// read-pool workers be `Send` (the engine thread spawns with the SM
-/// already moved in; readers race against the writer through the
-/// rwlock). Every existing concrete `Disk` impl (`FileDisk`,
-/// `MemDisk`, `FaultDisk`, `MemVfsDisk`) is already `Send` — adding
-/// the bound is a no-op at runtime. NOT `Sync` (FileDisk uses
-/// `RefCell<File>` internally for the shared seek-cursor); concurrent
-/// access is serialised at the SM level.
+/// read-pool workers be `Send + Sync` (the engine thread spawns with
+/// the SM already moved in; readers race against the writer through
+/// the rwlock).
+/// SP-Perf-A T5: FileDisk is now `Sync` for real — `read_at` is
+/// positional (`pread`/`seek_read`) and takes `&self`, so the
+/// per-file mutex T2 needed for `Sync` is gone. The `+ Sync` bound
+/// here was already declared; T5 lifts the runtime serialisation that
+/// satisfied it. Every existing concrete `Disk` impl (`FileDisk`,
+/// `MemDisk`, `FaultDisk`, `MemVfsDisk`) is `Send + Sync`.
 struct Wal {
     disk: Box<dyn Disk + Send + Sync>,
     end: u64,

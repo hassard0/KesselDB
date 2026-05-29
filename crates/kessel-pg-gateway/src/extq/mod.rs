@@ -3595,4 +3595,346 @@ mod tests {
         // Both statements dropped.
         assert_eq!(state.statement_count(), 0);
     }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-EXTQ T7 — Sync state-machine + error-attribution edge cases.
+    //
+    // The V1 message set (T1..T6) ships a working state machine — error
+    // sets `state.error_state = true`, subsequent non-Sync messages
+    // return `Skipped`, Sync clears the flag + emits RFQ. T7 audits the
+    // less-obvious shapes:
+    //
+    //  - Two consecutive errors before Sync → second error MUST NOT
+    //    re-emit ErrorResponse; the second message goes through Skipped.
+    //  - Sync with no preceding error → bare RFQ, no error_state to
+    //    clear (defensive — Sync is idempotent on a clean state).
+    //  - Bind error followed by Execute on the SAME portal name → the
+    //    Execute is Skipped (it cannot resolve the portal because Bind
+    //    never stored it; even if a stale portal existed, Skipped wins
+    //    because error_state is set).
+    //  - Multiple Parse errors in one pipeline before Sync → each error
+    //    is silently skipped without recursive error_state re-engagement.
+    //  - After Sync clears error_state, the next Parse must succeed
+    //    cleanly (no latent skip-mode bug).
+    //
+    // These edge cases were named in the SP-PG-EXTQ design spec §11
+    // weak-spot #9 (pipelined-error attribution). T7's audit confirms
+    // the existing implementation handles them correctly — no code
+    // change required, just lock the invariants against future drift.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// T7 audit #1: two consecutive errors before Sync. First error
+    /// returns `Failed(...)` + sets `error_state = true`. Second
+    /// (different) error-producing message returns `Skipped` — NOT
+    /// another `Failed(...)`. Locks the no-re-emit invariant.
+    #[test]
+    fn t7_consecutive_errors_before_sync_second_skipped_not_re_emitted() {
+        let mut state = SessionState::new();
+        // First error: Bind to a non-existent statement → UnknownStatement.
+        let bind1 = proto::ExtqMessage::Bind {
+            portal: "p1".to_string(),
+            stmt: "ghost1".to_string(),
+            param_formats: vec![],
+            param_values: vec![],
+            result_formats: vec![],
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, bind1) {
+            ExtqOutcome::Failed(ExtqError::UnknownStatement { name }) => {
+                assert_eq!(name, "ghost1");
+            }
+            other => panic!("first Bind expected UnknownStatement, got {other:?}"),
+        }
+        assert!(state.in_error_state(), "error_state must engage on first error");
+
+        // Second message that WOULD ALSO error (Bind to a different
+        // missing statement) — but the pre-skip check intercepts it
+        // BEFORE the dispatcher runs. Outcome is `Skipped`, NOT a
+        // second UnknownStatement.
+        let bind2 = proto::ExtqMessage::Bind {
+            portal: "p2".to_string(),
+            stmt: "ghost2".to_string(),
+            param_formats: vec![],
+            param_values: vec![],
+            result_formats: vec![],
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, bind2) {
+            ExtqOutcome::Skipped => {}
+            other => panic!("second Bind expected Skipped, got {other:?}"),
+        }
+        // error_state still engaged (only Sync clears).
+        assert!(state.in_error_state(), "error_state stays engaged through Skipped");
+    }
+
+    /// T7 audit #2: Sync after no errors — emits bare RFQ('I'), clears
+    /// the (already-clear) error_state, drops unnamed portal (which
+    /// didn't exist). Idempotent on a clean session — locks against
+    /// future drift where Sync would side-effect more state than spec'd.
+    #[test]
+    fn t7_sync_with_no_preceding_error_emits_rfq_idempotent() {
+        let mut state = SessionState::new();
+        // Seed a NAMED statement + named portal to confirm they're
+        // preserved across an "idempotent" Sync (Sync only drops the
+        // unnamed "" portal per spec §3 — named state survives).
+        seed_stmt(&mut state, "named_stmt", vec![]);
+        // Bind a named portal.
+        let bind = proto::ExtqMessage::Bind {
+            portal: "named_portal".to_string(),
+            stmt: "named_stmt".to_string(),
+            param_formats: vec![],
+            param_values: vec![],
+            result_formats: vec![],
+        };
+        assert!(matches!(
+            try_dispatch_extq(&mut state, &NoSchemaEngine, bind),
+            ExtqOutcome::Bytes(_)
+        ));
+        assert!(!state.in_error_state(), "must start clean");
+        assert_eq!(state.statement_count(), 1);
+        assert_eq!(state.portal_count(), 1);
+
+        // Sync on a clean state.
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, proto::ExtqMessage::Sync) {
+            ExtqOutcome::Bytes(b) => {
+                assert_eq!(b, vec![b'Z', 0, 0, 0, 5, b'I']);
+            }
+            other => panic!("Sync on clean state expected Bytes(RFQ), got {other:?}"),
+        }
+        // error_state still false.
+        assert!(!state.in_error_state());
+        // Named statement preserved.
+        assert!(state.get_statement("named_stmt").is_some());
+        // Named portal preserved (only "" gets dropped).
+        assert!(state.get_portal("named_portal").is_some());
+    }
+
+    /// T7 audit #3: Bind error followed by Execute against the same
+    /// portal name → Execute is Skipped. The portal was never stored
+    /// (Bind failed before insert), AND `error_state` is engaged, so
+    /// the Execute hits the pre-skip arm regardless of portal lookup.
+    #[test]
+    fn t7_bind_error_then_execute_same_portal_name_is_skipped() {
+        let mut state = SessionState::new();
+        // Bind to a non-existent statement → UnknownStatement +
+        // error_state engaged. Portal name "p1" is NOT stored because
+        // the dispatcher errored before insert.
+        let bind = proto::ExtqMessage::Bind {
+            portal: "p1".to_string(),
+            stmt: "missing_stmt".to_string(),
+            param_formats: vec![],
+            param_values: vec![],
+            result_formats: vec![],
+        };
+        assert!(matches!(
+            try_dispatch_extq(&mut state, &NoSchemaEngine, bind),
+            ExtqOutcome::Failed(ExtqError::UnknownStatement { .. })
+        ));
+        assert!(state.in_error_state());
+        // Portal p1 was NOT stored.
+        assert!(state.get_portal("p1").is_none(), "Bind must not have stored p1 on error");
+
+        // Execute against "p1" — Skipped (error_state pre-empts).
+        let exec = proto::ExtqMessage::Execute {
+            portal: "p1".to_string(),
+            max_rows: 0,
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, exec) {
+            ExtqOutcome::Skipped => {}
+            other => panic!("Execute after Bind error expected Skipped, got {other:?}"),
+        }
+        // No portal was ever stored, no state mutation happened.
+        assert!(state.get_portal("p1").is_none());
+    }
+
+    /// T7 audit #4: multiple Parse errors in one pipeline before Sync.
+    /// First Parse: an actual error doesn't happen because Parse only
+    /// fails on cap overflow or named collision. Instead simulate via
+    /// a Bind error (already covered) but ALSO verify that REPEATED
+    /// errors of the same kind don't drift error_state recursively.
+    /// Locks the "error_state is a latching bool, not a counter" shape.
+    #[test]
+    fn t7_repeated_errors_keep_error_state_a_latching_bool() {
+        let mut state = SessionState::new();
+        // Cause 3 errors in a row (each different) — each subsequent
+        // must Skip, none must re-engage error_state recursively.
+        let m1 = proto::ExtqMessage::Bind {
+            portal: "p1".to_string(),
+            stmt: "ghost1".to_string(),
+            param_formats: vec![],
+            param_values: vec![],
+            result_formats: vec![],
+        };
+        let m2 = proto::ExtqMessage::Describe {
+            target: DESCRIBE_TARGET_STATEMENT,
+            name: "ghost2".to_string(),
+        };
+        let m3 = proto::ExtqMessage::Execute {
+            portal: "ghost3".to_string(),
+            max_rows: 0,
+        };
+        // First: real error.
+        assert!(matches!(
+            try_dispatch_extq(&mut state, &NoSchemaEngine, m1),
+            ExtqOutcome::Failed(_)
+        ));
+        assert!(state.in_error_state());
+        // Second + third: Skipped (NOT Failed). State remains latched.
+        for m in [m2, m3] {
+            match try_dispatch_extq(&mut state, &NoSchemaEngine, m) {
+                ExtqOutcome::Skipped => {}
+                other => panic!("expected Skipped, got {other:?}"),
+            }
+            assert!(state.in_error_state(), "error_state stays latched");
+        }
+    }
+
+    /// T7 audit #5: after Sync clears error_state, the next Parse
+    /// succeeds cleanly. Locks against a future bug where the skip-
+    /// mode flag leaks past Sync (e.g. a future buffered-write rework
+    /// that forgets to reset error_state).
+    #[test]
+    fn t7_sync_then_parse_after_error_succeeds_cleanly() {
+        let mut state = SessionState::new();
+        // Engage error_state via a Bind to a missing stmt.
+        let bind = proto::ExtqMessage::Bind {
+            portal: "p1".to_string(),
+            stmt: "ghost".to_string(),
+            param_formats: vec![],
+            param_values: vec![],
+            result_formats: vec![],
+        };
+        assert!(matches!(
+            try_dispatch_extq(&mut state, &NoSchemaEngine, bind),
+            ExtqOutcome::Failed(_)
+        ));
+        assert!(state.in_error_state());
+
+        // Sync → bare RFQ, error_state cleared.
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, proto::ExtqMessage::Sync) {
+            ExtqOutcome::Bytes(b) => assert_eq!(b, vec![b'Z', 0, 0, 0, 5, b'I']),
+            other => panic!("Sync expected RFQ bytes, got {other:?}"),
+        }
+        assert!(!state.in_error_state(), "Sync must clear error_state");
+
+        // Next Parse must succeed (no latent skip).
+        let parse = proto::ExtqMessage::Parse {
+            name: "ok_stmt".to_string(),
+            sql: "SELECT * FROM t".to_string(),
+            param_oids: vec![],
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, parse) {
+            ExtqOutcome::Bytes(b) => assert_eq!(b, vec![b'1', 0, 0, 0, 4]),
+            other => panic!("post-Sync Parse expected ParseComplete, got {other:?}"),
+        }
+        assert!(state.get_statement("ok_stmt").is_some());
+        assert!(!state.in_error_state());
+    }
+
+    /// T7 audit #6: Flush in error_state is also Skipped. Spec §6 +
+    /// §4: only Sync escapes skip-until-Sync mode. Flush triggers a
+    /// real wire flush in normal mode but produces NO bytes in error
+    /// mode (the run_session boundary never sees a Bytes(Vec::new())
+    /// or Flush outcome from this path). Locks against a future
+    /// "Flush is harmless, just always run it" drift.
+    #[test]
+    fn t7_flush_in_error_state_is_skipped_not_flush_outcome() {
+        let mut state = SessionState::new();
+        state.set_error_state(true);
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, proto::ExtqMessage::Flush) {
+            ExtqOutcome::Skipped => {}
+            other => panic!("Flush in error_state expected Skipped, got {other:?}"),
+        }
+        assert!(state.in_error_state(), "Flush must NOT clear error_state");
+    }
+
+    /// T7 audit #7: pipelined success then error then success (with
+    /// Sync between the error block and the post-error block). Tests
+    /// the canonical pipeline shape every ORM emits: a series of
+    /// successes ending with a Sync, then a series potentially
+    /// containing an error closed with another Sync, then more
+    /// successes.
+    #[test]
+    fn t7_pipeline_success_error_sync_success_round_trip() {
+        let mut state = SessionState::new();
+
+        // Block 1: Parse + Sync → succeeds.
+        let p1 = proto::ExtqMessage::Parse {
+            name: "s1".to_string(),
+            sql: "SELECT * FROM t".to_string(),
+            param_oids: vec![],
+        };
+        assert!(matches!(
+            try_dispatch_extq(&mut state, &NoSchemaEngine, p1),
+            ExtqOutcome::Bytes(_)
+        ));
+        assert!(matches!(
+            try_dispatch_extq(&mut state, &NoSchemaEngine, proto::ExtqMessage::Sync),
+            ExtqOutcome::Bytes(_)
+        ));
+        assert_eq!(state.statement_count(), 1);
+
+        // Block 2: Bind error + (skipped Describe) + Sync.
+        let bind = proto::ExtqMessage::Bind {
+            portal: "p_bad".to_string(),
+            stmt: "missing".to_string(),
+            param_formats: vec![],
+            param_values: vec![],
+            result_formats: vec![],
+        };
+        assert!(matches!(
+            try_dispatch_extq(&mut state, &NoSchemaEngine, bind),
+            ExtqOutcome::Failed(_)
+        ));
+        let desc = proto::ExtqMessage::Describe {
+            target: DESCRIBE_TARGET_STATEMENT,
+            name: "s1".to_string(),
+        };
+        assert!(matches!(
+            try_dispatch_extq(&mut state, &NoSchemaEngine, desc),
+            ExtqOutcome::Skipped
+        ));
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, proto::ExtqMessage::Sync) {
+            ExtqOutcome::Bytes(b) => assert_eq!(b, vec![b'Z', 0, 0, 0, 5, b'I']),
+            other => panic!("Sync expected RFQ, got {other:?}"),
+        }
+        assert!(!state.in_error_state());
+
+        // Block 3: Parse new stmt + Sync — must succeed.
+        let p2 = proto::ExtqMessage::Parse {
+            name: "s2".to_string(),
+            sql: "SELECT * FROM t".to_string(),
+            param_oids: vec![],
+        };
+        assert!(matches!(
+            try_dispatch_extq(&mut state, &NoSchemaEngine, p2),
+            ExtqOutcome::Bytes(_)
+        ));
+        assert!(matches!(
+            try_dispatch_extq(&mut state, &NoSchemaEngine, proto::ExtqMessage::Sync),
+            ExtqOutcome::Bytes(_)
+        ));
+        // Both statements persist (Sync drops only unnamed "" portal).
+        assert!(state.get_statement("s1").is_some());
+        assert!(state.get_statement("s2").is_some());
+    }
+
+    /// T7 audit #8: Close in error_state is Skipped. Spec §6 reiterated
+    /// across every dispatcher. Locks the rule that even "harmless"
+    /// drop-state operations must wait for Sync.
+    #[test]
+    fn t7_close_in_error_state_is_skipped_state_preserved() {
+        let mut state = SessionState::new();
+        seed_stmt(&mut state, "ps", vec![]);
+        state.set_error_state(true);
+        let close = proto::ExtqMessage::Close {
+            target: DESCRIBE_TARGET_STATEMENT,
+            name: "ps".to_string(),
+        };
+        assert!(matches!(
+            try_dispatch_extq(&mut state, &NoSchemaEngine, close),
+            ExtqOutcome::Skipped
+        ));
+        // ps NOT dropped because Close was skipped.
+        assert!(state.get_statement("ps").is_some());
+        assert!(state.in_error_state());
+    }
 }

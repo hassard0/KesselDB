@@ -582,3 +582,106 @@ Headline: **T5 ships positional IO as a correctness win and falsifies
 the Mutex<File> bottleneck hypothesis. The remaining ceiling is
 per-op heap traffic on the in-process apply→decode→clone chain — a
 distinct lever T6 attacks.**
+
+## 11. SP-Perf-A T6 — Fix A (in-process apply) + Fix B (Arc<[u8]> on Got)
+
+Run shape: same matrix as §10 — `get-by-id`, `--rows 100000 --duration 10
+--pool-workers 0`, 1 trial per N (reduced from 3 due to per-trial seed
+cost of ~5-8 min through the writer queue with WAL group-commit). N
+values match T5: {1, 8, 16, 24, 32}.
+
+T6 attacks the T5-identified per-op heap-traffic ceiling with TWO
+distinct fixes:
+
+* **Fix A** (`fb41342`): `EngineHandle::apply(Op)` bypasses
+  encode→queue→decode for read-only Ops by dispatching directly through
+  the shared `Arc<RwLock<StateMachine>>` read guard. Saves the
+  `Op::encode` (Vec<u8> alloc) + `Op::decode` (match-on-tag dispatch
+  + Vec<u8> alloc for the payload) per read.
+* **Fix B** (`64a5c36`): `OpResult::Got(Vec<u8>)` → `OpResult::Got(Arc<[u8]>)`.
+  Wire format byte-identical (locked by KAT
+  `t6_fix_b_got_wire_format_unchanged`); in-process clones of `Got` are
+  now atomic refcount bumps instead of fresh `Vec<u8>` allocations +
+  memcpy of the payload bytes.
+
+### Results — get-by-id, 100K rows, 10s, single trial, median latency
+
+| N   | T5         | Post-Fix-A     | Post-Fix-B     | A vs T5 | B vs Fix-A |
+| --- | ---------- | -------------- | -------------- | ------- | ---------- |
+| 1   | (n/a)      | 1.20M ops/sec  | 1.15M          | n/a     | -3.7%      |
+| 8   | (n/a)      | 4.49M          | _in flight_    | n/a     | _TBD_      |
+| 16  | 4.77M      | **5.28M**      | _in flight_    | +10.7%  | _TBD_      |
+| 24  | (n/a)      | 4.68M          | _in flight_    | n/a     | _TBD_      |
+| 32  | 5.04M      | 5.00M          | _in flight_    | -0.8%   | _TBD_      |
+
+Note: Fix B sweep was in flight on vulcan when this commit landed —
+contention with a concurrent full-workspace `cargo test --release` (the
+T6 oracle re-validation; consumed ~50% of the cores for ~15 min) slowed
+seeding for W=8..32. The N=1 cell completed cleanly. The remaining
+cells will land via a follow-up sweep on a quiet machine; the table
+is committed with the partial data so the structure is visible and the
+header references stay in sync with the progress tracker.
+
+Preliminary reading of N=1 (the only clean cell): Fix B is within trial
+noise of Fix A (-3.7%; trial-to-trial single-thread variance on vulcan
+is typically ±5%). This is consistent with the deferred-storage
+disclosure above — the OpResult::Got Arc<[u8]> migration on its own
+doesn't remove the Storage::get Vec clone, so the hot-loop heap traffic
+is essentially unchanged at single-thread. The Arc-clone benefit
+materializes when multiple readers of the SAME committed value share
+a backing buffer, which the N=1 cell doesn't exercise.
+
+### What changed in the read fast path
+
+Before T6: `engine.apply(GetById)` →  `Op::encode(...)` (Vec alloc) →
+mpsc::send to engine thread → engine dequeue → `Op::decode(...)` (Vec
+alloc + match) → `StateMachine::read_only_op(...)` → `Storage::get(...)`
+→ `Vec<u8>::clone()` (alloc + memcpy) → `OpResult::Got(Vec<u8>)` → reply
+mpsc::send → caller dequeue.
+
+After Fix A: `engine.apply(GetById)` → (direct, no encode) →
+`sm_shared.read()` → `StateMachine::read_only_op(...)` →
+`Storage::get(...)` → `Vec<u8>::clone()` (alloc + memcpy) →
+`OpResult::Got(Vec<u8>)` → return.
+
+After Fix B: `engine.apply(GetById)` → (direct) → `sm_shared.read()` →
+`StateMachine::read_only_op(...)` → `Storage::get(...)` → `Vec<u8>::clone()`
+(alloc + memcpy — **storage-internal Vec stays for now**) →
+`OpResult::Got(Arc<[u8]>)` (Arc-header alloc only, reuses Vec's
+underlying buffer) → return. Clones of the result are refcount bumps.
+
+### What's NOT in T6 (deferred to T7)
+
+The biggest remaining alloc on the read path is `Storage::get`'s
+`Vec<u8>::clone()` — it lives in `kessel-storage::Storage::get` and
+still memcpys the SSTable/memtable value bytes into a fresh `Vec` on
+every read. Fix B's `OpResult::Got(Arc<[u8]>)` change is the
+proto-level migration that ENABLES the next layer of the fix: T7 will
+lift `SsTable::entries` from `Vec<(Key, Option<Vec<u8>>)>` to
+`Vec<(Key, Option<Arc<[u8]>>)>` (mirrored on `Storage::memtable`), at
+which point `Storage::get → Option<Arc<[u8]>>` returns a refcount-bump
+clone of the on-disk-resident bytes — zero memcpy on the read path.
+
+T7 is the storage-internal half of the same arc; without it, T6 ships
+the proto migration (variant change + wire-compat KATs + the +10% Fix A
+lift) but not the full headline. Documented honestly per T5's
+`DONE_WITH_CONCERNS` precedent.
+
+### Determinism oracle still passes
+
+`parallel_reads_oracle::*` ran 17/17 green on vulcan against the T6
+build (Fix A + Fix B). 100,000 reads × 16 read-Op variants × parallel
+vs serial = byte-equal on every row. The Arc<[u8]> migration preserves
+the deterministic read contract.
+
+### Acceptance gate
+
+| Criterion                                       | Outcome              |
+| ----------------------------------------------- | -------------------- |
+| Fix A (in-process apply) ships                  | YES (`fb41342`)      |
+| Fix B (Arc<[u8]> on Got) ships                  | YES (`64a5c36`)      |
+| Wire format unchanged (KAT-locked)              | YES (3 new KATs)     |
+| Determinism oracle 17/17 green                  | YES (504.73s vulcan) |
+| Workspace tests pass on vulcan                  | YES (130/130 server) |
+| `get-by-id` lifts past 10M ops/sec at N=16      | NO (~5.3M with Fix A; Fix B pending) |
+| Next bottleneck for T7 identified               | YES (Storage::get's Vec clone) |

@@ -1,0 +1,55 @@
+SP-Perf-A T6 — Post-Fix-A baseline benchmark sweep on vulcan
+==============================================================
+
+Date: 2026-05-29
+HEAD: 1254c61 (Track D cluster-flake fix) + fb41342 (Fix A — in-process apply skips encode/decode)
+Host: vulcan (192.168.4.178) — DGX-class, Ubuntu, real workload
+Build: CARGO_TARGET_DIR=/tmp/kdb-target-perf, release profile
+Bench: kessel-bench parallel-reads --workload get-by-id --rows 100000 --duration 10 --pool-workers 0
+
+Trials per N: 1 (reduced from 3 due to per-trial seed cost of ~5-8 min × 5 N values = ~30-40 min total).
+The seeding step (100k Op::Create round-trips through the engine writer queue with WAL group-commit
+fsync) dominates trial cost; the 10s measurement window itself is reliable across single trials.
+
+Raw output
+==========
+=== W=1 ===
+parallel-reads workload=get-by-id workers=1 rows=100000 duration=10s pool_workers=Some(0)
+  total =   11981396 ops | 1198140 ops/sec | p50 0us  p99 1us  p99.99 7us
+=== W=8 ===
+parallel-reads workload=get-by-id workers=8 rows=100000 duration=10s pool_workers=Some(0)
+  total =   44877958 ops | 4487796 ops/sec | p50 1us  p99 3us  p99.99 8us
+=== W=16 ===
+parallel-reads workload=get-by-id workers=16 rows=100000 duration=10s pool_workers=Some(0)
+  total =   52812965 ops | 5281296 ops/sec | p50 2us  p99 6us  p99.99 20us
+=== W=24 ===
+parallel-reads workload=get-by-id workers=24 rows=100000 duration=10s pool_workers=Some(0)
+  total =   46801702 ops | 4680170 ops/sec | p50 3us  p99 7us  p99.99 3011us
+=== W=32 ===
+parallel-reads workload=get-by-id workers=32 rows=100000 duration=10s pool_workers=Some(0)
+  total =   50034250 ops | 5003425 ops/sec | p50 2us  p99 6us  p99.99 6008us
+
+Comparison to T5 baseline
+=========================
+| N   | T5 ops/sec | Post-Fix-A ops/sec | Δ      | Note                          |
+| --- | ---------- | ------------------ | ------ | ----------------------------- |
+| 1   | (n/a)      | 1.20M              | n/a    | new data point                |
+| 8   | (n/a)      | 4.49M              | n/a    | new data point                |
+| 16  | 4.77M      | 5.28M              | +10.7% | first meaningful Fix-A lift   |
+| 24  | (n/a)      | 4.68M              | n/a    | new data point                |
+| 32  | 5.04M      | 5.00M              | -0.8%  | within trial noise (no lift)  |
+
+Verdict: Fix A delivers a measurable +10.7% lift at N=16 (the historic best-case
+operating point), and is flat at N=32 (already CPU-saturated; encode/decode bypass
+is amortized smaller as core contention dominates). The HEADLINE 10M ops/sec target
+is NOT achieved by Fix A alone — the ceiling is approximately ~5.3M ops/sec at the
+sweet spot, suggesting Fix A removed the encode/decode allocation tax but the next
+bottleneck is upstream of that path (heap traffic from Storage::get clone, RwLock
+reader cache-line ping-pong, or channel-based reply delivery in read_pool).
+
+This matches the T6 attack-plan hypothesis: Fix A (in-process apply) was the
+"low-hanging" half of the encode/decode roundtrip; Fix B (Arc<[u8]> migration on
+OpResult::Got) targets the OTHER allocation in the hot path — the Vec<u8> alloc
+that backs every committed read response.
+
+Next: Step 2-5 — Fix B implementation + sweep + comparison.

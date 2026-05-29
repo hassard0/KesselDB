@@ -28,6 +28,15 @@ kessel-sm = { path = "../../crates/kessel-sm" }
 # External DB drivers.
 rusqlite = { version = "0.31", features = ["bundled"] }
 postgres = { version = "0.19", features = ["with-serde_json-1"] }
+# TigerBeetle client. Gated by feature `tigerbeetle-real` because the
+# tigerbeetle-unofficial-sys crate downloads a Zig toolchain at build time
+# (~50 MiB) and requires bindgen + clang headers. Without this feature the
+# driver falls back to the honest-stub form documented in
+# tools/bench-compare/src/drivers/tigerbeetle.rs. To build with the real
+# client on vulcan: BINDGEN_EXTRA_CLANG_ARGS='-I/usr/lib/gcc/x86_64-linux-gnu/13/include' \
+#   cargo build --release --features tigerbeetle-real
+tigerbeetle-unofficial = { version = "0.14.28", optional = true }
+pollster = { version = "0.3", optional = true }
 
 # CLI + JSON + perf utilities.
 clap = { version = "4", features = ["derive"] }
@@ -36,6 +45,12 @@ serde_json = "1"
 rand = { version = "0.8", features = ["small_rng"] }
 crossbeam-channel = "0.5"
 anyhow = "1"
+
+[features]
+default = []
+# Opt-in real TigerBeetle client (build deps: bindgen, clang headers, Zig).
+# See drivers/tigerbeetle.rs for the version-skew caveats.
+tigerbeetle-real = ["dep:tigerbeetle-unofficial", "dep:pollster"]
 
 [profile.release]
 opt-level = 3

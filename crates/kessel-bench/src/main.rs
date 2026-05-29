@@ -578,45 +578,112 @@ fn run_profile(n: usize) {
 ///     either path through the engine queue, so this is a no-op
 ///     until T2 — recorded here so the same bench command works
 ///     unchanged across slices).
+/// SP-Perf-A T4: multi-workload benchmark sweep. Extends T2's
+/// point-read bench (`parallel-reads`) with 4 additional read shapes
+/// so the publishable headline isn't a single-workload artifact:
+///   - `get-by-id`:    point read (T2 baseline; matches the 4.75M peak)
+///   - `select-limit`: full-table-scan `Op::Select` with LIMIT 10
+///   - `select-sorted`: top-10 sorted by an indexed numeric column
+///   - `aggregate-sum`: COUNT/SUM scan over a numeric column
+///   - `find-by`:      indexed equality lookup (eq-secondary-index)
+#[derive(Clone, Copy)]
+enum BenchWorkload {
+    GetById,
+    SelectLimit,
+    SelectSorted,
+    AggregateSum,
+    FindBy,
+}
+
+impl BenchWorkload {
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "get-by-id" => Self::GetById,
+            "select-limit" => Self::SelectLimit,
+            "select-sorted" => Self::SelectSorted,
+            "aggregate-sum" => Self::AggregateSum,
+            "find-by" => Self::FindBy,
+            _ => return None,
+        })
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::GetById => "get-by-id",
+            Self::SelectLimit => "select-limit",
+            Self::SelectSorted => "select-sorted",
+            Self::AggregateSum => "aggregate-sum",
+            Self::FindBy => "find-by",
+        }
+    }
+}
+
 fn run_parallel_reads(
     workers: usize,
     rows: usize,
     duration_secs: u64,
     _pool_workers: Option<usize>,
+    workload: BenchWorkload,
 ) {
     use kesseldb_server::{spawn_engine_cfg, ServerConfig};
     let dir = std::env::temp_dir()
         .join(format!("kesseldb-bench-parreads-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let cfg = ServerConfig {
-        // pool_workers is recorded for forward-compat; T1's serve_cfg
-        // doesn't yet spawn the pool, but reading the field exercises
-        // the field plumbing and the bench command is stable across
-        // slices.
         read_workers: _pool_workers,
         ..ServerConfig::default()
     };
     let engine = spawn_engine_cfg(&dir, &cfg).expect("engine open");
 
-    // Seed: one table + `rows` records. Tiny 8-byte payload so the
-    // bench measures the apply-thread bottleneck, not the record
-    // serializer.
+    // Seed: one richer table so multi-workload bench has fields to scan,
+    // sort, aggregate, and equality-index.
+    //   field 1: v U64 (no index)
+    //   field 2: score I32 (eq + ordered index — sort/range/agg target)
+    //   field 3: group U16 (eq index — find-by target)
+    // Workload `get-by-id` only ever touches the primary key so the
+    // richer schema's row footprint is amortized across all workloads
+    // (rather than two distinct datasets with different memory pressure).
     let def = encode_type_def(
         "row",
-        &[Field {
-            field_id: 0,
-            name: "v".into(),
-            kind: FieldKind::U64,
-            nullable: false,
-        }],
+        &[
+            Field { field_id: 0, name: "v".into(), kind: FieldKind::U64, nullable: false },
+            Field { field_id: 0, name: "score".into(), kind: FieldKind::I32, nullable: false },
+            Field { field_id: 0, name: "group".into(), kind: FieldKind::U16, nullable: false },
+        ],
     );
     assert!(matches!(
         engine.apply(Op::CreateType { def }),
         OpResult::TypeCreated(_)
     ));
+    // Eq index on score (field 2)
+    let _ = engine.apply(Op::CreateIndex { type_id: 1, field_id: 2 });
+    // Ordered index on score (field 2) — enables FindRange + cheap MIN/MAX
+    let _ = engine.apply(Op::AddOrderedIndex { type_id: 1, field_id: 2 });
+    // Eq index on group (field 3) — the FindBy target
+    let _ = engine.apply(Op::CreateIndex { type_id: 1, field_id: 3 });
+
+    // Build ObjectType with the post-CreateType reassigned field ids so
+    // we can encode rows. Field ids are 1..=n by SM convention.
+    use kessel_catalog::ObjectType;
+    let ot = ObjectType::from_def(
+        "row".into(),
+        vec![
+            Field { field_id: 1, name: "v".into(), kind: FieldKind::U64, nullable: false },
+            Field { field_id: 2, name: "score".into(), kind: FieldKind::I32, nullable: false },
+            Field { field_id: 3, name: "group".into(), kind: FieldKind::U16, nullable: false },
+        ],
+    );
+
     for i in 0..rows {
         let id = ObjectId::from_u128(i as u128);
-        let rec = (i as u64).to_le_bytes().to_vec();
+        let rec = kessel_codec::encode(
+            &ot,
+            &[
+                kessel_codec::Value::Uint(i as u128),
+                kessel_codec::Value::Int(((i as i128) % 1000) - 500),
+                kessel_codec::Value::Uint((i as u128) % 100),
+            ],
+        )
+        .expect("encode seed row");
         let _ = engine.apply(Op::Create {
             type_id: 1,
             id,
@@ -624,25 +691,62 @@ fn run_parallel_reads(
         });
     }
 
-    // Workers race for `duration_secs`.
+    // Pre-build the "uncond program" once per workload — kessel-expr is
+    // cheap to clone but pre-building keeps the hot loop tight.
+    use kessel_expr::Program;
+    let uncond_program = Program::new().push_int(1).bytes();
+
     let engine_arc = std::sync::Arc::new(engine);
     let stop_at = Instant::now() + std::time::Duration::from_secs(duration_secs);
     let mut handles = Vec::with_capacity(workers);
     for w in 0..workers {
         let engine = engine_arc.clone();
+        let prog = uncond_program.clone();
         let h = std::thread::spawn(move || {
-            // Deterministic per-worker RNG seeded by worker id so two
-            // runs with the same workers parameter are reproducible.
             let mut rng = kessel_proto::Rng::new(0xC0FFEE + w as u64);
             let mut ops: u64 = 0;
             let mut lat_ns: Vec<u64> = Vec::with_capacity(1024 * 1024);
             while Instant::now() < stop_at {
-                let i = rng.below(rows as u64);
-                let id = ObjectId::from_u128(i as u128);
                 let s = Instant::now();
-                let r = engine.apply(Op::GetById { type_id: 1, id });
+                let r = match workload {
+                    BenchWorkload::GetById => {
+                        let i = rng.below(rows as u64);
+                        let id = ObjectId::from_u128(i as u128);
+                        engine.apply(Op::GetById { type_id: 1, id })
+                    }
+                    BenchWorkload::SelectLimit => engine.apply(Op::Select {
+                        type_id: 1,
+                        program: prog.clone(),
+                        limit: 10,
+                    }),
+                    BenchWorkload::SelectSorted => engine.apply(Op::SelectSorted {
+                        type_id: 1,
+                        program: prog.clone(),
+                        sort_field: 2,
+                        desc: false,
+                        offset: 0,
+                        limit: 10,
+                    }),
+                    BenchWorkload::AggregateSum => engine.apply(Op::Aggregate {
+                        type_id: 1,
+                        program: prog.clone(),
+                        kind: 1, // SUM
+                        field_id: 2,
+                    }),
+                    BenchWorkload::FindBy => {
+                        let v = ((rng.below(100) as u16).to_le_bytes()).to_vec();
+                        engine.apply(Op::FindBy {
+                            type_id: 1,
+                            field_id: 3,
+                            value: v,
+                        })
+                    }
+                };
                 lat_ns.push(s.elapsed().as_nanos() as u64);
-                debug_assert!(matches!(r, OpResult::Got(_) | OpResult::NotFound));
+                debug_assert!(matches!(
+                    r,
+                    OpResult::Got(_) | OpResult::NotFound
+                ));
                 ops += 1;
             }
             (ops, lat_ns)
@@ -659,8 +763,9 @@ fn run_parallel_reads(
     }
     lat_ns_all.sort_unstable();
     println!(
-        "parallel-reads workers={workers} rows={rows} duration={duration_secs}s \
-         pool_workers={:?}",
+        "parallel-reads workload={} workers={workers} rows={rows} \
+         duration={duration_secs}s pool_workers={:?}",
+        workload.label(),
         cfg.read_workers
     );
     println!(
@@ -681,11 +786,14 @@ fn main() {
     // positional CLI (`kessel-bench [N] [mem|file]`) is preserved
     // verbatim for every other mode.
     if args.get(1).map(|s| s.as_str()) == Some("parallel-reads") {
-        // Defaults from spec §9 step 3.
+        // Defaults from spec §9 step 3. T4: `--workload <kind>` selects
+        // among `get-by-id` (T2 baseline), `select-limit`, `select-sorted`,
+        // `aggregate-sum`, `find-by`.
         let mut workers: usize = 8;
         let mut rows: usize = 100_000;
         let mut duration: u64 = 10;
         let mut pool_workers: Option<usize> = None;
+        let mut workload: BenchWorkload = BenchWorkload::GetById;
         let mut i = 2;
         while i < args.len() {
             match args[i].as_str() {
@@ -706,10 +814,17 @@ fn main() {
                     pool_workers = args.get(i + 1).and_then(|s| s.parse().ok());
                     i += 2;
                 }
+                "--workload" => {
+                    workload = args
+                        .get(i + 1)
+                        .and_then(|s| BenchWorkload::parse(s))
+                        .unwrap_or(workload);
+                    i += 2;
+                }
                 _ => i += 1,
             }
         }
-        run_parallel_reads(workers, rows, duration, pool_workers);
+        run_parallel_reads(workers, rows, duration, pool_workers, workload);
         return;
     }
 

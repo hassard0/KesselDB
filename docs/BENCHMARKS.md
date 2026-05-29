@@ -685,3 +685,165 @@ the deterministic read contract.
 | Workspace tests pass on vulcan                  | YES (130/130 server) |
 | `get-by-id` lifts past 10M ops/sec at N=16      | NO (~5.3M with Fix A; Fix B pending) |
 | Next bottleneck for T7 identified               | YES (Storage::get's Vec clone) |
+
+## 12. SP-Perf-A T7 — storage-internal Vec<u8> → Arc<[u8]> (zero-memcpy reads)
+
+Run shape: same matrix as §10/§11 — `get-by-id`, `--rows 100000
+--duration 10 --pool-workers 0`, **3 trials per N (median)**. N values
+extend the §10 set: {1, 4, 8, 16, 24, 32}.
+
+T7 closes the residual hot-path memcpy that §11's Fix B identified.
+Fix B migrated `OpResult::Got` to `Arc<[u8]>` at the proto layer, but
+`Storage::get` was still cloning `Vec<u8>` out of the SSTable / memtable
+slot on every read, so the per-read cost remained O(value_bytes). T7
+lifts the **storage internals** to `Arc<[u8]>`:
+
+* `SsTable::entries: Vec<(Key, Option<Arc<[u8]>>)>` — Arc is minted
+  ONCE at `SsTable::open` (from the on-disk bytes); every reader
+  thereafter is a refcount bump.
+* `Storage::memtable: BTreeMap<Key, Option<Arc<[u8]>>>` and the txn
+  overlay match — wrap-once on commit, refcount-bump per read.
+* `Storage::get(&self, key) -> Option<Arc<[u8]>>` — the hot path
+  returns an `Arc::clone` (atomic increment, ~ns) instead of a
+  `Vec<u8>::clone` (alloc + memcpy of the value bytes, ~µs at the
+  parallel-reads pool's per-call budget).
+* Data-row (type_id ∈ [1, MAX_USER_TYPE_ID]) reads dispatch through a
+  new `mvcc::get_at_snapshot_arc` that threads the Arc end-to-end
+  through the version-chain walk. `SnapshotRead::Found(Vec<u8>)` is
+  preserved for off-hot-path callers (Tx::read, SM apply-arm snapshot
+  reads, 100+ tests with `Vec<u8>` byte-identity fixtures).
+
+### Results — get-by-id, **10K** rows, 10s, single trial
+
+The headline T7 sweep ran on vulcan while a concurrent Track-(stardust)
+`cargo test --workspace --release` was rebuilding ~50 rustc crates
+back-to-back; vulcan load averaged 18-22 throughout. The original plan
+was 100K rows × 3 trials × 10s; under contention the 100K seed phase
+(one `engine.apply(Op::Create)` per row through the WAL with group
+commit) extended from ~30s baseline to >5 min per cell, blowing the
+sweep budget. Sweep was rerun at **10K rows** to fit the budget; cells
+at the same row-count are apples-to-apples but cross-row-count
+comparisons against §11 carry the working-set caveat below.
+
+| N   | T6 Fix-B (100K)  | T7 (10K)      | Note                                  |
+| --- | ---------------- | ------------- | ------------------------------------- |
+| 1   | 1.15M ops/sec    | **1.38M**     | +20% (different row count)            |
+| 4   | (n/a — §11 skipped) | **3.73M**  | n/a                                   |
+| 8   | 4.70M            | **5.08M**     | +8.1%                                 |
+| 16  | 3.94M            | **4.95M**     | +25.7% (§11 N=16 under heavier contention) |
+| 24  | 4.73M            | **4.84M**     | +2.2%                                 |
+| 32  | 5.07M            | **4.71M**     | -7.1%                                 |
+
+**Headline question — did N=16 lift past 10M ops/sec? NO.** Post-T7
+N=16 sits around ~5M ops/sec at 10K rows, the same regime as Fix B
+and Fix A. The storage-internal Arc<[u8]> migration shipped cleanly
+(determinism oracle 17/17 green, every prior test still green) and
+removed the per-read memcpy from the hot path, but the workload's
+per-call cost is dominated by something OTHER than the value memcpy
+at the row sizes this bench exercises (~24-byte payloads after the
+codec). The Arc-clone benefit at small value sizes is masked by the
+constant per-op cost.
+
+### Working-set caveat — 10K vs 100K rows
+
+The 10K-row dataset's full keyspace + value slot fits in the memtable
++ a single bloom-filtered SSTable. The 100K-row dataset extends across
+more SSTables once flushed. The point-read path bloom-rejects extra
+tables in O(1), so the cost difference is small — but if any cell sat
+on a bloom false-positive boundary, the working-set change between
+§11 and §12 cells could account for a few percent of the delta. The
+contention noise on the §11 sweep is the larger factor; the §12 T7
+absolute numbers are a LOWER bound under that contention.
+
+### Next bottleneck — what's left at ~5M ops/sec
+
+With the Storage::get memcpy removed and the proto Got Arc-shared, the
+remaining per-op contributors on the parallel read path are:
+
+1. **`RwLock<StateMachine>` reader atomic CAS** — every `.read()` call
+   on the parallel path bumps a reader counter (atomic CAS); at high N
+   this becomes a cache-line ping-pong across the L2/LLC. Lock-free
+   alternatives: `arc_swap::ArcSwap<StateMachine>` (epoch-based
+   snapshot read; readers do a single load), or per-shard
+   `Arc<StateMachine>` with sharded apply queues (Perf-A-SHARD V2).
+2. **MVCC version chain walk per data-row read** — `scan_range_versions`
+   walks the (type_id, oid) prefix in the LSM each call. With one
+   version per oid (no concurrent writers), this is a single
+   binary-search hit, but `scan_range_versions` materialises a
+   `Vec<(Key, Option<Arc<[u8]>>)>` even for a single hit. A point-read
+   fast path `mvcc::point_get` that directly probes the bloom + does
+   one binary search would shave the Vec allocation.
+3. **`Op::GetById { type_id, id }` decode + dispatch overhead** —
+   the parallel path skips `Op::decode` (Fix A), but the
+   `Op::kind` match + `op_kind_counts[kind]` atomic increment still
+   fire per call. At µs-scale ops, these contribute single-digit
+   percent.
+
+The honest reading: **T7 ships the structural primitive (zero-memcpy
+storage) but the per-op constant is dominated by lock+dispatch
+overhead at this row size**. Lifting past 10M ops/sec needs the
+lock-free reader-snapshot or per-shard pool (Perf-A-SHARD / V2).
+
+
+### What changed in the read fast path
+
+After T7: `engine.apply(GetById)` → (direct, no encode) →
+`sm_shared.read()` → `StateMachine::read_only_op(...)` →
+`Storage::get(...)` → `mvcc::get_at_snapshot_arc(...)` →
+`scan_range_versions` (refcount bump per entry) → `Arc::clone` of
+the SSTable/memtable value slot (atomic increment, ZERO memcpy) →
+`OpResult::Got(Arc<[u8]>)` → return.
+
+Compare to post-T6 (Fix B): the only step removed is the
+`Vec<u8>::clone()` that materialised the value bytes inside
+`Storage::get` and `scan_range_versions`. That step's cost was
+proportional to `value_bytes × reads/sec`; at the bench's row width
+(~24 bytes after the codec) it's dominated by the per-call constant,
+but the bench harness scales with `reads/sec`, so removing it surfaces
+as a measurable lift when value size or read fan-out grows.
+
+### Wire-byte-untouched
+
+- WAL `Entry` keeps `value: Option<Vec<u8>>` (on-disk format
+  unchanged); replay wraps once into Arc on memtable load.
+- SSTable on-disk format unchanged; `SsTable::open` wraps once into
+  `Box<[u8]> → Arc<[u8]>`.
+- `OpResult::Got(Arc<[u8]>)` wire encoding from T6 Fix B is preserved
+  (locked by T6's KAT `t6_fix_b_got_wire_format_unchanged`).
+- `SnapshotRead::Found(Vec<u8>)` enum shape preserved; the
+  zero-copy path is the new `get_at_snapshot_arc` used by
+  `Storage::get` only.
+
+### Determinism oracle still passes
+
+`parallel_reads_oracle::*` ran **17/17 green** on vulcan against the
+T7 build. 100,000 reads × 16 read-Op variants × parallel vs serial =
+byte-equal on every row. The Arc<[u8]> storage-internal migration
+preserves the deterministic read contract end-to-end.
+
+### Test surface
+
+- `kessel-storage` lib: 98/98 green
+- `kessel-storage` integration (`integration_mvcc_si` +
+  `integration_mvcc_ssi` + `mvcc_replication_byte_identity` +
+  `pentest_mvcc_*` + `tx_integration`): green
+- `kessel-sm` lib: 148/148 green
+- `kessel-sm` pentest_mvcc_cutover: 10/10 green
+- `kessel-sm` pentest_mvcc_gc: 6/6 green
+- `parallel_reads_oracle` on vulcan: 17/17 green
+- `kesseldb-server` lib tests: green
+
+### Acceptance gate
+
+| Criterion                                       | Outcome |
+| ----------------------------------------------- | ------- |
+| Storage internals migrate to `Arc<[u8]>`        | YES (`SsTable::entries`, `Storage::memtable`, txn overlay) |
+| Storage::get returns `Option<Arc<[u8]>>`        | YES (refcount-bump on hot path) |
+| Wire/on-disk format unchanged                   | YES (WAL Entry + SSTable bytes preserved) |
+| Determinism oracle 17/17 green                  | YES (vulcan T7 build) |
+| `#![forbid(unsafe_code)]` honored               | YES |
+| No new external deps                            | YES |
+| `get-by-id` lifts past 10M ops/sec at N=16      | NO (~5M at 10K rows; lock+dispatch is next ceiling) |
+| Next bottleneck for V2 arc identified           | YES (RwLock reader CAS / per-shard pool / point-get fast path) |
+
+

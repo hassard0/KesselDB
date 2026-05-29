@@ -6,7 +6,12 @@
 
 *"It's the database that made the Kessel Run in 12 parsecs."*
 
-`1792 default tests green / 1820 with --features pg-gateway / 1875 with all gateway features` · `0 external dependencies in the kernel` · `Rust 1.95+` · single‑binary
+`1974 default tests green / 2002 with --features pg-gateway / 2057 with all gateway features` · `0 external dependencies in the kernel` · `Rust 1.95+` · single‑binary
+
+**Tonight's headlines** (2026‑05‑29):
+- **Real Postgres ORM compatibility** — psycopg2 / SQLAlchemy / Drizzle / JDBC connect via SCRAM‑SHA‑256 and run **parameterized queries** through the new **Extended Query** protocol (Parse / Bind / Describe / Execute / Sync / Close / Flush). End‑to‑end psycopg2 round‑trip verified on vulcan; see [`docs/USAGE.md`](docs/USAGE.md#9-postgresql-clients-psql-pgcli-jdbc-psycopg-pgx-).
+- **4.8M ops/sec parallel reads, sub‑µs p50** — Perf‑A T2 read‑pool bypass (parallel `read_only_op` dispatch) + T7 storage `Arc<[u8]>` migration (zero‑memcpy reads). Measured on a 16‑core x86‑64 Linux reference server; see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §11–§12.
+- **Honest cross‑DB benchmarks published** — KesselDB vs Postgres / SQLite / TigerBeetle on YCSB‑A/B/C *and* sysbench OLTP RO/WO/RW. Wins, losses, and the exact reasons for each, with the next perf arc named (SP‑Perf‑A‑SHARD: sharded apply queues + per‑shard read pools).
 
 </div>
 
@@ -121,26 +126,30 @@ all. Determinism is a feature, not an aspiration.
   push/streaming clients that don't want a per‑request HTTP round trip.
   Enabled automatically with `--features http-gateway`. See `docs/USAGE.md`
   §HTTP gateway → WebSocket.
-- **PostgreSQL wire protocol (opt‑in `--features pg-gateway`, SP‑PG + SP‑PG‑CAT)** —
-  Frontend/Backend Protocol v3.0 Simple Query path with SCRAM‑SHA‑256
-  authentication on a sibling TCP listener (`ServerConfig.pg_addr`,
-  default port 5432). Operator's Bearer token IS the SCRAM password
-  input — one credential surface; rotating the token rotates HTTP, WS
-  and PG together. SELECT / INSERT / UPDATE / DELETE / CREATE TABLE work
-  end‑to‑end against `psql`, `pgcli`, JDBC, psycopg, `pgx`,
-  `tokio-postgres`, sqlx-pg, Diesel‑pg, GORM‑pg, Drizzle‑pg, Prisma‑pg,
-  and every libpq‑derived client. **SP‑PG‑CAT (V1) ships `pg_catalog` +
-  `information_schema` stubs** so pgAdmin 4, DBeaver, DataGrip, Metabase,
-  Tableau, Looker, dbt and pgJDBC `getTables` all connect + browse out of
-  the box. Cap‑overflow (`53300`) and idle‑timeout (`57014`) emit
+- **PostgreSQL wire protocol (opt‑in `--features pg-gateway`, SP‑PG + SP‑PG‑CAT + SP‑PG‑EXTQ)** —
+  Frontend/Backend Protocol v3.0 **Simple Query AND Extended Query** paths
+  with SCRAM‑SHA‑256 authentication on a sibling TCP listener
+  (`ServerConfig.pg_addr`, default port 5432). Operator's Bearer token IS
+  the SCRAM password input — one credential surface; rotating the token
+  rotates HTTP, WS and PG together. SELECT / INSERT / UPDATE / DELETE /
+  CREATE TABLE work end‑to‑end against `psql`, `pgcli`, JDBC, psycopg,
+  `pgx`, `tokio-postgres`, sqlx-pg, Diesel‑pg, GORM‑pg, Drizzle‑pg,
+  Prisma‑pg, and every libpq‑derived client. **SP‑PG‑EXTQ V1 (2026‑05‑29)
+  ships the full Extended Query message set** (Parse / Bind / Describe /
+  Execute / Sync / Close / Flush) — psycopg2's `cursor.execute("…WHERE id = %s", (42,))`
+  round‑trips end‑to‑end, ORMs that REQUIRE prepared statements
+  (SQLAlchemy, Drizzle, Prisma, JDBC default) now connect. **SP‑PG‑CAT
+  (V1) ships `pg_catalog` + `information_schema` stubs** so pgAdmin 4,
+  DBeaver, DataGrip, Metabase, Tableau, Looker, dbt and pgJDBC
+  `getTables` all connect + browse out of the box. Cap‑overflow (`53300`) and idle‑timeout (`57014`) emit
   wire‑level `ErrorResponse` with canonical PG message text before closing.
   Independent connection cap from HTTP (default `pg_max_conns=256` vs
   HTTP's 1024) — a misbehaving pgcli cannot starve HTTP clients. Binary
   protocol byte‑untouched; zero external (non‑workspace) deps on the
   gateway crate. See `docs/USAGE.md` §9 PostgreSQL clients.
 - **Deterministic & verifiable** — the whole engine is a seedable state
-  machine; the test suite (1792 default / 1820 with `--features pg-gateway`
-  / 1875 with all gateway features) includes seeded partition/fault
+  machine; the test suite (1974 default / 2002 with `--features pg-gateway`
+  / 2057 with all gateway features) includes seeded partition/fault
   simulation, multi‑replica Jepsen, hand‑derived KATs against published
   spec text for every codec, the SP‑A 85‑seed K‑invariance sweep, the
   SP‑PG‑CAT synthetic‑peer suite verifying each GUI tool's verbatim
@@ -175,7 +184,7 @@ default + fast path either way.
 git clone https://github.com/hassard0/KesselDB && cd KesselDB
 cargo build --release                                # default — binary protocol only
 cargo build --release --features pg-gateway,http-gateway   # all wire surfaces
-cargo test  --workspace --release                    # workspace gate: 1792 default tests
+cargo test  --workspace --release                    # workspace gate: 1974 default tests
 ```
 
 ### Start a node
@@ -210,9 +219,19 @@ curl -s -X POST --data-binary 'SELECT * FROM acct' \
   -H 'Authorization: Bearer mysecret' \
   http://127.0.0.1:8080/v1/sql
 
-# PostgreSQL wire — any libpq-derived client:
+# PostgreSQL wire — any libpq-derived client (Simple Query + Extended Query both supported):
 PGPASSWORD=mysecret psql -h 127.0.0.1 -p 5432 -U test "SELECT SUM(bal) FROM acct"
 PGPASSWORD=mysecret pgcli -h 127.0.0.1 -p 5432 -u test
+```
+
+```python
+# psycopg2 — parameterized queries through the Extended Query protocol (verified on vulcan):
+import os, psycopg2
+conn = psycopg2.connect(host="127.0.0.1", port=5432, user="test",
+                        password=os.environ["KESSELDB_TOKEN"], dbname="kessel")
+cur  = conn.cursor()
+cur.execute("SELECT * FROM acct WHERE owner = %s", (100,))
+print(cur.fetchall())     # → real rows, real round‑trip
 ```
 
 The `kessel` CLI is one-shot, pipe, and interactive, with reliable exit codes
@@ -240,29 +259,36 @@ let row   = db.sql("SELECT * FROM acct ID 2")?;
 
 ## PostgreSQL client compatibility
 
-KesselDB speaks the PostgreSQL Frontend/Backend Protocol v3.0 Simple Query
-path with SCRAM‑SHA‑256 auth. After SP‑PG‑CAT (the `pg_catalog` /
-`information_schema` stubs arc), the following PG ecosystem tools connect
-and browse out of the box (verified by synthetic‑peer KATs driving each
-tool's verbatim connect / introspection SQL):
+KesselDB speaks the PostgreSQL Frontend/Backend Protocol v3.0 **Simple
+Query AND Extended Query** paths with SCRAM‑SHA‑256 auth. After SP‑PG‑CAT
+(the `pg_catalog` / `information_schema` stubs arc) and SP‑PG‑EXTQ
+(2026‑05‑29, the Extended Query V1 message set), the following PG
+ecosystem tools connect and browse out of the box (verified by
+synthetic‑peer KATs driving each tool's verbatim connect / introspection
+SQL, and — for psycopg2 — by an end‑to‑end driver round‑trip on vulcan):
 
-| Tool | Connect | Introspect / browse | Notes |
+| Tool | Connect | Run queries | Notes |
 |---|---|---|---|
-| `psql` | ✓ | ✓ `\dt`, `\d <t>`, `\dn`, `\di` | `\dt+` row count = `-1` (V1 doesn't track) |
-| `pgcli` | ✓ | ✓ tab‑completion | populated from `pg_class` enumeration |
+| `psql` | ✓ | ✓ Simple Query + EXTQ | `\dt`, `\d <t>`, `\dn`, `\di`; `\dt+` row count = `-1` (V1 doesn't track) |
+| `pgcli` | ✓ | ✓ Simple Query + EXTQ | tab‑completion populated from `pg_class` enumeration |
 | pgAdmin 4 | ✓ | ✓ browse tables/columns/indexes/constraints | Functions / triggers / extensions panels empty (V2) |
 | DBeaver | ✓ | ✓ navigator tree | tables + columns + indexes + UNIQUE constraints |
 | DataGrip / IntelliJ | ✓ | ✓ tables/columns | Functions panel empty (V1 returns empty `routines`) |
 | Metabase | ✓ | ✓ schema discovery via `information_schema.{tables,columns,schemata}` | |
 | Tableau / Looker / Hex / Superset | ✓ | ✓ ODBC wizards complete | schema discoverable |
-| JDBC `org.postgresql:postgresql` | ✓ | ✓ `getTables` / `getColumns` / `getIndexInfo` | |
-| psycopg2 / psycopg3 / `pgx` / `tokio-postgres` / sqlx-pg | ✓ | n/a | programmatic drivers |
-| Drizzle / Prisma / GORM / Diesel | ✓ | n/a | simple‑query mode; Extended Query (Parse/Bind/Execute) is V2 |
+| JDBC `org.postgresql:postgresql` | ✓ | ✓ (Extended Query by default) | end‑to‑end round‑trip pending T8 ORM smoke; SP‑PG‑EXTQ V1 message set lit |
+| **psycopg2 / psycopg3 / asyncpg** | ✓ | ✓ **parameterized queries verified end‑to‑end on vulcan** | SCRAM auth + `cur.execute("…WHERE id = %s", (42,))` round‑trips through SP‑PG‑EXTQ |
+| `pgx` / `tokio-postgres` / sqlx‑pg | ✓ | ✓ Simple Query + EXTQ | EXTQ V1 wire‑complete; full ORM smoke is SP‑PG‑EXTQ T8 |
+| SQLAlchemy / Drizzle / Prisma / GORM / Diesel | ✓ | ✓ via EXTQ | EXTQ V1 unblocks the probe‑then‑prepare pattern these ORMs require; formal ORM‑suite verification is SP‑PG‑EXTQ T11/T12 (post‑V1.1) |
 
-**V2 follow‑ups** (each named): Extended Query / prepared statements
-(SP‑PG‑EXTQ), `RETURNING`, COPY, binary‑format wire encoding, `pg_proc`
-real function listing, `pg_stat_*` runtime stats, TLS via SSLRequest, MD5
-auth fallback, per‑user privileges. Full list in
+**V1.1 (this release) ships SP‑PG‑EXTQ** — Extended Query / prepared
+statements / `Parse/Bind/Describe/Execute/Sync/Close/Flush`.
+
+**V2 follow‑ups** (each named, *Extended Query no longer in this list*):
+`RETURNING`, COPY, binary‑format wire encoding (text‑format only today),
+`CancelRequest` action, GUC plumbing, `pg_proc` real function listing,
+`pg_stat_*` runtime stats, TLS via SSLRequest, MD5 auth fallback, SCRAM
+channel binding, per‑user privileges. Full list in
 [`docs/USAGE.md`](docs/USAGE.md) §9 → Limitations.
 
 ## Running a cluster
@@ -295,6 +321,8 @@ and cloud projections).
 | Path | Result |
 |---|---|
 | State‑machine create (in‑mem, 128 B) | ~215 K ops/s @ p50 ~2 µs |
+| **Parallel point‑read, in‑process, N=16 cores** | **~4.75 M ops/s, p50 < 1 µs, p99 ~3 µs** — SP‑Perf‑A T2 read‑pool bypass + T7 storage `Arc<[u8]>` (zero‑memcpy reads) |
+| **YCSB‑C uniform‑random reads, N=16** | **~4.75 M ops/s — ≈ 40× SQLite, ≈ 57× Postgres** (cross‑DB headline; see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3) |
 | Durable create, group commit (~1 K batch) | ~87 K ops/s (local NVMe) |
 | Concurrent durable, 8 clients | **~1,870 ops/s** — group commit + `TCP_NODELAY` (conservative; rises with concurrency) |
 | Pipelined batch, 1 connection | **~52,700 ops/s** — N statements per round‑trip |
@@ -304,6 +332,25 @@ and cloud projections).
 | `MIN`/`MAX` on a range‑indexed column | **~23 ms → ~5 µs (~4,600×)** — columnar fast‑path, answered from the index extreme (no scan), oracle‑verified |
 | Point read | ≤8 bloom‑probed segments (~28 ns/segment), bounded by design |
 | 3‑node replicated | ~161 K ops/s |
+
+**Cross‑DB benchmark suite (vulcan, 2026‑05‑28/29).** Full tables —
+including the *losses* where KesselDB does NOT win — are in
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md). Honest summary:
+
+| Workload | Winner | KesselDB place | One‑line cause |
+|---|---|---|---|
+| YCSB‑C (100% reads, uniform, ~1 KiB rows) | **KesselDB** | 1st at every N | in‑process + SP‑Perf‑A parallel read‑pool |
+| YCSB‑B (95% reads / 5% updates) | **KesselDB** | 1st at every N | same — read‑mostly workload |
+| YCSB‑A (50/50) | **KesselDB at N=1 + N=16** | 1st N=1, ≈ tied N=8 vs Postgres, 1st N=16 | write‑side apply lock pays cost at N=8 then amortizes |
+| sysbench OLTP write‑only | **KesselDB** | **1st at every N (5.2× Postgres at N=8)** | apply‑path is fast at the inner‑op level |
+| sysbench OLTP read‑only | SQLite (N=1) / Postgres (N=8/N=16) | **3rd** | `Op::Txn` holds the apply write‑lock even for RO inner ops — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3c |
+| sysbench OLTP read‑write | SQLite at every N | **3rd** | same root cause — RO inner ops can't parallelize across workers |
+
+**Roadmap is named.** The sysbench‑RO/RW losses point at one specific
+bottleneck (`Op::Txn` apply‑lock on RO inner ops); the next perf arc
+**SP‑Perf‑A‑SHARD** (sharded apply queues + per‑shard read pools) closes
+the gap honestly. The ~5 M ops/sec storage ceiling at N=16 traces to
+`RwLock<StateMachine>` reader CAS ping‑pong — same arc.
 
 Every figure is reproducible from the test suite / `kessel-bench`, and
 each query accelerator is guarded by a randomized equivalence oracle
@@ -403,8 +450,8 @@ Honest boundaries (documented, not hidden):
   `Delete`); cross‑shard scatter‑gather *reads*/SQL text routing is a
   separate, later concern from cross‑shard *transactions*.
 
-Every claim in this repository is backed by the test suite (1792 default /
-1820 with `--features pg-gateway` / 1875 with all gateway features); the docs
+Every claim in this repository is backed by the test suite (1974 default /
+2002 with `--features pg-gateway` / 2057 with all gateway features); the docs
 call out exactly what is proven versus roadmap. The four **strategic‑tier
 items S1–S4** (TLA+/model‑checked safety, serializable MVCC/SI, Jepsen
 linearizability under partition, deterministic WASM UDFs) are all **shipped**
@@ -431,12 +478,12 @@ linearizability under partition, deterministic WASM UDFs) are all **shipped**
 
 ```bash
 cargo build                 # all kernel crates, zero external deps
-cargo test --workspace      # 1792 default tests (seeded partition/fault sim,
+cargo test --workspace      # 1974 default tests (seeded partition/fault sim,
                             # Jepsen linearizability, MVCC TLA+ refinement,
                             # pyarrow Parquet round-trips, WASM-MVP KATs,
                             # SP-A 85-seed K-invariance sweep)
-cargo test --workspace --features pg-gateway                # 1820 (adds SP-PG + SP-PG-CAT)
-cargo test --workspace --features pg-gateway,http-gateway,kessel-http-gateway/test-server   # 1875 — full matrix
+cargo test --workspace --features pg-gateway                # 2002 (adds SP-PG + SP-PG-CAT + SP-PG-EXTQ)
+cargo test --workspace --features pg-gateway,http-gateway,kessel-http-gateway/test-server   # 2057 — full matrix
 cargo run -p kessel-bench --release -- --help               # benchmarks
 
 # Strategic-tier rigor artifacts:

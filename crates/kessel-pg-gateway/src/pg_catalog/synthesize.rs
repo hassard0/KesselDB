@@ -2091,6 +2091,49 @@ pub fn psql_d_pg_foreign_table_empty() -> Vec<u8> {
     out
 }
 
+/// SP-PG-EXTQ T8 — synthesize a 0-row well-framed response for the
+/// canonical psycopg2/SQLAlchemy hstore-OID probe (and the broader
+/// pg_type ⋈ pg_namespace JOIN shape that probes for arbitrary
+/// extension type OIDs).
+///
+/// The canonical psycopg2 probe is (from
+/// `psycopg2.extras.HstoreAdapter.get_oids`):
+///
+/// ```sql
+/// SELECT t.oid, typarray
+/// FROM pg_type t JOIN pg_namespace ns
+///     ON typnamespace = ns.oid
+/// WHERE typname = 'hstore';
+/// ```
+///
+/// Without intercepting, the JOIN reaches kessel-sql which rejects
+/// the JOIN clause; psycopg2 then treats it as a probe failure and
+/// SQLAlchemy refuses to initialize the hstore extension at all
+/// (unless `use_native_hstore=False` is passed at engine creation).
+///
+/// By returning a well-framed 0-row response we tell psycopg2 "no
+/// hstore extension installed" — which is the truth (KesselDB has
+/// no extension catalog). Psycopg2 + SQLAlchemy 2.0 then proceed
+/// to set up the connection normally, no `use_native_hstore=False`
+/// needed. The same 0-row shape works for any extension type the
+/// driver probes — pg_type JOIN with `typname = '<x>'` returns 0
+/// rows for every `<x>` in V1, so the driver concludes the
+/// extension is not present.
+///
+/// Column shape: `oid OID, typarray OID`. Locked against
+/// `psycopg2.extras.HstoreAdapter.get_oids` exactly.
+pub fn hstore_probe_empty() -> Vec<u8> {
+    let fields = vec![
+        FieldMeta { name: "oid".to_string(), type_oid: PG_TYPE_OID },
+        FieldMeta { name: "typarray".to_string(), type_oid: PG_TYPE_OID },
+    ];
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    out.extend_from_slice(&encode_command_complete(&select_tag(0)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
 /// SP-PG-CAT T8 (real-psql) — psql `\dn` schema-list.
 ///
 /// Synthesize the canonical 2-column ("Name", "Owner") response for
@@ -4229,6 +4272,32 @@ mod tests {
         assert_eq!(information_schema_data_type_for_oid(PG_TYPE_BYTEA), "bytea");
         // Unknown OID → 'USER-DEFINED' per SQL standard fallback.
         assert_eq!(information_schema_data_type_for_oid(99999), "USER-DEFINED");
+    }
+
+    /// **SP-PG-EXTQ T8 — hstore_probe_empty emits a well-framed 0-row
+    /// response with 2 OID columns (oid, typarray).** Locks the
+    /// column shape against future drift — psycopg2 + SQLAlchemy
+    /// read the column count from the RD frame at probe time, so any
+    /// drift would re-introduce the `use_native_hstore=False` caveat.
+    #[test]
+    fn t8_hstore_probe_empty_byte_shape() {
+        let bytes = hstore_probe_empty();
+        // RowDescription header.
+        assert_eq!(bytes[0], b'T', "first frame MUST be RowDescription");
+        // u16 BE column count at bytes 5..7.
+        let col_count = u16::from_be_bytes([bytes[5], bytes[6]]);
+        assert_eq!(col_count, 2, "MUST advertise exactly 2 columns");
+        // Column names appear in the RD frame.
+        assert!(bytes.windows(b"oid\0".len()).any(|w| w == b"oid\0"),
+            "column 'oid' MUST be in the RD frame");
+        assert!(bytes.windows(b"typarray\0".len()).any(|w| w == b"typarray\0"),
+            "column 'typarray' MUST be in the RD frame");
+        // 0-row CommandComplete tag.
+        assert!(bytes.windows(b"SELECT 0\0".len()).any(|w| w == b"SELECT 0\0"),
+            "CommandComplete tag MUST be 'SELECT 0' (0 rows)");
+        // ReadyForQuery('I') trailer.
+        assert_eq!(&bytes[bytes.len() - 6..], &[b'Z', 0, 0, 0, 5, b'I'],
+            "MUST end with ReadyForQuery('I')");
     }
 
     /// **information_schema synthesizers handle empty engines

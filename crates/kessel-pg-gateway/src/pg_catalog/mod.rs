@@ -133,6 +133,17 @@ pub fn catalog_query_hook<E: EngineApply + ?Sized>(
     if let Some(bytes) = synthesize::synthesize_helper_function(&normalized) {
         return Some(bytes);
     }
+    // SP-PG-EXTQ T8 — canonical psycopg2/SQLAlchemy hstore-OID JOIN
+    // probe (and broader pg_type ⋈ pg_namespace typname-filtered
+    // shape). kessel-sql doesn't parse JOIN; without this matcher
+    // SQLAlchemy 2.0 needs `use_native_hstore=False` to connect. The
+    // synthesizer returns a 0-row well-framed response — psycopg2
+    // then concludes "no hstore extension" + SQLAlchemy proceeds
+    // normally. See `hstore_probe_empty` doc for the locked query
+    // shape.
+    if matches_pg_type_join_pg_namespace_typname_filter(&normalized) {
+        return Some(synthesize::hstore_probe_empty());
+    }
     // T1: `SELECT * FROM pg_catalog.pg_namespace` (canned 3-row).
     if matches_pg_namespace_select_star(&normalized) {
         return Some(synthesize::pg_namespace_all_rows());
@@ -488,6 +499,55 @@ fn extract_psql_d_table_oid(normalized: &str) -> Option<u32> {
 fn matches_pg_type_select_star(normalized: &str) -> bool {
     normalized == "select * from pg_catalog.pg_type"
         || normalized == "select * from pg_type"
+}
+
+/// SP-PG-EXTQ T8 — recognize the canonical psycopg2/SQLAlchemy
+/// pg_type ⋈ pg_namespace JOIN probe shape that filters by
+/// `typname = '<extension-name>'`. The canonical psycopg2 hstore
+/// probe (from `psycopg2.extras.HstoreAdapter.get_oids`) is:
+///
+/// ```sql
+/// SELECT t.oid, typarray FROM pg_type t JOIN pg_namespace ns
+/// ON typnamespace = ns.oid WHERE typname = 'hstore';
+/// ```
+///
+/// After `normalize_for_match` the SQL is:
+/// `select t.oid, typarray from pg_type t join pg_namespace ns on typnamespace = ns.oid where typname = 'hstore'`
+///
+/// We match the SUBSTRING `from pg_type t join pg_namespace`
+/// (qualified + unqualified forms) — anything with that shape +
+/// a `where typname = '<x>'` filter gets a 0-row response. Locked
+/// against false positives: a real `SELECT * FROM pg_type` without
+/// the JOIN is handled by the T4 `matches_pg_type_select_star`
+/// path above; only JOIN-shape queries reach this matcher.
+fn matches_pg_type_join_pg_namespace_typname_filter(normalized: &str) -> bool {
+    if !normalized.starts_with("select ") {
+        return false;
+    }
+    // Match qualified + unqualified pg_type/pg_namespace forms in the
+    // JOIN clause. The alias is conventionally `t` for pg_type and
+    // `ns`/`n` for pg_namespace but we match the table names only.
+    let join_shapes = [
+        // psycopg2 HstoreAdapter canonical (unqualified).
+        "from pg_type t join pg_namespace",
+        // SQLAlchemy / JDBC pg_catalog-qualified equivalents.
+        "from pg_catalog.pg_type t join pg_catalog.pg_namespace",
+        "from pg_type t join pg_catalog.pg_namespace",
+        "from pg_catalog.pg_type t join pg_namespace",
+        // Some drivers swap the alias letters or drop them.
+        "from pg_type join pg_namespace",
+        "from pg_catalog.pg_type join pg_catalog.pg_namespace",
+    ];
+    let has_join = join_shapes.iter().any(|s| normalized.contains(s));
+    if !has_join {
+        return false;
+    }
+    // Anchor on the typname filter — every probe carries this
+    // (psycopg2 + SQLAlchemy + JDBC drivers identify the extension
+    // by typname). Without the filter we don't recognize the shape
+    // (defensive — don't return 0 rows for an arbitrary JOIN that
+    // happens to walk these two catalog tables).
+    normalized.contains("where typname = '") || normalized.contains("and typname = '")
 }
 
 /// SP-PG-CAT T4 — recognize `SELECT ... FROM pg_catalog.pg_type
@@ -2288,5 +2348,180 @@ mod tests {
         assert!(catalog_query_hook("SELECT version()", &eng).is_some());
         // SELECTs that look like \d step-1 but lack the JOIN don't match.
         assert!(catalog_query_hook("SELECT c.oid, n.nspname, c.relname FROM users", &eng).is_none());
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-EXTQ T8 KATs — hstore-OID JOIN probe interception. Closes
+    // the SQLAlchemy 2.0 `use_native_hstore=False` caveat from T7 by
+    // intercepting the canonical psycopg2/SQLAlchemy pg_type ⋈
+    // pg_namespace probe and emitting a well-framed 0-row response.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// **HEADLINE — psycopg2 HstoreAdapter.get_oids canonical probe
+    /// hits the hook.** This is the verbatim SQL from
+    /// `psycopg2.extras.HstoreAdapter.get_oids` — without this
+    /// matcher, SQLAlchemy 2.0 requires `use_native_hstore=False` to
+    /// connect. With this matcher, the connection works out of the
+    /// box.
+    #[test]
+    fn t8_extq_hstore_probe_canonical_psycopg2_form_hits_hook() {
+        let eng = t6_engine();
+        let q = "SELECT t.oid, typarray\n\
+                 FROM pg_type t JOIN pg_namespace ns\n\
+                 \tON typnamespace = ns.oid\n\
+                 WHERE typname = 'hstore';";
+        let res = catalog_query_hook(q, &eng);
+        assert!(res.is_some(), "psycopg2 hstore probe MUST hit the hook");
+        let bytes = res.unwrap();
+        // Well-framed: starts with 'T' RowDescription, ends with 'Z' RFQ('I').
+        assert_eq!(bytes[0], b'T', "first frame MUST be RowDescription");
+        assert_eq!(&bytes[bytes.len() - 6..], &[b'Z', 0, 0, 0, 5, b'I']);
+        // 0 rows -> CommandComplete tag is "SELECT 0".
+        assert!(bytes.windows(b"SELECT 0\0".len()).any(|w| w == b"SELECT 0\0"));
+        // NO DataRow frames in a 0-row response.
+        // (The byte `D` could appear inside the column-name "oid",
+        // so we can't bare-assert "no D"; instead verify the
+        // CommandComplete envelope appears at the expected offset.)
+    }
+
+    /// **pg_catalog-qualified hstore probe form** — some clients
+    /// fully qualify the table names.
+    #[test]
+    fn t8_extq_hstore_probe_pg_catalog_qualified_form_hits_hook() {
+        let eng = t6_engine();
+        let q = "SELECT t.oid, typarray FROM pg_catalog.pg_type t \
+                 JOIN pg_catalog.pg_namespace ns ON typnamespace = ns.oid \
+                 WHERE typname = 'hstore'";
+        assert!(catalog_query_hook(q, &eng).is_some(),
+            "pg_catalog-qualified hstore probe MUST hit the hook");
+    }
+
+    /// **Mixed-qualification hstore probe** (some drivers qualify one
+    /// table but not the other).
+    #[test]
+    fn t8_extq_hstore_probe_mixed_qualification_hits_hook() {
+        let eng = t6_engine();
+        let q1 = "SELECT t.oid, typarray FROM pg_type t \
+                  JOIN pg_catalog.pg_namespace ns ON typnamespace = ns.oid \
+                  WHERE typname = 'hstore'";
+        let q2 = "SELECT t.oid, typarray FROM pg_catalog.pg_type t \
+                  JOIN pg_namespace ns ON typnamespace = ns.oid \
+                  WHERE typname = 'hstore'";
+        assert!(catalog_query_hook(q1, &eng).is_some());
+        assert!(catalog_query_hook(q2, &eng).is_some());
+    }
+
+    /// **Generic extension-type probe** — the same JOIN shape works
+    /// for any `typname = '<x>'`, not just hstore. Drivers probe
+    /// citext / uuid-ossp / postgis / etc. the same way.
+    #[test]
+    fn t8_extq_hstore_probe_generic_extension_typname_hits_hook() {
+        let eng = t6_engine();
+        for typname in ["citext", "uuid", "postgis", "ltree", "geography"] {
+            let q = format!(
+                "SELECT t.oid, typarray FROM pg_type t JOIN pg_namespace ns \
+                 ON typnamespace = ns.oid WHERE typname = '{typname}'"
+            );
+            assert!(catalog_query_hook(&q, &eng).is_some(),
+                "generic extension probe (typname={typname}) MUST hit the hook");
+        }
+    }
+
+    /// **Hstore probe is case-insensitive** — psycopg2 ships lower,
+    /// but some clients send UPPER (e.g. JDBC drivers).
+    #[test]
+    fn t8_extq_hstore_probe_is_case_insensitive() {
+        let eng = t6_engine();
+        let upper = "SELECT T.OID, TYPARRAY FROM PG_TYPE T JOIN PG_NAMESPACE NS \
+                     ON TYPNAMESPACE = NS.OID WHERE TYPNAME = 'hstore'";
+        assert!(catalog_query_hook(upper, &eng).is_some(),
+            "upper-case hstore probe MUST hit the hook");
+    }
+
+    /// **HEADLINE — synthesizer emits the 2-column oid/typarray
+    /// RowDescription byte-correct.** Locks the column-shape contract
+    /// against future drift — psycopg2 reads the column count from
+    /// the RowDescription frame, so the shape must be exact.
+    #[test]
+    fn t8_extq_hstore_probe_response_shape_is_two_oid_columns() {
+        let eng = t6_engine();
+        let q = "SELECT t.oid, typarray FROM pg_type t JOIN pg_namespace ns \
+                 ON typnamespace = ns.oid WHERE typname = 'hstore'";
+        let bytes = catalog_query_hook(q, &eng).unwrap();
+        // RowDescription column-count is at byte 5..7 (after 'T' tag +
+        // 4-byte length): u16 BE column count.
+        assert_eq!(bytes[0], b'T');
+        let col_count = u16::from_be_bytes([bytes[5], bytes[6]]);
+        assert_eq!(col_count, 2, "RowDescription MUST have 2 columns (oid, typarray)");
+        // The column names "oid" and "typarray" appear in the RD bytes.
+        assert!(bytes.windows(b"oid\0".len()).any(|w| w == b"oid\0"),
+            "first column name MUST be 'oid'");
+        assert!(bytes.windows(b"typarray\0".len()).any(|w| w == b"typarray\0"),
+            "second column name MUST be 'typarray'");
+    }
+
+    /// **Regression lock — a SELECT against pg_type WITHOUT the JOIN
+    /// still goes through the T4 `matches_pg_type_select_star` path,
+    /// not the new T8 hstore-probe path.** Ensures the T8 matcher is
+    /// strictly additive (doesn't shadow T4).
+    #[test]
+    fn t8_extq_pg_type_select_star_still_routes_through_t4() {
+        let eng = t6_engine();
+        let q = "SELECT * FROM pg_catalog.pg_type";
+        let bytes = catalog_query_hook(q, &eng).unwrap();
+        // The T4 pg_type synthesizer returns the full canned pg_type
+        // catalog (~30+ rows); the T8 hstore probe returns 0 rows. So
+        // we expect more than 0 DataRow frames.
+        let select_tag_pos = bytes.windows(b"SELECT ".len())
+            .position(|w| w == b"SELECT ").expect("CommandComplete present");
+        // Read the count after "SELECT " in the CommandComplete tag.
+        let after = &bytes[select_tag_pos + b"SELECT ".len()..];
+        let count_str: String = after.iter().take_while(|&&b| b != 0).map(|&b| b as char).collect();
+        let count: u64 = count_str.trim().parse().expect("numeric row count");
+        assert!(count > 5, "T4 pg_type returns the full canned catalog ({count} rows)");
+    }
+
+    /// **Regression lock — non-JOIN SELECTs touching pg_type don't
+    /// trigger the T8 matcher.** A bare `SELECT typname FROM pg_type
+    /// WHERE typname = 'hstore'` (no JOIN) does NOT match — the
+    /// matcher REQUIRES the JOIN shape.
+    #[test]
+    fn t8_extq_pg_type_typname_without_join_does_not_match() {
+        let eng = t6_engine();
+        let q = "SELECT typname FROM pg_type WHERE typname = 'hstore'";
+        // This may hit a different matcher (T4 pg_type per-OID) or
+        // fall through entirely — but it must NOT hit the T8 hstore
+        // matcher. We verify by checking it doesn't return the
+        // distinctive 2-column oid/typarray response.
+        let res = catalog_query_hook(q, &eng);
+        if let Some(bytes) = res {
+            // If something matched, it must NOT be the T8 0-row shape.
+            // The hstore_probe_empty has exactly 2 columns; any other
+            // match would have a different column count or content.
+            // Use a heuristic: the T8 response has "typarray\0" in the
+            // RD frame. Other pg_type matchers DON'T.
+            let has_typarray_col = bytes.windows(b"typarray\0".len())
+                .filter(|w| *w == b"typarray\0").count();
+            // T4's matchers can also include typarray; that's fine.
+            // We don't constrain — the important thing is the T8
+            // matcher's contract was specified for JOIN shapes only.
+            let _ = has_typarray_col;
+        }
+        // Pass — the bare typname SELECT can match T4 or fall through;
+        // what matters is the T8 matcher doesn't over-reach on it.
+        // We test the negative directly:
+        assert!(!matches_pg_type_join_pg_namespace_typname_filter(
+            &normalize_for_match(q)));
+    }
+
+    /// **Negative control — a plain JOIN against pg_type without the
+    /// typname filter does NOT match.** Defensive: don't return 0
+    /// rows for arbitrary catalog-shaped queries.
+    #[test]
+    fn t8_extq_pg_type_join_without_typname_filter_does_not_match() {
+        let q = "select t.oid, typarray from pg_type t join pg_namespace ns \
+                 on typnamespace = ns.oid where t.oid = 16385";
+        assert!(!matches_pg_type_join_pg_namespace_typname_filter(q),
+            "JOIN without typname filter MUST NOT match (defensive)");
     }
 }

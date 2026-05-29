@@ -59,7 +59,7 @@ real streaming cursors (SP-A T14 streaming-rows). See design spec §2.2.
 | T# | Scope | Status | Commit |
 |---|---|---|---|
 | **T1** | Design spec (816 LoC, 10 weak-spots + 5 open questions) + scaffold (`crates/kessel-pg-gateway/src/extq/mod.rs` with `SessionState`/`PreparedStmt`/`Portal`/`ExecState` + locked caps + `recognize_extq_tag` + placeholder `try_dispatch_extq` returning `NotYetImplemented`, `extq/proto.rs` with decoders for all 7 frontend messages, `extq/response.rs` with encoders for ParseComplete/BindComplete/CloseComplete/NoData/PortalSuspended/ParameterDescription) + `proto.rs` BE_CLOSE_COMPLETE constant + `server.rs::run_session` routes recognized extq tags to `try_dispatch_extq` and renders NYI as `0A000` while keeping the session alive (tolerant probe-then-fall-back unlocks SQLAlchemy/psycopg/JDBC probe pattern) + 37 KATs locking spec invariants. | **DONE** | `3691242` (spec) + `975c696` (scaffold) |
-| **T2** | Parse + ParseComplete e2e: real `try_dispatch_extq` arm for `P`; named/unnamed statement storage in `SessionState.statements`; ParseComplete emit; `08P01` for `MAX_PREPARED_STATEMENTS_PER_CONN` overflow + decode errors; lock the "Parse stores SQL VERBATIM" invariant; flip T1 regression-lock to "T2 emits ParseComplete for valid Parse". | **OPEN** | — |
+| **T2** | Parse + ParseComplete e2e: real `try_dispatch_extq` arm for `P`; named/unnamed statement storage in `SessionState.statements`; ParseComplete emit; `08P01` for `MAX_PREPARED_STATEMENTS_PER_CONN` overflow + decode errors; `42P05 prepared_statement_already_exists` for non-empty-name collision; lock the "Parse stores SQL VERBATIM" invariant; flip T1 regression-lock to "T2 emits ParseComplete for valid Parse". | **DONE** | `688f961` (dispatcher + KATs) + `1b7ad07` (server.rs wire-up) |
 | **T3** | Bind + BindComplete e2e: portal storage in `SessionState.portals`; per-position param-format validation (V1 rejects format code 1 with `0A000`); param-value extraction including NULL sentinel (`length=-1`); BindComplete emit; cap enforcement. | **OPEN** | — |
 | **T4** | Describe 'S' → ParameterDescription + RowDescription/NoData: schema lookup via existing `EngineApply::describe_table` + `kessel_sql::select_star_table`; emit ParameterDescription with the OID hints from Parse (or empty if Parse didn't provide); NoData for non-SELECT statements. | **OPEN** | — |
 | **T5** | Describe 'P' → RowDescription/NoData: same shape as Describe 'S' but no ParameterDescription (portals don't carry parameter info per PG spec — Bind already substituted). | **OPEN** | — |
@@ -268,22 +268,166 @@ covers:
 external deps); `#![forbid(unsafe_code)]` honored across all new
 modules.
 
-## Next session pickup — SP-PG-EXTQ T2
+## T2 — what landed (2026-05-28, commits `688f961` + `1b7ad07`)
 
-**Slice scope**: real `try_dispatch_extq` arm for `P` Parse —
-- Implement `try_parse(state, name, sql, param_oids)` that validates
-  name cap (`MAX_PREPARED_STATEMENTS_PER_CONN`), stores the
-  `PreparedStmt` in `state.statements`, emits `ParseComplete` bytes.
-- Empty-name `""` overwrites the unnamed (volatile) slot.
-- Named statement Parse beyond the cap → `08P01 protocol_violation`
-  with message including the cap.
-- Wire into `server::run_session`'s extq branch so the rendered
-  byte sequence is the ParseComplete envelope, not `0A000` NYI.
-- Flip the T1 `t1_try_dispatch_returns_not_yet_implemented_for_every_tag`
-  KAT's Parse arm to assert success + a new test that confirms
-  cap-overflow rejection.
-- Keep T1 KATs for the other 6 tags (Bind / Describe / Execute /
-  Sync / Close / Flush) returning NYI — T3..T8 will flip them
-  one at a time.
+**Two commits, +674 LoC net delta across 2 files (mod.rs +388, server.rs +286 incl. KATs):**
 
-Estimated +5-8 KATs.
+### Commit `688f961` — Parse dispatcher arm + KATs
+
+`crates/kessel-pg-gateway/src/extq/mod.rs`:
+
+- New `ExtqError::PreparedStatementAlreadyExists { name: String }`
+  variant — Spec §3 / PG §55.2.3: re-Parse on a NON-EMPTY name
+  that already exists rejects with SQLSTATE `42P05`. The empty-
+  name `""` slot is the volatile exception (silently replaced).
+- `try_dispatch_extq` Parse arm now calls a real `dispatch_parse`
+  helper that enforces, in order:
+  1. **Cap check** (fresh-name only): if `name` is fresh AND
+     `state.statements.len() >= MAX_PREPARED_STATEMENTS_PER_CONN`
+     → `TooManyPreparedStatements` → `08P01`. The fresh-name rule
+     is intentional — overwriting the unnamed `""` slot (or any
+     existing named slot, though that returns 42P05 first) does
+     NOT grow the map and so does NOT count against the cap.
+  2. **Name collision** (named only): non-empty name already
+     present → `PreparedStatementAlreadyExists` → `42P05`. The
+     original statement is preserved (no clobber).
+  3. **Store verbatim**: `PreparedStmt { sql, param_oids }`
+     inserted into `state.statements`. No SQL parse, no AST
+     cache, no normalization — spec §3 + spec §10 self-review
+     #1 explicitly defer SQL parse errors to Execute time so the
+     engine catalog state at Execute (not Parse) governs error
+     messages.
+  4. **ParseComplete emit**: 5-byte `1 [length=4]` envelope from
+     the existing `response::encode_parse_complete` (byte-locked
+     in T1 KATs).
+- New `SessionState::get_statement(name) -> Option<&PreparedStmt>`
+  read-only accessor — T2 KATs use this to confirm stored state;
+  T3+ Bind path will reuse it to resolve the target statement
+  without exposing the storage HashMap.
+- The other six dispatch arms (Bind / Describe / Execute / Sync /
+  Close / Flush) STILL return `NotYetImplemented` — T3..T8 widen
+  them per the §10 task decomposition.
+
+**+8 KATs (lib-level):**
+
+1. T1 `t1_try_dispatch_returns_not_yet_implemented_for_every_tag`
+   FLIPPED → T2 `t2_try_dispatch_returns_not_yet_implemented_for_the_six_non_parse_tags`
+   (Parse arm removed; the six remaining tags still locked as NYI).
+2. T2 `t2_dispatch_parse_unnamed_emits_parse_complete_and_stores_statement`
+   — happy path, byte-locked output + state mutation.
+3. T2 `t2_dispatch_parse_named_stores_under_supplied_name_with_oids`
+   — named-slot storage + OID carry-through.
+4. T2 `t2_dispatch_parse_named_collision_returns_already_exists`
+   — 42P05 + original-stmt-preserved invariant.
+5. T2 `t2_dispatch_parse_unnamed_overwrites_previous_unnamed_statement`
+   — silent replace path.
+6. T2 `t2_dispatch_parse_empty_sql_is_accepted` — §12 OQ #5.
+7. T2 `t2_dispatch_parse_stores_sql_verbatim_no_normalization`
+   — §3 verbatim-storage invariant.
+8. T2 `t2_dispatch_parse_rejects_when_cap_reached` — at-cap
+   success + over-cap rejection on the EXACT boundary.
+9. T2 `t2_dispatch_parse_at_cap_allows_unnamed_overwrite` — cap
+   check applies to FRESH names only; overwriting at-cap is fine.
+
+### Commit `1b7ad07` — server.rs wire-up + KATs
+
+`crates/kessel-pg-gateway/src/server.rs`:
+
+- New `let mut extq_state = crate::extq::SessionState::new();` at
+  the START of `run_session` (after the SCRAM handshake). The
+  state lives for the lifetime of the connection and drops
+  cleanly on Terminate / EOF / I/O error per spec §3.
+- The extq tag branch now decodes the body via the matching
+  `extq::proto::decode_*` per the tag, dispatches through
+  `try_dispatch_extq`, and routes the outcome:
+  - `Bytes(ParseComplete)` → write verbatim, flush.
+  - `Failed(NotYetImplemented { tag })` → `0A000` ErrorResponse
+    + RFQ (stay alive).
+  - `Failed(TooManyPreparedStatements)` → `08P01` with the cap
+    in the message + RFQ.
+  - `Failed(PreparedStatementAlreadyExists { name })` → `42P05`
+    + RFQ.
+  - `Failed(Decode { reason })` / decoder pre-dispatch rejection
+    → `08P01` + RFQ.
+  - `SyncCompleted` → bare `Z('I')` RFQ (defensive — T7 owns
+    Sync; today Sync hits NYI before reaching this branch, but
+    the match is exhaustive).
+- The connection STAYS ALIVE across every extq rejection (the T1
+  "tolerant probe-then-fall-back" contract is preserved). A
+  genuinely-unknown tag (e.g. backend `Z`) still closes with
+  `08P01` via the existing T1 invariant.
+
+**+3 KATs (server-level, net +2 after the T1 flip):**
+
+1. T1 `t1_extq_run_session_parse_tag_emits_0a000_and_stays_alive`
+   FLIPPED → T2 `t2_extq_run_session_parse_tag_emits_parse_complete`:
+   a valid Parse body now produces the 5-byte ParseComplete envelope
+   (`1 00 00 00 04`) on the wire instead of `0A000`. No `08P01`
+   (extq stays alive). **Headline byte-locked KAT** for SP-PG-EXTQ
+   §13 acceptance criteria #2 (psql `\bind` extended-query path
+   emits a parseable response).
+2. NEW T2 `t2_extq_run_session_bind_tag_still_emits_0a000_and_stays_alive`
+   — a Bind body STILL renders `0A000` + stays alive (locks the
+   "haven not half-shipped T3" invariant; flips when T3 lands).
+3. NEW T2 `t2_extq_run_session_parse_malformed_body_emits_08p01_and_stays_alive`
+   — a Parse body that the decoder rejects (missing-NUL in the
+   name cstring) emits `08P01` and the session stays alive. The
+   5-byte ParseComplete envelope must NOT appear (the dispatcher
+   never ran on a malformed body).
+
+### Test counts (release on vulcan, 2026-05-28):
+
+| Surface | Before T2 | After T2 | Delta |
+|---|---|---|---|
+| `kessel-pg-gateway` lib | 374 | 384 | +10 |
+| Workspace default | 1842 | 1857 | +15 |
+| Workspace `--features pg-gateway` | 1870 | 1885 | +15 |
+| Workspace `--all-features` | 1925 | 1940 | +15 |
+
+`kessel-sim` seed-7 GREEN (3 / 3); default tree-grep EMPTY (no new
+external deps); `#![forbid(unsafe_code)]` honored across all touched
+modules. CI green at every commit.
+
+### Headline question — does Parse + Sync round-trip via `run_session` emit ParseComplete + RFQ byte-correct?
+
+**Parse → ParseComplete: YES.** The 5-byte `1 00 00 00 04` envelope
+appears on the wire after a valid Parse body; locked by
+`t2_extq_run_session_parse_tag_emits_parse_complete` byte-for-byte.
+
+**Sync → RFQ: PARTIAL.** Sync currently hits the still-NYI arm,
+which renders `0A000 feature_not_supported` ErrorResponse +
+ReadyForQuery('I'). The RFQ envelope itself IS byte-correct
+(`Z 00 00 00 05 I`) — the 0A000 ErrorResponse BEFORE it is the
+T7 gap. After T7 wires the Sync handler, the round-trip will be:
+Parse → ParseComplete bytes → Sync → bare RFQ('I') (no
+intermediate ErrorResponse).
+
+## Next session pickup — SP-PG-EXTQ T3
+
+**Slice scope**: Bind + BindComplete e2e —
+- Implement `dispatch_bind(state, portal, stmt, param_formats,
+  param_values, result_formats)`:
+  - Validate the named statement exists in `state.statements`
+    (`UnknownStatement { name: stmt }` → `26000 invalid_sql_
+    statement_name`).
+  - Per-position param-format validation: any code `== 1` (binary)
+    → `BinaryFormatNotSupported { position }` → `0A000`. Length
+    conventions match PG: 0 codes = "all text", 1 code = "every
+    position the same", N codes = "per-position" (N must equal
+    `param_values.len()`).
+  - Per-portal cap: `MAX_PORTALS_PER_CONN` (4096) → `08P01`. The
+    fresh-name rule applies (overwriting the volatile `""` portal
+    does NOT grow the map).
+  - Empty-name `""` overwrites the unnamed portal silently
+    (matching the unnamed-statement shape in T2).
+  - Store `Portal { stmt_name, param_values, param_formats,
+    result_formats, exec_state: ExecState::Pending }`.
+  - Emit BindComplete bytes (5-byte `2 [length=4]` envelope).
+- Wire into `server::run_session`'s extq Bind branch so the
+  rendered byte sequence is BindComplete on the wire.
+- Flip the T2 `t2_try_dispatch_returns_not_yet_implemented_for_the_six_non_parse_tags`
+  KAT to remove Bind from the still-NYI list. Add ~5-8 T3 KATs
+  for the dispatcher + add 2-3 T3 server.rs KATs flipping the
+  Bind-emits-0A000 lock to Bind-emits-BindComplete.
+
+Estimated +5-8 lib KATs + 2-3 server KATs (~+8-10 total).

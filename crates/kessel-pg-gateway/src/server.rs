@@ -556,6 +556,19 @@ pub fn run_session<
                                 "42P05",
                                 format!("prepared statement \"{name}\" already exists"),
                             ),
+                            crate::extq::ExtqError::DuplicateCursor { name } => (
+                                "42P03",
+                                format!("cursor \"{name}\" already exists"),
+                            ),
+                            crate::extq::ExtqError::ParameterCountMismatch {
+                                expected,
+                                actual,
+                            } => (
+                                "08P02",
+                                format!(
+                                    "bind message supplies {actual} parameters, but prepared statement requires {expected}"
+                                ),
+                            ),
                         };
                         // Same "stay alive" contract as the T1
                         // branch — emit ErrorResponse + RFQ and
@@ -583,6 +596,16 @@ pub fn run_session<
                         rfq.extend_from_slice(&[crate::proto::BE_READY_FOR_QUERY, 0, 0, 0, 5, b'I']);
                         stream.write_all(&rfq)?;
                         stream.flush()?;
+                    }
+                    crate::extq::ExtqOutcome::Skipped => {
+                        // SP-PG-EXTQ T3 — spec §6 skip-until-Sync.
+                        // The dispatcher detected `error_state ==
+                        // true` and silently dropped this message.
+                        // We write NOTHING to the wire (PG protocol
+                        // §55.2.3: "the server discards messages
+                        // until it sees a Sync"). The next message
+                        // either repeats the skip OR is a Sync that
+                        // clears the flag (T7).
                     }
                 }
                 continue;
@@ -1253,20 +1276,31 @@ mod tests {
         );
     }
 
-    /// SP-PG-EXTQ T2 — extended-query 'B' Bind message (one of the
-    /// six still-NYI tags) STILL renders `0A000 feature_not_supported`
-    /// + RFQ and keeps the session alive. Locks the "T2 hasn't
-    /// half-shipped T3" invariant — when T3 lands, this test flips
-    /// to assert BindComplete (`2 [length=4]`) instead. Mirror tests
-    /// for D/E/S/C/H land alongside their own slices.
+    /// SP-PG-EXTQ T3 — extended-query 'B' Bind message is now a
+    /// REAL handler: a Parse + Bind pipeline produces ParseComplete
+    /// + BindComplete byte-for-byte on the wire instead of `0A000`.
+    /// HEADLINE T3 byte-locked KAT — Bind on the extq path emits
+    /// `2 00 00 00 04` after a referenced Parse.
+    ///
+    /// This KAT flips the T2 `..._bind_tag_still_emits_0a000` lock
+    /// (the test is renamed + reshaped). The Bind references the
+    /// volatile `""` statement installed by the preceding Parse, so
+    /// `UnknownStatement` is not raised.
     #[test]
-    fn t2_extq_run_session_bind_tag_still_emits_0a000_and_stays_alive() {
+    fn t3_extq_run_session_parse_then_bind_emits_parse_then_bind_complete() {
         let token = b"kessel-bearer-token";
-        // Minimal valid 'B' Bind body:
-        //   portal="" + NUL + stmt="" + NUL + pf_count=0 (i16 BE) +
-        //   pv_count=0 (i16 BE) + rf_count=0 (i16 BE)
-        // → 8 bytes payload.
-        let mut extra = {
+        // Frame 1: Parse "" "SELECT 1" 0 params.
+        let parse_frame = {
+            let payload: &[u8] = b"\0SELECT 1\0\0\0";
+            let length = (4 + payload.len()) as u32;
+            let mut f = Vec::new();
+            f.push(b'P');
+            f.extend_from_slice(&length.to_be_bytes());
+            f.extend_from_slice(payload);
+            f
+        };
+        // Frame 2: Bind "" "" pf=0 pv=0 rf=0 (8-byte payload).
+        let bind_frame = {
             let mut payload = Vec::new();
             payload.push(0); // portal
             payload.push(0); // stmt
@@ -1280,6 +1314,8 @@ mod tests {
             f.extend_from_slice(&payload);
             f
         };
+        let mut extra = parse_frame;
+        extra.extend_from_slice(&bind_frame);
         extra.extend_from_slice(&build_x_frame());
         let inbound = build_authed_inbound(
             token,
@@ -1296,18 +1332,169 @@ mod tests {
             || "serverN".to_string(),
             &engine,
         )
-        .expect("session stays alive across Bind NYI + Terminate");
+        .expect("session stays alive across Parse + Bind + Terminate");
         assert_eq!(session.user, "test");
+
         let out = &pipe.outbound;
+        // Byte-locked: ParseComplete (5 bytes) then BindComplete
+        // (5 bytes) appear consecutively somewhere in the outbound
+        // stream. Spec §9 envelopes.
+        let parse_then_bind: &[u8] = &[
+            b'1', 0, 0, 0, 4, // ParseComplete
+            b'2', 0, 0, 0, 4, // BindComplete
+        ];
         assert!(
-            out.windows(5).any(|w| w == b"0A000"),
-            "T2 Bind should still emit 0A000 NYI (until T3)"
+            out.windows(parse_then_bind.len())
+                .any(|w| w == parse_then_bind),
+            "outbound must carry the ParseComplete + BindComplete byte sequence"
         );
-        // 0A000, not 08P01 — Bind is on the extq path so it must
-        // stay alive.
+        // No 0A000 NYI ErrorResponse.
+        assert!(
+            !out.windows(5).any(|w| w == b"0A000"),
+            "T3 Bind should NOT emit 0A000 — it's a real handler now"
+        );
+        // No 08P01 — Bind on the extq path must stay alive.
         assert!(
             !out.windows(5).any(|w| w == b"08P01"),
-            "Bind on the extq path must NOT emit 08P01"
+            "Bind on the extq path must NEVER emit 08P01"
+        );
+    }
+
+    /// SP-PG-EXTQ T3 — a Bind that references a NON-EXISTENT
+    /// statement emits SQLSTATE `26000 invalid_sql_statement_name`
+    /// + RFQ and stays alive. Locks the unknown-statement error
+    /// path against drift to e.g. `0A000` or a connection close.
+    #[test]
+    fn t3_extq_run_session_bind_unknown_statement_emits_26000_and_stays_alive() {
+        let token = b"kessel-bearer-token";
+        // Bind referencing stmt "missing" (no Parse first) → 26000.
+        let bind_frame = {
+            let mut payload = Vec::new();
+            payload.push(0); // portal ""
+            payload.extend_from_slice(b"missing\0"); // stmt "missing"
+            payload.extend_from_slice(&0i16.to_be_bytes()); // pf_count
+            payload.extend_from_slice(&0i16.to_be_bytes()); // pv_count
+            payload.extend_from_slice(&0i16.to_be_bytes()); // rf_count
+            let length = (4 + payload.len()) as u32;
+            let mut f = Vec::new();
+            f.push(b'B');
+            f.extend_from_slice(&length.to_be_bytes());
+            f.extend_from_slice(&payload);
+            f
+        };
+        let mut extra = bind_frame;
+        extra.extend_from_slice(&build_x_frame());
+        let inbound = build_authed_inbound(
+            token,
+            "clientN",
+            "serverN",
+            "test",
+            &extra,
+        );
+        let mut pipe = Pipe::new(inbound);
+        let engine = EmptySelectEngine;
+        let session = run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("session stays alive across Bind/26000 + Terminate");
+        assert_eq!(session.user, "test");
+        assert!(
+            pipe.outbound.windows(5).any(|w| w == b"26000"),
+            "outbound must contain SQLSTATE 26000 for unknown statement"
+        );
+        // BindComplete must NOT appear.
+        let bind_complete: &[u8] = &[b'2', 0, 0, 0, 4];
+        assert!(
+            !pipe
+                .outbound
+                .windows(bind_complete.len())
+                .any(|w| w == bind_complete),
+            "BindComplete must NOT appear for unknown statement"
+        );
+    }
+
+    /// SP-PG-EXTQ T3 — a Bind with a binary-format parameter
+    /// emits SQLSTATE `0A000 feature_not_supported` + RFQ and
+    /// stays alive (V1 doesn't support binary params per spec §4;
+    /// V2 SP-PG-EXTQ-BIN lifts this). Bind hits the
+    /// BinaryFormatNotSupported arm BEFORE the parameter-count
+    /// check, so the test pre-Parses an unnamed stmt with no OID
+    /// hints to keep the path isolated.
+    #[test]
+    fn t3_extq_run_session_bind_binary_format_emits_0a000_and_stays_alive() {
+        let token = b"kessel-bearer-token";
+        // Parse: name "" + sql "SELECT $1" + 0 OID hints (so the
+        // param-count check is a no-op).
+        let parse_frame = {
+            let payload: &[u8] = b"\0SELECT $1\0\0\0";
+            let length = (4 + payload.len()) as u32;
+            let mut f = Vec::new();
+            f.push(b'P');
+            f.extend_from_slice(&length.to_be_bytes());
+            f.extend_from_slice(payload);
+            f
+        };
+        // Bind: portal "" stmt "" pf=1 code=1(binary) pv=1 val="x" rf=0.
+        let bind_frame = {
+            let mut payload = Vec::new();
+            payload.push(0); // portal
+            payload.push(0); // stmt
+            payload.extend_from_slice(&1i16.to_be_bytes()); // pf_count=1
+            payload.extend_from_slice(&1i16.to_be_bytes()); // pf=binary
+            payload.extend_from_slice(&1i16.to_be_bytes()); // pv_count=1
+            payload.extend_from_slice(&1i32.to_be_bytes()); // val length=1
+            payload.push(b'x'); // value byte
+            payload.extend_from_slice(&0i16.to_be_bytes()); // rf_count=0
+            let length = (4 + payload.len()) as u32;
+            let mut f = Vec::new();
+            f.push(b'B');
+            f.extend_from_slice(&length.to_be_bytes());
+            f.extend_from_slice(&payload);
+            f
+        };
+        let mut extra = parse_frame;
+        extra.extend_from_slice(&bind_frame);
+        extra.extend_from_slice(&build_x_frame());
+        let inbound = build_authed_inbound(
+            token,
+            "clientN",
+            "serverN",
+            "test",
+            &extra,
+        );
+        let mut pipe = Pipe::new(inbound);
+        let engine = EmptySelectEngine;
+        let session = run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("session stays alive across Bind binary-format + Terminate");
+        assert_eq!(session.user, "test");
+        assert!(
+            pipe.outbound.windows(5).any(|w| w == b"0A000"),
+            "outbound must contain SQLSTATE 0A000 for binary format"
+        );
+        // ParseComplete present (the preceding Parse succeeded).
+        let parse_complete: &[u8] = &[b'1', 0, 0, 0, 4];
+        assert!(
+            pipe.outbound
+                .windows(parse_complete.len())
+                .any(|w| w == parse_complete),
+            "ParseComplete must appear before the Bind rejection"
+        );
+        // BindComplete must NOT appear.
+        let bind_complete: &[u8] = &[b'2', 0, 0, 0, 4];
+        assert!(
+            !pipe
+                .outbound
+                .windows(bind_complete.len())
+                .any(|w| w == bind_complete),
+            "BindComplete must NOT appear for binary-format Bind"
         );
     }
 

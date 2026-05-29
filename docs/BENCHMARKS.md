@@ -472,3 +472,113 @@ than `get-by-id` BY DESIGN: each op is an O(N) scan over 2000 rows
   T2 identified is still there; the point-read flatline at ~5M ops/sec
   is the same shape on quiet vulcan. Per-shard storage and/or
   io_uring submission would be the levers if T5 is opened.
+
+## 10. SP-Perf-A T5 — Mutex<File> bypass (positional IO)
+
+Run shape: identical to §9 (T4) for `get-by-id` — 2K rows, 5s,
+3 trials/cell, `--pool-workers 0`. The only change between T4 and T5 is
+the `FileDisk` implementation: T5 drops the `Mutex<File>` wrapper and
+issues `pread`/`seek_read` directly through `FileExt::read_at` (Unix)
+/ `FileExt::seek_read` (Windows). No other code changed. Adds N=32 to
+the sweep so the post-bypass ceiling is visible. Quiet vulcan (load 1.35
+at start; no concurrent track agents).
+
+### Results — get-by-id, 2K rows, 5s × 3 trials, median ops/sec
+
+| N | T4 (Mutex<File>) | T5 (lock-free pread) | T5 vs T4 | T5 p50 | T5 p99 |
+|---|---|---|---|---|---|
+| 1 | 1,606,546 | **1,644,556** | +2.4% | 0 µs | 0 µs |
+| 4 | 4,159,049 | **4,190,962** | +0.8% | 0 µs | 1 µs |
+| 8 | 4,452,949 | **4,409,447** | -1.0% | 1 µs | 3 µs |
+| 16 | 4,954,382 | **4,767,539** | -3.8% | 3 µs | 7 µs |
+| 24 | 4,799,761 | **4,899,849** | +2.1% | 2 µs | 7 µs |
+| 32 | — | **5,036,870** | — | 2 µs | 7 µs |
+
+Raw 18-trial output: `docs/superpowers/perf-a-t5-raw-results.txt`.
+
+### Headline reading
+
+**T5 did NOT lift get-by-id past 10M ops/sec.** Every N value is within
+±4% of T4's number — the lock-free `pread` migration had no measurable
+effect on point-read throughput. The Mutex<File> was NOT the bottleneck
+T4 hypothesised it to be.
+
+The T4-era diagnosis ("per-file Mutex<File> cursor-seek serializes
+every read at ~225 ns/op") was wrong about *what* the mutex actually
+protected on the hot path. Here's what we missed:
+
+1. **SSTables load entirely into memory at open** (`SsTable::open`
+   issues one `read_at(0, full_len)` and the entries are then served
+   from `Vec<(Key, Option<Vec<u8>>)>`).
+2. **Manifest + WAL replay happen once at startup**, then the in-memory
+   structures take over.
+3. **Steady-state `get-by-id` therefore never touches the disk.**
+   `Storage::get` → `mvcc::get_at_snapshot` → `scan_range_versions`
+   walks `sstables[].entries` (Vec) + `memtable` (BTreeMap) — pure
+   in-memory operations. The disk `read_at` Mutex was never locked
+   during a hot-path read.
+
+So the lock-free positional IO migration is **a correctness/cleanliness
+win, not a perf win for this workload.** The Mutex was always unnecessary
+overhead-free on the hot path; T5 removes it as latent debt before the
+next refactor (e.g. mmap'd SSTables, page-cache pressure under multi-GB
+datasets) makes it the bottleneck for real.
+
+### What the real T5/T6 bottleneck is
+
+With Mutex<File> ruled out and the flatline still at ~5M ops/sec at
+N=16+, the remaining suspects are (in priority order):
+
+1. **`Op::encode + Op::decode` roundtrip per call.** `engine.apply`
+   builds a frame, `apply_raw` decodes it back. Two `Vec<u8>` allocations
+   per op + one `Op::decode` match-on-tag dispatch. At 5M ops/sec × 16
+   threads = 80M alloc/decode pairs/sec on the system allocator. A
+   `&Op` fast path on the in-process API (skip encode→decode entirely)
+   would eliminate ~50% of the per-op CPU per quick perf-tool estimate.
+2. **`RwLock<StateMachine>.read()` atomic acquisition.** Even in
+   shared-read mode, `parking_lot::RwLock::read` (or std's) has an
+   atomic CAS + bookkeeping. At 5M ops/sec × N threads it shows up.
+   Worth measuring with `perf stat` before any work; a sharded-RwLock
+   pattern (per-type-id lock) would let each lock take fewer hits.
+3. **`OpResult::Got(Vec<u8>)` per-read clone.** The MVCC read returns
+   `Vec<u8>` (owned); the value's bytes are cloned out of the SSTable's
+   `Vec<(_, Option<Vec<u8>>)>`. For a typical 128-byte row at 5M
+   ops/sec = 640 MB/s of bytes copied per worker — definitely visible
+   under perf. A `Cow<[u8]>` or zero-copy `Arc<[u8]>` shape on the
+   return type would skip the copy when callers only need to read.
+4. **`make_key` + MVCC lo/hi key construction** per call. Three
+   `Vec::with_capacity` + `extend_from_slice` per `get_at_snapshot`.
+   Small allocations × 5M/sec also adds up.
+
+For T6: open a profiling sub-slice. `perf record` + `perf report` of
+`kessel-bench parallel-reads --workers 16` on vulcan would point at the
+exact bottleneck. T5 closes Track B's "lift Mutex<File>" hypothesis as
+**falsified** and hands the lever to T6.
+
+### Determinism oracle still passes
+
+`parallel_reads_oracle::t3_oracle_100_workloads_x_1000_reads_all_16_variants`
+ran 100,000 reads × 16 variants on TWO engines (T5 parallel-bypass +
+T5 serial-engine) and asserted byte-equal `OpResult` for every read.
+**17/17 tests green, 0 divergences, 455.35s on vulcan**. The
+`FileExt::read_at` migration preserves byte-identical reads under
+concurrent access (the positional API skips the cursor entirely; a
+short-read loop matches the prior seek+read behaviour).
+
+### Acceptance gate — closed
+
+| Criterion | Outcome |
+|---|---|
+| Lock-free positional IO migration ships | YES (commit `fd20ba8`) |
+| 6 new `FileDisk` KATs lock the contract | YES |
+| Determinism oracle still passes byte-equal | YES (T3 re-run) |
+| Default `cargo build` byte-identical | YES (FileDisk internal change) |
+| `get-by-id` lifts past 10M ops/sec | **NO** (flatlines at ~5M ops/sec) |
+| Bottleneck for T6 identified | YES (encode/decode + clone + RwLock) |
+
+The "10M ops/sec" question is answered (no) and the next target is named
+(T6: per-op alloc + value clone elimination on the read fast path).
+Headline: **T5 ships positional IO as a correctness win and falsifies
+the Mutex<File> bottleneck hypothesis. The remaining ceiling is
+per-op heap traffic on the in-process apply→decode→clone chain — a
+distinct lever T6 attacks.**

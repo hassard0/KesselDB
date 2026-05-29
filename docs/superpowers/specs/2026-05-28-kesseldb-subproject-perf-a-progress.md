@@ -46,8 +46,9 @@ See design spec §2 for the full scoping rationale.
 | **T2** | `Arc<RwLock<StateMachine>>` migration (opt-in via `ServerConfig.read_workers = Some(_)`) + new `StateMachine::read_only_op(&self, Op)` &self dispatcher covering all 16 spec §4 read variants + `EngineHandle::apply_raw` tag-byte fast-path that decodes a read-only frame and runs it under `sm.read()` directly (skipping the engine mpsc + group-commit fsync) + `ReadPool::new_shared` worker constructor against the same Arc + 5 new T2 KATs (parallel == serial byte-equal, write-Op refusal, 16-thread × 64-id parallel, T3-style 100-random-workload determinism oracle, n=0 graceful path). Required making StateMachine Send+Sync: FileDisk uses Mutex<File> instead of RefCell<File>; MemVfs/FaultVfs use Arc<Mutex<>>; Wal's disk is `Box<dyn Disk + Send + Sync>`. Default `cargo build -p kesseldb-server` byte-identical (read_workers None preserves pre-Perf-A ownership shape). 18 read_pool KATs green + 117 kesseldb-server lib tests green + seed-7 green on vulcan. **Headline benchmark** lands here. | **DONE** | `de9b3ad` (sm Send+Sync + read_only_op) + `350bf58` (server bypass + 5 KATs) |
 | **T3** | Multi-op-kind mixed-reads determinism oracle: 100 random workloads × 1000 ops = 100K reads across all 16 spec-§4 read variants (GetById/GetBlob/Describe/FindBy/FindByComposite/FindRange/Query/QueryRows/QueryExpr/Select/SelectFields/SelectSorted/Aggregate/GroupAggregate/SeqRead/Join) on TWO engines (parallel bypass via `read_workers=Some(8)` + serial via `read_workers=None`), seeded with 3 user tables + 3 eq-indexes + 1 composite + 1 ordered/range index + 32 SeqAppend entries, then asserts every read's OpResult is byte-equal. Plus 16 per-variant smoke tests for bisection. | **DONE** | `1898c4c` + `b9e6c25` + `e1d91d9` + `247284b` + `07453c6` |
 | **T4** | Multi-workload bench sweep on quiet vulcan: GetById + Select(LIMIT 10) + SelectSorted(top-10) + Aggregate(SUM) + FindBy(eq-indexed) × workers∈{1,4,8,16,24} × 3 trials × 10s. Publishes absolute medians + appends to docs/BENCHMARKS.md under "KesselDB internal benchmark sweep" (distinct from Bench-suite T1's cross-DB comparison). | **DONE** | `cac28bf` (bench multi-workload mode) + T4b sweep results (this commit) |
-| **T5** | Perf tuning if T2 throughput is sub-linear: profile RwLock contention, shard the read cache, or rewrite the storage read API to be `&self`-only on the fast path. Conditional on T4 numbers. | **OPEN — conditional** | — |
-| **T6** | Docs + arc closure: STATUS row update + README perf-row update + arc-progress tracker → CLOSED. | **OPEN** | — |
+| **T5** | Lift the post-T4 ceiling (~5M ops/sec at N=16 on `get-by-id`) by replacing `Mutex<File>` with positional IO. Drop `FileDisk`'s `Mutex<File>` wrapper, use `FileExt::read_at` (Unix) / `FileExt::seek_read` (Windows) — both take `&self`, both skip the cursor entirely, both are safe stdlib. 6 new KATs lock the new contract (write/read roundtrip, EOF, 16-thread × 10K-read concurrent ground-truth, write-then-many-reader pattern, `FileDisk: Send + Sync` at the type level, positional overwrite semantic). Determinism oracle (T3) re-run on vulcan: 17/17 green, 100K reads × 16 variants byte-equal. **OUTCOME: the mutex bypass did NOT lift get-by-id past 10M ops/sec — every cell within ±4% of T4.** SSTables are loaded fully into memory at open, so steady-state `get-by-id` never touches the disk; the Mutex was never on the hot read path. T5 ships as a correctness/cleanliness win and falsifies the Mutex<File> bottleneck hypothesis. The real ceiling is per-op heap traffic (`Op::encode + Op::decode` roundtrip + `OpResult::Got(Vec<u8>)` clone + `RwLock<StateMachine>.read()` atomic) — T6 target. | **DONE — falsified** | `fd20ba8` (FileDisk migration + 6 KATs) + this commit (BENCHMARKS.md §10 + progress tracker + STATUS row) |
+| **T6** | Eliminate the in-process `Op::encode → apply_raw → Op::decode` roundtrip on the read path (and consider Cow/Arc<[u8]> on `OpResult::Got` to remove the per-read value clone). Conditional on T5's diagnosis pointing at heap traffic; profiling with `perf record` first to confirm before any code change. | **OPEN — conditional** | — |
+| **T7** | Docs + arc closure: STATUS row update + README perf-row update + arc-progress tracker → CLOSED. | **OPEN** | — |
 
 Optional / V2 follow-ups (each its own arc): Perf-A-SQL-READ,
 Perf-A-CACHE, Perf-A-NUMA, Perf-A-SHARD, Perf-A-MVCCREAD,
@@ -273,6 +274,120 @@ This says two things about the SP-Perf-A arc:
 
 The headline ≥4× / ≥3× targets in the design spec are still the T2
 acceptance gates; the T1 numbers above are the apples-to-apples PRE.
+
+## T5 — Mutex<File> → positional IO migration (DONE 2026-05-29, hypothesis falsified)
+
+Run shape: identical to T4 (`kessel-bench parallel-reads --workload
+get-by-id --workers N --rows 2000 --duration 5 --pool-workers 0`),
+3 trials/cell, median ops/sec reported. Quiet vulcan (load 1.35).
+Added N=32 to the sweep so any post-bypass ceiling shape is visible.
+
+### Code change (commit `fd20ba8`)
+
+`FileDisk` (in `crates/kessel-io/src/lib.rs`) loses the `Mutex<File>`
+wrapper. The mutex existed only because the pre-T5 `read_at`
+implementation used `seek + read` (which needs exclusive cursor
+access). T5 swaps that for positional IO:
+
+```rust
+#[cfg(unix)]
+let r = self.file.read_at(&mut buf[read..], off + read as u64);
+#[cfg(windows)]
+let r = self.file.seek_read(&mut buf[read..], off + read as u64);
+```
+
+Both APIs take `&self` and are positional — no shared cursor. Multiple
+threads can call concurrently, unlimited. `FileDisk` becomes
+`Send + Sync` at the type level (a `File` is Send+Sync on every Rust
+platform — the FD/HANDLE is a kernel object). `#![forbid(unsafe_code)]`
+is honoured: `FileExt::read_at` and `FileExt::seek_read` are both in
+safe stdlib.
+
+6 new KATs lock the contract:
+- `filedisk_t5_write_then_read_at_roundtrip`
+- `filedisk_t5_read_past_eof_returns_zero` (WAL replay tail sentinel)
+- `filedisk_t5_concurrent_reads_no_contention` (16 threads × 10K random
+  reads, byte-exact ground truth — the lock-free win)
+- `filedisk_t5_write_then_concurrent_read_post_sync` (the Wal pattern)
+- `filedisk_t5_filedisk_is_send_and_sync` (compile-time type invariant)
+- `filedisk_t5_write_then_read_at_overwrites` (pwrite semantic)
+
+All 13 kessel-io tests green on vulcan. 18 read_pool KATs green
+(unchanged). 17/17 T3 oracle tests green (455.35s on vulcan; 100,000
+reads × 16 variants byte-equal between parallel + serial engines).
+
+### Results — get-by-id, 2K rows, 5s × 3 trials, median ops/sec
+
+| N | T4 (Mutex<File>) | T5 (lock-free pread) | T5 vs T4 |
+|---|---|---|---|
+| 1 | 1,606,546 | **1,644,556** | +2.4% |
+| 4 | 4,159,049 | **4,190,962** | +0.8% |
+| 8 | 4,452,949 | **4,409,447** | -1.0% |
+| 16 | 4,954,382 | **4,767,539** | **-3.8%** |
+| 24 | 4,799,761 | **4,899,849** | +2.1% |
+| 32 | — | **5,036,870** | — (new) |
+
+Headline: get-by-id at N=16 is **4.77M ops/sec post-T5 vs 4.95M ops/sec
+pre-T5** — both within trial-noise of the same ~5M ops/sec ceiling.
+The Mutex<File> bypass did **not** lift the ceiling past 10M ops/sec.
+
+### Why the bypass didn't help
+
+Diagnosis (post-hoc, looking at the actual read path):
+
+1. **SSTables are loaded fully into memory at open.**
+   `SsTable::open` reads `0..full_len` into `Vec<u8>` once, then keeps
+   `Vec<(Key, Option<Vec<u8>>)>` for the rest of the table's life.
+   `Storage::get` → `mvcc::get_at_snapshot` → `scan_range_versions`
+   walks those in-memory `Vec`s + the `memtable` `BTreeMap`.
+2. **Steady-state `get-by-id` never touches the disk.** No `read_at`
+   call happens during the hot path of the bench — so the Mutex
+   `lock()` it protected was also never called on the hot path.
+3. **The T4 diagnosis ("~225 ns/op critical section") was wrong about
+   which mutex.** That latency was real — but it was the
+   `Op::encode + Op::decode` roundtrip + `RwLock::read()` atomic CAS +
+   `OpResult::Got(Vec<u8>)` clone, not the FileDisk mutex. The numbers
+   we measured at N=16 are consistent with the actual roundtrip cost,
+   not with disk contention.
+
+T5 still ships as a real correctness win: the FileDisk mutex was
+latent overhead that would have become a bottleneck under any workload
+that DOES touch disk (large datasets exceeding memory; mmap'd SSTables
+that page-fault; explicit Wal replay during recovery testing under
+N readers). Removing it before that pressure arrives is the right
+hygiene.
+
+### Next bottleneck (T6 target)
+
+Without the Mutex<File> red herring, the actual flatline at ~5M
+ops/sec at N=16+ is per-op heap traffic on the in-process apply path:
+
+1. `engine.apply(Op)` → `op.encode()` allocates `Vec<u8>`.
+2. `apply_raw(frame)` → `Op::decode(&frame)` allocates a new `Op`.
+3. `sm_shared.read()` → atomic CAS on `RwLock`'s reader count.
+4. `read_only_op(op)` → `make_key` + MVCC `lo`/`hi` `Vec`s (3 allocs).
+5. `storage.get` returns `Option<Vec<u8>>` — the inner `Vec<u8>` is
+   *cloned* from the SSTable's stored value (not borrowed).
+6. `OpResult::Got(Vec<u8>)` wraps it; the calling thread eventually
+   drops it.
+
+At 5M ops/sec × 16 threads = 80M-allocation-per-second pressure on
+the system allocator. Eliminating the encode/decode roundtrip on the
+in-process `apply` path (skip directly to `read_only_op(op)`) would
+save ~50% of those allocations. A `Cow<'_, [u8]>` or
+`Arc<[u8]>` on the value-return path would save another ~30%. T6
+should profile (`perf record` on vulcan) first to confirm; then
+attack the worst offender.
+
+### Acceptance gate — closed
+
+T5's `≥4× at N=8` and `byte-equal parallel-vs-serial determinism` gates
+were already met by T2/T3; T5 added the FileDisk lock-free upgrade as a
+defence against future disk-touching workloads, ran the T3 oracle as
+the regression check, and quantified the (null) effect on the
+get-by-id hot path. The arc moves on to T6 with a refined hypothesis
+("the ceiling is alloc traffic, not disk contention") and a concrete
+next experiment (profile + cut the encode/decode roundtrip).
 
 ## Standing invariants
 

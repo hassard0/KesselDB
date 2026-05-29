@@ -1,0 +1,62 @@
+uname: Linux vulcan 6.14.0-35-generic #35~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC Tue Oct 14 13:55:17 UTC 2 x86_64 x86_64 x86_64 GNU/Linux
+uptime:  02:39:13 up 5 days,  7:43,  0 user,  load average: 1.35, 2.01, 2.26
+host: vulcan
+date: 2026-05-29T06:39:13Z
+bench: /tmp/kdb-target-perf/release/kessel-bench
+# Apples-to-apples replay of SP-Perf-A T4 sweep: 2K rows, 5s, 3 trials,
+# get-by-id across N in {1,4,8,16,24,32}. Adds N=32 to detect a new ceiling.
+
+=== get-by-id workers=1 trial=1 ===
+parallel-reads workload=get-by-id workers=1 rows=2000 duration=5s pool_workers=Some(0)
+  total =    8238165 ops | 1647633 ops/sec | p50 0us  p99 0us  p99.99 4us
+=== get-by-id workers=1 trial=2 ===
+parallel-reads workload=get-by-id workers=1 rows=2000 duration=5s pool_workers=Some(0)
+  total =    8222778 ops | 1644556 ops/sec | p50 0us  p99 0us  p99.99 4us
+=== get-by-id workers=1 trial=3 ===
+parallel-reads workload=get-by-id workers=1 rows=2000 duration=5s pool_workers=Some(0)
+  total =    8205196 ops | 1641039 ops/sec | p50 0us  p99 0us  p99.99 4us
+=== get-by-id workers=4 trial=1 ===
+parallel-reads workload=get-by-id workers=4 rows=2000 duration=5s pool_workers=Some(0)
+  total =   20519920 ops | 4103984 ops/sec | p50 0us  p99 1us  p99.99 5us
+=== get-by-id workers=4 trial=2 ===
+parallel-reads workload=get-by-id workers=4 rows=2000 duration=5s pool_workers=Some(0)
+  total =   20954810 ops | 4190962 ops/sec | p50 0us  p99 1us  p99.99 5us
+=== get-by-id workers=4 trial=3 ===
+parallel-reads workload=get-by-id workers=4 rows=2000 duration=5s pool_workers=Some(0)
+  total =   21085208 ops | 4217042 ops/sec | p50 0us  p99 1us  p99.99 5us
+=== get-by-id workers=8 trial=1 ===
+parallel-reads workload=get-by-id workers=8 rows=2000 duration=5s pool_workers=Some(0)
+  total =   22047234 ops | 4409447 ops/sec | p50 1us  p99 3us  p99.99 9us
+=== get-by-id workers=8 trial=2 ===
+parallel-reads workload=get-by-id workers=8 rows=2000 duration=5s pool_workers=Some(0)
+  total =   21904265 ops | 4380853 ops/sec | p50 1us  p99 3us  p99.99 8us
+=== get-by-id workers=8 trial=3 ===
+parallel-reads workload=get-by-id workers=8 rows=2000 duration=5s pool_workers=Some(0)
+  total =   22292379 ops | 4458476 ops/sec | p50 1us  p99 3us  p99.99 7us
+=== get-by-id workers=16 trial=1 ===
+parallel-reads workload=get-by-id workers=16 rows=2000 duration=5s pool_workers=Some(0)
+  total =   24074854 ops | 4814971 ops/sec | p50 3us  p99 7us  p99.99 17us
+=== get-by-id workers=16 trial=2 ===
+parallel-reads workload=get-by-id workers=16 rows=2000 duration=5s pool_workers=Some(0)
+  total =   22934179 ops | 4586836 ops/sec | p50 3us  p99 7us  p99.99 19us
+=== get-by-id workers=16 trial=3 ===
+parallel-reads workload=get-by-id workers=16 rows=2000 duration=5s pool_workers=Some(0)
+  total =   23837697 ops | 4767539 ops/sec | p50 3us  p99 7us  p99.99 18us
+=== get-by-id workers=24 trial=1 ===
+parallel-reads workload=get-by-id workers=24 rows=2000 duration=5s pool_workers=Some(0)
+  total =   24254192 ops | 4850838 ops/sec | p50 3us  p99 7us  p99.99 3010us
+=== get-by-id workers=24 trial=2 ===
+parallel-reads workload=get-by-id workers=24 rows=2000 duration=5s pool_workers=Some(0)
+  total =   25055819 ops | 5011164 ops/sec | p50 2us  p99 7us  p99.99 3010us
+=== get-by-id workers=24 trial=3 ===
+parallel-reads workload=get-by-id workers=24 rows=2000 duration=5s pool_workers=Some(0)
+  total =   24499247 ops | 4899849 ops/sec | p50 2us  p99 7us  p99.99 3009us
+=== get-by-id workers=32 trial=1 ===
+parallel-reads workload=get-by-id workers=32 rows=2000 duration=5s pool_workers=Some(0)
+  total =   23532880 ops | 4706576 ops/sec | p50 3us  p99 7us  p99.99 6007us
+=== get-by-id workers=32 trial=2 ===
+parallel-reads workload=get-by-id workers=32 rows=2000 duration=5s pool_workers=Some(0)
+  total =   25240667 ops | 5048133 ops/sec | p50 2us  p99 7us  p99.99 6008us
+=== get-by-id workers=32 trial=3 ===
+parallel-reads workload=get-by-id workers=32 rows=2000 duration=5s pool_workers=Some(0)
+  total =   25184349 ops | 5036870 ops/sec | p50 2us  p99 7us  p99.99 6007us

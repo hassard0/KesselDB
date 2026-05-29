@@ -870,4 +870,208 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir_p);
         let _ = std::fs::remove_dir_all(&dir_s);
     }
+
+    // -----------------------------------------------------------------------
+    // SP-Perf-A T6 KATs — in-process apply fast-path (Fix A).
+    // -----------------------------------------------------------------------
+    //
+    // These lock the invariant that `EngineHandle::apply(op)` and
+    // `EngineHandle::apply_op(&op)` produce byte-identical OpResult to
+    // the encode→apply_raw→decode roundtrip on EVERY read variant.
+    // Regression-lock for the encode/decode bypass.
+
+    use kessel_catalog::{encode_type_def, Field, FieldKind};
+
+    /// Build a small engine seeded with one type "row(v U64, score I32 eq+ord, group U16 eq)"
+    /// + 1000 rows + indexes. Used by every T6 KAT.
+    fn seed_t6_engine(read_workers: Option<usize>) -> (crate::EngineHandle, std::path::PathBuf) {
+        use kessel_proto::{ObjectId, Op};
+        let dir = std::env::temp_dir().join(format!(
+            "kesseldb-t6-{}-{}",
+            std::process::id(),
+            rand_suffix()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = crate::ServerConfig {
+            read_workers,
+            ..crate::ServerConfig::default()
+        };
+        let engine = crate::spawn_engine_cfg(&dir, &cfg).unwrap();
+        let def = encode_type_def(
+            "row",
+            &[
+                Field { field_id: 0, name: "v".into(), kind: FieldKind::U64, nullable: false },
+                Field { field_id: 1, name: "score".into(), kind: FieldKind::I32, nullable: false },
+                Field { field_id: 2, name: "group".into(), kind: FieldKind::U16, nullable: false },
+            ],
+        );
+        assert!(matches!(
+            engine.apply(Op::CreateType { def }),
+            kessel_proto::OpResult::TypeCreated(_)
+        ));
+        let _ = engine.apply(Op::CreateIndex { type_id: 1, field_id: 2 });
+        let _ = engine.apply(Op::CreateIndex { type_id: 1, field_id: 1 });
+        let _ = engine.apply(Op::AddOrderedIndex { type_id: 1, field_id: 1 });
+        for i in 0..1000u32 {
+            let id = ObjectId::from_u128(i as u128);
+            let mut rec = Vec::with_capacity(14);
+            rec.extend_from_slice(&(i as u64).to_le_bytes());
+            rec.extend_from_slice(&(i as i32).to_le_bytes());
+            rec.extend_from_slice(&((i % 8) as u16).to_le_bytes());
+            let _ = engine.apply(Op::Create { type_id: 1, id, record: rec });
+        }
+        (engine, dir)
+    }
+
+    /// T6-KAT-1: apply(GetById) == apply_raw(encode(GetById)) byte-for-byte.
+    /// Locks the Fix A encode-bypass for the bench's hot path.
+    #[test]
+    fn t6_apply_get_by_id_matches_apply_raw_roundtrip() {
+        use kessel_proto::{ObjectId, Op};
+        let (engine, dir) = seed_t6_engine(Some(0));
+        for i in [0u128, 1, 42, 500, 999] {
+            let op = Op::GetById { type_id: 1, id: ObjectId::from_u128(i) };
+            let fast = engine.apply(op.clone());
+            let slow = engine.apply_raw(op.encode());
+            assert_eq!(fast, slow, "apply vs apply_raw diverged at id {i}");
+        }
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T6-KAT-2: apply(Select LIMIT 10) byte-equal to apply_raw fallback.
+    #[test]
+    fn t6_apply_select_limit_matches_apply_raw_roundtrip() {
+        use kessel_proto::Op;
+        let (engine, dir) = seed_t6_engine(Some(0));
+        let op = Op::Select { type_id: 1, program: vec![], limit: 10 };
+        let fast = engine.apply(op.clone());
+        let slow = engine.apply_raw(op.encode());
+        assert_eq!(fast, slow, "apply(Select) vs apply_raw diverged");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T6-KAT-3: apply(FindBy) byte-equal to apply_raw — exercise the
+    /// indexed equality path.
+    #[test]
+    fn t6_apply_find_by_matches_apply_raw_roundtrip() {
+        use kessel_proto::Op;
+        let (engine, dir) = seed_t6_engine(Some(0));
+        let op = Op::FindBy { type_id: 1, field_id: 2, value: 3u16.to_le_bytes().to_vec() };
+        let fast = engine.apply(op.clone());
+        let slow = engine.apply_raw(op.encode());
+        assert_eq!(fast, slow, "apply(FindBy) vs apply_raw diverged");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T6-KAT-4: apply(Aggregate SUM) byte-equal — exercises the O(rows) scan path.
+    #[test]
+    fn t6_apply_aggregate_matches_apply_raw_roundtrip() {
+        use kessel_proto::Op;
+        let (engine, dir) = seed_t6_engine(Some(0));
+        // Aggregate over indexed score field, SUM (kind 0).
+        let op = Op::Aggregate { type_id: 1, program: vec![], kind: 0, field_id: 1 };
+        let fast = engine.apply(op.clone());
+        let slow = engine.apply_raw(op.encode());
+        assert_eq!(fast, slow, "apply(Aggregate) vs apply_raw diverged");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T6-KAT-5: apply(SelectSorted) byte-equal — exercises the ordered-index
+    /// path with sort + limit.
+    #[test]
+    fn t6_apply_select_sorted_matches_apply_raw_roundtrip() {
+        use kessel_proto::Op;
+        let (engine, dir) = seed_t6_engine(Some(0));
+        let op = Op::SelectSorted {
+            type_id: 1,
+            program: vec![],
+            sort_field: 1,
+            desc: false,
+            offset: 0,
+            limit: 10,
+        };
+        let fast = engine.apply(op.clone());
+        let slow = engine.apply_raw(op.encode());
+        assert_eq!(fast, slow, "apply(SelectSorted) vs apply_raw diverged");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T6-KAT-6: apply_op(&Op) byref overload byte-equal to apply(Op) by-value,
+    /// across every read variant the bench drives.
+    #[test]
+    fn t6_apply_op_byref_matches_apply_by_value() {
+        use kessel_proto::{ObjectId, Op};
+        let (engine, dir) = seed_t6_engine(Some(0));
+        let ops = vec![
+            Op::GetById { type_id: 1, id: ObjectId::from_u128(42) },
+            Op::Select { type_id: 1, program: vec![], limit: 10 },
+            Op::FindBy { type_id: 1, field_id: 2, value: 3u16.to_le_bytes().to_vec() },
+            Op::Aggregate { type_id: 1, program: vec![], kind: 0, field_id: 1 },
+            Op::SelectSorted {
+                type_id: 1, program: vec![], sort_field: 1,
+                desc: false, offset: 0, limit: 10,
+            },
+            Op::Describe { type_id: 1 },
+        ];
+        for op in ops {
+            let by_val = engine.apply(op.clone());
+            let by_ref = engine.apply_op(&op);
+            assert_eq!(by_val, by_ref, "apply vs apply_op diverged on {:?}", op.kind());
+        }
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T6-KAT-7: writes still go through the engine queue on the fast
+    /// path (encode + send + reply). Locks the invariant that Fix A
+    /// doesn't silently bypass the write apply thread.
+    #[test]
+    fn t6_apply_write_op_still_uses_engine_queue() {
+        use kessel_proto::{ObjectId, Op, OpResult};
+        let (engine, dir) = seed_t6_engine(Some(0));
+        // Issue a fresh Create — must go to the engine thread, take a
+        // log slot, return Ok (or Constraint for a duplicate id which
+        // would also prove the engine processed it).
+        let r = engine.apply(Op::Create {
+            type_id: 1,
+            id: ObjectId::from_u128(5000),
+            record: {
+                let mut v = Vec::with_capacity(14);
+                v.extend_from_slice(&5000u64.to_le_bytes());
+                v.extend_from_slice(&0i32.to_le_bytes());
+                v.extend_from_slice(&0u16.to_le_bytes());
+                v
+            },
+        });
+        assert_eq!(r, OpResult::Ok, "write should reach engine and apply");
+        // Read it back via the fast path.
+        let g = engine.apply(Op::GetById {
+            type_id: 1, id: ObjectId::from_u128(5000),
+        });
+        assert!(matches!(g, OpResult::Got(_)), "write+read roundtrip on fast path");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T6-KAT-8: with `sm_shared = None` (read_workers = None), the
+    /// fast path is OFF and apply(GetById) routes through the engine
+    /// queue exactly as pre-T6. Result is byte-equal.
+    #[test]
+    fn t6_apply_without_sm_shared_falls_through_to_engine() {
+        use kessel_proto::{ObjectId, Op};
+        let (engine, dir) = seed_t6_engine(None); // read_workers = None ⇒ no sm_shared
+        for i in [0u128, 1, 42, 500, 999] {
+            let op = Op::GetById { type_id: 1, id: ObjectId::from_u128(i) };
+            let fast = engine.apply(op.clone());
+            let slow = engine.apply_raw(op.encode());
+            assert_eq!(fast, slow, "no-bypass apply vs apply_raw diverged at id {i}");
+        }
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

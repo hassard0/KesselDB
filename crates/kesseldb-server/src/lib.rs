@@ -667,7 +667,72 @@ impl EngineHandle {
     pub fn read_pool_workers(&self) -> usize {
         self.read_pool.as_ref().map(|p| p.workers()).unwrap_or(0)
     }
+    /// SP-Perf-A T6 (Fix A): in-process apply that skips the
+    /// `Op::encode() → apply_raw → Op::decode()` round-trip on the read
+    /// path. The wire boundary (`apply_raw`) is unchanged — binary,
+    /// HTTP, WS, and PG gateways still encode the Op and decode it
+    /// inside `apply_raw` exactly as before. This method is the
+    /// in-process callers' fast path (bench + tests + Rust embedders
+    /// that hold an `EngineHandle` directly).
+    ///
+    /// When `sm_shared` is Some AND the op is read-only, the dispatch
+    /// runs directly under the `RwLock<StateMachine>` read guard on
+    /// the submitting thread — zero encode, zero decode, one atomic
+    /// CAS on the rwlock reader count. Writes still go through the
+    /// engine queue (the apply thread is the single writer); the
+    /// encode-then-send is necessary because the engine consumes a
+    /// `Vec<u8>` frame on its mpsc.
     pub fn apply(&self, op: Op) -> OpResult {
+        // SP-Perf-A T6: read-only in-process fast path. Saves the
+        // Op::encode + Op::decode allocations at ~5M ops/sec × N
+        // threads — the largest single contributor to the T5-
+        // identified ~80M alloc/sec heap traffic ceiling.
+        if let Some(sm_shared) = &self.sm_shared {
+            if !op.is_mutating() {
+                // SP144H T1 parity: bump per-kind counter — matches
+                // apply_raw's behaviour exactly so observability stays
+                // symmetric across the two entry points.
+                let idx = op.kind() as usize;
+                if idx < 64 {
+                    self.op_kind_counts[idx].fetch_add(1, Ordering::AcqRel);
+                }
+                return match sm_shared.read() {
+                    Ok(g) => g.read_only_op(op),
+                    Err(_) => OpResult::SchemaError(
+                        "read lock poisoned".into(),
+                    ),
+                };
+            }
+        }
+        // Writes (or no sm_shared): keep the original encode + engine
+        // queue path. The engine thread decodes inside apply_one.
+        self.apply_raw(op.encode())
+    }
+
+    /// SP-Perf-A T6: identical in-process fast path to `apply`, but
+    /// accepts the Op by reference. Cheaper for callers that want to
+    /// retain ownership (e.g. retry loops, mixed-workload drivers).
+    /// For read-only ops it dispatches directly under the shared SM
+    /// read guard (`Op` is then cloned into `read_only_op`'s consumed
+    /// argument; for GetById/GetBlob/Describe this clone is a
+    /// stack-copy because the Op carries only Copy fields). For
+    /// writes it falls through to `apply_raw(op.encode())` exactly
+    /// like `apply` does.
+    pub fn apply_op(&self, op: &Op) -> OpResult {
+        if let Some(sm_shared) = &self.sm_shared {
+            if !op.is_mutating() {
+                let idx = op.kind() as usize;
+                if idx < 64 {
+                    self.op_kind_counts[idx].fetch_add(1, Ordering::AcqRel);
+                }
+                return match sm_shared.read() {
+                    Ok(g) => g.read_only_op(op.clone()),
+                    Err(_) => OpResult::SchemaError(
+                        "read lock poisoned".into(),
+                    ),
+                };
+            }
+        }
         self.apply_raw(op.encode())
     }
 

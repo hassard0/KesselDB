@@ -199,16 +199,25 @@ fn run_sysbench_oltp(
     let mut creates = String::new();
     for t in 1..=tables {
         drops.push_str(&format!("DROP TABLE IF EXISTS sbtest{t};"));
+        // Upstream sysbench uses CHAR(120)/CHAR(60). We use BYTEA here for
+        // two reasons: (1) symmetry with the SQLite driver (which uses BLOB
+        // for c/pad — SQLite has no fixed-width CHAR type with the same
+        // ORDER BY semantics), and (2) Postgres CHAR columns reject the
+        // arbitrary binary bytes we generate in the load phase, requiring
+        // a separate UTF-8-safe synth step that would diverge from the
+        // SQLite path. BYTEA preserves the row-width contract (the c+pad
+        // bundle is still ~180 bytes per row) and sorts in lexicographic
+        // byte order, which is what ORDER BY c does anyway.
+        let _ = sysbench::C_WIDTH;
+        let _ = sysbench::PAD_WIDTH;
         creates.push_str(&format!(
             "CREATE UNLOGGED TABLE sbtest{t} (
                 id BIGINT PRIMARY KEY,
                 k INTEGER NOT NULL DEFAULT 0,
-                c CHAR({c}) NOT NULL DEFAULT '',
-                pad CHAR({p}) NOT NULL DEFAULT ''
+                c BYTEA NOT NULL,
+                pad BYTEA NOT NULL
              );
-             CREATE INDEX IF NOT EXISTS sbtest{t}_k ON sbtest{t} (k);",
-            c = sysbench::C_WIDTH,
-            p = sysbench::PAD_WIDTH,
+             CREATE INDEX IF NOT EXISTS sbtest{t}_k ON sbtest{t} (k);"
         ));
     }
     setup.batch_execute(&drops)?;
@@ -229,17 +238,7 @@ fn run_sysbench_oltp(
         for i in 0..rows_per_table {
             rng.fill(&mut c_buf[..]);
             rng.fill(&mut pad_buf[..]);
-            // Replace any 0-bytes with 'a' so CHAR text columns don't choke.
-            for b in c_buf.iter_mut() {
-                if *b == 0 {
-                    *b = b'a';
-                }
-            }
-            for b in pad_buf.iter_mut() {
-                if *b == 0 {
-                    *b = b'a';
-                }
-            }
+            // BYTEA accepts any byte sequence — no UTF-8 fixup needed.
             let k = rng.gen::<i32>();
             // Tuple: u16 ncols=4.
             writer.write_all(&4i16.to_be_bytes())?;
@@ -371,11 +370,6 @@ fn run_sysbench_oltp(
                     // (b) UPDATE_NON_INDEX
                     let pk = rng.gen_range(0..rows_per_table as i64);
                     rng.fill(&mut c_buf[..]);
-                    for b in c_buf.iter_mut() {
-                        if *b == 0 {
-                            *b = b'a';
-                        }
-                    }
                     let _ = tx.execute(&stmts.6, &[&pk, &&c_buf[..]])?;
                     inner_count += 1;
                     // (c) DELETE + (d) INSERT — paired so dataset size is invariant
@@ -387,16 +381,6 @@ fn run_sysbench_oltp(
                     let k = rng.gen::<i32>();
                     rng.fill(&mut c_buf[..]);
                     rng.fill(&mut pad_buf[..]);
-                    for b in c_buf.iter_mut() {
-                        if *b == 0 {
-                            *b = b'a';
-                        }
-                    }
-                    for b in pad_buf.iter_mut() {
-                        if *b == 0 {
-                            *b = b'a';
-                        }
-                    }
                     let _ = tx.execute(
                         ins_stmt,
                         &[&shadow_id, &k, &&c_buf[..], &&pad_buf[..]],

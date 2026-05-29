@@ -51,6 +51,7 @@
 
 pub mod proto;
 pub mod response;
+pub mod substitute;
 
 use crate::engine::EngineApply;
 use crate::proto::{FE_BIND, FE_CLOSE, FE_DESCRIBE, FE_EXECUTE, FE_FLUSH, FE_PARSE, FE_SYNC};

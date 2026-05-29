@@ -577,6 +577,10 @@ pub fn run_session<
                                     tag_char = target as char,
                                 ),
                             ),
+                            crate::extq::ExtqError::SubstitutionFailed { reason } => (
+                                "08P01",
+                                format!("parameter substitution failed: {reason}"),
+                            ),
                         };
                         // Same "stay alive" contract as the T1
                         // branch — emit ErrorResponse + RFQ and
@@ -1885,6 +1889,256 @@ mod tests {
         assert!(
             pipe.outbound.windows(5).any(|w| w == b"34000"),
             "outbound must contain SQLSTATE 34000 for missing portal"
+        );
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // T5 server-integration KATs — Execute + Sync wire-up. Locks the
+    // §13 acceptance-criteria headline: a full Parse + Bind + Execute
+    // + Sync round-trip on the wire emits the canonical 5-piece
+    // backend sequence + RFQ('I'), with no `0A000` ErrorResponse
+    // (Execute + Sync are real handlers now). This is what every
+    // modern ORM probe issues at connect time.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// Build a Parse frame: `P [length] [name\0] [sql\0] [param_count:i16] [oid:i32]*`.
+    fn build_parse_frame(name: &str, sql: &str, param_oids: &[u32]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(name.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(sql.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&(param_oids.len() as i16).to_be_bytes());
+        for oid in param_oids {
+            payload.extend_from_slice(&oid.to_be_bytes());
+        }
+        let length = (4 + payload.len()) as u32;
+        let mut f = Vec::new();
+        f.push(b'P');
+        f.extend_from_slice(&length.to_be_bytes());
+        f.extend_from_slice(&payload);
+        f
+    }
+
+    /// Build a Bind frame.
+    fn build_bind_frame(
+        portal: &str,
+        stmt: &str,
+        param_formats: &[u16],
+        param_values: &[Option<&[u8]>],
+        result_formats: &[u16],
+    ) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(portal.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(stmt.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&(param_formats.len() as i16).to_be_bytes());
+        for f in param_formats {
+            payload.extend_from_slice(&(*f as i16).to_be_bytes());
+        }
+        payload.extend_from_slice(&(param_values.len() as i16).to_be_bytes());
+        for v in param_values {
+            match v {
+                None => payload.extend_from_slice(&(-1i32).to_be_bytes()),
+                Some(bytes) => {
+                    payload.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                    payload.extend_from_slice(bytes);
+                }
+            }
+        }
+        payload.extend_from_slice(&(result_formats.len() as i16).to_be_bytes());
+        for f in result_formats {
+            payload.extend_from_slice(&(*f as i16).to_be_bytes());
+        }
+        let length = (4 + payload.len()) as u32;
+        let mut f = Vec::new();
+        f.push(b'B');
+        f.extend_from_slice(&length.to_be_bytes());
+        f.extend_from_slice(&payload);
+        f
+    }
+
+    /// Build an Execute frame.
+    fn build_execute_frame(portal: &str, max_rows: i32) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(portal.as_bytes());
+        payload.push(0);
+        payload.extend_from_slice(&max_rows.to_be_bytes());
+        let length = (4 + payload.len()) as u32;
+        let mut f = Vec::new();
+        f.push(b'E');
+        f.extend_from_slice(&length.to_be_bytes());
+        f.extend_from_slice(&payload);
+        f
+    }
+
+    /// Build a Sync frame.
+    fn build_sync_frame() -> Vec<u8> {
+        vec![b'S', 0, 0, 0, 4]
+    }
+
+    /// HEADLINE T5 KAT: a Parse + Bind + Execute + Sync round-trip
+    /// on the wire emits the canonical sequence ParseComplete +
+    /// BindComplete + RowDescription + CommandComplete + ReadyForQuery.
+    /// The `EmptySelectEngine` returns 0 rows for `SELECT * FROM t`,
+    /// so the CommandComplete tag is `SELECT 0`.
+    ///
+    /// THIS is the §13 acceptance-criteria headline — every modern PG
+    /// ORM (SQLAlchemy / psycopg / asyncpg / JDBC / sqlx / Drizzle /
+    /// Prisma) issues this exact sequence at the protocol-probe phase.
+    #[test]
+    fn t5_extq_run_session_parse_bind_execute_sync_emits_canonical_sequence() {
+        let token = b"kessel-bearer-token";
+        let parse = build_parse_frame("", "SELECT * FROM t", &[]);
+        let bind = build_bind_frame("", "", &[], &[], &[]);
+        let exec = build_execute_frame("", 0);
+        let sync = build_sync_frame();
+        let mut extra = parse;
+        extra.extend_from_slice(&bind);
+        extra.extend_from_slice(&exec);
+        extra.extend_from_slice(&sync);
+        extra.extend_from_slice(&build_x_frame());
+        let inbound = build_authed_inbound(token, "clientN", "serverN", "test", &extra);
+        let mut pipe = Pipe::new(inbound);
+        let engine = EmptySelectEngine;
+        let session = run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("session stays alive through P+B+E+S+Terminate");
+        assert_eq!(session.user, "test");
+        let out = &pipe.outbound;
+        // ParseComplete + BindComplete consecutively.
+        let pc_bc: &[u8] = &[b'1', 0, 0, 0, 4, b'2', 0, 0, 0, 4];
+        assert!(
+            out.windows(pc_bc.len()).any(|w| w == pc_bc),
+            "outbound must carry ParseComplete + BindComplete consecutively"
+        );
+        // RowDescription 'T' appears (Execute's prelude includes it).
+        assert!(out.iter().any(|&b| b == b'T'));
+        // CommandComplete 'SELECT 0' (EmptySelectEngine returns 0 rows).
+        assert!(
+            out.windows(b"SELECT 0\0".len()).any(|w| w == b"SELECT 0\0"),
+            "outbound must carry CommandComplete tag SELECT 0"
+        );
+        // RFQ('I') trails — last 6 bytes before Terminate close.
+        assert!(
+            out.windows(6).any(|w| w == &[b'Z', 0, 0, 0, 5, b'I'][..]),
+            "outbound must carry RFQ('I') after Sync"
+        );
+        // No `0A000` (Execute + Sync are real now).
+        assert!(
+            !out.windows(5).any(|w| w == b"0A000"),
+            "Execute + Sync must NOT emit 0A000 — they are real handlers now"
+        );
+    }
+
+    /// SP-PG-EXTQ T5 — Execute on an unbound portal emits `34000
+    /// invalid_cursor_name` + RFQ. Session stays alive.
+    #[test]
+    fn t5_extq_run_session_execute_unbound_portal_emits_34000_and_stays_alive() {
+        let token = b"kessel-bearer-token";
+        let exec = build_execute_frame("nonexistent_portal", 0);
+        let sync = build_sync_frame();
+        let mut extra = exec;
+        extra.extend_from_slice(&sync);
+        extra.extend_from_slice(&build_x_frame());
+        let inbound = build_authed_inbound(token, "clientN", "serverN", "test", &extra);
+        let mut pipe = Pipe::new(inbound);
+        let engine = EmptySelectEngine;
+        let session = run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("session stays alive across unbound-portal Execute + Sync + Terminate");
+        assert_eq!(session.user, "test");
+        let out = &pipe.outbound;
+        assert!(
+            out.windows(5).any(|w| w == b"34000"),
+            "outbound must contain SQLSTATE 34000 for missing portal"
+        );
+    }
+
+    /// SP-PG-EXTQ T5 — Sync alone (no preceding P/B/D/E) emits ONLY
+    /// RFQ('I'). The minimal sync-as-flush case.
+    #[test]
+    fn t5_extq_run_session_sync_alone_emits_only_rfq() {
+        let token = b"kessel-bearer-token";
+        let sync = build_sync_frame();
+        let mut extra = sync;
+        extra.extend_from_slice(&build_x_frame());
+        let inbound = build_authed_inbound(token, "clientN", "serverN", "test", &extra);
+        let mut pipe = Pipe::new(inbound);
+        let engine = EmptySelectEngine;
+        run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("session stays alive across Sync-alone + Terminate");
+        let out = &pipe.outbound;
+        // After SCRAM auth flow's final RFQ, the Sync produces another
+        // RFQ. There should be at least 2 RFQ('I') envelopes in the
+        // stream — one from auth, one from Sync.
+        let rfq_count = out
+            .windows(6)
+            .filter(|w| *w == [b'Z', 0, 0, 0, 5, b'I'])
+            .count();
+        assert!(
+            rfq_count >= 2,
+            "Sync alone must emit RFQ; auth gives 1, Sync adds another (got {rfq_count} RFQ envelopes)"
+        );
+        // No error responses anywhere from this Sync.
+        // (Auth may have its own; we just look at the Sync side.)
+    }
+
+    /// SP-PG-EXTQ T5 — Parse + Bind + Execute (pipelined; no Sync
+    /// terminator before Terminate) does NOT emit a trailing RFQ.
+    /// The client MUST Sync to drain the response queue per PG §55.2.3.
+    /// V1's wire path emits the Execute response bytes (including
+    /// RowDescription + CommandComplete) but NO RFQ.
+    #[test]
+    fn t5_extq_run_session_pipelined_p_b_e_without_sync_emits_no_rfq() {
+        let token = b"kessel-bearer-token";
+        let parse = build_parse_frame("", "SELECT * FROM t", &[]);
+        let bind = build_bind_frame("", "", &[], &[], &[]);
+        let exec = build_execute_frame("", 0);
+        let mut extra = parse;
+        extra.extend_from_slice(&bind);
+        extra.extend_from_slice(&exec);
+        // NO Sync — Terminate immediately.
+        extra.extend_from_slice(&build_x_frame());
+        let inbound = build_authed_inbound(token, "clientN", "serverN", "test", &extra);
+        let mut pipe = Pipe::new(inbound);
+        let engine = EmptySelectEngine;
+        run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("session stays alive across P+B+E+Terminate (no Sync)");
+        let out = &pipe.outbound;
+        // ParseComplete + BindComplete appear.
+        let pc_bc: &[u8] = &[b'1', 0, 0, 0, 4, b'2', 0, 0, 0, 4];
+        assert!(out.windows(pc_bc.len()).any(|w| w == pc_bc));
+        // CommandComplete (from Execute) appears.
+        assert!(out.windows(b"SELECT 0\0".len()).any(|w| w == b"SELECT 0\0"));
+        // EXACTLY ONE RFQ in the stream — from the auth handshake.
+        // The post-Execute path does NOT add one (Sync wasn't issued).
+        let rfq_count = out
+            .windows(6)
+            .filter(|w| *w == [b'Z', 0, 0, 0, 5, b'I'])
+            .count();
+        assert_eq!(
+            rfq_count, 1,
+            "Pipelined P+B+E (no Sync) must NOT add a trailing RFQ — only the auth-handshake RFQ should be present (got {rfq_count})"
         );
     }
 

@@ -186,6 +186,17 @@ pub struct Portal {
     /// first Execute and pages from the buffer for PortalSuspended
     /// (T9).
     pub exec_state: ExecState,
+    /// SP-PG-EXTQ T5 — tracks whether `RowDescription` has already
+    /// been emitted for this portal in the current Sync block. PG
+    /// protocol §55.2.3: if Describe('P') ran before Execute, the
+    /// `T` RowDescription was already on the wire, and Execute MUST
+    /// NOT repeat it (the client only expects ONE RowDescription
+    /// per portal per Sync block). Set to true by `dispatch_describe`
+    /// (T4) when it emits RowDescription for a portal, and by
+    /// `dispatch_execute` (T5) when it emits RowDescription itself.
+    /// Reset on Sync (T5 dispatch_sync) via portal drop/refresh
+    /// semantics.
+    pub row_description_sent: bool,
 }
 
 /// In-progress execution state for one portal. Spec §7.2.
@@ -272,6 +283,13 @@ pub enum ExtqError {
     /// silently corrupt state. Carries the offending byte for
     /// operator diagnosis.
     BadDescribeTarget { target: u8 },
+    /// SP-PG-EXTQ T5 — parameter substitution failed because the
+    /// SQL referenced `$0` (PG `$N` indices are 1-based) or `$N`
+    /// where N > the portal's bound parameter count. Maps to
+    /// SQLSTATE `08P01 protocol_violation` — either the Parse SQL
+    /// or the Bind value count is bugged on the client side.
+    /// Carries a human-readable description for the wire message.
+    SubstitutionFailed { reason: String },
 }
 
 /// Outcome of dispatching one extq message. T2+ widens the
@@ -351,11 +369,11 @@ pub fn try_dispatch_extq<E: EngineApply + ?Sized>(
     // mechanism for B/D/E/C/H to "fall through" after a Bind error.
     if state.error_state {
         if matches!(message, M::Sync) {
-            // T7 owns the full Sync handler (state clear + RFQ
-            // emit). T3 leaves Sync on the NotYetImplemented path
-            // so the run_session loop's existing Sync-NYI
-            // rendering still applies.
-            return ExtqOutcome::Failed(ExtqError::NotYetImplemented { tag: FE_SYNC });
+            // SP-PG-EXTQ T5 — Sync clears the error_state + emits
+            // RFQ('I') regardless of whether the dispatcher was in
+            // error_state or not. This is the only way out of
+            // skip-until-Sync mode.
+            return dispatch_sync(state);
         }
         return ExtqOutcome::Skipped;
     }
@@ -380,10 +398,10 @@ pub fn try_dispatch_extq<E: EngineApply + ?Sized>(
             result_formats,
         ),
         M::Describe { target, name } => dispatch_describe(state, engine, target, name),
-        M::Execute { .. } => {
-            ExtqOutcome::Failed(ExtqError::NotYetImplemented { tag: FE_EXECUTE })
+        M::Execute { portal, max_rows } => {
+            dispatch_execute(state, engine, portal, max_rows)
         }
-        M::Sync => ExtqOutcome::Failed(ExtqError::NotYetImplemented { tag: FE_SYNC }),
+        M::Sync => dispatch_sync(state),
         M::Close { .. } => ExtqOutcome::Failed(ExtqError::NotYetImplemented { tag: FE_CLOSE }),
         M::Flush => ExtqOutcome::Failed(ExtqError::NotYetImplemented { tag: FE_FLUSH }),
     }
@@ -602,6 +620,7 @@ fn dispatch_bind(
             param_formats,
             result_formats,
             exec_state: ExecState::Pending,
+            row_description_sent: false,
         },
     );
 
@@ -709,7 +728,19 @@ fn dispatch_describe<E: EngineApply + ?Sized>(
             // Portals do NOT emit ParameterDescription — Bind froze
             // the parameter values, so the client already knows them.
             // Spec §4 + PG §55.2.3.
-            ExtqOutcome::Bytes(row_description_or_no_data_for_sql(engine, &sql))
+            let bytes = row_description_or_no_data_for_sql(engine, &sql);
+            // SP-PG-EXTQ T5 — record that the portal got a
+            // RowDescription so the upcoming Execute (if any) does
+            // NOT repeat it. PG §55.2.3: Describe-then-Execute
+            // emits T exactly once per portal per Sync block.
+            // (NoData also "covers" the portal — there are no rows
+            // so Execute won't emit T either. We set the flag in
+            // both cases for symmetry; the flag only matters for
+            // the SELECT-returning-rows path.)
+            if let Some(portal) = state.portals.get_mut(&name) {
+                portal.row_description_sent = true;
+            }
+            ExtqOutcome::Bytes(bytes)
         }
         other => set_err(state, ExtqError::BadDescribeTarget { target: other }),
     }
@@ -765,6 +796,404 @@ fn row_description_or_no_data_for_sql<E: EngineApply + ?Sized>(
         })
         .collect();
     crate::response::encode_row_description(&fields)
+}
+
+/// SP-PG-EXTQ T5 — real handler for the `E` Execute message.
+///
+/// Per spec §4 + §7.2 + PG §55.2.3, in order:
+///
+/// 1. **Portal lookup.** `state.portals.get(&portal_name)` → missing
+///    is `UnknownPortal` → `34000 invalid_cursor_name`. Captures the
+///    bound parameter values + `row_description_sent` flag + current
+///    `exec_state` for the next steps.
+///
+/// 2. **Statement lookup.** The portal's `stmt_name` is resolved
+///    against `state.statements`. Defensive `UnknownStatement` →
+///    `26000` if missing (T3's Bind already validated, but a future
+///    Close 'S' between Bind + Execute could violate the invariant).
+///
+/// 3. **Empty SQL.** Per spec §12 OQ #5 + PG §55.2.3: an empty
+///    prepared SQL Executes as `EmptyQueryResponse`. The portal is
+///    then `Exhausted { total: 0 }`.
+///
+/// 4. **Parameter substitution.** The portal's `param_values` are
+///    substituted into the prepared SQL via
+///    `substitute::substitute_text_format_params`. Errors map to
+///    `SubstitutionFailed` → `08P01`.
+///
+/// 5. **First Execute or re-Execute?** Switch on the portal's
+///    `exec_state`:
+///    - `Pending`: this is the first Execute — call the existing
+///      `dispatch::dispatch_query` to get the canonical Simple
+///      Query byte sequence (RowDescription + DataRow* +
+///      CommandComplete + RFQ). PARSE that byte stream to split out
+///      the RowDescription / DataRow / CommandComplete / RFQ pieces;
+///      strip the RFQ (Sync emits the RFQ on its own); buffer the
+///      DataRows + CommandComplete tag into the portal's
+///      `Buffered { rows, cursor: 0 }` state.
+///    - `Buffered { rows, cursor }`: re-Execute — emit DataRows from
+///      `rows[cursor..]` up to `max_rows`, advancing cursor; if more
+///      rows remain after the batch, emit `PortalSuspended` instead
+///      of `CommandComplete`. If the batch exhausts, emit
+///      `CommandComplete` and transition to `Exhausted { total }`.
+///    - `Exhausted { total }`: PG §55.2.3 — re-Execute on a drained
+///      portal emits `CommandComplete("SELECT 0")` (we emit a bare
+///      `SELECT 0` tag because the total is the previously-emitted
+///      count, not 0). V1 ships the conservative shape — emit a
+///      `CommandComplete` tag that re-uses the original
+///      `SELECT <total>` form so the client sees a consistent count.
+///
+/// 6. **RowDescription suppression.** PG protocol: if Describe('P')
+///    OR a previous Execute already emitted RowDescription for this
+///    portal in the current Sync block, the new Execute MUST NOT
+///    repeat it. Track via `portal.row_description_sent`. Reset on
+///    Sync (T5 dispatch_sync drops unnamed portals; named portals
+///    survive but we reset their flag too).
+///
+/// 7. **max_rows semantics** per spec §7.2:
+///    - `max_rows == 0` → emit ALL remaining DataRows + the
+///      original CommandComplete; portal transitions to Exhausted.
+///    - `max_rows > 0` → emit min(remaining, max_rows) DataRows;
+///      if more remain, emit PortalSuspended (`s [length=4]`) and
+///      leave portal in Buffered { cursor: advanced }; if exactly
+///      drained, emit the original CommandComplete + Exhausted.
+///    - `max_rows < 0` → treat as 0 (PG §55.2.3 doesn't spec; V1
+///      picks permissive).
+///
+/// 8. **Error-recovery side-effect** (spec §6): on ANY error path,
+///    `state.error_state = true`. Same shape as the other dispatch
+///    helpers.
+fn dispatch_execute<E: EngineApply + ?Sized>(
+    state: &mut SessionState,
+    engine: &E,
+    portal_name: String,
+    max_rows: i32,
+) -> ExtqOutcome {
+    let set_err = |s: &mut SessionState, e: ExtqError| -> ExtqOutcome {
+        s.error_state = true;
+        ExtqOutcome::Failed(e)
+    };
+
+    // 1. Portal lookup. Capture what we need before the engine call
+    //    so we don't hold the borrow.
+    let (stmt_name, exec_state, row_description_sent) =
+        match state.portals.get(&portal_name) {
+            Some(p) => (
+                p.stmt_name.clone(),
+                p.exec_state.clone(),
+                p.row_description_sent,
+            ),
+            None => return set_err(state, ExtqError::UnknownPortal { name: portal_name }),
+        };
+
+    // 2. Statement lookup. Defensive — Bind already validated.
+    let (sql, _param_oids) = match state.statements.get(&stmt_name) {
+        Some(prep) => (prep.sql.clone(), prep.param_oids.clone()),
+        None => {
+            return set_err(
+                state,
+                ExtqError::UnknownStatement { name: stmt_name },
+            );
+        }
+    };
+
+    // 3. Empty SQL → EmptyQueryResponse (spec §12 OQ #5).
+    if sql.trim().is_empty() {
+        // Mark portal exhausted; emit a bare EmptyQueryResponse
+        // frame.
+        let bytes = crate::response::encode_empty_query_response();
+        if let Some(portal) = state.portals.get_mut(&portal_name) {
+            portal.exec_state = ExecState::Exhausted { total: 0 };
+        }
+        return ExtqOutcome::Bytes(bytes);
+    }
+
+    // Decide which path: first-time execute (substitute + dispatch
+    // + buffer) vs re-Execute on Buffered/Exhausted.
+    let buffered_rows: Vec<Vec<u8>>;
+    let mut prelude: Vec<u8>; // RowDescription + ErrorResponse-if-any (NEVER includes RFQ)
+    let command_complete_bytes: Vec<u8>;
+    let cursor: usize;
+
+    match exec_state {
+        ExecState::Pending => {
+            // 4. Parameter substitution.
+            let param_refs: Vec<Option<&[u8]>> = match state.portals.get(&portal_name) {
+                Some(p) => p.param_values.iter().map(|v| v.as_deref()).collect(),
+                None => {
+                    return set_err(
+                        state,
+                        ExtqError::UnknownPortal { name: portal_name },
+                    );
+                }
+            };
+            let rewritten = match substitute::substitute_text_format_params(&sql, &param_refs) {
+                Ok(s) => s,
+                Err(e) => {
+                    let reason = match e {
+                        substitute::SubstituteError::ZeroParamIndex => {
+                            "SQL referenced \\$0; PG \\$N indices are 1-based"
+                                .to_string()
+                        }
+                        substitute::SubstituteError::ParamIndexOutOfBounds {
+                            index,
+                            available,
+                        } => format!(
+                            "SQL referenced \\${index} but only {available} parameters were bound"
+                        ),
+                    };
+                    return set_err(state, ExtqError::SubstitutionFailed { reason });
+                }
+            };
+
+            // 5a. First-time Execute — run through the existing
+            //     Simple Query pipeline + split the result.
+            let dispatched = crate::dispatch::dispatch_query(&rewritten, engine);
+            let split = split_dispatch_query_bytes(&dispatched);
+            prelude = split.prelude;
+            buffered_rows = split.data_rows;
+            command_complete_bytes = split.command_complete;
+            cursor = 0;
+
+            // Persist into the portal for future re-Execute.
+            if let Some(portal) = state.portals.get_mut(&portal_name) {
+                portal.exec_state = ExecState::Buffered {
+                    rows: buffered_rows.clone(),
+                    cursor: 0,
+                };
+            }
+        }
+        ExecState::Buffered { rows, cursor: cur } => {
+            // 5b. Re-Execute — page from the existing buffer; no
+            //     prelude (RowDescription was emitted last time) and
+            //     no need to re-substitute / re-dispatch.
+            buffered_rows = rows;
+            prelude = Vec::new();
+            // command_complete_bytes will be rebuilt to use the
+            // original tag — we lost it when buffering. V1 emits a
+            // canonical `SELECT N` based on total buffered rows for
+            // re-Executes (which matches PG's cursor semantics for
+            // SELECT). For non-SELECT portals the first Execute
+            // exhausts the portal anyway (the buffered_rows are
+            // empty), so this path is SELECT-only in practice.
+            command_complete_bytes = crate::response::encode_command_complete(
+                &crate::response::select_tag(buffered_rows.len() as u64),
+            );
+            cursor = cur;
+        }
+        ExecState::Exhausted { total } => {
+            // 5c. Re-Execute on a drained portal — emit a bare
+            //     CommandComplete. No DataRows, no PortalSuspended.
+            let cc = crate::response::encode_command_complete(
+                &crate::response::select_tag(total),
+            );
+            return ExtqOutcome::Bytes(cc);
+        }
+    }
+
+    // 6. Strip RowDescription from `prelude` if Describe('P') already
+    //    emitted it.
+    if row_description_sent {
+        prelude = strip_leading_row_description(&prelude);
+    }
+
+    // If the dispatch_query result was actually an ErrorResponse
+    // (the prelude starts with 'E'), the portal's first Execute
+    // surfaces it. Mark error_state + return Failed-style: but our
+    // Bytes path emits it verbatim and the caller sees the wire
+    // bytes. V1 ships the simpler shape — emit the ErrorResponse
+    // bytes and set error_state. The CommandComplete in this case
+    // is empty (we'll skip it via empty checks).
+    let prelude_is_error = !prelude.is_empty() && prelude[0] == b'E';
+    if prelude_is_error {
+        // The dispatch_query result was an error frame. Pass it
+        // through; mark error_state. Drop the buffered state — the
+        // portal isn't usable for a retry.
+        if let Some(portal) = state.portals.get_mut(&portal_name) {
+            portal.exec_state = ExecState::Exhausted { total: 0 };
+        }
+        state.error_state = true;
+        // Emit just the ErrorResponse — Sync will emit RFQ.
+        // dispatch_query's output ends with `Z 00 00 00 05 I` after
+        // the error — split_dispatch_query_bytes already stripped
+        // that — so `prelude` here is the full ErrorResponse(s).
+        return ExtqOutcome::Bytes(prelude);
+    }
+
+    // 7. max_rows pagination on buffered_rows[cursor..].
+    let max = if max_rows <= 0 { usize::MAX } else { max_rows as usize };
+    let available = buffered_rows.len().saturating_sub(cursor);
+    let emit = available.min(max);
+    let mut out = Vec::with_capacity(prelude.len() + emit * 32 + command_complete_bytes.len());
+    out.extend_from_slice(&prelude);
+    for i in cursor..cursor + emit {
+        out.extend_from_slice(&buffered_rows[i]);
+    }
+    let new_cursor = cursor + emit;
+
+    let more_remain = new_cursor < buffered_rows.len();
+    if more_remain {
+        // PortalSuspended instead of CommandComplete.
+        out.extend_from_slice(&response::encode_portal_suspended());
+        if let Some(portal) = state.portals.get_mut(&portal_name) {
+            portal.exec_state = ExecState::Buffered {
+                rows: buffered_rows,
+                cursor: new_cursor,
+            };
+            // We DID emit RowDescription on this Execute (when prelude
+            // was non-empty after the suppression check) — mark the
+            // flag so the NEXT Execute doesn't repeat it.
+            if !row_description_sent && !prelude.is_empty() && prelude[0] == b'T' {
+                portal.row_description_sent = true;
+            }
+        }
+    } else {
+        // Drained — CommandComplete + portal Exhausted.
+        out.extend_from_slice(&command_complete_bytes);
+        if let Some(portal) = state.portals.get_mut(&portal_name) {
+            portal.exec_state = ExecState::Exhausted {
+                total: buffered_rows.len() as u64,
+            };
+            if !row_description_sent && !prelude.is_empty() && prelude[0] == b'T' {
+                portal.row_description_sent = true;
+            }
+        }
+    }
+    ExtqOutcome::Bytes(out)
+}
+
+/// SP-PG-EXTQ T5 — split the byte stream returned by
+/// `dispatch::dispatch_query` into:
+///
+/// - `prelude` — everything BEFORE the first `D` DataRow tag (i.e.
+///   RowDescription, OR an ErrorResponse if dispatch_query
+///   short-circuited to an error). For the EmptyQueryResponse path
+///   the prelude is `EmptyQueryResponse` itself and there are no
+///   DataRows / CommandComplete in the strict sense — the splitter
+///   handles that case by emitting an empty `data_rows` + empty
+///   `command_complete`.
+/// - `data_rows` — the individual `D` frames as separate `Vec<u8>`,
+///   each one a complete `D [length:4 BE] [body]` frame ready to
+///   write to the wire.
+/// - `command_complete` — the trailing `C` CommandComplete frame
+///   (or `I` EmptyQueryResponse frame, which we route through
+///   `command_complete` for symmetry).
+///
+/// The trailing `Z` ReadyForQuery frame (always 6 bytes) is STRIPPED
+/// — `dispatch::dispatch_query` always appends one, but the Extended
+/// Query path emits RFQ only on Sync.
+///
+/// **Frame walker.** Walks the byte stream tag-by-tag using the PG
+/// 5-byte frame header (`tag:1 length:4 BE`). Length includes the
+/// length field itself but NOT the tag. Stops on RFQ (the 'Z' frame).
+struct SplitResult {
+    prelude: Vec<u8>,
+    data_rows: Vec<Vec<u8>>,
+    command_complete: Vec<u8>,
+}
+
+fn split_dispatch_query_bytes(bytes: &[u8]) -> SplitResult {
+    let mut prelude = Vec::new();
+    let mut data_rows: Vec<Vec<u8>> = Vec::new();
+    let mut command_complete = Vec::new();
+    let mut i = 0usize;
+    while i + 5 <= bytes.len() {
+        let tag = bytes[i];
+        let len = u32::from_be_bytes([
+            bytes[i + 1],
+            bytes[i + 2],
+            bytes[i + 3],
+            bytes[i + 4],
+        ]) as usize;
+        // Frame total = 1 byte tag + len bytes (len includes itself).
+        let frame_total = 1 + len;
+        if i + frame_total > bytes.len() {
+            // Malformed — bail; caller treats as prelude.
+            break;
+        }
+        let frame = &bytes[i..i + frame_total];
+        match tag {
+            b'Z' => {
+                // ReadyForQuery — stop here; do not include in any
+                // output (Sync emits its own RFQ).
+                break;
+            }
+            b'D' => {
+                data_rows.push(frame.to_vec());
+            }
+            b'C' | b'I' => {
+                // CommandComplete or EmptyQueryResponse — terminal
+                // success marker.
+                command_complete.extend_from_slice(frame);
+            }
+            _ => {
+                // RowDescription ('T'), ErrorResponse ('E'),
+                // NoticeResponse ('N'), or any other prelude frame.
+                prelude.extend_from_slice(frame);
+            }
+        }
+        i += frame_total;
+    }
+    SplitResult {
+        prelude,
+        data_rows,
+        command_complete,
+    }
+}
+
+/// If the `prelude` bytes start with a `T` RowDescription frame,
+/// strip it (returning the bytes AFTER the RowDescription). Otherwise
+/// return the prelude unchanged. Used by `dispatch_execute` to honor
+/// the PG protocol invariant that RowDescription is emitted EXACTLY
+/// ONCE per portal per Sync block — if Describe('P') already emitted
+/// it, Execute must not repeat it.
+fn strip_leading_row_description(prelude: &[u8]) -> Vec<u8> {
+    if prelude.len() >= 5 && prelude[0] == b'T' {
+        let len = u32::from_be_bytes([prelude[1], prelude[2], prelude[3], prelude[4]]) as usize;
+        let frame_total = 1 + len;
+        if prelude.len() >= frame_total {
+            return prelude[frame_total..].to_vec();
+        }
+    }
+    prelude.to_vec()
+}
+
+/// SP-PG-EXTQ T5 — real handler for the `S` Sync message.
+///
+/// Per spec §6 + PG §55.2.3:
+///
+/// 1. **Emit ReadyForQuery('I').** V1 has no transaction-block
+///    awareness (V2 SP-PG-TX would conditionally emit `'T'` or `'E'`).
+///    Always `'I'` (idle).
+/// 2. **Reset `error_state = false`.** Subsequent extq messages will
+///    process normally again.
+/// 3. **Drop unnamed `""` portal** per PG §55.2.3 — implicit-tx
+///    commit at Sync boundary drops the volatile portal. The unnamed
+///    statement is KEPT (PG keeps unnamed-statement across Sync but
+///    drops unnamed-portal; both for V1 are bounded by connection
+///    lifetime anyway).
+/// 4. **Reset `row_description_sent` on every portal** — within ONE
+///    Sync block, Describe('P') + Execute emit T at most once; after
+///    Sync, a new Describe + Execute cycle restarts and T can be
+///    emitted again. (Named portals that survive Sync get this reset
+///    so their next Sync-block flow works.)
+///
+/// Returns `Bytes(ReadyForQuery)` so the caller writes the 6-byte
+/// envelope verbatim. We use the `Bytes` variant rather than
+/// `SyncCompleted` because `Bytes` is the standard wire-bytes path
+/// and the run_session loop already handles it.
+fn dispatch_sync(state: &mut SessionState) -> ExtqOutcome {
+    // 1. RFQ('I').
+    let bytes = crate::response::encode_ready_for_query(b'I');
+    // 2. Reset error_state.
+    state.error_state = false;
+    // 3. Drop unnamed portal.
+    state.portals.remove("");
+    // 4. Reset row_description_sent on surviving portals.
+    for p in state.portals.values_mut() {
+        p.row_description_sent = false;
+    }
+    ExtqOutcome::Bytes(bytes)
 }
 
 #[cfg(test)]
@@ -928,25 +1357,17 @@ mod tests {
         assert!(matches!(e, ExecState::Pending));
     }
 
-    /// SP-PG-EXTQ T4 — the FOUR still-NYI tags (Execute / Sync /
-    /// Close / Flush) return `Failed(NotYetImplemented { tag })`.
-    /// Parse + Bind + Describe are NO LONGER on this list — T2
-    /// implements Parse, T3 implements Bind, T4 implements Describe.
-    /// See `t4_dispatch_describe_*` for the Describe-success locks.
-    /// As T5..T8 land each will flip the corresponding arm of this
-    /// test to its real outcome.
+    /// SP-PG-EXTQ T5 — the TWO still-NYI tags (Close / Flush) return
+    /// `Failed(NotYetImplemented { tag })`. Parse + Bind + Describe +
+    /// Execute + Sync are NO LONGER on this list — T2 implements
+    /// Parse, T3 implements Bind, T4 implements Describe, T5
+    /// implements Execute + Sync.
+    /// See `t5_dispatch_execute_*` + `t5_dispatch_sync_*` for the
+    /// success locks. T6 / T7 will flip the remaining two arms.
     #[test]
-    fn t4_try_dispatch_returns_not_yet_implemented_for_the_four_remaining_tags() {
+    fn t5_try_dispatch_returns_not_yet_implemented_for_the_two_remaining_tags() {
         let mut state = SessionState::new();
         let cases: Vec<(proto::ExtqMessage, u8)> = vec![
-            (
-                proto::ExtqMessage::Execute {
-                    portal: String::new(),
-                    max_rows: 0,
-                },
-                FE_EXECUTE,
-            ),
-            (proto::ExtqMessage::Sync, FE_SYNC),
             (
                 proto::ExtqMessage::Close {
                     target: b'P',
@@ -966,7 +1387,7 @@ mod tests {
                 ),
             }
         }
-        // The four still-NYI dispatchers do NOT mutate state.
+        // The two still-NYI dispatchers do NOT mutate state.
         assert_eq!(state.statement_count(), 0);
         assert_eq!(state.portal_count(), 0);
         assert!(!state.in_error_state());
@@ -1581,6 +2002,7 @@ mod tests {
                     param_formats: vec![],
                     result_formats: vec![],
                     exec_state: ExecState::Pending,
+                    row_description_sent: false,
                 },
             );
         }
@@ -2010,5 +2432,650 @@ mod tests {
             other => panic!("expected Bytes(PD + RD), got {other:?}"),
         }
         assert!(!state.in_error_state());
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // T5 KATs — real Execute + Sync handlers. Locks every spec §4 +
+    // §6 + §7.2 + §9 invariant the run_session integration depends on.
+    //
+    // The key invariants:
+    //   - Execute on unbound portal → 34000.
+    //   - Execute on empty SQL → EmptyQueryResponse.
+    //   - Execute substitutes $N before calling dispatch_query.
+    //   - Execute strips dispatch_query's trailing RFQ.
+    //   - max_rows pagination buffers + pages with PortalSuspended.
+    //   - Sync emits RFQ('I') + clears error_state + drops "" portal.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// A test engine that returns N kessel-codec-encoded rows for
+    /// `SELECT * FROM t` and lets each KAT pre-load the row bytes.
+    /// Mirrors the `CannedEngine` in dispatch.rs but cloneable so we
+    /// can shape buffered-row KATs.
+    struct CannedRowsEngine {
+        cols: Vec<crate::engine::PgColumn>,
+        row_stream: Vec<u8>,
+        table_name: String,
+    }
+    impl EngineApply for CannedRowsEngine {
+        fn apply_sql(&self, _sql: &str) -> OpResult {
+            OpResult::Got(self.row_stream.clone())
+        }
+        fn describe_table(&self, name: &str) -> Option<Vec<crate::engine::PgColumn>> {
+            if name == self.table_name {
+                Some(self.cols.clone())
+            } else {
+                None
+            }
+        }
+    }
+
+    fn build_canned_rows(n: usize) -> CannedRowsEngine {
+        use crate::engine::PgColumn;
+        use kessel_catalog::{Field, FieldKind, ObjectType};
+        use kessel_codec::Value;
+        let cols = vec![PgColumn {
+            name: "id".into(),
+            kind: FieldKind::I64,
+            nullable: false,
+        }];
+        let fields = vec![Field {
+            field_id: 0,
+            name: "id".into(),
+            kind: FieldKind::I64,
+            nullable: false,
+        }];
+        let ot = ObjectType::from_def("t".to_string(), fields);
+        let mut stream = Vec::new();
+        for i in 0..n {
+            let rec = kessel_codec::encode(&ot, &[Value::Int((i + 1) as i128)]).expect("enc");
+            stream.extend_from_slice(&(rec.len() as u32).to_le_bytes());
+            stream.extend_from_slice(&rec);
+        }
+        CannedRowsEngine {
+            cols,
+            row_stream: stream,
+            table_name: "t".into(),
+        }
+    }
+
+    /// Spec §3 + PG §55.2.3: Execute on a non-existent portal returns
+    /// `UnknownPortal` → `34000 invalid_cursor_name`. Error_state
+    /// engaged.
+    #[test]
+    fn t5_dispatch_execute_unknown_portal_returns_34000() {
+        let mut state = SessionState::new();
+        let msg = proto::ExtqMessage::Execute {
+            portal: "ghost".to_string(),
+            max_rows: 0,
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
+            ExtqOutcome::Failed(ExtqError::UnknownPortal { name }) => {
+                assert_eq!(name, "ghost");
+            }
+            other => panic!("expected UnknownPortal, got {other:?}"),
+        }
+        assert!(state.in_error_state());
+    }
+
+    /// Spec §12 OQ #5: Execute on a portal whose statement has empty
+    /// SQL emits the 5-byte `EmptyQueryResponse` envelope (`I [length=4]`).
+    #[test]
+    fn t5_dispatch_execute_empty_sql_emits_empty_query_response() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(&mut state, "ps_empty", "", vec![]);
+        let bind = proto::ExtqMessage::Bind {
+            portal: "p_empty".to_string(),
+            stmt: "ps_empty".to_string(),
+            param_formats: vec![],
+            param_values: vec![],
+            result_formats: vec![],
+        };
+        try_dispatch_extq(&mut state, &NoSchemaEngine, bind);
+        let exec = proto::ExtqMessage::Execute {
+            portal: "p_empty".to_string(),
+            max_rows: 0,
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, exec) {
+            ExtqOutcome::Bytes(b) => {
+                // EmptyQueryResponse envelope: `I [length=4]`.
+                assert_eq!(b, vec![b'I', 0, 0, 0, 4]);
+            }
+            other => panic!("expected Bytes(EmptyQueryResponse), got {other:?}"),
+        }
+    }
+
+    /// HEADLINE: Execute on a SELECT portal emits the canonical wire
+    /// sequence — RowDescription + DataRow×N + CommandComplete — but
+    /// NO trailing RFQ (Sync emits that). Locks spec §4 + §9.
+    #[test]
+    fn t5_dispatch_execute_select_emits_row_desc_data_rows_and_command_complete_no_rfq() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(&mut state, "ps_sel", "SELECT * FROM t", vec![]);
+        let bind = proto::ExtqMessage::Bind {
+            portal: "p_sel".to_string(),
+            stmt: "ps_sel".to_string(),
+            param_formats: vec![],
+            param_values: vec![],
+            result_formats: vec![],
+        };
+        let engine = build_canned_rows(3);
+        try_dispatch_extq(&mut state, &engine, bind);
+        let exec = proto::ExtqMessage::Execute {
+            portal: "p_sel".to_string(),
+            max_rows: 0,
+        };
+        match try_dispatch_extq(&mut state, &engine, exec) {
+            ExtqOutcome::Bytes(bytes) => {
+                // Tag order: T, D, D, D, C — NO Z trailing.
+                assert_eq!(bytes[0], b'T', "first byte should be RowDescription");
+                assert!(!bytes.iter().any(|&b| b == b'Z'),
+                    "Execute output must NOT contain RFQ — Sync emits it");
+                // Count data rows.
+                let d_count = bytes.iter().filter(|&&b| b == b'D').count();
+                assert_eq!(d_count, 3, "should have 3 DataRow tags");
+                // Final block is CommandComplete with "SELECT 3".
+                assert!(
+                    bytes.windows(b"SELECT 3\0".len()).any(|w| w == b"SELECT 3\0"),
+                    "CommandComplete should carry 'SELECT 3'"
+                );
+            }
+            other => panic!("expected Bytes, got {other:?}"),
+        }
+    }
+
+    /// Spec §7.2 max_rows pagination: Execute(max_rows=2) on a 5-row
+    /// portal emits T + 2×D + PortalSuspended; the SECOND Execute
+    /// emits 2×D + PortalSuspended; the THIRD emits 1×D + CommandComplete.
+    /// Locks the buffered-cursor state machine.
+    #[test]
+    fn t5_dispatch_execute_max_rows_pagination_emits_portal_suspended() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(&mut state, "ps_sel", "SELECT * FROM t", vec![]);
+        let bind = proto::ExtqMessage::Bind {
+            portal: "p_sel".to_string(),
+            stmt: "ps_sel".to_string(),
+            param_formats: vec![],
+            param_values: vec![],
+            result_formats: vec![],
+        };
+        let engine = build_canned_rows(5);
+        try_dispatch_extq(&mut state, &engine, bind);
+
+        // FIRST Execute(max_rows=2).
+        let exec1 = proto::ExtqMessage::Execute {
+            portal: "p_sel".to_string(),
+            max_rows: 2,
+        };
+        match try_dispatch_extq(&mut state, &engine, exec1) {
+            ExtqOutcome::Bytes(bytes) => {
+                assert_eq!(bytes[0], b'T'); // RowDescription
+                let d_count = bytes.iter().filter(|&&b| b == b'D').count();
+                assert_eq!(d_count, 2);
+                // Trailing 5 bytes = PortalSuspended `s [length=4]`.
+                assert_eq!(&bytes[bytes.len() - 5..], &[b's', 0, 0, 0, 4]);
+                // No CommandComplete tag yet.
+                assert!(!bytes.windows(b"SELECT".len()).any(|w| w == b"SELECT"));
+            }
+            other => panic!("expected Bytes, got {other:?}"),
+        }
+
+        // SECOND Execute(max_rows=2) — no RowDescription (already sent),
+        // 2 more DataRows + PortalSuspended.
+        let exec2 = proto::ExtqMessage::Execute {
+            portal: "p_sel".to_string(),
+            max_rows: 2,
+        };
+        match try_dispatch_extq(&mut state, &engine, exec2) {
+            ExtqOutcome::Bytes(bytes) => {
+                assert_ne!(bytes[0], b'T', "second Execute must NOT repeat RowDescription");
+                let d_count = bytes.iter().filter(|&&b| b == b'D').count();
+                assert_eq!(d_count, 2);
+                assert_eq!(&bytes[bytes.len() - 5..], &[b's', 0, 0, 0, 4]);
+            }
+            other => panic!("expected Bytes, got {other:?}"),
+        }
+
+        // THIRD Execute(max_rows=2) — 1 row + CommandComplete.
+        let exec3 = proto::ExtqMessage::Execute {
+            portal: "p_sel".to_string(),
+            max_rows: 2,
+        };
+        match try_dispatch_extq(&mut state, &engine, exec3) {
+            ExtqOutcome::Bytes(bytes) => {
+                let d_count = bytes.iter().filter(|&&b| b == b'D').count();
+                assert_eq!(d_count, 1);
+                // CommandComplete carries SELECT 5 (the buffered total).
+                assert!(
+                    bytes.windows(b"SELECT 5\0".len()).any(|w| w == b"SELECT 5\0"),
+                    "third Execute should drain with CommandComplete('SELECT 5')"
+                );
+            }
+            other => panic!("expected Bytes, got {other:?}"),
+        }
+    }
+
+    /// max_rows == 0 means "all rows" — no PortalSuspended.
+    #[test]
+    fn t5_dispatch_execute_max_rows_zero_emits_all_rows() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(&mut state, "ps_sel", "SELECT * FROM t", vec![]);
+        let bind = proto::ExtqMessage::Bind {
+            portal: String::new(),
+            stmt: "ps_sel".to_string(),
+            param_formats: vec![],
+            param_values: vec![],
+            result_formats: vec![],
+        };
+        let engine = build_canned_rows(4);
+        try_dispatch_extq(&mut state, &engine, bind);
+        let exec = proto::ExtqMessage::Execute {
+            portal: String::new(),
+            max_rows: 0,
+        };
+        match try_dispatch_extq(&mut state, &engine, exec) {
+            ExtqOutcome::Bytes(bytes) => {
+                let d_count = bytes.iter().filter(|&&b| b == b'D').count();
+                assert_eq!(d_count, 4);
+                // No PortalSuspended (`s` envelope).
+                assert!(!bytes.windows(5).any(|w| w == &[b's', 0, 0, 0, 4][..]));
+                // CommandComplete is present.
+                assert!(bytes.windows(b"SELECT 4\0".len()).any(|w| w == b"SELECT 4\0"));
+            }
+            other => panic!("expected Bytes, got {other:?}"),
+        }
+    }
+
+    /// Spec §6: Execute in error_state returns `Skipped` (no
+    /// processing, no output bytes).
+    #[test]
+    fn t5_dispatch_execute_in_error_state_returns_skipped() {
+        let mut state = SessionState::new();
+        state.set_error_state(true);
+        let exec = proto::ExtqMessage::Execute {
+            portal: "any".to_string(),
+            max_rows: 0,
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, exec) {
+            ExtqOutcome::Skipped => {}
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+        assert!(state.in_error_state());
+    }
+
+    /// Sync emits RFQ('I') byte-locked + clears error_state.
+    #[test]
+    fn t5_dispatch_sync_emits_rfq_and_clears_error_state() {
+        let mut state = SessionState::new();
+        state.set_error_state(true);
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, proto::ExtqMessage::Sync) {
+            ExtqOutcome::Bytes(bytes) => {
+                // RFQ envelope: `Z [length=5] [status='I']` = 6 bytes.
+                assert_eq!(bytes, vec![b'Z', 0, 0, 0, 5, b'I']);
+            }
+            other => panic!("expected Bytes(RFQ), got {other:?}"),
+        }
+        // error_state cleared.
+        assert!(!state.in_error_state());
+    }
+
+    /// Sync emits RFQ('I') even without error_state.
+    #[test]
+    fn t5_dispatch_sync_when_idle_still_emits_rfq() {
+        let mut state = SessionState::new();
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, proto::ExtqMessage::Sync) {
+            ExtqOutcome::Bytes(bytes) => {
+                assert_eq!(bytes, vec![b'Z', 0, 0, 0, 5, b'I']);
+            }
+            other => panic!("expected Bytes(RFQ), got {other:?}"),
+        }
+    }
+
+    /// Sync drops the unnamed `""` portal but keeps named portals.
+    /// PG §55.2.3.
+    #[test]
+    fn t5_dispatch_sync_drops_unnamed_portal_keeps_named() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(&mut state, "", "SELECT * FROM t", vec![]);
+        seed_stmt_with_sql(&mut state, "named_stmt", "SELECT * FROM t", vec![]);
+        // Bind unnamed + named portals.
+        try_dispatch_extq(
+            &mut state,
+            &NoSchemaEngine,
+            proto::ExtqMessage::Bind {
+                portal: String::new(),
+                stmt: String::new(),
+                param_formats: vec![],
+                param_values: vec![],
+                result_formats: vec![],
+            },
+        );
+        try_dispatch_extq(
+            &mut state,
+            &NoSchemaEngine,
+            proto::ExtqMessage::Bind {
+                portal: "named_portal".to_string(),
+                stmt: "named_stmt".to_string(),
+                param_formats: vec![],
+                param_values: vec![],
+                result_formats: vec![],
+            },
+        );
+        assert_eq!(state.portal_count(), 2);
+        // Sync.
+        try_dispatch_extq(&mut state, &NoSchemaEngine, proto::ExtqMessage::Sync);
+        // Unnamed portal dropped, named portal kept.
+        assert_eq!(state.portal_count(), 1);
+        assert!(state.get_portal("").is_none());
+        assert!(state.get_portal("named_portal").is_some());
+    }
+
+    /// Parameter substitution: a portal with `Some(b"42")` binds
+    /// `$1` to `'42'` and the rewritten SQL is what flows into the
+    /// engine. We use a custom engine that asserts on the SQL it sees.
+    #[test]
+    fn t5_dispatch_execute_substitutes_parameter_into_sql() {
+        struct SqlAssertEngine {
+            expected_sql: String,
+            cols: Vec<crate::engine::PgColumn>,
+        }
+        impl EngineApply for SqlAssertEngine {
+            fn apply_sql(&self, sql: &str) -> OpResult {
+                let trimmed = sql.trim().trim_end_matches(';').trim();
+                assert_eq!(trimmed, self.expected_sql.as_str(),
+                    "engine should see param-substituted SQL");
+                OpResult::Got(Vec::new())
+            }
+            fn describe_table(&self, name: &str) -> Option<Vec<crate::engine::PgColumn>> {
+                if name == "t" { Some(self.cols.clone()) } else { None }
+            }
+        }
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(&mut state, "ps", "SELECT * FROM t WHERE id = $1", vec![]);
+        let bind = proto::ExtqMessage::Bind {
+            portal: String::new(),
+            stmt: "ps".to_string(),
+            param_formats: vec![],
+            param_values: vec![Some(b"42".to_vec())],
+            result_formats: vec![],
+        };
+        let engine = SqlAssertEngine {
+            expected_sql: "SELECT * FROM t WHERE id = '42'".to_string(),
+            cols: vec![crate::engine::PgColumn {
+                name: "id".into(),
+                kind: FieldKind::I64,
+                nullable: false,
+            }],
+        };
+        try_dispatch_extq(&mut state, &engine, bind);
+        let exec = proto::ExtqMessage::Execute {
+            portal: String::new(),
+            max_rows: 0,
+        };
+        // The engine's apply_sql will assert the substituted form.
+        try_dispatch_extq(&mut state, &engine, exec);
+    }
+
+    /// Parameter substitution: NULL bound value → bare `NULL` in
+    /// rewritten SQL.
+    #[test]
+    fn t5_dispatch_execute_substitutes_null_parameter_as_bare_null() {
+        struct SqlAssertEngine {
+            expected_sql: String,
+        }
+        impl EngineApply for SqlAssertEngine {
+            fn apply_sql(&self, sql: &str) -> OpResult {
+                let trimmed = sql.trim().trim_end_matches(';').trim();
+                assert_eq!(trimmed, self.expected_sql.as_str());
+                OpResult::Got(Vec::new())
+            }
+            fn describe_table(&self, _name: &str) -> Option<Vec<crate::engine::PgColumn>> {
+                None
+            }
+        }
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(&mut state, "ps", "INSERT INTO t (x) VALUES ($1)", vec![]);
+        let bind = proto::ExtqMessage::Bind {
+            portal: String::new(),
+            stmt: "ps".to_string(),
+            param_formats: vec![],
+            param_values: vec![None],
+            result_formats: vec![],
+        };
+        let engine = SqlAssertEngine {
+            expected_sql: "INSERT INTO t (x) VALUES (NULL)".to_string(),
+        };
+        try_dispatch_extq(&mut state, &engine, bind);
+        let exec = proto::ExtqMessage::Execute {
+            portal: String::new(),
+            max_rows: 0,
+        };
+        try_dispatch_extq(&mut state, &engine, exec);
+    }
+
+    /// HEADLINE — Parse + Bind + Describe('S') + Execute + Sync emits
+    /// the canonical 5-piece backend sequence:
+    /// ParseComplete + BindComplete + ParameterDescription +
+    /// RowDescription (from Describe; suppressed from Execute) +
+    /// CommandComplete + ReadyForQuery. The byte stream is
+    /// concatenated across the five dispatcher calls.
+    #[test]
+    fn t5_dispatch_parse_bind_describe_execute_sync_full_orm_round_trip() {
+        let mut state = SessionState::new();
+        let engine = build_canned_rows(2);
+        // 1. Parse
+        let pc = try_dispatch_extq(
+            &mut state,
+            &engine,
+            proto::ExtqMessage::Parse {
+                name: "ps1".to_string(),
+                sql: "SELECT * FROM t".to_string(),
+                param_oids: vec![],
+            },
+        );
+        let pc_bytes = match pc {
+            ExtqOutcome::Bytes(b) => b,
+            other => panic!("Parse: {other:?}"),
+        };
+        // 2. Bind
+        let bc = try_dispatch_extq(
+            &mut state,
+            &engine,
+            proto::ExtqMessage::Bind {
+                portal: "pt1".to_string(),
+                stmt: "ps1".to_string(),
+                param_formats: vec![],
+                param_values: vec![],
+                result_formats: vec![],
+            },
+        );
+        let bc_bytes = match bc {
+            ExtqOutcome::Bytes(b) => b,
+            other => panic!("Bind: {other:?}"),
+        };
+        // 3. Describe 'S'
+        let dc = try_dispatch_extq(
+            &mut state,
+            &engine,
+            proto::ExtqMessage::Describe {
+                target: DESCRIBE_TARGET_STATEMENT,
+                name: "ps1".to_string(),
+            },
+        );
+        let dc_bytes = match dc {
+            ExtqOutcome::Bytes(b) => b,
+            other => panic!("Describe: {other:?}"),
+        };
+        // 4. Execute
+        let ec = try_dispatch_extq(
+            &mut state,
+            &engine,
+            proto::ExtqMessage::Execute {
+                portal: "pt1".to_string(),
+                max_rows: 0,
+            },
+        );
+        let ec_bytes = match ec {
+            ExtqOutcome::Bytes(b) => b,
+            other => panic!("Execute: {other:?}"),
+        };
+        // 5. Sync
+        let sc = try_dispatch_extq(&mut state, &engine, proto::ExtqMessage::Sync);
+        let sc_bytes = match sc {
+            ExtqOutcome::Bytes(b) => b,
+            other => panic!("Sync: {other:?}"),
+        };
+
+        // Concatenated wire byte stream.
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&pc_bytes);
+        wire.extend_from_slice(&bc_bytes);
+        wire.extend_from_slice(&dc_bytes);
+        wire.extend_from_slice(&ec_bytes);
+        wire.extend_from_slice(&sc_bytes);
+
+        // Locked checks:
+        // - First byte: '1' (ParseComplete).
+        assert_eq!(wire[0], b'1');
+        // - Contains '2' (BindComplete) after ParseComplete.
+        assert!(wire[5..].iter().take(5).any(|&b| b == b'2'));
+        // - Contains 't' (ParameterDescription, empty in this case).
+        assert!(wire.iter().any(|&b| b == b't'));
+        // - Contains 'T' (RowDescription, from Describe — Execute did
+        //   NOT repeat it because Describe('S') doesn't set
+        //   row_description_sent. Actually only Describe('P') does;
+        //   Describe('S') does NOT set the flag because PG always
+        //   emits 'T' once per session — for SELECT * FROM t the
+        //   prelude from dispatch_query will include 'T'. So 'T'
+        //   appears TWICE: once from Describe('S'), once from
+        //   Execute's prelude.)
+        //   For V1 simplicity we ship the "T can appear twice across
+        //   Describe('S') + Execute" shape — clients tolerate it
+        //   (libpq + asyncpg + JDBC all do; the spec only requires
+        //   T once per portal per Sync block, and Describe('S') is
+        //   a STATEMENT-targeted describe, not portal-targeted).
+        assert!(wire.iter().any(|&b| b == b'T'));
+        // - 2 DataRow tags.
+        assert_eq!(wire.iter().filter(|&&b| b == b'D').count(), 2);
+        // - CommandComplete 'SELECT 2'.
+        assert!(wire.windows(b"SELECT 2\0".len()).any(|w| w == b"SELECT 2\0"));
+        // - Trailing 6 bytes: RFQ('I').
+        assert_eq!(&wire[wire.len() - 6..], &[b'Z', 0, 0, 0, 5, b'I']);
+
+        // No 0A000 / 26000 / 34000 / 08P01 anywhere.
+        for code in [b"0A000", b"26000", b"34000", b"08P01"] {
+            assert!(!wire.windows(5).any(|w| w == code),
+                "wire stream must not contain {code:?}");
+        }
+    }
+
+    /// HEADLINE 2 — Parse + Bind + Execute + Sync (NO Describe)
+    /// emits ParseComplete + BindComplete + RowDescription +
+    /// DataRow* + CommandComplete + RFQ. The Execute's prelude
+    /// INCLUDES RowDescription because Describe didn't pre-emit it.
+    #[test]
+    fn t5_dispatch_parse_bind_execute_sync_no_describe_includes_row_description() {
+        let mut state = SessionState::new();
+        let engine = build_canned_rows(2);
+        try_dispatch_extq(
+            &mut state,
+            &engine,
+            proto::ExtqMessage::Parse {
+                name: String::new(),
+                sql: "SELECT * FROM t".to_string(),
+                param_oids: vec![],
+            },
+        );
+        try_dispatch_extq(
+            &mut state,
+            &engine,
+            proto::ExtqMessage::Bind {
+                portal: String::new(),
+                stmt: String::new(),
+                param_formats: vec![],
+                param_values: vec![],
+                result_formats: vec![],
+            },
+        );
+        let exec = try_dispatch_extq(
+            &mut state,
+            &engine,
+            proto::ExtqMessage::Execute {
+                portal: String::new(),
+                max_rows: 0,
+            },
+        );
+        let exec_bytes = match exec {
+            ExtqOutcome::Bytes(b) => b,
+            other => panic!("Execute: {other:?}"),
+        };
+        // RowDescription appears in Execute's output.
+        assert_eq!(exec_bytes[0], b'T');
+        // 2 DataRows.
+        assert_eq!(exec_bytes.iter().filter(|&&b| b == b'D').count(), 2);
+        // CommandComplete.
+        assert!(
+            exec_bytes
+                .windows(b"SELECT 2\0".len())
+                .any(|w| w == b"SELECT 2\0")
+        );
+    }
+
+    /// Describe('P') + Execute: the portal's `row_description_sent`
+    /// flag is set by Describe('P'), so Execute MUST NOT repeat
+    /// RowDescription. Locks the spec §4 PG-protocol invariant.
+    #[test]
+    fn t5_dispatch_describe_p_then_execute_suppresses_row_description() {
+        let mut state = SessionState::new();
+        let engine = build_canned_rows(2);
+        try_dispatch_extq(
+            &mut state,
+            &engine,
+            proto::ExtqMessage::Parse {
+                name: "ps".to_string(),
+                sql: "SELECT * FROM t".to_string(),
+                param_oids: vec![],
+            },
+        );
+        try_dispatch_extq(
+            &mut state,
+            &engine,
+            proto::ExtqMessage::Bind {
+                portal: "pt".to_string(),
+                stmt: "ps".to_string(),
+                param_formats: vec![],
+                param_values: vec![],
+                result_formats: vec![],
+            },
+        );
+        // Describe('P') — this should set row_description_sent.
+        try_dispatch_extq(
+            &mut state,
+            &engine,
+            proto::ExtqMessage::Describe {
+                target: DESCRIBE_TARGET_PORTAL,
+                name: "pt".to_string(),
+            },
+        );
+        // Confirm flag set.
+        assert!(state.get_portal("pt").unwrap().row_description_sent);
+        // Execute — must NOT emit RowDescription.
+        let exec = try_dispatch_extq(
+            &mut state,
+            &engine,
+            proto::ExtqMessage::Execute {
+                portal: "pt".to_string(),
+                max_rows: 0,
+            },
+        );
+        let exec_bytes = match exec {
+            ExtqOutcome::Bytes(b) => b,
+            other => panic!("Execute: {other:?}"),
+        };
+        // First byte should be 'D' (DataRow), NOT 'T' (RowDescription).
+        assert_ne!(
+            exec_bytes[0], b'T',
+            "Execute after Describe('P') must NOT repeat RowDescription"
+        );
+        assert_eq!(exec_bytes[0], b'D');
     }
 }

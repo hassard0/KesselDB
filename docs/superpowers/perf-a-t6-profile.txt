@@ -1,0 +1,86 @@
+SP-Perf-A T6 — profile capture
+
+Date: 2026-05-29
+Host: vulcan (admin@192.168.4.178), Ubuntu 6.14 / 6.17 HWE kernel
+Bench binary: /tmp/kdb-target-perf/release/kessel-bench parallel-reads
+              --workers 16 --rows 100000 --duration 10 --pool-workers 0
+              --workload get-by-id
+
+# 1. perf availability
+
+The kernel-shipped /usr/bin/perf is a shim that needs
+linux-tools-$(uname -r); a matching package is not installed for
+6.14.0-35 ("WARNING: perf not found for kernel 6.14.0-35"). The
+HWE-side perf at /usr/lib/linux-hwe-6.17-tools-6.17.0-22/perf IS
+installed but `perf stat` fails because
+/proc/sys/kernel/perf_event_paranoid is 4 (Ubuntu hardened default):
+
+    Access to performance monitoring and observability operations is
+    limited. ... perf_event_paranoid setting is 4: ...
+    >= 1: Disallow CPU event access
+
+Lowering the sysctl needs root; T6 stays unprivileged.
+
+# 2. samply (zero-root profiler)
+
+Installed via `cargo install samply` (admin user, ~/.cargo/bin/samply).
+Same blocker — samply uses perf_event_open under the hood and the
+kernel rejects it at paranoid=4:
+
+    '/proc/sys/kernel/perf_event_paranoid' is currently set to 4.
+    In order for samply to work with a non-root user, this level needs
+    to be set to 1 or lower.
+
+# 3. Conclusion: no hardware/stack profiling available without root
+
+The work falls back to T5's already-published structural diagnosis,
+which is a precise read of the apply chain and the SSTable+MVCC
+access pattern:
+
+  1. engine.apply(Op)   → op.encode()   — 1 Vec<u8> alloc
+  2. apply_raw(frame)   → Op::decode()  — 1 Op alloc (+ nested if any)
+  3. sm_shared.read()                   — atomic CAS on RwLock
+  4. read_only_op(op)   → make_key + MVCC lo/hi Vec  — 3 Vec allocs
+  5. Storage::get       → MVCC get_at_snapshot       — 2 Vec allocs
+                                                       + BTreeMap +
+                                                       Vec collect
+                                                       (scan_range_versions)
+                                                       + key.clone() +
+                                                       value.clone() per
+                                                       matched version
+  6. OpResult::Got(Vec<u8>)                          — 0 (moved)
+  7. (caller drop)                                   — N frees
+
+Per-op alloc count for get-by-id steady-state: ~8-10 small allocs
++ the BTreeMap scan_range_versions creates. At ~5M ops/sec measured
+at N=16 (T4/T5), that's 40-80M allocs/sec just on the read path —
+matching T5's "80M allocs/sec at N=16" headline.
+
+# 4. T6 attack plan (without hardware confirmation)
+
+The structural read is conservative — every numbered allocation
+above is a function of source code, not a hypothesis. The risk of
+attacking the wrong layer is small. Three fixes ranked by
+expected impact + reversibility:
+
+  Fix A: in-process `EngineHandle::apply_op(&Op)` — kills (1)+(2)
+         entirely. ~2 allocs/op gone. Reversible; binary wire
+         path is byte-untouched.
+
+  Fix C: rewrite `mvcc::get_at_snapshot` to NOT materialise a
+         BTreeMap + Vec from scan_range_versions on the
+         single-version-fetch path. Stack-allocated lo/hi keys,
+         direct in-iteration short-circuit. Kills (4)+(5).
+         Largest single win for get-by-id steady state.
+
+  Fix B (skipped this slice): OpResult::Got(Arc<[u8]>). 399
+         callsite churn risk vs T3 oracle determinism. Defer to
+         T7 if (5) survives Fix C.
+
+# 5. Re-profile attempt after fixes
+
+After Fix A + Fix C land we re-run the headline benchmark sweep
+(N=1/4/8/16/24/32 × 3 trials × 10s) on quiet vulcan with
+get-by-id; success criterion is N=16 ≥ 10M ops/sec. Honest
+negative diagnosis if not (cache-line bandwidth wall is the
+named alternative).

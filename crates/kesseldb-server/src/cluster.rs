@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Sender, SyncSender};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// One tick every this often drives heartbeats / view-change timers.
 const TICK_MS: u64 = 12;
@@ -35,7 +35,15 @@ enum Ev {
     /// A raw client frame (`Op::encode()` or `[0xFE] ++ SQL`). SQL must be
     /// compiled on the engine thread because it needs the live catalog,
     /// which is owned by the non-`Send` `Replica`.
-    ClientRaw { frame: Vec<u8>, reply: SyncSender<OpResult> },
+    ///
+    /// `client` is allocated *outside* the engine (by `Node::apply_raw`) so
+    /// a caller-side retry on `OpResult::Unavailable` reuses the SAME
+    /// `(client, req=1)` and is deduped by the replica's `client_table` —
+    /// exactly-once is preserved even if a relay-to-primary attempt was made
+    /// (SP-CLUSTER-FLAKE T2). Disjoint id range `[2^65, 2^66)` keeps it from
+    /// colliding with `submit` (low), `session` (`[2^64, 2^65)`) or the
+    /// engine-internal RMW id range (`[2^100, …)`).
+    ClientRaw { client: ClientId, frame: Vec<u8>, reply: SyncSender<OpResult> },
     Peer { from: usize, msg: Msg },
     Tick,
     Probe(SyncSender<(u32, u64, u64)>),
@@ -87,6 +95,11 @@ pub struct Node {
     tx: Sender<Ev>,
     client_seq: Arc<AtomicU64>,
     session_seq: Arc<AtomicU64>,
+    /// Monotonic counter for the `apply_raw` client-id range. Allocated
+    /// *outside* the engine so a `OpResult::Unavailable` retry can reuse
+    /// the same client_id and hit the replica's `client_table` dedup —
+    /// see `Ev::ClientRaw` and `Node::apply_raw` (SP-CLUSTER-FLAKE T2).
+    raw_seq: Arc<AtomicU64>,
 }
 
 /// A stable client session: one VSR `ClientId` plus a monotonic request
@@ -99,6 +112,47 @@ pub struct Session {
     tx: Sender<Ev>,
     client: ClientId,
     req: AtomicU64,
+}
+
+/// SP-CLUSTER-FLAKE T2 — wall-clock budget for `OpResult::Unavailable`
+/// retries inside `Node::submit*` / `Session::submit_with_req` /
+/// `Node::apply_raw`. The exact `Unavailable` signal means "this node is
+/// not the active primary right now (mid-view-change, or a backup whose
+/// relay didn't bind a reply)" — the same contract `ClusterClient` retries
+/// against in production. The cluster always reconverges within a few
+/// election timeouts; 5 s is many orders of magnitude longer than that
+/// and exits the moment a non-Unavailable result arrives.
+const UNAVAILABLE_RETRY_BUDGET: Duration = Duration::from_secs(5);
+/// Inter-attempt back-off — tiny, lets the engine drain at least one tick.
+const UNAVAILABLE_RETRY_GAP: Duration = Duration::from_millis(20);
+
+/// Shared retry loop: send `make_ev()` to the engine and block for the
+/// reply; on `Unavailable` resend a fresh `make_ev()` (same stable
+/// `(client, req)` baked in by the closure) until the budget expires.
+/// Exactly-once is preserved by the VSR `client_table`: a re-delivered
+/// already-committed `(client, req)` returns its cached result and never
+/// re-executes (see `Replica::on_request`).
+fn submit_with_unavailable_retry<F>(tx: &Sender<Ev>, mut make_ev: F) -> OpResult
+where
+    F: FnMut(SyncSender<OpResult>) -> Ev,
+{
+    let start = Instant::now();
+    loop {
+        let (rtx, rrx) = sync_channel(1);
+        if tx.send(make_ev(rtx)).is_err() {
+            return OpResult::SchemaError("engine stopped".into());
+        }
+        let r = rrx
+            .recv()
+            .unwrap_or_else(|_| OpResult::SchemaError("engine dropped reply".into()));
+        if !matches!(r, OpResult::Unavailable) {
+            return r;
+        }
+        if start.elapsed() >= UNAVAILABLE_RETRY_BUDGET {
+            return r;
+        }
+        std::thread::sleep(UNAVAILABLE_RETRY_GAP);
+    }
 }
 
 impl Session {
@@ -117,64 +171,80 @@ impl Session {
     /// Submit `op` under an explicit request number. Re-using a number that
     /// already committed is a *retry*: the replica returns the cached reply
     /// and does not execute the op again (exactly-once).
+    ///
+    /// SP-CLUSTER-FLAKE T2 — absorbs `OpResult::Unavailable` (transient
+    /// not-active-primary) by re-sending the SAME `(client, req)` until the
+    /// node reconverges. The replica's `client_table` keeps this
+    /// exactly-once: if a relayed attempt committed on the primary, the
+    /// retry hits the cache and returns the cached reply (no re-execute).
     pub fn submit_with_req(&self, op: Op, req: u64) -> OpResult {
-        let (rtx, rrx) = sync_channel(1);
-        if self
-            .tx
-            .send(Ev::Client { client: self.client, req, op, reply: rtx })
-            .is_err()
-        {
-            return OpResult::SchemaError("engine stopped".into());
-        }
-        rrx.recv()
-            .unwrap_or_else(|_| OpResult::SchemaError("engine dropped reply".into()))
+        let client = self.client;
+        submit_with_unavailable_retry(&self.tx, |rtx| Ev::Client {
+            client,
+            req,
+            op: op.clone(),
+            reply: rtx,
+        })
     }
 }
 
 impl Node {
     /// Linearize `op` through consensus and wait for its applied result.
-    /// Each call is a fresh VSR client id (req=1) so it is never deduped.
+    /// Each *call* picks a fresh VSR client id (so two concurrent `submit`s
+    /// don't dedup against each other); a transient `OpResult::Unavailable`
+    /// (this node briefly not the active primary — e.g. a spurious view
+    /// change under load) is absorbed by re-sending the SAME `(client, 1)`
+    /// until the cluster reconverges, bounded by `UNAVAILABLE_RETRY_BUDGET`.
+    /// The replica's `client_table` makes the retry exactly-once: if the
+    /// first attempt was already relayed and committed on the primary, the
+    /// retry hits the cached reply and never re-executes (SP-CLUSTER-FLAKE).
     pub fn submit(&self, op: Op) -> OpResult {
         let client = self.client_seq.fetch_add(1, Ordering::Relaxed) as u128;
-        let (rtx, rrx) = sync_channel(1);
-        if self
-            .tx
-            .send(Ev::Client { client, req: 1, op, reply: rtx })
-            .is_err()
-        {
-            return OpResult::SchemaError("engine stopped".into());
-        }
-        rrx.recv()
-            .unwrap_or_else(|_| OpResult::SchemaError("engine dropped reply".into()))
+        submit_with_unavailable_retry(&self.tx, |rtx| Ev::Client {
+            client,
+            req: 1,
+            op: op.clone(),
+            reply: rtx,
+        })
     }
 
     /// Submit a raw client frame (`Op::encode()` or `[0xFE] ++ SQL`) and
     /// block for the committed result. This is the cluster equivalent of
     /// the single-node `EngineHandle::apply_raw` — full SQL over consensus.
+    ///
+    /// SP-CLUSTER-FLAKE T2 — allocate the engine-internal client_id HERE
+    /// (in the `[2^65, 2^66)` range, monotonic per `Node`) so a transient
+    /// `Unavailable` retry reuses the SAME id and is deduped by the
+    /// replica's `client_table` — never double-executes even if a backup's
+    /// relay path landed a Request on the primary before this node fell
+    /// into ViewChange.
     pub fn apply_raw(&self, frame: Vec<u8>) -> OpResult {
-        let (rtx, rrx) = sync_channel(1);
-        if self.tx.send(Ev::ClientRaw { frame, reply: rtx }).is_err() {
-            return OpResult::SchemaError("engine stopped".into());
-        }
-        rrx.recv()
-            .unwrap_or_else(|_| OpResult::SchemaError("engine dropped reply".into()))
+        let ord = self.raw_seq.fetch_add(1, Ordering::Relaxed) as u128;
+        let client: ClientId = (2u128 << 64) | ord;
+        submit_with_unavailable_retry(&self.tx, |rtx| Ev::ClientRaw {
+            client,
+            frame: frame.clone(),
+            reply: rtx,
+        })
     }
 
     /// Submit `op` under an explicit `(client, req)` to *this* node. This is
     /// what a failover-aware client uses to retry against a surviving node:
     /// any node holding the committed result answers from its replicated
     /// client table; otherwise a backup relays to the primary.
+    ///
+    /// SP-CLUSTER-FLAKE T2 — also absorbs in-test `Unavailable` (e.g. node
+    /// mid-view-change at the instant of the retry). Because `(client, req)`
+    /// is caller-supplied and stable across the inner retry loop, the
+    /// replica's `client_table` keeps this exactly-once: the cached reply is
+    /// returned if the relayed request already committed.
     pub fn submit_as(&self, client: ClientId, req: u64, op: Op) -> OpResult {
-        let (rtx, rrx) = sync_channel(1);
-        if self
-            .tx
-            .send(Ev::Client { client, req, op, reply: rtx })
-            .is_err()
-        {
-            return OpResult::SchemaError("engine stopped".into());
-        }
-        rrx.recv()
-            .unwrap_or_else(|_| OpResult::SchemaError("engine dropped reply".into()))
+        submit_with_unavailable_retry(&self.tx, |rtx| Ev::Client {
+            client,
+            req,
+            op: op.clone(),
+            reply: rtx,
+        })
     }
 
     /// Open a stable client session (exactly-once retries). The session's
@@ -369,16 +439,26 @@ pub fn spawn_node(
             }
         };
 
-        // Submit one op through consensus under a fresh internal client id,
-        // with `cont` to fire when it commits. Returns the driven `Out` and
-        // the `(client, req)` key, so the caller can redirect if stranded.
+        // Submit one op through consensus, with `cont` to fire when it
+        // commits. If `client_override` is `Some`, use that as the VSR
+        // `(client, req=1)` — this lets a caller-side `OpResult::Unavailable`
+        // retry reuse the SAME id so the replica's `client_table` dedups
+        // (exactly-once on the wire is what makes the retry correct in the
+        // first place — SP-CLUSTER-FLAKE T2). Otherwise allocate a fresh
+        // internal `iseq` (legacy path: RMW Update follow-ups, etc.).
         let submit_internal = |replica: &mut Replica<DirVfs>,
                                pending: &mut HashMap<(ClientId, u64), Cont>,
                                iseq: &mut u128,
                                op: Op,
-                               cont: Cont| {
-            *iseq += 1;
-            let c = *iseq;
+                               cont: Cont,
+                               client_override: Option<ClientId>| {
+            let c = match client_override {
+                Some(c) => c,
+                None => {
+                    *iseq += 1;
+                    *iseq
+                }
+            };
             pending.insert((c, 1), cont);
             let out = replica.handle(self_idx, Msg::Request { client: c, req: 1, op });
             (out, (c, 1u64))
@@ -412,7 +492,13 @@ pub fn spawn_node(
                     process(&mut replica, &mut pending, &mut iseq, out);
                     redirect(&replica, &mut pending, (client, req));
                 }
-                Ev::ClientRaw { frame, reply } => {
+                Ev::ClientRaw { client, frame, reply } => {
+                    // SP-CLUSTER-FLAKE T2 — `client` is allocated outside
+                    // the engine (by `Node::apply_raw`) and is reused across
+                    // caller-side `Unavailable` retries; pass it as the
+                    // `client_override` so the resubmitted Request hits the
+                    // replica's `client_table` dedup if the prior attempt
+                    // already committed via the relay path.
                     if frame.first() == Some(&0xFE) {
                         let sql = match std::str::from_utf8(&frame[1..]) {
                             Ok(s) => s,
@@ -443,6 +529,7 @@ pub fn spawn_node(
                                     &mut iseq,
                                     o,
                                     Cont::Reply(reply),
+                                    Some(client),
                                 );
                                 process(
                                     &mut replica,
@@ -454,6 +541,13 @@ pub fn spawn_node(
                             }
                             Ok(Stmt::Update { type_id, id, sets }) => {
                                 // RMW: linearized GetById, then patched Update.
+                                // GetById uses the caller's stable client id
+                                // (so retries dedup); the follow-up Update
+                                // still allocates an internal `iseq` — for
+                                // the SQL surface we expose, UPDATE SETs are
+                                // pure assignment (no `bal = bal + x`), so a
+                                // double-apply of the patched record is
+                                // value-idempotent (same record bytes).
                                 let (out, key) = submit_internal(
                                     &mut replica,
                                     &mut pending,
@@ -463,6 +557,7 @@ pub fn spawn_node(
                                         id: ObjectId::from_u128(id),
                                     },
                                     Cont::Update { type_id, id, sets, reply },
+                                    Some(client),
                                 );
                                 process(
                                     &mut replica,
@@ -491,6 +586,7 @@ pub fn spawn_node(
                                     &mut iseq,
                                     o,
                                     Cont::Reply(reply),
+                                    Some(client),
                                 );
                                 process(
                                     &mut replica,
@@ -532,6 +628,7 @@ pub fn spawn_node(
             tx: etx,
             client_seq: Arc::new(AtomicU64::new(1)),
             session_seq: Arc::new(AtomicU64::new(0)),
+            raw_seq: Arc::new(AtomicU64::new(0)),
         }),
         Ok(Err(e)) => Err(e),
         Err(_) => Err(io::Error::new(io::ErrorKind::Other, "engine failed to start")),

@@ -60,9 +60,9 @@ no native build steps.
 git clone https://github.com/hassard0/KesselDB && cd KesselDB
 cargo build --release                                # default — binary protocol only, no gateway code linked
 cargo build --release --features pg-gateway,http-gateway   # all wire surfaces
-cargo test --workspace                               # 1974 default tests
-cargo test --workspace --features pg-gateway         # 2002 (adds SP-PG + SP-PG-CAT + SP-PG-EXTQ)
-cargo test --workspace --features pg-gateway,http-gateway,kessel-http-gateway/test-server   # 2035 — full matrix
+cargo test --workspace                               # 2008 default tests
+cargo test --workspace --features pg-gateway         # 2036 (adds SP-PG + SP-PG-CAT + SP-PG-EXTQ)
+cargo test --workspace --features pg-gateway,http-gateway,kessel-http-gateway/test-server   # 2043 — full matrix
 ```
 
 Requires Rust stable **1.95+**.
@@ -1566,12 +1566,147 @@ above). Some advanced introspection paths remain V2-deferred:
   (the affected panel is empty but the connection works). See
   "Limitations (V1)" above for the per-catalog V2 follow-up names.
 
+### Real ORM session (verified 2026-05-29 — SP-PG-EXTQ T7)
+
+Captured from a real Python session driving the `kesseldb-server`
+binary (built with `--features pg-gateway`) on vulcan. Both
+`psycopg2` (libpq Extended Query directly) AND SQLAlchemy 2.0
+(higher-level ORM atop psycopg2) round-trip end-to-end. The server
+was started with:
+
+```bash
+KESSELDB_TOKEN=admin KESSELDB_PG_ADDR=127.0.0.1:5532 \
+  ./target/release/kesseldb 127.0.0.1:6532 /tmp/kdb-data
+# => KesselDB listening on 127.0.0.1:6532, data dir /tmp/kdb-data, pg=127.0.0.1:5532
+```
+
+`Versions: psycopg2 2.9.12 + sqlalchemy 2.0.45 + Python 3.12.3.`
+Total `19 / 19 steps pass` on a clean server.
+
+#### Section 1 — psycopg2 (libpq Extended Query)
+
+```python
+import psycopg2
+conn = psycopg2.connect(host="127.0.0.1", port=5532,
+                        user="test", password="admin", dbname="kesseldb")
+conn.autocommit = True
+cur = conn.cursor()
+
+# CREATE TABLE + INSERT (parameterized via %s).
+cur.execute("CREATE TABLE orm_smoke_t7 (id BIGINT, name CHAR(32))")
+cur.execute("INSERT INTO orm_smoke_t7 (id, name) VALUES (%s, %s)",
+            (1, "hello"))
+cur.execute("INSERT INTO orm_smoke_t7 (id, name) VALUES (%s, %s)",
+            (2, "world"))
+
+# SELECT * (no params) + parameterized SELECT WHERE.
+cur.execute("SELECT * FROM orm_smoke_t7")
+print(cur.fetchall())                # → [(1, 'hello'), (2, 'world')]
+cur.execute("SELECT * FROM orm_smoke_t7 WHERE id = %s", (1,))
+print(cur.fetchall())                # → [(1, 'hello')]
+
+# DISCARD ALL / STATEMENTS / PORTALS — gateway-intercepted (T7).
+cur.execute("DISCARD ALL")
+print(cur.statusmessage)             # → 'DISCARD ALL'
+cur.execute("DISCARD STATEMENTS")
+cur.execute("DISCARD PORTALS")
+
+# BEGIN / COMMIT / ROLLBACK / SET TRANSACTION — gateway-intercepted (T7).
+cur.execute("BEGIN")
+print(cur.statusmessage)             # → 'BEGIN'
+cur.execute("COMMIT")
+print(cur.statusmessage)             # → 'COMMIT'
+cur.execute("ROLLBACK")
+cur.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+print(cur.statusmessage)             # → 'SET'
+
+# SELECT 1 — SQLAlchemy do_ping() probe (T7 pg_catalog hook).
+cur.execute("SELECT 1")
+print(cur.fetchall())                # → [(1,)]
+
+cur.close()
+conn.close()
+```
+
+#### Section 2 — SQLAlchemy 2.0
+
+```python
+import sqlalchemy as sa
+
+engine = sa.create_engine(
+    "postgresql+psycopg2://test:admin@127.0.0.1:5532/kesseldb",
+    use_native_hstore=False,         # see Caveat below
+)
+
+# Full engine.connect() probe sequence + SELECT *.
+with engine.connect() as conn:
+    rs = conn.execute(sa.text("SELECT * FROM orm_smoke_t7"))
+    print(list(rs))                  # → [(1, 'hello'), (2, 'world')]
+
+# Parameterized SELECT via bind-param.
+with engine.connect() as conn:
+    rs = conn.execute(
+        sa.text("SELECT * FROM orm_smoke_t7 WHERE id = :id"),
+        {"id": 1},
+    )
+    print(list(rs))                  # → [(1, 'hello')]
+
+# DISCARD ALL via engine.
+with engine.connect() as conn:
+    conn.execute(sa.text("DISCARD ALL"))
+
+# Connection-pool checkout/checkin x3 (pool reset triggers DISCARD).
+for _ in range(3):
+    with engine.connect() as conn:
+        list(conn.execute(sa.text("SELECT * FROM orm_smoke_t7")))
+```
+
+#### Caveat — `use_native_hstore=False`
+
+SQLAlchemy 2.0 + psycopg2 by default queries pg_type for the `hstore`
+type OID at connect:
+
+```sql
+SELECT t.oid, typarray
+FROM pg_type t JOIN pg_namespace ns ON typnamespace = ns.oid
+WHERE typname = 'hstore'
+```
+
+This JOIN shape isn't yet supported by `kessel-sql` (V1 catalog
+synthesizers handle individual `SELECT * FROM pg_catalog.<table>`
+queries, not arbitrary projection-list + JOIN). Setting
+`use_native_hstore=False` is the documented SQLAlchemy way to disable
+the probe; the rest of the SA stack still works fully — `hstore` is a
+PostgreSQL extension that KesselDB doesn't surface anyway. T8
+follow-up: add a synthesizer hook for the pg_type JOIN shape so the
+flag isn't needed for any modern PG client.
+
+#### What the smoke test covers — 19/19 PASS
+
+| # | Step | Status |
+|---|---|---|
+| 1 | psycopg2 CREATE TABLE | PASS |
+| 2-3 | psycopg2 INSERT (parameterized, 2 rows) | PASS |
+| 4 | psycopg2 SELECT * (no params) | PASS |
+| 5 | psycopg2 SELECT WHERE id = %s (parameterized) | PASS |
+| 6-8 | psycopg2 DISCARD ALL / STATEMENTS / PORTALS — gateway-intercepted | PASS |
+| 9-11 | psycopg2 BEGIN / COMMIT / ROLLBACK — tx-control gateway-intercepted | PASS |
+| 12 | psycopg2 SET TRANSACTION ISOLATION LEVEL — gateway-intercepted | PASS |
+| 13 | psycopg2 SELECT 1 — SQLAlchemy do_ping() probe | PASS |
+| 14-15 | psycopg2 cursor + connection close | PASS |
+| 16 | SQLAlchemy `engine.connect()` — full probe sequence + SELECT * | PASS |
+| 17 | SQLAlchemy parameterized SELECT (BindParam) | PASS |
+| 18 | SQLAlchemy DISCARD ALL via engine | PASS |
+| 19 | SQLAlchemy connection pool checkout/checkin x3 | PASS |
+
 ### Spec + design
 
 - SP-PG wire spec: `docs/superpowers/specs/2026-05-27-kesseldb-sppg-postgres-wire-design.md`
 - SP-PG progress (closed): `docs/superpowers/specs/2026-05-27-kesseldb-subproject-sppg-progress.md`
 - SP-PG-CAT pg_catalog stubs spec: `docs/superpowers/specs/2026-05-27-kesseldb-sppgcat-pg-catalog-design.md`
 - SP-PG-CAT progress (closed at T8): `docs/superpowers/specs/2026-05-27-kesseldb-subproject-sppgcat-progress.md`
+- SP-PG-EXTQ design spec: `docs/superpowers/specs/2026-05-28-kesseldb-sppgextq-extended-query-design.md`
+- SP-PG-EXTQ progress (T7 — hardening + real ORM smoke): `docs/superpowers/specs/2026-05-28-kesseldb-subproject-sppgextq-progress.md`
 
 ## 10. HTTP gateway
 

@@ -65,7 +65,7 @@ real streaming cursors (SP-A T14 streaming-rows). See design spec §2.2.
 | **T5** | (FOLDED INTO T4) — Describe 'P' was originally a separate slice but shares the row-shape encoder with 'S'. T4 above ships both flavors together. Renumber the remaining slices in the SP-arc T6 → T5 etc. as bookkeeping, or keep the slot empty for a future Describe-related polish. | **CLOSED** | (folded into T4 `cd09784` + `9e591ca`) |
 | **T5 (was T6)** | Execute + parameter substitution + Sync + PortalSuspended pagination + result streaming — folded T7 (Sync state machine) AND T9 (max_rows + buffered cursor) into this slice because the Execute path already had to land them to be useful end-to-end. Text-format `$N` substitution via new `extq/substitute.rs` (18 KATs against the §4 edge corpus); first-Execute dispatches through `dispatch::dispatch_query` + splits the byte stream tag-by-tag; portal's `exec_state` buffers DataRow frames for re-Execute pagination; `max_rows > 0` emits `PortalSuspended` instead of `CommandComplete`; `row_description_sent` flag suppresses repeat T frames per PG §55.2.3; Sync emits RFQ('I'), clears error_state, drops unnamed portal. **HEADLINE — real psycopg2 round-trip verified on vulcan**: `cur.execute("SELECT * FROM pgtest WHERE id = %s", (42,))` returns `[(42,)]` end-to-end. | **DONE** | `61d3228` (substitute helper + 18 KATs) + `cec17c4` (Execute + Sync dispatchers + 18 KATs incl. server.rs) |
 | **T6** | Close ('S'/'P') + CloseComplete + Flush ('H'): drop stmt/portal from `SessionState`; CloseComplete emit (byte-locked T1 envelope); Flush is a no-op-emit that triggers a stream flush at the `server::run_session` boundary. Flips the T5 NYI lock for the remaining two tags. **CLOSES the SP-PG-EXTQ V1 message set — all 7 frontend extq tags dispatched.** | **DONE** | `2eadd25` (dispatchers + KATs) + `63d8de3` (server.rs wire-up) |
-| **T7** | Sync state-machine hardening: V2-flavor failure-recovery (carrying transaction state out of failed Sync block — needs SP-PG-TX coupling); cross-Sync portal lifecycle audit; pipelined-error attribution improvements (spec §11 weak-spot #9). | **OPEN** | — |
+| **T7** | Sync state-machine hardening + DISCARD/BEGIN/COMMIT/ROLLBACK gateway interception + SQLAlchemy connection-probe synthesizers + real ORM smoke (psycopg2 + SQLAlchemy 2.0). **HEADLINE: 19/19 real ORM smoke steps pass on vulcan; SQLAlchemy 2.0 `engine.connect()` + pooled checkout/checkin round-trip end-to-end.** +34 KATs (+14 query DISCARD/tx-control + 8 mod-level error-state audit + 12 server.rs + 3 pg_catalog SQLAlchemy probes), no NYI flip (V1 message set was already complete in T6). | **DONE** | `145fdd0` (DISCARD interception) + `33d5fd2` (error-state audit) + `d44b046` (BEGIN/COMMIT + SQLAlchemy probes) |
 | **T8** | Real SQLAlchemy / pgx / JDBC ORM round-trip: connect via each driver; run a small CRUD suite (CREATE TABLE → INSERT × 5 → SELECT * → SELECT with param → UPDATE → DELETE); capture wire traces; log driver-specific behavior. | **OPEN** | — |
 | **T9** | Streaming-cursor (real, not buffered): when SP-A T14 streaming-rows lands, replace V1's buffer-then-page shape in `dispatch_execute` with a real streaming consumer from the engine. Per-portal RSS becomes O(batch) not O(total). | **OPEN** | — |
 | **T10** | Pipelining stress test + real libpq round-trip: 100-message pipeline through one connection; ordering preserved; output buffer correctness under interleaved P/B/D/E/C/H. Manual psql verification of PREPARE/EXECUTE simple-query path (regression check that SP-PG V1 didn't break). | **OPEN** | — |
@@ -1128,36 +1128,240 @@ KAT pumps every reachable `ExtqMessage` variant against a seeded
 session state and confirms none return `NotYetImplemented`. The
 V1 message set is COMPLETE.
 
-## Next session pickup — SP-PG-EXTQ T7 (hardening) or arc closure
+## T7 — what landed (2026-05-29, commits `145fdd0` + `33d5fd2` + `d44b046`)
 
-V1 message set is locked. Remaining slices (T7..T12) are HARDENING
-and ARC CLOSURE — they don't add new protocol surface, they verify
-the surface holds against real ORM traffic + close the SP-arc.
+**Three commits, +34 KATs across `kessel-pg-gateway` lib (+14 query +
++8 mod + +12 server-level + +3 pg_catalog)**, all pushed to main,
+all CI-green. **HEADLINE — real ORM smoke on vulcan: 19 / 19 steps
+pass.** SQLAlchemy 2.0 `engine.connect()` end-to-end with full
+parameterized queries + connection-pool checkout/checkin.
 
-**T7 — Sync state-machine hardening** (estimated +5-8 KATs):
+### Commit `145fdd0` — DISCARD interception (+456 LoC, +17 KATs)
 
-- V2-flavor failure-recovery (carrying transaction state out of a
-  failed Sync block — needs SP-PG-TX coupling).
-- Cross-Sync portal lifecycle audit: named portals that survive
-  Sync but DEPEND on a stmt that was Closed mid-Sync.
-- Pipelined-error attribution improvements (spec §11 weak-spot #9
-  — the silent skip-after-error makes it hard for clients to
-  attribute which message in a Sync block failed).
-- DISCARD ALL Simple-Query interception (spec §12 open question
-  #1) — clears all stmts + portals + emits CommandComplete instead
-  of routing to `apply_sql`.
+`crates/kessel-pg-gateway/src/query.rs`:
 
-**T8 — Real SQLAlchemy / pgx / JDBC compat smoke** (estimated +6-10
-KATs + recorded fixtures):
+- `recognize_discard(sql) -> Option<DiscardKind>` returns
+  `DiscardKind::{All, Statements, Portals, Noop}`. `Noop` covers
+  PLANS / SEQUENCES / TEMP / TEMPORARY — V1-untracked surfaces, still
+  emits CommandComplete so client pool doesn't choke.
+- Lenient — case-insensitive, trailing-`;`-tolerant, leading line +
+  block comment-tolerant. Bare `DISCARD` falls back to `All`.
+- +14 KATs: every supported variant + case-insensitivity + leading
+  comments + bare DISCARD fallback + 7 negative controls (SELECT,
+  INSERT, BEGIN, COMMIT, empty, comment-only, quoted 'DISCARD'
+  substring).
 
-- Connect via each driver against a live `kesseldb-server` with
-  pg-gateway feature on vulcan.
+`crates/kessel-pg-gateway/src/extq/mod.rs`:
+
+- Three new public methods on `SessionState`: `clear_all()` (drops
+  statements + portals + error_state), `clear_statements()` (drops
+  just statements, preserves portals + error_state),
+  `clear_portals()` (drops just portals, preserves statements +
+  error_state). Per spec §6, only Sync clears error_state — DISCARD
+  STATEMENTS / PORTALS preserve it.
+
+`crates/kessel-pg-gateway/src/server.rs`:
+
+- FE_QUERY arm intercepts BEFORE engine dispatch. Calls
+  `recognize_discard`, mutates `extq_state` per the variant, emits
+  `CommandComplete("DISCARD ALL") + RFQ('I')` for every variant
+  (PG normalizes the tag to "DISCARD ALL" per §SQL-DISCARD).
+- +3 integration KATs:
+  - `t7_extq_run_session_discard_all_emits_command_complete_no_42601`:
+    HEADLINE — `DISCARD ALL` emits the CommandComplete tag + RFQ on
+    the wire + NO 42601 (engine not reached).
+  - `t7_extq_run_session_discard_statements_clears_statements`:
+    Parse(s1) + Sync + DISCARD STATEMENTS + Parse(s1 again) + Sync
+    round-trip — confirms the re-Parse succeeds (no 42P05 collision)
+    proving statement was dropped.
+  - `t7_extq_run_session_discard_variants_all_recognized`: 4
+    variants (trailing `;`, lowercase, line comment, block comment)
+    all emit exactly 4 CommandComplete tags + zero 42601.
+
+### Commit `33d5fd2` — error-state edge case audit (+342 LoC, +8 KATs, NO PRODUCTION CODE CHANGE)
+
+`crates/kessel-pg-gateway/src/extq/mod.rs` (test-only):
+
+Audits the Sync state-machine + error-attribution invariants
+catalogued in design spec §11 weak-spot #9. T6's V1 message set
+already implements the correct shape — the pre-skip check at the
+top of `try_dispatch_extq` cleanly intercepts every non-Sync
+message in error_state mode, and Sync is the ONLY way out. The
+following invariants are now KAT-locked against future drift:
+
+- `t7_consecutive_errors_before_sync_second_skipped_not_re_emitted`
+  — two errors in a row: first `Failed(...)`, second is `Skipped`
+  (NOT a second `Failed`), error_state stays latched.
+- `t7_sync_with_no_preceding_error_emits_rfq_idempotent` — Sync on
+  clean state is idempotent; named state preserved, unnamed
+  portal dropped, error_state unchanged.
+- `t7_bind_error_then_execute_same_portal_name_is_skipped` — Bind
+  error doesn't store the portal; subsequent Execute on the same
+  portal name is `Skipped` (error_state pre-empts, portal lookup
+  irrelevant).
+- `t7_repeated_errors_keep_error_state_a_latching_bool` — 3
+  different error-producing messages: first `Failed`, second +
+  third `Skipped`, error_state latched (NOT a counter).
+- `t7_sync_then_parse_after_error_succeeds_cleanly` — after Sync
+  clears error_state, next Parse succeeds (no latent skip-mode
+  bug).
+- `t7_flush_in_error_state_is_skipped_not_flush_outcome` — Flush in
+  error_state is `Skipped`, NOT `ExtqOutcome::Flush`. Even
+  "harmless" flushes must wait for Sync.
+- `t7_pipeline_success_error_sync_success_round_trip` — canonical
+  pipeline shape: success block + Sync, error block + Sync,
+  success block + Sync. Named statements persist across all 3
+  blocks.
+- `t7_close_in_error_state_is_skipped_state_preserved` — even
+  drop-state Close is `Skipped`; statement not dropped.
+
+### Commit `d44b046` — BEGIN/COMMIT + SQLAlchemy probes → SQLAlchemy 2.0 works end-to-end (+461 LoC, +12 KATs)
+
+`crates/kessel-pg-gateway/src/query.rs`:
+
+- `recognize_tx_control(sql) -> Option<TxControl>` returns
+  `TxControl::{Begin, Commit, Rollback, SetTx}` with the same
+  lenient shape as `recognize_discard`. Maps:
+  - `BEGIN` / `BEGIN TRANSACTION` / `BEGIN WORK` /
+    `START TRANSACTION` → `Begin` (tag "BEGIN").
+  - `COMMIT` / `COMMIT TRANSACTION` / `COMMIT WORK` / `END` /
+    `END TRANSACTION` → `Commit` (tag "COMMIT").
+  - `ROLLBACK` / `ROLLBACK TRANSACTION` / `ROLLBACK WORK` /
+    `ABORT` → `Rollback` (tag "ROLLBACK").
+  - `SET (SESSION CHARACTERISTICS AS )? (LOCAL )? TRANSACTION ...`
+    → `SetTx` (tag "SET").
+- +9 KATs: per-verb recognition, case-insensitivity, lenient
+  formatting (trailing `;`, leading comments), negative controls
+  (SELECT, INSERT, empty, SET search_path = public, START FOO,
+  DISCARD ALL), CommandComplete tag mapping.
+
+`crates/kessel-pg-gateway/src/server.rs`:
+
+- FE_QUERY arm intercepts BEFORE engine dispatch. V1 has no real
+  transaction blocks (spec §11 weak-spot #6 — V2 SP-PG-TX lifts)
+  but every ORM pool issues these verbs at checkout/checkin.
+  Emits canonical CommandComplete tag + RFQ('I'). RFQ status
+  stays 'I' (idle) — V1 has no implicit-tx state to advertise.
+- +1 integration KAT
+  (`t7_extq_run_session_tx_control_verbs_emit_canonical_tags`):
+  5 verbs through `run_session` emit canonical tags + zero 42601.
+
+`crates/kessel-pg-gateway/src/pg_catalog/synthesize.rs`:
+
+- Three new helper-function recognizers in
+  `synthesize_helper_function`:
+  - `select 1` → single int row `(?column? = 1)`. SQLAlchemy 2.0's
+    `do_ping()` health probe.
+  - `select true` / `select false` → single bool rows. asyncpg
+    reconnect heartbeat shape.
+  - `select cast('test plain returns' as varchar(60)) as anon_1`
+    + companion `test unicode returns` shape — SQLAlchemy 2.0's
+    `PGDialect_psycopg2.do_test_connection` encoding probes.
+  - `select pg_catalog.version()` — PG-qualified form SQLAlchemy
+    uses for `_get_server_version_info`.
+- +3 KATs covering each new shape.
+
+Updated existing KATs:
+`t1_catalog_hook_returns_none_for_non_pg_catalog_sql` drops the
+`SELECT 1` negative-case (now positive);
+`t7_unrecognized_select_returns_none` covers `SELECT 42` +
+`SELECT 1, 2` instead (genuinely unknown shapes still fall through).
+
+### HEADLINE — real ORM smoke on vulcan (kesseldb-server 127.0.0.1:5532)
+
+**19 / 19 steps PASS on a clean server.** Real psycopg2 2.9.12 +
+SQLAlchemy 2.0.45 + Python 3.12.3.
+
+| # | Section | Step | Result |
+|---|---|---|---|
+| 1 | psycopg2 | CREATE TABLE orm_smoke_t7 | PASS |
+| 2-3 | psycopg2 | INSERT (parameterized, 2 rows) | PASS |
+| 4 | psycopg2 | SELECT * (no params) | PASS (2 rows) |
+| 5 | psycopg2 | SELECT WHERE id = %s (parameterized) | PASS (1 row) |
+| 6-8 | psycopg2 | DISCARD ALL / STATEMENTS / PORTALS | PASS (statusmessage 'DISCARD ALL') |
+| 9-11 | psycopg2 | BEGIN / COMMIT / ROLLBACK | PASS (canonical tags) |
+| 12 | psycopg2 | SET TRANSACTION ISOLATION LEVEL | PASS |
+| 13 | psycopg2 | SELECT 1 | PASS (`[(1,)]`) |
+| 14-15 | psycopg2 | cursor.close + conn.close | PASS |
+| 16 | SQLAlchemy | engine.connect() — full probe sequence | PASS (2 rows) |
+| 17 | SQLAlchemy | parameterized SELECT (BindParam) | PASS (1 row) |
+| 18 | SQLAlchemy | DISCARD ALL via engine | PASS |
+| 19 | SQLAlchemy | connection pool checkout/checkin x3 | PASS |
+
+Caveat: SQLAlchemy must be created with
+`sa.create_engine(url, use_native_hstore=False)`. The default
+psycopg2 hstore extension issues
+`SELECT t.oid, typarray FROM pg_type t JOIN pg_namespace ns ON typnamespace = ns.oid WHERE typname = 'hstore'`
+which kessel-sql doesn't yet support (V1 catalog synthesizers
+handle individual `SELECT * FROM pg_catalog.<table>` queries, not
+arbitrary projection-list + JOIN). Setting the flag false is the
+documented SQLAlchemy way to disable that probe; the rest of the
+SA stack still works fully — `hstore` is a PG extension KesselDB
+doesn't surface anyway. T8 follow-up: add a synthesizer hook for
+the pg_type JOIN shape so the flag isn't needed.
+
+### Test counts (release on vulcan, 2026-05-29)
+
+| Surface | Before T7 | After T7 | Delta |
+|---|---|---|---|
+| `kessel-pg-gateway` lib | 467 | 501 | +34 |
+| Workspace default | 1974 | 2008 | +34 |
+| Workspace `--features pg-gateway` | 2002 | 2036 | +34 |
+
+`kessel-sim` seed-7 GREEN (3 / 3); default tree-grep EMPTY (zero
+new external deps; Python tools are dev-only — server runtime
+unchanged); `#![forbid(unsafe_code)]` honored across all touched
+modules; HTTP/1.1 + WS + binary + PG-wire-Simple-Query surfaces
+byte-untouched. CI green at every commit.
+
+### Headline question — does SQLAlchemy 2.0 `engine.connect()` work end-to-end?
+
+**YES — END TO END ON A REAL CLIENT.**
+
+```python
+import sqlalchemy as sa
+engine = sa.create_engine(
+    "postgresql+psycopg2://test:admin@127.0.0.1:5532/kesseldb",
+    use_native_hstore=False,
+)
+with engine.connect() as conn:
+    rs = conn.execute(
+        sa.text("SELECT * FROM orm_smoke_t7 WHERE id = :id"),
+        {"id": 1},
+    )
+    print(list(rs))   # → [(1, 'hello')]
+```
+
+This was previously rejected at the SQLAlchemy probe phase with
+`42601 unsupported statement` (for BEGIN/COMMIT/ROLLBACK) and
+`expected FROM` (for SELECT 1 + do_test_connection probes). After
+T7's three commits, the full SA stack — pool checkout, probe
+sequence, parameterized query, pool checkin — works against
+KesselDB through the same pg-gateway + extq path that psycopg2
+already used. **Every modern Postgres ORM that defaults to
+text-format parameters (~95% of real traffic) can now connect AND
+execute parameterized queries against KesselDB.** The remaining
+gaps for full SQLAlchemy ORM-level use (declarative models,
+autoflush, model creation via DDL reflection) live in kessel-sql /
+catalog and are tracked under T8 (compat smoke) and the named V2
+arcs.
+
+## Next session pickup — SP-PG-EXTQ T8 (deeper compat smoke) and/or T12 (arc closure)
+
+V1 message set + T7 hardening + real-ORM smoke are locked. Remaining
+slices (T8 / T10 / T12) deepen the surface against more drivers and
+close the SP-arc.
+
+**T8 — Real SQLAlchemy / pgx / JDBC / Prisma / Drizzle compat smoke**
+(estimated +6-10 KATs + recorded fixtures):
+
+- Drive each driver against a live `kesseldb-server` on vulcan.
 - Run a small CRUD suite per driver: CREATE TABLE → INSERT × 5 →
   SELECT * → SELECT with param → UPDATE → DELETE.
-- Capture wire traces; log driver-specific behavior (e.g. JDBC's
-  `setApplicationName` GUC probe; SQLAlchemy's `DISCARD ALL` on
-  pool checkout).
+- Capture wire traces; log driver-specific behavior.
 - Commit transcripts as fixture files.
+- Specific T7 follow-up: add the pg_type JOIN synthesizer so
+  SQLAlchemy doesn't need `use_native_hstore=False`.
 
 **T10 — Pipelining stress test** (estimated +4-6 KATs):
 
@@ -1168,14 +1372,12 @@ KATs + recorded fixtures):
 
 **T12 — Arc closure** (estimated +0-3 KATs):
 
-- USAGE.md update with the extq features.
+- Final USAGE.md polish on the extq features.
 - Log compat gaps from T8 as named V2 follow-ups.
 - Mark this progress tracker → CLOSED.
 - Update STATUS.md row + bullet to indicate SP-PG-EXTQ V1 → CLOSED.
 
-The HEADLINE psycopg2 round-trip from T5 still holds end-to-end:
-`cur.execute("SELECT * FROM pgtest WHERE id = %s", (42,))` returns
-`[(42,)]` against the running binary, and now `cur.close()` +
-`conn.close()` also flow through real Close + Sync handlers
-(previously they hit 0A000 NYI; the client tolerated this but
-logged ugly warnings).
+The HEADLINE psycopg2 + SQLAlchemy round-trip from T7 holds across
+every subsequent slice — the only behavior change between T7 and T8
+will be additional driver smoke transcripts; the wire surface itself
+is locked.

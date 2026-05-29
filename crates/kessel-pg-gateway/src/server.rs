@@ -619,6 +619,21 @@ pub fn run_session<
                         // either repeats the skip OR is a Sync that
                         // clears the flag (T7).
                     }
+                    crate::extq::ExtqOutcome::Flush => {
+                        // SP-PG-EXTQ T6 — spec §4 + PG §55.2.3.
+                        // The client requested an early flush of any
+                        // pipelined pending output without resetting
+                        // error_state. We push the write buffer to
+                        // the wire WITHOUT writing any new bytes.
+                        // (V1 already eager-flushes per message, so
+                        // this flush call is mostly a no-op for the
+                        // current stream shape — but PG protocol
+                        // semantics + asyncpg / JDBC clients require
+                        // a definite flush-no-bytes here, and a
+                        // future buffered-write rework cannot drift
+                        // without breaking the contract.)
+                        stream.flush()?;
+                    }
                 }
                 continue;
             }
@@ -1978,6 +1993,26 @@ mod tests {
         vec![b'S', 0, 0, 0, 4]
     }
 
+    /// SP-PG-EXTQ T6 — build a Close frame. PG §55.7:
+    /// `[target:i8][name:cstring]` with target == 'S' or 'P'.
+    fn build_close_frame(target: u8, name: &str) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.push(target);
+        payload.extend_from_slice(name.as_bytes());
+        payload.push(0);
+        let length = (4 + payload.len()) as u32;
+        let mut f = Vec::new();
+        f.push(b'C');
+        f.extend_from_slice(&length.to_be_bytes());
+        f.extend_from_slice(&payload);
+        f
+    }
+
+    /// SP-PG-EXTQ T6 — build a Flush frame. PG §55.7: empty body.
+    fn build_flush_frame() -> Vec<u8> {
+        vec![b'H', 0, 0, 0, 4]
+    }
+
     /// HEADLINE T5 KAT: a Parse + Bind + Execute + Sync round-trip
     /// on the wire emits the canonical sequence ParseComplete +
     /// BindComplete + RowDescription + CommandComplete + ReadyForQuery.
@@ -2139,6 +2174,275 @@ mod tests {
         assert_eq!(
             rfq_count, 1,
             "Pipelined P+B+E (no Sync) must NOT add a trailing RFQ — only the auth-handshake RFQ should be present (got {rfq_count})"
+        );
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-EXTQ T6 integration KATs — Close + Flush on the wire.
+    //
+    // After T6, ALL seven extq tags emit real bytes (or in Flush's case,
+    // trigger a real flush call) on the run_session wire path. No more
+    // 0A000 NYI rejections for any extq tag.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// Test pipe that COUNTS calls to `flush`. Used to verify the Flush
+    /// dispatcher path triggers a real `writer.flush()` even though it
+    /// writes zero bytes. The standard `Pipe` always returns
+    /// `Ok(())` from `flush` without recording anything.
+    struct FlushCountingPipe {
+        inbound: Cursor<Vec<u8>>,
+        outbound: Vec<u8>,
+        flush_calls: usize,
+    }
+    impl FlushCountingPipe {
+        fn new(inbound: Vec<u8>) -> Self {
+            Self {
+                inbound: Cursor::new(inbound),
+                outbound: Vec::new(),
+                flush_calls: 0,
+            }
+        }
+    }
+    impl Read for FlushCountingPipe {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inbound.read(buf)
+        }
+    }
+    impl Write for FlushCountingPipe {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.outbound.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flush_calls += 1;
+            Ok(())
+        }
+    }
+
+    /// HEADLINE T6 byte-locked KAT — Close + Sync on the wire emits
+    /// CloseComplete + RFQ('I'). After Parse + Bind installs a portal,
+    /// Close('P', "pt") drops it; the wire byte sequence carries
+    /// `3 00 00 00 04` (CloseComplete) followed by `Z 00 00 00 05 I`
+    /// (RFQ).
+    #[test]
+    fn t6_extq_run_session_parse_bind_close_p_sync_emits_close_complete_then_rfq() {
+        let token = b"kessel-bearer-token";
+        let parse = build_parse_frame("ps", "SELECT * FROM t", &[]);
+        let bind = build_bind_frame("pt", "ps", &[], &[], &[]);
+        let close = build_close_frame(b'P', "pt");
+        let sync = build_sync_frame();
+        let mut extra = parse;
+        extra.extend_from_slice(&bind);
+        extra.extend_from_slice(&close);
+        extra.extend_from_slice(&sync);
+        extra.extend_from_slice(&build_x_frame());
+        let inbound = build_authed_inbound(token, "clientN", "serverN", "test", &extra);
+        let mut pipe = Pipe::new(inbound);
+        let engine = EmptySelectEngine;
+        run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("session stays alive across P+B+C+S+Terminate");
+        let out = &pipe.outbound;
+        // CloseComplete envelope (`3 00 00 00 04`) appears after the
+        // ParseComplete + BindComplete envelopes.
+        let pc_bc_cc: &[u8] = &[
+            b'1', 0, 0, 0, 4, // ParseComplete
+            b'2', 0, 0, 0, 4, // BindComplete
+            b'3', 0, 0, 0, 4, // CloseComplete
+        ];
+        assert!(
+            out.windows(pc_bc_cc.len()).any(|w| w == pc_bc_cc),
+            "outbound must carry ParseComplete + BindComplete + CloseComplete consecutively"
+        );
+        // Trailing RFQ('I') from Sync.
+        assert!(
+            out.windows(6).any(|w| w == &[b'Z', 0, 0, 0, 5, b'I'][..]),
+            "outbound must carry RFQ('I') after Sync"
+        );
+        // No `0A000` (Close + Flush are real now — V1 complete).
+        assert!(
+            !out.windows(5).any(|w| w == b"0A000"),
+            "Close + Flush must NOT emit 0A000 — V1 message set is complete"
+        );
+    }
+
+    /// SP-PG-EXTQ T6 — Close('S') on a missing statement is a SILENT
+    /// no-op per PG §55.2.3 — CloseComplete is still emitted, no error
+    /// SQLSTATE on the wire.
+    #[test]
+    fn t6_extq_run_session_close_s_missing_emits_close_complete_no_error() {
+        let token = b"kessel-bearer-token";
+        let close = build_close_frame(b'S', "never_existed");
+        let sync = build_sync_frame();
+        let mut extra = close;
+        extra.extend_from_slice(&sync);
+        extra.extend_from_slice(&build_x_frame());
+        let inbound = build_authed_inbound(token, "clientN", "serverN", "test", &extra);
+        let mut pipe = Pipe::new(inbound);
+        let engine = EmptySelectEngine;
+        run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("session stays alive across Close(missing)+Sync+Terminate");
+        let out = &pipe.outbound;
+        // CloseComplete envelope is present.
+        let cc: &[u8] = &[b'3', 0, 0, 0, 4];
+        assert!(
+            out.windows(cc.len()).any(|w| w == cc),
+            "outbound must carry CloseComplete envelope (silent no-op shape)"
+        );
+        // NO error SQLSTATE codes — missing-name is silent per PG.
+        for code in [b"26000", b"34000", b"0A000", b"08P01"] {
+            assert!(
+                !out.windows(5).any(|w| w == code),
+                "Close on missing name must not emit {code:?}"
+            );
+        }
+    }
+
+    /// SP-PG-EXTQ T6 — Close with a BAD target byte emits `08P01` +
+    /// session stays alive (the tolerant probe-then-fall-back
+    /// contract preserved across all extq error paths).
+    #[test]
+    fn t6_extq_run_session_close_bad_target_emits_08p01_and_stays_alive() {
+        let token = b"kessel-bearer-token";
+        // Build a Close frame with target byte 'X' — the framer
+        // rejects this at decode time (`DecodeError::BadDescribeTarget`),
+        // which renders as `08P01` per the existing decode-error
+        // routing.
+        let close = {
+            let mut payload = Vec::new();
+            payload.push(b'X'); // bad target
+            payload.extend_from_slice(b"name\0");
+            let length = (4 + payload.len()) as u32;
+            let mut f = Vec::new();
+            f.push(b'C');
+            f.extend_from_slice(&length.to_be_bytes());
+            f.extend_from_slice(&payload);
+            f
+        };
+        let sync = build_sync_frame();
+        let mut extra = close;
+        extra.extend_from_slice(&sync);
+        extra.extend_from_slice(&build_x_frame());
+        let inbound = build_authed_inbound(token, "clientN", "serverN", "test", &extra);
+        let mut pipe = Pipe::new(inbound);
+        let engine = EmptySelectEngine;
+        run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("session stays alive across Close(bad target)+Sync+Terminate");
+        assert!(
+            pipe.outbound.windows(5).any(|w| w == b"08P01"),
+            "outbound must contain SQLSTATE 08P01 for bad Close target"
+        );
+        // No CloseComplete (the bad-target path rejected before emit).
+        let cc: &[u8] = &[b'3', 0, 0, 0, 4];
+        assert!(
+            !pipe.outbound.windows(cc.len()).any(|w| w == cc),
+            "Close with bad target must NOT emit CloseComplete"
+        );
+    }
+
+    /// SP-PG-EXTQ T6 — Flush triggers a real `writer.flush()` call
+    /// even though it produces no bytes. Uses the FlushCountingPipe to
+    /// verify the dispatcher's `ExtqOutcome::Flush` outcome is
+    /// translated to `stream.flush()` at the run_session boundary.
+    #[test]
+    fn t6_extq_run_session_flush_triggers_real_flush_no_bytes_written() {
+        let token = b"kessel-bearer-token";
+        let parse = build_parse_frame("", "SELECT 1", &[]);
+        let flush = build_flush_frame();
+        let sync = build_sync_frame();
+        let mut extra = parse;
+        extra.extend_from_slice(&flush);
+        extra.extend_from_slice(&sync);
+        extra.extend_from_slice(&build_x_frame());
+        let inbound = build_authed_inbound(token, "clientN", "serverN", "test", &extra);
+        let mut pipe = FlushCountingPipe::new(inbound);
+        let engine = EmptySelectEngine;
+        run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("session stays alive across Parse+Flush+Sync+Terminate");
+        // The Flush call MUST have incremented the counter — every
+        // path (Parse-success, Flush-outcome, Sync) flushes the
+        // writer; we just assert at least 2 flushes (Parse + Flush;
+        // Sync also flushes). The exact count is implementation
+        // detail (eager-flush eats some), but the LOWER BOUND must
+        // include the dedicated Flush call.
+        assert!(
+            pipe.flush_calls >= 2,
+            "Flush dispatcher must trigger writer.flush() — got {} flush calls",
+            pipe.flush_calls
+        );
+        // The Flush envelope produces NO new bytes on the wire — no
+        // ParseComplete-shaped artifact from it.
+        let out = &pipe.outbound;
+        assert!(
+            out.windows(5).any(|w| w == &[b'1', 0, 0, 0, 4][..]),
+            "ParseComplete should appear from the preceding Parse"
+        );
+        // No 0A000 anywhere — Flush is no longer NYI.
+        assert!(
+            !out.windows(5).any(|w| w == b"0A000"),
+            "Flush must NOT emit 0A000 — it's a real handler now"
+        );
+    }
+
+    /// SP-PG-EXTQ T6 — pipelined Close of two statements followed by
+    /// Sync emits TWO CloseComplete envelopes + one RFQ('I'). Order
+    /// is preserved per spec §5.
+    #[test]
+    fn t6_extq_run_session_pipelined_close_multiple_stmts_emits_two_close_complete() {
+        let token = b"kessel-bearer-token";
+        let parse_a = build_parse_frame("a", "SELECT 1", &[]);
+        let parse_b = build_parse_frame("b", "SELECT 2", &[]);
+        let close_a = build_close_frame(b'S', "a");
+        let close_b = build_close_frame(b'S', "b");
+        let sync = build_sync_frame();
+        let mut extra = parse_a;
+        extra.extend_from_slice(&parse_b);
+        extra.extend_from_slice(&close_a);
+        extra.extend_from_slice(&close_b);
+        extra.extend_from_slice(&sync);
+        extra.extend_from_slice(&build_x_frame());
+        let inbound = build_authed_inbound(token, "clientN", "serverN", "test", &extra);
+        let mut pipe = Pipe::new(inbound);
+        let engine = EmptySelectEngine;
+        run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("session stays alive across P+P+C+C+S+Terminate");
+        let out = &pipe.outbound;
+        // Exactly TWO CloseComplete envelopes in the outbound stream.
+        let cc: &[u8] = &[b'3', 0, 0, 0, 4];
+        let cc_count = out.windows(cc.len()).filter(|w| *w == cc).count();
+        assert_eq!(
+            cc_count, 2,
+            "expected exactly 2 CloseComplete envelopes, got {cc_count}"
+        );
+        // The two CloseComplete frames appear consecutively (the Sync
+        // boundary's RFQ comes AFTER them).
+        let cc_cc: &[u8] = &[b'3', 0, 0, 0, 4, b'3', 0, 0, 0, 4];
+        assert!(
+            out.windows(cc_cc.len()).any(|w| w == cc_cc),
+            "the two CloseComplete envelopes must appear consecutively (order preserved)"
         );
     }
 

@@ -248,7 +248,7 @@ fn run_sysbench_oltp(
     let has_writes = workload.sysbench_has_writes();
     for tid in 0..n {
         let path = path.clone();
-        let h = std::thread::spawn(move || -> anyhow::Result<(u64, u64, Vec<u64>)> {
+        let h = std::thread::spawn(move || -> anyhow::Result<(u64, u64, u64, Vec<u64>)> {
             let flags = if needs_write {
                 OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX
             } else {
@@ -256,7 +256,12 @@ fn run_sysbench_oltp(
             };
             let c = Connection::open_with_flags(&path, flags)?;
             pragmas(&c)?;
-            c.busy_timeout(Duration::from_secs(10))?;
+            // Long busy_timeout — sysbench WO at N=8/16 has high contention
+            // on the rollback-journal exclusive lock. 60s lets the slowest
+            // writer wait through the contention window without surfacing
+            // SQLITE_BUSY to user code. (The contention itself is honest;
+            // crashing the bench is not.)
+            c.busy_timeout(Duration::from_secs(60))?;
             // Prepare per-table statements.
             #[allow(clippy::type_complexity)]
             struct PerTable<'a> {
@@ -300,96 +305,153 @@ fn run_sysbench_oltp(
             let mut rng = SmallRng::seed_from_u64(0xDEAD_BEEF ^ (tid as u64) ^ (trial as u64));
             let mut count_txns = 0u64;
             let mut count_inner = 0u64;
+            let mut count_aborts = 0u64;
             let mut lat = Vec::with_capacity(1 << 16);
             let mut c_buf = vec![0u8; sysbench::C_WIDTH];
             let mut pad_buf = vec![0u8; sysbench::PAD_WIDTH];
+            // Helper: is_busy_err — recognise SQLITE_BUSY / SQLITE_LOCKED
+            // from any rusqlite error chain.
+            fn is_busy(e: &rusqlite::Error) -> bool {
+                use rusqlite::ffi::ErrorCode;
+                if let rusqlite::Error::SqliteFailure(ffi_err, _) = e {
+                    matches!(
+                        ffi_err.code,
+                        ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
+                    )
+                } else {
+                    false
+                }
+            }
             loop {
                 if Instant::now() >= stop_at {
                     break;
                 }
                 let table_idx = rng.gen_range(0..tables);
                 let p = &mut tables_v[table_idx];
-                let mut inner_count = 0u64;
+                let inner_count: u64; // assigned in the Ok arm below
                 let s = Instant::now();
                 // SQLite uses BEGIN IMMEDIATE for writers (locks the DB
                 // for writes immediately, avoiding upgrade-from-shared
                 // deadlocks). RO transactions use plain BEGIN.
-                if has_writes {
-                    c.execute_batch("BEGIN IMMEDIATE")?;
-                } else {
-                    c.execute_batch("BEGIN")?;
+                let begin_sql = if has_writes { "BEGIN IMMEDIATE" } else { "BEGIN" };
+                let begin_res = c.execute_batch(begin_sql);
+                if let Err(e) = &begin_res {
+                    if is_busy(e) {
+                        // Busy on BEGIN — count abort, skip this iteration.
+                        // The bench keeps running; the abort is reported in
+                        // the note so reviewers see the honest rate.
+                        count_aborts += 1;
+                        continue;
+                    } else {
+                        return Err(begin_res.unwrap_err().into());
+                    }
                 }
 
-                if has_reads {
-                    let pk = rng.gen_range(0..rows_per_table as i64);
-                    let _: rusqlite::Result<Vec<u8>> =
-                        p.point.query_row(params![pk], |row| row.get(0));
-                    inner_count += 1;
-                    for which in 0..4 {
-                        let lo = rng.gen_range(
-                            0..(rows_per_table.saturating_sub(sysbench::RANGE_WIDTH)) as i64,
-                        );
-                        let hi = lo + sysbench::RANGE_WIDTH as i64 - 1;
-                        let st = match which {
-                            0 => &mut p.simple_range,
-                            1 => &mut p.sum_range,
-                            2 => &mut p.order_range,
-                            _ => &mut p.distinct_range,
-                        };
-                        let mut rows = st.query(params![lo, hi])?;
-                        while let Some(_r) = rows.next()? {}
-                        inner_count += 1;
-                    }
-                    for _ in 0..sysbench::POINT_SELECTS {
+                // Run the inner-op block. Each inner op may return
+                // SQLITE_BUSY when another worker holds an incompatible
+                // lock; treat that as an aborted txn (ROLLBACK + count abort
+                // + continue) rather than crashing the bench. This matches
+                // sysbench upstream's "ignored / reconnected" report shape.
+                let txn_res: rusqlite::Result<u64> = (|| {
+                    let mut local_inner = 0u64;
+                    if has_reads {
                         let pk = rng.gen_range(0..rows_per_table as i64);
                         let _: rusqlite::Result<Vec<u8>> =
                             p.point.query_row(params![pk], |row| row.get(0));
-                        inner_count += 1;
+                        local_inner += 1;
+                        for which in 0..4 {
+                            let lo = rng.gen_range(
+                                0..(rows_per_table.saturating_sub(sysbench::RANGE_WIDTH)) as i64,
+                            );
+                            let hi = lo + sysbench::RANGE_WIDTH as i64 - 1;
+                            let st = match which {
+                                0 => &mut p.simple_range,
+                                1 => &mut p.sum_range,
+                                2 => &mut p.order_range,
+                                _ => &mut p.distinct_range,
+                            };
+                            let mut rows = st.query(params![lo, hi])?;
+                            while let Some(_r) = rows.next()? {}
+                            local_inner += 1;
+                        }
+                        for _ in 0..sysbench::POINT_SELECTS {
+                            let pk = rng.gen_range(0..rows_per_table as i64);
+                            let _: rusqlite::Result<Vec<u8>> =
+                                p.point.query_row(params![pk], |row| row.get(0));
+                            local_inner += 1;
+                        }
                     }
-                }
+                    if has_writes {
+                        let pk = rng.gen_range(0..rows_per_table as i64);
+                        p.upd_idx.execute(params![pk])?;
+                        local_inner += 1;
+                        let pk = rng.gen_range(0..rows_per_table as i64);
+                        rng.fill(&mut c_buf[..]);
+                        p.upd_nix.execute(params![pk, &c_buf[..]])?;
+                        local_inner += 1;
+                        let shadow_id: i64 = (rows_per_table as i64)
+                            + (tid as i64) * 65_536
+                            + ((count_txns % 65_536) as i64);
+                        p.del.execute(params![shadow_id])?;
+                        local_inner += 1;
+                        let k = rng.gen::<i32>();
+                        rng.fill(&mut c_buf[..]);
+                        rng.fill(&mut pad_buf[..]);
+                        p.ins.execute(params![shadow_id, k, &c_buf[..], &pad_buf[..]])?;
+                        local_inner += 1;
+                    }
+                    Ok(local_inner)
+                })();
 
-                if has_writes {
-                    let pk = rng.gen_range(0..rows_per_table as i64);
-                    p.upd_idx.execute(params![pk])?;
-                    inner_count += 1;
-                    let pk = rng.gen_range(0..rows_per_table as i64);
-                    rng.fill(&mut c_buf[..]);
-                    p.upd_nix.execute(params![pk, &c_buf[..]])?;
-                    inner_count += 1;
-                    let shadow_id: i64 = (rows_per_table as i64)
-                        + (tid as i64) * 65_536
-                        + ((count_txns % 65_536) as i64);
-                    p.del.execute(params![shadow_id])?;
-                    inner_count += 1;
-                    let k = rng.gen::<i32>();
-                    rng.fill(&mut c_buf[..]);
-                    rng.fill(&mut pad_buf[..]);
-                    p.ins.execute(params![shadow_id, k, &c_buf[..], &pad_buf[..]])?;
-                    inner_count += 1;
+                match txn_res {
+                    Ok(li) => {
+                        inner_count = li;
+                        let commit_res = c.execute_batch("COMMIT");
+                        match commit_res {
+                            Ok(()) => {
+                                lat.push(s.elapsed().as_nanos() as u64);
+                                count_txns += 1;
+                                count_inner += inner_count;
+                            }
+                            Err(e) if is_busy(&e) => {
+                                let _ = c.execute_batch("ROLLBACK");
+                                count_aborts += 1;
+                            }
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                    Err(e) if is_busy(&e) => {
+                        let _ = c.execute_batch("ROLLBACK");
+                        count_aborts += 1;
+                    }
+                    Err(e) => return Err(e.into()),
                 }
-
-                c.execute_batch("COMMIT")?;
-                lat.push(s.elapsed().as_nanos() as u64);
-                count_txns += 1;
-                count_inner += inner_count;
             }
-            Ok((count_txns, count_inner, lat))
+            Ok((count_txns, count_inner, count_aborts, lat))
         });
         handles.push(h);
     }
     let mut total_txns = 0u64;
     let mut total_inner = 0u64;
+    let mut total_aborts = 0u64;
     let mut lat_ns: Vec<u64> = Vec::new();
     for h in handles {
-        let (txns, inner, l) = h.join().expect("sqlite worker panicked")?;
+        let (txns, inner, aborts, l) = h.join().expect("sqlite worker panicked")?;
         total_txns += txns;
         total_inner += inner;
+        total_aborts += aborts;
         lat_ns.extend(l);
     }
     let elapsed = started.elapsed().as_secs_f64();
     lat_ns.sort_unstable();
 
     let _ = std::fs::remove_file(&path);
+
+    let abort_pct = if total_txns + total_aborts > 0 {
+        (total_aborts as f64) * 100.0 / ((total_txns + total_aborts) as f64)
+    } else {
+        0.0
+    };
 
     Ok(BenchResult {
         db: "sqlite".into(),
@@ -406,7 +468,8 @@ fn run_sysbench_oltp(
             "sqlite via rusqlite-bundled; journal_mode=MEMORY synchronous=OFF; \
              BEGIN{} / COMMIT brackets each txn; SERIALIZABLE isolation \
              (SQLite's default — single-writer-at-a-time via the rollback journal lock); \
-             tables={}, rows/tbl={}; inner-ops/txn ≈ {:.1}; reported ops/sec = transactions/sec",
+             tables={}, rows/tbl={}; inner-ops/txn ≈ {:.1}; reported ops/sec = \
+             committed transactions/sec; aborts (SQLITE_BUSY rolled back) = {} ({:.1}% of attempted)",
             if has_writes { " IMMEDIATE" } else { "" },
             tables,
             rows_per_table,
@@ -415,6 +478,8 @@ fn run_sysbench_oltp(
             } else {
                 0.0
             },
+            total_aborts,
+            abort_pct,
         )),
     })
 }

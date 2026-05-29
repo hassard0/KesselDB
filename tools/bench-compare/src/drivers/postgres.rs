@@ -9,7 +9,8 @@
 use crate::workloads::Workload;
 use crate::{pct_us, BenchResult, Cli};
 use postgres::{Client, NoTls};
-use rand::{rngs::SmallRng, Rng, SeedableRng};
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 use std::time::{Duration, Instant};
 
 pub fn run(

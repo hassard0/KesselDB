@@ -13,7 +13,8 @@
 
 use crate::workloads::Workload;
 use crate::{pct_us, BenchResult, Cli};
-use rand::{rngs::SmallRng, Rng, SeedableRng};
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 use rusqlite::{params, Connection, OpenFlags};
 use std::time::{Duration, Instant};
 

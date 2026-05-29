@@ -14,6 +14,25 @@ If you want one number for "how fast is KesselDB", these aren't it — a
 single workload measures one slice. The honest read is in §3 (per-workload
 table) plus §6 (caveats).
 
+### Headline summary (wins AND losses, 2026-05-29)
+
+| Workload | Winner at N=16 | KesselDB place | Cause |
+|---|---|---|---|
+| YCSB-C (100% reads) | **KesselDB** 4.75M ops/s | 1st (≈ 40× SQLite, ≈ 57× Postgres) | SP-Perf-A T2 parallel read-pool + T7 Arc<[u8]> |
+| YCSB-B (95% reads / 5% updates) | **KesselDB** 576K ops/s | 1st (7.1× Postgres, 60× SQLite) | same — read-mostly amortizes the 5% write-lock |
+| YCSB-A (50/50) | **KesselDB** 80K ops/s | 1st (close to Postgres 74K) | write-lock contention starts to bite at 50% writes |
+| sysbench OLTP write-only | **KesselDB** 52K tx/s | 1st (4.1× Postgres) | apply-path is fast at the inner-op level |
+| sysbench OLTP read-only | Postgres 5,073 tx/s | **3rd** (KesselDB 680 tx/s) | `Op::Txn` apply-lock serializes RO inner ops — §3c |
+| sysbench OLTP read-write | Postgres 3,862 tx/s | **3rd** (KesselDB 711 tx/s) | same root cause — §3e |
+
+The two losses (sysbench RO + RW) share one bottleneck: `Op::Txn`
+wraps every inner op (even reads) under the StateMachine write lock,
+so N workers can't run their transaction brackets in parallel. The
+next perf arc **SP-Perf-A-SHARD** closes this gap — either by routing
+read-only `Op::Txn{ops}` through the Perf-A read-pool bypass when
+every inner op is statically detectable as read-only, or by sharded
+apply queues so K shards each get their own apply thread.
+
 ---
 
 ## 1. Hardware

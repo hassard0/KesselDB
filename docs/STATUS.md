@@ -5,8 +5,32 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 ## Current capabilities (2026-05-29)
 
 What a node running on today's `main` actually does. Every line below is
-covered by the workspace test suite (1910 default / 1938 with
-`--features pg-gateway` / 1993 with all gateway features).
+covered by the workspace test suite (1974 default / 2002 with
+`--features pg-gateway` / 2057 with all gateway features).
+
+**Tonight's deliveries (2026-05-29) — coherent state of the union:**
+
+- **Track A — PostgreSQL Extended Query (SP-PG-EXTQ V1).** Parse / Bind /
+  Describe / Execute / Sync / Close / Flush dispatched end-to-end. psycopg2
+  parameterized round-trip verified on vulcan (`cur.execute("…WHERE id = %s", (42,))`
+  returns real rows). SQLAlchemy / Drizzle / Prisma / JDBC default-EXTQ paths
+  unblocked at the wire level; full ORM-suite smoke is post-V1.1 (T8/T11/T12).
+- **Track B — Perf-A read-pool arc (T1 → T7).** Parallel-read bypass
+  (`read_only_op(&self, ...)` dispatch through `Arc<RwLock<StateMachine>>`) +
+  storage `Arc<[u8]>` migration on the read fast path: **4.75M ops/sec at
+  N=16 cores, p50 < 1 µs, p99 ~3 µs.** Storage point-read ceiling honestly
+  diagnosed at ~5M ops/sec (`RwLock` reader CAS ping-pong); next arc named
+  SP-Perf-A-SHARD (sharded apply queues + per-shard read pools).
+- **Track C — Cross-DB benchmark suite (SP-Bench-Suite T1-T3).** YCSB-A/B/C
+  (KesselDB wins) + sysbench OLTP RO/WO/RW (KesselDB wins WO decisively, loses
+  RO/RW to Postgres+SQLite — root cause: `Op::Txn` apply-lock held for the
+  whole bracket even when every inner op is read-only). Wins AND losses
+  published verbatim in [`docs/BENCHMARKS.md`](BENCHMARKS.md).
+- **Track D — Cluster test flakes (SP-CLUSTER-FLAKE T2).** Root-cause fixed
+  in `Node::submit*` / `apply_raw`: production VSR retry on transient
+  ViewChange. Not just a test relaxation — the actual production code path
+  now retries `Unavailable` the same way `ClusterClient` does. CI green at
+  HEAD `546e79a`.
 
 **Wire surfaces** (all opt-in via cargo features except the binary protocol):
 - **Binary** — length-prefixed `Op::encode()` over TCP; the deterministic fast

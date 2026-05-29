@@ -69,12 +69,13 @@ const OPS_PER_WORKLOAD: usize = 1000;
 const N_ROWS: u32 = 10_000;
 const N_TABLES: u32 = 3;
 
-/// 3-table schema:
-///   - type 1 "user":  v U64 (no index), score I32 (eq index + ordered),
-///                     group U16 (eq index), name Char(16) (nullable)
-///   - type 2 "post":  user_id Ref → user (FK), kind U16, bytes Bytes(8)
-///                     composite index on (user_id, kind)
-///   - type 3 "tag":   key Char(8), val U64 (eq index)
+/// 3-table schema. NOTE: kessel-sm CreateType deterministically reassigns
+/// field_ids to 1..=n at create-time, so we use 1-based indexing below.
+///   - type 1 "user":  field 1 v U64, field 2 score I32 (eq + ordered),
+///                     field 3 group U16 (eq), field 4 name Char(16) nullable
+///   - type 2 "post":  field 1 user_id Ref (eq), field 2 kind U16 (eq),
+///                     field 3 bytes Bytes(8); composite index on (1, 2)
+///   - type 3 "tag":   field 1 key Char(8), field 2 val U64 (eq)
 ///
 /// Seeded with N_ROWS rows in type 1, N_ROWS/2 in type 2 (with FK to type 1),
 /// N_ROWS/10 in type 3. A handful of SeqAppend entries are also written.
@@ -84,96 +85,84 @@ fn build_schemas(engine: &EngineHandle) {
         "user",
         &[
             Field { field_id: 0, name: "v".into(), kind: FieldKind::U64, nullable: false },
-            Field { field_id: 1, name: "score".into(), kind: FieldKind::I32, nullable: false },
-            Field { field_id: 2, name: "group".into(), kind: FieldKind::U16, nullable: false },
-            Field { field_id: 3, name: "name".into(), kind: FieldKind::Char(16), nullable: true },
+            Field { field_id: 0, name: "score".into(), kind: FieldKind::I32, nullable: false },
+            Field { field_id: 0, name: "group".into(), kind: FieldKind::U16, nullable: false },
+            Field { field_id: 0, name: "name".into(), kind: FieldKind::Char(16), nullable: true },
         ],
     );
-    assert!(matches!(
-        engine.apply(Op::CreateType { def: user_def }),
-        OpResult::TypeCreated(1)
-    ));
-    // eq index on score
-    assert!(matches!(
-        engine.apply(Op::CreateIndex { type_id: 1, field_id: 1 }),
-        OpResult::Ok
-    ));
-    // ordered (range) index on score — enables FindRange
-    assert!(matches!(
-        engine.apply(Op::AddOrderedIndex { type_id: 1, field_id: 1 }),
-        OpResult::Ok
-    ));
-    // eq index on group
-    assert!(matches!(
-        engine.apply(Op::CreateIndex { type_id: 1, field_id: 2 }),
-        OpResult::Ok
-    ));
+    let r = engine.apply(Op::CreateType { def: user_def });
+    assert!(matches!(r, OpResult::TypeCreated(1)), "user create: {r:?}");
+    // eq index on score (field 2)
+    let r = engine.apply(Op::CreateIndex { type_id: 1, field_id: 2 });
+    assert!(matches!(r, OpResult::Ok), "user eq-index score: {r:?}");
+    // ordered (range) index on score (field 2)
+    let r = engine.apply(Op::AddOrderedIndex { type_id: 1, field_id: 2 });
+    assert!(matches!(r, OpResult::Ok), "user ordered score: {r:?}");
+    // eq index on group (field 3)
+    let r = engine.apply(Op::CreateIndex { type_id: 1, field_id: 3 });
+    assert!(matches!(r, OpResult::Ok), "user eq-index group: {r:?}");
 
-    // type 2 — post (with FK on user_id → user)
+    // type 2 — post
     let post_def = encode_type_def(
         "post",
         &[
             Field { field_id: 0, name: "user_id".into(), kind: FieldKind::Ref, nullable: false },
-            Field { field_id: 1, name: "kind".into(), kind: FieldKind::U16, nullable: false },
-            Field { field_id: 2, name: "bytes".into(), kind: FieldKind::Bytes(8), nullable: false },
+            Field { field_id: 0, name: "kind".into(), kind: FieldKind::U16, nullable: false },
+            Field { field_id: 0, name: "bytes".into(), kind: FieldKind::Bytes(8), nullable: false },
         ],
     );
     let r = engine.apply(Op::CreateType { def: post_def });
-    assert!(matches!(r, OpResult::TypeCreated(2)), "post create type: {r:?}");
-    let r = engine.apply(Op::CreateIndex { type_id: 2, field_id: 0 });
-    assert!(matches!(r, OpResult::Ok), "post eq-index field 0 (Ref): {r:?}");
+    assert!(matches!(r, OpResult::TypeCreated(2)), "post create: {r:?}");
+    // field 1 is user_id (Ref)
     let r = engine.apply(Op::CreateIndex { type_id: 2, field_id: 1 });
-    assert!(matches!(r, OpResult::Ok), "post eq-index field 1 (U16): {r:?}");
-    // composite index on (user_id, kind)
-    assert!(matches!(
-        engine.apply(Op::AddCompositeIndex { type_id: 2, fields: vec![0, 1] }),
-        OpResult::Ok
-    ));
+    assert!(matches!(r, OpResult::Ok), "post eq-index field 1 (Ref): {r:?}");
+    // field 2 is kind (U16)
+    let r = engine.apply(Op::CreateIndex { type_id: 2, field_id: 2 });
+    assert!(matches!(r, OpResult::Ok), "post eq-index field 2 (U16): {r:?}");
+    // composite index on (user_id, kind) = (1, 2)
+    let r = engine.apply(Op::AddCompositeIndex { type_id: 2, fields: vec![1, 2] });
+    assert!(matches!(r, OpResult::Ok), "post composite (1,2): {r:?}");
 
-    // type 3 — tag (small dimension table)
+    // type 3 — tag
     let tag_def = encode_type_def(
         "tag",
         &[
             Field { field_id: 0, name: "key".into(), kind: FieldKind::Char(8), nullable: false },
-            Field { field_id: 1, name: "val".into(), kind: FieldKind::U64, nullable: false },
+            Field { field_id: 0, name: "val".into(), kind: FieldKind::U64, nullable: false },
         ],
     );
-    assert!(matches!(
-        engine.apply(Op::CreateType { def: tag_def }),
-        OpResult::TypeCreated(3)
-    ));
-    assert!(matches!(
-        engine.apply(Op::CreateIndex { type_id: 3, field_id: 1 }),
-        OpResult::Ok
-    ));
+    let r = engine.apply(Op::CreateType { def: tag_def });
+    assert!(matches!(r, OpResult::TypeCreated(3)), "tag create: {r:?}");
+    // field 2 is val (U64)
+    let r = engine.apply(Op::CreateIndex { type_id: 3, field_id: 2 });
+    assert!(matches!(r, OpResult::Ok), "tag eq-index val: {r:?}");
 }
 
 fn seed_data(engine: &EngineHandle) {
-    // Build ObjectType locally — mirrors what's in the engine catalog.
-    // The catalog isn't exposed via EngineHandle; we know the schema
-    // shape because build_schemas() set it.
+    // Build ObjectType locally with the same shape kessel-sm's
+    // CreateType deterministically assigns: field_ids 1..=n.
     let user_ot = ObjectType::from_def(
         "user".into(),
         vec![
-            Field { field_id: 0, name: "v".into(), kind: FieldKind::U64, nullable: false },
-            Field { field_id: 1, name: "score".into(), kind: FieldKind::I32, nullable: false },
-            Field { field_id: 2, name: "group".into(), kind: FieldKind::U16, nullable: false },
-            Field { field_id: 3, name: "name".into(), kind: FieldKind::Char(16), nullable: true },
+            Field { field_id: 1, name: "v".into(), kind: FieldKind::U64, nullable: false },
+            Field { field_id: 2, name: "score".into(), kind: FieldKind::I32, nullable: false },
+            Field { field_id: 3, name: "group".into(), kind: FieldKind::U16, nullable: false },
+            Field { field_id: 4, name: "name".into(), kind: FieldKind::Char(16), nullable: true },
         ],
     );
     let post_ot = ObjectType::from_def(
         "post".into(),
         vec![
-            Field { field_id: 0, name: "user_id".into(), kind: FieldKind::Ref, nullable: false },
-            Field { field_id: 1, name: "kind".into(), kind: FieldKind::U16, nullable: false },
-            Field { field_id: 2, name: "bytes".into(), kind: FieldKind::Bytes(8), nullable: false },
+            Field { field_id: 1, name: "user_id".into(), kind: FieldKind::Ref, nullable: false },
+            Field { field_id: 2, name: "kind".into(), kind: FieldKind::U16, nullable: false },
+            Field { field_id: 3, name: "bytes".into(), kind: FieldKind::Bytes(8), nullable: false },
         ],
     );
     let tag_ot = ObjectType::from_def(
         "tag".into(),
         vec![
-            Field { field_id: 0, name: "key".into(), kind: FieldKind::Char(8), nullable: false },
-            Field { field_id: 1, name: "val".into(), kind: FieldKind::U64, nullable: false },
+            Field { field_id: 1, name: "key".into(), kind: FieldKind::Char(8), nullable: false },
+            Field { field_id: 2, name: "val".into(), kind: FieldKind::U64, nullable: false },
         ],
     );
 
@@ -287,50 +276,51 @@ fn gen_random_read_op(rng: &mut Rng) -> (&'static str, Op) {
             type_id: 1 + rng.below(N_TABLES as u64) as u32,
         }),
         3 => {
-            // FindBy on type 1 score (i32) — eq-indexed
+            // FindBy on type 1 score (i32, field 2) — eq-indexed
             let v = ((rng.below(1000) as i32) - 500).to_le_bytes().to_vec();
-            ("FindBy", Op::FindBy { type_id: 1, field_id: 1, value: v })
+            ("FindBy", Op::FindBy { type_id: 1, field_id: 2, value: v })
         }
         4 => {
-            // FindByComposite on type 2 (user_id, kind)
+            // FindByComposite on type 2 (user_id field 1, kind field 2)
             let parent = ObjectId::from_u128(rng.below(N_ROWS as u64) as u128).0;
             let kind = ((rng.below(10) as u16).to_le_bytes()).to_vec();
             ("FindByComposite", Op::FindByComposite {
                 type_id: 2,
-                fields: vec![0, 1],
+                fields: vec![1, 2],
                 values: vec![parent.to_vec(), kind],
             })
         }
         5 => {
-            // FindRange on type 1 score (ordered index)
+            // FindRange on type 1 score (ordered index, field 2)
             let lo = ((rng.below(500) as i32) - 500).to_le_bytes().to_vec();
             let hi = ((rng.below(500) as i32)).to_le_bytes().to_vec();
             ("FindRange", Op::FindRange {
                 type_id: 1,
-                field_id: 1,
+                field_id: 2,
                 lo,
                 hi,
             })
         }
         6 => {
             // Query: AND-of-(Eq/Ge/Le) — 1 to 2 predicates over type 1.
+            // field 3 is group (U16, eq-indexed); field 2 is score (I32, range-indexed)
             let n_preds = 1 + rng.below(2) as usize;
             let mut preds = Vec::with_capacity(n_preds);
             for _ in 0..n_preds {
                 let p = rng.below(3);
                 match p {
                     0 => preds.push(Pred {
-                        field_id: 2,
+                        field_id: 3,
                         op: 0,
                         value: ((rng.below(50) as u16).to_le_bytes()).to_vec(),
                     }),
                     1 => preds.push(Pred {
-                        field_id: 1,
+                        field_id: 2,
                         op: 1,
                         value: ((rng.below(500) as i32) - 500).to_le_bytes().to_vec(),
                     }),
                     _ => preds.push(Pred {
-                        field_id: 1,
+                        field_id: 2,
                         op: 2,
                         value: ((rng.below(500) as i32)).to_le_bytes().to_vec(),
                     }),
@@ -342,7 +332,7 @@ fn gen_random_read_op(rng: &mut Rng) -> (&'static str, Op) {
             // QueryRows: eq + range preds + a uncond program
             let eq_preds = if rng.below(2) == 0 {
                 vec![(
-                    2u16,
+                    3u16,
                     ((rng.below(50) as u16).to_le_bytes()).to_vec(),
                 )]
             } else {
@@ -350,8 +340,8 @@ fn gen_random_read_op(rng: &mut Rng) -> (&'static str, Op) {
             };
             let range_preds = if rng.below(2) == 0 {
                 vec![
-                    (1u16, 1u8, ((rng.below(500) as i32) - 500).to_le_bytes().to_vec()),
-                    (1u16, 2u8, ((rng.below(500) as i32)).to_le_bytes().to_vec()),
+                    (2u16, 1u8, ((rng.below(500) as i32) - 500).to_le_bytes().to_vec()),
+                    (2u16, 2u8, ((rng.below(500) as i32)).to_le_bytes().to_vec()),
                 ]
             } else {
                 vec![]
@@ -365,9 +355,9 @@ fn gen_random_read_op(rng: &mut Rng) -> (&'static str, Op) {
             })
         }
         8 => {
-            // QueryExpr: load(score) >= K
+            // QueryExpr: load(score, field 2) >= K
             let k = (rng.below(1000) as i128) - 500;
-            let prog = Program::new().load(1).push_int(k).ge().bytes();
+            let prog = Program::new().load(2).push_int(k).ge().bytes();
             ("QueryExpr", Op::QueryExpr { type_id: 1, program: prog })
         }
         9 => {
@@ -379,44 +369,44 @@ fn gen_random_read_op(rng: &mut Rng) -> (&'static str, Op) {
             })
         }
         10 => {
-            // SelectFields: project score from type 1
+            // SelectFields: project score (2) + group (3) from type 1
             ("SelectFields", Op::SelectFields {
                 type_id: 1,
                 program: Program::new().push_int(1).bytes(),
-                fields: vec![1, 2],
+                fields: vec![2, 3],
                 limit: rng.below(30) as u32,
             })
         }
         11 => {
-            // SelectSorted: sort by score (asc/desc), pages
+            // SelectSorted: sort by score (field 2), pages
             ("SelectSorted", Op::SelectSorted {
                 type_id: 1,
                 program: Program::new().push_int(1).bytes(),
-                sort_field: 1,
+                sort_field: 2,
                 desc: rng.below(2) == 0,
                 offset: rng.below(20) as u32,
                 limit: 1 + rng.below(20) as u32,
             })
         }
         12 => {
-            // Aggregate: COUNT/SUM/MIN/MAX over score
+            // Aggregate: COUNT/SUM/MIN/MAX over score (field 2)
             let kind = rng.below(4) as u8;
             ("Aggregate", Op::Aggregate {
                 type_id: 1,
                 program: Program::new().push_int(1).bytes(),
                 kind,
-                field_id: 1,
+                field_id: 2,
             })
         }
         13 => {
-            // GroupAggregate: COUNT/SUM over score, grouped by group
+            // GroupAggregate: COUNT/SUM over score (field 2), grouped by group (field 3)
             let kind = rng.below(2) as u8;
             ("GroupAggregate", Op::GroupAggregate {
                 type_id: 1,
                 program: Program::new().push_int(1).bytes(),
-                group_field: 2,
+                group_field: 3,
                 kind,
-                agg_field: 1,
+                agg_field: 2,
             })
         }
         14 => {
@@ -427,17 +417,14 @@ fn gen_random_read_op(rng: &mut Rng) -> (&'static str, Op) {
             })
         }
         _ => {
-            // Join: self-join post.user_id × user.v (different widths so
-            // we tweak to user.user_id-style ref). Use post→user on
-            // user_id == score's underlying bytes — both 4B isn't
-            // matchable, so we use post(user_id, Ref/16B) → user(_, Ref?)
-            // Since `Op::Join` requires same width, do user.score × user.score
-            // (self-join) which always works.
+            // Join: self-join on user.score (field 2). `Op::Join`
+            // requires equal-width fields; both sides are I32 so
+            // this always matches.
             ("Join", Op::Join {
                 left_type: 1,
                 right_type: 1,
-                left_field: 1,
-                right_field: 1,
+                left_field: 2,
+                right_field: 2,
                 limit: 1 + rng.below(8) as u32,
             })
         }
@@ -572,7 +559,7 @@ fn t3_smoke_describe() {
 fn t3_smoke_find_by() {
     run_per_variant_smoke(4, 500, "FindBy", |r| Op::FindBy {
         type_id: 1,
-        field_id: 1,
+        field_id: 2,
         value: ((r.below(1000) as i32) - 500).to_le_bytes().to_vec(),
     });
 }
@@ -584,7 +571,7 @@ fn t3_smoke_find_by_composite() {
         let kind = ((r.below(10) as u16).to_le_bytes()).to_vec();
         Op::FindByComposite {
             type_id: 2,
-            fields: vec![0, 1],
+            fields: vec![1, 2],
             values: vec![parent.to_vec(), kind],
         }
     });
@@ -594,7 +581,7 @@ fn t3_smoke_find_by_composite() {
 fn t3_smoke_find_range() {
     run_per_variant_smoke(6, 500, "FindRange", |r| Op::FindRange {
         type_id: 1,
-        field_id: 1,
+        field_id: 2,
         lo: ((r.below(500) as i32) - 500).to_le_bytes().to_vec(),
         hi: ((r.below(500) as i32)).to_le_bytes().to_vec(),
     });
@@ -605,7 +592,7 @@ fn t3_smoke_query() {
     run_per_variant_smoke(7, 200, "Query", |r| Op::Query {
         type_id: 1,
         preds: vec![Pred {
-            field_id: 2,
+            field_id: 3,
             op: 0,
             value: ((r.below(50) as u16).to_le_bytes()).to_vec(),
         }],
@@ -616,7 +603,7 @@ fn t3_smoke_query() {
 fn t3_smoke_query_rows() {
     run_per_variant_smoke(8, 200, "QueryRows", |r| Op::QueryRows {
         type_id: 1,
-        eq_preds: vec![(2u16, ((r.below(50) as u16).to_le_bytes()).to_vec())],
+        eq_preds: vec![(3u16, ((r.below(50) as u16).to_le_bytes()).to_vec())],
         program: Program::new().push_int(1).bytes(),
         limit: r.below(50) as u32,
         range_preds: vec![],
@@ -628,7 +615,7 @@ fn t3_smoke_query_expr() {
     run_per_variant_smoke(9, 100, "QueryExpr", |r| Op::QueryExpr {
         type_id: 1,
         program: Program::new()
-            .load(1)
+            .load(2)
             .push_int((r.below(1000) as i128) - 500)
             .ge()
             .bytes(),
@@ -649,7 +636,7 @@ fn t3_smoke_select_fields() {
     run_per_variant_smoke(11, 100, "SelectFields", |r| Op::SelectFields {
         type_id: 1,
         program: Program::new().push_int(1).bytes(),
-        fields: vec![1, 2],
+        fields: vec![2, 3],
         limit: r.below(30) as u32,
     });
 }
@@ -659,7 +646,7 @@ fn t3_smoke_select_sorted() {
     run_per_variant_smoke(12, 100, "SelectSorted", |r| Op::SelectSorted {
         type_id: 1,
         program: Program::new().push_int(1).bytes(),
-        sort_field: 1,
+        sort_field: 2,
         desc: r.below(2) == 0,
         offset: r.below(20) as u32,
         limit: 1 + r.below(20) as u32,
@@ -672,7 +659,7 @@ fn t3_smoke_aggregate() {
         type_id: 1,
         program: Program::new().push_int(1).bytes(),
         kind: r.below(4) as u8,
-        field_id: 1,
+        field_id: 2,
     });
 }
 
@@ -681,9 +668,9 @@ fn t3_smoke_group_aggregate() {
     run_per_variant_smoke(14, 50, "GroupAggregate", |r| Op::GroupAggregate {
         type_id: 1,
         program: Program::new().push_int(1).bytes(),
-        group_field: 2,
+        group_field: 3,
         kind: r.below(2) as u8,
-        agg_field: 1,
+        agg_field: 2,
     });
 }
 
@@ -700,8 +687,8 @@ fn t3_smoke_join() {
     run_per_variant_smoke(16, 20, "Join", |r| Op::Join {
         left_type: 1,
         right_type: 1,
-        left_field: 1,
-        right_field: 1,
+        left_field: 2,
+        right_field: 2,
         limit: 1 + r.below(8) as u32,
     });
 }

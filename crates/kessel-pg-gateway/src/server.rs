@@ -434,6 +434,47 @@ pub fn run_session<
                         continue;
                     }
                 };
+                // SP-PG-EXTQ T7 — DISCARD interception. PG-spec
+                // DISCARD ALL / STATEMENTS / PORTALS is the
+                // connection-pool checkout-reset hook every modern
+                // ORM relies on (psycopg2, SQLAlchemy default pool,
+                // JDBC HikariCP, pgx). Without this intercept the
+                // SQL hits `kessel-sql` which doesn't know DISCARD
+                // and rejects with `42601 syntax_error`. We
+                // recognize DISCARD-flavors at the gateway, mutate
+                // the per-connection extq SessionState directly,
+                // and emit `CommandComplete("DISCARD ALL") + RFQ`
+                // so the pool's reset handshake completes cleanly.
+                //
+                // PLANS / SEQUENCES / TEMP / TEMPORARY variants are
+                // tracked as `DiscardKind::Noop` — V1 doesn't
+                // surface temp tables / GUCs / sequence cache, so
+                // the state-side action is empty, but we still emit
+                // CommandComplete so the client doesn't choke.
+                if let Some(kind) = crate::query::recognize_discard(&sql_owned) {
+                    match kind {
+                        crate::query::DiscardKind::All => {
+                            extq_state.clear_all();
+                        }
+                        crate::query::DiscardKind::Statements => {
+                            extq_state.clear_statements();
+                        }
+                        crate::query::DiscardKind::Portals => {
+                            extq_state.clear_portals();
+                        }
+                        crate::query::DiscardKind::Noop => {
+                            // V1-untracked surfaces; no state mutation.
+                        }
+                    }
+                    let mut resp = Vec::new();
+                    resp.extend_from_slice(
+                        &crate::response::encode_command_complete("DISCARD ALL"),
+                    );
+                    resp.extend_from_slice(&crate::response::encode_ready_for_query(b'I'));
+                    stream.write_all(&resp)?;
+                    stream.flush()?;
+                    continue;
+                }
                 let resp = crate::dispatch::dispatch_query(&sql_owned, engine);
                 stream.write_all(&resp)?;
                 stream.flush()?;
@@ -2821,5 +2862,139 @@ mod tests {
         assert!(!is_idle_timeout(std::io::ErrorKind::BrokenPipe));
         assert!(!is_idle_timeout(std::io::ErrorKind::ConnectionAborted));
         assert!(!is_idle_timeout(std::io::ErrorKind::Other));
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-EXTQ T7 — DISCARD ALL gateway interception KATs.
+    //
+    // Locks the ORM-pool adoption hook: `DISCARD ALL` on a Simple Query
+    // round-trip recognized + the per-connection extq SessionState is
+    // cleared + `CommandComplete("DISCARD ALL") + RFQ('I')` emitted —
+    // all WITHOUT reaching the engine (no 42601 syntax error).
+    // ───────────────────────────────────────────────────────────────────
+
+    /// HEADLINE T7 KAT: `DISCARD ALL` emits CommandComplete + RFQ on
+    /// the wire AND no 42601 syntax error. Locks the ORM pool checkout
+    /// path that every modern Postgres ORM relies on.
+    #[test]
+    fn t7_extq_run_session_discard_all_emits_command_complete_no_42601() {
+        let token = b"kessel-bearer-token";
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&build_q_frame("DISCARD ALL"));
+        extra.extend_from_slice(&build_x_frame());
+        let inbound = build_authed_inbound(token, "clientN", "serverN", "test", &extra);
+        let mut pipe = Pipe::new(inbound);
+        let engine = EmptySelectEngine;
+        run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("session stays alive across DISCARD ALL + Terminate");
+        let out = &pipe.outbound;
+        // CommandComplete tag "DISCARD ALL\0" present.
+        assert!(
+            out.windows(b"DISCARD ALL\0".len()).any(|w| w == b"DISCARD ALL\0"),
+            "outbound must carry CommandComplete tag 'DISCARD ALL\\0'"
+        );
+        // ReadyForQuery('I') emitted after.
+        assert!(
+            out.windows(6).any(|w| w == &[b'Z', 0, 0, 0, 5, b'I'][..]),
+            "outbound must carry RFQ('I') after DISCARD ALL"
+        );
+        // NO 42601 syntax_error (the engine must NOT have been reached).
+        assert!(
+            !out.windows(5).any(|w| w == b"42601"),
+            "DISCARD ALL must NOT emit 42601 — gateway-intercepted before engine dispatch"
+        );
+    }
+
+    /// SP-PG-EXTQ T7 — `DISCARD STATEMENTS` recognized; clears just
+    /// prepared statements (portals preserved across the call). We
+    /// verify via the round-trip: Parse(named) + Sync + DISCARD STATEMENTS
+    /// + Parse(same name again) + Sync — the re-Parse must succeed
+    /// (no `42P05 already_exists`) because the named stmt was dropped.
+    #[test]
+    fn t7_extq_run_session_discard_statements_clears_statements() {
+        let token = b"kessel-bearer-token";
+        let mut extra = Vec::new();
+        // First Parse under name "s1".
+        extra.extend_from_slice(&build_parse_frame("s1", "SELECT * FROM t", &[]));
+        extra.extend_from_slice(&build_sync_frame());
+        // DISCARD STATEMENTS — drops s1.
+        extra.extend_from_slice(&build_q_frame("DISCARD STATEMENTS"));
+        // Re-Parse under same name "s1" — must succeed (no collision).
+        extra.extend_from_slice(&build_parse_frame("s1", "SELECT * FROM t", &[]));
+        extra.extend_from_slice(&build_sync_frame());
+        extra.extend_from_slice(&build_x_frame());
+        let inbound = build_authed_inbound(token, "clientN", "serverN", "test", &extra);
+        let mut pipe = Pipe::new(inbound);
+        let engine = EmptySelectEngine;
+        run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("session stays alive");
+        let out = &pipe.outbound;
+        // Both Parses succeeded → two ParseComplete envelopes
+        // (`1 00 00 00 04`) present.
+        let pc: &[u8] = &[b'1', 0, 0, 0, 4];
+        let pc_count = out.windows(pc.len()).filter(|w| *w == pc).count();
+        assert_eq!(pc_count, 2, "must have 2 ParseComplete envelopes (one per Parse)");
+        // DISCARD ALL CommandComplete tag emitted in between.
+        assert!(
+            out.windows(b"DISCARD ALL\0".len()).any(|w| w == b"DISCARD ALL\0"),
+            "outbound must carry DISCARD ALL CommandComplete tag"
+        );
+        // No 42P05 (which would mean the cleared-state hook didn't fire).
+        assert!(
+            !out.windows(5).any(|w| w == b"42P05"),
+            "DISCARD STATEMENTS must have cleared named statement (no 42P05 collision)"
+        );
+    }
+
+    /// SP-PG-EXTQ T7 — `DISCARD ALL` SQL is case-insensitive +
+    /// trailing-`;`-tolerant + leading-comment-tolerant. Locks ORM
+    /// shape variance: psycopg2 emits `DISCARD ALL`, JDBC may emit
+    /// `discard all`, SQLAlchemy session may emit `DISCARD ALL;` and
+    /// HikariCP-style proxies sometimes prepend `-- pool reset`.
+    #[test]
+    fn t7_extq_run_session_discard_variants_all_recognized() {
+        let token = b"kessel-bearer-token";
+        let mut extra = Vec::new();
+        // Variant 1: trailing semicolon.
+        extra.extend_from_slice(&build_q_frame("DISCARD ALL;"));
+        // Variant 2: lowercase.
+        extra.extend_from_slice(&build_q_frame("discard all"));
+        // Variant 3: leading line comment.
+        extra.extend_from_slice(&build_q_frame("-- pool reset\nDISCARD ALL"));
+        // Variant 4: leading block comment.
+        extra.extend_from_slice(&build_q_frame("/* checkout */ DISCARD ALL"));
+        extra.extend_from_slice(&build_x_frame());
+        let inbound = build_authed_inbound(token, "clientN", "serverN", "test", &extra);
+        let mut pipe = Pipe::new(inbound);
+        let engine = EmptySelectEngine;
+        run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("session stays alive");
+        let out = &pipe.outbound;
+        // Exactly 4 CommandComplete("DISCARD ALL") tags — one per variant.
+        let cc_count = out
+            .windows(b"DISCARD ALL\0".len())
+            .filter(|w| *w == b"DISCARD ALL\0")
+            .count();
+        assert_eq!(cc_count, 4, "all 4 DISCARD variants must be recognized");
+        // No 42601 anywhere (none of them reached the engine).
+        assert!(
+            !out.windows(5).any(|w| w == b"42601"),
+            "no DISCARD variant must emit 42601"
+        );
     }
 }

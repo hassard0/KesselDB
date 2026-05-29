@@ -154,6 +154,128 @@ pub fn is_effectively_empty(sql: &str) -> bool {
     true
 }
 
+/// SP-PG-EXTQ T7 — DISCARD-flavor recognizer for the Simple Query
+/// path.
+///
+/// PG-spec DISCARD (PG §SQL-DISCARD) resets per-session state on the
+/// server. The vast majority of ORM connection pools (psycopg2,
+/// SQLAlchemy default pool, JDBC HikariCP, pgx) issue
+/// `DISCARD ALL` between checkouts to ensure the next caller sees a
+/// clean session — temp tables dropped, GUCs reset, prepared
+/// statements + portals cleared.
+///
+/// V1 KesselDB has no temp tables / GUCs / cursors / sequence cache, so
+/// the only state DISCARD actually touches is the extq SessionState
+/// (prepared statements + portals + error_state). Without this hook,
+/// the SQL hits `kessel-sql` which doesn't know DISCARD and rejects it
+/// with `42601 syntax_error` — breaking every ORM pool.
+///
+/// This recognizer is intentionally LENIENT — leading whitespace +
+/// line/block comments are stripped before the keyword test, trailing
+/// `;` is tolerated, the target keyword (ALL / STATEMENTS / PORTALS /
+/// PLANS / SEQUENCES / TEMP / TEMPORARY) is case-insensitive. Returns
+/// `Some(DiscardKind::*)` on a match and `None` for anything else (the
+/// caller's existing dispatch path is unchanged for non-DISCARD SQL).
+///
+/// V1 maps:
+/// - `DISCARD ALL` → `DiscardKind::All` (drop both stmts + portals +
+///   error_state).
+/// - `DISCARD STATEMENTS` → `DiscardKind::Statements` (drop just
+///   statements; portals preserved).
+/// - `DISCARD PORTALS` → `DiscardKind::Portals` (drop just portals;
+///   statements preserved).
+/// - `DISCARD PLANS` / `DISCARD SEQUENCES` / `DISCARD TEMP` /
+///   `DISCARD TEMPORARY` → `DiscardKind::Noop` (V1 doesn't track these,
+///   so DISCARD is a no-op; we still emit `DISCARD ALL` CommandComplete
+///   so the client doesn't choke).
+///
+/// Per PG §SQL-DISCARD, every variant emits `CommandComplete("DISCARD
+/// ALL")` (the literal tag for DISCARD is the input verb in PG's own
+/// implementation, but every libpq-based client treats the tag as
+/// opaque so V1 can normalize to `DISCARD ALL`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscardKind {
+    /// `DISCARD ALL` — full session reset.
+    All,
+    /// `DISCARD STATEMENTS` — drop prepared statements only.
+    Statements,
+    /// `DISCARD PORTALS` — drop portals only.
+    Portals,
+    /// `DISCARD PLANS` / `SEQUENCES` / `TEMP` / `TEMPORARY` — V1 doesn't
+    /// track these surfaces, so this is a no-op on the gateway side.
+    /// We still recognize + emit `CommandComplete` so the client
+    /// pool's state-reset handshake completes cleanly.
+    Noop,
+}
+
+/// Recognize a DISCARD-flavor SQL statement. Returns `Some(kind)` on
+/// a match (case-insensitive, leading-comment-tolerant, trailing-
+/// semicolon-tolerant) or `None` otherwise. See `DiscardKind` for the
+/// supported variants.
+pub fn recognize_discard(sql: &str) -> Option<DiscardKind> {
+    // Strip leading whitespace + comments using the existing
+    // dispatch.rs leading-comment-stripper shape (inlined here so
+    // query.rs stays dispatch.rs-independent).
+    let mut s = sql;
+    loop {
+        let trimmed = s.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("--") {
+            // Line comment to next \n.
+            match rest.find('\n') {
+                Some(p) => s = &rest[p + 1..],
+                None => return None, // comment-only → no DISCARD
+            }
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("/*") {
+            // Block comment — non-nesting, scan for `*/`.
+            match rest.find("*/") {
+                Some(p) => s = &rest[p + 2..],
+                None => return None,
+            }
+            continue;
+        }
+        s = trimmed;
+        break;
+    }
+    // Strip trailing whitespace + a single trailing `;` + more
+    // whitespace (the dispatch layer tolerates `SELECT 1;` and we
+    // mirror that here).
+    let mut t = s.trim_end();
+    if let Some(stripped) = t.strip_suffix(';') {
+        t = stripped.trim_end();
+    }
+    if t.is_empty() {
+        return None;
+    }
+    // Split on the first whitespace boundary into KEYWORD + REST.
+    let mut iter = t.splitn(2, |c: char| c.is_whitespace());
+    let kw = iter.next().unwrap_or("");
+    if !kw.eq_ignore_ascii_case("DISCARD") {
+        return None;
+    }
+    let rest = iter.next().unwrap_or("").trim();
+    // Bare `DISCARD` with no target → treat as DISCARD ALL per the
+    // PG spec's "default target" reading (in fact PG rejects bare
+    // DISCARD as a syntax error but V1 is lenient because some
+    // older asyncpg builds emit it on shutdown). Empty rest → All.
+    if rest.is_empty() {
+        return Some(DiscardKind::All);
+    }
+    // Take just the next token (target). Anything beyond the
+    // target — e.g. `DISCARD ALL EXTRA STUFF` — V1 still treats as
+    // valid because clients sometimes append benign suffixes
+    // (asyncpg has been seen appending `WAIT`).
+    let target = rest.split_whitespace().next().unwrap_or("");
+    match target.to_ascii_uppercase().as_str() {
+        "ALL" => Some(DiscardKind::All),
+        "STATEMENTS" => Some(DiscardKind::Statements),
+        "PORTALS" => Some(DiscardKind::Portals),
+        "PLANS" | "SEQUENCES" | "TEMP" | "TEMPORARY" => Some(DiscardKind::Noop),
+        _ => None,
+    }
+}
+
 /// Returns true if the SQL text appears to contain MULTIPLE
 /// statements separated by `;`. V1 rejects multi-statement Q with
 /// SQLSTATE `42601` syntax_error per spec §11 weak-spot #5 — KesselDB
@@ -403,5 +525,135 @@ mod tests {
     fn t3_semicolon_inside_comment_is_not_a_separator() {
         assert!(!contains_multiple_statements("SELECT 1 -- ; this is a comment\n"));
         assert!(!contains_multiple_statements("SELECT 1 /* ; ; ; */"));
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-EXTQ T7 KATs — DISCARD recognition. Locks the ORM-pool
+    // adoption hook that gateway-intercepts DISCARD ALL / STATEMENTS /
+    // PORTALS before the SQL reaches the engine.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// Headline T7 KAT: bare `DISCARD ALL` recognized.
+    #[test]
+    fn t7_recognize_discard_all_basic() {
+        assert_eq!(recognize_discard("DISCARD ALL"), Some(DiscardKind::All));
+    }
+
+    /// `DISCARD STATEMENTS` recognized as the statement-only variant.
+    #[test]
+    fn t7_recognize_discard_statements() {
+        assert_eq!(
+            recognize_discard("DISCARD STATEMENTS"),
+            Some(DiscardKind::Statements)
+        );
+    }
+
+    /// `DISCARD PORTALS` recognized as the portal-only variant.
+    #[test]
+    fn t7_recognize_discard_portals() {
+        assert_eq!(
+            recognize_discard("DISCARD PORTALS"),
+            Some(DiscardKind::Portals)
+        );
+    }
+
+    /// V1-untracked variants recognized as Noop (we still emit
+    /// CommandComplete so ORM pool checkout doesn't choke).
+    #[test]
+    fn t7_recognize_discard_noop_variants() {
+        assert_eq!(recognize_discard("DISCARD PLANS"), Some(DiscardKind::Noop));
+        assert_eq!(
+            recognize_discard("DISCARD SEQUENCES"),
+            Some(DiscardKind::Noop)
+        );
+        assert_eq!(recognize_discard("DISCARD TEMP"), Some(DiscardKind::Noop));
+        assert_eq!(
+            recognize_discard("DISCARD TEMPORARY"),
+            Some(DiscardKind::Noop)
+        );
+    }
+
+    /// Case-insensitive on the verb and target keyword.
+    #[test]
+    fn t7_recognize_discard_case_insensitive() {
+        assert_eq!(recognize_discard("discard all"), Some(DiscardKind::All));
+        assert_eq!(recognize_discard("Discard All"), Some(DiscardKind::All));
+        assert_eq!(recognize_discard("DISCARD all"), Some(DiscardKind::All));
+        assert_eq!(
+            recognize_discard("discard STATEMENTS"),
+            Some(DiscardKind::Statements)
+        );
+    }
+
+    /// Trailing `;` is tolerated (dispatch layer convention).
+    #[test]
+    fn t7_recognize_discard_with_trailing_semicolon() {
+        assert_eq!(recognize_discard("DISCARD ALL;"), Some(DiscardKind::All));
+        assert_eq!(
+            recognize_discard("  DISCARD ALL  ;  "),
+            Some(DiscardKind::All)
+        );
+    }
+
+    /// Leading whitespace + line comments + block comments stripped
+    /// before the keyword test (mirrors `cmd_complete_tag_for_sql`
+    /// tolerance of ORM-prepended SQL comments).
+    #[test]
+    fn t7_recognize_discard_with_leading_comments() {
+        assert_eq!(
+            recognize_discard("  -- pool checkout\n DISCARD ALL"),
+            Some(DiscardKind::All)
+        );
+        assert_eq!(
+            recognize_discard("/* connection reset */ DISCARD ALL"),
+            Some(DiscardKind::All)
+        );
+        assert_eq!(
+            recognize_discard("-- a\n-- b\n/* c */ DISCARD STATEMENTS"),
+            Some(DiscardKind::Statements)
+        );
+    }
+
+    /// Bare `DISCARD` with no target → treated as DISCARD ALL (lenient
+    /// shape some asyncpg builds emit on shutdown).
+    #[test]
+    fn t7_recognize_bare_discard_falls_back_to_all() {
+        assert_eq!(recognize_discard("DISCARD"), Some(DiscardKind::All));
+        assert_eq!(recognize_discard("DISCARD ;"), Some(DiscardKind::All));
+    }
+
+    /// Non-DISCARD SQL is NOT recognized (negative control — defends
+    /// the dispatch-fallthrough invariant).
+    #[test]
+    fn t7_recognize_discard_returns_none_for_non_discard_sql() {
+        assert_eq!(recognize_discard("SELECT 1"), None);
+        assert_eq!(recognize_discard("INSERT INTO t (id) VALUES (1)"), None);
+        assert_eq!(recognize_discard("BEGIN"), None);
+        assert_eq!(recognize_discard("COMMIT"), None);
+        assert_eq!(recognize_discard(""), None);
+        assert_eq!(recognize_discard("   "), None);
+        assert_eq!(recognize_discard("-- only a comment"), None);
+    }
+
+    /// `DISCARD` substring inside a different verb is NOT recognized
+    /// (defends against false positives like a quoted SQL literal
+    /// reading `'DISCARD'`).
+    #[test]
+    fn t7_recognize_discard_only_matches_leading_keyword() {
+        assert_eq!(recognize_discard("SELECT 'DISCARD'"), None);
+        assert_eq!(
+            recognize_discard("INSERT INTO logs (verb) VALUES ('DISCARD ALL')"),
+            None
+        );
+    }
+
+    /// Unknown DISCARD target → returns None (we don't silently treat
+    /// e.g. `DISCARD WIDGETS` as a no-op, because that's likely a
+    /// client bug or unsupported PG feature we shouldn't pretend to
+    /// implement).
+    #[test]
+    fn t7_recognize_discard_unknown_target_returns_none() {
+        assert_eq!(recognize_discard("DISCARD WIDGETS"), None);
+        assert_eq!(recognize_discard("DISCARD CONNECTIONS"), None);
     }
 }

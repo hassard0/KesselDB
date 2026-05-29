@@ -141,6 +141,35 @@ impl SessionState {
     fn set_error_state(&mut self, in_error: bool) {
         self.error_state = in_error;
     }
+
+    /// SP-PG-EXTQ T7 — drop ALL session state. Used by `DISCARD ALL`
+    /// gateway-side interception (`server::run_session` recognizes the
+    /// SQL and calls this before the dispatch path runs). Clears
+    /// statements + portals + error_state. Per PG §SQL-DISCARD, this
+    /// is the connection-pool checkout-reset hook every modern ORM
+    /// relies on.
+    pub fn clear_all(&mut self) {
+        self.statements.clear();
+        self.portals.clear();
+        self.error_state = false;
+    }
+
+    /// SP-PG-EXTQ T7 — drop just prepared statements. Used by
+    /// `DISCARD STATEMENTS`. Portals are preserved per PG semantics
+    /// (a portal already bound stays usable until explicit Close OR
+    /// Sync that drops the unnamed one). `error_state` is preserved
+    /// because DISCARD STATEMENTS is itself not a Sync-equivalent —
+    /// only Sync clears the error-skip flag (spec §6).
+    pub fn clear_statements(&mut self) {
+        self.statements.clear();
+    }
+
+    /// SP-PG-EXTQ T7 — drop just portals. Used by `DISCARD PORTALS`.
+    /// Statements are preserved. Same `error_state`-preservation
+    /// rationale as `clear_statements`.
+    pub fn clear_portals(&mut self) {
+        self.portals.clear();
+    }
 }
 
 /// A prepared statement (Parse output). Spec §3 — V1 stores the

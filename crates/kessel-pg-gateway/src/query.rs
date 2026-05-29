@@ -276,6 +276,147 @@ pub fn recognize_discard(sql: &str) -> Option<DiscardKind> {
     }
 }
 
+/// SP-PG-EXTQ T7 — transaction-control recognizer for the Simple
+/// Query path.
+///
+/// V1 KesselDB has no real transaction blocks (every statement is
+/// auto-committed at the engine layer; spec §11 weak-spot #6 names
+/// SP-PG-TX as the V2 arc that lifts this). But every ORM pool +
+/// session manager emits `BEGIN` / `COMMIT` / `ROLLBACK` (and the
+/// SQLAlchemy-default `SET SESSION CHARACTERISTICS AS TRANSACTION`
+/// shape) at checkout/checkin. Without gateway-side interception
+/// these reach `kessel-sql` which doesn't know them and rejects with
+/// `42601 unsupported statement` — breaking SQLAlchemy at the
+/// `engine.connect()` probe.
+///
+/// V1 V2-ish workaround: recognize the verbs at the gateway, treat
+/// them as NO-OPS at the storage layer (every statement is already
+/// auto-committed), emit the canonical CommandComplete tag, return
+/// RFQ('I'). The RFQ status byte STAYS 'I' (idle) because V1 has no
+/// real implicit-tx state to emit 'T' (transaction) for — V2 SP-PG-TX
+/// fixes the status byte properly.
+///
+/// Recognizes:
+/// - `BEGIN` / `BEGIN TRANSACTION` / `BEGIN WORK` / `START TRANSACTION` →
+///   `TxControl::Begin` (CommandComplete tag "BEGIN").
+/// - `COMMIT` / `COMMIT TRANSACTION` / `COMMIT WORK` / `END` /
+///   `END TRANSACTION` → `TxControl::Commit` (CommandComplete tag
+///   "COMMIT").
+/// - `ROLLBACK` / `ROLLBACK TRANSACTION` / `ROLLBACK WORK` / `ABORT`
+///   → `TxControl::Rollback` (CommandComplete tag "ROLLBACK").
+/// - `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL ...`
+///   + `SET TRANSACTION ISOLATION LEVEL ...` → `TxControl::SetTx`
+///   (CommandComplete tag "SET").
+///
+/// Returns `None` for anything else (the existing dispatch path is
+/// unchanged). Like `recognize_discard`, this is lenient on leading
+/// whitespace + comments + trailing `;`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxControl {
+    /// `BEGIN` / `START TRANSACTION` → CommandComplete tag "BEGIN".
+    Begin,
+    /// `COMMIT` / `END` → CommandComplete tag "COMMIT".
+    Commit,
+    /// `ROLLBACK` / `ABORT` → CommandComplete tag "ROLLBACK".
+    Rollback,
+    /// `SET (SESSION CHARACTERISTICS AS )? TRANSACTION ...` →
+    /// CommandComplete tag "SET". V1 doesn't track isolation level
+    /// (everything is committed-on-statement-success), so we accept
+    /// and discard.
+    SetTx,
+}
+
+impl TxControl {
+    /// CommandComplete tag PG emits for this verb.
+    pub fn command_tag(self) -> &'static str {
+        match self {
+            TxControl::Begin => "BEGIN",
+            TxControl::Commit => "COMMIT",
+            TxControl::Rollback => "ROLLBACK",
+            TxControl::SetTx => "SET",
+        }
+    }
+}
+
+/// Recognize a transaction-control SQL statement. See `TxControl` for
+/// the supported verbs. Returns `Some(kind)` on a match (case-
+/// insensitive, leading-comment-tolerant, trailing-semicolon-
+/// tolerant); `None` otherwise.
+pub fn recognize_tx_control(sql: &str) -> Option<TxControl> {
+    // Reuse the same leading-strip shape as recognize_discard.
+    let mut s = sql;
+    loop {
+        let trimmed = s.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("--") {
+            match rest.find('\n') {
+                Some(p) => s = &rest[p + 1..],
+                None => return None,
+            }
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("/*") {
+            match rest.find("*/") {
+                Some(p) => s = &rest[p + 2..],
+                None => return None,
+            }
+            continue;
+        }
+        s = trimmed;
+        break;
+    }
+    let mut t = s.trim_end();
+    if let Some(stripped) = t.strip_suffix(';') {
+        t = stripped.trim_end();
+    }
+    if t.is_empty() {
+        return None;
+    }
+    // Tokenize for the first 1-2 keywords.
+    let mut tokens = t.split_whitespace();
+    let kw1 = tokens.next().unwrap_or("").to_ascii_uppercase();
+    let kw2 = tokens.next().unwrap_or("").to_ascii_uppercase();
+    match kw1.as_str() {
+        "BEGIN" => {
+            // BEGIN / BEGIN TRANSACTION / BEGIN WORK / BEGIN ISOLATION ...
+            // Anything starting with BEGIN is a transaction-begin
+            // verb in PG (V1 is intentionally lax here).
+            Some(TxControl::Begin)
+        }
+        "START" => {
+            // START TRANSACTION — required two-word form.
+            if kw2 == "TRANSACTION" {
+                Some(TxControl::Begin)
+            } else {
+                None
+            }
+        }
+        "COMMIT" | "END" => {
+            // COMMIT / COMMIT TRANSACTION / COMMIT WORK / END / END
+            // TRANSACTION. END is a PG synonym for COMMIT.
+            Some(TxControl::Commit)
+        }
+        "ROLLBACK" | "ABORT" => {
+            // ROLLBACK / ROLLBACK TRANSACTION / ROLLBACK WORK / ABORT.
+            Some(TxControl::Rollback)
+        }
+        "SET" => {
+            // SET TRANSACTION ISOLATION LEVEL ...
+            // SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL ...
+            // SET LOCAL TRANSACTION ...
+            // Match against any SET that includes the word
+            // TRANSACTION in the first 5 tokens (catches all variants
+            // SQLAlchemy + asyncpg + JDBC emit on connect probe).
+            let head = t.to_ascii_uppercase();
+            if head.contains("TRANSACTION") {
+                Some(TxControl::SetTx)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Returns true if the SQL text appears to contain MULTIPLE
 /// statements separated by `;`. V1 rejects multi-statement Q with
 /// SQLSTATE `42601` syntax_error per spec §11 weak-spot #5 — KesselDB
@@ -655,5 +796,122 @@ mod tests {
     fn t7_recognize_discard_unknown_target_returns_none() {
         assert_eq!(recognize_discard("DISCARD WIDGETS"), None);
         assert_eq!(recognize_discard("DISCARD CONNECTIONS"), None);
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-EXTQ T7 KATs — transaction-control recognition. Locks the
+    // SQLAlchemy / asyncpg / JDBC pool checkout/checkin probe path
+    // (BEGIN / COMMIT / ROLLBACK / SET TRANSACTION ISOLATION LEVEL).
+    // ───────────────────────────────────────────────────────────────────
+
+    /// HEADLINE T7 KAT: `BEGIN` recognized as TxControl::Begin.
+    #[test]
+    fn t7_recognize_tx_control_begin() {
+        assert_eq!(recognize_tx_control("BEGIN"), Some(TxControl::Begin));
+        assert_eq!(
+            recognize_tx_control("BEGIN TRANSACTION"),
+            Some(TxControl::Begin)
+        );
+        assert_eq!(recognize_tx_control("BEGIN WORK"), Some(TxControl::Begin));
+        assert_eq!(
+            recognize_tx_control("START TRANSACTION"),
+            Some(TxControl::Begin)
+        );
+        assert_eq!(recognize_tx_control("begin"), Some(TxControl::Begin));
+    }
+
+    /// `COMMIT` + `END` variants recognized.
+    #[test]
+    fn t7_recognize_tx_control_commit() {
+        assert_eq!(recognize_tx_control("COMMIT"), Some(TxControl::Commit));
+        assert_eq!(
+            recognize_tx_control("COMMIT TRANSACTION"),
+            Some(TxControl::Commit)
+        );
+        assert_eq!(
+            recognize_tx_control("COMMIT WORK"),
+            Some(TxControl::Commit)
+        );
+        assert_eq!(recognize_tx_control("END"), Some(TxControl::Commit));
+        assert_eq!(
+            recognize_tx_control("END TRANSACTION"),
+            Some(TxControl::Commit)
+        );
+        assert_eq!(recognize_tx_control("commit"), Some(TxControl::Commit));
+    }
+
+    /// `ROLLBACK` + `ABORT` variants recognized.
+    #[test]
+    fn t7_recognize_tx_control_rollback() {
+        assert_eq!(
+            recognize_tx_control("ROLLBACK"),
+            Some(TxControl::Rollback)
+        );
+        assert_eq!(
+            recognize_tx_control("ROLLBACK TRANSACTION"),
+            Some(TxControl::Rollback)
+        );
+        assert_eq!(recognize_tx_control("ABORT"), Some(TxControl::Rollback));
+        assert_eq!(
+            recognize_tx_control("rollback"),
+            Some(TxControl::Rollback)
+        );
+    }
+
+    /// SQLAlchemy/JDBC isolation-level setter variants recognized.
+    #[test]
+    fn t7_recognize_tx_control_set_transaction_variants() {
+        assert_eq!(
+            recognize_tx_control("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"),
+            Some(TxControl::SetTx)
+        );
+        assert_eq!(
+            recognize_tx_control(
+                "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED"
+            ),
+            Some(TxControl::SetTx)
+        );
+        assert_eq!(
+            recognize_tx_control("SET LOCAL TRANSACTION ISOLATION LEVEL SERIALIZABLE"),
+            Some(TxControl::SetTx)
+        );
+    }
+
+    /// Trailing semicolon + leading comments are tolerated (mirrors
+    /// `recognize_discard`).
+    #[test]
+    fn t7_recognize_tx_control_lenient_formatting() {
+        assert_eq!(recognize_tx_control("BEGIN;"), Some(TxControl::Begin));
+        assert_eq!(
+            recognize_tx_control("  -- pool checkout\n BEGIN"),
+            Some(TxControl::Begin)
+        );
+        assert_eq!(
+            recognize_tx_control("/* sa */ COMMIT TRANSACTION;"),
+            Some(TxControl::Commit)
+        );
+    }
+
+    /// Negative control — non-tx-control SQL returns None.
+    #[test]
+    fn t7_recognize_tx_control_non_tx_sql_returns_none() {
+        assert_eq!(recognize_tx_control("SELECT 1"), None);
+        assert_eq!(recognize_tx_control("INSERT INTO t VALUES (1)"), None);
+        assert_eq!(recognize_tx_control(""), None);
+        // SET that isn't tx-control (e.g. SET search_path) → None.
+        assert_eq!(recognize_tx_control("SET search_path = public"), None);
+        assert_eq!(recognize_tx_control("SET timezone = 'UTC'"), None);
+        // START without TRANSACTION → None.
+        assert_eq!(recognize_tx_control("START FOO"), None);
+        assert_eq!(recognize_tx_control("DISCARD ALL"), None);
+    }
+
+    /// CommandComplete tag matches PG canonical strings.
+    #[test]
+    fn t7_tx_control_command_tag() {
+        assert_eq!(TxControl::Begin.command_tag(), "BEGIN");
+        assert_eq!(TxControl::Commit.command_tag(), "COMMIT");
+        assert_eq!(TxControl::Rollback.command_tag(), "ROLLBACK");
+        assert_eq!(TxControl::SetTx.command_tag(), "SET");
     }
 }

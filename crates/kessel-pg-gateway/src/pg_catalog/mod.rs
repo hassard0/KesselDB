@@ -1036,7 +1036,9 @@ mod tests {
         assert!(catalog_query_hook("CREATE TABLE t (id i64)", &eng).is_none());
         assert!(catalog_query_hook("UPDATE t SET v = 1 WHERE id = 2", &eng).is_none());
         assert!(catalog_query_hook("DELETE FROM t WHERE id = 1", &eng).is_none());
-        assert!(catalog_query_hook("SELECT 1", &eng).is_none());
+        // NOTE: `SELECT 1` is intercepted as of SP-PG-EXTQ T7 (SQLAlchemy
+        // connection-validity probe) — see
+        // `t7_select_1_returns_single_int_row` in synthesize.rs tests.
         assert!(catalog_query_hook("", &eng).is_none());
         assert!(catalog_query_hook("BEGIN", &eng).is_none());
     }

@@ -475,6 +475,26 @@ pub fn run_session<
                     stream.flush()?;
                     continue;
                 }
+                // SP-PG-EXTQ T7 — transaction-control interception.
+                // BEGIN / COMMIT / ROLLBACK / SET TRANSACTION ISOLATION
+                // LEVEL are the SQLAlchemy / asyncpg / JDBC connection
+                // probe's first round-trip. V1 has no real transaction
+                // blocks (every statement auto-commits per design spec
+                // §11 weak-spot #6; V2 SP-PG-TX lifts), but we
+                // recognize the verbs at the gateway and emit the
+                // canonical CommandComplete tag so the client's
+                // connect-probe succeeds. RFQ status stays `'I'`
+                // (idle) — V1 has no implicit-tx state to advertise.
+                if let Some(kind) = crate::query::recognize_tx_control(&sql_owned) {
+                    let mut resp = Vec::new();
+                    resp.extend_from_slice(
+                        &crate::response::encode_command_complete(kind.command_tag()),
+                    );
+                    resp.extend_from_slice(&crate::response::encode_ready_for_query(b'I'));
+                    stream.write_all(&resp)?;
+                    stream.flush()?;
+                    continue;
+                }
                 let resp = crate::dispatch::dispatch_query(&sql_owned, engine);
                 stream.write_all(&resp)?;
                 stream.flush()?;
@@ -2953,6 +2973,58 @@ mod tests {
         assert!(
             !out.windows(5).any(|w| w == b"42P05"),
             "DISCARD STATEMENTS must have cleared named statement (no 42P05 collision)"
+        );
+    }
+
+    /// SP-PG-EXTQ T7 — BEGIN / COMMIT / ROLLBACK / SET TRANSACTION
+    /// ISOLATION LEVEL gateway-intercepted. Locks the SQLAlchemy +
+    /// asyncpg + JDBC connection probe path.
+    #[test]
+    fn t7_extq_run_session_tx_control_verbs_emit_canonical_tags() {
+        let token = b"kessel-bearer-token";
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&build_q_frame("BEGIN"));
+        extra.extend_from_slice(&build_q_frame("COMMIT"));
+        extra.extend_from_slice(&build_q_frame("ROLLBACK"));
+        extra.extend_from_slice(&build_q_frame(
+            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+        ));
+        extra.extend_from_slice(&build_q_frame(
+            "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED",
+        ));
+        extra.extend_from_slice(&build_x_frame());
+        let inbound = build_authed_inbound(token, "clientN", "serverN", "test", &extra);
+        let mut pipe = Pipe::new(inbound);
+        let engine = EmptySelectEngine;
+        run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("session stays alive");
+        let out = &pipe.outbound;
+        // Each tx-control verb emits its canonical CommandComplete tag.
+        let tags: &[&[u8]] = &[b"BEGIN\0", b"COMMIT\0", b"ROLLBACK\0"];
+        for tag in tags {
+            assert!(
+                out.windows(tag.len()).any(|w| w == *tag),
+                "missing CommandComplete tag bytes: {tag:?}"
+            );
+        }
+        // SET tag appears twice (once for each SET).
+        let set_count = out
+            .windows(b"SET\0".len())
+            .filter(|w| *w == b"SET\0")
+            .count();
+        assert!(
+            set_count >= 2,
+            "expected ≥2 SET CommandComplete tags, got {set_count}"
+        );
+        // No 42601 — the engine must not have been reached.
+        assert!(
+            !out.windows(5).any(|w| w == b"42601"),
+            "no tx-control verb may emit 42601"
         );
     }
 

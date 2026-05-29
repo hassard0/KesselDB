@@ -2247,6 +2247,48 @@ pub fn synthesize_helper_function(normalized: &str) -> Option<Vec<u8>> {
     // try to be exhaustive — the simple forms are what tools issue.
     let s = strip_select_alias(normalized);
 
+    // ── SP-PG-EXTQ T7 — SQLAlchemy connection-validity probe ───────
+    // SQLAlchemy 2.0's PG dialect issues `SELECT 1` as its
+    // `do_ping()` and pool-checkout health probe. kessel-sql rejects
+    // `SELECT 1` (bare scalar SELECT — V1 requires `SELECT * FROM
+    // <table>` per design spec §11 weak-spot). Without this intercept
+    // SQLAlchemy refuses every `engine.connect()`. Intercept here and
+    // emit a single row with column "?column?" + value 1 (the libpq
+    // canonical shape for an anonymous scalar SELECT).
+    if s == "select 1" {
+        return Some(single_int_row("?column?", PG_TYPE_INT4, 1));
+    }
+    // Companion shape: `select true` / `select false` (some clients
+    // probe with these — e.g. asyncpg's reconnect heartbeat).
+    if s == "select true" {
+        return Some(single_bool_row("bool", true));
+    }
+    if s == "select false" {
+        return Some(single_bool_row("bool", false));
+    }
+    // SQLAlchemy 2.0 first-connect encoding probes (`PGDialect_psycopg2.
+    // do_test_connection` issues exactly these two text-roundtrip
+    // queries to validate the client encoding). After
+    // `strip_select_alias` removes the trailing `as anon_1`, the
+    // remainder is the canonical match below — both shapes are
+    // idiosyncratic to SQLAlchemy and zero risk for collisions.
+    //
+    // Note: `strip_select_alias` looks for ` as <ident>` and trims;
+    // the `as varchar(60)` INSIDE the CAST stays (it's followed by a
+    // close-paren, not by an identifier-only tail).
+    if s == "select cast('test plain returns' as varchar(60))" {
+        return Some(single_text_row("anon_1", "test plain returns"));
+    }
+    if s == "select cast('test unicode returns' as varchar(60))" {
+        return Some(single_text_row("anon_1", "test unicode returns"));
+    }
+    // SQLAlchemy 2.0 also probes `select pg_catalog.version()` (PG-
+    // qualified form). Handled by the version path below when the
+    // shape matches — but the parser strips `pg_catalog.` so add an
+    // explicit alias.
+    if s == "select pg_catalog.version()" {
+        return Some(single_text_row("version", KESSELDB_VERSION_STRING));
+    }
     // ── Single-call shapes (no args) ──────────────────────────────
     if s == "select version()" {
         return Some(single_text_row("version", KESSELDB_VERSION_STRING));
@@ -3555,6 +3597,85 @@ mod tests {
     // current_setting / multi-function probe).
     // ───────────────────────────────────────────────────────────────────
 
+    // ── SP-PG-EXTQ T7 — SQLAlchemy connection-validity probes ──────
+
+    /// **SP-PG-EXTQ T7 — `select 1` returns a single int row (column
+    /// `?column?`, value 1).** SQLAlchemy 2.0's PG dialect issues
+    /// `SELECT 1` as its `do_ping()` health probe; without this hook
+    /// every `engine.connect()` fails on V1's bare-scalar-SELECT
+    /// rejection.
+    #[test]
+    fn t7_select_1_returns_single_int_row() {
+        let bytes = synthesize_helper_function("select 1").expect("matches");
+        assert_eq!(bytes[0], b'T', "must begin with RowDescription");
+        // Column name "?column?" (PG canonical for anonymous SELECT 1).
+        assert!(
+            bytes.windows(b"?column?".len()).any(|w| w == b"?column?"),
+            "must carry column name '?column?'"
+        );
+        // CommandComplete tag "SELECT 1".
+        assert!(
+            bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"),
+            "must carry CommandComplete tag 'SELECT 1'"
+        );
+        // Trailing 6 bytes: RFQ('I').
+        assert_eq!(&bytes[bytes.len() - 6..], &[b'Z', 0, 0, 0, 5, b'I']);
+    }
+
+    /// **SP-PG-EXTQ T7 — `select true` / `select false` return single
+    /// bool rows.** Some clients probe with these (asyncpg reconnect
+    /// heartbeat).
+    #[test]
+    fn t7_select_true_false_return_bool_rows() {
+        let bt = synthesize_helper_function("select true").expect("matches true");
+        assert!(bt.windows(b"bool".len()).any(|w| w == b"bool"));
+        assert!(bt.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+        let bf = synthesize_helper_function("select false").expect("matches false");
+        assert!(bf.windows(b"bool".len()).any(|w| w == b"bool"));
+    }
+
+    /// **SP-PG-EXTQ T7 — SQLAlchemy `test plain returns` / `test
+    /// unicode returns` first-connect probes recognized.** These are
+    /// SQLAlchemy's `PGDialect_psycopg2.do_test_connection` text-
+    /// roundtrip queries; without this hook every SQLAlchemy
+    /// `engine.connect()` fails on V1's `expected FROM` rejection.
+    #[test]
+    fn t7_sqlalchemy_text_roundtrip_probes_recognized() {
+        let plain = synthesize_helper_function(
+            "select cast('test plain returns' as varchar(60)) as anon_1",
+        )
+        .expect("matches plain probe");
+        assert!(
+            plain
+                .windows(b"test plain returns".len())
+                .any(|w| w == b"test plain returns"),
+            "plain probe must echo 'test plain returns'"
+        );
+        // Column alias "anon_1" present.
+        assert!(plain.windows(b"anon_1".len()).any(|w| w == b"anon_1"));
+        let unicode = synthesize_helper_function(
+            "select cast('test unicode returns' as varchar(60)) as anon_1",
+        )
+        .expect("matches unicode probe");
+        assert!(
+            unicode
+                .windows(b"test unicode returns".len())
+                .any(|w| w == b"test unicode returns"),
+            "unicode probe must echo 'test unicode returns'"
+        );
+    }
+
+    /// **SP-PG-EXTQ T7 — `select pg_catalog.version()` (PG-qualified
+    /// form) recognized in addition to bare `select version()`.**
+    #[test]
+    fn t7_pg_catalog_qualified_version_recognized() {
+        let bytes = synthesize_helper_function("select pg_catalog.version()")
+            .expect("matches qualified");
+        assert!(bytes
+            .windows(KESSELDB_VERSION_STRING.len())
+            .any(|w| w == KESSELDB_VERSION_STRING.as_bytes()));
+    }
+
     /// **HEADLINE — `select version()` returns the canned KesselDB
     /// version string.**
     #[test]
@@ -3764,11 +3885,17 @@ mod tests {
     }
 
     /// **Unrecognized SELECT → None (falls through to engine apply).**
+    /// Note: SP-PG-EXTQ T7 added `select 1` / `select true` / `select
+    /// false` to the recognizer (SQLAlchemy probes) — those are now
+    /// covered by `t7_select_1_returns_single_int_row` +
+    /// `t7_select_true_false_return_bool_rows`. Genuinely-unknown
+    /// SELECTs still fall through.
     #[test]
     fn t7_unrecognized_select_returns_none() {
         assert!(synthesize_helper_function("select * from users").is_none());
-        assert!(synthesize_helper_function("select 1").is_none());
         assert!(synthesize_helper_function("select foo()").is_none());
+        assert!(synthesize_helper_function("select 42").is_none());
+        assert!(synthesize_helper_function("select 1, 2").is_none());
     }
 
     /// **Unrecognized SHOW ALL returns 0 rows (well-framed) per spec

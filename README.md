@@ -11,7 +11,7 @@
 **Tonight's headlines** (2026‑05‑29):
 - **Real Postgres ORM compatibility** — psycopg2 / SQLAlchemy / Drizzle / JDBC connect via SCRAM‑SHA‑256 and run **parameterized queries** through the new **Extended Query** protocol (Parse / Bind / Describe / Execute / Sync / Close / Flush). End‑to‑end psycopg2 round‑trip verified on vulcan; see [`docs/USAGE.md`](docs/USAGE.md#9-postgresql-clients-psql-pgcli-jdbc-psycopg-pgx-).
 - **4.8M ops/sec parallel reads, sub‑µs p50** — Perf‑A T2 read‑pool bypass (parallel `read_only_op` dispatch) + T7 storage `Arc<[u8]>` migration (zero‑memcpy reads). Measured on a 16‑core x86‑64 Linux reference server; see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §11–§12.
-- **Honest cross‑DB benchmarks published** — KesselDB vs Postgres / SQLite / TigerBeetle on YCSB‑A/B/C *and* sysbench OLTP RO/WO/RW. Wins, losses, and the exact reasons for each, with the next perf arc named (SP‑Perf‑A‑SHARD: sharded apply queues + per‑shard read pools).
+- **Honest cross‑DB benchmarks published** — KesselDB vs Postgres / SQLite / TigerBeetle on YCSB‑A/B/C, sysbench OLTP RO/WO/RW, *and* TPC‑H Q1/Q6 (analytical). 4 of 8 wins, 4 of 8 losses, every number disclosed with the exact reason — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md). Next perf arcs named (SP‑Perf‑A‑SHARD for the OLTP losses, SP‑Analytic‑Plan for the TPC‑H losses).
 
 </div>
 
@@ -345,12 +345,29 @@ including the *losses* where KesselDB does NOT win — are in
 | sysbench OLTP write‑only | **KesselDB** | **1st at every N (5.2× Postgres at N=8)** | apply‑path is fast at the inner‑op level |
 | sysbench OLTP read‑only | SQLite (N=1) / Postgres (N=8/N=16) | **3rd** | `Op::Txn` holds the apply write‑lock even for RO inner ops — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3c |
 | sysbench OLTP read‑write | SQLite at every N | **3rd** | same root cause — RO inner ops can't parallelize across workers |
+| TPC‑H Q1 (multi‑aggregate GROUP BY) | Postgres at every N | **3rd** | `Op::GroupAggregate` is full‑scan + per‑row VM, no order‑index narrowing — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3f |
+| TPC‑H Q6 (SUM with WHERE) | Postgres at every N | **3rd** | `Op::Aggregate` is full‑scan + per‑row VM — same root cause — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3g |
 
-**Roadmap is named.** The sysbench‑RO/RW losses point at one specific
-bottleneck (`Op::Txn` apply‑lock on RO inner ops); the next perf arc
-**SP‑Perf‑A‑SHARD** (sharded apply queues + per‑shard read pools) closes
-the gap honestly. The ~5 M ops/sec storage ceiling at N=16 traces to
-`RwLock<StateMachine>` reader CAS ping‑pong — same arc.
+**Roadmap is named — two distinct arcs close the published losses.**
+
+- **SP‑Perf‑A‑SHARD** (sharded apply queues + per‑shard read pools)
+  closes the sysbench RO/RW losses by routing read‑only `Op::Txn{ops}`
+  through the Perf‑A read‑pool bypass when every inner op is statically
+  detectable as read‑only. The ~5 M ops/sec storage ceiling at N=16
+  traces to `RwLock<StateMachine>` reader CAS ping‑pong — same arc.
+- **SP‑Analytic‑Plan** (range‑pred narrowing on aggregate scans) closes
+  the TPC‑H Q1/Q6 losses by teaching `Op::Aggregate` and
+  `Op::GroupAggregate` to consume the `range_preds: Vec<(u16, u8,
+  Vec<u8>)>` interface that already ships in `Op::QueryRows` (SP70). A
+  predicate like `l_shipdate BETWEEN ?` prunes the scan via the
+  existing `FindRange` machinery. Q1 also benefits from
+  `Op::GroupAggregateMulti` so 4× single‑aggregate scans collapse to 1×
+  multi‑aggregate scan.
+
+**Headline numbers worth quoting** (all from the same vulcan run):
+- **YCSB‑C reads, N=16**: KesselDB 4.75M ops/s — **57× Postgres**, **40× SQLite**
+- **YCSB‑B mixed (95/5), N=16**: KesselDB 576K ops/s — **7.1× Postgres**, **60× SQLite**
+- **sysbench OLTP write‑only, N=8**: KesselDB 53K tx/s — **5.2× Postgres**, **4.2× SQLite**
 
 Every figure is reproducible from the test suite / `kessel-bench`, and
 each query accelerator is guarded by a randomized equivalence oracle

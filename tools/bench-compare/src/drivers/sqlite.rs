@@ -13,7 +13,7 @@
 //! artifact. We report the resulting numbers and call it out in the
 //! BENCHMARKS.md "SQLite write-concurrency note".
 
-use crate::workloads::Workload;
+use crate::workloads::{sysbench, Workload};
 use crate::{pct_us, BenchResult, Cli};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -26,7 +26,11 @@ pub fn run(
     trial: u32,
     cli: &Cli,
 ) -> anyhow::Result<BenchResult> {
-    run_ycsb_mixed(*workload, n, trial, cli)
+    if workload.is_sysbench() {
+        run_sysbench_oltp(*workload, n, trial, cli)
+    } else {
+        run_ycsb_mixed(*workload, n, trial, cli)
+    }
 }
 
 fn pragmas(c: &Connection) -> anyhow::Result<()> {
@@ -172,6 +176,245 @@ fn run_ycsb_mixed(
              target write_ratio={:.2} actual={:.3}; single-writer-at-a-time \
              (rollback journal lock; N>1 writers serialize via busy_timeout)",
             write_ratio, actual_wr
+        )),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// sysbench OLTP (T3)
+// ---------------------------------------------------------------------------
+
+fn run_sysbench_oltp(
+    workload: Workload,
+    n: usize,
+    trial: u32,
+    cli: &Cli,
+) -> anyhow::Result<BenchResult> {
+    let tables = cli.tables;
+    let rows_per_table = cli.rows_per_table;
+    let duration = Duration::from_secs(cli.duration);
+    let needs_write = workload.sysbench_has_writes();
+    if tables == 0 || rows_per_table == 0 {
+        anyhow::bail!("sqlite sysbench: --tables and --rows-per-table must be >0");
+    }
+
+    let path = cli.sqlite_path.clone();
+    let _ = std::fs::remove_file(&path);
+
+    let setup = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+    )?;
+    pragmas(&setup)?;
+
+    // Create N tables. Each gets a secondary index on `k`.
+    let mut ddl = String::new();
+    for t in 1..=tables {
+        ddl.push_str(&format!(
+            "CREATE TABLE IF NOT EXISTS sbtest{t} (
+                id INTEGER PRIMARY KEY,
+                k INTEGER NOT NULL DEFAULT 0,
+                c BLOB NOT NULL,
+                pad BLOB NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS sbtest{t}_k ON sbtest{t}(k);"
+        ));
+    }
+    setup.execute_batch(&ddl)?;
+
+    // Load.
+    let mut rng = SmallRng::seed_from_u64(0xA5A5_5A5A ^ trial as u64);
+    setup.execute("BEGIN", [])?;
+    for t in 1..=tables {
+        let stmt_sql = format!("INSERT INTO sbtest{t} (id, k, c, pad) VALUES (?1, ?2, ?3, ?4)");
+        let mut stmt = setup.prepare(&stmt_sql)?;
+        let mut c_buf = vec![0u8; sysbench::C_WIDTH];
+        let mut pad_buf = vec![0u8; sysbench::PAD_WIDTH];
+        for i in 0..rows_per_table {
+            rng.fill(&mut c_buf[..]);
+            rng.fill(&mut pad_buf[..]);
+            let k = rng.gen::<i32>();
+            stmt.execute(params![i as i64, k, &c_buf[..], &pad_buf[..]])?;
+        }
+    }
+    setup.execute("COMMIT", [])?;
+    setup.execute_batch("ANALYZE")?;
+    drop(setup);
+
+    let started = Instant::now();
+    let stop_at = started + duration;
+    let mut handles = Vec::with_capacity(n);
+    let has_reads = workload.sysbench_has_reads();
+    let has_writes = workload.sysbench_has_writes();
+    for tid in 0..n {
+        let path = path.clone();
+        let h = std::thread::spawn(move || -> anyhow::Result<(u64, u64, Vec<u64>)> {
+            let flags = if needs_write {
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            } else {
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            };
+            let c = Connection::open_with_flags(&path, flags)?;
+            pragmas(&c)?;
+            c.busy_timeout(Duration::from_secs(10))?;
+            // Prepare per-table statements.
+            #[allow(clippy::type_complexity)]
+            struct PerTable<'a> {
+                point: rusqlite::Statement<'a>,
+                simple_range: rusqlite::Statement<'a>,
+                sum_range: rusqlite::Statement<'a>,
+                order_range: rusqlite::Statement<'a>,
+                distinct_range: rusqlite::Statement<'a>,
+                upd_idx: rusqlite::Statement<'a>,
+                upd_nix: rusqlite::Statement<'a>,
+                del: rusqlite::Statement<'a>,
+                ins: rusqlite::Statement<'a>,
+            }
+            // rusqlite Statements borrow Connection — keep them on the stack
+            // via a Vec<PerTable<'a>> with the same lifetime as c.
+            let mut tables_v: Vec<PerTable> = Vec::with_capacity(tables);
+            for t in 1..=tables {
+                tables_v.push(PerTable {
+                    point: c.prepare(&format!("SELECT c FROM sbtest{t} WHERE id = ?1"))?,
+                    simple_range: c.prepare(&format!(
+                        "SELECT c FROM sbtest{t} WHERE id BETWEEN ?1 AND ?2"
+                    ))?,
+                    sum_range: c.prepare(&format!(
+                        "SELECT SUM(k) FROM sbtest{t} WHERE id BETWEEN ?1 AND ?2"
+                    ))?,
+                    order_range: c.prepare(&format!(
+                        "SELECT c FROM sbtest{t} WHERE id BETWEEN ?1 AND ?2 ORDER BY c"
+                    ))?,
+                    distinct_range: c.prepare(&format!(
+                        "SELECT DISTINCT c FROM sbtest{t} WHERE id BETWEEN ?1 AND ?2 ORDER BY c"
+                    ))?,
+                    upd_idx: c.prepare(&format!("UPDATE sbtest{t} SET k = k + 1 WHERE id = ?1"))?,
+                    upd_nix: c.prepare(&format!("UPDATE sbtest{t} SET c = ?2 WHERE id = ?1"))?,
+                    del: c.prepare(&format!("DELETE FROM sbtest{t} WHERE id = ?1"))?,
+                    ins: c.prepare(&format!(
+                        "INSERT INTO sbtest{t} (id, k, c, pad) VALUES (?1, ?2, ?3, ?4)"
+                    ))?,
+                });
+            }
+
+            let mut rng = SmallRng::seed_from_u64(0xDEAD_BEEF ^ (tid as u64) ^ (trial as u64));
+            let mut count_txns = 0u64;
+            let mut count_inner = 0u64;
+            let mut lat = Vec::with_capacity(1 << 16);
+            let mut c_buf = vec![0u8; sysbench::C_WIDTH];
+            let mut pad_buf = vec![0u8; sysbench::PAD_WIDTH];
+            loop {
+                if Instant::now() >= stop_at {
+                    break;
+                }
+                let table_idx = rng.gen_range(0..tables);
+                let p = &mut tables_v[table_idx];
+                let mut inner_count = 0u64;
+                let s = Instant::now();
+                // SQLite uses BEGIN IMMEDIATE for writers (locks the DB
+                // for writes immediately, avoiding upgrade-from-shared
+                // deadlocks). RO transactions use plain BEGIN.
+                if has_writes {
+                    c.execute_batch("BEGIN IMMEDIATE")?;
+                } else {
+                    c.execute_batch("BEGIN")?;
+                }
+
+                if has_reads {
+                    let pk = rng.gen_range(0..rows_per_table as i64);
+                    let _: rusqlite::Result<Vec<u8>> =
+                        p.point.query_row(params![pk], |row| row.get(0));
+                    inner_count += 1;
+                    for which in 0..4 {
+                        let lo = rng.gen_range(
+                            0..(rows_per_table.saturating_sub(sysbench::RANGE_WIDTH)) as i64,
+                        );
+                        let hi = lo + sysbench::RANGE_WIDTH as i64 - 1;
+                        let st = match which {
+                            0 => &mut p.simple_range,
+                            1 => &mut p.sum_range,
+                            2 => &mut p.order_range,
+                            _ => &mut p.distinct_range,
+                        };
+                        let mut rows = st.query(params![lo, hi])?;
+                        while let Some(_r) = rows.next()? {}
+                        inner_count += 1;
+                    }
+                    for _ in 0..sysbench::POINT_SELECTS {
+                        let pk = rng.gen_range(0..rows_per_table as i64);
+                        let _: rusqlite::Result<Vec<u8>> =
+                            p.point.query_row(params![pk], |row| row.get(0));
+                        inner_count += 1;
+                    }
+                }
+
+                if has_writes {
+                    let pk = rng.gen_range(0..rows_per_table as i64);
+                    p.upd_idx.execute(params![pk])?;
+                    inner_count += 1;
+                    let pk = rng.gen_range(0..rows_per_table as i64);
+                    rng.fill(&mut c_buf[..]);
+                    p.upd_nix.execute(params![pk, &c_buf[..]])?;
+                    inner_count += 1;
+                    let shadow_id: i64 = (rows_per_table as i64)
+                        + (tid as i64) * 65_536
+                        + ((count_txns % 65_536) as i64);
+                    p.del.execute(params![shadow_id])?;
+                    inner_count += 1;
+                    let k = rng.gen::<i32>();
+                    rng.fill(&mut c_buf[..]);
+                    rng.fill(&mut pad_buf[..]);
+                    p.ins.execute(params![shadow_id, k, &c_buf[..], &pad_buf[..]])?;
+                    inner_count += 1;
+                }
+
+                c.execute_batch("COMMIT")?;
+                lat.push(s.elapsed().as_nanos() as u64);
+                count_txns += 1;
+                count_inner += inner_count;
+            }
+            Ok((count_txns, count_inner, lat))
+        });
+        handles.push(h);
+    }
+    let mut total_txns = 0u64;
+    let mut total_inner = 0u64;
+    let mut lat_ns: Vec<u64> = Vec::new();
+    for h in handles {
+        let (txns, inner, l) = h.join().expect("sqlite worker panicked")?;
+        total_txns += txns;
+        total_inner += inner;
+        lat_ns.extend(l);
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    lat_ns.sort_unstable();
+
+    let _ = std::fs::remove_file(&path);
+
+    Ok(BenchResult {
+        db: "sqlite".into(),
+        workload: workload.name().to_string(),
+        n,
+        trial,
+        ops_per_sec: total_txns as f64 / elapsed,
+        p50_us: pct_us(&lat_ns, 0.50),
+        p99_us: pct_us(&lat_ns, 0.99),
+        p99_99_us: pct_us(&lat_ns, 0.9999),
+        runtime_secs: elapsed,
+        rows: tables * rows_per_table,
+        note: Some(format!(
+            "sqlite via rusqlite-bundled; journal_mode=MEMORY synchronous=OFF; \
+             BEGIN{} / COMMIT brackets each txn; SERIALIZABLE isolation \
+             (SQLite's default — single-writer-at-a-time via the rollback journal lock); \
+             tables={}, rows/tbl={}; inner-ops/txn ≈ {:.1}; reported ops/sec = transactions/sec",
+            if has_writes { " IMMEDIATE" } else { "" },
+            tables,
+            rows_per_table,
+            if total_txns > 0 {
+                total_inner as f64 / total_txns as f64
+            } else {
+                0.0
+            },
         )),
     })
 }

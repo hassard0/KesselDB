@@ -183,6 +183,16 @@ pub fn run(
              YCSB-A/B writes to a misleading TB operation. See \
              drivers/tigerbeetle.rs header for full reasoning."
         }
+        Workload::OltpRO | Workload::OltpWO | Workload::OltpRW => {
+            "TigerBeetle has no arbitrary-SQL transaction primitive. Its \
+             API is account/transfer-shaped: create_transfers commits \
+             double-entry ledger movements atomically, but that is NOT a \
+             row-shape multi-statement BEGIN/COMMIT block. The sysbench \
+             OLTP workloads (sbtestN tables with `(id INT, k INT, c CHAR, \
+             pad CHAR)` rows + SELECT/UPDATE/DELETE/INSERT brackets) do \
+             not map honestly onto TB's ledger model. We refuse to translate \
+             — see drivers/tigerbeetle.rs header + BENCHMARKS.md §3c/§3d/§3e."
+        }
     };
     Ok(BenchResult {
         db: "tigerbeetle".into(),

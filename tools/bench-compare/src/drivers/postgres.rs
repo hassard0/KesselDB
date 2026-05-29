@@ -1,9 +1,11 @@
 //! Postgres driver via the `postgres` crate (sync), one connection per worker
-//! thread. T1 ships YCSB-C; T2+ extends with write paths.
+//! thread. T1 shipped YCSB-C; T2 adds YCSB-A (50/50) and YCSB-B (95/5).
 //!
 //! Configuration:
 //! - `synchronous_commit = on` (default) → matches KesselDB's
 //!   AutosyncMode::EveryCommit durability promise.
+//! - Table is UNLOGGED for symmetry with KesselDB MemVfs / SQLite
+//!   journal_mode=MEMORY (the "in-memory engine" parity tier).
 //! - Connection: sync `postgres::Client`, one per worker thread.
 
 use crate::workloads::Workload;
@@ -19,24 +21,29 @@ pub fn run(
     trial: u32,
     cli: &Cli,
 ) -> anyhow::Result<BenchResult> {
-    match workload {
-        Workload::YcsbC => run_ycsb_c(n, trial, cli),
-    }
+    run_ycsb_mixed(*workload, n, trial, cli)
 }
 
 fn schema_sql() -> &'static str {
     // YCSB schema: id PK + 10 random 100-byte fields. We use a single
     // bytea payload column for the field bundle — point-read throughput
-    // is the measured property, not column-projection cost.
+    // is the measured property, not column-projection cost. UPDATE replaces
+    // the whole payload, matching the KesselDB Op::Update semantics.
     "CREATE UNLOGGED TABLE IF NOT EXISTS ycsb (
         id BIGINT PRIMARY KEY,
         payload BYTEA NOT NULL
      )"
 }
 
-fn run_ycsb_c(n: usize, trial: u32, cli: &Cli) -> anyhow::Result<BenchResult> {
+fn run_ycsb_mixed(
+    workload: Workload,
+    n: usize,
+    trial: u32,
+    cli: &Cli,
+) -> anyhow::Result<BenchResult> {
     let rows = cli.rows;
     let duration = Duration::from_secs(cli.duration);
+    let write_ratio = workload.write_ratio();
 
     // --- setup: drop + recreate + load on a single connection ---
     let mut setup = Client::connect(&cli.pg_url, NoTls)?;
@@ -84,40 +91,62 @@ fn run_ycsb_c(n: usize, trial: u32, cli: &Cli) -> anyhow::Result<BenchResult> {
     let mut handles = Vec::with_capacity(n);
     for tid in 0..n {
         let url = cli.pg_url.clone();
-        let h = std::thread::spawn(move || -> anyhow::Result<(u64, Vec<u64>)> {
+        let h = std::thread::spawn(move || -> anyhow::Result<(u64, u64, Vec<u64>)> {
             let mut c = Client::connect(&url, NoTls)?;
-            let stmt = c.prepare("SELECT payload FROM ycsb WHERE id = $1")?;
+            let sel = c.prepare("SELECT payload FROM ycsb WHERE id = $1")?;
+            let upd = c.prepare("UPDATE ycsb SET payload = $2 WHERE id = $1")?;
             let mut rng = SmallRng::seed_from_u64(0xDEAD_BEEF ^ (tid as u64) ^ (trial as u64));
-            let mut count = 0u64;
+            let mut count_total = 0u64;
+            let mut count_writes = 0u64;
             let mut lat = Vec::with_capacity(1 << 16);
+            let mut payload = vec![0u8; 1024];
             loop {
                 if Instant::now() >= stop_at {
                     break;
                 }
                 let key = rng.gen_range(0..rows as i64);
-                let s = Instant::now();
-                let rows_back = c.query(&stmt, &[&key])?;
-                lat.push(s.elapsed().as_nanos() as u64);
-                debug_assert!(!rows_back.is_empty());
-                count += 1;
+                let is_write = write_ratio > 0.0 && rng.gen::<f64>() < write_ratio;
+                if is_write {
+                    rng.fill(&mut payload[..]);
+                    payload[..8].copy_from_slice(&key.to_be_bytes());
+                    let s = Instant::now();
+                    let n_rows = c.execute(&upd, &[&key, &&payload[..]])?;
+                    lat.push(s.elapsed().as_nanos() as u64);
+                    debug_assert!(n_rows == 1);
+                    count_writes += 1;
+                } else {
+                    let s = Instant::now();
+                    let rows_back = c.query(&sel, &[&key])?;
+                    lat.push(s.elapsed().as_nanos() as u64);
+                    debug_assert!(!rows_back.is_empty());
+                }
+                count_total += 1;
             }
-            Ok((count, lat))
+            Ok((count_total, count_writes, lat))
         });
         handles.push(h);
     }
     let mut total_ops = 0u64;
+    let mut total_writes = 0u64;
     let mut lat_ns: Vec<u64> = Vec::new();
     for h in handles {
-        let (ops, l) = h.join().expect("postgres worker panicked")?;
+        let (ops, w, l) = h.join().expect("postgres worker panicked")?;
         total_ops += ops;
+        total_writes += w;
         lat_ns.extend(l);
     }
     let elapsed = started.elapsed().as_secs_f64();
     lat_ns.sort_unstable();
 
+    let actual_wr = if total_ops > 0 {
+        total_writes as f64 / total_ops as f64
+    } else {
+        0.0
+    };
+
     Ok(BenchResult {
         db: "postgres".into(),
-        workload: "ycsb-c".into(),
+        workload: workload.name().to_string(),
         n,
         trial,
         ops_per_sec: total_ops as f64 / elapsed,
@@ -126,11 +155,11 @@ fn run_ycsb_c(n: usize, trial: u32, cli: &Cli) -> anyhow::Result<BenchResult> {
         p99_99_us: pct_us(&lat_ns, 0.9999),
         runtime_secs: elapsed,
         rows,
-        note: Some(
-            "postgres 16.x; UNLOGGED table for symmetry with mem-VFS KesselDB; \
-             synchronous_commit=on; loopback TCP via postgres crate"
-                .into(),
-        ),
+        note: Some(format!(
+            "postgres 16.x; UNLOGGED table; synchronous_commit=on; loopback TCP via postgres crate; \
+             target write_ratio={:.2} actual={:.3}",
+            write_ratio, actual_wr
+        )),
     })
 }
 

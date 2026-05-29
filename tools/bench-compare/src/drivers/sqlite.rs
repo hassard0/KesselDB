@@ -6,10 +6,12 @@
 //! This is the "in-memory engine" parity tier. T2 will add a "durable" tier
 //! that exercises WAL + synchronous=FULL on all DBs.
 //!
-//! SQLite is single-writer by design. Multiple connections (`N > 1`) read
-//! concurrently via WAL — but here we use MEMORY journal, so we open one
-//! shared in-memory DB via `file::memory:?cache=shared`. Each worker opens
-//! its own connection.
+//! SQLite is single-writer by design. journal_mode=MEMORY uses a rollback
+//! journal — there is exactly one writer at a time even with multiple
+//! connections. For YCSB-A (50% writes), N>1 workers will contend on the
+//! shared write lock; this is an honest property of SQLite, not a bench
+//! artifact. We report the resulting numbers and call it out in the
+//! BENCHMARKS.md "SQLite write-concurrency note".
 
 use crate::workloads::Workload;
 use crate::{pct_us, BenchResult, Cli};
@@ -24,9 +26,7 @@ pub fn run(
     trial: u32,
     cli: &Cli,
 ) -> anyhow::Result<BenchResult> {
-    match workload {
-        Workload::YcsbC => run_ycsb_c(n, trial, cli),
-    }
+    run_ycsb_mixed(*workload, n, trial, cli)
 }
 
 fn pragmas(c: &Connection) -> anyhow::Result<()> {
@@ -40,9 +40,16 @@ fn pragmas(c: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_ycsb_c(n: usize, trial: u32, cli: &Cli) -> anyhow::Result<BenchResult> {
+fn run_ycsb_mixed(
+    workload: Workload,
+    n: usize,
+    trial: u32,
+    cli: &Cli,
+) -> anyhow::Result<BenchResult> {
     let rows = cli.rows;
     let duration = Duration::from_secs(cli.duration);
+    let write_ratio = workload.write_ratio();
+    let needs_write = workload.has_writes();
 
     // Use a file-backed DB (deleted per trial). file::memory: cache=shared
     // would also work but has more cross-platform footguns; on-disk + journal_mode=MEMORY
@@ -76,41 +83,65 @@ fn run_ycsb_c(n: usize, trial: u32, cli: &Cli) -> anyhow::Result<BenchResult> {
     setup.execute_batch("ANALYZE")?;
     drop(setup);
 
-    // Steady-state: N worker threads, one connection each (read-only flags).
+    // Steady-state: N worker threads, one connection each.
+    // - Read-only workload (YCSB-C): each worker opens read-only.
+    // - Mixed workload (YCSB-A/B): each worker opens read-write; the SQLite
+    //   engine enforces single-writer-at-a-time via the rollback journal lock.
     let started = Instant::now();
     let stop_at = started + duration;
     let mut handles = Vec::with_capacity(n);
     for tid in 0..n {
         let path = path.clone();
-        let h = std::thread::spawn(move || -> anyhow::Result<(u64, Vec<u64>)> {
-            let c = Connection::open_with_flags(
-                &path,
-                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )?;
+        let h = std::thread::spawn(move || -> anyhow::Result<(u64, u64, Vec<u64>)> {
+            let flags = if needs_write {
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            } else {
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            };
+            let c = Connection::open_with_flags(&path, flags)?;
             pragmas(&c)?;
-            let mut stmt = c.prepare("SELECT payload FROM ycsb WHERE id = ?1")?;
+            // Bump the busy timeout so contended writers retry instead of
+            // failing with SQLITE_BUSY when another worker holds the lock.
+            c.busy_timeout(Duration::from_secs(10))?;
+            let mut sel = c.prepare("SELECT payload FROM ycsb WHERE id = ?1")?;
+            let mut upd = c.prepare("UPDATE ycsb SET payload = ?2 WHERE id = ?1")?;
             let mut rng = SmallRng::seed_from_u64(0xDEAD_BEEF ^ (tid as u64) ^ (trial as u64));
-            let mut count = 0u64;
+            let mut count_total = 0u64;
+            let mut count_writes = 0u64;
             let mut lat = Vec::with_capacity(1 << 16);
+            let mut payload = vec![0u8; 1024];
             loop {
                 if Instant::now() >= stop_at {
                     break;
                 }
                 let key = rng.gen_range(0..rows as i64);
-                let s = Instant::now();
-                let _v: Vec<u8> = stmt.query_row(params![key], |row| row.get(0))?;
-                lat.push(s.elapsed().as_nanos() as u64);
-                count += 1;
+                let is_write = write_ratio > 0.0 && rng.gen::<f64>() < write_ratio;
+                if is_write {
+                    rng.fill(&mut payload[..]);
+                    payload[..8].copy_from_slice(&key.to_le_bytes());
+                    let s = Instant::now();
+                    let n_rows = upd.execute(params![key, &payload[..]])?;
+                    lat.push(s.elapsed().as_nanos() as u64);
+                    debug_assert!(n_rows == 1);
+                    count_writes += 1;
+                } else {
+                    let s = Instant::now();
+                    let _v: Vec<u8> = sel.query_row(params![key], |row| row.get(0))?;
+                    lat.push(s.elapsed().as_nanos() as u64);
+                }
+                count_total += 1;
             }
-            Ok((count, lat))
+            Ok((count_total, count_writes, lat))
         });
         handles.push(h);
     }
     let mut total_ops = 0u64;
+    let mut total_writes = 0u64;
     let mut lat_ns: Vec<u64> = Vec::new();
     for h in handles {
-        let (ops, l) = h.join().expect("sqlite worker panicked")?;
+        let (ops, w, l) = h.join().expect("sqlite worker panicked")?;
         total_ops += ops;
+        total_writes += w;
         lat_ns.extend(l);
     }
     let elapsed = started.elapsed().as_secs_f64();
@@ -119,9 +150,15 @@ fn run_ycsb_c(n: usize, trial: u32, cli: &Cli) -> anyhow::Result<BenchResult> {
     // Best-effort cleanup; ignore failures.
     let _ = std::fs::remove_file(&path);
 
+    let actual_wr = if total_ops > 0 {
+        total_writes as f64 / total_ops as f64
+    } else {
+        0.0
+    };
+
     Ok(BenchResult {
         db: "sqlite".into(),
-        workload: "ycsb-c".into(),
+        workload: workload.name().to_string(),
         n,
         trial,
         ops_per_sec: total_ops as f64 / elapsed,
@@ -130,10 +167,11 @@ fn run_ycsb_c(n: usize, trial: u32, cli: &Cli) -> anyhow::Result<BenchResult> {
         p99_99_us: pct_us(&lat_ns, 0.9999),
         runtime_secs: elapsed,
         rows,
-        note: Some(
-            "sqlite via rusqlite-bundled; journal_mode=MEMORY synchronous=OFF \
-             (parity with KesselDB MemVfs / Postgres UNLOGGED durability tier)"
-                .into(),
-        ),
+        note: Some(format!(
+            "sqlite via rusqlite-bundled; journal_mode=MEMORY synchronous=OFF; \
+             target write_ratio={:.2} actual={:.3}; single-writer-at-a-time \
+             (rollback journal lock; N>1 writers serialize via busy_timeout)",
+            write_ratio, actual_wr
+        )),
     })
 }

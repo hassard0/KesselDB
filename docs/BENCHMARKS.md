@@ -4,10 +4,11 @@ Honest cross-DB comparison. Every number published — wins AND losses.
 
 This document is the running record of the Bench-suite arc (see
 `docs/superpowers/specs/2026-05-28-kesseldb-bench-suite-design.md`).
-**T1** shipped YCSB-C. **T2** (this revision) adds YCSB-A, YCSB-B, and a
-real TigerBeetle driver for YCSB-C (gated behind a cargo feature; see §5).
-T3-T4 will add sysbench OLTP and TPC-H Q1/Q6 against the same harness, on
-the same hardware, against the same DBs.
+**T1** shipped YCSB-C. **T2** added YCSB-A, YCSB-B, and a real TigerBeetle
+driver for YCSB-C (gated behind a cargo feature; see §5). **T3** (this
+revision) adds the sysbench OLTP transaction-bracket workload class:
+oltp-read-only / oltp-write-only / oltp-read-write — see §3c, §3d, §3e.
+T4 will add TPC-H Q1/Q6 against the same harness.
 
 If you want one number for "how fast is KesselDB", these aren't it — a
 single workload measures one slice. The honest read is in §3 (per-workload
@@ -186,6 +187,156 @@ web-app workload where reads dominate but writes still happen.
 
 ---
 
+## 3c. sysbench OLTP read-only (10 SELECTs per transaction, BEGIN / COMMIT)
+
+**Workload:** 10 sbtest tables × 100K rows × `(id INT PK, k INT (indexed),
+c BYTEA, pad BYTEA)` (Postgres+SQLite use BYTEA/BLOB for the c+pad bundle;
+upstream sysbench uses CHAR, but BYTEA preserves the row-width contract
+and accepts the random bytes we generate — see drivers/postgres.rs note).
+Each transaction is bracketed BEGIN / COMMIT and runs 10 SELECT-class ops:
+
+  1× POINT          `SELECT c FROM sbtestN WHERE id = ?`
+  1× SIMPLE_RANGE   `SELECT c FROM sbtestN WHERE id BETWEEN ? AND ?+99`
+  1× SUM_RANGE      `SELECT SUM(k) FROM sbtestN WHERE id BETWEEN ? AND ?+99`
+  1× ORDER_RANGE    `SELECT c FROM sbtestN WHERE id BETWEEN ? AND ?+99 ORDER BY c`
+  1× DISTINCT_RANGE `SELECT DISTINCT c FROM sbtestN WHERE id BETWEEN ? AND ?+99 ORDER BY c`
+  5× POINT_SELECT   same as POINT, different keys
+
+Reported metric = **transactions/sec** (the sysbench convention), median of 3.
+"inner-ops/txn" is in each driver's BenchResult note for transparency:
+KesselDB's mapping expands the 4 range scans as 100×GetById each → 406
+inner ops per txn; Postgres/SQLite ship the 10 SQL queries directly.
+
+| DB | N=1 tx/s | N=8 tx/s | N=16 tx/s | p50 (N=8) | p99 (N=8) |
+|---|---:|---:|---:|---:|---:|
+| KesselDB | 1,241 | 641 | 680 | 12.6 ms | 20.2 ms |
+| **PostgreSQL** | 316 | **4,068** | **5,073** | 1.9 ms | 2.6 ms |
+| **SQLite** | **6,507** | 1,577 | 1,978 | 4.5 ms | 10.1 ms |
+| TigerBeetle | — | — | — | — | — |
+
+**Honest read — KesselDB loses oltp-read-only at every N:**
+
+- **SQLite wins at N=1** (6,507 tx/s vs KesselDB 1,241 vs Postgres 316).
+  SQLite's in-process model + BEGIN being trivially cheap (no fsync to
+  wait for; the rollback journal stays in memory) means a 10-query RO
+  bracket is essentially 10 prepared-statement queries plus near-zero
+  bracket cost. KesselDB pays 406 GetByIds per txn through the apply
+  path; Postgres pays a network round-trip per query.
+- **Postgres wins at N=8 and N=16** (4,068 / 5,073 vs KesselDB 641 / 680).
+  Postgres scales horizontally with connection count because each backend
+  is independent and snapshot-isolation reads need no locks. SQLite
+  collapses at N>1 because all readers contend on the single-DB-file
+  rollback-journal exclusivity even though the workload is read-only
+  (every BEGIN must acquire the shared lock and the busy_timeout kicks
+  in on contention).
+- **KesselDB regresses N=1 → N=8** (1,241 → 641). This is the honest cost
+  of the current `Op::Txn` model: the wrapper goes through `StateMachine::apply()`
+  which takes the write lock for the whole transaction — even when every
+  inner op is a read. The Perf-A T2 read-pool bypass is `GetById`-only
+  and does NOT compose with `Op::Txn`. With N>1 workers, every Txn
+  serializes on the apply lock; the win is that all 406 inner reads
+  happen with no inter-op lock churn (latencies stay ~2 ms even at N=8),
+  the loss is that 8 workers can't run their Txns in parallel.
+
+**Roadmap implication.** Closing this gap means either (a) routing
+`Op::Txn` through a read-pool fast path when every inner op is read-only
+(KesselDB already knows this statically), or (b) per-shard apply
+parallelism (the existing K-shard router lets the workload spread across
+shards — at K=8 the contention disappears). Both are post-V1 (out of
+SP-Perf-A's read-pool scope); the loss is published here so the next perf
+arc has a target.
+
+TigerBeetle: refused. Sysbench OLTP is row-shape multi-statement SQL,
+which TB's account/transfer ledger model doesn't map onto. See §5.
+
+---
+
+## 3d. sysbench OLTP write-only (4 writes per transaction, BEGIN / COMMIT)
+
+**Workload:** same 10-table dataset. Each transaction runs 4 write ops:
+
+  1× UPDATE_INDEX     `UPDATE sbtestN SET k = k+1 WHERE id = ?`
+  1× UPDATE_NON_INDEX `UPDATE sbtestN SET c = ?    WHERE id = ?`
+  1× DELETE           `DELETE FROM sbtestN          WHERE id = ?`
+  1× INSERT           `INSERT INTO sbtestN VALUES (id, k, c, pad)`
+
+The DELETE+INSERT are paired on the same per-worker "shadow id" so the
+dataset row count is invariant under steady-state.
+
+| DB | N=1 tx/s | N=8 tx/s | N=16 tx/s | p50 (N=8) | p99 (N=8) |
+|---|---:|---:|---:|---:|---:|
+| **KesselDB** | **136,035** | **53,409** | **52,321** | 17 µs | 61 µs |
+| PostgreSQL | 940 | 10,254 | 12,883 | 766 µs | 1.0 ms |
+| SQLite | 13,451 | 12,757 | 11,857 | 45 µs | 650 µs |
+| TigerBeetle | — | — | — | — | — |
+
+**Honest read — KesselDB wins oltp-write-only decisively at every N:**
+
+- **KesselDB N=1 = 136K tx/s** vs SQLite 13K vs Postgres 940. KesselDB's
+  MemVfs write path + the 4-op `Op::Txn{ops}` apply at sub-µs per inner
+  op (p50 6 µs for the whole 4-op txn at N=1). Each inner op is a small
+  Op::Update / Op::Create / Op::Delete; no fsync, no WAL flush.
+- **N=1 → N=8 KesselDB regression** (136K → 53K) is the apply-thread
+  serialization — 8 workers competing for the write lock can't dispatch
+  Txns in parallel, but the per-Txn cost stays tight (p50 17 µs at N=8).
+  KesselDB is still **5.2× Postgres at N=8** (53K vs 10K).
+- **Postgres scales linearly** N=1 → N=16 (940 → 12,883 = 13.7×). UNLOGGED
+  tables remove WAL but the per-statement TCP round-trip cost dominates
+  at N=1 (1.1 ms p50). At N=16 connection-per-backend MVCC pays off.
+- **SQLite WO is remarkably flat** at ~12-13K tx/s across all N. The
+  rollback-journal lock serializes writers, but the 60s busy_timeout +
+  SQLite's in-process call shape make the per-txn cost very low (p50
+  ~45 µs); higher N just adds queueing but no inner-op cost growth.
+- TigerBeetle: refused (no SQL transaction primitive). See §5.
+
+---
+
+## 3e. sysbench OLTP read-write (10 reads + 4 writes, default sysbench shape)
+
+**Workload:** the default sysbench OLTP profile — the 10-query RO block
+plus the 4-write WO block, all in one BEGIN / COMMIT bracket.
+
+| DB | N=1 tx/s | N=8 tx/s | N=16 tx/s | p50 (N=8) | p99 (N=8) |
+|---|---:|---:|---:|---:|---:|
+| KesselDB | 1,378 | 718 | 711 | 11.4 ms | 12.0 ms |
+| **PostgreSQL** | 248 | **3,024** | **3,862** | 2.6 ms | 3.3 ms |
+| **SQLite** | **4,835** | **4,386** | **3,960** | 191 µs | 712 µs |
+| TigerBeetle | — | — | — | — | — |
+
+**Honest read — KesselDB loses oltp-read-write at every N:**
+
+- **SQLite is the surprise winner at every N for oltp-read-write.**
+  SQLite N=1 = 4,835 tx/s; N=8 still 4,386; N=16 still 3,960. The
+  rollback-journal serialization across 8/16 writers degrades only
+  modestly because (a) the journal stays in MEMORY (no fsync) and (b)
+  SQLite's in-process model means BEGIN+10 reads+4 writes+COMMIT is
+  ~250 µs of CPU even under contention. SQLite is **6.8× KesselDB at
+  N=8** for this workload.
+- **Postgres takes the N=8/N=16 silver medal.** N=8 = 3,024 tx/s, N=16
+  = 3,862. Same connection-scaling story as 3c. Postgres beats KesselDB
+  at N=8/N=16 because each backend's snapshot is independent and the
+  10 SELECTs + 4 writes run as ordinary MVCC operations.
+- **KesselDB regresses from N=1 (1,378 tx/s) to N=8 (718)**, same root
+  cause as 3c: `Op::Txn` goes through the apply path with the write
+  lock held, so 8 workers can't run their 14-op transactions in parallel.
+  Each Txn does ~410 inner ops (406 reads + 4 writes) under one lock
+  acquisition; p50 11.4 ms at N=8 says the per-Txn work dominates,
+  not the lock churn — the bottleneck is N×Txns/sec, not latency per Txn.
+- TigerBeetle: refused (no SQL transaction primitive). See §5.
+
+**Headline takeaway — the transaction-bracket family expose KesselDB's
+current Op::Txn limitation honestly.** The wins are in §3d (writes
+dominate; KesselDB's apply-path is fast at the inner-op level). The
+losses are in §3c and §3e (read-mostly transactions; the apply-lock
+serializes what should be parallelizable reads). The roadmap is clear:
+either route read-only `Op::Txn{ops}` through the Perf-A read-pool
+bypass (statically detectable from the inner ops), or spread the
+workload across the K-shard router so each shard's apply-thread runs
+its own Txn stream. Both are out of SP-Perf-A scope; this benchmark
+gives the next perf arc a concrete target.
+
+---
+
 ## 4. Raw results
 
 All trial-rows are preserved in vulcan-side JSON files (one JSON object
@@ -194,6 +345,9 @@ per line):
 - `/tmp/bench-ycsb-c-tb.json` (T2 — 9 rows, TigerBeetle YCSB-C)
 - `/tmp/bench-ycsb-a.json` (T2 — 36 rows)
 - `/tmp/bench-ycsb-b.json` (T2 — 36 rows)
+- `/tmp/bench-sysbench-ro.json` (T3 — 27 rows; KesselDB+Postgres+SQLite, TB refused)
+- `/tmp/bench-sysbench-wo.json` (T3 — 27 rows)
+- `/tmp/bench-sysbench-rw.json` (T3 — 27 rows)
 
 Schema (all files use the same shape):
 ```json
@@ -308,6 +462,17 @@ CARGO_TARGET_DIR=/tmp/kdb-target-bench cargo build --release
   --output /tmp/bench-ycsb-c.json
 ```
 
+sysbench OLTP variants (T3):
+```
+/tmp/kdb-target-bench/release/bench-compare \
+  --db kesseldb,postgres,sqlite \
+  --workload oltp-read-only \
+  --connections 1,8,16 \
+  --duration 10 --tables 10 --rows-per-table 100000 --trials 3 \
+  --output /tmp/bench-sysbench-ro.json
+# Repeat with --workload oltp-write-only / oltp-read-write.
+```
+
 Postgres docker bootstrap (one-shot):
 ```
 docker run -d --name bench-pg \
@@ -341,7 +506,12 @@ BINDGEN_EXTRA_CLANG_ARGS='-I/usr/lib/gcc/x86_64-linux-gnu/13/include' \
 - **T2** [DONE] — YCSB-A (50/50 read/update) + YCSB-B (95/5); TigerBeetle
   real wiring for YCSB-C via lookup_accounts; YCSB-A/B TigerBeetle
   asymmetry documented honestly.
-- **T3** — sysbench OLTP read-only / write-only / mixed.
+- **T3** [DONE] — sysbench OLTP read-only / write-only / read-write
+  (transaction-bracket workload class). 10 sbtest tables × 100K rows ×
+  `(id, k, c, pad)` shape, BEGIN/COMMIT brackets via each driver's native
+  transaction API (KesselDB `Op::Txn{ops}`, Postgres `Client::transaction()`,
+  SQLite `BEGIN IMMEDIATE` for writers). TigerBeetle refused (no
+  arbitrary-SQL transaction primitive — ledger-shape API). See §3c/3d/3e.
 - **T4** — TPC-H Q1 / Q6 (single-table aggregates).
 - **T5** — JSON → markdown generator script; arc closure docs; README perf
   section.

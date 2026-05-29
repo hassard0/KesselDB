@@ -127,13 +127,123 @@ vulcan:/tmp/bench-ycsb-b.json (36 rows), vulcan:/tmp/bench-ycsb-c-tb.json
 
 ---
 
-## T3 — sysbench OLTP [PLANNED]
+## T3 — sysbench OLTP [DONE_WITH_CONCERNS]
 
-- 10 tables × 100K rows × `(id, k, c, pad)` shape with secondary index on `k`.
-- 3 sub-workloads: oltp-read-only (10 SELECT/tx), oltp-write-only (4 writes/tx),
-  oltp-mixed (10+4/tx). 1 tx = the bench unit.
-- Add a transaction-bracket API to each driver (KesselDB BeginTx / CommitTx,
-  Postgres BEGIN/COMMIT, SQLite BEGIN/COMMIT).
+Commits (in order):
+- `7826f75` feat(bench-compare) — workload definitions + CLI surface
+  (`--tables`, `--rows-per-table` flags; OltpRO/OltpWO/OltpRW variants in
+  `workloads::Workload`; per-shape helpers `is_sysbench()`,
+  `sysbench_has_reads/writes()`; named constants in `workloads::sysbench`)
+- `bb5d5f0` feat(bench-compare) — driver tx-bracket support across all 4
+  drivers (KesselDB Op::Txn{ops}; Postgres Client::transaction(); SQLite
+  BEGIN IMMEDIATE for writers / BEGIN for RO; TigerBeetle honest skip)
+- `c5d9c9c` fix(bench-compare/postgres) — switch sysbench c+pad to BYTEA
+  (Postgres CHAR rejects arbitrary binary bytes in COPY BINARY)
+- `28c4b5a` fix(bench-compare/sqlite) — treat SQLITE_BUSY as abort (not
+  crash); busy_timeout 10s → 60s; new (txns, inner, aborts, lat)
+  return; abort% in note. Was needed to get SQLite N=8/N=16 WO+RW
+  through 60s of high write contention.
+- (next) docs(bench) — BENCHMARKS.md §3c/§3d/§3e + STATUS + this tracker
+
+Run shape on vulcan (3 trials × 10s × 10 tables × 100K rows/table = 1M
+total rows per DB per trial; load is NOT included in the measured 10s):
+
+```
+ssh admin@192.168.4.178
+cd ~/KesselDB && git pull && cd tools/bench-compare
+source ~/.cargo/env
+CARGO_TARGET_DIR=/tmp/kdb-target-bench cargo build --release
+/tmp/kdb-target-bench/release/bench-compare \
+  --db kesseldb,postgres,sqlite \
+  --workload oltp-read-only \
+  --connections 1,8,16 --duration 10 --tables 10 \
+  --rows-per-table 100000 --trials 3 \
+  --output /tmp/bench-sysbench-ro.json
+# Repeat with --workload oltp-write-only / oltp-read-write.
+```
+
+sysbench OLTP read-only results (3-trial median, tx/s):
+
+| DB | N=1 | N=8 | N=16 | p50 (N=8) | p99 (N=8) |
+|---|---:|---:|---:|---:|---:|
+| KesselDB | 1,241 | 641 | 680 | 12,642 µs | 20,203 µs |
+| Postgres | 316 | 4,068 | 5,073 | 1,931 µs | 2,553 µs |
+| SQLite | 6,507 | 1,577 | 1,978 | 4,548 µs | 10,096 µs |
+| TigerBeetle | — | — | — | — | — |
+
+sysbench OLTP write-only results (3-trial median, tx/s):
+
+| DB | N=1 | N=8 | N=16 | p50 (N=8) | p99 (N=8) |
+|---|---:|---:|---:|---:|---:|
+| KesselDB | 136,035 | 53,409 | 52,321 | 17 µs | 61 µs |
+| Postgres | 940 | 10,254 | 12,883 | 766 µs | 1,044 µs |
+| SQLite | 13,451 | 12,757 | 11,857 | 45 µs | 650 µs |
+| TigerBeetle | — | — | — | — | — |
+
+sysbench OLTP read-write results (3-trial median, tx/s):
+
+| DB | N=1 | N=8 | N=16 | p50 (N=8) | p99 (N=8) |
+|---|---:|---:|---:|---:|---:|
+| KesselDB | 1,378 | 718 | 711 | 11,352 µs | 11,998 µs |
+| Postgres | 248 | 3,024 | 3,862 | 2,608 µs | 3,349 µs |
+| SQLite | 4,835 | 4,386 | 3,960 | 191 µs | 712 µs |
+| TigerBeetle | — | — | — | — | — |
+
+Honest takeaways:
+- **oltp-read-only**: KesselDB LOSES at every N. SQLite wins N=1 (6.5K
+  tx/s, in-process + cheap journal); Postgres wins N=8/N=16 (5K tx/s,
+  true read-concurrency from per-backend MVCC snapshots). KesselDB's
+  Op::Txn wrapper goes through the apply path which takes the write lock
+  for the WHOLE transaction — even when every inner op is `GetById`. The
+  Perf-A T2 read-pool bypass is `GetById`-only and does NOT compose with
+  `Op::Txn`. Roadmap: route RO Op::Txn through the read-pool fast path
+  (statically knowable from Op::Txn{ops}) OR per-shard apply parallelism
+  via the K-shard router. Both are post-V1.
+- **oltp-write-only**: KesselDB WINS decisively at every N. N=1 = 136K
+  tx/s (= 10× SQLite + 145× Postgres). N=8/16 ~52K (= 4× SQLite + 5×
+  Postgres). The MemVfs no-fsync write path plus the tight Op::Txn{ops}
+  apply loop dominates. SQLite stays surprisingly flat ~12K across N
+  (rollback-journal serialization is fast in MEMORY mode). Postgres
+  is slow at N=1 (940) because BEGIN+4 ops+COMMIT = ~6 TCP RTTs.
+- **oltp-read-write**: KesselDB LOSES at every N. SQLite wins everywhere
+  (~4-5K tx/s — surprising; in-process model + MEMORY journal beats both
+  Postgres and KesselDB on the 14-op RW shape). Postgres takes silver at
+  N=8/N=16 (3-4K tx/s). KesselDB sits at ~700-1,400 tx/s, bottlenecked
+  by the same apply-lock serialization that hurts oltp-read-only.
+- **Headline**: KesselDB wins ONE of the 3 sysbench-OLTP variants
+  (write-only). The other 2 expose Op::Txn's apply-serialization gap.
+  Reported honestly; documented as a roadmap target for the next
+  perf arc.
+- **TigerBeetle**: refused all 3 sysbench variants. TB has no
+  arbitrary-SQL transaction primitive; its account/transfer ledger
+  model doesn't map onto row-shape SELECT/UPDATE/DELETE/INSERT brackets.
+
+Transaction isolation per DB (recorded in each result's `note` field):
+- KesselDB: snapshot isolation (SP112 / S2.3 — `Op::CommitTx` semantics;
+  the `Op::Txn` wrapper inherits SI at the Txn boundary)
+- Postgres: READ COMMITTED (Postgres 16 default)
+- SQLite: SERIALIZABLE (SQLite's only level; single-writer-at-a-time
+  via the rollback journal lock + BEGIN IMMEDIATE for write workloads)
+
+Schema mapping per driver:
+- KesselDB: 10 `sbtest{N}` types in the catalog with schema `(id U64,
+  k I32, c Char(120), pad Char(60))`. RO range scans expand as
+  `RANGE_WIDTH × Op::GetById` since the KesselDB apples-to-apples cost
+  is the same row-by-row read shape. SUM_RANGE / ORDER_RANGE /
+  DISTINCT_RANGE are also expanded as `RANGE_WIDTH × GetById` — the
+  client doesn't fold the SUM/ORDER/DISTINCT (the cost we measure is
+  the I/O cost of returning 100 records, which is what Postgres/SQLite
+  do too). Inner-ops/txn ≈ 406 for RO, 4 for WO, 410 for RW.
+- Postgres: 10 UNLOGGED tables × `(id BIGINT PK, k INTEGER, c BYTEA, pad BYTEA)`
+  with secondary index on k. BYTEA chosen over upstream CHAR because
+  Postgres CHAR rejects arbitrary binary bytes in COPY BINARY; BYTEA
+  preserves row-width contract and ORDER BY semantics (lexicographic
+  byte order).
+- SQLite: 10 tables × `(id INTEGER PK, k INTEGER, c BLOB, pad BLOB)`
+  with secondary index on k. journal_mode=MEMORY, synchronous=OFF.
+- TigerBeetle: refused with explanatory note.
+
+Raw JSON: vulcan:/tmp/bench-sysbench-{ro,wo,rw}.json (27 trial-rows each).
 
 ---
 

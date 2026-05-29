@@ -46,9 +46,19 @@ struct Cli {
     #[arg(long, default_value_t = 10)]
     duration: u64,
 
-    /// Rows to load before the steady-state phase.
+    /// Rows to load before the steady-state phase (YCSB-family workloads).
     #[arg(long, default_value_t = 100_000)]
     rows: usize,
+
+    /// sysbench OLTP: number of tables in the dataset.
+    /// Default matches upstream sysbench `--tables=10`.
+    #[arg(long, default_value_t = 10)]
+    tables: usize,
+
+    /// sysbench OLTP: rows per table in the dataset.
+    /// Default matches upstream sysbench `--table_size=100000`.
+    #[arg(long, default_value_t = 100_000)]
+    rows_per_table: usize,
 
     /// Trials per (db, workload, connections) — median reported.
     #[arg(long, default_value_t = 3)]

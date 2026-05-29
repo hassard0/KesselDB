@@ -301,8 +301,8 @@ pub enum ExtqError {
 pub enum ExtqOutcome {
     /// Successful dispatch — caller emits the bytes verbatim on the
     /// wire. May be empty (e.g. `Flush` doesn't itself encode a
-    /// response; T8 / T7 will route flush requests through the
-    /// per-message flush call).
+    /// response; the dedicated `Flush` outcome below carries that
+    /// case).
     Bytes(Vec<u8>),
     /// Dispatch failure — caller renders the error to an
     /// `ErrorResponse` frame and (for non-Sync messages) enters
@@ -320,6 +320,14 @@ pub enum ExtqOutcome {
     /// introduces the variant so Bind in error_state has the right
     /// shape today.
     Skipped,
+    /// SP-PG-EXTQ T6 — the dispatcher processed an `H` Flush message.
+    /// Per PG §55.2.3 + spec §4 Flush has no associated response —
+    /// the server simply pushes any pending pipelined output to the
+    /// wire. The `server::run_session` loop translates this outcome
+    /// into a `writer.flush()` call WITHOUT writing any bytes.
+    /// Distinct from `Bytes(Vec::new())` so the caller can clearly
+    /// see a flush was requested even when no bytes are pending.
+    Flush,
 }
 
 /// True iff `tag` is one of the seven Extended Query frontend message
@@ -345,16 +353,16 @@ pub fn recognize_extq_tag(tag: u8) -> bool {
 /// (one variant per tag from `extq::proto::ExtqMessage`). The return
 /// value is the outcome the caller renders to wire bytes.
 ///
-/// T4 contract: `Parse`, `Bind`, and `Describe` arms are REAL. The
-/// other four arms (Execute / Sync / Close / Flush) STILL return
-/// `Failed(NotYetImplemented)` — T5..T8 widen them one at a time per
-/// the SP-PG-EXTQ §10 task decomposition.
+/// T6 contract: ALL SEVEN extq arms (Parse / Bind / Describe / Execute
+/// / Sync / Close / Flush) are REAL. Zero `NotYetImplemented` returns.
+/// SP-PG-EXTQ V1 message set is COMPLETE.
 ///
 /// **Engine read-only invariant.** Describe (T4) only calls
 /// `engine.describe_table()` which is the catalog-read entry point;
-/// it does NOT call `apply_sql` and does NOT mutate engine state. T6
-/// (Execute) will use `apply_sql` — but that's mid-pipeline, after
-/// the client's Bind has stored the portal.
+/// it does NOT call `apply_sql` and does NOT mutate engine state.
+/// Execute (T5) uses `apply_sql` mid-pipeline, after the client's
+/// Bind has stored the portal. Close + Flush (T6) do not touch the
+/// engine at all.
 pub fn try_dispatch_extq<E: EngineApply + ?Sized>(
     state: &mut SessionState,
     engine: &E,
@@ -363,10 +371,9 @@ pub fn try_dispatch_extq<E: EngineApply + ?Sized>(
     use proto::ExtqMessage as M;
     // Spec §6 — once a pipelined error has set `error_state = true`,
     // every subsequent extq message is SILENTLY DROPPED until the
-    // dispatcher sees `Sync` (which clears the flag + emits RFQ —
-    // T7 wires that arm). Until T7, Sync itself still hits the
-    // NotYetImplemented arm below so this skip-check is the early
-    // mechanism for B/D/E/C/H to "fall through" after a Bind error.
+    // dispatcher sees `Sync` (which clears the flag + emits RFQ).
+    // Sync is the ONLY tag that breaks out of skip-until-Sync mode;
+    // Close + Flush + everything else gets `Skipped` here.
     if state.error_state {
         if matches!(message, M::Sync) {
             // SP-PG-EXTQ T5 — Sync clears the error_state + emits
@@ -402,8 +409,8 @@ pub fn try_dispatch_extq<E: EngineApply + ?Sized>(
             dispatch_execute(state, engine, portal, max_rows)
         }
         M::Sync => dispatch_sync(state),
-        M::Close { .. } => ExtqOutcome::Failed(ExtqError::NotYetImplemented { tag: FE_CLOSE }),
-        M::Flush => ExtqOutcome::Failed(ExtqError::NotYetImplemented { tag: FE_FLUSH }),
+        M::Close { target, name } => dispatch_close(state, target, name),
+        M::Flush => dispatch_flush(),
     }
 }
 
@@ -1196,6 +1203,73 @@ fn dispatch_sync(state: &mut SessionState) -> ExtqOutcome {
     ExtqOutcome::Bytes(bytes)
 }
 
+/// SP-PG-EXTQ T6 — real handler for the `C` Close message.
+///
+/// Per spec §4 + PG §55.2.3:
+///
+/// - `'S'` (statement) — drop the named statement from
+///   `state.statements`. **Silently no-ops** if the name doesn't
+///   exist (PG §55.2.3: "It is not an error to issue Close against
+///   a nonexistent statement or portal name"). Implicitly drops any
+///   portals that depend on the statement is NOT done by PG — those
+///   portals stay alive until the next Execute (where they'd fail
+///   the defensive `UnknownStatement` lookup) or explicit Close.
+///   V1 mirrors PG exactly.
+/// - `'P'` (portal) — drop the named portal from `state.portals`.
+///   Same silent no-op semantics if the name doesn't exist.
+/// - Anything else — `BadDescribeTarget { target }` → `08P01
+///   protocol_violation` (the same SQLSTATE Describe uses for bad
+///   target bytes; spec §4 treats Close + Describe identically for
+///   target-byte validation).
+///
+/// Always emits `CloseComplete` ('3') on success (5-byte envelope
+/// `3 00 00 00 04` from the T1-byte-locked
+/// `response::encode_close_complete`). Per PG §55.2.3 CloseComplete
+/// is emitted EVEN when the Close was a no-op — the client uses
+/// CloseComplete as a sync-point confirmation that the server saw
+/// the Close.
+///
+/// **Error-recovery side-effect** (spec §6): on the bad-target error
+/// path, set `state.error_state = true` BEFORE returning. The
+/// silent no-op for missing-name does NOT set error_state (it's not
+/// an error per PG §55.2.3).
+fn dispatch_close(state: &mut SessionState, target: u8, name: String) -> ExtqOutcome {
+    match target {
+        crate::proto::DESCRIBE_TARGET_STATEMENT => {
+            // PG §55.2.3: silent no-op if missing.
+            state.statements.remove(&name);
+            ExtqOutcome::Bytes(response::encode_close_complete())
+        }
+        crate::proto::DESCRIBE_TARGET_PORTAL => {
+            state.portals.remove(&name);
+            ExtqOutcome::Bytes(response::encode_close_complete())
+        }
+        other => {
+            state.error_state = true;
+            ExtqOutcome::Failed(ExtqError::BadDescribeTarget { target: other })
+        }
+    }
+}
+
+/// SP-PG-EXTQ T6 — real handler for the `H` Flush message.
+///
+/// Per spec §4 + PG §55.2.3:
+///
+/// Flush has no associated response. The server simply pushes any
+/// pending pipelined output to the wire. The `server::run_session`
+/// loop translates the `ExtqOutcome::Flush` return into a
+/// `writer.flush()` call WITHOUT writing any bytes.
+///
+/// Flush does NOT touch `error_state` — clients use Flush to drain
+/// pipelined output mid-pipeline (e.g. asyncpg + JDBC do this after
+/// every Describe), and the protocol spec is explicit that only
+/// Sync clears error_state.
+///
+/// No state mutation; no SessionState borrow required.
+fn dispatch_flush() -> ExtqOutcome {
+    ExtqOutcome::Flush
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1357,40 +1431,77 @@ mod tests {
         assert!(matches!(e, ExecState::Pending));
     }
 
-    /// SP-PG-EXTQ T5 — the TWO still-NYI tags (Close / Flush) return
-    /// `Failed(NotYetImplemented { tag })`. Parse + Bind + Describe +
-    /// Execute + Sync are NO LONGER on this list — T2 implements
-    /// Parse, T3 implements Bind, T4 implements Describe, T5
-    /// implements Execute + Sync.
-    /// See `t5_dispatch_execute_*` + `t5_dispatch_sync_*` for the
-    /// success locks. T6 / T7 will flip the remaining two arms.
+    /// SP-PG-EXTQ T6 — **ZERO tags remain NotYetImplemented**. All
+    /// seven frontend Extended Query tags (Parse / Bind / Describe /
+    /// Execute / Sync / Close / Flush) now dispatch through REAL
+    /// handlers — the T5 "two remaining" KAT flips to a zero-NYI
+    /// lock. The flipped invariant says: a fresh `SessionState` +
+    /// every reachable `ExtqMessage` variant goes through a real
+    /// dispatcher (Bytes/Skipped/Flush outcome — never
+    /// `NotYetImplemented`).
+    ///
+    /// Headline: SP-PG-EXTQ V1 message set is COMPLETE. T7 + T8 are
+    /// hardening (real ORM round-trip + Sync state-machine polish).
     #[test]
-    fn t5_try_dispatch_returns_not_yet_implemented_for_the_two_remaining_tags() {
+    fn t6_try_dispatch_no_tag_returns_not_yet_implemented_v1_complete() {
         let mut state = SessionState::new();
-        let cases: Vec<(proto::ExtqMessage, u8)> = vec![
-            (
-                proto::ExtqMessage::Close {
-                    target: b'P',
-                    name: String::new(),
-                },
-                FE_CLOSE,
-            ),
-            (proto::ExtqMessage::Flush, FE_FLUSH),
+        // Seed a stmt + portal so the Describe + Execute + Close
+        // arms have real targets to resolve. (Parse + Bind have no
+        // pre-state requirement; Sync + Flush have no resolution
+        // step.)
+        seed_stmt_with_sql(&mut state, "ps", "SELECT * FROM t", vec![]);
+        try_dispatch_extq(
+            &mut state,
+            &CannedTwoColEngine,
+            proto::ExtqMessage::Bind {
+                portal: "pt".to_string(),
+                stmt: "ps".to_string(),
+                param_formats: vec![],
+                param_values: vec![],
+                result_formats: vec![],
+            },
+        );
+        let cases: Vec<proto::ExtqMessage> = vec![
+            proto::ExtqMessage::Parse {
+                name: "fresh".to_string(),
+                sql: "SELECT 1".to_string(),
+                param_oids: vec![],
+            },
+            proto::ExtqMessage::Bind {
+                portal: "freshp".to_string(),
+                stmt: "ps".to_string(),
+                param_formats: vec![],
+                param_values: vec![],
+                result_formats: vec![],
+            },
+            proto::ExtqMessage::Describe {
+                target: DESCRIBE_TARGET_STATEMENT,
+                name: "ps".to_string(),
+            },
+            proto::ExtqMessage::Execute {
+                portal: "pt".to_string(),
+                max_rows: 0,
+            },
+            proto::ExtqMessage::Sync,
+            proto::ExtqMessage::Close {
+                target: DESCRIBE_TARGET_STATEMENT,
+                name: "ps".to_string(),
+            },
+            proto::ExtqMessage::Flush,
         ];
-        for (msg, expected_tag) in cases {
-            match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
+        for msg in cases {
+            let label = format!("{msg:?}");
+            match try_dispatch_extq(&mut state, &CannedTwoColEngine, msg) {
                 ExtqOutcome::Failed(ExtqError::NotYetImplemented { tag }) => {
-                    assert_eq!(tag, expected_tag);
+                    panic!(
+                        "tag 0x{tag:02X} ('{c}') for {label} returned NotYetImplemented \
+                         — SP-PG-EXTQ V1 should no longer have any NYI arms",
+                        c = tag as char,
+                    );
                 }
-                other => panic!(
-                    "expected NotYetImplemented(tag={expected_tag:#x}), got {other:?}"
-                ),
+                _ => {}
             }
         }
-        // The two still-NYI dispatchers do NOT mutate state.
-        assert_eq!(state.statement_count(), 0);
-        assert_eq!(state.portal_count(), 0);
-        assert!(!state.in_error_state());
     }
 
     // ───────────────────────────────────────────────────────────────────
@@ -3077,5 +3188,382 @@ mod tests {
             "Execute after Describe('P') must NOT repeat RowDescription"
         );
         assert_eq!(exec_bytes[0], b'D');
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // T6 KATs — real Close + Flush handlers. Locks every spec §4 + §6 +
+    // §9 invariant the run_session integration depends on.
+    //
+    // The key invariants:
+    //   - Close('S') drops the named statement + emits CloseComplete.
+    //   - Close('P') drops the named portal + emits CloseComplete.
+    //   - Close on missing name is a SILENT no-op + CloseComplete
+    //     (PG §55.2.3).
+    //   - Close with unknown target → 08P01 + error_state engaged.
+    //   - Close in error_state → Skipped (spec §6).
+    //   - Flush → ExtqOutcome::Flush (no bytes, no state mutation).
+    // ───────────────────────────────────────────────────────────────────
+
+    /// Spec §4 + §9: Close('S') on an existing statement drops it from
+    /// `state.statements` and emits the 5-byte CloseComplete envelope
+    /// (`3 00 00 00 04`).
+    #[test]
+    fn t6_dispatch_close_statement_drops_existing_and_emits_close_complete() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(&mut state, "to_drop", "SELECT 1", vec![]);
+        seed_stmt_with_sql(&mut state, "keep", "SELECT 2", vec![]);
+        assert_eq!(state.statement_count(), 2);
+        let msg = proto::ExtqMessage::Close {
+            target: DESCRIBE_TARGET_STATEMENT,
+            name: "to_drop".to_string(),
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
+            ExtqOutcome::Bytes(b) => {
+                // Byte-locked: spec §9 CloseComplete envelope.
+                assert_eq!(b, vec![b'3', 0, 0, 0, 4]);
+                assert_eq!(b.len(), 5);
+            }
+            other => panic!("expected Bytes(CloseComplete), got {other:?}"),
+        }
+        // The named stmt is gone; the other stmt stayed.
+        assert_eq!(state.statement_count(), 1);
+        assert!(state.get_statement("to_drop").is_none());
+        assert!(state.get_statement("keep").is_some());
+        assert!(!state.in_error_state());
+    }
+
+    /// Spec §4 + PG §55.2.3: Close('S') on a missing name is a SILENT
+    /// no-op — emit CloseComplete, do NOT engage error_state, do NOT
+    /// mutate any other state. The PG spec is explicit: "It is not
+    /// an error to issue Close against a nonexistent statement or
+    /// portal name". libpq + JDBC + asyncpg ALL rely on this.
+    #[test]
+    fn t6_dispatch_close_statement_missing_is_silent_no_op_with_close_complete() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(&mut state, "real", "SELECT 1", vec![]);
+        let msg = proto::ExtqMessage::Close {
+            target: DESCRIBE_TARGET_STATEMENT,
+            name: "ghost".to_string(),
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
+            ExtqOutcome::Bytes(b) => {
+                assert_eq!(b, vec![b'3', 0, 0, 0, 4]);
+            }
+            other => panic!("expected Bytes(CloseComplete), got {other:?}"),
+        }
+        // The real statement is untouched.
+        assert_eq!(state.statement_count(), 1);
+        assert!(state.get_statement("real").is_some());
+        assert!(!state.in_error_state());
+    }
+
+    /// Spec §4 + §9: Close('P') on an existing portal drops it from
+    /// `state.portals` and emits CloseComplete.
+    #[test]
+    fn t6_dispatch_close_portal_drops_existing_and_emits_close_complete() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(&mut state, "ps", "SELECT 1", vec![]);
+        // Bind two portals: one to drop, one to keep.
+        try_dispatch_extq(
+            &mut state,
+            &NoSchemaEngine,
+            proto::ExtqMessage::Bind {
+                portal: "drop_me".to_string(),
+                stmt: "ps".to_string(),
+                param_formats: vec![],
+                param_values: vec![],
+                result_formats: vec![],
+            },
+        );
+        try_dispatch_extq(
+            &mut state,
+            &NoSchemaEngine,
+            proto::ExtqMessage::Bind {
+                portal: "keep_me".to_string(),
+                stmt: "ps".to_string(),
+                param_formats: vec![],
+                param_values: vec![],
+                result_formats: vec![],
+            },
+        );
+        assert_eq!(state.portal_count(), 2);
+        let msg = proto::ExtqMessage::Close {
+            target: DESCRIBE_TARGET_PORTAL,
+            name: "drop_me".to_string(),
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
+            ExtqOutcome::Bytes(b) => {
+                assert_eq!(b, vec![b'3', 0, 0, 0, 4]);
+            }
+            other => panic!("expected Bytes(CloseComplete), got {other:?}"),
+        }
+        assert_eq!(state.portal_count(), 1);
+        assert!(state.get_portal("drop_me").is_none());
+        assert!(state.get_portal("keep_me").is_some());
+        // The backing statement is untouched (Close('P') does NOT
+        // cascade to the parent stmt — PG §55.2.3).
+        assert!(state.get_statement("ps").is_some());
+    }
+
+    /// Spec §4 + PG §55.2.3: Close('P') on a missing portal name is a
+    /// SILENT no-op + CloseComplete.
+    #[test]
+    fn t6_dispatch_close_portal_missing_is_silent_no_op_with_close_complete() {
+        let mut state = SessionState::new();
+        let msg = proto::ExtqMessage::Close {
+            target: DESCRIBE_TARGET_PORTAL,
+            name: "ghost_portal".to_string(),
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
+            ExtqOutcome::Bytes(b) => assert_eq!(b, vec![b'3', 0, 0, 0, 4]),
+            other => panic!("expected Bytes(CloseComplete), got {other:?}"),
+        }
+        assert!(!state.in_error_state());
+    }
+
+    /// Spec §4: Close with an UNKNOWN target byte → `BadDescribeTarget`
+    /// → `08P01 protocol_violation`. Error_state engaged per spec §6
+    /// (same shape as Describe with bad target).
+    #[test]
+    fn t6_dispatch_close_unknown_target_byte_returns_08p01_bad_target() {
+        let mut state = SessionState::new();
+        let msg = proto::ExtqMessage::Close {
+            target: b'X', // neither 'S' nor 'P'
+            name: "irrelevant".to_string(),
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
+            ExtqOutcome::Failed(ExtqError::BadDescribeTarget { target }) => {
+                assert_eq!(target, b'X');
+            }
+            other => panic!("expected BadDescribeTarget, got {other:?}"),
+        }
+        assert!(state.in_error_state());
+    }
+
+    /// Spec §6: when the dispatcher is in `error_state == true`, a
+    /// Close message is silently dropped (`ExtqOutcome::Skipped`)
+    /// WITHOUT mutating any state. The error_state flag is NOT
+    /// cleared (only Sync clears it).
+    #[test]
+    fn t6_dispatch_close_in_error_state_returns_skipped_without_processing() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(&mut state, "ps", "SELECT 1", vec![]);
+        state.set_error_state(true);
+        let msg = proto::ExtqMessage::Close {
+            target: DESCRIBE_TARGET_STATEMENT,
+            name: "ps".to_string(),
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
+            ExtqOutcome::Skipped => {}
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+        // Statement still present — Close was skipped.
+        assert!(state.get_statement("ps").is_some());
+        assert!(state.in_error_state());
+    }
+
+    /// Spec §4 + PG §55.2.3: Flush returns `ExtqOutcome::Flush` with
+    /// NO bytes and NO state mutation. The caller is expected to call
+    /// `writer.flush()` without writing anything.
+    #[test]
+    fn t6_dispatch_flush_returns_flush_outcome_with_no_state_mutation() {
+        let mut state = SessionState::new();
+        // Seed some state to verify Flush doesn't mutate it.
+        seed_stmt_with_sql(&mut state, "ps", "SELECT 1", vec![]);
+        try_dispatch_extq(
+            &mut state,
+            &NoSchemaEngine,
+            proto::ExtqMessage::Bind {
+                portal: "pt".to_string(),
+                stmt: "ps".to_string(),
+                param_formats: vec![],
+                param_values: vec![],
+                result_formats: vec![],
+            },
+        );
+        let stmt_count_before = state.statement_count();
+        let portal_count_before = state.portal_count();
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, proto::ExtqMessage::Flush) {
+            ExtqOutcome::Flush => {}
+            other => panic!("expected ExtqOutcome::Flush, got {other:?}"),
+        }
+        // State unchanged.
+        assert_eq!(state.statement_count(), stmt_count_before);
+        assert_eq!(state.portal_count(), portal_count_before);
+        assert!(!state.in_error_state());
+    }
+
+    /// Spec §6: Flush in error_state is dispatched as `Skipped` — the
+    /// skip-until-Sync invariant is in force; Flush is NOT a Sync. The
+    /// dispatcher's pre-check (top of `try_dispatch_extq`) catches this
+    /// before reaching `dispatch_flush`.
+    #[test]
+    fn t6_dispatch_flush_in_error_state_returns_skipped() {
+        let mut state = SessionState::new();
+        state.set_error_state(true);
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, proto::ExtqMessage::Flush) {
+            ExtqOutcome::Skipped => {}
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+        // Error_state still engaged (only Sync clears).
+        assert!(state.in_error_state());
+    }
+
+    /// HEADLINE T6 KAT: a full Parse + Bind + Execute + Close + Sync
+    /// pipeline through the dispatcher composes correctly. Locks the
+    /// T5 → T6 transition — every extq tag now produces real bytes.
+    /// The byte concat is ParseComplete + BindComplete +
+    /// RowDescription + DataRow* + CommandComplete + CloseComplete +
+    /// RFQ.
+    #[test]
+    fn t6_dispatch_parse_bind_execute_close_sync_full_round_trip() {
+        let mut state = SessionState::new();
+        let engine = build_canned_rows(2);
+        let pc = try_dispatch_extq(
+            &mut state,
+            &engine,
+            proto::ExtqMessage::Parse {
+                name: "ps".to_string(),
+                sql: "SELECT * FROM t".to_string(),
+                param_oids: vec![],
+            },
+        );
+        let pc_bytes = match pc {
+            ExtqOutcome::Bytes(b) => b,
+            other => panic!("Parse: {other:?}"),
+        };
+        let bc = try_dispatch_extq(
+            &mut state,
+            &engine,
+            proto::ExtqMessage::Bind {
+                portal: "pt".to_string(),
+                stmt: "ps".to_string(),
+                param_formats: vec![],
+                param_values: vec![],
+                result_formats: vec![],
+            },
+        );
+        let bc_bytes = match bc {
+            ExtqOutcome::Bytes(b) => b,
+            other => panic!("Bind: {other:?}"),
+        };
+        let ec = try_dispatch_extq(
+            &mut state,
+            &engine,
+            proto::ExtqMessage::Execute {
+                portal: "pt".to_string(),
+                max_rows: 0,
+            },
+        );
+        let ec_bytes = match ec {
+            ExtqOutcome::Bytes(b) => b,
+            other => panic!("Execute: {other:?}"),
+        };
+        // Close the named portal.
+        let cc = try_dispatch_extq(
+            &mut state,
+            &engine,
+            proto::ExtqMessage::Close {
+                target: DESCRIBE_TARGET_PORTAL,
+                name: "pt".to_string(),
+            },
+        );
+        let cc_bytes = match cc {
+            ExtqOutcome::Bytes(b) => b,
+            other => panic!("Close: {other:?}"),
+        };
+        let sc = try_dispatch_extq(&mut state, &engine, proto::ExtqMessage::Sync);
+        let sc_bytes = match sc {
+            ExtqOutcome::Bytes(b) => b,
+            other => panic!("Sync: {other:?}"),
+        };
+
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&pc_bytes);
+        wire.extend_from_slice(&bc_bytes);
+        wire.extend_from_slice(&ec_bytes);
+        wire.extend_from_slice(&cc_bytes);
+        wire.extend_from_slice(&sc_bytes);
+
+        // Locked checks:
+        // - First byte: '1' (ParseComplete).
+        assert_eq!(wire[0], b'1');
+        // - CloseComplete envelope (`3 00 00 00 04`) appears.
+        let close_complete: &[u8] = &[b'3', 0, 0, 0, 4];
+        assert!(
+            wire.windows(close_complete.len())
+                .any(|w| w == close_complete),
+            "wire stream must carry CloseComplete envelope after Execute"
+        );
+        // - Trailing 6 bytes: RFQ('I').
+        assert_eq!(&wire[wire.len() - 6..], &[b'Z', 0, 0, 0, 5, b'I']);
+        // - Portal was dropped by Close.
+        assert!(state.get_portal("pt").is_none());
+        // - Statement persists (Close on portal does not cascade).
+        assert!(state.get_statement("ps").is_some());
+
+        // No error-status codes anywhere.
+        for code in [b"0A000", b"26000", b"34000", b"08P01"] {
+            assert!(!wire.windows(5).any(|w| w == code),
+                "wire stream must not contain {code:?}");
+        }
+    }
+
+    /// Pipelined Close of multiple statements within one Sync block:
+    /// Close('S','a') + Close('S','b') + Sync emits 2× CloseComplete
+    /// followed by RFQ. Locks the order-preserving pipelining
+    /// invariant + the multi-Close composition.
+    #[test]
+    fn t6_dispatch_pipelined_close_multiple_stmts_in_one_sync_block() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(&mut state, "a", "SELECT 1", vec![]);
+        seed_stmt_with_sql(&mut state, "b", "SELECT 2", vec![]);
+        assert_eq!(state.statement_count(), 2);
+
+        let c1 = try_dispatch_extq(
+            &mut state,
+            &NoSchemaEngine,
+            proto::ExtqMessage::Close {
+                target: DESCRIBE_TARGET_STATEMENT,
+                name: "a".to_string(),
+            },
+        );
+        let c1_bytes = match c1 {
+            ExtqOutcome::Bytes(b) => b,
+            other => panic!("Close(a): {other:?}"),
+        };
+        let c2 = try_dispatch_extq(
+            &mut state,
+            &NoSchemaEngine,
+            proto::ExtqMessage::Close {
+                target: DESCRIBE_TARGET_STATEMENT,
+                name: "b".to_string(),
+            },
+        );
+        let c2_bytes = match c2 {
+            ExtqOutcome::Bytes(b) => b,
+            other => panic!("Close(b): {other:?}"),
+        };
+        let s = try_dispatch_extq(&mut state, &NoSchemaEngine, proto::ExtqMessage::Sync);
+        let s_bytes = match s {
+            ExtqOutcome::Bytes(b) => b,
+            other => panic!("Sync: {other:?}"),
+        };
+
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&c1_bytes);
+        wire.extend_from_slice(&c2_bytes);
+        wire.extend_from_slice(&s_bytes);
+
+        // EXACTLY two CloseComplete envelopes (5 bytes each), in order,
+        // followed by the 6-byte RFQ('I').
+        let expected: Vec<u8> = vec![
+            b'3', 0, 0, 0, 4, // CloseComplete 1
+            b'3', 0, 0, 0, 4, // CloseComplete 2
+            b'Z', 0, 0, 0, 5, b'I', // RFQ('I')
+        ];
+        assert_eq!(wire, expected);
+        // Both statements dropped.
+        assert_eq!(state.statement_count(), 0);
     }
 }

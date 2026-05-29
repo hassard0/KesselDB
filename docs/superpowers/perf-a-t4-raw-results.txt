@@ -1,0 +1,301 @@
+=== get-by-id N=1 trial=1 ===
+parallel-reads workload=get-by-id workers=1 rows=2000 duration=5s pool_workers=Some(0)
+  total =    8032730 ops | 1606546 ops/sec | p50 0us  p99 0us  p99.99 4us
+
+=== get-by-id N=1 trial=2 ===
+parallel-reads workload=get-by-id workers=1 rows=2000 duration=5s pool_workers=Some(0)
+  total =    8133280 ops | 1626656 ops/sec | p50 0us  p99 0us  p99.99 5us
+
+=== get-by-id N=1 trial=3 ===
+parallel-reads workload=get-by-id workers=1 rows=2000 duration=5s pool_workers=Some(0)
+  total =    8031902 ops | 1606380 ops/sec | p50 0us  p99 0us  p99.99 5us
+
+=== get-by-id N=4 trial=1 ===
+parallel-reads workload=get-by-id workers=4 rows=2000 duration=5s pool_workers=Some(0)
+  total =   20801199 ops | 4160240 ops/sec | p50 0us  p99 1us  p99.99 4us
+
+=== get-by-id N=4 trial=2 ===
+parallel-reads workload=get-by-id workers=4 rows=2000 duration=5s pool_workers=Some(0)
+  total =   20795243 ops | 4159049 ops/sec | p50 0us  p99 1us  p99.99 5us
+
+=== get-by-id N=4 trial=3 ===
+parallel-reads workload=get-by-id workers=4 rows=2000 duration=5s pool_workers=Some(0)
+  total =   20618309 ops | 4123662 ops/sec | p50 0us  p99 1us  p99.99 5us
+
+=== get-by-id N=8 trial=1 ===
+parallel-reads workload=get-by-id workers=8 rows=2000 duration=5s pool_workers=Some(0)
+  total =   22264744 ops | 4452949 ops/sec | p50 1us  p99 3us  p99.99 7us
+
+=== get-by-id N=8 trial=2 ===
+parallel-reads workload=get-by-id workers=8 rows=2000 duration=5s pool_workers=Some(0)
+  total =   21538104 ops | 4307621 ops/sec | p50 1us  p99 3us  p99.99 7us
+
+=== get-by-id N=8 trial=3 ===
+parallel-reads workload=get-by-id workers=8 rows=2000 duration=5s pool_workers=Some(0)
+  total =   23498292 ops | 4699658 ops/sec | p50 1us  p99 3us  p99.99 7us
+
+=== get-by-id N=16 trial=1 ===
+parallel-reads workload=get-by-id workers=16 rows=2000 duration=5s pool_workers=Some(0)
+  total =   24354386 ops | 4870877 ops/sec | p50 2us  p99 7us  p99.99 20us
+
+=== get-by-id N=16 trial=2 ===
+parallel-reads workload=get-by-id workers=16 rows=2000 duration=5s pool_workers=Some(0)
+  total =   25455269 ops | 5091054 ops/sec | p50 2us  p99 7us  p99.99 20us
+
+=== get-by-id N=16 trial=3 ===
+parallel-reads workload=get-by-id workers=16 rows=2000 duration=5s pool_workers=Some(0)
+  total =   24771912 ops | 4954382 ops/sec | p50 2us  p99 7us  p99.99 19us
+
+=== get-by-id N=24 trial=1 ===
+parallel-reads workload=get-by-id workers=24 rows=2000 duration=5s pool_workers=Some(0)
+  total =   26298751 ops | 5259750 ops/sec | p50 2us  p99 6us  p99.99 3009us
+
+=== get-by-id N=24 trial=2 ===
+parallel-reads workload=get-by-id workers=24 rows=2000 duration=5s pool_workers=Some(0)
+  total =   23561994 ops | 4712399 ops/sec | p50 3us  p99 7us  p99.99 3010us
+
+=== get-by-id N=24 trial=3 ===
+parallel-reads workload=get-by-id workers=24 rows=2000 duration=5s pool_workers=Some(0)
+  total =   23998803 ops | 4799761 ops/sec | p50 3us  p99 7us  p99.99 3010us
+
+=== select-limit N=1 trial=1 ===
+parallel-reads workload=select-limit workers=1 rows=2000 duration=5s pool_workers=Some(0)
+  total =       5871 ops | 1174 ops/sec | p50 843us  p99 951us  p99.99 2276us
+
+=== select-limit N=1 trial=2 ===
+parallel-reads workload=select-limit workers=1 rows=2000 duration=5s pool_workers=Some(0)
+  total =       5892 ops | 1178 ops/sec | p50 841us  p99 947us  p99.99 2141us
+
+=== select-limit N=1 trial=3 ===
+parallel-reads workload=select-limit workers=1 rows=2000 duration=5s pool_workers=Some(0)
+  total =       5890 ops | 1178 ops/sec | p50 841us  p99 948us  p99.99 1714us
+
+=== select-limit N=4 trial=1 ===
+parallel-reads workload=select-limit workers=4 rows=2000 duration=5s pool_workers=Some(0)
+  total =      23219 ops | 4644 ops/sec | p50 853us  p99 965us  p99.99 2262us
+
+=== select-limit N=4 trial=2 ===
+parallel-reads workload=select-limit workers=4 rows=2000 duration=5s pool_workers=Some(0)
+  total =      23192 ops | 4638 ops/sec | p50 854us  p99 967us  p99.99 2240us
+
+=== select-limit N=4 trial=3 ===
+parallel-reads workload=select-limit workers=4 rows=2000 duration=5s pool_workers=Some(0)
+  total =      23110 ops | 4622 ops/sec | p50 855us  p99 965us  p99.99 2597us
+
+=== select-limit N=8 trial=1 ===
+parallel-reads workload=select-limit workers=8 rows=2000 duration=5s pool_workers=Some(0)
+  total =      45775 ops | 9155 ops/sec | p50 866us  p99 979us  p99.99 2269us
+
+=== select-limit N=8 trial=2 ===
+parallel-reads workload=select-limit workers=8 rows=2000 duration=5s pool_workers=Some(0)
+  total =      45864 ops | 9173 ops/sec | p50 863us  p99 978us  p99.99 2514us
+
+=== select-limit N=8 trial=3 ===
+parallel-reads workload=select-limit workers=8 rows=2000 duration=5s pool_workers=Some(0)
+  total =      45922 ops | 9184 ops/sec | p50 863us  p99 976us  p99.99 2399us
+
+=== select-limit N=16 trial=1 ===
+parallel-reads workload=select-limit workers=16 rows=2000 duration=5s pool_workers=Some(0)
+  total =      89026 ops | 17805 ops/sec | p50 885us  p99 1013us  p99.99 8907us
+
+=== select-limit N=16 trial=2 ===
+parallel-reads workload=select-limit workers=16 rows=2000 duration=5s pool_workers=Some(0)
+  total =      88915 ops | 17783 ops/sec | p50 883us  p99 1148us  p99.99 9883us
+
+=== select-limit N=16 trial=3 ===
+parallel-reads workload=select-limit workers=16 rows=2000 duration=5s pool_workers=Some(0)
+  total =      88746 ops | 17749 ops/sec | p50 884us  p99 1183us  p99.99 14004us
+
+=== select-limit N=24 trial=1 ===
+parallel-reads workload=select-limit workers=24 rows=2000 duration=5s pool_workers=Some(0)
+  total =      87908 ops | 17582 ops/sec | p50 887us  p99 4884us  p99.99 20877us
+
+=== select-limit N=24 trial=2 ===
+parallel-reads workload=select-limit workers=24 rows=2000 duration=5s pool_workers=Some(0)
+  total =      87928 ops | 17586 ops/sec | p50 890us  p99 4040us  p99.99 9893us
+
+=== select-limit N=24 trial=3 ===
+parallel-reads workload=select-limit workers=24 rows=2000 duration=5s pool_workers=Some(0)
+  total =      88212 ops | 17642 ops/sec | p50 887us  p99 4098us  p99.99 12958us
+
+=== select-sorted N=1 trial=1 ===
+parallel-reads workload=select-sorted workers=1 rows=2000 duration=5s pool_workers=Some(0)
+  total =       1359 ops | 272 ops/sec | p50 3670us  p99 3776us  p99.99 6617us
+
+=== select-sorted N=1 trial=2 ===
+parallel-reads workload=select-sorted workers=1 rows=2000 duration=5s pool_workers=Some(0)
+  total =       1358 ops | 272 ops/sec | p50 3672us  p99 3887us  p99.99 6408us
+
+=== select-sorted N=1 trial=3 ===
+parallel-reads workload=select-sorted workers=1 rows=2000 duration=5s pool_workers=Some(0)
+  total =       1336 ops | 267 ops/sec | p50 3682us  p99 4549us  p99.99 7348us
+
+=== select-sorted N=4 trial=1 ===
+parallel-reads workload=select-sorted workers=4 rows=2000 duration=5s pool_workers=Some(0)
+  total =       5413 ops | 1083 ops/sec | p50 3687us  p99 3774us  p99.99 6817us
+
+=== select-sorted N=4 trial=2 ===
+parallel-reads workload=select-sorted workers=4 rows=2000 duration=5s pool_workers=Some(0)
+  total =       5430 ops | 1086 ops/sec | p50 3672us  p99 3772us  p99.99 6567us
+
+=== select-sorted N=4 trial=3 ===
+parallel-reads workload=select-sorted workers=4 rows=2000 duration=5s pool_workers=Some(0)
+  total =       4694 ops | 939 ops/sec | p50 3772us  p99 10297us  p99.99 15076us
+
+=== select-sorted N=8 trial=1 ===
+parallel-reads workload=select-sorted workers=8 rows=2000 duration=5s pool_workers=Some(0)
+  total =       7658 ops | 1532 ops/sec | p50 3868us  p99 12390us  p99.99 25486us
+
+=== select-sorted N=8 trial=2 ===
+parallel-reads workload=select-sorted workers=8 rows=2000 duration=5s pool_workers=Some(0)
+  total =       9161 ops | 1832 ops/sec | p50 3737us  p99 10136us  p99.99 26305us
+
+=== select-sorted N=8 trial=3 ===
+parallel-reads workload=select-sorted workers=8 rows=2000 duration=5s pool_workers=Some(0)
+  total =       9227 ops | 1845 ops/sec | p50 3731us  p99 9988us  p99.99 19794us
+
+=== select-sorted N=16 trial=1 ===
+parallel-reads workload=select-sorted workers=16 rows=2000 duration=5s pool_workers=Some(0)
+  total =       7813 ops | 1563 ops/sec | p50 8970us  p99 37692us  p99.99 80589us
+
+=== select-sorted N=16 trial=2 ===
+parallel-reads workload=select-sorted workers=16 rows=2000 duration=5s pool_workers=Some(0)
+  total =       7668 ops | 1534 ops/sec | p50 9392us  p99 33040us  p99.99 68147us
+
+=== select-sorted N=16 trial=3 ===
+parallel-reads workload=select-sorted workers=16 rows=2000 duration=5s pool_workers=Some(0)
+  total =      16701 ops | 3340 ops/sec | p50 3545us  p99 14275us  p99.99 33528us
+
+=== select-sorted N=24 trial=1 ===
+parallel-reads workload=select-sorted workers=24 rows=2000 duration=5s pool_workers=Some(0)
+  total =      21078 ops | 4216 ops/sec | p50 4447us  p99 11741us  p99.99 25176us
+
+=== select-sorted N=24 trial=2 ===
+parallel-reads workload=select-sorted workers=24 rows=2000 duration=5s pool_workers=Some(0)
+  total =      21105 ops | 4221 ops/sec | p50 4799us  p99 10778us  p99.99 30952us
+
+=== select-sorted N=24 trial=3 ===
+parallel-reads workload=select-sorted workers=24 rows=2000 duration=5s pool_workers=Some(0)
+  total =      21081 ops | 4216 ops/sec | p50 4456us  p99 11545us  p99.99 28249us
+
+=== aggregate-sum N=1 trial=1 ===
+parallel-reads workload=aggregate-sum workers=1 rows=2000 duration=5s pool_workers=Some(0)
+  total =       5063 ops | 1013 ops/sec | p50 970us  p99 1209us  p99.99 5526us
+
+=== aggregate-sum N=1 trial=2 ===
+parallel-reads workload=aggregate-sum workers=1 rows=2000 duration=5s pool_workers=Some(0)
+  total =       5181 ops | 1036 ops/sec | p50 962us  p99 985us  p99.99 1592us
+
+=== aggregate-sum N=1 trial=3 ===
+parallel-reads workload=aggregate-sum workers=1 rows=2000 duration=5s pool_workers=Some(0)
+  total =       4385 ops | 877 ops/sec | p50 965us  p99 4933us  p99.99 37957us
+
+=== aggregate-sum N=4 trial=1 ===
+parallel-reads workload=aggregate-sum workers=4 rows=2000 duration=5s pool_workers=Some(0)
+  total =      18386 ops | 3677 ops/sec | p50 981us  p99 4063us  p99.99 8597us
+
+=== aggregate-sum N=4 trial=2 ===
+parallel-reads workload=aggregate-sum workers=4 rows=2000 duration=5s pool_workers=Some(0)
+  total =      20295 ops | 4059 ops/sec | p50 981us  p99 1008us  p99.99 4073us
+
+=== aggregate-sum N=4 trial=3 ===
+parallel-reads workload=aggregate-sum workers=4 rows=2000 duration=5s pool_workers=Some(0)
+  total =      20437 ops | 4087 ops/sec | p50 976us  p99 998us  p99.99 2496us
+
+=== aggregate-sum N=8 trial=1 ===
+parallel-reads workload=aggregate-sum workers=8 rows=2000 duration=5s pool_workers=Some(0)
+  total =      40387 ops | 8077 ops/sec | p50 987us  p99 1009us  p99.99 2407us
+
+=== aggregate-sum N=8 trial=2 ===
+parallel-reads workload=aggregate-sum workers=8 rows=2000 duration=5s pool_workers=Some(0)
+  total =      40356 ops | 8071 ops/sec | p50 989us  p99 1008us  p99.99 2364us
+
+=== aggregate-sum N=8 trial=3 ===
+parallel-reads workload=aggregate-sum workers=8 rows=2000 duration=5s pool_workers=Some(0)
+  total =      40306 ops | 8061 ops/sec | p50 990us  p99 1010us  p99.99 2717us
+
+=== aggregate-sum N=16 trial=1 ===
+parallel-reads workload=aggregate-sum workers=16 rows=2000 duration=5s pool_workers=Some(0)
+  total =      78595 ops | 15719 ops/sec | p50 1006us  p99 1204us  p99.99 12149us
+
+=== aggregate-sum N=16 trial=2 ===
+parallel-reads workload=aggregate-sum workers=16 rows=2000 duration=5s pool_workers=Some(0)
+  total =      75429 ops | 15086 ops/sec | p50 1009us  p99 4006us  p99.99 9639us
+
+=== aggregate-sum N=16 trial=3 ===
+parallel-reads workload=aggregate-sum workers=16 rows=2000 duration=5s pool_workers=Some(0)
+  total =      78695 ops | 15739 ops/sec | p50 1005us  p99 1197us  p99.99 9635us
+
+=== aggregate-sum N=24 trial=1 ===
+parallel-reads workload=aggregate-sum workers=24 rows=2000 duration=5s pool_workers=Some(0)
+  total =      78255 ops | 15651 ops/sec | p50 1009us  p99 4342us  p99.99 17000us
+
+=== aggregate-sum N=24 trial=2 ===
+parallel-reads workload=aggregate-sum workers=24 rows=2000 duration=5s pool_workers=Some(0)
+  total =      78083 ops | 15617 ops/sec | p50 1009us  p99 5014us  p99.99 12006us
+
+=== aggregate-sum N=24 trial=3 ===
+parallel-reads workload=aggregate-sum workers=24 rows=2000 duration=5s pool_workers=Some(0)
+  total =      78356 ops | 15671 ops/sec | p50 1007us  p99 4350us  p99.99 20272us
+
+=== find-by N=1 trial=1 ===
+parallel-reads workload=find-by workers=1 rows=2000 duration=5s pool_workers=Some(0)
+  total =    1957078 ops | 391416 ops/sec | p50 2us  p99 2us  p99.99 9us
+
+=== find-by N=1 trial=2 ===
+parallel-reads workload=find-by workers=1 rows=2000 duration=5s pool_workers=Some(0)
+  total =    1951731 ops | 390346 ops/sec | p50 2us  p99 2us  p99.99 9us
+
+=== find-by N=1 trial=3 ===
+parallel-reads workload=find-by workers=1 rows=2000 duration=5s pool_workers=Some(0)
+  total =    1862515 ops | 372503 ops/sec | p50 2us  p99 2us  p99.99 9us
+
+=== find-by N=4 trial=1 ===
+parallel-reads workload=find-by workers=4 rows=2000 duration=5s pool_workers=Some(0)
+  total =    7085281 ops | 1417056 ops/sec | p50 2us  p99 3us  p99.99 9us
+
+=== find-by N=4 trial=2 ===
+parallel-reads workload=find-by workers=4 rows=2000 duration=5s pool_workers=Some(0)
+  total =    7083028 ops | 1416606 ops/sec | p50 2us  p99 3us  p99.99 8us
+
+=== find-by N=4 trial=3 ===
+parallel-reads workload=find-by workers=4 rows=2000 duration=5s pool_workers=Some(0)
+  total =    7093574 ops | 1418715 ops/sec | p50 2us  p99 3us  p99.99 9us
+
+=== find-by N=8 trial=1 ===
+parallel-reads workload=find-by workers=8 rows=2000 duration=5s pool_workers=Some(0)
+  total =   13823474 ops | 2764695 ops/sec | p50 2us  p99 3us  p99.99 11us
+
+=== find-by N=8 trial=2 ===
+parallel-reads workload=find-by workers=8 rows=2000 duration=5s pool_workers=Some(0)
+  total =   13780818 ops | 2756164 ops/sec | p50 2us  p99 3us  p99.99 10us
+
+=== find-by N=8 trial=3 ===
+parallel-reads workload=find-by workers=8 rows=2000 duration=5s pool_workers=Some(0)
+  total =   13573680 ops | 2714736 ops/sec | p50 2us  p99 3us  p99.99 12us
+
+=== find-by N=16 trial=1 ===
+parallel-reads workload=find-by workers=16 rows=2000 duration=5s pool_workers=Some(0)
+  total =   19881878 ops | 3976376 ops/sec | p50 3us  p99 6us  p99.99 19us
+
+=== find-by N=16 trial=2 ===
+parallel-reads workload=find-by workers=16 rows=2000 duration=5s pool_workers=Some(0)
+  total =   19199877 ops | 3839975 ops/sec | p50 3us  p99 6us  p99.99 23us
+
+=== find-by N=16 trial=3 ===
+parallel-reads workload=find-by workers=16 rows=2000 duration=5s pool_workers=Some(0)
+  total =   20505720 ops | 4101144 ops/sec | p50 3us  p99 6us  p99.99 31us
+
+=== find-by N=24 trial=1 ===
+parallel-reads workload=find-by workers=24 rows=2000 duration=5s pool_workers=Some(0)
+  total =   19591533 ops | 3918307 ops/sec | p50 3us  p99 6us  p99.99 3010us
+
+=== find-by N=24 trial=2 ===
+parallel-reads workload=find-by workers=24 rows=2000 duration=5s pool_workers=Some(0)
+  total =   20713099 ops | 4142620 ops/sec | p50 3us  p99 6us  p99.99 3010us
+
+=== find-by N=24 trial=3 ===
+parallel-reads workload=find-by workers=24 rows=2000 duration=5s pool_workers=Some(0)
+  total =   20385965 ops | 4077193 ops/sec | p50 3us  p99 6us  p99.99 3012us
+
+DONE

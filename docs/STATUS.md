@@ -5,8 +5,8 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 ## Current capabilities (2026-05-29)
 
 What a node running on today's `main` actually does. Every line below is
-covered by the workspace test suite (1905 default / 1933 with
-`--features pg-gateway` / 1988 with all gateway features).
+covered by the workspace test suite (1910 default / 1938 with
+`--features pg-gateway` / 1993 with all gateway features).
 
 **Wire surfaces** (all opt-in via cargo features except the binary protocol):
 - **Binary** — length-prefixed `Op::encode()` over TCP; the deterministic fast

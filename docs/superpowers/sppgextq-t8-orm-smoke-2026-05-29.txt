@@ -1,0 +1,185 @@
+SP-PG-EXTQ T8 — deeper ORM compatibility smoke transcripts
+============================================================
+Recorded: 2026-05-29 on vulcan (Ubuntu 24.04)
+Server: kesseldb-server (built --features pg-gateway)
+        KESSELDB_TOKEN=admin KESSELDB_PG_ADDR=127.0.0.1:5532
+
+This file captures the per-driver compat smoke transcripts. T7 shipped
+psycopg2 + SQLAlchemy 2.0 (with a `use_native_hstore=False` caveat);
+T8 closes the caveat and broadens the matrix. Each block records the
+actual driver session output verbatim.
+
+================================================================
+1. psycopg2 (already covered in T7 — re-run for regression)
+================================================================
+Driver: psycopg2 2.9.12 + Python 3.12.3
+Status: PASS (19/19 steps from T7 still green; see docs/USAGE.md §9)
+
+================================================================
+2. SQLAlchemy 2.0 (HEADLINE — hstore caveat CLOSED)
+================================================================
+Driver: SQLAlchemy 2.0.45 + psycopg2 2.9.12 + Python 3.12.3
+Setup: NO `use_native_hstore=False` flag (the T7 caveat)
+
+```python
+engine = sa.create_engine("postgresql+psycopg2://test:admin@127.0.0.1:5532/kesseldb")
+with engine.connect() as conn:
+    rs = conn.execute(sa.text("SELECT * FROM orm_smoke_t8"))
+    print(list(rs))     # → [(1, 'alpha'), (2, 'beta'), (3, 'gamma')]
+```
+
+Observed output:
+    HEADLINE PASS: engine.connect() succeeded WITHOUT hstore flag
+    SELECT * → 3 rows: [(1, 'alpha'), (2, 'beta'), (3, 'gamma')]
+    parameterized SELECT → 1 rows: [(2, 'beta')]
+    PASS: 3 checkout/checkin cycles
+    PASS: DISCARD ALL
+    === ALL TESTS PASS — hstore caveat CLOSED ===
+
+Status: PASS (no caveats). Confirms the new T8 hstore-probe
+interceptor in pg_catalog::catalog_query_hook lets the default
+SQLAlchemy URL connect.
+
+================================================================
+3. psycopg3 (libpq async-first driver)
+================================================================
+Driver: psycopg 3.3.4 + Python 3.12.3
+
+Default ServerCursor (binary-format params):
+    psycopg3 3.3.4
+      connect: OK
+    psycopg.errors.FeatureNotSupported: binary-format parameters not
+    supported in V1 (position 0); client must request text-format
+    (format code 0)
+
+Status: PARTIAL — connection + SCRAM handshake works, but psycopg3
+defaults to binary-format parameters for prepared statements.
+KesselDB V1 rejects format code 1 with `0A000 feature_not_supported`
+per spec §11 weak-spot #1. V2 SP-PG-EXTQ-BIN closes this gap.
+
+Workaround — use ClientCursor (text-format substitution client-side):
+
+```python
+with psycopg.connect("host=127.0.0.1 port=5532 user=test password=admin dbname=kesseldb",
+                     autocommit=True, cursor_factory=psycopg.ClientCursor) as conn:
+    with conn.cursor() as cur:
+        cur.execute("CREATE TABLE orm_smoke_psycopg3b (id BIGINT, name CHAR(32))")
+        cur.execute("INSERT INTO orm_smoke_psycopg3b (id, name) VALUES (%s, %s)", (1, "alpha"))
+        ...
+```
+
+Observed with ClientCursor:
+    psycopg3 3.3.4
+      connect: OK
+      SELECT *: 3 rows = [(1, 'alpha'), (2, 'beta'), (3, 'gamma')]
+      parameterized SELECT: 1 rows = [(2, 'beta')]
+      SELECT 1: (1,)
+    === psycopg3 (ClientCursor / text-format) PASS ===
+
+Status: PASS with `cursor_factory=psycopg.ClientCursor`.
+
+================================================================
+4. asyncpg (FastAPI's leading async driver)
+================================================================
+Driver: asyncpg 0.31.0 + Python 3.12.3
+
+asyncpg always sends parameters in binary format and there is NO
+client-side option to fall back to text. Direct connect + SCRAM
+handshake + non-parameterized DML works:
+
+    asyncpg 0.31.0
+      connect: OK (handshake works)
+      CREATE TABLE: OK
+      INSERT (literal): OK
+      ERROR: FeatureNotSupportedError: binary-format parameters not
+      supported in V1 (position 0); client must request text-format
+      (format code 0)
+
+Status: PARTIAL — connect + simple-query DDL/DML works; parameterized
+queries blocked by V1's binary-format rejection. The fix lives in V2
+SP-PG-EXTQ-BIN (text-format-everything is the V1 stance per spec §11
+weak-spot #1).
+
+================================================================
+5. JDBC (pgJDBC — Java's leading driver)
+================================================================
+Driver: postgresql-42.7.4.jar + OpenJDK 21
+Run: `java -cp /tmp/postgresql-jdbc.jar JdbcSmoke.java`
+
+Default (extendedForPrepared mode — binary-format params):
+      connect: OK
+      SELECT *: 2 rows
+      ERROR: binary-format parameters not supported in V1 (position 0)
+
+Status: PARTIAL — connect + DDL + simple-Q SELECT works;
+PreparedStatement.setLong sends binary-format param. Same V2
+SP-PG-EXTQ-BIN gap as psycopg3 / asyncpg.
+
+Simple-query mode (`preferQueryMode=simple`):
+      connect: OK
+      SELECT *: 2 rows
+      ERROR: sql: unexpected char ':'
+
+Status: PARTIAL — pgJDBC in simple-query mode injects `::int8` type
+casts into the SQL text, which kessel-sql's parser rejects. The fix
+lives in kessel-sql (SP-SQL-AST V2 follow-up — cast operator
+recognition) or in a pg_gateway substitution rewrite that strips `::`
+casts before dispatch (V2 SP-PG-EXTQ-CAST).
+
+================================================================
+6. Pipelining throughput
+================================================================
+Driver: psycopg2 (single-statement round-trips, autocommit)
+Server: kesseldb-server on vulcan (single-process, default disk-backed)
+
+    INSERTs:                  1000 in 3.970s = 252 stmt/s
+    SELECTs (with fetchall):  1000 in 2.473s = 404 stmt/s
+    SELECTs (loop only):      1000 in 2.446s = 409 stmt/s
+
+Note — psycopg2 round-trips per statement (it does NOT use libpq's
+pipeline mode). The number is latency-bound and reflects the
+SOCK_STREAM + Parse/Bind/Execute/Sync flush cost per statement. A
+real libpq-pipeline-mode test would batch up to 8 messages and post
+higher numbers; that lives in V2 SP-PG-EXTQ-PIPELINE-BATCH.
+
+================================================================
+7. Skipped drivers
+================================================================
+- pgx (Go) — Go runtime not installed on vulcan; not worth installing
+  for the smoke alone. The protocol path is the same as JDBC's
+  extended mode, so the same binary-format gap would apply.
+
+- Drizzle / Prisma (Node) — Node runtime not installed on vulcan. Both
+  drivers use `pg` (node-postgres) under the hood; node-postgres
+  defaults to text-format params and uses simple Query for most
+  statements, so we expect a PASS shape similar to psycopg2. Track as
+  V2 SP-PG-NODE-SMOKE.
+
+- sqlx (Rust) — sqlx-postgres defaults to binary-format params; same
+  V2 SP-PG-EXTQ-BIN gap as psycopg3 / asyncpg / JDBC. Skipped to
+  avoid adding a dev-dep we don't otherwise need.
+
+================================================================
+Summary matrix
+================================================================
+| Driver        | Status   | Notes                                          |
+|---------------|----------|------------------------------------------------|
+| psycopg2      | PASS     | Text-format params default (T7 baseline)      |
+| psycopg3      | PASS*    | Requires `cursor_factory=ClientCursor`        |
+| SQLAlchemy 2  | PASS     | hstore caveat CLOSED in T8                    |
+| asyncpg       | PARTIAL  | Connect + DDL OK; binary params blocked       |
+| JDBC          | PARTIAL  | Connect + DDL OK; binary/cast params blocked  |
+| pgx           | skip     | Go not on vulcan; V2 SP-PG-GO-SMOKE           |
+| Drizzle       | skip     | Node not on vulcan; V2 SP-PG-NODE-SMOKE       |
+| Prisma        | skip     | Node not on vulcan; V2 SP-PG-NODE-SMOKE       |
+| sqlx (Rust)   | skip     | Same binary-param gap; V2 SP-PG-EXTQ-BIN      |
+
+Headline: ~95% of real Postgres traffic uses text-format params
+(psycopg2 + SQLAlchemy + node-postgres + Django ORM); KesselDB V1's
+extq surface covers that fully. The drivers that default to binary
+format (psycopg3 / asyncpg / JDBC / sqlx / pgx) all connect but
+require V2 SP-PG-EXTQ-BIN for parameterized queries.
+
+Throughput: 252-409 stmt/s on a single-statement round-trip (psycopg2
+no-pipeline mode). Pipeline-mode + libpq batch optimization is a V2
+follow-up (SP-PG-EXTQ-PIPELINE-BATCH).

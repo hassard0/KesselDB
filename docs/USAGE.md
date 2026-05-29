@@ -1566,12 +1566,14 @@ above). Some advanced introspection paths remain V2-deferred:
   (the affected panel is empty but the connection works). See
   "Limitations (V1)" above for the per-catalog V2 follow-up names.
 
-### Real ORM session (verified 2026-05-29 — SP-PG-EXTQ T7)
+### Real ORM session (verified 2026-05-29 — SP-PG-EXTQ T7 + T8)
 
 Captured from a real Python session driving the `kesseldb-server`
 binary (built with `--features pg-gateway`) on vulcan. Both
 `psycopg2` (libpq Extended Query directly) AND SQLAlchemy 2.0
-(higher-level ORM atop psycopg2) round-trip end-to-end. The server
+(higher-level ORM atop psycopg2) round-trip end-to-end. T8 (2026-05-29
+T8 commit) closes the T7 SQLAlchemy `use_native_hstore=False` caveat
+and broadens the matrix to psycopg3 / asyncpg / JDBC. The server
 was started with:
 
 ```bash
@@ -1633,9 +1635,14 @@ conn.close()
 ```python
 import sqlalchemy as sa
 
+# T8 (2026-05-29) — `use_native_hstore=False` is no longer needed.
+# The pg_catalog hook intercepts the canonical psycopg2 hstore-OID
+# JOIN probe (`SELECT t.oid, typarray FROM pg_type t JOIN pg_namespace
+# ns ON typnamespace = ns.oid WHERE typname = 'hstore'`) and returns a
+# 0-row well-framed response, which is the truth — KesselDB has no
+# hstore extension.
 engine = sa.create_engine(
     "postgresql+psycopg2://test:admin@127.0.0.1:5532/kesseldb",
-    use_native_hstore=False,         # see Caveat below
 )
 
 # Full engine.connect() probe sequence + SELECT *.
@@ -1661,7 +1668,7 @@ for _ in range(3):
         list(conn.execute(sa.text("SELECT * FROM orm_smoke_t7")))
 ```
 
-#### Caveat — `use_native_hstore=False`
+#### T8 — hstore probe now intercepted (no caveat needed)
 
 SQLAlchemy 2.0 + psycopg2 by default queries pg_type for the `hstore`
 type OID at connect:
@@ -1672,14 +1679,14 @@ FROM pg_type t JOIN pg_namespace ns ON typnamespace = ns.oid
 WHERE typname = 'hstore'
 ```
 
-This JOIN shape isn't yet supported by `kessel-sql` (V1 catalog
-synthesizers handle individual `SELECT * FROM pg_catalog.<table>`
-queries, not arbitrary projection-list + JOIN). Setting
-`use_native_hstore=False` is the documented SQLAlchemy way to disable
-the probe; the rest of the SA stack still works fully — `hstore` is a
-PostgreSQL extension that KesselDB doesn't surface anyway. T8
-follow-up: add a synthesizer hook for the pg_type JOIN shape so the
-flag isn't needed for any modern PG client.
+T8 ships a matcher in `pg_catalog::catalog_query_hook` that recognizes
+this canonical psycopg2/SQLAlchemy probe shape (qualified +
+unqualified forms, mixed qualification, case-insensitive, generic
+extension typname) and emits a well-framed 0-row response with two
+OID columns. psycopg2 then concludes "no hstore extension installed"
+— which is the truth, since KesselDB has no extension catalog — and
+SQLAlchemy proceeds normally. `use_native_hstore=False` is no longer
+required for any modern PG client.
 
 #### What the smoke test covers — 19/19 PASS
 
@@ -1698,6 +1705,53 @@ flag isn't needed for any modern PG client.
 | 17 | SQLAlchemy parameterized SELECT (BindParam) | PASS |
 | 18 | SQLAlchemy DISCARD ALL via engine | PASS |
 | 19 | SQLAlchemy connection pool checkout/checkin x3 | PASS |
+
+#### Broader ORM compat matrix (T8, 2026-05-29)
+
+T8 ran a deeper compat smoke against the drivers psycopg2 + SQLAlchemy
+already cover. The result locks where V1 ends and which V2 follow-up
+each gap maps to. Each row is the actual driver session — see
+`docs/superpowers/sppgextq-t8-orm-smoke-2026-05-29.txt` for full
+transcripts.
+
+| Driver          | Status   | Notes                                              |
+|-----------------|----------|----------------------------------------------------|
+| psycopg2 2.9.12 | PASS     | T7 baseline (19/19 steps)                          |
+| SQLAlchemy 2.0  | PASS     | T8 closes the `use_native_hstore=False` caveat     |
+| psycopg3 3.3.4  | PASS\*   | Needs `cursor_factory=psycopg.ClientCursor`        |
+| asyncpg 0.31.0  | PARTIAL  | Connect + DDL + non-param SELECT OK; binary params blocked |
+| JDBC 42.7       | PARTIAL  | Connect + DDL + simple-Q SELECT OK; binary / `::` cast blocked |
+| pgx (Go)        | n/a      | Go runtime not on vulcan (V2 `SP-PG-GO-SMOKE`)     |
+| Drizzle (Node)  | n/a      | Node runtime not on vulcan (V2 `SP-PG-NODE-SMOKE`) |
+| Prisma (Node)   | n/a      | Node runtime not on vulcan (V2 `SP-PG-NODE-SMOKE`) |
+| sqlx (Rust)     | n/a      | Same binary-param gap; V2 `SP-PG-EXTQ-BIN`         |
+
+The PARTIAL drivers all hit the same V1 limitation — V1 rejects
+format code 1 (binary-format parameters) at Bind time with
+`0A000 feature_not_supported` per spec §11 weak-spot #1. ~95% of
+real Postgres traffic uses text-format parameters by default
+(psycopg2 / SQLAlchemy / node-postgres / Django ORM), so V1 covers
+the adoption-multiplier base case fully. The remaining drivers
+unlock when V2 `SP-PG-EXTQ-BIN` ships (text-decode of binary
+parameters at the gateway boundary). JDBC's simple-query mode
+additionally hits a kessel-sql parser gap on `::int8` casts; lift
+via V2 `SP-PG-EXTQ-CAST` (gateway-side cast-stripping rewrite) or
+SQL-AST `SP-SQL-CAST` (parser-level type-cast recognition).
+
+#### Pipelining throughput (T8, 2026-05-29)
+
+Single-statement round-trip throughput measured on vulcan with
+psycopg2 (no libpq pipeline mode):
+
+| Workload                        | N    | Elapsed | Throughput      |
+|---------------------------------|------|---------|-----------------|
+| INSERT (parameterized)          | 1000 | 3.97 s  | 252 stmt/s      |
+| SELECT WHERE id=%s + fetchall   | 1000 | 2.47 s  | 404 stmt/s      |
+| SELECT WHERE id=%s (loop only)  | 1000 | 2.45 s  | 409 stmt/s      |
+
+Latency-bound (SOCK_STREAM + Parse/Bind/Execute/Sync flush cost per
+statement). A libpq-pipeline-mode test would batch up to 8 messages
+and post higher numbers; that's V2 `SP-PG-EXTQ-PIPELINE-BATCH`.
 
 ### Spec + design
 

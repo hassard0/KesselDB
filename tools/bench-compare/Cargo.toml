@@ -1,0 +1,43 @@
+[package]
+name = "bench-compare"
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+publish = false
+description = "KesselDB cross-DB benchmark harness — Postgres / SQLite / TigerBeetle / KesselDB"
+
+# This crate lives OUTSIDE the KesselDB workspace on purpose. See
+# docs/superpowers/specs/2026-05-28-kesseldb-bench-suite-design.md §9.
+# It pulls in external runtime deps (rusqlite, tokio-postgres, etc.) that
+# would otherwise pollute KesselDB's zero-external-runtime-dep stance.
+# The default `cargo build` of KesselDB does NOT see this crate.
+[workspace]
+
+[[bin]]
+name = "bench-compare"
+path = "src/main.rs"
+
+[dependencies]
+# KesselDB in-process driver (workspace crates by relative path).
+kessel-proto = { path = "../../crates/kessel-proto" }
+kessel-io = { path = "../../crates/kessel-io" }
+kessel-catalog = { path = "../../crates/kessel-catalog" }
+kessel-codec = { path = "../../crates/kessel-codec" }
+kessel-sm = { path = "../../crates/kessel-sm" }
+
+# External DB drivers.
+rusqlite = { version = "0.31", features = ["bundled"] }
+postgres = { version = "0.19", features = ["with-serde_json-1"] }
+
+# CLI + JSON + perf utilities.
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.8"
+crossbeam-channel = "0.5"
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

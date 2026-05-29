@@ -6,7 +6,7 @@
 
 *"It's the database that made the Kessel Run in 12 parsecs."*
 
-`1974 default tests green / 2002 with --features pg-gateway / 2057 with all gateway features` · `0 external dependencies in the kernel` · `Rust 1.95+` · single‑binary
+`1974 default tests green / 2002 with --features pg-gateway / 2035 with all gateway features` · `0 external dependencies in the kernel` · `Rust 1.95+` · single‑binary
 
 **Tonight's headlines** (2026‑05‑29):
 - **Real Postgres ORM compatibility** — psycopg2 / SQLAlchemy / Drizzle / JDBC connect via SCRAM‑SHA‑256 and run **parameterized queries** through the new **Extended Query** protocol (Parse / Bind / Describe / Execute / Sync / Close / Flush). End‑to‑end psycopg2 round‑trip verified on vulcan; see [`docs/USAGE.md`](docs/USAGE.md#9-postgresql-clients-psql-pgcli-jdbc-psycopg-pgx-).
@@ -149,7 +149,7 @@ all. Determinism is a feature, not an aspiration.
   gateway crate. See `docs/USAGE.md` §9 PostgreSQL clients.
 - **Deterministic & verifiable** — the whole engine is a seedable state
   machine; the test suite (1974 default / 2002 with `--features pg-gateway`
-  / 2057 with all gateway features) includes seeded partition/fault
+  / 2035 with all gateway features) includes seeded partition/fault
   simulation, multi‑replica Jepsen, hand‑derived KATs against published
   spec text for every codec, the SP‑A 85‑seed K‑invariance sweep, the
   SP‑PG‑CAT synthetic‑peer suite verifying each GUI tool's verbatim
@@ -451,7 +451,7 @@ Honest boundaries (documented, not hidden):
   separate, later concern from cross‑shard *transactions*.
 
 Every claim in this repository is backed by the test suite (1974 default /
-2002 with `--features pg-gateway` / 2057 with all gateway features); the docs
+2002 with `--features pg-gateway` / 2035 with all gateway features); the docs
 call out exactly what is proven versus roadmap. The four **strategic‑tier
 items S1–S4** (TLA+/model‑checked safety, serializable MVCC/SI, Jepsen
 linearizability under partition, deterministic WASM UDFs) are all **shipped**
@@ -483,7 +483,7 @@ cargo test --workspace      # 1974 default tests (seeded partition/fault sim,
                             # pyarrow Parquet round-trips, WASM-MVP KATs,
                             # SP-A 85-seed K-invariance sweep)
 cargo test --workspace --features pg-gateway                # 2002 (adds SP-PG + SP-PG-CAT + SP-PG-EXTQ)
-cargo test --workspace --features pg-gateway,http-gateway,kessel-http-gateway/test-server   # 2057 — full matrix
+cargo test --workspace --features pg-gateway,http-gateway,kessel-http-gateway/test-server   # 2035 — full matrix
 cargo run -p kessel-bench --release -- --help               # benchmarks
 
 # Strategic-tier rigor artifacts:

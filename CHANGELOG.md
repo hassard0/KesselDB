@@ -91,7 +91,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning [Se
 
 ### Tests
 
-- 1974 default / 2002 with `--features pg-gateway` / 2057 with all
+- 1974 default / 2002 with `--features pg-gateway` / 2035 with all
   gateway features (vulcan-measured at HEAD `546e79a`).
 
 ## [1.0.0] — 2026-05-28

@@ -62,7 +62,7 @@ cargo build --release                                # default — binary protoc
 cargo build --release --features pg-gateway,http-gateway   # all wire surfaces
 cargo test --workspace                               # 1974 default tests
 cargo test --workspace --features pg-gateway         # 2002 (adds SP-PG + SP-PG-CAT + SP-PG-EXTQ)
-cargo test --workspace --features pg-gateway,http-gateway,kessel-http-gateway/test-server   # 2057 — full matrix
+cargo test --workspace --features pg-gateway,http-gateway,kessel-http-gateway/test-server   # 2035 — full matrix
 ```
 
 Requires Rust stable **1.95+**.

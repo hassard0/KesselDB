@@ -21,7 +21,7 @@ history. Every claim is backed by the test suite.
 cargo build --workspace                          # all crates, no external deps, no native steps
 cargo test  --workspace                          # 1974 default tests
 cargo test  --workspace --features pg-gateway    # 2002 (adds SP-PG + SP-PG-CAT + SP-PG-EXTQ)
-cargo test  --workspace --features pg-gateway,http-gateway,kessel-http-gateway/test-server   # 2057 — full matrix
+cargo test  --workspace --features pg-gateway,http-gateway,kessel-http-gateway/test-server   # 2035 — full matrix
 
 cargo run --release --bin kesseldb -- 127.0.0.1:7878 ./data   # single open node, binary protocol only
 

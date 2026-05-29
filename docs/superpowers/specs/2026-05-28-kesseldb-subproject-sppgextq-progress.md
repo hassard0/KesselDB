@@ -61,8 +61,8 @@ real streaming cursors (SP-A T14 streaming-rows). See design spec §2.2.
 | **T1** | Design spec (816 LoC, 10 weak-spots + 5 open questions) + scaffold (`crates/kessel-pg-gateway/src/extq/mod.rs` with `SessionState`/`PreparedStmt`/`Portal`/`ExecState` + locked caps + `recognize_extq_tag` + placeholder `try_dispatch_extq` returning `NotYetImplemented`, `extq/proto.rs` with decoders for all 7 frontend messages, `extq/response.rs` with encoders for ParseComplete/BindComplete/CloseComplete/NoData/PortalSuspended/ParameterDescription) + `proto.rs` BE_CLOSE_COMPLETE constant + `server.rs::run_session` routes recognized extq tags to `try_dispatch_extq` and renders NYI as `0A000` while keeping the session alive (tolerant probe-then-fall-back unlocks SQLAlchemy/psycopg/JDBC probe pattern) + 37 KATs locking spec invariants. | **DONE** | `3691242` (spec) + `975c696` (scaffold) |
 | **T2** | Parse + ParseComplete e2e: real `try_dispatch_extq` arm for `P`; named/unnamed statement storage in `SessionState.statements`; ParseComplete emit; `08P01` for `MAX_PREPARED_STATEMENTS_PER_CONN` overflow + decode errors; `42P05 prepared_statement_already_exists` for non-empty-name collision; lock the "Parse stores SQL VERBATIM" invariant; flip T1 regression-lock to "T2 emits ParseComplete for valid Parse". | **DONE** | `688f961` (dispatcher + KATs) + `1b7ad07` (server.rs wire-up) |
 | **T3** | Bind + BindComplete e2e: portal storage in `SessionState.portals`; per-position param-format validation (V1 rejects format code 1 with `0A000`); param-value extraction including NULL sentinel (`length=-1`); BindComplete emit; cap enforcement. | **DONE** | `7861b5b` (dispatcher + KATs) + `fb949bf` (server.rs wire-up) |
-| **T4** | Describe 'S' → ParameterDescription + RowDescription/NoData: schema lookup via existing `EngineApply::describe_table` + `kessel_sql::select_star_table`; emit ParameterDescription with the OID hints from Parse (or empty if Parse didn't provide); NoData for non-SELECT statements. | **OPEN** | — |
-| **T5** | Describe 'P' → RowDescription/NoData: same shape as Describe 'S' but no ParameterDescription (portals don't carry parameter info per PG spec — Bind already substituted). | **OPEN** | — |
+| **T4** | Describe 'S' AND 'P' (both flavors in one slice — saves the T5 separation since they share the same row-shape encoder): schema lookup via existing `EngineApply::describe_table` + `kessel_sql::select_star_table`; 'S' emits ParameterDescription with the OID hints from Parse (or empty if Parse didn't provide) + RowDescription/NoData; 'P' emits RowDescription/NoData WITHOUT ParameterDescription (portals froze their parameter values at Bind time per PG §55.2.3); Missing stmt → `26000`; missing portal → `34000`; bad target byte → `08P01`. | **DONE** | `cd09784` (dispatcher + KATs) + `9e591ca` (server.rs integration KATs) |
+| **T5** | (FOLDED INTO T4) — Describe 'P' was originally a separate slice but shares the row-shape encoder with 'S'. T4 above ships both flavors together. Renumber the remaining slices in the SP-arc T6 → T5 etc. as bookkeeping, or keep the slot empty for a future Describe-related polish. | **CLOSED** | (folded into T4 `cd09784` + `9e591ca`) |
 | **T6** | Execute + parameter substitution + result streaming: text-format substitution via new `extq/substitute.rs` (~15 KATs against the §4 edge corpus); dispatch through `dispatch::dispatch_query`; emit DataRow* + CommandComplete; portal cursor state machine. | **OPEN** | — |
 | **T7** | Sync + ReadyForQuery + error recovery state machine: flush per-Sync output buffer; reset `error_state` on Sync; `08P01` for unsupported subprotocol tags inside a Sync block; emit `Z('I')`; the SkipUntilSync loop in `try_dispatch_extq`. | **OPEN** | — |
 | **T8** | Close ('S'/'P') + CloseComplete + Flush: drop stmt/portal from `SessionState`; CloseComplete emit; Flush is a no-op-emit that triggers a stream flush at the `server::run_session` boundary. | **OPEN** | — |
@@ -623,3 +623,222 @@ Sync → bare RFQ('I') with no intermediate ErrorResponse.
 
 Estimated +5-8 lib KATs + 2-3 server KATs (~+8-10 total). T5
 (Describe 'P') reuses most of the T4 machinery.
+
+## T4 — what landed (2026-05-29, commits `cd09784` + `9e591ca`)
+
+**Two commits, +16 KATs net** (11 lib + 5 server.rs integration), all
+pushed to main, all CI-green. **T4 ships BOTH Describe flavors —
+statement ('S') AND portal ('P') — in one slice** because they share
+the same row-shape detection + encoder; the originally-planned T5 is
+folded into T4 with bookkeeping note (slice T5 row in the plan table
+is marked CLOSED with a pointer to T4's commit pair).
+
+### Commit `cd09784` — Describe dispatcher arms (S + P) + 11 KATs
+
+`crates/kessel-pg-gateway/src/extq/mod.rs`:
+
+- **`try_dispatch_extq` signature change** — now takes
+  `&E: EngineApply + ?Sized` as an extra parameter so the Describe
+  arm can call `engine.describe_table(&table_name)` (and T6 Execute
+  can use `apply_sql`). The skip-until-Sync error-state branch +
+  Parse/Bind arms are unchanged; the engine borrow is read-only.
+  Server.rs (commit 1's small fix-up) + all 29 existing test-site
+  callers updated to pass the engine in.
+- **`dispatch_describe(state, engine, target, name)`** handles the
+  S/P/other split per spec §4 + PG §55.2.3:
+  - **`'S'` (statement)** — resolve `name` against
+    `state.statements`. Missing → `UnknownStatement { name }` →
+    `26000 invalid_sql_statement_name`. Emit
+    `ParameterDescription(prep.param_oids)` (the byte-locked T1
+    encoder), followed by `RowDescription` (if the SQL is a
+    V1-renderable `SELECT * FROM <table>` per
+    `kessel_sql::select_star_table` + `engine.describe_table`) or
+    `NoData` (else).
+  - **`'P'` (portal)** — resolve `name` against `state.portals`.
+    Missing → `UnknownPortal { name }` → `34000
+    invalid_cursor_name`. Then resolve the portal's `stmt_name`
+    against `state.statements` (defensive — T3's Bind validation
+    prevents portal-without-stmt in production, but the dispatcher
+    locks the invariant against future Close-S-before-Describe-P
+    drift). Emit `RowDescription` / `NoData` per the same shape as
+    `'S'` — **but NOT ParameterDescription** (portals already froze
+    parameter values at Bind time per PG §55.2.3 — clients receive
+    `ParameterDescription` only on statement-targeted Describe).
+  - **other target byte** — `BadDescribeTarget { target }` →
+    `08P01`. The `decode_describe` path catches bad targets at
+    decode time (`DecodeError::BadDescribeTarget`), but the
+    dispatcher re-validates so a direct constructor of the message
+    variant can't bypass.
+- **`row_description_or_no_data_for_sql(engine, sql)`** helper —
+  shared between the 'S' and 'P' arms; reuses the Simple Query
+  path's exact detection (`kessel_sql::select_star_table` +
+  `engine.describe_table` + `response::encode_row_description`) so
+  Describe RowDescription bytes are **BYTE-EQUAL** to what `Q`
+  dispatcher emits for the same SQL — a critical invariant that
+  clients (asyncpg + JDBC especially) compare across the two
+  protocol paths. Same SQL trim shape too (`sql.trim().trim_end_matches(';').trim()`).
+- **`ExtqError::BadDescribeTarget { target: u8 }`** new variant.
+  Maps to SQLSTATE `08P01`.
+- **`error_state` side-effect** — on ANY error path
+  `dispatch_describe` sets `state.error_state = true` BEFORE
+  returning so subsequent pipelined messages until Sync hit the
+  early-skip branch at the top of `try_dispatch_extq` (matches the
+  T3 `dispatch_bind` shape).
+- **T3 NYI list KAT FLIPPED** → T4 lock: the still-NYI tags shrink
+  from 5 (D/E/S/C/H) → 4 (E/S/C/H). The Describe arm now produces
+  real wire bytes, not `0A000`.
+
+`crates/kessel-pg-gateway/src/proto.rs`:
+
+- `DESCRIBE_TARGET_STATEMENT: u8 = b'S'` constant.
+- `DESCRIBE_TARGET_PORTAL: u8 = b'P'` constant.
+
+`crates/kessel-pg-gateway/src/server.rs` (compile-fix only — full
+integration KATs land in the next commit):
+
+- `try_dispatch_extq` call passes `engine` through (forced by the
+  dispatcher's new signature).
+- `BadDescribeTarget` error mapping → `08P01 protocol_violation`
+  with the offending target byte in the rendered message.
+
+**+11 lib KATs** (10 brand new + 1 flipped NYI lock):
+
+1. **`t4_dispatch_describe_statement_select_emits_param_desc_and_row_desc`**
+   — Describe 'S' on `SELECT * FROM t` yields ParameterDescription
+   (echoing `param_oids = [23]`) followed by RowDescription whose
+   column metadata matches `engine.describe_table` for table "t".
+   Byte-equal to what the Simple Query path emits for the same SQL
+   (asserted via `response::encode_row_description` comparison).
+2. **`t4_dispatch_describe_statement_non_select_emits_param_desc_and_no_data`**
+   — Describe 'S' on `INSERT INTO t (id) VALUES ($1)` yields PD +
+   NoData (5-byte `n` envelope).
+3. **`t4_dispatch_describe_statement_with_no_oid_hints_emits_empty_param_desc`**
+   — Describe 'S' on a stmt with no Parse-time OID hints emits the
+   7-byte empty-OID PD envelope (`t [length=6] [count=0]`).
+4. **`t4_dispatch_describe_statement_missing_returns_26000`** —
+   Describe 'S' on a non-existent statement → `UnknownStatement` +
+   `error_state` engaged.
+5. **`t4_dispatch_describe_portal_select_emits_row_desc_only`** —
+   HEADLINE asymmetry KAT: Describe 'P' on a SELECT portal emits
+   ONLY RowDescription (`T`), NEVER ParameterDescription (`t`).
+6. **`t4_dispatch_describe_portal_non_select_emits_no_data`** —
+   Describe 'P' on a non-SELECT portal emits 5-byte NoData only.
+7. **`t4_dispatch_describe_portal_missing_returns_34000`** —
+   Describe 'P' on a non-existent portal → `UnknownPortal` +
+   `error_state` engaged.
+8. **`t4_dispatch_describe_in_error_state_returns_skipped_without_processing`**
+   — error_state Skip-until-Sync invariant (spec §6).
+9. **`t4_dispatch_describe_unknown_target_byte_returns_08p01_bad_target`**
+   — defensive bad-target-byte rejection.
+10. **`t4_dispatch_parse_bind_describe_s_round_trip_composes`** —
+    HEADLINE round-trip: Parse + Bind + Describe(S) in the dispatcher
+    yields ParseComplete + BindComplete + PD + RowDescription
+    byte-correct. Closest in-dispatcher equivalent to the
+    `run_session` 4-message round trip.
+11. **`t4_try_dispatch_returns_not_yet_implemented_for_the_four_remaining_tags`**
+    — T3 NYI list KAT flipped to the 4 remaining tags
+    (Execute/Sync/Close/Flush).
+
+### Commit `9e591ca` — server.rs Describe wire-up + 5 integration KATs
+
+`crates/kessel-pg-gateway/src/server.rs`:
+
+- **`t4_extq_run_session_parse_bind_describe_s_select_emits_canonical_sequence`**
+  — HEADLINE byte-locked KAT for §13 acceptance criteria. Full
+  inbound: SCRAM handshake + Parse(`SELECT * FROM t`) + Bind +
+  Describe(S) + Terminate. Asserts the canonical 4-message backend
+  byte sequence on the wire — ParseComplete + BindComplete +
+  ParameterDescription(empty) + RowDescription with column "id" —
+  AND that no `0A000` (Describe is real now) / `26000` / `34000`
+  appears anywhere. Every modern PG ORM probes THIS exact shape at
+  connect time.
+- **`t4_extq_run_session_parse_describe_s_insert_emits_no_data`** —
+  Parse(INSERT) + Describe(S) → ParseComplete + PD + NoData.
+- **`t4_extq_run_session_describe_s_missing_emits_26000_and_stays_alive`**
+  — Describe(S) on a missing statement → 26000 + RFQ + session stays
+  alive (the tolerant probe-then-fall-back contract preserved).
+- **`t4_extq_run_session_describe_p_select_portal_emits_row_desc_no_param_desc`**
+  — full Parse + Bind + Describe(P) round-trip; locks that the byte
+  AFTER BindComplete is RowDescription uppercase `T`, NEVER
+  ParameterDescription lowercase `t`. Spec §4 portal-vs-statement
+  asymmetry verified at the wire layer.
+- **`t4_extq_run_session_describe_p_missing_emits_34000_and_stays_alive`**
+  — Describe(P) on a missing portal → 34000 + RFQ + stays alive.
+
+### Test counts (release on vulcan, 2026-05-29)
+
+| Surface | Before T4 | After T4 | Delta |
+|---|---|---|---|
+| `kessel-pg-gateway` lib | 399 | 414 | +15 (11 mod + 5 server.rs net of 1 flip) |
+
+`kessel-sim` seed-7 GREEN (3 / 3); default tree-grep EMPTY (zero new
+external deps — `cargo tree -p kessel-pg-gateway -e normal` is
+workspace-only); `#![forbid(unsafe_code)]` honored across all
+touched modules. CI green at every commit.
+
+### Headline question — does Parse + Bind + Describe(S) + Sync emit the canonical 4-message wire sequence?
+
+**Parse → ParseComplete: YES** (locked byte-for-byte; same as T2/T3).
+
+**Bind → BindComplete: YES** (locked byte-for-byte; same as T3).
+
+**Describe(S) → ParameterDescription + RowDescription/NoData: YES**
+(locked byte-for-byte by
+`t4_extq_run_session_parse_bind_describe_s_select_emits_canonical_sequence`
+— the 4-message sequence `1 00 00 00 04 | 2 00 00 00 04 | t 00 00 00 06 00 00 | T [...]`
+appears on the wire consecutively, with no intermediate `0A000`).
+
+**Describe(P) → RowDescription/NoData (no PD): YES** (locked by
+`t4_extq_run_session_describe_p_select_portal_emits_row_desc_no_param_desc`
+— the byte after BindComplete is `T`, not `t`).
+
+**Sync → RFQ: PARTIAL** (same as T2/T3) — Sync still hits NYI →
+`0A000` ErrorResponse + RFQ. The RFQ envelope IS byte-correct
+(`Z 00 00 00 05 I`), but the intermediate ErrorResponse is the T7 gap.
+After T7 wires the Sync handler the full extq probe round-trip will
+be: Parse → ParseComplete → Bind → BindComplete → Describe → PD +
+RD/NoData → Sync → bare RFQ('I') with no intermediate ErrorResponse.
+That's the §13 acceptance-criteria target — SQLAlchemy / psycopg /
+asyncpg / JDBC / sqlx / Drizzle / Prisma probe pattern unblocked
+end-to-end.
+
+## Next session pickup — SP-PG-EXTQ T6
+
+(T5 was folded into T4 — see the plan table; the next slice is now
+the originally-planned T6 Execute work.)
+
+**Slice scope**: Execute + parameter substitution + result streaming.
+
+- Implement `extq/substitute.rs` — text-format `$N` substitution at
+  Execute time per spec §4 + the §4 7-row substitution table + 5
+  documented edge cases (identifier substitution forbidden, NULL-in-
+  WHERE three-valued logic, binary-format reject — already done at
+  Bind in T3, quoted-`$1`-in-comments, parameter-used-multiple-times).
+  Estimated ~15 KATs against the spec §4 edge corpus.
+- Implement `dispatch_execute(state, engine, portal, max_rows)`:
+  - Resolve portal → stmt → SQL string.
+  - Substitute `$1`/`$2`/... with the portal's `param_values` text
+    bytes (NULL → bare `NULL`; others → single-quoted with `'` →
+    `''` doubling per PG §4.1.2.1).
+  - Run rewritten SQL through `dispatch::dispatch_query(sql,
+    engine)` (the existing Simple Query pipeline — V1 reuses the
+    SAME pipeline so SP-PG-CAT catalog hook + the T8 SELECT
+    rendering Just Work for prepared statements with zero new
+    catalog code).
+  - Emit the result frames: `DataRow*` + `CommandComplete` for
+    non-paginated success, or `DataRow* + PortalSuspended` if
+    `max_rows > 0` and rows remain (T9 wires the full pagination
+    state machine; T6 ships the unpaginated path).
+- Wire into `server::run_session`'s extq Execute branch.
+- Flip the T4 NYI lock to remove Execute from the still-NYI list.
+
+After T6 lands, the full probe round-trip (Parse + Bind +
+Describe(S) + Execute + Sync) emits its canonical wire sequence
+modulo the Sync → bare-RFQ piece T7 owns. SQLAlchemy / psycopg's
+`cursor.execute("SELECT %s", (42,))` round-trip becomes the §13
+acceptance-criteria smoke target.
+
+Estimated +8-12 lib KATs (substitute + dispatch_execute) + 3-5
+server KATs (real Parse + Bind + Execute + Sync round-trip producing
+actual DataRow bytes against a real `EmptySelectEngine`-shaped
+mock).

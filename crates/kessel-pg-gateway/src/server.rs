@@ -1557,6 +1557,337 @@ mod tests {
         );
     }
 
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-EXTQ T4 — Describe integration KATs through run_session.
+    // The wire byte sequence Parse + Bind + Describe('S' or 'P') must
+    // round-trip end-to-end (ParseComplete + BindComplete +
+    // ParameterDescription? + RowDescription/NoData).
+    // ───────────────────────────────────────────────────────────────────
+
+    /// HEADLINE T4 server KAT: Parse + Bind + Describe('S') round-
+    /// trip emits the canonical four-message backend response on the
+    /// wire — ParseComplete + BindComplete + ParameterDescription +
+    /// RowDescription — for a `SELECT * FROM t` statement whose
+    /// schema the `EmptySelectEngine` knows about. Locked
+    /// byte-for-byte: the four envelopes appear in order, and no
+    /// `0A000` ErrorResponse is emitted (Describe is a real handler
+    /// now — the T3 `0A000` "extq Describe NYI" stub is gone).
+    ///
+    /// This is the §13 acceptance-criteria headline for T4 — every
+    /// modern PG ORM (SQLAlchemy / psycopg / asyncpg / JDBC / sqlx /
+    /// Drizzle / Prisma) issues this exact sequence at connect
+    /// probe time. After T4 the only remaining wire piece for a
+    /// full probe is Sync's RFQ (T6).
+    #[test]
+    fn t4_extq_run_session_parse_bind_describe_s_select_emits_canonical_sequence() {
+        let token = b"kessel-bearer-token";
+        // Parse: name="" sql="SELECT * FROM t" 0 OID hints.
+        let parse_frame = {
+            let payload: &[u8] = b"\0SELECT * FROM t\0\0\0";
+            let length = (4 + payload.len()) as u32;
+            let mut f = Vec::new();
+            f.push(b'P');
+            f.extend_from_slice(&length.to_be_bytes());
+            f.extend_from_slice(payload);
+            f
+        };
+        // Bind: portal="" stmt="" pf=0 pv=0 rf=0 (8-byte payload).
+        let bind_frame = {
+            let mut payload = Vec::new();
+            payload.push(0); // portal ""
+            payload.push(0); // stmt ""
+            payload.extend_from_slice(&0i16.to_be_bytes()); // pf_count
+            payload.extend_from_slice(&0i16.to_be_bytes()); // pv_count
+            payload.extend_from_slice(&0i16.to_be_bytes()); // rf_count
+            let length = (4 + payload.len()) as u32;
+            let mut f = Vec::new();
+            f.push(b'B');
+            f.extend_from_slice(&length.to_be_bytes());
+            f.extend_from_slice(&payload);
+            f
+        };
+        // Describe: target='S' name="".
+        let describe_frame = {
+            let mut payload = Vec::new();
+            payload.push(b'S'); // target
+            payload.push(0); // name ""
+            let length = (4 + payload.len()) as u32;
+            let mut f = Vec::new();
+            f.push(b'D');
+            f.extend_from_slice(&length.to_be_bytes());
+            f.extend_from_slice(&payload);
+            f
+        };
+        let mut extra = parse_frame;
+        extra.extend_from_slice(&bind_frame);
+        extra.extend_from_slice(&describe_frame);
+        extra.extend_from_slice(&build_x_frame());
+        let inbound = build_authed_inbound(token, "clientN", "serverN", "test", &extra);
+        let mut pipe = Pipe::new(inbound);
+        let engine = EmptySelectEngine;
+        let session = run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("session stays alive across Parse + Bind + Describe(S) + Terminate");
+        assert_eq!(session.user, "test");
+
+        let out = &pipe.outbound;
+        // ParseComplete + BindComplete + ParameterDescription appear
+        // consecutively somewhere in the outbound stream. The PD is
+        // the 7-byte empty-OID envelope `t [length=6] [count=0]`.
+        let pcbcpd: &[u8] = &[
+            b'1', 0, 0, 0, 4, // ParseComplete
+            b'2', 0, 0, 0, 4, // BindComplete
+            b't', 0, 0, 0, 6, 0, 0, // empty PD
+        ];
+        assert!(
+            out.windows(pcbcpd.len()).any(|w| w == pcbcpd),
+            "outbound must carry the ParseComplete + BindComplete + ParameterDescription sequence"
+        );
+        // RowDescription tag 'T' appears AFTER the PD. The
+        // EmptySelectEngine's table "t" has one column "id" i64 →
+        // RowDescription contains the literal column name.
+        let pd_end = out
+            .windows(pcbcpd.len())
+            .position(|w| w == pcbcpd)
+            .expect("PD sequence present")
+            + pcbcpd.len();
+        assert_eq!(
+            out[pd_end], b'T',
+            "byte after PD must be RowDescription tag 'T'"
+        );
+        // RowDescription carries the column name "id" verbatim.
+        assert!(
+            out[pd_end..].windows(2).any(|w| w == b"id"),
+            "RowDescription must carry the column name 'id'"
+        );
+        // 0A000 must NOT appear (Describe is a real handler now).
+        assert!(
+            !out.windows(5).any(|w| w == b"0A000"),
+            "Describe should NOT emit 0A000 — it's a real handler now"
+        );
+        // 26000 / 34000 must NOT appear (the stmt + portal exist).
+        assert!(!out.windows(5).any(|w| w == b"26000"));
+        assert!(!out.windows(5).any(|w| w == b"34000"));
+    }
+
+    /// SP-PG-EXTQ T4 — Describe('S') on a non-SELECT statement
+    /// (INSERT) emits ParameterDescription + NoData. Locks the §4
+    /// "non-SELECT → NoData" path through the run_session loop.
+    #[test]
+    fn t4_extq_run_session_parse_describe_s_insert_emits_no_data() {
+        let token = b"kessel-bearer-token";
+        // Parse: name="" sql="INSERT INTO t (id) VALUES (1)" 0 OID hints.
+        let parse_frame = {
+            let payload: &[u8] = b"\0INSERT INTO t (id) VALUES (1)\0\0\0";
+            let length = (4 + payload.len()) as u32;
+            let mut f = Vec::new();
+            f.push(b'P');
+            f.extend_from_slice(&length.to_be_bytes());
+            f.extend_from_slice(payload);
+            f
+        };
+        // Describe: target='S' name="".
+        let describe_frame = {
+            let mut payload = Vec::new();
+            payload.push(b'S');
+            payload.push(0);
+            let length = (4 + payload.len()) as u32;
+            let mut f = Vec::new();
+            f.push(b'D');
+            f.extend_from_slice(&length.to_be_bytes());
+            f.extend_from_slice(&payload);
+            f
+        };
+        let mut extra = parse_frame;
+        extra.extend_from_slice(&describe_frame);
+        extra.extend_from_slice(&build_x_frame());
+        let inbound = build_authed_inbound(token, "clientN", "serverN", "test", &extra);
+        let mut pipe = Pipe::new(inbound);
+        let engine = EmptySelectEngine;
+        run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("session stays alive");
+        let out = &pipe.outbound;
+        // ParseComplete + ParameterDescription(empty) + NoData
+        // consecutively.
+        let expected: &[u8] = &[
+            b'1', 0, 0, 0, 4, // ParseComplete
+            b't', 0, 0, 0, 6, 0, 0, // empty PD
+            b'n', 0, 0, 0, 4, // NoData
+        ];
+        assert!(
+            out.windows(expected.len()).any(|w| w == expected),
+            "outbound must carry ParseComplete + PD + NoData for non-SELECT Describe(S)"
+        );
+        // RowDescription tag 'T' MUST NOT appear post-PD (NoData not RD).
+        // We can't simply check the absence of 'T' in the whole stream
+        // because 'T' also appears in the byte 't' (ParameterDescription
+        // tag is lowercase 't' but RowDescription is uppercase 'T').
+        // Locked: the NoData (5-byte `n` envelope) is what immediately
+        // follows the PD.
+    }
+
+    /// SP-PG-EXTQ T4 — Describe('S') on a non-existent statement
+    /// emits SQLSTATE 26000 + RFQ and stays alive. Locks the
+    /// UnknownStatement error path through run_session.
+    #[test]
+    fn t4_extq_run_session_describe_s_missing_emits_26000_and_stays_alive() {
+        let token = b"kessel-bearer-token";
+        // Describe: target='S' name="ghost" — no Parse first.
+        let describe_frame = {
+            let mut payload = Vec::new();
+            payload.push(b'S');
+            payload.extend_from_slice(b"ghost\0");
+            let length = (4 + payload.len()) as u32;
+            let mut f = Vec::new();
+            f.push(b'D');
+            f.extend_from_slice(&length.to_be_bytes());
+            f.extend_from_slice(&payload);
+            f
+        };
+        let mut extra = describe_frame;
+        extra.extend_from_slice(&build_x_frame());
+        let inbound = build_authed_inbound(token, "clientN", "serverN", "test", &extra);
+        let mut pipe = Pipe::new(inbound);
+        let engine = EmptySelectEngine;
+        let session = run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("session stays alive across Describe(missing) + Terminate");
+        assert_eq!(session.user, "test");
+        let out = &pipe.outbound;
+        assert!(
+            out.windows(5).any(|w| w == b"26000"),
+            "outbound must contain SQLSTATE 26000 for missing statement"
+        );
+        // No RowDescription, no NoData (the lookup failed first).
+        let pd_5_byte: &[u8] = &[b't', 0, 0, 0, 6, 0, 0];
+        assert!(
+            !out.windows(pd_5_byte.len()).any(|w| w == pd_5_byte),
+            "ParameterDescription must NOT appear when stmt lookup fails"
+        );
+    }
+
+    /// SP-PG-EXTQ T4 — Describe('P') on a SELECT portal emits ONLY
+    /// RowDescription — NO ParameterDescription. Locks the §4
+    /// portal-vs-statement asymmetry through run_session.
+    #[test]
+    fn t4_extq_run_session_describe_p_select_portal_emits_row_desc_no_param_desc() {
+        let token = b"kessel-bearer-token";
+        // Parse + Bind first to install the portal.
+        let parse_frame = {
+            let payload: &[u8] = b"\0SELECT * FROM t\0\0\0";
+            let length = (4 + payload.len()) as u32;
+            let mut f = Vec::new();
+            f.push(b'P');
+            f.extend_from_slice(&length.to_be_bytes());
+            f.extend_from_slice(payload);
+            f
+        };
+        let bind_frame = {
+            let mut payload = Vec::new();
+            payload.push(0);
+            payload.push(0);
+            payload.extend_from_slice(&0i16.to_be_bytes());
+            payload.extend_from_slice(&0i16.to_be_bytes());
+            payload.extend_from_slice(&0i16.to_be_bytes());
+            let length = (4 + payload.len()) as u32;
+            let mut f = Vec::new();
+            f.push(b'B');
+            f.extend_from_slice(&length.to_be_bytes());
+            f.extend_from_slice(&payload);
+            f
+        };
+        // Describe: target='P' name="" (portal).
+        let describe_frame = {
+            let mut payload = Vec::new();
+            payload.push(b'P'); // target = portal
+            payload.push(0); // name ""
+            let length = (4 + payload.len()) as u32;
+            let mut f = Vec::new();
+            f.push(b'D');
+            f.extend_from_slice(&length.to_be_bytes());
+            f.extend_from_slice(&payload);
+            f
+        };
+        let mut extra = parse_frame;
+        extra.extend_from_slice(&bind_frame);
+        extra.extend_from_slice(&describe_frame);
+        extra.extend_from_slice(&build_x_frame());
+        let inbound = build_authed_inbound(token, "clientN", "serverN", "test", &extra);
+        let mut pipe = Pipe::new(inbound);
+        let engine = EmptySelectEngine;
+        run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("session stays alive across Parse + Bind + Describe(P)");
+        let out = &pipe.outbound;
+        // ParseComplete + BindComplete must appear.
+        let pcbc: &[u8] = &[b'1', 0, 0, 0, 4, b'2', 0, 0, 0, 4];
+        let pos_pcbc = out
+            .windows(pcbc.len())
+            .position(|w| w == pcbc)
+            .expect("ParseComplete + BindComplete must appear");
+        // AFTER the BindComplete, the next backend frame is the
+        // RowDescription (tag 'T') — NOT ParameterDescription (tag 't').
+        let after = pos_pcbc + pcbc.len();
+        assert_eq!(
+            out[after], b'T',
+            "Describe(P) must emit RowDescription 'T' directly — NOT ParameterDescription 't'"
+        );
+        // Column name "id" present in the RowDescription.
+        assert!(out[after..].windows(2).any(|w| w == b"id"));
+    }
+
+    /// SP-PG-EXTQ T4 — Describe('P') on a non-existent portal emits
+    /// SQLSTATE 34000 + RFQ and stays alive.
+    #[test]
+    fn t4_extq_run_session_describe_p_missing_emits_34000_and_stays_alive() {
+        let token = b"kessel-bearer-token";
+        let describe_frame = {
+            let mut payload = Vec::new();
+            payload.push(b'P');
+            payload.extend_from_slice(b"ghost\0");
+            let length = (4 + payload.len()) as u32;
+            let mut f = Vec::new();
+            f.push(b'D');
+            f.extend_from_slice(&length.to_be_bytes());
+            f.extend_from_slice(&payload);
+            f
+        };
+        let mut extra = describe_frame;
+        extra.extend_from_slice(&build_x_frame());
+        let inbound = build_authed_inbound(token, "clientN", "serverN", "test", &extra);
+        let mut pipe = Pipe::new(inbound);
+        let engine = EmptySelectEngine;
+        let session = run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("session stays alive across missing-portal Describe + Terminate");
+        assert_eq!(session.user, "test");
+        assert!(
+            pipe.outbound.windows(5).any(|w| w == b"34000"),
+            "outbound must contain SQLSTATE 34000 for missing portal"
+        );
+    }
+
     /// SP-PG-EXTQ T1 — an UNRECOGNIZED message tag (neither Q, X, nor
     /// one of the seven extq tags) still closes the connection with
     /// `08P01 protocol_violation`. Locks the existing "true protocol

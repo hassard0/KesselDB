@@ -3,6 +3,97 @@
 All notable changes to KesselDB will be documented in this file.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning [SemVer](https://semver.org).
 
+## [Unreleased]
+
+### Added
+
+- **PostgreSQL Extended Query protocol (SP-PG-EXTQ V1, 2026-05-29)** —
+  full V1 message set `P` (Parse) / `B` (Bind) / `D` (Describe) /
+  `E` (Execute) / `S` (Sync) / `C` (Close) / `H` (Flush). Per-connection
+  `SessionState` with named + unnamed prepared statements + portals up
+  to `MAX_PREPARED_STATEMENTS_PER_CONN = MAX_PORTALS_PER_CONN = 4096`.
+  Parse stores SQL VERBATIM; Bind validates parameter formats (text only;
+  binary rejected with `0A000` — V2 SP-PG-EXTQ-BIN) and parameter count
+  vs Parse's OID hints; Describe 'S' emits ParameterDescription +
+  RowDescription/NoData; Describe 'P' emits RowDescription/NoData;
+  Execute substitutes `$N` text-format parameters and dispatches
+  through `EngineApply::apply_sql`; `max_rows > 0` emits
+  `PortalSuspended` with buffered cursor pagination; Sync emits
+  `ReadyForQuery('I')` and clears the per-connection `error_state`;
+  Close drops named statements/portals; Flush triggers an outbound
+  flush. **End-to-end verification**: real `psycopg2.connect(...)` +
+  `cur.execute("…WHERE id = %s", (42,))` returns rows on vulcan.
+  SQLAlchemy / Drizzle / Prisma / JDBC default-EXTQ paths unblocked
+  at the wire level; full ORM-suite formal smoke (T8/T11/T12) is the
+  post-V1.1 follow-up.
+- **Cross-DB benchmark suite (SP-Bench-Suite T1-T3)** — KesselDB vs
+  Postgres + SQLite + TigerBeetle reproducible head-to-head harness at
+  `tools/bench-compare/`. Workloads: YCSB-A (50/50 read/update), YCSB-B
+  (95/5), YCSB-C (100% reads), sysbench OLTP read-only / write-only /
+  read-write. Wins AND losses published verbatim in
+  `docs/BENCHMARKS.md` — KesselDB wins YCSB-A/B/C and sysbench WO
+  decisively; loses sysbench RO and RW to Postgres / SQLite because
+  `Op::Txn` apply-lock serializes RO inner ops.
+- **Perf-A read-pool bypass (SP-Perf-A T1-T7)** — parallel-read dispatch
+  via `read_only_op(&self, ...)` through `Arc<RwLock<StateMachine>>`
+  (T2); in-process apply skips encode/decode roundtrip (T6 Fix A);
+  `OpResult::Got` carries `Arc<[u8]>` instead of `Vec<u8>` (T6 Fix B);
+  storage memtable + SSTable cached blocks + transaction overlay lifted
+  to `Arc<[u8]>` (T7). Measured: **~4.75M ops/sec at N=16 cores,
+  p50 < 1 µs, p99 ~3 µs** on the vulcan reference server. Storage
+  point-read ceiling honestly diagnosed at ~5M ops/sec (`RwLock`
+  reader CAS ping-pong); next arc named SP-Perf-A-SHARD.
+
+### Fixed
+
+- **Cluster test flakes (SP-CLUSTER-FLAKE T2, root-cause fix)** —
+  `Node::submit*` / `apply_raw` now retry transient `ViewChange` →
+  `Unavailable` the same way production `ClusterClient` does. The fix
+  lives in the production code path, not a test relaxation, so any
+  call site that previously saw an intermittent transient
+  `Unavailable` during a view-change is now automatically retried.
+  Closes the long-standing CI intermittent surfaced by stress runs.
+
+### Performance
+
+- Sub-µs p50 read latency at N=16 (Perf-A T2 + T7).
+- 4.75M ops/sec parallel-read ceiling (YCSB-C N=16 — ≈ 40× SQLite,
+  ≈ 57× Postgres).
+- sysbench OLTP write-only N=8 = 53,409 tx/s — 5.2× Postgres at
+  the same N.
+
+### Compatibility
+
+- psycopg2 / psycopg3 / asyncpg connect via SCRAM-SHA-256 and run
+  parameterized queries through Extended Query (verified on vulcan).
+- SQLAlchemy `create_engine(...)` + `text(... :id ...)` parameterized
+  SELECT works end-to-end (the formal ORM-suite shape is the T11
+  follow-up).
+- Drizzle / Prisma / JDBC default-EXTQ paths unblocked at the wire
+  level (formal driver smoke is T8/T12).
+
+### Documentation
+
+- README rewritten above the fold with the three night-headlines
+  (Postgres ORM compat / 4.8M ops/sec parallel reads / honest cross-DB
+  benches); compatibility matrix promoted; performance table adds
+  parallel-read row + cross-DB headline table; next-arc named.
+- STATUS preamble bumped to 2026-05-29 with a 4-track recap of
+  tonight's deliveries.
+- ARCHITECTURE: PG-wire section gains the SP-PG-EXTQ V1 paragraph;
+  storage section adds the T7 Arc<[u8]> read-fast-path note; atomic
+  transactions gains the honest Op::Txn apply-lock perf boundary
+  paragraph; V2 follow-ups list trimmed (Extended Query removed).
+- USAGE §9 reflects EXTQ V1 — psycopg2 parameterized + SQLAlchemy
+  samples; "Simple Query only" limitation dropped.
+- BENCHMARKS already published §3-§3e (sysbench OLTP) + §11-§12
+  (Perf-A T6/T7) as part of the night's commits.
+
+### Tests
+
+- 1974 default / 2002 with `--features pg-gateway` / 2057 with all
+  gateway features (vulcan-measured at HEAD `546e79a`).
+
 ## [1.0.0] — 2026-05-28
 
 Initial public release.

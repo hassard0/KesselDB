@@ -85,6 +85,10 @@ fn dump_all_versions<V: kessel_io::Vfs>(
         // Guard: only 28-byte versioned keys (legacy keys are shorter and
         // should not appear in these tests, but filter defensively).
         .filter(|(k, _)| k.len() == VERSIONED_KEY_LEN)
+        // SP-Perf-A T7: `scan_range_versions` yields `Option<Arc<[u8]>>`;
+        // this digest helper materialises `Option<Vec<u8>>` for stable
+        // byte-comparison against expected fixtures.
+        .map(|(k, v)| (k, v.map(|a| a.as_ref().to_vec())))
         .collect()
 }
 

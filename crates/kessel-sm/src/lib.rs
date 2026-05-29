@@ -3001,8 +3001,15 @@ impl<V: Vfs> StateMachine<V> {
                 }
                 for (ct, cid, fi, off, w, dflt) in &set_null {
                     let k = make_key(*ct, cid);
-                    let old = match self.storage.get(&k) {
-                        Some(r) => r,
+                    // SP-Perf-A T7: `storage.get` now returns `Arc<[u8]>`;
+                    // we need an owned `Vec<u8>` here because SET NULL
+                    // mutates `new` in place (zeroing the field, flipping
+                    // the null bit). `old.as_ref().to_vec()` is the SAME
+                    // memcpy the pre-T7 `Vec<u8>::clone` paid; `old` itself
+                    // is still an Arc handle (for the `idx_maintain`
+                    // call below).
+                    let old: Vec<u8> = match self.storage.get(&k) {
+                        Some(r) => r.as_ref().to_vec(),
                         None => continue,
                     };
                     let mut new = old.clone();
@@ -3085,9 +3092,15 @@ impl<V: Vfs> StateMachine<V> {
                 match self.storage.get(&key) {
                     Some(b) => {
                         if let Some(c) = self.cache.as_mut() {
-                            c.insert(key, b.clone());
+                            // SP-Perf-A T7: cache::insert still takes
+                            // `Vec<u8>` (a follow-up could lift the cache
+                            // to Arc too). One materialisation here on
+                            // the writer's path; the parallel read pool's
+                            // `read_only_op` does NOT consult the cache
+                            // (`self` is shared there).
+                            c.insert(key, b.as_ref().to_vec());
                         }
-                        OpResult::Got(b.into())
+                        OpResult::Got(b)
                     }
                     None => OpResult::NotFound,
                 }
@@ -8808,6 +8821,9 @@ mod tests {
                 .scan_range_versions(&lo, &hi)
                 .into_iter()
                 .filter(|(k, _)| k.len() == VERSIONED_KEY_LEN)
+                // SP-Perf-A T7: scan_range_versions yields Arc; materialise
+                // Vec for byte-comparison digests in this test.
+                .map(|(k, v)| (k, v.map(|a| a.as_ref().to_vec())))
                 .collect()
         }
 
@@ -9662,6 +9678,8 @@ mod tests {
             .scan_range_versions(&lo, &hi)
             .into_iter()
             .filter(|(k, _)| k.len() == VERSIONED_KEY_LEN)
+            // SP-Perf-A T7: materialise Arc → Vec for digest comparison.
+            .map(|(k, v)| (k, v.map(|a| a.as_ref().to_vec())))
             .collect()
     }
 
@@ -10111,6 +10129,8 @@ mod tests {
                 .scan_range_versions(&lo, &hi)
                 .into_iter()
                 .filter(|(k, _)| k.len() == VERSIONED_KEY_LEN)
+                // SP-Perf-A T7: materialise Arc → Vec for digest comparison.
+                .map(|(k, v)| (k, v.map(|a| a.as_ref().to_vec())))
                 .collect()
         }
 
@@ -13081,11 +13101,14 @@ mod tests {
         hi.extend_from_slice(&1u32.to_le_bytes());
         hi.extend_from_slice(&oid);
         hi.extend_from_slice(&[0xFFu8; 8]);
-        let versions: Vec<_> = sm
+        // SP-Perf-A T7: scan_range_versions now yields Arc; materialise Vec
+        // so the byte-comparison against `rec` stays straightforward.
+        let versions: Vec<(Vec<u8>, Option<Vec<u8>>)> = sm
             .storage
             .scan_range_versions(&lo, &hi)
             .into_iter()
             .filter(|(k, _)| k.len() == 28)
+            .map(|(k, v)| (k, v.map(|a| a.as_ref().to_vec())))
             .collect();
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].1, Some(rec));

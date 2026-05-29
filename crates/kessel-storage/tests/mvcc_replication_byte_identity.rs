@@ -77,6 +77,8 @@ fn dump_all_versions<V: kessel_io::Vfs>(
         // legacy 20-byte keys live below the versioned-key space and should
         // not appear here (none are written in these tests), but guard anyway.
         .filter(|(k, _)| k.len() == VERSIONED_KEY_LEN)
+        // SP-Perf-A T7: materialise Arc → Vec for byte-comparison digests.
+        .map(|(k, v)| (k, v.map(|a| a.as_ref().to_vec())))
         .collect()
 }
 

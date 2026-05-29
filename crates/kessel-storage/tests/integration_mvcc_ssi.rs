@@ -47,6 +47,8 @@ fn dump_all_versions<V: kessel_io::Vfs>(
         .scan_range_versions(&lo, &hi)
         .into_iter()
         .filter(|(k, _)| k.len() == VERSIONED_KEY_LEN)
+        // SP-Perf-A T7: materialise Arc → Vec for byte-comparison digests.
+        .map(|(k, v)| (k, v.map(|a| a.as_ref().to_vec())))
         .collect()
 }
 

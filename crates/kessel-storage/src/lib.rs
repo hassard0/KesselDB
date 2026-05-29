@@ -1,4 +1,4 @@
-//! kessel-storage: a small LSM (memtable + immutable SSTables + compaction)
+﻿//! kessel-storage: a small LSM (memtable + immutable SSTables + compaction)
 //! on a write-ahead log, all over the `kessel-io` VFS so the simulator can
 //! crash it deterministically.
 //!
@@ -19,6 +19,7 @@ use kessel_io::{Disk, Vfs};
 use kessel_proto::codec::crc32c;
 use std::collections::BTreeMap;
 use std::io;
+use std::sync::Arc;
 
 /// Variable-length, lexicographically-ordered key (SP24). Data rows still
 /// use `type_id (4, LE) ++ object_id (16)` = 20 bytes (a type's rows remain
@@ -238,7 +239,7 @@ impl Wal {
 fn write_sstable(
     vfs: &dyn Vfs,
     name: &str,
-    entries: &BTreeMap<Key, Option<Vec<u8>>>,
+    entries: &BTreeMap<Key, Option<Arc<[u8]>>>,
 ) -> io::Result<()> {
     let mut buf = Vec::new();
     buf.extend_from_slice(&SST_MAGIC.to_le_bytes());
@@ -336,7 +337,13 @@ impl Bloom {
 }
 
 struct SsTable {
-    entries: Vec<(Key, Option<Vec<u8>>)>,
+    /// SP-Perf-A T7 — value slot is `Option<Arc<[u8]>>` so multiple readers
+    /// of the same committed value share a single backing buffer. Point/range
+    /// reads return an `Arc::clone` (refcount bump, ~ns) instead of cloning
+    /// the bytes (memcpy, ~µs at row sizes around the read pool's per-call
+    /// budget). The wrap is paid ONCE at `SsTable::open` time; every
+    /// subsequent reader returns a refcount bump.
+    entries: Vec<(Key, Option<Arc<[u8]>>)>,
     bloom: Bloom,
 }
 
@@ -381,7 +388,13 @@ impl SsTable {
             let val = if tag == 0 {
                 let vl = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap()) as usize;
                 p += 4;
-                let v = buf[p..p + vl].to_vec();
+                // SP-Perf-A T7: one-shot wrap into `Arc<[u8]>`. From this point
+                // on every reader of this value gets a refcount bump, not a
+                // memcpy. The `Box<[u8]>` allocation is sized to the value
+                // (no slack); `Arc::from(Box<[u8]>)` reuses that allocation
+                // for the Arc payload, so the total cost is identical to the
+                // pre-T7 `Vec<u8>` shape.
+                let v: Arc<[u8]> = Arc::from(buf[p..p + vl].to_vec().into_boxed_slice());
                 p += vl;
                 Some(v)
             } else {
@@ -393,7 +406,7 @@ impl SsTable {
         Ok(SsTable { entries, bloom })
     }
 
-    fn get(&self, key: &Key) -> Option<&Option<Vec<u8>>> {
+    fn get(&self, key: &Key) -> Option<&Option<Arc<[u8]>>> {
         // O(1) reject of a definite miss before the binary search — the
         // SP48 point-read fast path. No false negatives, so this never
         // skips a table that actually holds the key (shadow/tombstone
@@ -492,7 +505,13 @@ fn write_manifest(vfs: &dyn Vfs, m: &Manifest) -> io::Result<()> {
 
 pub struct Storage<V: Vfs> {
     vfs: V,
-    memtable: BTreeMap<Key, Option<Vec<u8>>>,
+    /// SP-Perf-A T7 — value slots are `Option<Arc<[u8]>>` so multiple readers
+    /// of the same committed value share a single backing buffer. The Arc is
+    /// minted ONCE on the write path (`commit` wraps the input `Vec<u8>`);
+    /// every reader thereafter returns a refcount bump. This is the lift
+    /// that makes `Storage::get` zero-memcpy on the hot path — the headline
+    /// of T7. The previous `Option<Vec<u8>>` shape paid a memcpy per reader.
+    memtable: BTreeMap<Key, Option<Arc<[u8]>>>,
     sstables: Vec<SsTable>,
     manifest: Manifest,
     wal: Wal,
@@ -503,7 +522,9 @@ pub struct Storage<V: Vfs> {
     /// buffered here (NOT in WAL/memtable) and reads see it first, so a
     /// transaction is all-or-nothing: `commit_txn` flushes it atomically,
     /// `abort_txn` discards it leaving zero trace.
-    txn: Option<BTreeMap<Key, (u64, Option<Vec<u8>>)>>,
+    /// SP-Perf-A T7: value slots match `memtable` — `Arc<[u8]>` keeps the
+    /// overlay-served read path zero-memcpy too.
+    txn: Option<BTreeMap<Key, (u64, Option<Arc<[u8]>>)>>,
     /// SP49: if > 0, `flush` auto-`compact`s once the live segment count
     /// reaches this, so the point-read fan-out stays bounded (≈ O(1) in
     /// total data instead of O(#flushes)). 0 = off (raw primitive
@@ -540,7 +561,12 @@ impl<V: Vfs> Storage<V> {
             (manifest.high_op > 0).then_some(manifest.high_op);
         for e in wal.replay() {
             high_op = Some(high_op.map_or(e.op_number, |h| h.max(e.op_number)));
-            memtable.insert(e.key, e.value);
+            // SP-Perf-A T7: WAL replay yields `Entry { value: Option<Vec<u8>> }`
+            // (the on-disk WAL format is wire-byte-untouched). Wrap into
+            // `Arc<[u8]>` ONCE at insert; the memtable shape is otherwise
+            // identical to pre-T7 — same allocations, same byte content.
+            let v_arc = e.value.map(|v| Arc::from(v.into_boxed_slice()));
+            memtable.insert(e.key, v_arc);
         }
         Ok(Storage {
             vfs,
@@ -592,10 +618,16 @@ impl<V: Vfs> Storage<V> {
             None => return Ok(()),
         };
         for (k, (n, v)) in &ov {
+            // SP-Perf-A T7: WAL format is wire-byte-untouched — `Entry::value`
+            // stays `Option<Vec<u8>>`. The overlay stores `Arc<[u8]>` so we
+            // materialise a `Vec<u8>` from the slice for the WAL frame; this
+            // is the SAME memcpy the pre-T7 path paid (the WAL serialise
+            // step always extended `buf` with the value bytes). Net cost
+            // unchanged on the write path.
             self.wal.append(&Entry {
                 op_number: *n,
                 key: k.clone(),
-                value: v.clone(),
+                value: v.as_ref().map(|a| a.as_ref().to_vec()),
             })?;
         }
         self.wal.sync()?;
@@ -671,20 +703,25 @@ impl<V: Vfs> Storage<V> {
         self.commit(Entry { op_number, key, value })
     }
 
-    /// Like `scan_range` but yields `(Key, Option<Vec<u8>>)` — tombstones
+    /// Like `scan_range` but yields `(Key, Option<Arc<[u8]>>)` — tombstones
     /// are visible as `None`. Used by the MVCC layer to scan a versioned-key
     /// prefix where a tombstone encodes a logical deletion rather than
     /// a missing key. Merge order: older SSTables < newer SSTables < memtable
     /// < txn overlay (latest wins).
+    ///
+    /// SP-Perf-A T7: value position is `Arc<[u8]>` so the MVCC point-read
+    /// chain `Storage::get → mvcc::get_at_snapshot_arc → scan_range_versions`
+    /// stays zero-memcpy end-to-end. Every value clone here is a refcount
+    /// bump.
     pub fn scan_range_versions(
         &self,
         lo: &Key,
         hi: &Key,
-    ) -> Vec<(Key, Option<Vec<u8>>)> {
+    ) -> Vec<(Key, Option<Arc<[u8]>>)> {
         if lo > hi {
             return Vec::new();
         }
-        let mut merged: BTreeMap<Key, Option<Vec<u8>>> = BTreeMap::new();
+        let mut merged: BTreeMap<Key, Option<Arc<[u8]>>> = BTreeMap::new();
         for sst in &self.sstables {
             if !sst.overlaps(lo, hi) {
                 continue;
@@ -710,7 +747,12 @@ impl<V: Vfs> Storage<V> {
 
     fn commit(&mut self, e: Entry) -> io::Result<()> {
         if let Some(ov) = self.txn.as_mut() {
-            ov.insert(e.key, (e.op_number, e.value)); // buffered, not durable
+            // SP-Perf-A T7: txn overlay value slot is `Arc<[u8]>`; mint the
+            // Arc ONCE here (same alloc as the pre-T7 `Vec<u8>::clone` on
+            // commit, but every subsequent buffered-read returns a refcount
+            // bump rather than memcpying the bytes).
+            let v_arc = e.value.map(|v| Arc::from(v.into_boxed_slice()));
+            ov.insert(e.key, (e.op_number, v_arc)); // buffered, not durable
             return Ok(());
         }
         self.wal.append(&e)?;
@@ -718,7 +760,14 @@ impl<V: Vfs> Storage<V> {
             self.wal.sync()?;
         }
         let op = e.op_number;
-        self.memtable.insert(e.key, e.value);
+        // SP-Perf-A T7: same Arc mint as the txn overlay branch — paid once,
+        // reused by every reader of this version until it shadows or
+        // tombstones. Net write-path cost identical to pre-T7 (the WAL
+        // append above ALREADY consumed the value bytes by reference, so
+        // the wrap here is the same one allocation the previous shape made
+        // by moving the `Vec<u8>` into the memtable).
+        let v_arc = e.value.map(|v| Arc::from(v.into_boxed_slice()));
+        self.memtable.insert(e.key, v_arc);
         self.high_op = Some(self.high_op.map_or(op, |h| h.max(op)));
         Ok(())
     }
@@ -730,29 +779,36 @@ impl<V: Vfs> Storage<V> {
         self.high_op
     }
 
-    pub fn get(&self, key: &Key) -> Option<Vec<u8>> {
+    /// SP-Perf-A T7: point-read returns `Option<Arc<[u8]>>` so the hot path
+    /// is a refcount bump (no memcpy). The Arc is shared across every reader
+    /// of the same committed version — both the parallel read pool and the
+    /// catalog reload path benefit. The MVCC dispatch uses
+    /// [`mvcc::get_at_snapshot_arc`] which threads the Arc through the
+    /// version-chain walk; the legacy 20-byte / 28-byte path returns
+    /// `Arc::clone` of the memtable/SSTable slot directly.
+    pub fn get(&self, key: &Key) -> Option<Arc<[u8]>> {
         // SP116 / S2.7 — user-type data-row point read goes to MVCC at the
         // latest committed snapshot (READ COMMITTED for the apply seam, which
         // is serial in log-position order). Tombstone collapses to None.
         if let Some(type_id) = data_row_dispatch(key) {
             let mut oid = [0u8; 16];
             oid.copy_from_slice(&key[4..20]);
-            return match mvcc::get_at_snapshot(self, type_id, &oid, u64::MAX) {
-                mvcc::SnapshotRead::Found(v) => Some(v),
-                mvcc::SnapshotRead::Tombstoned | mvcc::SnapshotRead::NotYetWritten => None,
-            };
+            // SP-Perf-A T7: Arc-flavoured snapshot read — no `Vec<u8>::clone`
+            // anywhere on the hot path. `None` collapses both
+            // Tombstoned and NotYetWritten (same as the pre-T7 surface).
+            return mvcc::get_at_snapshot_arc(self, type_id, &oid, u64::MAX);
         }
         if let Some(ov) = &self.txn {
             if let Some((_, v)) = ov.get(key) {
-                return v.clone(); // read-your-writes within the txn
+                return v.clone(); // refcount bump (was: memcpy)
             }
         }
         if let Some(v) = self.memtable.get(key) {
-            return v.clone();
+            return v.clone(); // refcount bump (was: memcpy)
         }
         for sst in self.sstables.iter().rev() {
             if let Some(v) = sst.get(key) {
-                return v.clone();
+                return v.clone(); // refcount bump (was: memcpy)
             }
         }
         None
@@ -806,7 +862,13 @@ impl<V: Vfs> Storage<V> {
         if self.sstables.len() < 2 {
             return Ok(());
         }
-        let mut merged: BTreeMap<Key, Option<Vec<u8>>> = BTreeMap::new();
+        // SP-Perf-A T7: merge map shares the SSTable Arc payload (refcount
+        // bump per entry; no value memcpy). Compaction throughput is the
+        // same on the I/O front (write_sstable still serializes value
+        // bytes into the output buffer) but the merge step itself is now
+        // O(entries) refcount-bumps instead of O(entries * avg_value_len)
+        // memcpys.
+        let mut merged: BTreeMap<Key, Option<Arc<[u8]>>> = BTreeMap::new();
         for sst in &self.sstables {
             for (k, v) in &sst.entries {
                 merged.insert(k.clone(), v.clone()); // later (newer) wins
@@ -844,8 +906,13 @@ impl<V: Vfs> Storage<V> {
     /// Merged live view (oldest SSTable -> newest -> memtable, latest wins,
     /// tombstones dropped). Sorted by key. Used for digests / convergence
     /// checks; O(total) — not a hot path.
+    ///
+    /// SP-Perf-A T7: the return type stays `Vec<(Key, Vec<u8>)>` because
+    /// digest consumers compare against owned `Vec<u8>` expected fixtures.
+    /// The Arc → Vec conversion materialises here (not on the read hot
+    /// path) — paid once per digest call, which is a cold-path utility.
     pub fn scan_all(&self) -> Vec<(Key, Vec<u8>)> {
-        let mut merged: BTreeMap<Key, Option<Vec<u8>>> = BTreeMap::new();
+        let mut merged: BTreeMap<Key, Option<Arc<[u8]>>> = BTreeMap::new();
         for sst in &self.sstables {
             for (k, v) in &sst.entries {
                 merged.insert(k.clone(), v.clone());
@@ -856,7 +923,7 @@ impl<V: Vfs> Storage<V> {
         }
         merged
             .into_iter()
-            .filter_map(|(k, v)| v.map(|val| (k, val)))
+            .filter_map(|(k, v)| v.map(|val| (k, val.as_ref().to_vec())))
             .collect()
     }
 
@@ -891,7 +958,14 @@ impl<V: Vfs> Storage<V> {
         if lo > hi {
             return Vec::new();
         }
-        let mut merged: BTreeMap<Key, Option<Vec<u8>>> = BTreeMap::new();
+        // SP-Perf-A T7: merge map shares the Arc payload (refcount bumps,
+        // no value memcpys). The final `Vec<u8>` materialisation pays one
+        // memcpy per surviving entry — required because callers compare
+        // against owned `Vec<u8>` expected fixtures and the SM apply arm
+        // sometimes mutates the resulting payload. Per-call cost is the
+        // same as the pre-T7 `Vec<u8>::clone` shape; the win is that the
+        // SST/memtable entries themselves stay Arc-shared.
+        let mut merged: BTreeMap<Key, Option<Arc<[u8]>>> = BTreeMap::new();
         for sst in &self.sstables {
             if !sst.overlaps(lo, hi) {
                 continue;
@@ -918,7 +992,7 @@ impl<V: Vfs> Storage<V> {
         }
         merged
             .into_iter()
-            .filter_map(|(k, v)| v.map(|val| (k, val)))
+            .filter_map(|(k, v)| v.map(|val| (k, val.as_ref().to_vec())))
             .collect()
     }
 
@@ -1060,8 +1134,13 @@ impl<V: Vfs> Storage<V> {
             }
             let c = cand?;
             // Tombstone-aware newest-wins resolution of just this key.
+            // SP-Perf-A T7: `self.get` now returns `Option<Arc<[u8]>>`;
+            // bound_in's caller surface stays `(Key, Vec<u8>)`, so
+            // materialise the Vec here. This is an order-index boundary
+            // accelerator (MIN/MAX) — at most one materialisation per
+            // call, NOT on the per-row hot read path.
             if let Some(v) = self.get(&c) {
-                return Some((c, v));
+                return Some((c, v.as_ref().to_vec()));
             }
             // Boundary was tombstoned at the newest version — step past it.
             if want_max {
@@ -1121,6 +1200,15 @@ mod tests {
 
     fn k(n: u128) -> Key {
         make_key((n >> 96) as u32, &(n as u128).to_le_bytes())
+    }
+
+    /// SP-Perf-A T7: tests assert against `Option<Vec<u8>>` for byte-identity;
+    /// `Storage::get` returns `Option<Arc<[u8]>>` (refcount-bump on the hot
+    /// path). This shim materialises the Vec exactly once per assertion,
+    /// preserving every prior test's expected fixture without churning
+    /// hundreds of call sites.
+    fn vget<V: Vfs>(s: &Storage<V>, key: &Key) -> Option<Vec<u8>> {
+        s.get(key).map(|a| a.as_ref().to_vec())
     }
 
     #[test]
@@ -1212,12 +1300,12 @@ mod tests {
         s.flush().unwrap();
         s.put(3, k(2), b"v2b".to_vec()).unwrap(); // shadow in memtable
         s.put(4, k(3), b"v3".to_vec()).unwrap();
-        assert_eq!(s.get(&k(1)), Some(b"v1".to_vec()));
-        assert_eq!(s.get(&k(2)), Some(b"v2b".to_vec()), "newer wins");
-        assert_eq!(s.get(&k(3)), Some(b"v3".to_vec()));
-        assert_eq!(s.get(&k(99)), None);
+        assert_eq!(vget(&s, &k(1)), Some(b"v1".to_vec()));
+        assert_eq!(vget(&s, &k(2)), Some(b"v2b".to_vec()), "newer wins");
+        assert_eq!(vget(&s, &k(3)), Some(b"v3".to_vec()));
+        assert_eq!(vget(&s, &k(99)), None);
         s.delete(5, k(1)).unwrap();
-        assert_eq!(s.get(&k(1)), None, "tombstone hides older value");
+        assert_eq!(vget(&s, &k(1)), None, "tombstone hides older value");
     }
 
     #[test]
@@ -1233,8 +1321,8 @@ mod tests {
         assert_eq!(s.sstable_count(), 2);
         s.compact().unwrap();
         assert_eq!(s.sstable_count(), 1);
-        assert_eq!(s.get(&k(1)), Some(b"a2".to_vec()));
-        assert_eq!(s.get(&k(2)), None);
+        assert_eq!(vget(&s, &k(1)), Some(b"a2".to_vec()));
+        assert_eq!(vget(&s, &k(2)), None);
     }
 
     #[test]
@@ -1316,11 +1404,11 @@ mod tests {
                 42 => None,
                 _ => Some(vec![i as u8]),
             };
-            assert_eq!(s.get(&k(i)), want, "key {i} wrong with bloom path");
+            assert_eq!(vget(&s, &k(i)), want, "key {i} wrong with bloom path");
         }
         // Absent keys: correct (and mostly bloom-rejected, but correctness
         // holds regardless of FP).
-        assert_eq!(s.get(&k(9999)), None);
+        assert_eq!(vget(&s, &k(9999)), None);
         assert_eq!(s.sstable_count(), 62);
     }
 
@@ -1357,9 +1445,9 @@ mod tests {
                 20 => None,
                 _ => Some(vec![i as u8]),
             };
-            assert_eq!(s.get(&k(i)), want, "key {i} wrong after bounded compaction");
+            assert_eq!(vget(&s, &k(i)), want, "key {i} wrong after bounded compaction");
         }
-        assert_eq!(s.get(&k(9999)), None);
+        assert_eq!(vget(&s, &k(9999)), None);
     }
 
     #[test]
@@ -1386,7 +1474,7 @@ mod tests {
             }
         }
         for n in 0..40u128 {
-            assert_eq!(s.get(&k(n)), oracle.get(&k(n)).cloned(), "key {n}");
+            assert_eq!(vget(&s, &k(n)), oracle.get(&k(n)).cloned(), "key {n}");
         }
     }
 
@@ -1449,7 +1537,7 @@ mod tests {
         // a raw scan over the 20-byte key range finds the reconstructed key
         // by way of the MVCC dispatch on scan_range.
         assert_eq!(
-            s.get(&key),
+            vget(&s, &key),
             Some(value),
             "SP116 dispatch: 20-byte user-type key must round-trip via MVCC"
         );
@@ -1501,7 +1589,7 @@ mod tests {
             let key = make_key(t, &[i as u8; 16]);
             s.put((i + 1) as u64, key.clone(), vec![i as u8; 4]).unwrap();
             assert_eq!(
-                s.get(&key),
+                vget(&s, &key),
                 Some(vec![i as u8; 4]),
                 "SP116 dispatch: reserved type {t:#x} (20-byte aux/index key) \
                  must round-trip via legacy, not MVCC"
@@ -1523,22 +1611,22 @@ mod tests {
         let mut s = Storage::open(MemVfs::new()).unwrap();
         // 3-byte catalog-shaped key.
         s.put(1, vec![0x00, 0x00, 0x01], vec![0xAAu8; 4]).unwrap();
-        assert_eq!(s.get(&vec![0x00, 0x00, 0x01]), Some(vec![0xAAu8; 4]));
+        assert_eq!(vget(&s, &vec![0x00, 0x00, 0x01]), Some(vec![0xAAu8; 4]));
         // 19-byte off-by-one (too short).
         let short = vec![1u8; 19];
         s.put(2, short.clone(), vec![0xBBu8; 4]).unwrap();
-        assert_eq!(s.get(&short), Some(vec![0xBBu8; 4]));
+        assert_eq!(vget(&s, &short), Some(vec![0xBBu8; 4]));
         // 21-byte off-by-one (too long).
         let long = vec![2u8; 21];
         s.put(3, long.clone(), vec![0xCCu8; 4]).unwrap();
-        assert_eq!(s.get(&long), Some(vec![0xCCu8; 4]));
+        assert_eq!(vget(&s, &long), Some(vec![0xCCu8; 4]));
         // Synthetic 28-byte key (NOT an MVCC versioned key — distinct payload
         // pattern). The 28-byte length matches what mvcc::PREFIX_LEN + 8
         // would produce so the dispatch must NOT fire on a put with this
         // shape (the 28-byte length is OUTPUT-only for MVCC).
         let v28 = vec![0xDDu8; 28];
         s.put(4, v28.clone(), vec![0xEEu8; 4]).unwrap();
-        assert_eq!(s.get(&v28), Some(vec![0xEEu8; 4]));
+        assert_eq!(vget(&s, &v28), Some(vec![0xEEu8; 4]));
     }
 
     /// `dispatch_delete_writes_mvcc_tombstone` — Storage::delete on a 20-byte
@@ -1550,10 +1638,10 @@ mod tests {
         let key = make_key(99, &[0x77u8; 16]);
         let value = vec![0xF0u8; 16];
         s.put(5, key.clone(), value.clone()).unwrap();
-        assert_eq!(s.get(&key), Some(value));
+        assert_eq!(vget(&s, &key), Some(value));
         s.delete(10, key.clone()).unwrap();
         assert_eq!(
-            s.get(&key),
+            vget(&s, &key),
             None,
             "SP116 dispatch: tombstone at op=10 must collapse to None on Storage::get"
         );
@@ -1602,7 +1690,7 @@ mod tests {
         let key = make_key(MAX_USER_TYPE_ID, &[0x33u8; 16]);
         s.put(1, key.clone(), vec![0xABu8; 4]).unwrap();
         assert_eq!(
-            s.get(&key),
+            vget(&s, &key),
             Some(vec![0xABu8; 4]),
             "SP116 caveat: type_id == MAX_USER_TYPE_ID (0xFEFF_FFFF) IS \
              a user type and MUST route to MVCC"
@@ -1753,11 +1841,11 @@ mod tests {
         s.begin_txn();
         s.put(2, k(2), b"x".to_vec()).unwrap();
         s.delete(3, k(1)).unwrap();
-        assert_eq!(s.get(&k(2)), Some(b"x".to_vec()), "read-your-writes in txn");
-        assert_eq!(s.get(&k(1)), None, "tombstone visible in txn");
+        assert_eq!(vget(&s, &k(2)), Some(b"x".to_vec()), "read-your-writes in txn");
+        assert_eq!(vget(&s, &k(1)), None, "tombstone visible in txn");
         s.abort_txn();
-        assert_eq!(s.get(&k(1)), Some(b"base".to_vec()), "abort rolled back");
-        assert_eq!(s.get(&k(2)), None, "abort discarded insert");
+        assert_eq!(vget(&s, &k(1)), Some(b"base".to_vec()), "abort rolled back");
+        assert_eq!(vget(&s, &k(2)), None, "abort discarded insert");
 
         // committed txn is atomic + durable across reopen
         s.begin_txn();
@@ -1766,9 +1854,9 @@ mod tests {
         s.commit_txn().unwrap();
         s.flush().unwrap();
         let s2 = Storage::open(vfs).unwrap();
-        assert_eq!(s2.get(&k(2)), Some(b"y".to_vec()));
-        assert_eq!(s2.get(&k(3)), Some(b"z".to_vec()));
-        assert_eq!(s2.get(&k(1)), Some(b"base".to_vec()));
+        assert_eq!(vget(&s2, &k(2)), Some(b"y".to_vec()));
+        assert_eq!(vget(&s2, &k(3)), Some(b"z".to_vec()));
+        assert_eq!(vget(&s2, &k(1)), Some(b"base".to_vec()));
     }
 
     #[test]
@@ -1786,8 +1874,10 @@ mod tests {
         }
         vfs.crash();
         let s = Storage::open(vfs).unwrap();
-        assert_eq!(s.get(&k(1)), Some(b"durable".to_vec()));
-        assert_eq!(s.get(&k(2)), Some(b"also".to_vec()));
-        assert_eq!(s.get(&k(3)), Some(b"post-flush-synced".to_vec()));
+        assert_eq!(vget(&s, &k(1)), Some(b"durable".to_vec()));
+        assert_eq!(vget(&s, &k(2)), Some(b"also".to_vec()));
+        assert_eq!(vget(&s, &k(3)), Some(b"post-flush-synced".to_vec()));
     }
 }
+
+

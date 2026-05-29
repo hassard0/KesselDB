@@ -181,11 +181,19 @@ pub fn get_at_snapshot<V: Vfs>(
 
     // scan_range_versions yields tombstones as None; keys are in ascending
     // lex order = descending commit_opnum order.
+    //
+    // SP-Perf-A T7: scan_range_versions now yields `Option<Arc<[u8]>>`. The
+    // public `SnapshotRead::Found(Vec<u8>)` shape is preserved (byte-identity
+    // contract with 100+ existing tests), so we materialise the `Vec<u8>`
+    // here. This call site is OFF the hot read path — `Storage::get` now
+    // routes data-row reads through `get_at_snapshot_arc` (zero-copy).
+    // Direct callers of `get_at_snapshot` (Tx::read, SM apply-arm snapshot
+    // reads) still get the Vec<u8>-shaped enum, unchanged.
     for (k, v) in store.scan_range_versions(&lo, &hi) {
         match decode_commit_opnum(&k) {
             Ok(c) if c <= snapshot_opnum => {
                 return match v {
-                    Some(bytes) => SnapshotRead::Found(bytes),
+                    Some(bytes) => SnapshotRead::Found(bytes.as_ref().to_vec()),
                     None => SnapshotRead::Tombstoned,
                 };
             }
@@ -197,6 +205,45 @@ pub fn get_at_snapshot<V: Vfs>(
         }
     }
     SnapshotRead::NotYetWritten
+}
+
+/// SP-Perf-A T7: Arc-flavoured snapshot read used by `Storage::get` on the
+/// hot path. Returns `Option<Arc<[u8]>>` — `None` collapses both
+/// `SnapshotRead::NotYetWritten` and `SnapshotRead::Tombstoned` (which is
+/// the only distinction `Storage::get` cared about anyway). Threads the
+/// `Arc::clone` of the SSTable/memtable value slot end-to-end so the
+/// per-read cost is a refcount bump, not a memcpy.
+///
+/// Determinism: identical version-chain walk to `get_at_snapshot`. The
+/// `None` collapse on tombstone is consistent with `Storage::get`'s
+/// pre-T7 behaviour (`Tombstoned | NotYetWritten => None`).
+pub(crate) fn get_at_snapshot_arc<V: Vfs>(
+    store: &Storage<V>,
+    type_id: u32,
+    object_id: &[u8; 16],
+    snapshot_opnum: u64,
+) -> Option<std::sync::Arc<[u8]>> {
+    let mut lo = Vec::with_capacity(VERSIONED_KEY_LEN);
+    lo.extend_from_slice(&type_id.to_le_bytes());
+    lo.extend_from_slice(object_id);
+    lo.extend_from_slice(&[0x00u8; 8]);
+
+    let mut hi = Vec::with_capacity(VERSIONED_KEY_LEN);
+    hi.extend_from_slice(&type_id.to_le_bytes());
+    hi.extend_from_slice(object_id);
+    hi.extend_from_slice(&[0xFFu8; 8]);
+
+    for (k, v) in store.scan_range_versions(&lo, &hi) {
+        match decode_commit_opnum(&k) {
+            Ok(c) if c <= snapshot_opnum => {
+                // Match: tombstone OR live version. Both terminate the
+                // search (don't fall through to NotYetWritten).
+                return v; // refcount bump on the Arc, or None on tombstone
+            }
+            _ => continue,
+        }
+    }
+    None
 }
 
 /// Returns `true` iff any version of `(type_id, object_id)` exists in the
@@ -403,8 +450,16 @@ pub fn scan_at_snapshot<V: Vfs>(
             // Tombstones (v = None) are visible-as-deleted: do NOT
             // emit them; the row is logically deleted at this
             // snapshot.
+            //
+            // SP-Perf-A T7: `scan_range_versions` now yields
+            // `Option<Arc<[u8]>>`. The public surface of
+            // `scan_at_snapshot` stays `Vec<u8>` for byte-identity
+            // with the dozens of existing tests that assert exact
+            // `Vec<u8>` content; the cold-path conversion is a single
+            // memcpy here, NOT on the hot per-read path that
+            // `Storage::get` now uses (`get_at_snapshot_arc`).
             if let Some(bytes) = v {
-                out.push((oid, bytes));
+                out.push((oid, bytes.as_ref().to_vec()));
             }
         }
         // commit_opnum > snapshot_opnum: too new for our snapshot;

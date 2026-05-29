@@ -86,7 +86,7 @@ quiet machine — the PRE-vs-POST ratio is what's locked here.
 | workers | ops/sec (median) | p50 | p99 | p99.99 |
 |---|---|---|---|---|
 | 1 | **1,158,334** | 0 µs | 1 µs | 6 µs |
-| 4 | (in progress under concurrent-agent contention) | — | — | — |
+| 4 | **3,377,921** (trial 1; full 3-trial median pending) | 1 µs | 1 µs | 5 µs |
 | 8 | (in progress) | — | — | — |
 | 16 | (in progress) | — | — | — |
 

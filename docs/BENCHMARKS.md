@@ -3,9 +3,11 @@
 Honest cross-DB comparison. Every number published — wins AND losses.
 
 This document is the running record of the Bench-suite arc (see
-`docs/superpowers/specs/2026-05-28-kesseldb-bench-suite-design.md`). T1
-ships **YCSB-C only**; T2-T4 will add YCSB-A/B, sysbench OLTP, and TPC-H
-Q1/Q6 against the same harness, on the same hardware, against the same DBs.
+`docs/superpowers/specs/2026-05-28-kesseldb-bench-suite-design.md`).
+**T1** shipped YCSB-C. **T2** (this revision) adds YCSB-A, YCSB-B, and a
+real TigerBeetle driver for YCSB-C (gated behind a cargo feature; see §5).
+T3-T4 will add sysbench OLTP and TPC-H Q1/Q6 against the same harness, on
+the same hardware, against the same DBs.
 
 If you want one number for "how fast is KesselDB", these aren't it — a
 single workload measures one slice. The honest read is in §3 (per-workload
@@ -32,12 +34,12 @@ benched cores (best-effort; vulcan also runs persistent iddb containers).
 
 ## 2. DB versions + configuration
 
-| DB | Version | Driver | Durability tier (T1) |
+| DB | Version | Driver | Durability tier |
 |---|---|---|---|
 | KesselDB | git rev `<this commit>` | in-process (kessel-sm StateMachine) | MemVfs — no fsync |
 | PostgreSQL | 16.14 (docker `postgres:16` on 127.0.0.1:5533) | `postgres` crate (sync, loopback TCP) | UNLOGGED table, synchronous_commit=on |
 | SQLite | rusqlite-bundled (≥3.45) | `rusqlite` crate (linked, in-process) | journal_mode=MEMORY, synchronous=OFF |
-| TigerBeetle | 0.17.4 (`~/bench/bin/tigerbeetle`) | (T1 stub — see §5) | default |
+| TigerBeetle | 0.16.78 (`/tmp/tb016/tigerbeetle` — see §5 for why not 0.17.4) | `tigerbeetle-unofficial 0.14.28+0.16.78` (gated feature) | default |
 
 **All three measured DBs are calibrated to the same "in-memory engine"
 durability tier.** KesselDB's MemVfs has no real fsync; Postgres UNLOGGED
@@ -61,7 +63,16 @@ uniform-random key and issuing a single point-read by PK. Reported is the
 | **KesselDB** | **873,950** | ±4,584 | **3,756,961** | ±23,592 | **4,749,586** | ±395,154 | 1 µs | 3 µs |
 | SQLite | 139,823 | ±999 | 203,558 | ±32,811 | 118,482 | ±20,191 | 30 µs | 191 µs |
 | PostgreSQL | 5,396 | ±124 | 67,478 | ±396 | 82,628 | ±87 | 114 µs | 188 µs |
-| TigerBeetle | (T1 stub) | — | (T1 stub) | — | (T1 stub) | — | — | — |
+| TigerBeetle† | 159 | ±2 | 642 | ±0.1 | 1,281 | ±0.1 | 12,394 µs | 13,481 µs |
+
+† TigerBeetle row is from T2 (after the cross-DB T1 lock). The other three
+rows are preserved unchanged from T1's measurement run. **TigerBeetle
+asymmetry note**: TB Accounts are 128-byte fixed records, not the 1-KiB
+YCSB rows the other drivers serve. Each `lookup_accounts([id])` is a
+single-record RPC over TCP — TB is designed for batched ops (its own bench
+example pushes 8K transfers per batch). The number above measures TB's
+**single-record-lookup throughput at YCSB-shape random-key access**, not
+"TB performance" in general. See §5 + `drivers/tigerbeetle.rs`.
 
 **KesselDB wins YCSB-C** across all N. Approximate ratios at peak (N=16
 median): KesselDB / SQLite ≈ **40×**, KesselDB / Postgres ≈ **57×**.
@@ -108,10 +119,83 @@ cd tools/bench-compare && cargo build --release
 
 ---
 
+## 3a. YCSB-A (50% reads / 50% updates, uniform random, ~1 KiB rows)
+
+**Workload:** same 100K-row 1 KiB-row dataset as YCSB-C. Each worker loops
+10 s; per op, flips a coin — 50% probability `SELECT payload FROM ycsb
+WHERE id = ?`, 50% probability `UPDATE ycsb SET payload = ? WHERE id = ?`
+on a uniform-random key. Median of 3 trials.
+
+| DB | N=1 ops/s | N=8 ops/s | N=16 ops/s | p50 (N=8) | p99 (N=8) |
+|---|---:|---:|---:|---:|---:|
+| **KesselDB** | **116,390** | 66,660 | **79,830** | 109 µs | 337 µs |
+| PostgreSQL | 5,045 | 57,466 | 74,408 | 134 µs | 234 µs |
+| SQLite | **74,136** | 12,978 | 6,906 | 28 µs | 86 µs |
+| TigerBeetle | — | — | — | — | — |
+
+**Honest read:**
+
+- KesselDB **wins YCSB-A at N=1 and N=16**, **loses N=8 marginally to no
+  one** (the closest is Postgres at 57K vs KesselDB at 67K). The N=8 number
+  is below N=1 because at N=8 every UPDATE acquires the StateMachine write
+  lock and blocks the 7 readers — until Perf-A T5 ships per-shard storage
+  or apply-thread parallelism, the write-mix workload caps at the serial
+  apply-path throughput.
+- Postgres scales well with concurrency (N=1→N=16 = 15×) because each
+  connection runs in its own backend and writes go through standard MVCC.
+- SQLite **falls off a cliff** going N=1 → N=8 (74K → 13K) because all
+  writers serialize on the rollback-journal lock. SQLite N=1 with
+  prepared-statement INSERT/UPDATE is actually *fast* (the 6-µs latency
+  in YCSB-B confirms this is the engine's natural shape) — concurrent
+  writers are where it breaks down. This is the canonical "SQLite is
+  one-writer" property, NOT a benchmark artifact.
+- TigerBeetle cannot honestly map UPDATE — Accounts are append-only after
+  creation; `create_transfers` is double-entry ledger movement, not row
+  UPDATE. We refuse to publish a misleading TB number for YCSB-A. See §5.
+
+---
+
+## 3b. YCSB-B (95% reads / 5% updates, uniform random, ~1 KiB rows)
+
+**Workload:** same dataset; 95% reads / 5% writes. Captures the common
+web-app workload where reads dominate but writes still happen.
+
+| DB | N=1 ops/s | N=8 ops/s | N=16 ops/s | p50 (N=8) | p99 (N=8) |
+|---|---:|---:|---:|---:|---:|
+| **KesselDB** | **433,966** | **404,030** | **575,760** | 3 µs | 125 µs |
+| SQLite | 127,545 | 15,740 | 9,552 | 22 µs | 8,340 µs |
+| PostgreSQL | 5,249 | 65,827 | 80,536 | 116 µs | 199 µs |
+| TigerBeetle | — | — | — | — | — |
+
+**Honest read:**
+
+- KesselDB **wins YCSB-B decisively** at every N. At N=16 KesselDB
+  (576K ops/s) is **7.1× Postgres** (81K) and **60× SQLite** (9.5K). The
+  read-heavy shape lets the Perf-A T2 read-pool optimization kick in: 95%
+  of ops are `read_only_op(&self)` on the shared RwLock, which parallelize;
+  the 5% UPDATE serialize on the write lock but don't dominate the median.
+- The N=1 / N=8 ratio for KesselDB (434K → 404K) shows the write-lock
+  contention starting to bite even at 5% writes — but the N=16 jump back
+  to 576K is the parallel reads making up for it.
+- SQLite still falls off a cliff with multiple writers (same reason as
+  YCSB-A) and its p99 at N=8 (8.3 ms) is the busy_timeout sleeping while
+  the writer holds the lock.
+- Postgres scales linearly N=1→N=16 (~15.3×) but starts from a low base
+  (TCP overhead per op).
+- TigerBeetle: same as YCSB-A — refuses to translate writes.
+
+---
+
 ## 4. Raw results
 
-All 36 trial-rows from the T1 measurement run are preserved in
-`/tmp/bench-ycsb-c.json` on vulcan (one JSON object per line). The schema:
+All trial-rows are preserved in vulcan-side JSON files (one JSON object
+per line):
+- `/tmp/bench-ycsb-c.json` (T1 — 36 rows, 4 DBs × 3 N × 3 trials)
+- `/tmp/bench-ycsb-c-tb.json` (T2 — 9 rows, TigerBeetle YCSB-C)
+- `/tmp/bench-ycsb-a.json` (T2 — 36 rows)
+- `/tmp/bench-ycsb-b.json` (T2 — 36 rows)
+
+Schema (all files use the same shape):
 ```json
 {"db": "...", "workload": "...", "N": 1|8|16, "trial": 1|2|3,
  "ops_per_sec": float, "p50_us": int, "p99_us": int, "p99_99_us": int,
@@ -119,30 +203,57 @@ All 36 trial-rows from the T1 measurement run are preserved in
 ```
 
 T5 ships a `tools/bench-compare/scripts/render.py` (or equivalent) that
-regenerates the §3 table from the JSON.
+regenerates the §3 tables from the JSON.
 
 ---
 
-## 5. TigerBeetle status (T1 honest disclosure)
+## 5. TigerBeetle status (T2 — partially wired)
 
-TigerBeetle 0.17.4 IS installed on vulcan (~/bench/bin/tigerbeetle, version
-verified). T1 ships a **driver stub** that returns 0 ops/sec with a `note`
-flagging "deferred to T2". The reason is methodological, not technical:
+TigerBeetle 0.17.4 IS installed on vulcan at `~/bench/bin/tigerbeetle`.
+T2 wires a real Rust client via the `tigerbeetle-unofficial` crate, but
+the actual server used for the §3 YCSB-C TB number is the **0.16.78
+binary** at `/tmp/tb016/tigerbeetle`. Three honest disclosures:
 
-TigerBeetle's API is not generic key→value. It is account/transfer-shaped
-(`create_accounts`, `lookup_accounts`, `create_transfers`,
-`lookup_transfers`). For YCSB-C, the honest translation is:
+**(1) Version skew.** The available crates.io Rust clients
+(`tigerbeetle-unofficial`, `enfipy-tigerbeetle`) build the TigerBeetle C
+client from source at version 0.16.x. The TigerBeetle wire protocol
+changed between 0.16 and 0.17, so the 0.14.28+0.16.78 crate cannot talk
+to the 0.17.4 server. We run the published number against the 0.16.78
+binary (downloaded fresh in T2). When an updated client crate ships for
+0.17.x, T6 will rerun against 0.17.4 for parity.
+
+**(2) Workload-shape asymmetry.** TigerBeetle's API is not generic
+key→value. It is account/transfer-shaped (`create_accounts`,
+`lookup_accounts`, `create_transfers`, `lookup_transfers`). For YCSB-C:
 
 - Each YCSB row → one TigerBeetle `Account` (id = row id, ledger = 1,
-  code = 1, flags = 0, debits/credits = 0, user_data fields = first 32 B
-  of the row payload).
-- Each YCSB read → `lookup_accounts([id])` over the cluster connection.
+  code = 1). Account record is **128 B fixed**, not the 1-KiB YCSB row.
+- Each YCSB read → `lookup_accounts([id])` over loopback TCP.
 
-This is what T2 ships, alongside a clear caveat that YCSB-A/B (which are
-50% / 5% UPDATE workloads) do not map cleanly to TigerBeetle's
-append-only ledger — there's no "update a row in place" operation. T2
-documents that asymmetry honestly and publishes whatever maps, plus a
-"could not translate" row for whatever doesn't.
+The §3 number measures TB's single-record-lookup throughput at a
+YCSB-shape random-key access pattern. It does NOT measure "TB
+performance" in general — TB is designed for *batched* ops (the
+upstream example pushes 8K-transfer batches and achieves orders of
+magnitude higher throughput). One-at-a-time `lookup_accounts` is the
+worst case for TB's design.
+
+**(3) YCSB-A and YCSB-B cannot be honestly translated.** TigerBeetle
+Accounts are append-only after creation; there is no `update_account`
+op. The closest analog (`create_transfers` between two fixed accounts)
+measures double-entry transfer throughput, which is NOT a row-update
+workload. The §3a + §3b tables show "—" for TB, and the driver returns
+`ops_per_sec=0` with an explanatory `note`. We refuse to publish a
+misleading number.
+
+The real TigerBeetle wiring is behind the cargo feature
+`tigerbeetle-real` so the default `cargo build` of bench-compare stays
+hermetic (the TB build downloads a Zig toolchain and needs bindgen +
+clang headers). To build with the feature on vulcan:
+```
+BINDGEN_EXTRA_CLANG_ARGS='-I/usr/lib/gcc/x86_64-linux-gnu/13/include' \
+  CARGO_TARGET_DIR=/tmp/kdb-target-bench \
+  cargo build --release --features tigerbeetle-real
+```
 
 ---
 
@@ -204,21 +315,32 @@ docker run -d --name bench-pg \
   -p 127.0.0.1:5533:5432 postgres:16
 ```
 
-TigerBeetle bootstrap (T1 — installed but the driver wires up in T2):
+TigerBeetle bootstrap (T2 wires the real client):
 ```
-mkdir -p ~/bench/bin && cd ~/bench/bin
-curl -sSL https://github.com/tigerbeetle/tigerbeetle/releases/latest/download/tigerbeetle-x86_64-linux.zip -o tb.zip
-unzip -o tb.zip && rm tb.zip
-./tigerbeetle version    # should print: TigerBeetle version 0.17.4+...
+# T1 installed 0.17.4 at ~/bench/bin/tigerbeetle (kept for reference).
+# T2 added 0.16.78 alongside because the Rust client targets 0.16.x:
+mkdir -p /tmp/tb016 && cd /tmp
+curl -sLO https://github.com/tigerbeetle/tigerbeetle/releases/download/0.16.78/tigerbeetle-x86_64-linux.zip
+unzip -o tigerbeetle-x86_64-linux.zip -d /tmp/tb016/
+/tmp/tb016/tigerbeetle format --cluster=0 --replica=0 --replica-count=1 /tmp/tb-bench.tigerbeetle
+nohup /tmp/tb016/tigerbeetle start --addresses=3010 /tmp/tb-bench.tigerbeetle > /tmp/tb-server.log 2>&1 &
+# Build bench-compare with the TB-real feature (needs clang headers):
+cd ~/KesselDB/tools/bench-compare
+BINDGEN_EXTRA_CLANG_ARGS='-I/usr/lib/gcc/x86_64-linux-gnu/13/include' \
+  CARGO_TARGET_DIR=/tmp/kdb-target-bench cargo build --release --features tigerbeetle-real
+/tmp/kdb-target-bench/release/bench-compare \
+  --db tigerbeetle --workload ycsb-c --connections 1,8,16 \
+  --duration 10 --rows 100000 --tb-address 3010 \
+  --output /tmp/bench-ycsb-c-tb.json
 ```
 
 ---
 
 ## 8. Next slices
 
-- **T2** — YCSB-A (50/50 read/update) + YCSB-B (95/5); TigerBeetle real
-  wiring for YCSB-C via lookup_accounts; document YCSB-A/B TigerBeetle
-  asymmetry honestly.
+- **T2** [DONE] — YCSB-A (50/50 read/update) + YCSB-B (95/5); TigerBeetle
+  real wiring for YCSB-C via lookup_accounts; YCSB-A/B TigerBeetle
+  asymmetry documented honestly.
 - **T3** — sysbench OLTP read-only / write-only / mixed.
 - **T4** — TPC-H Q1 / Q6 (single-table aggregates).
 - **T5** — JSON → markdown generator script; arc closure docs; README perf

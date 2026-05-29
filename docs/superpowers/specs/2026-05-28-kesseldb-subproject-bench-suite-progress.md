@@ -53,17 +53,77 @@ arc adds zero workspace deps).
 
 ---
 
-## T2 — YCSB-A + YCSB-B + TigerBeetle real wiring [PLANNED]
+## T2 — YCSB-A + YCSB-B + TigerBeetle real wiring [DONE]
 
-- Add Op::Update path + write workers to KesselDB / Postgres / SQLite drivers.
-- YCSB-A = 50/50 read/update, uniform random key, ~1 KiB row.
-- YCSB-B = 95/5 read/update, same shape.
-- TigerBeetle driver: load via create_accounts (one account per YCSB row),
-  read via lookup_accounts. YCSB-A/B writes don't map cleanly to TB's
-  append-only ledger; document the asymmetry, run TB on YCSB-C only.
-- Output JSON: same shape; one row per (db, workload, N, trial).
-- Update BENCHMARKS.md with the new tables; preserve T1's YCSB-C table
-  unchanged (T1 numbers are the lock).
+Commits (in order):
+- `b00fab7` feat(bench-compare) — YCSB-A + YCSB-B workloads + update paths
+  (KesselDB Op::Update, Postgres UPDATE, SQLite UPDATE; TB honest stub for
+  unmappable workloads)
+- `6dae403` feat(bench-compare) — real TigerBeetle client behind
+  `tigerbeetle-real` cargo feature
+- `444dd5b` fix(bench-compare/tigerbeetle) — handle
+  `Result<(), CreateAccountsError>` shape
+- `4d92a45` fix(bench-compare/tigerbeetle) — reduce create_accounts batch
+  to 1K to avoid TooMuchData
+- (next) docs(bench) — BENCHMARKS.md update + STATUS + progress tracker
+
+YCSB-A results (3-trial median, 100K rows, 10s duration each):
+
+| DB | N=1 | N=8 | N=16 | p50 (N=8) | p99 (N=8) |
+|---|---:|---:|---:|---:|---:|
+| KesselDB | 116,390 | 66,660 | 79,830 | 109 µs | 337 µs |
+| Postgres | 5,045 | 57,466 | 74,408 | 134 µs | 234 µs |
+| SQLite | 74,136 | 12,978 | 6,906 | 28 µs | 86 µs |
+| TigerBeetle | — | — | — | — | — |
+
+YCSB-B results (3-trial median, 100K rows, 10s duration each):
+
+| DB | N=1 | N=8 | N=16 | p50 (N=8) | p99 (N=8) |
+|---|---:|---:|---:|---:|---:|
+| KesselDB | 433,966 | 404,030 | 575,760 | 3 µs | 125 µs |
+| SQLite | 127,545 | 15,740 | 9,552 | 22 µs | 8,340 µs |
+| Postgres | 5,249 | 65,827 | 80,536 | 116 µs | 199 µs |
+| TigerBeetle | — | — | — | — | — |
+
+TigerBeetle YCSB-C real (3-trial median, 100K rows, 10s duration each):
+
+| N=1 | N=8 | N=16 | p50 (N=8) | p99 (N=8) |
+|---:|---:|---:|---:|---:|
+| 159 | 642 | 1,281 | 12,394 µs | 13,481 µs |
+
+Honest takeaways:
+- **YCSB-A (50/50)**: KesselDB wins decisively at N=1 (116K vs SQLite 74K
+  vs Postgres 5K). At N=16 KesselDB still wins (~80K) but only marginally
+  vs Postgres (~74K). The write path serializes through the apply thread
+  — Perf-A T2 read-pool helps reads only. SQLite collapses with concurrent
+  writers (6.9K @ N=16) on the rollback-journal lock — canonical SQLite
+  one-writer property, not a benchmark artifact.
+- **YCSB-B (95/5)**: KesselDB wins decisively at every N. At N=16 KesselDB
+  (576K) is 7.1× Postgres (81K) and 60× SQLite (9.5K). The read-heavy
+  shape lets Perf-A T2 read-pool kick in for 95% of ops.
+- **TigerBeetle YCSB-C**: 159 ops/s @ N=1, 1,281 ops/s @ N=16. LOW because
+  TB is designed for batched ops (upstream example pushes 8K transfers per
+  batch); single-record `lookup_accounts` measures RPC round-trip + queue
+  overhead. The number is honest but not flattering for TB on this shape.
+- **TigerBeetle YCSB-A/B**: refused. TB Accounts are append-only after
+  creation; no row-UPDATE primitive maps honestly. Driver returns 0-ops
+  with explanatory `note`.
+
+TigerBeetle setup notes (captured in BENCHMARKS.md §5 + §7):
+- Available crates.io Rust clients target TB 0.16.x; vulcan's headline
+  binary is 0.17.4. Wire protocol differs. Downloaded 0.16.78 binary
+  alongside (at `/tmp/tb016/tigerbeetle`) so the
+  `tigerbeetle-unofficial 0.14.28+0.16.78` crate can talk to a matching
+  server. T6 re-tests against 0.17.4 if/when an updated client ships.
+- Build needs Zig toolchain (auto-downloaded) + bindgen + clang headers.
+  Gated behind `tigerbeetle-real` cargo feature so default build stays
+  hermetic. Build with `BINDGEN_EXTRA_CLANG_ARGS='-I/usr/lib/gcc/x86_64-linux-gnu/13/include'`.
+- Account record is 128 B fixed (not 1 KiB like the YCSB rows the other
+  drivers serve). Asymmetry documented in driver header + BENCHMARKS.md §5.
+
+Raw JSON: vulcan:/tmp/bench-ycsb-a.json (36 rows),
+vulcan:/tmp/bench-ycsb-b.json (36 rows), vulcan:/tmp/bench-ycsb-c-tb.json
+(9 rows).
 
 ---
 

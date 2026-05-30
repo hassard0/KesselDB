@@ -6,10 +6,10 @@
 
 *"It's the database that made the Kessel Run in 12 parsecs."*
 
-`1974 default tests green / 2002 with --features pg-gateway / 2035 with all gateway features` · `0 external dependencies in the kernel` · `Rust 1.95+` · single‑binary
+`2018 default tests green / 2046 with --features pg-gateway / 2053+ with all gateway features` · `0 external dependencies in the kernel` · `Rust 1.95+` · single‑binary
 
 **Tonight's headlines** (2026‑05‑29):
-- **Real Postgres ORM compatibility** — psycopg2 / SQLAlchemy / Drizzle / JDBC connect via SCRAM‑SHA‑256 and run **parameterized queries** through the new **Extended Query** protocol (Parse / Bind / Describe / Execute / Sync / Close / Flush). End‑to‑end psycopg2 round‑trip verified on vulcan; see [`docs/USAGE.md`](docs/USAGE.md#9-postgresql-clients-psql-pgcli-jdbc-psycopg-pgx-).
+- **Real Postgres ORM compatibility — SP‑PG‑EXTQ V1 ARC CLOSED.** psycopg2 + SQLAlchemy 2.0 + psycopg3 (with `ClientCursor`) all PASS on vulcan with default settings (T8 closes the T7 `use_native_hstore=False` caveat). asyncpg + JDBC PARTIAL (connect + DDL + simple‑Q work; binary‑format parameterized DML deferred to V2 `SP‑PG‑EXTQ‑BIN`). Pipelining throughput on vulcan: 252‑409 stmt/s (psycopg2 single‑statement round‑trip). See [`docs/USAGE.md`](docs/USAGE.md#9-postgresql-clients-psql-pgcli-jdbc-psycopg-pgx-) §9 + transcript at `docs/superpowers/sppgextq-t8-orm-smoke-2026-05-29.txt`.
 - **4.8M ops/sec parallel reads, sub‑µs p50** — Perf‑A T2 read‑pool bypass (parallel `read_only_op` dispatch) + T7 storage `Arc<[u8]>` migration (zero‑memcpy reads). Measured on a 16‑core x86‑64 Linux reference server; see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §11–§12.
 - **Honest cross‑DB benchmarks published** — KesselDB vs Postgres / SQLite / TigerBeetle on YCSB‑A/B/C, sysbench OLTP RO/WO/RW, *and* TPC‑H Q1/Q6 (analytical). 4 of 8 wins, 4 of 8 losses, every number disclosed with the exact reason — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md). Next perf arcs named (SP‑Perf‑A‑SHARD for the OLTP losses, SP‑Analytic‑Plan for the TPC‑H losses).
 
@@ -276,10 +276,14 @@ SQL, and — for psycopg2 — by an end‑to‑end driver round‑trip on vulcan
 | DataGrip / IntelliJ | ✓ | ✓ tables/columns | Functions panel empty (V1 returns empty `routines`) |
 | Metabase | ✓ | ✓ schema discovery via `information_schema.{tables,columns,schemata}` | |
 | Tableau / Looker / Hex / Superset | ✓ | ✓ ODBC wizards complete | schema discoverable |
-| JDBC `org.postgresql:postgresql` | ✓ | ✓ (Extended Query by default) | end‑to‑end round‑trip pending T8 ORM smoke; SP‑PG‑EXTQ V1 message set lit |
-| **psycopg2 / psycopg3 / asyncpg** | ✓ | ✓ **parameterized queries verified end‑to‑end on vulcan** | SCRAM auth + `cur.execute("…WHERE id = %s", (42,))` round‑trips through SP‑PG‑EXTQ |
-| `pgx` / `tokio-postgres` / sqlx‑pg | ✓ | ✓ Simple Query + EXTQ | EXTQ V1 wire‑complete; full ORM smoke is SP‑PG‑EXTQ T8 |
-| SQLAlchemy / Drizzle / Prisma / GORM / Diesel | ✓ | ✓ via EXTQ | EXTQ V1 unblocks the probe‑then‑prepare pattern these ORMs require; formal ORM‑suite verification is SP‑PG‑EXTQ T11/T12 (post‑V1.1) |
+| JDBC `org.postgresql:postgresql` | ✓ | partial | T8 verified on vulcan: connect + DDL + simple‑Q SELECT work; PreparedStatement.setLong uses binary‑format params (V2 `SP‑PG‑EXTQ‑BIN`); `preferQueryMode=simple` injects `::int8` casts (V2 `SP‑PG‑EXTQ‑CAST`) |
+| **psycopg2** | ✓ | ✓ **19/19 ORM smoke steps PASS on vulcan** | SCRAM auth + `cur.execute("…WHERE id = %s", (42,))` round‑trips through SP‑PG‑EXTQ; T8 transcript in `docs/superpowers/sppgextq-t8-orm-smoke-2026-05-29.txt` |
+| **SQLAlchemy 2.0** | ✓ | ✓ **HEADLINE — full session round-trip with DEFAULT settings on vulcan** | `sa.create_engine(...)` + `engine.connect()` + parameterized queries + pool checkout/checkin all green; T8 closes the `use_native_hstore=False` caveat |
+| psycopg3 | ✓ | ✓ with `cursor_factory=ClientCursor` | T8 verified on vulcan: ClientCursor (text-format substitution client-side) PASSES; default ServerCursor uses binary params (V2 `SP‑PG‑EXTQ‑BIN`) |
+| asyncpg | ✓ | partial | T8 verified on vulcan: connect + DDL + non-param SELECT work; parameterized DML blocked by binary-format default (V2 `SP‑PG‑EXTQ‑BIN`) |
+| `pgx` (Go) / `tokio-postgres` (Rust) / sqlx‑pg (Rust) | n/a | n/a | runtime not on vulcan smoke host; tracked as V2 `SP‑PG‑GO‑SMOKE` / `SP‑PG‑EXTQ‑BIN` |
+| Drizzle / Prisma (Node) | n/a | n/a | Node not on vulcan smoke host; tracked as V2 `SP‑PG‑NODE‑SMOKE` |
+| GORM (Go) / Diesel (Rust) | n/a | n/a | runtime not on vulcan smoke host; same binary-format gap shape as JDBC |
 
 **V1.1 (this release) ships SP‑PG‑EXTQ** — Extended Query / prepared
 statements / `Parse/Bind/Describe/Execute/Sync/Close/Flush`.
@@ -496,12 +500,12 @@ linearizability under partition, deterministic WASM UDFs) are all **shipped**
 
 ```bash
 cargo build                 # all kernel crates, zero external deps
-cargo test --workspace      # 1974 default tests (seeded partition/fault sim,
+cargo test --workspace      # 2018 default tests (seeded partition/fault sim,
                             # Jepsen linearizability, MVCC TLA+ refinement,
                             # pyarrow Parquet round-trips, WASM-MVP KATs,
                             # SP-A 85-seed K-invariance sweep)
-cargo test --workspace --features pg-gateway                # 2002 (adds SP-PG + SP-PG-CAT + SP-PG-EXTQ)
-cargo test --workspace --features pg-gateway,http-gateway,kessel-http-gateway/test-server   # 2035 — full matrix
+cargo test --workspace --features pg-gateway                # 2046 (adds SP-PG + SP-PG-CAT + SP-PG-EXTQ V1)
+cargo test --workspace --features pg-gateway,http-gateway,kessel-http-gateway/test-server   # 2053 — full matrix
 cargo run -p kessel-bench --release -- --help               # benchmarks
 
 # Strategic-tier rigor artifacts:

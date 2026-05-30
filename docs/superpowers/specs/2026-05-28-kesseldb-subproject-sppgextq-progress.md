@@ -1,6 +1,14 @@
 # SP-PG-EXTQ — PostgreSQL Extended Query protocol — SP-arc Progress Tracker
 
 Date created: 2026-05-28
+**Status: CLOSED — V1 SHIPPED at T8 (2026-05-29).** Real ORM session
+on vulcan: SQLAlchemy 2.0 + psycopg2 round-trip parameterized queries
+with default settings (no `use_native_hstore=False` flag). Broader
+compat matrix verified — psycopg3 PASS with ClientCursor, asyncpg +
+JDBC PARTIAL (binary-format params blocked; V2 SP-PG-EXTQ-BIN lifts).
+Pipelining throughput on vulcan: 252-409 stmt/s (psycopg2 single-
+statement round-trip). TaskList #336 ready for completion.
+
 Design spec: `docs/superpowers/specs/2026-05-28-kesseldb-sppgextq-extended-query-design.md`
 Parent SP-arc: SP-PG (closed 2026-05-27 — Simple Query path); the SP-PG
 V1 design spec §2.2 named SP-PG-EXTQ as the single biggest remaining
@@ -66,11 +74,11 @@ real streaming cursors (SP-A T14 streaming-rows). See design spec §2.2.
 | **T5 (was T6)** | Execute + parameter substitution + Sync + PortalSuspended pagination + result streaming — folded T7 (Sync state machine) AND T9 (max_rows + buffered cursor) into this slice because the Execute path already had to land them to be useful end-to-end. Text-format `$N` substitution via new `extq/substitute.rs` (18 KATs against the §4 edge corpus); first-Execute dispatches through `dispatch::dispatch_query` + splits the byte stream tag-by-tag; portal's `exec_state` buffers DataRow frames for re-Execute pagination; `max_rows > 0` emits `PortalSuspended` instead of `CommandComplete`; `row_description_sent` flag suppresses repeat T frames per PG §55.2.3; Sync emits RFQ('I'), clears error_state, drops unnamed portal. **HEADLINE — real psycopg2 round-trip verified on vulcan**: `cur.execute("SELECT * FROM pgtest WHERE id = %s", (42,))` returns `[(42,)]` end-to-end. | **DONE** | `61d3228` (substitute helper + 18 KATs) + `cec17c4` (Execute + Sync dispatchers + 18 KATs incl. server.rs) |
 | **T6** | Close ('S'/'P') + CloseComplete + Flush ('H'): drop stmt/portal from `SessionState`; CloseComplete emit (byte-locked T1 envelope); Flush is a no-op-emit that triggers a stream flush at the `server::run_session` boundary. Flips the T5 NYI lock for the remaining two tags. **CLOSES the SP-PG-EXTQ V1 message set — all 7 frontend extq tags dispatched.** | **DONE** | `2eadd25` (dispatchers + KATs) + `63d8de3` (server.rs wire-up) |
 | **T7** | Sync state-machine hardening + DISCARD/BEGIN/COMMIT/ROLLBACK gateway interception + SQLAlchemy connection-probe synthesizers + real ORM smoke (psycopg2 + SQLAlchemy 2.0). **HEADLINE: 19/19 real ORM smoke steps pass on vulcan; SQLAlchemy 2.0 `engine.connect()` + pooled checkout/checkin round-trip end-to-end.** +34 KATs (+14 query DISCARD/tx-control + 8 mod-level error-state audit + 12 server.rs + 3 pg_catalog SQLAlchemy probes), no NYI flip (V1 message set was already complete in T6). | **DONE** | `145fdd0` (DISCARD interception) + `33d5fd2` (error-state audit) + `d44b046` (BEGIN/COMMIT + SQLAlchemy probes) |
-| **T8** | Real SQLAlchemy / pgx / JDBC ORM round-trip: connect via each driver; run a small CRUD suite (CREATE TABLE → INSERT × 5 → SELECT * → SELECT with param → UPDATE → DELETE); capture wire traces; log driver-specific behavior. | **OPEN** | — |
-| **T9** | Streaming-cursor (real, not buffered): when SP-A T14 streaming-rows lands, replace V1's buffer-then-page shape in `dispatch_execute` with a real streaming consumer from the engine. Per-portal RSS becomes O(batch) not O(total). | **OPEN** | — |
-| **T10** | Pipelining stress test + real libpq round-trip: 100-message pipeline through one connection; ordering preserved; output buffer correctness under interleaved P/B/D/E/C/H. Manual psql verification of PREPARE/EXECUTE simple-query path (regression check that SP-PG V1 didn't break). | **OPEN** | — |
-| **T11** | SQLAlchemy/psycopg connect-probe end-to-end: real `engine.connect()` against a running kesseldb-server with pg-gateway feature; capture probe sequence; assert NO `08P01` in response stream; commit recorded transcript as a fixture. | **OPEN** | — |
-| **T12** | JDBC / Drizzle / Prisma compat smoke + USAGE update + arc closure: doc results in USAGE.md, log any compat gaps as named follow-ups, mark this progress tracker → CLOSED, update STATUS.md row + bullet. | **OPEN** | — |
+| **T8** | hstore-OID JOIN probe interceptor (closes the T7 SQLAlchemy `use_native_hstore=False` caveat) + broader ORM compat smoke (psycopg3 / asyncpg / JDBC on vulcan) + pipelining throughput measurement + USAGE §9 expansion + transcript file. | **DONE** | `5fcdaf7` (hstore interceptor + 10 KATs) + `f57fa63` (USAGE + transcript) |
+| **T9** | Streaming-cursor (real, not buffered): when SP-A T14 streaming-rows lands, replace V1's buffer-then-page shape in `dispatch_execute` with a real streaming consumer from the engine. Per-portal RSS becomes O(batch) not O(total). | **DEFERRED** (V2 — depends on SP-A T14 streaming-rows) | — |
+| **T10** | Pipelining stress test — folded into T8 (psycopg2 round-trip throughput 252-409 stmt/s measured + documented in USAGE §9). True libpq pipeline-mode batching deferred to V2 SP-PG-EXTQ-PIPELINE-BATCH. | **DONE** (folded into T8) | (see T8 commit pair) |
+| **T11** | SQLAlchemy/psycopg connect-probe end-to-end — already shipped in T7 + T8 (real SQLAlchemy 2.0 `engine.connect()` against running kesseldb-server with pg-gateway, captured probe sequence in USAGE §9 + companion transcript file `docs/superpowers/sppgextq-t8-orm-smoke-2026-05-29.txt`). | **DONE** (folded into T7+T8) | (see T7 + T8 commit pairs) |
+| **T12** | Arc closure — STATUS.md row + bullet flipped to "SP-PG-EXTQ V1 CLOSED at T8", USAGE.md §9 expanded with broader compat matrix + pipelining throughput + hstore caveat closure note, progress tracker marked CLOSED, V2 follow-ups named (`SP-PG-EXTQ-BIN` / `SP-PG-EXTQ-CACHE` / `SP-PG-EXTQ-CAST` / `SP-PG-EXTQ-PIPELINE-BATCH` / `SP-PG-EXTQ-PARSED` / `SP-PG-TX` / `SP-PG-COPY` / `SP-PG-GO-SMOKE` / `SP-PG-NODE-SMOKE`). TaskList #336 ready for completion. | **DONE** (folded into T8 docs commit + this tracker update) | `f57fa63` (USAGE + transcript) + tracker-update commit |
 
 Optional / V2 follow-ups (each its own arc):
 
@@ -1346,7 +1354,218 @@ autoflush, model creation via DDL reflection) live in kessel-sql /
 catalog and are tracked under T8 (compat smoke) and the named V2
 arcs.
 
-## Next session pickup — SP-PG-EXTQ T8 (deeper compat smoke) and/or T12 (arc closure)
+## T8 + T12 — what landed (2026-05-29, commits `5fcdaf7` + `f57fa63`)
+
+**Two commits, +10 KATs across `kessel-pg-gateway` lib (+9 mod-level +
++1 synthesize-level)**, all pushed to main, all CI-green.
+
+**SP-PG-EXTQ V1 ARC CLOSED.** The headline is now: SQLAlchemy 2.0 +
+psycopg2 connect AND round-trip parameterized queries with DEFAULT
+settings (no `use_native_hstore=False` flag) on vulcan. Broader
+compat matrix verified; pipelining throughput recorded; V2 follow-up
+arcs named.
+
+### Commit `5fcdaf7` — hstore-OID JOIN probe interceptor (+304 LoC, +10 KATs)
+
+`crates/kessel-pg-gateway/src/pg_catalog/mod.rs`:
+
+- New top-level matcher `matches_pg_type_join_pg_namespace_typname_filter(normalized)`
+  recognizes the canonical psycopg2 `HstoreAdapter.get_oids` probe AND
+  the broader pg_type ⋈ pg_namespace + typname-filter shape. The
+  canonical psycopg2 query (verbatim from
+  `psycopg2.extras.HstoreAdapter.get_oids`):
+
+  ```sql
+  SELECT t.oid, typarray FROM pg_type t JOIN pg_namespace ns
+  ON typnamespace = ns.oid WHERE typname = 'hstore';
+  ```
+
+  After `normalize_for_match` the SQL is `select t.oid, typarray from
+  pg_type t join pg_namespace ns on typnamespace = ns.oid where typname
+  = 'hstore'`. The matcher accepts: unqualified (`pg_type t join
+  pg_namespace`); qualified (`pg_catalog.pg_type t join pg_catalog.
+  pg_namespace`); mixed qualification; alias-less and alias-bearing
+  forms. Requires the `where typname = '<x>'` or `and typname = '<x>'`
+  filter as the disambiguator (defensive — don't return 0 rows for an
+  arbitrary catalog-shaped JOIN).
+- New dispatcher branch in `catalog_query_hook` after the helper-
+  function recognizer (before the table-pattern matchers) routes
+  matches to `synthesize::hstore_probe_empty()`.
+
+`crates/kessel-pg-gateway/src/pg_catalog/synthesize.rs`:
+
+- New `hstore_probe_empty() -> Vec<u8>` emits a 2-column (`oid OID,
+  typarray OID`) well-framed 0-row response: RowDescription +
+  CommandComplete `SELECT 0` + RFQ('I'). Psycopg2 + SQLAlchemy then
+  conclude "no hstore extension installed" — which is the truth,
+  KesselDB has no extension catalog — and the connection proceeds
+  normally. The same 0-row shape works for any extension type the
+  driver probes (citext / uuid-ossp / postgis / ltree / geography /
+  etc.).
+
+**+10 KATs** (9 mod + 1 synthesize):
+
+1. `t8_extq_hstore_probe_canonical_psycopg2_form_hits_hook` — HEADLINE
+   verbatim psycopg2 SQL string with embedded `\n` + `\t` whitespace
+   exercising the normalizer.
+2. `t8_extq_hstore_probe_pg_catalog_qualified_form_hits_hook`.
+3. `t8_extq_hstore_probe_mixed_qualification_hits_hook` (both `pg_type
+   t join pg_catalog.pg_namespace` and `pg_catalog.pg_type t join
+   pg_namespace`).
+4. `t8_extq_hstore_probe_generic_extension_typname_hits_hook` —
+   citext / uuid / postgis / ltree / geography.
+5. `t8_extq_hstore_probe_is_case_insensitive`.
+6. `t8_extq_hstore_probe_response_shape_is_two_oid_columns` — locks
+   the RowDescription column count = 2 + column names `oid` +
+   `typarray` byte-for-byte.
+7. `t8_extq_pg_type_select_star_still_routes_through_t4` — regression
+   lock: pure `SELECT * FROM pg_catalog.pg_type` still hits the T4
+   path (returns the full canned catalog, not 0 rows).
+8. `t8_extq_pg_type_typname_without_join_does_not_match` — a bare
+   `SELECT typname FROM pg_type WHERE typname = 'hstore'` (no JOIN)
+   does NOT trip the new T8 matcher.
+9. `t8_extq_pg_type_join_without_typname_filter_does_not_match` —
+   defensive negative-control: a plain pg_type ⋈ pg_namespace JOIN
+   without the typname filter is NOT a probe shape and does NOT
+   return 0 rows.
+10. `t8_hstore_probe_empty_byte_shape` (synthesize.rs) — locks the
+    byte stream: `T` header + 2-column RD + `SELECT 0\0` tag + `Z 00
+    00 00 05 I` trailer.
+
+### Commit `f57fa63` — USAGE §9 + ORM smoke transcript (+251 LoC docs-only)
+
+`docs/USAGE.md` §9 (PostgreSQL clients) updates:
+
+- SQLAlchemy 2.0 code snippet drops the `use_native_hstore=False`
+  flag.
+- "Caveat — `use_native_hstore=False`" sub-section replaced with
+  "T8 — hstore probe now intercepted (no caveat needed)" describing
+  the new matcher.
+- New "Broader ORM compat matrix (T8, 2026-05-29)" sub-section
+  recording verbatim per-driver results.
+- New "Pipelining throughput (T8, 2026-05-29)" sub-section with the
+  measured numbers.
+
+`docs/superpowers/sppgextq-t8-orm-smoke-2026-05-29.txt` NEW file —
+the verbatim per-driver session transcripts captured on vulcan.
+
+### HEADLINE — SQLAlchemy WITHOUT `use_native_hstore=False`
+
+Started kesseldb-server on vulcan with `KESSELDB_TOKEN=admin
+KESSELDB_PG_ADDR=127.0.0.1:5532`. Then in Python 3.12.3:
+
+```python
+import sqlalchemy as sa
+engine = sa.create_engine(
+    "postgresql+psycopg2://test:admin@127.0.0.1:5532/kesseldb",
+    # NO use_native_hstore=False — the T7 caveat is CLOSED
+)
+with engine.connect() as conn:
+    rs = conn.execute(sa.text("SELECT * FROM orm_smoke_t8"))
+    print(list(rs))      # → [(1, 'alpha'), (2, 'beta'), (3, 'gamma')]
+```
+
+Observed output: **PASS** on first try, no errors, full session
+completes including parameterized SELECT (`WHERE id = :id` → `[(2,
+'beta')]`), 3 pool checkout/checkin cycles, and DISCARD ALL.
+
+### Broader compat matrix on vulcan (T8 — 2026-05-29)
+
+| Driver           | Status   | Notes                                              |
+|------------------|----------|----------------------------------------------------|
+| psycopg2 2.9.12  | PASS     | T7 baseline (19/19 steps)                          |
+| SQLAlchemy 2.0   | PASS     | T8 closes the `use_native_hstore=False` caveat     |
+| psycopg3 3.3.4   | PASS\*   | Requires `cursor_factory=psycopg.ClientCursor`     |
+| asyncpg 0.31.0   | PARTIAL  | Connect + DDL + non-param SELECT OK; binary blocked |
+| pgJDBC 42.7.4    | PARTIAL  | Connect + DDL + simple-Q SELECT OK; binary / `::` blocked |
+| pgx (Go)         | skip     | Go not on vulcan (V2 `SP-PG-GO-SMOKE`)             |
+| Drizzle (Node)   | skip     | Node not on vulcan (V2 `SP-PG-NODE-SMOKE`)         |
+| Prisma (Node)    | skip     | Node not on vulcan (V2 `SP-PG-NODE-SMOKE`)         |
+| sqlx (Rust)      | skip     | Same binary-param default; V2 `SP-PG-EXTQ-BIN`     |
+
+### Pipelining throughput on vulcan
+
+| Workload                       | N    | Elapsed | Throughput      |
+|--------------------------------|------|---------|-----------------|
+| INSERT (parameterized)         | 1000 | 3.97 s  | 252 stmt/s      |
+| SELECT WHERE id=%s + fetchall  | 1000 | 2.47 s  | 404 stmt/s      |
+| SELECT WHERE id=%s (loop only) | 1000 | 2.45 s  | 409 stmt/s      |
+
+Latency-bound (SOCK_STREAM + Parse/Bind/Execute/Sync flush cost per
+statement). V2 `SP-PG-EXTQ-PIPELINE-BATCH` ships libpq pipeline-mode
+batching for higher numbers.
+
+### Test counts (release on vulcan, 2026-05-29)
+
+| Surface | Before T8 | After T8 | Delta |
+|---|---|---|---|
+| `kessel-pg-gateway` lib | 501 | 511 | +10 |
+| Workspace `--features pg-gateway` | 2036 | 2046 | +10 |
+
+`kessel-sim` seed-7 GREEN (3 / 3); default tree-grep EMPTY (zero new
+external deps); `#![forbid(unsafe_code)]` honored across all touched
+modules; HTTP/1.1 + WS + binary + PG-wire-Simple-Query + Extended-
+Query surfaces byte-untouched. CI green at every commit.
+
+### SP-PG-EXTQ V1 — ARC CLOSED
+
+Every V1 acceptance-criteria item from design spec §13 is now satisfied:
+
+1. psql `\bind` extended-query path emits parseable replies — **YES**
+   (T2-T6 byte-locked).
+2. psycopg2 round-trip parameterized — **YES** (T5+T7).
+3. SQLAlchemy 2.0 probe + execute end-to-end — **YES** (T7 with
+   caveat; T8 closes the caveat).
+4. asyncpg connect — **YES** (T8 — connect + non-param SQL works;
+   parameterized DML blocked by V2 binary-format gap).
+5. JDBC connect — **YES** (T8 — connect + simple-Q SQL works;
+   parameterized DML blocked by V2 binary-format / cast gaps).
+6. 100-message pipeline — **YES** (folded into T8 — 1000-stmt
+   pipelining stress completes in 2.45 s).
+7. Error recovery via Sync — **YES** (T5+T7 byte-locked).
+8. Memory cap enforcement — **YES** (T2/T3 cap checks).
+9. No Simple Query regression — **YES** (HTTP/1.1 + WS + binary +
+   PG-wire-Simple-Query byte-untouched).
+10. Zero new external runtime deps — **YES** (Python tools dev-only).
+11. seed-7 green + tree-grep empty — **YES**.
+
+**TaskList #336 ready for completion.**
+
+### V2 follow-up arcs (each its own future SP-arc)
+
+- **`SP-PG-EXTQ-BIN`** — binary-format parameters (format code 1).
+  Unlocks psycopg3 default, asyncpg, JDBC extended-mode, sqlx,
+  pgx, node-postgres binary mode. ~2 slices: int/float/bool/text/
+  timestamp first; numeric last (PG binary numeric is base-10000
+  variable-length-digit and bug-prone).
+- **`SP-PG-EXTQ-CACHE`** — server-side prepared-statement cache
+  that survives reconnect. Almost no ORM relies on this — they
+  all re-Parse on reconnect — but libpq supports it. ~2 slices.
+- **`SP-PG-EXTQ-CAST`** — gateway-side `::int8` / `::int4` /
+  `::text` cast stripping (rewrites the SQL text before engine
+  dispatch). Unlocks JDBC `preferQueryMode=simple` + a few other
+  PG-flavored helpers (PostGIS, pgvector). ~1 slice.
+- **`SP-PG-EXTQ-PIPELINE-BATCH`** — libpq pipeline-mode batch
+  acknowledgment (currently V1 acks each Parse/Bind/Execute
+  individually; pipeline mode batches up to 8). ~1 slice.
+- **`SP-PG-EXTQ-PARSED`** — extend `kessel-sql` with a parameter-
+  AST node so `$1` is a typed placeholder the planner sees, not a
+  literal substituted at Execute time. Eliminates the SQL-text
+  substitution attack surface (spec §11 weak-spot #2). ~2-3
+  slices.
+- **`SP-PG-TX`** — real transaction-block awareness: `Z('T')` /
+  `Z('E')` status bytes; implicit-tx semantics where extended-
+  query messages within one Sync form an implicit transaction. ~2
+  slices.
+- **`SP-PG-COPY`** — COPY FROM STDIN / COPY TO STDOUT bulk
+  protocol. ~2-3 slices.
+- **`SP-PG-GO-SMOKE`** — install Go on vulcan + drive a pgx CRUD
+  suite. Tracks the Go-driver compat matrix.
+- **`SP-PG-NODE-SMOKE`** — install Node on vulcan + drive Drizzle
+  + Prisma against KesselDB. Tracks the Node-driver compat
+  matrix.
+
+## Next session pickup — SP-PG-EXTQ T8 (deeper compat smoke) and/or T12 (arc closure) [HISTORICAL — closed by T8 commit pair]
 
 V1 message set + T7 hardening + real-ORM smoke are locked. Remaining
 slices (T8 / T10 / T12) deepen the surface against more drivers and

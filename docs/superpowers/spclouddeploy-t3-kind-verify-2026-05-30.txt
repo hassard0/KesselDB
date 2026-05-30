@@ -1,0 +1,160 @@
+=== SP-Cloud-Deploy T3 — kind verify transcript (vulcan, 2026-05-30) ===
+
+Verified end-to-end deploy of the SP-Cloud-Deploy Helm chart against
+a real kind (Kubernetes-in-Docker) cluster on vulcan.
+
+GHCR pull caveat: the published image at ghcr.io/hassard0/kesseldb:latest
+is currently PRIVATE (default for new ghcr packages). The verify
+sidestepped by building the image locally (`docker build -t
+ghcr.io/hassard0/kesseldb:latest .` on vulcan) and side-loading it
+into kind via `kind load docker-image`. Once the GHCR package is
+flipped public (or pullSecrets are configured), the helm install
+works as documented in NOTES.txt without intervention.
+
+
+--- environment ---
+$ helm version --short
+v3.16.3+gcfd0749
+
+$ kind version
+kind v0.24.0 go1.22.6 linux/amd64
+
+$ kubectl version --client=true
+Client Version: v1.31.0
+Kustomize Version: v5.4.2
+
+
+--- helm lint (Helm chart well-formedness) ---
+$ helm lint deploy/helm/kesseldb
+==> Linting deploy/helm/kesseldb
+[INFO] Chart.yaml: icon is recommended
+1 chart(s) linted, 0 chart(s) failed
+
+
+--- helm template (verify rendered YAML) ---
+$ helm template kesseldb deploy/helm/kesseldb
+# renders 4 objects:
+#   ServiceAccount      kesseldb
+#   PersistentVolumeClaim  kesseldb-data  (10Gi, RWO, default StorageClass)
+#   Service             kesseldb  (ClusterIP, ports binary 6532, http 6533, postgres 5432)
+#   Deployment          kesseldb  (replicas:1, Recreate, kessel:1100 non-root,
+#                                  livenessProbe TCP:6532, readinessProbe TCP:6532,
+#                                  KESSELDB_TOKEN secretRef -> kesseldb-token/token,
+#                                  KESSELDB_HTTP_ADDR + KESSELDB_PG_ADDR env)
+
+$ helm template kesseldb deploy/helm/kesseldb --set auth.secretName=''
+# KESSELDB_TOKEN env block correctly OMITTED (open-mode branch verified).
+
+
+--- cluster bring-up ---
+$ kind create cluster --name kesseldb-test --wait 90s
+Creating cluster "kesseldb-test" ...
+ ✓ Ensuring node image (kindest/node:v1.31.0)
+ ✓ Preparing nodes
+ ✓ Writing configuration
+ ✓ Starting control-plane
+ ✓ Installing CNI
+ ✓ Installing StorageClass
+ ✓ Waiting <= 1m30s for control-plane = Ready
+ • Ready after 17s
+
+
+--- pre-install: KESSELDB_TOKEN Secret ---
+$ kubectl create secret generic kesseldb-token --from-literal=token=smoketest
+secret/kesseldb-token created
+
+
+--- helm install ---
+$ helm install kesseldb ./deploy/helm/kesseldb
+NAME: kesseldb
+LAST DEPLOYED: Sat May 30 11:30:00 2026
+NAMESPACE: default
+STATUS: deployed
+REVISION: 1
+... (NOTES.txt rendered correctly, prints connect commands per surface)
+
+
+--- side-load image (workaround for private GHCR package) ---
+$ docker build -t ghcr.io/hassard0/kesseldb:latest ~/KesselDB
+Successfully built c305a4398ef8
+Successfully tagged ghcr.io/hassard0/kesseldb:latest
+
+$ kind load docker-image ghcr.io/hassard0/kesseldb:latest --name kesseldb-test
+Image: "ghcr.io/hassard0/kesseldb:latest" with ID "sha256:c305a4398ef8..." loaded onto node "kesseldb-test-control-plane"
+
+$ kubectl rollout restart deploy/kesseldb
+$ kubectl rollout status deploy/kesseldb --timeout=120s
+deployment "kesseldb" successfully rolled out
+
+
+--- cluster state ---
+$ kubectl get pods,svc,pvc -l app=kesseldb
+NAME                            READY   STATUS    RESTARTS   AGE
+pod/kesseldb-788987dfb8-b97d5   1/1     Running   0          65s
+
+NAME               TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)                      AGE
+service/kesseldb   ClusterIP   10.96.149.44   <none>        6532/TCP,6533/TCP,5432/TCP   5m35s
+
+NAME                                  STATUS   CAPACITY   ACCESS MODES   STORAGECLASS
+persistentvolumeclaim/kesseldb-data   Bound    10Gi       RWO            standard
+
+
+--- smoke: binary protocol via kessel CLI inside pod ---
+$ kubectl exec deploy/kesseldb -- kessel --addr 127.0.0.1:6532 --token smoketest \
+    'CREATE TABLE smoke (v U64 NOT NULL)'
+OK  (table created, type_id=1)
+
+$ kubectl exec deploy/kesseldb -- kessel --addr 127.0.0.1:6532 --token smoketest \
+    'INSERT INTO smoke ID 1 (v) VALUES (42)'
+OK
+
+$ kubectl exec deploy/kesseldb -- kessel --addr 127.0.0.1:6532 --token smoketest \
+    'SELECT SUM(v) FROM smoke'
+= 42  (16 bytes)
+
+
+--- smoke: HTTP gateway via port-forward ---
+$ kubectl port-forward svc/kesseldb 16533:6533 &
+
+$ curl -s -H 'Authorization: Bearer smoketest' http://127.0.0.1:16533/v1/health
+{"status":"ok","primary":true,"view":0,"op_number":4,"role":"primary"}
+
+$ curl -s -X POST -H 'Authorization: Bearer smoketest' \
+       -H 'Content-Type: text/plain' \
+       --data-binary 'SELECT * FROM smoke' \
+       http://127.0.0.1:16533/v1/sql
+{"status":"ok","bytes":36}
+# 36 bytes = 4-byte LE length prefix + 32-byte encoded row (smoke{v=42}).
+
+
+--- proven invariants ---
+- helm lint                  -> 0 chart(s) failed
+- helm template              -> 4 K8s objects rendered cleanly
+- helm template --set auth.secretName=''  -> open-mode branch correctly drops KESSELDB_TOKEN env
+- PVC bound                  -> 10Gi RWO, default StorageClass
+- Deployment ready           -> 1/1 pod, kessel:1100 non-root
+- Liveness + readiness       -> TCP:6532 probes green
+- Service                    -> ClusterIP, all 3 ports (binary 6532, http 6533, pg 5432) exposed
+- Binary CLI inside pod      -> CREATE + INSERT + SELECT SUM round-trip, correct result
+- HTTP /v1/health (with auth)-> {"status":"ok","primary":true,...}
+- HTTP /v1/sql (with auth)   -> {"status":"ok","bytes":36} for SELECT *
+
+
+--- tear down ---
+$ helm uninstall kesseldb
+release "kesseldb" uninstalled
+
+$ kind delete cluster --name kesseldb-test
+Deleting cluster "kesseldb-test" ...
+Deleted nodes: ["kesseldb-test-control-plane"]
+
+
+--- follow-up ---
+1. Flip ghcr.io/hassard0/kesseldb to PUBLIC visibility (one-time
+   manual step in GitHub UI -> packages -> kesseldb -> settings ->
+   change visibility -> Public). Once flipped, the helm install
+   path is one command end-to-end with no side-load workaround.
+2. Optional: pin Image to a versioned tag (--set image.tag=v1.2.3)
+   for reproducible rollouts instead of :latest.
+
+=== END TRANSCRIPT ===

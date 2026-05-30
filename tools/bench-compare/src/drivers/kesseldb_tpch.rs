@@ -27,21 +27,15 @@
 //!   accelerates). This closes the SP-Bench-Suite T4 TPC-H loss
 //!   without changing the kessel-expr semantics.
 //!
-//! - Q1 (single execution per "op"): four `Op::GroupAggregate` calls in
-//!   sequence — COUNT, SUM(l_quantity), SUM(l_extendedprice),
-//!   SUM(l_discount) — all grouped by `l_groupkey`, all with the WHERE
-//!   `l_shipdate <= 19980901` predicate. The client merges the four
-//!   per-group result maps and computes AVG = SUM / COUNT. The
-//!   "transactions" reported = full Q1 executions/sec.
-//!
-//!   **KesselDB capability gap recorded honestly**: `Op::GroupAggregate`
-//!   is single-column-per-call (computes one SUM/COUNT/MIN/MAX per
-//!   invocation). Q1's canonical SQL is one statement returning 8
-//!   aggregates; on KesselDB we issue 4 separate GroupAggregate calls
-//!   (the 4 base sums) and derive AVG client-side. This is honest about
-//!   the engine surface; a future capability slice could add
-//!   multi-aggregate GroupAggregate (`Op::GroupAggregateMulti`) so a
-//!   single call computes all 8 in one scan.
+//! - Q1 (single execution per "op"): **SP-Analytic-Plan-MULTI** —
+//!   one `Op::GroupAggregateMulti` call carrying 4 aggregates (COUNT,
+//!   SUM(l_quantity), SUM(l_extendedprice), SUM(l_discount)) all
+//!   grouped by `l_groupkey`, all under the same WHERE
+//!   `l_shipdate <= 19980901` predicate. The single-scan fold replaces
+//!   the previous 4× `Op::GroupAggregate` shape (each one a full-
+//!   narrowed-set scan with its own kessel-expr WHERE eval), so Q1
+//!   pays 1× the per-row cost instead of 4×. AVG = SUM / COUNT is
+//!   derived client-side from the per-group accumulators.
 //!
 //! - Q6 (single execution per "op"): one `Op::Aggregate { kind=SUM,
 //!   field_id=L_Q6_REVENUE }` with the WHERE
@@ -67,7 +61,6 @@ use kessel_expr::Program;
 use kessel_io::MemVfs;
 use kessel_proto::{ObjectId, Op, OpResult};
 use kessel_sm::StateMachine;
-use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -153,9 +146,10 @@ fn q6_predicate() -> Vec<u8> {
         .bytes()
 }
 
-/// Decode a `GroupAggregate` reply:
-/// `[u32 ngroups]` then per group `[u32 keylen][key][16B i128 LE]`.
-fn parse_group_aggregate(buf: &[u8]) -> Vec<(Vec<u8>, i128)> {
+/// Decode a `GroupAggregateMulti` reply:
+/// `[u32 ngroups]` then per group `[u32 keylen][key][16B i128 LE × n_aggs]`.
+/// `n_aggs` is implicit (the caller knows it from the request).
+fn parse_group_aggregate_multi(buf: &[u8], n_aggs: usize) -> Vec<(Vec<u8>, Vec<i128>)> {
     let mut out = Vec::new();
     if buf.len() < 4 { return out; }
     let n_groups = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
@@ -164,12 +158,15 @@ fn parse_group_aggregate(buf: &[u8]) -> Vec<(Vec<u8>, i128)> {
         if p + 4 > buf.len() { break; }
         let keylen = u32::from_le_bytes(buf[p..p+4].try_into().unwrap()) as usize;
         p += 4;
-        if p + keylen + 16 > buf.len() { break; }
+        if p + keylen + 16 * n_aggs > buf.len() { break; }
         let key = buf[p..p+keylen].to_vec();
         p += keylen;
-        let val = i128::from_le_bytes(buf[p..p+16].try_into().unwrap());
-        p += 16;
-        out.push((key, val));
+        let mut vs = Vec::with_capacity(n_aggs);
+        for _ in 0..n_aggs {
+            vs.push(i128::from_le_bytes(buf[p..p+16].try_into().unwrap()));
+            p += 16;
+        }
+        out.push((key, vs));
     }
     out
 }
@@ -266,49 +263,27 @@ pub fn run_tpch(
                 if Instant::now() >= stop_at { break; }
                 let s = Instant::now();
                 if is_q1 {
-                    // Q1: 4 GroupAggregate calls + client-side AVG fold.
+                    // SP-Analytic-Plan-MULTI Q1: ONE Op::GroupAggregateMulti
+                    // call carrying 4 aggregates instead of 4 separate
+                    // Op::GroupAggregate calls. The single-scan fold pays
+                    // 1× per-row WHERE-eval + 1× per-row group-key extract
+                    // (vs 4× in the pre-MULTI shape).
                     let g = sm.read().unwrap();
-                    // COUNT(*) per group.
-                    let r_count = g.read_only_op(Op::GroupAggregate {
+                    let r = g.read_only_op(Op::GroupAggregateMulti {
                         type_id: LINEITEM_TYPE_ID,
                         program: q1_prog.clone(),
                         group_field: fid::L_GROUPKEY,
-                        kind: 0, // COUNT
-                        agg_field: 0, // ignored for COUNT
-                        range_preds: q1_range.clone(),
-                    });
-                    // SUM(l_quantity) per group.
-                    let r_sum_q = g.read_only_op(Op::GroupAggregate {
-                        type_id: LINEITEM_TYPE_ID,
-                        program: q1_prog.clone(),
-                        group_field: fid::L_GROUPKEY,
-                        kind: 1, // SUM
-                        agg_field: fid::L_QUANTITY,
-                        range_preds: q1_range.clone(),
-                    });
-                    // SUM(l_extendedprice) per group.
-                    let r_sum_ep = g.read_only_op(Op::GroupAggregate {
-                        type_id: LINEITEM_TYPE_ID,
-                        program: q1_prog.clone(),
-                        group_field: fid::L_GROUPKEY,
-                        kind: 1, // SUM
-                        agg_field: fid::L_EXTENDEDPRICE,
-                        range_preds: q1_range.clone(),
-                    });
-                    // SUM(l_discount) per group — used for AVG(l_discount).
-                    let r_sum_dc = g.read_only_op(Op::GroupAggregate {
-                        type_id: LINEITEM_TYPE_ID,
-                        program: q1_prog.clone(),
-                        group_field: fid::L_GROUPKEY,
-                        kind: 1, // SUM
-                        agg_field: fid::L_DISCOUNT,
+                        aggregates: vec![
+                            (0, 0),                    // COUNT(*)
+                            (1, fid::L_QUANTITY),      // SUM(l_quantity)
+                            (1, fid::L_EXTENDEDPRICE), // SUM(l_extendedprice)
+                            (1, fid::L_DISCOUNT),      // SUM(l_discount)
+                        ],
                         range_preds: q1_range.clone(),
                     });
                     drop(g);
-                    // Verify all 4 returned Got and merge into one row-set.
-                    let (gc, gq, gep, gdc) = match (r_count, r_sum_q, r_sum_ep, r_sum_dc) {
-                        (OpResult::Got(c), OpResult::Got(q), OpResult::Got(ep), OpResult::Got(dc)) =>
-                            (c.to_vec(), q.to_vec(), ep.to_vec(), dc.to_vec()),
+                    let buf = match r {
+                        OpResult::Got(b) => b.to_vec(),
                         other => {
                             if count == 0 {
                                 eprintln!("kesseldb tpch Q1 failed: {:?}", other);
@@ -316,25 +291,19 @@ pub fn run_tpch(
                             break;
                         }
                     };
-                    let counts = parse_group_aggregate(&gc);
-                    let sum_qs = parse_group_aggregate(&gq);
-                    let sum_eps = parse_group_aggregate(&gep);
-                    let sum_dcs = parse_group_aggregate(&gdc);
-                    // Merge by key — BTreeMap for deterministic key order.
-                    let mut by_key: BTreeMap<Vec<u8>, (i128, i128, i128, i128)> = BTreeMap::new();
-                    for (k, v) in counts { by_key.entry(k).or_default().0 = v; }
-                    for (k, v) in sum_qs { by_key.entry(k).or_default().1 = v; }
-                    for (k, v) in sum_eps { by_key.entry(k).or_default().2 = v; }
-                    for (k, v) in sum_dcs { by_key.entry(k).or_default().3 = v; }
+                    // Parse [(group_key, [count, sum_q, sum_ep, sum_dc])].
+                    let groups = parse_group_aggregate_multi(&buf, 4);
                     // AVG = SUM / COUNT computed client-side. Used purely
-                    // to make sure the per-group result is exercised end-
-                    // to-end; we don't keep the avg values.
+                    // to exercise the per-group result end-to-end; we
+                    // don't keep the avg values. The BTreeMap collection
+                    // step is gone — Op::GroupAggregateMulti's result is
+                    // already in ascending group-key order.
                     let mut _checksum: i128 = 0;
-                    for (_k, (c, sq, sep, sdc)) in &by_key {
-                        let count = (*c).max(1);
-                        let avg_q = sq / count;
-                        let avg_ep = sep / count;
-                        let avg_dc = sdc / count;
+                    for (_k, vs) in &groups {
+                        let c = vs[0].max(1);
+                        let avg_q = vs[1] / c;
+                        let avg_ep = vs[2] / c;
+                        let avg_dc = vs[3] / c;
                         _checksum = _checksum
                             .wrapping_add(avg_q)
                             .wrapping_add(avg_ep)
@@ -400,14 +369,15 @@ pub fn run_tpch(
         rows,
         note: Some(if is_q1 {
             format!(
-                "MemVfs in-process; SF={} ({} rows); Q1 mapped as 4× \
-                 Op::GroupAggregate (COUNT + SUM(quantity) + SUM(extprice) \
-                 + SUM(discount)) grouped by synthetic 2-byte l_groupkey; \
-                 AVG computed client-side per group (Op::GroupAggregate is \
-                 single-aggregate-per-call). SP-Analytic-Plan T4: range \
-                 index on l_shipdate + range_preds=[<=19980901] narrow \
-                 each of the 4 scans via the order index. Ops/sec = full \
-                 Q1 executions/sec.",
+                "MemVfs in-process; SF={} ({} rows); Q1 mapped as ONE \
+                 Op::GroupAggregateMulti (COUNT + SUM(quantity) + \
+                 SUM(extprice) + SUM(discount)) grouped by synthetic \
+                 2-byte l_groupkey (SP-Analytic-Plan-MULTI — collapses \
+                 the previous 4× Op::GroupAggregate scan shape into one \
+                 single-scan fold); AVG computed client-side per group. \
+                 SP-Analytic-Plan T4: range index on l_shipdate + \
+                 range_preds=[<=19980901] narrow the single scan via \
+                 the order index. Ops/sec = full Q1 executions/sec.",
                 sf, rows
             )
         } else {

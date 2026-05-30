@@ -6,7 +6,7 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 
 What a node running on today's `main` actually does. Every line below is
 covered by the workspace test suite (2018 default / 2046 with
-`--features pg-gateway` / 2053 with all gateway features).
+`--features pg-gateway` / 2079 with all gateway features).
 
 **Tonight's deliveries (2026-05-29) — coherent state of the union:**
 

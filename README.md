@@ -6,7 +6,7 @@
 
 *"It's the database that made the Kessel Run in 12 parsecs."*
 
-`2018 default tests green / 2046 with --features pg-gateway / 2053+ with all gateway features` · `0 external dependencies in the kernel` · `Rust 1.95+` · single‑binary
+`2018 default tests green / 2046 with --features pg-gateway / 2079 with all gateway features` · `0 external dependencies in the kernel` · `Rust 1.95+` · single‑binary
 
 **Tonight's headlines** (2026‑05‑29):
 - **Real Postgres ORM compatibility — SP‑PG‑EXTQ V1 ARC CLOSED.** psycopg2 + SQLAlchemy 2.0 + psycopg3 (with `ClientCursor`) all PASS on vulcan with default settings (T8 closes the T7 `use_native_hstore=False` caveat). asyncpg + JDBC PARTIAL (connect + DDL + simple‑Q work; binary‑format parameterized DML deferred to V2 `SP‑PG‑EXTQ‑BIN`). Pipelining throughput on vulcan: 252‑409 stmt/s (psycopg2 single‑statement round‑trip). See [`docs/USAGE.md`](docs/USAGE.md#9-postgresql-clients-psql-pgcli-jdbc-psycopg-pgx-) §9 + transcript at `docs/superpowers/sppgextq-t8-orm-smoke-2026-05-29.txt`.
@@ -505,7 +505,7 @@ cargo test --workspace      # 2018 default tests (seeded partition/fault sim,
                             # pyarrow Parquet round-trips, WASM-MVP KATs,
                             # SP-A 85-seed K-invariance sweep)
 cargo test --workspace --features pg-gateway                # 2046 (adds SP-PG + SP-PG-CAT + SP-PG-EXTQ V1)
-cargo test --workspace --features pg-gateway,http-gateway,kessel-http-gateway/test-server   # 2053 — full matrix
+cargo test --workspace --features pg-gateway,http-gateway,kessel-http-gateway/test-server   # 2079 — full matrix
 cargo run -p kessel-bench --release -- --help               # benchmarks
 
 # Strategic-tier rigor artifacts:

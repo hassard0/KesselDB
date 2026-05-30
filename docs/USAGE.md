@@ -1824,6 +1824,104 @@ and post higher numbers; that's V2 `SP-PG-EXTQ-PIPELINE-BATCH`.
 - SP-PG-CAT progress (closed at T8): `docs/superpowers/specs/2026-05-27-kesseldb-subproject-sppgcat-progress.md`
 - SP-PG-EXTQ design spec: `docs/superpowers/specs/2026-05-28-kesseldb-sppgextq-extended-query-design.md`
 - SP-PG-EXTQ progress (T7 — hardening + real ORM smoke): `docs/superpowers/specs/2026-05-28-kesseldb-subproject-sppgextq-progress.md`
+- SP-PG-COPY design spec: `docs/superpowers/specs/2026-05-30-kesseldb-sppgcopy-design.md`
+- SP-PG-COPY progress (V1 SHIPPED at T4 — pg_dump / sysbench / `\copy` bulk-load): `docs/superpowers/specs/2026-05-30-kesseldb-subproject-sppgcopy-progress.md`
+
+### SP-PG-COPY — `COPY FROM STDIN` / `COPY TO STDOUT` bulk load (V1 SHIPPED 2026-05-30)
+
+PG's `COPY` command is the bulk-load lever every modern pg_dump
+restore, sysbench `prepare` phase, and analyst-friendly
+`psql \copy ... CSV` workflow uses — the same wire shape every
+PostgreSQL-aware ETL tool defaults to. V1 ships text format
+end-to-end for both directions; CSV + binary deferred to V2 arcs
+(`SP-PG-COPY-CSV`, `SP-PG-COPY-BIN`).
+
+```bash
+# COPY FROM STDIN — text format, the pg_dump default
+psql -h kesseldb -p 5532 -U test -d kesseldb -c \
+  "COPY users FROM STDIN" < users.tsv
+# → COPY 1000
+
+# psql \copy is the client-side wrapper around the same wire shape
+psql -h kesseldb -p 5532 -U test -d kesseldb -c \
+  '\copy users FROM /path/to/users.tsv'
+
+# COPY TO STDOUT — text format
+psql -h kesseldb -p 5532 -U test -d kesseldb -c \
+  "COPY users TO STDOUT" > users.tsv
+
+# Round-trip: export then re-import produces an identical row set.
+
+# Optional column list works in both directions.
+psql -h kesseldb -p 5532 -U test -d kesseldb -c \
+  "COPY users (id, name) FROM STDIN" < partial.tsv
+psql -h kesseldb -p 5532 -U test -d kesseldb -c \
+  "COPY users (id, name) TO STDOUT" > partial.tsv
+
+# NULL columns use the PG-canonical `\N` sentinel.
+printf '10\tfoo\n20\t\\N\n30\tbar\n' | \
+  psql -h kesseldb -p 5532 -U test -d kesseldb -c \
+    "COPY t (id, label) FROM STDIN"
+# → rows with id=20 have label=NULL
+```
+
+V1 text-format escapes per PG §COPY-FORMATS: rows separated by
+`\n`, fields by `\t`, NULL is `\N`, the 7 PG-canonical backslash
+escapes (`\b \f \n \r \t \v \\`) are recognized on input + emitted
+on output, and the legacy v2 end-of-data marker `\.` is tolerated
+on input.
+
+Connection state model: a `COPY ... FROM STDIN` Query transitions
+the connection to `CopyIn` state — the server then accepts only
+`CopyData`, `CopyDone`, `CopyFail`, or `Terminate` until the COPY
+exchange ends. Any other frontend tag in CopyIn = `08P01
+protocol_violation` + clean error + state cleared. A subsequent Q
+or extended-query message works normally — the connection STAYS
+ALIVE across COPY errors (matching the SP-PG-EXTQ tolerant
+probe-then-fall-back contract).
+
+**V1 throughput** (on vulcan, 1000 rows of `(BIGINT, CHAR(32))`):
+~257 rows/sec. The per-row pattern is `SELECT * FROM <table>`-like
+INSERT dispatch through `dispatch_query` for each parsed row;
+comparable to the SP-PG-EXTQ INSERT loop measured at T8
+(252 stmt/s). V2 `SP-PG-COPY-BULKAPPLY` would batch rows into a
+single `Op::Txn` and lift this 10-50×.
+
+**V1 atomicity divergence** vs PG: real PG uses "all-or-nothing on
+error" — if any row fails mid-COPY, the whole COPY rolls back. V1
+commits each row immediately (because the engine has no notion of
+tentative writes). A constraint failure at row 500 of 1000 leaves
+the first 499 committed. V2 `SP-PG-COPY-BULKAPPLY` restores PG
+semantics via the `Op::Txn` fold.
+
+**V1 NULL handling caveat**: kessel-sql's `INSERT VALUES` parser
+has no `NULL` keyword. SP-PG-COPY V1 works around this by OMITTING
+NULL columns from the synthesized `INSERT (col, col, ...) VALUES
+(...)` — kessel-sql's SP86 default-fill semantics for omitted
+nullable columns then applies. This means a NOT NULL column
+receiving `\N` surfaces as a clean `23502 not_null_violation`
+error at ingest time (matching PG).
+
+Rejected variants surface precise V2-pointing error messages:
+
+```text
+ERROR:  COPY binary format not supported in V1 (SP-PG-COPY-BIN)
+ERROR:  COPY csv format not supported in V1 (SP-PG-COPY-CSV)
+ERROR:  COPY FROM/TO file path not supported in V1; use STDIN/STDOUT (SP-PG-COPY-FILE)
+ERROR:  COPY FROM/TO PROGRAM not supported (permanent security restriction)
+```
+
+V2 follow-ups (each its own SP-arc):
+
+- `SP-PG-COPY-BIN` — binary format (`WITH (FORMAT binary)`).
+- `SP-PG-COPY-CSV` — CSV format with quoting + `HEADER` + custom
+  delimiters.
+- `SP-PG-COPY-BULKAPPLY` — per-batch `Op::Txn` fold for 10-50×
+  throughput win + PG-compatible all-or-nothing atomicity.
+- `SP-PG-COPY-FILE` — `COPY ... FROM '/path'` (operator-opt-in
+  only, security).
+- `SP-PG-COPY-PROGRAM` — `COPY ... FROM PROGRAM '...'` (permanent
+  hard pass).
 
 ## 10. HTTP gateway
 

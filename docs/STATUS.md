@@ -28,6 +28,27 @@ covered by the workspace test suite (2024 default / 2052 with
   `SP-PG-EXTQ-PIPELINE-BATCH` (libpq pipeline mode), `SP-PG-GO-SMOKE` (pgx),
   `SP-PG-NODE-SMOKE` (Drizzle / Prisma). **Arc closed — TaskList #336 ready
   for completion.**
+- **Track A.2 — PostgreSQL COPY bulk load (SP-PG-COPY V1 SHIPPED at T4 — 2026-05-30).**
+  `COPY <table> [(cols)] FROM STDIN` and `COPY <table> [(cols)] TO STDOUT`
+  dispatched end-to-end in text format. Per-connection CopyIn state machine:
+  CopyData / CopyDone / CopyFail handled while in CopyIn; any other tag =
+  `08P01` + state clear + STAY ALIVE (matches SP-PG-EXTQ tolerant probe
+  contract). **HEADLINE — real psql 16.14 smoke on vulcan: CREATE TABLE +
+  COPY FROM (3 rows) + SELECT * + COPY TO (3 rows on the wire) round-trip
+  byte-equal end-to-end.** NULL round-trip via `\N` sentinel works; 1k-row
+  ingest via COPY ran in 3.89s (~257 rows/sec — comparable to SP-PG-EXTQ
+  INSERT loop, lifts in V2 `SP-PG-COPY-BULKAPPLY` per-batch `Op::Txn` fold).
+  Binary / CSV / file / program variants rejected with precise
+  V2-pointing `0A000` messages (`SP-PG-COPY-BIN`, `SP-PG-COPY-CSV`,
+  `SP-PG-COPY-FILE`, `SP-PG-COPY-PROGRAM`). Unlocks `pg_dump` restore,
+  `sysbench prepare`, and `psql \copy` workflows. Smoke transcript:
+  `docs/superpowers/sppgcopy-t4-smoke-2026-05-30.txt`. Named V2 follow-ups:
+  `SP-PG-COPY-BIN` (binary format), `SP-PG-COPY-CSV` (CSV format with
+  quoting + HEADER), `SP-PG-COPY-BULKAPPLY` (per-batch Op::Txn fold for
+  10-50× throughput + PG-compatible all-or-nothing atomicity),
+  `SP-PG-COPY-FILE` (server-side file access — operator-opt-in only),
+  `SP-PG-COPY-PROGRAM` (permanent hard pass). **Arc closed — TaskList #350
+  ready for completion.**
 - **Track B — Perf-A read-pool arc (T1 → T7) + TXN-RO follow-on.** Parallel-read bypass
   (`read_only_op(&self, ...)` dispatch through `Arc<RwLock<StateMachine>>`) +
   storage `Arc<[u8]>` migration on the read fast path: **4.75M ops/sec at

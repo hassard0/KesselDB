@@ -1,0 +1,100 @@
+=== SP-PG-COPY T4 — real psql smoke on vulcan, 2026-05-30 ===
+
+Server: kesseldb release built from main, commit 3a6557b
+Listener: 127.0.0.1:5532 (PG-wire), 127.0.0.1:6532 (binary)
+Token: admin
+PG client: PostgreSQL 16.14 (Ubuntu psql)
+
+--- 1. CREATE TABLE via PG wire ---
+$ PGPASSWORD=admin psql -h 127.0.0.1 -p 5532 -U test -d kesseldb     -c 'CREATE TABLE copy_smoke (id BIGINT, name CHAR(32))'
+CREATE TABLE
+
+--- 2. COPY FROM STDIN — 3 rows ---
+$ printf '1\thello\n2\tworld\n3\tfrom-psql\n' |     PGPASSWORD=admin psql -h 127.0.0.1 -p 5532 -U test -d kesseldb         -c 'COPY copy_smoke FROM STDIN'
+COPY 3
+
+--- 3. SELECT * — rows are visible ---
+$ PGPASSWORD=admin psql -h 127.0.0.1 -p 5532 -U test -d kesseldb     -c 'SELECT * FROM copy_smoke'
+ id |   name
+----+-----------
+  1 | hello
+  2 | world
+  3 | from-psql
+(3 rows)
+
+--- 4. COPY TO STDOUT ---
+$ PGPASSWORD=admin psql -h 127.0.0.1 -p 5532 -U test -d kesseldb     -c 'COPY copy_smoke TO STDOUT'
+1	hello
+2	world
+3	from-psql
+
+--- 5. NULL round-trip ---
+$ PGPASSWORD=admin psql -h 127.0.0.1 -p 5532 -U test -d kesseldb     -c 'CREATE TABLE copy_null (id BIGINT, label CHAR(16))'
+CREATE TABLE
+$ printf '10\tfoo\n20\t\N\n30\tbar\n' | PGPASSWORD=admin psql ...     -c 'COPY copy_null FROM STDIN'
+COPY 3
+$ PGPASSWORD=admin psql ... -c 'SELECT * FROM copy_null'
+ id | label
+----+-------
+ 10 | foo
+ 20 |
+ 30 | bar
+(3 rows)
+$ PGPASSWORD=admin psql ... -c 'COPY copy_null TO STDOUT'
+10	foo
+20	\N
+30	bar
+
+--- 6. Full round-trip via file ---
+$ PGPASSWORD=admin psql ... -c 'COPY copy_null TO STDOUT' > /tmp/exp.tsv
+$ PGPASSWORD=admin psql ... -c 'CREATE TABLE copy_null_rt (id BIGINT, label CHAR(16))'
+CREATE TABLE
+$ PGPASSWORD=admin psql ... -c 'COPY copy_null_rt FROM STDIN' < /tmp/exp.tsv
+COPY 3
+$ PGPASSWORD=admin psql ... -c 'SELECT * FROM copy_null_rt'
+(same 3 rows including NULL)
+
+--- 7. 1k-row throughput (V1 per-row INSERT shape) ---
+$ python3 -c 'for i in range(1000): print(f"{i}\tpayload-{i}")' > /tmp/bench_1k.tsv
+$ time PGPASSWORD=admin psql ... -c 'COPY copy_bench FROM STDIN' < /tmp/bench_1k.tsv
+COPY 1000
+
+real    0m3.890s
+user    0m0.034s
+sys     0m0.007s
+
+Throughput: ~257 rows/sec — comparable to the SP-PG-EXTQ INSERT
+loop measured at T8 (252 stmt/s). V2 SP-PG-COPY-BULKAPPLY would
+batch into a single Op::Txn and lift this 10-50×.
+
+$ PGPASSWORD=admin psql ... -c 'COPY copy_bench TO STDOUT' | wc -l
+1000
+
+--- 8. Binary-format reject (V2 SP-PG-COPY-BIN pointer) ---
+$ PGPASSWORD=admin psql ... -c 'COPY copy_smoke FROM STDIN WITH (FORMAT binary)'
+ERROR:  COPY binary format not supported in V1 (SP-PG-COPY-BIN)
+
+Same session, follow-up COPY TO works (connection stayed alive):
+$ PGPASSWORD=admin psql -h 127.0.0.1 -p 5532 -U test -d kesseldb <<EOF2
+COPY copy_smoke FROM STDIN WITH (FORMAT binary);
+COPY copy_smoke TO STDOUT;
+EOF2
+ERROR:  COPY binary format not supported in V1 (SP-PG-COPY-BIN)
+1	hello
+2	world
+3	from-psql
+
+--- 9. CSV-format reject (V2 SP-PG-COPY-CSV pointer) ---
+$ PGPASSWORD=admin psql -h 127.0.0.1 -p 5532 -U test -d kesseldb <<EOF3
+COPY copy_smoke TO STDOUT WITH (FORMAT csv);
+SELECT * FROM copy_smoke;
+EOF3
+ERROR:  COPY csv format not supported in V1 (SP-PG-COPY-CSV)
+ id |   name
+----+-----------
+  1 | hello
+  2 | world
+  3 | from-psql
+(3 rows)
+
+=== SMOKE PASS ===

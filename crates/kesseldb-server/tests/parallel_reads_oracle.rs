@@ -740,6 +740,10 @@ fn t3_smoke_join() {
 /// TXN-RO oracle headline: 100 random workloads × 1000 Op::Txn calls,
 /// each Txn wraps 1-20 random RO inner ops. ~100K Op::Txn calls,
 /// ~1M inner reads total. Byte-equal between parallel + serial engines.
+/// SeqRead is excluded from inner-op generation because apply-Txn
+/// rejects it; the bypass mirrors that rejection; both paths agree
+/// (SchemaError), but the oracle is about the SUCCESS-path equivalence
+/// of the 15 Txn-permitted reads.
 #[test]
 fn txn_ro_oracle_100_workloads_x_1000_txns_byte_equal() {
     let (engine_p, dir_p) = spawn(Some(8), "txnro-p");
@@ -758,11 +762,17 @@ fn txn_ro_oracle_100_workloads_x_1000_txns_byte_equal() {
         for op_idx in 0..OPS_PER_WORKLOAD {
             // Random inner-op count 1..=20. Avoids the empty-Txn corner
             // (which has its own per-shape KAT); the bulk shape mirrors
-            // realistic Lambda-style multi-read patterns.
+            // realistic Lambda-style multi-read patterns. Rejects
+            // SeqRead inner ops since apply-Txn rejects them (the
+            // bypass mirrors that rejection — byte-equal — but the
+            // success-path oracle wants Ok-return equivalence).
             let n_inner = 1 + (rng.below(20) as usize);
             let mut inner = Vec::with_capacity(n_inner);
-            for _ in 0..n_inner {
-                let (_label, op) = gen_random_read_op(&mut rng);
+            while inner.len() < n_inner {
+                let (label, op) = gen_random_read_op(&mut rng);
+                if label == "SeqRead" {
+                    continue;
+                }
                 inner.push(op);
             }
             let txn = Op::Txn { ops: inner };
@@ -871,10 +881,12 @@ fn txn_ro_smoke_sysbench_shape_returns_ok() {
     let _ = std::fs::remove_dir_all(&dir_s);
 }
 
-/// TXN-RO smoke 4: every read variant inside one Txn. Locks all 16
-/// variants compose correctly inside an Op::Txn under the bypass.
+/// TXN-RO smoke 4: every Txn-permitted read variant inside one Txn.
+/// Locks the 15 read variants apply-Txn permits compose correctly
+/// inside an Op::Txn under the bypass. (SeqRead is NOT included —
+/// apply-Txn rejects it; the bypass mirrors that rejection.)
 #[test]
-fn txn_ro_smoke_all_16_variants_one_txn_returns_ok() {
+fn txn_ro_smoke_all_txn_permitted_variants_one_txn_returns_ok() {
     let (engine_p, dir_p) = spawn(Some(4), "txnro-allvariants-p");
     let (engine_s, dir_s) = spawn(None, "txnro-allvariants-s");
     let inner = vec![
@@ -953,7 +965,6 @@ fn txn_ro_smoke_all_16_variants_one_txn_returns_ok() {
             agg_field: 2,
             range_preds: vec![],
         },
-        Op::SeqRead { from: 0, limit: 4 },
         Op::Join {
             left_type: 1,
             right_type: 1,
@@ -964,8 +975,29 @@ fn txn_ro_smoke_all_16_variants_one_txn_returns_ok() {
     ];
     let p = engine_p.apply(Op::Txn { ops: inner.clone() });
     let s = engine_s.apply(Op::Txn { ops: inner });
-    assert_eq!(p, s, "16-variant Txn diverged: p={p:?} s={s:?}");
+    assert_eq!(p, s, "15-variant Txn diverged: p={p:?} s={s:?}");
     assert_eq!(p, OpResult::Ok);
+    drop(engine_p);
+    drop(engine_s);
+    let _ = std::fs::remove_dir_all(&dir_p);
+    let _ = std::fs::remove_dir_all(&dir_s);
+}
+
+/// TXN-RO smoke 7: Op::Txn{[SeqRead]} — SeqRead is permitted standalone
+/// but rejected inside Op::Txn by apply-Txn. The bypass mirrors that
+/// rejection so both engines return the same SchemaError.
+#[test]
+fn txn_ro_smoke_seqread_inside_txn_rejected_symmetrically() {
+    let (engine_p, dir_p) = spawn(Some(4), "txnro-seqread-p");
+    let (engine_s, dir_s) = spawn(None, "txnro-seqread-s");
+    let txn = Op::Txn {
+        ops: vec![Op::SeqRead { from: 0, limit: 4 }],
+    };
+    let p = engine_p.apply(txn.clone());
+    let s = engine_s.apply(txn);
+    assert_eq!(p, s, "SeqRead-in-Txn diverged: p={p:?} s={s:?}");
+    assert!(matches!(p, OpResult::SchemaError(_)),
+        "SeqRead inside Txn must SchemaError on both paths; got {p:?}");
     drop(engine_p);
     drop(engine_s);
     let _ = std::fs::remove_dir_all(&dir_p);

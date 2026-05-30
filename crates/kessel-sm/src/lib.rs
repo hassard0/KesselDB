@@ -2562,38 +2562,45 @@ impl<V: Vfs> StateMachine<V> {
             // SP-Perf-A-TXN-RO: all-RO Op::Txn{ops} bypass. The
             // server-side classifier `read_pool::is_read_only` only
             // routes a Txn here when every inner op is read-only, but
-            // we re-validate as defence-in-depth: a write inner op
-            // dispatched here would silently do nothing (read_only_op
-            // for a write returns SchemaError) — which would diverge
-            // from the apply path's success/failure verdict. We mirror
-            // apply-Txn's contract: iterate inner ops, return Ok on
-            // success, first failure verdict otherwise. Nested Op::Txn
-            // is rejected (apply-Txn also rejects it via the data-op
-            // validator, so behaviour is identical between paths).
+            // we re-validate against apply-Txn's data-op contract as
+            // defence-in-depth. Apply-Txn (kessel-sm Op::Txn arm)
+            // accepts a specific 19-op data set; we mirror its
+            // read-only subset EXACTLY so the bypass and apply paths
+            // produce identical verdicts (notably: SeqRead is
+            // permitted standalone but rejected inside Op::Txn by
+            // apply, so the bypass must reject it too).
+            //
+            // Permitted reads inside Op::Txn (mirrors apply-Txn):
+            //   GetById, Describe, Join, GetBlob, FindBy, Query,
+            //   QueryExpr, FindRange, FindByComposite, Select,
+            //   QueryRows, Aggregate, SelectFields, GroupAggregate,
+            //   SelectSorted. (No SeqRead — apply-Txn rejects it.)
             Op::Txn { ops } => {
                 for o in &ops {
                     let ok = matches!(
                         o,
                         Op::GetById { .. }
                             | Op::Describe { .. }
+                            | Op::Join { .. }
                             | Op::GetBlob { .. }
                             | Op::FindBy { .. }
-                            | Op::FindByComposite { .. }
-                            | Op::FindRange { .. }
                             | Op::Query { .. }
                             | Op::QueryExpr { .. }
+                            | Op::FindRange { .. }
+                            | Op::FindByComposite { .. }
                             | Op::Select { .. }
                             | Op::QueryRows { .. }
-                            | Op::SelectFields { .. }
-                            | Op::SelectSorted { .. }
                             | Op::Aggregate { .. }
+                            | Op::SelectFields { .. }
                             | Op::GroupAggregate { .. }
-                            | Op::SeqRead { .. }
-                            | Op::Join { .. }
+                            | Op::SelectSorted { .. }
                     );
                     if !ok {
+                        // Mirror apply-Txn's rejection message
+                        // verbatim so divergence-via-error-string
+                        // can't surface in any future test.
                         return OpResult::SchemaError(
-                            "read_only_op: Op::Txn contains non-read op (nested Txn or write)".into(),
+                            "Txn: only data ops allowed (no DDL / nested txn)".into(),
                         );
                     }
                 }

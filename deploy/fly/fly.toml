@@ -1,0 +1,120 @@
+# Fly.io deployment manifest for KesselDB.
+#
+# This ships the pre-built ghcr.io image directly — no Fly.io builder
+# step needed. Edit `app` to your own Fly app name; default `kesseldb`
+# will collide with whoever registered it first on Fly's global
+# namespace.
+#
+# Deploy sequence (see deploy/fly/README.md for the full walkthrough):
+#   fly launch --no-deploy --copy-config --name <your-app>
+#   fly secrets set KESSELDB_TOKEN=$(openssl rand -hex 32)
+#   fly volumes create kesseldb_data --size 10 --region iad
+#   fly deploy
+#
+# V1 caveats (intentional):
+# - Single VM only (matches the Helm chart's single-pod posture).
+#   Scaling out is SP-Cloud-Cluster (separate arc).
+# - All three wire surfaces published as raw TCP services. Fly's
+#   HTTPS-terminating handler is NOT used — KesselDB's binary +
+#   PG-wire protocols are not HTTP, and the HTTP gateway's TLS path
+#   is opt-in via `--features tls` (not enabled by default in the
+#   ghcr.io image). Pair with `fly certs` + your own ingress if you
+#   need public TLS.
+
+app = "kesseldb"
+primary_region = "iad"
+
+[build]
+  # Reuse the pre-built multi-arch image pushed by .github/workflows/release.yml.
+  # Pin to a specific version for reproducible deploys; `:latest` is
+  # convenient but every `fly deploy` will repull the registry head.
+  image = "ghcr.io/hassard0/kesseldb:latest"
+
+# ─────────────────────────────────────────────────────────────────────
+# Environment — matches the Dockerfile's defaults; KESSELDB_TOKEN is
+# NOT set here, only via `fly secrets set` (so it never lands in git).
+# ─────────────────────────────────────────────────────────────────────
+[env]
+  KESSELDB_HTTP_ADDR = "0.0.0.0:6533"
+  KESSELDB_PG_ADDR = "0.0.0.0:5432"
+
+# ─────────────────────────────────────────────────────────────────────
+# Persistent volume — mounted at /data, matches the Dockerfile's VOLUME.
+# The volume MUST exist before `fly deploy`:
+#   fly volumes create kesseldb_data --size 10 --region iad
+# ─────────────────────────────────────────────────────────────────────
+[[mounts]]
+  source = "kesseldb_data"
+  destination = "/data"
+
+# ─────────────────────────────────────────────────────────────────────
+# VM sizing. KesselDB's kernel is lean; bump for analytics workloads.
+# ─────────────────────────────────────────────────────────────────────
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+# ─────────────────────────────────────────────────────────────────────
+# Services — one stanza per wire surface, all raw TCP. Fly's
+# `internal_port` is the container-side port; `ports[]` are what's
+# published externally.
+# ─────────────────────────────────────────────────────────────────────
+
+# Binary protocol — `kessel` CLI native, fastest path.
+[[services]]
+  protocol = "tcp"
+  internal_port = 6532
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[services.ports]]
+    port = 6532
+    handlers = []
+
+  [[services.tcp_checks]]
+    interval = "10s"
+    timeout = "2s"
+    grace_period = "5s"
+
+# HTTP/1.1 + WebSocket gateway.
+[[services]]
+  protocol = "tcp"
+  internal_port = 6533
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[services.ports]]
+    port = 6533
+    handlers = []
+
+  [[services.tcp_checks]]
+    interval = "10s"
+    timeout = "2s"
+    grace_period = "5s"
+
+# PostgreSQL Frontend/Backend v3.0 gateway.
+[[services]]
+  protocol = "tcp"
+  internal_port = 5432
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[services.ports]]
+    port = 5432
+    handlers = []
+
+  [[services.tcp_checks]]
+    interval = "10s"
+    timeout = "2s"
+    grace_period = "5s"
+
+# ─────────────────────────────────────────────────────────────────────
+# Deploy strategy — `immediate` because Fly's rolling strategy can't
+# attach the volume to a new machine before the old one releases it
+# (single-writer KesselDB engine + single-attach volume).
+# ─────────────────────────────────────────────────────────────────────
+[deploy]
+  strategy = "immediate"

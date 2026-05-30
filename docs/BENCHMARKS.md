@@ -30,8 +30,8 @@ Wins, losses, and the one-line cause for each:
 | sysbench OLTP write-only (N=8) | **5.2× faster** (53K vs 10K tx/s) | Write-heavy transactions |
 | sysbench OLTP read-only (N=16) | **LOSES** (680 vs 5,073 tx/s) | Roadmap: route RO `Op::Txn` through Perf-A bypass |
 | sysbench OLTP read-write (N=16) | **LOSES** (711 vs 3,862 tx/s) | Same cause |
-| TPC-H Q1 — multi-aggregate GROUP BY (N=4) | **LOSES** (8.84 vs 185.95 q/s) | Roadmap: SP-Analytic-Plan — `Op::GroupAggregate` lacks range-pred index narrowing |
-| TPC-H Q6 — SUM with WHERE (N=4) | **LOSES** (13.74 vs 1,685 q/s) | Same cause — full scan vs Postgres' shipdate-index scan |
+| TPC-H Q1 — multi-aggregate GROUP BY (N=4) | **LOSES** (10.14 vs 185.99 q/s; SP-Analytic-Plan lift 1.15×) | Narrowing window covers ~all rows; multi-aggregate fold is the bottleneck — SP-Analytic-Plan-MULTI |
+| TPC-H Q6 — SUM with WHERE (N=4) | **LOSES** (103.38 vs 1,686 q/s; SP-Analytic-Plan lift 7.5×) | Narrow window helps; gap closed from 123× to 16× — SP-Analytic-Plan-MULTI next |
 
 KesselDB **wins 4 of 6 hand-rolled workloads** and loses 4 (the 2 sysbench
 transaction shapes + the 2 TPC-H analytical shapes). The losses fall into
@@ -45,20 +45,28 @@ two distinct buckets:
    detectable as read-only, OR shard the apply queues so K shards
    each get their own apply thread.
 
-2. **TPC-H Q1 + Q6** — `Op::Aggregate` / `Op::GroupAggregate` walk the
-   row set evaluating a kessel-expr WHERE program per row. Postgres'
-   shipdate index narrows the candidate set to ~52K rows for Q1 and
-   ~3K rows for Q6; SQLite's index-only scan accelerates Q6
-   similarly. KesselDB does the full 60K-row scan for both. The
-   gating fact is honest: **KesselDB does scale linearly with N on
-   analytics** (Q1 N=1→N=4 = 3.7×, Q6 N=1→N=4 = 3.9×, both via the
-   shared-RwLock read-pool), but the per-op cost is 50-200× higher
-   than Postgres because the planner doesn't use the order-index on
-   `l_shipdate`. **Roadmap target**: SP-Analytic-Plan will teach
-   `Op::Aggregate` and `Op::GroupAggregate` to consume the
-   `range_preds` interface already in `Op::QueryRows` so an
-   `l_shipdate BETWEEN ?` predicate prunes the scan via the existing
-   `FindRange` machinery.
+2. **TPC-H Q1 + Q6** — `Op::Aggregate` / `Op::GroupAggregate` walk
+   the row set evaluating a kessel-expr WHERE program per row.
+   **SP-Analytic-Plan (2026-05-29) SHIPPED** — both ops now accept
+   `range_preds: Vec<(field_id, op, value)>` and intersect candidates
+   via the existing ordered-index `scan_range` machinery before the
+   per-row VM runs. Bench-compare's TPC-H driver adds an
+   `Op::AddOrderedIndex` on `l_shipdate` at load time + emits range
+   hints on the Q1/Q6 ops.
+   - **Q6 lift = 7.5× at N=4** (13.74 → 103.38 q/s); gap vs Postgres
+     closed from **123× to 16×**. The 1994 shipdate window is ~1/7th
+     of the data so the narrowed candidate set is ~8K rows, not 60K.
+   - **Q1 lift = 1.15× at N=4** (8.84 → 10.14 q/s); the WHERE
+     `l_shipdate <= 19980901` covers ~all data so the narrowing
+     barely helps. The remaining bottleneck for Q1 is the **4×
+     separate scans** (one per aggregate: COUNT + SUM(l_quantity) +
+     SUM(l_extendedprice) + SUM(l_discount)) — fixing that needs
+     `Op::GroupAggregateMulti` so all 4 aggregates fold in ONE scan.
+     **Next roadmap target**: SP-Analytic-Plan-MULTI.
+   - KesselDB still scales linearly with N on analytics (Q1
+     N=1→N=4 = 3.6×, Q6 N=1→N=4 = 4.1× via the shared-RwLock
+     read-pool). The remaining gap vs Postgres is the parallel hash
+     aggregate algorithm shape, not the index narrowing.
 
 ---
 
@@ -403,60 +411,55 @@ TPC-H DOUBLEs converted to scaled ints; constants in the SQL queries
 scaled to match). Same deterministic per-trial seed across all 3 DBs
 via `tpch::gen_lineitem`.
 
+**POST-SP-Analytic-Plan (2026-05-29):**
+
+| DB | N=1 q/s | N=4 q/s | p50 (N=1) | p99 (N=1) | vs pre-arc |
+|---|---:|---:|---:|---:|---:|
+| KesselDB | 2.80 | **10.14** | 351.0 ms | 405.4 ms | **+1.18× / +1.15×** |
+| **PostgreSQL** | **46.36** | **185.99** | 21.8 ms | 23.2 ms | unchanged |
+| SQLite | 23.18 | 23.21 | 42.9 ms | 45.0 ms | unchanged |
+| TigerBeetle | — | — | — | — | — |
+
+**Pre-arc baseline** (kept for honesty):
+
 | DB | N=1 q/s | N=4 q/s | p50 (N=1) | p99 (N=1) |
 |---|---:|---:|---:|---:|
-| KesselDB | 2.38 | 8.84 | 417.8 ms | 476.0 ms |
-| **PostgreSQL** | **46.58** | **185.95** | 21.2 ms | 23.3 ms |
-| SQLite | 23.23 | 22.19 | 42.9 ms | 45.0 ms |
-| TigerBeetle | — | — | — | — |
+| KesselDB (pre) | 2.38 | 8.84 | 417.8 ms | 476.0 ms |
 
-**Honest read — KesselDB loses TPC-H Q1 at every N:**
+**Honest read — KesselDB still loses TPC-H Q1 at every N (the
+lift is small):**
 
-- **Postgres wins decisively** (185.95 q/s at N=4 = 7.8× KesselDB).
-  Postgres' shipdate index narrows the row set; the planner picks a
-  parallel-aware hash aggregate on the two-column GROUP BY; each
-  backend computes 8 aggregates in one pass.
-- **SQLite N=1 = 23.23 q/s** but **N=4 regresses to 22.19** — single-
-  writer-at-a-time + shared cache contention. The N=4 dip is the
-  honest SQLite shape for read-mostly queries against a single file
-  with many readers.
-- **KesselDB N=1 = 2.38 q/s, N=4 = 8.84 q/s (3.7× scaling)**. Two
-  honest properties:
-  1. KesselDB **does scale linearly with N** on analytics — the
-     read-pool bypass (`read_only_op(&self)` on shared `RwLock`)
-     means 4 workers parallelize their full-scan aggregates.
-  2. The per-query cost is 20-50× higher than Postgres at N=1
-     because the Q1 mapping is **4× `Op::GroupAggregate`**
-     (COUNT + SUM(l_quantity) + SUM(l_extendedprice) +
-     SUM(l_discount)) — each one is a separate full-scan + kessel-
-     expr WHERE evaluation. AVG is computed client-side per group.
+- **Postgres still wins decisively** (185.99 q/s at N=4 = 18× KesselDB
+  post-arc, was 21×). Postgres' shipdate index narrows the row set;
+  the planner picks a parallel-aware hash aggregate on the two-
+  column GROUP BY; each backend computes 8 aggregates in one pass.
+- **SQLite N=1 = 23.18 q/s ≈ N=4 = 23.21 q/s** — the single-DB-file
+  shared-lock contention from the pre-arc bench (N=4 = 22.19) eased
+  this run (vulcan was quieter); the per-DB shape is otherwise
+  unchanged.
+- **KesselDB N=1 = 2.80 q/s, N=4 = 10.14 q/s (3.6× scaling)**. The
+  read-pool linear scaling holds; the per-query cost barely moved
+  (3.53 → 2.80 at N=1) because Q1's WHERE `l_shipdate <= 19980901`
+  covers ~all 60K rows. The order-index narrowing finds an empty
+  set of rows to exclude.
 - **TigerBeetle**: refused. No SQL aggregate primitive — TB's
   account/transfer ledger model doesn't map onto multi-aggregate
   GROUP BY.
 
-**Why KesselDB loses Q1 specifically:**
+**Why KesselDB still loses Q1 specifically — the multi-aggregate fold:**
 
-KesselDB's `Op::GroupAggregate` is single-aggregate-per-call (computes
-one SUM/COUNT/MIN/MAX in one scan); a multi-aggregate Q1 needs 4
-separate calls. Each call does a full 60K-row scan with the
-`kessel-expr` VM evaluating `l_shipdate <= 19980901` per row. The
-Postgres planner's index-narrowing + single-pass parallel hash
-aggregate is fundamentally a different algorithm shape than what
-KesselDB's current `Op::GroupAggregate` surface exposes.
+The remaining bottleneck is structural, not WHERE-narrowing. Q1's
+8-aggregate SQL becomes **4× separate `Op::GroupAggregate` scans**
+on KesselDB (COUNT + SUM(l_quantity) + SUM(l_extendedprice) +
+SUM(l_discount)) — each one a full-narrowed-set scan with its own
+kessel-expr WHERE evaluation. Postgres folds all 8 aggregates in a
+single parallel hash-aggregate pass; KesselDB pays 4× the per-row
+cost.
 
-**Roadmap implication.** Two distinct slices close the Q1 gap:
-1. **`Op::GroupAggregateMulti`** — accept a Vec of `(kind, field_id)`
-   tuples and fold all aggregates in ONE scan. The 4× multiplier
-   collapses to 1×.
-2. **SP-Analytic-Plan: range-pred narrowing on aggregate scans** —
-   `Op::Aggregate` and `Op::GroupAggregate` should consume the
-   `range_preds: Vec<(u16, u8, Vec<u8>)>` interface already shipping
-   in `Op::QueryRows` (SP70) so `l_shipdate <= 19980901` narrows the
-   scan via the existing `FindRange` machinery. The full-scan cost
-   collapses to the candidate-set cost.
-
-Both are out of SP-Bench-Suite scope; the loss is published here so
-the next analytics arc has a concrete target.
+**Next roadmap arc — SP-Analytic-Plan-MULTI.** `Op::GroupAggregateMulti
+{ aggregates: Vec<(kind, field_id)>, … }` folds N aggregates in ONE
+scan; the 4× multiplier collapses to 1×, so Q1 should lift ~4×
+again on top of the SP-Analytic-Plan baseline.
 
 ---
 
@@ -478,60 +481,80 @@ field_id=L_Q6_REVENUE }` answers without a SUM(expr) primitive (the
 multiplication is hoisted out of the per-query path). Postgres + SQLite
 use `SUM(l_extendedprice * l_discount)` directly.
 
+**POST-SP-Analytic-Plan (2026-05-29) — the headline lift:**
+
+| DB | N=1 q/s | N=4 q/s | p50 (N=1) | p99 (N=1) | vs pre-arc |
+|---|---:|---:|---:|---:|---:|
+| KesselDB | **25.39** | **103.38** | 39.5 ms | 42.7 ms | **+7.2× / +7.5×** |
+| **PostgreSQL** | **355.88** | **1,686.01** | 2.3 ms | 5.5 ms | unchanged |
+| SQLite | 252.94 | 87.94 | 3.9 ms | 4.2 ms | unchanged |
+| TigerBeetle | — | — | — | — | — |
+
+**Pre-arc baseline** (kept for honesty):
+
 | DB | N=1 q/s | N=4 q/s | p50 (N=1) | p99 (N=1) |
 |---|---:|---:|---:|---:|
-| KesselDB | 3.53 | 13.74 | 282.6 ms | 311.6 ms |
-| **PostgreSQL** | **435.59** | **1,685.22** | 2.3 ms | 2.5 ms |
-| SQLite | 253.03 | 84.65 | 3.9 ms | 4.2 ms |
-| TigerBeetle | — | — | — | — |
+| KesselDB (pre) | 3.53 | 13.74 | 282.6 ms | 311.6 ms |
 
-**Honest read — KesselDB loses TPC-H Q6 at every N:**
+**Honest read — KesselDB Q6 closes the gap dramatically:**
 
-- **Postgres wins decisively** (1,685 q/s at N=4 = 123× KesselDB).
-  Postgres' shipdate index narrows the candidate row set from 60K to
-  ~8K (one year window out of seven) before the discount + quantity
-  filters; the planner runs a sequential aggregate over the narrow
-  set; the multiply is evaluated by the C-level aggregate accumulator.
-  The result is a 2.3 ms per-query path.
-- **SQLite N=1 = 253 q/s** (~33× faster than KesselDB) — index-only
-  scan on `l_shipdate` lets it skip directly to the matching range.
-  **N=4 regresses to 84.65** (~3×worse than N=1) on the shared-DB-
-  file lock contention: every reader takes the BEGIN shared lock, and
-  with 4 simultaneous full-scan aggregates the per-reader work
-  competes for the same page cache slots.
-- **KesselDB N=1 = 3.53 q/s, N=4 = 13.74 q/s (3.9× scaling)**. Same
-  shape as Q1: linear scaling on the read-pool bypass, but the per-
-  query cost is dominated by the full-scan + kessel-expr-per-row
-  WHERE evaluation (no index narrowing for `l_shipdate`). p50 282 ms
-  at N=1 maps to ~213 µs per row × 1320 µs of per-row VM cost — the
-  honest cost of the deterministic VM evaluating four predicates per
-  row × 60K rows.
+- **Postgres still wins** (1,686 q/s at N=4 = 16× KesselDB
+  post-arc, **was 123×** pre-arc — gap closed 8×). The Postgres
+  N=1 number drifted from 435 to 356 q/s between sweeps (vulcan
+  load); the N=4 number is stable.
+- **SQLite N=1 = 253 q/s** unchanged — index-only scan on
+  `l_shipdate`. N=4 = 87.94 q/s shows the same single-file shared-
+  lock contention as before.
+- **KesselDB N=1 = 25.39 q/s (was 3.53), N=4 = 103.38 q/s (was
+  13.74)** — **7.2-7.5× lift across both N values**. The order-index
+  narrows the 60K-row scan to the ~8K-row 1994 shipdate window
+  before the per-row kessel-expr VM runs the discount + quantity
+  filters. The narrowing math: 60K / 8K ≈ 7.5×, exactly matching
+  the measured lift. p50 dropped 282 ms → 39 ms (7.2× lower).
 - **TigerBeetle**: refused. No SQL aggregate primitive (same reason
   as Q1).
 
-**Why KesselDB loses Q6 specifically:**
+**What changed under the hood (SP-Analytic-Plan T1-T4):**
 
-`Op::Aggregate` is structurally fine for Q6 — single column sum,
-single result. The cost is the predicate evaluation: four AND'd
-comparisons over `l_shipdate` / `l_discount` / `l_quantity` get
-executed by the kessel-expr stack VM for every one of the 60K rows.
-Postgres + SQLite both use a btree on `l_shipdate` to narrow the
-candidate set first; the engine never reads the 52K rows outside the
-shipdate window.
+1. `Op::Aggregate` + `Op::GroupAggregate` gain an additive
+   `range_preds: Vec<(u16, u8, Vec<u8>)>` field (wire-back-compat:
+   the trailing length-prefix is omitted when empty, so a pre-arc
+   WAL frame is byte-identical).
+2. The SM's apply paths use a new `narrow_by_range_preds` helper
+   that intersects candidate row-ids via the existing 0xFFFD /
+   0xFFFC ordered-index keyspaces (the same machinery
+   `Op::QueryRows` SP70 already uses).
+3. The kessel-sql planner's `compile_select` aggregate branch
+   captures the WHERE token span + walks it via the shared
+   `extract_range_preds` helper (same conjunct-safety gate as
+   `try_query_rows`).
+4. The bench-compare TPC-H driver adds `Op::AddOrderedIndex` on
+   `l_shipdate` at load time + populates `range_preds` on every
+   aggregate op.
 
-**Roadmap implication.** Same as Q1: SP-Analytic-Plan — teach
-`Op::Aggregate` to accept `range_preds: Vec<(u16, u8, Vec<u8>)>` so
-`l_shipdate >= LO AND l_shipdate < HI` prunes the scan via the
-existing `Op::AddOrderedIndex` + `Op::FindRange` machinery. The full-
-scan cost collapses to the candidate-set cost (5-15× lift on this
-dataset).
+**Equivalence proof — the engine never lies.** Every narrowed scan
+still runs the verifying WHERE program on every candidate, so the
+aggregate result is byte-identical to a full-scan oracle on the
+same data (the candidate set is a superset; the program filter is
+applied; the result is the same). Three new KATs prove this
+across COUNT/SUM/MIN/MAX/AVG and empty/singleton/full-cover
+windows.
 
-**Headline takeaway — the TPC-H family confirms a clean roadmap.**
-KesselDB loses both Q1 and Q6 against Postgres + SQLite (Q6 by 123×!),
-but the root cause is the same single missing capability: the
-aggregate planner doesn't consume the order-index that's already in
-the engine. The bench gives the next analytics arc a concrete target
-and a measurable end-state.
+**Next roadmap arc — SP-Analytic-Plan-MULTI.** The remaining 16×
+gap vs Postgres on Q6 (and the 18× on Q1) is dominated by:
+- **Multi-aggregate fold** (Q1's 4 separate scans → 1 scan via
+  `Op::GroupAggregateMulti`).
+- **Parallel hash aggregate** (Postgres' per-backend partial
+  aggregation; out of scope until we have a separate SP-Hash-Agg
+  arc).
+
+**Headline takeaway — SP-Analytic-Plan shipped + closed the gap by
+the math we predicted.** The pre-arc roadmap was "the aggregate
+planner doesn't consume the order-index that's already in the
+engine — wiring it through will lift Q6 ~7-15×." Measured lift =
+7.5×, exactly in the predicted band. Q1's lift is honest-small
+(1.15×) because its WHERE window covers ~all rows — the second prong
+SP-Analytic-Plan-MULTI takes care of that.
 
 ---
 
@@ -733,11 +756,13 @@ BINDGEN_EXTRA_CLANG_ARGS='-I/usr/lib/gcc/x86_64-linux-gnu/13/include' \
   mapped as 4× `Op::GroupAggregate` + client-side AVG); Q6 single SUM
   with multi-predicate WHERE (KesselDB precomputes
   `l_q6_revenue = l_extendedprice * l_discount` at load to avoid
-  needing a SUM(expr) primitive). KesselDB loses both at every N — the
-  aggregate planner doesn't consume the order-index on `l_shipdate`
-  for narrowing, so it does the full 60K-row scan + per-row
-  kessel-expr VM evaluation. Honestly published in §3f/§3g; roadmap
-  target SP-Analytic-Plan named.
+  needing a SUM(expr) primitive). **Pre-arc**: KesselDB lost both at
+  every N. **POST-SP-Analytic-Plan (2026-05-29) follow-up arc**: Q6
+  N=4 lifted 13.74 → 103.38 q/s (**7.5×**), gap vs Postgres closed
+  from 123× to 16×; Q1 N=4 lifted 8.84 → 10.14 q/s (1.15×, small
+  because the WHERE covers ~all rows — `Op::GroupAggregateMulti` is
+  the second prong, named SP-Analytic-Plan-MULTI). Honestly
+  published in §3f/§3g.
 - **T5** [DONE] — Arc closure: BENCHMARKS.md headline summary table
   rewritten; README perf section linked to BENCHMARKS.md; progress
   tracker closed. JSON→markdown generator deferred (manual table

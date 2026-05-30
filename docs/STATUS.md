@@ -5,8 +5,8 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 ## Current capabilities (2026-05-29)
 
 What a node running on today's `main` actually does. Every line below is
-covered by the workspace test suite (2018 default / 2046 with
-`--features pg-gateway` / 2079 with all gateway features).
+covered by the workspace test suite (2024 default / 2052 with
+`--features pg-gateway` / 2084 with all gateway features).
 
 **Tonight's deliveries (2026-05-29) — coherent state of the union:**
 
@@ -38,15 +38,41 @@ covered by the workspace test suite (2018 default / 2046 with
   (KesselDB wins) + sysbench OLTP RO/WO/RW (KesselDB wins WO decisively, loses
   RO/RW to Postgres+SQLite — root cause: `Op::Txn` apply-lock held for the
   whole bracket even when every inner op is read-only) + TPC-H Q1/Q6
-  (KesselDB loses both — Postgres uses shipdate index narrowing, KesselDB
-  does full-scan + per-row VM eval; KesselDB still scales linearly with N
-  via read-pool but the per-query cost is 50-200× higher). Two roadmap arcs
+  (pre-arc KesselDB lost both — Postgres uses shipdate index narrowing,
+  KesselDB did full-scan + per-row VM eval; **SP-Analytic-Plan (2026-05-29)
+  closed the Q6 gap 7.5×**, 123×→16× vs Postgres). Two roadmap arcs
   named: **SP-Perf-A-SHARD** (closes sysbench RO/RW) +
-  **SP-Analytic-Plan** (closes TPC-H Q1/Q6 by teaching `Op::Aggregate` /
-  `Op::GroupAggregate` to consume the `range_preds` interface already in
-  `Op::QueryRows`). Wins AND losses published verbatim in
+  **SP-Analytic-Plan-MULTI** (the second prong for Q1 — folds 4 scans
+  into 1 via `Op::GroupAggregateMulti`; T4 first prong already lifted Q1
+  1.15× via range_preds). Wins AND losses published verbatim in
   [`docs/BENCHMARKS.md`](BENCHMARKS.md). Arc closed at T5; T6 final-sweep
   remains.
+- **Track E — SP-Analytic-Plan (2026-05-29, V1 SHIPPED).** Closes the
+  SP-Bench-Suite T4 TPC-H Q6 loss by teaching `Op::Aggregate` +
+  `Op::GroupAggregate` to consume the `range_preds: Vec<(field_id, op,
+  value)>` interface already shipping in `Op::QueryRows` (SP70). T1
+  design + scaffold (additive proto field, wire-back-compat preserved).
+  T2 kessel-sm apply paths use a shared `narrow_by_range_preds` helper
+  that intersects candidate row-ids via the existing 0xFFFD/0xFFFC
+  ordered-index keyspaces BEFORE the per-row WHERE program runs (the
+  program still verifies every candidate, so the aggregate result is
+  byte-identical to a full-scan oracle — proven by 3 equivalence KATs
+  across COUNT/SUM/MIN/MAX/AVG and empty/singleton/full-cover windows).
+  T3 kessel-sql `compile_select` aggregate branch emits range_preds via
+  a shared `extract_range_preds` helper (same conjunct-safety gate as
+  `try_query_rows`); proven end-to-end by an indexed-vs-unindexed-twin
+  KAT across 7 SQL shapes. T4 bench-compare TPC-H driver adds
+  `Op::AddOrderedIndex` on `l_shipdate` + range_preds on Q1/Q6 ops.
+  **Headline on vulcan (3-trial median × 30s × SF=0.01 ≈ 60K rows)**:
+  Q6 N=1 3.53 → **25.39 q/s (7.2×)**, Q6 N=4 13.74 → **103.38 q/s
+  (7.5×)** — gap vs Postgres closed from 123× to 16×; Q1 N=1 2.38 →
+  2.80 q/s (1.18×), Q1 N=4 8.84 → 10.14 q/s (1.15×) — small because
+  Q1's WHERE covers ~all rows (the multi-aggregate fold is the next
+  prong, SP-Analytic-Plan-MULTI). Workspace tests: 2018 → **2024**
+  default (+6 new KATs: 1 proto wire-back-compat, 3 SM equivalence,
+  2 SQL planner integration). seed-7 GREEN; CI green at HEAD `8726157`;
+  `#![forbid(unsafe_code)]` honored; zero new external deps; HTTP/1.1 +
+  WS + binary + PG-wire surfaces byte-untouched.
 - **Track D — Cluster test flakes (SP-CLUSTER-FLAKE T2).** Root-cause fixed
   in `Node::submit*` / `apply_raw`: production VSR retry on transient
   ViewChange. Not just a test relaxation — the actual production code path

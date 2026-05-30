@@ -1180,6 +1180,91 @@ fn lit_to_value(l: &Lit, k: FieldKind) -> Result<Value, SqlError> {
     })
 }
 
+/// SP-Analytic-Plan T3: extract `(field_id, op, value)` half-range
+/// hints from a WHERE token span, mirroring the exact shape
+/// `try_query_rows` uses for `Op::QueryRows`. Conjunct-safety gate
+/// (no top-level `OR` / `NOT` / parens) is part of the helper too —
+/// a disjunctive WHERE silently returns an empty vec (safe: the
+/// program-only path == verified full scan).
+///
+/// `op` encoding: 0=`>`, 1=`>=`, 2=`<`, 3=`<=`. The field must have
+/// an order index (numeric ≤8B or CHAR/BYTES); otherwise the hint is
+/// silently dropped (caller's narrowing helper would ignore it too).
+///
+/// Used by BOTH `try_query_rows` (Op::QueryRows) AND `compile_select`'s
+/// `Proj::Agg` branch (Op::Aggregate / Op::GroupAggregate) so an
+/// aggregate WHERE with `d >= LO AND d < HI` on an order-indexed `d`
+/// gains the same scan-narrowing acceleration as the row query.
+fn extract_range_preds(
+    ot: &ObjectType,
+    span: &[Tok],
+) -> Vec<(u16, u8, Vec<u8>)> {
+    let unsafe_for_hints = span.iter().any(|t| {
+        matches!(t, Tok::Punct('('))
+            || matches!(t, Tok::Ident(k)
+                if k.eq_ignore_ascii_case("OR")
+                || k.eq_ignore_ascii_case("NOT"))
+    });
+    if unsafe_for_hints {
+        return Vec::new();
+    }
+    let mut out: Vec<(u16, u8, Vec<u8>)> = Vec::new();
+    let mut i = 0;
+    while i + 2 < span.len() {
+        // SP70: `col {> >= < <=} int` on an order-indexed column.
+        if let (Tok::Ident(c), Tok::Cmp(cmp), Tok::Int(n)) =
+            (&span[i], &span[i + 1], &span[i + 2])
+        {
+            let rop = match *cmp {
+                ">" => Some(0u8),
+                ">=" => Some(1u8),
+                "<" => Some(2u8),
+                "<=" => Some(3u8),
+                _ => None,
+            };
+            if let (Some(rop), Some(f)) =
+                (rop, ot.fields.iter().find(|f| &f.name == c))
+            {
+                if ot.ordered.contains(&f.field_id) {
+                    let w = f.kind.width() as usize;
+                    out.push((
+                        f.field_id,
+                        rop,
+                        n.to_le_bytes()[..w.min(16)].to_vec(),
+                    ));
+                }
+            }
+        }
+        // SP90: `col {> >= < <=} 'str'` on an order-indexed CHAR/BYTES.
+        if let (Tok::Ident(c), Tok::Cmp(cmp), Tok::Str(s)) =
+            (&span[i], &span[i + 1], &span[i + 2])
+        {
+            let rop = match *cmp {
+                ">" => Some(0u8),
+                ">=" => Some(1u8),
+                "<" => Some(2u8),
+                "<=" => Some(3u8),
+                _ => None,
+            };
+            if let (Some(rop), Some(f)) =
+                (rop, ot.fields.iter().find(|f| &f.name == c))
+            {
+                if ot.ordered.contains(&f.field_id)
+                    && matches!(
+                        f.kind,
+                        kessel_catalog::FieldKind::Char(_)
+                            | kessel_catalog::FieldKind::Bytes(_)
+                    )
+                {
+                    out.push((f.field_id, rop, s.clone().into_bytes()));
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Try the restricted `SELECT * FROM t [WHERE c=v [AND c=v]*] [LIMIT n]`
 /// grammar -> `Op::QueryRows`. Returns None (caller restores + falls back)
 /// on anything outside it.
@@ -1252,63 +1337,12 @@ fn try_query_rows(p: &mut P) -> Option<Op> {
                         }
                     }
                 }
-                // SP70: `col {> >= < <=} int` on an order-indexed column.
-                if let (Tok::Ident(c), Tok::Cmp(cmp), Tok::Int(n)) =
-                    (&span[i], &span[i + 1], &span[i + 2])
-                {
-                    let rop = match *cmp {
-                        ">" => Some(0u8),
-                        ">=" => Some(1u8),
-                        "<" => Some(2u8),
-                        "<=" => Some(3u8),
-                        _ => None,
-                    };
-                    if let (Some(rop), Some(f)) =
-                        (rop, ot.fields.iter().find(|f| &f.name == c))
-                    {
-                        if ot.ordered.contains(&f.field_id) {
-                            let w = f.kind.width() as usize;
-                            range_preds.push((
-                                f.field_id,
-                                rop,
-                                n.to_le_bytes()[..w.min(16)].to_vec(),
-                            ));
-                        }
-                    }
-                }
-                // SP90: `col {> >= < <=} 'str'` on an order-indexed
-                // CHAR/BYTES column — the value bytes are the string
-                // itself (the engine width-normalises lexicographically).
-                if let (Tok::Ident(c), Tok::Cmp(cmp), Tok::Str(s)) =
-                    (&span[i], &span[i + 1], &span[i + 2])
-                {
-                    let rop = match *cmp {
-                        ">" => Some(0u8),
-                        ">=" => Some(1u8),
-                        "<" => Some(2u8),
-                        "<=" => Some(3u8),
-                        _ => None,
-                    };
-                    if let (Some(rop), Some(f)) =
-                        (rop, ot.fields.iter().find(|f| &f.name == c))
-                    {
-                        if ot.ordered.contains(&f.field_id)
-                            && matches!(
-                                f.kind,
-                                kessel_catalog::FieldKind::Char(_)
-                                    | kessel_catalog::FieldKind::Bytes(_)
-                            )
-                        {
-                            range_preds.push((
-                                f.field_id,
-                                rop,
-                                s.clone().into_bytes(),
-                            ));
-                        }
-                    }
-                }
                 i += 1;
             }
+            // SP-Analytic-Plan T3: range hints via shared helper (same
+            // conjunct-safety gate already enforced above). Replaces the
+            // SP70/SP90 inline walks formerly here — see extract_range_preds.
+            range_preds = extract_range_preds(&ot, span);
         }
         prog
     } else {
@@ -1450,10 +1484,21 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
             .ok_or_else(|| format!("unknown column `{n}`"))
     };
 
-    let program = if p.kw("WHERE") {
-        compile_where(p, &ot)?
+    // SP-Analytic-Plan T3: capture the WHERE token span so we can
+    // (separately) walk it for `(field, op, val)` half-range hints to
+    // populate `range_preds` on aggregate Ops (mirroring exactly what
+    // try_query_rows does for Op::QueryRows). The full WHERE still
+    // compiles to the verifying `program` below, so the engine's
+    // result is always identical to a scan — range hints only
+    // accelerate.
+    let (program, agg_range_preds) = if p.kw("WHERE") {
+        let ws = p.i;
+        let prog = compile_where(p, &ot)?;
+        let span: &[Tok] = &p.t[ws..p.i];
+        let rp = extract_range_preds(&ot, span);
+        (prog, rp)
     } else {
-        Program::new().push_int(1).bytes() // always true
+        (Program::new().push_int(1).bytes(), Vec::new())
     };
 
     let mut group: Option<String> = None;
@@ -1499,9 +1544,12 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
                     group_field: fid(&g)?,
                     kind: k,
                     agg_field: af,
-                    // T3 wires aggregate-WHERE range hint extraction; T1
-                    // scaffold emits empty (pre-arc back-compat behaviour).
-                    range_preds: vec![],
+                    // SP-Analytic-Plan T3: scan-narrowing range hints
+                    // extracted from the WHERE token span via the
+                    // shared helper. Empty when there's no WHERE / no
+                    // ordered-index match / disjunctive WHERE (safe
+                    // back-compat fallback to full scan).
+                    range_preds: agg_range_preds,
                 })
             } else {
                 Ok(Op::Aggregate {
@@ -1509,7 +1557,7 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
                     program,
                     kind: k,
                     field_id: af,
-                    range_preds: vec![],
+                    range_preds: agg_range_preds,
                 })
             }
         }
@@ -2360,6 +2408,138 @@ mod tests {
             us.iter().max().unwrap().to_le_bytes().to_vec(),
             "SQL MAX(u)"
         );
+    }
+
+    /// SP-Analytic-Plan T3: `SELECT SUM(x) FROM t WHERE d >= LO AND d
+    /// < HI` compiles to `Op::Aggregate { range_preds: [(d, 1, LO), (d,
+    /// 2, HI)] }` when an order index on `d` exists. Same compilation
+    /// path for `SELECT COUNT(*) ... GROUP BY g` (Op::GroupAggregate).
+    /// Conjunct-safety gate: `OR` in the WHERE drops the hints
+    /// (program-only path = full scan, still correct).
+    #[test]
+    fn sp_analytic_plan_sql_planner_emits_range_preds_for_aggregate() {
+        use kessel_proto::Op;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (g U8 NOT NULL, d I32 NOT NULL, x I64 NOT NULL)");
+        run(&mut sm, 2, "CREATE RANGE INDEX ON t (d)");
+        // Op::Aggregate — SUM with a half-range WHERE on `d`.
+        let op = compile("SELECT SUM(x) FROM t WHERE d >= 100 AND d < 200", sm.catalog()).expect("compile");
+        match op {
+            Op::Aggregate { range_preds, .. } => {
+                assert_eq!(range_preds.len(), 2, "expected two range hints (>= and <), got {range_preds:?}");
+                let d_fid = sm.catalog().get(1).unwrap().fields.iter()
+                    .find(|f| f.name == "d").unwrap().field_id;
+                let ge = &range_preds[0];
+                let lt = &range_preds[1];
+                assert_eq!(ge.0, d_fid);
+                assert_eq!(ge.1, 1u8, "`d >= 100` should encode op=1 (>=)");
+                assert_eq!(lt.0, d_fid);
+                assert_eq!(lt.1, 2u8, "`d < 200` should encode op=2 (<)");
+                // Numeric value: I32 LE-truncated to 4 bytes.
+                assert_eq!(ge.2, 100i32.to_le_bytes().to_vec());
+                assert_eq!(lt.2, 200i32.to_le_bytes().to_vec());
+            }
+            other => panic!("expected Op::Aggregate, got {other:?}"),
+        }
+        // Op::GroupAggregate — GROUP BY + half-range WHERE on `d`.
+        let op = compile("SELECT COUNT(x) FROM t WHERE d >= 50 GROUP BY g", sm.catalog()).expect("compile");
+        match op {
+            Op::GroupAggregate { range_preds, .. } => {
+                assert_eq!(range_preds.len(), 1, "expected one range hint, got {range_preds:?}");
+                assert_eq!(range_preds[0].1, 1u8, "`d >= 50` should encode op=1 (>=)");
+            }
+            other => panic!("expected Op::GroupAggregate, got {other:?}"),
+        }
+        // OR at top level — conjunct-safety gate drops the hints.
+        let op = compile("SELECT SUM(x) FROM t WHERE d >= 100 OR d < 50", sm.catalog()).expect("compile");
+        match op {
+            Op::Aggregate { range_preds, .. } => {
+                assert!(range_preds.is_empty(), "OR WHERE must drop range hints, got {range_preds:?}");
+            }
+            other => panic!("expected Op::Aggregate, got {other:?}"),
+        }
+        // Aggregate WITHOUT a WHERE — no hints (no token span).
+        let op = compile("SELECT COUNT(x) FROM t", sm.catalog()).expect("compile");
+        match op {
+            Op::Aggregate { range_preds, .. } => {
+                assert!(range_preds.is_empty(), "no WHERE ⇒ no range hints");
+            }
+            other => panic!("expected Op::Aggregate, got {other:?}"),
+        }
+        // Aggregate on a non-ordered column — hint silently dropped.
+        let op = compile("SELECT SUM(x) FROM t WHERE g >= 5 AND g < 7", sm.catalog()).expect("compile");
+        match op {
+            Op::Aggregate { range_preds, .. } => {
+                assert!(range_preds.is_empty(), "non-ordered column ⇒ no hints (g has no RANGE INDEX), got {range_preds:?}");
+            }
+            other => panic!("expected Op::Aggregate, got {other:?}"),
+        }
+    }
+
+    /// SP-Analytic-Plan T3 oracle: the planner-emitted range_preds
+    /// produce a result byte-identical to the same SQL run against an
+    /// un-indexed twin table (where the planner emits empty
+    /// range_preds and the engine does a full scan). End-to-end proof
+    /// that the planner's emission + the SM's narrowing are
+    /// semantically equivalent.
+    #[test]
+    fn sp_analytic_plan_aggregate_indexed_equals_unindexed_twin() {
+        use kessel_proto::Rng;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        // `idx` has the range index; `noidx` is the un-indexed twin.
+        run(&mut sm, 1, "CREATE TABLE idx (g U8 NOT NULL, d I32 NOT NULL, x I64 NOT NULL)");
+        run(&mut sm, 2, "CREATE TABLE noidx (g U8 NOT NULL, d I32 NOT NULL, x I64 NOT NULL)");
+        run(&mut sm, 3, "CREATE RANGE INDEX ON idx (d)");
+        let mut rng = Rng::new(0xA1A1_B2B2_C3C3);
+        // Monotonic op_number is mandatory — SP94 replay guard rejects
+        // non-monotonic ops as "already applied". Interleave with a
+        // single counter so each insert gets its own op.
+        let mut next_op = 100u64;
+        for id in 1..=200u32 {
+            let g = (id % 5) as u8;
+            let d = (rng.below(1000)) as i32 - 100; // -100..900
+            let x = rng.below(10_000) as i64;
+            run(&mut sm, next_op,
+                &format!("INSERT INTO idx (id, g, d, x) VALUES ({id}, {g}, {d}, {x})"));
+            next_op += 1;
+            run(&mut sm, next_op,
+                &format!("INSERT INTO noidx (id, g, d, x) VALUES ({id}, {g}, {d}, {x})"));
+            next_op += 1;
+        }
+        let scalar = |sm: &mut StateMachine<MemVfs>, op: u64, q: &str| -> Vec<u8> {
+            match run(sm, op, q) {
+                OpResult::Got(b) => b.to_vec(),
+                o => panic!("expected Got for `{q}`, got {o:?}"),
+            }
+        };
+        // For each shape: ensure indexed table (range_preds emitted)
+        // and unindexed twin (range_preds empty) agree byte-for-byte.
+        let pairs: &[(&str, &str)] = &[
+            ("SELECT SUM(x) FROM idx WHERE d >= 100 AND d < 500",
+             "SELECT SUM(x) FROM noidx WHERE d >= 100 AND d < 500"),
+            ("SELECT COUNT(x) FROM idx WHERE d >= 0",
+             "SELECT COUNT(x) FROM noidx WHERE d >= 0"),
+            ("SELECT MIN(x) FROM idx WHERE d > 200 AND d <= 750",
+             "SELECT MIN(x) FROM noidx WHERE d > 200 AND d <= 750"),
+            ("SELECT MAX(x) FROM idx WHERE d <= -50",
+             "SELECT MAX(x) FROM noidx WHERE d <= -50"),
+            ("SELECT COUNT(x) FROM idx WHERE d >= 50 AND d < 250 GROUP BY g",
+             "SELECT COUNT(x) FROM noidx WHERE d >= 50 AND d < 250 GROUP BY g"),
+            ("SELECT SUM(x) FROM idx WHERE d >= 50 AND d < 250 GROUP BY g",
+             "SELECT SUM(x) FROM noidx WHERE d >= 50 AND d < 250 GROUP BY g"),
+            // Empty match window
+            ("SELECT SUM(x) FROM idx WHERE d >= 999999 AND d < 9999999",
+             "SELECT SUM(x) FROM noidx WHERE d >= 999999 AND d < 9999999"),
+        ];
+        let mut op = next_op + 100;
+        for (q_idx, q_noidx) in pairs {
+            let r_idx = scalar(&mut sm, op, q_idx); op += 1;
+            let r_no = scalar(&mut sm, op, q_noidx); op += 1;
+            assert_eq!(
+                r_idx, r_no,
+                "indexed (range_preds) vs unindexed (full scan) diverged for `{q_idx}`"
+            );
+        }
     }
 
     /// SP86: a column `DEFAULT` is applied to omitted INSERT columns

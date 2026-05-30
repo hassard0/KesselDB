@@ -228,16 +228,25 @@ inner-op semantic drift) trips the oracle.
    ~680 tx/s to ≥3000 tx/s** (closing the Postgres-loss gap from ~7.5×
    to ~1.5×). At N=1 we expect a smaller lift (the bypass saves the
    write-lock contention, but N=1 has no contention).
+   **ACHIEVED — vulcan 3-trial median, 10s × 10×100K-row dataset:**
+   - N=1: 1,241 → **2,299 tx/s (1.85×)** — Postgres 316 → 7.3× faster.
+   - N=8: 641 → **16,213 tx/s (25.3×)** — Postgres 4,068 → 4.0× faster
+     (was 6.3× LOSING).
+   - N=16: 680 → **28,977 tx/s (42.6×)** — Postgres 5,073 → 5.7× faster
+     (was 7.5× LOSING). **Headline gate beaten 9.7×.**
+   oltp-read-write (mixed-RW) unchanged as designed (V1 limit;
+   SP-Perf-A-TXN-RW next): N=1 1,378 → 1,472, N=8 718 → 715,
+   N=16 711 → 712.
 
-## 7. Task decomposition
+## 7. Task decomposition (all T1-T5 DONE 2026-05-29; V1 SHIPPED)
 
-| T# | Scope |
-|---|---|
-| T1 | Design spec (this file) + progress tracker + scaffold + classifier extension (`read_pool::is_read_only` recurses into Op::Txn) + classifier KATs (all-RO Txn classifies true; mixed Txn classifies false; nested-Txn-with-mixed-inner classifies false). |
-| T2 | SM `read_only_op` Op::Txn arm + per-arm KATs (single inner op, 10 inner ops, mixed-shape inners, write-op-injected refused, empty ops vec) + dispatch wiring (`apply_raw` tag-15 + `apply` classifier swap). |
-| T3 | Determinism oracle extension: `txn_ro_oracle_100k_workloads_byte_equal` lock. |
-| T4 | Bench-compare driver: oltp-read-only routes via `sm.read().unwrap().read_only_op(Op::Txn{ops})`; vulcan sysbench OLTP sweep (RO + RW + WO baseline + post) and BENCHMARKS.md §3c/§3e update. |
-| T5 | STATUS row + arc closure + progress tracker close-out. |
+| T# | Scope | Status | Commit |
+|---|---|---|---|
+| T1 | Design spec + progress tracker. | **DONE** | `fc8baff` |
+| T2 | Classifier extension (`read_pool::is_read_only` recurses into Op::Txn) + 4 classifier KATs. | **DONE** | `e2479ec` |
+| T3 | SM `read_only_op` Op::Txn arm + per-arm KATs + dispatch wiring (`apply_raw` tag-15 + `apply` classifier swap) + determinism oracle extension (`txn_ro_oracle_100_workloads_x_1000_txns_byte_equal` + 7 per-shape smoke KATs). | **DONE** | `3dbe8fe` + `75001e5` (SeqRead rejection fix) + `fcff211` (per-variant bisect) + `4ebb338` (smoke 4 GetBlob{0} fix) |
+| T4 | Bench-compare driver: oltp-read-only routes via `sm.read().unwrap().read_only_op(Op::Txn{ops})`; vulcan sysbench OLTP sweep (RO + RW pre/post) and BENCHMARKS.md §3c/§3e update. | **DONE** | this commit; bench numbers in §6 acceptance below + BENCHMARKS.md §3c |
+| T5 | STATUS row + arc closure + progress tracker close-out. | **DONE** | this commit |
 
 ## 8. Weak spots
 

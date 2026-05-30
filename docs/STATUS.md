@@ -28,12 +28,17 @@ covered by the workspace test suite (2024 default / 2052 with
   `SP-PG-EXTQ-PIPELINE-BATCH` (libpq pipeline mode), `SP-PG-GO-SMOKE` (pgx),
   `SP-PG-NODE-SMOKE` (Drizzle / Prisma). **Arc closed — TaskList #336 ready
   for completion.**
-- **Track B — Perf-A read-pool arc (T1 → T7).** Parallel-read bypass
+- **Track B — Perf-A read-pool arc (T1 → T7) + TXN-RO follow-on.** Parallel-read bypass
   (`read_only_op(&self, ...)` dispatch through `Arc<RwLock<StateMachine>>`) +
   storage `Arc<[u8]>` migration on the read fast path: **4.75M ops/sec at
   N=16 cores, p50 < 1 µs, p99 ~3 µs.** Storage point-read ceiling honestly
-  diagnosed at ~5M ops/sec (`RwLock` reader CAS ping-pong); next arc named
-  SP-Perf-A-SHARD (sharded apply queues + per-shard read pools).
+  diagnosed at ~5M ops/sec (`RwLock` reader CAS ping-pong). Follow-on
+  **SP-Perf-A-TXN-RO V1 SHIPPED (2026-05-29)** — all-RO `Op::Txn{ops}` now
+  classified statically + routed through the same bypass, closing the
+  sysbench oltp-read-only loss (N=16 680 → 28,977 tx/s, 42.6× lift, now
+  5.7× faster than Postgres). Next arcs named: **SP-Perf-A-TXN-RW**
+  (mixed-RW Op::Txn via SI + commit-time conflict detection) +
+  **SP-Perf-A-SHARD** (sharded apply queues + per-shard read pools).
 - **Track C — Cross-DB benchmark suite (SP-Bench-Suite T1-T5).** YCSB-A/B/C
   (KesselDB wins) + sysbench OLTP RO/WO/RW (KesselDB wins WO decisively, loses
   RO/RW to Postgres+SQLite — root cause: `Op::Txn` apply-lock held for the
@@ -41,7 +46,7 @@ covered by the workspace test suite (2024 default / 2052 with
   (pre-arc KesselDB lost both — Postgres uses shipdate index narrowing,
   KesselDB did full-scan + per-row VM eval; **SP-Analytic-Plan (2026-05-29)
   closed the Q6 gap 7.5×**, 123×→16× vs Postgres). Two roadmap arcs
-  named: **SP-Perf-A-SHARD** (closes sysbench RO/RW) +
+  named: **SP-Perf-A-TXN-RW** (closes sysbench RW; RO already CLOSED by SP-Perf-A-TXN-RO 2026-05-29) +
   **SP-Analytic-Plan-MULTI** (the second prong for Q1 — folds 4 scans
   into 1 via `Op::GroupAggregateMulti`; T4 first prong already lifted Q1
   1.15× via range_preds). Wins AND losses published verbatim in
@@ -73,6 +78,45 @@ covered by the workspace test suite (2024 default / 2052 with
   2 SQL planner integration). seed-7 GREEN; CI green at HEAD `8726157`;
   `#![forbid(unsafe_code)]` honored; zero new external deps; HTTP/1.1 +
   WS + binary + PG-wire surfaces byte-untouched.
+- **Track F — SP-Perf-A-TXN-RO (2026-05-29, V1 SHIPPED).** Closes the
+  SP-Bench-Suite T3 sysbench OLTP read-only loss (KesselDB was LOSING
+  at every N≥8 because `Op::Txn{ops}` was routed through
+  `StateMachine::apply()` even when every inner op was a read — the
+  Perf-A T2 read-pool bypass was `GetById`-only and didn't compose
+  with Op::Txn). Five slices T1-T5 all DONE: T1 design spec + progress
+  tracker; T2 server-side classifier (`read_pool::is_read_only`) now
+  recurses into `Op::Txn { ops }` and returns true iff every inner op
+  is read-only; T3 `StateMachine::read_only_op` gains an Op::Txn arm
+  that mirrors apply-Txn's 15-variant data-op contract EXACTLY
+  (SeqRead permitted bare-Op but rejected inside Txn; verbatim error
+  string match for divergence-via-string-eq safety) plus dispatch
+  wiring (`apply_raw` tag-15 + in-process `apply` classifier swap)
+  plus determinism oracle extension (`txn_ro_oracle_100_workloads_x_1000_txns_byte_equal`
+  + 7 per-shape smoke KATs covering empty Txn, single inner, sysbench
+  shape (410 inner ops), 15 permitted variants, SeqRead-rejection
+  symmetry, mixed-RW falls through, write-at-front falls through);
+  T4 bench-compare driver routes RO Txns via
+  `sm.read().unwrap().read_only_op(Op::Txn{ops})`; T5 STATUS + arc
+  closure. **HEADLINE on vulcan (3-trial median × 10s × 10×100K rows)**:
+  oltp-read-only N=1 1,241 → **2,299 tx/s (1.85×)**; N=8 641 →
+  **16,213 tx/s (25.3×)**; N=16 680 → **28,977 tx/s (42.6×)** —
+  gate was ≥3000 at N=16; **beaten 9.7×**. KesselDB now BEATS Postgres
+  by 4.0× at N=8 and **5.7× at N=16** (was LOSING by 6.3× / 7.5×).
+  p50 at N=8 dropped from 12.6 ms to 475 µs (26× faster). oltp-RW
+  unchanged within noise as designed (mixed-RW V1 limit; named follow-up
+  SP-Perf-A-TXN-RW). Workspace tests: kesseldb-server lib 137 GREEN
+  (+22 new test-binary tests); seed-7 GREEN; `#![forbid(unsafe_code)]`
+  honored; zero new external deps; HTTP/1.1 + WS + binary + PG-wire
+  surfaces byte-untouched; default `cargo build -p kesseldb-server`
+  byte-identical (the classifier extension + SM arm are additive;
+  `is_mutating()` in proto unchanged so VSR / replication / op-number
+  assignment all carry on as before). Five commits: `fc8baff` (T1
+  design), `e2479ec` (T2 classifier), `3dbe8fe` (T3 SM arm + dispatch +
+  oracle), `75001e5` (T3 SeqRead-rejection-mirror fix), `fcff211`
+  (T3 per-variant bisect), `4ebb338` (T3 smoke 4 GetBlob{0} fix),
+  plus this commit (T4 bench sweep + T5 closure). Progress tracker
+  `docs/superpowers/specs/2026-05-29-kesseldb-spperfa-txnro-progress.md`
+  CLOSED. **Arc closed — TaskList #341 ready for completion.**
 - **Track D — Cluster test flakes (SP-CLUSTER-FLAKE T2).** Root-cause fixed
   in `Node::submit*` / `apply_raw`: production VSR retry on transient
   ViewChange. Not just a test relaxation — the actual production code path

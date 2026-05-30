@@ -28,22 +28,26 @@ Wins, losses, and the one-line cause for each:
 | YCSB-B (95/5 mixed, N=16) | **7.1× faster** (576K vs 81K ops/s) | Realistic web workload |
 | YCSB-A (50/50 mixed, N=16) | marginal win (80K vs 74K ops/s) | Mixed workload — write-lock bites at 50% |
 | sysbench OLTP write-only (N=8) | **5.2× faster** (53K vs 10K tx/s) | Write-heavy transactions |
-| sysbench OLTP read-only (N=16) | **LOSES** (680 vs 5,073 tx/s) | Roadmap: route RO `Op::Txn` through Perf-A bypass |
+| sysbench OLTP read-only (N=16) | **5.7× faster** (28,977 vs 5,073 tx/s; SP-Perf-A-TXN-RO lift 42.6×) | Was LOSING; arc closed |
 | sysbench OLTP read-write (N=16) | **LOSES** (711 vs 3,862 tx/s) | Same cause |
 | TPC-H Q1 — multi-aggregate GROUP BY (N=4) | **LOSES** (10.14 vs 185.99 q/s; SP-Analytic-Plan lift 1.15×) | Narrowing window covers ~all rows; multi-aggregate fold is the bottleneck — SP-Analytic-Plan-MULTI |
 | TPC-H Q6 — SUM with WHERE (N=4) | **LOSES** (103.38 vs 1,686 q/s; SP-Analytic-Plan lift 7.5×) | Narrow window helps; gap closed from 123× to 16× — SP-Analytic-Plan-MULTI next |
 
-KesselDB **wins 4 of 6 hand-rolled workloads** and loses 4 (the 2 sysbench
-transaction shapes + the 2 TPC-H analytical shapes). The losses fall into
+KesselDB **wins 5 of 6 hand-rolled workloads** and loses 3 (1 sysbench
+transaction shape + the 2 TPC-H analytical shapes). The losses fall into
 two distinct buckets:
 
-1. **sysbench OLTP RO + RW** — `Op::Txn` wraps every inner op (even
-   reads) under the StateMachine write lock, so N workers can't run
-   their transaction brackets in parallel. **Roadmap target**:
-   SP-Perf-A-SHARD will route read-only `Op::Txn{ops}` through the
-   Perf-A read-pool bypass when every inner op is statically
-   detectable as read-only, OR shard the apply queues so K shards
-   each get their own apply thread.
+1. **sysbench OLTP RW** (mixed reads + writes) — `Op::Txn` still
+   wraps every inner op under the StateMachine write lock when ANY
+   inner op is a write, so N workers can't run mixed transaction
+   brackets in parallel. (sysbench OLTP RO previously fell in this
+   bucket — **SP-Perf-A-TXN-RO (2026-05-29) SHIPPED** and closed it:
+   N=8 641 → 16,213 tx/s (25.3×); N=16 680 → 28,977 tx/s (42.6×);
+   KesselDB now BEATS Postgres 5.7× at N=16. Next is the mixed-RW
+   closure.) **Roadmap target**: **SP-Perf-A-TXN-RW** — snapshot
+   isolation on the read pool + commit-time conflict detection; OR
+   **SP-Perf-A-SHARD** — sharded apply queues so K shards each get
+   their own apply thread.
 
 2. **TPC-H Q1 + Q6** — `Op::Aggregate` / `Op::GroupAggregate` walk
    the row set evaluating a kessel-expr WHERE program per row.
@@ -261,6 +265,8 @@ Reported metric = **transactions/sec** (the sysbench convention), median of 3.
 KesselDB's mapping expands the 4 range scans as 100×GetById each → 406
 inner ops per txn; Postgres/SQLite ship the 10 SQL queries directly.
 
+**Pre-arc (HEAD `8726157`, before SP-Perf-A-TXN-RO):**
+
 | DB | N=1 tx/s | N=8 tx/s | N=16 tx/s | p50 (N=8) | p99 (N=8) |
 |---|---:|---:|---:|---:|---:|
 | KesselDB | 1,241 | 641 | 680 | 12.6 ms | 20.2 ms |
@@ -268,37 +274,46 @@ inner ops per txn; Postgres/SQLite ship the 10 SQL queries directly.
 | **SQLite** | **6,507** | 1,577 | 1,978 | 4.5 ms | 10.1 ms |
 | TigerBeetle | — | — | — | — | — |
 
-**Honest read — KesselDB loses oltp-read-only at every N:**
+**Post-arc (HEAD post-SP-Perf-A-TXN-RO, all-RO Op::Txn bypass active):**
 
-- **SQLite wins at N=1** (6,507 tx/s vs KesselDB 1,241 vs Postgres 316).
-  SQLite's in-process model + BEGIN being trivially cheap (no fsync to
-  wait for; the rollback journal stays in memory) means a 10-query RO
-  bracket is essentially 10 prepared-statement queries plus near-zero
-  bracket cost. KesselDB pays 406 GetByIds per txn through the apply
-  path; Postgres pays a network round-trip per query.
-- **Postgres wins at N=8 and N=16** (4,068 / 5,073 vs KesselDB 641 / 680).
-  Postgres scales horizontally with connection count because each backend
-  is independent and snapshot-isolation reads need no locks. SQLite
-  collapses at N>1 because all readers contend on the single-DB-file
-  rollback-journal exclusivity even though the workload is read-only
-  (every BEGIN must acquire the shared lock and the busy_timeout kicks
-  in on contention).
-- **KesselDB regresses N=1 → N=8** (1,241 → 641). This is the honest cost
-  of the current `Op::Txn` model: the wrapper goes through `StateMachine::apply()`
-  which takes the write lock for the whole transaction — even when every
-  inner op is a read. The Perf-A T2 read-pool bypass is `GetById`-only
-  and does NOT compose with `Op::Txn`. With N>1 workers, every Txn
-  serializes on the apply lock; the win is that all 406 inner reads
-  happen with no inter-op lock churn (latencies stay ~2 ms even at N=8),
-  the loss is that 8 workers can't run their Txns in parallel.
+| DB | N=1 tx/s | N=8 tx/s | N=16 tx/s | p50 (N=8) | p99 (N=8) |
+|---|---:|---:|---:|---:|---:|
+| **KesselDB** | **2,299** | **16,213** | **28,977** | **475 µs** | **620 µs** |
+| PostgreSQL | 316 | 4,068 | 5,073 | 1.9 ms | 2.6 ms |
+| SQLite | 6,507 | 1,577 | 1,978 | 4.5 ms | 10.1 ms |
+| TigerBeetle | — | — | — | — | — |
 
-**Roadmap implication.** Closing this gap means either (a) routing
-`Op::Txn` through a read-pool fast path when every inner op is read-only
-(KesselDB already knows this statically), or (b) per-shard apply
-parallelism (the existing K-shard router lets the workload spread across
-shards — at K=8 the contention disappears). Both are post-V1 (out of
-SP-Perf-A's read-pool scope); the loss is published here so the next perf
-arc has a target.
+**Honest read — KesselDB now WINS oltp-read-only at N≥8 (was LOSING):**
+
+- **Lift on KesselDB**: N=1 1,241 → 2,299 (**1.85×**); N=8 641 → 16,213
+  (**25.3×**); N=16 680 → 28,977 (**42.6×**). p50 at N=8 dropped from
+  12.6 ms to 475 µs (**26× faster**); p99 21 ms → 620 µs.
+- **vs Postgres**: pre-arc KesselDB LOST at N=8/16 by 6.3×/7.5×; post-arc
+  KesselDB WINS by **4.0×/5.7×** at N=8/16. (N=1 was already a 3.9× win;
+  now 7.3×.)
+- **vs SQLite N=1**: SQLite still wins N=1 (6,507 vs 2,299) — SQLite in-
+  process round-trip is fundamentally hard to beat at N=1 (no syscall
+  cost, no lock cost). At N=8/16 KesselDB pulls ahead (16K/29K vs 2K).
+- **Cause of the lift**: SP-Perf-A-TXN-RO recognises all-RO `Op::Txn{ops}`
+  statically (`read_pool::is_read_only` recurses into the inner-op
+  vector) and routes it through `StateMachine::read_only_op` under the
+  `Arc<RwLock<…>>` read guard — same fast path SP-Perf-A T2 wired for
+  bare-Op reads. N parallel workers no longer serialize on the apply
+  write lock; each runs its 406-inner-op Txn against committed state in
+  parallel. Byte-identical determinism with the apply path proven by
+  100K-workload oracle (`txn_ro_oracle_100_workloads_x_1000_txns_byte_equal`).
+
+**Honest residuals.**
+- **N=1 lift is modest** (1.85×) because at N=1 there is no contention
+  on the apply lock — the bypass saves the encode/decode round-trip
+  through `apply_raw` but nothing else. The 2.3K vs apply-path 1.2K gap
+  is the elimination of per-Txn frame encode/decode + the engine mpsc
+  hop.
+- **Mixed-RW Txn still goes through apply** (V1 limit, explicit;
+  classifier returns false for any Txn with a write inner op). The
+  oltp-read-write workload (§3e) is unchanged — SP-Perf-A-TXN-RW is
+  the named follow-up that closes that gap with snapshot isolation +
+  commit-time conflict detection.
 
 TigerBeetle: refused. Sysbench OLTP is row-shape multi-statement SQL,
 which TB's account/transfer ledger model doesn't map onto. See §5.
@@ -350,6 +365,8 @@ dataset row count is invariant under steady-state.
 **Workload:** the default sysbench OLTP profile — the 10-query RO block
 plus the 4-write WO block, all in one BEGIN / COMMIT bracket.
 
+**Pre-arc (HEAD `8726157`, before SP-Perf-A-TXN-RO):**
+
 | DB | N=1 tx/s | N=8 tx/s | N=16 tx/s | p50 (N=8) | p99 (N=8) |
 |---|---:|---:|---:|---:|---:|
 | KesselDB | 1,378 | 718 | 711 | 11.4 ms | 12.0 ms |
@@ -357,7 +374,20 @@ plus the 4-write WO block, all in one BEGIN / COMMIT bracket.
 | **SQLite** | **4,835** | **4,386** | **3,960** | 191 µs | 712 µs |
 | TigerBeetle | — | — | — | — | — |
 
-**Honest read — KesselDB loses oltp-read-write at every N:**
+**Post-arc (HEAD post-SP-Perf-A-TXN-RO):** unchanged within noise — the
+arc only routes ALL-RO `Op::Txn` through the bypass; mixed-RW `Op::Txn`
+(this workload) still goes through `apply` (V1 explicit limit; the
+classifier `read_pool::is_read_only` returns false for any `Op::Txn`
+with a write inner op). The closure of the RW gap is the named follow-up
+**SP-Perf-A-TXN-RW** (snapshot isolation on the read pool + commit-time
+conflict detection).
+
+| DB | N=1 tx/s | N=8 tx/s | N=16 tx/s | p50 (N=8) | p99 (N=8) |
+|---|---:|---:|---:|---:|---:|
+| KesselDB | 1,472 | 715 | 712 | 11.3 ms | 12.0 ms |
+| (Postgres + SQLite unchanged from pre-arc table above.) |||||
+
+**Honest read — KesselDB still loses oltp-read-write at every N (V1 limit):**
 
 - **SQLite is the surprise winner at every N for oltp-read-write.**
   SQLite N=1 = 4,835 tx/s; N=8 still 4,386; N=16 still 3,960. The
@@ -571,6 +601,8 @@ per line):
 - `/tmp/bench-sysbench-rw.json` (T3 — 27 rows)
 - `/tmp/bench-tpch-q1.json` (T4 — 18 rows; KesselDB+Postgres+SQLite, TB refused; 3 trials × 2 N × 3 DBs)
 - `/tmp/bench-tpch-q6.json` (T4 — 18 rows; same shape)
+- `/tmp/bench-oltp-ro-postarcb.json` (SP-Perf-A-TXN-RO — 9 rows; KesselDB post-arc oltp-RO sweep)
+- `/tmp/bench-oltp-rw-postarcb.json` (SP-Perf-A-TXN-RO — 9 rows; KesselDB post-arc oltp-RW sweep, no-op vs pre-arc as designed)
 
 Schema (all files use the same shape):
 ```json

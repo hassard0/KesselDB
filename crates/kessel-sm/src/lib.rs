@@ -9384,6 +9384,228 @@ mod tests {
         );
     }
 
+    // ========================================================================
+    // SP-Hash-Agg T3 — parallel vs serial equivalence KATs.
+    //
+    // The parallel hash-aggregate path is triggered when the candidate
+    // row count crosses MIN_PARALLEL_ROWS (8192). These tests build a
+    // workload large enough to cross that threshold, then compare the
+    // engine's output against a hand-computed expected value derived
+    // from the same input data — proving that the parallel-merge result
+    // is byte-identical to a serial fold. Combine ops are associative
+    // for SUM/COUNT and associative+commutative for MIN/MAX; AVG is
+    // computed POST-merge from (sum, count) via integer division (the
+    // serial semantics), so the parallel path is mathematically
+    // equivalent. Both tests also assert repeatability — running the
+    // same op twice produces identical bytes (no thread-scheduling
+    // non-determinism leaks through).
+    // ========================================================================
+
+    /// SP-Hash-Agg T3: Op::GroupAggregateMulti parallel path (rows ≥
+    /// MIN_PARALLEL_ROWS) produces the byte-correct multi-aggregate
+    /// result + is repeatable across runs.
+    #[test]
+    fn sp_hash_agg_group_aggregate_multi_parallel_eq_serial() {
+        use kessel_expr::Program;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: q_type_def() });
+        // 10_000 rows crosses MIN_PARALLEL_ROWS (8192) ⇒ parallel
+        // path engaged. 3 groups (owner ∈ {1, 2, 3}) ⇒ tractable
+        // hand-expected. Per-group values are a deterministic
+        // sequence so SUM/MIN/MAX/AVG are easy to predict.
+        const N: u64 = 10_000;
+        for i in 0..N {
+            let owner = ((i % 3) as u32) + 1; // 1, 2, 3, 1, 2, 3, …
+            let v = (i + 1) as u32; // 1..=10000
+            sm.apply(
+                10 + i,
+                Op::Create {
+                    type_id: 1,
+                    id: ObjectId::from_u128(i as u128),
+                    record: qrec(owner, 0, v),
+                },
+            );
+        }
+        // Hand-compute expected per-group values (count, sum, min, max).
+        let mut expected: std::collections::BTreeMap<u32, (i128, i128, i128, i128)> =
+            std::collections::BTreeMap::new();
+        for i in 0..N {
+            let owner = ((i % 3) as u32) + 1;
+            let v = (i + 1) as i128;
+            let e = expected.entry(owner).or_insert((0, 0, i128::MAX, i128::MIN));
+            e.0 += 1;
+            e.1 += v;
+            e.2 = e.2.min(v);
+            e.3 = e.3.max(v);
+        }
+        let aggs: Vec<(u8, u16)> = vec![(0, 0), (1, 3), (2, 3), (3, 3), (4, 3)];
+        let prog = Program::new().push_int(1).bytes();
+        let run = || -> Vec<u8> {
+            match sm.read_only_op(Op::GroupAggregateMulti {
+                type_id: 1,
+                program: prog.clone(),
+                group_field: 1,
+                aggregates: aggs.clone(),
+                range_preds: vec![],
+            }) {
+                OpResult::Got(b) => b.to_vec(),
+                o => panic!("multi parallel: {o:?}"),
+            }
+        };
+        let bytes_a = run();
+        let bytes_b = run();
+        assert_eq!(
+            bytes_a, bytes_b,
+            "parallel hash-agg must be deterministic across runs"
+        );
+        // Decode the result + compare per-group per-slot against the
+        // hand-computed model.
+        let n_groups = u32::from_le_bytes(bytes_a[0..4].try_into().unwrap()) as usize;
+        assert_eq!(n_groups, expected.len(), "group count");
+        let mut p = 4;
+        let mut got: Vec<(u32, Vec<i128>)> = Vec::with_capacity(n_groups);
+        for _ in 0..n_groups {
+            let kl = u32::from_le_bytes(bytes_a[p..p + 4].try_into().unwrap()) as usize;
+            p += 4;
+            let key = u32::from_le_bytes(bytes_a[p..p + 4].try_into().unwrap());
+            p += kl;
+            let mut vs = Vec::with_capacity(aggs.len());
+            for _ in 0..aggs.len() {
+                vs.push(i128::from_le_bytes(bytes_a[p..p + 16].try_into().unwrap()));
+                p += 16;
+            }
+            got.push((key, vs));
+        }
+        // Output must be in ascending key order (BTreeMap contract).
+        let keys: Vec<u32> = got.iter().map(|(k, _)| *k).collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(
+            keys, sorted,
+            "parallel hash-agg must emit groups in ascending key order"
+        );
+        for (k, vs) in &got {
+            let (cnt, sum, mn, mx) = expected[k];
+            assert_eq!(vs[0], cnt, "COUNT for group {k}");
+            assert_eq!(vs[1], sum, "SUM for group {k}");
+            assert_eq!(vs[2], mn, "MIN for group {k}");
+            assert_eq!(vs[3], mx, "MAX for group {k}");
+            assert_eq!(vs[4], sum / cnt, "AVG (integer) for group {k}");
+        }
+    }
+
+    /// SP-Hash-Agg T3: Op::Aggregate parallel path (rows ≥
+    /// MIN_PARALLEL_ROWS) produces the byte-correct scalar aggregate
+    /// result + is repeatable across runs. Exercises all 5 kinds
+    /// (COUNT / SUM / MIN / MAX / AVG) over the same 10K-row input.
+    #[test]
+    fn sp_hash_agg_aggregate_parallel_eq_serial() {
+        use kessel_expr::Program;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: q_type_def() });
+        // 10_000 rows crosses MIN_PARALLEL_ROWS (8192) ⇒ parallel
+        // path engaged. v = i+1 so SUM = N×(N+1)/2 and the
+        // MIN/MAX are 1 and N.
+        const N: u64 = 10_000;
+        for i in 0..N {
+            sm.apply(
+                10 + i,
+                Op::Create {
+                    type_id: 1,
+                    id: ObjectId::from_u128(i as u128),
+                    record: qrec(0, 0, (i + 1) as u32),
+                },
+            );
+        }
+        let prog = Program::new().push_int(1).bytes();
+        let agg = |sm: &StateMachine<MemVfs>, kind: u8| -> i128 {
+            match sm.read_only_op(Op::Aggregate {
+                type_id: 1,
+                program: prog.clone(),
+                kind,
+                field_id: 3,
+                range_preds: vec![],
+            }) {
+                OpResult::Got(b) => i128::from_le_bytes(b[..].try_into().unwrap()),
+                o => panic!("agg parallel kind={kind}: {o:?}"),
+            }
+        };
+        let n = N as i128;
+        let expected_sum = n * (n + 1) / 2;
+        let expected_count = n;
+        let expected_min = 1i128;
+        let expected_max = n;
+        let expected_avg = expected_sum / expected_count;
+        // Run each kind twice — locks the determinism contract (no
+        // thread-scheduling non-determinism leaks through the
+        // parallel merge).
+        for kind in 0..=4u8 {
+            let a = agg(&sm, kind);
+            let b = agg(&sm, kind);
+            assert_eq!(
+                a, b,
+                "parallel scalar-agg kind={kind} must be deterministic across runs"
+            );
+        }
+        assert_eq!(agg(&sm, 0), expected_count, "COUNT");
+        assert_eq!(agg(&sm, 1), expected_sum, "SUM");
+        assert_eq!(agg(&sm, 2), expected_min, "MIN");
+        assert_eq!(agg(&sm, 3), expected_max, "MAX");
+        assert_eq!(agg(&sm, 4), expected_avg, "AVG (integer)");
+    }
+
+    /// SP-Hash-Agg T3: the parallel path's apply arm and read_only_op
+    /// arm produce byte-identical results for Op::GroupAggregateMulti
+    /// at scale (the determinism contract — both arms call the same
+    /// `group_aggregate_multi` helper, which now uses the parallel
+    /// path when rows ≥ MIN_PARALLEL_ROWS).
+    #[test]
+    fn sp_hash_agg_apply_eq_read_only_op_at_scale() {
+        use kessel_expr::Program;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: q_type_def() });
+        const N: u64 = 10_000;
+        for i in 0..N {
+            sm.apply(
+                10 + i,
+                Op::Create {
+                    type_id: 1,
+                    id: ObjectId::from_u128(i as u128),
+                    record: qrec(((i % 4) as u32) + 1, 0, (i + 1) as u32),
+                },
+            );
+        }
+        let aggs: Vec<(u8, u16)> = vec![(0, 0), (1, 3), (4, 3)];
+        let prog = Program::new().push_int(1).bytes();
+        let r_apply = match sm.apply(
+            100_000,
+            Op::GroupAggregateMulti {
+                type_id: 1,
+                program: prog.clone(),
+                group_field: 1,
+                aggregates: aggs.clone(),
+                range_preds: vec![],
+            },
+        ) {
+            OpResult::Got(b) => b.to_vec(),
+            o => panic!("apply: {o:?}"),
+        };
+        let r_ro = match sm.read_only_op(Op::GroupAggregateMulti {
+            type_id: 1,
+            program: prog,
+            group_field: 1,
+            aggregates: aggs,
+            range_preds: vec![],
+        }) {
+            OpResult::Got(b) => b.to_vec(),
+            o => panic!("ro: {o:?}"),
+        };
+        assert_eq!(
+            r_apply, r_ro,
+            "parallel-path apply and read_only_op must produce byte-identical results"
+        );
+    }
+
     #[test]
     fn group_aggregate_is_readonly_and_deterministic() {
         use kessel_expr::Program;

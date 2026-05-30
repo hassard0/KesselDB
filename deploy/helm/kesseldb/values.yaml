@@ -1,0 +1,212 @@
+# Default values for the KesselDB Helm chart.
+#
+# This V1 chart ships a SINGLE-POD stateful deployment — the binary,
+# HTTP+WS, and PostgreSQL wire surfaces are all exposed by one pod
+# bound to one PersistentVolumeClaim. Running a replicated VSR cluster
+# under k8s is tracked separately as SP-Cloud-Cluster (StatefulSet,
+# per-replica PVCs, headless Service, ClusterClient endpoints).
+#
+# To override any value:
+#   helm install kesseldb ./deploy/helm/kesseldb \
+#     --set image.tag=v1.2.3 \
+#     --set persistence.size=50Gi \
+#     --set service.type=LoadBalancer
+
+# ─────────────────────────────────────────────────────────────────────
+# Image — defaults to the ghcr.io image pushed by `.github/workflows/release.yml`.
+# ─────────────────────────────────────────────────────────────────────
+image:
+  # The release.yml docker job tags `ghcr.io/<owner>/<repo>` lowercased.
+  repository: ghcr.io/hassard0/kesseldb
+  # `latest` works out-of-the-box; pin to `1.2.3` (no leading v) for
+  # reproducible rollouts. The release workflow publishes both `:<version>`
+  # and `:v<version>`, plus `:latest` for non-prerelease tags.
+  tag: latest
+  # `IfNotPresent` is safe with pinned tags; switch to `Always` if you
+  # rely on the `:latest` tag and want every restart to re-pull.
+  pullPolicy: IfNotPresent
+  # imagePullSecrets — list of secret names referenced for pulling
+  # private registry images. ghcr.io public images need no secret.
+  pullSecrets: []
+
+# ─────────────────────────────────────────────────────────────────────
+# Auth — the operator token. We pull it from a k8s Secret (NOT a
+# value here) so it never lands in git or in `helm get values` output.
+#
+# Create the Secret BEFORE `helm install`:
+#   kubectl create secret generic kesseldb-token \
+#     --from-literal=token=$(openssl rand -hex 32)
+#
+# Then `--set auth.secretName=kesseldb-token` (or leave the default).
+# To run in OPEN mode (no auth), set auth.secretName="" — the
+# Deployment will skip the env-from-secret entirely.
+# ─────────────────────────────────────────────────────────────────────
+auth:
+  # Name of the Secret holding the KESSELDB_TOKEN value. Set to ""
+  # to disable token auth (open mode).
+  secretName: kesseldb-token
+  # Key within the Secret. Default `token`.
+  secretKey: token
+
+# ─────────────────────────────────────────────────────────────────────
+# Persistence — one PVC for the data directory. KesselDB's storage
+# is a single-writer LSM + WAL, so one PVC is the correct shape.
+# ─────────────────────────────────────────────────────────────────────
+persistence:
+  enabled: true
+  # 10 GiB is a generous V1 default (KesselDB's overhead is low; the
+  # actual capacity you need scales with your row volume). Bump for
+  # production.
+  size: 10Gi
+  # storageClassName: "" means the cluster's default StorageClass.
+  # Pin to a specific SC name (e.g. "gp3", "premium-rwo") to force
+  # one — required if your default SC isn't appropriate for a DB
+  # workload (you generally want SSD-class IOPS).
+  storageClassName: ""
+  # `ReadWriteOnce` matches the single-pod shape. Multi-attach is
+  # explicitly NOT supported (engine is single-writer).
+  accessModes:
+    - ReadWriteOnce
+  # PV reclaim policy on PVC deletion. `Retain` keeps the underlying
+  # volume — pick `Delete` only if you want `helm uninstall` to wipe
+  # data (NOT recommended for production).
+  # Reclaim policy is set on the StorageClass, not on the PVC; this
+  # placeholder is informational only.
+  annotations: {}
+
+# ─────────────────────────────────────────────────────────────────────
+# Service — one ClusterIP exposing all three wire surfaces.
+# ─────────────────────────────────────────────────────────────────────
+service:
+  # ClusterIP for in-cluster access. Switch to LoadBalancer or NodePort
+  # if you want external traffic; pair LoadBalancer with cloud
+  # provider-specific annotations.
+  type: ClusterIP
+  # Per-surface port mapping. Internal (container) ports match the
+  # Dockerfile defaults; service ports are the same for predictability.
+  binary:
+    port: 6532
+    targetPort: 6532
+  http:
+    port: 6533
+    targetPort: 6533
+  postgres:
+    # NOTE: 5432 is the well-known PG port. Cluster operators with
+    # a real Postgres in the same namespace should change one of
+    # them — overlapping Service ports on the same selector are
+    # fine, but DNS aliases across namespaces can confuse clients.
+    port: 5432
+    targetPort: 5432
+  # Annotations applied to the Service (e.g. for AWS NLB tuning, GCP
+  # internal LB selection, etc.).
+  annotations: {}
+
+# ─────────────────────────────────────────────────────────────────────
+# Resources — sized for a small production deployment. KesselDB's
+# kernel is lean (memtable + bloom filters + LRU cache); the bulk of
+# memory pressure comes from the parallel read pool (SP-Perf-A).
+# ─────────────────────────────────────────────────────────────────────
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    # 4 CPUs is the SP-Hash-Agg V1 target (4-way row-chunk parallelism).
+    # Burst higher for analytics workloads.
+    cpu: "4"
+    memory: 4Gi
+
+# ─────────────────────────────────────────────────────────────────────
+# Probes — KesselDB exposes /v1/health on the HTTP gateway.
+# We use a TCP probe on the binary port too (covers the path where
+# only the binary gateway is healthy but HTTP isn't enabled).
+# ─────────────────────────────────────────────────────────────────────
+probes:
+  liveness:
+    enabled: true
+    # TCP socket probe on the binary port — the engine being up
+    # is sufficient for liveness; HTTP/PG gateways are opt-in.
+    tcpSocket:
+      port: 6532
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    enabled: true
+    tcpSocket:
+      port: 6532
+    initialDelaySeconds: 2
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+
+# ─────────────────────────────────────────────────────────────────────
+# Wire-surface knobs — these become env vars on the container. Match
+# the Dockerfile's defaults so the chart works without overrides.
+# ─────────────────────────────────────────────────────────────────────
+env:
+  # Bind addresses (override only if you want to disable a surface;
+  # set to "" to drop that listener).
+  httpAddr: "0.0.0.0:6533"
+  pgAddr: "0.0.0.0:5432"
+  # The binary protocol listen address is the first positional arg
+  # to the entrypoint — see args[] below.
+
+# Extra arbitrary env vars (key/value); appended verbatim to the
+# container's env list.
+extraEnv: []
+# Example:
+# extraEnv:
+#   - name: RUST_LOG
+#     value: info
+
+# Container args. By default we override the Dockerfile's CMD to
+# pass the binary listen addr + the data mountpoint explicitly,
+# which makes operator overrides obvious.
+args:
+  - "0.0.0.0:6532"
+  - "/data"
+
+# ─────────────────────────────────────────────────────────────────────
+# ServiceAccount — a minimal SA per release; no RBAC bindings (KesselDB
+# doesn't talk to the k8s API).
+# ─────────────────────────────────────────────────────────────────────
+serviceAccount:
+  create: true
+  # Name; leave empty to use the chart-generated name.
+  name: ""
+  annotations: {}
+
+# ─────────────────────────────────────────────────────────────────────
+# Pod-level knobs.
+# ─────────────────────────────────────────────────────────────────────
+podAnnotations: {}
+podLabels: {}
+
+# securityContext — match the Dockerfile's non-root kessel:1100 user.
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1100
+  runAsGroup: 1100
+  fsGroup: 1100
+  # The kessel user owns /data via fsGroup; no privileged operations
+  # needed.
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false  # KesselDB needs to write to /data
+  capabilities:
+    drop:
+      - ALL
+
+# Node placement.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# ─────────────────────────────────────────────────────────────────────
+# Naming overrides (standard helm convention).
+# ─────────────────────────────────────────────────────────────────────
+nameOverride: ""
+fullnameOverride: ""

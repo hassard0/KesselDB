@@ -1,0 +1,109 @@
+KesselDB has been installed.
+
+══════════════════════════════════════════════════════════════════════
+  Release    : {{ .Release.Name }}
+  Namespace  : {{ .Release.Namespace }}
+  Chart      : {{ .Chart.Name }}-{{ .Chart.Version }}
+  Image      : {{ .Values.image.repository }}:{{ .Values.image.tag }}
+══════════════════════════════════════════════════════════════════════
+
+{{- if .Values.auth.secretName }}
+
+1. AUTH TOKEN (required — create BEFORE the pod can serve requests)
+
+   The Deployment references a pre-existing Secret named
+   "{{ .Values.auth.secretName }}" with a key "{{ .Values.auth.secretKey }}".
+   Create it now if it does not yet exist:
+
+     kubectl -n {{ .Release.Namespace }} create secret generic \
+       {{ .Values.auth.secretName }} \
+       --from-literal={{ .Values.auth.secretKey }}=$(openssl rand -hex 32)
+
+   The pod will CrashLoopBackoff with `MountVolume.SetUp failed for
+   secret` until the Secret exists. This is intentional — running
+   open-mode by accident in a cluster would expose the database.
+
+   To run intentionally without auth, helm upgrade with:
+     --set auth.secretName=""
+
+{{- else }}
+
+1. OPEN MODE — no auth (the auth.secretName value is empty).
+
+   The pod accepts unauthenticated connections on all three wire
+   surfaces. This is fine for a dev cluster; do NOT use in production.
+
+{{- end }}
+
+2. CONNECT
+
+   In-cluster, the Service exposes three ports:
+
+     binary   :{{ .Values.service.binary.port }}    (kessel CLI native)
+     http     :{{ .Values.service.http.port }}    (HTTP/1.1 + WebSocket)
+     postgres :{{ .Values.service.postgres.port }}    (PostgreSQL Frontend/Backend v3.0)
+
+   Service DNS:
+     {{ include "kesseldb.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local
+
+   From another pod in the cluster:
+
+     # binary (kessel CLI):
+     kessel --addr {{ include "kesseldb.fullname" . }}:{{ .Values.service.binary.port }} \
+{{- if .Values.auth.secretName }}
+            --token "$KESSELDB_TOKEN" \
+{{- end }}
+            'SELECT 1'
+
+     # HTTP:
+     curl -X POST \
+{{- if .Values.auth.secretName }}
+       -H "Authorization: Bearer $KESSELDB_TOKEN" \
+{{- end }}
+       --data-binary 'SELECT 1' \
+       http://{{ include "kesseldb.fullname" . }}:{{ .Values.service.http.port }}/v1/sql
+
+     # psql:
+{{- if .Values.auth.secretName }}
+     PGPASSWORD="$KESSELDB_TOKEN" psql \
+       -h {{ include "kesseldb.fullname" . }} \
+       -p {{ .Values.service.postgres.port }} \
+       -U kessel \
+       "SELECT 1"
+{{- else }}
+     psql -h {{ include "kesseldb.fullname" . }} \
+          -p {{ .Values.service.postgres.port }} \
+          -U kessel \
+          "SELECT 1"
+{{- end }}
+
+3. PORT-FORWARD FROM LOCALHOST (for laptop access)
+
+     # All three ports at once:
+     kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "kesseldb.fullname" . }} \
+       {{ .Values.service.binary.port }}:{{ .Values.service.binary.port }} \
+       {{ .Values.service.http.port }}:{{ .Values.service.http.port }} \
+       {{ .Values.service.postgres.port }}:{{ .Values.service.postgres.port }}
+
+     # Then connect via 127.0.0.1 with whichever client you prefer.
+
+4. SMOKE TEST INSIDE THE POD
+
+     kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "kesseldb.fullname" . }} -- \
+       kessel --addr 127.0.0.1:{{ .Values.service.binary.port }} \
+{{- if .Values.auth.secretName }}
+              --token "$KESSELDB_TOKEN" \
+{{- end }}
+              'SELECT 1'
+
+══════════════════════════════════════════════════════════════════════
+
+V1 limit: SINGLE-POD deployment (data PVC is ReadWriteOnce). Multi-
+replica VSR clustering under k8s is SP-Cloud-Cluster (separate arc;
+StatefulSet + per-replica PVCs + ClusterClient endpoints).
+
+Upstream docs:
+  README       : https://github.com/hassard0/KesselDB
+  USAGE  §11   : https://github.com/hassard0/KesselDB/blob/main/docs/USAGE.md
+  STATUS       : https://github.com/hassard0/KesselDB/blob/main/docs/STATUS.md
+══════════════════════════════════════════════════════════════════════

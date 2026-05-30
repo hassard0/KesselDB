@@ -1,0 +1,36 @@
+apiVersion: v2
+name: kesseldb
+description: |
+  KesselDB — deterministic replicated SQL database with binary, HTTP/WS,
+  and PostgreSQL Frontend/Backend v3.0 wire surfaces on a zero-dep Rust
+  kernel. V1 chart ships a single-pod stateful deployment; the multi-node
+  cluster shape is tracked separately as SP-Cloud-Cluster.
+type: application
+
+# Chart version (bump on chart changes; semver).
+version: 0.1.0
+
+# Default appVersion targets the `:latest` image tag; pin via
+# values.yaml::image.tag = "1.2.3" for reproducible rollouts.
+appVersion: "latest"
+
+home: https://github.com/hassard0/KesselDB
+sources:
+  - https://github.com/hassard0/KesselDB
+
+maintainers:
+  - name: KesselDB
+    url: https://github.com/hassard0/KesselDB
+
+keywords:
+  - database
+  - sql
+  - postgres
+  - kv
+  - deterministic
+  - replication
+
+# Honest annotation: a v0.x chart against an unstable app surface.
+# Stability matches the upstream STATUS.md production-readiness gate.
+annotations:
+  category: Database

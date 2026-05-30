@@ -1,0 +1,122 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kesseldb.fullname" . }}
+  labels:
+    {{- include "kesseldb.labels" . | nindent 4 }}
+spec:
+  # V1 chart is SINGLE-POD by design — the KesselDB engine is single-writer
+  # and the data PVC is ReadWriteOnce. Running multiple replicas of this
+  # Deployment will split-brain. Multi-replica is SP-Cloud-Cluster
+  # (StatefulSet + per-replica PVCs + VSR ClusterClient endpoints).
+  replicas: 1
+  # Recreate so we don't try to mount the ReadWriteOnce PVC twice during
+  # rolling updates.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "kesseldb.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "kesseldb.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "kesseldb.serviceAccountName" . }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.securityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: kesseldb
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            {{- toYaml .Values.args | nindent 12 }}
+          ports:
+            - name: binary
+              containerPort: {{ .Values.service.binary.targetPort }}
+              protocol: TCP
+            - name: http
+              containerPort: {{ .Values.service.http.targetPort }}
+              protocol: TCP
+            - name: postgres
+              containerPort: {{ .Values.service.postgres.targetPort }}
+              protocol: TCP
+          env:
+            {{- if .Values.env.httpAddr }}
+            - name: KESSELDB_HTTP_ADDR
+              value: {{ .Values.env.httpAddr | quote }}
+            {{- end }}
+            {{- if .Values.env.pgAddr }}
+            - name: KESSELDB_PG_ADDR
+              value: {{ .Values.env.pgAddr | quote }}
+            {{- end }}
+            {{- if .Values.auth.secretName }}
+            - name: KESSELDB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.secretName | quote }}
+                  key: {{ .Values.auth.secretKey | quote }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if .Values.probes.liveness.enabled }}
+          livenessProbe:
+            tcpSocket:
+              port: {{ .Values.probes.liveness.tcpSocket.port }}
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          {{- end }}
+          {{- if .Values.probes.readiness.enabled }}
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.probes.readiness.tcpSocket.port }}
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          {{- end }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+        {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "kesseldb.fullname" . }}-data
+        {{- else }}
+          emptyDir: {}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

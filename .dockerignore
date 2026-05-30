@@ -1,0 +1,15 @@
+# Keep the build context lean — only the source tree + Cargo.lock matter.
+target/
+**/target/
+.git/
+.github/
+docs/superpowers/
+docs/book/
+kesseldb-tla/
+*.tmp
+*.log
+*.bak
+kesseldb-data/
+*.kdb
+.DS_Store
+Thumbs.db

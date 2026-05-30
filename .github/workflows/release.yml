@@ -33,6 +33,7 @@ on:
 
 permissions:
   contents: write   # softprops/action-gh-release needs this to upload assets
+  packages: write   # docker/build-push-action pushes to ghcr.io/<owner>/<repo>
 
 env:
   CARGO_TERM_COLOR: always
@@ -286,6 +287,79 @@ jobs:
           path: ${{ runner.temp }}/stage/*
           if-no-files-found: error
           retention-days: 7
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Docker image — multi-arch (linux/amd64 + linux/arm64) build & push
+  # to ghcr.io/<owner>/<repo>. Best-effort: pinned outside `publish:`'s
+  # `needs:` so a transient registry blip can't gate the binary release.
+  # Tagged `:<version>` AND `:latest` on `v*` tags; image is NOT pushed
+  # on workflow_dispatch (the workflow_dispatch tag input is for
+  # republishing the binary release; the Docker image should be tied to
+  # a real git tag).
+  # ─────────────────────────────────────────────────────────────────────
+  docker:
+    name: build + push Docker image (multi-arch)
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    if: ${{ github.event_name == 'push' }}
+    env:
+      VER: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU (for arm64 cross-build)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags (lowercased)
+        id: tags
+        shell: bash
+        run: |
+          # ghcr.io requires lowercase image names. github.repository is
+          # already `<owner>/<repo>`; lowercase it defensively.
+          REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          IMG="ghcr.io/${REPO}"
+          # Strip the leading `v` for the docker tag (PEP/SemVer-style),
+          # plus also publish `:latest` for non-prerelease tags.
+          VTAG="${VER#v}"
+          TAGS="${IMG}:${VTAG},${IMG}:${VER}"
+          if [[ "${VER}" != *-* ]]; then
+            TAGS="${TAGS},${IMG}:latest"
+          fi
+          echo "image=${IMG}" >> "$GITHUB_OUTPUT"
+          echo "tags=${TAGS}"  >> "$GITHUB_OUTPUT"
+          echo "Pushing tags: ${TAGS}"
+
+      - name: Build + push multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          # Cache the registry-side layer to keep subsequent tag builds
+          # fast; first build of a fresh repo takes ~15 min for the arm64
+          # cross-compile.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ env.VER }}
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.title=KesselDB
+            org.opencontainers.image.description=Deterministic replicated SQL database; binary + HTTP + WebSocket + PostgreSQL wire on a zero-dep Rust kernel
 
   # ─────────────────────────────────────────────────────────────────────
   # Publish: gather every artifact, build a combined SHA256SUMS, and

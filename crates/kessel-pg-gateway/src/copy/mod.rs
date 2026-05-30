@@ -91,6 +91,16 @@ pub struct CopyInState {
     /// each parsed row MUST have exactly this many tab-separated
     /// fields.
     pub column_count: u16,
+    /// Per-column KesselDB `FieldKind` for the chosen-column list,
+    /// in the same order as `columns`. Used by the COPY-FROM
+    /// row-to-INSERT synthesizer to pick the right SQL literal
+    /// rendering — numeric kinds render as bare decimal (no quotes),
+    /// string / bytes kinds render as `'...'`-quoted (with `'`
+    /// doubled). Pairs 1:1 with `columns` (and has length
+    /// `column_count`). Carried so the per-row INSERT dispatch
+    /// doesn't have to re-query `engine.describe_table()` for every
+    /// row.
+    pub column_kinds: Vec<kessel_catalog::FieldKind>,
     /// Trailing-incomplete-row bytes carried over from the previous
     /// `CopyData` frame. A row can span multiple `CopyData` frames
     /// because PG's CopyData is a binary framing, not a logical row
@@ -105,10 +115,26 @@ impl CopyInState {
     /// Build a fresh CopyIn state for a `COPY <table> FROM STDIN`
     /// exchange.
     pub fn new(table: String, columns: Option<Vec<String>>, column_count: u16) -> Self {
+        Self::new_with_kinds(table, columns, column_count, Vec::new())
+    }
+
+    /// Build a fresh CopyIn state with per-column `FieldKind`s for
+    /// schema-aware SQL-literal rendering. Preferred constructor —
+    /// `new()` is the back-compat shim that leaves `column_kinds`
+    /// empty (the synthesizer falls back to always-quoted rendering,
+    /// which works for CHAR columns but trips kessel-sql's
+    /// integer-column type check).
+    pub fn new_with_kinds(
+        table: String,
+        columns: Option<Vec<String>>,
+        column_count: u16,
+        column_kinds: Vec<kessel_catalog::FieldKind>,
+    ) -> Self {
         Self {
             table,
             columns,
             column_count,
+            column_kinds,
             carry: Vec::new(),
             rows_ingested: 0,
         }
@@ -155,7 +181,8 @@ mod tests {
     }
 
     /// SP-PG-COPY T1: `CopyInState::new` builds the state with the
-    /// expected initial values (empty carry, zero rows ingested).
+    /// expected initial values (empty carry, zero rows ingested,
+    /// empty column_kinds — back-compat shim).
     #[test]
     fn t1_copy_in_state_new_initial_values() {
         let s = CopyInState::new(
@@ -168,5 +195,24 @@ mod tests {
         assert_eq!(s.column_count, 2);
         assert!(s.carry.is_empty());
         assert_eq!(s.rows_ingested, 0);
+        assert!(s.column_kinds.is_empty());
+    }
+
+    /// SP-PG-COPY T2 fix: `CopyInState::new_with_kinds` carries the
+    /// per-column FieldKinds for schema-aware SQL synthesis.
+    #[test]
+    fn t2_copy_in_state_new_with_kinds_carries_kinds() {
+        let s = CopyInState::new_with_kinds(
+            "users".to_string(),
+            Some(vec!["id".to_string(), "name".to_string()]),
+            2,
+            vec![
+                kessel_catalog::FieldKind::I64,
+                kessel_catalog::FieldKind::Char(32),
+            ],
+        );
+        assert_eq!(s.column_kinds.len(), 2);
+        assert_eq!(s.column_kinds[0], kessel_catalog::FieldKind::I64);
+        assert_eq!(s.column_kinds[1], kessel_catalog::FieldKind::Char(32));
     }
 }

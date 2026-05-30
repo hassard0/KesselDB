@@ -93,28 +93,38 @@ pub fn dispatch_copy_in_start<E: EngineApply + ?Sized>(
             };
         }
     };
-    // Validate the supplied column list (if any) against the schema.
-    let chosen_columns: Vec<String> = match columns.as_ref() {
-        Some(cols) => {
-            for c in cols {
-                if !schema_cols.iter().any(|s| s.name == *c) {
-                    return CopyInStartOutcome::Failed {
-                        bytes: error_response_then_rfq(
-                            "42703",
-                            &format!(
-                                "column \"{c}\" of relation \"{table}\" does not exist"
-                            ),
-                        ),
-                    };
+    // Validate the supplied column list (if any) against the schema,
+    // and capture the per-column FieldKind so the row-to-INSERT
+    // synthesizer can pick numeric-vs-quoted-literal rendering.
+    let (chosen_columns, chosen_kinds): (Vec<String>, Vec<kessel_catalog::FieldKind>) =
+        match columns.as_ref() {
+            Some(cols) => {
+                let mut kinds = Vec::with_capacity(cols.len());
+                for c in cols {
+                    match schema_cols.iter().find(|s| s.name == *c) {
+                        Some(sc) => kinds.push(sc.kind),
+                        None => {
+                            return CopyInStartOutcome::Failed {
+                                bytes: error_response_then_rfq(
+                                    "42703",
+                                    &format!(
+                                        "column \"{c}\" of relation \"{table}\" does not exist"
+                                    ),
+                                ),
+                            };
+                        }
+                    }
                 }
+                (cols.clone(), kinds)
             }
-            cols.clone()
-        }
-        None => schema_cols.iter().map(|s| s.name.clone()).collect(),
-    };
+            None => (
+                schema_cols.iter().map(|s| s.name.clone()).collect(),
+                schema_cols.iter().map(|s| s.kind).collect(),
+            ),
+        };
     let ncols = chosen_columns.len() as u16;
     let bytes = encode_copy_in_response(ncols);
-    let state = CopyInState::new(table, Some(chosen_columns), ncols);
+    let state = CopyInState::new_with_kinds(table, Some(chosen_columns), ncols, chosen_kinds);
     CopyInStartOutcome::Started { bytes, state }
 }
 
@@ -189,6 +199,7 @@ pub fn process_copy_data<E: EngineApply + ?Sized>(
                 let sql = match synthesize_insert_sql(
                     &state.table,
                     state.columns.as_deref(),
+                    &state.column_kinds,
                     &fields,
                 ) {
                     Ok(s) => s,
@@ -417,13 +428,21 @@ fn reject_message(reason: &RejectReason) -> String {
 }
 
 /// Synthesize an `INSERT INTO <table> [(cols)] VALUES (...)`
-/// statement from a parsed COPY row. Each NULL field renders as
-/// the keyword `NULL`; each non-NULL field is single-quoted with
-/// embedded single-quotes doubled (`'` → `''`), matching the
-/// PG-canonical SQL-literal escape.
+/// statement from a parsed COPY row. NULL renders as the `NULL`
+/// keyword. Non-NULL fields render as either a BARE decimal literal
+/// (for numeric `FieldKind`s — I8/I16/I32/I64/I128 + U8/U16/U32/U64/
+/// U128 + Bool + Timestamp + Fixed) or a `'...'`-quoted literal
+/// (for byte-string kinds — Char/Bytes/Ref/OverflowRef), matching
+/// the kessel-sql `lit_to_value` type-pairing in `kessel-sql::lib.rs`.
+///
+/// `kinds` MUST have the same length as `fields` — if empty (the
+/// pre-T2-fix path used by tests that don't carry kinds), every
+/// field falls back to the quoted form (which works for CHAR
+/// columns but trips integer columns at the kessel-sql parser).
 fn synthesize_insert_sql(
     table: &str,
     columns: Option<&[String]>,
+    kinds: &[kessel_catalog::FieldKind],
     fields: &[Option<Vec<u8>>],
 ) -> Result<String, String> {
     let mut s = String::with_capacity(64);
@@ -449,15 +468,36 @@ fn synthesize_insert_sql(
             Some(bytes) => {
                 let text = std::str::from_utf8(bytes)
                     .map_err(|_| "field is not valid UTF-8".to_string())?;
-                s.push('\'');
-                for c in text.chars() {
-                    if c == '\'' {
-                        s.push_str("''");
-                    } else {
-                        s.push(c);
+                let want_quoted = kinds
+                    .get(i)
+                    .map(|k| matches!(
+                        k,
+                        kessel_catalog::FieldKind::Char(_)
+                            | kessel_catalog::FieldKind::Bytes(_)
+                            | kessel_catalog::FieldKind::Ref
+                            | kessel_catalog::FieldKind::OverflowRef
+                    ))
+                    // No kinds info → quoted (back-compat).
+                    .unwrap_or(true);
+                if want_quoted {
+                    s.push('\'');
+                    for c in text.chars() {
+                        if c == '\'' {
+                            s.push_str("''");
+                        } else {
+                            s.push(c);
+                        }
                     }
+                    s.push('\'');
+                } else {
+                    // Numeric / bool / timestamp / fixed — render
+                    // as a bare token. Trust the COPY-format input
+                    // bytes are already a decimal literal (PG text-
+                    // format for numeric types IS the decimal
+                    // representation; pg_dump emits e.g. `42` not
+                    // `"42"`).
+                    s.push_str(text);
                 }
-                s.push('\'');
             }
         }
     }

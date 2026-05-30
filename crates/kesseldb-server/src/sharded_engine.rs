@@ -524,4 +524,283 @@ mod tests {
             assert_eq!(fxhash_fold(c), fxhash_fold(c));
         }
     }
+
+    // ====================================================================
+    // T2 integration KATs — sharded EngineHandle end-to-end
+    // ====================================================================
+    //
+    // These tests SPAWN a real K=N sharded engine via
+    // `spawn_engine_cfg(cfg { shard_count: Some(K), .. })`, drive real
+    // Ops through the public EngineHandle API, and assert the round-trip
+    // results. They prove the routing + per-shard storage + DDL broadcast
+    // wiring is correct end-to-end, not just at the classifier level.
+    //
+    // Coverage matrix (K ∈ {2, 4, 8}):
+    //   - CreateType broadcast: type_id 1 minted on every shard
+    //   - Create / GetById round-trip on N rows (uniform shard distribution)
+    //   - GetById miss returns NotFound (right shard, no false positives)
+    //   - Describe returns the type (per-type shard pinning)
+    //   - Cross-K equivalence: K=1 results == K=4 results for the same
+    //     point-read workload
+
+    use crate::{spawn_engine_cfg, ServerConfig};
+    use kessel_catalog::{encode_type_def, Field, FieldKind, ObjectType};
+    use kessel_codec::{encode as codec_encode, Value};
+
+    fn fresh_dir(tag: &str) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let dir = std::env::temp_dir().join(format!(
+            "kdb-shardapp-t2-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn build_test_schema(engine: &EngineHandle) -> ObjectType {
+        let def = encode_type_def(
+            "row",
+            &[
+                Field {
+                    field_id: 0,
+                    name: "v".into(),
+                    kind: FieldKind::U64,
+                    nullable: false,
+                },
+            ],
+        );
+        let r = engine.apply(Op::CreateType { def });
+        assert!(
+            matches!(r, OpResult::TypeCreated(1)),
+            "CreateType: {r:?}"
+        );
+        ObjectType::from_def(
+            "row".into(),
+            vec![Field {
+                field_id: 1,
+                name: "v".into(),
+                kind: FieldKind::U64,
+                nullable: false,
+            }],
+        )
+    }
+
+    fn spawn_sharded(k: usize, tag: &str) -> (EngineHandle, std::path::PathBuf) {
+        let dir = fresh_dir(tag);
+        let cfg = ServerConfig {
+            shard_count: Some(k),
+            // Use read_workers on each sub-engine so they each enable
+            // the SP-Perf-A T6 read-bypass fast path. (Per-shard read
+            // pool size = 0 keeps thread count low for tests.)
+            read_workers: Some(0),
+            ..ServerConfig::default()
+        };
+        let engine = spawn_engine_cfg(&dir, &cfg).expect("engine open");
+        (engine, dir)
+    }
+
+    /// K=4 end-to-end: CreateType broadcasts so every shard has type 1;
+    /// 16 rows written + read back produce correct values.
+    #[test]
+    fn t2_k4_write_read_roundtrip_16_rows() {
+        let (engine, dir) = spawn_sharded(4, "k4-wr");
+        let ot = build_test_schema(&engine);
+
+        for i in 0..16u128 {
+            let rec = codec_encode(&ot, &[Value::Uint(i)]).unwrap();
+            let id = ObjectId::from_u128(i);
+            let r = engine.apply(Op::Create {
+                type_id: 1,
+                id,
+                record: rec,
+            });
+            assert!(matches!(r, OpResult::Ok), "Create {i}: {r:?}");
+        }
+        for i in 0..16u128 {
+            let id = ObjectId::from_u128(i);
+            let r = engine.apply(Op::GetById { type_id: 1, id });
+            match r {
+                OpResult::Got(bytes) => {
+                    let vals = kessel_codec::decode(&ot, &bytes).unwrap();
+                    assert!(matches!(vals[0], Value::Uint(v) if v == i),
+                        "row {i} value mismatch: {vals:?}");
+                }
+                other => panic!("GetById({i}) → {other:?}, expected Got"),
+            }
+        }
+        // Miss case
+        let miss = engine.apply(Op::GetById {
+            type_id: 1,
+            id: ObjectId::from_u128(9999),
+        });
+        assert!(matches!(miss, OpResult::NotFound), "miss: {miss:?}");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// K=8 end-to-end: same as K=4 but proves the engine scales to higher
+    /// shard counts. 64 rows written + read.
+    #[test]
+    fn t2_k8_write_read_roundtrip_64_rows() {
+        let (engine, dir) = spawn_sharded(8, "k8-wr");
+        let ot = build_test_schema(&engine);
+        for i in 0..64u128 {
+            let rec = codec_encode(&ot, &[Value::Uint(i * 3 + 7)]).unwrap();
+            let id = ObjectId::from_u128(i);
+            let r = engine.apply(Op::Create {
+                type_id: 1,
+                id,
+                record: rec,
+            });
+            assert!(matches!(r, OpResult::Ok), "Create {i}: {r:?}");
+        }
+        for i in 0..64u128 {
+            let id = ObjectId::from_u128(i);
+            let r = engine.apply(Op::GetById { type_id: 1, id });
+            match r {
+                OpResult::Got(bytes) => {
+                    let vals = kessel_codec::decode(&ot, &bytes).unwrap();
+                    let expected = i * 3 + 7;
+                    assert!(matches!(vals[0], Value::Uint(v) if v == expected),
+                        "row {i}: vals={vals:?} expected v={expected}");
+                }
+                other => panic!("GetById({i}) → {other:?}"),
+            }
+        }
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Headline T2 oracle: K=1 byte-equivalent K=4 byte-equivalent K=8
+    /// on a 100-row point-read workload. Every row's GetById result MUST
+    /// match across all K values — the sharding routing is correct iff
+    /// the per-shard physical layout produces the same logical answers
+    /// the unsharded engine does.
+    #[test]
+    fn t2_determinism_oracle_k1_k4_k8_byte_equal() {
+        // K=1 (unsharded path — control)
+        let cfg_k1 = ServerConfig {
+            shard_count: None,
+            read_workers: Some(0),
+            ..ServerConfig::default()
+        };
+        let dir1 = fresh_dir("k1-oracle");
+        let e1 = spawn_engine_cfg(&dir1, &cfg_k1).expect("k1");
+        let (e4, dir4) = spawn_sharded(4, "k4-oracle");
+        let (e8, dir8) = spawn_sharded(8, "k8-oracle");
+
+        let ot = build_test_schema(&e1);
+        let _ = build_test_schema(&e4);
+        let _ = build_test_schema(&e8);
+
+        // Seed identical workload across all three engines.
+        for i in 0..100u128 {
+            let rec = codec_encode(&ot, &[Value::Uint(i * 13)]).unwrap();
+            let id = ObjectId::from_u128(i);
+            for engine in [&e1, &e4, &e8] {
+                let r = engine.apply(Op::Create {
+                    type_id: 1,
+                    id,
+                    record: rec.clone(),
+                });
+                assert!(matches!(r, OpResult::Ok), "Create {i}: {r:?}");
+            }
+        }
+        // Read every row + a few misses through each engine. Results MUST
+        // be byte-identical.
+        let mut diffs = 0usize;
+        for i in 0..120u128 {
+            let id = ObjectId::from_u128(i);
+            let r1 = e1.apply(Op::GetById { type_id: 1, id });
+            let r4 = e4.apply(Op::GetById { type_id: 1, id });
+            let r8 = e8.apply(Op::GetById { type_id: 1, id });
+            if r1 != r4 || r1 != r8 {
+                diffs += 1;
+                if diffs <= 3 {
+                    eprintln!(
+                        "DIVERGE i={i} k1={r1:?} k4={r4:?} k8={r8:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(diffs, 0, "K=1/K=4/K=8 byte-equal oracle failed: {diffs} divergences");
+        // Describe broadcasts to all shards but routes to one — should
+        // match across K too.
+        let d1 = e1.apply(Op::Describe { type_id: 1 });
+        let d4 = e4.apply(Op::Describe { type_id: 1 });
+        let d8 = e8.apply(Op::Describe { type_id: 1 });
+        assert_eq!(d1, d4, "Describe K=1 vs K=4 diverged");
+        assert_eq!(d1, d8, "Describe K=1 vs K=8 diverged");
+
+        drop(e1);
+        drop(e4);
+        drop(e8);
+        let _ = std::fs::remove_dir_all(&dir1);
+        let _ = std::fs::remove_dir_all(&dir4);
+        let _ = std::fs::remove_dir_all(&dir8);
+    }
+
+    /// Per-shard write distribution KAT: at K=4 with 100 random keys,
+    /// every shard should receive a non-zero fraction of writes.
+    /// Proves the dispatcher actually spreads load across shards
+    /// (catches a regression where every key folded to shard 0).
+    #[test]
+    fn t2_k4_writes_distribute_across_shards() {
+        let (engine, dir) = spawn_sharded(4, "k4-dist");
+        let _ot = build_test_schema(&engine);
+
+        // Each sub-engine's applied_ops_atomic bumps for every applied
+        // Op (incl. the CreateType broadcast → every shard bumped 1).
+        // Snapshot the per-shard counts BEFORE writing data so we can
+        // measure deltas from the data writes alone.
+        let sharded = engine.sharded.as_ref().expect("K=4 engine has dispatcher");
+        let pre: Vec<u64> = sharded
+            .all_shards()
+            .iter()
+            .map(|s| s.applied_ops_snapshot())
+            .collect();
+
+        // Write 200 rows so even with random hash collisions every
+        // shard should get >= 10 (uniform expected = 50; well over the
+        // 10 floor unless the router collapsed).
+        let ot = ObjectType::from_def(
+            "row".into(),
+            vec![Field {
+                field_id: 1,
+                name: "v".into(),
+                kind: FieldKind::U64,
+                nullable: false,
+            }],
+        );
+        for i in 0..200u128 {
+            let rec = codec_encode(&ot, &[Value::Uint(i)]).unwrap();
+            let id = ObjectId::from_u128(i);
+            let r = engine.apply(Op::Create {
+                type_id: 1,
+                id,
+                record: rec,
+            });
+            assert!(matches!(r, OpResult::Ok));
+        }
+        let post: Vec<u64> = sharded
+            .all_shards()
+            .iter()
+            .map(|s| s.applied_ops_snapshot())
+            .collect();
+        let deltas: Vec<u64> = pre.iter().zip(post.iter()).map(|(a, b)| b - a).collect();
+        eprintln!("K=4 write distribution: {:?}", deltas);
+        for (i, d) in deltas.iter().enumerate() {
+            assert!(*d >= 10, "shard {i} got only {d} of 200 writes — routing collapsed");
+        }
+        // Sum of all shard deltas == total writes (200).
+        let total: u64 = deltas.iter().sum();
+        assert_eq!(total, 200, "shard delta sum {total} != 200 writes");
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

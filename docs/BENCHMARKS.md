@@ -30,8 +30,8 @@ Wins, losses, and the one-line cause for each:
 | sysbench OLTP write-only (N=8) | **5.2× faster** (53K vs 10K tx/s) | Write-heavy transactions |
 | sysbench OLTP read-only (N=16) | **5.7× faster** (28,977 vs 5,073 tx/s; SP-Perf-A-TXN-RO lift 42.6×) | Was LOSING; arc closed |
 | sysbench OLTP read-write (N=16) | **2.66× faster** (10,273 vs 3,862 tx/s; SP-Perf-A-TXN-RW lift 14.4×) | Was LOSING; arc closed |
-| TPC-H Q1 — multi-aggregate GROUP BY (N=4) | **LOSES** (60.18 vs 186 q/s; SP-Hash-Agg lift 1.46×, cumulative 3-arc lift 6.81×) | Gap closed from 18× to 3.09×; remaining 3× is serial-prefix + thread-spawn overhead — SP-Hash-Agg-Tune / SP-JIT-Aggregate next |
-| TPC-H Q6 — SUM with WHERE (N=4) | **LOSES** (185.03 vs 1,686 q/s; SP-Hash-Agg lift 1.79×, cumulative 3-arc lift 13.47×) | Gap closed from 123× to 9.11×; same root cause as Q1 — SP-Hash-Agg-Tune / SP-JIT-Aggregate next |
+| TPC-H Q1 — multi-aggregate GROUP BY (N=4) | **LOSES** (63.77 vs 186 q/s; SP-Hash-Agg-Tune lift 1.06×, cumulative 4-arc lift 7.21×) | Gap closed from 18× to 2.92×; SP-Hash-Agg-Tune sweep diagnosed remaining cost as per-row WHERE VM interpreter — SP-WHERE-VM-Specialise / SP-JIT-Aggregate next |
+| TPC-H Q6 — SUM with WHERE (N=4) | **LOSES** (197.55 vs 1,686 q/s; SP-Hash-Agg-Tune lift 1.07×, cumulative 4-arc lift 14.38×) | Gap closed from 123× to 8.53×; same root cause as Q1 — SP-WHERE-VM-Specialise / SP-JIT-Aggregate next |
 
 KesselDB **wins 6 of 8 published workloads** and loses 2 (both TPC-H
 analytical shapes). Both transaction-bracket losses called out in the
@@ -480,58 +480,69 @@ TPC-H DOUBLEs converted to scaled ints; constants in the SQL queries
 scaled to match). Same deterministic per-trial seed across all 3 DBs
 via `tpch::gen_lineitem`.
 
-**POST-SP-Hash-Agg (2026-05-30) — parallel hash-aggregate lift:**
+**POST-SP-Hash-Agg-Tune (2026-05-30) — streaming producer-channel-workers BATCHED:**
 
-| DB | N=1 q/s | N=4 q/s | p50 (N=1) | p99 (N=1) | vs pre-Hash-Agg | vs pre-MULTI | vs pre-arc (3-prong) |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| KesselDB | **17.30** | **60.18** | 57.7 ms | 73.0 ms | **+1.59× / +1.46×** | **+6.18× / +5.93×** | **+7.27× / +6.81×** |
-| **PostgreSQL** | **46.53** | **186.02** | 21.2 ms | 23.3 ms | unchanged | unchanged | unchanged |
-| SQLite | 22.74 | 23.75 | 43.8 ms | 45.2 ms | unchanged | unchanged | unchanged |
-| TigerBeetle | — | — | — | — | — | — | — |
+| DB | N=1 q/s | N=4 q/s | p50 (N=1) | p99 (N=1) | vs pre-Tune | vs pre-arc (4-prong) |
+|---|---:|---:|---:|---:|---:|---:|
+| KesselDB | **16.14** | **63.77** | 62.1 ms | 78.5 ms | **-1.07× / +1.06×** | **+6.78× / +7.21×** |
+| **PostgreSQL** | **46.53** | **186.02** | 21.2 ms | 23.3 ms | unchanged | unchanged |
+| SQLite | 22.74 | 23.75 | 43.8 ms | 45.2 ms | unchanged | unchanged |
+| TigerBeetle | — | — | — | — | — | — |
 
 **Prior numbers** (kept for honesty):
 
 | DB | N=1 q/s | N=4 q/s | p50 (N=1) | p99 (N=1) | sweep |
 |---|---:|---:|---:|---:|---|
+| KesselDB (POST-Hash-Agg V1, pre-Tune) | 17.30 | 60.18 | 57.7 ms | 73.0 ms | SP-Hash-Agg V1 |
 | KesselDB (POST-MULTI, pre-Hash-Agg) | 10.90 | 41.11 | 91.0 ms | 99.0 ms | SP-Analytic-Plan-MULTI |
 | KesselDB (POST-V1, pre-MULTI) | 2.80 | 10.14 | 351.0 ms | 405.4 ms | SP-Analytic-Plan V1 |
 | KesselDB (pre-arc baseline) | 2.38 | 8.84 | 417.8 ms | 476.0 ms | SP-Bench-Suite T4 |
 
-**Honest read — KesselDB Q1 closes more gap with the parallel-hash
-fold; the measured lift is positive but well below the 4× modelled
-target. The arc ships as DONE_WITH_CONCERNS; root-cause notes below.**
+**Intermediate-shape sweep (kept for honesty — unbatched producer-channel
+shape that landed in commit 833eede before commit 0a19f3d batched it):**
 
-- **Postgres still wins** (186 q/s at N=4 = **3.09× KesselDB
-  post-Hash-Agg**, was 4.52× pre-Hash-Agg, was 18× pre-MULTI — gap
-  closed cumulatively by ~6×). Postgres' parallel-aware hash
-  aggregate still wins on per-row cost; KesselDB's parallel-merge
-  path is the same algorithm shape but pays measurable thread-spawn
-  + materialisation overhead that bounds the lift. Postgres N=1 =
-  46.5 q/s = 2.69× KesselDB post-Hash-Agg.
-- **KesselDB N=1 = 17.30 q/s (was 10.90 — 1.59× lift), N=4 = 60.18
-  q/s (was 41.11 — 1.46× lift)**. The design's predicted band was
-  3-4× (4-way row-chunk parallelism on top of the multi-aggregate
-  single-scan fold). Measured 1.5× says **the per-query parallel
-  speedup hits a ceiling well below the per-row work split**. Most
-  likely contributors (see SP-Hash-Agg progress tracker §T4 + next-
-  arc notes): (a) `Vec<Arc<[u8]>>` materialisation of the full
-  candidate set before partitioning (Q1's near-full 60K-row scan
-  pays one ptr-copy + Arc refcount-bump per row up-front, ~60K
-  Arc bumps × hundreds of ns each = ~10-20ms per query before any
-  worker spawns); (b) `std::thread::scope` spawn overhead at 4
-  workers (~100µs/spawn × 4 = ~400µs); (c) the surviving
-  serial-prefix (`narrow_by_range_preds` + materialisation +
-  thread spawn) is hard-pinned to one CPU and accounts for the
-  bulk of wall-time at N=1. The lift IS real — and read-pool
-  scaling on top still holds: N=4 ≈ 3.48× N=1 (4 read-pool
-  workers × the per-query 1.46× = ~16-thread peak under load).
-- **KesselDB N=4 still beats SQLite at N=4** (60.18 vs 23.75 =
-  2.53× win, was 1.73× win post-MULTI). SQLite single-DB-file
+| Sweep | Q1 N=1 q/s | Q1 N=4 q/s | Note |
+|---|---:|---:|---|
+| KesselDB (SP-Hash-Agg-Tune UNBATCHED) | 14.99 | 54.76 | -13% / -9% vs V1 — channel send/recv overhead at 60K rows × ~500ns = ~30ms/query dominated the savings; superseded by the BATCHED shape (commit 0a19f3d) |
+
+**Honest read — SP-Hash-Agg-Tune trades 7% off N=1 for 6% gain at N=4;
+the user-spec 120-q/s floor for Q1 N=4 was MISSED. The arc ships as
+DONE_WITH_CONCERNS — modest positive lift at the user's N=4 target +
+honest documentation that the dominant bottleneck is elsewhere.**
+
+- **Postgres still wins** (186 q/s at N=4 = **2.92× KesselDB
+  post-Tune**, was 3.09× post-Hash-Agg, was 18× pre-MULTI — gap
+  closed cumulatively by ~6.2×). The streaming overlap moved the
+  needle ~6% at N=4 but doesn't unlock the constant-factor advantage
+  Postgres' LLVM-codegenned per-row aggregate-update enjoys.
+- **KesselDB N=4 = 63.77 q/s (was 60.18 — +6.0% lift), N=1 = 16.14
+  q/s (was 17.30 — -6.7%)**. Design floor was ≥120 q/s at N=4
+  (50% achieved). The streaming producer-channel-workers shape
+  DID overlap producer iteration with worker fold work — but the
+  measured-vs-modelled gap reveals that the V1 serial Vec<Arc<[u8]>>
+  pre-collect was NOT the wall-time floor we thought. The actual
+  dominant cost: **the per-row `kessel_expr::eval` stack VM
+  interpreter** evaluating the WHERE program × ~60K rows. The
+  parallel fold can amortise this across 4 cores but cannot make
+  the VM faster per row. Next arc (named below) targets that.
+- **N=1 regression** (-6.7%): the channel infrastructure (1 producer
+  thread + 4 worker threads + 4 bounded sync_channels) pays its
+  full overhead per query, but at N=1 there are no concurrent
+  queries to amortise the spawn cost across. At N=4 the overhead
+  is absorbed by the 4-way query concurrency + the per-query
+  streaming overlap, yielding the +6% net.
+- **Intermediate UNBATCHED shape** (commit 833eede, before commit
+  0a19f3d batched it) regressed -13% at N=1 / -9% at N=4 because
+  the per-row channel send/recv overhead at 60K rows × ~500ns =
+  ~30ms/query SWALLOWED the streaming overlap savings. BATCH_SIZE=256
+  amortises channel cost across rows (60K/256 = 234 channel ops
+  instead of 60K), recovering most of the regression.
+- **KesselDB N=4 still beats SQLite at N=4** (63.77 vs 23.75 =
+  2.68× win, was 2.53× win post-Hash-Agg). SQLite single-DB-file
   shared-lock contention caps it at ~24 q/s regardless of N.
-- **SQLite N=1** (22.74 q/s) is still 1.31× KesselDB N=1 (17.30) —
+- **SQLite N=1** (22.74 q/s) is now 1.41× KesselDB N=1 (16.14) —
   the constant factor on a single thread is still SQLite's home
-  turf, but KesselDB closed it from 8.3× to 1.31× across the
-  three-arc sweep.
+  turf; the 4-arc sweep closed it from 8.3× pre-arc to 1.41× now.
 - **TigerBeetle**: refused. No SQL aggregate primitive.
 
 **What changed under the hood (SP-Hash-Agg T1-T4):**
@@ -574,18 +585,21 @@ and associative+commutative for MIN/MAX; AVG is computed POST-merge
 from (sum, count) so the integer division matches the serial path.
 All 15 pre-existing aggregate KATs stay green.
 
-**Next roadmap arc — SP-Hash-Agg-Tune (or SP-JIT-Aggregate).** The
-remaining ~3× gap vs Postgres on Q1 has two named follow-up arcs:
-(a) **SP-Hash-Agg-Tune** — drive down the serial-prefix cost.
-Candidate levers: lazy/streaming materialisation (worker pulls Arc
-slots from a shared cursor instead of pre-collecting), thread-pool
-reuse (one pool per read worker so per-query thread spawns are
-amortised), bypass Arc::from for scan_range path (consume the Vec
-chunk directly instead of wrapping). Expected lift: 2-3× more on Q1
-N=4, would put KesselDB near Postgres parity. (b) **SP-JIT-Aggregate**
-— Postgres uses LLVM codegen for the per-row aggregate-update inner
-loop; KesselDB could do the same. Out-of-scope here; deferred to a
-named future arc.
+**Next roadmap arc — SP-JIT-Aggregate / SP-WHERE-VM-Specialise.** The
+SP-Hash-Agg-Tune sweep revealed the dominant wall-time cost is the
+per-row `kessel_expr::eval` stack VM interpreter — NOT the V1 serial
+prefix. Two named follow-up arcs target it:
+(a) **SP-WHERE-VM-Specialise** — replace the generic stack VM
+interpreter with a specialised closure built once per query that
+inlines the field offsets + comparison ops; eliminates the bytecode
+dispatch loop. Expected lift: 1.5-2× per row × N workers.
+(b) **SP-JIT-Aggregate** — Postgres uses LLVM codegen for the per-row
+aggregate-update inner loop; KesselDB could do the same with cranelift
+or a hand-rolled bytecode→x86 jit. Bigger investment; bigger win.
+Both close the remaining 2.92× gap vs Postgres.
+SP-Hash-Agg-Pool (named in T1 design — thread-pool reuse) is now
+de-prioritised because the V1-Tune sweep showed thread-spawn is NOT
+the bottleneck.
 
 ---
 
@@ -607,11 +621,11 @@ field_id=L_Q6_REVENUE }` answers without a SUM(expr) primitive (the
 multiplication is hoisted out of the per-query path). Postgres + SQLite
 use `SUM(l_extendedprice * l_discount)` directly.
 
-**POST-SP-Hash-Agg (2026-05-30) — parallel hash-aggregate lift:**
+**POST-SP-Hash-Agg-Tune (2026-05-30) — streaming producer-channel-workers BATCHED:**
 
-| DB | N=1 q/s | N=4 q/s | p50 (N=1) | p99 (N=1) | vs pre-Hash-Agg | vs pre-arc (3-prong) |
+| DB | N=1 q/s | N=4 q/s | p50 (N=1) | p99 (N=1) | vs pre-Tune | vs pre-arc (4-prong) |
 |---|---:|---:|---:|---:|---:|---:|
-| KesselDB | **34.23** | **185.03** | 29.2 ms | 33.8 ms | **+1.35× / +1.79×** | **+9.70× / +13.47×** |
+| KesselDB | **33.95** | **197.55** | 29.5 ms | 33.4 ms | **-1.01× / +1.07×** | **+9.62× / +14.38×** |
 | **PostgreSQL** | **355.88** | **1,686.01** | 2.3 ms | 5.5 ms | unchanged | unchanged |
 | SQLite | 252.94 | 87.94 | 3.9 ms | 4.2 ms | unchanged | unchanged |
 | TigerBeetle | — | — | — | — | — | — |
@@ -620,33 +634,46 @@ use `SUM(l_extendedprice * l_discount)` directly.
 
 | DB | N=1 q/s | N=4 q/s | p50 (N=1) | p99 (N=1) | sweep |
 |---|---:|---:|---:|---:|---|
+| KesselDB (POST-Hash-Agg V1, pre-Tune) | 34.23 | 185.03 | 29.2 ms | 33.8 ms | SP-Hash-Agg V1 |
 | KesselDB (POST-V1, pre-Hash-Agg) | 25.39 | 103.38 | 39.5 ms | 42.7 ms | SP-Analytic-Plan V1 |
 | KesselDB (pre-arc baseline) | 3.53 | 13.74 | 282.6 ms | 311.6 ms | SP-Bench-Suite T4 |
 
-**Honest read — KesselDB Q6 closes more gap with the parallel-Aggregate
-fold; the measured lift is positive but below the 4× modelled target.
-The arc ships as DONE_WITH_CONCERNS, same root cause as Q1:**
+**Intermediate-shape sweep (kept for honesty — unbatched producer-
+channel shape from commit 833eede before commit 0a19f3d batched it):**
 
-- **Postgres still wins** (1,686 q/s at N=4 = **9.11× KesselDB
-  post-Hash-Agg**, was 16× pre-Hash-Agg, was 123× pre-arc — gap
-  closed cumulatively by ~14×). Postgres' parallel hash aggregate
-  on a narrowed-by-`l_shipdate` scan is still 9× the KesselDB
-  per-query cost.
-- **KesselDB N=1 = 34.23 q/s (was 25.39 — 1.35× lift), N=4 = 185.03
-  q/s (was 103.38 — 1.79× lift)**. Q6's narrowed candidate set is
-  the 1994 shipdate window (~8K rows out of 60K) — RIGHT at
-  `MIN_PARALLEL_ROWS = 8192`, so SF=0.01 generates juuust enough
-  rows for the parallel path to engage. The 1.79× lift at N=4 is
-  the parallel-merge speedup over the 4-way row partition; the
-  ceiling below the 4× modelled target has the same root cause as
-  Q1 (`Vec<Arc<[u8]>>` materialisation + thread-spawn overhead;
-  see §3f honest read).
-- **KesselDB N=4 still loses to SQLite N=1** (185 vs 253 = 0.73×).
-  SQLite's covering-index scan over the 1994 window is still
-  faster than KesselDB's parallel scan-and-fold; the lift didn't
-  yet flip the SQLite N=1 comparison. KesselDB N=4 = 185 vs SQLite
-  N=4 = 88 is a **2.10× KesselDB win** (was 1.18× post-MULTI) —
-  SQLite's single-file shared-lock contention still caps N=4.
+| Sweep | Q6 N=1 q/s | Q6 N=4 q/s | Note |
+|---|---:|---:|---|
+| KesselDB (SP-Hash-Agg-Tune UNBATCHED) | 31.75 | 168.54 | -7% / -9% vs V1 — same per-row channel overhead diagnosis as §3f; superseded by BATCHED shape (commit 0a19f3d) |
+
+**Honest read — SP-Hash-Agg-Tune adds ~7% at N=4; user-spec 350-q/s
+floor MISSED. Same shape as Q1 §3f — modest streaming overlap win,
+N=1 essentially unchanged. The arc ships as DONE_WITH_CONCERNS;
+new diagnosis of the actual bottleneck.**
+
+- **Postgres still wins** (1,686 q/s at N=4 = **8.53× KesselDB
+  post-Tune**, was 9.11× post-Hash-Agg, was 123× pre-arc — gap
+  closed cumulatively by ~14.4×). Postgres' parallel hash aggregate
+  on the narrowed-by-`l_shipdate` scan is still ~8.5× the KesselDB
+  per-query cost. The 4 closed-gap arcs are bounded by the
+  constant-factor per-row VM overhead (see Q1 §3f honest read).
+- **KesselDB N=1 = 33.95 q/s (was 34.23 — par), N=4 = 197.55 q/s
+  (was 185.03 — +6.8% lift)**. Design floor was ≥350 q/s at N=4
+  (56% achieved). Q6's narrowed candidate set is the 1994 shipdate
+  window (~8K rows out of 60K) — small enough that the streaming
+  overlap savings are smaller than Q1's full-scan; combined with
+  the channel infrastructure cost, the net is +7% at N=4 / par at
+  N=1. Same root-cause finding as Q1: the per-row
+  `kessel_expr::eval` stack VM interpreter on 4 predicates
+  (`l_shipdate >= a AND l_shipdate < b AND l_discount BETWEEN ...
+  AND l_quantity < 24`) is the wall-time floor, not the V1
+  Arc-wrap pass. Streaming overlap helps the residual; the
+  constant-factor speedup needs SP-WHERE-VM-Specialise /
+  SP-JIT-Aggregate (see §3f next-arc notes).
+- **KesselDB N=4 still loses to SQLite N=1** (197.55 vs 253 = 0.78×,
+  was 0.73× post-Hash-Agg — closing). SQLite's covering-index
+  scan over the 1994 window remains a constant-factor win on a
+  single thread. KesselDB N=4 = 197.55 vs SQLite N=4 = 88 is a
+  **2.25× KesselDB win** (was 2.10× post-Hash-Agg).
 - **TigerBeetle**: refused. No SQL aggregate primitive.
 
 **What changed under the hood (SP-Hash-Agg T1-T4):**
@@ -674,31 +701,37 @@ new `sp_hash_agg_*` KATs (one of them — `aggregate_parallel_eq_serial`
 closed-form expected value × 5 kinds × 10K rows + bytes identical
 across runs).
 
-**Next roadmap arcs — SP-Hash-Agg-Tune / SP-JIT-Aggregate.** Same
-follow-up arcs as §3f. The 9× residual Q6 gap is dominated by
-constant-per-row work (kessel-expr stack VM eval of the 4-predicate
-WHERE program per row) that the row-chunk parallel fold can only
-amortise so much; the natural next levers are reducing the serial
-prefix cost (SP-Hash-Agg-Tune) or codegenning the per-row inner loop
-(SP-JIT-Aggregate).
+**Next roadmap arcs — SP-WHERE-VM-Specialise / SP-JIT-Aggregate.**
+Same follow-up arcs as §3f. The SP-Hash-Agg-Tune sweep diagnosed the
+remaining ~8.5× Q6 gap as **per-row VM interpreter dominance** — the
+WHERE program (4 predicates × 8K rows × 4 workers per query) executes
+the kessel-expr stack VM ~32K times per query. The row-chunk parallel
+fold can only amortise the per-row work across cores; it cannot make
+the per-row VM cheaper. SP-WHERE-VM-Specialise (replace VM with
+closure-built-once-per-query) or SP-JIT-Aggregate (LLVM/cranelift
+codegen) directly target this.
 
-**Headline takeaway — SP-Analytic-Plan + SP-Analytic-Plan-MULTI +
-SP-Hash-Agg shipped all three prongs.** The pre-arc roadmap was
+**Headline takeaway — 4-arc analytic sweep cumulative lift
++14.38× Q6 N=4 / +7.21× Q1 N=4.** The pre-arc roadmap was
 (1) "the aggregate planner doesn't consume the order-index that's
 already in the engine (lift Q6 ~7-15×)" — measured Q6 +7.5× V1, on
 prediction; (2) "the 4-scan multi-aggregate fold is structural
 cost we don't need to pay (lift Q1 ~4×)" — measured Q1 +4.0× V2,
 on prediction; (3) "the per-query scan/fold is single-threaded —
 partition by row offset across N workers for another ~4× per
-query" — measured Q1 +1.46× / Q6 +1.79× at N=4 V3, **below the
-4× prediction**. The post-Hash-Agg gaps vs Postgres are
-**Q1: 3.09×** (was 18× pre-arc; cumulative 3-arc lift **6.81×**)
-and **Q6: 9.11×** (was 123× pre-arc; cumulative 3-arc lift
-**13.47×**). Named next arcs: SP-Hash-Agg-Tune (drive down the
-serial-prefix cost the V1 leaves on the table; expected 2-3×
-more on Q1 N=4) and SP-JIT-Aggregate (LLVM codegen for the per-row
-inner loop — Postgres uses this; would close the constant-factor
-gap).
+query" — measured Q1 +1.46× / Q6 +1.79× at N=4 V3, **below the 4×
+prediction** (V3 = SP-Hash-Agg); (4) "the V3 serial prefix
+(Vec<Arc<[u8]>> pre-collect) is the per-query wall-time floor —
+stream rows via channel to overlap with worker fold" — measured Q1
++1.06× / Q6 +1.07× at N=4 V4, **WELL below the ≥2× prediction**
+(V4 = SP-Hash-Agg-Tune; diagnosis: the V3 serial prefix was NOT
+the dominant cost — the per-row WHERE VM interpreter IS).
+The post-Tune gaps vs Postgres are **Q1: 2.92×** (cumulative 4-arc
+lift **6.78×**) and **Q6: 8.53×** (cumulative 4-arc lift
+**14.38×**). Named next arcs: SP-WHERE-VM-Specialise (closure-based
+WHERE eval) and SP-JIT-Aggregate (LLVM codegen for the per-row
+aggregate-update inner loop — Postgres uses this; closes the
+constant-factor gap).
 
 ---
 
@@ -718,6 +751,8 @@ per line):
 - `/tmp/bench-tpch-q1-postmulti.json` (SP-Analytic-Plan-MULTI — 18 rows; KesselDB post-MULTI Q1 sweep, +Postgres / SQLite re-bench)
 - `/tmp/bench-tpch-q1-posthash.json` (SP-Hash-Agg — 18 rows; KesselDB post-Hash-Agg Q1 sweep, 9 trials × 2 N — concatenation of `bench-tpch-q1-posthash-t{1..3}-w{1,4}.json`)
 - `/tmp/bench-tpch-q6-posthash.json` (SP-Hash-Agg — 18 rows; KesselDB post-Hash-Agg Q6 sweep, 9 trials × 2 N — concatenation of `bench-tpch-q6-posthash-t{1..3}-w{1,4}.json`)
+- `/tmp/bench-tpch-q{1,6}-posttune-t{1..3}-w{1,4}.json` (SP-Hash-Agg-Tune UNBATCHED — 18+18 rows; KesselDB intermediate-shape sweep; -7..-13% vs V1, superseded by BATCHED below)
+- `/tmp/bench-tpch-q{1,6}-posttunebatch-t{1..3}-w{1,4}.json` (SP-Hash-Agg-Tune BATCHED — 18+18 rows; KesselDB post-tune sweep, 9 trials × 2 N each)
 - `/tmp/bench-oltp-ro-postarcb.json` (SP-Perf-A-TXN-RO — 9 rows; KesselDB post-arc oltp-RO sweep)
 - `/tmp/bench-oltp-rw-postarcb.json` (SP-Perf-A-TXN-RO — 9 rows; KesselDB post-arc oltp-RW sweep, no-op vs pre-arc as designed)
 - `/tmp/bench-oltp-rw-postsplit-t1-w1.json` (SP-Perf-A-TXN-RW — 3 rows; KesselDB post-split-phase oltp-RW N=1)

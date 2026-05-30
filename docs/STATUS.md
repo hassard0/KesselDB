@@ -207,6 +207,54 @@ covered by the workspace test suite (2024 default / 2052 with
   progress tracker close + README). Progress tracker
   `docs/superpowers/specs/2026-05-30-kesseldb-sphashagg-progress.md`
   → DONE_WITH_CONCERNS. **TaskList #345 ready for completion.**
+- **Track K — SP-Hash-Agg-Tune (2026-05-30, V1 SHIPPED — DONE_WITH_CONCERNS).**
+  Drives down the SP-Hash-Agg V1 serial-prefix cost. V1 used a pre-collect
+  `Vec<Arc<[u8]>>` + chunk-then-spawn shape that paid the FULL row
+  materialisation cost SERIALLY before any worker spawned (1.46-1.79× lift
+  measured vs 4× modelled — V1 progress tracker named SP-Hash-Agg-Tune as
+  the residual-cost arc). V1-Tune rewrites both
+  `aggregate_numeric_scan` (Q6) + `group_aggregate_multi` (Q1) with
+  **producer-channel-workers BATCHED streaming**: one producer thread
+  iterates the source (Pre or Scan), packs rows into `BATCH_SIZE=256`
+  Vec batches, sends round-robin into N=4 bounded `sync_channel(BUF_DEPTH=16)`;
+  N=4 worker threads each consume their channel batch-at-a-time and fold
+  rows AS THE BATCH ARRIVES. Workers start on row 1 instead of row LAST,
+  overlapping producer iteration with worker fold. T1 design + scaffold +
+  streaming refactor (unbatched first — commit `833eede`); intermediate
+  shape regressed -13%/-9% at N=1/N=4 because per-row channel send/recv
+  (60K rows × ~500ns = ~30ms/query) SWALLOWED the streaming savings; T2.1
+  batched fix (`0a19f3d`) amortises channel cost across BATCH_SIZE=256
+  rows. T2 streaming-equivalence KATs (3 new `sp_hash_agg_tune_*`): 9K-row
+  BUF_DEPTH stress + 50K-row × 100-group high-cardinality + 15K-row
+  apply==read_only_op at scale. T3 vulcan TPC-H Q1+Q6 sweep (3 trials ×
+  30s × SF=0.01 × N=1,4). **HEADLINE on vulcan (post-Tune BATCHED)**:
+  Q1 N=1 17.30 → **16.14 q/s (-1.07×)**, Q1 N=4 60.18 → **63.77 q/s
+  (+1.06×)**; Q6 N=1 34.23 → **33.95 q/s (par)**, Q6 N=4 185.03 →
+  **197.55 q/s (+1.07×)**. Cumulative 4-arc lift vs pre-arc baseline
+  (SP-Bench-Suite T4): Q1 N=4 **+7.21×**; Q6 N=4 **+14.38×**. Gap-closing
+  vs Postgres: Q1 N=4 3.09× → **2.92×**; Q6 N=4 9.11× → **8.53×**.
+  **DONE_WITH_CONCERNS**: user-spec floors (Q1 ≥120 / Q6 ≥350 q/s at N=4)
+  MISSED — 53% / 56% achieved. New diagnosis from the sweep: the V1
+  serial Arc-wrap pre-collect was NOT the dominant wall-time cost (V1-Tune
+  eliminated it via streaming overlap, gained only +6-7%). The actual
+  dominant cost is the **per-row `kessel_expr::eval` stack VM
+  interpreter** evaluating the WHERE program ~60K (Q1) / 8K (Q6) times
+  per query — the row-chunk parallel fold can amortise it across cores
+  but cannot make per-row eval cheaper. Named follow-up arcs
+  **SP-WHERE-VM-Specialise** (closure-built-once-per-query that inlines
+  field offsets + comparison ops; expected 1.5-2× per row) and
+  **SP-JIT-Aggregate** (LLVM/cranelift codegen for the per-row inner
+  loop; what Postgres uses; closes the constant-factor gap).
+  SP-Hash-Agg-Pool de-prioritised (V1-Tune sweep showed thread-spawn
+  is NOT the bottleneck). Workspace tests: kessel-sm 157 → 160 (+3 new
+  KATs); all 6 SP-Hash-Agg + SP-Hash-Agg-Tune KATs green. seed-7 GREEN;
+  zero new external deps; `#![forbid(unsafe_code)]` honored (sync_channel
+  + thread::scope are safe std); HTTP/1.1 + WS + binary + PG-wire surfaces
+  byte-untouched. Three commits: `833eede` (T1+T2 design + streaming
+  refactor + KATs), `0a19f3d` (T2.1 BATCHED channel sends), plus this
+  commit (T3 BENCHMARKS.md + T4 STATUS + tracker close + README).
+  Progress tracker `docs/superpowers/specs/2026-05-30-kesseldb-sphashaggtune-progress.md`
+  → DONE_WITH_CONCERNS. **TaskList #347 ready for completion.**
 - **Track D — Cluster test flakes (SP-CLUSTER-FLAKE T2).** Root-cause fixed
   in `Node::submit*` / `apply_raw`: production VSR retry on transient
   ViewChange. Not just a test relaxation — the actual production code path

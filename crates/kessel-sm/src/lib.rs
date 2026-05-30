@@ -1385,6 +1385,115 @@ impl<V: Vfs> StateMachine<V> {
     ///
     /// Determinism: reads are pure functions of committed state. The T3
     /// oracle compares parallel vs serial results byte-for-byte.
+    /// SP-Analytic-Plan T2 helper. Given `range_preds: Vec<(field_id,
+    /// op, value)>` (`op` 0=`>` 1=`>=` 2=`<` 3=`<=`) on order-indexed
+    /// fields, intersect candidate row-ids via the existing ordered-
+    /// index keyspace (`0xFFFD` numeric or `0xFFFC` variable-length).
+    /// Returns:
+    ///   - `None` if `range_preds.is_empty()` or no field is usable —
+    ///     caller falls back to full-scan.
+    ///   - `Some(set)` if at least one field narrowed (the set is the
+    ///     intersection across all usable fields).
+    /// Hints on fields that are NOT order-indexed are silently ignored
+    /// (same shape as `Op::QueryRows`'s existing pattern). The caller
+    /// still re-verifies every candidate with the WHERE program, so an
+    /// over-permissive candidate set is fine.
+    fn narrow_by_range_preds(
+        &self,
+        type_id: u32,
+        ot: &kessel_catalog::ObjectType,
+        range_preds: &[(u16, u8, Vec<u8>)],
+    ) -> Option<std::collections::BTreeSet<[u8; 16]>> {
+        if range_preds.is_empty() {
+            return None;
+        }
+        let rfields: std::collections::BTreeSet<u16> =
+            range_preds.iter().map(|(f, _, _)| *f).collect();
+        let mut cand: Option<std::collections::BTreeSet<[u8; 16]>> = None;
+        for fid in rfields {
+            if !ot.ordered.contains(&fid) {
+                continue;
+            }
+            let (klo, khi) = if let Some((_, w, kind)) =
+                Self::ord_field_pos(ot, fid)
+            {
+                let mut lo_ok = [0u8; 8];
+                let mut hi_ok = [0xFFu8; 8];
+                let mut usable = false;
+                for (f, rop, val) in range_preds {
+                    if *f != fid {
+                        continue;
+                    }
+                    let vk = match Self::order_key(kind, &Self::norm(val, w)) {
+                        Some(k) => k,
+                        None => continue,
+                    };
+                    match *rop {
+                        0 | 1 if vk > lo_ok => lo_ok = vk,
+                        2 | 3 if vk < hi_ok => hi_ok = vk,
+                        0..=3 => {}
+                        _ => continue,
+                    }
+                    usable = true;
+                }
+                if !usable {
+                    continue;
+                }
+                let idxt = 0xFFFD_0000 | (type_id & 0xFFFF);
+                let mut a = [0u8; 16];
+                a[..2].copy_from_slice(&fid.to_le_bytes());
+                a[2..10].copy_from_slice(&lo_ok);
+                let mut b = [0u8; 16];
+                b[..2].copy_from_slice(&fid.to_le_bytes());
+                b[2..10].copy_from_slice(&hi_ok);
+                b[10..].copy_from_slice(&[0xFFu8; 6]);
+                (make_key(idxt, &a), make_key(idxt, &b))
+            } else if let Some((_, w, k)) = Self::vord_field_pos(ot, fid) {
+                let mut lo_v = vec![0u8; w];
+                let mut hi_v = vec![0xFFu8; w];
+                let mut usable = false;
+                for (f, rop, val) in range_preds {
+                    if *f != fid {
+                        continue;
+                    }
+                    let vk = Self::vorder_key(k, val, w);
+                    match *rop {
+                        0 | 1 if vk > lo_v => lo_v = vk,
+                        2 | 3 if vk < hi_v => hi_v = vk,
+                        0..=3 => {}
+                        _ => continue,
+                    }
+                    usable = true;
+                }
+                if !usable {
+                    continue;
+                }
+                (
+                    Self::voidx_key(type_id, fid, &lo_v),
+                    Self::voidx_key(type_id, fid, &hi_v),
+                )
+            } else {
+                continue;
+            };
+            let mut ids: std::collections::BTreeSet<[u8; 16]> =
+                std::collections::BTreeSet::new();
+            for (_, entry) in self.storage.scan_range(&klo, &khi) {
+                for ch in entry.chunks(16) {
+                    if ch.len() == 16 {
+                        let mut a = [0u8; 16];
+                        a.copy_from_slice(ch);
+                        ids.insert(a);
+                    }
+                }
+            }
+            cand = Some(match cand {
+                None => ids,
+                Some(prev) => prev.intersection(&ids).copied().collect(),
+            });
+        }
+        cand
+    }
+
     pub fn read_only_op(&self, op: Op) -> OpResult {
         match op {
             Op::GetById { type_id, id } => {
@@ -1874,11 +1983,14 @@ impl<V: Vfs> StateMachine<V> {
                 }
                 OpResult::Got(out.into())
             }
-            Op::Aggregate { type_id, program, kind, field_id, range_preds: _range_preds } => {
+            Op::Aggregate { type_id, program, kind, field_id, range_preds } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
                     None => return OpResult::SchemaError(format!("no type {type_id}")),
                 };
+                // SP-Analytic-Plan: narrow scan via order-index when
+                // range hints present. None ⇒ full-scan (back-compat).
+                let cand = self.narrow_by_range_preds(type_id, &ot, &range_preds);
                 if (kind == 2 || kind == 3)
                     && Self::ord_field_pos(&ot, field_id).is_none()
                 {
@@ -1898,7 +2010,10 @@ impl<V: Vfs> StateMachine<V> {
                             .push_int(1)
                             .bytes()
                             .as_slice();
-                    if uncond && ot.ordered.contains(&field_id) {
+                    // SP-Analytic-Plan: skip the index-extreme fast path
+                    // when range hints are present — the narrowed set
+                    // may exclude the global extreme.
+                    if uncond && ot.ordered.contains(&field_id) && cand.is_none() {
                         return match self.agg_extreme_var(
                             type_id,
                             field_id,
@@ -1910,23 +2025,11 @@ impl<V: Vfs> StateMachine<V> {
                             None => OpResult::Got(Vec::<u8>::new().into()),
                         };
                     }
-                    let lo = make_key(type_id, &[0u8; 16]);
-                    let hi = make_key(type_id, &[0xFFu8; 16]);
                     let mut best: Option<Vec<u8>> = None;
-                    for (_, rec) in self.storage.scan_range(&lo, &hi) {
-                        if !uncond {
-                            match kessel_expr::eval(&program, &ot, &rec) {
-                                Ok(true) => {}
-                                Ok(false) => continue,
-                                Err(e) => {
-                                    return OpResult::SchemaError(format!(
-                                        "agg program: {e:?}"
-                                    ))
-                                }
-                            }
-                        }
+                    // Helper to fold one record into the running extreme.
+                    let fold = |rec: &[u8], best: &mut Option<Vec<u8>>| {
                         if let Some(raw) = rec.get(off..off + w) {
-                            best = Some(match best {
+                            *best = Some(match best.take() {
                                 None => raw.to_vec(),
                                 Some(b) => {
                                     let ord = Self::cmp_field(fk, raw, &b);
@@ -1938,6 +2041,46 @@ impl<V: Vfs> StateMachine<V> {
                                     if take { raw.to_vec() } else { b }
                                 }
                             });
+                        }
+                    };
+                    match &cand {
+                        Some(ids) => {
+                            for id in ids {
+                                let rec = match self.storage.get(&make_key(type_id, id)) {
+                                    Some(r) => r,
+                                    None => continue,
+                                };
+                                if !uncond {
+                                    match kessel_expr::eval(&program, &ot, &rec) {
+                                        Ok(true) => {}
+                                        Ok(false) => continue,
+                                        Err(e) => {
+                                            return OpResult::SchemaError(format!(
+                                                "agg program: {e:?}"
+                                            ))
+                                        }
+                                    }
+                                }
+                                fold(&rec, &mut best);
+                            }
+                        }
+                        None => {
+                            let lo = make_key(type_id, &[0u8; 16]);
+                            let hi = make_key(type_id, &[0xFFu8; 16]);
+                            for (_, rec) in self.storage.scan_range(&lo, &hi) {
+                                if !uncond {
+                                    match kessel_expr::eval(&program, &ot, &rec) {
+                                        Ok(true) => {}
+                                        Ok(false) => continue,
+                                        Err(e) => {
+                                            return OpResult::SchemaError(format!(
+                                                "agg program: {e:?}"
+                                            ))
+                                        }
+                                    }
+                                }
+                                fold(&rec, &mut best);
+                            }
                         }
                     }
                     return OpResult::Got(best.unwrap_or_default().into());
@@ -1966,7 +2109,7 @@ impl<V: Vfs> StateMachine<V> {
                 };
                 let uncond = program
                     == kessel_expr::Program::new().push_int(1).bytes().as_slice();
-                if uncond {
+                if uncond && cand.is_none() {
                     if let (Some((off, w, fk)), true) =
                         (fpos, kind == 2 || kind == 3)
                     {
@@ -1982,33 +2125,60 @@ impl<V: Vfs> StateMachine<V> {
                         }
                     }
                 }
-                let lo = make_key(type_id, &[0u8; 16]);
-                let hi = make_key(type_id, &[0xFFu8; 16]);
                 let mut count: i128 = 0;
                 let mut sum: i128 = 0;
                 let mut mn: Option<i128> = None;
                 let mut mx: Option<i128> = None;
-                for (_, rec) in self.storage.scan_range(&lo, &hi) {
-                    if !uncond {
-                        match kessel_expr::eval(&program, &ot, &rec) {
-                            Ok(true) => {}
-                            Ok(false) => continue,
-                            Err(e) => {
-                                return OpResult::SchemaError(format!(
-                                    "agg program: {e:?}"
-                                ))
-                            }
-                        }
-                    }
-                    count += 1;
+                let mut fold_rec = |rec: &[u8], count: &mut i128, sum: &mut i128, mn: &mut Option<i128>, mx: &mut Option<i128>| {
+                    *count += 1;
                     if let Some((off, w, fk)) = fpos {
                         if let Some(raw) = rec.get(off..off + w) {
                             use kessel_catalog::FieldKind::*;
                             let signed = matches!(fk, I8 | I16 | I32 | I64 | Fixed { .. });
                             let v = decode_i128(raw, w, signed);
-                            sum = sum.wrapping_add(v);
-                            mn = Some(mn.map_or(v, |m| m.min(v)));
-                            mx = Some(mx.map_or(v, |m| m.max(v)));
+                            *sum = sum.wrapping_add(v);
+                            *mn = Some(mn.map_or(v, |m| m.min(v)));
+                            *mx = Some(mx.map_or(v, |m| m.max(v)));
+                        }
+                    }
+                };
+                match &cand {
+                    Some(ids) => {
+                        for id in ids {
+                            let rec = match self.storage.get(&make_key(type_id, id)) {
+                                Some(r) => r,
+                                None => continue,
+                            };
+                            if !uncond {
+                                match kessel_expr::eval(&program, &ot, &rec) {
+                                    Ok(true) => {}
+                                    Ok(false) => continue,
+                                    Err(e) => {
+                                        return OpResult::SchemaError(format!(
+                                            "agg program: {e:?}"
+                                        ))
+                                    }
+                                }
+                            }
+                            fold_rec(&rec, &mut count, &mut sum, &mut mn, &mut mx);
+                        }
+                    }
+                    None => {
+                        let lo = make_key(type_id, &[0u8; 16]);
+                        let hi = make_key(type_id, &[0xFFu8; 16]);
+                        for (_, rec) in self.storage.scan_range(&lo, &hi) {
+                            if !uncond {
+                                match kessel_expr::eval(&program, &ot, &rec) {
+                                    Ok(true) => {}
+                                    Ok(false) => continue,
+                                    Err(e) => {
+                                        return OpResult::SchemaError(format!(
+                                            "agg program: {e:?}"
+                                        ))
+                                    }
+                                }
+                            }
+                            fold_rec(&rec, &mut count, &mut sum, &mut mn, &mut mx);
                         }
                     }
                 }
@@ -2080,11 +2250,14 @@ impl<V: Vfs> StateMachine<V> {
                 }
                 OpResult::Got(out.into())
             }
-            Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds: _range_preds } => {
+            Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
                     None => return OpResult::SchemaError(format!("no type {type_id}")),
                 };
+                // SP-Analytic-Plan: narrow scan via order-index when
+                // range hints present. None ⇒ full-scan (back-compat).
+                let cand = self.narrow_by_range_preds(type_id, &ot, &range_preds);
                 let layout = ot.compute_layout();
                 let gpos = match ot.fields.iter().position(|f| f.field_id == group_field) {
                     Some(i) => (layout.offsets[i], ot.fields[i].kind.width() as usize),
@@ -2118,23 +2291,10 @@ impl<V: Vfs> StateMachine<V> {
                 > = std::collections::BTreeMap::new();
                 let uncond = program
                     == kessel_expr::Program::new().push_int(1).bytes().as_slice();
-                let lo = make_key(type_id, &[0u8; 16]);
-                let hi = make_key(type_id, &[0xFFu8; 16]);
-                for (_, rec) in self.storage.scan_range(&lo, &hi) {
-                    if !uncond {
-                        match kessel_expr::eval(&program, &ot, &rec) {
-                            Ok(true) => {}
-                            Ok(false) => continue,
-                            Err(e) => {
-                                return OpResult::SchemaError(format!(
-                                    "group program: {e:?}"
-                                ))
-                            }
-                        }
-                    }
+                let mut fold_rec = |rec: &[u8], groups: &mut std::collections::BTreeMap<Vec<u8>, (i128, i128, Option<i128>, Option<i128>)>| {
                     let gkey = match rec.get(gpos.0..gpos.0 + gpos.1) {
                         Some(b) => b.to_vec(),
-                        None => continue,
+                        None => return,
                     };
                     let e = groups.entry(gkey).or_insert((0, 0, None, None));
                     e.0 += 1;
@@ -2146,6 +2306,46 @@ impl<V: Vfs> StateMachine<V> {
                             e.1 = e.1.wrapping_add(v);
                             e.2 = Some(e.2.map_or(v, |m| m.min(v)));
                             e.3 = Some(e.3.map_or(v, |m| m.max(v)));
+                        }
+                    }
+                };
+                match &cand {
+                    Some(ids) => {
+                        for id in ids {
+                            let rec = match self.storage.get(&make_key(type_id, id)) {
+                                Some(r) => r,
+                                None => continue,
+                            };
+                            if !uncond {
+                                match kessel_expr::eval(&program, &ot, &rec) {
+                                    Ok(true) => {}
+                                    Ok(false) => continue,
+                                    Err(e) => {
+                                        return OpResult::SchemaError(format!(
+                                            "group program: {e:?}"
+                                        ))
+                                    }
+                                }
+                            }
+                            fold_rec(&rec, &mut groups);
+                        }
+                    }
+                    None => {
+                        let lo = make_key(type_id, &[0u8; 16]);
+                        let hi = make_key(type_id, &[0xFFu8; 16]);
+                        for (_, rec) in self.storage.scan_range(&lo, &hi) {
+                            if !uncond {
+                                match kessel_expr::eval(&program, &ot, &rec) {
+                                    Ok(true) => {}
+                                    Ok(false) => continue,
+                                    Err(e) => {
+                                        return OpResult::SchemaError(format!(
+                                            "group program: {e:?}"
+                                        ))
+                                    }
+                                }
+                            }
+                            fold_rec(&rec, &mut groups);
                         }
                     }
                 }
@@ -4374,11 +4574,14 @@ impl<V: Vfs> StateMachine<V> {
             // Current body uses legacy 20-byte data-row keyspace (scan_range + reduce);
             // T2.C rewrites against data_row_scan(type_id, u64::MAX) per Decision 4
             // (composite read arm, per-statement auto-commit).
-            Op::Aggregate { type_id, program, kind, field_id, range_preds: _range_preds } => {
+            Op::Aggregate { type_id, program, kind, field_id, range_preds } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
                     None => return OpResult::SchemaError(format!("no type {type_id}")),
                 };
+                // SP-Analytic-Plan: narrow scan via order-index when
+                // range hints present. None ⇒ full-scan (back-compat).
+                let cand = self.narrow_by_range_preds(type_id, &ot, &range_preds);
                 // #73: MIN/MAX over a CHAR/BYTES/U128/I128 column (the
                 // SP87/SP91 `0xFFFC` keyspace). Self-contained early
                 // return; the numeric ≤8B path below is unchanged.
@@ -4404,7 +4607,9 @@ impl<V: Vfs> StateMachine<V> {
                             .as_slice();
                     // Fast path: no filter + an ordered index ⇒ read
                     // the index extreme (never changes the answer).
-                    if uncond && ot.ordered.contains(&field_id) {
+                    // SP-Analytic-Plan: only when no range narrowing
+                    // (a narrowed set may exclude the global extreme).
+                    if uncond && ot.ordered.contains(&field_id) && cand.is_none() {
                         return match self.agg_extreme_var(
                             type_id,
                             field_id,
@@ -4418,23 +4623,10 @@ impl<V: Vfs> StateMachine<V> {
                     }
                     // Slow path (the oracle): scan + filter, track the
                     // extreme raw bytes via the kind-correct comparator.
-                    let lo = make_key(type_id, &[0u8; 16]);
-                    let hi = make_key(type_id, &[0xFFu8; 16]);
                     let mut best: Option<Vec<u8>> = None;
-                    for (_, rec) in self.storage.scan_range(&lo, &hi) {
-                        if !uncond {
-                            match kessel_expr::eval(&program, &ot, &rec) {
-                                Ok(true) => {}
-                                Ok(false) => continue,
-                                Err(e) => {
-                                    return OpResult::SchemaError(format!(
-                                        "agg program: {e:?}"
-                                    ))
-                                }
-                            }
-                        }
+                    let fold = |rec: &[u8], best: &mut Option<Vec<u8>>| {
                         if let Some(raw) = rec.get(off..off + w) {
-                            best = Some(match best {
+                            *best = Some(match best.take() {
                                 None => raw.to_vec(),
                                 Some(b) => {
                                     let ord = Self::cmp_field(fk, raw, &b);
@@ -4446,6 +4638,46 @@ impl<V: Vfs> StateMachine<V> {
                                     if take { raw.to_vec() } else { b }
                                 }
                             });
+                        }
+                    };
+                    match &cand {
+                        Some(ids) => {
+                            for id in ids {
+                                let rec = match self.storage.get(&make_key(type_id, id)) {
+                                    Some(r) => r,
+                                    None => continue,
+                                };
+                                if !uncond {
+                                    match kessel_expr::eval(&program, &ot, &rec) {
+                                        Ok(true) => {}
+                                        Ok(false) => continue,
+                                        Err(e) => {
+                                            return OpResult::SchemaError(format!(
+                                                "agg program: {e:?}"
+                                            ))
+                                        }
+                                    }
+                                }
+                                fold(&rec, &mut best);
+                            }
+                        }
+                        None => {
+                            let lo = make_key(type_id, &[0u8; 16]);
+                            let hi = make_key(type_id, &[0xFFu8; 16]);
+                            for (_, rec) in self.storage.scan_range(&lo, &hi) {
+                                if !uncond {
+                                    match kessel_expr::eval(&program, &ot, &rec) {
+                                        Ok(true) => {}
+                                        Ok(false) => continue,
+                                        Err(e) => {
+                                            return OpResult::SchemaError(format!(
+                                                "agg program: {e:?}"
+                                            ))
+                                        }
+                                    }
+                                }
+                                fold(&rec, &mut best);
+                            }
                         }
                     }
                     return OpResult::Got(best.unwrap_or_default().into());
@@ -4482,7 +4714,7 @@ impl<V: Vfs> StateMachine<V> {
                 // accelerators — the slow path below is the oracle.
                 let uncond = program
                     == kessel_expr::Program::new().push_int(1).bytes().as_slice();
-                if uncond {
+                if uncond && cand.is_none() {
                     if let (Some((off, w, fk)), true) =
                         (fpos, kind == 2 || kind == 3)
                     {
@@ -4498,33 +4730,60 @@ impl<V: Vfs> StateMachine<V> {
                         }
                     }
                 }
-                let lo = make_key(type_id, &[0u8; 16]);
-                let hi = make_key(type_id, &[0xFFu8; 16]);
                 let mut count: i128 = 0;
                 let mut sum: i128 = 0;
                 let mut mn: Option<i128> = None;
                 let mut mx: Option<i128> = None;
-                for (_, rec) in self.storage.scan_range(&lo, &hi) {
-                    if !uncond {
-                        match kessel_expr::eval(&program, &ot, &rec) {
-                            Ok(true) => {}
-                            Ok(false) => continue,
-                            Err(e) => {
-                                return OpResult::SchemaError(format!(
-                                    "agg program: {e:?}"
-                                ))
-                            }
-                        }
-                    }
-                    count += 1;
+                let mut fold_rec = |rec: &[u8], count: &mut i128, sum: &mut i128, mn: &mut Option<i128>, mx: &mut Option<i128>| {
+                    *count += 1;
                     if let Some((off, w, fk)) = fpos {
                         if let Some(raw) = rec.get(off..off + w) {
                             use kessel_catalog::FieldKind::*;
                             let signed = matches!(fk, I8 | I16 | I32 | I64 | Fixed { .. });
                             let v = decode_i128(raw, w, signed);
-                            sum = sum.wrapping_add(v);
-                            mn = Some(mn.map_or(v, |m| m.min(v)));
-                            mx = Some(mx.map_or(v, |m| m.max(v)));
+                            *sum = sum.wrapping_add(v);
+                            *mn = Some(mn.map_or(v, |m| m.min(v)));
+                            *mx = Some(mx.map_or(v, |m| m.max(v)));
+                        }
+                    }
+                };
+                match &cand {
+                    Some(ids) => {
+                        for id in ids {
+                            let rec = match self.storage.get(&make_key(type_id, id)) {
+                                Some(r) => r,
+                                None => continue,
+                            };
+                            if !uncond {
+                                match kessel_expr::eval(&program, &ot, &rec) {
+                                    Ok(true) => {}
+                                    Ok(false) => continue,
+                                    Err(e) => {
+                                        return OpResult::SchemaError(format!(
+                                            "agg program: {e:?}"
+                                        ))
+                                    }
+                                }
+                            }
+                            fold_rec(&rec, &mut count, &mut sum, &mut mn, &mut mx);
+                        }
+                    }
+                    None => {
+                        let lo = make_key(type_id, &[0u8; 16]);
+                        let hi = make_key(type_id, &[0xFFu8; 16]);
+                        for (_, rec) in self.storage.scan_range(&lo, &hi) {
+                            if !uncond {
+                                match kessel_expr::eval(&program, &ot, &rec) {
+                                    Ok(true) => {}
+                                    Ok(false) => continue,
+                                    Err(e) => {
+                                        return OpResult::SchemaError(format!(
+                                            "agg program: {e:?}"
+                                        ))
+                                    }
+                                }
+                            }
+                            fold_rec(&rec, &mut count, &mut sum, &mut mn, &mut mx);
                         }
                     }
                 }
@@ -4608,11 +4867,14 @@ impl<V: Vfs> StateMachine<V> {
             // Current body uses legacy 20-byte data-row keyspace; T2.C rewrites against
             // data_row_scan(type_id, u64::MAX) per Decision 4 (read arm,
             // per-statement auto-commit at u64::MAX snapshot).
-            Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds: _range_preds } => {
+            Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
                     None => return OpResult::SchemaError(format!("no type {type_id}")),
                 };
+                // SP-Analytic-Plan: narrow scan via order-index when
+                // range hints present. None ⇒ full-scan (back-compat).
+                let cand = self.narrow_by_range_preds(type_id, &ot, &range_preds);
                 let layout = ot.compute_layout();
                 let gpos = match ot.fields.iter().position(|f| f.field_id == group_field) {
                     Some(i) => (layout.offsets[i], ot.fields[i].kind.width() as usize),
@@ -4652,23 +4914,10 @@ impl<V: Vfs> StateMachine<V> {
                 // still read by offset, result is identical.
                 let uncond = program
                     == kessel_expr::Program::new().push_int(1).bytes().as_slice();
-                let lo = make_key(type_id, &[0u8; 16]);
-                let hi = make_key(type_id, &[0xFFu8; 16]);
-                for (_, rec) in self.storage.scan_range(&lo, &hi) {
-                    if !uncond {
-                        match kessel_expr::eval(&program, &ot, &rec) {
-                            Ok(true) => {}
-                            Ok(false) => continue,
-                            Err(e) => {
-                                return OpResult::SchemaError(format!(
-                                    "group program: {e:?}"
-                                ))
-                            }
-                        }
-                    }
+                let mut fold_rec = |rec: &[u8], groups: &mut std::collections::BTreeMap<Vec<u8>, (i128, i128, Option<i128>, Option<i128>)>| {
                     let gkey = match rec.get(gpos.0..gpos.0 + gpos.1) {
                         Some(b) => b.to_vec(),
-                        None => continue,
+                        None => return,
                     };
                     let e = groups.entry(gkey).or_insert((0, 0, None, None));
                     e.0 += 1;
@@ -4680,6 +4929,46 @@ impl<V: Vfs> StateMachine<V> {
                             e.1 = e.1.wrapping_add(v);
                             e.2 = Some(e.2.map_or(v, |m| m.min(v)));
                             e.3 = Some(e.3.map_or(v, |m| m.max(v)));
+                        }
+                    }
+                };
+                match &cand {
+                    Some(ids) => {
+                        for id in ids {
+                            let rec = match self.storage.get(&make_key(type_id, id)) {
+                                Some(r) => r,
+                                None => continue,
+                            };
+                            if !uncond {
+                                match kessel_expr::eval(&program, &ot, &rec) {
+                                    Ok(true) => {}
+                                    Ok(false) => continue,
+                                    Err(e) => {
+                                        return OpResult::SchemaError(format!(
+                                            "group program: {e:?}"
+                                        ))
+                                    }
+                                }
+                            }
+                            fold_rec(&rec, &mut groups);
+                        }
+                    }
+                    None => {
+                        let lo = make_key(type_id, &[0u8; 16]);
+                        let hi = make_key(type_id, &[0xFFu8; 16]);
+                        for (_, rec) in self.storage.scan_range(&lo, &hi) {
+                            if !uncond {
+                                match kessel_expr::eval(&program, &ot, &rec) {
+                                    Ok(true) => {}
+                                    Ok(false) => continue,
+                                    Err(e) => {
+                                        return OpResult::SchemaError(format!(
+                                            "group program: {e:?}"
+                                        ))
+                                    }
+                                }
+                            }
+                            fold_rec(&rec, &mut groups);
                         }
                     }
                 }
@@ -8478,6 +8767,205 @@ mod tests {
         let (b, _, _) = build();
         assert_eq!(before, after, "GroupAggregate must not mutate state");
         assert_eq!(a, b, "GroupAggregate must be deterministic");
+    }
+
+    /// SP-Analytic-Plan T2: range_preds-narrowed Op::Aggregate is byte-
+    /// identical to the full-scan oracle on the same data. The range
+    /// hint narrows the candidate set; the WHERE program (which still
+    /// runs on every candidate) verifies — so the math is identical.
+    /// Build: 100 rows with `v` in [0, 100). Add an ordered index on
+    /// field 3 (`v`). For each kind/range pair we run the SAME
+    /// Op::Aggregate WHERE PROGRAM, twice: once with `range_preds:
+    /// vec![]` (full-scan oracle), once with the equivalent half-range
+    /// hints. Result bytes MUST match. Both read_only_op + apply paths
+    /// covered.
+    #[test]
+    fn sp_analytic_plan_aggregate_range_preds_equivalent_to_full_scan() {
+        use kessel_expr::Program;
+        let build_sm = || {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            sm.apply(1, Op::CreateType { def: q_type_def() });
+            sm.apply(2, Op::AddOrderedIndex { type_id: 1, field_id: 3 });
+            for i in 0..100u64 {
+                sm.apply(10 + i, Op::Create {
+                    type_id: 1, id: ObjectId::from_u128(i as u128),
+                    record: qrec((i % 7) as u32, 0, i as u32),
+                });
+            }
+            sm
+        };
+        // Pre-build a kessel-expr program that filters v >= lo AND v < hi
+        // (mirrors the planner's emission for the same WHERE).
+        let prog_v_range = |lo: u32, hi: u32| -> Vec<u8> {
+            Program::new()
+                .load(3).push_int(lo as i128).ge()
+                .load(3).push_int(hi as i128).lt()
+                .and()
+                .bytes()
+        };
+        // (kind label, lo, hi)
+        let cases: &[(u8, u32, u32, &str)] = &[
+            (0, 20, 60, "COUNT v in [20,60)"),
+            (1, 20, 60, "SUM v in [20,60)"),
+            (2, 20, 60, "MIN v in [20,60)"),
+            (3, 20, 60, "MAX v in [20,60)"),
+            (4, 20, 60, "AVG v in [20,60)"),
+            (0, 99, 100, "COUNT v in [99,100) — singleton"),
+            (1, 1000, 2000, "SUM v in [1000,2000) — empty"),
+            (0, 0, 100, "COUNT v in [0,100) — full"),
+        ];
+        let mut sm = build_sm();
+        for (k, lo, hi, label) in cases {
+            let p = prog_v_range(*lo, *hi);
+            // Oracle: full-scan (empty range_preds).
+            let oracle = match sm.apply(1000, Op::Aggregate {
+                type_id: 1, program: p.clone(), kind: *k, field_id: 3,
+                range_preds: vec![],
+            }) {
+                OpResult::Got(b) => b.to_vec(),
+                o => panic!("oracle {label}: {o:?}"),
+            };
+            // Narrowed: v >= lo (op=1) AND v < hi (op=2).
+            let narrowed = match sm.apply(1001, Op::Aggregate {
+                type_id: 1, program: p.clone(), kind: *k, field_id: 3,
+                range_preds: vec![
+                    (3u16, 1u8, (*lo).to_le_bytes().to_vec()),
+                    (3u16, 2u8, (*hi).to_le_bytes().to_vec()),
+                ],
+            }) {
+                OpResult::Got(b) => b.to_vec(),
+                o => panic!("narrowed {label}: {o:?}"),
+            };
+            assert_eq!(narrowed, oracle, "Aggregate (apply) range_preds-narrowed != full-scan oracle for {label}");
+            // Same via read_only_op (the parallel-read path).
+            let oracle_ro = match sm.read_only_op(Op::Aggregate {
+                type_id: 1, program: p.clone(), kind: *k, field_id: 3,
+                range_preds: vec![],
+            }) {
+                OpResult::Got(b) => b.to_vec(),
+                o => panic!("oracle_ro {label}: {o:?}"),
+            };
+            let narrowed_ro = match sm.read_only_op(Op::Aggregate {
+                type_id: 1, program: p.clone(), kind: *k, field_id: 3,
+                range_preds: vec![
+                    (3u16, 1u8, (*lo).to_le_bytes().to_vec()),
+                    (3u16, 2u8, (*hi).to_le_bytes().to_vec()),
+                ],
+            }) {
+                OpResult::Got(b) => b.to_vec(),
+                o => panic!("narrowed_ro {label}: {o:?}"),
+            };
+            assert_eq!(narrowed_ro, oracle_ro, "Aggregate (read_only_op) range_preds != full-scan for {label}");
+            assert_eq!(narrowed, narrowed_ro, "Aggregate apply vs read_only_op diverged for {label}");
+        }
+    }
+
+    /// SP-Analytic-Plan T2: range_preds-narrowed Op::GroupAggregate is
+    /// byte-identical to the full-scan oracle on the same data. Same
+    /// data shape as the scalar test, group by `owner` (field 1).
+    #[test]
+    fn sp_analytic_plan_group_aggregate_range_preds_equivalent_to_full_scan() {
+        use kessel_expr::Program;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: q_type_def() });
+        sm.apply(2, Op::AddOrderedIndex { type_id: 1, field_id: 3 });
+        for i in 0..100u64 {
+            sm.apply(10 + i, Op::Create {
+                type_id: 1, id: ObjectId::from_u128(i as u128),
+                record: qrec((i % 5) as u32, 0, i as u32),
+            });
+        }
+        let prog_v_range = |lo: u32, hi: u32| -> Vec<u8> {
+            Program::new()
+                .load(3).push_int(lo as i128).ge()
+                .load(3).push_int(hi as i128).lt()
+                .and()
+                .bytes()
+        };
+        let cases: &[(u8, u32, u32, &str)] = &[
+            (0, 20, 60, "GROUP COUNT v in [20,60)"),
+            (1, 20, 60, "GROUP SUM v in [20,60)"),
+            (2, 20, 60, "GROUP MIN v in [20,60)"),
+            (3, 20, 60, "GROUP MAX v in [20,60)"),
+            (0, 0, 100, "GROUP COUNT v in [0,100) — full"),
+            (1, 1000, 2000, "GROUP SUM v in [1000,2000) — empty"),
+        ];
+        for (k, lo, hi, label) in cases {
+            let p = prog_v_range(*lo, *hi);
+            let oracle = match sm.apply(2000, Op::GroupAggregate {
+                type_id: 1, program: p.clone(), group_field: 1, kind: *k, agg_field: 3,
+                range_preds: vec![],
+            }) {
+                OpResult::Got(b) => b.to_vec(),
+                o => panic!("oracle {label}: {o:?}"),
+            };
+            let narrowed = match sm.apply(2001, Op::GroupAggregate {
+                type_id: 1, program: p.clone(), group_field: 1, kind: *k, agg_field: 3,
+                range_preds: vec![
+                    (3u16, 1u8, (*lo).to_le_bytes().to_vec()),
+                    (3u16, 2u8, (*hi).to_le_bytes().to_vec()),
+                ],
+            }) {
+                OpResult::Got(b) => b.to_vec(),
+                o => panic!("narrowed {label}: {o:?}"),
+            };
+            assert_eq!(narrowed, oracle, "GroupAggregate (apply) range_preds != full-scan for {label}");
+            // read_only_op equivalence
+            let oracle_ro = match sm.read_only_op(Op::GroupAggregate {
+                type_id: 1, program: p.clone(), group_field: 1, kind: *k, agg_field: 3,
+                range_preds: vec![],
+            }) {
+                OpResult::Got(b) => b.to_vec(),
+                o => panic!("oracle_ro {label}: {o:?}"),
+            };
+            let narrowed_ro = match sm.read_only_op(Op::GroupAggregate {
+                type_id: 1, program: p.clone(), group_field: 1, kind: *k, agg_field: 3,
+                range_preds: vec![
+                    (3u16, 1u8, (*lo).to_le_bytes().to_vec()),
+                    (3u16, 2u8, (*hi).to_le_bytes().to_vec()),
+                ],
+            }) {
+                OpResult::Got(b) => b.to_vec(),
+                o => panic!("narrowed_ro {label}: {o:?}"),
+            };
+            assert_eq!(narrowed_ro, oracle_ro, "GroupAggregate read_only_op range_preds != full-scan for {label}");
+            assert_eq!(narrowed, narrowed_ro, "GroupAggregate apply vs read_only_op diverged for {label}");
+        }
+    }
+
+    /// SP-Analytic-Plan T2: range_preds on a NON-ordered field is a
+    /// no-op (silently ignored — the program still verifies, so the
+    /// answer is correct, the path just falls back to full scan).
+    /// `kind` (f2, U16) is NOT order-indexed; pass a hint anyway and
+    /// assert the result still matches the full-scan oracle.
+    #[test]
+    fn sp_analytic_plan_aggregate_range_pred_on_non_ordered_field_is_noop() {
+        use kessel_expr::Program;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: q_type_def() });
+        for i in 0..30u64 {
+            sm.apply(10 + i, Op::Create {
+                type_id: 1, id: ObjectId::from_u128(i as u128),
+                record: qrec((i % 4) as u32, 0, i as u32),
+            });
+        }
+        let p = Program::new().push_int(1).bytes();
+        let oracle = match sm.apply(99, Op::Aggregate {
+            type_id: 1, program: p.clone(), kind: 0, field_id: 3,
+            range_preds: vec![],
+        }) {
+            OpResult::Got(b) => b.to_vec(),
+            o => panic!("oracle: {o:?}"),
+        };
+        // Range hint on field 2 (`kind`, NOT order-indexed) — ignored.
+        let with_hint = match sm.apply(100, Op::Aggregate {
+            type_id: 1, program: p, kind: 0, field_id: 3,
+            range_preds: vec![(2u16, 1u8, 0u16.to_le_bytes().to_vec())],
+        }) {
+            OpResult::Got(b) => b.to_vec(),
+            o => panic!("with_hint: {o:?}"),
+        };
+        assert_eq!(with_hint, oracle, "range_pred on non-ordered field must be ignored, result must match full-scan");
     }
 
     // ---- Sub-project 23: ORDER BY + OFFSET/LIMIT ----

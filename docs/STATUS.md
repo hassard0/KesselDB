@@ -255,6 +255,41 @@ covered by the workspace test suite (2024 default / 2052 with
   commit (T3 BENCHMARKS.md + T4 STATUS + tracker close + README).
   Progress tracker `docs/superpowers/specs/2026-05-30-kesseldb-sphashaggtune-progress.md`
   → DONE_WITH_CONCERNS. **TaskList #347 ready for completion.**
+- **Track L — SP-Perf-A-SHARD-1 (2026-05-30, design + scaffold + K=1
+  regression-lock LANDED; multi-arc continuation NAMED).** Attacks the
+  SP-Perf-A T7 ~5M ops/sec ceiling diagnosed as `RwLock<StateMachine>`
+  reader-count CAS ping-pong between cores. SHARD partitions the key
+  space into K per-CPU shards, each its own `Arc<RwLock<StateMachine>>`
+  + read lock; readers on shard 0 don't contend with readers on shard
+  1. **Honestly scoped as multi-arc**: SHARD-1 (this slice) ships
+  design + scaffold + K=1 regression-lock; the K=N apply plumbing is
+  multi-week core work named `SP-Perf-A-SHARD-APPLY` (V2). T1 design
+  spec (11 sections + 8 weak-spots + 7 locked invariants + 6-arc
+  decomposition: SHARD-APPLY, SHARD-READ, SHARD-SCAN, SHARD-XTXN,
+  SHARD-BENCH). T2 scaffold: `crates/kesseldb-server/src/sharded_sm.rs`
+  with `ShardedStateMachine<V>`, `shard_of_key` (K=1 short-circuit +
+  K>=2 fxhash-mod), `shard_of_op` (point ops → `Single`, scans / joins
+  / cross-shard Txn → `FanOut`), `read_only_op_k1` (panics on K>=2 as
+  fail-fast against stale K=N configs). 11 KATs (all green on vulcan)
+  including the headline `shard_k1_matches_unsharded_sm_byte_equal`
+  regression-lock — seeds two state machines identically, wraps one
+  in a K=1 `ShardedStateMachine`, asserts byte-equal `read_only_op`
+  results across hit/miss/Describe ops. `ServerConfig.shard_count:
+  Option<usize>` field added but NOT wired into `spawn_engine_cfg`
+  (engine wiring is SHARD-APPLY's job); default `None` preserves
+  SP-Perf-A T7 ownership shape. **No throughput lift in this slice —
+  named scope was design + scaffold, NOT measurement.** That's
+  SHARD-BENCH's job once SHARD-APPLY + SHARD-READ + SHARD-SCAN
+  merge. Workspace tests: kesseldb-server lib 148 → 159 (+11 SHARD
+  tests, 0 regressions); kessel-sim release 3/3 green; `cargo build
+  --workspace` clean; `#![forbid(unsafe_code)]` honored; zero new
+  external runtime deps (`fxhash_fold` inline, 8 lines). Two commits:
+  `f634f07` (T1 design + tracker), `d5691a6` (T2 scaffold + 11 KATs),
+  plus this commit (tracker T2 done + STATUS row + README untouched).
+  Progress tracker `docs/superpowers/specs/2026-05-30-kesseldb-spperfa-shard-progress.md`
+  → PAUSED at SHARD-1 DONE (multi-arc continuation named). **TaskList
+  #348 partial progress — design + scaffold landed; K=N apply path is
+  the SP-Perf-A-SHARD-APPLY sub-arc.**
 - **Track D — Cluster test flakes (SP-CLUSTER-FLAKE T2).** Root-cause fixed
   in `Node::submit*` / `apply_raw`: production VSR retry on transient
   ViewChange. Not just a test relaxation — the actual production code path

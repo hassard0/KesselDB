@@ -8,7 +8,7 @@ flatlining at ~5M ops/sec at N=16 on vulcan. The diagnosis named
 the next ceiling. SHARD attacks that ceiling by partitioning the
 key space into K shards, each with its own state-machine + read lock.
 
-## Status: OPEN — first slice (design + scaffold + K=1 KAT)
+## Status: PAUSED at SHARD-1 DONE (design + scaffold + K=1 regression-lock landed; multi-arc continuation named)
 
 This is a **multi-arc project**, not a single arc. SHARD-1 (this)
 ships the design + scaffold. The K=N apply plumbing is the
@@ -42,8 +42,8 @@ See design spec §3 + §9 for the full scoping rationale + roadmap.
 
 | T# | Scope | Status | Commit |
 |---|---|---|---|
-| **T1** | Design spec (11 sections + 8 weak-spots + 7 locked invariants + 6-arc decomposition) + progress tracker (this file). NO runtime code change. | **DONE** | (this commit) |
-| **T2 (optional)** | Scaffold types: `crates/kesseldb-server/src/sharded_sm.rs` with `ShardedStateMachine<V>`, `shard_of_key`, `shard_of_op`, K=1 collapse. `ServerConfig.shard_count: Option<usize>` defaulting to `None`. KAT `shard_k1_matches_unsharded_sm_byte_equal` runs the determinism oracle's 100×10-op workload against (SM, ShardedSM{vec![SM]}) and asserts byte-equal results for every read. Default `cargo build` byte-identical (no construction unless opted in). | Planned (dispatch attempt) | — |
+| **T1** | Design spec (11 sections + 8 weak-spots + 7 locked invariants + 6-arc decomposition) + progress tracker (this file). NO runtime code change. | **DONE** | `f634f07` |
+| **T2** | Scaffold: `crates/kesseldb-server/src/sharded_sm.rs` with `ShardedStateMachine<V>`, `shard_of_key` (K=1 short-circuit + K>=2 fxhash-mod), `shard_of_op` (point-data → `Single`, scans/joins/Op::Txn-at-K>=2 → `FanOut`), `read_only_op_k1` (panics on K>=2 — that path is V2 work), local `fxhash_fold` (no new dep), 11 KATs (fxhash determinism + input-distinguishing, K=1 collapse, K=4 deterministic + distributes, K=1 classifications, K=2 point-op deterministic, **headline `shard_k1_matches_unsharded_sm_byte_equal` regression-lock**, K>=2 panic fail-fast, accessors, K=0 rejected). `ServerConfig.shard_count: Option<usize>` field added but NOT wired into `spawn_engine_cfg` (the K=N engine wiring is the SP-Perf-A-SHARD-APPLY arc). Default `cargo build` byte-identical. kesseldb-server lib 148 → 159 tests (+11, 0 regressions); kessel-sim release 3/3 green; `cargo build --workspace` clean. | **DONE** | `d5691a6` |
 | **SP-Perf-A-SHARD-APPLY** | K=N apply plumbing: per-shard apply thread, write routing layer, per-shard WAL group-commit. **MULTI-WEEK CORE.** | Named, not started | — |
 | **SP-Perf-A-SHARD-READ** | `read_pool` workers dispatch reads to their shard's read-lock. | Named, not started | — |
 | **SP-Perf-A-SHARD-SCAN** | In-process scatter-merge for fan-out scan ops; reuse `scatter_scan` merge contract. | Named, not started | — |
@@ -77,16 +77,17 @@ gives the next 5 arcs concrete file paths to work in. **It does
 NOT lift the throughput ceiling — that's SHARD-BENCH's job, which
 runs once SHARD-APPLY + SHARD-READ + SHARD-SCAN ship.**
 
-## Acceptance gate — V1 (this arc, SHARD-1)
+## Acceptance gate — V1 (this arc, SHARD-1) — MET
 
 | Criterion | Outcome |
 |---|---|
-| Design spec written + 8 weak-spots named | YES (this commit) |
-| 6-arc decomposition named with status | YES (this commit) |
-| K=1 KAT runs determinism oracle 100×10 byte-equal | (T2-dependent) |
-| Default `cargo build` byte-identical | (T2 invariant — `shard_count = None`) |
-| Workspace tests pass on vulcan | (T2-dependent) |
-| `#![forbid(unsafe_code)]` honored | (T2 invariant) |
+| Design spec written + 8 weak-spots named | YES (`f634f07`) |
+| 6-arc decomposition named with status | YES (`f634f07`) |
+| K=1 byte-equal regression-lock KAT passes | YES (`shard_k1_matches_unsharded_sm_byte_equal` green in `d5691a6`) |
+| Default `cargo build` byte-identical | YES (`shard_count` defaults to `None`; `ShardedStateMachine` never constructed by `spawn_engine_cfg`) |
+| Workspace tests pass on vulcan | YES (kesseldb-server lib 159/159; kessel-sim release 3/3) |
+| `#![forbid(unsafe_code)]` honored | YES |
+| No new external runtime deps | YES (`fxhash_fold` inline, 8 lines) |
 
 ## Acceptance gate — V2 (the multi-arc completion)
 

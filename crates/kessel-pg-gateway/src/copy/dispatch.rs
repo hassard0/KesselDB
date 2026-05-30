@@ -967,6 +967,7 @@ mod tests {
             table: "t".to_string(),
             columns: None,
             column_count: 1,
+            column_kinds: Vec::new(),
             carry: Vec::new(),
             rows_ingested: 5,
         };

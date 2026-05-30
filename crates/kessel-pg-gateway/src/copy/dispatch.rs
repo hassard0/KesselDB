@@ -340,21 +340,12 @@ pub fn dispatch_copy_to<E: EngineApply + ?Sized>(
     out.extend_from_slice(&encode_copy_out_response(ncols));
     let mut emitted = 0u64;
     for row in &rows {
-        // Project the chosen columns from the full row.
-        let projected: Vec<Option<&[u8]>> = chosen_indices
-            .iter()
-            .map(|&i| row.get(i).cloned().flatten())
-            .collect();
-        // We need the projected to own slices into `row`, not into a
-        // temporary — flatten by reborrow.
+        // Project the chosen columns from the full row, borrowing
+        // the column bytes (`Option<&[u8]>` per column).
         let projected_refs: Vec<Option<&[u8]>> = chosen_indices
             .iter()
             .map(|&i| row.get(i).and_then(|c| c.as_deref()))
             .collect();
-        // Drop the wrongly-constructed `projected` (it borrowed
-        // `cloned`). The Vec was only built to satisfy the type
-        // checker exploration; we re-use `projected_refs` below.
-        let _ = projected;
         let payload = encode_text_row(&projected_refs);
         out.extend_from_slice(&encode_copy_data(&payload));
         emitted += 1;
@@ -890,7 +881,7 @@ mod tests {
             kind: FieldKind::I64,
             nullable: false,
         }];
-        let mut eng = make_engine(cols);
+        let eng = make_engine(cols);
         // First row succeeds (Ok), second triggers Constraint.
         *eng.result.lock().unwrap() = vec![
             OpResult::Constraint("NOT NULL violated".into()),

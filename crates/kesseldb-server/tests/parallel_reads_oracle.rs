@@ -973,6 +973,16 @@ fn txn_ro_smoke_all_txn_permitted_variants_one_txn_returns_ok() {
             limit: 4,
         },
     ];
+    // Bisect on divergence: run each inner op as a 1-op Txn on both
+    // engines and report which one diverges. This gives the post-mortem
+    // the specific arm to fix in the bypass validator.
+    for (idx, single) in inner.iter().enumerate() {
+        let p_one = engine_p.apply(Op::Txn { ops: vec![single.clone()] });
+        let s_one = engine_s.apply(Op::Txn { ops: vec![single.clone()] });
+        assert_eq!(p_one, s_one,
+            "15-variant Txn — inner op {idx} ({:?}) diverged: p={p_one:?} s={s_one:?}",
+            single.kind());
+    }
     let p = engine_p.apply(Op::Txn { ops: inner.clone() });
     let s = engine_s.apply(Op::Txn { ops: inner });
     assert_eq!(p, s, "15-variant Txn diverged: p={p:?} s={s:?}");

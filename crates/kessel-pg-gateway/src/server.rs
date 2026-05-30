@@ -362,6 +362,12 @@ pub fn run_session<
     // cleanly on return/Terminate/EOF. The state owns its statements
     // + portals — there is no global table to clean up.
     let mut extq_state = crate::extq::SessionState::new();
+    // ─── Per-connection COPY state (SP-PG-COPY §3) ────────────────
+    // Defaults to Idle. A `COPY <table> FROM STDIN` Query transitions
+    // to In; CopyData/CopyDone/CopyFail process while In; CopyDone +
+    // CopyFail return to Idle. A `COPY <table> TO STDOUT` is handled
+    // inline inside the Q-dispatch branch — it never enters In state.
+    let mut copy_state = crate::copy::CopyState::Idle;
     // ─── Query loop ───────────────────────────────────────────────
     loop {
         let mut tag_buf = [0u8; 1];
@@ -418,6 +424,84 @@ pub fn run_session<
         let mut body = vec![0u8; body_len];
         stream.read_exact(&mut body)?;
 
+        // ─── SP-PG-COPY — CopyIn state machine ────────────────────
+        // While the connection is in CopyIn (after a `COPY <table>
+        // FROM STDIN` Query), only `d` CopyData, `c` CopyDone, `f`
+        // CopyFail, and `X` Terminate are valid frontend tags. Any
+        // other tag is a protocol violation per spec §3.
+        if copy_state.is_in() {
+            match tag {
+                crate::proto::FE_COPY_DATA => {
+                    let in_state = match std::mem::replace(
+                        &mut copy_state,
+                        crate::copy::CopyState::Idle,
+                    ) {
+                        crate::copy::CopyState::In(s) => s,
+                        crate::copy::CopyState::Idle => unreachable!("is_in() guarded"),
+                    };
+                    match crate::copy::dispatch::process_copy_data(&body, in_state, engine) {
+                        crate::copy::dispatch::CopyDataOutcome::Continue { state } => {
+                            // Server is silent during COPY FROM
+                            // until CopyDone (PG §55.2.5). Restore
+                            // state + loop.
+                            copy_state = crate::copy::CopyState::In(state);
+                        }
+                        crate::copy::dispatch::CopyDataOutcome::Failed { bytes } => {
+                            stream.write_all(&bytes)?;
+                            stream.flush()?;
+                            // copy_state already swapped to Idle.
+                        }
+                    }
+                    continue;
+                }
+                crate::proto::FE_COPY_DONE => {
+                    let in_state = match std::mem::replace(
+                        &mut copy_state,
+                        crate::copy::CopyState::Idle,
+                    ) {
+                        crate::copy::CopyState::In(s) => s,
+                        crate::copy::CopyState::Idle => unreachable!("is_in() guarded"),
+                    };
+                    let resp = crate::copy::dispatch::finalize_copy_in_success(&in_state);
+                    stream.write_all(&resp)?;
+                    stream.flush()?;
+                    continue;
+                }
+                crate::proto::FE_COPY_FAIL => {
+                    // Replace state with Idle FIRST, then surface the
+                    // reason from the body.
+                    copy_state = crate::copy::CopyState::Idle;
+                    let reason =
+                        crate::copy::proto::decode_copy_fail(&body).unwrap_or("(unspecified)");
+                    let resp = crate::copy::dispatch::finalize_copy_in_failure(reason);
+                    stream.write_all(&resp)?;
+                    stream.flush()?;
+                    continue;
+                }
+                crate::proto::FE_TERMINATE => {
+                    return Ok(session);
+                }
+                other => {
+                    // Any other tag while in CopyIn is a protocol
+                    // violation (08P01). The V1 contract: emit the
+                    // error + RFQ, clear copy_state, STAY ALIVE so
+                    // the client can retry — same tolerant shape as
+                    // the SP-PG-EXTQ probe-then-fall-back contract.
+                    copy_state = crate::copy::CopyState::Idle;
+                    let resp = crate::dispatch::error_response_then_rfq(
+                        crate::error::SEVERITY_ERROR,
+                        "08P01",
+                        &format!(
+                            "unexpected message tag 0x{other:02X} in COPY mode (expected CopyData / CopyDone / CopyFail / Terminate)"
+                        ),
+                    );
+                    stream.write_all(&resp)?;
+                    stream.flush()?;
+                    continue;
+                }
+            }
+        }
+
         match tag {
             crate::proto::FE_QUERY => {
                 // Parse Q body — strip trailing NUL, validate UTF-8.
@@ -434,6 +518,64 @@ pub fn run_session<
                         continue;
                     }
                 };
+                // SP-PG-COPY T2/T3 — COPY interceptor. The Q text
+                // is checked for the COPY shape FIRST so we can
+                // either:
+                //   - Transition to CopyIn state + emit
+                //     CopyInResponse (COPY FROM STDIN), OR
+                //   - Run the full COPY TO STDOUT exchange inline
+                //     (CopyOutResponse + N×CopyData + CopyDone +
+                //     CommandComplete + RFQ), OR
+                //   - Emit a precise 0A000 rejection if the COPY
+                //     variant is V2-only (binary, csv, file,
+                //     program) or unsupported.
+                //
+                // Non-COPY SQL passes through to the existing
+                // DISCARD / tx-control / dispatch_query path.
+                if let Some(parsed) = crate::copy::command::parse_copy_command(&sql_owned) {
+                    match &parsed {
+                        crate::copy::command::ParsedCopy::From { .. } => {
+                            match crate::copy::dispatch::dispatch_copy_in_start(
+                                parsed, engine,
+                            ) {
+                                crate::copy::dispatch::CopyInStartOutcome::Started {
+                                    bytes,
+                                    state,
+                                } => {
+                                    stream.write_all(&bytes)?;
+                                    stream.flush()?;
+                                    copy_state = crate::copy::CopyState::In(state);
+                                }
+                                crate::copy::dispatch::CopyInStartOutcome::Failed { bytes } => {
+                                    stream.write_all(&bytes)?;
+                                    stream.flush()?;
+                                }
+                            }
+                            continue;
+                        }
+                        crate::copy::command::ParsedCopy::To { .. } => {
+                            let resp = crate::copy::dispatch::dispatch_copy_to(
+                                parsed, engine,
+                            );
+                            stream.write_all(&resp)?;
+                            stream.flush()?;
+                            continue;
+                        }
+                        crate::copy::command::ParsedCopy::Rejected { .. } => {
+                            // Route through dispatch_copy_in_start
+                            // for a precise rejection message; the
+                            // failure path emits ErrorResponse + RFQ
+                            // and doesn't transition state.
+                            if let crate::copy::dispatch::CopyInStartOutcome::Failed { bytes } =
+                                crate::copy::dispatch::dispatch_copy_in_start(parsed, engine)
+                            {
+                                stream.write_all(&bytes)?;
+                                stream.flush()?;
+                            }
+                            continue;
+                        }
+                    }
+                }
                 // SP-PG-EXTQ T7 — DISCARD interception. PG-spec
                 // DISCARD ALL / STATEMENTS / PORTALS is the
                 // connection-pool checkout-reset hook every modern

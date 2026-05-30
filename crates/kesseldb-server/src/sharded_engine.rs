@@ -1212,4 +1212,554 @@ mod tests {
         drop(engine);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ====================================================================
+    // T3 SHARD-SCAN K-invariance oracle — 12 scan ops × K∈{1,4,8}
+    // ====================================================================
+    //
+    // The load-bearing correctness invariant for SHARD-SCAN: every scan-
+    // shape Op produces the SAME logical answer at K=1, K=4, and K=8.
+    //
+    // Test shape: build a richer schema (id u128 PK + `v` u64 + `g` u32
+    // group field), seed N rows with deterministic values across all
+    // three engines, then run each scan op against all three and assert
+    // the results are equivalent.
+    //
+    // Equivalence flavors:
+    //   - byte-equal: Sorted / Aggregate sum/min/max / GroupAggregate
+    //     (results are inherently ordered/aggregated)
+    //   - multiset-equal: Unordered (Select/QueryRows/SelectFields) and
+    //     OidConcat (FindBy/FindByComposite) — order may differ between
+    //     K=1 (sorted by oid) and K=N (per-shard concat) but the set of
+    //     rows/oids is identical
+    //   - byte-equal: OidSortedUnion (Query/QueryExpr/FindRange) — both
+    //     K=1 and K=N produce sorted+dedup'd oid lists
+
+    use kessel_catalog::FieldKind as FK;
+
+    /// Build a schema with `v: u64` (indexed) and `g: u32` (range-indexed).
+    fn build_oracle_schema(engine: &EngineHandle) -> ObjectType {
+        let def = encode_type_def(
+            "row",
+            &[
+                Field {
+                    field_id: 0,
+                    name: "v".into(),
+                    kind: FK::U64,
+                    nullable: false,
+                },
+                Field {
+                    field_id: 1,
+                    name: "g".into(),
+                    kind: FK::U32,
+                    nullable: false,
+                },
+            ],
+        );
+        let r = engine.apply(Op::CreateType { def });
+        assert!(matches!(r, OpResult::TypeCreated(1)), "CreateType: {r:?}");
+        // Add a secondary index on `v` (field_id=1 because field_id 0 is
+        // the synthetic id field).
+        let r = engine.apply(Op::CreateIndex {
+            type_id: 1,
+            field_id: 1,
+        });
+        assert!(matches!(r, OpResult::Ok), "CreateIndex v: {r:?}");
+        // Add range index on `g` (field_id=2).
+        let r = engine.apply(Op::AddOrderedIndex {
+            type_id: 1,
+            field_id: 2,
+        });
+        assert!(matches!(r, OpResult::Ok), "AddOrderedIndex g: {r:?}");
+        ObjectType::from_def(
+            "row".into(),
+            vec![
+                Field {
+                    field_id: 1,
+                    name: "v".into(),
+                    kind: FK::U64,
+                    nullable: false,
+                },
+                Field {
+                    field_id: 2,
+                    name: "g".into(),
+                    kind: FK::U32,
+                    nullable: false,
+                },
+            ],
+        )
+    }
+
+    /// Helper: parse a `[u32 rowlen][record]*` payload into Vec<Vec<u8>>
+    /// so the oracle can multiset-compare across K values.
+    fn parse_rows(payload: &[u8]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut p = 0;
+        while p + 4 <= payload.len() {
+            let len =
+                u32::from_le_bytes(payload[p..p + 4].try_into().unwrap()) as usize;
+            p += 4;
+            if p + len > payload.len() {
+                break;
+            }
+            out.push(payload[p..p + len].to_vec());
+            p += len;
+        }
+        out
+    }
+
+    /// Helper: parse `[16-byte oid]*` payload into Vec<[u8;16]>.
+    fn parse_oids(payload: &[u8]) -> Vec<[u8; 16]> {
+        payload
+            .chunks(16)
+            .filter(|c| c.len() == 16)
+            .map(|c| {
+                let mut a = [0u8; 16];
+                a.copy_from_slice(c);
+                a
+            })
+            .collect()
+    }
+
+    /// Seed N rows with deterministic values into an engine. `v = i*7`,
+    /// `g = i % 4` (so groups are 0,1,2,3). Returns the ObjectType.
+    fn seed_oracle(engine: &EngineHandle, ot: &ObjectType, n: u128) {
+        for i in 0..n {
+            let v: u128 = i * 7;
+            let g: u128 = i % 4;
+            let rec =
+                codec_encode(ot, &[Value::Uint(v), Value::Uint(g)]).unwrap();
+            let id = ObjectId::from_u128(i);
+            let r = engine.apply(Op::Create {
+                type_id: 1,
+                id,
+                record: rec,
+            });
+            assert!(matches!(r, OpResult::Ok), "seed row {i}: {r:?}");
+        }
+    }
+
+    /// Headline T3 oracle: spin up K∈{1,4,8} engines with identical
+    /// data; assert every scan op produces equivalent results across K.
+    #[test]
+    fn t3_shard_scan_k_invariance_oracle_12_ops() {
+        let n_rows = 100u128;
+
+        // Spin up three engines.
+        let cfg_k1 = ServerConfig {
+            shard_count: None,
+            read_workers: Some(0),
+            ..ServerConfig::default()
+        };
+        let dir1 = fresh_dir("scan-k1");
+        let e1 = spawn_engine_cfg(&dir1, &cfg_k1).expect("k1 spawn");
+        let (e4, dir4) = spawn_sharded(4, "scan-k4");
+        let (e8, dir8) = spawn_sharded(8, "scan-k8");
+
+        // Build identical schemas + indexes on each.
+        let ot = build_oracle_schema(&e1);
+        let _ = build_oracle_schema(&e4);
+        let _ = build_oracle_schema(&e8);
+
+        // Seed identical data.
+        seed_oracle(&e1, &ot, n_rows);
+        seed_oracle(&e4, &ot, n_rows);
+        seed_oracle(&e8, &ot, n_rows);
+
+        // -------------------------------------------------------------
+        // 1. Op::Select (unordered concat — multiset equal across K)
+        // -------------------------------------------------------------
+        let select = Op::Select {
+            type_id: 1,
+            program: kessel_expr::Program::new().push_int(1).bytes(),
+            limit: 0, // all rows
+        };
+        let r1 = e1.apply(select.clone());
+        let r4 = e4.apply(select.clone());
+        let r8 = e8.apply(select);
+        let rows1 = match &r1 {
+            OpResult::Got(b) => parse_rows(b),
+            o => panic!("k1 Select: {o:?}"),
+        };
+        let rows4 = match &r4 {
+            OpResult::Got(b) => parse_rows(b),
+            o => panic!("k4 Select: {o:?}"),
+        };
+        let rows8 = match &r8 {
+            OpResult::Got(b) => parse_rows(b),
+            o => panic!("k8 Select: {o:?}"),
+        };
+        let mut s1: Vec<Vec<u8>> = rows1.clone();
+        let mut s4 = rows4.clone();
+        let mut s8 = rows8.clone();
+        s1.sort();
+        s4.sort();
+        s8.sort();
+        assert_eq!(s1.len(), n_rows as usize, "k1 Select row count");
+        assert_eq!(s4, s1, "Select multiset diverged K=4 vs K=1");
+        assert_eq!(s8, s1, "Select multiset diverged K=8 vs K=1");
+
+        // -------------------------------------------------------------
+        // 2. Op::SelectSorted by `v` ascending (byte-equal across K)
+        // -------------------------------------------------------------
+        let sorted = Op::SelectSorted {
+            type_id: 1,
+            program: kessel_expr::Program::new().push_int(1).bytes(),
+            sort_field: 1, // v
+            desc: false,
+            offset: 0,
+            limit: 0,
+        };
+        let r1 = e1.apply(sorted.clone());
+        let r4 = e4.apply(sorted.clone());
+        let r8 = e8.apply(sorted);
+        assert_eq!(r1, r4, "SelectSorted byte diverged K=4 vs K=1");
+        assert_eq!(r1, r8, "SelectSorted byte diverged K=8 vs K=1");
+
+        // -------------------------------------------------------------
+        // 3. Op::Aggregate COUNT (kind=0): byte-equal i128 LE
+        // -------------------------------------------------------------
+        let count = Op::Aggregate {
+            type_id: 1,
+            program: kessel_expr::Program::new().push_int(1).bytes(),
+            kind: 0,
+            field_id: 1,
+            range_preds: vec![],
+        };
+        let r1 = e1.apply(count.clone());
+        let r4 = e4.apply(count.clone());
+        let r8 = e8.apply(count);
+        assert_eq!(r1, r4, "Aggregate COUNT K=4 vs K=1");
+        assert_eq!(r1, r8, "Aggregate COUNT K=8 vs K=1");
+
+        // -------------------------------------------------------------
+        // 4. Op::Aggregate SUM (kind=1): byte-equal
+        // -------------------------------------------------------------
+        let sum = Op::Aggregate {
+            type_id: 1,
+            program: kessel_expr::Program::new().push_int(1).bytes(),
+            kind: 1,
+            field_id: 1, // v
+            range_preds: vec![],
+        };
+        let r1 = e1.apply(sum.clone());
+        let r4 = e4.apply(sum.clone());
+        let r8 = e8.apply(sum);
+        assert_eq!(r1, r4, "Aggregate SUM K=4 vs K=1");
+        assert_eq!(r1, r8, "Aggregate SUM K=8 vs K=1");
+
+        // -------------------------------------------------------------
+        // 5. Op::Aggregate MIN (kind=2): byte-equal
+        // -------------------------------------------------------------
+        let min = Op::Aggregate {
+            type_id: 1,
+            program: kessel_expr::Program::new().push_int(1).bytes(),
+            kind: 2,
+            field_id: 1,
+            range_preds: vec![],
+        };
+        let r1 = e1.apply(min.clone());
+        let r4 = e4.apply(min.clone());
+        let r8 = e8.apply(min);
+        assert_eq!(r1, r4, "Aggregate MIN K=4 vs K=1");
+        assert_eq!(r1, r8, "Aggregate MIN K=8 vs K=1");
+
+        // -------------------------------------------------------------
+        // 6. Op::Aggregate MAX (kind=3): byte-equal
+        // -------------------------------------------------------------
+        let max = Op::Aggregate {
+            type_id: 1,
+            program: kessel_expr::Program::new().push_int(1).bytes(),
+            kind: 3,
+            field_id: 1,
+            range_preds: vec![],
+        };
+        let r1 = e1.apply(max.clone());
+        let r4 = e4.apply(max.clone());
+        let r8 = e8.apply(max);
+        assert_eq!(r1, r4, "Aggregate MAX K=4 vs K=1");
+        assert_eq!(r1, r8, "Aggregate MAX K=8 vs K=1");
+
+        // -------------------------------------------------------------
+        // 7. Op::GroupAggregate SUM by `g`: byte-equal (BTreeMap-ordered)
+        // -------------------------------------------------------------
+        let group_sum = Op::GroupAggregate {
+            type_id: 1,
+            program: kessel_expr::Program::new().push_int(1).bytes(),
+            group_field: 2, // g
+            kind: 1,        // SUM
+            agg_field: 1,   // v
+            range_preds: vec![],
+        };
+        let r1 = e1.apply(group_sum.clone());
+        let r4 = e4.apply(group_sum.clone());
+        let r8 = e8.apply(group_sum);
+        assert_eq!(r1, r4, "GroupAggregate SUM K=4 vs K=1");
+        assert_eq!(r1, r8, "GroupAggregate SUM K=8 vs K=1");
+
+        // -------------------------------------------------------------
+        // 8. Op::GroupAggregateMulti (COUNT + SUM) by `g`: byte-equal
+        // -------------------------------------------------------------
+        let group_multi = Op::GroupAggregateMulti {
+            type_id: 1,
+            program: kessel_expr::Program::new().push_int(1).bytes(),
+            group_field: 2,
+            aggregates: vec![(0u8, 1u16), (1u8, 1u16)], // COUNT and SUM on v
+            range_preds: vec![],
+        };
+        let r1 = e1.apply(group_multi.clone());
+        let r4 = e4.apply(group_multi.clone());
+        let r8 = e8.apply(group_multi);
+        assert_eq!(r1, r4, "GroupAggregateMulti K=4 vs K=1");
+        assert_eq!(r1, r8, "GroupAggregateMulti K=8 vs K=1");
+
+        // -------------------------------------------------------------
+        // 9. Op::FindBy on `v` (multiset-equal): pick a value that hits
+        // -------------------------------------------------------------
+        // Row i=3 has v=21; FindBy v=21 → exactly 1 row.
+        let findby = Op::FindBy {
+            type_id: 1,
+            field_id: 1,
+            value: 21u64.to_le_bytes().to_vec(),
+        };
+        let r1 = e1.apply(findby.clone());
+        let r4 = e4.apply(findby.clone());
+        let r8 = e8.apply(findby);
+        let mut o1 = match &r1 {
+            OpResult::Got(b) => parse_oids(b),
+            o => panic!("k1 FindBy: {o:?}"),
+        };
+        let mut o4 = match &r4 {
+            OpResult::Got(b) => parse_oids(b),
+            o => panic!("k4 FindBy: {o:?}"),
+        };
+        let mut o8 = match &r8 {
+            OpResult::Got(b) => parse_oids(b),
+            o => panic!("k8 FindBy: {o:?}"),
+        };
+        o1.sort();
+        o4.sort();
+        o8.sort();
+        assert_eq!(o1.len(), 1, "FindBy v=21 expected 1 hit");
+        assert_eq!(o4, o1, "FindBy multiset K=4 vs K=1");
+        assert_eq!(o8, o1, "FindBy multiset K=8 vs K=1");
+
+        // -------------------------------------------------------------
+        // 10. Op::FindRange on `g` (byte-equal: sorted dedup'd oids)
+        // -------------------------------------------------------------
+        let findrange = Op::FindRange {
+            type_id: 1,
+            field_id: 2,
+            lo: 1u32.to_le_bytes().to_vec(),
+            hi: 2u32.to_le_bytes().to_vec(),
+        };
+        let r1 = e1.apply(findrange.clone());
+        let r4 = e4.apply(findrange.clone());
+        let r8 = e8.apply(findrange);
+        assert_eq!(r1, r4, "FindRange byte K=4 vs K=1");
+        assert_eq!(r1, r8, "FindRange byte K=8 vs K=1");
+
+        // -------------------------------------------------------------
+        // 11. Op::Query (eq predicate, byte-equal: sorted dedup'd oids)
+        // -------------------------------------------------------------
+        let query = Op::Query {
+            type_id: 1,
+            preds: vec![kessel_proto::Pred {
+                field_id: 2, // g
+                op: 0,       // eq
+                value: 2u32.to_le_bytes().to_vec(),
+            }],
+        };
+        let r1 = e1.apply(query.clone());
+        let r4 = e4.apply(query.clone());
+        let r8 = e8.apply(query);
+        assert_eq!(r1, r4, "Query byte K=4 vs K=1");
+        assert_eq!(r1, r8, "Query byte K=8 vs K=1");
+
+        // -------------------------------------------------------------
+        // 12. Op::QueryExpr (byte-equal: sorted dedup'd oids)
+        // -------------------------------------------------------------
+        // Expression: g == 1
+        let prog = kessel_expr::Program::new()
+            .load(2)
+            .push_int(1)
+            .eq()
+            .bytes();
+        let qexpr = Op::QueryExpr {
+            type_id: 1,
+            program: prog,
+        };
+        let r1 = e1.apply(qexpr.clone());
+        let r4 = e4.apply(qexpr.clone());
+        let r8 = e8.apply(qexpr);
+        assert_eq!(r1, r4, "QueryExpr byte K=4 vs K=1");
+        assert_eq!(r1, r8, "QueryExpr byte K=8 vs K=1");
+
+        // -------------------------------------------------------------
+        // 13. Op::QueryRows + Op::SelectFields (sanity)
+        // -------------------------------------------------------------
+        let qrows = Op::QueryRows {
+            type_id: 1,
+            eq_preds: vec![],
+            program: kessel_expr::Program::new().push_int(1).bytes(),
+            limit: 0,
+            range_preds: vec![],
+        };
+        let r1 = e1.apply(qrows.clone());
+        let r4 = e4.apply(qrows.clone());
+        let r8 = e8.apply(qrows);
+        let mut q1 = match &r1 {
+            OpResult::Got(b) => parse_rows(b),
+            o => panic!("k1 QueryRows: {o:?}"),
+        };
+        let mut q4 = match &r4 {
+            OpResult::Got(b) => parse_rows(b),
+            o => panic!("k4 QueryRows: {o:?}"),
+        };
+        let mut q8 = match &r8 {
+            OpResult::Got(b) => parse_rows(b),
+            o => panic!("k8 QueryRows: {o:?}"),
+        };
+        q1.sort();
+        q4.sort();
+        q8.sort();
+        assert_eq!(q4, q1, "QueryRows multiset K=4 vs K=1");
+        assert_eq!(q8, q1, "QueryRows multiset K=8 vs K=1");
+
+        let sf = Op::SelectFields {
+            type_id: 1,
+            program: kessel_expr::Program::new().push_int(1).bytes(),
+            fields: vec![1, 2],
+            limit: 0,
+        };
+        let r1 = e1.apply(sf.clone());
+        let r4 = e4.apply(sf.clone());
+        let r8 = e8.apply(sf);
+        let mut f1 = match &r1 {
+            OpResult::Got(b) => parse_rows(b),
+            o => panic!("k1 SelectFields: {o:?}"),
+        };
+        let mut f4 = match &r4 {
+            OpResult::Got(b) => parse_rows(b),
+            o => panic!("k4 SelectFields: {o:?}"),
+        };
+        let mut f8 = match &r8 {
+            OpResult::Got(b) => parse_rows(b),
+            o => panic!("k8 SelectFields: {o:?}"),
+        };
+        f1.sort();
+        f4.sort();
+        f8.sort();
+        assert_eq!(f4, f1, "SelectFields multiset K=4 vs K=1");
+        assert_eq!(f8, f1, "SelectFields multiset K=8 vs K=1");
+
+        drop(e1);
+        drop(e4);
+        drop(e8);
+        let _ = std::fs::remove_dir_all(&dir1);
+        let _ = std::fs::remove_dir_all(&dir4);
+        let _ = std::fs::remove_dir_all(&dir8);
+    }
+
+    /// T3 supplement: a 200-row dataset with non-uniform group sizes
+    /// (some groups bigger than others) catches edge cases in
+    /// GroupAggregate where K=1 and K=N produce different group orders
+    /// or AVG-style asymmetry.
+    #[test]
+    fn t3_shard_scan_group_agg_byte_equal_uneven_groups() {
+        let cfg_k1 = ServerConfig {
+            shard_count: None,
+            read_workers: Some(0),
+            ..ServerConfig::default()
+        };
+        let dir1 = fresh_dir("uneven-k1");
+        let e1 = spawn_engine_cfg(&dir1, &cfg_k1).expect("k1 spawn");
+        let (e4, dir4) = spawn_sharded(4, "uneven-k4");
+        let ot = build_oracle_schema(&e1);
+        let _ = build_oracle_schema(&e4);
+        // Seed 200 rows. v = i, g = (i*i) % 7 → 7 groups of varying size.
+        for i in 0..200u128 {
+            let g: u128 = (i * i) % 7;
+            let rec =
+                codec_encode(&ot, &[Value::Uint(i), Value::Uint(g)]).unwrap();
+            let id = ObjectId::from_u128(i);
+            assert!(matches!(
+                e1.apply(Op::Create {
+                    type_id: 1,
+                    id,
+                    record: rec.clone(),
+                }),
+                OpResult::Ok
+            ));
+            assert!(matches!(
+                e4.apply(Op::Create {
+                    type_id: 1,
+                    id,
+                    record: rec,
+                }),
+                OpResult::Ok
+            ));
+        }
+        // GroupAggregate COUNT + SUM + MIN + MAX on each
+        for kind in [0u8, 1, 2, 3] {
+            let op = Op::GroupAggregate {
+                type_id: 1,
+                program: kessel_expr::Program::new().push_int(1).bytes(),
+                group_field: 2,
+                kind,
+                agg_field: 1,
+                range_preds: vec![],
+            };
+            let r1 = e1.apply(op.clone());
+            let r4 = e4.apply(op);
+            assert_eq!(r1, r4, "GroupAggregate kind={kind} K=4 vs K=1 diverged");
+        }
+        drop(e1);
+        drop(e4);
+        let _ = std::fs::remove_dir_all(&dir1);
+        let _ = std::fs::remove_dir_all(&dir4);
+    }
+
+    /// T3 supplement: Aggregate AVG (kind=4) hard-fails at K>=2 by design.
+    /// K=1 returns the correct value; K=N returns SchemaError.
+    #[test]
+    fn t3_shard_scan_aggregate_avg_asymmetric_k1_vs_kn() {
+        let cfg_k1 = ServerConfig {
+            shard_count: None,
+            read_workers: Some(0),
+            ..ServerConfig::default()
+        };
+        let dir1 = fresh_dir("avg-k1");
+        let e1 = spawn_engine_cfg(&dir1, &cfg_k1).expect("k1 spawn");
+        let (e4, dir4) = spawn_sharded(4, "avg-k4");
+        let ot = build_oracle_schema(&e1);
+        let _ = build_oracle_schema(&e4);
+        seed_oracle(&e1, &ot, 20);
+        seed_oracle(&e4, &ot, 20);
+        let avg = Op::Aggregate {
+            type_id: 1,
+            program: kessel_expr::Program::new().push_int(1).bytes(),
+            kind: 4,
+            field_id: 1,
+            range_preds: vec![],
+        };
+        let r1 = e1.apply(avg.clone());
+        let r4 = e4.apply(avg);
+        // K=1: correct AVG (some i128 value).
+        match r1 {
+            OpResult::Got(_) => {}
+            o => panic!("K=1 AVG should succeed, got {o:?}"),
+        }
+        // K=4: documented SchemaError.
+        match r4 {
+            OpResult::SchemaError(msg) => {
+                assert!(msg.contains("AVG"), "K=4 AVG msg: {msg}");
+            }
+            o => panic!("K=4 AVG should SchemaError, got {o:?}"),
+        }
+        drop(e1);
+        drop(e4);
+        let _ = std::fs::remove_dir_all(&dir1);
+        let _ = std::fs::remove_dir_all(&dir4);
+    }
 }

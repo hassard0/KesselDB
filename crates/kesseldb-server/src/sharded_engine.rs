@@ -314,6 +314,37 @@ pub fn route_op(op: &Op, k: usize) -> ShardRoute {
     }
 }
 
+/// SP-Perf-A-SHARD-SCAN-FASTPATH Approach B: classify "tiny scan" ops
+/// for which the per-shard dispatch overhead (even via the persistent
+/// pool's channel-send/recv) dominates the useful work. For such ops,
+/// the dispatcher walks every shard sequentially on the caller thread
+/// (`scatter_serial`) instead of fanning out via the pool.
+///
+/// **Predicate**: returns `true` ONLY for `Op::FindBy` and
+/// `Op::FindByComposite`. Both are equality-index lookups whose per-op
+/// cost at K=1 is sub-microsecond (~500ns measured on vulcan for
+/// `find-by` in BENCHMARKS §14). At K=4 the pool's per-call overhead
+/// (~100µs measured) is 200× the useful work — the fan-out machinery
+/// is the wrong shape for this op class.
+///
+/// **Not tiny** (handled by the pool path):
+/// - `Op::FindRange / Op::Query / Op::QueryExpr` — variable-shape
+///   result sets; per-shard work is non-trivial (range scan + sort).
+/// - `Op::Select / SelectFields / SelectSorted / QueryRows` — scan
+///   operations; per-shard work scales with row count.
+/// - `Op::Aggregate / GroupAggregate / GroupAggregateMulti` — per-shard
+///   work is the full-shard aggregate fold; fan-out wins on multi-core.
+///
+/// K-invariance preserved byte-equal: `scatter_serial` collects results
+/// in shard-id order (same order as the pool's `worker_txs[0..K]`
+/// drain) and routes through `merge_scan_results` with the same
+/// `ScatterKind`. The resulting merged payload is byte-identical to
+/// what the parallel path would produce.
+#[inline]
+fn is_tiny_scan(op: &Op) -> bool {
+    matches!(op, Op::FindBy { .. } | Op::FindByComposite { .. })
+}
+
 /// The sharded dispatcher held by `EngineHandle` when
 /// `ServerConfig.shard_count = Some(K)` with `K >= 2`. Owns K
 /// independent per-shard `EngineHandle`s; the public `EngineHandle`
@@ -493,6 +524,25 @@ impl ShardedDispatcher {
             Ok(k) => k,
             Err(e) => return e,
         };
+        // SP-Perf-A-SHARD-SCAN-FASTPATH Approach B: for "tiny scan"
+        // ops where the per-op cost is sub-microsecond at K=1 (FindBy
+        // on a primary/secondary indexed column), even the persistent
+        // pool's channel-send/recv overhead (~10-100µs at K=4 under
+        // contention) dominates the useful work. For these ops, walk
+        // every shard SEQUENTIALLY on the dispatcher thread — no
+        // channel hop, no worker dispatch. Total time = K × per-op
+        // cost (~4µs at K=8 for FindBy) which beats even the pool.
+        //
+        // The is_tiny_scan predicate is tightly scoped:
+        //   - Op::FindBy { type_id, field_id, value }
+        //   - Op::FindByComposite { type_id, fields, values }
+        // These are equality-index lookups whose K=1 baseline emits
+        // oids in secondary-index iteration order (OidConcat merge).
+        // Sequential walk preserves the same shard-id-ordered concat
+        // as the parallel path — K-invariance unchanged.
+        if is_tiny_scan(op) {
+            return self.scatter_serial(op, &resolved_kind);
+        }
         // 2. SP-Perf-A-SHARD-SCAN-FASTPATH: dispatch via the persistent
         //    worker pool instead of spawning K threads per call. Per-call
         //    overhead drops from ~1500µs (4-thread spawn at K=4) to
@@ -508,6 +558,30 @@ impl ShardedDispatcher {
             &resolved_kind,
             cancel,
         )
+    }
+
+    /// SP-Perf-A-SHARD-SCAN-FASTPATH Approach B: serial-walk scatter
+    /// for tiny ops. Calls each shard sequentially on the dispatcher
+    /// thread (no pool, no channel hop). Total wall-clock = K × per-op
+    /// cost — for FindBy at ~500ns/op, that's ~4µs at K=8 vs ~100µs
+    /// via the pool. Merge uses the same `merge_scan_results` path so
+    /// determinism + K-invariance are preserved byte-equal.
+    ///
+    /// Used for FindBy / FindByComposite (OidConcat merge) where the
+    /// per-shard reply is a raw `[16B oid]*` blob (typically 0-16
+    /// bytes per shard for a primary-key-like lookup).
+    fn scatter_serial(&self, op: &Op, kind: &ScatterKind) -> OpResult {
+        let mut gathered: Vec<OpResult> = Vec::with_capacity(self.shards.len());
+        for shard in &self.shards {
+            let r = shard.apply_op(op);
+            // V1 hard-fail: a non-Got from any shard poisons the merge
+            // with that slot's typed error. Matches scatter_and_merge_ctx.
+            if !matches!(r, OpResult::Got(_)) {
+                return r;
+            }
+            gathered.push(r);
+        }
+        crate::scatter_scan::merge_scan_results(gathered, kind)
     }
 
     /// Legacy spawn-per-call scatter path. Kept for compatibility with
@@ -1780,6 +1854,141 @@ mod tests {
             let r4 = e4.apply(op);
             assert_eq!(r1, r4, "GroupAggregate kind={kind} K=4 vs K=1 diverged");
         }
+        drop(e1);
+        drop(e4);
+        let _ = std::fs::remove_dir_all(&dir1);
+        let _ = std::fs::remove_dir_all(&dir4);
+    }
+
+    // ============================================================
+    // SP-Perf-A-SHARD-SCAN-FASTPATH Approach B: is_tiny_scan KAT +
+    // serial-walk invariance with the pool path.
+    // ============================================================
+
+    /// `is_tiny_scan` returns true for FindBy/FindByComposite only.
+    /// Every other Op variant must NOT be classified as tiny — we
+    /// walk a representative subset (full coverage is locked by
+    /// `route_op_k4_scans_scatter_post_shard_scan` + the K-invariance
+    /// oracle which exercises every scan variant).
+    #[test]
+    fn fastpath_is_tiny_scan_classifies_findby_only() {
+        let findby = Op::FindBy {
+            type_id: 1,
+            field_id: 0,
+            value: vec![0u8; 8],
+        };
+        let findby_comp = Op::FindByComposite {
+            type_id: 1,
+            fields: vec![0, 1],
+            values: vec![vec![0u8; 8], vec![0u8; 8]],
+        };
+        assert!(is_tiny_scan(&findby));
+        assert!(is_tiny_scan(&findby_comp));
+
+        // Negative cases: scan-shape ops that are NOT tiny.
+        let not_tiny: Vec<Op> = vec![
+            Op::Select { type_id: 1, program: vec![], limit: 10 },
+            Op::QueryRows {
+                type_id: 1,
+                eq_preds: vec![],
+                program: vec![],
+                limit: 10,
+                range_preds: vec![],
+            },
+            Op::SelectFields {
+                type_id: 1,
+                program: vec![],
+                fields: vec![],
+                limit: 10,
+            },
+            Op::SelectSorted {
+                type_id: 1,
+                program: vec![],
+                sort_field: 0,
+                desc: false,
+                offset: 0,
+                limit: 10,
+            },
+            Op::Aggregate {
+                type_id: 1,
+                program: vec![],
+                kind: 0,
+                field_id: 0,
+                range_preds: vec![],
+            },
+            Op::FindRange {
+                type_id: 1,
+                field_id: 0,
+                lo: vec![0u8; 8],
+                hi: vec![0xFFu8; 8],
+            },
+            Op::Query { type_id: 1, preds: vec![] },
+            Op::GetById {
+                type_id: 1,
+                id: ObjectId::from_u128(1),
+            },
+        ];
+        for op in &not_tiny {
+            assert!(!is_tiny_scan(op), "false positive on {op:?}");
+        }
+    }
+
+    /// Serial-walk path (Approach B) must produce results that match
+    /// K=1 in multiset semantics (the OidConcat merge per the
+    /// SHARD-SCAN T3 oracle). FindBy's K=1 baseline emits oids in
+    /// secondary-index iteration order; the serial walk concatenates
+    /// per-shard reply payloads in shard-id order, which the K-
+    /// invariance oracle documents as multiset-equal to K=1.
+    #[test]
+    fn fastpath_serial_findby_matches_k1_multiset() {
+        let cfg_k1 = ServerConfig {
+            shard_count: None,
+            read_workers: Some(0),
+            ..ServerConfig::default()
+        };
+        let dir1 = fresh_dir("fastpath-serial-k1");
+        let e1 = spawn_engine_cfg(&dir1, &cfg_k1).expect("k1 spawn");
+        let (e4, dir4) = spawn_sharded(4, "fastpath-serial-k4");
+        let ot = build_oracle_schema(&e1);
+        let _ = build_oracle_schema(&e4);
+        seed_oracle(&e1, &ot, 50);
+        seed_oracle(&e4, &ot, 50);
+        // FindBy on the indexed `v` field (field_id=1, U64 with
+        // CreateIndex in build_oracle_schema). K=4 goes through the
+        // is_tiny_scan → scatter_serial fast path because FindBy is
+        // tiny. We use v=21 (row i=3 has v=i*7=21 per seed_oracle).
+        // type_id=1 is what CreateType returned in build_oracle_schema
+        // (asserted via TypeCreated(1) there); ObjectType::from_def
+        // returns type_id=0 as a wire-side hint that's not the real
+        // engine-assigned id.
+        let _ = ot; // silence unused-binding now that we use type_id=1 directly
+        let findby = Op::FindBy {
+            type_id: 1,
+            field_id: 1,
+            value: 21u64.to_le_bytes().to_vec(),
+        };
+        let r1 = e1.apply(findby.clone());
+        let r4 = e4.apply(findby);
+        // Both should be Got; payload is a `[16B oid]*` concatenation.
+        // Multiset-equal per the SHARD-SCAN T3 OidConcat oracle.
+        let p1 = match r1 {
+            OpResult::Got(b) => b.to_vec(),
+            o => panic!("K=1 FindBy got {o:?}"),
+        };
+        let p4 = match r4 {
+            OpResult::Got(b) => b.to_vec(),
+            o => panic!("K=4 FindBy got {o:?}"),
+        };
+        assert_eq!(p1.len() % 16, 0, "K=1 oid payload must be 16-byte aligned");
+        assert_eq!(p4.len() % 16, 0, "K=4 oid payload must be 16-byte aligned");
+        let mut oids1: Vec<&[u8]> = p1.chunks(16).collect();
+        let mut oids4: Vec<&[u8]> = p4.chunks(16).collect();
+        oids1.sort();
+        oids4.sort();
+        assert_eq!(
+            oids1, oids4,
+            "serial FindBy at K=4 must be multiset-equal to K=1"
+        );
         drop(e1);
         drop(e4);
         let _ = std::fs::remove_dir_all(&dir1);

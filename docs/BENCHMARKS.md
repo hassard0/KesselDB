@@ -1728,7 +1728,7 @@ The find-by regression motivates a follow-up arc:
 | No new external deps | YES |
 | V1 limitations honestly documented | YES (AVG / Join / per-type-pin / snapshot each named) |
 
-## 13. SP-PG-COPY-BULKAPPLY — 100K-row COPY FROM STDIN (2026-05-30)
+## 15. SP-PG-COPY-BULKAPPLY — 100K-row COPY FROM STDIN (2026-05-30)
 
 **Workload**: `COPY <table> FROM STDIN` of 100,000 rows of
 `(BIGINT id, CHAR(64) name)` — ~50-byte text-format rows. Single

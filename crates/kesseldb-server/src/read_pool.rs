@@ -57,8 +57,24 @@ use std::thread::JoinHandle;
 ///   GetById, GetBlob, FindBy, FindByComposite, FindRange, Query, QueryExpr,
 ///   Select, QueryRows, SelectFields, SelectSorted, Aggregate, GroupAggregate,
 ///   Describe, SeqRead, Join.
+///
+/// SP-Perf-A-TXN-RO extension: `Op::Txn { ops }` is read-only IFF every
+/// inner op is read-only. The proto-level `Op::is_mutating()` classifies
+/// Op::Txn as always-mutating (conservative — it cannot know the inner
+/// composition at the variant-discriminant level); the server-side
+/// classifier here recurses the inner ops and reclassifies all-RO Txns
+/// as read-only so the apply_raw / read pool dispatch can route them
+/// around the write lock. Mixed-RW Op::Txn still classifies as
+/// mutating and falls through to the engine queue, byte-untouched.
 pub fn is_read_only(op: &Op) -> bool {
-    !op.is_mutating()
+    match op {
+        // SP-Perf-A-TXN-RO: all-RO Op::Txn is read-only. Empty Txn
+        // (`ops.is_empty()`) is read-only by `.all` short-circuit — the
+        // SM apply-Txn path returns Ok for empty too, so the bypass
+        // matches that contract.
+        Op::Txn { ops } => ops.iter().all(is_read_only),
+        _ => !op.is_mutating(),
+    }
 }
 
 /// One unit of work for a read worker: an opaque request frame (the same
@@ -384,10 +400,13 @@ mod tests {
         ]
     }
 
-    /// KAT-1: the classifier mirrors `Op::is_mutating()` for every variant.
-    /// Locks the invariant the spec calls out: proto is the source of
-    /// truth; adding a new write Op variant trips the proto-side test;
-    /// this side then becomes automatically correct via the negation.
+    /// KAT-1: the classifier mirrors `Op::is_mutating()` for every variant
+    /// EXCEPT `Op::Txn{ops}` which the SP-Perf-A-TXN-RO server-side
+    /// classifier reclassifies based on inner-op composition (proto's
+    /// `is_mutating` cannot inspect inners). The exception is locked
+    /// separately by `txn_ro_classifier_all_ro_inner_ops_is_read_only`
+    /// + `txn_ro_classifier_mixed_inner_ops_is_not_read_only`. For every
+    /// other variant the negation invariant still holds.
     #[test]
     fn is_read_only_matches_proto_classifier_for_every_variant() {
         let ops = every_op_variant();
@@ -408,6 +427,13 @@ mod tests {
              every_op_variant() and re-check is_mutating() classification"
         );
         for op in &ops {
+            // SP-Perf-A-TXN-RO: Op::Txn is the documented exception
+            // (server-side recursive classifier inspects inner ops;
+            // proto cannot). Skip the variant-discriminant equality
+            // assertion for Txn; the txn_ro_* KATs lock its behaviour.
+            if matches!(op, Op::Txn { .. }) {
+                continue;
+            }
             assert_eq!(
                 is_read_only(op),
                 !op.is_mutating(),
@@ -417,16 +443,21 @@ mod tests {
         }
     }
 
-    /// KAT-2: the read-only set is exactly the 16 variants the spec §4
-    /// names. Locks both directions: any drift (a write-op reclassified
-    /// as read, or vice versa) trips this.
+    /// KAT-2: the read-only set is exactly the 16 spec §4 variants PLUS
+    /// `Op::Txn{ops: []}` (empty Txn is all-RO by vacuous truth, which
+    /// matches apply-Txn's empty-ops behaviour: it returns Ok without
+    /// doing any work). The bare 16-variant Set is locked by the
+    /// `bare_read_only_set_matches_spec_section_4` helper below.
     #[test]
     fn read_only_set_matches_spec_section_4() {
+        // SP-Perf-A-TXN-RO: with empty-ops Op::Txn in `every_op_variant()`,
+        // the read-only set is the 16 spec variants + Op::Txn (kind 15).
         let expected: std::collections::BTreeSet<u8> = [
             6,  // GetById
             7,  // GetBlob
             9,  // FindBy
             11, // Query
+            15, // Op::Txn (all-RO; empty here)
             16, // QueryExpr
             18, // FindRange
             19, // Select
@@ -462,8 +493,8 @@ mod tests {
             every_op_variant().iter().map(Op::kind).collect();
         let write_set: std::collections::BTreeSet<u8> =
             all.difference(&read_set).copied().collect();
-        // 46 total - 16 read = 30 write kinds.
-        assert_eq!(write_set.len(), 30, "write-set cardinality drifted");
+        // 46 total - (16 spec §4 reads + 1 Op::Txn-empty) = 29 write kinds.
+        assert_eq!(write_set.len(), 29, "write-set cardinality drifted");
     }
 
     /// KAT-4: ReadPool::new(0, ...) is a graceful no-op pool — no
@@ -641,11 +672,14 @@ mod tests {
     }
 
     /// KAT-12: every write Op kind from the spec §4 list is classified
-    /// as NOT read-only.
+    /// as NOT read-only. SP-Perf-A-TXN-RO: kind 15 (Op::Txn) is removed
+    /// from this list — it's now content-dependent (all-RO inners ⇒ RO,
+    /// mixed ⇒ write). Locked separately by
+    /// `txn_ro_classifier_mixed_inner_ops_is_not_read_only`.
     #[test]
     fn write_ops_are_not_read_only() {
         let write_kinds: &[u8] = &[
-            1, 2, 3, 4, 5, 8, 10, 12, 13, 14, 15, 17, 24, 29, 30, 31, 32, 33, 34, 36,
+            1, 2, 3, 4, 5, 8, 10, 12, 13, 14, 17, 24, 29, 30, 31, 32, 33, 34, 36,
             37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
         ];
         let by_kind: std::collections::HashMap<u8, Op> =
@@ -1074,5 +1108,172 @@ mod tests {
         }
         drop(engine);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // SP-Perf-A-TXN-RO classifier KATs — Op::Txn{ops} recursion locks.
+    // -----------------------------------------------------------------------
+    //
+    // The proto `Op::is_mutating()` cannot inspect inner ops; it classifies
+    // every Op::Txn as mutating (conservative). The server-side classifier
+    // here recurses inner ops and reclassifies all-RO Op::Txn as read-only
+    // so the apply_raw/apply dispatch can route them around the write lock.
+    // These KATs lock both directions: all-RO ⇒ RO; ANY write inner ⇒ write.
+
+    /// TXN-RO-KAT-1: empty Op::Txn{ops: vec![]} classifies as read-only.
+    /// Matches apply-Txn's empty-ops behaviour (returns Ok without work).
+    #[test]
+    fn txn_ro_classifier_empty_txn_is_read_only() {
+        let op = Op::Txn { ops: vec![] };
+        assert!(is_read_only(&op), "empty Op::Txn should classify as RO");
+        // Proto side stays mutating (conservative) — the SP-Perf-A-TXN-RO
+        // documented exception in KAT-1.
+        assert!(op.is_mutating(), "proto Op::is_mutating(Txn) is conservatively true");
+    }
+
+    /// TXN-RO-KAT-2: a Txn with only read-only inner ops classifies as
+    /// read-only. Walks every spec §4 read variant inside one Txn.
+    #[test]
+    fn txn_ro_classifier_all_ro_inner_ops_is_read_only() {
+        use kessel_proto::ObjectId;
+        let id = ObjectId::from_u128(7);
+        let all_ro_inners = vec![
+            Op::GetById { type_id: 1, id },
+            Op::GetBlob { handle: 0 },
+            Op::Describe { type_id: 1 },
+            Op::FindBy { type_id: 1, field_id: 0, value: vec![] },
+            Op::FindByComposite { type_id: 1, fields: vec![], values: vec![] },
+            Op::FindRange { type_id: 1, field_id: 0, lo: vec![], hi: vec![] },
+            Op::Query { type_id: 1, preds: vec![Pred { field_id: 0, op: 0, value: vec![] }] },
+            Op::QueryExpr { type_id: 1, program: vec![] },
+            Op::Select { type_id: 1, program: vec![], limit: 0 },
+            Op::QueryRows {
+                type_id: 1, eq_preds: vec![], program: vec![],
+                limit: 0, range_preds: vec![],
+            },
+            Op::SelectFields { type_id: 1, program: vec![], fields: vec![], limit: 0 },
+            Op::SelectSorted {
+                type_id: 1, program: vec![], sort_field: 0,
+                desc: false, offset: 0, limit: 0,
+            },
+            Op::Aggregate {
+                type_id: 1, program: vec![], kind: 0, field_id: 0, range_preds: vec![],
+            },
+            Op::GroupAggregate {
+                type_id: 1, program: vec![], group_field: 0,
+                kind: 0, agg_field: 0, range_preds: vec![],
+            },
+            Op::SeqRead { from: 0, limit: 0 },
+            Op::Join {
+                left_type: 1, right_type: 1, left_field: 0,
+                right_field: 0, limit: 0,
+            },
+        ];
+        let op = Op::Txn { ops: all_ro_inners };
+        assert!(
+            is_read_only(&op),
+            "Op::Txn with all 16 spec §4 read variants must classify as RO"
+        );
+    }
+
+    /// TXN-RO-KAT-3: any write inner op poisons the Txn — classifies as
+    /// write. Locks the safety invariant: a single write must keep the
+    /// Txn on the apply path so the write actually persists.
+    #[test]
+    fn txn_ro_classifier_mixed_inner_ops_is_not_read_only() {
+        use kessel_proto::ObjectId;
+        let id = ObjectId::from_u128(7);
+        // 9 reads + 1 write (the canonical sysbench-RW shape inverted: a
+        // single Op::Create at the end of an otherwise-read Txn).
+        let mut inners = Vec::new();
+        for _ in 0..9 {
+            inners.push(Op::GetById { type_id: 1, id });
+        }
+        inners.push(Op::Create { type_id: 1, id, record: vec![] });
+        let op = Op::Txn { ops: inners };
+        assert!(
+            !is_read_only(&op),
+            "mixed-RW Op::Txn must classify as write (apply-path)"
+        );
+    }
+
+    /// TXN-RO-KAT-4: a write at position 0 (not just at the end) still
+    /// classifies the whole Txn as write — locks the `.all` short-circuit
+    /// from skipping the rest of the walk.
+    #[test]
+    fn txn_ro_classifier_write_at_front_is_not_read_only() {
+        use kessel_proto::ObjectId;
+        let id = ObjectId::from_u128(7);
+        let mut inners = vec![Op::Create { type_id: 1, id, record: vec![] }];
+        for _ in 0..9 {
+            inners.push(Op::GetById { type_id: 1, id });
+        }
+        let op = Op::Txn { ops: inners };
+        assert!(
+            !is_read_only(&op),
+            "Op::Txn with a write at the front must classify as write"
+        );
+    }
+
+    /// TXN-RO-KAT-5: nested Op::Txn{Txn{[reads]}} classifies as RO when
+    /// the inner Txn is RO (recursion). This is a defensive lock — the
+    /// SM apply-Txn validator rejects nested Txn outright, but the
+    /// bypass's read_only_op Txn arm has its own validator (design §3.2)
+    /// that ALSO rejects nested Txn. Both paths agree: nested Txn never
+    /// executes, period. The classifier's recursion is correct here —
+    /// it just means the bypass attempt will then trip the structural
+    /// validator and return SchemaError, matching apply's rejection.
+    #[test]
+    fn txn_ro_classifier_nested_all_ro_recurses() {
+        use kessel_proto::ObjectId;
+        let id = ObjectId::from_u128(7);
+        let inner_txn = Op::Txn {
+            ops: vec![Op::GetById { type_id: 1, id }],
+        };
+        let outer_txn = Op::Txn { ops: vec![inner_txn] };
+        assert!(
+            is_read_only(&outer_txn),
+            "nested all-RO Txn classifies as RO (recursion); SM validator \
+             handles the rejection downstream — symmetric with apply-Txn"
+        );
+    }
+
+    /// TXN-RO-KAT-6: nested Op::Txn with a mixed inner Txn classifies as
+    /// write (the recursion finds the write deep inside).
+    #[test]
+    fn txn_ro_classifier_nested_mixed_classifies_as_write() {
+        use kessel_proto::ObjectId;
+        let id = ObjectId::from_u128(7);
+        let inner_txn = Op::Txn {
+            ops: vec![
+                Op::GetById { type_id: 1, id },
+                Op::Create { type_id: 1, id, record: vec![] },
+            ],
+        };
+        let outer_txn = Op::Txn { ops: vec![inner_txn] };
+        assert!(
+            !is_read_only(&outer_txn),
+            "nested mixed Txn classifies as write via recursion"
+        );
+    }
+
+    /// TXN-RO-KAT-7: 410-inner-op Txn (the sysbench-RO shape: 1+4×100+5
+    /// GetByIds = 410 reads) classifies as RO. Locks the bulk-walk
+    /// performance & correctness for the headline workload.
+    #[test]
+    fn txn_ro_classifier_sysbench_ro_shape_classifies_as_ro() {
+        use kessel_proto::ObjectId;
+        let mut inners = Vec::with_capacity(410);
+        for i in 0..410u128 {
+            inners.push(Op::GetById {
+                type_id: 1,
+                id: ObjectId::from_u128(i),
+            });
+        }
+        let op = Op::Txn { ops: inners };
+        assert!(
+            is_read_only(&op),
+            "sysbench-RO-shape (410 GetByIds in one Txn) classifies as RO"
+        );
     }
 }

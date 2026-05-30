@@ -623,6 +623,7 @@ fn run_parallel_reads(
     duration_secs: u64,
     _pool_workers: Option<usize>,
     workload: BenchWorkload,
+    shard_count: Option<usize>,
 ) {
     use kesseldb_server::{spawn_engine_cfg, ServerConfig};
     let dir = std::env::temp_dir()
@@ -630,6 +631,10 @@ fn run_parallel_reads(
     let _ = std::fs::remove_dir_all(&dir);
     let cfg = ServerConfig {
         read_workers: _pool_workers,
+        // SP-Perf-A-SHARD-APPLY: opt-in K=N sharded engine when
+        // --shard-count N is passed (N >= 2). None / Some(1) preserves
+        // the pre-SHARD single-engine ownership shape byte-for-byte.
+        shard_count,
         ..ServerConfig::default()
     };
     let engine = spawn_engine_cfg(&dir, &cfg).expect("engine open");
@@ -765,9 +770,10 @@ fn run_parallel_reads(
     lat_ns_all.sort_unstable();
     println!(
         "parallel-reads workload={} workers={workers} rows={rows} \
-         duration={duration_secs}s pool_workers={:?}",
+         duration={duration_secs}s pool_workers={:?} shard_count={:?}",
         workload.label(),
-        cfg.read_workers
+        cfg.read_workers,
+        cfg.shard_count,
     );
     println!(
         "  total = {total_ops:>10} ops | {:.0} ops/sec | p50 {}us  p99 {}us  p99.99 {}us",
@@ -795,6 +801,9 @@ fn main() {
         let mut duration: u64 = 10;
         let mut pool_workers: Option<usize> = None;
         let mut workload: BenchWorkload = BenchWorkload::GetById;
+        // SP-Perf-A-SHARD-APPLY: --shard-count N opts in to K=N sharded
+        // engine spawn. Unset = unsharded (single engine path).
+        let mut shard_count: Option<usize> = None;
         let mut i = 2;
         while i < args.len() {
             match args[i].as_str() {
@@ -822,10 +831,14 @@ fn main() {
                         .unwrap_or(workload);
                     i += 2;
                 }
+                "--shard-count" => {
+                    shard_count = args.get(i + 1).and_then(|s| s.parse().ok());
+                    i += 2;
+                }
                 _ => i += 1,
             }
         }
-        run_parallel_reads(workers, rows, duration, pool_workers, workload);
+        run_parallel_reads(workers, rows, duration, pool_workers, workload, shard_count);
         return;
     }
 

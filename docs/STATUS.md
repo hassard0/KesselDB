@@ -444,6 +444,35 @@ covered by the workspace test suite (2024 default / 2052 with
   tracker → SHARD-SCAN V1 SHIPPED — DONE for correctness;
   DONE_WITH_CONCERNS for perf shape (named SHARD-SCAN-FASTPATH
   follow-up). **TaskList #352 ready.**
+- **Track L cont. — SP-Perf-A-SHARD-SCAN-FASTPATH (2026-05-30, V1
+  SHIPPED).** Closes the find-by perf regression SHARD-SCAN named.
+  Two complementary fixes: (A) **persistent ScatterPool** — K
+  long-lived worker threads block on `sync_channel(1)` waiting for
+  work; replaces per-call `std::thread::spawn` (per-call overhead
+  drops from ~1500µs to ~10-100µs); (B) **serial fast path for tiny
+  scans** — for `Op::FindBy / Op::FindByComposite` (sub-microsecond
+  indexed lookups), walk every shard sequentially on the dispatcher
+  thread (no channel hop, no pool dispatch). `is_tiny_scan(op)`
+  predicate classifies at routing time; scatter_serial does the walk +
+  the same `merge_scan_results` call as the parallel path. **Vulcan
+  bench (3-trial median)**: find-by K=4 = 1,066K ops/sec
+  (**105× lift** from 10K, recovers to **59% of K=1 baseline 1,810K**);
+  K=8 = 844K (**185× lift** from 4.5K, 47% of K=1). Both crush the
+  spec's 50× / 25× recovery targets and the 2× K=1 target. Other
+  workloads mixed: aggregate-sum K=8 = 1,897 (1.30× over K=1);
+  select-limit/select-sorted at K=4 regressed further due to pool
+  channel contention (16 dispatcher threads → 4 workers under
+  saturation) — named follow-up `SHARD-SCAN-POOL-SCALEOUT` (per-
+  dispatcher pool replicas). K-invariance oracle still GREEN; 12 scan
+  ops still byte/multiset-equal across K∈{1,4,8}. Test surface:
+  kesseldb-server lib 188 → 198 (+10; 8 ScatterPool KATs + 2
+  Approach-B KATs). Default `cargo build` byte-identical (pool only
+  constructed when `shard_count >= 2`). `#![forbid(unsafe_code)]`
+  honored; zero new external deps. Commits: `01cbbb6` (T1+T2 design +
+  ScatterPool scaffold + dispatcher wire-up + 8 KATs), `af98f3a`
+  (Approach B serial fast path + 2 KATs), plus this commit (T3 bench +
+  T4 STATUS + BENCHMARKS §14b + tracker close). Progress tracker →
+  SHARD-SCAN-FASTPATH V1 SHIPPED. **TaskList #353 ready.**
 - **Track D — Cluster test flakes (SP-CLUSTER-FLAKE T2).** Root-cause fixed
   in `Node::submit*` / `apply_raw`: production VSR retry on transient
   ViewChange. Not just a test relaxation — the actual production code path

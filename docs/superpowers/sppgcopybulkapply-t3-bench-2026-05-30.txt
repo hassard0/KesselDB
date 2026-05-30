@@ -1,0 +1,63 @@
+=== SP-PG-COPY-BULKAPPLY T3 — 100K-row COPY bench on vulcan, 2026-05-30 ===
+
+Hardware: vulcan, see docs/BENCHMARKS.md §1.
+KesselDB build: release, commit 2931158 (this arc, T1+T2).
+                CARGO_TARGET_DIR=/tmp/kdb-target-copybulk
+                --features pg-gateway
+Reference DB: Postgres 16 (docker bench-pg, default fsync=on).
+Data shape: 100K rows × (BIGINT id, CHAR(64) name) — 50-byte text-format rows.
+PG client: PostgreSQL 16.14 psql.
+
+--- KesselDB V1 baseline (per-row dispatch via KESSELDB_COPY_BATCH_SIZE=1) ---
+
+10K rows (full 100K would take ~350s):
+$ time PGPASSWORD=admin psql -h 127.0.0.1 -p 5532 -U test -d kesseldb \
+    -c 'COPY bulk_v1 FROM STDIN' < /tmp/copybulk-10k.tsv
+COPY 10000
+real    0m35.065s
+→ 10000 / 35.065 = 285 rows/sec
+
+--- KesselDB V2 (BULKAPPLY default batch_size=1024) ---
+
+3 trials, 100K rows each (table dropped between trials):
+
+=== bulk_t1 ===
+real    0m1.929s    → 51,840 rows/sec
+=== bulk_t2 ===
+real    0m1.870s    → 53,476 rows/sec
+=== bulk_t3 ===
+real    0m1.965s    → 50,891 rows/sec
+
+Median: 1.929s → 51,840 rows/sec
+
+--- Postgres 16 reference ---
+
+3 trials, 100K rows each (table dropped between trials):
+
+=== pg_t1 ===
+real    0m0.173s    → 578,034 rows/sec
+=== pg_t2 ===
+real    0m0.168s    → 595,238 rows/sec
+=== pg_t3 ===
+real    0m0.193s    → 518,134 rows/sec
+
+Median: 0.173s → 578,034 rows/sec
+
+--- Headline ---
+
+| DB                            | rows/sec  | vs V1 baseline | vs Postgres |
+|-------------------------------|-----------|----------------|-------------|
+| KesselDB V1 (per-row)         |       285 | 1.00×          | 0.0005×     |
+| KesselDB V2 (batch_size=1024) |    51,840 | **181.9×**     | 0.090×      |
+| Postgres 16                   |   578,034 | 2027×          | 1.00×       |
+
+Result: BULKAPPLY V1 lifts COPY throughput **181.9× over V1 baseline**.
+Closes the 257-rows/sec V1-CLOSURE gap; KesselDB now within ~11× of
+Postgres 16 (was ~2000× behind).
+
+--- Row-count verification ---
+
+$ PGPASSWORD=admin psql -h 127.0.0.1 -p 5532 -U test -d kesseldb -c 'SELECT * FROM bulk'
+... (100000 rows)
+
+Round-trip works: all 100K rows are visible to SELECT after the COPY commits.

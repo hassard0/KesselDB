@@ -1826,6 +1826,8 @@ and post higher numbers; that's V2 `SP-PG-EXTQ-PIPELINE-BATCH`.
 - SP-PG-EXTQ progress (T7 — hardening + real ORM smoke): `docs/superpowers/specs/2026-05-28-kesseldb-subproject-sppgextq-progress.md`
 - SP-PG-COPY design spec: `docs/superpowers/specs/2026-05-30-kesseldb-sppgcopy-design.md`
 - SP-PG-COPY progress (V1 SHIPPED at T4 — pg_dump / sysbench / `\copy` bulk-load): `docs/superpowers/specs/2026-05-30-kesseldb-subproject-sppgcopy-progress.md`
+- SP-PG-COPY-BULKAPPLY design spec: `docs/superpowers/specs/2026-05-30-kesseldb-sppgcopybulkapply-design.md`
+- SP-PG-COPY-BULKAPPLY progress (V1 SHIPPED — 181.9× COPY throughput lift via per-batch Op::Txn fold): `docs/superpowers/specs/2026-05-30-kesseldb-subproject-sppgcopybulkapply-progress.md`
 
 ### SP-PG-COPY — `COPY FROM STDIN` / `COPY TO STDOUT` bulk load (V1 SHIPPED 2026-05-30)
 
@@ -1880,19 +1882,35 @@ or extended-query message works normally — the connection STAYS
 ALIVE across COPY errors (matching the SP-PG-EXTQ tolerant
 probe-then-fall-back contract).
 
-**V1 throughput** (on vulcan, 1000 rows of `(BIGINT, CHAR(32))`):
-~257 rows/sec. The per-row pattern is `SELECT * FROM <table>`-like
-INSERT dispatch through `dispatch_query` for each parsed row;
-comparable to the SP-PG-EXTQ INSERT loop measured at T8
-(252 stmt/s). V2 `SP-PG-COPY-BULKAPPLY` would batch rows into a
-single `Op::Txn` and lift this 10-50×.
+**Throughput** (on vulcan, 100K rows of `(BIGINT, CHAR(64))`, 2026-05-30):
+**~51,840 rows/sec** with SP-PG-COPY-BULKAPPLY (default
+`KESSELDB_COPY_BATCH_SIZE=1024`). The V1 per-row baseline was
+~285 rows/sec; BULKAPPLY V1 lifts **181.9×** by folding N rows into a
+single multi-row `INSERT INTO t (cols) VALUES (...), (...), ...`
+which kessel-sql compiles to `Op::Txn { ops: Vec<Op::Create> }` —
+one apply round-trip + one WAL fsync per batch instead of one per
+row. Tunable via `KESSELDB_COPY_BATCH_SIZE` env at server start
+(clamped to `[1, 65536]`); set to `1` to restore V1-baseline shape.
+Postgres 16 reference on the same workload: ~578K rows/sec — KesselDB
+is now within ~11× of Postgres COPY throughput (was ~2000× behind).
+Bench transcript: `docs/superpowers/sppgcopybulkapply-t3-bench-2026-05-30.txt`.
 
-**V1 atomicity divergence** vs PG: real PG uses "all-or-nothing on
-error" — if any row fails mid-COPY, the whole COPY rolls back. V1
-commits each row immediately (because the engine has no notion of
-tentative writes). A constraint failure at row 500 of 1000 leaves
-the first 499 committed. V2 `SP-PG-COPY-BULKAPPLY` restores PG
-semantics via the `Op::Txn` fold.
+**Atomicity** vs PG: SP-PG-COPY-BULKAPPLY V1 is **per-batch
+atomic** — each batch (default 1024 rows) is wrapped in an `Op::Txn`,
+so any inner-op failure rolls back the whole batch. Real PG is
+**whole-COPY atomic** (an implicit transaction wraps every row in
+the COPY). A constraint failure at row 1500 of 10000 with the
+default batch size: rows 1-1024 stay committed; rows 1025-1500's
+batch rolls back; COPY aborts. The named follow-up arc
+`SP-PG-COPY-BULKAPPLY-WHOLECOPY` would close the rest of the gap
+(gated on an engine-side streaming-Txn shape landing first).
+
+**NULL-row fallback**: a batch containing any `\N` NULL field falls
+back to per-row dispatch (the column-omit trick V1 relies on for
+NULL handling requires per-row column lists, which multi-row INSERT
+can't carry). Throughput on NULL-heavy tables is therefore similar to
+the V1 baseline; throughput on all-non-NULL tables (sysbench /
+pg_dump common case) lands the headline lift.
 
 **V1 NULL handling caveat**: kessel-sql's `INSERT VALUES` parser
 has no `NULL` keyword. SP-PG-COPY V1 works around this by OMITTING
@@ -1916,8 +1934,14 @@ V2 follow-ups (each its own SP-arc):
 - `SP-PG-COPY-BIN` — binary format (`WITH (FORMAT binary)`).
 - `SP-PG-COPY-CSV` — CSV format with quoting + `HEADER` + custom
   delimiters.
-- `SP-PG-COPY-BULKAPPLY` — per-batch `Op::Txn` fold for 10-50×
-  throughput win + PG-compatible all-or-nothing atomicity.
+- `SP-PG-COPY-BULKAPPLY-WHOLECOPY` — whole-COPY atomicity (one
+  Op::Txn covers every row) for full PG-compatible
+  all-or-nothing semantics. Gated on an engine-side streaming-Txn
+  shape (`Op::TxnBegin / TxnAppend / TxnCommit`) landing first;
+  otherwise a 100M-row COPY would buffer 100M rows in RSS.
+- `SP-PG-COPY-BULKAPPLY-NULLBATCH` — restore the BULKAPPLY win for
+  batches containing NULL fields (today they fall back to per-row
+  dispatch).
 - `SP-PG-COPY-FILE` — `COPY ... FROM '/path'` (operator-opt-in
   only, security).
 - `SP-PG-COPY-PROGRAM` — `COPY ... FROM PROGRAM '...'` (permanent

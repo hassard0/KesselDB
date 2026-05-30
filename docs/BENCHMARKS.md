@@ -30,6 +30,7 @@ Wins, losses, and the one-line cause for each:
 | sysbench OLTP write-only (N=8) | **5.2× faster** (53K vs 10K tx/s) | Write-heavy transactions |
 | sysbench OLTP read-only (N=16) | **5.7× faster** (28,977 vs 5,073 tx/s; SP-Perf-A-TXN-RO lift 42.6×) | Was LOSING; arc closed |
 | sysbench OLTP read-write (N=16) | **2.66× faster** (10,273 vs 3,862 tx/s; SP-Perf-A-TXN-RW lift 14.4×) | Was LOSING; arc closed |
+| **PG COPY FROM STDIN 100K rows (single conn)** | **LOSES** (51,840 vs 578,034 rows/s; SP-PG-COPY-BULKAPPLY lift **181.9×** from V1 baseline 285 r/s) | Gap closed from ~2000× to 11.1×; the per-row apply-thread+fsync ceiling is the remaining cost — next slice would be the engine-side Op::Txn streaming shape |
 | TPC-H Q1 — multi-aggregate GROUP BY (N=4) | **LOSES** (63.77 vs 186 q/s; SP-Hash-Agg-Tune lift 1.06×, cumulative 4-arc lift 7.21×) | Gap closed from 18× to 2.92×; SP-Hash-Agg-Tune sweep diagnosed remaining cost as per-row WHERE VM interpreter — SP-WHERE-VM-Specialise / SP-JIT-Aggregate next |
 | TPC-H Q6 — SUM with WHERE (N=4) | **LOSES** (197.55 vs 1,686 q/s; SP-Hash-Agg-Tune lift 1.07×, cumulative 4-arc lift 14.38×) | Gap closed from 123× to 8.53×; same root cause as Q1 — SP-WHERE-VM-Specialise / SP-JIT-Aggregate next |
 
@@ -1570,5 +1571,72 @@ rwlock CAS lines live in different cores' L1s.
 | `#![forbid(unsafe_code)]` honored | YES |
 | No new external deps | YES |
 | V1 limitations honestly documented | YES (scan / Txn / VSR each named V2 arc) |
+
+## 13. SP-PG-COPY-BULKAPPLY — 100K-row COPY FROM STDIN (2026-05-30)
+
+**Workload**: `COPY <table> FROM STDIN` of 100,000 rows of
+`(BIGINT id, CHAR(64) name)` — ~50-byte text-format rows. Single
+connection. Wall-clock measured via `time`. Three trials per DB; the
+median is reported.
+
+**Why this workload matters**: PG's `COPY FROM STDIN` is the bulk-load
+lever every modern pg_dump restore, sysbench `prepare` phase, and
+analyst-friendly `psql \copy ... CSV` workflow uses. SP-PG-COPY V1
+(2026-05-30) shipped the wire surface end-to-end but per-row apply
+dispatch capped throughput at ~257 rows/sec (V1 weak-spot #1). This
+arc folds N rows into one multi-row `INSERT INTO t (cols) VALUES
+(...), (...), ...`, which kessel-sql compiles to `Op::Txn { ops: Vec
+<Op::Create> }` — one apply round-trip + one WAL fsync per batch.
+
+**Setup**:
+
+- KesselDB build: `cargo build --release --bin kesseldb --features pg-gateway`
+  from commit 2931158 (T1+T2 of this arc).
+  `CARGO_TARGET_DIR=/tmp/kdb-target-copybulk` for the bench-local
+  target dir.
+- Listener: PG-wire `127.0.0.1:5532`, binary `127.0.0.1:6532`.
+- Reference DB: Postgres 16 (docker `bench-pg`, default `fsync=on`).
+- V1-baseline path: same KesselDB binary, started with
+  `KESSELDB_COPY_BATCH_SIZE=1` (per-row dispatch, the V1 shape).
+- V2 path: same KesselDB binary, default `KESSELDB_COPY_BATCH_SIZE=1024`.
+- Full transcript: `docs/superpowers/sppgcopybulkapply-t3-bench-2026-05-30.txt`.
+
+**Results** (median of 3 trials, 100K rows / table; V1-baseline number
+extrapolated from a 10K-row measured run because the 100K-row V1 run
+would take ~6 minutes):
+
+| Configuration | 100K-row wall-clock | rows/sec | vs V1 | vs Postgres |
+|---|---|---|---|---|
+| KesselDB V1 (`KESSELDB_COPY_BATCH_SIZE=1`) | ~350s (extrapolated from 35.065s/10K) | **285** | 1.00× | 0.0005× |
+| KesselDB V2 (default `KESSELDB_COPY_BATCH_SIZE=1024`) | 1.929s | **51,840** | **181.9×** | 0.090× |
+| Postgres 16 (reference) | 0.173s | **578,034** | 2,027× | 1.00× |
+
+**Headline**: BULKAPPLY V1 lifts COPY throughput **181.9×** over V1
+baseline. KesselDB is now within ~11× of Postgres 16 on the COPY
+workload (was ~2000× behind). Wins/losses:
+
+- **vs V1 baseline (per-row dispatch)**: 181.9× lift. Comes from
+  batching 1024 parsed rows into one multi-row INSERT — one
+  `Op::Txn` round-trip + one WAL fsync per batch instead of one per
+  row.
+- **vs Postgres 16**: 11.1× behind. Remaining cost diagnosed as
+  per-batch SQL synthesis + multi-row INSERT compilation; the
+  apply-thread + WAL fsync side is no longer dominant. Future V2-of-V2
+  arc (`SP-PG-COPY-BULKAPPLY-WHOLECOPY`) would close the rest via
+  whole-COPY atomicity + a typed-binding shape that bypasses SQL
+  synthesis entirely.
+
+**Atomicity model** (documented divergence — design spec §6):
+
+| Behaviour | V1 (per-row) | V2 (per-batch) | Postgres (whole-COPY) |
+|---|---|---|---|
+| Row 500 of 1000 NOT NULL violation | rows 1-499 committed, COPY aborts | rows in failing batch all roll back, prior batches stay | nothing committed, COPY aborts |
+| Crash mid-COPY | last applied row durable | last applied BATCH durable | nothing durable |
+
+V2 is closer to PG than V1 but still not identical. `SP-PG-COPY-
+BULKAPPLY-WHOLECOPY` (named follow-up) would close the gap by
+buffering the entire COPY in one Op::Txn — gated on engine-side
+`Op::TxnBegin / Op::TxnAppend / Op::TxnCommit` shape landing first
+(otherwise a 100M-row COPY would buffer 100M rows in RSS).
 
 

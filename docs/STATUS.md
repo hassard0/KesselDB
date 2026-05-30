@@ -36,18 +36,32 @@ covered by the workspace test suite (2024 default / 2052 with
   contract). **HEADLINE — real psql 16.14 smoke on vulcan: CREATE TABLE +
   COPY FROM (3 rows) + SELECT * + COPY TO (3 rows on the wire) round-trip
   byte-equal end-to-end.** NULL round-trip via `\N` sentinel works; 1k-row
-  ingest via COPY ran in 3.89s (~257 rows/sec — comparable to SP-PG-EXTQ
-  INSERT loop, lifts in V2 `SP-PG-COPY-BULKAPPLY` per-batch `Op::Txn` fold).
-  Binary / CSV / file / program variants rejected with precise
-  V2-pointing `0A000` messages (`SP-PG-COPY-BIN`, `SP-PG-COPY-CSV`,
-  `SP-PG-COPY-FILE`, `SP-PG-COPY-PROGRAM`). Unlocks `pg_dump` restore,
-  `sysbench prepare`, and `psql \copy` workflows. Smoke transcript:
-  `docs/superpowers/sppgcopy-t4-smoke-2026-05-30.txt`. Named V2 follow-ups:
-  `SP-PG-COPY-BIN` (binary format), `SP-PG-COPY-CSV` (CSV format with
-  quoting + HEADER), `SP-PG-COPY-BULKAPPLY` (per-batch Op::Txn fold for
-  10-50× throughput + PG-compatible all-or-nothing atomicity),
-  `SP-PG-COPY-FILE` (server-side file access — operator-opt-in only),
-  `SP-PG-COPY-PROGRAM` (permanent hard pass). **Arc closed — TaskList #350
+  ingest via COPY ran in 3.89s (~257 rows/sec — V1 baseline, lifted 181.9×
+  in V2 SP-PG-COPY-BULKAPPLY below). Binary / CSV / file / program variants
+  rejected with precise V2-pointing `0A000` messages (`SP-PG-COPY-BIN`,
+  `SP-PG-COPY-CSV`, `SP-PG-COPY-FILE`, `SP-PG-COPY-PROGRAM`). Unlocks
+  `pg_dump` restore, `sysbench prepare`, and `psql \copy` workflows. Smoke
+  transcript: `docs/superpowers/sppgcopy-t4-smoke-2026-05-30.txt`. **Arc
+  closed — TaskList #350 ready for completion.**
+- **Track A.3 — PostgreSQL COPY throughput (SP-PG-COPY-BULKAPPLY V1 SHIPPED — 2026-05-30).**
+  COPY FROM STDIN now buffers up to `COPY_BATCH_SIZE` rows (default 1024,
+  env-overridable via `KESSELDB_COPY_BATCH_SIZE`) and flushes each batch as
+  ONE multi-row `INSERT INTO t (cols) VALUES (...), (...), ...`, which
+  kessel-sql compiles to `Op::Txn { ops: Vec<Op::Create> }` — one apply
+  round-trip + one WAL fsync per batch instead of one per row. **HEADLINE —
+  100K-row COPY on vulcan: 1.929s = 51,840 rows/sec (median of 3 trials), a
+  181.9× lift over the V1 baseline 285 rows/sec.** KesselDB now within ~11×
+  of Postgres 16 (578,034 rows/sec) on the same workload (was ~2000×
+  behind). Per-batch atomicity: each batch is an `Op::Txn` and rolls back
+  whole on any inner failure (documented divergence vs PG's whole-COPY
+  atomicity — `SP-PG-COPY-BULKAPPLY-WHOLECOPY` named as follow-up arc,
+  gated on engine-side streaming-Txn shape). NULL-row fallback preserves
+  correctness for nullable schemas (each NULL-containing batch falls back
+  to per-row dispatch; all-non-NULL batches get the headline lift). Bench
+  transcript: `docs/superpowers/sppgcopybulkapply-t3-bench-2026-05-30.txt`.
+  Named follow-up arcs: `SP-PG-COPY-BULKAPPLY-WHOLECOPY` (full PG-
+  compatible atomicity), `SP-PG-COPY-BULKAPPLY-NULLBATCH` (restore the
+  BULKAPPLY win for NULL-heavy batches). **Arc closed — TaskList #351
   ready for completion.**
 - **Track B — Perf-A read-pool arc (T1 → T7) + TXN-RO follow-on.** Parallel-read bypass
   (`read_only_op(&self, ...)` dispatch through `Arc<RwLock<StateMachine>>`) +

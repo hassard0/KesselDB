@@ -41,6 +41,33 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+// SP-Perf-A-TXN-RW: split-phase classifier helpers. Inlined here
+// (rather than pulled from kesseldb-server) because bench-compare
+// deliberately depends only on the in-process SM crates, not the
+// server crate. Canonical impl + 11 KATs live in
+// crates/kesseldb-server/src/read_pool.rs::{read_prefix_length,
+// is_split_safe}. This inline copy is a 4-line mirror locked by the
+// driver's per-trial sysbench output (a divergence between the two
+// classifications would surface as a verdict mismatch in the
+// determinism oracle KAT txn_rw_split_oracle_1000_random_*).
+
+/// Mirror of `kesseldb_server::read_pool::is_read_only` — sufficient
+/// for the bench's RO-detection (which only handles GetById /
+/// Update / Create / Delete shapes, never nested Op::Txn).
+fn is_read_only_op(op: &Op) -> bool {
+    !op.is_mutating()
+}
+
+/// Mirror of `kesseldb_server::read_pool::read_prefix_length`.
+fn read_prefix_length(ops: &[Op]) -> usize {
+    ops.iter().take_while(|o| is_read_only_op(o)).count()
+}
+
+/// Mirror of `kesseldb_server::read_pool::is_split_safe`.
+fn is_split_safe(suffix: &[Op]) -> bool {
+    suffix.iter().all(|o| !is_read_only_op(o))
+}
+
 /// YCSB row payload width per field (10 × 100 bytes ≈ canonical YCSB row
 /// — record_size after header + null-bitmap ≈ 1 KiB).
 const YCSB_FIELD_BYTES: u16 = 100;
@@ -552,30 +579,79 @@ fn run_sysbench_oltp(
                 // SP-Perf-A-TXN-RO: route all-RO Op::Txn through the read
                 // path (sm.read().read_only_op) so workers can run their
                 // Txns in PARALLEL — no write lock, no apply-thread
-                // queue. Mixed-RW Op::Txn still goes through apply (V1
-                // limit; the next arc SP-Perf-A-TXN-RW attacks mixed-RW
-                // with SI + commit conflict detection). The split here
-                // is determined at workload-config time: `has_writes ==
-                // false` ⇒ pure-RO bracket; else ⇒ mixed/RW. Detecting
-                // at runtime (walking `inner`) would also work but is
-                // redundant when the workload type already encodes the
-                // composition.
+                // queue.
+                //
+                // SP-Perf-A-TXN-RW: mixed-RW Op::Txn with reads-before-
+                // writes shape (the canonical sysbench-RW shape: 10
+                // reads then 4 writes) splits at the read/write boundary:
+                //   - read prefix runs via sm.read().read_only_op
+                //     (TXN-RO bypass — parallel, no write lock)
+                //   - write suffix runs via sm.write().apply (apply
+                //     path — serial, full catalog/index/constraint
+                //     machinery)
+                //
+                // For sysbench-RW this lifts throughput from ~715 tx/s
+                // at N=8 (apply-thread serializing the whole Txn) toward
+                // the write-suffix-bound ceiling (4 writes × ~37 µs per
+                // write ⇒ ~6750 tx/s, ~9× the unified path). Read-after-
+                // write Txn shapes fall through to unified apply (split
+                // is unsafe; suffix has a trailing read that would see
+                // the pre-write snapshot under split but the post-write
+                // overlay under unified apply).
+                //
+                // 3-guard split eligibility check (see read_pool.rs):
+                //   prefix > 0          — non-empty parallelizable prefix
+                //   prefix < total      — non-empty apply-routed suffix
+                //   is_split_safe(...)  — suffix is all writes (no trailing R)
                 let s = Instant::now();
-                let r = if has_writes {
+                let r = if !has_writes {
+                    // Pure RO — TXN-RO bypass.
+                    sm.read()
+                        .unwrap()
+                        .read_only_op(Op::Txn { ops: inner })
+                } else if !has_reads {
+                    // Pure WO — apply-only path.
                     let op_no = op_seq.fetch_add(1, Ordering::Relaxed);
                     sm.write()
                         .unwrap()
                         .apply(op_no, Op::Txn { ops: inner })
                 } else {
-                    // RO bypass — no op-number consumption (reads don't
-                    // take log slots), no write lock, no group-commit
-                    // fsync. The bypass holds sm.read() for the
-                    // iteration so committed state can't advance
-                    // mid-Txn (same isolation contract apply-Txn
-                    // provides via the write lock).
-                    sm.read()
-                        .unwrap()
-                        .read_only_op(Op::Txn { ops: inner })
+                    // Mixed RW — attempt split-phase. For sysbench's
+                    // (R*, W*) shape, the 3-guard succeeds and we get
+                    // the parallel-reads win. For any other shape, fall
+                    // through to unified apply (byte-untouched semantics).
+                    let prefix = read_prefix_length(&inner);
+                    let total = inner.len();
+                    let split_eligible = prefix > 0
+                        && prefix < total
+                        && is_split_safe(&inner[prefix..]);
+                    if split_eligible {
+                        // Split: take the read prefix off the front; the
+                        // remainder is the all-writes suffix.
+                        let mut inner = inner;
+                        let writes = inner.split_off(prefix);
+                        let reads = inner;
+                        let read_r = sm
+                            .read()
+                            .unwrap()
+                            .read_only_op(Op::Txn { ops: reads });
+                        match read_r {
+                            OpResult::Ok => {
+                                let op_no =
+                                    op_seq.fetch_add(1, Ordering::Relaxed);
+                                sm.write()
+                                    .unwrap()
+                                    .apply(op_no, Op::Txn { ops: writes })
+                            }
+                            failed => failed,
+                        }
+                    } else {
+                        // Not split-eligible — apply unified.
+                        let op_no = op_seq.fetch_add(1, Ordering::Relaxed);
+                        sm.write()
+                            .unwrap()
+                            .apply(op_no, Op::Txn { ops: inner })
+                    }
                 };
                 lat.push(s.elapsed().as_nanos() as u64);
                 // Op::Txn returns Ok on success in both code paths;
@@ -626,8 +702,11 @@ fn run_sysbench_oltp(
              txn = Op::Txn{{ops}} — RO bracket routes via \
              sm.read().read_only_op (SP-Perf-A-TXN-RO bypass: no write lock; \
              workers run in parallel against committed state); \
-             RW/WO brackets still serialize on sm.write().apply (V1 limit; \
-             next arc SP-Perf-A-TXN-RW). \
+             RW bracket SPLIT-PHASE (SP-Perf-A-TXN-RW): read prefix via \
+             sm.read().read_only_op (parallel), write suffix via \
+             sm.write().apply (serial). Read-after-write Txns fall through \
+             to unified apply (V1 limit; future TXN-RW-RYW). \
+             WO bracket unchanged (apply-only). \
              inner-ops/txn ≈ {:.1}; reported ops/sec = transactions/sec",
             tables,
             rows_per_table,

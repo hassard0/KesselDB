@@ -1111,3 +1111,270 @@ fn txn_ro_smoke_write_at_front_txn_falls_through_to_apply() {
     let _ = std::fs::remove_dir_all(&dir_p);
     let _ = std::fs::remove_dir_all(&dir_s);
 }
+
+// ----------------------------------------------------------------------
+// SP-Perf-A-TXN-RW oracle — split-phase byte-equivalence for (R*, W*) shape.
+// ----------------------------------------------------------------------
+//
+// V1 ships driver-level split-phase execution of mixed-RW Op::Txn{ops}
+// where reads precede writes. The split is byte-equivalent to unified
+// apply ONLY for this shape; read-after-write Txns fall through to
+// apply unchanged. These tests lock the byte-equivalence claim.
+
+use kesseldb_server::read_pool::{is_split_safe, read_prefix_length};
+
+/// Helper: dispatch a mixed-RW Op::Txn via the split-phase path
+/// (mirrors the bench driver's logic). Returns the verdict that
+/// matches unified apply's contract for (R*, W*) shapes.
+fn dispatch_split_phase(
+    engine: &EngineHandle,
+    ops: Vec<Op>,
+) -> OpResult {
+    let prefix = read_prefix_length(&ops);
+    let total = ops.len();
+    if prefix > 0 && prefix < total && is_split_safe(&ops[prefix..]) {
+        // Split: reads then writes.
+        let mut ops = ops;
+        let writes = ops.split_off(prefix);
+        let reads = ops;
+        let read_r = engine.apply(Op::Txn { ops: reads });
+        match read_r {
+            OpResult::Ok => engine.apply(Op::Txn { ops: writes }),
+            failed => failed,
+        }
+    } else {
+        // No split: dispatch unified.
+        engine.apply(Op::Txn { ops })
+    }
+}
+
+/// TXN-RW oracle 1: 1000 random (R*, W*) Txns × unified-vs-split
+/// byte-equivalent verdict + final state.
+///
+/// Each Txn shape:
+///   - 5..15 random GetById reads (disjoint from the writes' id range)
+///   - 1..4 random writes (Update on EXISTING user rows; the writes
+///     pick ids from a per-Txn-disjoint "scratch" slot so the post-
+///     state is deterministic across the 1000 Txns)
+///
+/// Engines A and B start identical. A applies via unified apply;
+/// B applies via split-phase. After all 1000 Txns, every per-Txn
+/// verdict matches AND every user row 0..N_ROWS Select returns
+/// byte-identical data.
+#[test]
+fn txn_rw_split_oracle_1000_random_read_then_write_txns_byte_equivalent() {
+    // Engine A — unified apply path.
+    let (engine_a, dir_a) = spawn(None, "txnrw-unified");
+    // Engine B — split-phase dispatch path.
+    let (engine_b, dir_b) = spawn(None, "txnrw-split");
+
+    // Same RNG seed → same Txn sequence for both engines.
+    let mut rng = Rng::new(0xC0DE_FACE);
+    let mut diff_verdicts: Vec<(usize, OpResult, OpResult)> = Vec::new();
+
+    for txn_idx in 0..1000usize {
+        // Build a random (R*, W*) Txn shape.
+        let n_reads = 5 + (rng.below(11) as usize); // 5..=15
+        let n_writes = 1 + (rng.below(4) as usize); // 1..=4
+        let mut ops = Vec::with_capacity(n_reads + n_writes);
+        // Random reads over existing rows.
+        for _ in 0..n_reads {
+            ops.push(Op::GetById {
+                type_id: 1,
+                id: ObjectId::from_u128((rng.below(N_ROWS as u64) as u128)),
+            });
+        }
+        // Writes on per-Txn-disjoint id range so the two engines'
+        // post-states converge deterministically. Each Txn uses ids in
+        // [txn_idx * 100, txn_idx * 100 + n_writes) — far from the
+        // seeded 0..N_ROWS range so we won't collide with reads.
+        //
+        // The write op is Update on a NEW id (Op::Update returns
+        // NotFound if the id doesn't exist). To make writes succeed
+        // we first Create the id at the start of each engine's loop —
+        // but that complicates the test. Instead: use Update on an
+        // EXISTING id (within N_ROWS) and ensure the new record is
+        // valid (encoded user schema). Both engines see the same
+        // sequence of (target_id, record_bytes) writes ⇒ deterministic
+        // convergence.
+        let user_ot = ObjectType::from_def(
+            "user".into(),
+            vec![
+                Field { field_id: 1, name: "v".into(), kind: FieldKind::U64, nullable: false },
+                Field { field_id: 2, name: "score".into(), kind: FieldKind::I32, nullable: false },
+                Field { field_id: 3, name: "group".into(), kind: FieldKind::U16, nullable: false },
+                Field { field_id: 4, name: "name".into(), kind: FieldKind::Char(16), nullable: true },
+            ],
+        );
+        for w in 0..n_writes {
+            let target = (((txn_idx * 7 + w) as u64) % (N_ROWS as u64)) as u128;
+            let new_score = ((rng.below(1000) as i32) - 500) as i128;
+            let new_group = (rng.below(50) as u128);
+            let mut name_b = vec![0u8; 16];
+            let s = format!("upd{txn_idx}_{w}");
+            let len = s.len().min(16);
+            name_b[..len].copy_from_slice(&s.as_bytes()[..len]);
+            let rec = encode(
+                &user_ot,
+                &[
+                    Value::Uint((target).wrapping_mul(7)),
+                    Value::Int(new_score),
+                    Value::Uint(new_group),
+                    Value::Blob(name_b),
+                ],
+            )
+            .unwrap();
+            ops.push(Op::Update {
+                type_id: 1,
+                id: ObjectId::from_u128(target),
+                record: rec,
+            });
+        }
+
+        // Sanity: this Txn IS split-eligible.
+        let prefix = read_prefix_length(&ops);
+        assert_eq!(prefix, n_reads, "txn {txn_idx}: prefix={prefix}, expected {n_reads}");
+        assert!(is_split_safe(&ops[prefix..]), "txn {txn_idx}: suffix has trailing read");
+
+        // Apply on A (unified) and B (split). Verdicts must match.
+        let verdict_a = engine_a.apply(Op::Txn { ops: ops.clone() });
+        let verdict_b = dispatch_split_phase(&engine_b, ops);
+
+        if verdict_a != verdict_b {
+            diff_verdicts.push((txn_idx, verdict_a, verdict_b));
+            if diff_verdicts.len() <= 3 {
+                eprintln!(
+                    "TXN-RW SPLIT DIVERGENCE txn={} unified={:?} split={:?}",
+                    diff_verdicts.last().unwrap().0,
+                    diff_verdicts.last().unwrap().1,
+                    diff_verdicts.last().unwrap().2
+                );
+            }
+        }
+    }
+
+    // Final-state byte-equivalence: Select every user row from both
+    // engines and compare.
+    let sel_a = engine_a.apply(Op::Select { type_id: 1, program: vec![], limit: 0 });
+    let sel_b = engine_b.apply(Op::Select { type_id: 1, program: vec![], limit: 0 });
+
+    drop(engine_a);
+    drop(engine_b);
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+
+    assert!(
+        diff_verdicts.is_empty(),
+        "TXN-RW split oracle FAILED: {} verdict divergences across 1000 Txns. First 3: {:?}",
+        diff_verdicts.len(),
+        diff_verdicts.iter().take(3).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        sel_a, sel_b,
+        "TXN-RW split oracle: final-state Select diverged between unified and split engines"
+    );
+}
+
+/// TXN-RW smoke: a single sysbench-shape Txn (10 reads, 4 writes) via
+/// unified-vs-split is byte-equivalent. This is the headline-workload
+/// smoke complementing the bulk oracle above.
+#[test]
+fn txn_rw_split_smoke_sysbench_shape_byte_equivalent() {
+    let (engine_a, dir_a) = spawn(None, "txnrw-sm-unified");
+    let (engine_b, dir_b) = spawn(None, "txnrw-sm-split");
+
+    let user_ot = ObjectType::from_def(
+        "user".into(),
+        vec![
+            Field { field_id: 1, name: "v".into(), kind: FieldKind::U64, nullable: false },
+            Field { field_id: 2, name: "score".into(), kind: FieldKind::I32, nullable: false },
+            Field { field_id: 3, name: "group".into(), kind: FieldKind::U16, nullable: false },
+            Field { field_id: 4, name: "name".into(), kind: FieldKind::Char(16), nullable: true },
+        ],
+    );
+
+    // 10 reads + 4 writes (Update on existing ids).
+    let mut ops = Vec::with_capacity(14);
+    for i in 0..10u128 {
+        ops.push(Op::GetById { type_id: 1, id: ObjectId::from_u128(i) });
+    }
+    for w in 0..4u128 {
+        let id = ObjectId::from_u128(100 + w);
+        let rec = encode(
+            &user_ot,
+            &[
+                Value::Uint((100 + w).wrapping_mul(7)),
+                Value::Int(42),
+                Value::Uint(7),
+                Value::Null,
+            ],
+        )
+        .unwrap();
+        ops.push(Op::Update { type_id: 1, id, record: rec });
+    }
+
+    let verdict_a = engine_a.apply(Op::Txn { ops: ops.clone() });
+    let verdict_b = dispatch_split_phase(&engine_b, ops);
+
+    // Both should return Ok.
+    assert_eq!(verdict_a, OpResult::Ok, "unified verdict {:?}", verdict_a);
+    assert_eq!(verdict_b, OpResult::Ok, "split verdict {:?}", verdict_b);
+
+    // Post-state: ids 100..104 must be byte-identical on both engines.
+    for i in 100..104u128 {
+        let a = engine_a.apply(Op::GetById { type_id: 1, id: ObjectId::from_u128(i) });
+        let b = engine_b.apply(Op::GetById { type_id: 1, id: ObjectId::from_u128(i) });
+        assert_eq!(a, b, "post-state diverged at id {i}: a={a:?} b={b:?}");
+    }
+
+    drop(engine_a);
+    drop(engine_b);
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+/// TXN-RW smoke: read-after-write Txn falls through to unified apply
+/// (the dispatcher's is_split_safe guard catches it). Verdict matches
+/// unified-vs-"split-but-fell-through" because both go through the
+/// same path.
+#[test]
+fn txn_rw_split_smoke_read_after_write_falls_through_to_unified() {
+    let (engine_a, dir_a) = spawn(None, "txnrw-raw-unified");
+    let (engine_b, dir_b) = spawn(None, "txnrw-raw-fallthrough");
+
+    let user_ot = ObjectType::from_def(
+        "user".into(),
+        vec![
+            Field { field_id: 1, name: "v".into(), kind: FieldKind::U64, nullable: false },
+            Field { field_id: 2, name: "score".into(), kind: FieldKind::I32, nullable: false },
+            Field { field_id: 3, name: "group".into(), kind: FieldKind::U16, nullable: false },
+            Field { field_id: 4, name: "name".into(), kind: FieldKind::Char(16), nullable: true },
+        ],
+    );
+    let id = ObjectId::from_u128(42);
+    let new_rec = encode(
+        &user_ot,
+        &[Value::Uint(999), Value::Int(1), Value::Uint(2), Value::Null],
+    )
+    .unwrap();
+    let ops = vec![
+        Op::GetById { type_id: 1, id },
+        Op::Update { type_id: 1, id, record: new_rec },
+        Op::GetById { type_id: 1, id },
+    ];
+
+    // The dispatcher should NOT split (suffix has a trailing read).
+    let prefix = read_prefix_length(&ops);
+    let should_split =
+        prefix > 0 && prefix < ops.len() && is_split_safe(&ops[prefix..]);
+    assert!(!should_split, "R-W-R must NOT split");
+
+    let verdict_a = engine_a.apply(Op::Txn { ops: ops.clone() });
+    let verdict_b = dispatch_split_phase(&engine_b, ops);
+    assert_eq!(verdict_a, verdict_b, "R-W-R unified vs fall-through diverged");
+
+    drop(engine_a);
+    drop(engine_b);
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}

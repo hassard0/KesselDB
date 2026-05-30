@@ -12,6 +12,7 @@ pub mod cluster;
 pub mod read_pool;
 pub mod router;
 pub mod scatter_scan;
+pub mod sharded_sm;
 
 use kessel_io::DirVfs;
 use kessel_proto::wire::{read_frame, write_frame};
@@ -207,6 +208,18 @@ pub struct ServerConfig {
     ///
     /// See `docs/superpowers/specs/2026-05-28-kesseldb-perf-a-parallel-reads-design.md`.
     pub read_workers: Option<usize>,
+    /// SP-Perf-A-SHARD T2 (scaffold): named config slot for the future
+    /// sharded-SM apply path. **NOT yet wired into `spawn_engine_cfg`** —
+    /// this scaffold ships the [`sharded_sm::ShardedStateMachine`] type
+    /// + K=1 regression-lock, but the engine-spawn integration is a
+    /// V2 arc (`SP-Perf-A-SHARD-APPLY`). `None` (default) = pre-SHARD
+    /// behaviour (single `Arc<RwLock<StateMachine>>` per SP-Perf-A T2).
+    /// `Some(1)` = K=1 collapse (functionally identical to `None`,
+    /// reserved for the V2 wiring's regression check). `Some(N)` for
+    /// `N >= 2` is reserved for SP-Perf-A-SHARD-APPLY.
+    ///
+    /// See `docs/superpowers/specs/2026-05-30-kesseldb-spperfa-shard-design.md`.
+    pub shard_count: Option<usize>,
 }
 
 impl Default for ServerConfig {
@@ -224,6 +237,7 @@ impl Default for ServerConfig {
             pg_max_conns: 256,
             pg_idle_timeout: std::time::Duration::from_secs(600),
             read_workers: None,
+            shard_count: None,
         }
     }
 }

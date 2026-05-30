@@ -581,17 +581,20 @@ impl EngineHandle {
         if let Some(sm_shared) = &self.sm_shared {
             if let Some(&tag) = frame.first() {
                 // Cheap kind-table lookup against the spec §4 read-only
-                // set (16 variants). Avoids a full Op::decode for write
-                // frames — only successful classification needs the
-                // structural decode. SQL (0xFE), admin (0xFA..0xFC,
-                // 0xF4..0xF9), session (0xFD), etc. miss the table and
-                // fall through.
-                let is_read_tag = matches!(
+                // set (16 variants) PLUS tag 15 (Op::Txn — needs a
+                // structural recheck via is_read_only because its
+                // RO-ness depends on inner-op composition). Avoids a
+                // full Op::decode for write frames — only successful
+                // classification needs the structural decode. SQL
+                // (0xFE), admin (0xFA..0xFC, 0xF4..0xF9), session
+                // (0xFD), etc. miss the table and fall through.
+                let is_read_candidate = matches!(
                     tag,
                     6  // GetById
                   | 7  // GetBlob
                   | 9  // FindBy
                   | 11 // Query
+                  | 15 // SP-Perf-A-TXN-RO: Op::Txn (structural recheck)
                   | 16 // QueryExpr
                   | 18 // FindRange
                   | 19 // Select
@@ -605,32 +608,45 @@ impl EngineHandle {
                   | 28 // Join
                   | 35 // SeqRead
                 );
-                if is_read_tag {
+                if is_read_candidate {
                     if let Some(op) = Op::decode(&frame) {
-                        // SP144H T1: bump per-Op::kind() counter on the
-                        // read path too — observability symmetry with
-                        // writes. `applied_ops_atomic` is NOT bumped
-                        // (preserves SP142 semantic: applied_ops counts
-                        // log positions).
-                        let idx = tag as usize;
-                        if idx < 64 {
-                            self.op_kind_counts[idx]
-                                .fetch_add(1, Ordering::AcqRel);
+                        // SP-Perf-A-TXN-RO: for tag 15 (Op::Txn) the
+                        // tag alone is insufficient — must walk inner
+                        // ops via the recursive classifier. For the
+                        // other 16 tags this is a cheap negation of
+                        // the proto `is_mutating` already proven by
+                        // KAT. Mixed-RW Txn falls through to the
+                        // engine queue, byte-untouched.
+                        if read_pool::is_read_only(&op) {
+                            // SP144H T1: bump per-Op::kind() counter
+                            // on the read path too — observability
+                            // symmetry with writes. `applied_ops_atomic`
+                            // is NOT bumped (preserves SP142 semantic:
+                            // applied_ops counts log positions).
+                            let idx = tag as usize;
+                            if idx < 64 {
+                                self.op_kind_counts[idx]
+                                    .fetch_add(1, Ordering::AcqRel);
+                            }
+                            // V1: dispatch directly on the submitting
+                            // thread under the read guard. The optional
+                            // ReadPool exists for fairness/CPU-pinning
+                            // under bursty workloads; with no pool (or
+                            // workers=0) the submitting thread runs the
+                            // read itself, which is the lowest-latency
+                            // path on the bench. The pool is exercised
+                            // via `dispatch_via_pool` (see ReadPool
+                            // tests).
+                            return match sm_shared.read() {
+                                Ok(g) => g.read_only_op(op),
+                                Err(_) => OpResult::SchemaError(
+                                    "read lock poisoned".into(),
+                                ),
+                            };
                         }
-                        // V1: dispatch directly on the submitting
-                        // thread under the read guard. The optional
-                        // ReadPool exists for fairness/CPU-pinning
-                        // under bursty workloads; with no pool (or
-                        // workers=0) the submitting thread runs the
-                        // read itself, which is the lowest-latency
-                        // path on the bench. The pool is exercised
-                        // via `dispatch_via_pool` (see ReadPool tests).
-                        return match sm_shared.read() {
-                            Ok(g) => g.read_only_op(op),
-                            Err(_) => OpResult::SchemaError(
-                                "read lock poisoned".into(),
-                            ),
-                        };
+                        // Classified as write (mixed-RW Op::Txn, or
+                        // SP-Perf-A-TXN-RO not yet wiring all tags) —
+                        // fall through to the engine queue.
                     }
                     // Decode failed → fall through to the engine queue
                     // (engine returns SchemaError uniformly).
@@ -687,8 +703,14 @@ impl EngineHandle {
         // Op::encode + Op::decode allocations at ~5M ops/sec × N
         // threads — the largest single contributor to the T5-
         // identified ~80M alloc/sec heap traffic ceiling.
+        //
+        // SP-Perf-A-TXN-RO: use `read_pool::is_read_only` (recurses
+        // into Op::Txn) instead of `!op.is_mutating()` so all-RO Txn
+        // wrappers route via the bypass too. Mixed-RW Txn still
+        // classifies as mutating (the recursion finds a write inner
+        // op) and falls through to the engine queue, byte-untouched.
         if let Some(sm_shared) = &self.sm_shared {
-            if !op.is_mutating() {
+            if read_pool::is_read_only(&op) {
                 // SP144H T1 parity: bump per-kind counter — matches
                 // apply_raw's behaviour exactly so observability stays
                 // symmetric across the two entry points.
@@ -720,7 +742,8 @@ impl EngineHandle {
     /// like `apply` does.
     pub fn apply_op(&self, op: &Op) -> OpResult {
         if let Some(sm_shared) = &self.sm_shared {
-            if !op.is_mutating() {
+            // SP-Perf-A-TXN-RO: classifier swap (recurses into Op::Txn).
+            if read_pool::is_read_only(op) {
                 let idx = op.kind() as usize;
                 if idx < 64 {
                     self.op_kind_counts[idx].fetch_add(1, Ordering::AcqRel);

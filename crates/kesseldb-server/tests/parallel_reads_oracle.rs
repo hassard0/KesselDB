@@ -722,3 +722,346 @@ fn t3_smoke_join() {
         limit: 1 + r.below(8) as u32,
     });
 }
+
+// -------------------------------------------------------------------------
+// SP-Perf-A-TXN-RO determinism oracle — all-RO Op::Txn{ops} parallel vs
+// serial byte-equality. Same harness as T3 but every read is wrapped in
+// an Op::Txn with a random inner-op count, so the bypass exercises its
+// SP-Perf-A-TXN-RO Op::Txn arm (StateMachine::read_only_op) end-to-end
+// against the same engine that processed the inner ops in T3 directly.
+//
+// Acceptance lock: 100K all-RO Op::Txn calls × parallel vs serial
+// byte-equal. Plus 6 per-shape smoke tests (empty Txn, single inner,
+// 16-inner mixed-variant Txn, 410-inner sysbench-shape Txn, 1-write
+// poisoned-Txn falls through to apply path symmetry, mixed-RW Txn
+// returns identical results on both engines).
+// -------------------------------------------------------------------------
+
+/// TXN-RO oracle headline: 100 random workloads × 1000 Op::Txn calls,
+/// each Txn wraps 1-20 random RO inner ops. ~100K Op::Txn calls,
+/// ~1M inner reads total. Byte-equal between parallel + serial engines.
+#[test]
+fn txn_ro_oracle_100_workloads_x_1000_txns_byte_equal() {
+    let (engine_p, dir_p) = spawn(Some(8), "txnro-p");
+    let (engine_s, dir_s) = spawn(None, "txnro-s");
+
+    let mut total_txns = 0usize;
+    let mut total_inner_ops = 0usize;
+    let mut diffs: Vec<(usize, usize, usize)> = Vec::new();
+
+    for workload_idx in 0..N_WORKLOADS {
+        let mut rng = Rng::new(
+            (workload_idx as u64)
+                .wrapping_mul(1000)
+                .wrapping_add(0xDEC0_DECF),
+        );
+        for op_idx in 0..OPS_PER_WORKLOAD {
+            // Random inner-op count 1..=20. Avoids the empty-Txn corner
+            // (which has its own per-shape KAT); the bulk shape mirrors
+            // realistic Lambda-style multi-read patterns.
+            let n_inner = 1 + (rng.below(20) as usize);
+            let mut inner = Vec::with_capacity(n_inner);
+            for _ in 0..n_inner {
+                let (_label, op) = gen_random_read_op(&mut rng);
+                inner.push(op);
+            }
+            let txn = Op::Txn { ops: inner };
+            let p = engine_p.apply(txn.clone());
+            let s = engine_s.apply(txn);
+            total_txns += 1;
+            total_inner_ops += n_inner;
+            if p != s {
+                diffs.push((workload_idx, op_idx, n_inner));
+                if diffs.len() <= 3 {
+                    eprintln!(
+                        "TXN-RO DIVERGENCE workload={} op={} n_inner={} \
+                         parallel={:?} serial={:?}",
+                        workload_idx, op_idx, n_inner, p, s
+                    );
+                }
+            }
+        }
+    }
+
+    drop(engine_p);
+    drop(engine_s);
+    let _ = std::fs::remove_dir_all(&dir_p);
+    let _ = std::fs::remove_dir_all(&dir_s);
+
+    assert_eq!(
+        total_txns,
+        N_WORKLOADS * OPS_PER_WORKLOAD,
+        "expected {} txns, ran {}",
+        N_WORKLOADS * OPS_PER_WORKLOAD,
+        total_txns
+    );
+    assert!(
+        total_inner_ops > N_WORKLOADS * OPS_PER_WORKLOAD,
+        "inner-ops count {total_inner_ops} should exceed txn count"
+    );
+    assert!(
+        diffs.is_empty(),
+        "TXN-RO oracle FAILED: {} divergences across {} all-RO Op::Txn calls \
+         ({} inner reads). First 10: {:?}",
+        diffs.len(),
+        total_txns,
+        total_inner_ops,
+        diffs.iter().take(10).collect::<Vec<_>>()
+    );
+}
+
+/// TXN-RO smoke 1: empty Op::Txn{ops:[]} returns Ok on both engines.
+#[test]
+fn txn_ro_smoke_empty_txn_returns_ok() {
+    let (engine_p, dir_p) = spawn(Some(4), "txnro-empty-p");
+    let (engine_s, dir_s) = spawn(None, "txnro-empty-s");
+    let p = engine_p.apply(Op::Txn { ops: vec![] });
+    let s = engine_s.apply(Op::Txn { ops: vec![] });
+    assert_eq!(p, s, "empty Txn diverged: p={p:?} s={s:?}");
+    assert_eq!(p, OpResult::Ok, "empty Txn should be Ok, got {p:?}");
+    drop(engine_p);
+    drop(engine_s);
+    let _ = std::fs::remove_dir_all(&dir_p);
+    let _ = std::fs::remove_dir_all(&dir_s);
+}
+
+/// TXN-RO smoke 2: single-inner-op Txn matches engine-level single-op.
+/// Locks the invariant that a 1-inner-op Txn produces Ok (success) even
+/// though the bare single-op would return Got(...) — the apply-Txn
+/// contract discards inner payloads.
+#[test]
+fn txn_ro_smoke_single_inner_op_returns_ok() {
+    let (engine_p, dir_p) = spawn(Some(4), "txnro-single-p");
+    let (engine_s, dir_s) = spawn(None, "txnro-single-s");
+    let op = Op::GetById {
+        type_id: 1,
+        id: ObjectId::from_u128(42),
+    };
+    let p = engine_p.apply(Op::Txn { ops: vec![op.clone()] });
+    let s = engine_s.apply(Op::Txn { ops: vec![op] });
+    assert_eq!(p, s, "single-inner-op Txn diverged: p={p:?} s={s:?}");
+    assert_eq!(p, OpResult::Ok, "1-inner RO Txn should be Ok, got {p:?}");
+    drop(engine_p);
+    drop(engine_s);
+    let _ = std::fs::remove_dir_all(&dir_p);
+    let _ = std::fs::remove_dir_all(&dir_s);
+}
+
+/// TXN-RO smoke 3: 410-inner-op Txn (sysbench-RO shape) returns Ok and
+/// matches the serial engine byte-for-byte.
+#[test]
+fn txn_ro_smoke_sysbench_shape_returns_ok() {
+    let (engine_p, dir_p) = spawn(Some(8), "txnro-sysbench-p");
+    let (engine_s, dir_s) = spawn(None, "txnro-sysbench-s");
+    let mut inner = Vec::with_capacity(410);
+    // 1 POINT + 4×100 SUM_RANGE expansion + 5 POINT_SELECTS = 406, +4 padding = 410
+    for i in 0..410u128 {
+        inner.push(Op::GetById {
+            type_id: 1,
+            id: ObjectId::from_u128(i % (N_ROWS as u128)),
+        });
+    }
+    let p = engine_p.apply(Op::Txn { ops: inner.clone() });
+    let s = engine_s.apply(Op::Txn { ops: inner });
+    assert_eq!(p, s, "sysbench-shape Txn diverged: p={p:?} s={s:?}");
+    assert_eq!(p, OpResult::Ok);
+    drop(engine_p);
+    drop(engine_s);
+    let _ = std::fs::remove_dir_all(&dir_p);
+    let _ = std::fs::remove_dir_all(&dir_s);
+}
+
+/// TXN-RO smoke 4: every read variant inside one Txn. Locks all 16
+/// variants compose correctly inside an Op::Txn under the bypass.
+#[test]
+fn txn_ro_smoke_all_16_variants_one_txn_returns_ok() {
+    let (engine_p, dir_p) = spawn(Some(4), "txnro-allvariants-p");
+    let (engine_s, dir_s) = spawn(None, "txnro-allvariants-s");
+    let inner = vec![
+        Op::GetById { type_id: 1, id: ObjectId::from_u128(7) },
+        Op::GetBlob { handle: 0 },
+        Op::Describe { type_id: 1 },
+        Op::FindBy {
+            type_id: 1,
+            field_id: 2,
+            value: 0i32.to_le_bytes().to_vec(),
+        },
+        Op::FindByComposite {
+            type_id: 2,
+            fields: vec![1, 2],
+            values: vec![
+                ObjectId::from_u128(7).0.to_vec(),
+                0u16.to_le_bytes().to_vec(),
+            ],
+        },
+        Op::FindRange {
+            type_id: 1,
+            field_id: 2,
+            lo: (-500i32).to_le_bytes().to_vec(),
+            hi: 500i32.to_le_bytes().to_vec(),
+        },
+        Op::Query {
+            type_id: 1,
+            preds: vec![Pred {
+                field_id: 3,
+                op: 0,
+                value: 0u16.to_le_bytes().to_vec(),
+            }],
+        },
+        Op::QueryRows {
+            type_id: 1,
+            eq_preds: vec![],
+            program: Program::new().push_int(1).bytes(),
+            limit: 10,
+            range_preds: vec![],
+        },
+        Op::QueryExpr {
+            type_id: 1,
+            program: Program::new().load(2).push_int(0).ge().bytes(),
+        },
+        Op::Select {
+            type_id: 1,
+            program: Program::new().push_int(1).bytes(),
+            limit: 5,
+        },
+        Op::SelectFields {
+            type_id: 1,
+            program: Program::new().push_int(1).bytes(),
+            fields: vec![2, 3],
+            limit: 5,
+        },
+        Op::SelectSorted {
+            type_id: 1,
+            program: Program::new().push_int(1).bytes(),
+            sort_field: 2,
+            desc: false,
+            offset: 0,
+            limit: 5,
+        },
+        Op::Aggregate {
+            type_id: 1,
+            program: Program::new().push_int(1).bytes(),
+            kind: 0,
+            field_id: 2,
+            range_preds: vec![],
+        },
+        Op::GroupAggregate {
+            type_id: 1,
+            program: Program::new().push_int(1).bytes(),
+            group_field: 3,
+            kind: 0,
+            agg_field: 2,
+            range_preds: vec![],
+        },
+        Op::SeqRead { from: 0, limit: 4 },
+        Op::Join {
+            left_type: 1,
+            right_type: 1,
+            left_field: 2,
+            right_field: 2,
+            limit: 4,
+        },
+    ];
+    let p = engine_p.apply(Op::Txn { ops: inner.clone() });
+    let s = engine_s.apply(Op::Txn { ops: inner });
+    assert_eq!(p, s, "16-variant Txn diverged: p={p:?} s={s:?}");
+    assert_eq!(p, OpResult::Ok);
+    drop(engine_p);
+    drop(engine_s);
+    let _ = std::fs::remove_dir_all(&dir_p);
+    let _ = std::fs::remove_dir_all(&dir_s);
+}
+
+/// TXN-RO smoke 5: mixed-RW Op::Txn (10 reads + 1 write) — both engines
+/// agree on the result via the apply path. The bypass classifier rejects
+/// this Txn so it falls through to apply on the parallel engine too;
+/// parallel and serial must produce the same outcome (apply-Txn is
+/// deterministic). Locks the apply-path symmetry under the new
+/// classifier dispatch logic.
+#[test]
+fn txn_ro_smoke_mixed_rw_txn_falls_through_to_apply() {
+    use kessel_codec::Value;
+    let (engine_p, dir_p) = spawn(Some(4), "txnro-mixedrw-p");
+    let (engine_s, dir_s) = spawn(None, "txnro-mixedrw-s");
+    // Build a record for a new (post-seed-data) user row.
+    let user_ot = ObjectType::from_def(
+        "user".into(),
+        vec![
+            Field { field_id: 1, name: "v".into(), kind: FieldKind::U64, nullable: false },
+            Field { field_id: 2, name: "score".into(), kind: FieldKind::I32, nullable: false },
+            Field { field_id: 3, name: "group".into(), kind: FieldKind::U16, nullable: false },
+            Field { field_id: 4, name: "name".into(), kind: FieldKind::Char(16), nullable: true },
+        ],
+    );
+    let new_id = ObjectId::from_u128(99_999);
+    let new_rec = encode(
+        &user_ot,
+        &[Value::Uint(7), Value::Int(0), Value::Uint(0), Value::Null],
+    )
+    .unwrap();
+    let mut inner: Vec<Op> = Vec::with_capacity(11);
+    for i in 0..10u128 {
+        inner.push(Op::GetById {
+            type_id: 1,
+            id: ObjectId::from_u128(i),
+        });
+    }
+    inner.push(Op::Create { type_id: 1, id: new_id, record: new_rec });
+    let p = engine_p.apply(Op::Txn { ops: inner.clone() });
+    let s = engine_s.apply(Op::Txn { ops: inner });
+    assert_eq!(p, s, "mixed-RW Txn diverged: p={p:?} s={s:?}");
+    // The write committed → Op::Ok
+    assert_eq!(p, OpResult::Ok);
+    // Verify the write actually persisted on both engines.
+    let p_get = engine_p.apply(Op::GetById { type_id: 1, id: new_id });
+    let s_get = engine_s.apply(Op::GetById { type_id: 1, id: new_id });
+    assert_eq!(p_get, s_get, "post-Txn GetById diverged: p={p_get:?} s={s_get:?}");
+    assert!(matches!(p_get, OpResult::Got(_)),
+        "mixed-RW Txn write should have persisted on parallel engine; got {p_get:?}");
+    drop(engine_p);
+    drop(engine_s);
+    let _ = std::fs::remove_dir_all(&dir_p);
+    let _ = std::fs::remove_dir_all(&dir_s);
+}
+
+/// TXN-RO smoke 6: a Txn containing a write at position 0 (instead of
+/// the end) also falls through to apply correctly, on both engines.
+/// Locks the .all short-circuit doesn't accidentally let a write slip
+/// through the bypass.
+#[test]
+fn txn_ro_smoke_write_at_front_txn_falls_through_to_apply() {
+    use kessel_codec::Value;
+    let (engine_p, dir_p) = spawn(Some(4), "txnro-writefront-p");
+    let (engine_s, dir_s) = spawn(None, "txnro-writefront-s");
+    let user_ot = ObjectType::from_def(
+        "user".into(),
+        vec![
+            Field { field_id: 1, name: "v".into(), kind: FieldKind::U64, nullable: false },
+            Field { field_id: 2, name: "score".into(), kind: FieldKind::I32, nullable: false },
+            Field { field_id: 3, name: "group".into(), kind: FieldKind::U16, nullable: false },
+            Field { field_id: 4, name: "name".into(), kind: FieldKind::Char(16), nullable: true },
+        ],
+    );
+    let new_id = ObjectId::from_u128(88_888);
+    let new_rec = encode(
+        &user_ot,
+        &[Value::Uint(1), Value::Int(0), Value::Uint(0), Value::Null],
+    )
+    .unwrap();
+    let mut inner: Vec<Op> = Vec::with_capacity(11);
+    inner.push(Op::Create { type_id: 1, id: new_id, record: new_rec });
+    for i in 0..10u128 {
+        inner.push(Op::GetById {
+            type_id: 1,
+            id: ObjectId::from_u128(i),
+        });
+    }
+    let p = engine_p.apply(Op::Txn { ops: inner.clone() });
+    let s = engine_s.apply(Op::Txn { ops: inner });
+    assert_eq!(p, s, "write-at-front Txn diverged: p={p:?} s={s:?}");
+    assert_eq!(p, OpResult::Ok);
+    drop(engine_p);
+    drop(engine_s);
+    let _ = std::fs::remove_dir_all(&dir_p);
+    let _ = std::fs::remove_dir_all(&dir_s);
+}

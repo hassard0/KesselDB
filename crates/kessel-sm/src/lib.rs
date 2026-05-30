@@ -2559,6 +2559,66 @@ impl<V: Vfs> StateMachine<V> {
                 }
                 OpResult::Got(out.into())
             }
+            // SP-Perf-A-TXN-RO: all-RO Op::Txn{ops} bypass. The
+            // server-side classifier `read_pool::is_read_only` only
+            // routes a Txn here when every inner op is read-only, but
+            // we re-validate as defence-in-depth: a write inner op
+            // dispatched here would silently do nothing (read_only_op
+            // for a write returns SchemaError) — which would diverge
+            // from the apply path's success/failure verdict. We mirror
+            // apply-Txn's contract: iterate inner ops, return Ok on
+            // success, first failure verdict otherwise. Nested Op::Txn
+            // is rejected (apply-Txn also rejects it via the data-op
+            // validator, so behaviour is identical between paths).
+            Op::Txn { ops } => {
+                for o in &ops {
+                    let ok = matches!(
+                        o,
+                        Op::GetById { .. }
+                            | Op::Describe { .. }
+                            | Op::GetBlob { .. }
+                            | Op::FindBy { .. }
+                            | Op::FindByComposite { .. }
+                            | Op::FindRange { .. }
+                            | Op::Query { .. }
+                            | Op::QueryExpr { .. }
+                            | Op::Select { .. }
+                            | Op::QueryRows { .. }
+                            | Op::SelectFields { .. }
+                            | Op::SelectSorted { .. }
+                            | Op::Aggregate { .. }
+                            | Op::GroupAggregate { .. }
+                            | Op::SeqRead { .. }
+                            | Op::Join { .. }
+                    );
+                    if !ok {
+                        return OpResult::SchemaError(
+                            "read_only_op: Op::Txn contains non-read op (nested Txn or write)".into(),
+                        );
+                    }
+                }
+                // Each inner op runs against the same `&self` snapshot.
+                // The bypass holds `sm.read()` for the duration so no
+                // writer can advance committed state mid-Txn — same
+                // isolation guarantee apply-Txn provides via the write
+                // lock. Inner-op result payloads are discarded (apply-
+                // Txn does the same — its return value is Ok, not the
+                // collection of inner reads).
+                for o in ops {
+                    let r = self.read_only_op(o);
+                    let failed = matches!(
+                        r,
+                        OpResult::Exists
+                            | OpResult::NotFound
+                            | OpResult::SchemaError(_)
+                            | OpResult::Constraint(_)
+                    );
+                    if failed {
+                        return r;
+                    }
+                }
+                OpResult::Ok
+            }
             // Any non-read op routed here is a server-side bug — the
             // dispatcher should have refused it. Return SchemaError as
             // defence-in-depth.

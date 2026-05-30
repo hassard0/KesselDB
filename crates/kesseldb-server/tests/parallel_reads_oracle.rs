@@ -417,6 +417,7 @@ fn gen_random_read_op(rng: &mut Rng) -> (&'static str, Op) {
                 program: Program::new().push_int(1).bytes(),
                 kind,
                 field_id: 2,
+                range_preds: vec![],
             })
         }
         13 => {
@@ -428,6 +429,7 @@ fn gen_random_read_op(rng: &mut Rng) -> (&'static str, Op) {
                 group_field: 3,
                 kind,
                 agg_field: 2,
+                range_preds: vec![],
             })
         }
         14 => {
@@ -686,6 +688,7 @@ fn t3_smoke_aggregate() {
         program: Program::new().push_int(1).bytes(),
         kind: r.below(4) as u8,
         field_id: 2,
+        range_preds: vec![],
     });
 }
 
@@ -697,6 +700,7 @@ fn t3_smoke_group_aggregate() {
         group_field: 3,
         kind: r.below(2) as u8,
         agg_field: 2,
+        range_preds: vec![],
     });
 }
 

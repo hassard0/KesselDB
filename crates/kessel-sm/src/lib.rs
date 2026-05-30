@@ -1874,7 +1874,7 @@ impl<V: Vfs> StateMachine<V> {
                 }
                 OpResult::Got(out.into())
             }
-            Op::Aggregate { type_id, program, kind, field_id } => {
+            Op::Aggregate { type_id, program, kind, field_id, range_preds: _range_preds } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
                     None => return OpResult::SchemaError(format!("no type {type_id}")),
@@ -2080,7 +2080,7 @@ impl<V: Vfs> StateMachine<V> {
                 }
                 OpResult::Got(out.into())
             }
-            Op::GroupAggregate { type_id, program, group_field, kind, agg_field } => {
+            Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds: _range_preds } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
                     None => return OpResult::SchemaError(format!("no type {type_id}")),
@@ -4374,7 +4374,7 @@ impl<V: Vfs> StateMachine<V> {
             // Current body uses legacy 20-byte data-row keyspace (scan_range + reduce);
             // T2.C rewrites against data_row_scan(type_id, u64::MAX) per Decision 4
             // (composite read arm, per-statement auto-commit).
-            Op::Aggregate { type_id, program, kind, field_id } => {
+            Op::Aggregate { type_id, program, kind, field_id, range_preds: _range_preds } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
                     None => return OpResult::SchemaError(format!("no type {type_id}")),
@@ -4608,7 +4608,7 @@ impl<V: Vfs> StateMachine<V> {
             // Current body uses legacy 20-byte data-row keyspace; T2.C rewrites against
             // data_row_scan(type_id, u64::MAX) per Decision 4 (read arm,
             // per-statement auto-commit at u64::MAX snapshot).
-            Op::GroupAggregate { type_id, program, group_field, kind, agg_field } => {
+            Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds: _range_preds } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
                     None => return OpResult::SchemaError(format!("no type {type_id}")),
@@ -8060,7 +8060,7 @@ mod tests {
                    fid: u16,
                    p: Vec<u8>|
          -> Vec<u8> {
-            match sm.apply(op, Op::Aggregate { type_id: 1, program: p, kind: k, field_id: fid })
+            match sm.apply(op, Op::Aggregate { type_id: 1, program: p, kind: k, field_id: fid, range_preds: vec![] })
             {
                 OpResult::Got(b) => b.to_vec(),
                 o => panic!("expected Got, got {o:?}"),
@@ -8117,7 +8117,7 @@ mod tests {
         }
         // SUM/AVG over a CHAR column stay an honest SchemaError.
         assert!(matches!(
-            sm.apply(9001, Op::Aggregate { type_id: 1, program: all.clone(), kind: 1, field_id: 2 }),
+            sm.apply(9001, Op::Aggregate { type_id: 1, program: all.clone(), kind: 1, field_id: 2, range_preds: vec![] }),
             OpResult::SchemaError(_)
         ));
         // Deterministic.
@@ -8141,7 +8141,7 @@ mod tests {
             });
         }
         let agg = |sm: &mut StateMachine<MemVfs>, op, k, prog: Vec<u8>| -> i128 {
-            match sm.apply(op, Op::Aggregate { type_id: 1, program: prog, kind: k, field_id: 3 }) {
+            match sm.apply(op, Op::Aggregate { type_id: 1, program: prog, kind: k, field_id: 3, range_preds: vec![] }) {
                 OpResult::Got(b) => i128::from_le_bytes(b[..].try_into().unwrap()),
                 o => panic!("expected Got, got {o:?}"),
             }
@@ -8189,7 +8189,7 @@ mod tests {
             model.push((o, v));
         }
         let agg = |sm: &mut StateMachine<MemVfs>, op: u64, k: u8, p: Vec<u8>| -> i128 {
-            match sm.apply(op, Op::Aggregate { type_id: 1, program: p, kind: k, field_id: 3 })
+            match sm.apply(op, Op::Aggregate { type_id: 1, program: p, kind: k, field_id: 3, range_preds: vec![] })
             {
                 OpResult::Got(b) => i128::from_le_bytes(b[..].try_into().unwrap()),
                 o => panic!("expected Got, got {o:?}"),
@@ -8257,7 +8257,7 @@ mod tests {
             let t = std::time::Instant::now();
             let r = match sm.apply(
                 op,
-                Op::Aggregate { type_id: 1, program: p, kind: k, field_id: 3 },
+                Op::Aggregate { type_id: 1, program: p, kind: k, field_id: 3, range_preds: vec![] },
             ) {
                 OpResult::Got(b) => i128::from_le_bytes(b[..].try_into().unwrap()),
                 o => panic!("{o:?}"),
@@ -8294,7 +8294,7 @@ mod tests {
             });
         }
         let avg = |sm: &mut StateMachine<MemVfs>, op, prog: Vec<u8>| -> i128 {
-            match sm.apply(op, Op::Aggregate { type_id: 1, program: prog, kind: 4, field_id: 3 }) {
+            match sm.apply(op, Op::Aggregate { type_id: 1, program: prog, kind: 4, field_id: 3, range_preds: vec![] }) {
                 OpResult::Got(b) => i128::from_le_bytes(b[..].try_into().unwrap()),
                 o => panic!("{o:?}"),
             }
@@ -8323,7 +8323,7 @@ mod tests {
             }
             let d0 = sm.digest();
             let prog = Program::new().push_int(1).bytes();
-            let s = match sm.apply(99, Op::Aggregate { type_id: 1, program: prog, kind: 1, field_id: 3 }) {
+            let s = match sm.apply(99, Op::Aggregate { type_id: 1, program: prog, kind: 1, field_id: 3, range_preds: vec![] }) {
                 OpResult::Got(b) => i128::from_le_bytes(b[..].try_into().unwrap()),
                 o => panic!("{o:?}"),
             };
@@ -8436,17 +8436,17 @@ mod tests {
         };
         let all = Program::new().push_int(1).bytes();
         // SUM(v) GROUP BY owner -> {1:30, 2:20, 3:100} ascending key order
-        match sm.apply(20, Op::GroupAggregate { type_id: 1, program: all.clone(), group_field: 1, kind: 1, agg_field: 3 }) {
+        match sm.apply(20, Op::GroupAggregate { type_id: 1, program: all.clone(), group_field: 1, kind: 1, agg_field: 3, range_preds: vec![] }) {
             OpResult::Got(b) => assert_eq!(parse(&b), vec![(1, 30), (2, 20), (3, 100)]),
             o => panic!("{o:?}"),
         }
         // COUNT GROUP BY owner -> {1:2, 2:3, 3:1}
-        match sm.apply(21, Op::GroupAggregate { type_id: 1, program: all.clone(), group_field: 1, kind: 0, agg_field: 0 }) {
+        match sm.apply(21, Op::GroupAggregate { type_id: 1, program: all.clone(), group_field: 1, kind: 0, agg_field: 0, range_preds: vec![] }) {
             OpResult::Got(b) => assert_eq!(parse(&b), vec![(1, 2), (2, 3), (3, 1)]),
             o => panic!("{o:?}"),
         }
         // MAX(v) GROUP BY owner -> {1:20, 2:8, 3:100}
-        match sm.apply(22, Op::GroupAggregate { type_id: 1, program: all, group_field: 1, kind: 3, agg_field: 3 }) {
+        match sm.apply(22, Op::GroupAggregate { type_id: 1, program: all, group_field: 1, kind: 3, agg_field: 3, range_preds: vec![] }) {
             OpResult::Got(b) => assert_eq!(parse(&b), vec![(1, 20), (2, 8), (3, 100)]),
             o => panic!("{o:?}"),
         }
@@ -8467,7 +8467,7 @@ mod tests {
             let d0 = sm.digest();
             let r = match sm.apply(99, Op::GroupAggregate {
                 type_id: 1, program: Program::new().push_int(1).bytes(),
-                group_field: 1, kind: 1, agg_field: 3,
+                group_field: 1, kind: 1, agg_field: 3, range_preds: vec![],
             }) {
                 OpResult::Got(b) => b,
                 o => panic!("{o:?}"),
@@ -15142,6 +15142,7 @@ mod tests {
             program: always_true,
             kind: 0, // COUNT
             field_id: 0,
+            range_preds: vec![],
         });
         match r {
             OpResult::Got(b) => {

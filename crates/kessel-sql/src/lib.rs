@@ -1499,6 +1499,9 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
                     group_field: fid(&g)?,
                     kind: k,
                     agg_field: af,
+                    // T3 wires aggregate-WHERE range hint extraction; T1
+                    // scaffold emits empty (pre-arc back-compat behaviour).
+                    range_preds: vec![],
                 })
             } else {
                 Ok(Op::Aggregate {
@@ -1506,6 +1509,7 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
                     program,
                     kind: k,
                     field_id: af,
+                    range_preds: vec![],
                 })
             }
         }

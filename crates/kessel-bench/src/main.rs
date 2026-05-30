@@ -732,6 +732,7 @@ fn run_parallel_reads(
                         program: prog.clone(),
                         kind: 1, // SUM
                         field_id: 2,
+                        range_preds: vec![],
                     }),
                     BenchWorkload::FindBy => {
                         let v = ((rng.below(100) as u16).to_le_bytes()).to_vec();

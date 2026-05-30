@@ -240,6 +240,7 @@ pub fn run_tpch(
                         group_field: fid::L_GROUPKEY,
                         kind: 0, // COUNT
                         agg_field: 0, // ignored for COUNT
+                        range_preds: vec![],
                     });
                     // SUM(l_quantity) per group.
                     let r_sum_q = g.read_only_op(Op::GroupAggregate {
@@ -248,6 +249,7 @@ pub fn run_tpch(
                         group_field: fid::L_GROUPKEY,
                         kind: 1, // SUM
                         agg_field: fid::L_QUANTITY,
+                        range_preds: vec![],
                     });
                     // SUM(l_extendedprice) per group.
                     let r_sum_ep = g.read_only_op(Op::GroupAggregate {
@@ -256,6 +258,7 @@ pub fn run_tpch(
                         group_field: fid::L_GROUPKEY,
                         kind: 1, // SUM
                         agg_field: fid::L_EXTENDEDPRICE,
+                        range_preds: vec![],
                     });
                     // SUM(l_discount) per group — used for AVG(l_discount).
                     let r_sum_dc = g.read_only_op(Op::GroupAggregate {
@@ -264,6 +267,7 @@ pub fn run_tpch(
                         group_field: fid::L_GROUPKEY,
                         kind: 1, // SUM
                         agg_field: fid::L_DISCOUNT,
+                        range_preds: vec![],
                     });
                     drop(g);
                     // Verify all 4 returned Got and merge into one row-set.
@@ -309,6 +313,7 @@ pub fn run_tpch(
                         program: q6_prog.clone(),
                         kind: 1, // SUM
                         field_id: fid::L_Q6_REVENUE,
+                        range_preds: vec![],
                     });
                     drop(g);
                     match r {

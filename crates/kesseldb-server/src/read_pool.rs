@@ -317,7 +317,7 @@ mod tests {
                 limit: 0,
                 range_preds: vec![],
             },
-            Op::Aggregate { type_id: 1, program: vec![], kind: 0, field_id: 0 },
+            Op::Aggregate { type_id: 1, program: vec![], kind: 0, field_id: 0, range_preds: vec![] },
             Op::SelectFields { type_id: 1, program: vec![], fields: vec![], limit: 0 },
             Op::GroupAggregate {
                 type_id: 1,
@@ -325,6 +325,7 @@ mod tests {
                 group_field: 0,
                 kind: 0,
                 agg_field: 0,
+                range_preds: vec![],
             },
             Op::SelectSorted {
                 type_id: 1,
@@ -972,7 +973,7 @@ mod tests {
         use kessel_proto::Op;
         let (engine, dir) = seed_t6_engine(Some(0));
         // Aggregate over indexed score field, SUM (kind 0).
-        let op = Op::Aggregate { type_id: 1, program: vec![], kind: 0, field_id: 1 };
+        let op = Op::Aggregate { type_id: 1, program: vec![], kind: 0, field_id: 1, range_preds: vec![] };
         let fast = engine.apply(op.clone());
         let slow = engine.apply_raw(op.encode());
         assert_eq!(fast, slow, "apply(Aggregate) vs apply_raw diverged");
@@ -1011,7 +1012,7 @@ mod tests {
             Op::GetById { type_id: 1, id: ObjectId::from_u128(42) },
             Op::Select { type_id: 1, program: vec![], limit: 10 },
             Op::FindBy { type_id: 1, field_id: 2, value: 3u16.to_le_bytes().to_vec() },
-            Op::Aggregate { type_id: 1, program: vec![], kind: 0, field_id: 1 },
+            Op::Aggregate { type_id: 1, program: vec![], kind: 0, field_id: 1, range_preds: vec![] },
             Op::SelectSorted {
                 type_id: 1, program: vec![], sort_field: 1,
                 desc: false, offset: 0, limit: 10,

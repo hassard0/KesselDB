@@ -1627,6 +1627,7 @@ mod tests {
                 program: vec![],
                 kind: 0,
                 field_id: 0,
+                range_preds: vec![],
             }),
             Route::Unsupported(_)
         ));

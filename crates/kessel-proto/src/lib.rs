@@ -106,8 +106,24 @@ pub enum Op {
     },
     /// Aggregate (Sub-project 20) over rows matching `program`:
     /// `kind` 0=COUNT, 1=SUM, 2=MIN, 3=MAX of `field_id` (numeric).
+    /// `range_preds` (SP-Analytic-Plan) mirror the `Op::QueryRows` field:
+    /// `(field_id, op, value)` half-range hints (`op` 0=`>` 1=`>=` 2=`<`
+    /// 3=`<=`) on order-indexed fields. When non-empty, the SM narrows
+    /// the scan via the existing ordered-index machinery BEFORE the
+    /// row-by-row program filter. `program` (the full WHERE) still
+    /// verifies every candidate, so the aggregate result is identical
+    /// regardless of the candidate set — the indexes only accelerate.
+    /// `range_preds` is encoded *after* `field_id` so an older frame
+    /// (no range hints) decodes to an empty list and behaves exactly
+    /// as before (wire-compatible).
     /// Result returned as a 16-byte little-endian i128 in `Got`.
-    Aggregate { type_id: TypeId, program: Vec<u8>, kind: u8, field_id: u16 },
+    Aggregate {
+        type_id: TypeId,
+        program: Vec<u8>,
+        kind: u8,
+        field_id: u16,
+        range_preds: Vec<(u16, u8, Vec<u8>)>,
+    },
     /// Projection (Sub-project 21): like `Select` but each returned row is
     /// only the concatenated bytes of `fields` (in order), not the whole
     /// record. Result = `[u32 rowlen][row]*`. Read-only & deterministic.
@@ -117,12 +133,18 @@ pub enum Op {
     /// 2 MIN / 3 MAX) of `agg_field` per group. Result =
     /// `[u32 ngroups]` then per group `[u32 keylen][key][16B i128 LE]`,
     /// groups in ascending key order (deterministic). Read-only.
+    /// `range_preds` (SP-Analytic-Plan) mirror `Op::QueryRows`: when
+    /// non-empty, the SM narrows the scan via the existing ordered-
+    /// index machinery BEFORE the row-by-row program filter (and the
+    /// group fold). Wire-back-compat via length-prefixed conditional
+    /// trailing encode (matches the `Op::Aggregate` shape).
     GroupAggregate {
         type_id: TypeId,
         program: Vec<u8>,
         group_field: u16,
         kind: u8,
         agg_field: u16,
+        range_preds: Vec<(u16, u8, Vec<u8>)>,
     },
     /// Schema introspection (Sub-project 34): returns the table's serialized
     /// `(name, fields)` definition so a client can decode `SELECT` rows.
@@ -891,11 +913,22 @@ impl Op {
                     }
                 }
             }
-            Op::Aggregate { type_id, program, kind, field_id } => {
+            Op::Aggregate { type_id, program, kind, field_id, range_preds } => {
                 codec::put_u32(&mut b, *type_id);
                 codec::put_bytes(&mut b, program);
                 b.push(*kind);
                 b.extend_from_slice(&field_id.to_le_bytes());
+                // SP-Analytic-Plan: trailing range hints. Empty ⇒ omit
+                // entirely so a pre-arc frame is byte-identical (back-
+                // compat). Decode tolerates the absence.
+                if !range_preds.is_empty() {
+                    codec::put_u32(&mut b, range_preds.len() as u32);
+                    for (f, o, v) in range_preds {
+                        b.extend_from_slice(&f.to_le_bytes());
+                        b.push(*o);
+                        codec::put_bytes(&mut b, v);
+                    }
+                }
             }
             Op::SelectFields { type_id, program, fields, limit } => {
                 codec::put_u32(&mut b, *type_id);
@@ -906,12 +939,21 @@ impl Op {
                 }
                 codec::put_u32(&mut b, *limit);
             }
-            Op::GroupAggregate { type_id, program, group_field, kind, agg_field } => {
+            Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds } => {
                 codec::put_u32(&mut b, *type_id);
                 codec::put_bytes(&mut b, program);
                 b.extend_from_slice(&group_field.to_le_bytes());
                 b.push(*kind);
                 b.extend_from_slice(&agg_field.to_le_bytes());
+                // SP-Analytic-Plan: trailing range hints; empty ⇒ omit.
+                if !range_preds.is_empty() {
+                    codec::put_u32(&mut b, range_preds.len() as u32);
+                    for (f, o, v) in range_preds {
+                        b.extend_from_slice(&f.to_le_bytes());
+                        b.push(*o);
+                        codec::put_bytes(&mut b, v);
+                    }
+                }
             }
             Op::AddCompositeIndex { type_id, fields }
             | Op::DropIndex { type_id, fields } => {
@@ -1215,12 +1257,25 @@ impl Op {
                 };
                 Op::QueryRows { type_id, eq_preds, program, limit, range_preds }
             }
-            20 => Op::Aggregate {
-                type_id: c.u32()?,
-                program: c.bytes()?,
-                kind: c.u8()?,
-                field_id: c.u16()?,
-            },
+            20 => {
+                let type_id = c.u32()?;
+                let program = c.bytes()?;
+                let kind = c.u8()?;
+                let field_id = c.u16()?;
+                // SP-Analytic-Plan: optional trailing range hints.
+                // Absent (older frame) ⇒ empty ⇒ identical behaviour.
+                let range_preds = if c.remaining() > 0 {
+                    let m = c.u32()? as usize;
+                    let mut rp = Vec::with_capacity(m);
+                    for _ in 0..m {
+                        rp.push((c.u16()?, c.u8()?, c.bytes()?));
+                    }
+                    rp
+                } else {
+                    Vec::new()
+                };
+                Op::Aggregate { type_id, program, kind, field_id, range_preds }
+            }
             21 => {
                 let type_id = c.u32()?;
                 let program = c.bytes()?;
@@ -1231,13 +1286,24 @@ impl Op {
                 }
                 Op::SelectFields { type_id, program, fields, limit: c.u32()? }
             }
-            22 => Op::GroupAggregate {
-                type_id: c.u32()?,
-                program: c.bytes()?,
-                group_field: c.u16()?,
-                kind: c.u8()?,
-                agg_field: c.u16()?,
-            },
+            22 => {
+                let type_id = c.u32()?;
+                let program = c.bytes()?;
+                let group_field = c.u16()?;
+                let kind = c.u8()?;
+                let agg_field = c.u16()?;
+                let range_preds = if c.remaining() > 0 {
+                    let m = c.u32()? as usize;
+                    let mut rp = Vec::with_capacity(m);
+                    for _ in 0..m {
+                        rp.push((c.u16()?, c.u8()?, c.bytes()?));
+                    }
+                    rp
+                } else {
+                    Vec::new()
+                };
+                Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds }
+            }
             24 => {
                 let type_id = c.u32()?;
                 let nf = c.u32()? as usize;
@@ -1497,9 +1563,13 @@ mod tests {
             Op::Describe { type_id: 4 },
             Op::DropType { type_id: 4 },
             Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9 },
-            Op::Aggregate { type_id: 4, program: vec![1], kind: 1, field_id: 3 },
+            Op::Aggregate { type_id: 4, program: vec![1], kind: 1, field_id: 3, range_preds: vec![] },
+            // SP-Analytic-Plan: aggregate w/ range hints — new wire suffix.
+            Op::Aggregate { type_id: 4, program: vec![1], kind: 1, field_id: 3, range_preds: vec![(2, 1, vec![7, 0]), (2, 3, vec![9, 0])] },
             Op::SelectFields { type_id: 4, program: vec![1], fields: vec![1, 3], limit: 5 },
-            Op::GroupAggregate { type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3 },
+            Op::GroupAggregate { type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3, range_preds: vec![] },
+            // SP-Analytic-Plan: group-agg w/ range hints — new wire suffix.
+            Op::GroupAggregate { type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3, range_preds: vec![(2, 1, vec![1, 0]), (2, 3, vec![5, 0])] },
             Op::SelectSorted { type_id: 4, program: vec![1], sort_field: 3, desc: true, offset: 2, limit: 5 },
             Op::AddCompositeIndex { type_id: 4, fields: vec![1, 3] },
             Op::DropIndex { type_id: 4, fields: vec![1] },
@@ -1877,5 +1947,82 @@ mod tests {
             Some(r_ac),
             "WatermarkRejected{{AboveCommitCeiling{{1000,10}}}} must roundtrip",
         );
+    }
+
+    /// SP-Analytic-Plan T1: empty `range_preds` on `Op::Aggregate` /
+    /// `Op::GroupAggregate` produces the pre-arc byte-identical wire
+    /// (the trailing range-hints `u32 len` is OMITTED when empty), so
+    /// any SP-Analytic-Plan-PRE WAL or replication frame still decodes.
+    /// A SP-Analytic-Plan-PRE encoder would have written:
+    ///   [kind=20][u32 type_id][u32 prog_len][prog][u8 kind][u16 field_id]
+    /// We reconstruct that exact byte stream and assert decode → empty
+    /// range_preds.
+    #[test]
+    fn sp_analytic_plan_aggregate_wire_backcompat() {
+        // ---- Op::Aggregate ----
+        let post = Op::Aggregate {
+            type_id: 4,
+            program: vec![1, 2, 3],
+            kind: 1,
+            field_id: 7,
+            range_preds: vec![],
+        };
+        let enc = post.encode();
+        // Hand-roll the pre-arc bytes: same as the post-arc encoder when
+        // `range_preds` is empty (no trailing u32).
+        let mut hand = Vec::new();
+        hand.push(20u8); // kind tag
+        hand.extend_from_slice(&4u32.to_le_bytes()); // type_id
+        hand.extend_from_slice(&3u32.to_le_bytes()); // prog_len
+        hand.extend_from_slice(&[1, 2, 3]); // prog
+        hand.push(1u8); // kind
+        hand.extend_from_slice(&7u16.to_le_bytes()); // field_id
+        assert_eq!(enc, hand, "empty range_preds must encode to pre-arc bytes");
+        let dec = Op::decode(&hand).expect("decode pre-arc Aggregate");
+        assert_eq!(dec, post, "pre-arc Aggregate decodes to empty range_preds");
+
+        // ---- Op::GroupAggregate ----
+        let post_g = Op::GroupAggregate {
+            type_id: 4,
+            program: vec![9],
+            group_field: 2,
+            kind: 0,
+            agg_field: 5,
+            range_preds: vec![],
+        };
+        let enc_g = post_g.encode();
+        let mut hand_g = Vec::new();
+        hand_g.push(22u8); // kind tag
+        hand_g.extend_from_slice(&4u32.to_le_bytes()); // type_id
+        hand_g.extend_from_slice(&1u32.to_le_bytes()); // prog_len
+        hand_g.extend_from_slice(&[9]); // prog
+        hand_g.extend_from_slice(&2u16.to_le_bytes()); // group_field
+        hand_g.push(0u8); // kind
+        hand_g.extend_from_slice(&5u16.to_le_bytes()); // agg_field
+        assert_eq!(enc_g, hand_g, "empty range_preds must encode to pre-arc bytes");
+        let dec_g = Op::decode(&hand_g).expect("decode pre-arc GroupAggregate");
+        assert_eq!(dec_g, post_g, "pre-arc GroupAggregate decodes to empty range_preds");
+
+        // ---- Non-empty range_preds: round-trips cleanly. ----
+        for rp in [
+            vec![(2u16, 1u8, vec![1, 0, 0, 0])],
+            vec![(2, 1, vec![1, 0]), (2, 3, vec![9, 0])],
+            vec![(7, 0, vec![]), (8, 3, vec![0xFF; 8])],
+        ] {
+            for op in [
+                Op::Aggregate {
+                    type_id: 4, program: vec![1], kind: 1, field_id: 3,
+                    range_preds: rp.clone(),
+                },
+                Op::GroupAggregate {
+                    type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3,
+                    range_preds: rp.clone(),
+                },
+            ] {
+                let bytes = op.encode();
+                let back = Op::decode(&bytes).expect("decode non-empty range_preds");
+                assert_eq!(back, op, "round-trip with range_preds={:?}", rp);
+            }
+        }
     }
 }

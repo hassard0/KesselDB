@@ -1990,7 +1990,120 @@ ws.onmessage = ev => {
 - SP-WS WebSocket spec: `docs/superpowers/specs/2026-05-26-kesseldb-spws-websocket-design.md`
 - Internal record: `docs/superpowers/specs/2026-05-24-kesseldb-subproject141-http-gateway.md`
 
-## 11. Backup & monitoring
+## 11. Deploying to the cloud
+
+KesselDB ships four supported deploy shapes — pick the one that
+matches the runtime you already operate. The V1 cloud-deploy story
+is **single-pod / single-VM** (matches the engine's single-writer
+posture); replicated VSR clustering on k8s / Fly.io is tracked as
+the named follow-up arc **SP-Cloud-Cluster**.
+
+### 11.1 Docker (single-host)
+
+The fastest path from zero to a running node:
+
+```bash
+docker run --rm \
+  -p 6532:6532 -p 6533:6533 -p 5432:5432 \
+  -v $PWD/kesseldb-data:/data \
+  -e KESSELDB_TOKEN=$(openssl rand -hex 32) \
+  ghcr.io/hassard0/kesseldb:latest
+```
+
+The image is multi-arch (`linux/amd64` + `linux/arm64`), runs as a
+dedicated non-root `kessel:1100` UID, exposes all three wire surfaces,
+and is ~77 MiB stripped. See [`Dockerfile`](../Dockerfile) for the
+layout + env var matrix.
+
+### 11.2 Kubernetes (Helm chart)
+
+A Helm chart lives at [`deploy/helm/kesseldb/`](../deploy/helm/kesseldb).
+Single-pod, ReadWriteOnce PVC, ClusterIP service.
+
+```bash
+# 1. Pre-create the token Secret (Helm chart references it by name).
+kubectl create secret generic kesseldb-token \
+  --from-literal=token=$(openssl rand -hex 32)
+
+# 2. Install.
+helm install kesseldb ./deploy/helm/kesseldb
+
+# 3. Verify.
+kubectl wait --for=condition=ready pod -l app=kesseldb --timeout=120s
+kubectl exec deploy/kesseldb -- \
+  kessel --addr 127.0.0.1:6532 --token "$KESSELDB_TOKEN" 'SELECT 1'
+```
+
+Overridable values (full list in
+[`deploy/helm/kesseldb/values.yaml`](../deploy/helm/kesseldb/values.yaml)):
+`image.tag`, `persistence.size`, `persistence.storageClassName`,
+`resources.{requests,limits}`, `service.type`, `auth.secretName`
+(set to `""` for open mode).
+
+Verified end-to-end on vulcan (kind v0.24.0 + Kubernetes v1.31.0 +
+helm v3.16.3) — transcript at
+[`docs/superpowers/spclouddeploy-t3-kind-verify-2026-05-30.txt`](superpowers/spclouddeploy-t3-kind-verify-2026-05-30.txt).
+
+### 11.3 Fly.io (`fly.toml`)
+
+A ready-to-deploy `fly.toml` lives at
+[`deploy/fly/fly.toml`](../deploy/fly/fly.toml).
+
+```bash
+cd deploy/fly
+fly launch --no-deploy --copy-config --name <your-app>
+fly secrets set KESSELDB_TOKEN=$(openssl rand -hex 32)
+fly volumes create kesseldb_data --size 10 --region iad
+fly deploy
+```
+
+Full walkthrough + connect-from-outside section + backup commands
+in [`deploy/fly/README.md`](../deploy/fly/README.md).
+
+### 11.4 Custom (any container runtime)
+
+The Docker image is a plain OCI image — anywhere that runs OCI
+containers (Nomad, ECS, Cloud Run, Azure Container Apps, your own
+systemd-nspawn unit) works the same way:
+
+```
+image:      ghcr.io/hassard0/kesseldb:latest
+entrypoint: /usr/local/bin/kesseldb
+args:       ["0.0.0.0:6532", "/data"]
+env:        KESSELDB_TOKEN  (required for auth; omit for open mode)
+            KESSELDB_HTTP_ADDR=0.0.0.0:6533  (opt-in HTTP gateway)
+            KESSELDB_PG_ADDR=0.0.0.0:5432    (opt-in PostgreSQL gateway)
+volume:     /data  (mount a persistent volume here; the engine writes
+                    its WAL + LSM + manifest under this dir)
+ports:      6532/tcp  (binary protocol)
+            6533/tcp  (HTTP/1.1 + WebSocket — opt-in)
+            5432/tcp  (PostgreSQL Frontend/Backend v3.0 — opt-in)
+```
+
+Health check: TCP probe on `:6532` is sufficient (engine being up
+implies the surface is accepting connections). If you have the HTTP
+gateway enabled, prefer `GET /v1/health` (returns
+`{"status":"ok","primary":true,...}` from the active engine).
+
+### V1 cloud-deploy caveats (named, not vague)
+
+- **Single-pod / single-VM by design.** The engine is single-writer;
+  the data PVC / Fly volume is single-attach. Multi-replica VSR
+  clustering on k8s + Fly is the named **SP-Cloud-Cluster** arc
+  (StatefulSet + per-replica PVCs + headless Service + ClusterClient
+  endpoints).
+- **No public TLS in the v1 ghcr.io image.** The image is built with
+  `--features pg-gateway,http-gateway` only; `--features tls` is
+  opt-in (rustls). Pair with your platform's ingress (k8s Ingress +
+  cert-manager, `fly certs`, etc.) or a fronting reverse proxy if
+  you need HTTPS in front of `:6533` from the public internet.
+- **GHCR package visibility.** The `ghcr.io/hassard0/kesseldb`
+  package is currently private (default for new GHCR packages); to
+  pull from a fresh cluster without `imagePullSecrets`, flip the
+  package to Public in the GitHub UI (repo Packages -> kesseldb ->
+  Settings -> Change visibility -> Public).
+
+## 12. Backup & monitoring
 
 Both are handled on the engine thread, so a snapshot is crash‑consistent and
 metrics are exact. Using the embedded engine handle:
@@ -2012,7 +2125,7 @@ replica divergence. In a cluster, `Node::probe()` returns
 
 Restore = point a fresh node at a snapshot directory and start it.
 
-## 12. Wire protocol
+## 13. Wire protocol
 
 Each message is length‑prefixed: `[u32 little‑endian length][payload]`.
 
@@ -2028,7 +2141,7 @@ Each message is length‑prefixed: `[u32 little‑endian length][payload]`.
 This is intentionally tiny — any language can speak it with a socket and the
 length framing. `kessel-client` implements all of it.
 
-## 13. Troubleshooting
+## 14. Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|

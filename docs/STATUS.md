@@ -117,6 +117,44 @@ covered by the workspace test suite (2024 default / 2052 with
   plus this commit (T4 bench sweep + T5 closure). Progress tracker
   `docs/superpowers/specs/2026-05-29-kesseldb-spperfa-txnro-progress.md`
   CLOSED. **Arc closed — TaskList #341 ready for completion.**
+- **Track G — SP-Analytic-Plan-MULTI (2026-05-30, V1 SHIPPED).** Closes
+  the SP-Analytic-Plan T4 residual TPC-H Q1 gap (was 18× behind
+  Postgres). New `Op::GroupAggregateMulti { aggregates: Vec<(kind,
+  field_id)>, range_preds, … }` at wire tag 47 — additive new variant;
+  existing Op::Aggregate (20) + Op::GroupAggregate (22) wire bytes
+  byte-identical (back-compat). Folds N aggregates (COUNT/SUM/MIN/
+  MAX/AVG) per row in ONE scan instead of N×Op::GroupAggregate calls,
+  collapsing the per-row WHERE-eval + group-key-extract cost from N×
+  to 1×. T1 design + scaffold + wire KAT (3 vectors covering Q1
+  shape). T2 SM apply paths via shared `group_aggregate_multi()`
+  helper used by BOTH apply + read_only_op (byte-identical results
+  guaranteed) + 3 equivalence KATs (vs N×Op::GroupAggregate, apply
+  vs read_only_op, full-cover range_preds invariant). T3 kessel-sql
+  `compile_select` projection parser refactored to accept comma-
+  separated mix of leading group cols + aggregate calls; emits
+  Op::GroupAggregateMulti for ≥2 aggregates / leading-col + ≥1 agg
+  (single-agg paths byte-identical, plain-col-after-agg + multi-agg-
+  without-GROUP-BY rejected). T4 bench-compare TPC-H Q1 driver uses
+  one Op::GroupAggregateMulti carrying 4 aggregates instead of 4
+  separate Op::GroupAggregate + client-side BTreeMap merge.
+  **HEADLINE on vulcan (3-trial median × 30s × SF=0.01 ≈ 60K rows)**:
+  Q1 N=1 2.80 → **10.90 q/s (3.89×)**, Q1 N=4 10.14 → **41.11 q/s
+  (4.05×)** — gap vs Postgres closed from 18× to **4.5×**; KesselDB
+  N=4 now **BEATS SQLite N=4** (41.11 vs 23.75 = 1.73× win, was 2.3×
+  loss). The design predicted 3-4× lift band — measured 3.9-4.0×
+  lift is exactly on prediction. The remaining 4.5× Q1 gap is
+  parallel hash aggregate (next arc, SP-Hash-Agg). Workspace tests:
+  kessel-proto 15 → 16, kessel-sm 151 → 154, kessel-sql 38 → 40,
+  kesseldb-server read_pool 33 GREEN (variant count 46 → 47).
+  seed-7 GREEN (partition_corpus_is_deterministic); zero new
+  external deps; `#![forbid(unsafe_code)]` honored; HTTP/1.1 + WS +
+  binary + PG-wire surfaces byte-untouched. Six commits: `d0aa4e4`
+  (T1 design), `eb1a417` (T1+T2 scaffold + SM helper), `c74e74a`
+  (T2 equivalence KATs), `60345a3` (T3 SQL planner + KATs), `d48d3c4`
+  (T4 bench driver), `ff35ed9` (T4 read_pool variant fix), plus this
+  commit (T5 closure). Progress tracker
+  `docs/superpowers/specs/2026-05-30-kesseldb-spanalyticplanmulti-progress.md`
+  CLOSED. **Arc closed — TaskList #342 ready for completion.**
 - **Track D — Cluster test flakes (SP-CLUSTER-FLAKE T2).** Root-cause fixed
   in `Node::submit*` / `apply_raw`: production VSR retry on transient
   ViewChange. Not just a test relaxation — the actual production code path

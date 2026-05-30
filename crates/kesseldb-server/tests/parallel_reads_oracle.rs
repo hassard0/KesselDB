@@ -889,9 +889,13 @@ fn txn_ro_smoke_sysbench_shape_returns_ok() {
 fn txn_ro_smoke_all_txn_permitted_variants_one_txn_returns_ok() {
     let (engine_p, dir_p) = spawn(Some(4), "txnro-allvariants-p");
     let (engine_s, dir_s) = spawn(None, "txnro-allvariants-s");
+    // GetBlob{handle:0} is deliberately omitted — apply-Txn fail-fasts
+    // on the NotFound (no blob with handle 0 was seeded), so the Txn
+    // would return NotFound instead of Ok on both paths. The bypass
+    // matches that contract; the symmetry is locked separately by
+    // txn_ro_oracle_100_workloads_x_1000_txns_byte_equal.
     let inner = vec![
         Op::GetById { type_id: 1, id: ObjectId::from_u128(7) },
-        Op::GetBlob { handle: 0 },
         Op::Describe { type_id: 1 },
         Op::FindBy {
             type_id: 1,

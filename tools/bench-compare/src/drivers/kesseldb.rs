@@ -549,18 +549,37 @@ fn run_sysbench_oltp(
 
                 let inner_len = inner.len();
 
-                // Submit as one Op::Txn — KesselDB's atomic transaction wrapper.
-                // RO transactions still go through apply() because Op::Txn
-                // requires it (the SI snapshot is taken at the Txn boundary).
-                let op_no = op_seq.fetch_add(1, Ordering::Relaxed);
+                // SP-Perf-A-TXN-RO: route all-RO Op::Txn through the read
+                // path (sm.read().read_only_op) so workers can run their
+                // Txns in PARALLEL — no write lock, no apply-thread
+                // queue. Mixed-RW Op::Txn still goes through apply (V1
+                // limit; the next arc SP-Perf-A-TXN-RW attacks mixed-RW
+                // with SI + commit conflict detection). The split here
+                // is determined at workload-config time: `has_writes ==
+                // false` ⇒ pure-RO bracket; else ⇒ mixed/RW. Detecting
+                // at runtime (walking `inner`) would also work but is
+                // redundant when the workload type already encodes the
+                // composition.
                 let s = Instant::now();
-                let r = sm.write().unwrap().apply(
-                    op_no,
-                    Op::Txn { ops: inner },
-                );
+                let r = if has_writes {
+                    let op_no = op_seq.fetch_add(1, Ordering::Relaxed);
+                    sm.write()
+                        .unwrap()
+                        .apply(op_no, Op::Txn { ops: inner })
+                } else {
+                    // RO bypass — no op-number consumption (reads don't
+                    // take log slots), no write lock, no group-commit
+                    // fsync. The bypass holds sm.read() for the
+                    // iteration so committed state can't advance
+                    // mid-Txn (same isolation contract apply-Txn
+                    // provides via the write lock).
+                    sm.read()
+                        .unwrap()
+                        .read_only_op(Op::Txn { ops: inner })
+                };
                 lat.push(s.elapsed().as_nanos() as u64);
-                // Op::Txn returns a result aggregating the inner ops; we
-                // tolerate variable shape (`Got`, `Ok`, `OkBatch`).
+                // Op::Txn returns Ok on success in both code paths;
+                // inner-op result payloads are discarded by both.
                 debug_assert!(!matches!(r, OpResult::NotFound), "txn missing row");
 
                 count_txns += 1;
@@ -604,9 +623,11 @@ fn run_sysbench_oltp(
         rows: tables * rows_per_table,
         note: Some(format!(
             "MemVfs in-process; SP112 snapshot isolation; tables={}, rows/tbl={}; \
-             txn = Op::Txn{{ops}} on the serial apply path (writes serialize; \
-             reads also serialize because Op::Txn goes through apply for snapshot \
-             coherence — Perf-A read-pool bypass is GetById-only). \
+             txn = Op::Txn{{ops}} — RO bracket routes via \
+             sm.read().read_only_op (SP-Perf-A-TXN-RO bypass: no write lock; \
+             workers run in parallel against committed state); \
+             RW/WO brackets still serialize on sm.write().apply (V1 limit; \
+             next arc SP-Perf-A-TXN-RW). \
              inner-ops/txn ≈ {:.1}; reported ops/sec = transactions/sec",
             tables,
             rows_per_table,

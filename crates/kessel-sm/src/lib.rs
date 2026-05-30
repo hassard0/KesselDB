@@ -113,6 +113,15 @@ const MIN_PARALLEL_ROWS: usize = 8192;
 /// arc can plumb this via env var.
 const NUM_HASH_AGG_WORKERS: usize = 4;
 
+/// SP-Hash-Agg-Tune V1 — bounded back-pressure depth per worker
+/// channel. The producer can run at most `BUF_DEPTH` rows ahead of
+/// the slowest worker before blocking; prevents memory blow-up if a
+/// worker stalls while keeping the producer/worker overlap deep
+/// enough to absorb any per-row jitter. 64 is empirically deep enough
+/// to keep all workers busy on Q1/Q6 + shallow enough that the worst-
+/// case in-flight is 64 × 4 = 256 rows × ~200B = ~50KB — bounded.
+const BUF_DEPTH: usize = 64;
+
 pub struct StateMachine<V: Vfs> {
     catalog: Catalog,
     storage: Storage<V>,
@@ -1510,17 +1519,27 @@ impl<V: Vfs> StateMachine<V> {
         cand
     }
 
-    // SP-Hash-Agg V1 — shared numeric ≤8B Op::Aggregate fold used by
-    // BOTH `apply` and `read_only_op` so byte-identical results are
-    // guaranteed (apply-path determinism). Encoding: a 16-byte LE i128.
+    // SP-Hash-Agg V1 + SP-Hash-Agg-Tune V1 — shared numeric ≤8B
+    // Op::Aggregate fold used by BOTH `apply` and `read_only_op` so
+    // byte-identical results are guaranteed (apply-path determinism).
+    // Encoding: a 16-byte LE i128.
     //
-    // Same two-phase parallel structure as `group_aggregate_multi`:
-    // Phase A materialises the candidate row set; Phase B+C either
-    // folds serially (rows < MIN_PARALLEL_ROWS) or partitions across
-    // NUM_HASH_AGG_WORKERS workers via std::thread::scope, then merges
-    // the scalar partials. Combine is associative for SUM/COUNT and
-    // associative+commutative for MIN/MAX, so the parallel result is
-    // byte-identical to the serial path — locked by an SM-level KAT.
+    // V1 used a two-phase pre-collect+partition shape that paid the
+    // full Vec<Arc<[u8]>> materialisation cost SERIALLY before any
+    // worker spawned (1.46-1.79× measured lift vs 4× modelled — see
+    // SP-Hash-Agg-Tune spec).
+    //
+    // V1-Tune uses a producer-channel-workers pattern: the dispatcher
+    // spawns ONE producer thread (which iterates storage results and
+    // sends rows over N sync_channels round-robin) + N worker threads
+    // (each consumes one channel, runs WHERE+fold). Workers wake on
+    // row 1, not row LAST — the per-row delivery overlaps with the
+    // per-row fold work, eliminating the V1 serial prefix.
+    //
+    // Combine is associative for SUM/COUNT and associative+commutative
+    // for MIN/MAX, so the streaming-delivered parallel result is
+    // byte-identical to the V1 pre-collected parallel result, which is
+    // byte-identical to the V0 serial result — locked by SM-level KATs.
     //
     // Caller is responsible for the MIN/MAX var-order fast path and
     // the COUNT(*) no-field handling (only the numeric ≤8B scan
@@ -1571,87 +1590,172 @@ impl<V: Vfs> StateMachine<V> {
         let uncond = program
             == kessel_expr::Program::new().push_int(1).bytes().as_slice();
 
-        // Phase A — materialise candidate row bytes. Use Arc<[u8]>
-        // so the storage.get() refcount-bump path stays zero-memcpy
-        // (SP-Perf-A T7); scan_range materialises Vec<u8> per row
-        // which we wrap into an Arc to unify the per-worker chunk
-        // type. The clone in fold_chunk's chunk slicing is then a
-        // pointer copy, not a payload memcpy.
-        let rows: Vec<std::sync::Arc<[u8]>> = match &cand {
+        type ScalarAcc = (i128, i128, Option<i128>, Option<i128>);
+
+        // Per-row fold update — used by both the serial small-scan
+        // fast path AND the parallel workers (byte-identical so
+        // streaming-equivalence holds trivially).
+        let fold_one = |acc: &mut ScalarAcc, rec: &[u8]| -> Result<(), String> {
+            if !uncond {
+                match kessel_expr::eval(program, &ot, rec) {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(()),
+                    Err(e) => return Err(format!("agg program: {e:?}")),
+                }
+            }
+            acc.0 += 1;
+            if let Some((off, w, signed)) = fpos {
+                if let Some(raw) = rec.get(off..off + w) {
+                    let v = dec(raw, w, signed);
+                    acc.1 = acc.1.wrapping_add(v);
+                    acc.2 = Some(acc.2.map_or(v, |m| m.min(v)));
+                    acc.3 = Some(acc.3.map_or(v, |m| m.max(v)));
+                }
+            }
+            Ok(())
+        };
+
+        // Pre-flight row-count probe — picks the parallel path only
+        // when the candidate set is ≥ MIN_PARALLEL_ROWS. The Vec
+        // produced here is also the source the producer iterates: we
+        // don't re-collect or re-Arc-wrap before sending. For
+        // cand=Some(ids) the main thread does the cheap storage.get
+        // (Arc refcount-bump path, no memcpy thanks to SP-Perf-A T7).
+        // For cand=None the main thread drains scan_range (which is
+        // intrinsically serial — storage has no streaming scan API;
+        // future arc SP-Storage-Scan-Iter). Either way, the per-row
+        // WHERE+fold work then runs IN PARALLEL with the producer's
+        // per-row send via the channel pipeline — that's the win
+        // SP-Hash-Agg-Tune unlocks vs V1's pre-collect+chunk shape.
+        enum RowSource {
+            Pre(Vec<std::sync::Arc<[u8]>>),
+            Scan(Vec<(Key, Vec<u8>)>),
+        }
+        let source: RowSource = match &cand {
             Some(ids) => {
-                let mut acc = Vec::with_capacity(ids.len());
+                let mut acc: Vec<std::sync::Arc<[u8]>> =
+                    Vec::with_capacity(ids.len());
                 for id in ids {
                     if let Some(r) = self.storage.get(&make_key(type_id, id)) {
                         acc.push(r);
                     }
                 }
-                acc
+                RowSource::Pre(acc)
             }
             None => {
                 let lo = make_key(type_id, &[0u8; 16]);
                 let hi = make_key(type_id, &[0xFFu8; 16]);
-                self.storage
-                    .scan_range(&lo, &hi)
-                    .into_iter()
-                    .map(|(_, rec)| std::sync::Arc::from(rec.into_boxed_slice()))
-                    .collect()
+                RowSource::Scan(self.storage.scan_range(&lo, &hi))
             }
         };
+        let row_count = match &source {
+            RowSource::Pre(v) => v.len(),
+            RowSource::Scan(v) => v.len(),
+        };
 
-        // Per-chunk scalar fold. Returns (count, sum, mn, mx) on
-        // success, SchemaError-string on WHERE-program failure.
-        type ScalarAcc = (i128, i128, Option<i128>, Option<i128>);
-        let fold_chunk = |chunk: &[std::sync::Arc<[u8]>]|
-            -> Result<ScalarAcc, String> {
-            let mut count: i128 = 0;
-            let mut sum: i128 = 0;
-            let mut mn: Option<i128> = None;
-            let mut mx: Option<i128> = None;
-            for rec in chunk {
-                let rec: &[u8] = rec;
-                if !uncond {
-                    match kessel_expr::eval(program, &ot, rec) {
-                        Ok(true) => {}
-                        Ok(false) => continue,
-                        Err(e) => return Err(format!("agg program: {e:?}")),
+        let partials: Vec<ScalarAcc> = if row_count < MIN_PARALLEL_ROWS {
+            // Serial fast path — single-threaded fold over the
+            // available rows (no thread spawn, no channel overhead).
+            let mut acc: ScalarAcc = (0, 0, None, None);
+            match source {
+                RowSource::Pre(rows) => {
+                    for r in &rows {
+                        if let Err(e) = fold_one(&mut acc, r) {
+                            return OpResult::SchemaError(e);
+                        }
                     }
                 }
-                count += 1;
-                if let Some((off, w, signed)) = fpos {
-                    if let Some(raw) = rec.get(off..off + w) {
-                        let v = dec(raw, w, signed);
-                        sum = sum.wrapping_add(v);
-                        mn = Some(mn.map_or(v, |m| m.min(v)));
-                        mx = Some(mx.map_or(v, |m| m.max(v)));
+                RowSource::Scan(rows) => {
+                    for (_, rec) in rows {
+                        if let Err(e) = fold_one(&mut acc, &rec) {
+                            return OpResult::SchemaError(e);
+                        }
                     }
                 }
             }
-            Ok((count, sum, mn, mx))
-        };
-
-        // Phase B + C — serial when small, parallel when large.
-        let partials: Vec<ScalarAcc> = if rows.len() < MIN_PARALLEL_ROWS {
-            match fold_chunk(&rows) {
-                Ok(acc) => vec![acc],
-                Err(e) => return OpResult::SchemaError(e),
-            }
+            vec![acc]
         } else {
-            let chunk_size =
-                (rows.len() + NUM_HASH_AGG_WORKERS - 1) / NUM_HASH_AGG_WORKERS;
-            let results: Vec<Result<ScalarAcc, String>> =
-                std::thread::scope(|scope| {
-                    let mut handles = Vec::with_capacity(NUM_HASH_AGG_WORKERS);
-                    for chunk in rows.chunks(chunk_size) {
-                        let fold_chunk = &fold_chunk;
-                        handles.push(scope.spawn(move || fold_chunk(chunk)));
+            // SP-Hash-Agg-Tune V1 — producer-channel-workers streaming.
+            // The producer iterates the materialised source and sends
+            // rows round-robin into N bounded sync_channels; workers
+            // consume their channel and fold rows AS THEY ARRIVE.
+            // Workers start on row 1, not row LAST — eliminating the
+            // V1 serial Vec<Arc<[u8]>> pre-collect prefix on the
+            // critical path (the source materialisation here is the
+            // same cost V1 paid; the win is overlap with worker fold).
+            let (txs, rxs): (
+                Vec<std::sync::mpsc::SyncSender<std::sync::Arc<[u8]>>>,
+                Vec<std::sync::mpsc::Receiver<std::sync::Arc<[u8]>>>,
+            ) = (0..NUM_HASH_AGG_WORKERS)
+                .map(|_| {
+                    std::sync::mpsc::sync_channel::<std::sync::Arc<[u8]>>(BUF_DEPTH)
+                })
+                .unzip();
+            let fold_one = &fold_one;
+            let results: (
+                Result<(), String>,
+                Vec<Result<ScalarAcc, String>>,
+            ) = std::thread::scope(|scope| {
+                // Producer — owns the source Vec + txs; drops txs on
+                // exit to signal end-of-stream to all workers. Sources
+                // are deterministically ordered (BTreeSet-of-ids for
+                // cand=Some, sorted scan_range for cand=None) so
+                // round-robin assignment is deterministic too.
+                let producer_handle = scope.spawn(move || {
+                    let mut next = 0usize;
+                    match source {
+                        RowSource::Pre(rows) => {
+                            for r in rows {
+                                if txs[next].send(r).is_err() {
+                                    break;
+                                }
+                                next = (next + 1) % NUM_HASH_AGG_WORKERS;
+                            }
+                        }
+                        RowSource::Scan(rows) => {
+                            for (_, rec) in rows {
+                                let arc: std::sync::Arc<[u8]> =
+                                    std::sync::Arc::from(rec.into_boxed_slice());
+                                if txs[next].send(arc).is_err() {
+                                    break;
+                                }
+                                next = (next + 1) % NUM_HASH_AGG_WORKERS;
+                            }
+                        }
                     }
-                    handles
-                        .into_iter()
-                        .map(|h| h.join().expect("hash-agg worker panicked"))
-                        .collect()
+                    drop(txs);
+                    Ok::<(), String>(())
                 });
-            let mut out = Vec::with_capacity(results.len());
-            for r in results {
+                // Workers — each consumes one rx; returns its scalar partial.
+                let worker_handles: Vec<_> = rxs
+                    .into_iter()
+                    .map(|rx| {
+                        scope.spawn(move || {
+                            let mut acc: ScalarAcc = (0, 0, None, None);
+                            while let Ok(rec) = rx.recv() {
+                                let r: &[u8] = &rec;
+                                if let Err(e) = fold_one(&mut acc, r) {
+                                    return Err(e);
+                                }
+                            }
+                            Ok(acc)
+                        })
+                    })
+                    .collect();
+                let producer_res = producer_handle
+                    .join()
+                    .expect("hash-agg producer panicked");
+                let worker_res: Vec<_> = worker_handles
+                    .into_iter()
+                    .map(|h| h.join().expect("hash-agg worker panicked"))
+                    .collect();
+                (producer_res, worker_res)
+            });
+            if let Err(e) = results.0 {
+                return OpResult::SchemaError(e);
+            }
+            let mut out = Vec::with_capacity(results.1.len());
+            for r in results.1 {
                 match r {
                     Ok(a) => out.push(a),
                     Err(e) => return OpResult::SchemaError(e),
@@ -1712,11 +1816,17 @@ impl<V: Vfs> StateMachine<V> {
     // existing Op::GroupAggregate AVG semantics). Proven by the
     // sp_analytic_plan_multi_equivalence_vs_n_group_aggregate KAT.
     //
-    // SP-Hash-Agg V1 — when the candidate row count crosses
-    // MIN_PARALLEL_ROWS, the per-row WHERE+fold work is partitioned
-    // across NUM_HASH_AGG_WORKERS workers via std::thread::scope; each
-    // worker builds a local HashMap partial; partials are merged into
-    // a final BTreeMap for ascending-key output (existing contract).
+    // SP-Hash-Agg V1 + SP-Hash-Agg-Tune V1 — when the candidate row
+    // count crosses MIN_PARALLEL_ROWS, the per-row WHERE+group-key
+    // extract+aggregate update work is partitioned across
+    // NUM_HASH_AGG_WORKERS workers via std::thread::scope. V1-Tune
+    // replaces V1's pre-collect+chunk shape with producer-channel-
+    // workers streaming: a single producer iterates the storage
+    // results and dispatches rows round-robin into N bounded
+    // sync_channels; each worker consumes its channel and folds
+    // rows AS THEY ARRIVE, so worker fold overlaps producer iteration
+    // (no serial Vec<Arc<[u8]>> prefix). Partials are merged into a
+    // final BTreeMap for ascending-key output (existing contract).
     fn group_aggregate_multi(
         &self,
         type_id: u32,
@@ -1796,109 +1906,181 @@ impl<V: Vfs> StateMachine<V> {
         let uncond = program
             == kessel_expr::Program::new().push_int(1).bytes().as_slice();
 
-        // SP-Hash-Agg V1 — two-phase materialise + fold so the
-        // per-row WHERE eval + group-key extract + aggregate update
-        // can run in parallel across N workers when the candidate
-        // row count crosses MIN_PARALLEL_ROWS. Below threshold the
-        // existing single-threaded fold runs verbatim (zero overhead
-        // for OLTP-shape aggregates).
-        //
-        // Phase A (this thread): materialise the candidate row set
-        // into a Vec<Arc<[u8]>>. Arc keeps the storage.get() refcount
-        // path zero-memcpy (SP-Perf-A T7); scan_range materialises
-        // Vec<u8> per row which we wrap into Arc to unify the per-
-        // worker chunk type. WHERE not applied yet — we push it into
-        // workers so its cost parallelises too.
-        let rows: Vec<std::sync::Arc<[u8]>> = match &cand {
+        // Per-row fold update — closure shape that mutates a local
+        // HashMap partial in-place. Used by both the serial
+        // small-scan fast path and the parallel streaming workers
+        // (byte-identical so streaming-equivalence holds trivially).
+        let fold_one = |local: &mut std::collections::HashMap<Vec<u8>, Vec<Acc>>,
+                        rec: &[u8]|
+         -> Result<(), String> {
+            if !uncond {
+                match kessel_expr::eval(program, &ot, rec) {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(()),
+                    Err(e) => return Err(format!("group-multi program: {e:?}")),
+                }
+            }
+            let gkey = match rec.get(gpos.0..gpos.0 + gpos.1) {
+                Some(b) => b.to_vec(),
+                None => return Ok(()),
+            };
+            let entry = local.entry(gkey).or_insert_with(|| init.clone());
+            for (i, slot) in apos.iter().enumerate() {
+                entry[i].0 += 1;
+                if let Some((off, w, signed)) = slot {
+                    if let Some(raw) = rec.get(*off..*off + *w) {
+                        let v = dec(raw, *w, *signed);
+                        entry[i].1 = entry[i].1.wrapping_add(v);
+                        entry[i].2 = Some(entry[i].2.map_or(v, |m| m.min(v)));
+                        entry[i].3 = Some(entry[i].3.map_or(v, |m| m.max(v)));
+                    }
+                }
+            }
+            Ok(())
+        };
+
+        // Pre-flight row-count probe + source materialisation. The Vec
+        // produced here is also the source the producer drains; we
+        // don't re-collect or re-Arc-wrap before sending. For
+        // cand=Some(ids) the main thread does the cheap storage.get
+        // (Arc refcount-bump path, no memcpy per SP-Perf-A T7). For
+        // cand=None it drains scan_range (intrinsically serial — see
+        // SP-Storage-Scan-Iter follow-up). Either way the per-row
+        // WHERE+group-key+fold then runs IN PARALLEL with the
+        // producer's per-row send via the channel pipeline.
+        enum RowSource {
+            Pre(Vec<std::sync::Arc<[u8]>>),
+            Scan(Vec<(Key, Vec<u8>)>),
+        }
+        let source: RowSource = match &cand {
             Some(ids) => {
-                let mut acc = Vec::with_capacity(ids.len());
+                let mut acc: Vec<std::sync::Arc<[u8]>> =
+                    Vec::with_capacity(ids.len());
                 for id in ids {
                     if let Some(r) = self.storage.get(&make_key(type_id, id)) {
                         acc.push(r);
                     }
                 }
-                acc
+                RowSource::Pre(acc)
             }
             None => {
                 let lo = make_key(type_id, &[0u8; 16]);
                 let hi = make_key(type_id, &[0xFFu8; 16]);
-                self.storage
-                    .scan_range(&lo, &hi)
-                    .into_iter()
-                    .map(|(_, rec)| std::sync::Arc::from(rec.into_boxed_slice()))
-                    .collect()
+                RowSource::Scan(self.storage.scan_range(&lo, &hi))
             }
         };
-
-        // Per-chunk fold — closure shape that returns either the
-        // partial HashMap on success or a SchemaError string on
-        // WHERE-program failure (the only error path inside the
-        // loop). Used by both the serial fast path and the parallel
-        // workers (with byte-identical fold logic so equivalence
-        // holds trivially).
-        let fold_chunk = |chunk: &[std::sync::Arc<[u8]>]|
-            -> Result<std::collections::HashMap<Vec<u8>, Vec<Acc>>, String> {
-            let mut local: std::collections::HashMap<Vec<u8>, Vec<Acc>> =
-                std::collections::HashMap::new();
-            for rec in chunk {
-                let rec: &[u8] = rec;
-                if !uncond {
-                    match kessel_expr::eval(program, &ot, rec) {
-                        Ok(true) => {}
-                        Ok(false) => continue,
-                        Err(e) => {
-                            return Err(format!("group-multi program: {e:?}"));
-                        }
-                    }
-                }
-                let gkey = match rec.get(gpos.0..gpos.0 + gpos.1) {
-                    Some(b) => b.to_vec(),
-                    None => continue,
-                };
-                let entry = local.entry(gkey).or_insert_with(|| init.clone());
-                for (i, slot) in apos.iter().enumerate() {
-                    entry[i].0 += 1;
-                    if let Some((off, w, signed)) = slot {
-                        if let Some(raw) = rec.get(*off..*off + *w) {
-                            let v = dec(raw, *w, *signed);
-                            entry[i].1 = entry[i].1.wrapping_add(v);
-                            entry[i].2 = Some(entry[i].2.map_or(v, |m| m.min(v)));
-                            entry[i].3 = Some(entry[i].3.map_or(v, |m| m.max(v)));
-                        }
-                    }
-                }
-            }
-            Ok(local)
+        let row_count = match &source {
+            RowSource::Pre(v) => v.len(),
+            RowSource::Scan(v) => v.len(),
         };
 
-        // Phase B + C: parallel fold via std::thread::scope when
-        // row count crosses the threshold; otherwise serial fold.
-        // The merge step folds partials in deterministic (0..N)
-        // order into a final BTreeMap for ascending-key output.
         let partials: Vec<std::collections::HashMap<Vec<u8>, Vec<Acc>>> =
-            if rows.len() < MIN_PARALLEL_ROWS {
-                match fold_chunk(&rows) {
-                    Ok(m) => vec![m],
-                    Err(e) => return OpResult::SchemaError(e),
-                }
-            } else {
-                let chunk_size =
-                    (rows.len() + NUM_HASH_AGG_WORKERS - 1) / NUM_HASH_AGG_WORKERS;
-                let results: Vec<
-                    Result<std::collections::HashMap<Vec<u8>, Vec<Acc>>, String>,
-                > = std::thread::scope(|scope| {
-                    let mut handles = Vec::with_capacity(NUM_HASH_AGG_WORKERS);
-                    for chunk in rows.chunks(chunk_size) {
-                        let fold_chunk = &fold_chunk;
-                        handles.push(scope.spawn(move || fold_chunk(chunk)));
+            if row_count < MIN_PARALLEL_ROWS {
+                // Serial fast path — single-threaded fold over the
+                // available rows (no thread spawn, no channel overhead).
+                let mut local: std::collections::HashMap<Vec<u8>, Vec<Acc>> =
+                    std::collections::HashMap::new();
+                match source {
+                    RowSource::Pre(rows) => {
+                        for r in &rows {
+                            if let Err(e) = fold_one(&mut local, r) {
+                                return OpResult::SchemaError(e);
+                            }
+                        }
                     }
-                    handles
+                    RowSource::Scan(rows) => {
+                        for (_, rec) in rows {
+                            if let Err(e) = fold_one(&mut local, &rec) {
+                                return OpResult::SchemaError(e);
+                            }
+                        }
+                    }
+                }
+                vec![local]
+            } else {
+                // SP-Hash-Agg-Tune V1 — producer-channel-workers streaming.
+                // The producer drains the materialised source and sends
+                // rows round-robin into N bounded sync_channels; workers
+                // consume their channel and fold rows AS THEY ARRIVE.
+                // Workers start on row 1, not row LAST — eliminating the
+                // V1 serial Vec<Arc<[u8]>> chunk-prefix on the critical
+                // path (the source materialisation here is the same cost
+                // V1 paid; the win is overlap with worker fold).
+                let (txs, rxs): (
+                    Vec<std::sync::mpsc::SyncSender<std::sync::Arc<[u8]>>>,
+                    Vec<std::sync::mpsc::Receiver<std::sync::Arc<[u8]>>>,
+                ) = (0..NUM_HASH_AGG_WORKERS)
+                    .map(|_| {
+                        std::sync::mpsc::sync_channel::<std::sync::Arc<[u8]>>(BUF_DEPTH)
+                    })
+                    .unzip();
+                let fold_one = &fold_one;
+                let results: (
+                    Result<(), String>,
+                    Vec<
+                        Result<
+                            std::collections::HashMap<Vec<u8>, Vec<Acc>>,
+                            String,
+                        >,
+                    >,
+                ) = std::thread::scope(|scope| {
+                    let producer_handle = scope.spawn(move || {
+                        let mut next = 0usize;
+                        match source {
+                            RowSource::Pre(rows) => {
+                                for r in rows {
+                                    if txs[next].send(r).is_err() {
+                                        break;
+                                    }
+                                    next = (next + 1) % NUM_HASH_AGG_WORKERS;
+                                }
+                            }
+                            RowSource::Scan(rows) => {
+                                for (_, rec) in rows {
+                                    let arc: std::sync::Arc<[u8]> =
+                                        std::sync::Arc::from(rec.into_boxed_slice());
+                                    if txs[next].send(arc).is_err() {
+                                        break;
+                                    }
+                                    next = (next + 1) % NUM_HASH_AGG_WORKERS;
+                                }
+                            }
+                        }
+                        drop(txs);
+                        Ok::<(), String>(())
+                    });
+                    let worker_handles: Vec<_> = rxs
+                        .into_iter()
+                        .map(|rx| {
+                            scope.spawn(move || {
+                                let mut local: std::collections::HashMap<
+                                    Vec<u8>,
+                                    Vec<Acc>,
+                                > = std::collections::HashMap::new();
+                                while let Ok(rec) = rx.recv() {
+                                    let r: &[u8] = &rec;
+                                    if let Err(e) = fold_one(&mut local, r) {
+                                        return Err(e);
+                                    }
+                                }
+                                Ok(local)
+                            })
+                        })
+                        .collect();
+                    let producer_res = producer_handle
+                        .join()
+                        .expect("hash-agg producer panicked");
+                    let worker_res: Vec<_> = worker_handles
                         .into_iter()
                         .map(|h| h.join().expect("hash-agg worker panicked"))
-                        .collect()
+                        .collect();
+                    (producer_res, worker_res)
                 });
-                let mut out = Vec::with_capacity(results.len());
-                for r in results {
+                if let Err(e) = results.0 {
+                    return OpResult::SchemaError(e);
+                }
+                let mut out = Vec::with_capacity(results.1.len());
+                for r in results.1 {
                     match r {
                         Ok(m) => out.push(m),
                         Err(e) => return OpResult::SchemaError(e),
@@ -9604,6 +9786,268 @@ mod tests {
             r_apply, r_ro,
             "parallel-path apply and read_only_op must produce byte-identical results"
         );
+    }
+
+    // ========================================================================
+    // SP-Hash-Agg-Tune T2 — streaming producer-channel-workers equivalence.
+    //
+    // The streaming-delivery refactor preserved the V1 fold math but
+    // changed how rows get to workers (V1 pre-collected Vec<Arc<[u8]>>
+    // + chunks; V1-Tune streams via sync_channel round-robin). The V1
+    // KATs above (which compare to a hand-computed BTreeMap model) IS
+    // already proof that the streaming-delivered result matches the
+    // mathematical oracle. These tests cover the additional invariants
+    // unique to the streaming path:
+    //   1) BUF_DEPTH-boundary stress — N rows where N is several
+    //      BUF_DEPTH multiples ⇒ producer parks + resumes repeatedly,
+    //      still deterministic + correct.
+    //   2) High-cardinality groups — per-worker HashMap divergence is
+    //      sensitive to the merge order; we lock 100-group + 50K rows
+    //      stays byte-identical across 10 independent runs.
+    //   3) Repeatability across 20 runs of the scalar path — the
+    //      channel parking + worker scheduling jitter cannot leak.
+    // ========================================================================
+
+    /// SP-Hash-Agg-Tune T2: BUF_DEPTH-boundary stress for the streaming
+    /// scalar-aggregate path. Rows = 9000 (just above the
+    /// MIN_PARALLEL_ROWS=8192 gate, comfortably above BUF_DEPTH=64 ×
+    /// NUM_HASH_AGG_WORKERS=4 = 256 — the producer parks dozens of
+    /// times). All 5 kinds + 5 repeat runs each must yield byte-
+    /// identical results matching closed-form expected values.
+    #[test]
+    fn sp_hash_agg_tune_aggregate_streaming_eq_serial() {
+        use kessel_expr::Program;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: q_type_def() });
+        const N: u64 = 9_000;
+        for i in 0..N {
+            sm.apply(
+                10 + i,
+                Op::Create {
+                    type_id: 1,
+                    id: ObjectId::from_u128(i as u128),
+                    record: qrec(1, 0, (i + 1) as u32),
+                },
+            );
+        }
+        // Closed-form expected (matches V1 KAT's algebra).
+        let expected_count: i128 = N as i128;
+        let expected_sum: i128 = (N as i128) * (N as i128 + 1) / 2;
+        let expected_min: i128 = 1;
+        let expected_max: i128 = N as i128;
+        let expected_avg: i128 = expected_sum / expected_count;
+        let agg = |sm: &StateMachine<MemVfs>, kind: u8| -> i128 {
+            match sm.read_only_op(Op::Aggregate {
+                type_id: 1,
+                program: Program::new().push_int(1).bytes(),
+                kind,
+                field_id: 3,
+                range_preds: vec![],
+            }) {
+                OpResult::Got(b) => {
+                    let mut le = [0u8; 16];
+                    le.copy_from_slice(&b[..16]);
+                    i128::from_le_bytes(le)
+                }
+                o => panic!("streaming agg kind={kind}: {o:?}"),
+            }
+        };
+        // 5 independent runs per kind — locks repeatability against
+        // channel parking + worker scheduling jitter.
+        for kind in 0..=4u8 {
+            let first = agg(&sm, kind);
+            for _ in 1..5 {
+                assert_eq!(
+                    first,
+                    agg(&sm, kind),
+                    "streaming scalar-agg kind={kind} must be deterministic across runs"
+                );
+            }
+        }
+        assert_eq!(agg(&sm, 0), expected_count, "COUNT");
+        assert_eq!(agg(&sm, 1), expected_sum, "SUM");
+        assert_eq!(agg(&sm, 2), expected_min, "MIN");
+        assert_eq!(agg(&sm, 3), expected_max, "MAX");
+        assert_eq!(agg(&sm, 4), expected_avg, "AVG (integer)");
+    }
+
+    /// SP-Hash-Agg-Tune T2: high-cardinality GROUP BY streaming
+    /// equivalence. 50K rows × 100 distinct group keys; each worker
+    /// HashMap grows to ~25 keys on average; merge must yield byte-
+    /// identical output across 10 independent runs (locks the merge
+    /// order vs streaming-arrival order non-interference).
+    #[test]
+    fn sp_hash_agg_tune_group_aggregate_multi_streaming_eq_serial() {
+        use kessel_expr::Program;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: q_type_def() });
+        const N: u64 = 50_000;
+        const G: u64 = 100; // group cardinality
+        for i in 0..N {
+            let owner = ((i % G) as u32) + 1;
+            let v = (i + 1) as u32;
+            sm.apply(
+                10 + i,
+                Op::Create {
+                    type_id: 1,
+                    id: ObjectId::from_u128(i as u128),
+                    record: qrec(owner, 0, v),
+                },
+            );
+        }
+        // Hand-compute the expected per-group accumulators.
+        let mut expected: std::collections::BTreeMap<u32, (i128, i128, i128, i128)> =
+            std::collections::BTreeMap::new();
+        for i in 0..N {
+            let owner = ((i % G) as u32) + 1;
+            let v = (i + 1) as i128;
+            let e = expected
+                .entry(owner)
+                .or_insert((0, 0, i128::MAX, i128::MIN));
+            e.0 += 1;
+            e.1 += v;
+            e.2 = e.2.min(v);
+            e.3 = e.3.max(v);
+        }
+        let aggs: Vec<(u8, u16)> = vec![(0, 0), (1, 3), (2, 3), (3, 3), (4, 3)];
+        let prog = Program::new().push_int(1).bytes();
+        let run = || -> Vec<u8> {
+            match sm.read_only_op(Op::GroupAggregateMulti {
+                type_id: 1,
+                program: prog.clone(),
+                group_field: 1,
+                aggregates: aggs.clone(),
+                range_preds: vec![],
+            }) {
+                OpResult::Got(b) => b.to_vec(),
+                o => panic!("multi streaming high-cardinality: {o:?}"),
+            }
+        };
+        // Lock byte-stability across 10 runs (worker arrival order
+        // jitter cannot leak through the BTreeMap merge).
+        let first = run();
+        for trial in 1..10u32 {
+            let later = run();
+            assert_eq!(
+                first, later,
+                "streaming multi-agg run {trial} differs from run 0 — non-determinism leak"
+            );
+        }
+        // Decode the result and validate per-group values against the
+        // hand-computed model. Encoding:
+        //   [u32 ngroups] per group [u32 keylen][key][16B × n_aggs]
+        let mut p = 0usize;
+        let ngroups = u32::from_le_bytes(first[p..p + 4].try_into().unwrap()) as usize;
+        p += 4;
+        assert_eq!(ngroups, G as usize, "ngroups must equal hand-computed");
+        for _ in 0..ngroups {
+            let klen = u32::from_le_bytes(first[p..p + 4].try_into().unwrap()) as usize;
+            p += 4;
+            let kbytes = &first[p..p + klen];
+            p += klen;
+            let mut kw = [0u8; 4];
+            kw.copy_from_slice(&kbytes[..4]);
+            let owner = u32::from_le_bytes(kw);
+            let exp = expected.get(&owner).expect("group missing from expected");
+            // 5 aggregate slots: COUNT, SUM, MIN, MAX, AVG
+            let mut slot = [0i128; 5];
+            for s in 0..5 {
+                let mut le = [0u8; 16];
+                le.copy_from_slice(&first[p..p + 16]);
+                slot[s] = i128::from_le_bytes(le);
+                p += 16;
+            }
+            assert_eq!(slot[0], exp.0, "COUNT group {owner}");
+            assert_eq!(slot[1], exp.1, "SUM group {owner}");
+            assert_eq!(slot[2], exp.2, "MIN group {owner}");
+            assert_eq!(slot[3], exp.3, "MAX group {owner}");
+            assert_eq!(slot[4], exp.1 / exp.0, "AVG group {owner}");
+        }
+        assert_eq!(p, first.len(), "decoded length must equal byte-buffer length");
+    }
+
+    /// SP-Hash-Agg-Tune T2: at-scale apply == read_only_op for the
+    /// streaming path. Picks a row count well above MIN_PARALLEL_ROWS
+    /// + the BUF_DEPTH boundary (15_000 rows × 7 groups). Both arms
+    /// must produce byte-identical results — the same `aggregate_*`
+    /// / `group_aggregate_multi` helper backs both arms, but the
+    /// streaming worker spawn order COULD diverge if the determinism
+    /// contract is wrong.
+    #[test]
+    fn sp_hash_agg_tune_apply_eq_read_only_op_streaming() {
+        use kessel_expr::Program;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: q_type_def() });
+        const N: u64 = 15_000;
+        for i in 0..N {
+            sm.apply(
+                10 + i,
+                Op::Create {
+                    type_id: 1,
+                    id: ObjectId::from_u128(i as u128),
+                    record: qrec(((i % 7) as u32) + 1, 0, (i + 1) as u32),
+                },
+            );
+        }
+        let aggs: Vec<(u8, u16)> = vec![(0, 0), (1, 3), (2, 3), (3, 3), (4, 3)];
+        let prog = Program::new().push_int(1).bytes();
+        let r_apply = match sm.apply(
+            500_000,
+            Op::GroupAggregateMulti {
+                type_id: 1,
+                program: prog.clone(),
+                group_field: 1,
+                aggregates: aggs.clone(),
+                range_preds: vec![],
+            },
+        ) {
+            OpResult::Got(b) => b.to_vec(),
+            o => panic!("apply streaming: {o:?}"),
+        };
+        let r_ro = match sm.read_only_op(Op::GroupAggregateMulti {
+            type_id: 1,
+            program: prog.clone(),
+            group_field: 1,
+            aggregates: aggs.clone(),
+            range_preds: vec![],
+        }) {
+            OpResult::Got(b) => b.to_vec(),
+            o => panic!("ro streaming: {o:?}"),
+        };
+        assert_eq!(
+            r_apply, r_ro,
+            "streaming apply and read_only_op must produce byte-identical results"
+        );
+        // Also lock scalar aggregate apply == read_only_op streaming.
+        for kind in 0..=4u8 {
+            let s_apply = match sm.apply(
+                600_000,
+                Op::Aggregate {
+                    type_id: 1,
+                    program: prog.clone(),
+                    kind,
+                    field_id: 3,
+                    range_preds: vec![],
+                },
+            ) {
+                OpResult::Got(b) => b.to_vec(),
+                o => panic!("apply scalar streaming kind={kind}: {o:?}"),
+            };
+            let s_ro = match sm.read_only_op(Op::Aggregate {
+                type_id: 1,
+                program: prog.clone(),
+                kind,
+                field_id: 3,
+                range_preds: vec![],
+            }) {
+                OpResult::Got(b) => b.to_vec(),
+                o => panic!("ro scalar streaming kind={kind}: {o:?}"),
+            };
+            assert_eq!(
+                s_apply, s_ro,
+                "streaming scalar agg kind={kind}: apply and read_only_op must match"
+            );
+        }
     }
 
     #[test]

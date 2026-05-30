@@ -54,14 +54,24 @@ pub fn format_result(r: &OpResult) -> String {
         OpResult::Exists => "EXISTS  (row already present)".to_string(),
         OpResult::NotFound => "NOT FOUND".to_string(),
         OpResult::Constraint(m) => format!("CONSTRAINT  {m}"),
-        OpResult::SchemaError(m) => format!("ERROR  {m}"),
+        OpResult::SchemaError(m) => {
+            // The server-side `apply_one` paths uniformly prefix
+            // SQL-compile errors with `"sql: "`. Strip it on the way out
+            // so the user sees the friendly message directly
+            // (`ERROR  unknown table \`foo\``) rather than the
+            // double-namespaced `ERROR  sql: unknown table \`foo\``.
+            let body = m.strip_prefix("sql: ").unwrap_or(m);
+            format!("ERROR  {body}")
+        }
         OpResult::Unavailable => {
             "UNAVAILABLE  (this node is not the active primary — connect with a \
              cluster address list / ClusterClient)"
                 .to_string()
         }
         OpResult::Unauthorized => {
-            "UNAUTHORIZED  (missing or wrong --token)".to_string()
+            "UNAUTHORIZED  (auth failed — does your --token / \
+             $KESSELDB_TOKEN match the server's KESSELDB_TOKEN env?)"
+                .to_string()
         }
         OpResult::Got(b) if b.len() == 16 => {
             // The common scalar reply (aggregate result is a 16-byte i128).
@@ -335,7 +345,11 @@ pub fn format_result_json(r: &OpResult) -> String {
             format!(r#"{{"status":"constraint","message":{}}}"#, json_str(m))
         }
         OpResult::SchemaError(m) => {
-            format!(r#"{{"status":"error","message":{}}}"#, json_str(m))
+            // Mirror the text path: strip the server-side `"sql: "`
+            // prefix so JSON consumers get the friendly inner message
+            // (e.g. ``unknown table `foo` — did you mean `food`?``).
+            let body = m.strip_prefix("sql: ").unwrap_or(m);
+            format!(r#"{{"status":"error","message":{}}}"#, json_str(body))
         }
         OpResult::Unavailable => {
             r#"{"status":"unavailable"}"#.to_string()

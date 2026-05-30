@@ -105,11 +105,52 @@ fn main() {
         None => Client::connect(&addr),
     }
     .unwrap_or_else(|e| {
-        eprintln!("kessel: cannot connect to {addr}: {e}");
-        eprintln!(
-            "  hint: is a server running? start one with:\n        \
-             cargo run --release --bin kesseldb -- {addr} ./data"
-        );
+        // Differentiated diagnosis: connection refused / DNS / auth all
+        // get different hints — the generic "I/O error" left users
+        // guessing whether the address was wrong, the server was down,
+        // or their token was bad.
+        let kind = e.kind();
+        match kind {
+            std::io::ErrorKind::ConnectionRefused => {
+                eprintln!(
+                    "kessel: couldn't connect to {addr} — connection refused"
+                );
+                eprintln!(
+                    "  hint: is the server running on that address? start \
+                     one with:\n        kesseldb {addr} ./data\n  or set \
+                     --addr to the actual listener (default 127.0.0.1:7878)."
+                );
+            }
+            std::io::ErrorKind::PermissionDenied => {
+                // do_auth() returns PermissionDenied for "bad token"
+                eprintln!(
+                    "kessel: authentication failed connecting to {addr} — \
+                     server rejected the token"
+                );
+                eprintln!(
+                    "  hint: does --token (or $KESSELDB_TOKEN) match the \
+                     server's KESSELDB_TOKEN env? a server without a \
+                     KESSELDB_TOKEN configured does not accept --token."
+                );
+            }
+            std::io::ErrorKind::TimedOut => {
+                eprintln!(
+                    "kessel: connect to {addr} timed out — host reachable \
+                     but not accepting connections"
+                );
+                eprintln!(
+                    "  hint: check firewall rules and that the server is \
+                     listening on that port (default 7878 for binary)."
+                );
+            }
+            _ => {
+                eprintln!("kessel: cannot connect to {addr}: {e}");
+                eprintln!(
+                    "  hint: is a server running? start one with:\n        \
+                     kesseldb {addr} ./data"
+                );
+            }
+        }
         std::process::exit(1);
     });
 

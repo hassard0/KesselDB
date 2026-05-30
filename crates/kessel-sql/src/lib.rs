@@ -168,8 +168,139 @@ impl<'a> P<'a> {
             .types
             .iter()
             .find(|t| t.name == name)
-            .ok_or_else(|| format!("unknown table `{name}`"))
+            .ok_or_else(|| {
+                let candidates: Vec<&str> =
+                    self.cat.types.iter().map(|t| t.name.as_str()).collect();
+                match suggest(name, &candidates) {
+                    Some(s) => {
+                        format!("unknown table `{name}` — did you mean `{s}`?")
+                    }
+                    None if candidates.is_empty() => format!(
+                        "unknown table `{name}` (no tables defined yet — use \
+                         CREATE TABLE first)"
+                    ),
+                    None => format!("unknown table `{name}`"),
+                }
+            })
     }
+}
+
+/// Return the best near-match for `name` from `candidates`, or `None` if
+/// none is close enough. Zero-dep: case-insensitive prefix match wins over
+/// edit-distance ≤ 2 (Damerau-Levenshtein-lite over ASCII). Designed so
+/// the suggestion never embarrasses us with a wildly unrelated string.
+///
+/// Public so the SQL layer's other "unknown X" sites can reuse the same
+/// suggestion shape, and so the server-side `apply_one` path can wrap the
+/// raw `compile_stmt` error in a richer message later if it wants to.
+pub fn suggest<'a>(name: &str, candidates: &'a [&'a str]) -> Option<&'a str> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let needle = name.to_ascii_lowercase();
+    // 1) Exact case-insensitive: if the user typed wrong case, suggest the
+    //    canonical spelling.
+    for &c in candidates {
+        if c.eq_ignore_ascii_case(name) && c != name {
+            return Some(c);
+        }
+    }
+    // 2) Case-insensitive prefix or substring containment (length ≥ 3 so
+    //    we don't suggest every short noise match).
+    if needle.len() >= 3 {
+        for &c in candidates {
+            let cl = c.to_ascii_lowercase();
+            if cl.starts_with(&needle) || needle.starts_with(&cl) {
+                return Some(c);
+            }
+        }
+    }
+    // 3) Edit distance ≤ max(1, len/4). Picks the lexicographically first
+    //    among ties so suggestions are deterministic.
+    let max_edits = (name.len() / 4).max(1);
+    let mut best: Option<(&str, usize)> = None;
+    for &c in candidates {
+        let d = edit_distance(&needle, &c.to_ascii_lowercase(), max_edits + 1);
+        if d <= max_edits {
+            match best {
+                None => best = Some((c, d)),
+                Some((_, bd)) if d < bd => best = Some((c, d)),
+                _ => {}
+            }
+        }
+    }
+    best.map(|(c, _)| c)
+}
+
+/// Render an "unknown column `col` on table `t`" error with a did-you-mean
+/// suggestion from the table's actual column list. Centralized so every
+/// `unknown column` site in this crate emits the same shape; safe to call
+/// even when the table has zero columns. Public for use in tests.
+pub fn unknown_column_err(col: &str, ot: &ObjectType) -> String {
+    let candidates: Vec<&str> =
+        ot.fields.iter().map(|f| f.name.as_str()).collect();
+    match suggest(col, &candidates) {
+        Some(s) => format!(
+            "unknown column `{col}` on table `{t}` — did you mean `{s}`?",
+            t = ot.name
+        ),
+        None => {
+            // Inline up to 4 column names so users see the shape without
+            // an extra DESCRIBE round-trip.
+            let mut hint = String::new();
+            let mut first = true;
+            for c in candidates.iter().take(4) {
+                if first {
+                    hint.push_str("; have: ");
+                    first = false;
+                } else {
+                    hint.push_str(", ");
+                }
+                hint.push('`');
+                hint.push_str(c);
+                hint.push('`');
+            }
+            if candidates.len() > 4 {
+                hint.push_str(", …");
+            }
+            format!(
+                "unknown column `{col}` on table `{t}`{hint}",
+                t = ot.name
+            )
+        }
+    }
+}
+
+/// Bounded Levenshtein distance — returns `cap` as soon as the running
+/// distance can no longer fall below it. Two-row DP, O(a.len()*b.len())
+/// time, O(min(a,b)) space. Pure, zero-dep.
+fn edit_distance(a: &str, b: &str, cap: usize) -> usize {
+    let av: Vec<u8> = a.bytes().collect();
+    let bv: Vec<u8> = b.bytes().collect();
+    let (a, b) = if av.len() < bv.len() { (&av, &bv) } else { (&bv, &av) };
+    if b.len() - a.len() >= cap {
+        return cap;
+    }
+    let mut prev: Vec<usize> = (0..=a.len()).collect();
+    let mut curr: Vec<usize> = vec![0; a.len() + 1];
+    for (j, bj) in b.iter().enumerate() {
+        curr[0] = j + 1;
+        let mut row_min = curr[0];
+        for (i, ai) in a.iter().enumerate() {
+            let cost = if ai.eq_ignore_ascii_case(bj) { 0 } else { 1 };
+            curr[i + 1] = (prev[i + 1] + 1)
+                .min(curr[i] + 1)
+                .min(prev[i] + cost);
+            if curr[i + 1] < row_min {
+                row_min = curr[i + 1];
+            }
+        }
+        if row_min >= cap {
+            return cap;
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[a.len()].min(cap)
 }
 
 fn kind_of(name: &str, arg: Option<i128>) -> Result<FieldKind, SqlError> {
@@ -478,7 +609,7 @@ pub fn compile_stmt(sql: &str, cat: &Catalog) -> Result<Stmt, SqlError> {
                     .fields
                     .iter()
                     .find(|f| f.name == col)
-                    .ok_or_else(|| format!("unknown column `{col}`"))?;
+                    .ok_or_else(|| unknown_column_err(&col, &ot))?;
                 sets.push((f.field_id, lit_to_value(&lit, f.kind)?));
                 match p.peek() {
                     Some(Tok::Punct(',')) => {
@@ -544,7 +675,7 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
                     .fields
                     .iter()
                     .find(|f| f.name == c)
-                    .ok_or_else(|| format!("unknown column `{c}`"))?;
+                    .ok_or_else(|| unknown_column_err(&c, &ot))?;
                 cols.push(f.field_id);
                 match p.next() {
                     Some(Tok::Punct(',')) => continue,
@@ -578,7 +709,7 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
                 .fields
                 .iter()
                 .find(|f| f.name == c)
-                .ok_or_else(|| format!("unknown column `{c}`"))?;
+                .ok_or_else(|| unknown_column_err(&c, &ot))?;
             return Ok(Op::DropField {
                 type_id: ot.type_id,
                 field_id: f.field_id,
@@ -591,7 +722,7 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
                 .fields
                 .iter()
                 .find(|f| f.name == c)
-                .ok_or_else(|| format!("unknown column `{c}`"))?
+                .ok_or_else(|| unknown_column_err(&c, &ot))?
                 .field_id;
             p.expect_kw("TO")?;
             let newname = p.ident()?;
@@ -611,7 +742,7 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
                 .fields
                 .iter()
                 .find(|f| f.name == c)
-                .ok_or_else(|| format!("unknown column `{c}`"))?;
+                .ok_or_else(|| unknown_column_err(&c, &ot))?;
             return Ok(Op::AddBalanceGuard {
                 type_id: ot.type_id,
                 field_id: f.field_id,
@@ -931,7 +1062,7 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
                     .fields
                     .iter()
                     .find(|f| f.name == c)
-                    .ok_or_else(|| format!("unknown column `{c}`"))?;
+                    .ok_or_else(|| unknown_column_err(&c, &ot))?;
                 cols.push(f.field_id);
                 match p.next() {
                     Some(Tok::Punct(',')) => continue,
@@ -1491,13 +1622,13 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
             .fields
             .iter()
             .find(|f| f.name == lf_col)
-            .ok_or_else(|| format!("unknown column `{lf_col}`"))?
+            .ok_or_else(|| unknown_column_err(&lf_col, lf_tbl))?
             .field_id;
         let rfid = rf_tbl
             .fields
             .iter()
             .find(|f| f.name == rf_col)
-            .ok_or_else(|| format!("unknown column `{rf_col}`"))?
+            .ok_or_else(|| unknown_column_err(&rf_col, rf_tbl))?
             .field_id;
         let mut limit = 0u32;
         if p.kw("LIMIT") {
@@ -1532,7 +1663,7 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
             .iter()
             .find(|f| f.name == n)
             .map(|f| f.field_id)
-            .ok_or_else(|| format!("unknown column `{n}`"))
+            .ok_or_else(|| unknown_column_err(n, &ot))
     };
 
     // SP-Analytic-Plan T3: capture the WHERE token span so we can
@@ -1868,7 +1999,7 @@ fn term(p: &mut P, ot: &ObjectType) -> Result<Program, SqlError> {
                 .fields
                 .iter()
                 .find(|f| f.name == name)
-                .ok_or_else(|| format!("unknown column `{name}`"))?;
+                .ok_or_else(|| unknown_column_err(&name, ot))?;
             Ok(Program::new().load(f.field_id))
         }
         _ => Err("bad WHERE term".into()),
@@ -3958,6 +4089,73 @@ mod tests {
         assert!(compile("DROP TABLE x", &cat).is_err());
         assert!(compile("INSERT INTO nope ID 1 (a) VALUES (1)", &cat).is_err());
         assert!(compile("CREATE TABLE t (a NOPETYPE)", &cat).is_err());
+    }
+
+    /// SP-DX: unknown-table error carries a did-you-mean suggestion
+    /// when a near-match exists; sites that previously rendered raw
+    /// `unknown table \`foo\`` now render the friendlier form. The
+    /// suggestion is deterministic.
+    #[test]
+    fn unknown_table_suggests_near_match() {
+        let mut cat = Catalog::default();
+        cat.types.push(ObjectType::from_def(
+            "accounts".into(),
+            vec![Field {
+                field_id: 1,
+                name: "id".into(),
+                kind: FieldKind::U64,
+                nullable: false,
+            }],
+        ));
+        let e = compile("SELECT * FROM acconts", &cat).unwrap_err();
+        assert!(e.contains("unknown table"), "{e}");
+        assert!(e.contains("did you mean"), "{e}");
+        assert!(e.contains("`accounts`"), "{e}");
+
+        // Wildly unrelated → no false suggestion.
+        let e = compile("SELECT * FROM xyzzy12345", &cat).unwrap_err();
+        assert!(e.contains("unknown table"), "{e}");
+        assert!(!e.contains("did you mean"), "no spurious suggestion: {e}");
+
+        // Empty catalog → educational message.
+        let cat0 = Catalog::default();
+        let e = compile("SELECT * FROM nope", &cat0).unwrap_err();
+        assert!(e.contains("no tables defined"), "{e}");
+    }
+
+    /// SP-DX: unknown-column errors include the table name and either
+    /// a did-you-mean or the head of the column list — agents/users
+    /// don't need a separate DESCRIBE round-trip to see the schema.
+    #[test]
+    fn unknown_column_includes_table_context() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE acct (owner U32 NOT NULL, bal I64 NOT NULL)");
+        let cat = sm.catalog();
+        // Typo close to a real column → suggestion.
+        let e = compile("SELECT * FROM acct WHERE owne = 1", cat).unwrap_err();
+        assert!(e.contains("unknown column `owne`"), "{e}");
+        assert!(e.contains("on table `acct`"), "{e}");
+        assert!(e.contains("did you mean `owner`"), "{e}");
+        // Unrelated name → falls back to listing available columns.
+        let e = compile("SELECT * FROM acct WHERE zzz = 1", cat).unwrap_err();
+        assert!(e.contains("unknown column `zzz`"), "{e}");
+        assert!(e.contains("on table `acct`"), "{e}");
+        assert!(e.contains("`owner`") && e.contains("`bal`"), "{e}");
+    }
+
+    /// SP-DX: `suggest` is total + deterministic + zero-dep.
+    #[test]
+    fn suggest_helper_basic_shape() {
+        let cands = ["accounts", "orders", "users"];
+        assert_eq!(suggest("acconts", &cands), Some("accounts"));
+        assert_eq!(suggest("user", &cands), Some("users"));
+        assert_eq!(suggest("ORDER", &cands), Some("orders"));
+        assert_eq!(suggest("zzz", &cands), None);
+        assert_eq!(suggest("anything", &[]), None);
+        // Stable across calls.
+        let a = suggest("acconts", &cands);
+        let b = suggest("acconts", &cands);
+        assert_eq!(a, b);
     }
 
     #[test]

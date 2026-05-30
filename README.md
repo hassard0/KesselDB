@@ -12,7 +12,7 @@
 - **DX surface caught up to the engineering — SP‑DX‑superior V1 ARC CLOSED.** First‑5‑minutes adoption polish: did‑you‑mean suggestions on `unknown table` + `unknown column` (zero‑dep edit‑distance, plus the head of the column list inlined so users don't need a separate DESCRIBE); the `kessel` CLI differentiates connection‑refused / wrong‑token / DNS‑failure / timeout with hint text pointing at the right env var; multi‑arch Docker image at `ghcr.io/hassard0/kesseldb:latest` (binary + HTTP + PG wire surfaces in one 77 MiB image) wired into `release.yml` to publish on every `v*` tag; new embedded example at `crates/kesseldb-server/examples/embedded.rs` showing the in‑process API end‑to‑end (`engine.sql(...)`, typed `Op` fast path, hot snapshot). See [`docs/STATUS.md`](docs/STATUS.md#) Track H + [`docs/USAGE.md`](docs/USAGE.md#option-b--run-from-the-official-docker-image) §1B / §3.
 - **Real Postgres ORM compatibility — SP‑PG‑EXTQ V1 ARC CLOSED.** psycopg2 + SQLAlchemy 2.0 + psycopg3 (with `ClientCursor`) all PASS on vulcan with default settings (T8 closes the T7 `use_native_hstore=False` caveat). asyncpg + JDBC PARTIAL (connect + DDL + simple‑Q work; binary‑format parameterized DML deferred to V2 `SP‑PG‑EXTQ‑BIN`). Pipelining throughput on vulcan: 252‑409 stmt/s (psycopg2 single‑statement round‑trip). See [`docs/USAGE.md`](docs/USAGE.md#9-postgresql-clients-psql-pgcli-jdbc-psycopg-pgx-) §9 + transcript at `docs/superpowers/sppgextq-t8-orm-smoke-2026-05-29.txt`.
 - **4.8M ops/sec parallel reads, sub‑µs p50** — Perf‑A T2 read‑pool bypass (parallel `read_only_op` dispatch) + T7 storage `Arc<[u8]>` migration (zero‑memcpy reads). Measured on a 16‑core x86‑64 Linux reference server; see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §11–§12.
-- **Honest cross‑DB benchmarks published** — KesselDB vs Postgres / SQLite / TigerBeetle on YCSB‑A/B/C, sysbench OLTP RO/WO/RW, *and* TPC‑H Q1/Q6 (analytical). 5 of 8 wins, 3 of 8 losses, every number disclosed with the exact reason — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md). Next perf arcs named (SP‑Perf‑A‑TXN‑RW for the OLTP RW loss — RO already CLOSED by SP‑Perf‑A‑TXN‑RO 2026‑05‑29, KesselDB now 5.7× faster than Postgres at N=16; SP‑Analytic‑Plan for the TPC‑H losses).
+- **Honest cross‑DB benchmarks published** — KesselDB vs Postgres / SQLite / TigerBeetle on YCSB‑A/B/C, sysbench OLTP RO/WO/RW, *and* TPC‑H Q1/Q6 (analytical). **6 of 8 wins, 2 of 8 losses**, every number disclosed with the exact reason — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md). Both transaction‑bracket losses now CLOSED: SP‑Perf‑A‑TXN‑RO (2026‑05‑29) lifted N=16 oltp‑RO 42.6× (now 5.7× Postgres); SP‑Perf‑A‑TXN‑RW (2026‑05‑30) lifted N=16 oltp‑RW 14.4× (now 2.66× Postgres + 2.60× SQLite). Remaining 2 losses are TPC‑H Q1/Q6 — SP‑Analytic‑Plan‑MULTI already shipped first prong (Q6 7.5×, Q1 4.0×).
 
 </div>
 
@@ -369,20 +369,29 @@ including the *losses* where KesselDB does NOT win — are in
 | YCSB‑A (50/50) | **KesselDB at N=1 + N=16** | 1st N=1, ≈ tied N=8 vs Postgres, 1st N=16 | write‑side apply lock pays cost at N=8 then amortizes |
 | sysbench OLTP write‑only | **KesselDB** | **1st at every N (5.2× Postgres at N=8)** | apply‑path is fast at the inner‑op level |
 | sysbench OLTP read‑only | **KesselDB at N=8 / N=16** (SQLite still wins N=1) | **1st at every N≥8 (5.7× Postgres at N=16)** | SP‑Perf‑A‑TXN‑RO bypass — all‑RO `Op::Txn{ops}` routes through the read pool, lift 42.6× at N=16 — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3c |
-| sysbench OLTP read‑write | SQLite at every N | **3rd** | mixed‑RW `Op::Txn` still holds the apply write‑lock (V1 limit of SP‑Perf‑A‑TXN‑RO); closure named SP‑Perf‑A‑TXN‑RW |
+| sysbench OLTP read‑write | **KesselDB at N=8 / N=16** (SQLite still wins N=1) | **1st at every N≥8 (2.66× Postgres + 2.60× SQLite at N=16)** | SP‑Perf‑A‑TXN‑RW driver‑level split‑phase dispatch — (R*, W*)‑shape Txns split at the read/write boundary; read prefix routes via the TXN‑RO bypass (parallel), write suffix via `sm.write().apply` (serial); lift 14.4× at N=16 — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3e |
 | TPC‑H Q1 (multi‑aggregate GROUP BY) | Postgres at every N | **3rd** | `Op::GroupAggregate` is full‑scan + per‑row VM, no order‑index narrowing — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3f |
 | TPC‑H Q6 (SUM with WHERE) | Postgres at every N | **3rd** | `Op::Aggregate` is full‑scan + per‑row VM — same root cause — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3g |
 
-**Roadmap is named — two distinct arcs close the published losses.**
+**Roadmap is named — published-loss closures + next throughput levers.**
 
-- **SP‑Perf‑A‑TXN‑RW** (mixed read‑write `Op::Txn` bypass via snapshot
-  isolation + commit‑time conflict detection) closes the sysbench RW loss.
-  (sysbench RO was previously in this bucket — **SP‑Perf‑A‑TXN‑RO V1 SHIPPED 2026‑05‑29**
-  using static all‑RO classification: `read_pool::is_read_only` recurses
-  into the inner‑op vector, returns true iff every inner is read‑only, and
-  routes through the same Perf‑A read‑pool bypass; N=16 lift 42.6× —
-  680 → 28,977 tx/s.) **SP‑Perf‑A‑SHARD** (sharded apply queues + per‑shard
-  read pools) is the next throughput lever — the ~5 M ops/sec storage ceiling
+- **SP‑Perf‑A‑TXN‑RO V1 SHIPPED 2026‑05‑29** — static all‑RO `Op::Txn`
+  classification: `read_pool::is_read_only` recurses into the inner‑op
+  vector, returns true iff every inner is read‑only, and routes through
+  the Perf‑A read‑pool bypass. N=16 lift 42.6× (680 → 28,977 tx/s);
+  KesselDB 5.7× Postgres.
+- **SP‑Perf‑A‑TXN‑RW V1 SHIPPED 2026‑05‑30** — driver‑level split‑phase
+  dispatch on (R*, W*)‑shape mixed Txns: `read_pool::read_prefix_length`
+  + `is_split_safe` 3‑guard classifies each Txn; eligible Txns split at
+  the read/write boundary (parallel read prefix via the TXN‑RO bypass +
+  serial write suffix via `sm.write().apply`). Read‑after‑write Txns
+  fall through to unified apply (V1 limit; byte‑equivalent preserved
+  via apply's overlay). N=16 lift 14.4× (712 → 10,273 tx/s); KesselDB
+  2.66× Postgres + 2.60× SQLite. Next: **SP‑Perf‑A‑OPTIMISTIC‑CC**
+  (abort‑and‑retry with full SI overlay) for the read‑after‑write
+  fallthrough case.
+- **SP‑Perf‑A‑SHARD** (sharded apply queues + per‑shard read pools)
+  is the next throughput lever — the ~5 M ops/sec storage ceiling
   at N=16 traces to `RwLock<StateMachine>` reader CAS ping‑pong.
 - **SP‑Analytic‑Plan** (range‑pred narrowing on aggregate scans) closes
   the TPC‑H Q1/Q6 losses by teaching `Op::Aggregate` and

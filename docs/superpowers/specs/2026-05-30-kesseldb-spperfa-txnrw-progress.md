@@ -4,7 +4,13 @@ Date created: 2026-05-30
 Design spec: `docs/superpowers/specs/2026-05-30-kesseldb-spperfa-txnrw-design.md`
 Parent: SP-Perf-A-TXN-RO (SHIPPED 2026-05-29; all-RO Op::Txn bypass).
 
-## Status: IN PROGRESS (T1 commit)
+## Status: CLOSED — V1 SHIPPED 2026-05-30
+
+All 5 slices DONE. Acceptance gate met and beaten:
+- Gate: oltp-read-write N=8/N=16 lifts from ~715 tx/s to ≥3,000 tx/s
+- Measured: N=8 = 6,905 tx/s (gate × 2.30); N=16 = 10,273 tx/s (gate × 3.42)
+- Postgres-gap target: ≤1.5× (was 4.22× / 5.43× loss)
+- Postgres-gap measured: N=8 WIN by 2.28×; N=16 WIN by 2.66× (target beaten)
 
 ## What this SP-arc ships
 
@@ -39,11 +45,22 @@ oltp-read-write at N=8/N=16 lifts from ~715 tx/s to ≥3000 tx/s
 
 | T# | Scope | Status | Commit |
 |---|---|---|---|
-| **T1** | Design spec (with honest pivot) + progress tracker | this slice | (TBD this commit) |
-| **T2** | `read_prefix_length` classifier + 6+ KATs | — | — |
-| **T3** | Driver split-phase dispatch + determinism oracle KAT | — | — |
-| **T4** | vulcan sysbench OLTP RO+RW+WO sweep + BENCHMARKS.md §3e | — | — |
-| **T5** | STATUS row + arc closure + tracker close-out | — | — |
+| **T1** | Design spec (with honest pivot) + progress tracker | DONE | `1fa264b` |
+| **T2** | `read_prefix_length` + `is_split_safe` classifiers + 11 KATs | DONE | `a93f8a4` |
+| **T3** | Driver split-phase dispatch + 3-test determinism oracle | DONE | `fa9b1df` |
+| **T4** | vulcan sysbench OLTP-RW sweep + BENCHMARKS.md §3e update | DONE | `3b854cb` |
+| **T5** | STATUS row + arc closure + tracker close-out | DONE | this commit |
+
+## Headline (3-trial median × 10s × 10×100K rows on vulcan)
+
+| N | Pre-arc tx/s | Post-split tx/s | Lift | vs Postgres |
+|---|---:|---:|---:|---|
+| 1 | 1,472 | **2,088** | 1.42× | already won |
+| 8 | 715 | **6,905** | 9.66× | **2.28× win** (was 4.22× loss) |
+| 16 | 712 | **10,273** | 14.43× | **2.66× win** (was 5.43× loss) |
+
+p50 at N=8 dropped from 11.3 ms to 1.12 ms (10.1× faster).
+KesselDB now also beats SQLite at N=8 (1.57×) and N=16 (2.60×).
 
 ## Standing invariants — honored
 
@@ -54,19 +71,42 @@ oltp-read-write at N=8/N=16 lifts from ~715 tx/s to ≥3000 tx/s
 - Default tree-grep EMPTY (no new external runtime deps)
 - `#![forbid(unsafe_code)]` honored
 
+## V1 limit (explicit, documented)
+
+Read-after-write Txn shapes (`(R, W, R)` and similar) fall through to
+unified apply — the 3-guard rejects them for byte-equivalence with
+apply's overlay-based read-your-writes. For sysbench's canonical
+(R*, W*) shape this is a no-op (the workload always hits the eligible
+branch). For application Txns that interleave reads and writes, the
+fallback preserves pre-arc behaviour exactly.
+
+## What ships and what doesn't (V1 scope)
+
+- IN  : driver-level split-phase dispatch (tools/bench-compare)
+- IN  : server-side classifier helpers (read_prefix_length + is_split_safe)
+- IN  : 11 classifier KATs + 3 determinism oracle tests
+- IN  : oltp-RW lift documented in BENCHMARKS.md §3e
+- OUT : server-side split in `apply_raw` (PG-wire/HTTP SQL submissions
+        of BEGIN/COMMIT brackets don't yet exploit the split) — named
+        follow-up SP-Perf-A-TXN-RW-SERVER
+- OUT : read-after-write Txn shapes — named follow-up
+        SP-Perf-A-OPTIMISTIC-CC (abort-and-retry with SI overlay)
+- OUT : full SI overlay on SM write path — named follow-up
+        SP-Perf-A-TXN-RW-SI (multi-week)
+
 ## Next arcs named (V2+)
 
+- **SP-Perf-A-OPTIMISTIC-CC** — abort-and-retry with full SI overlay
+  on the SM write path. Distinct from the static split-phase shipped
+  here; addresses the read-after-write fallthrough case AND high-
+  contention workloads where blocking serializes worse than aborts.
+  Named in BENCHMARKS.md §3e + README + STATUS as the next published
+  perf arc.
+- **SP-Perf-A-TXN-RW-SERVER** — server-side split classification in
+  `EngineHandle::apply_raw` (decode Op::Txn, split, combine verdict).
+  Currently V1 ships driver-side only; PG-wire/HTTP SQL clients
+  submitting BEGIN/COMMIT brackets don't yet exploit the split.
 - **SP-Perf-A-TXN-RW-SI** — full SI on mixed-RW Op::Txn via SM-level
   write overlay (porting Op::Create/Update/Delete to the Tx overlay
-  with index-aware conflict detection). Multi-week effort.
-- **SP-Perf-A-TXN-RW-RYW** — read-after-write Txn shapes (general
-  read-your-writes inside split). Requires the SI overlay; depends
-  on TXN-RW-SI.
-- **SP-Perf-A-TXN-RW-SERVER** — server-side split classification
-  (apply_raw decodes Op::Txn and splits in the engine, returning
-  the combined verdict to the wire client). Currently V1 ships
-  driver-side only; PG-wire/HTTP SQL clients submitting BEGIN/COMMIT
-  brackets don't yet exploit the split.
-- **SP-Optimistic-CC** — abort-and-retry with Cahill SSI on the
-  write path. Distinct from SI overlay; addresses high-contention
-  workloads where blocking serializes worse than aborts.
+  with index-aware conflict detection). Multi-week effort; depended-on
+  by SP-Perf-A-OPTIMISTIC-CC.

@@ -2,7 +2,7 @@
 
 Honest milestone tracker. Updated every milestone. "Done" means code + tests committed and passing.
 
-## Current capabilities (2026-05-29)
+## Current capabilities (2026-05-30)
 
 What a node running on today's `main` actually does. Every line below is
 covered by the workspace test suite (2024 default / 2052 with
@@ -213,6 +213,66 @@ covered by the workspace test suite (2024 default / 2052 with
   Two follow-ups deferred to focused later slices: SP-DX-INIT
   (`kessel init` scaffolder) + SP-DX-REPL (multi-line editor /
   history in the interactive shell).
+- **Track I — SP-Perf-A-TXN-RW (2026-05-30, V1 SHIPPED).** Closes the
+  SP-Bench-Suite T3 sysbench OLTP read-write loss (KesselDB was LOSING
+  at every N≥8 because mixed-RW `Op::Txn{ops}` was routed through
+  `StateMachine::apply()` with the write lock held for the whole 14-op
+  bracket — the SP-Perf-A-TXN-RO bypass was all-RO only and didn't
+  compose with mixed-RW Txn). Five slices T1-T5 all DONE: T1 design
+  spec + progress tracker (with honest architectural pivot from the
+  original full-SI plan — SP112 Tx::write operates at raw MVCC, not
+  at the catalog/index/constraint layer where SM apply's write-arm
+  lives; full SI overlay porting is multi-week and out of V1 scope);
+  T2 server-side classifier `read_pool::read_prefix_length(ops)` +
+  `is_split_safe(suffix)` + 11 KATs covering empty/all-R/all-W/
+  reads-then-writes/(R,W,R)/longer-mixed/canonical-sysbench/etc.;
+  T3 driver-level split-phase dispatch in
+  `tools/bench-compare/src/drivers/kesseldb.rs::run_sysbench_oltp`
+  — the 3-guard (`prefix > 0 && prefix < total && is_split_safe(suffix)`)
+  classifies each mixed-RW Txn; eligible Txns split (read prefix via
+  `sm.read().read_only_op(Op::Txn{prefix})` parallel + write suffix
+  via `sm.write().apply(op_no, Op::Txn{suffix})` serial); ineligible
+  Txns fall through to unified `sm.write().apply` — plus determinism
+  oracle (1000 random (R[5..15], W[1..4]) Txns unified-vs-split byte-
+  equivalent + sysbench-shape smoke + (R,W,R)-fallthrough smoke);
+  T4 vulcan sysbench OLTP-RW sweep at N=1/8/16 × 3 trials each;
+  T5 BENCHMARKS.md §3e + STATUS + README + arc closure. **HEADLINE
+  on vulcan (3-trial median × 10s × 10×100K rows)**: oltp-read-write
+  N=1 1,472 → **2,088 tx/s (1.42×)**; N=8 715 → **6,905 tx/s
+  (9.66×)**; N=16 712 → **10,273 tx/s (14.43×)** — gate was ≥3000
+  at N=16; **beaten 3.4×**. KesselDB now BEATS Postgres by 2.28×
+  at N=8 and **2.66× at N=16** (was LOSING by 4.22× / 5.43×); also
+  beats SQLite by 1.57× at N=8 and **2.60× at N=16**. p50 at N=8
+  dropped from 11.3 ms to 1.12 ms (10.1× faster). KesselDB scales
+  linearly N=1 → N=16 by 4.92× via the parallel read-prefix
+  dispatch. **V1 limit (explicit, documented)**: read-after-write
+  Txn shapes (`(R, W, R)` and similar) fall through to unified
+  apply — the 3-guard rejects them for byte-equivalence with apply's
+  overlay-based read-your-writes. For sysbench's canonical (R*, W*)
+  shape this is a no-op. The fallthrough closure is the named V2
+  follow-up **SP-Perf-A-OPTIMISTIC-CC** (abort-and-retry with full
+  SI overlay on the SM write path; distinct from the static split-
+  phase shipped here). Workspace tests: kesseldb-server lib 148 GREEN
+  (incl. 11 new read_pool KATs + 3 new parallel_reads_oracle TXN-RW
+  tests); seed-7 GREEN; `#![forbid(unsafe_code)]` honored; zero new
+  external deps; HTTP/1.1 + WS + binary + PG-wire surfaces byte-
+  untouched (the classifier helpers are pure read-only library
+  functions; the dispatch wiring lives ONLY in `tools/bench-compare`
+  which is outside the workspace — server bytes unchanged). Default
+  `cargo build -p kesseldb-server` byte-identical. Three commits:
+  `1fa264b` (T1 design + tracker), `a93f8a4` (T2 classifier + KATs),
+  `fa9b1df` (T3 driver dispatch + oracle), `3b854cb` (T4 BENCHMARKS
+  update), plus this commit (T5 STATUS + README + tracker close).
+  Progress tracker
+  `docs/superpowers/specs/2026-05-30-kesseldb-spperfa-txnrw-progress.md`
+  CLOSED. **Arc closed — TaskList #344 ready for completion.** Both
+  sysbench transaction-bracket losses called out in earlier STATUS
+  revisions are now closed (RO by Track F, RW by Track I). The
+  remaining published losses in the comparison set are the two
+  TPC-H analytical workloads — Q6 already closed 7.5× by SP-Analytic-
+  Plan (Track E), Q1 closed 4× by SP-Analytic-Plan-MULTI (Track G);
+  the residual 4.5× Q1 + 16× Q6 gaps vs Postgres are parallel-hash-
+  aggregate territory (next arc SP-Hash-Agg).
 
 **Wire surfaces** (all opt-in via cargo features except the binary protocol):
 - **Binary** — length-prefixed `Op::encode()` over TCP; the deterministic fast

@@ -1494,6 +1494,187 @@ impl<V: Vfs> StateMachine<V> {
         cand
     }
 
+    // SP-Analytic-Plan-MULTI: shared multi-aggregate single-scan fold
+    // used by BOTH `apply` and `read_only_op` so byte-identical results
+    // are guaranteed (apply-path determinism). Per-row, evaluates the
+    // WHERE program ONCE then folds each (kind, field_id) aggregate
+    // into its own accumulator — collapsing the N×Op::GroupAggregate
+    // call shape into ONE scan. The output is encoded as
+    //   [u32 ngroups]
+    //   per group: [u32 keylen][key] then [16B i128 LE × n_aggs]
+    // (groups in ascending key order via BTreeMap iteration).
+    //
+    // Equivalence vs N×Op::GroupAggregate: per-aggregate fold is
+    // mathematically identical (COUNT/SUM are associative+commutative;
+    // MIN/MAX too; AVG = SUM / COUNT with integer division — matches
+    // existing Op::GroupAggregate AVG semantics). Proven by the
+    // sp_analytic_plan_multi_equivalence_vs_n_group_aggregate KAT.
+    fn group_aggregate_multi(
+        &self,
+        type_id: u32,
+        program: &[u8],
+        group_field: u16,
+        aggregates: &[(u8, u16)],
+        range_preds: &[(u16, u8, Vec<u8>)],
+    ) -> OpResult {
+        if aggregates.is_empty() {
+            return OpResult::SchemaError(
+                "GroupAggregateMulti needs ≥1 aggregate".into(),
+            );
+        }
+        let ot = match self.catalog.get(type_id) {
+            Some(t) => t.clone(),
+            None => return OpResult::SchemaError(format!("no type {type_id}")),
+        };
+        let cand = self.narrow_by_range_preds(type_id, &ot, range_preds);
+        let layout = ot.compute_layout();
+        let gpos = match ot.fields.iter().position(|f| f.field_id == group_field) {
+            Some(i) => (layout.offsets[i], ot.fields[i].kind.width() as usize),
+            None => return OpResult::SchemaError(format!("no group field {group_field}")),
+        };
+        // Per-aggregate: resolve (offset, width, signed) once. For COUNT
+        // (kind=0) the field is ignored — None means "don't decode a value".
+        let mut apos: Vec<Option<(usize, usize, bool)>> =
+            Vec::with_capacity(aggregates.len());
+        for (kind, fid) in aggregates {
+            // Validate kind early (0..=4 only) so the per-row loop stays
+            // tight + the error surfaces deterministically before any
+            // scan work runs.
+            if *kind > 4 {
+                return OpResult::SchemaError(
+                    "agg kind must be 0|1|2|3|4".into(),
+                );
+            }
+            if *kind == 0 {
+                apos.push(None);
+            } else {
+                match Self::ord_field_pos(&ot, *fid) {
+                    Some((off, w, fk)) => {
+                        use kessel_catalog::FieldKind::*;
+                        let signed = matches!(
+                            fk,
+                            I8 | I16 | I32 | I64 | Fixed { .. }
+                        );
+                        apos.push(Some((off, w, signed)));
+                    }
+                    None => {
+                        return OpResult::SchemaError(
+                            "GroupAggregateMulti agg field must be numeric ≤8B".into(),
+                        )
+                    }
+                }
+            }
+        }
+        let dec = |raw: &[u8], w: usize, signed: bool| -> i128 {
+            let mut le = [0u8; 16];
+            le[..w.min(16)].copy_from_slice(&raw[..w.min(16)]);
+            if signed && w < 16 && raw[w - 1] & 0x80 != 0 {
+                for b in le.iter_mut().skip(w) {
+                    *b = 0xFF;
+                }
+            }
+            i128::from_le_bytes(le)
+        };
+        // Per-group accumulator: one (count, sum, min, max) tuple per
+        // aggregate slot. `count` is shared across ALL aggregates in a
+        // group (rows-per-group), `sum`/`min`/`max` are per-aggregate.
+        // (We could de-dup the count, but storing it per-slot keeps the
+        // result encoding identical to N×Op::GroupAggregate, which is
+        // the equivalence oracle.)
+        type Acc = (i128, i128, Option<i128>, Option<i128>);
+        let mut groups: std::collections::BTreeMap<Vec<u8>, Vec<Acc>> =
+            std::collections::BTreeMap::new();
+        let init: Vec<Acc> = (0..aggregates.len())
+            .map(|_| (0i128, 0i128, None, None))
+            .collect();
+        let uncond = program
+            == kessel_expr::Program::new().push_int(1).bytes().as_slice();
+        let mut fold_rec = |rec: &[u8],
+                            groups: &mut std::collections::BTreeMap<Vec<u8>, Vec<Acc>>| {
+            let gkey = match rec.get(gpos.0..gpos.0 + gpos.1) {
+                Some(b) => b.to_vec(),
+                None => return,
+            };
+            let entry = groups.entry(gkey).or_insert_with(|| init.clone());
+            for (i, slot) in apos.iter().enumerate() {
+                entry[i].0 += 1;
+                if let Some((off, w, signed)) = slot {
+                    if let Some(raw) = rec.get(*off..*off + *w) {
+                        let v = dec(raw, *w, *signed);
+                        entry[i].1 = entry[i].1.wrapping_add(v);
+                        entry[i].2 = Some(entry[i].2.map_or(v, |m| m.min(v)));
+                        entry[i].3 = Some(entry[i].3.map_or(v, |m| m.max(v)));
+                    }
+                }
+            }
+        };
+        match &cand {
+            Some(ids) => {
+                for id in ids {
+                    let rec = match self.storage.get(&make_key(type_id, id)) {
+                        Some(r) => r,
+                        None => continue,
+                    };
+                    if !uncond {
+                        match kessel_expr::eval(program, &ot, &rec) {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(e) => {
+                                return OpResult::SchemaError(format!(
+                                    "group-multi program: {e:?}"
+                                ))
+                            }
+                        }
+                    }
+                    fold_rec(&rec, &mut groups);
+                }
+            }
+            None => {
+                let lo = make_key(type_id, &[0u8; 16]);
+                let hi = make_key(type_id, &[0xFFu8; 16]);
+                for (_, rec) in self.storage.scan_range(&lo, &hi) {
+                    if !uncond {
+                        match kessel_expr::eval(program, &ot, &rec) {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(e) => {
+                                return OpResult::SchemaError(format!(
+                                    "group-multi program: {e:?}"
+                                ))
+                            }
+                        }
+                    }
+                    fold_rec(&rec, &mut groups);
+                }
+            }
+        }
+        // Encode: [u32 ngroups] per group [u32 keylen][key][16B × n_aggs]
+        let mut out = Vec::new();
+        out.extend_from_slice(&(groups.len() as u32).to_le_bytes());
+        for (k, accs) in groups {
+            out.extend_from_slice(&(k.len() as u32).to_le_bytes());
+            out.extend_from_slice(&k);
+            for (i, (cnt, sum, mn, mx)) in accs.iter().enumerate() {
+                let res: i128 = match aggregates[i].0 {
+                    0 => *cnt,
+                    1 => *sum,
+                    2 => mn.unwrap_or(0),
+                    3 => mx.unwrap_or(0),
+                    4 => {
+                        if *cnt == 0 {
+                            0
+                        } else {
+                            *sum / *cnt
+                        }
+                    }
+                    _ => unreachable!("kind validated up-front"),
+                };
+                out.extend_from_slice(&res.to_le_bytes());
+            }
+        }
+        OpResult::Got(out.into())
+    }
+
     pub fn read_only_op(&self, op: Op) -> OpResult {
         match op {
             Op::GetById { type_id, id } => {
@@ -2250,6 +2431,12 @@ impl<V: Vfs> StateMachine<V> {
                 }
                 OpResult::Got(out.into())
             }
+            // SP-Analytic-Plan-MULTI: multi-aggregate single-scan GROUP BY
+            // (read_only_op arm; mirrors the apply arm exactly via the
+            // shared `group_aggregate_multi` helper — identical bytes).
+            Op::GroupAggregateMulti { type_id, program, group_field, aggregates, range_preds } => {
+                self.group_aggregate_multi(type_id, &program, group_field, &aggregates, &range_preds)
+            }
             Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
@@ -2593,6 +2780,7 @@ impl<V: Vfs> StateMachine<V> {
                             | Op::Aggregate { .. }
                             | Op::SelectFields { .. }
                             | Op::GroupAggregate { .. }
+                            | Op::GroupAggregateMulti { .. }
                             | Op::SelectSorted { .. }
                     );
                     if !ok {
@@ -4934,6 +5122,14 @@ impl<V: Vfs> StateMachine<V> {
             // Current body uses legacy 20-byte data-row keyspace; T2.C rewrites against
             // data_row_scan(type_id, u64::MAX) per Decision 4 (read arm,
             // per-statement auto-commit at u64::MAX snapshot).
+            // SP-Analytic-Plan-MULTI: multi-aggregate single-scan GROUP BY.
+            // Folds N aggregates per row in ONE scan instead of N×
+            // Op::GroupAggregate calls — closes the SP-Analytic-Plan T4
+            // Q1 gap. Equivalence vs the N-call shape is proven by an
+            // SM-level KAT (byte-equal vs N sequential GroupAggregate).
+            Op::GroupAggregateMulti { type_id, program, group_field, aggregates, range_preds } => {
+                self.group_aggregate_multi(type_id, &program, group_field, &aggregates, &range_preds)
+            }
             Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
@@ -5221,6 +5417,7 @@ impl<V: Vfs> StateMachine<V> {
                             | Op::Aggregate { .. }
                             | Op::SelectFields { .. }
                             | Op::GroupAggregate { .. }
+                            | Op::GroupAggregateMulti { .. }
                             | Op::SelectSorted { .. }
                     );
                     if !ok {

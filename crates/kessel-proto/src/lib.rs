@@ -316,6 +316,37 @@ pub enum Op {
     /// `docs/superpowers/specs/2026-05-24-mvcc-si-s2-5-design.md`.
     AdvanceWatermark { low_water_mark: u64 },
 
+    /// SP-Analytic-Plan-MULTI: multi-aggregate single-scan GROUP BY.
+    /// Collapses N×`Op::GroupAggregate` (each doing its own full-narrowed
+    /// scan) into ONE scan that folds N aggregates per row. Closes the
+    /// SP-Analytic-Plan T4 residual Q1 gap (the WHERE-narrowing prong
+    /// shipped V1; this is the multi-aggregate-fold prong V2).
+    ///
+    /// `aggregates` = `Vec<(kind, field_id)>`. `kind` mirrors the existing
+    /// `Op::Aggregate` codes: 0=COUNT, 1=SUM, 2=MIN, 3=MAX, 4=AVG. For
+    /// COUNT the `field_id` is ignored (convention: 0). Must be non-empty
+    /// (single-aggregate callers use the existing `Op::GroupAggregate`).
+    ///
+    /// `range_preds` (mirrors `Op::GroupAggregate`): half-range hints on
+    /// order-indexed fields; the SM narrows the scan via the existing
+    /// ordered-index machinery BEFORE the row-by-row program filter +
+    /// group fold. `program` still verifies every candidate, so the
+    /// aggregate result is identical regardless of the candidate set —
+    /// the indexes only accelerate.
+    ///
+    /// Result encoding: `[u32 ngroups]` then per group
+    /// `[u32 keylen][key][n_aggs × 16B i128 LE]`, groups in ascending
+    /// key order (deterministic, mirrors `Op::GroupAggregate`'s shape
+    /// but with N per-group values instead of 1; `n_aggs` is implicit —
+    /// the caller knows it from the request).
+    GroupAggregateMulti {
+        type_id: TypeId,
+        program: Vec<u8>,
+        group_field: u16,
+        aggregates: Vec<(u8, u16)>,
+        range_preds: Vec<(u16, u8, Vec<u8>)>,
+    },
+
     /// SP123 / S2.X: per-replica active-snapshot report — closes the
     /// SP115-shipped honest caveat that `active_snapshots` is per-replica
     /// local. Each replica periodically submits this op via VSR carrying
@@ -670,6 +701,9 @@ impl Op {
             Op::AdvanceWatermark { .. } => 45,
             // SP123 / S2.X: per-replica active-snapshot report at wire tag 46.
             Op::ReportActiveSnapshot { .. } => 46,
+            // SP-Analytic-Plan-MULTI: multi-aggregate single-scan GROUP BY
+            // at wire tag 47 (next free).
+            Op::GroupAggregateMulti { .. } => 47,
         }
     }
 
@@ -700,6 +734,7 @@ impl Op {
                 | Op::Aggregate { .. }
                 | Op::SelectFields { .. }
                 | Op::GroupAggregate { .. }
+                | Op::GroupAggregateMulti { .. }
                 | Op::SelectSorted { .. }
                 | Op::FindByComposite { .. }
         )
@@ -953,6 +988,30 @@ impl Op {
                         b.push(*o);
                         codec::put_bytes(&mut b, v);
                     }
+                }
+            }
+            // SP-Analytic-Plan-MULTI: wire tag 47.
+            //   [u32 type_id]
+            //   [u32 prog_len][prog]
+            //   [u16 group_field]
+            //   [u32 n_aggs] { [u8 kind][u16 field_id] }*
+            //   [u32 n_range_preds] { [u16 f][u8 op][u32 v_len][v] }*
+            // n_range_preds is REQUIRED (no back-compat omission since
+            // this variant is brand-new; reader symmetry is simpler).
+            Op::GroupAggregateMulti { type_id, program, group_field, aggregates, range_preds } => {
+                codec::put_u32(&mut b, *type_id);
+                codec::put_bytes(&mut b, program);
+                b.extend_from_slice(&group_field.to_le_bytes());
+                codec::put_u32(&mut b, aggregates.len() as u32);
+                for (k, f) in aggregates {
+                    b.push(*k);
+                    b.extend_from_slice(&f.to_le_bytes());
+                }
+                codec::put_u32(&mut b, range_preds.len() as u32);
+                for (f, o, v) in range_preds {
+                    b.extend_from_slice(&f.to_le_bytes());
+                    b.push(*o);
+                    codec::put_bytes(&mut b, v);
                 }
             }
             Op::AddCompositeIndex { type_id, fields }
@@ -1303,6 +1362,30 @@ impl Op {
                     Vec::new()
                 };
                 Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds }
+            }
+            // SP-Analytic-Plan-MULTI: wire tag 47.
+            47 => {
+                let type_id = c.u32()?;
+                let program = c.bytes()?;
+                let group_field = c.u16()?;
+                let n = c.u32()? as usize;
+                if n == 0 {
+                    // N=0 aggregates makes no semantic sense (the result
+                    // encoding has nothing per group). Reject at decode.
+                    return None;
+                }
+                let mut aggregates = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let k = c.u8()?;
+                    let f = c.u16()?;
+                    aggregates.push((k, f));
+                }
+                let m = c.u32()? as usize;
+                let mut range_preds = Vec::with_capacity(m);
+                for _ in 0..m {
+                    range_preds.push((c.u16()?, c.u8()?, c.bytes()?));
+                }
+                Op::GroupAggregateMulti { type_id, program, group_field, aggregates, range_preds }
             }
             24 => {
                 let type_id = c.u32()?;
@@ -2024,5 +2107,96 @@ mod tests {
                 assert_eq!(back, op, "round-trip with range_preds={:?}", rp);
             }
         }
+    }
+
+    // ========================================================================
+    // SP-Analytic-Plan-MULTI T1 — wire round-trip KAT for Op::GroupAggregateMulti.
+    //
+    // The new variant must encode/decode byte-identically for the canonical
+    // request shapes (empty range_preds + non-empty range_preds, with
+    // 2+ aggregates), AND the existing Op::Aggregate / Op::GroupAggregate
+    // bytes must stay byte-identical (back-compat lock).
+    // ========================================================================
+
+    #[test]
+    fn sp_analytic_plan_multi_group_aggregate_multi_wire_round_trip() {
+        // Canonical Q1-shape: 4 aggregates over a 2-byte group key, with
+        // a single half-range hint on the shipdate column.
+        let ops = vec![
+            // 2 aggregates, empty range_preds
+            Op::GroupAggregateMulti {
+                type_id: 4,
+                program: vec![1],
+                group_field: 1,
+                aggregates: vec![(0, 0), (1, 3)],
+                range_preds: vec![],
+            },
+            // 4 aggregates (Q1 shape: COUNT + 3 SUMs), one range_pred
+            Op::GroupAggregateMulti {
+                type_id: 7,
+                program: vec![1, 2, 3],
+                group_field: 16,
+                aggregates: vec![(0, 0), (1, 4), (1, 5), (1, 6)],
+                range_preds: vec![(10, 3, vec![0x05, 0x35, 0x2F, 0x01])],
+            },
+            // 5 aggregates incl. AVG (kind=4) + 2 range_preds
+            Op::GroupAggregateMulti {
+                type_id: 99,
+                program: vec![],
+                group_field: 0,
+                aggregates: vec![(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)],
+                range_preds: vec![(2, 1, vec![1, 0]), (2, 3, vec![9, 0])],
+            },
+        ];
+        for op in ops {
+            let enc = op.encode();
+            assert_eq!(enc[0], 47, "wire tag must be 47");
+            assert_eq!(op.kind(), 47);
+            assert!(!op.is_mutating(), "GroupAggregateMulti is read-only");
+            let dec = Op::decode(&enc).expect("decode GroupAggregateMulti");
+            assert_eq!(dec, op, "round-trip must be byte-identical");
+        }
+        // N=0 aggregates: must fail decode (semantically meaningless).
+        let mut bad = vec![47u8];
+        bad.extend_from_slice(&4u32.to_le_bytes()); // type_id
+        bad.extend_from_slice(&0u32.to_le_bytes()); // prog_len
+        bad.extend_from_slice(&0u16.to_le_bytes()); // group_field
+        bad.extend_from_slice(&0u32.to_le_bytes()); // n_aggs = 0
+        bad.extend_from_slice(&0u32.to_le_bytes()); // n_range_preds = 0
+        assert!(
+            Op::decode(&bad).is_none(),
+            "n_aggs=0 must be rejected at decode"
+        );
+
+        // Back-compat lock: a single Op::Aggregate frame encodes to
+        // exactly the same bytes as before this arc shipped (the new
+        // variant must not perturb tag-20 / tag-22 encoding).
+        let agg = Op::Aggregate {
+            type_id: 4, program: vec![1, 2, 3], kind: 1, field_id: 7,
+            range_preds: vec![],
+        };
+        let agg_enc = agg.encode();
+        let mut hand = Vec::new();
+        hand.push(20u8);
+        hand.extend_from_slice(&4u32.to_le_bytes());
+        hand.extend_from_slice(&3u32.to_le_bytes());
+        hand.extend_from_slice(&[1, 2, 3]);
+        hand.push(1u8);
+        hand.extend_from_slice(&7u16.to_le_bytes());
+        assert_eq!(agg_enc, hand, "Op::Aggregate wire MUST stay byte-identical");
+        let g = Op::GroupAggregate {
+            type_id: 4, program: vec![9], group_field: 2, kind: 0, agg_field: 5,
+            range_preds: vec![],
+        };
+        let g_enc = g.encode();
+        let mut hand_g = Vec::new();
+        hand_g.push(22u8);
+        hand_g.extend_from_slice(&4u32.to_le_bytes());
+        hand_g.extend_from_slice(&1u32.to_le_bytes());
+        hand_g.extend_from_slice(&[9]);
+        hand_g.extend_from_slice(&2u16.to_le_bytes());
+        hand_g.push(0u8);
+        hand_g.extend_from_slice(&5u16.to_le_bytes());
+        assert_eq!(g_enc, hand_g, "Op::GroupAggregate wire MUST stay byte-identical");
     }
 }

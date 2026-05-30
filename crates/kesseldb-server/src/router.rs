@@ -562,6 +562,20 @@ impl<'a> Conn<'a> {
             }
             // Already-resolved Sorted (call sites that pre-resolve).
             other @ ScatterKind::Sorted { .. } => other,
+            // SP-Perf-A-SHARD-SCAN: the new scatter kinds
+            // (OidSortedUnion / AggregateMerge / GroupAggregateMerge
+            // / GroupAggregateMultiMerge) are emitted by the in-process
+            // sharded engine (`sharded_engine.rs::route_op`) but the
+            // cluster router doesn't generate them today (its `route()`
+            // still classifies the corresponding ops as Unsupported or
+            // Single — they'd ship in a follow-up arc that extends the
+            // cluster router with the same coverage). If a caller
+            // somehow hands us one here, pass through unmodified: the
+            // merger handles each kind's catalog-independent merge.
+            other @ ScatterKind::OidSortedUnion => other,
+            other @ ScatterKind::AggregateMerge { .. } => other,
+            other @ ScatterKind::GroupAggregateMerge { .. } => other,
+            other @ ScatterKind::GroupAggregateMultiMerge { .. } => other,
         };
         // 2. Build per-shard `ClusterClient` snapshots. We must hand
         //    fresh, owned clients to the worker threads — the `Conn`'s

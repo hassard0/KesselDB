@@ -381,6 +381,61 @@ pub enum ScatterKind {
     /// is present exactly once); byte-identical to K=1 only when
     /// every match lives on a single shard.
     OidConcat,
+    /// SP-Perf-A-SHARD-SCAN: K-invariant secondary-index oid merge for
+    /// `Op::Query / QueryExpr / FindRange` whose K=1 baselines emit
+    /// oids in **sorted** order (via `matched.sort_unstable()` in
+    /// kessel-sm). To stay byte-identical to K=1, the cross-shard
+    /// merge must dedup + sort the union (every shard returns a
+    /// sub-set of oids; the union is then sorted).
+    ///
+    /// **OidConcat vs OidSortedUnion**: OidConcat is the right shape
+    /// for `FindBy / FindByComposite` whose K=1 baseline emits oids in
+    /// secondary-index iteration order (which is "insertion-order on
+    /// the index entries", NOT lexical). OidSortedUnion is the right
+    /// shape for ops whose K=1 baseline sort+dedups before emitting
+    /// (`Query`, `QueryExpr`, `FindRange`). Validates per-shard payload
+    /// length % 16 == 0 like OidConcat.
+    OidSortedUnion,
+    /// SP-Perf-A-SHARD-SCAN: aggregate-merge for `Op::Aggregate`.
+    /// `kind` is the aggregate kind (0=COUNT, 1=SUM, 2=MIN, 3=MAX,
+    /// 4=AVG). For numeric ≤8B fields the per-shard reply is `[i128 LE]`
+    /// (16 bytes). For var-width MIN/MAX (CHAR/BYTES/U128/I128) it's
+    /// raw bytes of `field_kind` width — the merger uses `cmp_field`
+    /// of `field_kind` to compare.
+    ///
+    /// **AVG (kind=4) is rejected with SchemaError at K>=2**: the
+    /// per-shard reply is `sum/count`, which can't be re-averaged
+    /// without weighting. SHARD-SCAN-AVG (follow-up) would change the
+    /// wire shape to ship `(sum, count)` so the merger can compute
+    /// the global average; V1 hard-fails (K=1 AVG unchanged).
+    AggregateMerge {
+        /// 0=COUNT, 1=SUM, 2=MIN, 3=MAX, 4=AVG.
+        kind: u8,
+        /// FieldKind of the aggregated field (for var-width MIN/MAX).
+        /// COUNT/SUM ignore this (always i128 LE).
+        field_kind: FieldKind,
+    },
+    /// SP-Perf-A-SHARD-SCAN: group-aggregate merge for
+    /// `Op::GroupAggregate`. The per-shard reply is
+    /// `[u32 ngroups][[u32 keylen][key][i128 result]]*`. The merger
+    /// accumulates per-group values across shards using the
+    /// kind-appropriate combine (sum for 0/1, min for 2, max for 3,
+    /// reject for 4). Output is byte-identical to K=1 (groups sorted
+    /// by key bytes since kessel-sm emits via BTreeMap).
+    GroupAggregateMerge {
+        /// 0=COUNT, 1=SUM, 2=MIN, 3=MAX, 4=AVG.
+        kind: u8,
+    },
+    /// SP-Perf-A-SHARD-SCAN: multi-aggregate group merge for
+    /// `Op::GroupAggregateMulti`. Per-shard reply is
+    /// `[u32 ngroups][[u32 keylen][key][16B * n_aggs]]*`. Per-group
+    /// per-slot combination follows the `kinds` vector (one entry
+    /// per aggregate slot). Any kind=4 (AVG) slot hard-fails.
+    GroupAggregateMultiMerge {
+        /// Per-slot kinds; same `aggregates` shape `Op::GroupAggregateMulti`
+        /// carries (kind, field_id), but the merger only needs the kind.
+        kinds: Vec<u8>,
+    },
 }
 
 /// Merge per-shard results into a single `OpResult` per the strategy
@@ -457,6 +512,16 @@ pub fn merge_scan_results(
             *limit,
         ),
         ScatterKind::OidConcat => merge_oid_concat(&payloads),
+        ScatterKind::OidSortedUnion => merge_oid_sorted_union(&payloads),
+        ScatterKind::AggregateMerge { kind, field_kind } => {
+            merge_aggregate(&payloads, *kind, *field_kind)
+        }
+        ScatterKind::GroupAggregateMerge { kind } => {
+            merge_group_aggregate(&payloads, *kind)
+        }
+        ScatterKind::GroupAggregateMultiMerge { kinds } => {
+            merge_group_aggregate_multi(&payloads, kinds)
+        }
     }
 }
 
@@ -494,6 +559,381 @@ fn merge_oid_concat(payloads: &[&[u8]]) -> OpResult {
     let mut out: Vec<u8> = Vec::with_capacity(total);
     for p in payloads {
         out.extend_from_slice(p);
+    }
+    OpResult::Got(out.into())
+}
+
+/// SP-Perf-A-SHARD-SCAN: sorted, deduplicated union of per-shard
+/// 16-byte oid lists.
+///
+/// `Op::Query`, `Op::QueryExpr`, `Op::FindRange` (and any other op
+/// whose K=1 reply emits oids in sorted order) need the cross-shard
+/// merge to preserve that order. The per-shard reply is the same
+/// `[16-byte oid]*` shape as `OidConcat`, but the merge step
+/// sort_unstable + dedup the union.
+///
+/// Dedup: oids are unique across shards by construction (each row
+/// lives on exactly one shard, so its oid only appears in that
+/// shard's reply). But the SAME oid could appear within a single
+/// shard's reply IF a secondary index has duplicate entries — defensive
+/// dedup keeps the merge byte-identical to a deduplicated K=1 source.
+fn merge_oid_sorted_union(payloads: &[&[u8]]) -> OpResult {
+    let mut total = 0usize;
+    for (i, p) in payloads.iter().enumerate() {
+        if p.len() % 16 != 0 {
+            return OpResult::SchemaError(format!(
+                "scatter sorted-oid merge: shard {i} returned {} bytes \
+                 (not a multiple of 16-byte oid width)",
+                p.len()
+            ));
+        }
+        total = total.saturating_add(p.len());
+    }
+    let mut ids: Vec<[u8; 16]> = Vec::with_capacity(total / 16);
+    for p in payloads {
+        for chunk in p.chunks(16) {
+            // Safe: length-checked above; chunks of size 16 only.
+            let mut a = [0u8; 16];
+            a.copy_from_slice(chunk);
+            ids.push(a);
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    let mut out: Vec<u8> = Vec::with_capacity(ids.len() * 16);
+    for id in ids {
+        out.extend_from_slice(&id);
+    }
+    OpResult::Got(out.into())
+}
+
+/// SP-Perf-A-SHARD-SCAN: aggregate-merge for `Op::Aggregate` across
+/// shards.
+///
+/// Per-shard reply shape (mirrors `kessel-sm`'s `Op::Aggregate` arm):
+/// - COUNT (kind=0), SUM (kind=1): 16 bytes `i128 LE` (one i128).
+/// - MIN (kind=2), MAX (kind=3) for numeric ≤8B fields: 16 bytes
+///   `i128 LE` (per-shard min/max as i128). For var-width MIN/MAX
+///   (`Char(_)`, `Bytes(_)`, `U128`, `I128`): raw field-width bytes
+///   (may be empty for "no matching rows"). The merger uses
+///   `cmp_field` to compare across shards.
+/// - AVG (kind=4): **rejected with SchemaError at K>=2** — the
+///   per-shard reply is `sum/count`, which can't be re-averaged
+///   without weighting. V1 limitation; SHARD-SCAN-AVG follow-up
+///   would change the wire shape to include `(sum, count)`.
+///
+/// Determinism: byte-identical to the K=1 baseline for kinds 0..=3
+/// (sum/min/max are associative). AVG hard-fails at K>=2 by design.
+fn merge_aggregate(
+    payloads: &[&[u8]],
+    kind: u8,
+    field_kind: FieldKind,
+) -> OpResult {
+    match kind {
+        0 | 1 => {
+            // COUNT or SUM: every shard returns i128 LE; sum across.
+            let mut acc: i128 = 0;
+            for (i, p) in payloads.iter().enumerate() {
+                if p.is_empty() {
+                    // Empty payload means "no rows"; contributes 0.
+                    continue;
+                }
+                if p.len() != 16 {
+                    return OpResult::SchemaError(format!(
+                        "scatter agg COUNT/SUM merge: shard {i} returned {} \
+                         bytes (expected 16)",
+                        p.len()
+                    ));
+                }
+                let mut le = [0u8; 16];
+                le.copy_from_slice(&p[..16]);
+                acc = acc.wrapping_add(i128::from_le_bytes(le));
+            }
+            OpResult::Got(acc.to_le_bytes().to_vec().into())
+        }
+        2 | 3 => {
+            // MIN/MAX: numeric ≤8B path returns 16 bytes (i128 LE);
+            // var-width MIN/MAX returns raw field-width bytes.
+            // We distinguish by `field_kind.width()`: ≤8 = numeric i128
+            // path, >8 OR variable-width = raw-bytes path.
+            //
+            // Numeric-path detection uses the OUTER bound (≤8B) since
+            // kessel-sm's Aggregate routes <=8B numerics through
+            // `aggregate_numeric_scan` (which emits i128 LE) and >8B
+            // (U128/I128) or char/bytes through `agg_extreme_var`
+            // (which emits raw bytes).
+            let numeric_path = matches!(
+                field_kind,
+                FieldKind::U8
+                    | FieldKind::U16
+                    | FieldKind::U32
+                    | FieldKind::U64
+                    | FieldKind::I8
+                    | FieldKind::I16
+                    | FieldKind::I32
+                    | FieldKind::I64
+                    | FieldKind::Bool
+                    | FieldKind::Timestamp
+                    | FieldKind::Fixed { .. }
+            );
+            if numeric_path {
+                let want_max = kind == 3;
+                let mut best: Option<i128> = None;
+                for (i, p) in payloads.iter().enumerate() {
+                    if p.is_empty() {
+                        continue; // shard had no matching rows
+                    }
+                    if p.len() != 16 {
+                        return OpResult::SchemaError(format!(
+                            "scatter agg MIN/MAX merge: shard {i} returned \
+                             {} bytes (expected 16 for numeric ≤8B)",
+                            p.len()
+                        ));
+                    }
+                    let mut le = [0u8; 16];
+                    le.copy_from_slice(&p[..16]);
+                    let v = i128::from_le_bytes(le);
+                    best = Some(match best {
+                        None => v,
+                        Some(b) => {
+                            if want_max {
+                                b.max(v)
+                            } else {
+                                b.min(v)
+                            }
+                        }
+                    });
+                }
+                // Mirrors the K=1 var-empty path: when no shard had
+                // any rows, emit i128 0 (matches the numeric default).
+                let out_v = best.unwrap_or(0);
+                OpResult::Got(out_v.to_le_bytes().to_vec().into())
+            } else {
+                // Variable-width MIN/MAX: raw bytes per shard. Compare
+                // via cmp_sort_value (kind-aware). Empty payload means
+                // "no matching rows" — skip.
+                let want_max = kind == 3;
+                let mut best: Option<Vec<u8>> = None;
+                for p in payloads {
+                    if p.is_empty() {
+                        continue;
+                    }
+                    let candidate: Vec<u8> = p.to_vec();
+                    best = Some(match best {
+                        None => candidate,
+                        Some(b) => {
+                            let ord = cmp_sort_value(field_kind, &candidate, &b);
+                            let take = if want_max {
+                                ord == Ordering::Greater
+                            } else {
+                                ord == Ordering::Less
+                            };
+                            if take {
+                                candidate
+                            } else {
+                                b
+                            }
+                        }
+                    });
+                }
+                OpResult::Got(best.unwrap_or_default().into())
+            }
+        }
+        4 => {
+            // AVG: documented hard-fail at K>=2.
+            OpResult::SchemaError(
+                "scatter agg AVG (kind=4) not supported at K>=2: per-shard \
+                 reply is sum/count, which cannot be re-averaged without \
+                 weights. See SHARD-SCAN-AVG follow-up; K=1 AVG works."
+                    .into(),
+            )
+        }
+        _ => OpResult::SchemaError(format!("scatter agg: unknown kind {kind}")),
+    }
+}
+
+/// SP-Perf-A-SHARD-SCAN: group-aggregate merge for
+/// `Op::GroupAggregate`.
+///
+/// Per-shard reply shape (from `kessel-sm`'s `Op::GroupAggregate`
+/// arm):
+///   `[u32 ngroups]` then `ngroups × ([u32 keylen][key bytes][i128 LE])`.
+///
+/// The merger walks every shard's groups into a single
+/// `BTreeMap<Vec<u8>, i128>` (combining values per `kind`), then
+/// re-emits in sorted-by-key order to match the K=1 baseline (which
+/// also uses a `BTreeMap`).
+///
+/// Combine functions per kind:
+///   - 0 (COUNT), 1 (SUM): sum
+///   - 2 (MIN): min
+///   - 3 (MAX): max
+///   - 4 (AVG): SchemaError (same V1 gap as `merge_aggregate`)
+fn merge_group_aggregate(payloads: &[&[u8]], kind: u8) -> OpResult {
+    if kind == 4 {
+        return OpResult::SchemaError(
+            "scatter group-agg AVG (kind=4) not supported at K>=2: same \
+             wire-shape gap as Op::Aggregate AVG; see SHARD-SCAN-AVG."
+                .into(),
+        );
+    }
+    if kind > 4 {
+        return OpResult::SchemaError(format!(
+            "scatter group-agg: unknown kind {kind}"
+        ));
+    }
+    let mut acc: std::collections::BTreeMap<Vec<u8>, i128> =
+        std::collections::BTreeMap::new();
+    for (sid, p) in payloads.iter().enumerate() {
+        if p.is_empty() {
+            continue;
+        }
+        if p.len() < 4 {
+            return OpResult::SchemaError(format!(
+                "scatter group-agg merge: shard {sid} payload too short \
+                 ({} bytes, expected >=4 for ngroups header)",
+                p.len()
+            ));
+        }
+        let ngroups = u32::from_le_bytes(p[..4].try_into().unwrap()) as usize;
+        let mut pos = 4usize;
+        for g in 0..ngroups {
+            if pos + 4 > p.len() {
+                return OpResult::SchemaError(format!(
+                    "scatter group-agg: shard {sid} group {g} truncated \
+                     keylen prefix"
+                ));
+            }
+            let keylen = u32::from_le_bytes(p[pos..pos + 4].try_into().unwrap())
+                as usize;
+            pos += 4;
+            if pos + keylen + 16 > p.len() {
+                return OpResult::SchemaError(format!(
+                    "scatter group-agg: shard {sid} group {g} truncated \
+                     key+value (keylen={keylen})"
+                ));
+            }
+            let key = p[pos..pos + keylen].to_vec();
+            pos += keylen;
+            let mut le = [0u8; 16];
+            le.copy_from_slice(&p[pos..pos + 16]);
+            let v = i128::from_le_bytes(le);
+            pos += 16;
+            acc.entry(key)
+                .and_modify(|cur| {
+                    *cur = match kind {
+                        0 | 1 => cur.wrapping_add(v),
+                        2 => (*cur).min(v),
+                        3 => (*cur).max(v),
+                        _ => unreachable!("kind 4/>4 rejected above"),
+                    };
+                })
+                .or_insert(v);
+        }
+    }
+    // Re-encode.
+    let mut out = Vec::new();
+    out.extend_from_slice(&(acc.len() as u32).to_le_bytes());
+    for (k, v) in acc {
+        out.extend_from_slice(&(k.len() as u32).to_le_bytes());
+        out.extend_from_slice(&k);
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    OpResult::Got(out.into())
+}
+
+/// SP-Perf-A-SHARD-SCAN: multi-aggregate group merge for
+/// `Op::GroupAggregateMulti`.
+///
+/// Per-shard reply (from `kessel-sm`'s `group_aggregate_multi`):
+///   `[u32 ngroups]` then `ngroups × ([u32 keylen][key bytes][16B * n_aggs])`.
+///
+/// Each per-group payload has one `i128 LE` slot per aggregate; the
+/// merger combines per-slot using the `kinds[slot]` policy (sum for
+/// 0/1, min for 2, max for 3, SchemaError for 4).
+fn merge_group_aggregate_multi(payloads: &[&[u8]], kinds: &[u8]) -> OpResult {
+    if kinds.is_empty() {
+        return OpResult::SchemaError(
+            "scatter group-agg-multi merge: empty kinds vector".into(),
+        );
+    }
+    for (i, k) in kinds.iter().enumerate() {
+        if *k == 4 {
+            return OpResult::SchemaError(format!(
+                "scatter group-agg-multi merge: slot {i} kind=4 (AVG) not \
+                 supported at K>=2; see SHARD-SCAN-AVG follow-up"
+            ));
+        }
+        if *k > 4 {
+            return OpResult::SchemaError(format!(
+                "scatter group-agg-multi merge: slot {i} unknown kind {k}"
+            ));
+        }
+    }
+    let n_aggs = kinds.len();
+    let slot_bytes = n_aggs * 16;
+    let mut acc: std::collections::BTreeMap<Vec<u8>, Vec<i128>> =
+        std::collections::BTreeMap::new();
+    for (sid, p) in payloads.iter().enumerate() {
+        if p.is_empty() {
+            continue;
+        }
+        if p.len() < 4 {
+            return OpResult::SchemaError(format!(
+                "scatter group-agg-multi: shard {sid} payload too short \
+                 ({} bytes, expected >=4)",
+                p.len()
+            ));
+        }
+        let ngroups = u32::from_le_bytes(p[..4].try_into().unwrap()) as usize;
+        let mut pos = 4usize;
+        for g in 0..ngroups {
+            if pos + 4 > p.len() {
+                return OpResult::SchemaError(format!(
+                    "scatter group-agg-multi: shard {sid} group {g} \
+                     truncated keylen prefix"
+                ));
+            }
+            let keylen = u32::from_le_bytes(p[pos..pos + 4].try_into().unwrap())
+                as usize;
+            pos += 4;
+            if pos + keylen + slot_bytes > p.len() {
+                return OpResult::SchemaError(format!(
+                    "scatter group-agg-multi: shard {sid} group {g} \
+                     truncated key+slots"
+                ));
+            }
+            let key = p[pos..pos + keylen].to_vec();
+            pos += keylen;
+            let mut slot_vals: Vec<i128> = Vec::with_capacity(n_aggs);
+            for _ in 0..n_aggs {
+                let mut le = [0u8; 16];
+                le.copy_from_slice(&p[pos..pos + 16]);
+                slot_vals.push(i128::from_le_bytes(le));
+                pos += 16;
+            }
+            acc.entry(key)
+                .and_modify(|cur| {
+                    for (i, v) in slot_vals.iter().enumerate() {
+                        cur[i] = match kinds[i] {
+                            0 | 1 => cur[i].wrapping_add(*v),
+                            2 => cur[i].min(*v),
+                            3 => cur[i].max(*v),
+                            _ => unreachable!("validated above"),
+                        };
+                    }
+                })
+                .or_insert(slot_vals);
+        }
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(&(acc.len() as u32).to_le_bytes());
+    for (k, slots) in acc {
+        out.extend_from_slice(&(k.len() as u32).to_le_bytes());
+        out.extend_from_slice(&k);
+        for v in slots {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
     }
     OpResult::Got(out.into())
 }
@@ -738,9 +1178,15 @@ pub fn scatter_and_merge_ctx<C: ShardCaller>(
                 merge_scan_results(gathered, kind)
             }
         }
-        ScatterKind::Sorted { .. } => {
-            // Sorted needs every shard's payload first; gather all,
-            // then merge.
+        ScatterKind::Sorted { .. }
+        | ScatterKind::OidSortedUnion
+        | ScatterKind::AggregateMerge { .. }
+        | ScatterKind::GroupAggregateMerge { .. }
+        | ScatterKind::GroupAggregateMultiMerge { .. } => {
+            // Sorted + aggregate-shaped kinds need every shard's
+            // payload first; gather all, then merge via
+            // `merge_scan_results`. Same skew/timeout/partial-mode
+            // contract as the Sorted gather above.
             let mut gathered: Vec<OpResult> = Vec::with_capacity(k);
             let mut first_bad: Option<OpResult> = None;
             for (i, (rx, deadline)) in
@@ -4305,5 +4751,317 @@ mod tests {
             cancelled2.load(Ordering::SeqCst) >= 1,
             "shard_2 observed cancel pre-call"
         );
+    }
+
+    // ====================================================================
+    // SP-Perf-A-SHARD-SCAN unit tests — new ScatterKind merge functions
+    // ====================================================================
+
+    /// `merge_oid_sorted_union` should sort+dedup the union of per-shard
+    /// 16-byte oid payloads (matches `Op::Query/QueryExpr/FindRange` K=1
+    /// behaviour which sort_unstable+dedups before emit).
+    #[test]
+    fn shard_scan_oid_sorted_union_sorts_and_dedups() {
+        let id = |n: u8| {
+            let mut a = [0u8; 16];
+            a[15] = n;
+            a
+        };
+        // Shard 0 has ids 3, 1; shard 1 has ids 2, 1 (1 is dup across
+        // shards — defensive dedup); shard 2 has nothing.
+        let s0: Vec<u8> = id(3).iter().chain(id(1).iter()).copied().collect();
+        let s1: Vec<u8> = id(2).iter().chain(id(1).iter()).copied().collect();
+        let s2: Vec<u8> = Vec::new();
+        let payloads: Vec<&[u8]> = vec![&s0, &s1, &s2];
+        let r = merge_oid_sorted_union(&payloads);
+        match r {
+            OpResult::Got(b) => {
+                // Expected: sorted [1, 2, 3], deduped, each 16 bytes.
+                assert_eq!(b.len(), 48, "expected 3×16 bytes, got {}", b.len());
+                let mut got: Vec<u8> = Vec::new();
+                for chunk in b.chunks(16) {
+                    got.push(chunk[15]);
+                }
+                assert_eq!(got, vec![1u8, 2, 3]);
+            }
+            other => panic!("expected Got, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shard_scan_oid_sorted_union_rejects_unaligned_payload() {
+        // Shard 0 returns 15 bytes (not a multiple of 16) → SchemaError.
+        let s0: Vec<u8> = vec![0u8; 15];
+        let payloads: Vec<&[u8]> = vec![&s0];
+        let r = merge_oid_sorted_union(&payloads);
+        assert!(matches!(r, OpResult::SchemaError(_)));
+    }
+
+    /// `merge_aggregate` for COUNT (kind=0) sums per-shard i128 counts.
+    #[test]
+    fn shard_scan_agg_merge_count_sums() {
+        // Three shards: 5 rows + 3 rows + 0 rows = 8 total.
+        let s0 = 5i128.to_le_bytes().to_vec();
+        let s1 = 3i128.to_le_bytes().to_vec();
+        let s2: Vec<u8> = Vec::new(); // empty = no rows
+        let payloads: Vec<&[u8]> = vec![&s0, &s1, &s2];
+        let r = merge_aggregate(&payloads, 0, FieldKind::U8);
+        match r {
+            OpResult::Got(b) => {
+                let mut le = [0u8; 16];
+                le.copy_from_slice(&b[..16]);
+                assert_eq!(i128::from_le_bytes(le), 8);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// `merge_aggregate` for SUM (kind=1) sums per-shard i128 sums.
+    #[test]
+    fn shard_scan_agg_merge_sum_combines() {
+        let s0 = 100i128.to_le_bytes().to_vec();
+        let s1 = (-30i128).to_le_bytes().to_vec();
+        let s2 = 7i128.to_le_bytes().to_vec();
+        let payloads: Vec<&[u8]> = vec![&s0, &s1, &s2];
+        let r = merge_aggregate(&payloads, 1, FieldKind::I64);
+        match r {
+            OpResult::Got(b) => {
+                let mut le = [0u8; 16];
+                le.copy_from_slice(&b[..16]);
+                assert_eq!(i128::from_le_bytes(le), 77);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// `merge_aggregate` for MIN (kind=2) takes min across shards.
+    /// Numeric ≤8B path: 16-byte i128 LE per shard.
+    #[test]
+    fn shard_scan_agg_merge_min_numeric() {
+        let s0 = 50i128.to_le_bytes().to_vec();
+        let s1 = 10i128.to_le_bytes().to_vec();
+        let s2 = 100i128.to_le_bytes().to_vec();
+        let payloads: Vec<&[u8]> = vec![&s0, &s1, &s2];
+        let r = merge_aggregate(&payloads, 2, FieldKind::U64);
+        match r {
+            OpResult::Got(b) => {
+                let mut le = [0u8; 16];
+                le.copy_from_slice(&b[..16]);
+                assert_eq!(i128::from_le_bytes(le), 10);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// `merge_aggregate` for MAX (kind=3) takes max across shards.
+    #[test]
+    fn shard_scan_agg_merge_max_numeric() {
+        let s0 = 50i128.to_le_bytes().to_vec();
+        let s1 = 10i128.to_le_bytes().to_vec();
+        let s2 = 100i128.to_le_bytes().to_vec();
+        let payloads: Vec<&[u8]> = vec![&s0, &s1, &s2];
+        let r = merge_aggregate(&payloads, 3, FieldKind::U64);
+        match r {
+            OpResult::Got(b) => {
+                let mut le = [0u8; 16];
+                le.copy_from_slice(&b[..16]);
+                assert_eq!(i128::from_le_bytes(le), 100);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// `merge_aggregate` for AVG (kind=4) hard-fails at K>=2 by design.
+    #[test]
+    fn shard_scan_agg_merge_avg_rejected() {
+        let s0 = 50i128.to_le_bytes().to_vec();
+        let payloads: Vec<&[u8]> = vec![&s0];
+        let r = merge_aggregate(&payloads, 4, FieldKind::U64);
+        match r {
+            OpResult::SchemaError(msg) => {
+                assert!(msg.contains("AVG"), "msg: {msg}");
+            }
+            other => panic!("expected SchemaError, got {other:?}"),
+        }
+    }
+
+    /// `merge_aggregate` MIN with var-width path (CHAR) compares bytes.
+    #[test]
+    fn shard_scan_agg_merge_min_var_width_char() {
+        // 4-byte CHAR field; shard 0 has "ccc", shard 1 has "aaa".
+        let s0 = b"ccc\0".to_vec();
+        let s1 = b"aaa\0".to_vec();
+        let payloads: Vec<&[u8]> = vec![&s0, &s1];
+        let r = merge_aggregate(&payloads, 2, FieldKind::Char(4));
+        match r {
+            OpResult::Got(b) => {
+                assert_eq!(&b[..], b"aaa\0");
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// `merge_group_aggregate` combines per-group i128 values across shards.
+    /// Group "A" has SUM 10 on shard 0, SUM 5 on shard 1 → merged SUM 15.
+    /// Group "B" only on shard 1, SUM 3.
+    /// Group "C" only on shard 0, SUM 7.
+    #[test]
+    fn shard_scan_group_agg_merge_sum() {
+        fn encode_groups(items: &[(&[u8], i128)]) -> Vec<u8> {
+            let mut out = (items.len() as u32).to_le_bytes().to_vec();
+            for (k, v) in items {
+                out.extend_from_slice(&(k.len() as u32).to_le_bytes());
+                out.extend_from_slice(k);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out
+        }
+        let s0 = encode_groups(&[(b"A", 10), (b"C", 7)]);
+        let s1 = encode_groups(&[(b"A", 5), (b"B", 3)]);
+        let payloads: Vec<&[u8]> = vec![&s0, &s1];
+        let r = merge_group_aggregate(&payloads, 1); // SUM
+        match r {
+            OpResult::Got(b) => {
+                // Expected: 3 groups, sorted by key: A=15, B=3, C=7.
+                let n = u32::from_le_bytes(b[..4].try_into().unwrap()) as usize;
+                assert_eq!(n, 3, "expected 3 merged groups");
+                let mut pos = 4;
+                let mut got: Vec<(Vec<u8>, i128)> = Vec::new();
+                for _ in 0..n {
+                    let kl = u32::from_le_bytes(
+                        b[pos..pos + 4].try_into().unwrap(),
+                    ) as usize;
+                    pos += 4;
+                    let k = b[pos..pos + kl].to_vec();
+                    pos += kl;
+                    let mut le = [0u8; 16];
+                    le.copy_from_slice(&b[pos..pos + 16]);
+                    let v = i128::from_le_bytes(le);
+                    pos += 16;
+                    got.push((k, v));
+                }
+                assert_eq!(
+                    got,
+                    vec![
+                        (b"A".to_vec(), 15),
+                        (b"B".to_vec(), 3),
+                        (b"C".to_vec(), 7),
+                    ]
+                );
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// `merge_group_aggregate` with MIN takes per-group min across shards.
+    #[test]
+    fn shard_scan_group_agg_merge_min() {
+        fn encode_groups(items: &[(&[u8], i128)]) -> Vec<u8> {
+            let mut out = (items.len() as u32).to_le_bytes().to_vec();
+            for (k, v) in items {
+                out.extend_from_slice(&(k.len() as u32).to_le_bytes());
+                out.extend_from_slice(k);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out
+        }
+        let s0 = encode_groups(&[(b"x", 50), (b"y", 5)]);
+        let s1 = encode_groups(&[(b"x", 10), (b"y", 100)]);
+        let payloads: Vec<&[u8]> = vec![&s0, &s1];
+        let r = merge_group_aggregate(&payloads, 2); // MIN
+        match r {
+            OpResult::Got(b) => {
+                let n = u32::from_le_bytes(b[..4].try_into().unwrap()) as usize;
+                assert_eq!(n, 2);
+                let mut pos = 4;
+                let mut got: Vec<(Vec<u8>, i128)> = Vec::new();
+                for _ in 0..n {
+                    let kl = u32::from_le_bytes(
+                        b[pos..pos + 4].try_into().unwrap(),
+                    ) as usize;
+                    pos += 4;
+                    let k = b[pos..pos + kl].to_vec();
+                    pos += kl;
+                    let mut le = [0u8; 16];
+                    le.copy_from_slice(&b[pos..pos + 16]);
+                    pos += 16;
+                    got.push((k, i128::from_le_bytes(le)));
+                }
+                assert_eq!(
+                    got,
+                    vec![(b"x".to_vec(), 10), (b"y".to_vec(), 5),]
+                );
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// `merge_group_aggregate_multi`: two aggregates per group (COUNT + SUM).
+    /// Group "A": shard0 (cnt=2, sum=10), shard1 (cnt=3, sum=5)
+    ///        → merged (cnt=5, sum=15).
+    /// Group "B": only on shard0 (cnt=1, sum=7).
+    #[test]
+    fn shard_scan_group_agg_multi_merge() {
+        fn encode_groups(items: &[(&[u8], Vec<i128>)]) -> Vec<u8> {
+            let mut out = (items.len() as u32).to_le_bytes().to_vec();
+            for (k, vs) in items {
+                out.extend_from_slice(&(k.len() as u32).to_le_bytes());
+                out.extend_from_slice(k);
+                for v in vs {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            out
+        }
+        let s0 = encode_groups(&[(b"A", vec![2, 10]), (b"B", vec![1, 7])]);
+        let s1 = encode_groups(&[(b"A", vec![3, 5])]);
+        let payloads: Vec<&[u8]> = vec![&s0, &s1];
+        // kinds: [COUNT, SUM] = [0, 1]
+        let r = merge_group_aggregate_multi(&payloads, &[0u8, 1u8]);
+        match r {
+            OpResult::Got(b) => {
+                let n = u32::from_le_bytes(b[..4].try_into().unwrap()) as usize;
+                assert_eq!(n, 2);
+                let mut pos = 4;
+                let mut got: Vec<(Vec<u8>, Vec<i128>)> = Vec::new();
+                for _ in 0..n {
+                    let kl = u32::from_le_bytes(
+                        b[pos..pos + 4].try_into().unwrap(),
+                    ) as usize;
+                    pos += 4;
+                    let k = b[pos..pos + kl].to_vec();
+                    pos += kl;
+                    let mut slots = Vec::new();
+                    for _ in 0..2 {
+                        let mut le = [0u8; 16];
+                        le.copy_from_slice(&b[pos..pos + 16]);
+                        slots.push(i128::from_le_bytes(le));
+                        pos += 16;
+                    }
+                    got.push((k, slots));
+                }
+                assert_eq!(
+                    got,
+                    vec![
+                        (b"A".to_vec(), vec![5, 15]),
+                        (b"B".to_vec(), vec![1, 7]),
+                    ]
+                );
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// `merge_group_aggregate_multi` rejects AVG (kind=4) in any slot.
+    #[test]
+    fn shard_scan_group_agg_multi_merge_rejects_avg_slot() {
+        let payloads: Vec<&[u8]> = vec![];
+        let r = merge_group_aggregate_multi(&payloads, &[0u8, 4u8]);
+        match r {
+            OpResult::SchemaError(msg) => {
+                assert!(msg.contains("AVG"), "msg: {msg}");
+            }
+            other => panic!("got {other:?}"),
+        }
     }
 }

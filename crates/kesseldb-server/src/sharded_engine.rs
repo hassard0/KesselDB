@@ -68,8 +68,13 @@
 //! `apply_raw` calls inside `broadcast_to_all_shards`), so every
 //! shard's catalog state after the SAME DDL prefix is byte-identical.
 
+use crate::scatter_scan::{
+    scatter_and_merge, ScatterKind, ShardCaller, DEFAULT_PER_SHARD_TIMEOUT,
+};
 use crate::EngineHandle;
+use kessel_catalog::FieldKind;
 use kessel_proto::{Op, OpResult};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 /// Local mirror of `kessel_storage::make_key` (the storage crate is not
@@ -121,14 +126,21 @@ pub fn shard_of_key(key: &[u8], k: usize) -> usize {
 /// `Broadcast` — schema-DDL op; the router applies it to every shard
 /// in sequence (catalog state stays byte-identical across shards).
 ///
-/// `ShardZero` — V1 scan/Txn/admin op that doesn't have a single
-/// owning key. Routes to shard 0 only (V1 limitation documented at
-/// module top; V2 SHARD-SCAN wires scatter-merge).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `ShardZero` — op that doesn't have a single owning key AND isn't a
+/// scan-shape (Txn, XSHARD admin frames). Routes to shard 0 only —
+/// the SHARD-XTXN follow-up arc unwinds this for Op::Txn.
+///
+/// `Scatter(kind)` — SP-Perf-A-SHARD-SCAN: scan-shape op that needs
+/// to fan out to every shard. The `ScatterKind` discriminator picks
+/// the merge strategy (Unordered concat / Sorted heap-merge / OidConcat
+/// union / OidSortedUnion sort+dedup / AggregateMerge / ...). The
+/// router calls `scatter_and_merge` with N `InProcShardCaller`s.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShardRoute {
     Single(usize),
     Broadcast,
     ShardZero,
+    Scatter(ScatterKind),
 }
 
 /// Compute the shard route for an op against a K-shard cluster. `K=1`
@@ -160,21 +172,35 @@ pub fn route_op(op: &Op, k: usize) -> ShardRoute {
             ShardRoute::Single(shard_of_key(&make_key_inline(0xFFFF_FFFF, &id), k))
         }
 
-        // ----- Per-type ops route by (type_id, zero oid) -----
-        // FindBy / FindByComposite / FindRange / Describe land all
-        // rows of a type on ONE shard so per-type lookups are
-        // single-shard. Matches the SHARD-1 scaffold policy. (This
-        // means within-type scans by index are correct at K>=2; the
-        // limitation is that ALL rows of a given type live on ONE
-        // shard, which limits per-type write throughput to a single
-        // shard's apply thread. The lift comes from DIFFERENT types
-        // landing on different shards.)
-        Op::FindBy { type_id, .. }
-        | Op::FindByComposite { type_id, .. }
-        | Op::FindRange { type_id, .. }
-        | Op::Describe { type_id } => {
+        // ----- Describe: per-type op, single-shard. Catalog is
+        // byte-identical across shards (DDL is broadcast), so any
+        // shard answers identically. Route by type to a deterministic
+        // owning shard (matches SHARD-APPLY scaffold for stability;
+        // we could just send to shard 0 but the per-type spread keeps
+        // describe load distributed across shards).
+        Op::Describe { type_id } => {
             let key = make_key_inline(*type_id, &[0u8; 16]);
             ShardRoute::Single(shard_of_key(&key, k))
+        }
+
+        // ----- SP-Perf-A-SHARD-SCAN: secondary-index lookups must
+        // scatter. SHARD-APPLY's per-type pin was wrong for FindBy
+        // because Create/Update routes by (type_id, id) — every row
+        // of a type spreads across shards. The per-shard secondary
+        // index only sees that shard's slice of the rows, so any
+        // single shard's FindBy returns only ~1/K matches.
+        //
+        // The fan-out emits each shard's matching oids; the merge
+        // unions them. K=1 baseline emits the per-shard iteration
+        // order (matches OidConcat). K>=2 multiset-equals K=1.
+        Op::FindBy { .. } | Op::FindByComposite { .. } => {
+            ShardRoute::Scatter(ScatterKind::OidConcat)
+        }
+        // FindRange's K=1 baseline sort_unstable+dedups its oid set
+        // (see kessel-sm `Op::FindRange` arm). To match byte-exact,
+        // the cross-shard merge must do the same — OidSortedUnion.
+        Op::FindRange { .. } => {
+            ShardRoute::Scatter(ScatterKind::OidSortedUnion)
         }
 
         // Sequencer ops — all live on a single fixed shard derived
@@ -209,21 +235,75 @@ pub fn route_op(op: &Op, k: usize) -> ShardRoute {
         // so they route to the same shard the type's rows live on.
         // (None currently in this category — DDL covers them.)
 
-        // ----- Scan / Txn / cross-shard ops (V1 → ShardZero) -----
-        // V1 limitation: these route to shard 0 only. V2
-        // SP-Perf-A-SHARD-SCAN wires scatter-merge across shards.
-        // Documented at module top.
-        Op::Select { .. }
-        | Op::SelectFields { .. }
-        | Op::SelectSorted { .. }
-        | Op::Aggregate { .. }
-        | Op::GroupAggregate { .. }
-        | Op::GroupAggregateMulti { .. }
-        | Op::Query { .. }
-        | Op::QueryRows { .. }
-        | Op::QueryExpr { .. }
-        | Op::Join { .. }
-        | Op::Txn { .. }
+        // ----- SP-Perf-A-SHARD-SCAN: row-scan ops scatter -----
+        // Pre-arc: ShardZero (incorrect — returned ~1/K of the data).
+        // Post-arc: Scatter via the SP-A merge machinery.
+        Op::Select { limit, .. }
+        | Op::QueryRows { limit, .. }
+        | Op::SelectFields { limit, .. } => {
+            ShardRoute::Scatter(ScatterKind::Unordered { limit: *limit })
+        }
+        // SelectSorted needs catalog-resolved (kind, offset, width)
+        // for the per-shard sort field. We stash field_id into
+        // sort_offset with sort_width=0 as the sentinel "resolve at
+        // dispatch time"; the dispatcher reads shard 0's catalog
+        // (DDL is broadcast so identical across shards) and rewrites
+        // the ScatterKind before fan-out — mirrors the cluster
+        // router's `scatter_read` pattern.
+        Op::SelectSorted { sort_field, desc, offset, limit, .. } => {
+            ShardRoute::Scatter(ScatterKind::Sorted {
+                sort_kind: FieldKind::U8, // placeholder; resolved at dispatch
+                sort_offset: *sort_field as u32, // field-id sentinel
+                sort_width: 0,                   // sentinel: resolve at dispatch
+                desc: *desc,
+                offset: *offset,
+                limit: *limit,
+            })
+        }
+        // Aggregate / GroupAggregate / GroupAggregateMulti: per-shard
+        // partial aggregates combined by the kind-aware mergers
+        // (sum/min/max for kinds 0..=3; AVG=4 hard-fails at K>=2).
+        // Aggregate's `field_kind` is catalog-derived; the dispatcher
+        // resolves it before fan-out. Use a placeholder + the
+        // field_id-as-sentinel pattern (stash field_id into a
+        // FieldKind variant that we never use elsewhere).
+        Op::Aggregate { kind, .. } => {
+            // Placeholder field_kind=U8 (resolved at dispatch via
+            // catalog lookup against shard 0). The merger only
+            // consults field_kind for kind=2|3 var-width MIN/MAX;
+            // kind=0|1 ignores it entirely.
+            ShardRoute::Scatter(ScatterKind::AggregateMerge {
+                kind: *kind,
+                field_kind: FieldKind::U8,
+            })
+        }
+        Op::GroupAggregate { kind, .. } => {
+            ShardRoute::Scatter(ScatterKind::GroupAggregateMerge {
+                kind: *kind,
+            })
+        }
+        Op::GroupAggregateMulti { aggregates, .. } => {
+            ShardRoute::Scatter(ScatterKind::GroupAggregateMultiMerge {
+                kinds: aggregates.iter().map(|(k, _)| *k).collect(),
+            })
+        }
+        // Query / QueryExpr: K=1 baseline sort+dedups oid output;
+        // OidSortedUnion preserves byte-identity.
+        Op::Query { .. } | Op::QueryExpr { .. } => {
+            ShardRoute::Scatter(ScatterKind::OidSortedUnion)
+        }
+
+        // ----- Op::Join — NON-GOAL for SHARD-SCAN -----
+        // Cross-shard join needs build-side broadcast or shuffle;
+        // separate SHARD-JOIN arc. V1 routes to shard 0 (returns
+        // wrong results at K>=2; documented).
+        Op::Join { .. } => ShardRoute::ShardZero,
+
+        // ----- Op::Txn / cross-shard admin (V1 → ShardZero) -----
+        // SHARD-XTXN is the follow-up arc that handles cross-shard
+        // transactions. V1 keeps single-shard txn semantics on
+        // shard 0.
+        Op::Txn { .. }
         | Op::CommitTx { .. }
         | Op::XshardApply { .. }
         | Op::XshardDecide { .. }
@@ -245,7 +325,15 @@ pub struct ShardedDispatcher {
     /// is spawned with `shard_count = None` (so it's a vanilla
     /// single-engine — no recursion) and its own data dir
     /// (`<root>/shard-<i>`).
-    shards: Vec<EngineHandle>,
+    ///
+    /// SP-Perf-A-SHARD-SCAN: wrapped in `Arc` so the scatter-merge
+    /// machinery can hand each per-shard `InProcShardCaller` an
+    /// owned (cloneable) reference. The `Arc<EngineHandle>` is cheap
+    /// — the EngineHandle itself only holds Arc-backed atomics + an
+    /// mpsc Sender (which is Clone) — but the outer Arc lets the
+    /// thread-spawn helper take ownership without moving the
+    /// dispatcher's slot.
+    shards: Vec<Arc<EngineHandle>>,
 }
 
 impl ShardedDispatcher {
@@ -272,7 +360,9 @@ impl ShardedDispatcher {
             shards.len() >= 2,
             "ShardedDispatcher requires K >= 2 (K=1 collapses to unsharded)"
         );
-        Self { shards }
+        Self {
+            shards: shards.into_iter().map(Arc::new).collect(),
+        }
     }
 
     /// Apply a request frame, routing to its owning shard(s). Mirrors
@@ -336,7 +426,166 @@ impl ShardedDispatcher {
                 }
                 first_result.expect("broadcast: K >= 2 by invariant")
             }
+            ShardRoute::Scatter(kind) => self.scatter_dispatch(&op, kind),
         }
+    }
+
+    /// SP-Perf-A-SHARD-SCAN: scatter `op` across every shard via the
+    /// SP-A scatter-merge machinery, returning the merged `OpResult`.
+    ///
+    /// Steps:
+    ///   1. Resolve any catalog-dependent merge parameters (Sorted
+    ///      needs sort-field offset/width; Aggregate kind=2|3 needs
+    ///      field_kind for var-width MIN/MAX). The dispatcher consults
+    ///      shard 0's catalog via `Op::Describe` — DDL is broadcast so
+    ///      every shard's catalog is byte-identical.
+    ///   2. Build N `InProcShardCaller`s — each wraps an `Arc<EngineHandle>`
+    ///      pointing at the corresponding sub-engine. Owned (the trait
+    ///      requires `Send + 'static`) so the per-shard workers spawned
+    ///      by `scatter_and_merge` can move them across threads.
+    ///   3. Fan-out + merge via `scatter_and_merge` (zero-dep std::thread
+    ///      workers per shard, shard-id-ordered merge, per-shard
+    ///      timeout = DEFAULT_PER_SHARD_TIMEOUT).
+    fn scatter_dispatch(&self, op: &Op, kind: ScatterKind) -> OpResult {
+        // 1. Resolve catalog-dependent params.
+        let resolved_kind = match self.resolve_scatter_kind(op, kind) {
+            Ok(k) => k,
+            Err(e) => return e,
+        };
+        // 2. Build per-shard in-process callers.
+        let callers: Vec<InProcShardCaller> = self
+            .shards
+            .iter()
+            .map(|engine| InProcShardCaller {
+                engine: engine.clone(),
+            })
+            .collect();
+        // 3. Fan-out + merge with the same default-timeout the cluster
+        //    router uses. Cancel starts false (no precondition LIMIT).
+        let cancel = Arc::new(AtomicBool::new(false));
+        scatter_and_merge(
+            callers,
+            op,
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &resolved_kind,
+            cancel,
+        )
+    }
+
+    /// Resolve catalog-dependent ScatterKind fields. For
+    /// `ScatterKind::Sorted` with the sentinel `sort_width == 0`,
+    /// look up the field's (kind, byte-offset, byte-width) via
+    /// `Op::Describe` against shard 0 (DDL is broadcast so every
+    /// shard's catalog is identical). For `ScatterKind::AggregateMerge`
+    /// with kind=2|3 (MIN/MAX), look up the agg field's FieldKind so
+    /// the merger knows whether to take the numeric ≤8B path
+    /// (i128 LE) or the var-width path (raw bytes).
+    ///
+    /// Returns `Ok(resolved_kind)` or `Err(OpResult::SchemaError(...))`
+    /// if the catalog lookup fails (type missing, field missing, etc.).
+    fn resolve_scatter_kind(
+        &self,
+        op: &Op,
+        kind: ScatterKind,
+    ) -> Result<ScatterKind, OpResult> {
+        match kind {
+            ScatterKind::Sorted {
+                sort_offset,
+                sort_width,
+                desc,
+                offset,
+                limit,
+                ..
+            } if sort_width == 0 => {
+                // sentinel: resolve via catalog. sort_offset holds the
+                // field-id (cast from u16 → u32 by route_op).
+                let sort_field = sort_offset as u16;
+                let type_id = match op {
+                    Op::SelectSorted { type_id, .. } => *type_id,
+                    _ => {
+                        return Err(OpResult::SchemaError(
+                            "scatter: Sorted route on non-SelectSorted op".into(),
+                        ))
+                    }
+                };
+                let (sk, soff, sw) =
+                    self.describe_field(type_id, sort_field)?;
+                Ok(ScatterKind::Sorted {
+                    sort_kind: sk,
+                    sort_offset: soff as u32,
+                    sort_width: sw as u32,
+                    desc,
+                    offset,
+                    limit,
+                })
+            }
+            ScatterKind::AggregateMerge { kind, .. } if kind == 2 || kind == 3 => {
+                // MIN/MAX need the agg field's kind to pick numeric-vs-
+                // var-width merge path. Pull (kind=*, field_id) from the
+                // Op.
+                let (type_id, field_id) = match op {
+                    Op::Aggregate { type_id, field_id, .. } => {
+                        (*type_id, *field_id)
+                    }
+                    _ => {
+                        return Err(OpResult::SchemaError(
+                            "scatter: AggregateMerge on non-Aggregate op".into(),
+                        ))
+                    }
+                };
+                let (fk, _off, _w) = self.describe_field(type_id, field_id)?;
+                Ok(ScatterKind::AggregateMerge {
+                    kind,
+                    field_kind: fk,
+                })
+            }
+            // COUNT (0), SUM (1), AVG (4) merges don't consult
+            // field_kind; pass through.
+            other => Ok(other),
+        }
+    }
+
+    /// Look up a field's `(kind, byte-offset, byte-width)` via
+    /// `Op::Describe` against shard 0. Mirrors
+    /// `router.rs::Conn::scatter_read`'s catalog-resolve path. DDL is
+    /// broadcast so shard 0's catalog == every shard's catalog.
+    fn describe_field(
+        &self,
+        type_id: u32,
+        field_id: u16,
+    ) -> Result<(FieldKind, usize, usize), OpResult> {
+        let blob = match self.shards[0].apply_op(&Op::Describe { type_id }) {
+            OpResult::Got(b) => b,
+            OpResult::NotFound => {
+                return Err(OpResult::SchemaError(format!(
+                    "scatter: type {type_id} not found"
+                )));
+            }
+            other => {
+                return Err(OpResult::SchemaError(format!(
+                    "scatter: describe shard 0: {other:?}"
+                )));
+            }
+        };
+        let (_name, fields) = match kessel_catalog::decode_type_def(&blob) {
+            Some(p) => p,
+            None => {
+                return Err(OpResult::SchemaError(
+                    "scatter: catalog describe blob decode failed".into(),
+                ));
+            }
+        };
+        let mut record_offset = kessel_catalog::HEADER_BYTES;
+        for f in &fields {
+            let w = f.kind.width() as usize;
+            if f.field_id == field_id {
+                return Ok((f.kind, record_offset, w));
+            }
+            record_offset += w;
+        }
+        Err(OpResult::SchemaError(format!(
+            "scatter: field {field_id} not in type {type_id}"
+        )))
     }
 
     /// Sum of every shard's applied-op count. Stats are per-shard;
@@ -350,8 +599,44 @@ impl ShardedDispatcher {
 
     /// Borrow all sub-engines (for shutdown / drop coordination).
     #[inline]
-    pub fn all_shards(&self) -> &[EngineHandle] {
+    pub fn all_shards(&self) -> &[Arc<EngineHandle>] {
         &self.shards
+    }
+}
+
+/// SP-Perf-A-SHARD-SCAN: per-shard caller for the in-process sharded
+/// engine. Implements `ShardCaller` so the SP-A scatter-merge
+/// machinery (`scatter_and_merge`, `scatter_scan_fanout`) can fan a
+/// scan op out across in-process shards exactly the way the cluster
+/// router fans out across TCP-attached shards — same trait, different
+/// transport.
+///
+/// Holds an `Arc<EngineHandle>` to the per-shard sub-engine; the
+/// `call` method dispatches directly via `EngineHandle::apply_op` —
+/// the SP-Perf-A T6 in-process fast path (zero encode/decode, single
+/// RwLock read for read-only ops). Network/serialization-free per
+/// shard hop.
+pub struct InProcShardCaller {
+    engine: Arc<EngineHandle>,
+}
+
+impl InProcShardCaller {
+    /// Construct from an Arc'd sub-engine handle.
+    pub fn new(engine: Arc<EngineHandle>) -> Self {
+        Self { engine }
+    }
+}
+
+impl ShardCaller for InProcShardCaller {
+    fn call(&mut self, op: &Op) -> Result<OpResult, String> {
+        // In-process dispatch via the T6 fast path — for read-only ops
+        // this is a direct `sm_shared.read().read_only_op(op.clone())`
+        // call (zero encode/decode, one RwLock acquire). For write
+        // ops it routes through the sub-engine's apply thread mpsc
+        // exactly as the unsharded path does (the scatter machinery
+        // only fans out scan-shape READ ops in V1, so writes don't
+        // exercise this path; including the case for future-proofing).
+        Ok(self.engine.apply_op(op))
     }
 }
 
@@ -472,45 +757,169 @@ mod tests {
     }
 
     #[test]
-    fn route_op_k4_scans_route_to_shard_zero() {
+    fn route_op_k4_txn_routes_to_shard_zero() {
+        // SP-Perf-A-SHARD-SCAN: scan ops now Scatter (was ShardZero).
+        // Op::Txn + Op::Join + XSHARD ops still route to shard 0 (V1
+        // SHARD-XTXN/SHARD-JOIN are separate arcs).
         for op in [
-            Op::Select {
-                type_id: 1,
-                program: vec![],
+            Op::Txn { ops: vec![] },
+            Op::Join {
+                left_type: 1,
+                right_type: 2,
+                left_field: 1,
+                right_field: 1,
                 limit: 10,
             },
-            Op::Aggregate {
-                type_id: 1,
-                program: vec![],
-                kind: 0,
-                field_id: 1,
-                range_preds: vec![],
-            },
-            Op::Txn { ops: vec![] },
         ] {
-            assert_eq!(route_op(&op, 4), ShardRoute::ShardZero, "scan {op:?}");
+            assert_eq!(route_op(&op, 4), ShardRoute::ShardZero, "{op:?}");
         }
     }
 
     #[test]
-    fn route_op_per_type_ops_pin_to_one_shard() {
-        // FindBy / Describe for the SAME type_id MUST always land on
-        // the same shard (so a type's secondary-index lookup hits the
-        // shard where its rows live).
-        let find_op = Op::FindBy {
-            type_id: 42,
-            field_id: 1,
-            value: vec![1, 2, 3],
-        };
-        let desc_op = Op::Describe { type_id: 42 };
-        let r1 = route_op(&find_op, 8);
-        let r2 = route_op(&desc_op, 8);
-        assert_eq!(r1, r2, "FindBy and Describe diverged on per-type pinning");
-        // Different type_ids may land on different shards.
-        let _r3 = route_op(&Op::Describe { type_id: 43 }, 8);
-        // (We don't assert r3 != r1 — they may coincidentally land on
-        // the same shard for some K; the contract is just that the
-        // mapping is deterministic.)
+    fn route_op_k4_scans_scatter_post_shard_scan() {
+        // SP-Perf-A-SHARD-SCAN: 12 scan-shape ops now route Scatter.
+        // Pre-arc: ShardZero (returned 1/K of data). Post-arc:
+        // Scatter(kind) with kind-matched merge strategy.
+        let cases: Vec<(Op, fn(&ScatterKind) -> bool)> = vec![
+            (
+                Op::Select {
+                    type_id: 1,
+                    program: vec![],
+                    limit: 10,
+                },
+                |k| matches!(k, ScatterKind::Unordered { limit: 10 }),
+            ),
+            (
+                Op::QueryRows {
+                    type_id: 1,
+                    eq_preds: vec![],
+                    program: vec![],
+                    limit: 7,
+                    range_preds: vec![],
+                },
+                |k| matches!(k, ScatterKind::Unordered { limit: 7 }),
+            ),
+            (
+                Op::SelectFields {
+                    type_id: 1,
+                    program: vec![],
+                    fields: vec![1],
+                    limit: 3,
+                },
+                |k| matches!(k, ScatterKind::Unordered { limit: 3 }),
+            ),
+            (
+                Op::SelectSorted {
+                    type_id: 1,
+                    program: vec![],
+                    sort_field: 1,
+                    desc: false,
+                    offset: 0,
+                    limit: 5,
+                },
+                |k| matches!(k, ScatterKind::Sorted { .. }),
+            ),
+            (
+                Op::Aggregate {
+                    type_id: 1,
+                    program: vec![],
+                    kind: 1,
+                    field_id: 1,
+                    range_preds: vec![],
+                },
+                |k| matches!(k, ScatterKind::AggregateMerge { kind: 1, .. }),
+            ),
+            (
+                Op::GroupAggregate {
+                    type_id: 1,
+                    program: vec![],
+                    group_field: 1,
+                    kind: 0,
+                    agg_field: 2,
+                    range_preds: vec![],
+                },
+                |k| matches!(k, ScatterKind::GroupAggregateMerge { kind: 0 }),
+            ),
+            (
+                Op::GroupAggregateMulti {
+                    type_id: 1,
+                    program: vec![],
+                    group_field: 1,
+                    aggregates: vec![(0, 1), (1, 2)],
+                    range_preds: vec![],
+                },
+                |k| matches!(k, ScatterKind::GroupAggregateMultiMerge { .. }),
+            ),
+            (
+                Op::FindBy {
+                    type_id: 1,
+                    field_id: 1,
+                    value: vec![1, 2, 3],
+                },
+                |k| matches!(k, ScatterKind::OidConcat),
+            ),
+            (
+                Op::FindByComposite {
+                    type_id: 1,
+                    fields: vec![1, 2],
+                    values: vec![vec![1], vec![2]],
+                },
+                |k| matches!(k, ScatterKind::OidConcat),
+            ),
+            (
+                Op::FindRange {
+                    type_id: 1,
+                    field_id: 1,
+                    lo: vec![],
+                    hi: vec![],
+                },
+                |k| matches!(k, ScatterKind::OidSortedUnion),
+            ),
+            (
+                Op::Query {
+                    type_id: 1,
+                    preds: vec![],
+                },
+                |k| matches!(k, ScatterKind::OidSortedUnion),
+            ),
+            (
+                Op::QueryExpr {
+                    type_id: 1,
+                    program: vec![],
+                },
+                |k| matches!(k, ScatterKind::OidSortedUnion),
+            ),
+        ];
+        for (op, check) in &cases {
+            match route_op(op, 4) {
+                ShardRoute::Scatter(k) => {
+                    assert!(
+                        check(&k),
+                        "wrong ScatterKind for {op:?}: got {k:?}"
+                    );
+                }
+                other => panic!(
+                    "expected Scatter for scan-shape op {op:?}, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn route_op_describe_pins_to_single_shard() {
+        // Describe is per-type but the catalog is identical across
+        // shards (DDL is broadcast). Route to a deterministic owning
+        // shard so describe load distributes across shards (better
+        // than always shard 0). Different type_ids may pin to
+        // different shards — but the SAME type_id always pins to the
+        // SAME shard.
+        let r1 = route_op(&Op::Describe { type_id: 42 }, 8);
+        let r2 = route_op(&Op::Describe { type_id: 42 }, 8);
+        assert_eq!(r1, r2, "Describe routing not deterministic");
+        match r1 {
+            ShardRoute::Single(s) => assert!(s < 8),
+            other => panic!("expected Single, got {other:?}"),
+        }
     }
 
     #[test]

@@ -278,6 +278,25 @@ let row   = db.sql("SELECT * FROM acct ID 2")?;
 → Full instructions, SQL reference, cluster setup, auth and operations are in
 **[`docs/USAGE.md`](docs/USAGE.md)**.
 
+## Deploy
+
+Four supported single-host shapes (the V1 cloud-deploy story is
+single-pod / single-VM; replicated VSR clustering on k8s + Fly is
+SP‑Cloud‑Cluster, a named follow‑up arc).
+
+| Shape | One-liner | Reference |
+|---|---|---|
+| **Docker** (any host) | `docker run -p 6532:6532 -p 6533:6533 -p 5432:5432 -e KESSELDB_TOKEN=admin -v /tmp/kdb-data:/data ghcr.io/hassard0/kesseldb:latest` | [`Dockerfile`](Dockerfile) |
+| **Kubernetes** | `helm install kesseldb ./deploy/helm/kesseldb` (pre-create the `kesseldb-token` Secret first) | [`deploy/helm/kesseldb/`](deploy/helm/kesseldb) |
+| **Fly.io** | `fly launch --copy-config --no-deploy && fly secrets set KESSELDB_TOKEN=… && fly volumes create kesseldb_data --size 10 && fly deploy` | [`deploy/fly/`](deploy/fly) |
+| **Custom** (Nomad / ECS / Cloud Run / systemd-nspawn / …) | Same OCI image; mount `/data`, set `KESSELDB_TOKEN`, expose 6532/6533/5432 | [`docs/USAGE.md`](docs/USAGE.md) §11.4 |
+
+Full walkthrough + caveats (TLS, single‑attach volume, GHCR
+visibility) in [`docs/USAGE.md`](docs/USAGE.md) §11. Helm chart
+verified end‑to‑end on vulcan (kind + kubectl v1.31.0 + helm v3.16.3) —
+transcript at
+[`docs/superpowers/spclouddeploy-t3-kind-verify-2026-05-30.txt`](docs/superpowers/spclouddeploy-t3-kind-verify-2026-05-30.txt).
+
 ## PostgreSQL client compatibility
 
 KesselDB speaks the PostgreSQL Frontend/Backend Protocol v3.0 **Simple

@@ -9005,6 +9005,237 @@ mod tests {
         }
     }
 
+    // ========================================================================
+    // SP-Analytic-Plan-MULTI T2 — equivalence KAT.
+    //
+    // The Op::GroupAggregateMulti single-scan fold MUST produce per-group
+    // values byte-identical to the sequence of values produced by
+    // N×Op::GroupAggregate calls (one per (kind, field_id) pair) on the
+    // same data. Per-aggregate fold is associative+commutative for
+    // COUNT/SUM/MIN/MAX, and AVG = SUM / COUNT with integer division —
+    // matching the existing Op::GroupAggregate AVG semantics. The
+    // result encoding is `[u32 ngroups]` then per group `[u32 keylen]
+    // [key]` followed by N×16B i128 values (one per aggregate slot, in
+    // the order they were requested).
+    // ========================================================================
+
+    /// SP-Analytic-Plan-MULTI T2: byte-equivalence vs N×Op::GroupAggregate.
+    /// For each (kind, agg_field) pair in `aggregates`, the per-group value
+    /// in the Multi result MUST equal what a separate Op::GroupAggregate
+    /// would have returned for the same group.
+    #[test]
+    fn sp_analytic_plan_multi_equivalence_vs_n_group_aggregate() {
+        use kessel_expr::Program;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: q_type_def() });
+        // Same workload as the single-aggregate KAT so the per-aggregate
+        // expected values are already known from elsewhere in this file.
+        let data = [(1u32, 10u32), (1, 20), (2, 5), (2, 7), (2, 8), (3, 100)];
+        for (i, (o, v)) in data.iter().enumerate() {
+            sm.apply(
+                2 + i as u64,
+                Op::Create {
+                    type_id: 1,
+                    id: ObjectId::from_u128(i as u128),
+                    record: qrec(*o, 0, *v),
+                },
+            );
+        }
+        let all = Program::new().push_int(1).bytes();
+        // Helper: parse a [u32 ngroups][per group [u32 keylen][key u32 LE]
+        // [16B × n_aggs]] result. For this test all keys are 4-byte u32s.
+        let parse_multi = |b: &[u8], n_aggs: usize| -> Vec<(u32, Vec<i128>)> {
+            let mut out = Vec::new();
+            let n = u32::from_le_bytes(b[0..4].try_into().unwrap()) as usize;
+            let mut p = 4;
+            for _ in 0..n {
+                let kl = u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize;
+                p += 4;
+                let key = u32::from_le_bytes(b[p..p + 4].try_into().unwrap());
+                p += kl;
+                let mut vs = Vec::with_capacity(n_aggs);
+                for _ in 0..n_aggs {
+                    vs.push(i128::from_le_bytes(b[p..p + 16].try_into().unwrap()));
+                    p += 16;
+                }
+                out.push((key, vs));
+            }
+            out
+        };
+        let parse_single = |b: &[u8]| -> Vec<(u32, i128)> {
+            let mut out = Vec::new();
+            let n = u32::from_le_bytes(b[0..4].try_into().unwrap()) as usize;
+            let mut p = 4;
+            for _ in 0..n {
+                let kl = u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize;
+                p += 4;
+                let key = u32::from_le_bytes(b[p..p + 4].try_into().unwrap());
+                p += kl;
+                let val = i128::from_le_bytes(b[p..p + 16].try_into().unwrap());
+                p += 16;
+                out.push((key, val));
+            }
+            out
+        };
+        // Q1-shape multi: COUNT(*) + SUM(v) + MIN(v) + MAX(v) + AVG(v).
+        let aggs: Vec<(u8, u16)> = vec![(0, 0), (1, 3), (2, 3), (3, 3), (4, 3)];
+        let multi_bytes = match sm.read_only_op(Op::GroupAggregateMulti {
+            type_id: 1,
+            program: all.clone(),
+            group_field: 1,
+            aggregates: aggs.clone(),
+            range_preds: vec![],
+        }) {
+            OpResult::Got(b) => b.to_vec(),
+            o => panic!("multi: {o:?}"),
+        };
+        let multi = parse_multi(&multi_bytes, aggs.len());
+        // For each aggregate slot, run an Op::GroupAggregate and compare
+        // per-group values (the Multi slot[i] must equal the single op's
+        // value for that group).
+        for (slot, (k, f)) in aggs.iter().enumerate() {
+            let single = match sm.read_only_op(Op::GroupAggregate {
+                type_id: 1,
+                program: all.clone(),
+                group_field: 1,
+                kind: *k,
+                agg_field: *f,
+                range_preds: vec![],
+            }) {
+                OpResult::Got(b) => parse_single(&b),
+                o => panic!("single (kind={k}, field={f}): {o:?}"),
+            };
+            assert_eq!(
+                multi.len(),
+                single.len(),
+                "group count differs at slot {slot} (kind={k}, field={f})"
+            );
+            for ((mk, mv), (sk, sv)) in multi.iter().zip(single.iter()) {
+                assert_eq!(mk, sk, "group keys differ at slot {slot}");
+                assert_eq!(
+                    mv[slot], *sv,
+                    "value differs at slot {slot} (kind={k}, field={f}) group {mk}"
+                );
+            }
+        }
+        // Byte-shape sanity: groups in ascending key order via BTreeMap.
+        let keys: Vec<u32> = multi.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, vec![1, 2, 3], "groups must be ascending");
+    }
+
+    /// SP-Analytic-Plan-MULTI T2: apply path and read_only_op path produce
+    /// byte-identical results (the determinism contract — both paths use
+    /// the shared `group_aggregate_multi` helper).
+    #[test]
+    fn sp_analytic_plan_multi_apply_eq_read_only_op() {
+        use kessel_expr::Program;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: q_type_def() });
+        for i in 0..30u64 {
+            sm.apply(
+                2 + i,
+                Op::Create {
+                    type_id: 1,
+                    id: ObjectId::from_u128(i as u128),
+                    record: qrec((i % 4) as u32, 0, i as u32 + 1),
+                },
+            );
+        }
+        let aggs: Vec<(u8, u16)> = vec![(0, 0), (1, 3), (4, 3)];
+        let prog = Program::new().push_int(1).bytes();
+        let r_apply = match sm.apply(
+            500,
+            Op::GroupAggregateMulti {
+                type_id: 1,
+                program: prog.clone(),
+                group_field: 1,
+                aggregates: aggs.clone(),
+                range_preds: vec![],
+            },
+        ) {
+            OpResult::Got(b) => b.to_vec(),
+            o => panic!("apply: {o:?}"),
+        };
+        let r_ro = match sm.read_only_op(Op::GroupAggregateMulti {
+            type_id: 1,
+            program: prog,
+            group_field: 1,
+            aggregates: aggs,
+            range_preds: vec![],
+        }) {
+            OpResult::Got(b) => b.to_vec(),
+            o => panic!("ro: {o:?}"),
+        };
+        assert_eq!(
+            r_apply, r_ro,
+            "apply and read_only_op paths must produce byte-identical results"
+        );
+    }
+
+    /// SP-Analytic-Plan-MULTI T2: Multi w/ range_preds equals Multi w/o
+    /// range_preds equals N×GroupAggregate when the range covers all rows
+    /// (the narrowing only accelerates; the result must be invariant).
+    #[test]
+    fn sp_analytic_plan_multi_range_preds_equivalence() {
+        use kessel_expr::Program;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        // Type with an ordered index on the value column so range_preds
+        // narrows via the order index.
+        let tdef = encode_type_def(
+            "qr",
+            &[
+                Field { field_id: 0, name: "owner".into(), kind: FieldKind::U32, nullable: false },
+                Field { field_id: 0, name: "v".into(),     kind: FieldKind::U32, nullable: false },
+            ],
+        );
+        sm.apply(1, Op::CreateType { def: tdef });
+        sm.apply(2, Op::AddOrderedIndex { type_id: 1, field_id: 2 });
+        // Build records via the catalog/codec to avoid layout drift.
+        let ot = sm.catalog().get(1).expect("qr type").clone();
+        for i in 0..50u64 {
+            let rec = kessel_codec::encode(&ot, &[
+                kessel_codec::Value::Int(((i % 5) as i128)),
+                kessel_codec::Value::Int(i as i128),
+            ]).expect("encode qr");
+            sm.apply(3 + i, Op::Create {
+                type_id: 1,
+                id: ObjectId::from_u128(i as u128),
+                record: rec,
+            });
+        }
+        let aggs: Vec<(u8, u16)> = vec![(0, 0), (1, 2), (3, 2)]; // COUNT, SUM(v), MAX(v)
+        let prog = Program::new().push_int(1).bytes();
+        let no_range = match sm.read_only_op(Op::GroupAggregateMulti {
+            type_id: 1,
+            program: prog.clone(),
+            group_field: 1,
+            aggregates: aggs.clone(),
+            range_preds: vec![],
+        }) {
+            OpResult::Got(b) => b.to_vec(),
+            o => panic!("{o:?}"),
+        };
+        // Full-cover range: v >= 0 AND v <= u32::MAX (everything).
+        let full_range = vec![
+            (2u16, 1u8, 0u32.to_le_bytes().to_vec()),
+            (2u16, 3u8, u32::MAX.to_le_bytes().to_vec()),
+        ];
+        let with_range = match sm.read_only_op(Op::GroupAggregateMulti {
+            type_id: 1,
+            program: prog,
+            group_field: 1,
+            aggregates: aggs,
+            range_preds: full_range,
+        }) {
+            OpResult::Got(b) => b.to_vec(),
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(
+            no_range, with_range,
+            "full-cover range_preds must yield byte-identical result"
+        );
+    }
+
     #[test]
     fn group_aggregate_is_readonly_and_deterministic() {
         use kessel_expr::Program;

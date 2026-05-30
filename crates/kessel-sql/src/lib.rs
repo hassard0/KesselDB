@@ -388,7 +388,8 @@ fn plan_string(stmt: &Stmt, cat: &Catalog) -> String {
                 format!("Seq Scan on {} → filter → sort", tname(*type_id))
             }
             Op::Aggregate { type_id, .. }
-            | Op::GroupAggregate { type_id, .. } => {
+            | Op::GroupAggregate { type_id, .. }
+            | Op::GroupAggregateMulti { type_id, .. } => {
                 format!("Aggregate over Seq Scan on {}", tname(*type_id))
             }
             Op::Join { left_type, right_type, .. } => format!(
@@ -1371,42 +1372,92 @@ fn try_query_rows(p: &mut P) -> Option<Op> {
 }
 
 fn compile_select(p: &mut P) -> Result<Op, SqlError> {
-    // projection
+    // SP-Analytic-Plan-MULTI T3: projection parser now accepts a
+    // comma-separated mix of plain identifiers (leading group cols) and
+    // aggregate calls. Shapes (`g` = ident, `A(...)` = COUNT/SUM/MIN/
+    // MAX/AVG):
+    //   `*`                       → Proj::Star
+    //   `g [, g]*`                → Proj::Cols
+    //   `A(x)`                    → Proj::Aggs(1 agg, 0 leading cols)
+    //   `A(x), B(y) [, …]`        → Proj::Aggs(≥2 aggs, 0 leading cols)
+    //   `g [, g]*, A(x) [, A(y)]*` → Proj::Aggs(≥1 agg, ≥1 leading col)
+    // Once an aggregate has been seen, subsequent plain identifiers are
+    // an error (would imply a non-aggregated, non-GROUP-BY column).
+    struct AggSpec { kind: u8, field: Option<String> }
     enum Proj {
         Star,
         Cols(Vec<String>),
-        Agg(u8, Option<String>), // 0 COUNT,1 SUM,2 MIN,3 MAX
+        Aggs { leading_cols: Vec<String>, aggs: Vec<AggSpec> },
+    }
+    // Sniff a token as the start of an aggregate call (case-insensitive
+    // keyword followed by `(`). Returns the canonical kind code (0..=4).
+    fn agg_kind(w: &str) -> Option<u8> {
+        match w.to_ascii_uppercase().as_str() {
+            "COUNT" => Some(0),
+            "SUM" => Some(1),
+            "MIN" => Some(2),
+            "MAX" => Some(3),
+            "AVG" => Some(4),
+            _ => None,
+        }
+    }
+    fn parse_agg(p: &mut P) -> Result<AggSpec, SqlError> {
+        // The caller has confirmed the next token is an aggregate ident.
+        let kind = match p.next() {
+            Some(Tok::Ident(w)) => agg_kind(&w).ok_or("not an aggregate")?,
+            _ => return Err("aggregate name expected".into()),
+        };
+        p.punct('(')?;
+        let field = if matches!(p.peek(), Some(Tok::Star)) {
+            p.i += 1;
+            None
+        } else {
+            Some(p.ident()?)
+        };
+        p.punct(')')?;
+        Ok(AggSpec { kind, field })
     }
     let proj = if matches!(p.peek(), Some(Tok::Star)) {
         p.i += 1;
         Proj::Star
-    } else if let Some(Tok::Ident(w)) = p.peek().cloned() {
-        let up = w.to_ascii_uppercase();
-        if matches!(up.as_str(), "COUNT" | "SUM" | "MIN" | "MAX" | "AVG") {
-            p.i += 1;
-            p.punct('(')?;
-            let f = if matches!(p.peek(), Some(Tok::Star)) {
-                p.i += 1;
-                None
+    } else if let Some(Tok::Ident(_)) = p.peek() {
+        // Walk the comma-separated projection list, splitting items into
+        // leading group cols vs aggregates as we go. The first aggregate
+        // flips a mode bit; after that, plain identifiers are an error.
+        let mut leading_cols: Vec<String> = Vec::new();
+        let mut aggs: Vec<AggSpec> = Vec::new();
+        let mut have_agg = false;
+        loop {
+            // Look at the next ident WITHOUT consuming the cursor — the
+            // aggregate-vs-column choice depends on whether `(` follows.
+            let is_agg = match (p.peek().cloned(), p.t.get(p.i + 1).cloned()) {
+                (Some(Tok::Ident(w)), Some(Tok::Punct('(')))
+                    if agg_kind(&w).is_some() => true,
+                _ => false,
+            };
+            if is_agg {
+                aggs.push(parse_agg(p)?);
+                have_agg = true;
             } else {
-                Some(p.ident()?)
-            };
-            p.punct(')')?;
-            let k = match up.as_str() {
-                "COUNT" => 0,
-                "SUM" => 1,
-                "MIN" => 2,
-                "MAX" => 3,
-                _ => 4, // AVG
-            };
-            Proj::Agg(k, f)
-        } else {
-            let mut cols = vec![p.ident()?];
-            while matches!(p.peek(), Some(Tok::Punct(','))) {
-                p.i += 1;
-                cols.push(p.ident()?);
+                if have_agg {
+                    return Err(
+                        "plain column after aggregate not allowed (move it before \
+                         the aggregates or wrap it in MIN/MAX)"
+                            .into(),
+                    );
+                }
+                leading_cols.push(p.ident()?);
             }
-            Proj::Cols(cols)
+            if matches!(p.peek(), Some(Tok::Punct(','))) {
+                p.i += 1;
+                continue;
+            }
+            break;
+        }
+        if aggs.is_empty() {
+            Proj::Cols(leading_cols)
+        } else {
+            Proj::Aggs { leading_cols, aggs }
         }
     } else {
         return Err("bad SELECT projection".into());
@@ -1532,34 +1583,90 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
     }
 
     match proj {
-        Proj::Agg(k, f) => {
-            let af = match &f {
-                Some(c) => fid(c)?,
-                None => 0,
+        Proj::Aggs { leading_cols, aggs } => {
+            // SP-Analytic-Plan-MULTI T3: choose between the byte-identical
+            // single-aggregate path (Op::Aggregate / Op::GroupAggregate)
+            // and the multi-aggregate path (Op::GroupAggregateMulti).
+            //
+            //   1 agg + 0 leading cols + no GROUP BY → Op::Aggregate
+            //   1 agg + 0 leading cols + GROUP BY g  → Op::GroupAggregate
+            //   1 agg + 1 leading col   (=> GROUP BY implied)
+            //                                        → Op::GroupAggregateMulti
+            //   ≥2 aggs                              → Op::GroupAggregateMulti
+            //
+            // When `leading_cols` is non-empty AND there's also an explicit
+            // GROUP BY, they must agree (V1 single-column GROUP BY only;
+            // matches Op::GroupAggregate's constraint).
+            let resolve_agg = |a: &AggSpec| -> Result<(u8, u16), SqlError> {
+                let af = match &a.field {
+                    Some(c) => fid(c)?,
+                    None => 0,
+                };
+                Ok((a.kind, af))
             };
-            if let Some(g) = group {
-                Ok(Op::GroupAggregate {
-                    type_id: ot.type_id,
-                    program,
-                    group_field: fid(&g)?,
-                    kind: k,
-                    agg_field: af,
-                    // SP-Analytic-Plan T3: scan-narrowing range hints
-                    // extracted from the WHERE token span via the
-                    // shared helper. Empty when there's no WHERE / no
-                    // ordered-index match / disjunctive WHERE (safe
-                    // back-compat fallback to full scan).
-                    range_preds: agg_range_preds,
-                })
-            } else {
-                Ok(Op::Aggregate {
-                    type_id: ot.type_id,
-                    program,
-                    kind: k,
-                    field_id: af,
-                    range_preds: agg_range_preds,
-                })
+            // Single-aggregate back-compat path (byte-identical emit).
+            if aggs.len() == 1 && leading_cols.is_empty() {
+                let (k, af) = resolve_agg(&aggs[0])?;
+                if let Some(g) = group {
+                    return Ok(Op::GroupAggregate {
+                        type_id: ot.type_id,
+                        program,
+                        group_field: fid(&g)?,
+                        kind: k,
+                        agg_field: af,
+                        range_preds: agg_range_preds,
+                    });
+                } else {
+                    return Ok(Op::Aggregate {
+                        type_id: ot.type_id,
+                        program,
+                        kind: k,
+                        field_id: af,
+                        range_preds: agg_range_preds,
+                    });
+                }
             }
+            // Multi-aggregate / leading-col path.
+            // Determine the single group field (V1: one column).
+            let group_field = match (group, leading_cols.as_slice()) {
+                (Some(g), []) => fid(&g)?,
+                (None, [c]) => fid(c)?,
+                (Some(g), [c]) => {
+                    if g != *c {
+                        return Err(format!(
+                            "GROUP BY column `{g}` must match leading projection `{c}`"
+                        ));
+                    }
+                    fid(&g)?
+                }
+                (None, []) => {
+                    // ≥2 aggs but no group field — there's no group key. V1
+                    // requires a GROUP BY (single-column) for the Multi op;
+                    // a "no GROUP BY" multi-aggregate (one row, N values)
+                    // is a follow-on shape (out of scope for V1).
+                    return Err(
+                        "multi-aggregate SELECT requires GROUP BY (V1)".into(),
+                    );
+                }
+                (_, _) => {
+                    return Err(
+                        "multi-column GROUP BY not supported in V1 (use one \
+                         leading group column)"
+                            .into(),
+                    );
+                }
+            };
+            let mut resolved: Vec<(u8, u16)> = Vec::with_capacity(aggs.len());
+            for a in &aggs {
+                resolved.push(resolve_agg(a)?);
+            }
+            Ok(Op::GroupAggregateMulti {
+                type_id: ot.type_id,
+                program,
+                group_field,
+                aggregates: resolved,
+                range_preds: agg_range_preds,
+            })
         }
         _ if sort.is_some() => {
             let (c, desc) = sort.unwrap();
@@ -2473,6 +2580,177 @@ mod tests {
                 assert!(range_preds.is_empty(), "non-ordered column ⇒ no hints (g has no RANGE INDEX), got {range_preds:?}");
             }
             other => panic!("expected Op::Aggregate, got {other:?}"),
+        }
+    }
+
+    /// SP-Analytic-Plan-MULTI T3: a SELECT with ≥2 aggregates (or a
+    /// leading group column + ≥1 aggregate) compiles to a single
+    /// `Op::GroupAggregateMulti`, not N separate `Op::GroupAggregate`
+    /// calls. Single-aggregate paths stay byte-identical for back-compat.
+    #[test]
+    fn sp_analytic_plan_multi_sql_planner_emits_group_aggregate_multi() {
+        use kessel_proto::Op;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (g U8 NOT NULL, d I32 NOT NULL, x I64 NOT NULL, y I64 NOT NULL)");
+        run(&mut sm, 2, "CREATE RANGE INDEX ON t (d)");
+
+        // ≥2 aggregates with GROUP BY g → Op::GroupAggregateMulti.
+        let op = compile(
+            "SELECT SUM(x), SUM(y) FROM t WHERE d >= 100 AND d < 200 GROUP BY g",
+            sm.catalog(),
+        ).expect("compile multi");
+        match op {
+            Op::GroupAggregateMulti { aggregates, range_preds, group_field, .. } => {
+                assert_eq!(aggregates.len(), 2, "expected 2 aggs, got {aggregates:?}");
+                assert_eq!(aggregates[0].0, 1u8, "first agg = SUM");
+                assert_eq!(aggregates[1].0, 1u8, "second agg = SUM");
+                assert_eq!(range_preds.len(), 2, "range_preds must carry both hints");
+                let g_fid = sm.catalog().get(1).unwrap().fields.iter()
+                    .find(|f| f.name == "g").unwrap().field_id;
+                assert_eq!(group_field, g_fid);
+            }
+            other => panic!("expected Op::GroupAggregateMulti, got {other:?}"),
+        }
+
+        // Leading group col + 1 agg → Op::GroupAggregateMulti.
+        let op = compile(
+            "SELECT g, COUNT(x) FROM t WHERE d >= 50",
+            sm.catalog(),
+        ).expect("compile leading-col+agg");
+        match op {
+            Op::GroupAggregateMulti { aggregates, group_field, range_preds, .. } => {
+                assert_eq!(aggregates.len(), 1);
+                assert_eq!(aggregates[0].0, 0u8, "COUNT");
+                let g_fid = sm.catalog().get(1).unwrap().fields.iter()
+                    .find(|f| f.name == "g").unwrap().field_id;
+                assert_eq!(group_field, g_fid);
+                assert_eq!(range_preds.len(), 1, "one half-range hint");
+            }
+            other => panic!("expected Op::GroupAggregateMulti, got {other:?}"),
+        }
+
+        // Q1-shape: `SELECT g, SUM(x), SUM(y), COUNT(*) FROM t WHERE d
+        // <= 200 GROUP BY g` → 3 aggregates.
+        let op = compile(
+            "SELECT g, SUM(x), SUM(y), COUNT(x) FROM t WHERE d <= 200 GROUP BY g",
+            sm.catalog(),
+        ).expect("compile q1-shape");
+        match op {
+            Op::GroupAggregateMulti { aggregates, .. } => {
+                assert_eq!(aggregates.len(), 3, "expected 3 aggs, got {aggregates:?}");
+                assert_eq!(aggregates[0].0, 1u8, "SUM(x)");
+                assert_eq!(aggregates[1].0, 1u8, "SUM(y)");
+                assert_eq!(aggregates[2].0, 0u8, "COUNT");
+            }
+            other => panic!("expected Op::GroupAggregateMulti, got {other:?}"),
+        }
+
+        // Back-compat: single agg without leading col stays Op::Aggregate /
+        // Op::GroupAggregate (byte-identical to pre-arc emit).
+        let op = compile("SELECT SUM(x) FROM t WHERE d >= 50", sm.catalog())
+            .expect("compile single-agg");
+        assert!(matches!(op, Op::Aggregate { .. }), "single agg = Aggregate, got {op:?}");
+        let op = compile("SELECT SUM(x) FROM t WHERE d >= 50 GROUP BY g", sm.catalog())
+            .expect("compile single-agg + GROUP BY");
+        assert!(matches!(op, Op::GroupAggregate { .. }),
+            "single agg + GROUP BY = GroupAggregate, got {op:?}");
+
+        // Plain-column after aggregate is rejected.
+        let err = compile("SELECT SUM(x), g FROM t GROUP BY g", sm.catalog());
+        assert!(err.is_err(), "plain col after agg must error, got {err:?}");
+
+        // Multi without GROUP BY (and no leading col) is rejected in V1.
+        let err = compile("SELECT SUM(x), SUM(y) FROM t", sm.catalog());
+        assert!(err.is_err(), "multi-agg w/o GROUP BY must error in V1");
+    }
+
+    /// SP-Analytic-Plan-MULTI T3 end-to-end oracle: a multi-aggregate
+    /// SQL query executed via the planner-emitted Op::GroupAggregateMulti
+    /// MUST produce per-aggregate per-group values byte-identical to the
+    /// sequence of separate Op::GroupAggregate calls (the old shape).
+    #[test]
+    fn sp_analytic_plan_multi_sql_indexed_equals_n_single_aggregate() {
+        use kessel_proto::Op;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (g U8 NOT NULL, x I64 NOT NULL, y I64 NOT NULL)");
+        let mut next_op = 10u64;
+        for id in 1..=80u32 {
+            let g = (id % 4) as u8;
+            let x = (id * 3) as i64;
+            let y = (id * 5) as i64 - 17;
+            run(&mut sm, next_op,
+                &format!("INSERT INTO t (id, g, x, y) VALUES ({id}, {g}, {x}, {y})"));
+            next_op += 1;
+        }
+        // Multi via SQL.
+        let multi_op = compile(
+            "SELECT g, SUM(x), SUM(y), MIN(x), MAX(y), COUNT(x) FROM t GROUP BY g",
+            sm.catalog(),
+        ).expect("compile");
+        let multi_bytes = match sm.apply(next_op, multi_op) {
+            OpResult::Got(b) => b.to_vec(),
+            o => panic!("{o:?}"),
+        };
+        next_op += 1;
+        // Parse multi result (key is U8 = 1 byte).
+        let parse_multi = |b: &[u8], n_aggs: usize| -> Vec<(u8, Vec<i128>)> {
+            let mut out = Vec::new();
+            let n = u32::from_le_bytes(b[0..4].try_into().unwrap()) as usize;
+            let mut p = 4;
+            for _ in 0..n {
+                let kl = u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize;
+                p += 4;
+                let key = b[p];
+                p += kl;
+                let mut vs = Vec::with_capacity(n_aggs);
+                for _ in 0..n_aggs {
+                    vs.push(i128::from_le_bytes(b[p..p + 16].try_into().unwrap()));
+                    p += 16;
+                }
+                out.push((key, vs));
+            }
+            out
+        };
+        let parse_single = |b: &[u8]| -> Vec<(u8, i128)> {
+            let mut out = Vec::new();
+            let n = u32::from_le_bytes(b[0..4].try_into().unwrap()) as usize;
+            let mut p = 4;
+            for _ in 0..n {
+                let kl = u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize;
+                p += 4;
+                let key = b[p];
+                p += kl;
+                let val = i128::from_le_bytes(b[p..p + 16].try_into().unwrap());
+                p += 16;
+                out.push((key, val));
+            }
+            out
+        };
+        let multi = parse_multi(&multi_bytes, 5);
+
+        // Compare slot-by-slot against SUM(x), SUM(y), MIN(x), MAX(y), COUNT(x).
+        let queries = [
+            "SELECT SUM(x) FROM t GROUP BY g",
+            "SELECT SUM(y) FROM t GROUP BY g",
+            "SELECT MIN(x) FROM t GROUP BY g",
+            "SELECT MAX(y) FROM t GROUP BY g",
+            "SELECT COUNT(x) FROM t GROUP BY g",
+        ];
+        for (slot, q) in queries.iter().enumerate() {
+            let op = compile(q, sm.catalog()).expect("compile single");
+            assert!(matches!(op, Op::GroupAggregate { .. }), "single-agg path");
+            let single_bytes = match sm.apply(next_op, op) {
+                OpResult::Got(b) => b.to_vec(),
+                o => panic!("{o:?}"),
+            };
+            next_op += 1;
+            let single = parse_single(&single_bytes);
+            assert_eq!(multi.len(), single.len(), "group count differs at slot {slot}");
+            for ((mk, mv), (sk, sv)) in multi.iter().zip(single.iter()) {
+                assert_eq!(mk, sk, "key mismatch at slot {slot}");
+                assert_eq!(mv[slot], *sv,
+                    "slot {slot} value mismatch for group {mk} (query {q})");
+            }
         }
     }
 

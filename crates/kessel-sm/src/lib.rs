@@ -97,6 +97,22 @@ pub fn encode_overflow_record(fixed: &[u8], entries: &[(u16, Vec<u8>)]) -> Vec<u
 /// Bounded LRU; digest-invisible; `with_cache` overrides it.
 const DEFAULT_READ_CACHE: usize = 8192;
 
+/// SP-Hash-Agg V1 — minimum candidate-row count to trigger the parallel
+/// hash-aggregate path in `Op::Aggregate` / `Op::GroupAggregateMulti`.
+/// Below this threshold the existing single-threaded fold is used (no
+/// thread-spawn overhead). Tuned for the Q6 narrowed-window (~8K rows)
+/// + the Q1 full-scan (~60K rows). Determinism unaffected (parallel
+/// result is byte-identical to serial).
+const MIN_PARALLEL_ROWS: usize = 8192;
+
+/// SP-Hash-Agg V1 — worker count for the parallel hash-aggregate path.
+/// 4 mirrors the typical `--connections 4` bench shape: combined with
+/// the Perf-A T2 read-pool's per-Op dispatch, peak parallelism is
+/// 4×4 = 16 cores during an N=4 bench. vulcan has 80 logical cores so
+/// safe; on small boxes the oversubscription would hurt — a future
+/// arc can plumb this via env var.
+const NUM_HASH_AGG_WORKERS: usize = 4;
+
 pub struct StateMachine<V: Vfs> {
     catalog: Catalog,
     storage: Storage<V>,

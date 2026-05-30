@@ -23,7 +23,7 @@
 #![allow(dead_code)]
 
 use crate::proto::{
-    BE_COMMAND_COMPLETE, FE_COPY_DATA, FE_COPY_DONE, FE_COPY_FAIL, FORMAT_CODE_TEXT,
+    BE_COMMAND_COMPLETE, FE_COPY_DATA, FE_COPY_DONE, FORMAT_CODE_TEXT,
 };
 
 /// `G` CopyInResponse tag. Server sends in reply to a `Q` containing

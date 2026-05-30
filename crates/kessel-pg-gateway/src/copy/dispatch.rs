@@ -24,7 +24,7 @@ use crate::copy::proto::{
     encode_copy_out_response,
 };
 use crate::copy::text::{encode_text_row, is_end_of_data_marker, parse_text_row_bytes};
-use crate::copy::{CopyInState, CopyState, MAX_COPY_DATA_BUFFER};
+use crate::copy::{CopyInState, MAX_COPY_DATA_BUFFER};
 use crate::dispatch;
 use crate::engine::EngineApply;
 use crate::error::{encode_error_response, SEVERITY_ERROR};

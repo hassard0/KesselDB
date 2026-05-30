@@ -428,77 +428,112 @@ fn reject_message(reason: &RejectReason) -> String {
 }
 
 /// Synthesize an `INSERT INTO <table> [(cols)] VALUES (...)`
-/// statement from a parsed COPY row. NULL renders as the `NULL`
-/// keyword. Non-NULL fields render as either a BARE decimal literal
-/// (for numeric `FieldKind`s — I8/I16/I32/I64/I128 + U8/U16/U32/U64/
-/// U128 + Bool + Timestamp + Fixed) or a `'...'`-quoted literal
-/// (for byte-string kinds — Char/Bytes/Ref/OverflowRef), matching
-/// the kessel-sql `lit_to_value` type-pairing in `kessel-sql::lib.rs`.
+/// statement from a parsed COPY row.
+///
+/// **NULL handling**: kessel-sql's INSERT VALUES parser accepts ONLY
+/// `Tok::Int(...)` and `Tok::Str(...)` literals — it has no `NULL`
+/// keyword in the value position. SP-PG-COPY works around this by
+/// OMITTING the NULL columns from BOTH the column list AND the
+/// VALUES tuple — kessel-sql then auto-fills NULL for any nullable
+/// omitted column (per the SP86 default-fill semantics in
+/// kessel-sql::lib.rs ~line 1219-1236). This means: a NOT NULL
+/// column receiving a `\N` COPY value will surface as a clean
+/// "missing NOT NULL column" error at INSERT time, which is exactly
+/// PG's `23502 not_null_violation` semantics.
+///
+/// **Non-NULL field rendering**: bare decimal for numeric `FieldKind`s
+/// (I8/I16/I32/I64/I128 + U8/U16/U32/U64/U128 + Bool + Timestamp +
+/// Fixed) or `'...'`-quoted (with `'` doubled) for byte-string
+/// kinds (Char/Bytes/Ref/OverflowRef), matching kessel-sql's
+/// `lit_to_value` type-pairing.
 ///
 /// `kinds` MUST have the same length as `fields` — if empty (the
 /// pre-T2-fix path used by tests that don't carry kinds), every
 /// field falls back to the quoted form (which works for CHAR
 /// columns but trips integer columns at the kessel-sql parser).
+///
+/// If the caller supplied an explicit column list (`COPY t (col1,
+/// col2) FROM STDIN`), V1 always emits the full caller-supplied
+/// column list — NULL fields are dropped from BOTH the column list
+/// and the values tuple at the same position, so column/value
+/// counts stay matched. If columns is `None`, V1 uses `engine.
+/// describe_table`'s schema order, and drops the same way.
 fn synthesize_insert_sql(
     table: &str,
     columns: Option<&[String]>,
     kinds: &[kessel_catalog::FieldKind],
     fields: &[Option<Vec<u8>>],
 ) -> Result<String, String> {
+    // Compute the (col, kind, text) tuples for NON-NULL fields only
+    // — NULL fields are dropped so kessel-sql's INSERT-omits-column
+    // auto-NULL-fill applies.
+    let cols_slice: Option<&[String]> = columns;
+    let mut entries: Vec<(Option<&str>, kessel_catalog::FieldKind, String)> =
+        Vec::with_capacity(fields.len());
+    for (i, v) in fields.iter().enumerate() {
+        if let Some(bytes) = v {
+            let text = std::str::from_utf8(bytes)
+                .map_err(|_| "field is not valid UTF-8".to_string())?
+                .to_string();
+            let col_name = cols_slice.and_then(|c| c.get(i).map(|s| s.as_str()));
+            let kind = kinds
+                .get(i)
+                .copied()
+                // Fallback: pick a kind that triggers quoted rendering.
+                .unwrap_or(kessel_catalog::FieldKind::Char(0));
+            entries.push((col_name, kind, text));
+        }
+    }
+
     let mut s = String::with_capacity(64);
     s.push_str("INSERT INTO ");
     s.push_str(table);
-    if let Some(cols) = columns {
+    // Always emit the column list if we have one OR if any column
+    // was dropped (so kessel-sql knows which positions we did/didn't
+    // provide). The exception: if columns is None AND every field
+    // is non-NULL AND we have no schema, we omit the column list and
+    // pass the values positionally — but in practice the COPY path
+    // always has columns from dispatch_copy_in_start.
+    let have_col_list = cols_slice.is_some();
+    if have_col_list {
         s.push_str(" (");
-        for (i, c) in cols.iter().enumerate() {
+        for (i, (col, _, _)) in entries.iter().enumerate() {
             if i > 0 {
                 s.push_str(", ");
             }
-            s.push_str(c);
+            s.push_str(col.expect("col list always present when columns is Some"));
         }
         s.push(')');
     }
     s.push_str(" VALUES (");
-    for (i, v) in fields.iter().enumerate() {
+    for (i, (_, kind, text)) in entries.iter().enumerate() {
         if i > 0 {
             s.push_str(", ");
         }
-        match v {
-            None => s.push_str("NULL"),
-            Some(bytes) => {
-                let text = std::str::from_utf8(bytes)
-                    .map_err(|_| "field is not valid UTF-8".to_string())?;
-                let want_quoted = kinds
-                    .get(i)
-                    .map(|k| matches!(
-                        k,
-                        kessel_catalog::FieldKind::Char(_)
-                            | kessel_catalog::FieldKind::Bytes(_)
-                            | kessel_catalog::FieldKind::Ref
-                            | kessel_catalog::FieldKind::OverflowRef
-                    ))
-                    // No kinds info → quoted (back-compat).
-                    .unwrap_or(true);
-                if want_quoted {
-                    s.push('\'');
-                    for c in text.chars() {
-                        if c == '\'' {
-                            s.push_str("''");
-                        } else {
-                            s.push(c);
-                        }
-                    }
-                    s.push('\'');
+        let want_quoted = matches!(
+            kind,
+            kessel_catalog::FieldKind::Char(_)
+                | kessel_catalog::FieldKind::Bytes(_)
+                | kessel_catalog::FieldKind::Ref
+                | kessel_catalog::FieldKind::OverflowRef
+        );
+        if want_quoted {
+            s.push('\'');
+            for c in text.chars() {
+                if c == '\'' {
+                    s.push_str("''");
                 } else {
-                    // Numeric / bool / timestamp / fixed — render
-                    // as a bare token. Trust the COPY-format input
-                    // bytes are already a decimal literal (PG text-
-                    // format for numeric types IS the decimal
-                    // representation; pg_dump emits e.g. `42` not
-                    // `"42"`).
-                    s.push_str(text);
+                    s.push(c);
                 }
             }
+            s.push('\'');
+        } else {
+            // Numeric / bool / timestamp / fixed — render as a bare
+            // token. Trust the COPY-format input bytes are already a
+            // decimal literal (PG text-format for numeric types IS
+            // the decimal representation; pg_dump emits `42` not
+            // `"42"`).
+            s.push_str(text);
         }
     }
     s.push(')');
@@ -791,7 +826,13 @@ mod tests {
                 assert!(state.carry.is_empty());
                 let applied = eng.applied.lock().unwrap();
                 assert_eq!(applied.len(), 3);
-                assert!(applied[0].contains("INSERT INTO t (id, name) VALUES ('1', 'hello')"));
+                // CopyInState::new (no kinds) → both fields quoted +
+                // both kept (neither is NULL).
+                assert!(
+                    applied[0].contains("INSERT INTO t (id, name) VALUES ('1', 'hello')"),
+                    "unexpected SQL: {}",
+                    applied[0]
+                );
                 assert!(applied[1].contains("'world'"));
                 assert!(applied[2].contains("'foo'"));
             }
@@ -840,10 +881,16 @@ mod tests {
         assert!(applied[3].contains("'40'"), "row 4 should contain '40'");
     }
 
-    /// SP-PG-COPY T2: NULL field (`\N`) renders as the `NULL` keyword
-    /// in the synthesized INSERT.
+    /// SP-PG-COPY T2: a NULL field (`\N`) is OMITTED from both the
+    /// INSERT column list and the VALUES tuple — kessel-sql's
+    /// "omitted nullable column auto-fills NULL" semantics (SP86)
+    /// is what V1 relies on, because kessel-sql has no `NULL`
+    /// literal in INSERT VALUES. So an `id\tname` table with
+    /// `1\t\N` COPY data synthesizes `INSERT INTO t (id) VALUES
+    /// ('1')` — the `name` column is dropped, kessel-sql auto-fills
+    /// NULL for it (because it's nullable).
     #[test]
-    fn t2_process_copy_data_null_field_renders_null_keyword() {
+    fn t2_process_copy_data_null_field_drops_from_insert() {
         let cols = vec![
             PgColumn { name: "id".into(), kind: FieldKind::I64, nullable: false },
             PgColumn { name: "name".into(), kind: FieldKind::Char(32), nullable: true },
@@ -863,7 +910,14 @@ mod tests {
         }
         let applied = eng.applied.lock().unwrap();
         assert_eq!(applied.len(), 1);
-        assert!(applied[0].contains("VALUES ('1', NULL)"));
+        // V1: kinds is empty because new() doesn't carry kinds, so
+        // the `id` column gets quoted. The NULL `name` column is
+        // dropped from both the column list and values.
+        assert!(
+            applied[0].contains("INSERT INTO t (id) VALUES ('1')"),
+            "unexpected SQL: {}",
+            applied[0]
+        );
     }
 
     /// SP-PG-COPY T2: the `\.` end-of-data marker line is silently

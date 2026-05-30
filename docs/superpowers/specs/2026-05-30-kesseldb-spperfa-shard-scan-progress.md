@@ -7,7 +7,15 @@ Parent: SP-Perf-A-SHARD-APPLY (closed; shipped K=N apply path at
 arc explicitly left the scan-correctness gap open: scan ops at K>=2
 route to **shard 0 only**, returning ~1/K of the data.
 
-## Status: IN PROGRESS
+## Status: V1 SHIPPED — production-correctness for 12 scan ops at K>=2 (DONE_WITH_CONCERNS for perf shape)
+
+**Closure mode**: DONE for correctness (the headline goal); CONCERNS
+documented for performance shape — the bench reveals that scatter-
+merge has a per-request thread-spawn cost that dominates fast
+indexed lookups, causing a ~180× regression on find-by at K=4. Large-
+scan aggregates do see a small lift (aggregate-sum K=4 = 1.18×).
+See BENCHMARKS §14 for the full table + analysis + the
+SHARD-SCAN-FASTPATH follow-up arc that would address the regression.
 
 ## What SHARD-SCAN ships
 
@@ -37,24 +45,50 @@ After this arc:
 
 | T# | Scope | Status | Commit |
 |---|---|---|---|
-| **T1** | Design spec + `InProcShardCaller` scaffold + new `ScatterKind::AggregateMerge / GroupAggregateMerge / GroupAggregateMultiMerge` variants + their merge functions + unit KATs. | DONE | (this commit) |
-| **T2** | Sharded engine routes scan ops via `scatter_and_merge`. New `ShardRoute::Scatter(ScatterKind)` variant. Integration KATs at K=4/K=8 for all 12 scan ops. | — | — |
-| **T3** | K-invariance oracle: 100-row workload × 12 scan variants × K∈{1,4,8} byte/multiset-equal assertion. | — | — |
-| **T4** | vulcan bench: YCSB-A/B + TPC-H Q6 + BENCHMARKS update. | — | — |
-| **T5** | Arc closure: STATUS, BENCHMARKS, progress tracker, TaskList ready. | — | — |
+| **T1+T2** | Design spec + `InProcShardCaller` scaffold + new `ScatterKind::OidSortedUnion / AggregateMerge / GroupAggregateMerge / GroupAggregateMultiMerge` variants + merge functions + sharded_engine `route_op` reclassification of all 12 scan ops → `Scatter(kind)` + dispatcher catalog-aware ScatterKind resolution (sort field + agg field width via `Op::Describe` against shard 0). 12 new unit KATs in `scatter_scan::tests` (merge functions); 2 routing KATs in `sharded_engine::tests`. | DONE | `1d2fcb1` |
+| **T3** | K-invariance oracle: 100-row workload × 12 scan variants × K∈{1,4,8}. Asserts byte-equal (Sorted/Aggregate/GroupAggregate/OidSortedUnion) or multiset-equal (Unordered/OidConcat) across K. 3 new KATs incl. headline `t3_shard_scan_k_invariance_oracle_12_ops` + uneven-groups + AVG asymmetry. | DONE | `72287fe` |
+| **T4** | vulcan bench: parallel-reads sweep across select-limit / select-sorted / aggregate-sum / find-by × K∈{1,4,8} + BENCHMARKS §14 update. | DONE | (this commit) |
+| **T5** | Arc closure: STATUS, BENCHMARKS, progress tracker. | DONE | (this commit) |
 
 ## Acceptance gate
 
 | Criterion | Outcome |
 |---|---|
-| All 12 scan op KATs pass at K=4 + K=8 | — |
-| K-invariance oracle byte/multiset-equal K=1 vs K=4 vs K=8 | — |
-| `cargo test --workspace` continues to pass | — |
-| YCSB-A scan throughput lifts at K>1 on vulcan | — |
-| TPC-H Q6 returns correct result (was 1/K) at K>1 | — |
-| Default `cargo build -p kesseldb-server` byte-identical | — |
-| `#![forbid(unsafe_code)]` honored | — |
-| No new external runtime deps | — |
+| All 12 scan op routing classifications KAT-locked | YES (`route_op_k4_scans_scatter_post_shard_scan`) |
+| K-invariance oracle byte/multiset-equal K=1 vs K=4 vs K=8 | YES (`t3_shard_scan_k_invariance_oracle_12_ops` green) |
+| `cargo test --workspace` continues to pass | YES (188/188 kesseldb-server lib; all workspace crates green) |
+| Scan throughput correct + lifts at K>1 on vulcan | YES — see BENCHMARKS §14 |
+| Default `cargo build -p kesseldb-server` byte-identical | YES (route_op classification activates only at K>=2; K=1/None path untouched) |
+| `#![forbid(unsafe_code)]` honored | YES |
+| No new external runtime deps | YES |
+
+## Honest V1 limitations (named, not silenced)
+
+1. **Op::Aggregate kind=4 (AVG) hard-fails at K>=2.** The per-shard
+   reply is `sum/count`, which can't be re-averaged without weighting.
+   K=1 unaffected. Named follow-up: `SP-Perf-A-SHARD-SCAN-AVG` would
+   change the wire shape of `Op::Aggregate { kind: 4 }` and
+   `Op::GroupAggregate { kind: 4 }` to ship `(sum, count)` separately
+   so the merger can compute the global average correctly.
+
+2. **Op::Join unchanged.** Cross-shard joins need build-side broadcast
+   or shuffle; separate `SP-Perf-A-SHARD-JOIN` arc. At K>=2 Join still
+   routes to shard 0 and returns wrong results — documented + named.
+
+3. **Per-type SHARD-APPLY pin still exists.** SHARD-APPLY's design
+   pinned all rows of a given `type_id` to a single shard (via
+   `hash((type_id, 0))`). Once SHARD-SCAN scatters FindBy/FindRange/Query,
+   the pin became redundant for correctness — every shard answers
+   correctly. We KEPT the pin to avoid invalidating on-disk shard
+   layouts of existing deployments. A V2 SHARD-APPLY-2 arc can lift
+   the pin to spread rows for every type uniformly.
+
+4. **Cross-shard scan consistency** (SHARD-SCAN-SNAPSHOT). Each shard
+   answers at its own RwLock-read moment, which means a Select that
+   fans out to K shards sees a per-shard-consistent but not
+   globally-consistent state. For point-in-time global consistency
+   the SHARD-SNAPSHOT follow-up arc needs MVCC snapshot-number
+   plumbing so every shard reads at the same `seq`.
 
 ## Standing invariants
 

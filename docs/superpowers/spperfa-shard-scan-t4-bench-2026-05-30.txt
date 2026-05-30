@@ -1,0 +1,35 @@
+## SP-Perf-A-SHARD-SCAN — vulcan bench sweep (--pool-workers 16, 10K rows, 10s)
+
+=== select-limit ===
+parallel-reads workload=select-limit workers=16 rows=10000 duration=10s pool_workers=Some(16) shard_count=None
+  total =      25493 ops | 2549 ops/sec | p50 6289us  p99 9422us  p99.99 27346us
+parallel-reads workload=select-limit workers=16 rows=10000 duration=10s pool_workers=Some(16) shard_count=Some(4)
+  total =      19030 ops | 1903 ops/sec | p50 8317us  p99 13778us  p99.99 35246us
+parallel-reads workload=select-limit workers=16 rows=10000 duration=10s pool_workers=Some(16) shard_count=Some(8)
+  total =      16264 ops | 1626 ops/sec | p50 9625us  p99 18013us  p99.99 25165us
+
+=== select-sorted ===
+parallel-reads workload=select-sorted workers=16 rows=10000 duration=10s pool_workers=Some(16) shard_count=None
+  total =       6703 ops | 670 ops/sec | p50 23458us  p99 40942us  p99.99 62702us
+parallel-reads workload=select-sorted workers=16 rows=10000 duration=10s pool_workers=Some(16) shard_count=Some(4)
+  total =       6954 ops | 695 ops/sec | p50 21834us  p99 50061us  p99.99 110988us
+parallel-reads workload=select-sorted workers=16 rows=10000 duration=10s pool_workers=Some(16) shard_count=Some(8)
+  total =       6723 ops | 672 ops/sec | p50 22534us  p99 52079us  p99.99 76508us
+
+=== aggregate-sum ===
+parallel-reads workload=aggregate-sum workers=16 rows=10000 duration=10s pool_workers=Some(16) shard_count=None
+  total =      14805 ops | 1480 ops/sec | p50 10508us  p99 16922us  p99.99 23673us
+parallel-reads workload=aggregate-sum workers=16 rows=10000 duration=10s pool_workers=Some(16) shard_count=Some(4)
+  total =      17481 ops | 1748 ops/sec | p50 8996us  p99 15989us  p99.99 34891us
+parallel-reads workload=aggregate-sum workers=16 rows=10000 duration=10s pool_workers=Some(16) shard_count=Some(8)
+  total =      12929 ops | 1293 ops/sec | p50 12392us  p99 23080us  p99.99 31263us
+
+=== find-by ===
+parallel-reads workload=find-by workers=16 rows=10000 duration=10s pool_workers=Some(16) shard_count=None
+  total =   18054048 ops | 1805405 ops/sec | p50 8us  p99 11us  p99.99 72us
+parallel-reads workload=find-by workers=16 rows=10000 duration=10s pool_workers=Some(16) shard_count=Some(4)
+  total =     101196 ops | 10120 ops/sec | p50 1502us  p99 3564us  p99.99 5235us
+parallel-reads workload=find-by workers=16 rows=10000 duration=10s pool_workers=Some(16) shard_count=Some(8)
+  total =      45649 ops | 4565 ops/sec | p50 3402us  p99 7321us  p99.99 10415us
+
+BENCH_DONE

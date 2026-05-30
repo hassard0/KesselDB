@@ -376,6 +376,74 @@ covered by the workspace test suite (2024 default / 2052 with
   named). **TaskList #349 DONE — K=N apply plumbing is the
   multi-week core SHARD-1 named; today's slice ships it AND lifts
   the ~5M ops/sec ceiling to 14.93M.**
+- **Track L cont. — SP-Perf-A-SHARD-SCAN (2026-05-30, scatter-merge
+  for scan ops at K>=2 SHIPPED — production-correctness fix).**
+  SHARD-APPLY left a known gap: scan ops (Select / QueryRows /
+  SelectFields / SelectSorted / Aggregate / GroupAggregate / etc.)
+  routed to shard 0 ONLY at K>=2, returning ~1/K of the data. This
+  arc wires the SP-A scatter-merge machinery (`scatter_scan.rs`,
+  already in production use by the cluster router for network-attached
+  shards) into the in-process sharded engine via a new
+  `InProcShardCaller` impl of `ShardCaller` (calls
+  `EngineHandle::apply_op` directly — zero network, zero
+  serialization). Same machinery, same merge contract, different
+  transport. Routing reclassification: 12 scan ops (Select /
+  QueryRows / SelectFields / SelectSorted / Aggregate / GroupAggregate
+  / GroupAggregateMulti / FindBy / FindByComposite / FindRange /
+  Query / QueryExpr) all switch from `ShardZero` to
+  `Scatter(ScatterKind)`. Three NEW `ScatterKind` variants added:
+  `OidSortedUnion` (sort+dedup oid union for Query/QueryExpr/FindRange
+  whose K=1 baseline sort_unstable+dedups), `AggregateMerge { kind,
+  field_kind }` (COUNT/SUM sum i128s; MIN/MAX pick numeric ≤8B vs
+  var-width path), `GroupAggregateMerge { kind }` /
+  `GroupAggregateMultiMerge { kinds }` (BTreeMap-based per-group
+  combine). Catalog-dependent params (Sorted's sort-field byte offset
+  + width; AggregateMerge's MIN/MAX field_kind) resolved at dispatch
+  time via `Op::Describe` against shard 0 — mirrors cluster
+  router's `scatter_read` pattern. T1+T2: 14 new KATs (12 merge
+  function + 2 routing classification). T3: K-invariance oracle —
+  100-row workload × 12 scan ops × K∈{1,4,8} asserts byte-equal
+  (Sorted/Aggregate/GroupAggregate/OidSortedUnion) or multiset-equal
+  (Unordered/OidConcat) (`t3_shard_scan_k_invariance_oracle_12_ops`
+  green; supplemented by `t3_shard_scan_group_agg_byte_equal_uneven_groups`
+  for non-uniform group sizes and `t3_shard_scan_aggregate_avg_asymmetric_k1_vs_kn`
+  documenting the AVG limitation). T4: vulcan bench sweep across
+  select-limit / select-sorted / aggregate-sum / find-by × K∈{1,4,8}
+  — results in BENCHMARKS §14. Honest V1 limitations: (1) Op::Aggregate
+  kind=4 (AVG) hard-fails at K>=2 because per-shard reply is
+  sum/count without per-shard count — `SHARD-SCAN-AVG` follow-up
+  changes the wire shape; K=1 AVG unchanged. (2) Op::Join unchanged
+  (cross-shard join is `SHARD-JOIN`'s job). (3) SHARD-APPLY's
+  per-type pin still exists (redundant for correctness now but kept
+  to avoid invalidating on-disk shard layouts; `SHARD-APPLY-2`
+  lifts it). (4) Cross-shard scan snapshot consistency requires MVCC
+  `seq` plumbing (`SHARD-SCAN-SNAPSHOT`). Test surface: kesseldb-server
+  lib 172 → 188 tests (+16; 0 regressions); workspace clean;
+  `#![forbid(unsafe_code)]` honored; zero new external runtime deps;
+  default `cargo build` byte-identical (new routing classifications
+  only activate when `shard_count >= 2`). Vulcan bench sweep (T4,
+  --pool-workers 16, 10K rows, 10s): select-limit K=4 = 0.75× /
+  K=8 = 0.64× (LIMIT 10 = per-shard does ~4×/8× excess scan work
+  then merges to 10 — measured regression); select-sorted K=4/8 ≈
+  1.0× (k-way heap merge overhead ≈ per-shard scan savings);
+  **aggregate-sum K=4 = 1.18× lift** (full-scan SUM fans out, K=4
+  is the sweet spot; K=8 = 0.87× as routing overhead dominates);
+  find-by K=4 = 0.006× (1.8M → 10K ops/sec — secondary-index lookup
+  is sub-microsecond at K=1, thread-spawn overhead of scatter-merge
+  ~1500µs vs ~500ns direct path causes massive structural regression
+  on point-shaped indexed lookups). **Honest verdict**: SHARD-SCAN
+  ships the correctness fix (12 scan ops now return right answers at
+  K>=2 instead of 1/K). Perf is workload-dependent: large-scan
+  aggregates benefit at K=4; small-result-set indexed lookups
+  regress significantly. Named follow-up `SHARD-SCAN-FASTPATH`
+  would short-circuit tiny-result-set ops to avoid per-request
+  thread-spawn — could recover 100×+ of the find-by overhead.
+  Commits: `1d2fcb1` (T1+T2 scaffold + routing + 14 KATs),
+  `72287fe` (T3 K-invariance oracle + 3 KATs), plus this commit
+  (T4 bench + T5 STATUS + BENCHMARKS §14 + tracker close). Progress
+  tracker → SHARD-SCAN V1 SHIPPED — DONE for correctness;
+  DONE_WITH_CONCERNS for perf shape (named SHARD-SCAN-FASTPATH
+  follow-up). **TaskList #352 ready.**
 - **Track D — Cluster test flakes (SP-CLUSTER-FLAKE T2).** Root-cause fixed
   in `Node::submit*` / `apply_raw`: production VSR retry on transient
   ViewChange. Not just a test relaxation — the actual production code path

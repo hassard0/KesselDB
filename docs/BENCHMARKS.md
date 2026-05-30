@@ -1572,6 +1572,162 @@ rwlock CAS lines live in different cores' L1s.
 | No new external deps | YES |
 | V1 limitations honestly documented | YES (scan / Txn / VSR each named V2 arc) |
 
+## 14. SP-Perf-A-SHARD-SCAN — scatter-merge for scan ops at K>=2
+
+Run shape: `parallel-reads --workload {select-limit, select-sorted,
+aggregate-sum, find-by} --workers 16 --rows 10000 --duration 10
+--pool-workers 16 --shard-count {baseline, 4, 8}` on vulcan. Same
+machine and `--rows` as §13 SHARD-APPLY so cells are directly
+comparable.
+
+SHARD-APPLY (§13) shipped the K=N apply path but explicitly left scan
+ops broken: at K>=2 they routed to shard 0 only and returned ~1/K of
+the data. SHARD-SCAN wires the SP-A scatter-merge machinery
+(`scatter_scan.rs`, already used by the cluster router for
+network-attached shards) into the in-process sharded engine. Same
+machinery, same merge contract, different transport — `InProcShardCaller`
+calls `EngineHandle::apply_op` directly (zero network, zero
+serialization) where the cluster's `ClusterClient` did a TCP round
+trip per shard.
+
+### Routing changes (sharded_engine::route_op)
+
+| Op | Pre-SCAN route | Post-SCAN route |
+|---|---|---|
+| `Op::Select / QueryRows / SelectFields` | ShardZero (1/K data) | `Scatter(Unordered { limit })` |
+| `Op::SelectSorted` | ShardZero | `Scatter(Sorted)` (k-way heap merge) |
+| `Op::Aggregate kind=0..3` | ShardZero | `Scatter(AggregateMerge { kind })` |
+| `Op::Aggregate kind=4 (AVG)` | ShardZero | SchemaError at K>=2 (documented) |
+| `Op::GroupAggregate / GroupAggregateMulti` | ShardZero | `Scatter(GroupAggregate*Merge)` |
+| `Op::FindBy / FindByComposite` | Single (per-type pin) | `Scatter(OidConcat)` |
+| `Op::FindRange / Query / QueryExpr` | ShardZero / per-type pin | `Scatter(OidSortedUnion)` |
+| `Op::Join` | ShardZero | ShardZero (non-goal — SHARD-JOIN) |
+| `Op::Txn / XSHARD` | ShardZero | ShardZero (SHARD-XTXN's job) |
+
+### Results — vulcan, --pool-workers 16, --workers 16, 10K rows, 10s
+
+Pre-arc: K>=2 routed to shard 0 → returned ~1/K of the data
+(`select-limit` returned 10 of however many rows shard 0 had;
+`aggregate-sum` returned the SUM of shard 0's slice only). Numbers
+below are POST-ARC, with scatter-merge wired across all shards (every
+row counted, every match returned).
+
+| Workload | K=1 ops/sec | K=4 ops/sec | K=8 ops/sec | K=4 vs K=1 | K=8 vs K=1 | Notes |
+|---|---|---|---|---|---|---|
+| `select-limit` (LIMIT 10) | **2,549** | 1,903 | 1,626 | 0.75× | 0.64× | LIMIT 10 = per-shard does ~4×/8× excess scan work then merges to 10 — measured regression |
+| `select-sorted` (LIMIT 10, sorted) | **670** | 695 | 672 | 1.04× | 1.00× | k-way heap merge overhead ≈ per-shard scan savings — flat |
+| `aggregate-sum` (full-scan SUM) | **1,480** | **1,748** | 1,293 | **1.18×** | 0.87× | Per-shard SUM fans out; small lift at K=4, K=8 routing overhead dominates |
+| `find-by` (eq-index, K=1 ~500ns/op) | **1,805,405** | 10,120 | 4,565 | 0.006× | 0.003× | Secondary-index lookup is microsecond-scale; per-request 4-thread-spawn + scatter overhead = ~1500µs vs ~500ns direct path — **massive structural regression** |
+
+### Honest framing — the bench tells a hard truth
+
+The vulcan numbers are NOT a "scatter wins universally" story. They
+are a measured trade between **correctness at K>=2** (the production-
+correctness gap SHARD-APPLY left open) and **per-request scatter
+overhead** (the cost of spawning K worker threads + collecting K
+replies + merging vs a single direct call).
+
+**Where scatter helps**: `aggregate-sum` at K=4 (1.18× lift) — the
+per-shard work (scan + fold over 2,500 rows) is large enough to
+amortize the per-request thread-spawn + merge overhead. K=8 cell
+regresses because 8 thread spawns per request × 16 workers × 1300
+requests/sec ≈ 166K thread starts/sec, which starts to dominate.
+
+**Where scatter is neutral**: `select-sorted` — per-shard scan-and-
+sort + k-way heap merge ≈ single full-scan + single sort.
+
+**Where scatter hurts**: `select-limit` (LIMIT 10) — every shard
+scans its slice, ALL shards complete their per-shard LIMIT 10
+scans (the cancel-on-LIMIT path doesn't fire fast enough across
+in-process threads), then the merger throws away K-1 batches' worth
+of work. `find-by` — the regression is dramatic because the
+underlying op is sub-microsecond at K=1; thread-spawn overhead
+(~1ms for 4 threads) is 3 orders of magnitude bigger than the
+useful work. **For point-shaped indexed lookups at K>=2, scatter
+is the wrong shape.** A future SHARD-SCAN-FASTPATH optimization
+could short-circuit FindBy/FindRange/Query when the SM detects the
+match-set is small and the per-shard reply already has the answer —
+but V1 prioritizes correctness over throughput.
+
+**Net verdict**: SHARD-SCAN ships the **correctness fix** (12 scan
+ops now return right answers at K>=2 instead of 1/K of the data).
+The performance numbers are workload-dependent: large-scan
+aggregates benefit at K=4; small-result-set indexed lookups regress
+significantly. Operators should profile their scan workload before
+opting into K>=2, OR scope sharding to write-heavy workloads where
+SHARD-APPLY's ~3× lift on point ops dominates.
+
+The find-by regression motivates a follow-up arc:
+
+- **SHARD-SCAN-FASTPATH**: detect "tiny result set" ops (FindBy /
+  FindByComposite / FindRange / Query / QueryExpr) and short-circuit
+  to a per-shard sequential walk OR a per-thread-pool dispatch (vs
+  fresh `std::thread::spawn` per request). Could recover 100×+ of
+  the find-by overhead.
+
+### Honest framing — what V1 ships and what's deferred
+
+**SHARD-SCAN V1 ships (production-correctness fix):**
+
+1. 12 scan ops now scatter via SP-A's existing merge contract. K=1
+   path is byte-identical to pre-arc (the new routing classification
+   only activates when shard_count >= 2).
+2. 3 new `ScatterKind` variants (`OidSortedUnion`,
+   `AggregateMerge { kind, field_kind }`, `GroupAggregateMerge { kind }`,
+   `GroupAggregateMultiMerge { kinds }`) with kind-aware combine
+   functions (sum for COUNT/SUM, min/max for MIN/MAX).
+3. K-invariance oracle: 100-row workload × 12 scan variants × K∈{1,4,8}
+   asserting byte-equal (Sorted/Aggregate/GroupAggregate/OidSortedUnion)
+   or multiset-equal (Unordered/OidConcat) results.
+4. Cluster router pass-through arms for the new ScatterKind variants
+   so `cargo build --workspace` stays clean (its `route()` doesn't
+   emit them today, but the merger handles them identically).
+
+**SHARD-SCAN V1 explicitly does not ship (each is a named follow-up arc):**
+
+1. **`Op::Aggregate { kind: 4 } (AVG) at K>=2`** — per-shard reply is
+   `sum/count`, can't be re-averaged without weights. `SHARD-SCAN-AVG`
+   would change the wire shape of AVG ops to ship `(sum, count)`
+   separately. K=1 AVG unchanged.
+2. **`Op::Join` cross-shard** — `SHARD-JOIN` arc; needs build-side
+   broadcast or shuffle.
+3. **Per-type SHARD-APPLY pin** — SHARD-APPLY pinned all rows of a
+   given type to one shard via `hash((type_id, 0))`. With SHARD-SCAN
+   the pin is redundant (every shard answers correctly via scatter)
+   but kept to avoid invalidating on-disk shard layouts. `SHARD-APPLY-2`
+   can lift the pin.
+4. **Cross-shard scan snapshot consistency** — `SHARD-SCAN-SNAPSHOT`;
+   needs MVCC `seq` plumbing so every shard reads at the same
+   point-in-time.
+
+### Test surface (vulcan, post-SHARD-SCAN)
+
+- `kesseldb-server` lib: 172 → 188 tests (+16; 0 regressions).
+  - 12 merge-function KATs in `scatter_scan::tests`
+  - 2 routing classifier KATs in `sharded_engine::tests`
+  - 3 K-invariance oracle KATs in `sharded_engine::tests`
+  - 1 prior test (`route_op_per_type_ops_pin_to_one_shard`) renamed
+    to `route_op_describe_pins_to_single_shard` because FindBy is
+    no longer per-type-pinned (it scatters).
+- Default `cargo build` byte-identical (route_op's new
+  classifications only fire when `shard_count >= 2`; K=1/None path
+  untouched).
+- `#![forbid(unsafe_code)]` honored; zero new external runtime deps.
+
+### Acceptance gate
+
+| Criterion | Outcome |
+|---|---|
+| 12 scan ops routing classifications KAT-locked | YES |
+| K-invariance oracle K=1 vs K=4 vs K=8 byte/multiset-equal | YES |
+| Workspace tests pass | YES (188/188 server lib; all crates green) |
+| Scan throughput CORRECT at K>1 (was 1/K of data) | YES — all 12 scan ops return right answers at K>=2 |
+| Scan throughput LIFTS at K>1 | MIXED — aggregate-sum K=4 = 1.18×; select-limit/find-by REGRESS due to per-request thread-spawn overhead. Documented honest verdict + SHARD-SCAN-FASTPATH named follow-up |
+| Default `cargo build` byte-identical | YES |
+| `#![forbid(unsafe_code)]` honored | YES |
+| No new external deps | YES |
+| V1 limitations honestly documented | YES (AVG / Join / per-type-pin / snapshot each named) |
+
 ## 13. SP-PG-COPY-BULKAPPLY — 100K-row COPY FROM STDIN (2026-05-30)
 
 **Workload**: `COPY <table> FROM STDIN` of 100,000 rows of

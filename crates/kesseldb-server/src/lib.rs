@@ -12,6 +12,7 @@ pub mod cluster;
 pub mod read_pool;
 pub mod router;
 pub mod scatter_scan;
+pub mod sharded_engine;
 pub mod sharded_sm;
 
 use kessel_io::DirVfs;
@@ -567,6 +568,23 @@ pub struct EngineHandle {
     /// when `cfg.read_workers.is_some()`, but the pool's worker count
     /// may be 0 (graceful fall-through to submitting-thread dispatch).
     read_pool: Option<Arc<read_pool::ReadPool>>,
+    /// SP-Perf-A-SHARD-APPLY: optional K=N sharded dispatcher. When
+    /// `Some`, `apply_raw` / `apply` route every frame through this
+    /// dispatcher's per-shard sub-engines instead of the local
+    /// engine queue. Constructed only when
+    /// `ServerConfig.shard_count = Some(K)` with `K >= 2` —
+    /// `None` for the default unsharded path (preserves SP-Perf-A
+    /// T7 ownership shape byte-for-byte).
+    ///
+    /// The fields ABOVE (`tx`, `sm_shared`, `read_pool`, etc.) refer
+    /// to a degenerate "router-shell" engine that holds no data —
+    /// it owns an empty StateMachine spawned at `<data_dir>/router/`
+    /// but every apply routes through the dispatcher. The router
+    /// shell's atomics (`applied_ops_atomic`, `op_kind_counts`,
+    /// `inflight`) are kept for the gateway compatibility surfaces
+    /// (HTTP / PG / metrics) which still consult them; SHARD V2
+    /// will plumb true cluster-aggregate counters.
+    sharded: Option<sharded_engine::SharedDispatcher>,
 }
 
 impl EngineHandle {
@@ -586,6 +604,16 @@ impl EngineHandle {
     /// read guard. Writes + SQL + admin tags still route through the
     /// engine thread, preserving every serial-apply invariant.
     pub fn apply_raw(&self, frame: Vec<u8>) -> OpResult {
+        // SP-Perf-A-SHARD-APPLY: when the engine was spawned with
+        // `shard_count = Some(K)` for K >= 2, route the frame through
+        // the K-shard dispatcher. The dispatcher decodes the op,
+        // computes its owning shard via `hash(key) % K`, and
+        // forwards to that shard's sub-engine. DDL ops broadcast to
+        // every shard; scan/Txn/admin ops route to shard 0 (V1
+        // limitation, see `sharded_engine.rs` module doc).
+        if let Some(sharded) = &self.sharded {
+            return sharded.apply_raw(frame);
+        }
         // SP-Perf-A T2: read-only bypass. When opted in, decode the
         // frame's first byte against the proto read-only tag table
         // (Ops only; SQL `0xFE` + admin tags fall through). A successful
@@ -713,6 +741,16 @@ impl EngineHandle {
     /// encode-then-send is necessary because the engine consumes a
     /// `Vec<u8>` frame on its mpsc.
     pub fn apply(&self, op: Op) -> OpResult {
+        // SP-Perf-A-SHARD-APPLY: route through the per-shard
+        // dispatcher when sharded. The dispatcher's `apply_raw`
+        // re-decodes the encoded op for routing, then dispatches to
+        // the owning shard whose sub-engine's apply path also has
+        // the SP-Perf-A T6 in-process fast path enabled (each
+        // sub-engine is itself a vanilla EngineHandle with
+        // sm_shared populated).
+        if self.sharded.is_some() {
+            return self.apply_raw(op.encode());
+        }
         // SP-Perf-A T6: read-only in-process fast path. Saves the
         // Op::encode + Op::decode allocations at ~5M ops/sec × N
         // threads — the largest single contributor to the T5-
@@ -755,6 +793,11 @@ impl EngineHandle {
     /// writes it falls through to `apply_raw(op.encode())` exactly
     /// like `apply` does.
     pub fn apply_op(&self, op: &Op) -> OpResult {
+        // SP-Perf-A-SHARD-APPLY: see `apply()` — route through the
+        // per-shard dispatcher when sharded.
+        if self.sharded.is_some() {
+            return self.apply_raw(op.encode());
+        }
         if let Some(sm_shared) = &self.sm_shared {
             // SP-Perf-A-TXN-RO: classifier swap (recurses into Op::Txn).
             if read_pool::is_read_only(op) {
@@ -848,10 +891,37 @@ pub fn spawn_engine(data_dir: impl AsRef<Path>) -> io::Result<EngineHandle> {
 /// Spawn the owning engine thread (it opens the data dir itself, since
 /// `StateMachine<DirVfs>` is not `Send`). Blocks until the engine is ready
 /// or returns the open error. `cfg.max_inflight` bounds the queue.
+///
+/// SP-Perf-A-SHARD-APPLY: when `cfg.shard_count = Some(K)` with `K >= 2`,
+/// this function:
+///   1. Spawns K **independent** sub-engines, one per shard, each
+///      rooted at `data_dir/shard-<i>/` with `shard_count = None`
+///      (no recursion — sub-engines are vanilla unsharded engines).
+///   2. Spawns a degenerate "router-shell" engine at `data_dir/router/`
+///      whose only purpose is to satisfy the EngineHandle field
+///      shape (atomics, gateway compatibility). Every apply on the
+///      shell short-circuits through the `ShardedDispatcher` to the
+///      owning sub-engine, so the router shell's own apply thread
+///      effectively idles.
+///   3. Returns an `EngineHandle` whose `sharded` field is `Some` —
+///      `apply_raw` / `apply` route every frame through the
+///      dispatcher.
+///
+/// When `cfg.shard_count` is `None` or `Some(1)`, the function takes
+/// the original single-engine path — byte-identical to pre-SHARD.
 pub fn spawn_engine_cfg(
     data_dir: impl AsRef<Path>,
     cfg: &ServerConfig,
 ) -> io::Result<EngineHandle> {
+    // SP-Perf-A-SHARD-APPLY: K >= 2 sharded fan-out.
+    if let Some(k) = cfg.shard_count {
+        if k >= 2 {
+            return spawn_sharded_engine_cfg(data_dir.as_ref(), cfg, k);
+        }
+        // k == 0 or k == 1 ⇒ fall through to the unsharded path
+        // (K=1 is functionally identical to the unsharded engine
+        // per the SHARD-1 K=1 collapse contract).
+    }
     let max_inflight = cfg.max_inflight;
     let dir = data_dir.as_ref().to_path_buf();
     let (tx, rx) = channel::<EngineMsg>();
@@ -1463,11 +1533,89 @@ pub fn spawn_engine_cfg(
                 http_counters: http_counters_for_handle,
                 sm_shared,
                 read_pool,
+                // SP-Perf-A-SHARD-APPLY: no sharding on this path —
+                // this is the unsharded sub-engine itself (used both
+                // by default-unsharded mode AND as a per-shard
+                // sub-engine inside a sharded EngineHandle).
+                sharded: None,
             })
         }
         Ok(Err(e)) => Err(e),
         Err(_) => Err(io::Error::new(io::ErrorKind::Other, "engine failed to start")),
     }
+}
+
+/// SP-Perf-A-SHARD-APPLY: K=N sharded engine spawn.
+///
+/// Constructs K **independent** per-shard sub-engines (rooted at
+/// `data_dir/shard-<i>/`), wires them into a `ShardedDispatcher`, and
+/// returns an `EngineHandle` whose `sharded` field is `Some` — every
+/// `apply_raw` / `apply` then routes through the dispatcher.
+///
+/// Each sub-engine inherits `read_workers`, `max_inflight`, `tls`,
+/// `token`, etc. from `cfg` — but `shard_count` is forced to `None`
+/// to prevent recursion. The router shell (this top-level handle's
+/// atomics, op_kind_counts, etc.) is spawned at `data_dir/router/`
+/// with `shard_count = None` and idles — its mpsc apply thread
+/// receives nothing because `apply_raw` short-circuits via the
+/// dispatcher before ever touching the engine queue.
+///
+/// V1 SHARD-APPLY scope (named in dispatch + design spec §3):
+///   - Per-shard StateMachine + apply thread + WAL + SSTables.
+///   - Key routing via `hash(make_key(type_id, oid)) % K`.
+///   - DDL broadcast to every shard (sequential).
+///   - Scan ops route to shard 0 only (V1 limitation —
+///     `SP-Perf-A-SHARD-SCAN` is the named follow-up arc).
+///   - WAL recovery per-shard via each sub-engine's existing
+///     `StateMachine::open` path (no cross-shard recovery
+///     coordination needed — each shard is its own consistent unit).
+pub fn spawn_sharded_engine_cfg(
+    data_dir: &Path,
+    cfg: &ServerConfig,
+    k: usize,
+) -> io::Result<EngineHandle> {
+    assert!(k >= 2, "spawn_sharded_engine_cfg requires K >= 2");
+    std::fs::create_dir_all(data_dir)?;
+
+    // Build a per-shard config: inherit everything but force
+    // `shard_count = None` (recursion guard) AND null out the
+    // listener-related ports (each sub-engine doesn't bind its own
+    // HTTP / PG listener — only the router shell does).
+    let mut sub_cfg = cfg.clone();
+    sub_cfg.shard_count = None;
+    sub_cfg.http_addr = None;
+    sub_cfg.http_tls_addr = None;
+    sub_cfg.pg_addr = None;
+
+    // Spawn K sub-engines, each rooted at `data_dir/shard-<i>`.
+    let mut shards: Vec<EngineHandle> = Vec::with_capacity(k);
+    for i in 0..k {
+        let shard_dir = data_dir.join(format!("shard-{i}"));
+        let engine = spawn_engine_cfg(&shard_dir, &sub_cfg)?;
+        shards.push(engine);
+    }
+
+    // Build the dispatcher.
+    let dispatcher = Arc::new(sharded_engine::ShardedDispatcher::new(shards));
+
+    // Spawn the router shell at `data_dir/router/`. This handle's
+    // own apply thread is effectively dead — every `apply_raw` /
+    // `apply` short-circuits via `self.sharded`. The shell exists
+    // so the EngineHandle field shape (atomics, tx, etc.) stays
+    // populated for backward compatibility with the gateways /
+    // metrics surfaces.
+    let router_dir = data_dir.join("router");
+    let mut shell_cfg = cfg.clone();
+    shell_cfg.shard_count = None;
+    shell_cfg.http_addr = None;
+    shell_cfg.http_tls_addr = None;
+    shell_cfg.pg_addr = None;
+    // The shell never serves real reads/writes, so it doesn't need
+    // the read_pool (it'd just waste threads).
+    shell_cfg.read_workers = None;
+    let mut shell = spawn_engine_cfg(&router_dir, &shell_cfg)?;
+    shell.sharded = Some(dispatcher);
+    Ok(shell)
 }
 
 fn handle_conn<S: std::io::Read + std::io::Write>(

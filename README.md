@@ -8,7 +8,8 @@
 
 `2018 default tests green / 2046 with --features pg-gateway / 2079 with all gateway features` · `0 external dependencies in the kernel` · `Rust 1.95+` · single‑binary
 
-**Tonight's headlines** (2026‑05‑29):
+**Tonight's headlines** (2026‑05‑30):
+- **DX surface caught up to the engineering — SP‑DX‑superior V1 ARC CLOSED.** First‑5‑minutes adoption polish: did‑you‑mean suggestions on `unknown table` + `unknown column` (zero‑dep edit‑distance, plus the head of the column list inlined so users don't need a separate DESCRIBE); the `kessel` CLI differentiates connection‑refused / wrong‑token / DNS‑failure / timeout with hint text pointing at the right env var; multi‑arch Docker image at `ghcr.io/hassard0/kesseldb:latest` (binary + HTTP + PG wire surfaces in one 77 MiB image) wired into `release.yml` to publish on every `v*` tag; new embedded example at `crates/kesseldb-server/examples/embedded.rs` showing the in‑process API end‑to‑end (`engine.sql(...)`, typed `Op` fast path, hot snapshot). See [`docs/STATUS.md`](docs/STATUS.md#) Track H + [`docs/USAGE.md`](docs/USAGE.md#option-b--run-from-the-official-docker-image) §1B / §3.
 - **Real Postgres ORM compatibility — SP‑PG‑EXTQ V1 ARC CLOSED.** psycopg2 + SQLAlchemy 2.0 + psycopg3 (with `ClientCursor`) all PASS on vulcan with default settings (T8 closes the T7 `use_native_hstore=False` caveat). asyncpg + JDBC PARTIAL (connect + DDL + simple‑Q work; binary‑format parameterized DML deferred to V2 `SP‑PG‑EXTQ‑BIN`). Pipelining throughput on vulcan: 252‑409 stmt/s (psycopg2 single‑statement round‑trip). See [`docs/USAGE.md`](docs/USAGE.md#9-postgresql-clients-psql-pgcli-jdbc-psycopg-pgx-) §9 + transcript at `docs/superpowers/sppgextq-t8-orm-smoke-2026-05-29.txt`.
 - **4.8M ops/sec parallel reads, sub‑µs p50** — Perf‑A T2 read‑pool bypass (parallel `read_only_op` dispatch) + T7 storage `Arc<[u8]>` migration (zero‑memcpy reads). Measured on a 16‑core x86‑64 Linux reference server; see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §11–§12.
 - **Honest cross‑DB benchmarks published** — KesselDB vs Postgres / SQLite / TigerBeetle on YCSB‑A/B/C, sysbench OLTP RO/WO/RW, *and* TPC‑H Q1/Q6 (analytical). 5 of 8 wins, 3 of 8 losses, every number disclosed with the exact reason — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md). Next perf arcs named (SP‑Perf‑A‑TXN‑RW for the OLTP RW loss — RO already CLOSED by SP‑Perf‑A‑TXN‑RO 2026‑05‑29, KesselDB now 5.7× faster than Postgres at N=16; SP‑Analytic‑Plan for the TPC‑H losses).
@@ -177,6 +178,26 @@ The release workflow builds these as part of `cargo build --release
 --features pg-gateway,http-gateway` so the binaries you download include the
 PostgreSQL and HTTP gateways out of the box; the binary protocol is the
 default + fast path either way.
+
+### Or run the official Docker image
+
+A pre-published multi-arch (`linux/amd64` + `linux/arm64`) image is
+pushed to GitHub Container Registry on every `v*` release. The image
+bundles the same `--features pg-gateway,http-gateway` server you would
+build from source, runs as a non-root UID, and exposes all three wire
+surfaces (binary 6532, HTTP+WS 6533, PostgreSQL 5432).
+
+```bash
+docker run --rm \
+  -p 6532:6532 -p 6533:6533 -p 5432:5432 \
+  -v $PWD/kesseldb-data:/data \
+  -e KESSELDB_TOKEN=changeme \
+  ghcr.io/hassard0/kesseldb:latest
+```
+
+Stripped image size: ~77 MiB. See [`Dockerfile`](Dockerfile) and
+[`docs/USAGE.md`](docs/USAGE.md#option-b--run-from-the-official-docker-image)
+for the layout + the matrix of supported env vars.
 
 ### Or build from source
 

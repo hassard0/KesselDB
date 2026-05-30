@@ -51,7 +51,34 @@ curl -L https://github.com/hassard0/KesselDB/releases/download/$VER/SHA256SUMS -
 sha256sum -c SHA256SUMS --ignore-missing
 ```
 
-### Option B — build from source
+### Option B — run from the official Docker image
+
+A pre-published multi-arch image (`linux/amd64` + `linux/arm64`) is
+pushed to GitHub Container Registry on every `v*` release. The image
+is the existing `--features pg-gateway,http-gateway` server, runs as a
+non-root `kessel:1100` UID, and exposes all three wire surfaces.
+
+```bash
+# Pull and run, mounting a host data dir + a one-token auth surface.
+docker run --rm \
+  -p 6532:6532 -p 6533:6533 -p 5432:5432 \
+  -v $PWD/kesseldb-data:/data \
+  -e KESSELDB_TOKEN=changeme \
+  ghcr.io/hassard0/kesseldb:latest
+
+# From another shell, the bare kessel CLI works exactly like local:
+kessel --addr 127.0.0.1:6532 --token changeme \
+  'CREATE TABLE acct (owner U32 NOT NULL, bal I64 NOT NULL)'
+# or via the HTTP gateway on :6533, or psql on :5432.
+```
+
+Default ports inside the container: `6532` binary, `6533` HTTP+WS,
+`5432` PostgreSQL. Persist the data dir with `-v <host>:/data`. The
+image is rebuilt from `Dockerfile` at the repo root — see that file
+for the two-stage layout (rust:1-slim builder → debian-bookworm-slim
+runtime, ~77 MiB stripped).
+
+### Option C — build from source
 
 KesselDB is pure Rust with **no external dependencies** in the kernel and
 no native build steps.
@@ -219,6 +246,42 @@ db.call(&op)?; // finds the primary, retries the *same* (client,req) on
 `ClusterClient` holds a stable session id and a monotonic request number, so a
 retry after a primary change returns the original committed reply rather than
 re‑executing.
+
+### Embedded — KesselDB inside your Rust process
+
+Skip the network round-trip entirely: depend on `kesseldb-server` directly
+and call the engine in-process. Read paths take the SP‑Perf‑A bypass under
+an `RwLock::read()` (sub‑µs latency); writes still serialise through the
+engine thread's deterministic apply.
+
+```rust
+use kesseldb_server::{spawn_engine_cfg, ServerConfig};
+use kessel_proto::OpResult;
+
+let cfg = ServerConfig { read_workers: Some(0), ..Default::default() };
+let engine = spawn_engine_cfg("./kesseldb-data", &cfg)?;
+
+// SQL fast path — same compile + apply as a wire `[0xFE] ++ sql` frame,
+// minus the socket.
+engine.sql("CREATE TABLE acct (owner U32 NOT NULL, bal I64 NOT NULL)");
+engine.sql("INSERT INTO acct ID 1 (owner, bal) VALUES (100, 50)");
+match engine.sql("SELECT SUM(bal) FROM acct WHERE owner = 100") {
+    OpResult::Got(b) => println!("sum = {}", i128::from_le_bytes(b[..16].try_into().unwrap())),
+    other            => panic!("{other:?}"),
+}
+
+// Hot consistent backup — copies the data dir while no apply is in flight.
+engine.snapshot("./kesseldb-data.snap")?;
+```
+
+A complete walkthrough — typed `Op` fast path, `kessel_codec::encode`
+round-trip, snapshot — lives at
+[`crates/kesseldb-server/examples/embedded.rs`](../crates/kesseldb-server/examples/embedded.rs).
+Run it from the repo root:
+
+```bash
+cargo run --release --example embedded -p kesseldb-server
+```
 
 ## 4. SQL reference
 

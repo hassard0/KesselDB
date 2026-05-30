@@ -160,6 +160,59 @@ covered by the workspace test suite (2024 default / 2052 with
   ViewChange. Not just a test relaxation — the actual production code path
   now retries `Unavailable` the same way `ClusterClient` does. CI green at
   HEAD `546e79a`.
+- **Track H — SP-DX-superior (2026-05-30, V1 SHIPPED).** Developer-experience
+  audit on top of the perf + protocol wins. Three concrete shipments, each
+  individually load-bearing for first-5-minutes adoption:
+  1. **Better errors (T1).** `unknown table` now suggests the closest match
+     in the live catalog via a zero-dep edit-distance + prefix matcher; on
+     an empty catalog the message says "no tables defined yet — use CREATE
+     TABLE first" instead of a bare `unknown table \`foo\``. `unknown
+     column` now includes the owning table name + either a did-you-mean
+     (e.g. `owne` → `owner`) or the head of the actual column list, so
+     users never need a separate `DESCRIBE` round-trip. The `kessel` CLI
+     differentiates connection-refused / wrong-token / DNS-failure /
+     timeout — each branch points at the env var or flag that controls
+     that surface. Text + JSON paths strip the duplicative server-side
+     `sql:` prefix from SchemaError so users see the friendly inner
+     message directly. (+3 KATs: `suggest` shape, `unknown_table` did-
+     you-mean, `unknown_column` table-context.)
+  2. **Docker image (T2).** `Dockerfile` at the repo root composes the
+     existing `--features pg-gateway,http-gateway` release binary into a
+     debian-slim runtime image (77 MiB stripped, ~25 MiB build context
+     via `.dockerignore`). Image runs as a dedicated non-root `kessel:1100`
+     UID; default ENTRYPOINT exposes all three wire surfaces (binary
+     6532, HTTP+WS 6533, PG 5432). `release.yml` gains a parallel
+     `docker` job that builds multi-arch (linux/amd64 + linux/arm64) and
+     pushes to `ghcr.io/<owner>/<repo>` on every `v*` tag, tagged
+     `:<version>`, `v<version>`, AND `:latest` for non-prerelease tags.
+     Best-effort (continue-on-error: true) so a registry/QEMU blip can't
+     gate the binary release. **Verified end-to-end on vulcan**: image
+     builds clean (rust:1-slim base, no system deps), starts cleanly,
+     HTTP gateway accepts `CREATE TABLE` + `SELECT COUNT(*)` round-trip.
+  3. **Embedded example (T3).** `crates/kesseldb-server/examples/
+     embedded.rs` walks the public in-process API end-to-end: spawn
+     engine with Perf-A read-bypass on, SQL DDL + DML via the new
+     `EngineHandle::sql` inherent (`apply_raw([0xFE]++sql)` with a
+     named entry point), typed `Op::Create` via the codec, hot
+     snapshot. Only depends on already-pinned workspace crates — zero
+     new external dep, zero new feature flag. **Verified on vulcan**:
+     `cargo run --release --example embedded -p kesseldb-server`
+     completes in <1 s with all assertions green
+     (`SUM(bal) = 1049`, `kv → [Uint(7), Uint(42)]`, 3-file snapshot).
+
+  Workspace tests +3 (KATs in kessel-sql for the new error helpers).
+  seed-7 GREEN; `#![forbid(unsafe_code)]` honored; zero new external
+  deps; HTTP/1.1 + WS + binary + PG-wire surfaces byte-untouched (the
+  CLI + SQL-compile error rewordings are pure-text changes on the
+  client-side render path; SchemaError variant + wire payload bytes
+  are byte-identical). Default `cargo build -p kesseldb-server`
+  byte-identical (new `EngineHandle::sql` is additive). Five commits:
+  `c65b010` (T1 errors), `e52e9da` (T2 Dockerfile + release.yml),
+  `85b8d90` (T2 base-image fix), `33d21c7` (T3 embedded example +
+  EngineHandle::sql), plus this commit (STATUS + USAGE + README).
+  Two follow-ups deferred to focused later slices: SP-DX-INIT
+  (`kessel init` scaffolder) + SP-DX-REPL (multi-line editor /
+  history in the interactive shell).
 
 **Wire surfaces** (all opt-in via cargo features except the binary protocol):
 - **Binary** — length-prefixed `Op::encode()` over TCP; the deterministic fast

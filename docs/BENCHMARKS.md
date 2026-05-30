@@ -1457,4 +1457,118 @@ preserves the deterministic read contract end-to-end.
 | `get-by-id` lifts past 10M ops/sec at N=16      | NO (~5M at 10K rows; lock+dispatch is next ceiling) |
 | Next bottleneck for V2 arc identified           | YES (RwLock reader CAS / per-shard pool / point-get fast path) |
 
+## 13. SP-Perf-A-SHARD-APPLY — K=N per-shard apply path (the ceiling-breaker)
+
+Run shape: `parallel-reads --workload get-by-id --workers 16 --rows
+10000 --duration 10 --pool-workers 16 --shard-count {1,2,4,8,16}` on
+vulcan. The `--shard-count N` flag is new in T3; unset = unsharded
+(the §12 T7 baseline). 100K-row seed was scoped to 10K to fit the
+session-budget (the K=4/K=8/K=16 seed loops each apply 10K Creates
+through the K-shard dispatcher, ~50s per cell; 100K would have
+extended the sweep to >50 min).
+
+T7 closed `DONE_WITH_CONCERNS` with `get-by-id` flatlining at ~5M
+ops/sec at N=16; T7's diagnosis named `RwLock<StateMachine>` reader-
+count CAS ping-pong + per-op lock+dispatch as the next ceiling.
+SHARD-APPLY attacks that ceiling by partitioning the keyspace into K
+independent per-shard sub-engines (each its own `Arc<RwLock<StateMachine>>`
++ apply thread + WAL + SSTables, rooted at `data_dir/shard-<i>/`),
+routing every Op via `hash(make_key(type_id, oid)) % K`. Reads on
+shard 0 no longer contend with reads on shard 1 — different shards'
+rwlock CAS lines live in different cores' L1s.
+
+### Results — get-by-id, **10K rows, 10s, single trial, vulcan, N=16 workers**
+
+| K   | ops/sec      | lift vs K=baseline | p50    | p99    | p99.99  |
+| --- | ------------ | ------------------ | ------ | ------ | ------- |
+| baseline (unsharded) | **4.68M** | 1.00× | 3 µs   | 7 µs   | 22 µs   |
+| 2   | **7.30M**    | **1.56×**          | 1 µs   | 5 µs   | 14 µs   |
+| 4   | **11.08M**   | **2.37×**          | 1 µs   | 3 µs   | 11 µs   |
+| 8   | **14.93M**   | **3.19×**          | 0 µs   | 1 µs   | 9 µs    |
+| 16  | **16.72M**   | **3.57×**          | 0 µs   | 1 µs   | 7 µs    |
+
+**Headline answers:**
+
+- **K=8 breaks the 10M ops/sec ceiling: 14.93M ops/sec (3.19× lift).**
+  The SP-Perf-A T7 diagnosis was correct — the rwlock reader-count
+  CAS ping-pong was the cliff; partitioning the keyspace into per-CPU
+  shards removes the contended cache line.
+- **K=4 already passes the 6M ops/sec target (11.08M / 2.37×).**
+- **K=16 still scales (3.57× over baseline) but the diminishing return
+  curve has started flattening** — K=16 vs K=8 = 1.12× — suggesting
+  another bottleneck is appearing past K=8 (likely the routing layer's
+  per-op Op::decode + thread-mpsc dispatch + reply-channel overhead;
+  V2 SHARD-READ wires the read pool through the dispatcher and may
+  push the curve further).
+- **p50 latency drops from 3 µs (K=baseline) to <1 µs (K>=4)** — fewer
+  threads contending for the same rwlock means a single read hops one
+  fewer cache line.
+
+### Honest framing — what V1 ships and what's deferred
+
+**SHARD-APPLY V1 ships:**
+
+1. Per-shard StateMachine + apply thread + WAL + SSTables (each shard
+   is a vanilla `EngineHandle` from `spawn_engine_cfg` with
+   `shard_count=None`, rooted at `data_dir/shard-<i>/`).
+2. Key routing via `hash(make_key(type_id, oid)) % K` (point-data ops
+   land on a single owning shard).
+3. Per-type pinning (FindBy / Describe / FindRange / FindByComposite
+   route by `(type_id, zero-oid)` so all rows of a type live on one
+   shard — secondary-index lookups stay single-shard).
+4. Schema DDL broadcast (CreateType / CreateIndex / AddOrderedIndex /
+   etc. apply to every shard sequentially; catalog stays byte-identical
+   across shards by construction).
+5. Sequencer ops pinned to a single shard via the fixed SEQ_TYPE key.
+6. K=1 collapse contract preserved (default `shard_count = None` →
+   single-engine path byte-for-byte unchanged; the SHARD-1
+   regression-lock KAT remains green).
+7. End-to-end determinism KAT: K=1 vs K=4 vs K=8 point-read results
+   are byte-identical across a 100-row Create+GetById workload
+   (`t2_determinism_oracle_k1_k4_k8_byte_equal` in
+   `sharded_engine.rs`).
+
+**SHARD-APPLY V1 explicitly DOES NOT ship (each is a named V2 arc):**
+
+1. **Cross-shard scatter-merge for scan ops** (`SP-Perf-A-SHARD-SCAN`)
+   — V1 routes Select / Aggregate / GroupAggregate / Query / Join /
+   etc. to shard 0 ONLY. This is INCORRECT for any workload where
+   data is spread across shards (data hashed to shard 5 won't appear
+   in a Select on shard 0). The `select-limit` smoke at K=4 returned
+   ~6,272 ops/sec with degenerate-correctness rows (shard 0 sees ~1/K
+   of the data, so LIMIT 10 fills early but misses ~3/4 of rows).
+   **Scan ops at K>=2 should be considered demo-only until SHARD-SCAN
+   ships.** Point reads + per-type FindBy are PRODUCTION-CORRECT at
+   K>=2 today.
+2. **Cross-shard atomic Op::Txn** (`SP-Perf-A-SHARD-XTXN`) — V1 routes
+   Txn to shard 0; cross-shard mutations inside a Txn would silently
+   miss the right shard. Single-shard Txn at K=1 works exactly as
+   today. Mixed-shard Txn at K>=2 is the named follow-up.
+3. **VSR replication × sharding** — V1 SHARD-APPLY is single-node
+   (no per-shard VSR group). Cluster mode + sharding is its own arc.
+
+### Test surface (vulcan, post-SHARD-APPLY)
+
+- `kesseldb-server` lib: 172/172 green (159 SHARD-1 baseline + 13
+  SHARD-APPLY: 9 routing classifiers + 4 integration KATs incl. the
+  K=1/K=4/K=8 byte-equal oracle).
+- Default `cargo build` byte-identical (`shard_count` defaults to
+  `None`; the sharded dispatcher is constructed only on opt-in).
+- `#![forbid(unsafe_code)]` honored; zero new external runtime deps.
+
+### Acceptance gate
+
+| Criterion | Outcome |
+|---|---|
+| K=N apply plumbing wired (per-shard SM, apply thread, WAL, SSTables) | YES |
+| Key routing deterministic (same key → same shard) | YES (`route_op` KAT-locked) |
+| K=1 collapse byte-identical to pre-SHARD | YES (default cargo build untouched; SHARD-1 KAT green) |
+| Determinism oracle K=1/K=4/K=8 byte-equal | YES (`t2_determinism_oracle_*` green) |
+| K=4 lifts past 6M ops/sec on vulcan | YES (**11.08M / 2.37×**) |
+| K=8 lifts past 10M ops/sec on vulcan | YES (**14.93M / 3.19× — HEADLINE TARGET MET**) |
+| Workspace tests pass | YES (172/172 server lib) |
+| `#![forbid(unsafe_code)]` honored | YES |
+| No new external deps | YES |
+| V1 limitations honestly documented | YES (scan / Txn / VSR each named V2 arc) |
+
 

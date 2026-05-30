@@ -8,7 +8,15 @@ flatlining at ~5M ops/sec at N=16 on vulcan. The diagnosis named
 the next ceiling. SHARD attacks that ceiling by partitioning the
 key space into K shards, each with its own state-machine + read lock.
 
-## Status: PAUSED at SHARD-1 DONE (design + scaffold + K=1 regression-lock landed; multi-arc continuation named)
+## Status: SHARD-APPLY DONE (K=N apply path SHIPPED; 3.19× lift at K=8 on vulcan, breaks 10M ops/sec ceiling)
+
+**Update (2026-05-30 — SHARD-APPLY closed)**: V2's K=N apply plumbing
+slice SHIPPED. The K=N apply path is wired, KAT-locked, and benchmarked
+on vulcan: K=8 = 14.93M ops/sec (3.19× over the SP-Perf-A T7 ~5M
+ceiling); K=16 = 16.72M ops/sec (3.57×). The next sub-arcs (SHARD-READ,
+SHARD-SCAN, SHARD-XTXN, SHARD-BENCH-full) remain named.
+
+## Historical status (pre-SHARD-APPLY): PAUSED at SHARD-1 DONE
 
 This is a **multi-arc project**, not a single arc. SHARD-1 (this)
 ships the design + scaffold. The K=N apply plumbing is the
@@ -44,7 +52,16 @@ See design spec §3 + §9 for the full scoping rationale + roadmap.
 |---|---|---|---|
 | **T1** | Design spec (11 sections + 8 weak-spots + 7 locked invariants + 6-arc decomposition) + progress tracker (this file). NO runtime code change. | **DONE** | `f634f07` |
 | **T2** | Scaffold: `crates/kesseldb-server/src/sharded_sm.rs` with `ShardedStateMachine<V>`, `shard_of_key` (K=1 short-circuit + K>=2 fxhash-mod), `shard_of_op` (point-data → `Single`, scans/joins/Op::Txn-at-K>=2 → `FanOut`), `read_only_op_k1` (panics on K>=2 — that path is V2 work), local `fxhash_fold` (no new dep), 11 KATs (fxhash determinism + input-distinguishing, K=1 collapse, K=4 deterministic + distributes, K=1 classifications, K=2 point-op deterministic, **headline `shard_k1_matches_unsharded_sm_byte_equal` regression-lock**, K>=2 panic fail-fast, accessors, K=0 rejected). `ServerConfig.shard_count: Option<usize>` field added but NOT wired into `spawn_engine_cfg` (the K=N engine wiring is the SP-Perf-A-SHARD-APPLY arc). Default `cargo build` byte-identical. kesseldb-server lib 148 → 159 tests (+11, 0 regressions); kessel-sim release 3/3 green; `cargo build --workspace` clean. | **DONE** | `d5691a6` |
-| **SP-Perf-A-SHARD-APPLY** | K=N apply plumbing: per-shard apply thread, write routing layer, per-shard WAL group-commit. **MULTI-WEEK CORE.** | Named, not started | — |
+| **SP-Perf-A-SHARD-APPLY T1** | Per-shard `EngineHandle` scaffold + `route_op` key→shard routing classifier + `spawn_sharded_engine_cfg` (spawns K vanilla sub-engines rooted at `data_dir/shard-<i>/` + a router shell at `data_dir/router/` whose `EngineHandle.sharded = Some(dispatcher)`). `apply_raw`/`apply`/`apply_op` short-circuit through the dispatcher. DDL broadcasts to every shard sequentially (catalog stays byte-identical by deterministic allocator). Scan/Txn/admin route to shard 0 (V1 limitation, named SHARD-SCAN follow-up). 9 routing unit KATs. **DONE.** | `76d5a50` |
+| **SP-Perf-A-SHARD-APPLY T2** | 4 end-to-end integration KATs: K=4 16-row write/read round-trip; K=8 64-row round-trip; **HEADLINE K=1/K=4/K=8 byte-equal determinism oracle** on 100-row workload (proves routing is correct end-to-end); K=4 200-row write distribution KAT (every shard receives >= 10/200, sum=200). kesseldb-server lib 159 → 172 tests. **DONE.** | `37371fd` |
+| **SP-Perf-A-SHARD-APPLY T3** | `--shard-count N` flag on `kessel-bench parallel-reads` so the same harness measures K=1/2/4/8/16. **DONE.** | `27e3092` |
+| **SP-Perf-A-SHARD-APPLY T5** | vulcan YCSB-C sweep: K=baseline 4.68M ops/sec; K=2 7.30M (1.56×); **K=4 11.08M (2.37×, blows past 6M target)**; **K=8 14.93M (3.19×, BREAKS the 10M ceiling — HEADLINE)**; K=16 16.72M (3.57×). Diminishing returns past K=8 suggest routing-layer overhead is the next ceiling — V2 SHARD-READ should help. **DONE.** | (this commit) |
+| **SP-Perf-A-SHARD-APPLY T6** | Arc closure: STATUS, BENCHMARKS §13, progress tracker. **DONE.** | (this commit) |
+| **SP-Perf-A-SHARD-APPLY-WAL** | V1 reuses each sub-engine's existing per-shard WAL (each sub-engine is a vanilla `StateMachine` with its own `data_dir/shard-<i>/wal`, recovers independently via `StateMachine::open`). The "per-shard WAL fsync contention" concern named in the dispatch doesn't apply because each sub-engine has its OWN WAL on its own data dir — no shared fsync to contend on. **CLOSED by virtue of T1's per-shard sub-engine shape.** | (subsumed) |
+| **SP-Perf-A-SHARD-READ** | `read_pool` workers dispatch reads to their shard's read-lock. V1 already enables per-sub-engine `read_workers` so reads go through each sub-engine's existing T6 in-process fast path; SHARD-READ as a separate arc is now about making the OUTER router-shell read pool shard-aware (skipping the dispatcher overhead). **Named, not started; would lift the K=16 1.12× ceiling further.** | Named, not started | — |
+| **SP-Perf-A-SHARD-SCAN** | In-process scatter-merge for fan-out scan ops; reuse `scatter_scan` merge contract. **V1 SHARD-APPLY routes scans to shard 0 ONLY — incorrect for spread data.** This arc is the production-correctness fix for scan ops at K>=2. | Named, not started | — |
+| **SP-Perf-A-SHARD-XTXN** | Cross-shard atomic txns via XSHARD keyspace 2PC. V1 routes Op::Txn to shard 0 only. | Named, not started | — |
+| **SP-Perf-A-SHARD-BENCH** | Multi-workload K=N sweep on vulcan (YCSB-A/B/C, sysbench OLTP, TPC-H). T5 shipped the YCSB-C cell; the full matrix is its own arc. | Named, not started (T5 = YCSB-C only) | — |
 | **SP-Perf-A-SHARD-READ** | `read_pool` workers dispatch reads to their shard's read-lock. | Named, not started | — |
 | **SP-Perf-A-SHARD-SCAN** | In-process scatter-merge for fan-out scan ops; reuse `scatter_scan` merge contract. | Named, not started | — |
 | **SP-Perf-A-SHARD-XTXN** | Cross-shard atomic txns via XSHARD keyspace 2PC. | Named, not started | — |

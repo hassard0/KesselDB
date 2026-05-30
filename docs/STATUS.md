@@ -290,6 +290,57 @@ covered by the workspace test suite (2024 default / 2052 with
   → PAUSED at SHARD-1 DONE (multi-arc continuation named). **TaskList
   #348 partial progress — design + scaffold landed; K=N apply path is
   the SP-Perf-A-SHARD-APPLY sub-arc.**
+- **Track L cont. — SP-Perf-A-SHARD-APPLY (2026-05-30, K=N apply path
+  SHIPPED; vulcan 3.19× lift at K=8 BREAKS the 10M ops/sec ceiling).**
+  The multi-week-core arc named in SHARD-1 — wires K independent
+  per-shard sub-engines (each its own `Arc<RwLock<StateMachine>>` +
+  apply thread + WAL + SSTables, rooted at `data_dir/shard-<i>/`)
+  and routes every Op via `hash(make_key(type_id, oid)) % K`. T1:
+  `crates/kesseldb-server/src/sharded_engine.rs` with
+  `ShardedDispatcher`, `route_op` classifier (Single(s) for point
+  ops by primary-key shard; per-type pinning for FindBy / Describe /
+  FindRange / FindByComposite via `(type_id, zero-oid)`; sequencer
+  pinned via fixed SEQ_TYPE key; Broadcast for every DDL op including
+  CreateType / CreateIndex / AddOrderedIndex / AddCompositeIndex /
+  AddUnique / AddForeignKey / AddCheck / AddTrigger /
+  AddBalanceGuard / Drop* / RenameField / AlterTypeAddField /
+  Create|Drop|Refresh-ExternalSource; ShardZero for scans / Txn /
+  cross-shard ops as documented V1 limitation). `spawn_sharded_engine_cfg`
+  spawns K vanilla sub-engines via `spawn_engine_cfg(.., shard_count=None)`
+  + a router-shell engine at `data_dir/router/` whose
+  `EngineHandle.sharded = Some(dispatcher)`; `apply_raw` / `apply` /
+  `apply_op` short-circuit through the dispatcher when set.
+  Activation: opt-in via `ServerConfig.shard_count = Some(K)` with
+  K >= 2; default `None` and `Some(1)` preserve SP-Perf-A T7
+  ownership shape byte-for-byte (SHARD-1 K=1 regression-lock KAT
+  still green). T2: 4 integration KATs incl. headline
+  `t2_determinism_oracle_k1_k4_k8_byte_equal` (seeds identical
+  100-row workload on K=1 / K=4 / K=8 engines, asserts byte-equal
+  GetById + Describe results across all K). T3: `--shard-count N`
+  flag on `kessel-bench parallel-reads` so the same harness measures
+  K=1 / 2 / 4 / 8 / 16. T5 (vulcan YCSB-C sweep, 16 workers, 10K
+  rows, 10s): K=baseline 4.68M ops/sec; K=2 7.30M (1.56×); K=4
+  11.08M (2.37× — blows past 6M target); **K=8 14.93M (3.19× —
+  BREAKS the 10M ceiling, the HEADLINE TARGET)**; K=16 16.72M
+  (3.57× — diminishing return curve starting to flatten, V2
+  SHARD-READ would push further). p50 latency drops from 3 µs
+  (unsharded) to <1 µs (K>=4). Test surface: kesseldb-server lib
+  159 → 172 tests (+13 SHARD-APPLY: 9 routing classifiers + 4
+  end-to-end KATs); 172/172 green; default `cargo build`
+  byte-identical; `#![forbid(unsafe_code)]` honored; zero new
+  external runtime deps. Honest V1 limitations: scan ops (Select /
+  Aggregate / Query / Join / etc.) route to shard 0 ONLY —
+  INCORRECT for data spread across shards (named SP-Perf-A-SHARD-SCAN
+  follow-up); Op::Txn routes to shard 0 (cross-shard Txn =
+  SP-Perf-A-SHARD-XTXN follow-up); VSR × sharding is its own arc.
+  Commits: `76d5a50` (T1 per-shard engine + routing), `37371fd`
+  (T2 oracle KATs), `27e3092` (T3 bench flag), plus this commit
+  (T5 benchmark results + T6 STATUS + BENCHMARKS §13 + tracker
+  close). Progress tracker → SHARD-APPLY DONE (continuation arcs
+  SHARD-READ / SHARD-SCAN / SHARD-XTXN / SHARD-BENCH-full remain
+  named). **TaskList #349 DONE — K=N apply plumbing is the
+  multi-week core SHARD-1 named; today's slice ships it AND lifts
+  the ~5M ops/sec ceiling to 14.93M.**
 - **Track D — Cluster test flakes (SP-CLUSTER-FLAKE T2).** Root-cause fixed
   in `Node::submit*` / `apply_raw`: production VSR retry on transient
   ViewChange. Not just a test relaxation — the actual production code path

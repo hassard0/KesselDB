@@ -28,7 +28,7 @@
 # zero-dep stance is preserved (no new runtime deps added to any crate).
 ################################################################################
 
-FROM rust:1.83-slim AS builder
+FROM rust:1-slim AS builder
 WORKDIR /src
 
 # Copy the source tree. .dockerignore keeps target/ + git data out of the

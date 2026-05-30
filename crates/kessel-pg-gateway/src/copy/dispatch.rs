@@ -152,10 +152,12 @@ pub enum CopyDataOutcome {
 /// splitting on `\n`. For each complete row:
 /// - skip if the row is the `\.` end-of-data marker;
 /// - else parse via `parse_text_row_bytes`;
-/// - else synthesize `INSERT INTO <table> [(cols)] VALUES (...)`;
-/// - dispatch through `dispatch::dispatch_query`;
-/// - if the dispatch response contains an ErrorResponse,
-///   surface the bytes + abort the COPY.
+/// - else **SP-PG-COPY-BULKAPPLY V1**: append to `state.pending_rows`;
+/// - when `pending_rows.len() >= state.batch_size`, drain via
+///   `flush_pending_batch` — synthesize one multi-row INSERT (or fall
+///   back to per-row dispatch if any pending row contains a NULL),
+///   dispatch through `dispatch::dispatch_query` ONCE, and clear the
+///   buffer.
 ///
 /// The trailing incomplete row (if any) goes back into the carry
 /// buffer for the next CopyData frame.
@@ -196,47 +198,28 @@ pub fn process_copy_data<E: EngineApply + ?Sized>(
         }
         match parse_text_row_bytes(line, state.column_count as usize) {
             Ok(fields) => {
-                let sql = match synthesize_insert_sql(
-                    &state.table,
-                    state.columns.as_deref(),
-                    &state.column_kinds,
-                    &fields,
-                ) {
-                    Ok(s) => s,
-                    Err(reason) => {
-                        return CopyDataOutcome::Failed {
-                            bytes: error_response_then_rfq(
-                                "22023",
-                                &format!(
-                                    "COPY row {} encode failed: {reason}",
-                                    state.rows_ingested + 1
-                                ),
-                            ),
-                        };
+                // SP-PG-COPY-BULKAPPLY V1 — buffer instead of dispatch.
+                state.pending_rows.push(fields);
+                if state.pending_rows.len() >= state.batch_size {
+                    if let Some(fail_bytes) = flush_pending_batch(&mut state, engine) {
+                        return CopyDataOutcome::Failed { bytes: fail_bytes };
                     }
-                };
-                let resp = dispatch::dispatch_query(&sql, engine);
-                // Inspect the response for an ErrorResponse.
-                if let Some((sqlstate, msg)) = extract_error_response(&resp) {
-                    return CopyDataOutcome::Failed {
-                        bytes: error_response_then_rfq(
-                            &sqlstate,
-                            &format!(
-                                "COPY row {}: {msg}",
-                                state.rows_ingested + 1
-                            ),
-                        ),
-                    };
                 }
-                state.rows_ingested += 1;
             }
             Err(e) => {
+                // The failing row number is the next row past the
+                // already-ingested + already-buffered count. Compute
+                // BEFORE clearing the pending buffer.
+                let failing_row =
+                    state.rows_ingested + state.pending_rows.len() as u64 + 1;
+                // Drop the pending buffer on parse failure — those
+                // rows were never applied (PG semantics: abort).
+                state.pending_rows.clear();
                 return CopyDataOutcome::Failed {
                     bytes: error_response_then_rfq(
                         "22023",
                         &format!(
-                            "COPY row {} parse failed: {e:?}",
-                            state.rows_ingested + 1
+                            "COPY row {failing_row} parse failed: {e:?}"
                         ),
                     ),
                 };
@@ -248,10 +231,185 @@ pub fn process_copy_data<E: EngineApply + ?Sized>(
     CopyDataOutcome::Continue { state }
 }
 
-/// Finalize a successful COPY FROM STDIN exchange (CopyDone received).
-/// Emits `CommandComplete("COPY N")` + `ReadyForQuery('I')`. The
-/// caller transitions back to `CopyState::Idle`.
-pub fn finalize_copy_in_success(state: &CopyInState) -> Vec<u8> {
+/// **SP-PG-COPY-BULKAPPLY V1** — drain `state.pending_rows` as one
+/// engine round-trip.
+///
+/// Strategy:
+/// - If every pending row is **all-non-NULL**, synthesize one
+///   multi-row `INSERT INTO t (cols) VALUES (...), (...), ...` and
+///   dispatch ONCE. kessel-sql compiles multi-tuple INSERT to
+///   `Op::Txn { ops: Vec<Op::Create> }`, so the apply thread sees a
+///   single all-or-nothing transaction per batch.
+/// - If ANY pending row contains a NULL field, fall back to V1
+///   per-row dispatch (the column-omit-on-NULL trick that kessel-sql
+///   relies on requires per-row column lists, which multi-row INSERT
+///   can't carry). The batch is still wire-correct; the throughput
+///   win is forfeited for that one batch.
+///
+/// On success: clears `pending_rows`, advances `rows_ingested`, and
+/// returns None. The state's `batch_start_row` is bumped to the new
+/// next-row position.
+///
+/// On failure: returns Some(bytes) — an ErrorResponse + RFQ frame
+/// with the batch's row-range tagged in the message. Caller must
+/// emit those bytes and transition to Idle.
+///
+/// Returns None when `pending_rows` is empty (no-op).
+pub fn flush_pending_batch<E: EngineApply + ?Sized>(
+    state: &mut CopyInState,
+    engine: &E,
+) -> Option<Vec<u8>> {
+    if state.pending_rows.is_empty() {
+        return None;
+    }
+    let batch_size = state.pending_rows.len();
+    let batch_start = state.batch_start_row;
+    let batch_end = batch_start + batch_size as u64 - 1;
+    let rows = std::mem::take(&mut state.pending_rows);
+
+    let has_null = rows.iter().any(|r| r.iter().any(|f| f.is_none()));
+    let result = if has_null {
+        // Fallback: per-row dispatch through the existing V1 path.
+        // Each row is one `INSERT INTO t [(non_null_cols)] VALUES (...)`
+        // — kessel-sql auto-fills NULL for the omitted nullable
+        // columns. Atomicity: per-row (same as V1).
+        flush_per_row(state, engine, &rows, batch_start)
+    } else {
+        // Fast path: one multi-row INSERT.
+        flush_multi_row(state, engine, &rows, batch_start, batch_end)
+    };
+
+    if result.is_none() {
+        // Success: advance the row counters + batch start.
+        state.rows_ingested += batch_size as u64;
+        state.batch_start_row = batch_end + 1;
+    } else {
+        // Failure: drop pending (already taken above) — defensive
+        // even though we already drained.
+        state.pending_rows.clear();
+    }
+    result
+}
+
+/// Fast path — one multi-row `INSERT INTO t (cols) VALUES (...), ...`
+/// dispatched through `dispatch::dispatch_query`. kessel-sql compiles
+/// to `Op::Txn { ops: Vec<Op::Create> }`, so the apply thread sees a
+/// single atomic batch.
+fn flush_multi_row<E: EngineApply + ?Sized>(
+    state: &CopyInState,
+    engine: &E,
+    rows: &[Vec<Option<Vec<u8>>>],
+    batch_start: u64,
+    batch_end: u64,
+) -> Option<Vec<u8>> {
+    let sql = match synthesize_multi_row_insert_sql(
+        &state.table,
+        state.columns.as_deref(),
+        &state.column_kinds,
+        rows,
+    ) {
+        Ok(s) => s,
+        Err(reason) => {
+            return Some(error_response_then_rfq(
+                "22023",
+                &format!(
+                    "COPY batch starting at row {batch_start}: encode failed: {reason}"
+                ),
+            ));
+        }
+    };
+    let resp = dispatch::dispatch_query(&sql, engine);
+    if let Some((sqlstate, msg)) = extract_error_response(&resp) {
+        Some(error_response_then_rfq(
+            &sqlstate,
+            &format!(
+                "COPY batch starting at row {batch_start} (rows {batch_start}..{batch_end}): {msg}"
+            ),
+        ))
+    } else {
+        None
+    }
+}
+
+/// Fallback path — per-row dispatch. Used when any row in the batch
+/// has a NULL field (kessel-sql multi-row INSERT can't express NULL
+/// in a VALUES tuple via the column-omit trick because all tuples
+/// share the same column list). Atomicity: per-row (same as V1).
+fn flush_per_row<E: EngineApply + ?Sized>(
+    state: &CopyInState,
+    engine: &E,
+    rows: &[Vec<Option<Vec<u8>>>],
+    batch_start: u64,
+) -> Option<Vec<u8>> {
+    for (i, fields) in rows.iter().enumerate() {
+        let row_num = batch_start + i as u64;
+        let sql = match synthesize_insert_sql(
+            &state.table,
+            state.columns.as_deref(),
+            &state.column_kinds,
+            fields,
+        ) {
+            Ok(s) => s,
+            Err(reason) => {
+                return Some(error_response_then_rfq(
+                    "22023",
+                    &format!(
+                        "COPY row {row_num} encode failed: {reason}"
+                    ),
+                ));
+            }
+        };
+        let resp = dispatch::dispatch_query(&sql, engine);
+        if let Some((sqlstate, msg)) = extract_error_response(&resp) {
+            return Some(error_response_then_rfq(
+                &sqlstate,
+                &format!("COPY row {row_num}: {msg}"),
+            ));
+        }
+    }
+    None
+}
+
+/// Outcome of finalizing a COPY FROM STDIN exchange at CopyDone.
+///
+/// **SP-PG-COPY-BULKAPPLY V1** — CopyDone now triggers a tail-drain of
+/// any rows still sitting in `pending_rows`, which can fail (a
+/// constraint violation in the final partial batch). Distinguish the
+/// success and failure paths so the server loop emits the right
+/// bytes.
+#[derive(Debug)]
+pub enum CopyDoneOutcome {
+    /// Tail-drain succeeded; emit the bytes (CommandComplete + RFQ).
+    Ok { bytes: Vec<u8> },
+    /// Tail-drain failed; emit the bytes (ErrorResponse + RFQ).
+    Failed { bytes: Vec<u8> },
+}
+
+/// **SP-PG-COPY-BULKAPPLY V1** — finalize a successful COPY FROM
+/// STDIN exchange (CopyDone received). Drains any rows still in
+/// `pending_rows` as a final multi-row INSERT batch, then emits
+/// `CommandComplete("COPY N")` + `ReadyForQuery('I')`.
+///
+/// If the tail-drain fails (e.g. a NOT NULL violation in the last
+/// partial batch), emits `ErrorResponse + RFQ` per the standard
+/// error path.
+pub fn finalize_copy_in_success<E: EngineApply + ?Sized>(
+    state: &mut CopyInState,
+    engine: &E,
+) -> CopyDoneOutcome {
+    if !state.pending_rows.is_empty() {
+        if let Some(fail_bytes) = flush_pending_batch(state, engine) {
+            return CopyDoneOutcome::Failed { bytes: fail_bytes };
+        }
+    }
+    CopyDoneOutcome::Ok {
+        bytes: finalize_copy_in_success_no_flush(state),
+    }
+}
+
+/// Inner: emit CommandComplete + RFQ. Separated so the dispatch KAT
+/// can lock the byte shape independently of the flush path.
+pub fn finalize_copy_in_success_no_flush(state: &CopyInState) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&encode_command_complete(&copy_tag(state.rows_ingested)));
     out.extend_from_slice(&encode_ready_for_query(b'I'));
@@ -540,6 +698,93 @@ fn synthesize_insert_sql(
     Ok(s)
 }
 
+/// **SP-PG-COPY-BULKAPPLY V1** — synthesize a single multi-row
+/// `INSERT INTO t (cols) VALUES (...), (...), ..., (...)`. Caller
+/// MUST guarantee every row in `rows` is all-non-NULL — multi-row
+/// INSERT can't carry per-tuple column lists, and kessel-sql lacks
+/// a `NULL` literal in VALUES, so a NULL field would require dropping
+/// a column from a tuple, which breaks the cols/values count match.
+///
+/// kessel-sql compiles the resulting SQL to `Op::Txn { ops: Vec<
+/// Op::Create> }` (per `crates/kessel-sql/src/lib.rs` lines 1245-1260),
+/// so the engine sees ONE atomic round-trip for the whole batch.
+///
+/// Returns `Err(...)` if any field is not valid UTF-8 (matching the
+/// per-row synthesizer's contract).
+fn synthesize_multi_row_insert_sql(
+    table: &str,
+    columns: Option<&[String]>,
+    kinds: &[kessel_catalog::FieldKind],
+    rows: &[Vec<Option<Vec<u8>>>],
+) -> Result<String, String> {
+    debug_assert!(!rows.is_empty(), "caller must pre-check empty batch");
+    debug_assert!(
+        rows.iter().all(|r| r.iter().all(|f| f.is_some())),
+        "caller must pre-check has_null fallback before multi-row synth"
+    );
+
+    let cols_slice: Option<&[String]> = columns;
+
+    // Pre-allocate generously: ~50 bytes per tuple is the sysbench
+    // shape. 1024 rows → 50 KiB.
+    let mut s = String::with_capacity(rows.len() * 64);
+    s.push_str("INSERT INTO ");
+    s.push_str(table);
+    if let Some(cols) = cols_slice {
+        s.push_str(" (");
+        for (i, c) in cols.iter().enumerate() {
+            if i > 0 {
+                s.push_str(", ");
+            }
+            s.push_str(c);
+        }
+        s.push(')');
+    }
+    s.push_str(" VALUES ");
+    for (ri, row) in rows.iter().enumerate() {
+        if ri > 0 {
+            s.push_str(", ");
+        }
+        s.push('(');
+        for (i, v) in row.iter().enumerate() {
+            if i > 0 {
+                s.push_str(", ");
+            }
+            let bytes = v
+                .as_ref()
+                .expect("caller must pre-check has_null before multi-row synth");
+            let text = std::str::from_utf8(bytes)
+                .map_err(|_| "field is not valid UTF-8".to_string())?;
+            let kind = kinds
+                .get(i)
+                .copied()
+                .unwrap_or(kessel_catalog::FieldKind::Char(0));
+            let want_quoted = matches!(
+                kind,
+                kessel_catalog::FieldKind::Char(_)
+                    | kessel_catalog::FieldKind::Bytes(_)
+                    | kessel_catalog::FieldKind::Ref
+                    | kessel_catalog::FieldKind::OverflowRef
+            );
+            if want_quoted {
+                s.push('\'');
+                for c in text.chars() {
+                    if c == '\'' {
+                        s.push_str("''");
+                    } else {
+                        s.push(c);
+                    }
+                }
+                s.push('\'');
+            } else {
+                s.push_str(text);
+            }
+        }
+        s.push(')');
+    }
+    Ok(s)
+}
+
 /// Walk a `dispatch::dispatch_query` byte-stream and, if the first
 /// frame is `E` ErrorResponse, return `Some((sqlstate, message))`
 /// extracted from the ErrorResponse payload. Returns `None` if no
@@ -804,9 +1049,10 @@ mod tests {
         }
     }
 
-    /// SP-PG-COPY T2: a single CopyData containing 3 rows ingests 3
-    /// rows. The applied SQL for each row contains the `INSERT INTO t`
-    /// shape with the right values.
+    /// SP-PG-COPY T2 / SP-PG-COPY-BULKAPPLY V1: a single CopyData
+    /// containing 3 rows with `batch_size=1` ingests 3 rows per-row
+    /// (V1 baseline shape). The applied SQL for each row contains
+    /// the `INSERT INTO t` shape with the right values.
     #[test]
     fn t2_process_copy_data_three_rows_ingests_three_inserts() {
         let cols = vec![
@@ -814,16 +1060,20 @@ mod tests {
             PgColumn { name: "name".into(), kind: FieldKind::Char(32), nullable: true },
         ];
         let eng = make_engine(cols);
-        let state = CopyInState::new(
+        let mut state = CopyInState::new(
             "t".to_string(),
             Some(vec!["id".to_string(), "name".to_string()]),
             2,
         );
+        // Force per-row dispatch (V1 baseline shape) so this KAT's
+        // SQL-shape assertion still locks the per-row synthesis path.
+        state.batch_size = 1;
         let data = b"1\thello\n2\tworld\n3\tfoo\n";
         match process_copy_data(data, state, &eng) {
             CopyDataOutcome::Continue { state } => {
                 assert_eq!(state.rows_ingested, 3);
                 assert!(state.carry.is_empty());
+                assert!(state.pending_rows.is_empty());
                 let applied = eng.applied.lock().unwrap();
                 assert_eq!(applied.len(), 3);
                 // CopyInState::new (no kinds) → both fields quoted +
@@ -840,11 +1090,211 @@ mod tests {
         }
     }
 
-    /// SP-PG-COPY T2: a CopyData with an incomplete trailing row
-    /// stashes the partial bytes in carry; the next CopyData picks
-    /// up where the first left off.
+    /// SP-PG-COPY-BULKAPPLY V1: a CopyData containing 3 rows with
+    /// `batch_size=1024` (the default) BUFFERS — none are applied
+    /// until the flush triggers (CopyDone). After `flush_pending_batch`,
+    /// the engine has seen ONE multi-row INSERT covering all 3 rows.
     #[test]
-    fn t2_process_copy_data_carries_partial_row() {
+    fn bulkapply_three_rows_under_batch_size_buffers_until_flush() {
+        let cols = vec![
+            PgColumn { name: "id".into(), kind: FieldKind::I64, nullable: false },
+            PgColumn { name: "name".into(), kind: FieldKind::Char(32), nullable: true },
+        ];
+        let eng = make_engine(cols);
+        let state = CopyInState::new(
+            "t".to_string(),
+            Some(vec!["id".to_string(), "name".to_string()]),
+            2,
+        );
+        // Default batch_size=1024 → 3 rows do not trigger flush.
+        let data = b"1\thello\n2\tworld\n3\tfoo\n";
+        let mut state = match process_copy_data(data, state, &eng) {
+            CopyDataOutcome::Continue { state } => state,
+            other => panic!("expected Continue, got {other:?}"),
+        };
+        // No INSERT has fired yet — rows are buffered.
+        assert_eq!(state.rows_ingested, 0);
+        assert_eq!(state.pending_rows.len(), 3);
+        assert_eq!(eng.applied.lock().unwrap().len(), 0);
+
+        // Drain via flush_pending_batch — one multi-row INSERT to
+        // the engine.
+        let result = flush_pending_batch(&mut state, &eng);
+        assert!(result.is_none(), "flush should succeed");
+        assert_eq!(state.rows_ingested, 3);
+        assert!(state.pending_rows.is_empty());
+        let applied = eng.applied.lock().unwrap();
+        assert_eq!(
+            applied.len(),
+            1,
+            "expected ONE multi-row INSERT for 3 buffered rows; got {} dispatches: {:?}",
+            applied.len(),
+            *applied
+        );
+        // The single dispatched SQL must carry three VALUES tuples.
+        assert!(
+            applied[0].contains("VALUES ('1', 'hello'), ('2', 'world'), ('3', 'foo')"),
+            "unexpected SQL: {}",
+            applied[0]
+        );
+        // Locked: exactly 2 ", (" delimiters between 3 tuples.
+        assert_eq!(applied[0].matches("), (").count(), 2);
+    }
+
+    /// SP-PG-COPY-BULKAPPLY V1: when `pending_rows` reaches
+    /// `batch_size`, a flush fires automatically inside
+    /// `process_copy_data`. 2 * batch_size rows + batch_size=4 →
+    /// 2 multi-row INSERTs fired during processing.
+    #[test]
+    fn bulkapply_threshold_flush_during_processing() {
+        let cols = vec![PgColumn {
+            name: "id".into(),
+            kind: FieldKind::I64,
+            nullable: false,
+        }];
+        let eng = make_engine(cols);
+        let mut state = CopyInState::new(
+            "t".to_string(),
+            Some(vec!["id".to_string()]),
+            1,
+        );
+        state.batch_size = 4;
+        // 8 rows = 2 batches at batch_size=4.
+        let data = b"1\n2\n3\n4\n5\n6\n7\n8\n";
+        match process_copy_data(data, state, &eng) {
+            CopyDataOutcome::Continue { state } => {
+                assert_eq!(state.rows_ingested, 8);
+                assert!(state.pending_rows.is_empty());
+                let applied = eng.applied.lock().unwrap();
+                assert_eq!(
+                    applied.len(),
+                    2,
+                    "expected exactly 2 batches at batch_size=4 for 8 rows"
+                );
+                // Each batch is one multi-row INSERT with 4 tuples.
+                for sql in applied.iter() {
+                    assert_eq!(sql.matches("), (").count(), 3);
+                }
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
+    }
+
+    /// SP-PG-COPY-BULKAPPLY V1: a row containing a NULL field
+    /// triggers the per-row fallback for the WHOLE batch (the
+    /// kessel-sql column-omit trick can't be expressed in multi-row
+    /// INSERT). Flush emits N per-row INSERTs instead of 1 multi-row.
+    #[test]
+    fn bulkapply_null_in_batch_falls_back_to_per_row() {
+        let cols = vec![
+            PgColumn { name: "id".into(), kind: FieldKind::I64, nullable: false },
+            PgColumn { name: "name".into(), kind: FieldKind::Char(32), nullable: true },
+        ];
+        let eng = make_engine(cols);
+        let mut state = CopyInState::new(
+            "t".to_string(),
+            Some(vec!["id".to_string(), "name".to_string()]),
+            2,
+        );
+        state.batch_size = 3;
+        // 3 rows; middle has a NULL field.
+        let data = b"1\thello\n2\t\\N\n3\tworld\n";
+        match process_copy_data(data, state, &eng) {
+            CopyDataOutcome::Continue { state } => {
+                assert_eq!(state.rows_ingested, 3);
+                let applied = eng.applied.lock().unwrap();
+                // Per-row fallback: 3 separate INSERTs.
+                assert_eq!(
+                    applied.len(),
+                    3,
+                    "NULL in batch must fall back to per-row dispatch"
+                );
+                // None of the dispatches is multi-row (no ", (" delim).
+                for sql in applied.iter() {
+                    assert!(
+                        !sql.contains("), ("),
+                        "per-row fallback SQL must not be multi-tuple: {sql}"
+                    );
+                }
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
+    }
+
+    /// SP-PG-COPY-BULKAPPLY V1: a constraint error in a batch surfaces
+    /// the "in batch starting at row N" tag (the engine's Op::Txn
+    /// failure doesn't carry the exact failing op index — see design
+    /// §9 weak-spot #5).
+    #[test]
+    fn bulkapply_engine_error_in_batch_tags_batch_range() {
+        let cols = vec![PgColumn {
+            name: "id".into(),
+            kind: FieldKind::I64,
+            nullable: false,
+        }];
+        let eng = make_engine(cols);
+        // The multi-row dispatch result is a single Constraint error.
+        *eng.result.lock().unwrap() = vec![OpResult::Constraint(
+            "UNIQUE violated".into(),
+        )];
+        let mut state = CopyInState::new(
+            "t".to_string(),
+            Some(vec!["id".to_string()]),
+            1,
+        );
+        state.batch_size = 4;
+        let data = b"1\n2\n3\n4\n";
+        match process_copy_data(data, state, &eng) {
+            CopyDataOutcome::Failed { bytes } => {
+                assert_eq!(bytes[0], b'E');
+                // Tag must mention "batch starting at row 1".
+                assert!(
+                    bytes
+                        .windows(b"batch starting at row 1".len())
+                        .any(|w| w == b"batch starting at row 1"),
+                    "expected 'batch starting at row 1' tag in error"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// SP-PG-COPY-BULKAPPLY V1: an empty batch is a no-op for
+    /// `flush_pending_batch`. CopyDone with zero rows ingested must
+    /// emit `COPY 0` and dispatch nothing to the engine.
+    #[test]
+    fn bulkapply_empty_batch_is_noop() {
+        let cols = vec![PgColumn {
+            name: "id".into(),
+            kind: FieldKind::I64,
+            nullable: false,
+        }];
+        let eng = make_engine(cols);
+        let mut state = CopyInState::new(
+            "t".to_string(),
+            Some(vec!["id".to_string()]),
+            1,
+        );
+        let result = flush_pending_batch(&mut state, &eng);
+        assert!(result.is_none());
+        assert_eq!(state.rows_ingested, 0);
+        assert_eq!(eng.applied.lock().unwrap().len(), 0);
+        // CopyDone path emits "COPY 0".
+        match finalize_copy_in_success(&mut state, &eng) {
+            CopyDoneOutcome::Ok { bytes } => {
+                assert!(bytes.windows(b"COPY 0\0".len()).any(|w| w == b"COPY 0\0"));
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        // Still no engine dispatch.
+        assert_eq!(eng.applied.lock().unwrap().len(), 0);
+    }
+
+    /// SP-PG-COPY-BULKAPPLY V1: CopyDone with a partial tail batch
+    /// (rows < batch_size) triggers a tail-drain — one multi-row
+    /// INSERT fires + the COPY N tag reports the right count.
+    #[test]
+    fn bulkapply_copydone_drains_tail() {
         let cols = vec![PgColumn {
             name: "id".into(),
             kind: FieldKind::I64,
@@ -856,6 +1306,46 @@ mod tests {
             Some(vec!["id".to_string()]),
             1,
         );
+        // 5 rows; default batch_size=1024 so they all sit in pending.
+        let data = b"1\n2\n3\n4\n5\n";
+        let mut state = match process_copy_data(data, state, &eng) {
+            CopyDataOutcome::Continue { state } => state,
+            other => panic!("expected Continue, got {other:?}"),
+        };
+        assert_eq!(state.pending_rows.len(), 5);
+        assert_eq!(state.rows_ingested, 0);
+
+        match finalize_copy_in_success(&mut state, &eng) {
+            CopyDoneOutcome::Ok { bytes } => {
+                assert!(bytes.windows(b"COPY 5\0".len()).any(|w| w == b"COPY 5\0"));
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        assert_eq!(state.rows_ingested, 5);
+        let applied = eng.applied.lock().unwrap();
+        assert_eq!(applied.len(), 1, "tail-drain should fire ONE multi-row INSERT");
+        // 5 tuples = 4 separators.
+        assert_eq!(applied[0].matches("), (").count(), 4);
+    }
+
+    /// SP-PG-COPY T2: a CopyData with an incomplete trailing row
+    /// stashes the partial bytes in carry; the next CopyData picks
+    /// up where the first left off. Uses batch_size=1 so each
+    /// complete row dispatches immediately (V1-baseline shape).
+    #[test]
+    fn t2_process_copy_data_carries_partial_row() {
+        let cols = vec![PgColumn {
+            name: "id".into(),
+            kind: FieldKind::I64,
+            nullable: false,
+        }];
+        let eng = make_engine(cols);
+        let mut state = CopyInState::new(
+            "t".to_string(),
+            Some(vec!["id".to_string()]),
+            1,
+        );
+        state.batch_size = 1; // V1-baseline (per-row) for the assertion below.
         // Two complete rows + a partial "30" with no trailing \n.
         let data1 = b"10\n20\n30";
         let state = match process_copy_data(data1, state, &eng) {
@@ -896,11 +1386,16 @@ mod tests {
             PgColumn { name: "name".into(), kind: FieldKind::Char(32), nullable: true },
         ];
         let eng = make_engine(cols);
-        let state = CopyInState::new(
+        let mut state = CopyInState::new(
             "t".to_string(),
             Some(vec!["id".to_string(), "name".to_string()]),
             2,
         );
+        // BULKAPPLY V1: NULL-row fallback also drops the column from
+        // the per-row INSERT, but the row is BUFFERED until a flush.
+        // Set batch_size=1 to make the assertion below match the
+        // original V1 "applied immediately" semantics.
+        state.batch_size = 1;
         let data = b"1\t\\N\n";
         match process_copy_data(data, state, &eng) {
             CopyDataOutcome::Continue { state } => {
@@ -930,7 +1425,8 @@ mod tests {
             nullable: false,
         }];
         let eng = make_engine(cols);
-        let state = CopyInState::new("t".to_string(), Some(vec!["id".to_string()]), 1);
+        let mut state = CopyInState::new("t".to_string(), Some(vec!["id".to_string()]), 1);
+        state.batch_size = 1; // V1-baseline (per-row) for the count assertion below.
         // Two real rows + the \. marker line.
         let data = b"1\n2\n\\.\n";
         match process_copy_data(data, state, &eng) {
@@ -953,7 +1449,12 @@ mod tests {
             nullable: false,
         }];
         let eng = make_engine(cols);
-        let state = CopyInState::new("t".to_string(), Some(vec!["id".to_string()]), 1);
+        let mut state = CopyInState::new("t".to_string(), Some(vec!["id".to_string()]), 1);
+        // V1-baseline (per-row) — keeps the "row 2" tag deterministic
+        // independent of batching (BULKAPPLY would compute the same
+        // tag from rows_ingested+pending+1 but the legacy assertion
+        // is the simplest lock).
+        state.batch_size = 1;
         let data = b"1\n2\tbadextra\n3\n";
         match process_copy_data(data, state, &eng) {
             CopyDataOutcome::Failed { bytes } => {
@@ -981,7 +1482,10 @@ mod tests {
             OpResult::Constraint("NOT NULL violated".into()),
             OpResult::Ok,
         ];
-        let state = CopyInState::new("t".to_string(), Some(vec!["id".to_string()]), 1);
+        let mut state = CopyInState::new("t".to_string(), Some(vec!["id".to_string()]), 1);
+        // V1-baseline (per-row) — each row gets its own batch so the
+        // per-row constraint failure tag still says "row 2".
+        state.batch_size = 1;
         // engine.result is consumed via `pop()` so the LAST result
         // in the vec is for the FIRST row dispatch — order matches.
         let data = b"1\n2\n";
@@ -1003,7 +1507,8 @@ mod tests {
             nullable: false,
         }];
         let eng = make_engine(cols);
-        let state = CopyInState::new("t".to_string(), Some(vec!["id".to_string()]), 1);
+        let mut state = CopyInState::new("t".to_string(), Some(vec!["id".to_string()]), 1);
+        state.batch_size = 1; // V1-baseline (per-row) for the count assertion below.
         let data = b"10\r\n20\r\n";
         match process_copy_data(data, state, &eng) {
             CopyDataOutcome::Continue { state } => {
@@ -1017,15 +1522,14 @@ mod tests {
     /// `CommandComplete("COPY N") + RFQ` byte-correct.
     #[test]
     fn t2_finalize_copy_in_success_emits_command_complete_rfq() {
-        let state = CopyInState {
-            table: "t".to_string(),
-            columns: None,
-            column_count: 1,
-            column_kinds: Vec::new(),
-            carry: Vec::new(),
-            rows_ingested: 5,
-        };
-        let bytes = finalize_copy_in_success(&state);
+        let mut state = CopyInState::new("t".to_string(), None, 1);
+        state.rows_ingested = 5;
+        // SP-PG-COPY-BULKAPPLY V1 — finalize must NOT have any
+        // pending rows when called for the "already-flushed" path
+        // this test exercises (the dispatch test below covers the
+        // tail-drain path).
+        assert!(state.pending_rows.is_empty());
+        let bytes = finalize_copy_in_success_no_flush(&state);
         assert!(bytes.windows(b"COPY 5\0".len()).any(|w| w == b"COPY 5\0"));
         // Last 6 bytes = RFQ('I').
         assert_eq!(&bytes[bytes.len() - 6..], &[b'Z', 0, 0, 0, 5, b'I']);

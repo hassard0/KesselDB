@@ -455,14 +455,24 @@ pub fn run_session<
                     continue;
                 }
                 crate::proto::FE_COPY_DONE => {
-                    let in_state = match std::mem::replace(
+                    let mut in_state = match std::mem::replace(
                         &mut copy_state,
                         crate::copy::CopyState::Idle,
                     ) {
                         crate::copy::CopyState::In(s) => s,
                         crate::copy::CopyState::Idle => unreachable!("is_in() guarded"),
                     };
-                    let resp = crate::copy::dispatch::finalize_copy_in_success(&in_state);
+                    // SP-PG-COPY-BULKAPPLY V1 — drain any pending
+                    // rows as a final multi-row INSERT batch BEFORE
+                    // emitting CommandComplete. Surface a tail-drain
+                    // failure as a normal ErrorResponse + RFQ.
+                    let resp = match crate::copy::dispatch::finalize_copy_in_success(
+                        &mut in_state,
+                        engine,
+                    ) {
+                        crate::copy::dispatch::CopyDoneOutcome::Ok { bytes }
+                        | crate::copy::dispatch::CopyDoneOutcome::Failed { bytes } => bytes,
+                    };
                     stream.write_all(&resp)?;
                     stream.flush()?;
                     continue;
@@ -3379,17 +3389,26 @@ mod tests {
             out.windows(6).any(|w| w == rfq),
             "ReadyForQuery('I') MUST appear after CopyDone"
         );
-        // 3 INSERTs were dispatched to the engine.
+        // SP-PG-COPY-BULKAPPLY V1 — the 3 rows are folded into a
+        // single multi-row INSERT (kessel-sql compiles it to one
+        // Op::Txn). Default batch_size=1024 so all 3 rows fit in
+        // one batch + the CopyDone-finalize drains them as one
+        // dispatch.
         let applied = engine.applied.lock().unwrap();
         let insert_count = applied
             .iter()
             .filter(|s| s.to_ascii_uppercase().contains("INSERT"))
             .count();
-        assert_eq!(insert_count, 3, "exactly 3 INSERT rows ingested");
-        // Each INSERT has the right per-row VALUES.
-        assert!(applied.iter().any(|s| s.contains("'hello'")));
-        assert!(applied.iter().any(|s| s.contains("'world'")));
-        assert!(applied.iter().any(|s| s.contains("'from-psql'")));
+        assert_eq!(
+            insert_count, 1,
+            "BULKAPPLY V1: 3 rows fold into ONE multi-row INSERT (Op::Txn)"
+        );
+        // The single dispatched INSERT carries all three per-row VALUES.
+        assert!(applied[0].contains("'hello'"));
+        assert!(applied[0].contains("'world'"));
+        assert!(applied[0].contains("'from-psql'"));
+        // 3 VALUES tuples joined by ", (" → exactly 2 delimiters.
+        assert_eq!(applied[0].matches("), (").count(), 2);
     }
 
     /// SP-PG-COPY T2: a CopyFail mid-stream emits the canonical

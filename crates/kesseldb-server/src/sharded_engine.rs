@@ -69,7 +69,8 @@
 //! shard's catalog state after the SAME DDL prefix is byte-identical.
 
 use crate::scatter_scan::{
-    scatter_and_merge, ScatterKind, ShardCaller, DEFAULT_PER_SHARD_TIMEOUT,
+    scatter_and_merge, scatter_and_merge_via_pool, ScatterKind, ScatterPool,
+    ShardCaller, DEFAULT_PER_SHARD_TIMEOUT,
 };
 use crate::EngineHandle;
 use kessel_catalog::FieldKind;
@@ -334,6 +335,15 @@ pub struct ShardedDispatcher {
     /// thread-spawn helper take ownership without moving the
     /// dispatcher's slot.
     shards: Vec<Arc<EngineHandle>>,
+    /// SP-Perf-A-SHARD-SCAN-FASTPATH: persistent worker pool for
+    /// in-process scatter. Spawned once per dispatcher (one worker per
+    /// shard); replaces the per-call `std::thread::spawn` path that
+    /// dominated find-by perf at K=4 (~1500µs spawn overhead vs ~500ns
+    /// of useful work). Same merge contract as `scatter_and_merge`; per-
+    /// call overhead drops from ~1500µs to ~5-10µs (channel send/recv).
+    /// Lifetime tied to the dispatcher — `ScatterPool::drop` joins every
+    /// worker cleanly.
+    scatter_pool: ScatterPool,
 }
 
 impl ShardedDispatcher {
@@ -360,8 +370,39 @@ impl ShardedDispatcher {
             shards.len() >= 2,
             "ShardedDispatcher requires K >= 2 (K=1 collapses to unsharded)"
         );
+        let arced: Vec<Arc<EngineHandle>> =
+            shards.into_iter().map(Arc::new).collect();
+        // Build the FASTPATH worker pool: one worker per shard, each
+        // closing over its own `Arc<EngineHandle>` for direct
+        // `apply_op` dispatch. The pool spawns K workers up front; they
+        // block on their per-worker `sync_channel` until a scatter call
+        // dispatches work. Per-call overhead = channel send/recv (~5µs)
+        // instead of thread spawn (~250µs/thread).
+        let dispatch_fns: Vec<
+            Box<dyn Fn(&Op, &Arc<AtomicBool>) -> OpResult + Send + Sync + 'static>,
+        > = arced
+            .iter()
+            .map(|engine_arc| {
+                let engine = engine_arc.clone();
+                let boxed: Box<
+                    dyn Fn(&Op, &Arc<AtomicBool>) -> OpResult
+                        + Send
+                        + Sync
+                        + 'static,
+                > = Box::new(move |op: &Op, _cancel: &Arc<AtomicBool>| {
+                    // T6 in-process fast path — for read-only ops this
+                    // is a single `sm_shared.read().read_only_op(op.clone())`
+                    // call (zero encode/decode, one RwLock acquire).
+                    // Write ops route through the apply mpsc as usual.
+                    engine.apply_op(op)
+                });
+                boxed
+            })
+            .collect();
+        let scatter_pool = ScatterPool::new(dispatch_fns);
         Self {
-            shards: shards.into_iter().map(Arc::new).collect(),
+            shards: arced,
+            scatter_pool,
         }
     }
 
@@ -452,7 +493,34 @@ impl ShardedDispatcher {
             Ok(k) => k,
             Err(e) => return e,
         };
-        // 2. Build per-shard in-process callers.
+        // 2. SP-Perf-A-SHARD-SCAN-FASTPATH: dispatch via the persistent
+        //    worker pool instead of spawning K threads per call. Per-call
+        //    overhead drops from ~1500µs (4-thread spawn at K=4) to
+        //    ~5-10µs (4 channel sends + 4 recvs). The merge contract is
+        //    byte-identical to the spawn-per-call path; the pool is
+        //    constructed once with K workers and reused for every
+        //    scatter call against this dispatcher.
+        let cancel = Arc::new(AtomicBool::new(false));
+        scatter_and_merge_via_pool(
+            &self.scatter_pool,
+            op,
+            DEFAULT_PER_SHARD_TIMEOUT,
+            &resolved_kind,
+            cancel,
+        )
+    }
+
+    /// Legacy spawn-per-call scatter path. Kept for compatibility with
+    /// any caller that explicitly wants per-call thread spawn semantics
+    /// (e.g. for tests that want to verify the merge contract without
+    /// pool involvement). Production dispatch always uses
+    /// `scatter_dispatch` which routes through the pool.
+    #[allow(dead_code)]
+    fn scatter_dispatch_legacy(&self, op: &Op, kind: ScatterKind) -> OpResult {
+        let resolved_kind = match self.resolve_scatter_kind(op, kind) {
+            Ok(k) => k,
+            Err(e) => return e,
+        };
         let callers: Vec<InProcShardCaller> = self
             .shards
             .iter()
@@ -460,8 +528,6 @@ impl ShardedDispatcher {
                 engine: engine.clone(),
             })
             .collect();
-        // 3. Fan-out + merge with the same default-timeout the cluster
-        //    router uses. Cancel starts false (no precondition LIMIT).
         let cancel = Arc::new(AtomicBool::new(false));
         scatter_and_merge(
             callers,

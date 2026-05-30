@@ -1510,6 +1510,192 @@ impl<V: Vfs> StateMachine<V> {
         cand
     }
 
+    // SP-Hash-Agg V1 — shared numeric ≤8B Op::Aggregate fold used by
+    // BOTH `apply` and `read_only_op` so byte-identical results are
+    // guaranteed (apply-path determinism). Encoding: a 16-byte LE i128.
+    //
+    // Same two-phase parallel structure as `group_aggregate_multi`:
+    // Phase A materialises the candidate row set; Phase B+C either
+    // folds serially (rows < MIN_PARALLEL_ROWS) or partitions across
+    // NUM_HASH_AGG_WORKERS workers via std::thread::scope, then merges
+    // the scalar partials. Combine is associative for SUM/COUNT and
+    // associative+commutative for MIN/MAX, so the parallel result is
+    // byte-identical to the serial path — locked by an SM-level KAT.
+    //
+    // Caller is responsible for the MIN/MAX var-order fast path and
+    // the COUNT(*) no-field handling (only the numeric ≤8B scan
+    // path is shared here).
+    fn aggregate_numeric_scan(
+        &self,
+        type_id: u32,
+        program: &[u8],
+        kind: u8,
+        field_id: u16,
+        range_preds: &[(u16, u8, Vec<u8>)],
+    ) -> OpResult {
+        if kind > 4 {
+            return OpResult::SchemaError("agg kind must be 0|1|2|3|4".into());
+        }
+        let ot = match self.catalog.get(type_id) {
+            Some(t) => t.clone(),
+            None => return OpResult::SchemaError(format!("no type {type_id}")),
+        };
+        let cand = self.narrow_by_range_preds(type_id, &ot, range_preds);
+        // COUNT skips the field; SUM/MIN/MAX/AVG need a numeric ≤8B field.
+        let fpos: Option<(usize, usize, bool)> = if kind == 0 {
+            None
+        } else {
+            match Self::ord_field_pos(&ot, field_id) {
+                Some((off, w, fk)) => {
+                    use kessel_catalog::FieldKind::*;
+                    let signed = matches!(fk, I8 | I16 | I32 | I64 | Fixed { .. });
+                    Some((off, w, signed))
+                }
+                None => {
+                    return OpResult::SchemaError(
+                        "Aggregate field must be numeric ≤8B".into(),
+                    )
+                }
+            }
+        };
+        let dec = |raw: &[u8], w: usize, signed: bool| -> i128 {
+            let mut le = [0u8; 16];
+            le[..w.min(16)].copy_from_slice(&raw[..w.min(16)]);
+            if signed && w < 16 && raw[w - 1] & 0x80 != 0 {
+                for b in le.iter_mut().skip(w) {
+                    *b = 0xFF;
+                }
+            }
+            i128::from_le_bytes(le)
+        };
+        let uncond = program
+            == kessel_expr::Program::new().push_int(1).bytes().as_slice();
+
+        // Phase A — materialise candidate row bytes. Use Arc<[u8]>
+        // so the storage.get() refcount-bump path stays zero-memcpy
+        // (SP-Perf-A T7); scan_range materialises Vec<u8> per row
+        // which we wrap into an Arc to unify the per-worker chunk
+        // type. The clone in fold_chunk's chunk slicing is then a
+        // pointer copy, not a payload memcpy.
+        let rows: Vec<std::sync::Arc<[u8]>> = match &cand {
+            Some(ids) => {
+                let mut acc = Vec::with_capacity(ids.len());
+                for id in ids {
+                    if let Some(r) = self.storage.get(&make_key(type_id, id)) {
+                        acc.push(r);
+                    }
+                }
+                acc
+            }
+            None => {
+                let lo = make_key(type_id, &[0u8; 16]);
+                let hi = make_key(type_id, &[0xFFu8; 16]);
+                self.storage
+                    .scan_range(&lo, &hi)
+                    .into_iter()
+                    .map(|(_, rec)| std::sync::Arc::from(rec.into_boxed_slice()))
+                    .collect()
+            }
+        };
+
+        // Per-chunk scalar fold. Returns (count, sum, mn, mx) on
+        // success, SchemaError-string on WHERE-program failure.
+        type ScalarAcc = (i128, i128, Option<i128>, Option<i128>);
+        let fold_chunk = |chunk: &[std::sync::Arc<[u8]>]|
+            -> Result<ScalarAcc, String> {
+            let mut count: i128 = 0;
+            let mut sum: i128 = 0;
+            let mut mn: Option<i128> = None;
+            let mut mx: Option<i128> = None;
+            for rec in chunk {
+                let rec: &[u8] = rec;
+                if !uncond {
+                    match kessel_expr::eval(program, &ot, rec) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(e) => return Err(format!("agg program: {e:?}")),
+                    }
+                }
+                count += 1;
+                if let Some((off, w, signed)) = fpos {
+                    if let Some(raw) = rec.get(off..off + w) {
+                        let v = dec(raw, w, signed);
+                        sum = sum.wrapping_add(v);
+                        mn = Some(mn.map_or(v, |m| m.min(v)));
+                        mx = Some(mx.map_or(v, |m| m.max(v)));
+                    }
+                }
+            }
+            Ok((count, sum, mn, mx))
+        };
+
+        // Phase B + C — serial when small, parallel when large.
+        let partials: Vec<ScalarAcc> = if rows.len() < MIN_PARALLEL_ROWS {
+            match fold_chunk(&rows) {
+                Ok(acc) => vec![acc],
+                Err(e) => return OpResult::SchemaError(e),
+            }
+        } else {
+            let chunk_size =
+                (rows.len() + NUM_HASH_AGG_WORKERS - 1) / NUM_HASH_AGG_WORKERS;
+            let results: Vec<Result<ScalarAcc, String>> =
+                std::thread::scope(|scope| {
+                    let mut handles = Vec::with_capacity(NUM_HASH_AGG_WORKERS);
+                    for chunk in rows.chunks(chunk_size) {
+                        let fold_chunk = &fold_chunk;
+                        handles.push(scope.spawn(move || fold_chunk(chunk)));
+                    }
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().expect("hash-agg worker panicked"))
+                        .collect()
+                });
+            let mut out = Vec::with_capacity(results.len());
+            for r in results {
+                match r {
+                    Ok(a) => out.push(a),
+                    Err(e) => return OpResult::SchemaError(e),
+                }
+            }
+            out
+        };
+
+        // Merge scalar partials in deterministic (0..N) order.
+        let mut count: i128 = 0;
+        let mut sum: i128 = 0;
+        let mut mn: Option<i128> = None;
+        let mut mx: Option<i128> = None;
+        for (c, s, lo, hi) in partials {
+            count += c;
+            sum = sum.wrapping_add(s);
+            mn = match (mn, lo) {
+                (None, b) => b,
+                (a, None) => a,
+                (Some(a), Some(b)) => Some(a.min(b)),
+            };
+            mx = match (mx, hi) {
+                (None, b) => b,
+                (a, None) => a,
+                (Some(a), Some(b)) => Some(a.max(b)),
+            };
+        }
+        let result: i128 = match kind {
+            0 => count,
+            1 => sum,
+            2 => mn.unwrap_or(0),
+            3 => mx.unwrap_or(0),
+            4 => {
+                if count == 0 {
+                    0
+                } else {
+                    sum / count // integer AVG (floor toward zero)
+                }
+            }
+            _ => unreachable!("kind validated up-front"),
+        };
+        OpResult::Got(result.to_le_bytes().to_vec().into())
+    }
+
     // SP-Analytic-Plan-MULTI: shared multi-aggregate single-scan fold
     // used by BOTH `apply` and `read_only_op` so byte-identical results
     // are guaranteed (apply-path determinism). Per-row, evaluates the
@@ -1525,6 +1711,12 @@ impl<V: Vfs> StateMachine<V> {
     // MIN/MAX too; AVG = SUM / COUNT with integer division — matches
     // existing Op::GroupAggregate AVG semantics). Proven by the
     // sp_analytic_plan_multi_equivalence_vs_n_group_aggregate KAT.
+    //
+    // SP-Hash-Agg V1 — when the candidate row count crosses
+    // MIN_PARALLEL_ROWS, the per-row WHERE+fold work is partitioned
+    // across NUM_HASH_AGG_WORKERS workers via std::thread::scope; each
+    // worker builds a local HashMap partial; partials are merged into
+    // a final BTreeMap for ascending-key output (existing contract).
     fn group_aggregate_multi(
         &self,
         type_id: u32,
@@ -1598,72 +1790,150 @@ impl<V: Vfs> StateMachine<V> {
         // result encoding identical to N×Op::GroupAggregate, which is
         // the equivalence oracle.)
         type Acc = (i128, i128, Option<i128>, Option<i128>);
-        let mut groups: std::collections::BTreeMap<Vec<u8>, Vec<Acc>> =
-            std::collections::BTreeMap::new();
         let init: Vec<Acc> = (0..aggregates.len())
             .map(|_| (0i128, 0i128, None, None))
             .collect();
         let uncond = program
             == kessel_expr::Program::new().push_int(1).bytes().as_slice();
-        let mut fold_rec = |rec: &[u8],
-                            groups: &mut std::collections::BTreeMap<Vec<u8>, Vec<Acc>>| {
-            let gkey = match rec.get(gpos.0..gpos.0 + gpos.1) {
-                Some(b) => b.to_vec(),
-                None => return,
-            };
-            let entry = groups.entry(gkey).or_insert_with(|| init.clone());
-            for (i, slot) in apos.iter().enumerate() {
-                entry[i].0 += 1;
-                if let Some((off, w, signed)) = slot {
-                    if let Some(raw) = rec.get(*off..*off + *w) {
-                        let v = dec(raw, *w, *signed);
-                        entry[i].1 = entry[i].1.wrapping_add(v);
-                        entry[i].2 = Some(entry[i].2.map_or(v, |m| m.min(v)));
-                        entry[i].3 = Some(entry[i].3.map_or(v, |m| m.max(v)));
-                    }
-                }
-            }
-        };
-        match &cand {
+
+        // SP-Hash-Agg V1 — two-phase materialise + fold so the
+        // per-row WHERE eval + group-key extract + aggregate update
+        // can run in parallel across N workers when the candidate
+        // row count crosses MIN_PARALLEL_ROWS. Below threshold the
+        // existing single-threaded fold runs verbatim (zero overhead
+        // for OLTP-shape aggregates).
+        //
+        // Phase A (this thread): materialise the candidate row set
+        // into a Vec<Arc<[u8]>>. Arc keeps the storage.get() refcount
+        // path zero-memcpy (SP-Perf-A T7); scan_range materialises
+        // Vec<u8> per row which we wrap into Arc to unify the per-
+        // worker chunk type. WHERE not applied yet — we push it into
+        // workers so its cost parallelises too.
+        let rows: Vec<std::sync::Arc<[u8]>> = match &cand {
             Some(ids) => {
+                let mut acc = Vec::with_capacity(ids.len());
                 for id in ids {
-                    let rec = match self.storage.get(&make_key(type_id, id)) {
-                        Some(r) => r,
-                        None => continue,
-                    };
-                    if !uncond {
-                        match kessel_expr::eval(program, &ot, &rec) {
-                            Ok(true) => {}
-                            Ok(false) => continue,
-                            Err(e) => {
-                                return OpResult::SchemaError(format!(
-                                    "group-multi program: {e:?}"
-                                ))
-                            }
-                        }
+                    if let Some(r) = self.storage.get(&make_key(type_id, id)) {
+                        acc.push(r);
                     }
-                    fold_rec(&rec, &mut groups);
                 }
+                acc
             }
             None => {
                 let lo = make_key(type_id, &[0u8; 16]);
                 let hi = make_key(type_id, &[0xFFu8; 16]);
-                for (_, rec) in self.storage.scan_range(&lo, &hi) {
-                    if !uncond {
-                        match kessel_expr::eval(program, &ot, &rec) {
-                            Ok(true) => {}
-                            Ok(false) => continue,
-                            Err(e) => {
-                                return OpResult::SchemaError(format!(
-                                    "group-multi program: {e:?}"
-                                ))
-                            }
+                self.storage
+                    .scan_range(&lo, &hi)
+                    .into_iter()
+                    .map(|(_, rec)| std::sync::Arc::from(rec.into_boxed_slice()))
+                    .collect()
+            }
+        };
+
+        // Per-chunk fold — closure shape that returns either the
+        // partial HashMap on success or a SchemaError string on
+        // WHERE-program failure (the only error path inside the
+        // loop). Used by both the serial fast path and the parallel
+        // workers (with byte-identical fold logic so equivalence
+        // holds trivially).
+        let fold_chunk = |chunk: &[std::sync::Arc<[u8]>]|
+            -> Result<std::collections::HashMap<Vec<u8>, Vec<Acc>>, String> {
+            let mut local: std::collections::HashMap<Vec<u8>, Vec<Acc>> =
+                std::collections::HashMap::new();
+            for rec in chunk {
+                let rec: &[u8] = rec;
+                if !uncond {
+                    match kessel_expr::eval(program, &ot, rec) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(e) => {
+                            return Err(format!("group-multi program: {e:?}"));
                         }
                     }
-                    fold_rec(&rec, &mut groups);
+                }
+                let gkey = match rec.get(gpos.0..gpos.0 + gpos.1) {
+                    Some(b) => b.to_vec(),
+                    None => continue,
+                };
+                let entry = local.entry(gkey).or_insert_with(|| init.clone());
+                for (i, slot) in apos.iter().enumerate() {
+                    entry[i].0 += 1;
+                    if let Some((off, w, signed)) = slot {
+                        if let Some(raw) = rec.get(*off..*off + *w) {
+                            let v = dec(raw, *w, *signed);
+                            entry[i].1 = entry[i].1.wrapping_add(v);
+                            entry[i].2 = Some(entry[i].2.map_or(v, |m| m.min(v)));
+                            entry[i].3 = Some(entry[i].3.map_or(v, |m| m.max(v)));
+                        }
+                    }
+                }
+            }
+            Ok(local)
+        };
+
+        // Phase B + C: parallel fold via std::thread::scope when
+        // row count crosses the threshold; otherwise serial fold.
+        // The merge step folds partials in deterministic (0..N)
+        // order into a final BTreeMap for ascending-key output.
+        let partials: Vec<std::collections::HashMap<Vec<u8>, Vec<Acc>>> =
+            if rows.len() < MIN_PARALLEL_ROWS {
+                match fold_chunk(&rows) {
+                    Ok(m) => vec![m],
+                    Err(e) => return OpResult::SchemaError(e),
+                }
+            } else {
+                let chunk_size =
+                    (rows.len() + NUM_HASH_AGG_WORKERS - 1) / NUM_HASH_AGG_WORKERS;
+                let results: Vec<
+                    Result<std::collections::HashMap<Vec<u8>, Vec<Acc>>, String>,
+                > = std::thread::scope(|scope| {
+                    let mut handles = Vec::with_capacity(NUM_HASH_AGG_WORKERS);
+                    for chunk in rows.chunks(chunk_size) {
+                        let fold_chunk = &fold_chunk;
+                        handles.push(scope.spawn(move || fold_chunk(chunk)));
+                    }
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().expect("hash-agg worker panicked"))
+                        .collect()
+                });
+                let mut out = Vec::with_capacity(results.len());
+                for r in results {
+                    match r {
+                        Ok(m) => out.push(m),
+                        Err(e) => return OpResult::SchemaError(e),
+                    }
+                }
+                out
+            };
+
+        // Merge all partials into a sorted BTreeMap (ascending key
+        // order — the existing contract). The (0..N) iteration order
+        // is deterministic + combine ops are associative for SUM/COUNT
+        // and associative+commutative for MIN/MAX, so the result is
+        // byte-identical to the serial path.
+        let mut groups: std::collections::BTreeMap<Vec<u8>, Vec<Acc>> =
+            std::collections::BTreeMap::new();
+        for partial in partials {
+            for (k, accs) in partial {
+                let entry = groups.entry(k).or_insert_with(|| init.clone());
+                for (i, src) in accs.into_iter().enumerate() {
+                    entry[i].0 += src.0;
+                    entry[i].1 = entry[i].1.wrapping_add(src.1);
+                    entry[i].2 = match (entry[i].2, src.2) {
+                        (None, b) => b,
+                        (a, None) => a,
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                    };
+                    entry[i].3 = match (entry[i].3, src.3) {
+                        (None, b) => b,
+                        (a, None) => a,
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                    };
                 }
             }
         }
+
         // Encode: [u32 ngroups] per group [u32 keylen][key][16B × n_aggs]
         let mut out = Vec::new();
         out.extend_from_slice(&(groups.len() as u32).to_le_bytes());
@@ -2181,12 +2451,15 @@ impl<V: Vfs> StateMachine<V> {
                 OpResult::Got(out.into())
             }
             Op::Aggregate { type_id, program, kind, field_id, range_preds } => {
+                // SP-Hash-Agg V1 — both Op::Aggregate apply arms route
+                // through the shared numeric-≤8B helper for the
+                // serial-and-parallel fold. The MIN/MAX var-order
+                // (CHAR/BYTES/U128/I128) path stays inline here
+                // (different result encoding — raw bytes, not i128).
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
                     None => return OpResult::SchemaError(format!("no type {type_id}")),
                 };
-                // SP-Analytic-Plan: narrow scan via order-index when
-                // range hints present. None ⇒ full-scan (back-compat).
                 let cand = self.narrow_by_range_preds(type_id, &ot, &range_preds);
                 if (kind == 2 || kind == 3)
                     && Self::ord_field_pos(&ot, field_id).is_none()
@@ -2207,9 +2480,6 @@ impl<V: Vfs> StateMachine<V> {
                             .push_int(1)
                             .bytes()
                             .as_slice();
-                    // SP-Analytic-Plan: skip the index-extreme fast path
-                    // when range hints are present — the narrowed set
-                    // may exclude the global extreme.
                     if uncond && ot.ordered.contains(&field_id) && cand.is_none() {
                         return match self.agg_extreme_var(
                             type_id,
@@ -2223,7 +2493,6 @@ impl<V: Vfs> StateMachine<V> {
                         };
                     }
                     let mut best: Option<Vec<u8>> = None;
-                    // Helper to fold one record into the running extreme.
                     let fold = |rec: &[u8], best: &mut Option<Vec<u8>>| {
                         if let Some(raw) = rec.get(off..off + w) {
                             *best = Some(match best.take() {
@@ -2282,27 +2551,23 @@ impl<V: Vfs> StateMachine<V> {
                     }
                     return OpResult::Got(best.unwrap_or_default().into());
                 }
+                // SP-Hash-Agg V1 — numeric ≤8B index-extreme fast path
+                // bypasses both serial + parallel folds (it never reads
+                // rows, just the index entry). Only kept here because it
+                // needs `cand`-checked context. Below it: the shared
+                // helper handles the row-scanning fold (serial or
+                // parallel based on candidate-row count).
                 let fpos = if kind == 0 {
                     None
                 } else {
                     match Self::ord_field_pos(&ot, field_id) {
-                        Some((off, w, fk)) => Some((off, w, fk)),
+                        Some(p) => Some(p),
                         None => {
                             return OpResult::SchemaError(
                                 "Aggregate field must be numeric ≤8B".into(),
                             )
                         }
                     }
-                };
-                let decode_i128 = |raw: &[u8], w: usize, signed: bool| -> i128 {
-                    let mut le = [0u8; 16];
-                    le[..w.min(16)].copy_from_slice(&raw[..w.min(16)]);
-                    if signed && w < 16 && raw[w - 1] & 0x80 != 0 {
-                        for b in le.iter_mut().skip(w) {
-                            *b = 0xFF;
-                        }
-                    }
-                    i128::from_le_bytes(le)
                 };
                 let uncond = program
                     == kessel_expr::Program::new().push_int(1).bytes().as_slice();
@@ -2314,90 +2579,31 @@ impl<V: Vfs> StateMachine<V> {
                         let signed =
                             matches!(fk, I8 | I16 | I32 | I64 | Fixed { .. });
                         if ot.ordered.contains(&field_id) {
+                            let dec = |raw: &[u8], w: usize, signed: bool| -> i128 {
+                                let mut le = [0u8; 16];
+                                le[..w.min(16)].copy_from_slice(&raw[..w.min(16)]);
+                                if signed && w < 16 && raw[w - 1] & 0x80 != 0 {
+                                    for b in le.iter_mut().skip(w) {
+                                        *b = 0xFF;
+                                    }
+                                }
+                                i128::from_le_bytes(le)
+                            };
                             let r = self
                                 .agg_extreme(type_id, field_id, off, w, kind == 3)
-                                .map(|raw| decode_i128(&raw, w, signed))
+                                .map(|raw| dec(&raw, w, signed))
                                 .unwrap_or(0);
                             return OpResult::Got(r.to_le_bytes().to_vec().into());
                         }
                     }
                 }
-                let mut count: i128 = 0;
-                let mut sum: i128 = 0;
-                let mut mn: Option<i128> = None;
-                let mut mx: Option<i128> = None;
-                let mut fold_rec = |rec: &[u8], count: &mut i128, sum: &mut i128, mn: &mut Option<i128>, mx: &mut Option<i128>| {
-                    *count += 1;
-                    if let Some((off, w, fk)) = fpos {
-                        if let Some(raw) = rec.get(off..off + w) {
-                            use kessel_catalog::FieldKind::*;
-                            let signed = matches!(fk, I8 | I16 | I32 | I64 | Fixed { .. });
-                            let v = decode_i128(raw, w, signed);
-                            *sum = sum.wrapping_add(v);
-                            *mn = Some(mn.map_or(v, |m| m.min(v)));
-                            *mx = Some(mx.map_or(v, |m| m.max(v)));
-                        }
-                    }
-                };
-                match &cand {
-                    Some(ids) => {
-                        for id in ids {
-                            let rec = match self.storage.get(&make_key(type_id, id)) {
-                                Some(r) => r,
-                                None => continue,
-                            };
-                            if !uncond {
-                                match kessel_expr::eval(&program, &ot, &rec) {
-                                    Ok(true) => {}
-                                    Ok(false) => continue,
-                                    Err(e) => {
-                                        return OpResult::SchemaError(format!(
-                                            "agg program: {e:?}"
-                                        ))
-                                    }
-                                }
-                            }
-                            fold_rec(&rec, &mut count, &mut sum, &mut mn, &mut mx);
-                        }
-                    }
-                    None => {
-                        let lo = make_key(type_id, &[0u8; 16]);
-                        let hi = make_key(type_id, &[0xFFu8; 16]);
-                        for (_, rec) in self.storage.scan_range(&lo, &hi) {
-                            if !uncond {
-                                match kessel_expr::eval(&program, &ot, &rec) {
-                                    Ok(true) => {}
-                                    Ok(false) => continue,
-                                    Err(e) => {
-                                        return OpResult::SchemaError(format!(
-                                            "agg program: {e:?}"
-                                        ))
-                                    }
-                                }
-                            }
-                            fold_rec(&rec, &mut count, &mut sum, &mut mn, &mut mx);
-                        }
-                    }
-                }
-                let result: i128 = match kind {
-                    0 => count,
-                    1 => sum,
-                    2 => mn.unwrap_or(0),
-                    3 => mx.unwrap_or(0),
-                    4 => {
-                        if count == 0 {
-                            0
-                        } else {
-                            sum / count
-                        }
-                    }
-                    _ => {
-                        return OpResult::SchemaError(
-                            "agg kind must be 0|1|2|3|4".into(),
-                        )
-                    }
-                };
-                OpResult::Got(result.to_le_bytes().to_vec().into())
+                self.aggregate_numeric_scan(
+                    type_id,
+                    &program,
+                    kind,
+                    field_id,
+                    &range_preds,
+                )
             }
             Op::SelectSorted { type_id, program, sort_field, desc, offset, limit } => {
                 let ot = match self.catalog.get(type_id) {
@@ -4845,13 +5051,18 @@ impl<V: Vfs> StateMachine<V> {
             // Current body uses legacy 20-byte data-row keyspace (scan_range + reduce);
             // T2.C rewrites against data_row_scan(type_id, u64::MAX) per Decision 4
             // (composite read arm, per-statement auto-commit).
+            //
+            // SP-Hash-Agg V1 — both Op::Aggregate apply arms route
+            // through the shared `aggregate_numeric_scan` helper for
+            // the numeric ≤8B scan fold (serial below threshold,
+            // parallel above). The MIN/MAX var-order (CHAR/BYTES/
+            // U128/I128) path stays inline here — different result
+            // encoding (raw bytes, not i128).
             Op::Aggregate { type_id, program, kind, field_id, range_preds } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
                     None => return OpResult::SchemaError(format!("no type {type_id}")),
                 };
-                // SP-Analytic-Plan: narrow scan via order-index when
-                // range hints present. None ⇒ full-scan (back-compat).
                 let cand = self.narrow_by_range_preds(type_id, &ot, &range_preds);
                 // #73: MIN/MAX over a CHAR/BYTES/U128/I128 column (the
                 // SP87/SP91 `0xFFFC` keyspace). Self-contained early
@@ -4876,10 +5087,6 @@ impl<V: Vfs> StateMachine<V> {
                             .push_int(1)
                             .bytes()
                             .as_slice();
-                    // Fast path: no filter + an ordered index ⇒ read
-                    // the index extreme (never changes the answer).
-                    // SP-Analytic-Plan: only when no range narrowing
-                    // (a narrowed set may exclude the global extreme).
                     if uncond && ot.ordered.contains(&field_id) && cand.is_none() {
                         return match self.agg_extreme_var(
                             type_id,
@@ -4889,11 +5096,9 @@ impl<V: Vfs> StateMachine<V> {
                             kind == 3,
                         ) {
                             Some(raw) => OpResult::Got(raw.into()),
-                            None => OpResult::Got(Vec::<u8>::new().into()), // empty
+                            None => OpResult::Got(Vec::<u8>::new().into()),
                         };
                     }
-                    // Slow path (the oracle): scan + filter, track the
-                    // extreme raw bytes via the kind-correct comparator.
                     let mut best: Option<Vec<u8>> = None;
                     let fold = |rec: &[u8], best: &mut Option<Vec<u8>>| {
                         if let Some(raw) = rec.get(off..off + w) {
@@ -4953,12 +5158,15 @@ impl<V: Vfs> StateMachine<V> {
                     }
                     return OpResult::Got(best.unwrap_or_default().into());
                 }
-                // COUNT needs no field; SUM/MIN/MAX need a numeric ≤8B field.
+                // Numeric ≤8B SUM/MIN/MAX/AVG + COUNT. The index-extreme
+                // fast path stays here (it never reads rows); below it,
+                // the shared helper handles the row-scanning fold
+                // (serial or parallel based on candidate-row count).
                 let fpos = if kind == 0 {
                     None
                 } else {
                     match Self::ord_field_pos(&ot, field_id) {
-                        Some((off, w, fk)) => Some((off, w, fk)),
+                        Some(p) => Some(p),
                         None => {
                             return OpResult::SchemaError(
                                 "Aggregate field must be numeric ≤8B".into(),
@@ -4966,23 +5174,6 @@ impl<V: Vfs> StateMachine<V> {
                         }
                     }
                 };
-                let decode_i128 = |raw: &[u8], w: usize, signed: bool| -> i128 {
-                    let mut le = [0u8; 16];
-                    le[..w.min(16)].copy_from_slice(&raw[..w.min(16)]);
-                    if signed && w < 16 && raw[w - 1] & 0x80 != 0 {
-                        for b in le.iter_mut().skip(w) {
-                            *b = 0xFF;
-                        }
-                    }
-                    i128::from_le_bytes(le)
-                };
-                // SP73 columnar fast-path. `uncond` = the planner's
-                // canonical always-true program (no WHERE): the per-row
-                // expr-VM filter is then pure overhead, so skip it and
-                // fold only the aggregated column. For MIN/MAX of an
-                // order-indexed column with no filter, skip the scan
-                // entirely and read the index extreme. Both are pure
-                // accelerators — the slow path below is the oracle.
                 let uncond = program
                     == kessel_expr::Program::new().push_int(1).bytes().as_slice();
                 if uncond && cand.is_none() {
@@ -4993,90 +5184,31 @@ impl<V: Vfs> StateMachine<V> {
                         let signed =
                             matches!(fk, I8 | I16 | I32 | I64 | Fixed { .. });
                         if ot.ordered.contains(&field_id) {
+                            let dec = |raw: &[u8], w: usize, signed: bool| -> i128 {
+                                let mut le = [0u8; 16];
+                                le[..w.min(16)].copy_from_slice(&raw[..w.min(16)]);
+                                if signed && w < 16 && raw[w - 1] & 0x80 != 0 {
+                                    for b in le.iter_mut().skip(w) {
+                                        *b = 0xFF;
+                                    }
+                                }
+                                i128::from_le_bytes(le)
+                            };
                             let r = self
                                 .agg_extreme(type_id, field_id, off, w, kind == 3)
-                                .map(|raw| decode_i128(&raw, w, signed))
+                                .map(|raw| dec(&raw, w, signed))
                                 .unwrap_or(0);
                             return OpResult::Got(r.to_le_bytes().to_vec().into());
                         }
                     }
                 }
-                let mut count: i128 = 0;
-                let mut sum: i128 = 0;
-                let mut mn: Option<i128> = None;
-                let mut mx: Option<i128> = None;
-                let mut fold_rec = |rec: &[u8], count: &mut i128, sum: &mut i128, mn: &mut Option<i128>, mx: &mut Option<i128>| {
-                    *count += 1;
-                    if let Some((off, w, fk)) = fpos {
-                        if let Some(raw) = rec.get(off..off + w) {
-                            use kessel_catalog::FieldKind::*;
-                            let signed = matches!(fk, I8 | I16 | I32 | I64 | Fixed { .. });
-                            let v = decode_i128(raw, w, signed);
-                            *sum = sum.wrapping_add(v);
-                            *mn = Some(mn.map_or(v, |m| m.min(v)));
-                            *mx = Some(mx.map_or(v, |m| m.max(v)));
-                        }
-                    }
-                };
-                match &cand {
-                    Some(ids) => {
-                        for id in ids {
-                            let rec = match self.storage.get(&make_key(type_id, id)) {
-                                Some(r) => r,
-                                None => continue,
-                            };
-                            if !uncond {
-                                match kessel_expr::eval(&program, &ot, &rec) {
-                                    Ok(true) => {}
-                                    Ok(false) => continue,
-                                    Err(e) => {
-                                        return OpResult::SchemaError(format!(
-                                            "agg program: {e:?}"
-                                        ))
-                                    }
-                                }
-                            }
-                            fold_rec(&rec, &mut count, &mut sum, &mut mn, &mut mx);
-                        }
-                    }
-                    None => {
-                        let lo = make_key(type_id, &[0u8; 16]);
-                        let hi = make_key(type_id, &[0xFFu8; 16]);
-                        for (_, rec) in self.storage.scan_range(&lo, &hi) {
-                            if !uncond {
-                                match kessel_expr::eval(&program, &ot, &rec) {
-                                    Ok(true) => {}
-                                    Ok(false) => continue,
-                                    Err(e) => {
-                                        return OpResult::SchemaError(format!(
-                                            "agg program: {e:?}"
-                                        ))
-                                    }
-                                }
-                            }
-                            fold_rec(&rec, &mut count, &mut sum, &mut mn, &mut mx);
-                        }
-                    }
-                }
-                let result: i128 = match kind {
-                    0 => count,
-                    1 => sum,
-                    2 => mn.unwrap_or(0),
-                    3 => mx.unwrap_or(0),
-                    4 => {
-                        if count == 0 {
-                            0
-                        } else {
-                            sum / count // integer AVG (floor toward zero)
-                        }
-                    }
-                    _ => {
-                        return OpResult::SchemaError(
-                            "agg kind must be 0|1|2|3|4".into(),
-                        )
-                    }
-                };
-                OpResult::Got(result.to_le_bytes().to_vec().into())
+                self.aggregate_numeric_scan(
+                    type_id,
+                    &program,
+                    kind,
+                    field_id,
+                    &range_preds,
+                )
             }
 
             // SP116 / S2.7 (Decision 3): cutover scheduled for T2.C.

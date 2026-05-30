@@ -11,9 +11,21 @@
 //!     (precomputed at load) so `Op::Aggregate kind=SUM` can fold the
 //!     Q6 revenue without an expression-VM aggregate path.
 //!
-//! - Load: one `Op::Txn { ops: vec![Create*N] }` batched insert. The
-//!   apply-path serializes all the Creates under one write lock; we are
-//!   NOT measuring load throughput so the batched-create cost is hidden.
+//! - Load: one `Op::Txn { ops: vec![Create*N] }` batched insert + a
+//!   range index on `l_shipdate` (added at table-creation time so the
+//!   batched inserts maintain it as they go). The apply-path
+//!   serializes all the Creates under one write lock; we are NOT
+//!   measuring load throughput so the batched-create + index cost is
+//!   hidden.
+//!
+//! - **SP-Analytic-Plan T4**: aggregate ops carry `range_preds:
+//!   Vec<(field_id, op, value)>` half-range hints on the
+//!   l_shipdate-indexed column. The SM narrows the candidate row-set
+//!   via the existing ordered-index machinery BEFORE the per-row
+//!   WHERE program runs (the program still verifies every candidate
+//!   so the result is byte-identical to a full scan — the index only
+//!   accelerates). This closes the SP-Bench-Suite T4 TPC-H loss
+//!   without changing the kessel-expr semantics.
 //!
 //! - Q1 (single execution per "op"): four `Op::GroupAggregate` calls in
 //!   sequence — COUNT, SUM(l_quantity), SUM(l_extendedprice),
@@ -181,6 +193,15 @@ pub fn run_tpch(
         OpResult::TypeCreated(_) => {}
         other => anyhow::bail!("kesseldb tpch: CreateType lineitem: {:?}", other),
     }
+    // SP-Analytic-Plan T4: range index on l_shipdate so both Q1
+    // (l_shipdate <= 19980901) and Q6 (l_shipdate >= 19940101 AND
+    // l_shipdate < 19950101) get scan-narrowing via range_preds. Mirrors
+    // the Postgres `idx_lineitem_shipdate` btree the postgres_tpch driver
+    // creates.
+    match sm.apply(2, Op::AddOrderedIndex { type_id: LINEITEM_TYPE_ID, field_id: fid::L_SHIPDATE }) {
+        OpResult::Ok => {}
+        other => anyhow::bail!("kesseldb tpch: AddOrderedIndex l_shipdate: {:?}", other),
+    }
     let ot = sm.catalog().get(LINEITEM_TYPE_ID).expect("lineitem type").clone();
 
     // Deterministic per-trial seed: same seed across all 3 DBs so byte-
@@ -203,7 +224,7 @@ pub fn run_tpch(
         });
     }
     // Use a strictly-increasing op_number per Txn.
-    let bulk_op_no = 2u64;
+    let bulk_op_no = 3u64;
     let r = sm.apply(bulk_op_no, Op::Txn { ops });
     if matches!(r, OpResult::SchemaError(_) | OpResult::NotFound) {
         anyhow::bail!("kesseldb tpch: bulk Op::Txn{{Create*}} failed: {:?}", r);
@@ -219,10 +240,24 @@ pub fn run_tpch(
     let q6_prog = q6_predicate();
     let is_q1 = matches!(workload, Workload::TpchQ1 { .. });
 
+    // SP-Analytic-Plan T4: range_preds for scan-narrowing via the
+    // l_shipdate ordered index. Q1 has a single `l_shipdate <= HI` hint;
+    // Q6 has `>=` LO AND `<` HI. L_SHIPDATE is I32 (4 LE bytes), op codes
+    // 0=`>` 1=`>=` 2=`<` 3=`<=` per Op::QueryRows convention.
+    let q1_range: Vec<(u16, u8, Vec<u8>)> = vec![
+        (fid::L_SHIPDATE, 3, tpch_const::Q1_SHIPDATE_HI.to_le_bytes().to_vec()),
+    ];
+    let q6_range: Vec<(u16, u8, Vec<u8>)> = vec![
+        (fid::L_SHIPDATE, 1, tpch_const::Q6_SHIPDATE_LO.to_le_bytes().to_vec()),
+        (fid::L_SHIPDATE, 2, tpch_const::Q6_SHIPDATE_HI.to_le_bytes().to_vec()),
+    ];
+
     for tid in 0..n {
         let sm = Arc::clone(&sm);
         let q1_prog = q1_prog.clone();
         let q6_prog = q6_prog.clone();
+        let q1_range = q1_range.clone();
+        let q6_range = q6_range.clone();
         let h = std::thread::spawn(move || -> (u64, Vec<u64>) {
             let mut count = 0u64;
             let mut lat = Vec::with_capacity(4096);
@@ -240,7 +275,7 @@ pub fn run_tpch(
                         group_field: fid::L_GROUPKEY,
                         kind: 0, // COUNT
                         agg_field: 0, // ignored for COUNT
-                        range_preds: vec![],
+                        range_preds: q1_range.clone(),
                     });
                     // SUM(l_quantity) per group.
                     let r_sum_q = g.read_only_op(Op::GroupAggregate {
@@ -249,7 +284,7 @@ pub fn run_tpch(
                         group_field: fid::L_GROUPKEY,
                         kind: 1, // SUM
                         agg_field: fid::L_QUANTITY,
-                        range_preds: vec![],
+                        range_preds: q1_range.clone(),
                     });
                     // SUM(l_extendedprice) per group.
                     let r_sum_ep = g.read_only_op(Op::GroupAggregate {
@@ -258,7 +293,7 @@ pub fn run_tpch(
                         group_field: fid::L_GROUPKEY,
                         kind: 1, // SUM
                         agg_field: fid::L_EXTENDEDPRICE,
-                        range_preds: vec![],
+                        range_preds: q1_range.clone(),
                     });
                     // SUM(l_discount) per group — used for AVG(l_discount).
                     let r_sum_dc = g.read_only_op(Op::GroupAggregate {
@@ -267,7 +302,7 @@ pub fn run_tpch(
                         group_field: fid::L_GROUPKEY,
                         kind: 1, // SUM
                         agg_field: fid::L_DISCOUNT,
-                        range_preds: vec![],
+                        range_preds: q1_range.clone(),
                     });
                     drop(g);
                     // Verify all 4 returned Got and merge into one row-set.
@@ -313,7 +348,7 @@ pub fn run_tpch(
                         program: q6_prog.clone(),
                         kind: 1, // SUM
                         field_id: fid::L_Q6_REVENUE,
-                        range_preds: vec![],
+                        range_preds: q6_range.clone(),
                     });
                     drop(g);
                     match r {
@@ -369,8 +404,10 @@ pub fn run_tpch(
                  Op::GroupAggregate (COUNT + SUM(quantity) + SUM(extprice) \
                  + SUM(discount)) grouped by synthetic 2-byte l_groupkey; \
                  AVG computed client-side per group (Op::GroupAggregate is \
-                 single-aggregate-per-call). Ops/sec = full Q1 \
-                 executions/sec.",
+                 single-aggregate-per-call). SP-Analytic-Plan T4: range \
+                 index on l_shipdate + range_preds=[<=19980901] narrow \
+                 each of the 4 scans via the order index. Ops/sec = full \
+                 Q1 executions/sec.",
                 sf, rows
             )
         } else {
@@ -380,7 +417,10 @@ pub fn run_tpch(
                  predicate WHERE (l_shipdate range + l_discount range + \
                  l_quantity < 24). l_q6_revenue is the precomputed \
                  l_extendedprice * l_discount product stored at load \
-                 (KesselDB has no SUM(expr) primitive yet). Ops/sec = \
+                 (KesselDB has no SUM(expr) primitive yet). SP-Analytic-\
+                 Plan T4: range index on l_shipdate + range_preds=[>= \
+                 19940101, <19950101] narrow the scan via the order \
+                 index (the ~8K-row 1994 window out of 60K). Ops/sec = \
                  full Q6 executions/sec.",
                 sf, rows
             )

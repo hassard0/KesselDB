@@ -397,6 +397,15 @@ mod tests {
             },
             Op::AdvanceWatermark { low_water_mark: 0 },
             Op::ReportActiveSnapshot { replica_id: 0, min_active_snapshot: 0 },
+            // SP-Analytic-Plan-MULTI: multi-aggregate GROUP BY (wire tag 47).
+            // Read-only — composes with the read-pool dispatch.
+            Op::GroupAggregateMulti {
+                type_id: 1,
+                program: vec![],
+                group_field: 0,
+                aggregates: vec![(0, 0)],
+                range_preds: vec![],
+            },
         ]
     }
 
@@ -410,7 +419,7 @@ mod tests {
     #[test]
     fn is_read_only_matches_proto_classifier_for_every_variant() {
         let ops = every_op_variant();
-        // The 46 distinct `Op::kind()` values cover every variant. A
+        // The 47 distinct `Op::kind()` values cover every variant. A
         // missing variant in `every_op_variant()` is the regression
         // trigger.
         let kinds: std::collections::BTreeSet<u8> = ops.iter().map(Op::kind).collect();
@@ -422,7 +431,7 @@ mod tests {
         );
         assert_eq!(
             kinds.len(),
-            46,
+            47,
             "Op variant count drifted — add the new variant to \
              every_op_variant() and re-check is_mutating() classification"
         );
@@ -470,6 +479,7 @@ mod tests {
             27, // Describe
             28, // Join
             35, // SeqRead
+            47, // SP-Analytic-Plan-MULTI: GroupAggregateMulti
         ]
         .into_iter()
         .collect();
@@ -493,7 +503,10 @@ mod tests {
             every_op_variant().iter().map(Op::kind).collect();
         let write_set: std::collections::BTreeSet<u8> =
             all.difference(&read_set).copied().collect();
-        // 46 total - (16 spec §4 reads + 1 Op::Txn-empty) = 29 write kinds.
+        // 47 total - (17 reads incl. SP-Analytic-Plan-MULTI tag 47 + 1
+        // Op::Txn-empty) = 29 write kinds. The new variant is read-only,
+        // so it lands in the read set and the write-set cardinality is
+        // unchanged.
         assert_eq!(write_set.len(), 29, "write-set cardinality drifted");
     }
 

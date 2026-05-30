@@ -155,6 +155,58 @@ covered by the workspace test suite (2024 default / 2052 with
   commit (T5 closure). Progress tracker
   `docs/superpowers/specs/2026-05-30-kesseldb-spanalyticplanmulti-progress.md`
   CLOSED. **Arc closed — TaskList #342 ready for completion.**
+- **Track J — SP-Hash-Agg (2026-05-30, V1 SHIPPED — DONE_WITH_CONCERNS).**
+  Closes the SP-Analytic-Plan-MULTI residual TPC-H Q1 + Q6 gaps vs
+  Postgres' parallel hash aggregate by parallelising the per-row
+  aggregate-fold across N=4 worker threads within a single query.
+  `std::thread::scope` + per-worker `HashMap` partials + sorted-`BTreeMap`
+  merge for ascending-key output. Zero new external deps (std-only since
+  Rust 1.63); `#![forbid(unsafe_code)]` honored. Two-phase
+  materialise + parallel-fold: Phase A (dispatcher) collects candidate
+  rows into `Vec<Arc<[u8]>>` (Arc keeps the storage.get refcount path
+  zero-memcpy per SP-Perf-A T7; scan_range results wrapped in Arc to
+  unify the per-worker chunk type); Phase B (4 workers) each fold one
+  row-offset chunk into a local HashMap partial (or scalar accumulator
+  for Op::Aggregate); Phase C merges partials in deterministic (0..N)
+  order into a sorted BTreeMap. Combine ops are associative for SUM/
+  COUNT and associative+commutative for MIN/MAX; AVG computed POST-merge
+  from (sum, count) via integer division (matches serial path byte-for-
+  byte). `MIN_PARALLEL_ROWS = 8192` gates the parallel path; below
+  threshold the existing single-threaded fold runs verbatim (zero
+  overhead for OLTP-shape aggregates). T1 design + scaffold + constants.
+  T2 SM apply paths: `aggregate_numeric_scan` helper added (replaces
+  ~280 lines of inline-duplicated loop) called from both Op::Aggregate
+  apply arms; `group_aggregate_multi` rewritten with the parallel
+  path. T3 three new SM-level equivalence KATs lock parallel == serial
+  byte-for-byte at scale (10K rows × Q1-shape Multi, 10K rows × Q6-shape
+  Aggregate, apply == read_only_op at scale). T4 vulcan TPC-H Q1+Q6
+  sweep (3 trials × 30s × SF=0.01 × N=1,4 × 3 per-cell trials = 9
+  trials/cell). **HEADLINE on vulcan**: Q1 N=1 10.90 → **17.30 q/s
+  (+1.59×)**, Q1 N=4 41.11 → **60.18 q/s (+1.46×)**; Q6 N=1 25.39 →
+  **34.23 q/s (+1.35×)**, Q6 N=4 103.38 → **185.03 q/s (+1.79×)**.
+  Cumulative 3-arc lift vs pre-arc baseline (SP-Bench-Suite T4): Q1
+  N=4 **+6.81×**; Q6 N=4 **+13.47×**. Gap-closing vs Postgres: Q1 N=4
+  4.52× → **3.09×** (was 18× pre-arc); Q6 N=4 16× → **9.11×** (was
+  123× pre-arc). **DONE_WITH_CONCERNS**: design predicted 4×
+  per-query lift (4-way row-chunk parallelism), measured 1.5×.
+  Diagnosis (BENCHMARKS.md §3f honest read): the serial prefix
+  (`Vec<Arc<[u8]>>` materialisation of the candidate row set + thread-
+  spawn cost at 4 workers) is hard-pinned to one CPU and accounts for
+  the bulk of wall-time. Named follow-up arcs **SP-Hash-Agg-Tune**
+  (streaming materialisation, thread-pool reuse, bypass Arc::from on
+  the scan_range path; expected 2-3× more) and **SP-JIT-Aggregate**
+  (LLVM codegen for the per-row inner loop, what Postgres uses).
+  Workspace tests: kessel-sm 154 → 157 (+3); all 15 pre-existing
+  aggregate KATs stay green. seed-7 GREEN; zero new external deps;
+  `#![forbid(unsafe_code)]` honored; HTTP/1.1 + WS + binary + PG-wire
+  surfaces byte-untouched. Five commits: `49d318c` (T1 design +
+  progress tracker + MIN_PARALLEL_ROWS const), `fa30246` (T2 parallel
+  hash aggregate for Op::Aggregate + Op::GroupAggregateMulti),
+  `21d0b8b` (T3 equivalence + determinism KATs), `5b0fb14` (T4
+  BENCHMARKS.md §3f/§3g/§1 update), plus this commit (T5 STATUS +
+  progress tracker close + README). Progress tracker
+  `docs/superpowers/specs/2026-05-30-kesseldb-sphashagg-progress.md`
+  → DONE_WITH_CONCERNS. **TaskList #345 ready for completion.**
 - **Track D — Cluster test flakes (SP-CLUSTER-FLAKE T2).** Root-cause fixed
   in `Node::submit*` / `apply_raw`: production VSR retry on transient
   ViewChange. Not just a test relaxation — the actual production code path

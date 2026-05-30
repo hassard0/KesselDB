@@ -12,7 +12,7 @@
 - **DX surface caught up to the engineering — SP‑DX‑superior V1 ARC CLOSED.** First‑5‑minutes adoption polish: did‑you‑mean suggestions on `unknown table` + `unknown column` (zero‑dep edit‑distance, plus the head of the column list inlined so users don't need a separate DESCRIBE); the `kessel` CLI differentiates connection‑refused / wrong‑token / DNS‑failure / timeout with hint text pointing at the right env var; multi‑arch Docker image at `ghcr.io/hassard0/kesseldb:latest` (binary + HTTP + PG wire surfaces in one 77 MiB image) wired into `release.yml` to publish on every `v*` tag; new embedded example at `crates/kesseldb-server/examples/embedded.rs` showing the in‑process API end‑to‑end (`engine.sql(...)`, typed `Op` fast path, hot snapshot). See [`docs/STATUS.md`](docs/STATUS.md#) Track H + [`docs/USAGE.md`](docs/USAGE.md#option-b--run-from-the-official-docker-image) §1B / §3.
 - **Real Postgres ORM compatibility — SP‑PG‑EXTQ V1 ARC CLOSED.** psycopg2 + SQLAlchemy 2.0 + psycopg3 (with `ClientCursor`) all PASS on vulcan with default settings (T8 closes the T7 `use_native_hstore=False` caveat). asyncpg + JDBC PARTIAL (connect + DDL + simple‑Q work; binary‑format parameterized DML deferred to V2 `SP‑PG‑EXTQ‑BIN`). Pipelining throughput on vulcan: 252‑409 stmt/s (psycopg2 single‑statement round‑trip). See [`docs/USAGE.md`](docs/USAGE.md#9-postgresql-clients-psql-pgcli-jdbc-psycopg-pgx-) §9 + transcript at `docs/superpowers/sppgextq-t8-orm-smoke-2026-05-29.txt`.
 - **4.8M ops/sec parallel reads, sub‑µs p50** — Perf‑A T2 read‑pool bypass (parallel `read_only_op` dispatch) + T7 storage `Arc<[u8]>` migration (zero‑memcpy reads). Measured on a 16‑core x86‑64 Linux reference server; see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §11–§12.
-- **Honest cross‑DB benchmarks published** — KesselDB vs Postgres / SQLite / TigerBeetle on YCSB‑A/B/C, sysbench OLTP RO/WO/RW, *and* TPC‑H Q1/Q6 (analytical). **6 of 8 wins, 2 of 8 losses**, every number disclosed with the exact reason — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md). Both transaction‑bracket losses now CLOSED: SP‑Perf‑A‑TXN‑RO (2026‑05‑29) lifted N=16 oltp‑RO 42.6× (now 5.7× Postgres); SP‑Perf‑A‑TXN‑RW (2026‑05‑30) lifted N=16 oltp‑RW 14.4× (now 2.66× Postgres + 2.60× SQLite). Remaining 2 losses are TPC‑H Q1/Q6 — SP‑Analytic‑Plan‑MULTI already shipped first prong (Q6 7.5×, Q1 4.0×).
+- **Honest cross‑DB benchmarks published** — KesselDB vs Postgres / SQLite / TigerBeetle on YCSB‑A/B/C, sysbench OLTP RO/WO/RW, *and* TPC‑H Q1/Q6 (analytical). **6 of 8 wins, 2 of 8 losses**, every number disclosed with the exact reason — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md). Both transaction‑bracket losses now CLOSED: SP‑Perf‑A‑TXN‑RO (2026‑05‑29) lifted N=16 oltp‑RO 42.6× (now 5.7× Postgres); SP‑Perf‑A‑TXN‑RW (2026‑05‑30) lifted N=16 oltp‑RW 14.4× (now 2.66× Postgres + 2.60× SQLite). The TPC‑H Q1/Q6 losses got three sequential lift arcs: SP‑Analytic‑Plan (range‑pred narrowing, Q6 7.5×), SP‑Analytic‑Plan‑MULTI (single‑scan multi‑aggregate fold, Q1 4.0×), and **SP‑Hash‑Agg (2026‑05‑30) parallel hash aggregate**: Q1 N=4 41 → 60 q/s (+1.46×), Q6 N=4 103 → 185 q/s (+1.79×). Cumulative 3‑arc lift Q1 +6.81× / Q6 +13.47×; gap vs Postgres closed Q1 18× → 3.09× / Q6 123× → 9.11×.
 
 </div>
 
@@ -370,8 +370,8 @@ including the *losses* where KesselDB does NOT win — are in
 | sysbench OLTP write‑only | **KesselDB** | **1st at every N (5.2× Postgres at N=8)** | apply‑path is fast at the inner‑op level |
 | sysbench OLTP read‑only | **KesselDB at N=8 / N=16** (SQLite still wins N=1) | **1st at every N≥8 (5.7× Postgres at N=16)** | SP‑Perf‑A‑TXN‑RO bypass — all‑RO `Op::Txn{ops}` routes through the read pool, lift 42.6× at N=16 — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3c |
 | sysbench OLTP read‑write | **KesselDB at N=8 / N=16** (SQLite still wins N=1) | **1st at every N≥8 (2.66× Postgres + 2.60× SQLite at N=16)** | SP‑Perf‑A‑TXN‑RW driver‑level split‑phase dispatch — (R*, W*)‑shape Txns split at the read/write boundary; read prefix routes via the TXN‑RO bypass (parallel), write suffix via `sm.write().apply` (serial); lift 14.4× at N=16 — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3e |
-| TPC‑H Q1 (multi‑aggregate GROUP BY) | Postgres at every N | **3rd** | `Op::GroupAggregate` is full‑scan + per‑row VM, no order‑index narrowing — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3f |
-| TPC‑H Q6 (SUM with WHERE) | Postgres at every N | **3rd** | `Op::Aggregate` is full‑scan + per‑row VM — same root cause — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3g |
+| TPC‑H Q1 (multi‑aggregate GROUP BY) | Postgres at every N | **2nd at N=4 (beats SQLite); 3rd at N=1** | Three‑arc lift cumulative **+6.81×** (8.84 → 60.18 q/s N=4); gap vs Postgres closed **18× → 3.09×**; SP‑Hash‑Agg V1 parallel path 1.46× lift at N=4 — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3f |
+| TPC‑H Q6 (SUM with WHERE) | Postgres at every N | **2nd at N=4 (beats SQLite); 3rd at N=1** | Three‑arc lift cumulative **+13.47×** (13.74 → 185.03 q/s N=4); gap vs Postgres closed **123× → 9.11×**; SP‑Hash‑Agg V1 parallel path 1.79× lift at N=4 — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3g |
 
 **Roadmap is named — published-loss closures + next throughput levers.**
 
@@ -393,14 +393,18 @@ including the *losses* where KesselDB does NOT win — are in
 - **SP‑Perf‑A‑SHARD** (sharded apply queues + per‑shard read pools)
   is the next throughput lever — the ~5 M ops/sec storage ceiling
   at N=16 traces to `RwLock<StateMachine>` reader CAS ping‑pong.
-- **SP‑Analytic‑Plan** (range‑pred narrowing on aggregate scans) closes
-  the TPC‑H Q1/Q6 losses by teaching `Op::Aggregate` and
-  `Op::GroupAggregate` to consume the `range_preds: Vec<(u16, u8,
-  Vec<u8>)>` interface that already ships in `Op::QueryRows` (SP70). A
-  predicate like `l_shipdate BETWEEN ?` prunes the scan via the
-  existing `FindRange` machinery. Q1 also benefits from
-  `Op::GroupAggregateMulti` so 4× single‑aggregate scans collapse to 1×
-  multi‑aggregate scan.
+- **SP‑Analytic‑Plan + SP‑Analytic‑Plan‑MULTI + SP‑Hash‑Agg
+  V1 SHIPPED (2026‑05‑29 → 2026‑05‑30)** — three sequential arcs
+  for the TPC‑H Q1/Q6 losses: (1) range‑pred narrowing on aggregate
+  scans via the `range_preds: Vec<(u16, u8, Vec<u8>)>` interface
+  (Q6 7.5× at N=4); (2) `Op::GroupAggregateMulti` folds N aggregates
+  in one scan (Q1 4.0× at N=4); (3) parallel hash aggregate
+  (`std::thread::scope` + per‑worker `HashMap` partials + sorted‑
+  `BTreeMap` merge) for rows ≥ 8192 (Q1 +1.46× / Q6 +1.79× at N=4).
+  Cumulative gap‑closing **Q1 18× → 3.09×** and **Q6 123× → 9.11×**.
+  Next: **SP‑Hash‑Agg‑Tune** (streaming materialisation + thread‑pool
+  reuse; expected another 2‑3× on Q1 N=4) and **SP‑JIT‑Aggregate**
+  (LLVM codegen for the per‑row inner loop, what Postgres uses).
 
 **Headline numbers worth quoting** (all from the same vulcan run):
 - **YCSB‑C reads, N=16**: KesselDB 4.75M ops/s — **57× Postgres**, **40× SQLite**

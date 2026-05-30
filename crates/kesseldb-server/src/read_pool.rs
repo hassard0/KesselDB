@@ -77,6 +77,65 @@ pub fn is_read_only(op: &Op) -> bool {
     }
 }
 
+/// SP-Perf-A-TXN-RW: count consecutive read-only ops at the head of
+/// `ops`. The (read_prefix, write_suffix) split at this index is safe
+/// for split-phase execution (read prefix runs via the TXN-RO bypass;
+/// write suffix runs via the apply path with full catalog/index/
+/// constraint machinery).
+///
+/// Cases:
+///   - `ops.is_empty()` ⇒ returns 0 (no prefix to split). Caller routes
+///     empty Op::Txn to the TXN-RO bypass which returns Ok.
+///   - `ops[0]` is a write ⇒ returns 0 (no parallelizable prefix).
+///     Caller routes to apply unchanged.
+///   - All reads ⇒ returns `ops.len()`. Caller routes to TXN-RO bypass
+///     directly (no split needed).
+///   - Mixed `(R, R, ..., R, W, ..., W)` ⇒ returns the count of
+///     leading reads. Caller dispatches the split:
+///       read prefix via `read_only_op(Op::Txn{prefix})` — parallel
+///       write suffix via `apply(op_no, Op::Txn{suffix})` — serial
+///
+///   - Mixed with read-after-write (e.g. `(R, W, R)`) ⇒ returns the
+///     count of leading reads BEFORE the first write (1 in this
+///     example). The trailing reads stay in the suffix where apply-
+///     Txn's overlay preserves read-your-writes correctness.
+///
+/// SAFETY CONTRACT: The split-phase execution is byte-equivalent to
+/// unified apply ONLY for `(R*, W*)` shapes (reads-then-writes). For
+/// `(R, W, R)` shapes, the split would lose the apply-Txn overlay's
+/// read-your-writes for the trailing R (it'd see the pre-W snapshot,
+/// not the post-W overlay). The driver-level dispatcher MUST verify
+/// the suffix `ops[prefix_len..]` contains NO read-only ops before
+/// invoking the split (use `is_split_safe` below as a guard).
+///
+/// `read_prefix_length` is the LOCATION of the split; `is_split_safe`
+/// is the SAFETY of splitting at that location. Both must pass for
+/// split-phase to be correct.
+pub fn read_prefix_length(ops: &[Op]) -> usize {
+    ops.iter().take_while(|o| is_read_only(o)).count()
+}
+
+/// SP-Perf-A-TXN-RW: the suffix `ops[prefix_len..]` must contain NO
+/// read-only ops for the split-phase execution to be byte-equivalent
+/// to unified apply (otherwise the trailing read would see the pre-
+/// write snapshot under split, but the post-write overlay under
+/// unified apply — observable divergence).
+///
+/// True iff every op in the suffix is a write (mutating). The empty
+/// suffix is trivially split-safe (no ops to misclassify); the
+/// dispatcher should NOT split in that case because there's nothing
+/// to run on the apply path — route the whole thing to the TXN-RO
+/// bypass instead.
+///
+/// Use as: `prefix > 0 && prefix < ops.len() && is_split_safe(&ops[prefix..])`
+/// — the three guards together ensure (a) the prefix is non-empty
+/// (worth parallelizing), (b) the suffix is non-empty (worth
+/// apply-routing), and (c) the suffix has no trailing reads (byte-
+/// equivalence holds).
+pub fn is_split_safe(suffix: &[Op]) -> bool {
+    suffix.iter().all(|o| !is_read_only(o))
+}
+
 /// One unit of work for a read worker: an opaque request frame (the same
 /// shape `EngineHandle::apply_raw` accepts) + a per-task oneshot reply.
 type ReadTask = (Vec<u8>, SyncSender<OpResult>);
@@ -1288,5 +1347,219 @@ mod tests {
             is_read_only(&op),
             "sysbench-RO-shape (410 GetByIds in one Txn) classifies as RO"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // SP-Perf-A-TXN-RW classifier KATs — read_prefix_length + is_split_safe.
+    // -----------------------------------------------------------------------
+    //
+    // These lock the (R*, W*) split-phase boundary detection. The driver-
+    // level split dispatcher composes both into a 3-guard check:
+    //   prefix > 0 && prefix < ops.len() && is_split_safe(suffix)
+
+    /// TXN-RW-KAT-1: empty ops ⇒ prefix length 0.
+    #[test]
+    fn txn_rw_prefix_empty_returns_zero() {
+        assert_eq!(read_prefix_length(&[]), 0);
+    }
+
+    /// TXN-RW-KAT-2: pure-RO ops ⇒ prefix length == ops.len().
+    /// Sysbench-RO shape: 10 reads → prefix = 10 (caller routes
+    /// to TXN-RO bypass, not the split path).
+    #[test]
+    fn txn_rw_prefix_pure_reads_returns_full_length() {
+        use kessel_proto::{ObjectId, Op};
+        let mut ops = Vec::new();
+        for i in 0..10u128 {
+            ops.push(Op::GetById { type_id: 1, id: ObjectId::from_u128(i) });
+        }
+        assert_eq!(read_prefix_length(&ops), 10);
+        // The (prefix > 0 && prefix < ops.len()) guard excludes this
+        // shape from the split path.
+        let prefix = read_prefix_length(&ops);
+        assert!(prefix == ops.len(), "pure-reads ⇒ no split needed (route to TXN-RO)");
+    }
+
+    /// TXN-RW-KAT-3: pure-write ops ⇒ prefix length == 0.
+    /// First op is a write (Op::Create) so no parallelizable read
+    /// prefix. The dispatcher's 3-guard check excludes this shape;
+    /// caller routes to apply unchanged.
+    #[test]
+    fn txn_rw_prefix_pure_writes_returns_zero() {
+        use kessel_proto::{ObjectId, Op};
+        let ops = vec![
+            Op::Create { type_id: 1, id: ObjectId::from_u128(1), record: vec![] },
+            Op::Update { type_id: 1, id: ObjectId::from_u128(2), record: vec![] },
+            Op::Delete { type_id: 1, id: ObjectId::from_u128(3) },
+        ];
+        assert_eq!(read_prefix_length(&ops), 0);
+    }
+
+    /// TXN-RW-KAT-4: canonical sysbench-RW shape (10 reads then 4
+    /// writes) ⇒ prefix length == 10. The 3-guard check holds:
+    /// prefix(10) > 0; prefix(10) < total(14); suffix is all writes.
+    /// This is the HEADLINE shape for the perf win.
+    #[test]
+    fn txn_rw_prefix_sysbench_rw_shape_returns_ten() {
+        use kessel_proto::{ObjectId, Op};
+        let mut ops = Vec::new();
+        // 10 GetById reads
+        for i in 0..10u128 {
+            ops.push(Op::GetById { type_id: 1, id: ObjectId::from_u128(i) });
+        }
+        // 4 writes (UPDATE_INDEX, UPDATE_NON_INDEX, DELETE, INSERT)
+        ops.push(Op::Update { type_id: 1, id: ObjectId::from_u128(100), record: vec![] });
+        ops.push(Op::Update { type_id: 1, id: ObjectId::from_u128(101), record: vec![] });
+        ops.push(Op::Delete { type_id: 1, id: ObjectId::from_u128(102) });
+        ops.push(Op::Create { type_id: 1, id: ObjectId::from_u128(103), record: vec![] });
+
+        let prefix = read_prefix_length(&ops);
+        assert_eq!(prefix, 10, "sysbench-RW shape: 10 reads, 4 writes ⇒ prefix=10");
+        // 3-guard check
+        assert!(prefix > 0, "prefix must be non-empty");
+        assert!(prefix < ops.len(), "suffix must be non-empty");
+        assert!(is_split_safe(&ops[prefix..]), "suffix must be all-writes");
+    }
+
+    /// TXN-RW-KAT-5: read-after-write shape (R, W, R) ⇒ prefix=1,
+    /// suffix has a trailing read (NOT split-safe). The dispatcher's
+    /// is_split_safe guard catches this and falls through to apply
+    /// — preserves read-your-writes semantics for the trailing R.
+    #[test]
+    fn txn_rw_prefix_read_after_write_is_not_split_safe() {
+        use kessel_proto::{ObjectId, Op};
+        let id = ObjectId::from_u128(7);
+        let ops = vec![
+            Op::GetById { type_id: 1, id },
+            Op::Update { type_id: 1, id, record: vec![] },
+            Op::GetById { type_id: 1, id },
+        ];
+        let prefix = read_prefix_length(&ops);
+        assert_eq!(prefix, 1, "leading read counted; first write stops the prefix");
+        assert!(
+            !is_split_safe(&ops[prefix..]),
+            "suffix (W, R) contains a read ⇒ NOT split-safe; \
+             dispatcher must fall through to unified apply"
+        );
+    }
+
+    /// TXN-RW-KAT-6: empty suffix is trivially split-safe (vacuously).
+    /// is_split_safe(&[]) == true. The dispatcher's other guards
+    /// (`prefix > 0 && prefix < ops.len()`) exclude this case, so
+    /// is_split_safe is never the deciding factor for empty suffix —
+    /// but the empty-vector vacuous-truth contract matters for the
+    /// recursion shape.
+    #[test]
+    fn txn_rw_is_split_safe_empty_suffix_is_true_vacuous() {
+        assert!(is_split_safe(&[]), "empty suffix is vacuously split-safe");
+    }
+
+    /// TXN-RW-KAT-7: write-only suffix (4 sysbench writes) is split-safe.
+    #[test]
+    fn txn_rw_is_split_safe_all_writes_suffix() {
+        use kessel_proto::{ObjectId, Op};
+        let id = ObjectId::from_u128(7);
+        let suffix = vec![
+            Op::Update { type_id: 1, id, record: vec![] },
+            Op::Update { type_id: 1, id, record: vec![] },
+            Op::Delete { type_id: 1, id },
+            Op::Create { type_id: 1, id, record: vec![] },
+        ];
+        assert!(is_split_safe(&suffix), "all-writes suffix is split-safe");
+    }
+
+    /// TXN-RW-KAT-8: 3-guard dispatcher check on the canonical
+    /// sysbench-RW Op::Txn shape. Confirms the dispatcher exits the
+    /// 3-guard with split=YES.
+    #[test]
+    fn txn_rw_dispatcher_3guard_sysbench_rw_splits() {
+        use kessel_proto::{ObjectId, Op};
+        let mut ops = Vec::new();
+        for i in 0..10u128 {
+            ops.push(Op::GetById { type_id: 1, id: ObjectId::from_u128(i) });
+        }
+        for i in 0..4u128 {
+            ops.push(Op::Update { type_id: 1, id: ObjectId::from_u128(100 + i), record: vec![] });
+        }
+        let prefix = read_prefix_length(&ops);
+        let should_split =
+            prefix > 0 && prefix < ops.len() && is_split_safe(&ops[prefix..]);
+        assert!(should_split, "sysbench-RW shape passes 3-guard ⇒ split-phase");
+    }
+
+    /// TXN-RW-KAT-9: 3-guard dispatcher check on a Txn with read-
+    /// after-write (R, W, R) shape — must NOT split. The
+    /// is_split_safe guard catches it.
+    #[test]
+    fn txn_rw_dispatcher_3guard_read_after_write_does_not_split() {
+        use kessel_proto::{ObjectId, Op};
+        let id = ObjectId::from_u128(7);
+        let ops = vec![
+            Op::GetById { type_id: 1, id },
+            Op::Update { type_id: 1, id, record: vec![] },
+            Op::GetById { type_id: 1, id },
+        ];
+        let prefix = read_prefix_length(&ops);
+        let should_split =
+            prefix > 0 && prefix < ops.len() && is_split_safe(&ops[prefix..]);
+        assert!(
+            !should_split,
+            "read-after-write shape must NOT split (preserves RYW via apply overlay)"
+        );
+    }
+
+    /// TXN-RW-KAT-10: write-led shape (W, W, R, R) — prefix=0 ⇒ no
+    /// split. The is_split_safe check is never even consulted because
+    /// `prefix > 0` already fails. Dispatcher falls through to apply.
+    #[test]
+    fn txn_rw_dispatcher_3guard_write_led_does_not_split() {
+        use kessel_proto::{ObjectId, Op};
+        let id = ObjectId::from_u128(7);
+        let ops = vec![
+            Op::Update { type_id: 1, id, record: vec![] },
+            Op::Update { type_id: 1, id, record: vec![] },
+            Op::GetById { type_id: 1, id },
+            Op::GetById { type_id: 1, id },
+        ];
+        let prefix = read_prefix_length(&ops);
+        let should_split =
+            prefix > 0 && prefix < ops.len() && is_split_safe(&ops[prefix..]);
+        assert!(
+            !should_split,
+            "write-led Txn must NOT split (prefix=0; nothing to parallelize)"
+        );
+    }
+
+    /// TXN-RW-KAT-11: nested Op::Txn inside a parent Txn. The outer
+    /// classifier's `is_read_only` recurses, so a Txn{[reads, Txn{[reads]}]}
+    /// would compute prefix=ops.len() (all-RO via recursion). A Txn{[reads,
+    /// Txn{[reads, write]}]} would compute the prefix as the leading reads
+    /// up to the nested Txn (which the recursion sees as a write because
+    /// the inner Txn contains a write). The SM rejects nested Txn at apply,
+    /// so this KAT is a defence-in-depth verification of the classifier
+    /// behaviour, not a behaviour the bench drives.
+    #[test]
+    fn txn_rw_prefix_nested_mixed_txn_counts_as_write() {
+        use kessel_proto::{ObjectId, Op};
+        let id = ObjectId::from_u128(7);
+        let nested_mixed = Op::Txn {
+            ops: vec![
+                Op::GetById { type_id: 1, id },
+                Op::Update { type_id: 1, id, record: vec![] },
+            ],
+        };
+        let ops = vec![
+            Op::GetById { type_id: 1, id },  // R
+            Op::GetById { type_id: 1, id },  // R
+            nested_mixed,                    // mixed nested Txn ⇒ classified as write via recursion
+            Op::GetById { type_id: 1, id },  // R (in the suffix)
+        ];
+        let prefix = read_prefix_length(&ops);
+        assert_eq!(
+            prefix, 2,
+            "leading 2 reads counted; nested mixed Txn stops the prefix (recursion sees write inside)"
+        );
+        // The suffix has a trailing read ⇒ NOT split-safe.
+        assert!(!is_split_safe(&ops[prefix..]));
     }
 }

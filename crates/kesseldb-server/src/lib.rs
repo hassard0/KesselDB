@@ -796,6 +796,22 @@ impl EngineHandle {
         out
     }
 
+    /// In-process SQL fast path for embedded callers. Compiles + applies
+    /// the statement on the engine thread exactly like the binary wire's
+    /// `[0xFE] ++ sql` frame, but avoids the network round-trip entirely
+    /// — embedders that hold an `EngineHandle` get the same ~sub-µs
+    /// latency the in-process bench measures.
+    ///
+    /// Multi-statement scripts are NOT split here (one SQL string =
+    /// one op). For atomic transactions use `BEGIN`/`COMMIT` over the
+    /// network surface, or build an `Op::Txn` and call [`Self::apply`].
+    pub fn sql(&self, sql: &str) -> OpResult {
+        let mut f = Vec::with_capacity(sql.len() + 1);
+        f.push(0xFE);
+        f.extend_from_slice(sql.as_bytes());
+        self.apply_raw(f)
+    }
+
     /// Take a consistent on-disk snapshot/backup into `dest`. The engine
     /// flushes, then copies its data dir while no apply is in flight, so
     /// `StateMachine::open(dest)` recovers an identical state.

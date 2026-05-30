@@ -68,3 +68,12 @@ path = "src/lib.rs"
 [[bin]]
 name = "kesseldb"
 path = "src/main.rs"
+
+# SP-DX-superior T3: embedded usage example. `cargo run --release
+# --example embedded -p kesseldb-server` spawns an in-process engine
+# and drives SQL + typed Op + snapshot through the same public API
+# the network surface uses. Only depends on already-pinned workspace
+# crates (no new external dep) so the zero-dep stance is preserved.
+[[example]]
+name = "embedded"
+path = "examples/embedded.rs"

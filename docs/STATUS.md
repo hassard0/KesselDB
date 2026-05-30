@@ -325,6 +325,64 @@ covered by the workspace test suite (2024 default / 2052 with
   Plan (Track E), Q1 closed 4× by SP-Analytic-Plan-MULTI (Track G);
   the residual 4.5× Q1 + 16× Q6 gaps vs Postgres are parallel-hash-
   aggregate territory (next arc SP-Hash-Agg).
+- **Track K — SP-Cloud-Deploy (2026-05-30, V1 SHIPPED).** Production
+  deploy story on top of SP-DX-superior's `Dockerfile` + ghcr.io push.
+  Three artifacts shipped, each individually load-bearing for
+  first-deploy adoption: (1) a Helm chart at
+  `deploy/helm/kesseldb/` — single-pod (replicas:1 + Recreate
+  strategy because the engine is single-writer + PVC is RWO),
+  ServiceAccount + 10 GiB PVC + ClusterIP Service exposing all
+  three wire surfaces (binary 6532, HTTP+WS 6533, PostgreSQL 5432) +
+  Deployment with kessel:1100 non-root + TCP-on-binary liveness +
+  readiness probes + `KESSELDB_TOKEN` env from a pre-existing
+  Secret (default name `kesseldb-token`, key `token`) + 4 CPU /
+  4 Gi limits matching SP-Hash-Agg's 4-way parallel target. Helm
+  v3.16.3 lint: 0 chart(s) failed. (2) `deploy/fly/fly.toml` +
+  `deploy/fly/README.md` — Fly.io single-VM deployment pinned to
+  the ghcr.io image, three [[services]] TCP stanzas (one per wire
+  surface), `auto_stop_machines=off` + `min_machines_running=1`
+  (stateful engine — autostop would break long-lived connections),
+  `strategy=immediate` (single-attach volume). TOML well-formed
+  (Python tomllib parser pass). (3) USAGE §11 + README Deploy
+  section + kind-verify transcript file. **Verified end-to-end on
+  vulcan** (kind v0.24.0 + Kubernetes v1.31.0 + helm v3.16.3 —
+  all installed user-local to vulcan):
+  `helm lint` 0 failed → `helm template` renders 4 K8s objects
+  correctly (SA + PVC + Svc + Deploy; open-mode branch verified
+  via `--set auth.secretName=''`) → `kind create cluster` →
+  `kubectl create secret generic kesseldb-token` →
+  `helm install kesseldb ./deploy/helm/kesseldb` → image side-
+  loaded (GHCR package currently private; documented as a
+  follow-up, see Caveats below) → `kubectl rollout status` GREEN →
+  `kubectl exec deploy/kesseldb -- kessel ... CREATE TABLE` /
+  `INSERT` / `SELECT SUM(v)` returns `= 42` (binary protocol round-
+  trip GREEN) → HTTP `/v1/health` returns
+  `{"status":"ok","primary":true,"view":0,"op_number":4,...}` →
+  HTTP `/v1/sql` `SELECT * FROM smoke` returns
+  `{"status":"ok","bytes":36}` (4-byte LE len prefix + 32-byte
+  encoded row). USAGE.md §11 inserted with sub-sections 11.1
+  (Docker single-host) / 11.2 (Helm) / 11.3 (Fly) / 11.4 (Custom —
+  Nomad/ECS/Cloud Run/systemd-nspawn); former §11-13 (Backup /
+  Wire / Troubleshooting) renumbered to §12-14. README gains a
+  4-row Deploy table pointing at each artifact. **V1 caveats
+  (named, not vague)**: single-pod / single-VM by design (the named
+  follow-up arc SP-Cloud-Cluster will ship StatefulSet + per-replica
+  PVCs + headless Service + ClusterClient endpoints); no public TLS
+  in the v1 ghcr.io image (`--features tls` is opt-in; pair with
+  ingress + cert-manager / `fly certs` if HTTPS is required on the
+  HTTP gateway); GHCR package visibility currently private (default
+  for new ghcr packages; flip to Public in the GitHub UI for
+  one-command kubernetes pull). Zero Rust code touched (this slice
+  is YAML + Markdown only); workspace test count unchanged; default
+  `cargo build` byte-identical; HTTP/1.1 + WS + binary + PG-wire
+  surfaces byte-untouched; `#![forbid(unsafe_code)]` honored (no
+  Rust changes); zero new external deps. Six commits: `e3eca27`
+  (T1 Helm chart skeleton), `449929d` (T2 fly.toml + Fly README),
+  `1a7ceb9` (T3 kind verify transcript), `a3b7d0f` (T4 USAGE §11),
+  `4c5e793` (T5 README Deploy section), plus this commit (T6 STATUS +
+  progress tracker). Progress tracker
+  `docs/superpowers/specs/2026-05-30-kesseldb-spclouddeploy-progress.md`
+  CLOSED. **Arc closed — TaskList #346 ready for completion.**
 
 **Wire surfaces** (all opt-in via cargo features except the binary protocol):
 - **Binary** — length-prefixed `Op::encode()` over TCP; the deterministic fast

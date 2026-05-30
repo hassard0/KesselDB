@@ -30,7 +30,7 @@ WebSocket gateways are wired in.
 git clone https://github.com/hassard0/KesselDB && cd KesselDB
 cargo build --release                                       # binary protocol only
 cargo build --release --features pg-gateway,http-gateway    # all wire surfaces
-cargo test  --workspace --release                           # 1974 default tests
+cargo test  --workspace --release                           # 2018 default tests
 ```
 
 Requires Rust stable 1.95+. No system libraries, no native build steps.

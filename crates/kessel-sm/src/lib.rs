@@ -114,13 +114,24 @@ const MIN_PARALLEL_ROWS: usize = 8192;
 const NUM_HASH_AGG_WORKERS: usize = 4;
 
 /// SP-Hash-Agg-Tune V1 — bounded back-pressure depth per worker
-/// channel. The producer can run at most `BUF_DEPTH` rows ahead of
-/// the slowest worker before blocking; prevents memory blow-up if a
-/// worker stalls while keeping the producer/worker overlap deep
-/// enough to absorb any per-row jitter. 64 is empirically deep enough
-/// to keep all workers busy on Q1/Q6 + shallow enough that the worst-
-/// case in-flight is 64 × 4 = 256 rows × ~200B = ~50KB — bounded.
-const BUF_DEPTH: usize = 64;
+/// channel, measured in BATCHES (not individual rows). The producer
+/// can run at most `BUF_DEPTH × BATCH_SIZE` rows ahead of the slowest
+/// worker before blocking; prevents memory blow-up if a worker stalls
+/// while keeping producer/worker overlap deep enough to absorb per-
+/// batch jitter. 16 batches × 256 rows = 4096 rows in-flight per
+/// worker × 4 workers = 16384 rows worst-case = bounded.
+const BUF_DEPTH: usize = 16;
+
+/// SP-Hash-Agg-Tune V1 — rows per channel message. Batching amortises
+/// the channel send/recv cost across many rows: at 60K rows the V1-
+/// initial unbatched shape paid 60K channel ops × ~500ns = ~30ms of
+/// per-query overhead — MORE than the V1 Arc-wrap pass we eliminated.
+/// At BATCH_SIZE=256, the overhead drops to 60K/256 = 234 ops × ~500ns
+/// = ~120µs — back-of-the-envelope a 250× reduction. The batch is a
+/// `Vec<Arc<[u8]>>` so workers iterate it locally with zero channel
+/// contention. Determinism is preserved: per-row order within a batch
+/// + round-robin batch assignment to workers ⇒ same row → same worker.
+const BATCH_SIZE: usize = 256;
 
 pub struct StateMachine<V: Vfs> {
     catalog: Catalog,
@@ -1675,20 +1686,23 @@ impl<V: Vfs> StateMachine<V> {
             }
             vec![acc]
         } else {
-            // SP-Hash-Agg-Tune V1 — producer-channel-workers streaming.
-            // The producer iterates the materialised source and sends
-            // rows round-robin into N bounded sync_channels; workers
-            // consume their channel and fold rows AS THEY ARRIVE.
-            // Workers start on row 1, not row LAST — eliminating the
-            // V1 serial Vec<Arc<[u8]>> pre-collect prefix on the
-            // critical path (the source materialisation here is the
-            // same cost V1 paid; the win is overlap with worker fold).
+            // SP-Hash-Agg-Tune V1 — producer-channel-workers BATCHED
+            // streaming. The producer iterates the materialised source
+            // and packs rows into BATCH_SIZE-sized Vec batches, sending
+            // them round-robin into N bounded sync_channels. Workers
+            // consume their channel batch-at-a-time and fold rows AS
+            // THE BATCH ARRIVES — amortising channel send/recv across
+            // BATCH_SIZE rows. Determinism preserved: deterministic
+            // source iteration order + round-robin batch assignment ⇒
+            // every row lands in the same worker on every run.
             let (txs, rxs): (
-                Vec<std::sync::mpsc::SyncSender<std::sync::Arc<[u8]>>>,
-                Vec<std::sync::mpsc::Receiver<std::sync::Arc<[u8]>>>,
+                Vec<std::sync::mpsc::SyncSender<Vec<std::sync::Arc<[u8]>>>>,
+                Vec<std::sync::mpsc::Receiver<Vec<std::sync::Arc<[u8]>>>>,
             ) = (0..NUM_HASH_AGG_WORKERS)
                 .map(|_| {
-                    std::sync::mpsc::sync_channel::<std::sync::Arc<[u8]>>(BUF_DEPTH)
+                    std::sync::mpsc::sync_channel::<Vec<std::sync::Arc<[u8]>>>(
+                        BUF_DEPTH,
+                    )
                 })
                 .unzip();
             let fold_one = &fold_one;
@@ -1696,46 +1710,65 @@ impl<V: Vfs> StateMachine<V> {
                 Result<(), String>,
                 Vec<Result<ScalarAcc, String>>,
             ) = std::thread::scope(|scope| {
-                // Producer — owns the source Vec + txs; drops txs on
-                // exit to signal end-of-stream to all workers. Sources
-                // are deterministically ordered (BTreeSet-of-ids for
-                // cand=Some, sorted scan_range for cand=None) so
-                // round-robin assignment is deterministic too.
                 let producer_handle = scope.spawn(move || {
                     let mut next = 0usize;
+                    let mut buf: Vec<std::sync::Arc<[u8]>> =
+                        Vec::with_capacity(BATCH_SIZE);
+                    let flush = |buf: &mut Vec<std::sync::Arc<[u8]>>,
+                                 next: &mut usize,
+                                 txs: &[std::sync::mpsc::SyncSender<
+                        Vec<std::sync::Arc<[u8]>>,
+                    >]|
+                     -> bool {
+                        if buf.is_empty() {
+                            return true;
+                        }
+                        let take = std::mem::replace(
+                            buf,
+                            Vec::with_capacity(BATCH_SIZE),
+                        );
+                        if txs[*next].send(take).is_err() {
+                            return false;
+                        }
+                        *next = (*next + 1) % NUM_HASH_AGG_WORKERS;
+                        true
+                    };
                     match source {
                         RowSource::Pre(rows) => {
                             for r in rows {
-                                if txs[next].send(r).is_err() {
+                                buf.push(r);
+                                if buf.len() >= BATCH_SIZE && !flush(&mut buf, &mut next, &txs) {
                                     break;
                                 }
-                                next = (next + 1) % NUM_HASH_AGG_WORKERS;
                             }
+                            let _ = flush(&mut buf, &mut next, &txs);
                         }
                         RowSource::Scan(rows) => {
                             for (_, rec) in rows {
                                 let arc: std::sync::Arc<[u8]> =
                                     std::sync::Arc::from(rec.into_boxed_slice());
-                                if txs[next].send(arc).is_err() {
+                                buf.push(arc);
+                                if buf.len() >= BATCH_SIZE && !flush(&mut buf, &mut next, &txs) {
                                     break;
                                 }
-                                next = (next + 1) % NUM_HASH_AGG_WORKERS;
                             }
+                            let _ = flush(&mut buf, &mut next, &txs);
                         }
                     }
                     drop(txs);
                     Ok::<(), String>(())
                 });
-                // Workers — each consumes one rx; returns its scalar partial.
                 let worker_handles: Vec<_> = rxs
                     .into_iter()
                     .map(|rx| {
                         scope.spawn(move || {
                             let mut acc: ScalarAcc = (0, 0, None, None);
-                            while let Ok(rec) = rx.recv() {
-                                let r: &[u8] = &rec;
-                                if let Err(e) = fold_one(&mut acc, r) {
-                                    return Err(e);
+                            while let Ok(batch) = rx.recv() {
+                                for rec in &batch {
+                                    let r: &[u8] = rec;
+                                    if let Err(e) = fold_one(&mut acc, r) {
+                                        return Err(e);
+                                    }
                                 }
                             }
                             Ok(acc)
@@ -1998,20 +2031,24 @@ impl<V: Vfs> StateMachine<V> {
                 }
                 vec![local]
             } else {
-                // SP-Hash-Agg-Tune V1 — producer-channel-workers streaming.
-                // The producer drains the materialised source and sends
-                // rows round-robin into N bounded sync_channels; workers
-                // consume their channel and fold rows AS THEY ARRIVE.
-                // Workers start on row 1, not row LAST — eliminating the
-                // V1 serial Vec<Arc<[u8]>> chunk-prefix on the critical
-                // path (the source materialisation here is the same cost
-                // V1 paid; the win is overlap with worker fold).
+                // SP-Hash-Agg-Tune V1 — producer-channel-workers BATCHED
+                // streaming. The producer iterates the materialised
+                // source and packs rows into BATCH_SIZE-sized Vec
+                // batches, sending them round-robin into N bounded
+                // sync_channels. Workers consume their channel batch-
+                // at-a-time and fold rows AS THE BATCH ARRIVES —
+                // amortising channel send/recv across BATCH_SIZE rows.
+                // Determinism preserved: deterministic source iteration
+                // order + round-robin batch assignment ⇒ every row
+                // lands in the same worker on every run.
                 let (txs, rxs): (
-                    Vec<std::sync::mpsc::SyncSender<std::sync::Arc<[u8]>>>,
-                    Vec<std::sync::mpsc::Receiver<std::sync::Arc<[u8]>>>,
+                    Vec<std::sync::mpsc::SyncSender<Vec<std::sync::Arc<[u8]>>>>,
+                    Vec<std::sync::mpsc::Receiver<Vec<std::sync::Arc<[u8]>>>>,
                 ) = (0..NUM_HASH_AGG_WORKERS)
                     .map(|_| {
-                        std::sync::mpsc::sync_channel::<std::sync::Arc<[u8]>>(BUF_DEPTH)
+                        std::sync::mpsc::sync_channel::<Vec<std::sync::Arc<[u8]>>>(
+                            BUF_DEPTH,
+                        )
                     })
                     .unzip();
                 let fold_one = &fold_one;
@@ -2026,24 +2063,51 @@ impl<V: Vfs> StateMachine<V> {
                 ) = std::thread::scope(|scope| {
                     let producer_handle = scope.spawn(move || {
                         let mut next = 0usize;
+                        let mut buf: Vec<std::sync::Arc<[u8]>> =
+                            Vec::with_capacity(BATCH_SIZE);
+                        let flush = |buf: &mut Vec<std::sync::Arc<[u8]>>,
+                                     next: &mut usize,
+                                     txs: &[std::sync::mpsc::SyncSender<
+                            Vec<std::sync::Arc<[u8]>>,
+                        >]|
+                         -> bool {
+                            if buf.is_empty() {
+                                return true;
+                            }
+                            let take = std::mem::replace(
+                                buf,
+                                Vec::with_capacity(BATCH_SIZE),
+                            );
+                            if txs[*next].send(take).is_err() {
+                                return false;
+                            }
+                            *next = (*next + 1) % NUM_HASH_AGG_WORKERS;
+                            true
+                        };
                         match source {
                             RowSource::Pre(rows) => {
                                 for r in rows {
-                                    if txs[next].send(r).is_err() {
+                                    buf.push(r);
+                                    if buf.len() >= BATCH_SIZE
+                                        && !flush(&mut buf, &mut next, &txs)
+                                    {
                                         break;
                                     }
-                                    next = (next + 1) % NUM_HASH_AGG_WORKERS;
                                 }
+                                let _ = flush(&mut buf, &mut next, &txs);
                             }
                             RowSource::Scan(rows) => {
                                 for (_, rec) in rows {
                                     let arc: std::sync::Arc<[u8]> =
                                         std::sync::Arc::from(rec.into_boxed_slice());
-                                    if txs[next].send(arc).is_err() {
+                                    buf.push(arc);
+                                    if buf.len() >= BATCH_SIZE
+                                        && !flush(&mut buf, &mut next, &txs)
+                                    {
                                         break;
                                     }
-                                    next = (next + 1) % NUM_HASH_AGG_WORKERS;
                                 }
+                                let _ = flush(&mut buf, &mut next, &txs);
                             }
                         }
                         drop(txs);
@@ -2057,10 +2121,12 @@ impl<V: Vfs> StateMachine<V> {
                                     Vec<u8>,
                                     Vec<Acc>,
                                 > = std::collections::HashMap::new();
-                                while let Ok(rec) = rx.recv() {
-                                    let r: &[u8] = &rec;
-                                    if let Err(e) = fold_one(&mut local, r) {
-                                        return Err(e);
+                                while let Ok(batch) = rx.recv() {
+                                    for rec in &batch {
+                                        let r: &[u8] = rec;
+                                        if let Err(e) = fold_one(&mut local, r) {
+                                            return Err(e);
+                                        }
                                     }
                                 }
                                 Ok(local)

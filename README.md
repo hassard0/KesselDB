@@ -409,9 +409,22 @@ including the *losses* where KesselDB does NOT win — are in
   2.66× Postgres + 2.60× SQLite. Next: **SP‑Perf‑A‑OPTIMISTIC‑CC**
   (abort‑and‑retry with full SI overlay) for the read‑after‑write
   fallthrough case.
-- **SP‑Perf‑A‑SHARD** (sharded apply queues + per‑shard read pools)
-  is the next throughput lever — the ~5 M ops/sec storage ceiling
-  at N=16 traces to `RwLock<StateMachine>` reader CAS ping‑pong.
+- **SP‑Perf‑A‑SHARD‑APPLY V1 SHIPPED 2026‑05‑30** — wires K
+  independent per‑shard sub‑engines (each its own
+  `Arc<RwLock<StateMachine>>` + apply thread + WAL + SSTables,
+  rooted at `data_dir/shard‑<i>/`) and routes every Op via
+  `hash(make_key(type_id, oid)) % K`. Activation: opt‑in via
+  `ServerConfig.shard_count = Some(K)` (default `None` =
+  pre‑SHARD byte‑identical). **Vulcan get‑by‑id sweep
+  (10K rows, 16 workers, 10s):** K=baseline 4.68M ops/s → K=2
+  7.30M (1.56×) → K=4 11.08M (2.37×) → **K=8 14.93M (3.19× —
+  BREAKS the 10M ceiling)** → K=16 16.72M (3.57×). p50 latency
+  drops 3 µs → <1 µs. V1 limitations: scans/Txn route to shard 0
+  (named `SP‑Perf‑A‑SHARD‑SCAN` / `‑XTXN` follow‑ups);
+  per‑type FindBy / Describe pins all rows of a type to one
+  shard (per‑type lookups stay single‑shard); cross‑shard atomic
+  Txn deferred. Next: **SP‑Perf‑A‑SHARD‑SCAN** (scatter‑merge for
+  Select / Aggregate / Query so K>=2 scan ops see all data).
 - **SP‑Analytic‑Plan + SP‑Analytic‑Plan‑MULTI + SP‑Hash‑Agg +
   SP‑Hash‑Agg‑Tune V1 SHIPPED (2026‑05‑29 → 2026‑05‑30)** — four
   sequential arcs for the TPC‑H Q1/Q6 losses: (1) range‑pred

@@ -1271,12 +1271,46 @@ pub fn scatter_and_merge_ctx<C: ShardCaller>(
 // reply; replies merge in shard-id order via the same merge contract
 // the spawn-per-call path uses.
 
+/// SP-Perf-A-SHARD-SCAN-POOL-SCALEOUT: per-worker channel bound.
+///
+/// Bumped from 1 → 64 on 2026-06-01 to close the FASTPATH regression
+/// on `select-limit` / `select-sorted` at K=4 (see
+/// `docs/superpowers/specs/2026-06-01-kesseldb-spperfa-shard-scan-pool-scaleout-design.md`).
+///
+/// **Why bigger:** `kessel-bench parallel-reads --workers 16` opens
+/// 16 concurrent client connections; each becomes its own dispatcher
+/// thread inside `ShardedDispatcher`. With `sync_channel(1)` every
+/// pool worker only accepts the next item once the dispatcher of the
+/// previous item has drained its reply — so at K=4 with 16
+/// dispatchers, the four worker channels became FIFO queues
+/// serializing all 16 dispatchers onto 4 workers. The longer the
+/// per-op work (`select-limit` clipping 100K rows, `select-sorted`
+/// scan+sort), the worse the head-of-line blocking.
+///
+/// **Why 64:** an order of magnitude bigger than the typical
+/// `--workers 16` dispatcher count, with bounded memory cost (a
+/// queued `PoolWorkItem` is ~64-128 bytes, so 64 × K workers ≈ a
+/// few KB worst-case). Not a runtime knob — bumping it again means
+/// editing this const + the `pool_bound_is_sixty_four_per_spec` KAT.
+///
+/// **Why not unbounded:** an unbounded channel would let a slow
+/// shard accumulate millions of in-flight work items if connection
+/// churn outran worker throughput — bounded is bounded-memory.
+///
+/// **Determinism preserved:** the bound is purely a backpressure
+/// ceiling. Per-shard dispatch order, per-shard reply order, merge
+/// semantics, K-invariance — all unchanged.
+const POOL_BOUND: usize = 64;
+
 /// SP-Perf-A-SHARD-SCAN-FASTPATH: a per-shard work item dispatched
 /// to a `ScatterPool` worker. The worker invokes its long-lived
 /// `dispatch_fn` against `op` + `cancel`, then sends the result on
-/// `reply_tx`. Backpressure via `sync_channel(1)` — the dispatcher
-/// always drains the previous batch before issuing the next, so the
-/// channel is empty when send returns.
+/// `reply_tx`. Backpressure via `sync_channel(POOL_BOUND)` — the
+/// dispatcher usually drains the previous batch before issuing the
+/// next (so the channel is typically empty when send returns), but
+/// under high-concurrency load (16 dispatcher threads all dispatching
+/// against the same K workers) the bound prevents `send()` from
+/// blocking each dispatcher behind the worker's serialization queue.
 struct PoolWorkItem {
     /// The op to dispatch on this shard. Cloned by the dispatcher.
     op: Op,
@@ -1334,16 +1368,23 @@ impl ScatterPool {
         let mut workers: Vec<Option<thread::JoinHandle<()>>> =
             Vec::with_capacity(k);
         for (i, dispatch_fn) in dispatch_fns.into_iter().enumerate() {
-            // sync_channel(1): one in-flight work item per worker.
-            // The dispatcher always drains all K replies before
-            // issuing the next batch, so the channel is empty when
-            // send returns. Bound=1 is the natural choice — bound>1
-            // would queue work items the worker hasn't processed,
-            // which complicates Drop (workers must drain queue before
-            // exiting). Bound=0 (rendezvous) would force the
-            // dispatcher to wait for the worker to enter `recv()`,
-            // serializing dispatch across shards.
-            let (tx, rx) = mpsc::sync_channel::<PoolWorkItem>(1);
+            // sync_channel(POOL_BOUND): per-worker bounded queue.
+            //
+            // POOL-SCALEOUT (2026-06-01): bumped from 1 → 64 to absorb
+            // 16 concurrent dispatcher threads dispatching against
+            // the same K workers under saturation (each connection
+            // is its own dispatcher; bound=1 serialized 16 dispatchers
+            // through K worker channels, regressing select-limit /
+            // select-sorted by ~50-69% at K=4).
+            //
+            // Drop semantics: a worker still drains every queued
+            // item on the rx side as the pool's Drop signal works by
+            // closing tx (worker sees RecvError after the queue is
+            // empty, exits cleanly). The single previous batch's
+            // synchronous wait pattern still holds; the bound just
+            // means later dispatchers don't block when the previous
+            // batch's worker hasn't yet been woken to recv.
+            let (tx, rx) = mpsc::sync_channel::<PoolWorkItem>(POOL_BOUND);
             let handle = thread::Builder::new()
                 .name(format!("kdb-scatter-pool-worker-{i}"))
                 .spawn(move || pool_worker_loop(rx, dispatch_fn))
@@ -5537,6 +5578,117 @@ mod tests {
         // Cancel was fired so any subsequent dispatch on the same flag
         // would short-circuit.
         assert!(cancel.load(AtomicOrdering::SeqCst));
+    }
+
+    /// **POOL-SCALEOUT KAT — `POOL_BOUND` is the documented bound (=64).**
+    /// Lock the constant value so a regression that bumps it back to
+    /// 1 (FASTPATH-shape regression on select-limit / select-sorted)
+    /// or to a wildly different number (unbounded queue OOM risk) is
+    /// caught at test time. See `docs/superpowers/specs/2026-06-01-
+    /// kesseldb-spperfa-shard-scan-pool-scaleout-design.md` for the
+    /// rationale (16 dispatchers × K workers under saturation; 64 ~=
+    /// an order of magnitude bigger than the typical dispatcher count).
+    #[test]
+    fn pool_bound_is_sixty_four_per_spec() {
+        assert_eq!(
+            POOL_BOUND, 64,
+            "POOL-SCALEOUT (2026-06-01) specifies POOL_BOUND=64; \
+             bump = spec change"
+        );
+    }
+
+    /// **POOL-SCALEOUT KAT — 16 dispatcher threads × 100 ops each all
+    /// complete via a shared K=4 pool, without per-dispatcher deadlock
+    /// or lost work.** This is the high-concurrency dispatch shape the
+    /// arc was scoped against: `kessel-bench parallel-reads --workers
+    /// 16` opens 16 concurrent client connections, each becoming its
+    /// own dispatcher thread; all 16 dispatch into the same K worker
+    /// channels. With POOL_BOUND=1 (the FASTPATH default) the channel-
+    /// full backpressure would serialize them; with POOL_BOUND=64 they
+    /// queue freely and every dispatch returns a `Got(_)` reply.
+    ///
+    /// Acceptance: every one of the 16 × 100 = 1600 dispatches completes
+    /// within a generous deadline (5 seconds), the per-shard counter
+    /// records every call, and the merged reply is `Got(_)` for every
+    /// dispatch. Failure modes this catches: deadlock (some dispatcher
+    /// never returns), lost work (counter < 1600), or non-Got slot
+    /// (bound interaction broke a worker's reply send).
+    #[test]
+    fn pool_high_concurrency_16_dispatchers_x_100_ops_no_deadlock() {
+        const N_DISPATCHERS: usize = 16;
+        const OPS_PER_DISPATCHER: usize = 100;
+        const K: usize = 4;
+        let (pool, counters) = build_pool_with_canned(vec![
+            OpResult::Got(vec![].into()),
+            OpResult::Got(vec![].into()),
+            OpResult::Got(vec![].into()),
+            OpResult::Got(vec![].into()),
+        ]);
+        assert_eq!(pool.shard_count(), K);
+        let pool = Arc::new(pool);
+        let completed = Arc::new(AtomicUsize::new(0));
+        let non_got = Arc::new(AtomicUsize::new(0));
+        let mut handles: Vec<thread::JoinHandle<()>> =
+            Vec::with_capacity(N_DISPATCHERS);
+        let start = Instant::now();
+        for _dispatcher_id in 0..N_DISPATCHERS {
+            let pool_for_thread = pool.clone();
+            let completed_for_thread = completed.clone();
+            let non_got_for_thread = non_got.clone();
+            let h = thread::spawn(move || {
+                for _ in 0..OPS_PER_DISPATCHER {
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    let r = scatter_and_merge_via_pool(
+                        &pool_for_thread,
+                        &dummy_select(),
+                        DEFAULT_PER_SHARD_TIMEOUT,
+                        &ScatterKind::OidConcat,
+                        cancel,
+                    );
+                    if !matches!(r, OpResult::Got(_)) {
+                        non_got_for_thread.fetch_add(1, Ordering::SeqCst);
+                    }
+                    completed_for_thread.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            handles.push(h);
+        }
+        // Every dispatcher must finish within a generous deadline.
+        for h in handles {
+            h.join().expect("dispatcher thread joined");
+        }
+        let elapsed = start.elapsed();
+        let total_ops = N_DISPATCHERS * OPS_PER_DISPATCHER;
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            total_ops,
+            "every dispatch must complete (deadlock check)"
+        );
+        assert_eq!(
+            non_got.load(Ordering::SeqCst),
+            0,
+            "every dispatch must return Got (bound interaction sanity)"
+        );
+        // Per-shard counter sums to N_DISPATCHERS * OPS_PER_DISPATCHER
+        // across all 4 workers.
+        let total_calls: usize = counters
+            .iter()
+            .map(|c| c.load(Ordering::SeqCst))
+            .sum();
+        assert_eq!(
+            total_calls,
+            total_ops * K,
+            "every shard was called once per dispatch (no lost work)"
+        );
+        // Loose wall-clock bound: 1600 dispatches across 4 workers
+        // should fit comfortably under 5s on any reasonable host.
+        // Bound=1 would push this WAY past 5s under saturation; the
+        // KAT catches a regression.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "high-concurrency dispatch took {elapsed:?} (expected <5s; \
+             >5s suggests POOL_BOUND regression to a smaller value)"
+        );
     }
 
     /// Throughput sanity: dispatching 1000 work items via the pool

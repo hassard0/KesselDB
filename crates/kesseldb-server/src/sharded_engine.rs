@@ -336,10 +336,11 @@ pub fn route_op(op: &Op, k: usize) -> ShardRoute {
 ///   work is the full-shard aggregate fold; fan-out wins on multi-core.
 ///
 /// K-invariance preserved byte-equal: `scatter_serial` collects results
-/// in shard-id order (same order as the pool's `worker_txs[0..K]`
-/// drain) and routes through `merge_scan_results` with the same
-/// `ScatterKind`. The resulting merged payload is byte-identical to
-/// what the parallel path would produce.
+/// in shard-id order (same order the pool's per-call reply rxs are
+/// drained in shard-id order via the dispatcher's `Vec<Receiver>`) and
+/// routes through `merge_scan_results` with the same `ScatterKind`.
+/// The resulting merged payload is byte-identical to what the parallel
+/// path would produce.
 #[inline]
 fn is_tiny_scan(op: &Op) -> bool {
     matches!(op, Op::FindBy { .. } | Op::FindByComposite { .. })

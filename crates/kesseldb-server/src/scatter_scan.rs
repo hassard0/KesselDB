@@ -58,7 +58,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1271,47 +1271,69 @@ pub fn scatter_and_merge_ctx<C: ShardCaller>(
 // reply; replies merge in shard-id order via the same merge contract
 // the spawn-per-call path uses.
 
-/// SP-Perf-A-SHARD-SCAN-POOL-SCALEOUT: per-worker channel bound.
+/// SP-Perf-A-SHARD-SCAN-POOL-SCALEOUT: shared work-queue bound.
 ///
-/// Bumped from 1 → 64 on 2026-06-01 to close the FASTPATH regression
-/// on `select-limit` / `select-sorted` at K=4 (see
-/// `docs/superpowers/specs/2026-06-01-kesseldb-spperfa-shard-scan-pool-scaleout-design.md`).
-///
-/// **Why bigger:** `kessel-bench parallel-reads --workers 16` opens
-/// 16 concurrent client connections; each becomes its own dispatcher
-/// thread inside `ShardedDispatcher`. With `sync_channel(1)` every
-/// pool worker only accepts the next item once the dispatcher of the
-/// previous item has drained its reply — so at K=4 with 16
-/// dispatchers, the four worker channels became FIFO queues
-/// serializing all 16 dispatchers onto 4 workers. The longer the
-/// per-op work (`select-limit` clipping 100K rows, `select-sorted`
-/// scan+sort), the worse the head-of-line blocking.
+/// Locked at 64 since the 2026-06-01 POOL-SCALEOUT V1 T1 ship; the
+/// constant survived the T2/T4 escalation from per-shard worker
+/// channels (Approach A) to M shared workers (Approach C). It now
+/// bounds the SINGLE shared work queue every dispatcher pushes into.
 ///
 /// **Why 64:** an order of magnitude bigger than the typical
 /// `--workers 16` dispatcher count, with bounded memory cost (a
-/// queued `PoolWorkItem` is ~64-128 bytes, so 64 × K workers ≈ a
-/// few KB worst-case). Not a runtime knob — bumping it again means
-/// editing this const + the `pool_bound_is_sixty_four_per_spec` KAT.
+/// queued `PoolWorkItem` is ~64-128 bytes, so 64 ≈ a few KB
+/// worst-case). Not a runtime knob — bumping it again means editing
+/// this const + the `pool_bound_is_sixty_four_per_spec` KAT.
 ///
-/// **Why not unbounded:** an unbounded channel would let a slow
-/// shard accumulate millions of in-flight work items if connection
-/// churn outran worker throughput — bounded is bounded-memory.
+/// **Why not unbounded:** an unbounded channel would let dispatcher
+/// churn accumulate unbounded in-flight work — bounded is bounded-
+/// memory.
 ///
 /// **Determinism preserved:** the bound is purely a backpressure
-/// ceiling. Per-shard dispatch order, per-shard reply order, merge
-/// semantics, K-invariance — all unchanged.
+/// ceiling. Per-call shard dispatch order, per-call reply ordering
+/// (the dispatcher collects `Vec<Receiver>` in shard-id order), merge
+/// semantics, K-invariance — all unchanged regardless of which of the
+/// M workers fulfills a given `(shard_id, op)` pair.
 const POOL_BOUND: usize = 64;
 
-/// SP-Perf-A-SHARD-SCAN-FASTPATH: a per-shard work item dispatched
-/// to a `ScatterPool` worker. The worker invokes its long-lived
-/// `dispatch_fn` against `op` + `cancel`, then sends the result on
-/// `reply_tx`. Backpressure via `sync_channel(POOL_BOUND)` — the
-/// dispatcher usually drains the previous batch before issuing the
-/// next (so the channel is typically empty when send returns), but
-/// under high-concurrency load (16 dispatcher threads all dispatching
-/// against the same K workers) the bound prevents `send()` from
-/// blocking each dispatcher behind the worker's serialization queue.
+/// SP-Perf-A-SHARD-SCAN-POOL-SCALEOUT: per-shard parallelism
+/// multiplier.
+///
+/// Total worker count = `max(K * POOL_WORKERS_PER_SHARD, MIN_POOL_WORKERS)`.
+/// 4 keeps the M / K ratio at "enough workers per shard to cover the
+/// typical concurrent-dispatcher count without one shard hogging all
+/// workers".
+const POOL_WORKERS_PER_SHARD: usize = 4;
+
+/// SP-Perf-A-SHARD-SCAN-POOL-SCALEOUT: floor on total worker count.
+///
+/// At K=2 or K=3 the K × POOL_WORKERS_PER_SHARD multiplier would
+/// undersize the pool relative to the typical `--workers 16`
+/// dispatcher fan-in. 16 is the typical concurrent-dispatcher count
+/// — pinning the floor here means K=2 sees the same dispatch headroom
+/// as K=8.
+const MIN_POOL_WORKERS: usize = 16;
+
+/// SP-Perf-A-SHARD-SCAN-POOL-SCALEOUT (T2/T4 — Approach C): a work
+/// item dispatched to the shared `ScatterPool` queue. Any of the M
+/// workers can pick it up; the worker uses `shard_id` to select its
+/// dispatch closure from the shared `Arc<Vec<Box<dyn Fn>>>` table.
+///
+/// **Why a shard_id field (Approach C)** instead of a per-shard
+/// channel (Approach A, V1 T1): POOL-SCALEOUT V1 T1 bumped per-shard
+/// `sync_channel(1)` to `sync_channel(64)`, expecting that the
+/// queue-full backpressure was the bottleneck. Vulcan bench refuted
+/// that: at K=4 with 16 dispatchers, select-limit / select-sorted /
+/// aggregate-sum at K=4 were unchanged from POST-FASTPATH (the bound
+/// bump had no measurable effect). The real bottleneck was per-worker
+/// throughput — each worker serially processes its queue, so 16
+/// dispatchers waiting on 4 workers always serialize at ~ workers /
+/// dispatchers throughput. T2/T4 escalated to Approach C from the
+/// design spec: M = max(K * 4, 16) shared workers race for items
+/// off a single queue; any worker can fulfill any shard's op.
 struct PoolWorkItem {
+    /// Which shard's dispatch closure to invoke for this op. Indexes
+    /// into the worker's `Arc<Vec<Box<dyn Fn>>>` table.
+    shard_id: u32,
     /// The op to dispatch on this shard. Cloned by the dispatcher.
     op: Op,
     /// Cancellation flag shared with all K workers for this scatter
@@ -1321,35 +1343,53 @@ struct PoolWorkItem {
     reply_tx: mpsc::SyncSender<OpResult>,
 }
 
-/// SP-Perf-A-SHARD-SCAN-FASTPATH: persistent thread pool for in-process
-/// scatter-merge. Spawns N workers at construction time (one per
-/// shard); each worker blocks on its own `sync_channel`, processing
-/// work items in order. Replaces the per-call `std::thread::spawn`
-/// path that dominated `find-by` perf at K=4 (~1500µs spawn overhead
-/// vs ~500ns of useful work).
+/// SP-Perf-A-SHARD-SCAN-POOL-SCALEOUT (T2/T4 — Approach C): persistent
+/// shared-queue thread pool for in-process scatter-merge.
+///
+/// Spawns `M = max(K * POOL_WORKERS_PER_SHARD, MIN_POOL_WORKERS)`
+/// workers at construction time. All M workers race for items off a
+/// single shared `mpsc::sync_channel(POOL_BOUND)` queue. Each worker
+/// holds a clone of `Arc<Vec<Box<dyn Fn>>>` (the per-shard dispatch
+/// closures) and uses the work item's `shard_id` to select the right
+/// closure per op.
+///
+/// **V1 (T1, replaced T2/T4)** spawned 1 worker per shard with a
+/// per-shard `sync_channel(1 → 64)` queue. Vulcan bench confirmed
+/// that bound bump was insufficient — per-worker throughput, not
+/// channel-send backpressure, was the bottleneck. **T2/T4 (Approach
+/// C, this implementation)** spreads workers wider so 16 concurrent
+/// dispatchers no longer queue behind K serial workers.
 ///
 /// Pool lifetime: created once per `ShardedDispatcher`, destroyed when
-/// the dispatcher drops. `Drop` closes every worker's tx (causes
-/// `RecvError` on the worker side, clean loop exit, JoinHandle joins).
+/// the dispatcher drops. `Drop` closes the work tx (causes `RecvError`
+/// on the worker side once the queue is drained, clean loop exit,
+/// JoinHandles join).
 ///
-/// Per-shard dispatch closure: stored once at pool construction (a
-/// `Box<dyn Fn(&Op, &Arc<AtomicBool>) -> OpResult + Send + Sync>`).
-/// In the in-process case this is a closure that captures
-/// `Arc<EngineHandle>` for the shard and calls `engine.apply_op(op)`.
-/// Boxing the closure once at construction (vs per-call) keeps the
-/// hot path allocation-free.
+/// Per-shard dispatch closure: stored once at pool construction in
+/// `Arc<Vec<Box<dyn Fn(&Op, &Arc<AtomicBool>) -> OpResult + Send +
+/// Sync>>>`. In the in-process case each closure captures
+/// `Arc<EngineHandle>` for its shard and calls `engine.apply_op(op)`.
+/// The `Arc` lets every one of the M workers hold a reference without
+/// per-worker re-allocation.
 pub struct ScatterPool {
-    /// Per-shard tx for sending `PoolWorkItem`s. Indexed by shard id.
-    worker_txs: Vec<mpsc::SyncSender<PoolWorkItem>>,
-    /// Per-shard worker JoinHandles, kept for clean shutdown. Wrapped
-    /// in `Option` because `Drop` takes them out to join.
+    /// Single shared work-queue tx. Cloned to every caller of
+    /// `scatter_and_merge_via_pool`; M workers race for items off the
+    /// matching rx (held inside an `Arc<Mutex<...>>` so each worker
+    /// can `recv()`).
+    work_tx: mpsc::SyncSender<PoolWorkItem>,
+    /// M worker JoinHandles, kept for clean shutdown. Wrapped in
+    /// `Option` because `Drop` takes them out to join.
     workers: Vec<Option<thread::JoinHandle<()>>>,
+    /// Shard count (length of the dispatch_fns vector each worker
+    /// holds). Exposed via `shard_count()`.
+    shard_count: usize,
 }
 
 impl ScatterPool {
-    /// Construct a pool with one worker per shard. `dispatch_fns` must
-    /// have length K (one closure per shard). Each closure is moved
-    /// into its worker thread and called once per work item.
+    /// Construct a pool with K dispatch closures (one per shard) and
+    /// spawn M = max(K * POOL_WORKERS_PER_SHARD, MIN_POOL_WORKERS)
+    /// workers. Each worker can dispatch to any shard via the work
+    /// item's `shard_id` field.
     ///
     /// The closures are `Send + Sync + 'static`; in the in-process
     /// case they capture an `Arc<EngineHandle>` and invoke
@@ -1363,58 +1403,85 @@ impl ScatterPool {
         >,
     ) -> Self {
         let k = dispatch_fns.len();
-        let mut worker_txs: Vec<mpsc::SyncSender<PoolWorkItem>> =
-            Vec::with_capacity(k);
+        // K=0 edge case: zero workers, zero queue. The dispatch path
+        // (`scatter_and_merge_via_pool`) short-circuits on
+        // `shard_count() == 0` before touching the channel, so the
+        // sender we construct here is only kept alive for Drop
+        // symmetry.
+        let m = if k == 0 {
+            0
+        } else {
+            (k * POOL_WORKERS_PER_SHARD).max(MIN_POOL_WORKERS)
+        };
+        let (work_tx, work_rx) =
+            mpsc::sync_channel::<PoolWorkItem>(POOL_BOUND.max(1));
+        // Wrap rx in Arc<Mutex<...>> so M workers can race for items.
+        // The Mutex hop is brief (a recv() lock per item dequeued)
+        // and uncontended in steady state — workers are mostly idle
+        // waiting on recv(), so the lock is rarely held > 1µs.
+        let work_rx = Arc::new(Mutex::new(work_rx));
+        // Wrap dispatch_fns in an Arc so every worker holds a
+        // reference without per-worker allocation. The closures
+        // themselves are Sync (Box<dyn Fn + Sync>) so invoking them
+        // from any worker is safe.
+        let dispatch_fns: Arc<
+            Vec<
+                Box<dyn Fn(&Op, &Arc<AtomicBool>) -> OpResult + Send + Sync + 'static>,
+            >,
+        > = Arc::new(dispatch_fns);
         let mut workers: Vec<Option<thread::JoinHandle<()>>> =
-            Vec::with_capacity(k);
-        for (i, dispatch_fn) in dispatch_fns.into_iter().enumerate() {
-            // sync_channel(POOL_BOUND): per-worker bounded queue.
-            //
-            // POOL-SCALEOUT (2026-06-01): bumped from 1 → 64 to absorb
-            // 16 concurrent dispatcher threads dispatching against
-            // the same K workers under saturation (each connection
-            // is its own dispatcher; bound=1 serialized 16 dispatchers
-            // through K worker channels, regressing select-limit /
-            // select-sorted by ~50-69% at K=4).
-            //
-            // Drop semantics: a worker still drains every queued
-            // item on the rx side as the pool's Drop signal works by
-            // closing tx (worker sees RecvError after the queue is
-            // empty, exits cleanly). The single previous batch's
-            // synchronous wait pattern still holds; the bound just
-            // means later dispatchers don't block when the previous
-            // batch's worker hasn't yet been woken to recv.
-            let (tx, rx) = mpsc::sync_channel::<PoolWorkItem>(POOL_BOUND);
+            Vec::with_capacity(m);
+        for i in 0..m {
+            let rx_clone = work_rx.clone();
+            let fns_clone = dispatch_fns.clone();
             let handle = thread::Builder::new()
                 .name(format!("kdb-scatter-pool-worker-{i}"))
-                .spawn(move || pool_worker_loop(rx, dispatch_fn))
+                .spawn(move || pool_worker_loop(rx_clone, fns_clone))
                 .expect(
                     "kdb-scatter-pool: worker spawn (std::thread; zero-dep)",
                 );
-            worker_txs.push(tx);
             workers.push(Some(handle));
         }
-        Self { worker_txs, workers }
+        Self { work_tx, workers, shard_count: k }
     }
 
-    /// Number of workers (= number of shards).
+    /// Number of shards K (length of the dispatch_fns vector). NOT
+    /// the worker count — Approach C decouples those (M = K*4 floor 16).
     #[inline]
     pub fn shard_count(&self) -> usize {
-        self.worker_txs.len()
+        self.shard_count
+    }
+
+    /// Total worker count M (test-visible; helps the new
+    /// `pool_worker_count_scales_with_k` KAT lock the M formula).
+    #[inline]
+    pub fn worker_count(&self) -> usize {
+        self.workers.len()
     }
 }
 
 impl Drop for ScatterPool {
     fn drop(&mut self) {
-        // Drop every worker's tx — causes `recv()` to return
-        // `Err(RecvError)`, the worker exits its loop, JoinHandle
-        // joins. We `take()` each worker JoinHandle out of its Option
-        // BEFORE dropping the txs so the order is:
-        //   1. Move the txs out + drop them (workers see RecvError).
-        //   2. Join every worker (each is in its post-loop exit path).
-        // Reversing the order would deadlock (join before drop = wait
-        // for a worker that's still blocked on recv).
-        self.worker_txs.clear();
+        // Drop the work tx — once the queue drains, every worker's
+        // `recv()` returns `Err(RecvError)`, the worker exits its
+        // loop, and the JoinHandle joins. We replace `work_tx` with
+        // a synthetic closed sender first (taking ownership out of
+        // self) so the Drop order is:
+        //   1. The original work_tx is dropped (queue tx-count drops
+        //      to 0 once any cloned senders are gone).
+        //   2. Every worker drains the remaining queue + exits.
+        //   3. Each JoinHandle joins.
+        //
+        // The `mem::replace` dance is needed because we can't move
+        // `self.work_tx` out of a `&mut self` Drop. A small unsafe-
+        // free trick: replace with a fresh sender backed by a fresh
+        // (rendezvous) channel — the synthetic rx is dropped at end
+        // of scope, leaving the synthetic tx with no readers; the
+        // real workers don't see it.
+        let (synthetic_tx, _synthetic_rx) =
+            mpsc::sync_channel::<PoolWorkItem>(1);
+        let real_tx = std::mem::replace(&mut self.work_tx, synthetic_tx);
+        drop(real_tx);
         for slot in self.workers.iter_mut() {
             if let Some(h) = slot.take() {
                 let _ = h.join();
@@ -1423,49 +1490,91 @@ impl Drop for ScatterPool {
     }
 }
 
-/// Worker loop: block on `recv()`, dispatch the op via the long-lived
-/// closure, send the result back. `RecvError` (pool dropped) exits the
-/// loop cleanly. A poisoned reply_tx (SendError — caller dropped the
-/// receiver e.g. on a LIMIT-cancellation timeout) is silently ignored
-/// (same clean-exit shape as the spawn-per-call path).
+/// Worker loop (Approach C): block on the SHARED `recv()`, dispatch
+/// the op via the per-shard closure picked by `item.shard_id`, send
+/// the result back.
+///
+/// `RecvError` (pool dropped) exits the loop cleanly. A poisoned
+/// reply_tx (SendError — caller dropped the receiver e.g. on a
+/// LIMIT-cancellation timeout) is silently ignored (same clean-exit
+/// shape as the V1 spawn-per-call path).
+///
+/// The recv hop holds the work-queue Mutex briefly while pulling one
+/// item; the closure invocation + reply send happen WITHOUT the lock.
+/// Under contention (M workers all racing for items in a hot queue)
+/// the lock is the bottleneck only if per-op work is sub-microsecond
+/// — for the ~5µs+ ops POOL-SCALEOUT targets the lock-hop cost is
+/// negligible (~50ns).
 fn pool_worker_loop(
-    rx: mpsc::Receiver<PoolWorkItem>,
-    dispatch_fn: Box<
-        dyn Fn(&Op, &Arc<AtomicBool>) -> OpResult + Send + Sync + 'static,
+    rx: Arc<Mutex<mpsc::Receiver<PoolWorkItem>>>,
+    dispatch_fns: Arc<
+        Vec<
+            Box<dyn Fn(&Op, &Arc<AtomicBool>) -> OpResult + Send + Sync + 'static>,
+        >,
     >,
 ) {
-    while let Ok(item) = rx.recv() {
-        // SP155 §3.7: pre-call cancel check. If the dispatcher has
-        // already cancelled (LIMIT-hit on an earlier scatter, or
-        // pre-fired cancel), short-circuit to Unavailable so the
-        // dispatcher's merge loop sees a non-Got slot without doing
-        // any work. Cheap relaxed load.
+    loop {
+        // Pull one item from the shared queue under the recv lock.
+        // Releasing the lock BEFORE invoking the dispatch closure
+        // means other workers can recv concurrently while we work.
+        let item = {
+            let guard = match rx.lock() {
+                Ok(g) => g,
+                // Mutex poisoned (a previous worker panicked while
+                // holding the lock — shouldn't happen in practice
+                // since the lock is held only across `recv()`). Exit
+                // the worker; the pool itself will outlive this
+                // worker, but a poisoned mutex means we can't safely
+                // pull more items.
+                Err(_poisoned) => break,
+            };
+            match guard.recv() {
+                Ok(it) => it,
+                // Pool dropped + queue drained → exit cleanly.
+                Err(_recv_err) => break,
+            }
+        };
+        // Lock released. Pick the per-shard closure and invoke.
         let r = if item.cancel.load(AtomicOrdering::SeqCst) {
+            // SP155 §3.7 pre-call cancel check: if the dispatcher
+            // has already cancelled (LIMIT hit on an earlier scatter,
+            // or pre-fired cancel), short-circuit to Unavailable.
             OpResult::Unavailable
         } else {
-            (dispatch_fn)(&item.op, &item.cancel)
+            let idx = item.shard_id as usize;
+            // Defensive bounds check: the dispatcher only sends valid
+            // shard_ids (0..K), but a malformed item would panic in
+            // release mode without this guard.
+            if idx < dispatch_fns.len() {
+                (dispatch_fns[idx])(&item.op, &item.cancel)
+            } else {
+                OpResult::Unavailable
+            }
         };
-        // Best-effort send — SendError on dropped rx is the clean-exit
-        // path (same shape as scatter_and_merge_ctx's worker tx).
+        // Best-effort send — SendError on dropped rx is the clean-
+        // exit path (same shape as scatter_and_merge_ctx's worker tx).
         let _ = item.reply_tx.send(r);
     }
 }
 
-/// SP-Perf-A-SHARD-SCAN-FASTPATH: fan out `op` to every worker in
-/// `pool`, then merge per `kind` exactly like `scatter_and_merge_ctx`.
-/// Per-call overhead is ~5-10µs (channel send + recv) instead of
-/// ~1500µs (thread spawn). The merge contract is byte-identical.
+/// SP-Perf-A-SHARD-SCAN-FASTPATH (V1) + POOL-SCALEOUT T2/T4 (V2):
+/// fan out `op` to the K shards via the shared work queue, then merge
+/// per `kind` exactly like `scatter_and_merge_ctx`.
 ///
-/// V1 hard-fail behavior: any non-Got slot poisons the merge with
-/// that slot's typed error. K-invariance preserved (workers are
-/// stateless from the dispatch path's perspective; per-shard reply
-/// ordering is by `pool.worker_txs[i]` index).
+/// Per-call overhead is ~5-10µs (shared-queue send + dedicated reply-
+/// channel recv) instead of ~1500µs (thread spawn). The merge contract
+/// is byte-identical to V1.
 ///
-/// Worker count MUST match the caller's expected shard count (the
-/// pool is constructed with K workers; this function dispatches to
-/// all of them). Passing a pool with the wrong K is a programming
-/// error (asserted in debug; in release the smaller of the two wins
-/// — no crash, but the merge result is for a different K).
+/// V1 hard-fail behavior preserved: any non-Got slot poisons the merge
+/// with that slot's typed error. K-invariance preserved: each shard
+/// gets its own dedicated `reply_tx`/`reply_rx` pair (one per call,
+/// per shard); the dispatcher collects rxs in shard-id order so the
+/// merge sees per-shard replies indexed by shard_id, NOT by worker.
+/// Any of the M pool workers may fulfill any (shard_id, op) pair —
+/// determinism is unaffected.
+///
+/// The pool's `shard_count()` MUST match the caller's expected shard
+/// count. Passing a pool with the wrong K is a programming error.
 pub fn scatter_and_merge_via_pool(
     pool: &ScatterPool,
     op: &Op,
@@ -1483,35 +1592,38 @@ pub fn scatter_and_merge_via_pool(
     if cancel.load(AtomicOrdering::SeqCst) {
         return OpResult::Got(Vec::<u8>::new().into());
     }
-    // Dispatch one work item per worker. Each gets a fresh
-    // `sync_channel(SHARD_BACKPRESSURE_BOUND)` reply rx — same skew-
-    // defense bound the spawn-per-call path uses.
+    // Dispatch K work items (one per shard) into the shared work
+    // queue (Approach C — POOL-SCALEOUT T2/T4). Each carries a
+    // dedicated `sync_channel(SHARD_BACKPRESSURE_BOUND)` reply rx —
+    // same skew-defense bound the spawn-per-call path uses. Any of
+    // the M pool workers may fulfill any (shard_id, op) pair; the
+    // dispatcher collects rxs in shard-id order so the merge phase
+    // sees per-shard replies indexed by shard, NOT by worker.
     let mut rxs: Vec<mpsc::Receiver<OpResult>> = Vec::with_capacity(k);
-    for (i, worker_tx) in pool.worker_txs.iter().enumerate() {
+    for i in 0..k {
         let (reply_tx, reply_rx) =
             mpsc::sync_channel::<OpResult>(SHARD_BACKPRESSURE_BOUND);
         let item = PoolWorkItem {
+            shard_id: i as u32,
             op: op.clone(),
             cancel: cancel.clone(),
             reply_tx,
         };
-        // `send` blocks if the worker is still processing a previous
-        // work item. In practice the previous batch's last reply was
-        // already drained before this call (synchronous merge loop in
-        // the caller below), so the worker is idling in `recv()` and
-        // send returns immediately. If a worker has died (its tx
-        // dropped), surface that as Unavailable for the slot — the
-        // merge layer treats it like any other non-Got result.
-        if worker_tx.send(item).is_err() {
-            // Worker dead — push a synthetic Unavailable reply by
-            // creating a tx/rx pair and sending on it ourselves.
+        // `send` blocks only if the shared queue is full (POOL_BOUND
+        // items in flight). In normal operation the queue drains
+        // quickly because M >> K workers race for items. If the pool
+        // is shutting down (work_tx receiver dropped — shouldn't
+        // happen while the dispatcher holds it), surface a synthetic
+        // Unavailable so the merge layer sees a clean non-Got slot.
+        if pool.work_tx.send(item).is_err() {
             let (dead_tx, dead_rx) =
                 mpsc::sync_channel::<OpResult>(SHARD_BACKPRESSURE_BOUND);
             let _ = dead_tx.send(OpResult::Unavailable);
             rxs.push(dead_rx);
-            // Log-shape debug-assert: a worker dying mid-flight is a
-            // crash bug we want to surface in tests.
-            debug_assert!(false, "kdb-scatter-pool: worker {i} died");
+            // Log-shape debug-assert: a closed work_tx means the pool
+            // is being torn down underneath us — a crash bug we want
+            // to surface in tests.
+            debug_assert!(false, "kdb-scatter-pool: work_tx closed for shard {i}");
             continue;
         }
         rxs.push(reply_rx);
@@ -5580,6 +5692,90 @@ mod tests {
         assert!(cancel.load(AtomicOrdering::SeqCst));
     }
 
+    /// **POOL-SCALEOUT T2/T4 KAT — pool spawns M workers shared across
+    /// shards via the shared work queue.** Approach C from the design
+    /// spec: M = max(K * POOL_WORKERS_PER_SHARD, MIN_POOL_WORKERS).
+    /// Locks the M formula so a regression that reverts to per-shard
+    /// 1-worker (Approach A V1) is caught.
+    ///
+    /// Verifies:
+    /// - K=0 → 0 workers (degenerate)
+    /// - K=2 → MIN_POOL_WORKERS (16) (floor enforced)
+    /// - K=4 → max(16, 16) = 16 (floor still wins)
+    /// - K=8 → max(32, 16) = 32 (multiplier wins)
+    /// - K=16 → max(64, 16) = 64 (multiplier wins)
+    #[test]
+    fn pool_worker_count_scales_with_k_per_approach_c() {
+        let mk = |k: usize| -> ScatterPool {
+            let mut fns: Vec<
+                Box<dyn Fn(&Op, &Arc<AtomicBool>) -> OpResult + Send + Sync>,
+            > = Vec::with_capacity(k);
+            for _ in 0..k {
+                fns.push(Box::new(|_op, _cancel| OpResult::Got(vec![].into())));
+            }
+            ScatterPool::new(fns)
+        };
+        assert_eq!(mk(0).worker_count(), 0, "K=0 → 0 workers");
+        assert_eq!(mk(2).worker_count(), 16, "K=2 → floor 16");
+        assert_eq!(mk(4).worker_count(), 16, "K=4 → floor 16");
+        assert_eq!(mk(8).worker_count(), 32, "K=8 → K*4 = 32");
+        assert_eq!(mk(16).worker_count(), 64, "K=16 → K*4 = 64");
+        assert_eq!(POOL_WORKERS_PER_SHARD, 4, "per-shard multiplier locked");
+        assert_eq!(MIN_POOL_WORKERS, 16, "floor locked");
+    }
+
+    /// **POOL-SCALEOUT T2/T4 KAT — any worker can fulfill any shard's
+    /// op (closure dispatch by shard_id).** Approach C requires that a
+    /// work item carrying shard_id=N gets handled by the dispatch_fns[N]
+    /// closure regardless of which of the M workers picks it up. With
+    /// the per-shard counters in `build_pool_with_canned`, dispatching
+    /// K items per call across 100 dispatches must increment each
+    /// shard's counter exactly 100 times (not 100/K times, which would
+    /// indicate workers were stealing each other's shard_ids).
+    #[test]
+    fn pool_dispatch_by_shard_id_is_correct_under_shared_workers() {
+        let (pool, counters) = build_pool_with_canned(vec![
+            OpResult::Got(vec![1u8; 16].into()), // shard 0 returns 0x01..
+            OpResult::Got(vec![2u8; 16].into()), // shard 1 returns 0x02..
+            OpResult::Got(vec![3u8; 16].into()), // shard 2 returns 0x03..
+            OpResult::Got(vec![4u8; 16].into()), // shard 3 returns 0x04..
+        ]);
+        // M = max(4*4, 16) = 16 workers shared across 4 shards.
+        assert_eq!(pool.shard_count(), 4);
+        assert_eq!(pool.worker_count(), 16);
+        // Dispatch 100 calls and assert each shard's counter += 100.
+        for _ in 0..100 {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let r = scatter_and_merge_via_pool(
+                &pool,
+                &dummy_select(),
+                DEFAULT_PER_SHARD_TIMEOUT,
+                &ScatterKind::OidConcat,
+                cancel,
+            );
+            // OidConcat: shard-id-ordered concat of 4 × 16-byte payloads.
+            // Byte structure proves shard_id correctness: shard 0's
+            // 16 bytes are 0x01..., shard 1's are 0x02..., etc.
+            let want = {
+                let mut v = Vec::with_capacity(64);
+                v.extend_from_slice(&[1u8; 16]);
+                v.extend_from_slice(&[2u8; 16]);
+                v.extend_from_slice(&[3u8; 16]);
+                v.extend_from_slice(&[4u8; 16]);
+                v
+            };
+            assert_eq!(r, OpResult::Got(want.into()));
+        }
+        for (i, c) in counters.iter().enumerate() {
+            assert_eq!(
+                c.load(Ordering::SeqCst),
+                100,
+                "shard {i} should have been dispatched to 100 times \
+                 (any of M workers may have served it)"
+            );
+        }
+    }
+
     /// **POOL-SCALEOUT KAT — `POOL_BOUND` is the documented bound (=64).**
     /// Lock the constant value so a regression that bumps it back to
     /// 1 (FASTPATH-shape regression on select-limit / select-sorted)
@@ -5602,10 +5798,14 @@ mod tests {
     /// or lost work.** This is the high-concurrency dispatch shape the
     /// arc was scoped against: `kessel-bench parallel-reads --workers
     /// 16` opens 16 concurrent client connections, each becoming its
-    /// own dispatcher thread; all 16 dispatch into the same K worker
-    /// channels. With POOL_BOUND=1 (the FASTPATH default) the channel-
-    /// full backpressure would serialize them; with POOL_BOUND=64 they
-    /// queue freely and every dispatch returns a `Got(_)` reply.
+    /// own dispatcher thread; all 16 dispatch into the same shared work
+    /// queue. With Approach C (M = max(K*4, 16) = 16 workers shared
+    /// across K=4 shards), the dispatchers do NOT serialize behind a
+    /// per-shard worker — any of the 16 workers picks up the next item,
+    /// regardless of shard_id. Failure modes this catches: deadlock
+    /// (some dispatcher never returns), lost work (counter < 1600),
+    /// or non-Got slot (shared-queue interaction broke a worker's reply
+    /// send).
     ///
     /// Acceptance: every one of the 16 × 100 = 1600 dispatches completes
     /// within a generous deadline (5 seconds), the per-shard counter

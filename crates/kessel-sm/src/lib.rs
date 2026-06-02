@@ -955,7 +955,17 @@ impl<V: Vfs> StateMachine<V> {
         match kind {
             U8 | U16 | U32 | U64 | U128 | Bool | Timestamp => load_u(&a).cmp(&load_u(&b)),
             I8 | I16 | I32 | I64 | I128 | Fixed { .. } => load_i(&a).cmp(&load_i(&b)),
-            Char(_) | Bytes(_) | Ref | OverflowRef => a.cmp(&b),
+            // SP-CHAR-PAD-COMPARE V1 (2026-06-02): PG CHAR(N) semantic —
+            // trailing NUL/space padding is insignificant. Matches the
+            // kessel-expr EQ/NE/ord trim so SQL-path (Op::QueryRows via
+            // expr-VM) and non-SQL path (Op::Query via cmp_field) agree
+            // on `WHERE name = 'hello'` against a CHAR(32) column.
+            // `Ref` / `OverflowRef` stay full-byte: ObjectIds are fixed
+            // 16-byte and trailing NULs in a low-id ObjectId are
+            // significant.
+            Char(_) | Bytes(_) => kessel_expr::right_trim_char_pad(&a)
+                .cmp(kessel_expr::right_trim_char_pad(&b)),
+            Ref | OverflowRef => a.cmp(&b),
         }
     }
 
@@ -17377,6 +17387,115 @@ mod tests {
             sm_a.global_min_active_snapshot(),
             Some(175),
             "SP123: after the workload, global min = 175 (replica 2 unchanged)"
+        );
+    }
+
+    // =========================================================================
+    // SP-CHAR-PAD-COMPARE V1 — cmp_field treats trailing NUL/space padding
+    // as insignificant for CHAR(N) / Bytes(N) (PG §9.20 semantic). Ref /
+    // OverflowRef stay full-byte. Mirrors the kessel-expr trim so the
+    // SQL path (Op::QueryRows ⇒ expr-VM) and non-SQL path (Op::Query ⇒
+    // cmp_field) agree on padded-vs-bare CHAR comparisons.
+    // =========================================================================
+
+    #[test]
+    fn spcharpadcompare_cmp_field_char_padded_lhs_bare_rhs_equal() {
+        use kessel_catalog::FieldKind;
+        use kessel_io::MemVfs;
+        // CHAR(8) — stored "hello\0\0\0", literal bare "hello".
+        let lhs = b"hello\0\0\0".to_vec();
+        let rhs = b"hello".to_vec();
+        let ord = StateMachine::<MemVfs>::cmp_field(FieldKind::Char(8), &lhs, &rhs);
+        assert_eq!(ord, std::cmp::Ordering::Equal);
+        // Swap arms — symmetry holds.
+        let ord2 = StateMachine::<MemVfs>::cmp_field(FieldKind::Char(8), &rhs, &lhs);
+        assert_eq!(ord2, std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn spcharpadcompare_cmp_field_char_space_padding_equal() {
+        use kessel_catalog::FieldKind;
+        use kessel_io::MemVfs;
+        let ord = StateMachine::<MemVfs>::cmp_field(
+            FieldKind::Char(8),
+            b"hello   ",
+            b"hello",
+        );
+        assert_eq!(ord, std::cmp::Ordering::Equal);
+        // Mixed NUL + space padding equally insignificant.
+        let ord2 = StateMachine::<MemVfs>::cmp_field(
+            FieldKind::Char(8),
+            b"hi \0  \0",
+            b"hi",
+        );
+        assert_eq!(ord2, std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn spcharpadcompare_cmp_field_char_distinct_content_preserved() {
+        use kessel_catalog::FieldKind;
+        use kessel_io::MemVfs;
+        // Distinct content stays distinct.
+        let ord = StateMachine::<MemVfs>::cmp_field(
+            FieldKind::Char(8),
+            b"hello\0\0\0",
+            b"world\0\0\0",
+        );
+        assert_ne!(ord, std::cmp::Ordering::Equal);
+        // Range cmp: "hi" < "ho" after trim.
+        let lt = StateMachine::<MemVfs>::cmp_field(
+            FieldKind::Char(8),
+            b"hi\0\0\0\0\0\0",
+            b"ho\0\0\0\0\0\0",
+        );
+        assert_eq!(lt, std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn spcharpadcompare_cmp_field_ref_distinct_ids_stay_distinct() {
+        use kessel_catalog::FieldKind;
+        use kessel_io::MemVfs;
+        // Ref / OverflowRef are 16-byte ObjectIds. cmp_field pre-norms
+        // both sides to width 16, then compares — the Ref arm uses
+        // full-byte ordering (no trim) so neither side's trailing NULs
+        // can collapse a distinct ObjectId. Two low-id ObjectIds remain
+        // ordered correctly.
+        let oid_one = [
+            0x01u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let oid_two = [
+            0x02u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let ord =
+            StateMachine::<MemVfs>::cmp_field(FieldKind::Ref, &oid_one, &oid_two);
+        assert_eq!(
+            ord,
+            std::cmp::Ordering::Less,
+            "Ref must order ObjectIds full-byte; 0x01… < 0x02…"
+        );
+        // Self-comparison equal.
+        let ord_eq =
+            StateMachine::<MemVfs>::cmp_field(FieldKind::Ref, &oid_one, &oid_one);
+        assert_eq!(ord_eq, std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn spcharpadcompare_cmp_field_char_width_truncation_then_trim() {
+        use kessel_catalog::FieldKind;
+        use kessel_io::MemVfs;
+        // cmp_field pre-norms each side to the field's width (here 8),
+        // then trims trailing NUL/space. Confirms the trim runs AFTER
+        // the width normalisation step (no semantic surprise from
+        // operand-length differences).
+        let ord = StateMachine::<MemVfs>::cmp_field(
+            FieldKind::Char(8),
+            b"hi",            // norm → b"hi\0\0\0\0\0\0"
+            b"hi      ",      // norm → b"hi      " (already 8)
+        );
+        assert_eq!(
+            ord,
+            std::cmp::Ordering::Equal,
+            "CHAR(8) cmp trims pre-norm + post-trim consistently"
         );
     }
 }

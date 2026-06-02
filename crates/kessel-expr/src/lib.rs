@@ -56,6 +56,27 @@ const LIKE: u8 = 20; // pop pattern(Bytes) + value(Bytes) -> Int 0/1 (SQL LIKE)
 const SHA256: u8 = 21; // pop value(Bytes) -> Bytes (32-byte digest)
 const HMAC256: u8 = 22; // pop key(Bytes), value(Bytes) -> Bytes (HMAC-SHA256)
 
+/// PG `CHAR(N)` comparison semantic (SQL §9.20): trailing padding
+/// bytes are insignificant. The engine stores fixed-width
+/// `Char(N)` / `Bytes(N)` values NUL-padded
+/// (`kessel-codec::raw_from_value`); PG semantics also call for
+/// trailing-space insignificance. Trim BOTH 0x00 and 0x20 so the
+/// comparator handles either source (engine-stored or literal-with-
+/// space-padding). Used by `EQ` / `NE` / `LT` / `LE` / `GT` / `GE`
+/// in the interpreter AND by `materialise_cmp` in the specialised
+/// `compile_filter` closure, keeping the determinism oracle byte-equal.
+///
+/// SP-CHAR-PAD-COMPARE V1 (2026-06-02). Closes the
+/// `WHERE name = $1` against `CHAR(N)` returning 0 rows symptom
+/// surfaced by SP-PG-EXTQ-BIN-RESULTS T3.
+pub fn right_trim_char_pad(b: &[u8]) -> &[u8] {
+    let end = b
+        .iter()
+        .rposition(|&c| c != 0 && c != b' ')
+        .map_or(0, |i| i + 1);
+    &b[..end]
+}
+
 /// Deterministic SQL `LIKE` matcher: `%` = any (incl. empty) byte run,
 /// `_` = exactly one byte. Iterative with the classic single backtrack
 /// point — O(|s|·|p|) worst case, no recursion, no allocation.
@@ -340,7 +361,9 @@ fn run(
                     $f(o)
                 }
                 (Value::Bytes(x), Value::Bytes(y)) => {
-                    let o = x.cmp(y);
+                    // SP-CHAR-PAD-COMPARE V1: PG CHAR(N) semantic —
+                    // trailing NUL/space padding is insignificant.
+                    let o = right_trim_char_pad(x).cmp(right_trim_char_pad(y));
                     $f(o)
                 }
                 _ => false, // Null or mixed => false (deterministic)
@@ -401,12 +424,29 @@ fn run(
             EQ => {
                 let b = pop!();
                 let a = pop!();
-                st.push(Value::Int((a == b) as i128));
+                // SP-CHAR-PAD-COMPARE V1: PG CHAR(N) semantic — bytes×bytes
+                // equality ignores trailing NUL/space padding. Other operand
+                // shapes (Int×Int, Null, mixed) keep the Value PartialEq
+                // semantic (which is exact-byte for Int and propagates Null
+                // correctly per the existing oracle).
+                let eq = match (&a, &b) {
+                    (Value::Bytes(x), Value::Bytes(y)) => {
+                        right_trim_char_pad(x) == right_trim_char_pad(y)
+                    }
+                    _ => a == b,
+                };
+                st.push(Value::Int(eq as i128));
             }
             NE => {
                 let b = pop!();
                 let a = pop!();
-                st.push(Value::Int((a != b) as i128));
+                let ne = match (&a, &b) {
+                    (Value::Bytes(x), Value::Bytes(y)) => {
+                        right_trim_char_pad(x) != right_trim_char_pad(y)
+                    }
+                    _ => a != b,
+                };
+                st.push(Value::Int(ne as i128));
             }
             LIKE => {
                 let pat = pop!();
@@ -803,7 +843,13 @@ fn materialise_cmp(lhs: Operand, rhs: Operand, op: CmpOp) -> FilterFn {
         return Box::new(move |rec| {
             let a = fa(rec); let b = fb(rec);
             match (a, b) {
-                (Some(av), Some(bv)) => cmp_apply(av.as_slice().cmp(bv.as_slice()), op),
+                // SP-CHAR-PAD-COMPARE V1: bytes×bytes cmp ignores trailing
+                // NUL/space padding (PG CHAR(N) semantic). Keeps the
+                // specialised closure byte-equal to `eval` (determinism oracle).
+                (Some(av), Some(bv)) => cmp_apply(
+                    right_trim_char_pad(&av).cmp(right_trim_char_pad(&bv)),
+                    op,
+                ),
                 _ => false,
             }
         });
@@ -1488,5 +1534,227 @@ mod tests {
             let want = eval(&code, &o, &r).unwrap_or(false);
             assert_eq!(f(&r), want, "age={age} bal={bal}");
         }
+    }
+
+    // =========================================================================
+    // SP-CHAR-PAD-COMPARE V1 — PG CHAR(N) padding-aware byte comparison.
+    // =========================================================================
+    //
+    // The engine stores `Char(N)` / `Bytes(N)` values right-NUL-padded
+    // to the field width (`kessel-codec::raw_from_value`). PG semantic
+    // §9.20 says trailing padding (space in PG, NUL in this engine) is
+    // insignificant in CHAR comparison. These KATs lock the trim
+    // semantic + assert closure ↔ interpreter byte-equivalence.
+
+    /// Schema with a single CHAR(8) field at field_id=1.
+    fn ot_char8() -> ObjectType {
+        ObjectType {
+            type_id: 1,
+            name: "tc".into(),
+            schema_ver: 1,
+            fields: vec![
+                Field { field_id: 1, name: "s".into(), kind: FieldKind::Char(8), nullable: false },
+            ],
+            indexes: vec![],
+            unique: vec![],
+            fks: vec![],
+            checks: vec![],
+            triggers: vec![],
+            ordered: vec![],
+            composite: vec![],
+            defaults: vec![],
+        }
+    }
+
+    /// Build a CHAR(8) record whose field bytes are the NUL-padded
+    /// shape of `content` (e.g. content=b"hello" → 8 bytes
+    /// b"hello\0\0\0").
+    fn rec_char8(content: &[u8]) -> Vec<u8> {
+        let o = ot_char8();
+        let l = o.compute_layout();
+        let mut b = vec![0u8; l.record_size];
+        let off = l.offsets[0];
+        let n = content.len().min(8);
+        b[off..off + n].copy_from_slice(&content[..n]);
+        b
+    }
+
+    #[test]
+    fn right_trim_char_pad_helper() {
+        assert_eq!(right_trim_char_pad(b"hello\0\0\0"), b"hello");
+        assert_eq!(right_trim_char_pad(b"hello   "), b"hello");
+        assert_eq!(right_trim_char_pad(b"hello \0 \0"), b"hello");
+        assert_eq!(right_trim_char_pad(b"hello"), b"hello");
+        assert_eq!(right_trim_char_pad(b"\0\0\0"), b"");
+        assert_eq!(right_trim_char_pad(b"    "), b"");
+        assert_eq!(right_trim_char_pad(b""), b"");
+        // Embedded NUL/space stays.
+        assert_eq!(right_trim_char_pad(b"a\0b\0\0\0"), b"a\0b");
+        assert_eq!(right_trim_char_pad(b"a b   "), b"a b");
+    }
+
+    #[test]
+    fn spcharpadcompare_eq_padded_lhs_bare_rhs() {
+        // THE FIX: LHS comes from stored CHAR(8) row (NUL-padded 8 bytes),
+        // RHS is the SQL literal pushed as raw 5 bytes. Pre-arc: 0 rows.
+        // Post-arc: 1 row.
+        let code = Program::new().load(1).push_bytes(b"hello").eq().bytes();
+        let o = ot_char8();
+        assert_eq!(eval(&code, &o, &rec_char8(b"hello")), Ok(true));
+    }
+
+    #[test]
+    fn spcharpadcompare_eq_bare_lhs_padded_rhs() {
+        // Symmetric: push padded literal, load CHAR field already padded.
+        // Both right-trim to "hello" -> equal.
+        let code = Program::new()
+            .load(1)
+            .push_bytes(b"hello\0\0\0")
+            .eq()
+            .bytes();
+        let o = ot_char8();
+        assert_eq!(eval(&code, &o, &rec_char8(b"hello")), Ok(true));
+        // Same with space-padded literal.
+        let code2 = Program::new()
+            .load(1)
+            .push_bytes(b"hello   ")
+            .eq()
+            .bytes();
+        assert_eq!(eval(&code2, &o, &rec_char8(b"hello")), Ok(true));
+    }
+
+    #[test]
+    fn spcharpadcompare_eq_preserves_distinct_content() {
+        // Trimming padding must not collapse distinct content.
+        let code = Program::new().load(1).push_bytes(b"hello").eq().bytes();
+        let o = ot_char8();
+        assert_eq!(eval(&code, &o, &rec_char8(b"world")), Ok(false));
+        assert_eq!(eval(&code, &o, &rec_char8(b"hi")), Ok(false));
+        // Embedded NUL stays significant: "hi\0x" != "hi".
+        let code2 = Program::new().load(1).push_bytes(b"hi").eq().bytes();
+        assert_eq!(eval(&code2, &o, &rec_char8(b"hi\0x")), Ok(false));
+    }
+
+    #[test]
+    fn spcharpadcompare_eq_all_padding_equals_empty() {
+        // All-padding value == empty literal.
+        let code = Program::new().load(1).push_bytes(b"").eq().bytes();
+        let o = ot_char8();
+        // Stored: 8 NULs (rec_char8 with empty content).
+        assert_eq!(eval(&code, &o, &rec_char8(b"")), Ok(true));
+        // Space-only constant literal == empty stored.
+        let code2 = Program::new()
+            .load(1)
+            .push_bytes(b"        ")
+            .eq()
+            .bytes();
+        assert_eq!(eval(&code2, &o, &rec_char8(b"")), Ok(true));
+    }
+
+    #[test]
+    fn spcharpadcompare_ne_consistent_with_eq() {
+        // NE must mirror EQ — if EQ now says true after trim, NE says false.
+        let code_eq = Program::new().load(1).push_bytes(b"hello").eq().bytes();
+        let code_ne = Program::new().load(1).push_bytes(b"hello").ne().bytes();
+        let o = ot_char8();
+        let r = rec_char8(b"hello");
+        let eq = eval(&code_eq, &o, &r).unwrap();
+        let ne = eval(&code_ne, &o, &r).unwrap();
+        assert!(eq);
+        assert!(!ne);
+        // Distinct content: EQ=false, NE=true.
+        let r2 = rec_char8(b"world");
+        assert!(!eval(&code_eq, &o, &r2).unwrap());
+        assert!(eval(&code_ne, &o, &r2).unwrap());
+    }
+
+    #[test]
+    fn spcharpadcompare_ord_trims_both_sides() {
+        // LT/LE/GT/GE on padded CHAR fields use trimmed bytes.
+        let o = ot_char8();
+        // "hi" stored as "hi\0\0\0\0\0\0"; trims to "hi".
+        // Literal "ho" trims to "ho".
+        // "hi" < "ho" should be true.
+        let lt = Program::new().load(1).push_bytes(b"ho").lt().bytes();
+        assert_eq!(eval(&lt, &o, &rec_char8(b"hi")), Ok(true));
+        // Equal-after-trim: "hi   " (literal) vs "hi" (stored) -> "hi" cmp "hi".
+        let le = Program::new().load(1).push_bytes(b"hi   ").le().bytes();
+        assert_eq!(eval(&le, &o, &rec_char8(b"hi")), Ok(true));
+        let ge = Program::new().load(1).push_bytes(b"hi   ").ge().bytes();
+        assert_eq!(eval(&ge, &o, &rec_char8(b"hi")), Ok(true));
+        // "hi" > "ha" (after trim on both sides).
+        let gt = Program::new().load(1).push_bytes(b"ha").gt().bytes();
+        assert_eq!(eval(&gt, &o, &rec_char8(b"hi")), Ok(true));
+    }
+
+    #[test]
+    fn spcharpadcompare_compile_filter_byte_equals_interpreter() {
+        // Determinism oracle: the specialised closure result MUST byte-equal
+        // the interpreter's result for every CHAR(N) program shape.
+        let programs: Vec<Vec<u8>> = vec![
+            Program::new().load(1).push_bytes(b"hello").eq().bytes(),
+            Program::new().load(1).push_bytes(b"hello").ne().bytes(),
+            Program::new().load(1).push_bytes(b"hi").lt().bytes(),
+            Program::new().load(1).push_bytes(b"hi").le().bytes(),
+            Program::new().load(1).push_bytes(b"hi").gt().bytes(),
+            Program::new().load(1).push_bytes(b"hi").ge().bytes(),
+            Program::new().load(1).push_bytes(b"hello   ").eq().bytes(),
+            Program::new().load(1).push_bytes(b"hello\0\0\0").eq().bytes(),
+            Program::new().load(1).push_bytes(b"").eq().bytes(),
+        ];
+        let o = ot_char8();
+        let contents: &[&[u8]] = &[
+            b"hello",
+            b"hi",
+            b"world",
+            b"",
+            b"hello\0",
+            b"hi      ",
+            b"a",
+            b"z",
+        ];
+        for code in &programs {
+            let f = compile_filter(code, &o).expect("compile");
+            for c in contents {
+                let r = rec_char8(c);
+                let want = eval(code, &o, &r).unwrap_or(false);
+                let got = f(&r);
+                assert_eq!(
+                    got, want,
+                    "program {:?} content {:?}: closure={got} eval={want}",
+                    code, c
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn spcharpadcompare_int_eq_unchanged_by_trim() {
+        // Regression: trim only touches Bytes×Bytes path. Int×Int eq still
+        // exact-byte. Use the original ot() schema with I32 / I64 fields.
+        let o = ot();
+        let code = Program::new().load(1).push_int(42).eq().bytes();
+        assert_eq!(eval(&code, &o, &rec(42, 0)), Ok(true));
+        assert_eq!(eval(&code, &o, &rec(41, 0)), Ok(false));
+    }
+
+    #[test]
+    fn spcharpadcompare_const_vs_const_bytes_trims() {
+        // No field load involved: both sides constant Bytes operands.
+        // Confirms the trim isn't gated on field reads.
+        let o = ot_char8();
+        let zero = rec_char8(b""); // record content irrelevant; not loaded
+        let code = Program::new()
+            .push_bytes(b"abc")
+            .push_bytes(b"abc   ")
+            .eq()
+            .bytes();
+        assert_eq!(eval(&code, &o, &zero), Ok(true));
+        let code2 = Program::new()
+            .push_bytes(b"abc")
+            .push_bytes(b"abcd")
+            .eq()
+            .bytes();
+        assert_eq!(eval(&code2, &o, &zero), Ok(false));
     }
 }

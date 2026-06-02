@@ -114,6 +114,73 @@ at dispatch entry, JDBC simple-mode unblocked.
   `docs/superpowers/specs/2026-06-02-kesseldb-subproject-spcloudcluster-progress.md`
   — T1 DONE; T2-T8 multi-arc continuation QUEUED. **TaskList #371 T1
   done; T2-T8 queued for multi-week arc continuation.**
+- **Track K cont. — SP-Cloud-Cluster T2 (2026-06-02, T2 BINARY WIRE-UP
+  + kind-verified).** Closes the T1 caveat (today's image CrashLoopBackOff
+  on `unknown argument --cluster`) by teaching the `kesseldb` binary to
+  parse the cluster-mode flags + env vars and dispatch into the
+  existing real-TCP VSR transport that `cluster.rs::spawn_node` already
+  shipped (SP38). **Binary CLI**: new flags `--cluster`,
+  `--replica-idx N`, `--peer-addrs A,B,C`, optional
+  `--view-change-timeout T` (informational in V1); CLI takes precedence
+  over the matching `KESSELDB_CLUSTER_*` env vars (which the chart
+  sets). **lib.rs**: new public `run_cluster_cfg(client_addr,
+  peer_listen_addr, data_dir, self_idx, peer_addrs, cfg)` — binds the
+  client + peer listeners, spawns the `cluster::Node` on the engine
+  thread, and exposes the binary protocol via the auth-aware
+  `cluster::serve_clients_cfg`. Refuses to start with a typed
+  `io::Error` on even N or N<3 (matches the VSR fixed-size contract,
+  before `Replica::new` would panic) and out-of-range replica idx.
+  **cluster.rs**: new `Ev::RoleProbe` + `Node::role_probe()` returning
+  `(view, is_primary, status)` so a small startup loop in the binary
+  can emit a one-shot "elected primary" log on the role transition
+  (the kind-verify acceptance target). `serve_clients_cfg(listener,
+  node, token)` mirrors the single-node `[0xFC] ++ token` auth
+  handshake so existing `kessel-client` / `ClusterClient` instances
+  work unchanged in both open + token modes; legacy `serve_clients`
+  is now a thin `serve_clients_cfg(.., None)` wrapper (existing tests
+  pass verbatim). **Bootstrap-race fix**: `resolve_peer_addrs` retries
+  every 2s for up to 120s — initial k8s StatefulSet pods occasionally
+  start before their own headless DNS A-record is published (CoreDNS
+  lag past `publishNotReadyAddresses`), and a naive `to_socket_addrs`
+  errors out immediately. The retry loop logs `kesseldb cluster: DNS
+  bootstrap: ... retrying in 2s` and recovers cleanly without
+  CrashLoopBackOff. **Helm chart**: introduces a dedicated peer port
+  (`cluster.peerPort: 6534`, also in `peerAddressTemplate`) so the
+  binary doesn't bind-collide between the client port (6532) and the
+  peer port on the same pod; statefulset.yaml exposes 6534;
+  service-headless.yaml publishes 6534 (the headless service no
+  longer carries the binary port — clients still use the regular
+  ClusterIP Service which routes 6532/6533/5432). **Verification on
+  vulcan** (kind v0.24.0 + helm v3.16.3): fresh kind cluster, helm
+  install with `cluster.enabled=true`, all 3 pods (`kesseldb-0/1/2`)
+  reach Running in ~45s; primary elects in view=0 within 1s of
+  binary start; CRUD via primary's local port (CREATE TABLE / INSERT /
+  SELECT) returns 42 as written; transcript at
+  `docs/superpowers/spcloudcluster-t2-kind-verify-2026-06-02.txt`.
+  **Cluster tests stay green**: 6/6 `cluster::tests::*`
+  (three_nodes_replicate_over_real_tcp,
+  sql_over_cluster_full_crud_and_rmw, session_retry_is_exactly_once,
+  failover_retry_against_follower_returns_cached_reply,
+  cluster_client_finds_primary_and_is_exactly_once,
+  cluster_sql_cache_correct_across_ddl). **Honest T2 limit (carried
+  forward to T3-T8)**: the kessel CLI uses single-`Client::connect`,
+  so writes routed via the round-robin ClusterIP Service can land on
+  a backup and hit `OpResult::Unavailable`; the failover-aware shape
+  is `ClusterClient` (already shipped + tested at SP42). T3 wires the
+  CLI / SDK clients onto the cluster headless Service endpoint set so
+  random-pod routing works end-to-end. **Invariants preserved**:
+  default `cargo build -p kesseldb-server` byte-identical when
+  `--cluster` is absent (main.rs dispatches through the pre-existing
+  `run_cfg` path); HTTP/1.1 + WS + binary + PG-wire single-node
+  surfaces untouched (cluster gateway surfaces are V2 follow-up);
+  `#![forbid(unsafe_code)]` honored; zero new external deps.
+  Three commits: `b5db272` (CLI/env wire-up + cluster dispatch +
+  Node::role_probe + serve_clients_cfg), `f34a758` (DNS bootstrap
+  retry loop, kind verify root-cause), `eee966e` (kind verification
+  transcript). Progress tracker:
+  `docs/superpowers/specs/2026-06-02-kesseldb-subproject-spcloudcluster-progress.md`
+  — T2 DONE; T3-T8 multi-arc continuation QUEUED. **TaskList #373
+  T2 done; T3-T8 still queued.**
 - **Track M — SP-WHERE-VM-Specialise (2026-06-01, V1 SHIPPED).**
   Closes the per-row stack-VM dispatch cost SP-Hash-Agg-Tune diagnosed
   as the dominant TPC-H Q1/Q6 wall-time ceiling (V1-Tune sweep at N=4

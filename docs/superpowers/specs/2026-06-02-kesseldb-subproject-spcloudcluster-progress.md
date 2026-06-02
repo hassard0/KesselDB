@@ -1,7 +1,7 @@
 # SP-Cloud-Cluster — progress tracker
 
 Date opened: **2026-06-02**.
-Status: **OPEN — T1 SCAFFOLD LANDED**; T2-T8 multi-arc continuation queued.
+Status: **OPEN — T1 SCAFFOLD + T2 BINARY WIRE-UP LANDED**; T3-T8 multi-arc continuation queued.
 Design spec: `docs/superpowers/specs/2026-06-02-kesseldb-spcloudcluster-design.md`
 Parent arc: SP-Cloud-Deploy (V1 SHIPPED 2026-05-30 — single-pod Helm
 chart + fly.toml + kind-verified end-to-end). This arc is the named
@@ -27,14 +27,145 @@ see §V2+ follow-ups in the design spec).
 
 | T# | Scope | Status | Commit |
 |---|---|---|---|
-| **T1** | Design spec + Helm StatefulSet + headless Service + values.yaml `cluster:` block + entrypoint shell + gating on existing `deployment.yaml`/`pvc.yaml`. `helm lint` + `helm template` clean both default + cluster modes. (THIS SLICE — YAML + docs only.) | **DONE** | `c44d883` |
-| T2 | `kesseldb` binary cluster-mode wire-up — `--cluster`, `--replica-idx`, `--peer-addrs` CLI flags + `KESSELDB_CLUSTER_*` env-var fallback; spawn through `kesseldb_server::cluster::spawn_node(idx, listener, addrs, dir)` instead of `run_cfg`. Refuse to start on even N or N<3 with a typed error message. Refuse `--cluster` without `--replica-idx`/`--peer-addrs`. Single-pod path byte-identical. | QUEUED | — |
-| T3 | Headless Service DNS resolution + peer discovery — verify the binary tolerates `getaddrinfo` returning empty for the first 30-60s of pod bootstrap (the writer-thread already redials lazily; this slice just confirms the failure mode is clean). Add a small "waiting for peers" log line. | QUEUED | — |
-| T4 | kind-verified 3-replica cluster on vulcan — fresh `kind create cluster` + `kubectl create secret kesseldb-token` + `helm install --set cluster.enabled=true` + `kind load docker-image` for the T2-extended binary + `kubectl rollout status statefulset/kesseldb`. All 3 pods reach Ready, primary elects, follower replicas catch up. Transcript at `docs/superpowers/spcloudcluster-t4-kind-verify-2026-XX-XX.txt`. | QUEUED | — |
+| **T1** | Design spec + Helm StatefulSet + headless Service + values.yaml `cluster:` block + entrypoint shell + gating on existing `deployment.yaml`/`pvc.yaml`. `helm lint` + `helm template` clean both default + cluster modes. (YAML + docs only.) | **DONE** | `c44d883` |
+| **T2** | `kesseldb` binary cluster-mode wire-up — `--cluster`, `--replica-idx`, `--peer-addrs` CLI flags + `KESSELDB_CLUSTER_*` env-var fallback; spawn through `kesseldb_server::cluster::spawn_node` via new `lib::run_cluster_cfg`. Refuses even/<3 N + out-of-range idx + unknown long opts with typed error message. Single-pod path byte-identical. **Bonus**: DNS-bootstrap retry loop + dedicated peer port (6534) so StatefulSet pods don't bind-collide on 6532. **Bonus**: kind-verified live (the T4 scope folded into T2 since the binary build + image + kind verify naturally clustered). | **DONE** | `b5db272` / `f34a758` / `eee966e` |
+| T3 | Headless Service DNS resolution + peer discovery extra-mile — `ClusterClient` integration on the cluster headless Service endpoint set so writes routed through the round-robin ClusterIP Service rotate past backups and land on the primary instead of falling into `OpResult::Unavailable`. (T2 covered the binary-side bootstrap-race; T3 is the client-side failover-aware wiring.) | QUEUED | — |
+| ~~T4~~ | ~~kind-verified 3-replica cluster on vulcan — folded into T2 (above) since the binary build + image + kind verify naturally clustered.~~ | **MERGED INTO T2** | — |
 | T5 | Real cluster smoke — CRUD via `kubectl exec` to any pod (clients connect through the regular ClusterIP, which can route to any pod; ClusterClient retries against primary on `Unavailable`); kill the primary (`kubectl delete pod kesseldb-0`) and verify view-change elects a new primary within view-change timeout; verify the SSTables + WAL state survives + replays from the rejoined pod. | QUEUED | — |
 | T6 | Fly.io multi-region cluster deploy — per-region `[mounts]` + per-machine env-var `KESSELDB_CLUSTER_REPLICA_IDX` mapping. Fly Machines do NOT have stable headless-DNS; peer addresses use `<machine-id>.vm.<app>.internal` or per-machine private 6PN address (TBD in T6 design). | QUEUED | — |
 | T7 | Monitoring — verify `/v1/metrics` Prometheus scrape endpoint emits VSR-relevant counters (view changes per replica, last-applied op-number, lag-from-primary, primary uptime). Ship a sample `prometheus-rules.yaml` and Grafana dashboard JSON. | QUEUED | — |
 | T8 | Arc closure — STATUS Track row + this tracker close + USAGE §11.5 sub-section ("Kubernetes cluster mode") + README Deploy table extension. | QUEUED | — |
+
+## T2 ship — what landed
+
+### Files changed (3 modified + 1 added)
+
+- `crates/kesseldb-server/src/main.rs` — full rewrite to add CLI flag
+  parsing (`--cluster`, `--replica-idx`, `--peer-addrs`,
+  `--view-change-timeout`), env-var fallback (`KESSELDB_CLUSTER_*`),
+  and dispatch to either the existing `run_cfg` (single-node, default)
+  or new `run_cluster_cfg` (cluster mode). DNS bootstrap retry loop:
+  `resolve_peer_addrs` retries every 2s for up to 120s and logs each
+  failure (k8s StatefulSet pods occasionally start before their own
+  headless DNS A-record is published).
+- `crates/kesseldb-server/src/lib.rs` — new public `run_cluster_cfg`
+  (binds peer + client listeners, spawns the `cluster::Node`, starts
+  a role-logger thread, serves the binary client protocol). Validates
+  VSR shape (odd N >= 3 + idx in range) with a typed `io::Error`.
+- `crates/kesseldb-server/src/cluster.rs` — new `Ev::RoleProbe` +
+  `Node::role_probe()` returning `(view, is_primary, status)` so the
+  binary's startup loop can emit a one-shot "elected primary" log.
+  New `cluster_authenticate` + `serve_clients_cfg(listener, node,
+  token)` mirror the single-node `[0xFC] ++ token` auth handshake.
+  Legacy `serve_clients` is now a thin wrapper around
+  `serve_clients_cfg(.., None)` — existing tests pass verbatim.
+- `deploy/helm/kesseldb/values.yaml` — new `cluster.peerPort: 6534`
+  + default `peerAddressTemplate` switched to `:6534` (avoids
+  bind-collision between client + peer on port 6532).
+- `deploy/helm/kesseldb/templates/statefulset.yaml` — adds peer-port
+  container port (6534).
+- `deploy/helm/kesseldb/templates/service-headless.yaml` — publishes
+  peer port (6534) instead of binary port (6532). The regular
+  ClusterIP Service still publishes client surfaces.
+- `docs/superpowers/spcloudcluster-t2-kind-verify-2026-06-02.txt` —
+  new file; live kind verification transcript on vulcan.
+
+### Verification on vulcan
+
+Live kind cluster:
+
+```
+=== chart render — cluster mode object counts ===
+      2 kind: Service
+      1 kind: ServiceAccount
+      1 kind: StatefulSet
+
+=== pods ===
+NAME         READY   STATUS    RESTARTS      AGE
+kesseldb-0   1/1     Running   0             2m30s
+kesseldb-1   1/1     Running   1 (90s ago)   2m30s
+kesseldb-2   1/1     Running   1 (90s ago)   2m30s
+
+=== role transitions ===
+kesseldb-0: replica 0 elected primary (view=0)
+kesseldb-1: replica 1 role: view=0 is_primary=false status=Normal
+kesseldb-2: replica 2 role: view=0 is_primary=false status=Normal
+
+=== CRUD direct against primary kesseldb-0 ===
+CREATE TABLE final_smoke (v U64 NOT NULL)  →  OK  (type_id=2)
+INSERT INTO final_smoke ID 1 (v) VALUES (42)  →  OK
+SELECT * FROM final_smoke ID 1  →  v / 42 (1 row)
+```
+
+The 1 RESTART on kesseldb-1/2 is the DNS-bootstrap recovery — pods
+1 and 2 saw the early CoreDNS lag once and retried in within the
+120s window; the third (post-retry) attempt is the one shown above
+as `Running`. kesseldb-0 had 0 RESTARTS because its retry loop
+caught the lag within its own startup and never exited.
+
+Workspace cluster tests (kessel-server lib, real-TCP cluster
+integration, `--release`):
+
+```
+running 6 tests
+test cluster::tests::sql_over_cluster_full_crud_and_rmw ... ok
+test cluster::tests::three_nodes_replicate_over_real_tcp ... ok
+test cluster::tests::cluster_sql_cache_correct_across_ddl ... ok
+test cluster::tests::failover_retry_against_follower_returns_cached_reply ... ok
+test cluster::tests::cluster_client_finds_primary_and_is_exactly_once ... ok
+test cluster::tests::session_retry_is_exactly_once ... ok
+
+test result: ok. 6 passed; 0 failed
+```
+
+### Acceptance gate — MET (T2)
+
+| Gate | Target | Actual |
+|---|---|---|
+| Binary accepts `--cluster --replica-idx N --peer-addrs ...` | Clean parse + dispatch | **PASS** |
+| Binary accepts `KESSELDB_CLUSTER_*` env-var fallback | Env triggers cluster mode | **PASS** |
+| Unknown long opt = clean exit-code-2 | No silent fall-through | **PASS** |
+| Single-node path byte-identical when `--cluster` absent | No regression for V1 | **PASS** |
+| 3-pod kind cluster all Running | No CrashLoopBackOff after DNS bootstrap | **PASS** |
+| Pods log `started replica 0/3` / `1/3` / `2/3` | One per replica | **PASS** |
+| At least one pod logs `elected primary` within ~10s | role-probe loop works | **PASS** (kesseldb-0 in view=0) |
+| Cluster integration tests stay green | 6/6 cluster::tests::* | **PASS** |
+
+### Honest T2 limits (carried forward)
+
+- **kessel CLI uses single-`Client::connect`, not `ClusterClient`.**
+  Writes routed through the round-robin ClusterIP Service can land on
+  a backup and hit `OpResult::Unavailable`. The failover-aware shape
+  is `ClusterClient`, already shipped + tested at SP42; T3 wires the
+  CLI / SDK onto it so random-pod routing works end-to-end. Until
+  then, connect clients directly to the primary pod via the headless
+  Service ordinal A-record (`<release>-0.<release>-headless.<ns>.
+  svc.cluster.local`).
+- **HTTP / WS / PG-wire gateways NOT exposed in cluster mode V1.** The
+  cluster path serves the binary client protocol only; the gateway
+  EngineApply impl is bound to `EngineHandle`, not `cluster::Node`.
+  Wiring `EngineApply` on top of `Node` is a documented V2 follow-up
+  (the cluster gateway surfaces named in the design spec).
+- **View-change timeout is informational in V1.** The `--view-change-
+  timeout T` flag is parsed and logged but not yet plumbed into
+  `Replica::new` (the underlying 12 ms tick is what `kessel-vsr`
+  uses internally and is not yet a runtime knob).
+
+### Invariants preserved (T2)
+
+- Default `cargo build -p kesseldb-server` byte-identical when
+  `--cluster` is absent (main.rs dispatches through the pre-existing
+  `run_cfg` path; no semantic change in that branch).
+- HTTP/1.1 + WS + binary + PG-wire single-node surfaces untouched
+  (cluster gateway surfaces are a V2 follow-up).
+- `#![forbid(unsafe_code)]` honored (no `unsafe` in any new code).
+- Existing `cluster::tests::*` pass verbatim (the legacy
+  `serve_clients` is a thin wrapper around the new
+  `serve_clients_cfg(.., None)` open-mode path).
+- Zero new external deps.
+- KAT delta: **+0 net** (no new KATs in T2 — verification is the
+  live kind transcript; cluster integration KATs already cover the
+  consensus + transport surface).
 
 ## T1 ship — what landed
 

@@ -2329,6 +2329,9 @@ mod tests {
             (PG_TYPE_TEXT, b"hi".to_vec()),
             (PG_TYPE_VARCHAR, b"vc".to_vec()),
             (PG_TYPE_TIMESTAMPTZ, vec![0; 8]),
+            // SP-PG-EXTQ-BIN-NUMERIC T3 — NUMERIC now on the supported
+            // list. Canonical zero header (8 bytes, all-zero).
+            (PG_TYPE_NUMERIC, vec![0; 8]),
         ] {
             let mut state = SessionState::new();
             seed_stmt(&mut state, "ps", vec![oid]);
@@ -2352,34 +2355,40 @@ mod tests {
         }
     }
 
-    /// SP-PG-EXTQ-BIN T2 — NUMERIC binary at Bind is rejected with
-    /// the precise `SP-PG-EXTQ-BIN-NUMERIC` follow-up arc name so
-    /// operators can grep for the gap.
+    /// SP-PG-EXTQ-BIN-NUMERIC T3 — NUMERIC binary at Bind is now ACCEPTED
+    /// (V1 of SP-PG-EXTQ-BIN deferred this; this arc lifts the V1 reject).
+    /// The Bind admission check sees NUMERIC on the supported list and
+    /// stores the portal; Execute decodes via `binary_numeric::decode_*`.
     #[test]
-    fn t2bin_dispatch_bind_numeric_binary_rejected_with_followup_arc() {
+    fn t3num_dispatch_bind_numeric_binary_admitted() {
         let mut state = SessionState::new();
         seed_stmt(&mut state, "pn", vec![PG_TYPE_NUMERIC]);
+        // Canonical NUMERIC `42` wire (ndigits=1, weight=0, sign=POS,
+        // dscale=0, digit=42).
+        let numeric_42_wire = vec![
+            0x00, 0x01, // ndigits=1
+            0x00, 0x00, // weight=0
+            0x00, 0x00, // sign=POS
+            0x00, 0x00, // dscale=0
+            0x00, 0x2A, // digit[0]=42
+        ];
         let msg = proto::ExtqMessage::Bind {
             portal: String::new(),
             stmt: "pn".to_string(),
             param_formats: vec![FORMAT_CODE_BINARY],
-            param_values: vec![Some(vec![0; 8])],
+            param_values: vec![Some(numeric_42_wire)],
             result_formats: vec![],
         };
         match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
-            ExtqOutcome::Failed(ExtqError::BinaryFormatUnsupportedForType {
-                position,
-                type_oid,
-                arc,
-            }) => {
-                assert_eq!(position, 0);
-                assert_eq!(type_oid, PG_TYPE_NUMERIC);
-                assert_eq!(arc, "SP-PG-EXTQ-BIN-NUMERIC");
-            }
-            other => panic!("expected BinaryFormatUnsupportedForType, got {other:?}"),
+            ExtqOutcome::Bytes(bytes) => assert_eq!(
+                bytes,
+                vec![b'2', 0, 0, 0, 4],
+                "expected BindComplete for NUMERIC binary"
+            ),
+            other => panic!("expected BindComplete for NUMERIC binary, got {other:?}"),
         }
-        assert_eq!(state.portal_count(), 0);
-        assert!(state.in_error_state());
+        assert_eq!(state.portal_count(), 1);
+        assert!(!state.in_error_state());
     }
 
     /// SP-PG-EXTQ-BIN T2 — unknown OIDs (e.g. JSONB 3802) reject with

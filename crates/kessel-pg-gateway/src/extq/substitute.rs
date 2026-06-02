@@ -169,10 +169,7 @@ pub fn decode_binary_param(bytes: &[u8], type_oid: u32) -> Result<String, Binary
         PG_TYPE_TEXT | PG_TYPE_VARCHAR => decode_text(bytes, type_oid),
         PG_TYPE_BYTEA => Ok(decode_bytea(bytes)),
         PG_TYPE_TIMESTAMPTZ => decode_timestamptz(bytes),
-        PG_TYPE_NUMERIC => Err(BinaryDecodeError::Unsupported {
-            type_oid,
-            arc: "SP-PG-EXTQ-BIN-NUMERIC",
-        }),
+        PG_TYPE_NUMERIC => decode_numeric(bytes),
         _ => Err(BinaryDecodeError::Unsupported {
             type_oid,
             arc: "SP-PG-EXTQ-BIN-EXTRA",
@@ -346,6 +343,7 @@ pub fn binary_format_supported_for_oid(type_oid: u32) -> bool {
             | PG_TYPE_VARCHAR
             | PG_TYPE_BYTEA
             | PG_TYPE_TIMESTAMPTZ
+            | PG_TYPE_NUMERIC
     )
 }
 
@@ -464,6 +462,46 @@ fn decode_bytea(bytes: &[u8]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+/// SP-PG-EXTQ-BIN-NUMERIC T3 — decode the PG NUMERIC binary wire frame
+/// via the pure-Rust codec in `extq::binary_numeric`. Maps the codec's
+/// error enum into the dispatcher's `BinaryDecodeError` shape so the
+/// existing error-propagation paths in `preprocess_params` +
+/// `dispatch_execute` work without per-variant churn.
+fn decode_numeric(bytes: &[u8]) -> Result<String, BinaryDecodeError> {
+    use crate::extq::binary_numeric::{decode_numeric_binary, BinaryNumericError};
+    decode_numeric_binary(bytes).map_err(|e| match e {
+        BinaryNumericError::NaN => BinaryDecodeError::Unsupported {
+            type_oid: PG_TYPE_NUMERIC,
+            arc: "SP-PG-EXTQ-BIN-NUMERIC-NAN",
+        },
+        BinaryNumericError::OutOfRange { arc, .. } => BinaryDecodeError::Unsupported {
+            type_oid: PG_TYPE_NUMERIC,
+            arc,
+        },
+        BinaryNumericError::WrongLength { actual } => BinaryDecodeError::WrongLength {
+            type_oid: PG_TYPE_NUMERIC,
+            expected: 8,
+            actual,
+        },
+        BinaryNumericError::Truncated { .. } => BinaryDecodeError::BadValue {
+            type_oid: PG_TYPE_NUMERIC,
+            reason: "NUMERIC binary digit array truncated",
+        },
+        BinaryNumericError::BadSign { .. } => BinaryDecodeError::BadValue {
+            type_oid: PG_TYPE_NUMERIC,
+            reason: "NUMERIC binary unknown sign code",
+        },
+        BinaryNumericError::BadDigit { .. } => BinaryDecodeError::BadValue {
+            type_oid: PG_TYPE_NUMERIC,
+            reason: "NUMERIC binary digit out of [0, 9999]",
+        },
+        BinaryNumericError::BadDecimalString { .. } => BinaryDecodeError::BadValue {
+            type_oid: PG_TYPE_NUMERIC,
+            reason: "NUMERIC binary decoder returned invalid string (unreachable)",
+        },
+    })
 }
 
 /// Convert PG binary TIMESTAMPTZ (i64 microseconds since
@@ -671,6 +709,11 @@ fn render_binary_decoded(type_oid: u32, literal: &str) -> PreparedParam {
         PG_TYPE_BYTEA => PreparedParam::Raw(format!("'{literal}'::bytea")),
         // Timestamptz — same shape with `::timestamptz` cast.
         PG_TYPE_TIMESTAMPTZ => PreparedParam::Raw(format!("'{literal}'::timestamptz")),
+        // Numeric — single-quoted (kessel-sql accepts a quoted decimal
+        // literal the same way it accepts text-format NUMERIC params).
+        // The decoder already emitted a bare canonical decimal string
+        // (no `'`), so the Text variant's `'`→`''` escape is a no-op.
+        PG_TYPE_NUMERIC => PreparedParam::Text(literal.as_bytes().to_vec()),
         // Should never reach here — the Bind-time admission check
         // already rejected unsupported OIDs. Defensive: emit Raw.
         _ => PreparedParam::Raw(literal.to_string()),
@@ -1398,17 +1441,70 @@ mod tests {
         }
     }
 
-    /// NUMERIC binary explicitly rejects with the named follow-up arc
-    /// `SP-PG-EXTQ-BIN-NUMERIC` so operators can grep for the gap.
+    /// SP-PG-EXTQ-BIN-NUMERIC T3 — NUMERIC binary now decodes via the
+    /// `extq::binary_numeric` codec. The all-zero header (no digits, no
+    /// dscale, sign=POS) decodes to "0".
     #[test]
-    fn t1bin_decode_numeric_returns_unsupported_with_followup_arc() {
-        let err = decode_binary_param(&[0x00; 8], PG_TYPE_NUMERIC).unwrap_err();
+    fn t3num_decode_numeric_zero_through_codec() {
+        let out = decode_binary_param(&[0x00; 8], PG_TYPE_NUMERIC).expect("ok");
+        assert_eq!(out, "0");
+    }
+
+    /// SP-PG-EXTQ-BIN-NUMERIC T3 — NUMERIC binary `42` decodes through
+    /// the codec.
+    #[test]
+    fn t3num_decode_numeric_42_through_codec() {
+        let bytes = [
+            0x00, 0x01, // ndigits=1
+            0x00, 0x00, // weight=0
+            0x00, 0x00, // sign=POS
+            0x00, 0x00, // dscale=0
+            0x00, 0x2A, // digit[0]=42
+        ];
+        let out = decode_binary_param(&bytes, PG_TYPE_NUMERIC).expect("ok");
+        assert_eq!(out, "42");
+    }
+
+    /// SP-PG-EXTQ-BIN-NUMERIC T3 — NUMERIC binary NaN sign rejects with
+    /// the `SP-PG-EXTQ-BIN-NUMERIC-NAN` follow-up arc name (so operators
+    /// can grep for the gap on the V2 path).
+    #[test]
+    fn t3num_decode_numeric_nan_rejects_with_followup_arc() {
+        let bytes = [0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00];
+        let err = decode_binary_param(&bytes, PG_TYPE_NUMERIC).unwrap_err();
         match err {
             BinaryDecodeError::Unsupported { type_oid, arc } => {
                 assert_eq!(type_oid, PG_TYPE_NUMERIC);
-                assert_eq!(arc, "SP-PG-EXTQ-BIN-NUMERIC");
+                assert_eq!(arc, "SP-PG-EXTQ-BIN-NUMERIC-NAN");
             }
             other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    /// SP-PG-EXTQ-BIN-NUMERIC T3 — out-of-range NUMERIC (≥10^18 integer
+    /// part) rejects with `SP-PG-EXTQ-BIN-NUMERIC-BIGNUM` so operators
+    /// can identify the bignum carve-out.
+    #[test]
+    fn t3num_decode_numeric_out_of_range_rejects_with_bignum_arc() {
+        // Build a 5-base-10000-digit NUMERIC (10^16-ish * 10000 > 10^18).
+        // ndigits=5, weight=4 (so digit[0] is at base-10000^4 = 10^16),
+        // sign=POS, dscale=0, digits=[9999, 9999, 9999, 9999, 9999].
+        let mut bytes = vec![
+            0x00, 0x05, // ndigits=5
+            0x00, 0x04, // weight=4
+            0x00, 0x00, // sign=POS
+            0x00, 0x00, // dscale=0
+        ];
+        for _ in 0..5 {
+            bytes.extend_from_slice(&9999i16.to_be_bytes());
+        }
+        let err = decode_binary_param(&bytes, PG_TYPE_NUMERIC).unwrap_err();
+        match err {
+            BinaryDecodeError::Unsupported { type_oid, arc } => {
+                assert_eq!(type_oid, PG_TYPE_NUMERIC);
+                assert_eq!(arc, "SP-PG-EXTQ-BIN-NUMERIC-BIGNUM");
+            }
+            other => panic!("expected Unsupported (bignum), got {other:?}"),
         }
     }
 
@@ -1445,12 +1541,13 @@ mod tests {
     }
 
     /// `binary_format_supported_for_oid` accepts the V1 supported set
-    /// and rejects NUMERIC + unknown OIDs. Locked so a future drift
-    /// (e.g. forgetting TIMESTAMPTZ in the helper) can't silently
-    /// accept-then-fail-at-decode.
+    /// (post SP-PG-EXTQ-BIN-NUMERIC T3 this now includes NUMERIC) and
+    /// rejects everything else. Locked so a future drift (e.g.
+    /// forgetting TIMESTAMPTZ in the helper) can't silently accept-
+    /// then-fail-at-decode.
     #[test]
     fn t1bin_binary_format_supported_for_oid_matches_decoder() {
-        // Supported.
+        // Supported (V1 BIN + V1 BIN-RESULTS + V2 BIN-NUMERIC T3).
         for oid in [
             PG_TYPE_BOOL,
             PG_TYPE_INT2,
@@ -1462,6 +1559,7 @@ mod tests {
             PG_TYPE_VARCHAR,
             PG_TYPE_BYTEA,
             PG_TYPE_TIMESTAMPTZ,
+            PG_TYPE_NUMERIC,
         ] {
             assert!(
                 binary_format_supported_for_oid(oid),
@@ -1469,15 +1567,18 @@ mod tests {
             );
         }
         // Unsupported.
-        assert!(!binary_format_supported_for_oid(PG_TYPE_NUMERIC));
         assert!(!binary_format_supported_for_oid(3802 /* JSONB */));
         assert!(!binary_format_supported_for_oid(2950 /* UUID */));
         assert!(!binary_format_supported_for_oid(0));
     }
 
-    /// `unsupported_binary_arc_for_oid` names the right follow-up arc
-    /// for both the NUMERIC carve-out and the generic "extra types"
-    /// bucket.
+    /// `unsupported_binary_arc_for_oid` still names a follow-up arc for
+    /// each unsupported OID. NUMERIC's `SP-PG-EXTQ-BIN-NUMERIC` arc
+    /// remains as the naming helper since the OID hash hasn't moved,
+    /// but the param decoder now accepts NUMERIC — operators reaching
+    /// the helper now would be on the COPY-BIN-NUMERIC follow-up path.
+    /// (Each call site has its own admission check; this helper still
+    /// names the arc per OID.)
     #[test]
     fn t1bin_unsupported_binary_arc_naming() {
         assert_eq!(

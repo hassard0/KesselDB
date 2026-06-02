@@ -116,10 +116,7 @@ pub fn encode_binary_value(
         PG_TYPE_TEXT | PG_TYPE_VARCHAR => Ok(text.to_vec()),
         PG_TYPE_BYTEA => encode_bytea(text),
         PG_TYPE_TIMESTAMPTZ => encode_timestamptz(text),
-        PG_TYPE_NUMERIC => Err(BinaryEncodeError::Unsupported {
-            type_oid,
-            arc: "SP-PG-EXTQ-BIN-NUMERIC",
-        }),
+        PG_TYPE_NUMERIC => encode_numeric(text),
         _ => Err(BinaryEncodeError::Unsupported {
             type_oid,
             arc: "SP-PG-EXTQ-BIN-EXTRA",
@@ -143,6 +140,7 @@ pub fn binary_result_supported_for_oid(type_oid: u32) -> bool {
             | PG_TYPE_VARCHAR
             | PG_TYPE_BYTEA
             | PG_TYPE_TIMESTAMPTZ
+            | PG_TYPE_NUMERIC
     )
 }
 
@@ -281,6 +279,35 @@ fn decode_hex_nibble(b: u8) -> Result<u8, BinaryEncodeError> {
             reason: format!("BYTEA hex contains non-hex byte 0x{b:02X}"),
         }),
     }
+}
+
+/// SP-PG-EXTQ-BIN-NUMERIC T3 — encode a decimal-text NUMERIC value
+/// (the same shape `render_pg_text` would emit for a NUMERIC column —
+/// bare `[-]?\d+(\.\d+)?`) into the PG NUMERIC binary wire format via
+/// the pure-Rust codec in `extq::binary_numeric`.
+fn encode_numeric(text: &[u8]) -> Result<Vec<u8>, BinaryEncodeError> {
+    use crate::extq::binary_numeric::{encode_numeric_binary, BinaryNumericError};
+    let s = std::str::from_utf8(text).map_err(|_| BinaryEncodeError::BadValue {
+        type_oid: PG_TYPE_NUMERIC,
+        reason: format!(
+            "NUMERIC text must be valid UTF-8 (got {:?})",
+            String::from_utf8_lossy(text)
+        ),
+    })?;
+    encode_numeric_binary(s).map_err(|e| match e {
+        BinaryNumericError::OutOfRange { arc, .. } => BinaryEncodeError::Unsupported {
+            type_oid: PG_TYPE_NUMERIC,
+            arc,
+        },
+        BinaryNumericError::BadDecimalString { input, reason } => BinaryEncodeError::BadValue {
+            type_oid: PG_TYPE_NUMERIC,
+            reason: format!("NUMERIC text {input:?}: {reason}"),
+        },
+        other => BinaryEncodeError::BadValue {
+            type_oid: PG_TYPE_NUMERIC,
+            reason: format!("NUMERIC encode error: {other:?}"),
+        },
+    })
 }
 
 /// Encode an ISO timestamp string `YYYY-MM-DD HH:MM:SS.ffffff+00` as
@@ -846,16 +873,34 @@ mod tests {
         assert_eq!(i64::from_be_bytes(out.try_into().unwrap()), 1_000_000);
     }
 
-    /// NUMERIC binary requested → Unsupported with V2 arc name.
+    /// SP-PG-EXTQ-BIN-NUMERIC T3 — NUMERIC binary `3.14` now encodes
+    /// through the codec to the canonical 12-byte wire (ndigits=2,
+    /// weight=0, sign=POS, dscale=2, [3, 1400]).
     #[test]
-    fn t1binr_encode_numeric_returns_unsupported_with_arc() {
-        let err = encode_binary_value(b"3.14", PG_TYPE_NUMERIC).unwrap_err();
+    fn t3num_encode_numeric_3_14_through_codec() {
+        let out = encode_binary_value(b"3.14", PG_TYPE_NUMERIC).expect("ok");
+        assert_eq!(
+            out,
+            vec![
+                0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, // header
+                0x00, 0x03, // digit[0]=3
+                0x05, 0x78, // digit[1]=1400
+            ]
+        );
+    }
+
+    /// SP-PG-EXTQ-BIN-NUMERIC T3 — out-of-range NUMERIC encode rejects
+    /// with the `SP-PG-EXTQ-BIN-NUMERIC-BIGNUM` follow-up arc.
+    #[test]
+    fn t3num_encode_numeric_out_of_range_rejects_with_bignum_arc() {
+        let big = "1".to_string() + &"0".repeat(18); // 10^18, ≥ V1 cap
+        let err = encode_binary_value(big.as_bytes(), PG_TYPE_NUMERIC).unwrap_err();
         match err {
             BinaryEncodeError::Unsupported { arc, type_oid } => {
-                assert_eq!(arc, "SP-PG-EXTQ-BIN-NUMERIC");
+                assert_eq!(arc, "SP-PG-EXTQ-BIN-NUMERIC-BIGNUM");
                 assert_eq!(type_oid, PG_TYPE_NUMERIC);
             }
-            other => panic!("expected Unsupported, got {other:?}"),
+            other => panic!("expected Unsupported (bignum), got {other:?}"),
         }
     }
 
@@ -1033,10 +1078,33 @@ mod tests {
         assert_eq!(cols[1], None);
     }
 
-    /// NUMERIC binary requested → Encode error with the V2 arc.
+    /// SP-PG-EXTQ-BIN-NUMERIC T3 — NUMERIC binary now flows through
+    /// the codec at `rewrite_data_row_with_formats` time. The DataRow
+    /// "3.14" comes out as a 12-byte binary blob (the canonical NUMERIC
+    /// wire shape).
     #[test]
-    fn t1binr_rewrite_data_row_numeric_binary_rejects() {
+    fn t3num_rewrite_data_row_numeric_binary_encodes() {
         let frame = encode_data_row(&[Some(b"3.14")]);
+        let out =
+            rewrite_data_row_with_formats(&frame, &[1], &[PG_TYPE_NUMERIC]).expect("ok");
+        let cols = parse_data_row(&out).expect("parse");
+        assert_eq!(
+            cols[0],
+            Some(vec![
+                0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, // header
+                0x00, 0x03, // digit[0]=3
+                0x05, 0x78, // digit[1]=1400
+            ])
+        );
+    }
+
+    /// SP-PG-EXTQ-BIN-NUMERIC T3 — out-of-range NUMERIC inside a
+    /// DataRow rewrite reports the `SP-PG-EXTQ-BIN-NUMERIC-BIGNUM`
+    /// follow-up arc.
+    #[test]
+    fn t3num_rewrite_data_row_numeric_out_of_range_rejects() {
+        let big = "1".to_string() + &"0".repeat(18); // 10^18, exceeds V1 cap
+        let frame = encode_data_row(&[Some(big.as_bytes())]);
         let err = rewrite_data_row_with_formats(&frame, &[1], &[PG_TYPE_NUMERIC]).unwrap_err();
         match err {
             BinaryRewriteError::Encode {
@@ -1044,9 +1112,9 @@ mod tests {
                 error: BinaryEncodeError::Unsupported { arc, .. },
             } => {
                 assert_eq!(position, 0);
-                assert_eq!(arc, "SP-PG-EXTQ-BIN-NUMERIC");
+                assert_eq!(arc, "SP-PG-EXTQ-BIN-NUMERIC-BIGNUM");
             }
-            other => panic!("expected Encode::Unsupported, got {other:?}"),
+            other => panic!("expected Encode::Unsupported (bignum), got {other:?}"),
         }
     }
 
@@ -1174,7 +1242,9 @@ mod tests {
     // ───────────────────────────────────────────────────────────────
 
     /// `binary_result_supported_for_oid` matches the same set as
-    /// `substitute::binary_format_supported_for_oid`.
+    /// `substitute::binary_format_supported_for_oid`. After
+    /// SP-PG-EXTQ-BIN-NUMERIC T3, NUMERIC is now on the supported list
+    /// for both sides.
     #[test]
     fn t1binr_supported_oid_set_matches_param_side() {
         for oid in [
@@ -1188,6 +1258,7 @@ mod tests {
             PG_TYPE_VARCHAR,
             PG_TYPE_BYTEA,
             PG_TYPE_TIMESTAMPTZ,
+            PG_TYPE_NUMERIC,
         ] {
             assert!(binary_result_supported_for_oid(oid), "oid {oid} should be supported");
             assert!(
@@ -1195,7 +1266,7 @@ mod tests {
                 "param side should also support oid {oid}"
             );
         }
-        for oid in [PG_TYPE_NUMERIC, 114, 2950, 1009] {
+        for oid in [114 /* json */, 2950 /* uuid */, 1009 /* _text */] {
             assert!(!binary_result_supported_for_oid(oid), "oid {oid} should NOT be supported");
         }
     }

@@ -133,22 +133,32 @@ pub fn dispatch_copy_in_start<E: EngineApply + ?Sized>(
         };
     // SP-PG-COPY-BIN V1 — when the format is Binary, V1 must reject
     // unsupported column types at COPY-start (NUMERIC / UUID / JSONB /
-    // ARRAY) because per-row decoding has no recovery path. Same
-    // supported set as `binary_format_supported_for_oid`.
+    // ARRAY) because per-row decoding has no recovery path.
+    //
+    // SP-PG-EXTQ-BIN-NUMERIC T3 — the extq path now supports NUMERIC,
+    // but the COPY-BIN-NUMERIC arc is still deferred (COPY's per-row
+    // framing has different recovery semantics). Pre-reject NUMERIC
+    // explicitly before consulting `binary_format_supported_for_oid`
+    // so the COPY follow-up arc owns its own enablement.
     if format.is_binary() {
         for (name, kind) in chosen_columns.iter().zip(chosen_kinds.iter()) {
             let oid = field_kind_to_oid(*kind);
-            if !binary_format_supported_for_oid(oid) {
-                let arc = if oid == crate::proto::PG_TYPE_NUMERIC {
-                    "SP-PG-COPY-BIN-NUMERIC"
-                } else {
-                    "SP-PG-COPY-BIN-EXTRA"
-                };
+            if oid == crate::proto::PG_TYPE_NUMERIC {
                 return CopyInStartOutcome::Failed {
                     bytes: error_response_then_rfq(
                         "0A000",
                         &format!(
-                            "COPY binary: column \"{name}\" type OID {oid} not supported in V1 ({arc})"
+                            "COPY binary: column \"{name}\" type OID {oid} not supported in V1 (SP-PG-COPY-BIN-NUMERIC)"
+                        ),
+                    ),
+                };
+            }
+            if !binary_format_supported_for_oid(oid) {
+                return CopyInStartOutcome::Failed {
+                    bytes: error_response_then_rfq(
+                        "0A000",
+                        &format!(
+                            "COPY binary: column \"{name}\" type OID {oid} not supported in V1 (SP-PG-COPY-BIN-EXTRA)"
                         ),
                     ),
                 };
@@ -818,20 +828,28 @@ pub fn dispatch_copy_to<E: EngineApply + ?Sized>(
     // SP-PG-COPY-BIN V1 — pre-reject unsupported column types at
     // COPY-TO-start time (NUMERIC / UUID / JSONB / ARRAY). Same set as
     // `binary_format_supported_for_oid`. Mirrors the COPY FROM pre-check.
+    //
+    // SP-PG-EXTQ-BIN-NUMERIC T3 — extq path now supports NUMERIC, but
+    // COPY-BIN-NUMERIC is still a deferred follow-up arc; pre-reject
+    // NUMERIC explicitly so the COPY arc owns its own enablement.
     if format.is_binary() {
         for (i, &idx) in chosen_indices.iter().enumerate() {
             let kind = schema_cols[idx].kind;
             let oid = field_kind_to_oid(kind);
-            if !binary_format_supported_for_oid(oid) {
-                let arc = if oid == crate::proto::PG_TYPE_NUMERIC {
-                    "SP-PG-COPY-BIN-NUMERIC"
-                } else {
-                    "SP-PG-COPY-BIN-EXTRA"
-                };
+            if oid == crate::proto::PG_TYPE_NUMERIC {
                 return error_response_then_rfq(
                     "0A000",
                     &format!(
-                        "COPY binary: column \"{}\" type OID {oid} not supported in V1 ({arc})",
+                        "COPY binary: column \"{}\" type OID {oid} not supported in V1 (SP-PG-COPY-BIN-NUMERIC)",
+                        chosen_names[i]
+                    ),
+                );
+            }
+            if !binary_format_supported_for_oid(oid) {
+                return error_response_then_rfq(
+                    "0A000",
+                    &format!(
+                        "COPY binary: column \"{}\" type OID {oid} not supported in V1 (SP-PG-COPY-BIN-EXTRA)",
                         chosen_names[i]
                     ),
                 );

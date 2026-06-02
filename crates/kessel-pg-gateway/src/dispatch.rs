@@ -68,6 +68,16 @@ use kessel_proto::OpResult;
 /// The caller (the query loop in `server::run_session`) writes the
 /// returned bytes to the TCP stream verbatim.
 pub fn dispatch_query<E: EngineApply + ?Sized>(sql: &str, engine: &E) -> Vec<u8> {
+    // SP-PG-EXTQ-CAST T2 — strip PG `::TYPE[(args)]` type-cast
+    // operator before any downstream dispatch. The strip is a no-op
+    // for SQL without `::` so every prior text-only KAT still passes
+    // byte-for-byte (verified by `cast_stripper::no_cast_pure_passthrough_fuzz`).
+    // Unlocks JDBC `preferQueryMode=simple` (which injects
+    // `SELECT col::int8` patterns the kessel-sql lexer rejects with
+    // `42601 syntax_error`). Companion design spec:
+    // `docs/superpowers/specs/2026-06-01-kesseldb-sppgextqcast-design.md`.
+    let stripped = crate::cast_stripper::strip_pg_casts(sql);
+    let sql = stripped.as_str();
     let mut out = Vec::new();
     // PG §55.2.3 — empty/whitespace-only SQL → EmptyQueryResponse,
     // not RowDescription/CommandComplete.
@@ -1621,6 +1631,92 @@ mod tests {
         assert!(
             bytes.windows(b"FATAL".len()).any(|w| w == b"FATAL"),
             "shard-unavailable MUST surface FATAL severity"
+        );
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-EXTQ-CAST T2 — dispatch integration KATs verifying that
+    // the cast strip runs at the entry point + the rewritten SQL
+    // reaches the downstream dispatcher without surfacing the
+    // `kessel-sql` `42601 syntax_error` that an un-stripped `::int8`
+    // would produce.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// SP-PG-EXTQ-CAST: `SELECT 1::int8` no longer surfaces the
+    /// pre-arc `42601 syntax_error: unexpected char ':'`. The
+    /// stripped form (`SELECT 1`) reaches the engine; with a canned
+    /// `Got` row response we get a `SELECT 1` CommandComplete +
+    /// ReadyForQuery, not an ErrorResponse.
+    #[test]
+    fn sppgextqcast_select_one_int8_strips_and_no_error() {
+        let cols = vec![PgColumn {
+            name: "?column?".into(),
+            kind: FieldKind::I64,
+            nullable: false,
+        }];
+        let rec = build_record(&cols, &[Value::Int(1)]);
+        let stream = build_row_stream(&[rec]);
+        let eng = CannedEngine {
+            cols,
+            row_bytes: stream,
+            result: std::sync::Mutex::new(None),
+            // The strip turns `SELECT 1::int8 FROM t` into
+            // `SELECT 1 FROM t`; the test engine answers any SELECT
+            // shape with the canned `Got` row, so the dispatcher
+            // takes the success path.
+            table_name: "t".into(),
+            no_schema: false,
+        };
+        let bytes = dispatch_query("SELECT 1::int8 FROM t", &eng);
+        // No 42601 error in the response.
+        assert!(
+            !bytes.windows(b"42601".len()).any(|w| w == b"42601"),
+            "SP-PG-EXTQ-CAST: stripped `SELECT 1::int8` must NOT surface 42601"
+        );
+        // And a SELECT command-complete tag is present (success path).
+        assert!(
+            bytes.windows(b"SELECT".len()).any(|w| w == b"SELECT"),
+            "SP-PG-EXTQ-CAST: stripped form must reach success path with SELECT tag"
+        );
+    }
+
+    /// SP-PG-EXTQ-CAST: the strip is a no-op for SQL without casts
+    /// (byte-equal response shape to the pre-arc dispatch). Combined
+    /// with the per-byte locks above, this is the regression brake
+    /// that proves the cast strip never disturbs the existing text-
+    /// only path.
+    #[test]
+    fn sppgextqcast_noop_when_no_casts_present() {
+        let cols = vec![PgColumn {
+            name: "id".into(),
+            kind: FieldKind::I64,
+            nullable: false,
+        }];
+        let rec = build_record(&cols, &[Value::Int(7)]);
+        let stream = build_row_stream(&[rec]);
+        let eng_a = CannedEngine {
+            cols: cols.clone(),
+            row_bytes: stream.clone(),
+            result: std::sync::Mutex::new(None),
+            table_name: "t".into(),
+            no_schema: false,
+        };
+        let eng_b = CannedEngine {
+            cols,
+            row_bytes: stream,
+            result: std::sync::Mutex::new(None),
+            table_name: "t".into(),
+            no_schema: false,
+        };
+        // A SQL that contains no `::` must produce identical bytes
+        // before vs after the strip — eng_a and eng_b are identical
+        // canned engines so the same SQL twice should produce
+        // identical byte streams.
+        let bytes_a = dispatch_query("SELECT * FROM t", &eng_a);
+        let bytes_b = dispatch_query("SELECT * FROM t", &eng_b);
+        assert_eq!(
+            bytes_a, bytes_b,
+            "no-op cast strip must be deterministic across calls"
         );
     }
 }

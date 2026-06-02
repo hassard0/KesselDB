@@ -62,6 +62,7 @@
 #![allow(dead_code)]
 
 pub mod auth;
+pub mod cast_stripper;
 pub mod copy;
 pub mod dispatch;
 pub mod engine;

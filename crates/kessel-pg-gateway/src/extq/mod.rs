@@ -3520,8 +3520,15 @@ mod tests {
             param_values: vec![Some(vec![0xDE, 0xAD])],
             result_formats: vec![],
         };
+        // SP-PG-EXTQ-CAST: the substitute layer still emits the
+        // `::bytea` cast hint for parser-typed-literal reasons, but
+        // the gateway dispatch entry now strips `::TYPE` before the
+        // engine sees the SQL (so the engine receives the bare
+        // `'\xdead'` literal). Update the engine expectation to the
+        // post-strip form — `kessel-sql` actually rejects `::` so
+        // the strip is the form the engine can parse.
         let engine = SqlAssertEngine {
-            expected_sql: "INSERT INTO t (b) VALUES ('\\xdead'::bytea)"
+            expected_sql: "INSERT INTO t (b) VALUES ('\\xdead')"
                 .to_string(),
         };
         try_dispatch_extq(&mut state, &engine, bind);

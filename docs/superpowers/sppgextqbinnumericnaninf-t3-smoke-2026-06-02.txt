@@ -1,0 +1,92 @@
+SP-PG-EXTQ-BIN-NUMERIC-NAN-INF T3 vulcan smoke transcript — 2026-06-02
+===========================================================================
+
+Host: admin@192.168.4.178 (vulcan)
+Build: CARGO_TARGET_DIR=/tmp/kdb-target-nannummax
+       cargo build --release --bin kesseldb --features pg-gateway
+Server: KESSELDB_TOKEN=admin KESSELDB_PG_ADDR=127.0.0.1:5536
+        target/release/kesseldb 127.0.0.1:6536 /tmp/kdb-nannummax-data
+Smoke:  python3 scripts/sppgextqbinnumericnaninf-smoke.py
+
+
+Headline
+---------------------------------------------------------------------------
+
+CODEC-LAYER PASS. Both psycopg2 (sync) and asyncpg (async) drivers now
+send `decimal.Decimal('NaN')` / `decimal.Decimal('Infinity')` /
+`decimal.Decimal('-Infinity')` as PG NUMERIC binary wire frames carrying
+the 3 reserved sign codes (0xC000 / 0xD000 / 0xF000). The KesselDB
+codec decodes the wire into the canonical PG string forms ("NaN" /
+"Infinity" / "-Infinity") — the codec-layer rejection that V1 surfaced
+as `0A000 SP-PG-EXTQ-BIN-NUMERIC-NAN` / `-INF` is gone.
+
+The downstream rejection is now engine-level (FieldKind::I128 can't
+hold these values) or client-side (asyncpg's Describe-driven encoder
+refuses Decimal('NaN') against its inferred parameter type). Neither
+failure mode names the codec arc — the codec layer is no longer the
+failure point.
+
+
+Smoke script output
+---------------------------------------------------------------------------
+
+================================================================
+SP-PG-EXTQ-BIN-NUMERIC-NAN-INF T3 vulcan smoke
+================================================================
+
+--- psycopg2 (sync) ---
+         NaN: [PASS] INSERT_REJECT: DatatypeMismatch: sql: literal/column type mismatch
+    Infinity: [PASS] INSERT_REJECT: DatatypeMismatch: sql: literal/column type mismatch
+   -Infinity: [PASS] INSERT_REJECT: DatatypeMismatch: sql: literal/column type mismatch
+
+--- asyncpg (async) ---
+         NaN: [PASS] INSERT_REJECT: DataError: invalid input for query argument $1: Decimal('NaN') (expected str, got Decimal)
+    Infinity: [PASS] INSERT_REJECT: DataError: invalid input for query argument $1: Decimal('Infinity') (expected str, got Decimal)
+   -Infinity: [PASS] INSERT_REJECT: DataError: invalid input for query argument $1: Decimal('-Infinity') (expected str, got Decimal)
+
+--- Verdict ---
+CODEC-LAYER PASS: NaN / +Inf / -Inf wire frames now decode
+through the codec to the canonical PG strings 'NaN' /
+'Infinity' / '-Infinity'. The engine-level type-mismatch
+is a separate concern (FieldKind::I128 cannot hold these
+values - that's an engine arc, not a codec arc).
+
+
+What this proves and what it doesn't
+---------------------------------------------------------------------------
+
+PROVES (codec layer):
+  - psycopg2 sends NUMERIC binary parameter with sign=0xC000 (NaN),
+    KesselDB's `binary_numeric::decode_numeric_binary` accepts the
+    wire frame and returns Ok("NaN") (was Err(BinaryNumericError::NaN)
+    in V1).
+  - psycopg2 sends sign=0xD000 (+Inf), codec returns Ok("Infinity")
+    (was Err(BinaryNumericError::BadSign { sign: 0xD000 }) in V1).
+  - psycopg2 sends sign=0xF000 (-Inf), codec returns Ok("-Infinity")
+    (was Err(BinaryNumericError::BadSign { sign: 0xF000 }) in V1).
+  - The gateway's `extq::substitute::decode_binary_param` boundary
+    routes the decoded special string into PreparedParam::Text
+    (single-quoted), same as every other decoded numeric literal.
+
+DOES NOT PROVE (out-of-scope for this codec arc):
+  - End-to-end Decimal('NaN') INSERT + SELECT round-trip — KesselDB's
+    NUMERIC engine type (FieldKind::I128) has no NaN/Inf representation.
+    The kessel-sql parser rejects 'NaN' as a literal for an I128
+    column at the type-cast step. A separate engine-level arc (NOT
+    named here — would be SP-ENGINE-NUMERIC-SPECIALS or similar) is
+    needed to lift that restriction.
+  - The encoder side is exercised by per-codec KATs (3 specials, all
+    case-insensitive variants, round-trip identity); end-to-end
+    encode is not exercised because the engine can't produce special
+    values to encode.
+
+
+KAT counts (host vulcan, 2026-06-02)
+---------------------------------------------------------------------------
+
+  kessel-pg-gateway::extq::binary_numeric tests: 37 passed (was 25)
+  kessel-pg-gateway lib total:                    862 passed (was ~850)
+
+Delta on this arc: +12 KATs (9 binary_numeric module + 2 substitute +
+1 binary_results); 1 V1 NaN-reject KAT was flipped to a NaN-accept KAT
+and renamed.

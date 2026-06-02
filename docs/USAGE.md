@@ -1874,8 +1874,15 @@ digits — the typical ORM Decimal/BigDecimal range. Wired into both
 `extq::binary_results::encode_binary_value` (Execute result path). The
 `binary_format_supported_for_oid` / `binary_result_supported_for_oid`
 predicates now include PG_TYPE_NUMERIC (OID 1700). Wider values reject
-with the precise `SP-PG-EXTQ-BIN-NUMERIC-BIGNUM` follow-up; NaN
-rejects with `SP-PG-EXTQ-BIN-NUMERIC-NAN`. Vulcan smoke transcript:
+with the precise `SP-PG-EXTQ-BIN-NUMERIC-BIGNUM` follow-up. NaN /
++Infinity / -Infinity (`sign=0xC000` / `0xD000` / `0xF000`) decode to
+the canonical PG strings `"NaN"` / `"Infinity"` / `"-Infinity"` and
+encode from case-insensitive variants of the same strings (including
+short `"inf"` / `"+inf"` / `"-inf"` aliases) — closed by
+**SP-PG-EXTQ-BIN-NUMERIC-NAN-INF (2026-06-02)** at the codec layer;
+the engine-level NUMERIC storage of these specials remains a separate
+follow-up (FieldKind::I128 has no native NaN/Inf representation).
+Vulcan smoke transcript:
 `docs/superpowers/sppgextqbinnumeric-t4-smoke-2026-06-02.txt`
 (psycopg2 + asyncpg both decode `Decimal('42')` / `Decimal('-7')` /
 `Decimal('999999999')` from kesseldb-emitted NUMERIC binary DataRow).

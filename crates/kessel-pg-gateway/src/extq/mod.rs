@@ -768,12 +768,40 @@ fn dispatch_describe<E: EngineApply + ?Sized>(
             // Resolve + extract what we need from the borrow before
             // calling the engine (the engine call would have to share
             // the &state borrow otherwise).
-            let (sql, param_oids) = match state.statements.get(&name) {
+            let (sql, parse_param_oids) = match state.statements.get(&name) {
                 Some(prep) => (prep.sql.clone(), prep.param_oids.clone()),
                 None => return set_err(state, ExtqError::UnknownStatement { name }),
             };
-            let mut out = response::encode_parameter_description(&param_oids);
+            // SP-PG-EXTQ-BIN T3 — when Parse provided no OID hints,
+            // synthesize a ParameterDescription from the SQL's `$N`
+            // placeholder count. asyncpg (and the libpq prepared-stmt
+            // cache flow generally) refuses to Bind any params unless
+            // PD declares at least that many positions. V1 emits
+            // every position as PG_TYPE_TEXT — the gateway accepts
+            // TEXT binary (= UTF-8 bytes) for every type and routes
+            // the substitute layer's text path, which works for the
+            // SQL parser regardless of the column's actual type.
+            let described_oids = if parse_param_oids.is_empty() {
+                let n = substitute::count_placeholders(&sql);
+                vec![crate::proto::PG_TYPE_TEXT; n]
+            } else {
+                parse_param_oids
+            };
+            let mut out = response::encode_parameter_description(&described_oids);
             out.extend_from_slice(&row_description_or_no_data_for_sql(engine, &sql));
+            // SP-PG-EXTQ-BIN T3 — persist the synthesized OIDs back
+            // into the stored statement so subsequent Bind +
+            // dispatch_bind binary-format admission can use them
+            // (without this, Bind's `expected_param_count` would
+            // still see 0 and accept any count, but the binary path
+            // would route through the missing-OID branch).
+            if !described_oids.is_empty() {
+                if let Some(prep) = state.statements.get_mut(&name) {
+                    if prep.param_oids.is_empty() {
+                        prep.param_oids = described_oids;
+                    }
+                }
+            }
             ExtqOutcome::Bytes(out)
         }
         crate::proto::DESCRIBE_TARGET_PORTAL => {
@@ -800,12 +828,23 @@ fn dispatch_describe<E: EngineApply + ?Sized>(
             // RowDescription so the upcoming Execute (if any) does
             // NOT repeat it. PG §55.2.3: Describe-then-Execute
             // emits T exactly once per portal per Sync block.
-            // (NoData also "covers" the portal — there are no rows
-            // so Execute won't emit T either. We set the flag in
-            // both cases for symmetry; the flag only matters for
-            // the SELECT-returning-rows path.)
-            if let Some(portal) = state.portals.get_mut(&name) {
-                portal.row_description_sent = true;
+            //
+            // SP-PG-EXTQ-BIN T3 fix — only set the suppression flag
+            // when Describe('P') actually emitted T (not n). For
+            // `SELECT * FROM t WHERE id = $1` Describe('P') runs
+            // BEFORE parameter substitution; the SQL doesn't match
+            // V1's `SELECT * FROM <table>` strict shape so the helper
+            // returns NoData. The subsequent Execute then runs the
+            // substituted SQL and gets a real RowDescription from
+            // the engine — that MUST be emitted (the previous "set
+            // the flag for symmetry" behavior was wrong; it caused
+            // psycopg3 to receive DataRows without a preceding T).
+            let described_rd =
+                !bytes.is_empty() && bytes[0] == crate::proto::BE_ROW_DESCRIPTION;
+            if described_rd {
+                if let Some(portal) = state.portals.get_mut(&name) {
+                    portal.row_description_sent = true;
+                }
             }
             ExtqOutcome::Bytes(bytes)
         }

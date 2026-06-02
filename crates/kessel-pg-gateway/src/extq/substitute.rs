@@ -180,6 +180,156 @@ pub fn decode_binary_param(bytes: &[u8], type_oid: u32) -> Result<String, Binary
     }
 }
 
+/// SP-PG-EXTQ-BIN T2 — scan a SQL string for `$N` placeholders and
+/// return the maximum `N` found (0 if none). Honors the same lexical-
+/// skip rules as `substitute_inner` (single-quoted strings, double-
+/// quoted identifiers, line comments, block comments, dollar-quoted
+/// strings).
+///
+/// Used by `dispatch_describe` for the `Describe('S')` synthesis path:
+/// when Parse provided no OID hints, V1 falls back to emitting a
+/// `ParameterDescription` of `[PG_TYPE_TEXT; max_n]` so drivers like
+/// asyncpg (which rely on the server's parameter-count answer before
+/// they'll Bind) know how many params the SQL takes. PG itself does
+/// real type inference here; V1 does the simpler-but-correct shape
+/// (text encoding works for every supported binary type because the
+/// `text-format` wire bytes are valid UTF-8 the gateway can
+/// substitute via the existing text path).
+pub fn count_placeholders(sql: &str) -> usize {
+    let mut max_n = 0usize;
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // Skip single-quoted strings.
+        if b == b'\'' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // Skip double-quoted identifiers.
+        if b == b'"' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // Skip line comments.
+        if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            let end = bytes[i..].iter().position(|&x| x == b'\n').map(|p| i + p);
+            i = end.map(|p| p + 1).unwrap_or(bytes.len());
+            continue;
+        }
+        // Skip block comments.
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            let rest = &bytes[i + 2..];
+            let end = rest
+                .windows(2)
+                .position(|w| w == b"*/")
+                .map(|p| i + 2 + p + 2)
+                .unwrap_or(bytes.len());
+            i = end;
+            continue;
+        }
+        // `$` handling.
+        if b == b'$' {
+            // Dollar-quoted (tagged or empty-tag) — skip entirely.
+            if i + 1 < bytes.len() && (is_tag_start_byte(bytes[i + 1]) || bytes[i + 1] == b'$') {
+                // Skip ahead past the dollar-quoted region. Re-use
+                // substitute_inner's logic via a stub.
+                // For simplicity: find the next `$` and check if the
+                // close tag matches.
+                if bytes[i + 1] == b'$' {
+                    // Empty-tag — find next `$$`.
+                    let mut j = i + 2;
+                    let mut found = false;
+                    while j + 1 < bytes.len() {
+                        if bytes[j] == b'$' && bytes[j + 1] == b'$' {
+                            i = j + 2;
+                            found = true;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    if !found {
+                        i = bytes.len();
+                    }
+                    continue;
+                } else {
+                    // Tagged — find matching close tag.
+                    let tag_start = i + 1;
+                    let mut tag_end = tag_start;
+                    while tag_end < bytes.len() && is_tag_cont_byte(bytes[tag_end]) {
+                        tag_end += 1;
+                    }
+                    if tag_end < bytes.len() && bytes[tag_end] == b'$' {
+                        let tag = &bytes[tag_start..tag_end];
+                        let opener_end = tag_end + 1;
+                        let mut j = opener_end;
+                        let mut found = false;
+                        while j < bytes.len() {
+                            if bytes[j] == b'$' {
+                                let after = j + 1;
+                                if after + tag.len() <= bytes.len()
+                                    && &bytes[after..after + tag.len()] == tag
+                                    && after + tag.len() < bytes.len()
+                                    && bytes[after + tag.len()] == b'$'
+                                {
+                                    i = after + tag.len() + 1;
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            j += 1;
+                        }
+                        if !found {
+                            i = bytes.len();
+                        }
+                        continue;
+                    }
+                }
+            }
+            // `$N` — greedy decimal scan.
+            let mut digit_end = i + 1;
+            while digit_end < bytes.len() && bytes[digit_end].is_ascii_digit() {
+                digit_end += 1;
+            }
+            if digit_end > i + 1 {
+                let digits = std::str::from_utf8(&bytes[i + 1..digit_end])
+                    .expect("ascii digits are utf8");
+                if let Ok(n) = digits.parse::<usize>() {
+                    if n > max_n {
+                        max_n = n;
+                    }
+                }
+                i = digit_end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    max_n
+}
+
 /// True iff `type_oid` is one V1's `decode_binary_param` accepts
 /// (used by `dispatch_bind` to admit binary params for supported
 /// OIDs and reject the rest at Bind time, BEFORE the portal stores).

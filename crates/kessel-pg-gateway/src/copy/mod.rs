@@ -43,6 +43,7 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
 
+pub mod binary;
 pub mod command;
 pub mod csv;
 pub mod dispatch;
@@ -123,6 +124,14 @@ pub enum CopyFormat {
     /// PG CSV format — RFC 4180 + PG superset (HEADER + custom
     /// DELIMITER / QUOTE / ESCAPE / NULL options). SP-PG-COPY-CSV V1.
     Csv(csv::CsvOptions),
+    /// **SP-PG-COPY-BIN V1** — PG binary format per §55.2.7. 19-byte
+    /// signature header + length-prefixed per-field binary values +
+    /// 2-byte i16 -1 end-of-data marker. No options struct — V1 has
+    /// no binary-specific options. Same supported type set as
+    /// SP-PG-EXTQ-BIN-RESULTS (BOOL, INT2/4/8, FLOAT4/8, TEXT,
+    /// VARCHAR, BYTEA, TIMESTAMPTZ); NUMERIC is V2
+    /// SP-PG-COPY-BIN-NUMERIC.
+    Binary,
 }
 
 impl Default for CopyFormat {
@@ -135,6 +144,13 @@ impl CopyFormat {
     /// True iff this is a CSV-format COPY (any options).
     pub fn is_csv(&self) -> bool {
         matches!(self, CopyFormat::Csv(_))
+    }
+
+    /// **SP-PG-COPY-BIN V1** — true iff this is a binary-format COPY.
+    /// The dispatcher branches on this to pick the binary codec from
+    /// `copy::binary`.
+    pub fn is_binary(&self) -> bool {
+        matches!(self, CopyFormat::Binary)
     }
 }
 
@@ -195,6 +211,13 @@ pub struct CopyInState {
     /// consumed-and-discarded yet. The dispatcher flips this to false
     /// after dropping the header row.
     pub pending_header: bool,
+    /// **SP-PG-COPY-BIN V1** — true once the PG binary 19-byte header
+    /// (signature + flags + extension-area-length) has been consumed.
+    /// Per PG §55.2.7 the header is part of the first CopyData payload,
+    /// not a separate frame, so the dispatcher tracks "have we seen it"
+    /// per-session to decide whether the next bytes are header or row.
+    /// Always false for Text / CSV.
+    pub binary_header_consumed: bool,
 }
 
 impl CopyInState {
@@ -255,6 +278,7 @@ impl CopyInState {
             batch_start_row: 1,
             format,
             pending_header,
+            binary_header_consumed: false,
         }
     }
 }

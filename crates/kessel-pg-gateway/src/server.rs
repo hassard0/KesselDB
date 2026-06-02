@@ -3568,8 +3568,14 @@ mod tests {
     /// SP-PG-COPY T2: binary-format COPY → 0A000 with the precise
     /// `SP-PG-COPY-BIN` V2-pointing message; connection stays in
     /// Idle (a follow-up Q works).
+    ///
+    /// **SP-PG-COPY-BIN V1 flip:** binary FORMAT is no longer rejected.
+    /// The session enters CopyIn state and emits `CopyInResponse(G)`
+    /// with the binary format byte set to 1. We no longer assert the
+    /// V2-pointing message; instead we assert the session is alive and
+    /// emitted a G frame with overall format = 1 (binary).
     #[test]
-    fn t2_run_session_copy_binary_format_rejected_precisely() {
+    fn t2_run_session_copy_binary_format_accepted_v1() {
         let token = b"kessel-bearer-token";
         let cols = vec![crate::engine::PgColumn {
             name: "id".into(),
@@ -3586,6 +3592,20 @@ mod tests {
         extra.extend_from_slice(&build_q_frame(
             "COPY t FROM STDIN WITH (FORMAT binary)",
         ));
+        // Send a binary header + end-of-data + CopyDone so the COPY
+        // succeeds with zero rows, returning the session to Idle.
+        let mut cd1: Vec<u8> = Vec::new();
+        cd1.extend_from_slice(crate::copy::binary::PG_BINARY_SIGNATURE);
+        cd1.extend_from_slice(&0u32.to_be_bytes()); // flags
+        cd1.extend_from_slice(&0u32.to_be_bytes()); // header extension length
+        cd1.extend_from_slice(&(-1i16).to_be_bytes()); // EOD marker
+        let mut cd_frame = Vec::new();
+        cd_frame.push(b'd');
+        cd_frame.extend_from_slice(&((4 + cd1.len()) as u32).to_be_bytes());
+        cd_frame.extend_from_slice(&cd1);
+        extra.extend_from_slice(&cd_frame);
+        // CopyDone (`c` + 4-byte length).
+        extra.extend_from_slice(&[b'c', 0, 0, 0, 4]);
         // Follow-up Q proves the session is alive in Idle.
         extra.extend_from_slice(&build_q_frame("SELECT * FROM t"));
         extra.extend_from_slice(&build_x_frame());
@@ -3598,14 +3618,24 @@ mod tests {
             || "serverN".to_string(),
             &engine,
         )
-        .expect("session stays alive across binary-format reject");
+        .expect("session stays alive across binary-format COPY");
 
         let out = &pipe.outbound;
-        assert!(out.windows(5).any(|w| w == b"0A000"));
+        // The expected `G` frame for ncols=1 is byte-equal to:
+        //   G [length=9] [format=1] [ncols=1] [code=1]
+        // = `G 0 0 0 9 1 0 1 0 1`
+        let expected_g_binary = [b'G', 0, 0, 0, 9, 1, 0, 1, 0, 1];
         assert!(
-            out.windows(b"SP-PG-COPY-BIN".len())
-                .any(|w| w == b"SP-PG-COPY-BIN"),
-            "precise V2-arc pointer expected in the rejection message"
+            out.windows(expected_g_binary.len())
+                .any(|w| w == &expected_g_binary[..]),
+            "expected CopyInResponse(G) with format=1 (binary), out len={}, first 64 bytes: {:?}",
+            out.len(),
+            &out[..out.len().min(64)]
+        );
+        // COPY 0 tag confirms the zero-row binary COPY finalized.
+        assert!(
+            out.windows(b"COPY 0\0".len()).any(|w| w == b"COPY 0\0"),
+            "expected COPY 0 CommandComplete tag"
         );
     }
 

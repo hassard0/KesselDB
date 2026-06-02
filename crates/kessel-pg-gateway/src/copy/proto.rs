@@ -23,7 +23,7 @@
 #![allow(dead_code)]
 
 use crate::proto::{
-    BE_COMMAND_COMPLETE, FE_COPY_DATA, FE_COPY_DONE, FORMAT_CODE_TEXT,
+    BE_COMMAND_COMPLETE, FE_COPY_DATA, FE_COPY_DONE, FORMAT_CODE_BINARY, FORMAT_CODE_TEXT,
 };
 
 /// `G` CopyInResponse tag. Server sends in reply to a `Q` containing
@@ -76,6 +76,21 @@ pub fn encode_copy_out_response(ncols: u16) -> Vec<u8> {
     encode_copy_n_response(BE_COPY_OUT_RESPONSE, ncols)
 }
 
+/// **SP-PG-COPY-BIN V1** — `G` CopyInResponse with overall format byte
+/// = 1 (binary) and per-column format codes = 1 across the board.
+/// Same wire shape as `encode_copy_in_response` modulo the format-byte
+/// + per-column code values.
+pub fn encode_copy_in_response_binary(ncols: u16) -> Vec<u8> {
+    encode_copy_n_response_binary(BE_COPY_IN_RESPONSE, ncols)
+}
+
+/// **SP-PG-COPY-BIN V1** — `H` CopyOutResponse with overall format byte
+/// = 1 (binary). Server emits this in reply to a `COPY <table> TO
+/// STDOUT WITH (FORMAT binary)` Query.
+pub fn encode_copy_out_response_binary(ncols: u16) -> Vec<u8> {
+    encode_copy_n_response_binary(BE_COPY_OUT_RESPONSE, ncols)
+}
+
 /// Shared helper — `G` and `H` have the SAME wire shape modulo the
 /// tag byte. PG §55.7 explicitly notes the symmetry; sharing the
 /// encoder locks the byte-equality invariant across the two directions.
@@ -90,6 +105,22 @@ fn encode_copy_n_response(tag: u8, ncols: u16) -> Vec<u8> {
     frame.extend_from_slice(&ncols.to_be_bytes());
     for _ in 0..n {
         frame.extend_from_slice(&FORMAT_CODE_TEXT.to_be_bytes());
+    }
+    frame
+}
+
+/// **SP-PG-COPY-BIN V1** — shared binary variant of `encode_copy_n_response`.
+/// Overall format byte + per-column format codes are all 1 (binary).
+fn encode_copy_n_response_binary(tag: u8, ncols: u16) -> Vec<u8> {
+    let n = ncols as usize;
+    let length = (4 + 1 + 2 + 2 * n) as u32;
+    let mut frame = Vec::with_capacity(1 + length as usize);
+    frame.push(tag);
+    frame.extend_from_slice(&length.to_be_bytes());
+    frame.push(FORMAT_CODE_BINARY as u8); // overall format = 1 (binary)
+    frame.extend_from_slice(&ncols.to_be_bytes());
+    for _ in 0..n {
+        frame.extend_from_slice(&FORMAT_CODE_BINARY.to_be_bytes());
     }
     frame
 }
@@ -330,6 +361,62 @@ mod tests {
         // Very large counts (u64::MAX) — render as decimal, no
         // overflow.
         assert_eq!(copy_tag(u64::MAX), "COPY 18446744073709551615");
+    }
+
+    /// SP-PG-COPY-BIN V1: `G` CopyInResponse binary variant emits
+    /// format byte 1 (binary) AND per-column format codes 1, while
+    /// keeping the rest of the wire shape identical to the text variant.
+    #[test]
+    fn binv1_copy_in_response_binary_two_cols_byte_locked() {
+        let frame = encode_copy_in_response_binary(2);
+        let mut expected = Vec::new();
+        expected.push(b'G');
+        expected.extend_from_slice(&11u32.to_be_bytes());
+        expected.push(1); // format = binary
+        expected.extend_from_slice(&2u16.to_be_bytes()); // ncols
+        expected.extend_from_slice(&1u16.to_be_bytes()); // col 0 format = binary
+        expected.extend_from_slice(&1u16.to_be_bytes()); // col 1 format = binary
+        assert_eq!(frame, expected);
+        assert_eq!(frame.len(), 12);
+    }
+
+    /// SP-PG-COPY-BIN V1: `H` CopyOutResponse binary variant emits
+    /// format byte 1 (binary) AND per-column format codes 1.
+    #[test]
+    fn binv1_copy_out_response_binary_two_cols_byte_locked() {
+        let frame = encode_copy_out_response_binary(2);
+        let mut expected = Vec::new();
+        expected.push(b'H');
+        expected.extend_from_slice(&11u32.to_be_bytes());
+        expected.push(1);
+        expected.extend_from_slice(&2u16.to_be_bytes());
+        expected.extend_from_slice(&1u16.to_be_bytes());
+        expected.extend_from_slice(&1u16.to_be_bytes());
+        assert_eq!(frame, expected);
+    }
+
+    /// SP-PG-COPY-BIN V1: the binary `G`/`H` variants differ from the
+    /// text variants ONLY in the format byte + per-column code values
+    /// (the tag, length, and ncols slot are byte-identical). Locks the
+    /// "binary is text-plus-format-flips" invariant.
+    #[test]
+    fn binv1_binary_vs_text_response_shape_identical_modulo_format_bytes() {
+        for n in [0u16, 1, 2, 7] {
+            let g_text = encode_copy_in_response(n);
+            let g_bin = encode_copy_in_response_binary(n);
+            assert_eq!(g_text.len(), g_bin.len(), "ncols={n}: same length");
+            // Tag + length + ncols slot are byte-equal.
+            assert_eq!(&g_text[0..5], &g_bin[0..5]);
+            assert_eq!(&g_text[6..8], &g_bin[6..8]);
+            // Format byte and per-column codes differ.
+            assert_eq!(g_text[5], 0);
+            assert_eq!(g_bin[5], 1);
+            for i in 0..n as usize {
+                let off = 8 + 2 * i;
+                assert_eq!(g_text[off..off + 2], [0x00, 0x00]);
+                assert_eq!(g_bin[off..off + 2], [0x00, 0x01]);
+            }
+        }
     }
 
     /// Tag-byte distinctness across the COPY-mode encoders. A byte-

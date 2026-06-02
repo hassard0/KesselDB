@@ -241,7 +241,13 @@ pub(crate) fn parse_with_options(s: &str) -> Result<CopyFormat, RejectReason> {
     let fmt = format_name.unwrap_or_else(|| "text".to_string());
     match fmt.to_ascii_uppercase().as_str() {
         "TEXT" => Ok(CopyFormat::Text),
-        "BINARY" => Err(RejectReason::BinaryFormat),
+        // SP-PG-COPY-BIN V1 — lifted from Rejected to accepted. The
+        // dispatcher now routes binary-format COPY through the new
+        // `copy::binary` codec. CSV-specific options (DELIMITER, QUOTE,
+        // HEADER, etc.) paired with FORMAT binary are silently ignored
+        // by V1 — PG itself rejects but the V1 tolerant stance matches
+        // the SP-PG-COPY-CSV "unknown option silently dropped" rule.
+        "BINARY" => Ok(CopyFormat::Binary),
         "CSV" => {
             let mut csv_opts = CsvOptions::default();
             for (k, v) in &opts {
@@ -683,13 +689,18 @@ mod tests {
         }
     }
 
-    /// SP-PG-COPY T1: `WITH (FORMAT binary)` → `RejectReason::BinaryFormat`
-    /// so the dispatcher can emit a precise V2-pointing error.
+    /// SP-PG-COPY-BIN V1: `WITH (FORMAT binary)` → `ParsedCopy::From {
+    /// format: Binary }` (no longer rejected — V1 lifts).
     #[test]
-    fn t1_parse_copy_binary_format_rejected() {
+    fn t1_parse_copy_binary_format_accepted_in_v1() {
         match parse_copy_command("COPY t FROM STDIN WITH (FORMAT binary)") {
-            Some(ParsedCopy::Rejected { reason: RejectReason::BinaryFormat }) => {}
-            other => panic!("expected Rejected(BinaryFormat), got {other:?}"),
+            Some(ParsedCopy::From { format: CopyFormat::Binary, .. }) => {}
+            other => panic!("expected From with Binary format, got {other:?}"),
+        }
+        // TO direction too.
+        match parse_copy_command("COPY t TO STDOUT WITH (FORMAT binary)") {
+            Some(ParsedCopy::To { format: CopyFormat::Binary, .. }) => {}
+            other => panic!("expected To with Binary format, got {other:?}"),
         }
     }
 

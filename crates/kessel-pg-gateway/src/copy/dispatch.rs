@@ -18,18 +18,26 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
 
+use crate::copy::binary::{
+    encode_binary_end_of_data, encode_binary_header, encode_binary_row, BinaryDecodeError,
+    BinaryDecoder, BinaryState,
+};
 use crate::copy::command::{ParsedCopy, RejectReason};
 use crate::copy::csv::{encode_csv_record, parse_csv_record, CsvOptions, CsvParseError};
 use crate::copy::proto::{
     copy_tag, encode_copy_data, encode_copy_done, encode_copy_in_response,
-    encode_copy_out_response,
+    encode_copy_in_response_binary, encode_copy_out_response,
+    encode_copy_out_response_binary,
 };
 use crate::copy::text::{encode_text_row, is_end_of_data_marker, parse_text_row_bytes};
 use crate::copy::{CopyFormat, CopyInState, MAX_COPY_DATA_BUFFER};
 use crate::dispatch;
 use crate::engine::EngineApply;
 use crate::error::{encode_error_response, SEVERITY_ERROR};
+use crate::extq::binary_results::{encode_binary_value, BinaryEncodeError};
+use crate::extq::substitute::{binary_format_supported_for_oid, decode_binary_param};
 use crate::response::{encode_command_complete, encode_ready_for_query};
+use crate::types::field_kind_to_oid;
 
 /// Outcome of starting a COPY FROM STDIN exchange.
 #[derive(Debug)]
@@ -123,8 +131,36 @@ pub fn dispatch_copy_in_start<E: EngineApply + ?Sized>(
                 schema_cols.iter().map(|s| s.kind).collect(),
             ),
         };
+    // SP-PG-COPY-BIN V1 — when the format is Binary, V1 must reject
+    // unsupported column types at COPY-start (NUMERIC / UUID / JSONB /
+    // ARRAY) because per-row decoding has no recovery path. Same
+    // supported set as `binary_format_supported_for_oid`.
+    if format.is_binary() {
+        for (name, kind) in chosen_columns.iter().zip(chosen_kinds.iter()) {
+            let oid = field_kind_to_oid(*kind);
+            if !binary_format_supported_for_oid(oid) {
+                let arc = if oid == crate::proto::PG_TYPE_NUMERIC {
+                    "SP-PG-COPY-BIN-NUMERIC"
+                } else {
+                    "SP-PG-COPY-BIN-EXTRA"
+                };
+                return CopyInStartOutcome::Failed {
+                    bytes: error_response_then_rfq(
+                        "0A000",
+                        &format!(
+                            "COPY binary: column \"{name}\" type OID {oid} not supported in V1 ({arc})"
+                        ),
+                    ),
+                };
+            }
+        }
+    }
     let ncols = chosen_columns.len() as u16;
-    let bytes = encode_copy_in_response(ncols);
+    let bytes = if format.is_binary() {
+        encode_copy_in_response_binary(ncols)
+    } else {
+        encode_copy_in_response(ncols)
+    };
     let state = CopyInState::new_with_format(
         table,
         Some(chosen_columns),
@@ -187,8 +223,10 @@ pub fn process_copy_data<E: EngineApply + ?Sized>(
     // SP-PG-COPY-CSV V1 — branch on the format. CSV uses a record-
     // oriented parser (a record can span multiple physical lines when
     // it contains quoted newlines); text uses the existing line-
-    // oriented parser.
-    if state.format.is_csv() {
+    // oriented parser. SP-PG-COPY-BIN V1 adds the binary branch.
+    if state.format.is_binary() {
+        process_copy_data_binary(state, engine)
+    } else if state.format.is_csv() {
         process_copy_data_csv(state, engine)
     } else {
         process_copy_data_text(state, engine)
@@ -327,6 +365,185 @@ fn process_copy_data_csv<E: EngineApply + ?Sized>(
                     bytes: error_response_then_rfq("22023", &msg),
                 };
             }
+        }
+    }
+}
+
+/// **SP-PG-COPY-BIN V1** — binary-format CopyData processor. Uses the
+/// streaming `BinaryDecoder` to consume the 19-byte header (once per
+/// session — flag tracked in `CopyInState::binary_header_consumed`)
+/// and per-row records. Decoded binary field bytes are routed through
+/// `extq::substitute::decode_binary_param` to produce text-format
+/// values, then fed into the existing BULKAPPLY V1 multi-row INSERT
+/// fold (the same path text + CSV use).
+///
+/// Trade-off: per-value binary→text round trip is wasteful for
+/// throughput-heavy binary COPY (V2 `SP-PG-COPY-BIN-DIRECT` could
+/// bypass via typed parameter binding). V1 prioritises correctness +
+/// code reuse over throughput.
+///
+/// End-of-data marker: `BinaryDecoder` flips to `EndOfData` when the
+/// `\xff\xff` marker is consumed; subsequent CopyData payloads (if
+/// any — a well-behaved client follows the marker with CopyDone) are
+/// silently dropped (V1 tolerant stance — matches text + CSV).
+fn process_copy_data_binary<E: EngineApply + ?Sized>(
+    mut state: CopyInState,
+    engine: &E,
+) -> CopyDataOutcome {
+    let bytes = std::mem::take(&mut state.carry);
+    let mut dec = if state.binary_header_consumed {
+        BinaryDecoder::new_in_body(&bytes)
+    } else {
+        BinaryDecoder::new(&bytes)
+    };
+    // Step 1: consume the 19-byte header if we haven't yet.
+    if !state.binary_header_consumed {
+        match dec.consume_header() {
+            Ok(true) => {
+                state.binary_header_consumed = true;
+            }
+            Ok(false) => {
+                // Not enough bytes yet — carry everything and wait.
+                state.carry = bytes;
+                return CopyDataOutcome::Continue { state };
+            }
+            Err(e) => {
+                return CopyDataOutcome::Failed {
+                    bytes: error_response_then_rfq(
+                        binary_decode_sqlstate(&e),
+                        &binary_decode_message(&e, 0),
+                    ),
+                };
+            }
+        }
+    }
+    // Step 2: parse per-row binary records, decode each column's
+    // binary bytes back to text, then push into the BULKAPPLY pending
+    // buffer. Stop on EndOfData OR on Ok(None) at row boundary.
+    let expected = state.column_count as usize;
+    // Snapshot the per-column OIDs for the decoder (resolved once).
+    let oids: Vec<u32> = state
+        .column_kinds
+        .iter()
+        .map(|k| field_kind_to_oid(*k))
+        .collect();
+    loop {
+        match dec.next_row(expected) {
+            Ok(Some(fields)) => {
+                // Decode each column's binary bytes to text using the
+                // SP-PG-EXTQ-BIN param decoder. NULL stays NULL.
+                let mut row_text: Vec<Option<Vec<u8>>> = Vec::with_capacity(fields.len());
+                for (i, f) in fields.iter().enumerate() {
+                    match f {
+                        None => row_text.push(None),
+                        Some(b) => {
+                            let oid = oids.get(i).copied().unwrap_or(0);
+                            match decode_binary_param(b, oid) {
+                                Ok(text) => row_text.push(Some(text.into_bytes())),
+                                Err(e) => {
+                                    let failing_row = state.rows_ingested
+                                        + state.pending_rows.len() as u64
+                                        + 1;
+                                    state.pending_rows.clear();
+                                    return CopyDataOutcome::Failed {
+                                        bytes: error_response_then_rfq(
+                                            "22P02",
+                                            &format!(
+                                                "COPY binary row {failing_row} column {i} (OID {oid}): {e:?}"
+                                            ),
+                                        ),
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+                state.pending_rows.push(row_text);
+                if state.pending_rows.len() >= state.batch_size {
+                    if let Some(fail_bytes) = flush_pending_batch(&mut state, engine) {
+                        return CopyDataOutcome::Failed { bytes: fail_bytes };
+                    }
+                }
+            }
+            Ok(None) => {
+                let new_state = dec.state();
+                let cursor = dec.cursor();
+                // Drop the decoder before we move bytes around.
+                drop(dec);
+                match new_state {
+                    BinaryState::EndOfData => {
+                        // V1 tolerant stance: any trailing bytes after
+                        // the EOD marker are dropped (the client should
+                        // send CopyDone next).
+                        state.carry.clear();
+                        return CopyDataOutcome::Continue { state };
+                    }
+                    BinaryState::Body => {
+                        // Partial row — carry from where the decoder
+                        // stopped.
+                        state.carry = bytes[cursor..].to_vec();
+                        return CopyDataOutcome::Continue { state };
+                    }
+                    BinaryState::Header => {
+                        // Unreachable — we already consumed the header
+                        // above OR returned Continue earlier.
+                        state.carry = bytes;
+                        return CopyDataOutcome::Continue { state };
+                    }
+                }
+            }
+            Err(e) => {
+                let failing_row =
+                    state.rows_ingested + state.pending_rows.len() as u64 + 1;
+                state.pending_rows.clear();
+                return CopyDataOutcome::Failed {
+                    bytes: error_response_then_rfq(
+                        binary_decode_sqlstate(&e),
+                        &binary_decode_message(&e, failing_row),
+                    ),
+                };
+            }
+        }
+    }
+}
+
+/// **SP-PG-COPY-BIN V1** — map `BinaryDecodeError` to a PG SQLSTATE.
+fn binary_decode_sqlstate(e: &BinaryDecodeError) -> &'static str {
+    match e {
+        BinaryDecodeError::BadSignature
+        | BinaryDecodeError::HeaderExtensionTooLarge { .. }
+        | BinaryDecodeError::BadFieldLength { .. } => "08P01",
+        BinaryDecodeError::UnsupportedFlags { .. } => "0A000",
+        BinaryDecodeError::FieldCountMismatch { .. } | BinaryDecodeError::Truncated => "22023",
+    }
+}
+
+/// **SP-PG-COPY-BIN V1** — render a `BinaryDecodeError` into a precise
+/// client-facing message. `failing_row` is the 1-based row index (or 0
+/// if the error happened before any row — e.g. header parsing).
+fn binary_decode_message(e: &BinaryDecodeError, failing_row: u64) -> String {
+    match e {
+        BinaryDecodeError::BadSignature => {
+            "COPY binary: bad signature (expected PGCOPY\\n\\xff\\r\\n\\0)".to_string()
+        }
+        BinaryDecodeError::UnsupportedFlags { flags } => {
+            format!(
+                "COPY binary: header flags 0x{flags:08X} not supported in V1 (SP-PG-COPY-BIN-OID)"
+            )
+        }
+        BinaryDecodeError::HeaderExtensionTooLarge { length } => {
+            format!("COPY binary: header extension length {length} exceeds 16 MiB cap")
+        }
+        BinaryDecodeError::FieldCountMismatch { expected, actual } => {
+            format!(
+                "COPY binary row {failing_row}: expected {expected} columns, got {actual}"
+            )
+        }
+        BinaryDecodeError::BadFieldLength { length } => {
+            format!("COPY binary row {failing_row}: bad field length {length}")
+        }
+        BinaryDecodeError::Truncated => {
+            format!("COPY binary row {failing_row}: truncated")
         }
     }
 }
@@ -598,6 +815,36 @@ pub fn dispatch_copy_to<E: EngineApply + ?Sized>(
     };
     let ncols = chosen_indices.len() as u16;
 
+    // SP-PG-COPY-BIN V1 — pre-reject unsupported column types at
+    // COPY-TO-start time (NUMERIC / UUID / JSONB / ARRAY). Same set as
+    // `binary_format_supported_for_oid`. Mirrors the COPY FROM pre-check.
+    if format.is_binary() {
+        for (i, &idx) in chosen_indices.iter().enumerate() {
+            let kind = schema_cols[idx].kind;
+            let oid = field_kind_to_oid(kind);
+            if !binary_format_supported_for_oid(oid) {
+                let arc = if oid == crate::proto::PG_TYPE_NUMERIC {
+                    "SP-PG-COPY-BIN-NUMERIC"
+                } else {
+                    "SP-PG-COPY-BIN-EXTRA"
+                };
+                return error_response_then_rfq(
+                    "0A000",
+                    &format!(
+                        "COPY binary: column \"{}\" type OID {oid} not supported in V1 ({arc})",
+                        chosen_names[i]
+                    ),
+                );
+            }
+        }
+    }
+    // SP-PG-COPY-BIN V1 — per-column PG type OIDs for the chosen
+    // projection. Used by the binary value encoder per row.
+    let chosen_oids: Vec<u32> = chosen_indices
+        .iter()
+        .map(|&i| field_kind_to_oid(schema_cols[i].kind))
+        .collect();
+
     // Drive the SELECT * FROM <table> path through dispatch_query
     // and pull the row text-bytes out of the DataRow frames.
     let select_sql = format!("SELECT * FROM {}", table);
@@ -612,10 +859,18 @@ pub fn dispatch_copy_to<E: EngineApply + ?Sized>(
     // from the DataRow frames.
     let rows = extract_data_rows(&resp);
 
-    // Build CopyOutResponse + (optional CSV header row) + N × CopyData
+    // Build CopyOutResponse + (optional CSV header row OR binary
+    // signature header) + N × CopyData + (optional binary EOD marker)
     // + CopyDone + CommandComplete("COPY N") + RFQ.
     let mut out = Vec::new();
-    out.extend_from_slice(&encode_copy_out_response(ncols));
+    if format.is_binary() {
+        out.extend_from_slice(&encode_copy_out_response_binary(ncols));
+        // PG §55.2.7 — emit the 19-byte signature header as the FIRST
+        // CopyData payload.
+        out.extend_from_slice(&encode_copy_data(&encode_binary_header()));
+    } else {
+        out.extend_from_slice(&encode_copy_out_response(ncols));
+    }
 
     // SP-PG-COPY-CSV V1 — emit HEADER row first if requested.
     if let CopyFormat::Csv(opts) = &format {
@@ -653,9 +908,62 @@ pub fn dispatch_copy_to<E: EngineApply + ?Sized>(
                     str_refs.iter().map(|o| o.as_deref()).collect();
                 encode_csv_record(&str_opt_refs, opts)
             }
+            CopyFormat::Binary => {
+                // SP-PG-COPY-BIN V1 — per-column binary encoding via the
+                // existing SP-PG-EXTQ-BIN-RESULTS encoder. Decode the
+                // text-format DataRow column bytes, then re-encode as
+                // binary per OID.
+                //
+                // Owned-bytes intermediate so the borrowed slice lives
+                // long enough for `encode_binary_row` (which takes
+                // `&[Option<&[u8]>]`).
+                let mut binary_owned: Vec<Option<Vec<u8>>> =
+                    Vec::with_capacity(projected_refs.len());
+                let mut encode_error: Option<BinaryEncodeError> = None;
+                let mut error_col = 0usize;
+                for (i, col) in projected_refs.iter().enumerate() {
+                    match col {
+                        None => binary_owned.push(None),
+                        Some(text) => {
+                            let oid = chosen_oids.get(i).copied().unwrap_or(0);
+                            match encode_binary_value(text, oid) {
+                                Ok(bytes) => binary_owned.push(Some(bytes)),
+                                Err(e) => {
+                                    encode_error = Some(e);
+                                    error_col = i;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(e) = encode_error {
+                    // Abort the whole COPY TO — emit ErrorResponse +
+                    // RFQ (no CopyDone since the COPY was aborted
+                    // mid-stream).
+                    return error_response_then_rfq(
+                        "0A000",
+                        &format!(
+                            "COPY binary TO row {} column {} (OID {}): {:?}",
+                            emitted + 1,
+                            error_col,
+                            chosen_oids.get(error_col).copied().unwrap_or(0),
+                            e
+                        ),
+                    );
+                }
+                let binary_refs: Vec<Option<&[u8]>> =
+                    binary_owned.iter().map(|o| o.as_deref()).collect();
+                encode_binary_row(&binary_refs)
+            }
         };
         out.extend_from_slice(&encode_copy_data(&payload));
         emitted += 1;
+    }
+    // SP-PG-COPY-BIN V1 — emit the end-of-data marker as a final
+    // CopyData before CopyDone.
+    if format.is_binary() {
+        out.extend_from_slice(&encode_copy_data(&encode_binary_end_of_data()));
     }
     out.extend_from_slice(&encode_copy_done());
     out.extend_from_slice(&encode_command_complete(&copy_tag(emitted)));

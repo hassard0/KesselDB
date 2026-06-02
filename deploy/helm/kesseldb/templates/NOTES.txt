@@ -98,9 +98,53 @@ KesselDB has been installed.
 
 ══════════════════════════════════════════════════════════════════════
 
+{{- if .Values.cluster.enabled }}
+
+5. CLUSTER MODE — failover-aware client (SP-Cloud-Cluster T3)
+
+   This release runs as a {{ .Values.cluster.replicas }}-replica VSR
+   StatefulSet. Writes routed through the round-robin ClusterIP Service
+   may land on a backup, which answers UNAVAILABLE. Use the `kessel`
+   CLI's `--addrs` flag (cluster mode) so it rotates past backups
+   automatically and lands on the active primary:
+
+     kessel --addrs \
+{{- $name := include "kesseldb.fullname" . }}
+{{- $ns := .Release.Namespace }}
+{{- $port := .Values.service.binary.port }}
+{{- $repl := int .Values.cluster.replicas }}
+{{- range $i, $_ := until $repl }}
+       {{ $name }}-{{ $i }}.{{ $name }}-headless.{{ $ns }}.svc.cluster.local:{{ $port }}{{ if lt (add1 $i) $repl }},\{{ end }}
+{{- end }}
+{{- if $.Values.auth.secretName }}
+       --token "$KESSELDB_TOKEN" \
+{{- end }}
+       'SELECT 1'
+
+   The `--addr` (singular) flag still works against a specific pod
+   (`{{ include "kesseldb.fullname" . }}-0.{{ include "kesseldb.fullname" . }}-headless.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.binary.port }}` — the primary in view=0)
+   for tools that don't yet know about `--addrs`.
+
+   Primary-kill recovery: delete the primary pod and the next
+   `--addrs` invocation rotates past the deleted address, lands on a
+   surviving replica, and after view-change the new primary commits
+   the write — exactly the failover smoke covered by
+   SP-Cloud-Cluster T5.
+
+{{- end }}
+
+══════════════════════════════════════════════════════════════════════
+
+{{- if not .Values.cluster.enabled }}
 V1 limit: SINGLE-POD deployment (data PVC is ReadWriteOnce). Multi-
 replica VSR clustering under k8s is SP-Cloud-Cluster (separate arc;
 StatefulSet + per-replica PVCs + ClusterClient endpoints).
+{{- else }}
+Cluster-mode V1 limit: HTTP / WS / PG-wire gateways NOT served when
+`cluster.enabled=true` (binary protocol only). Gateway cluster
+surfaces are a documented V2 follow-up (see SP-Cloud-Cluster
+design spec §4).
+{{- end }}
 
 Upstream docs:
   README       : https://github.com/hassard0/KesselDB

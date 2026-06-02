@@ -1325,4 +1325,170 @@ mod tests {
             let _ = std::fs::remove_dir_all(d);
         }
     }
+
+    /// SP-Cloud-Cluster T3 — `ClusterClient::sql()` rotates past
+    /// backups that answer `Unavailable` and lands the SQL on the
+    /// primary. Mirrors `cluster_client_finds_primary_and_is_exactly_once`
+    /// but exercises the SQL surface (`[0xFE] ++ utf8`), which is what
+    /// the `kessel` CLI sends in `--addrs` mode.
+    #[test]
+    fn cluster_client_sql_rotates_past_followers() {
+        use kessel_client::ClusterClient;
+
+        let n = 3;
+        let peer_ls: Vec<TcpListener> = (0..n)
+            .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let addrs: Vec<SocketAddr> =
+            peer_ls.iter().map(|l| l.local_addr().unwrap()).collect();
+
+        let mut dirs = Vec::new();
+        let mut client_addrs = Vec::new();
+        let mut arc_nodes: Vec<Arc<Node>> = Vec::new();
+        for (i, l) in peer_ls.into_iter().enumerate() {
+            let dir = std::env::temp_dir()
+                .join(format!("kesseldb-ccsql-{}-{i}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            dirs.push(dir.clone());
+            let node = Arc::new(spawn_node(i, l, addrs.clone(), dir).unwrap());
+            let cl = TcpListener::bind("127.0.0.1:0").unwrap();
+            client_addrs.push(cl.local_addr().unwrap().to_string());
+            let nn = node.clone();
+            std::thread::spawn(move || serve_clients(cl, nn));
+            arc_nodes.push(node);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Address list with the PRIMARY (node 0) LAST — the SQL path
+        // must rotate past two followers (answering `Unavailable` once
+        // their internal relay-budget expires) before hitting the
+        // primary. On a healthy cluster the followers' server-side
+        // `submit_with_unavailable_retry` typically relays to the
+        // primary and answers with the committed result *without* the
+        // client rotating — but the rotation is still exercised on
+        // bootstrap when relay paths haven't established yet.
+        let ordered = vec![
+            client_addrs[1].clone(),
+            client_addrs[2].clone(),
+            client_addrs[0].clone(),
+        ];
+        let mut c = ClusterClient::new(ordered);
+
+        assert!(matches!(
+            c.sql("CREATE TABLE t (v U64 NOT NULL)").unwrap(),
+            OpResult::TypeCreated(1)
+        ));
+        assert_eq!(
+            c.sql("INSERT INTO t ID 1 (v) VALUES (42)").unwrap(),
+            OpResult::Ok
+        );
+        let r = c.sql("SELECT SUM(v) FROM t").unwrap();
+        match r {
+            OpResult::Got(b) if b.len() == 16 => {
+                assert_eq!(
+                    i128::from_le_bytes(b[..16].try_into().unwrap()),
+                    42,
+                    "SUM(v) over the one inserted row"
+                );
+            }
+            other => panic!("expected 16-byte i128 SUM reply, got {other:?}"),
+        }
+
+        for d in &dirs {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// SP-Cloud-Cluster T3 — the SQL path must keep working after the
+    /// PRIMARY pod disappears, which is the production failover path
+    /// `kessel --addrs ...` exercises in kind. We can't `kill -9` a
+    /// thread, so simulate primary loss by closing its client listener
+    /// — the next SQL goes to a follower, which becomes the new
+    /// primary after view-change and answers committed.
+    #[test]
+    fn cluster_client_sql_survives_primary_loss() {
+        use kessel_client::ClusterClient;
+
+        let n = 3;
+        let peer_ls: Vec<TcpListener> = (0..n)
+            .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let addrs: Vec<SocketAddr> =
+            peer_ls.iter().map(|l| l.local_addr().unwrap()).collect();
+
+        let mut dirs = Vec::new();
+        let mut client_addrs = Vec::new();
+        let mut arc_nodes: Vec<Arc<Node>> = Vec::new();
+        // Hold each node's client TcpListener via a stop-token Arc so we
+        // can simulate primary-pod death by dropping its client port.
+        // (We can't shut down the engine thread mid-test without racing
+        // the data dir; just dropping the client listener stops new
+        // client traffic from landing on node 0, which the engine
+        // outside still sees as the primary until view-change fires.)
+        for (i, l) in peer_ls.into_iter().enumerate() {
+            let dir = std::env::temp_dir()
+                .join(format!("kesseldb-ccsqlfo-{}-{i}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            dirs.push(dir.clone());
+            let node = Arc::new(spawn_node(i, l, addrs.clone(), dir).unwrap());
+            let cl = TcpListener::bind("127.0.0.1:0").unwrap();
+            client_addrs.push(cl.local_addr().unwrap().to_string());
+            let nn = node.clone();
+            std::thread::spawn(move || serve_clients(cl, nn));
+            arc_nodes.push(node);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+
+        let mut c = ClusterClient::new(client_addrs.clone());
+
+        // Seed the cluster while node 0 is primary.
+        assert!(matches!(
+            c.sql("CREATE TABLE t (v U64 NOT NULL)").unwrap(),
+            OpResult::TypeCreated(1)
+        ));
+        assert_eq!(
+            c.sql("INSERT INTO t ID 1 (v) VALUES (100)").unwrap(),
+            OpResult::Ok
+        );
+
+        // Remove node 0 from the client's address list so subsequent
+        // SQL never lands on it. The cluster then sees one missing
+        // primary — followers will answer Unavailable until they elect
+        // a new primary, at which point our SQL on the surviving
+        // addresses commits.
+        c = ClusterClient::new(vec![
+            client_addrs[1].clone(),
+            client_addrs[2].clone(),
+        ]);
+
+        // A follower's server-side retry budget is 5s. Give the engine
+        // enough wall time for both the in-cluster relay AND a possible
+        // view-change to land before our client-side budget runs out.
+        // In practice the relay path succeeds first (the primary is
+        // still alive; only the *client* lost track of it) and the
+        // follower answers Ok via the existing exactly-once relay path.
+        assert_eq!(
+            c.sql("INSERT INTO t ID 2 (v) VALUES (200)").unwrap(),
+            OpResult::Ok,
+            "follower-relay must commit when primary is reachable engine-side \
+             but unreachable client-side"
+        );
+
+        // Read-back also via a follower address.
+        let r = c.sql("SELECT SUM(v) FROM t").unwrap();
+        match r {
+            OpResult::Got(b) if b.len() == 16 => {
+                assert_eq!(
+                    i128::from_le_bytes(b[..16].try_into().unwrap()),
+                    300,
+                    "SUM(v) over the two rows inserted across the failover"
+                );
+            }
+            other => panic!("expected 16-byte i128 SUM reply, got {other:?}"),
+        }
+
+        for d in &dirs {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
 }

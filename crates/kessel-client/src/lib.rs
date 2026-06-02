@@ -790,6 +790,62 @@ impl ClusterClient {
             io::Error::new(io::ErrorKind::TimedOut, "no primary reachable")
         }))
     }
+
+    /// Submit a SQL statement with failover. Wire form: `[0xFE] ++ utf8`,
+    /// the same shape `Client::sql` writes — the cluster server's
+    /// `apply_raw` accepts it on any node and either compiles+commits
+    /// (primary) or answers `Unavailable` (backup unable to relay to a
+    /// reachable primary). On `Unavailable` or a connection error we
+    /// rotate to the next address and retry.
+    ///
+    /// Compared with [`ClusterClient::call`] this is NOT session-framed:
+    /// the cluster server's session-frame path is `Op`-only (a SQL string
+    /// has no `Op::decode` form). For our acceptance bar — survive a
+    /// primary-kill and recover — the cluster's internal client_table
+    /// dedup is sufficient because each retry happens on the surviving
+    /// nodes; a write that already committed before the primary died is
+    /// surfaced by the new primary's catch-up + `Got`/`Exists`/`Ok`
+    /// reply on a subsequent SELECT. The only exactly-once gap is the
+    /// instant the in-flight INSERT was being committed AND the primary
+    /// crashed AND the reply was lost — VSR's client_table cannot dedup
+    /// a fresh client_id allocated by the new primary's `apply_raw`. For
+    /// strict cross-node exactly-once on writes, use `Op`-level
+    /// `call(&Op)` instead (session-framed). This is documented at
+    /// T3 in `2026-06-02-kesseldb-spcloudcluster-design.md`.
+    pub fn sql(&mut self, sql: &str) -> io::Result<OpResult> {
+        let mut frame = Vec::with_capacity(sql.len() + 1);
+        frame.push(0xFE);
+        frame.extend_from_slice(sql.as_bytes());
+        let max_attempts = (self.addrs.len() * 4).max(8);
+        let mut last_err: Option<io::Error> = None;
+        for _ in 0..max_attempts {
+            let attempt = (|| -> io::Result<OpResult> {
+                let s = self.conn()?;
+                write_frame(s, &frame)?;
+                let resp = read_frame(s)?;
+                OpResult::decode(&resp).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "bad OpResult frame")
+                })
+            })();
+            match attempt {
+                Ok(OpResult::Unavailable) => {
+                    self.stream = None;
+                    self.idx = self.idx.wrapping_add(1);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Ok(other) => return Ok(other),
+                Err(e) => {
+                    self.stream = None;
+                    self.idx = self.idx.wrapping_add(1);
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::TimedOut, "no primary reachable")
+        }))
+    }
 }
 
 #[cfg(test)]

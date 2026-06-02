@@ -26,7 +26,7 @@
 use kessel_client::{
     format_result, format_result_json, render_projection, render_rows,
     render_rows_json, render_schema, render_schema_json,
-    render_typed_result, render_typed_result_json, Client,
+    render_typed_result, render_typed_result_json, Client, ClusterClient,
 };
 use kessel_proto::OpResult;
 use std::io::{BufRead, IsTerminal, Write};
@@ -36,13 +36,17 @@ const HELP: &str = "\
 kessel — KesselDB CLI
 
 USAGE:
-  kessel [--addr HOST:PORT] [--token TOKEN] [--json] [\"SQL\"]
+  kessel [--addr HOST:PORT | --addrs A1,A2,...] [--token TOKEN] [--json] [\"SQL\"]
 
 OPTIONS:
-  --addr  HOST:PORT   server address (default 127.0.0.1:7878)
-  --token TOKEN       shared-secret token, if the server requires auth
-  --json              emit one JSON object per statement (for agents)
-  -h, --help          show this help
+  --addr   HOST:PORT       single server address (default 127.0.0.1:7878)
+  --addrs  A1,A2,...       comma-separated cluster addresses; the CLI
+                           uses ClusterClient and rotates past any node
+                           that answers UNAVAILABLE so writes land on
+                           the active primary (SP-Cloud-Cluster)
+  --token  TOKEN           shared-secret token, if the server requires auth
+  --json                   emit one JSON object per statement (for agents)
+  -h, --help               show this help
 
 MODES:
   one-shot   pass a SQL string as the final argument
@@ -67,9 +71,29 @@ struct Opts {
     timing: bool,
 }
 
+/// Abstract over the single-target and cluster-aware client variants so
+/// the rest of the CLI doesn't care which underlying connection it has.
+/// Cluster mode (`--addrs A1,A2,...`) routes SQL through
+/// `ClusterClient::sql`, which rotates past nodes that answer
+/// `Unavailable` until the SQL lands on the active primary.
+enum Conn {
+    Single(Client),
+    Cluster(ClusterClient),
+}
+
+impl Conn {
+    fn sql(&mut self, sql: &str) -> std::io::Result<OpResult> {
+        match self {
+            Conn::Single(c) => c.sql(sql),
+            Conn::Cluster(c) => c.sql(sql),
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut addr = "127.0.0.1:7878".to_string();
+    let mut addrs: Vec<String> = Vec::new();
     let mut token: Option<String> = None;
     let mut sql_parts: Vec<String> = Vec::new();
     let mut opts = Opts { json: false, timing: false };
@@ -88,6 +112,27 @@ fn main() {
                     None => fail_usage("--addr needs a value"),
                 }
             }
+            "--addrs" => {
+                i += 1;
+                match args.get(i) {
+                    Some(a) => {
+                        addrs = a
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        if addrs.is_empty() {
+                            fail_usage(
+                                "--addrs needs a comma-separated list of \
+                                 HOST:PORT",
+                            );
+                        }
+                    }
+                    None => fail_usage(
+                        "--addrs needs a comma-separated HOST:PORT list",
+                    ),
+                }
+            }
             "--token" => {
                 i += 1;
                 match args.get(i) {
@@ -100,71 +145,87 @@ fn main() {
         i += 1;
     }
 
-    let mut client = match &token {
-        Some(t) => Client::connect_authed(&addr, t.as_bytes()),
-        None => Client::connect(&addr),
-    }
-    .unwrap_or_else(|e| {
-        // Differentiated diagnosis: connection refused / DNS / auth all
-        // get different hints — the generic "I/O error" left users
-        // guessing whether the address was wrong, the server was down,
-        // or their token was bad.
-        let kind = e.kind();
-        match kind {
-            std::io::ErrorKind::ConnectionRefused => {
-                eprintln!(
-                    "kessel: couldn't connect to {addr} — connection refused"
-                );
-                eprintln!(
-                    "  hint: is the server running on that address? start \
-                     one with:\n        kesseldb {addr} ./data\n  or set \
-                     --addr to the actual listener (default 127.0.0.1:7878)."
-                );
-            }
-            std::io::ErrorKind::PermissionDenied => {
-                // do_auth() returns PermissionDenied for "bad token"
-                eprintln!(
-                    "kessel: authentication failed connecting to {addr} — \
-                     server rejected the token"
-                );
-                eprintln!(
-                    "  hint: does --token (or $KESSELDB_TOKEN) match the \
-                     server's KESSELDB_TOKEN env? a server without a \
-                     KESSELDB_TOKEN configured does not accept --token."
-                );
-            }
-            std::io::ErrorKind::TimedOut => {
-                eprintln!(
-                    "kessel: connect to {addr} timed out — host reachable \
-                     but not accepting connections"
-                );
-                eprintln!(
-                    "  hint: check firewall rules and that the server is \
-                     listening on that port (default 7878 for binary)."
-                );
-            }
-            _ => {
-                eprintln!("kessel: cannot connect to {addr}: {e}");
-                eprintln!(
-                    "  hint: is a server running? start one with:\n        \
-                     kesseldb {addr} ./data"
-                );
-            }
+    // `--addrs` (cluster) takes precedence over `--addr` (single). The
+    // single-target path stays the default so existing single-pod
+    // installs work byte-identically.
+    let mut conn = if !addrs.is_empty() {
+        let mut cc = ClusterClient::new(addrs.clone());
+        if let Some(t) = &token {
+            cc = cc.with_token(t.as_bytes().to_vec());
         }
-        std::process::exit(1);
-    });
+        Conn::Cluster(cc)
+    } else {
+        let client = match &token {
+            Some(t) => Client::connect_authed(&addr, t.as_bytes()),
+            None => Client::connect(&addr),
+        }
+        .unwrap_or_else(|e| {
+            // Differentiated diagnosis: connection refused / DNS / auth all
+            // get different hints — the generic "I/O error" left users
+            // guessing whether the address was wrong, the server was down,
+            // or their token was bad.
+            let kind = e.kind();
+            match kind {
+                std::io::ErrorKind::ConnectionRefused => {
+                    eprintln!(
+                        "kessel: couldn't connect to {addr} — connection refused"
+                    );
+                    eprintln!(
+                        "  hint: is the server running on that address? start \
+                         one with:\n        kesseldb {addr} ./data\n  or set \
+                         --addr to the actual listener (default 127.0.0.1:7878)."
+                    );
+                }
+                std::io::ErrorKind::PermissionDenied => {
+                    // do_auth() returns PermissionDenied for "bad token"
+                    eprintln!(
+                        "kessel: authentication failed connecting to {addr} — \
+                         server rejected the token"
+                    );
+                    eprintln!(
+                        "  hint: does --token (or $KESSELDB_TOKEN) match the \
+                         server's KESSELDB_TOKEN env? a server without a \
+                         KESSELDB_TOKEN configured does not accept --token."
+                    );
+                }
+                std::io::ErrorKind::TimedOut => {
+                    eprintln!(
+                        "kessel: connect to {addr} timed out — host reachable \
+                         but not accepting connections"
+                    );
+                    eprintln!(
+                        "  hint: check firewall rules and that the server is \
+                         listening on that port (default 7878 for binary)."
+                    );
+                }
+                _ => {
+                    eprintln!("kessel: cannot connect to {addr}: {e}");
+                    eprintln!(
+                        "  hint: is a server running? start one with:\n        \
+                         kesseldb {addr} ./data"
+                    );
+                }
+            }
+            std::process::exit(1);
+        });
+        Conn::Single(client)
+    };
 
     // One-shot mode.
     if !sql_parts.is_empty() {
         let stmt = sql_parts.join(" ");
-        std::process::exit(run_one(&mut client, &stmt, &opts));
+        std::process::exit(run_one(&mut conn, &stmt, &opts));
     }
 
     // Pipe / interactive mode.
     let interactive = std::io::stdin().is_terminal();
     if interactive {
+        let label = match &conn {
+            Conn::Single(_) => addr.clone(),
+            Conn::Cluster(_) => format!("cluster {}", addrs.join(",")),
+        };
         println!(
-            "KesselDB shell — connected to {addr}.  \\? for commands, \
+            "KesselDB shell — connected to {label}.  \\? for commands, \
              \\q to quit."
         );
         prompt();
@@ -187,9 +248,9 @@ fn main() {
         }
         // Meta-commands (shell ergonomics; not sent as SQL).
         if let Some(rest) = s.strip_prefix('\\') {
-            handle_meta(rest.trim(), &mut client, &mut opts);
+            handle_meta(rest.trim(), &mut conn, &mut opts);
         } else {
-            run_one(&mut client, s, &opts);
+            run_one(&mut conn, s, &opts);
         }
         if interactive {
             prompt();
@@ -207,7 +268,7 @@ fn prompt() {
 
 /// Backslash meta-commands. Kept to what existing server ops back, so
 /// nothing here is a half-working illusion.
-fn handle_meta(cmd: &str, client: &mut Client, opts: &mut Opts) {
+fn handle_meta(cmd: &str, conn: &mut Conn, opts: &mut Opts) {
     let (head, arg) = match cmd.split_once(char::is_whitespace) {
         Some((h, a)) => (h, a.trim()),
         None => (cmd, ""),
@@ -222,7 +283,7 @@ fn handle_meta(cmd: &str, client: &mut Client, opts: &mut Opts) {
             if arg.is_empty() {
                 eprintln!("usage: \\d <table>");
             } else {
-                run_one(client, &format!("DESCRIBE {arg}"), opts);
+                run_one(conn, &format!("DESCRIBE {arg}"), opts);
             }
         }
         other => eprintln!(
@@ -235,21 +296,21 @@ fn handle_meta(cmd: &str, client: &mut Client, opts: &mut Opts) {
 /// Run one statement, print the result in the chosen format, return the
 /// process exit code it implies (0 ok, 1 errored) — so one-shot callers
 /// and agents get a reliable signal without parsing prose.
-fn run_one(client: &mut Client, sql: &str, opts: &Opts) -> i32 {
+fn run_one(conn: &mut Conn, sql: &str, opts: &Opts) -> i32 {
     let t0 = Instant::now();
-    let code = match client.sql(sql) {
+    let code = match conn.sql(sql) {
         Ok(OpResult::Got(b)) => {
             let is_explain = sql
                 .trim_start()
                 .get(..7)
                 .map_or(false, |k| k.eq_ignore_ascii_case("EXPLAIN"));
             if opts.json {
-                print_got_json(client, sql, &b, is_explain);
+                print_got_json(conn, sql, &b, is_explain);
                 0
             } else {
                 // SP-Perf-A T6 Fix B: `b` is `Arc<[u8]>`; deref to a slice
                 // for the print path (which only needs read-only bytes).
-                print_got_text(client, sql, &b, is_explain);
+                print_got_text(conn, sql, &b, is_explain);
                 0
             }
         }
@@ -291,7 +352,7 @@ fn run_one(client: &mut Client, sql: &str, opts: &Opts) -> i32 {
 
 /// Text mode: decode whole-row / projection SELECTs into aligned tables,
 /// EXPLAIN into its plan text, everything else into a one-line summary.
-fn print_got_text(client: &mut Client, sql: &str, b: &[u8], explain: bool) {
+fn print_got_text(conn: &mut Conn, sql: &str, b: &[u8], explain: bool) {
     if explain {
         println!("{}", String::from_utf8_lossy(b));
         return;
@@ -308,14 +369,14 @@ fn print_got_text(client: &mut Client, sql: &str, b: &[u8], explain: bool) {
         return;
     }
     if let Some(t) = kessel_sql::select_star_table(sql) {
-        if let Ok(OpResult::Got(def)) = client.sql(&format!("DESCRIBE {t}")) {
+        if let Ok(OpResult::Got(def)) = conn.sql(&format!("DESCRIBE {t}")) {
             if let Some(table) = render_rows(&def, b) {
                 println!("{table}");
                 return;
             }
         }
     } else if let Some((t, cols)) = kessel_sql::select_columns(sql) {
-        if let Ok(OpResult::Got(def)) = client.sql(&format!("DESCRIBE {t}")) {
+        if let Ok(OpResult::Got(def)) = conn.sql(&format!("DESCRIBE {t}")) {
             if let Some(table) = render_projection(&def, &cols, b) {
                 println!("{table}");
                 return;
@@ -328,7 +389,7 @@ fn print_got_text(client: &mut Client, sql: &str, b: &[u8], explain: bool) {
 /// JSON mode: a single object per statement. Whole-row SELECT* gets a
 /// real `rows` array; EXPLAIN gets its `plan`; otherwise the stable
 /// scalar/status object.
-fn print_got_json(client: &mut Client, sql: &str, b: &[u8], explain: bool) {
+fn print_got_json(conn: &mut Conn, sql: &str, b: &[u8], explain: bool) {
     if explain {
         let plan = String::from_utf8_lossy(b).replace('"', "'");
         println!(r#"{{"status":"ok","plan":"{plan}"}}"#);
@@ -345,7 +406,7 @@ fn print_got_json(client: &mut Client, sql: &str, b: &[u8], explain: bool) {
         return;
     }
     if let Some(t) = kessel_sql::select_star_table(sql) {
-        if let Ok(OpResult::Got(def)) = client.sql(&format!("DESCRIBE {t}")) {
+        if let Ok(OpResult::Got(def)) = conn.sql(&format!("DESCRIBE {t}")) {
             if let Some(rows) = render_rows_json(&def, b) {
                 println!(r#"{{"status":"ok","rows":{rows}}}"#);
                 return;

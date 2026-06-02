@@ -1830,9 +1830,22 @@ The remaining residual ORM gaps are:
   (`docs/superpowers/sppgextqcast-t3-smoke-2026-06-02.txt`). Real
   pgJDBC round-trip awaits `javac` install on vulcan, tracked as V2
   `SP-PG-JDBC-SMOKE`.
-- Parameterized SELECT with a CHAR(N) WHERE clause may match zero rows
+- ~~Parameterized SELECT with a CHAR(N) WHERE clause may match zero rows
   because the engine's EQ-on-Char doesn't ignore trailing NUL padding
-  on the storage side; lifts in `SP-CHAR-PAD-COMPARE` (engine-side).
+  on the storage side; lifts in `SP-CHAR-PAD-COMPARE` (engine-side).~~
+  → **CLOSED 2026-06-02 by SP-CHAR-PAD-COMPARE V1** — the engine's
+  `kessel-expr` EQ / NE / LT / LE / GT / GE opcodes (and the engine-wide
+  `kessel-sm::cmp_field` helper) now treat trailing NUL (0x00) and
+  space (0x20) as insignificant on `Char(_)` / `Bytes(_)` byte
+  comparisons (PG SQL §9.20 semantic, with the storage-aware NUL
+  widening — engine stores fixed-width values NUL-padded). asyncpg
+  `WHERE name = $1` against `CHAR(32)` now returns the matching row
+  on vulcan; BETWEEN / NE also work; the Describe-on-`$N` enabler
+  (substitute `$N` with NULL for the table-name probe) closes the
+  asyncpg ProtocolError that the engine fix unmasked. Storage /
+  indexes / hashing UNCHANGED — only the comparison layer trims. +15
+  KATs across kessel-expr / kessel-sm / kessel-pg-gateway. Smoke
+  transcript: `docs/superpowers/spcharpadcompare-t3-smoke-2026-06-02.txt`.
 - Binary NUMERIC / JSONB / UUID / ARRAY remain V2 (`SP-PG-EXTQ-BIN-
   NUMERIC` / `SP-PG-EXTQ-BIN-EXTRA`).
 

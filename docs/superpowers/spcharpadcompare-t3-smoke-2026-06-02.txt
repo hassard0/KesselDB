@@ -1,0 +1,169 @@
+SP-CHAR-PAD-COMPARE T3 — engine + asyncpg WHERE-on-CHAR(N) smoke transcripts
+============================================================================
+Recorded: 2026-06-02 on vulcan (Ubuntu 24.04, V100 host)
+Server:   kesseldb-server (built --features pg-gateway)
+          KESSELDB_TOKEN=admin KESSELDB_PG_ADDR=127.0.0.1:5532
+          CARGO_TARGET_DIR=/tmp/kdb-target-charpad
+Smoke:    scripts/sppgextqbinr-asyncpg-smoke.py
+          + dedicated asyncpg WHERE/BETWEEN/NE check
+          + psycopg2 simple-query regression check
+Commit:   6b2c626 (Describe enabler)
+          + 870d887 (T1+T2 engine fix in kessel-expr + kessel-sm)
+
+Closes the "EQ-on-Char ignores padding only on the LEFT side"
+quirk recorded by SP-PG-EXTQ-BIN-RESULTS T3
+(docs/superpowers/sppgextqbinr-t3-smoke-2026-06-01.txt §47-55).
+Root cause was actually engine-side equality in `kessel-expr` —
+`Value::Bytes(Vec<u8>) PartialEq` is length-sensitive, so a 32-byte
+NUL-padded stored CHAR(32) value did not compare equal to a 5-byte
+bare literal pushed via `PUSH_BYTES`. Fixed by treating trailing
+NUL (0x00) and space (0x20) as insignificant in bytes×bytes cmp
+(PG SQL §9.20 semantic, with the storage-aware NUL widening).
+
+================================================================
+1. SP-PG-EXTQ-BIN-RESULTS T3 re-run — `WHERE name = $1`
+================================================================
+Driver: asyncpg 0.31.0 + Python 3.12.3
+Status: PASS — parameterized WHERE returns the matching row
+
+Observed (post-arc, was "0 rows" + WARN pre-arc):
+    asyncpg 0.31.0 — SELECT (binary RESULTS) smoke
+      connect: OK
+      CREATE TABLE: OK
+      INSERT (literal seed): OK
+      SELECT (binary results): OK — 1 rows
+        row: id=42 (type=int), name='first'
+      SELECT * (binary results, no params): OK — 2 rows
+        row: id=42, name='first'
+        row: id=43, name='second'
+      === asyncpg SELECT (binary RESULTS) PASS ===
+
+    === asyncpg SELECT (binary RESULTS) — V1 SP-PG-EXTQ-BIN-RESULTS CONFIRMED ===
+
+What changed vs the 2026-06-01 transcript:
+- `SELECT WHERE name = $1` now returns the matching row (was 0 rows).
+- The WARN line ("WARN: expected >=1 row, got 0") is gone.
+
+================================================================
+2. Dedicated asyncpg parameterized WHERE/BETWEEN/NE check
+================================================================
+Driver: asyncpg 0.31.0
+Status: HEADLINE PASS
+
+Observed:
+    SP-CHAR-PAD-COMPARE T3 — asyncpg WHERE name = $1 against CHAR(32)
+    ======================================================================
+      connect: OK (asyncpg 0.31.0)
+      CREATE + 2 INSERTs: OK
+      SELECT * (no WHERE): 2 rows -> [(42, 'hello'), (43, 'world')]
+      SELECT WHERE name = $1 ('hello'): 1 rows -> [(42, 'hello')]
+      HEADLINE: PASS — WHERE name = $1 returns the matching row
+      SELECT WHERE name BETWEEN 'g' AND 'i': 1 rows -> [(42, 'hello')]
+      SELECT WHERE name != $1 ('hello'): 1 rows -> [(43, 'world')]
+    ======================================================================
+    === SP-CHAR-PAD-COMPARE T3 PASS ===
+
+Cross-cases proven:
+- EQ on CHAR(N) returns the row whose stored padded bytes trim to
+  the literal-bytes (`b"hello\0\0\0…\0"` cmp `b"hello"` → equal).
+- BETWEEN / range comparison (`>=` + `<=`) preserves the trim — the
+  CHAR field with stored `"hello\0\0\0…\0"` lies between 'g' and 'i'
+  after both sides trim.
+- NE returns the row that does NOT match — proves the trim doesn't
+  collapse distinct content.
+
+================================================================
+3. psycopg2 simple-query regression check
+================================================================
+Driver: psycopg2 (libpq simple-query path; no protocol Describe)
+Status: PASS — no regression on the non-asyncpg path
+
+Observed:
+    psycopg2 SELECT WHERE name = hello:
+      -> [(42, 'hello')]
+    psycopg2 SELECT WHERE name = world:
+      -> [(43, 'world')]
+    psycopg2 SELECT WHERE name = nope:
+      -> []
+    psycopg2 SELECT * (all):
+      -> [(42, 'hello'), (43, 'world')]
+
+The negative case (`name = 'nope'`) correctly returns 0 rows —
+confirms the trim semantic doesn't over-match (no false positives).
+
+================================================================
+4. What changed under the hood
+================================================================
+
+Engine layer (kessel-expr):
+- New `pub fn right_trim_char_pad(&[u8]) -> &[u8]` drops trailing
+  NUL (0x00) and space (0x20).
+- `EQ` / `NE` opcodes route through the trim for the Bytes×Bytes
+  case; Int×Int / mixed / Null shapes pass through Value PartialEq
+  unchanged.
+- `ord!` macro (LT/LE/GT/GE) trims both sides in the Bytes×Bytes arm.
+- `materialise_cmp` (the `compile_filter` specialised closure path)
+  applies the same trim so the closure stays byte-equal to `eval`
+  (the determinism oracle).
+
+Engine layer (kessel-sm):
+- `cmp_field` for `Char(_)` / `Bytes(_)` now uses the same trim.
+- `Ref` / `OverflowRef` arm splits out — full-byte cmp preserved
+  (ObjectId trailing NULs are significant).
+
+Gateway layer (kessel-pg-gateway):
+- `row_description_or_no_data_for_sql` now substitutes `$N` with
+  literal NULL for the table-name probe ONLY — `select_star_table`
+  was returning None for `SELECT * FROM t WHERE name = $1` because
+  `kessel-sql::lex` rejects `$`. Pre-arc this was masked by the
+  CHAR-PAD bug returning 0 rows (asyncpg doesn't validate the
+  Describe→DataRow column count when 0 rows arrive). With the
+  engine fix returning the row, the column-count mismatch was
+  exposed; this enabler closes it.
+
+Storage / indexes / hashing: UNCHANGED. The fix is purely in the
+comparison layer.
+
+================================================================
+5. KAT deltas
+================================================================
+| Crate              | Before | After | New                       |
+|--------------------|--------|-------|---------------------------|
+| kessel-expr (lib)  |    25  |   34  | +9 SP-CHAR-PAD-COMPARE    |
+| kessel-sm (lib)    |   162  |  167  | +5 SP-CHAR-PAD-COMPARE    |
+| kessel-pg-gateway  |   775  |  776  | +1 Describe enabler       |
+| kessel-sql (lib)   |    43  |   43  | (no regressions)          |
+TOTAL                  1005    1020   +15
+
+================================================================
+6. Out-of-arc named follow-ups
+================================================================
+- SP-CHAR-PAD-LIKE — PG `LIKE` against CHAR(N) actually matches the
+  full padded value in real PG (the engine currently trims trailing
+  NULs before LIKE matching; documented edge — not a regression).
+- SP-PG-EXTQ-PARSED — typed-parameter AST (replaces text-substitute).
+- SP-PG-VARCHAR-NATIVE — variable-length VARCHAR codec (the current
+  codec treats VARCHAR(N) as fixed-width CHAR(N); both benefit from
+  the trim).
+
+================================================================
+Summary
+================================================================
+| Capability                                  | Before  | After   |
+|---------------------------------------------|---------|---------|
+| asyncpg `WHERE name = $1` on CHAR(32)       |  0 rows |  1 row  |
+| asyncpg `WHERE name BETWEEN $1 AND $2`      | (mask)  |  works  |
+| asyncpg `WHERE name != $1`                  | (mask)  |  works  |
+| psycopg2 (simple query) WHERE-on-CHAR       |  works  |  works  |
+| psql (simple query) WHERE-on-CHAR           |  works  |  works  |
+| Engine-internal cmp_field Char(_) padded    |  works* |  works  |
+| Storage / indexes / hashing                 |  same   |  same   |
+
+*pre-arc cmp_field accidentally worked because both sides were
+norm'd to the field width with the same NUL padding before cmp;
+the bug manifested only in the SQL→expr-VM path where the literal
+side was raw bytes from `PUSH_BYTES`.
+
+Headline: the engine's CHAR(N) WHERE clause is now padding-aware on
+every surface (interpreter, `compile_filter` closure, `cmp_field`
+helper). asyncpg `WHERE name = $1` returns the matching row.

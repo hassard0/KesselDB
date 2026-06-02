@@ -1,0 +1,45 @@
+
+=== SP-PG-EXTQ-CAST-VALIDATE-COMPAT T3 smoke ===
+
+table created
+
+--- INT4 param + INT8 cast (HEADLINE) ---
+  Parse  sql='INSERT INTO compat (id, n) VALUES ($1::int8, $2)' param_oids=[23, 25]
+  Bind   values=[b'42', b'compat']
+  -> OK  status=1
+
+--- INT8 param + INT4 cast ---
+  Parse  sql='INSERT INTO compat (id, n) VALUES ($1::int4, $2)' param_oids=[20, 25]
+  Bind   values=[b'7', b'narrow']
+  -> OK  status=1
+
+--- TEXT param + VARCHAR cast ---
+  Parse  sql='INSERT INTO compat (id, n) VALUES (1, $1::varchar)' param_oids=[25]
+  Bind   values=[b'hello']
+  -> OK  status=1
+
+--- Cross-category TEXT + INT8 (must reject) ---
+  Parse  sql='INSERT INTO compat (id, n) VALUES ($1::int8, $2)' param_oids=[25, 25]
+  Bind   values=[b'99', b'reject']
+  -> OK rejected: ERROR:  cannot cast parameter $1 from type with OID 25 to declared cast type OID 20
+
+--- Strict-equality INT8 + INT8 ---
+  Parse  sql='INSERT INTO compat (id, n) VALUES ($1::int8, $2)' param_oids=[20, 25]
+  Bind   values=[b'1000', b'base']
+  -> OK  status=1
+
+Final table rows (expect 4 inserts from cases 1, 2, 3, 5):
+  (1, 'hello')
+  (7, 'narrow')
+  (42, 'compat')
+  (1000, 'base')
+
+=== Results ===
+  [PASS] INT4 param + INT8 cast (HEADLINE)
+  [PASS] INT8 param + INT4 cast
+  [PASS] TEXT param + VARCHAR cast
+  [PASS] Cross-category TEXT + INT8 (must reject)
+  [PASS] Strict-equality INT8 + INT8
+
+SP-PG-EXTQ-CAST-VALIDATE-COMPAT SMOKE: ALL PASS
+

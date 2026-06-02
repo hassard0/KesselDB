@@ -1953,6 +1953,34 @@ The remaining residual ORM gaps are:
   flagged. Literal casts (no `$N`) bypass the validator so the
   parent arc's psql shapes still PASS. Smoke:
   `docs/superpowers/sppgextqcastvalidate-t3-smoke-2026-06-02.txt`.
+- ~~SP-PG-EXTQ-CAST-VALIDATE V1 enforces STRICT OID equality — pgJDBC's
+  default Java-`int` against `::int8` cast (and psycopg3's
+  Python-`int` against `::int8`) false-rejected with 42846 because
+  the wire-supplied INT4 OID didn't equal the declared INT8 OID.~~ →
+  **CLOSED 2026-06-02 by SP-PG-EXTQ-CAST-VALIDATE-COMPAT V1** — V1
+  strict equality relaxes to PG's `pg_type.dat::typcategory` table.
+  `types::oid_category(oid)` returns the category byte ('N' numeric,
+  'S' string, 'B' bool, 'D' date/time, 'U' unknown/bytea);
+  `types::oid_castable(param_oid, cast_oid)` accepts the pair iff
+  strict equality OR `param_oid == 0` (omitted hint skip) OR
+  same-category widening. `dispatch_bind`'s validator swaps the
+  strict `!=` check for `!oid_castable(...)`. Intra-category
+  widenings now accept (INT4↔INT8, INT8↔FLOAT8, INT4↔NUMERIC,
+  TEXT↔VARCHAR, etc.); cross-category mismatches (TEXT vs INT8,
+  BOOL vs INT8, BYTEA vs TEXT) STILL reject with the same
+  `ExtqError::CastOidMismatch` → `42846 cannot_coerce` wire frame
+  so the V1 silent-coercion vector stays closed. **vulcan-verified**
+  via psycopg3 PQ-layer 5-case smoke
+  (`docs/superpowers/sppgextqcastvalidatecompat-t3-smoke-2026-06-02.txt`):
+  INT4+INT8 / INT8+INT4 / TEXT+VARCHAR all accept; cross-category
+  TEXT+INT8 still rejects with the exact 42846 message; strict-
+  equality INT8+INT8 still works. +14 KATs across types::tests +
+  extq::tests. V2 follow-ups named:
+  `SP-PG-EXTQ-CAST-VALIDATE-COMPAT-RANGE` (overflow-check the
+  param value vs cast-type range),
+  `SP-PG-EXTQ-CAST-VALIDATE-LITERAL` (validate literal casts too),
+  `SP-PG-EXTQ-CAST-VALIDATE-CATEGORY-CROSS` (accept the cross-
+  category casts PG itself accepts, e.g. TEXT '42' → INT8).
 
 #### Pipelining throughput (T8, 2026-05-29)
 
@@ -1991,6 +2019,8 @@ and post higher numbers; that's V2 `SP-PG-EXTQ-PIPELINE-BATCH`.
 - SP-PG-EXTQ-CAST smoke transcript (V1 SHIPPED — psql `SELECT 1::int8` round-trip PASS): `docs/superpowers/sppgextqcast-t3-smoke-2026-06-02.txt`
 - SP-PG-EXTQ-CAST-VALIDATE design spec: `docs/superpowers/specs/2026-06-02-kesseldb-sppgextqcastvalidate-design.md`
 - SP-PG-EXTQ-CAST-VALIDATE smoke transcript (V1 SHIPPED — HEADLINE: $N cast OID mismatch returns 42846 cannot_coerce via psycopg3 PQ-layer): `docs/superpowers/sppgextqcastvalidate-t3-smoke-2026-06-02.txt`
+- SP-PG-EXTQ-CAST-VALIDATE-COMPAT design spec: `docs/superpowers/specs/2026-06-02-kesseldb-sppgextqcastvalidatecompat-design.md`
+- SP-PG-EXTQ-CAST-VALIDATE-COMPAT smoke transcript (V1 SHIPPED — HEADLINE: pgJDBC INT4 param + INT8 cast accepted; cross-category TEXT + INT8 still rejects with 42846): `docs/superpowers/sppgextqcastvalidatecompat-t3-smoke-2026-06-02.txt`
 
 ### SP-PG-COPY — `COPY FROM STDIN` / `COPY TO STDOUT` bulk load (V1 SHIPPED 2026-05-30)
 

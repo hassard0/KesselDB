@@ -89,6 +89,16 @@ Optional / V2 follow-ups (each its own arc):
   binary still rejects (V2 SP-PG-EXTQ-BIN-NUMERIC). Binary RESULTS
   emit is the next arc (V2 SP-PG-EXTQ-BIN-RESULTS). See
   `docs/superpowers/specs/2026-06-01-kesseldb-subproject-sppgextqbin-progress.md`.
+- **SP-PG-EXTQ-CAST (V2 — CLOSED 2026-06-02 at T2)** — gateway-side
+  `::TYPE[(args)]` cast stripping (rewrites the SQL text before
+  engine dispatch). Single-pass state-machine scanner preserves
+  cast-like text inside single-quoted strings, line comments, and
+  block comments. Closes the JDBC `preferQueryMode=simple` PARTIAL
+  in the T8 ORM matrix; `psql -c 'SELECT 1::int8'` returns 1 on
+  vulcan (was `42601 unexpected char ':'` pre-arc). Real pgJDBC
+  round-trip awaits javac install (V2 `SP-PG-JDBC-SMOKE`). See
+  `docs/superpowers/specs/2026-06-01-kesseldb-sppgextqcast-design.md`
+  + smoke transcript `docs/superpowers/sppgextqcast-t3-smoke-2026-06-02.txt`.
 - **SP-PG-EXTQ-CACHE (V2)** — server-side prepared-statement cache
   that survives reconnect. Almost no ORM relies on this — they all
   re-Parse on reconnect — but libpq supports it and a future

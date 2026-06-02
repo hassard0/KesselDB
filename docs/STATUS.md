@@ -2,14 +2,51 @@
 
 Honest milestone tracker. Updated every milestone. "Done" means code + tests committed and passing.
 
-## Current capabilities (2026-06-01)
+## Current capabilities (2026-06-02)
 
 What a node running on today's `main` actually does. Every line below is
 covered by the workspace test suite (2048 default / 2059 with
-`--features pg-gateway` / 2063 with all gateway features).
+`--features pg-gateway` / 2063 with all gateway features) plus +26 KATs
+from the SP-PG-EXTQ-CAST V1 arc landed 2026-06-02.
 
-**Tonight's delivery (2026-06-01) — coherent state of the union:**
+**Tonight's delivery (2026-06-02) — coherent state of the union:**
 
+- **Track A.-1 — PostgreSQL JDBC simple-mode `::cast` rewrite (SP-PG-EXTQ-CAST V1 SHIPPED at T2 — 2026-06-02).**
+  Closes the V2 follow-up named in the SP-PG-EXTQ T8 ORM compat
+  matrix (`docs/superpowers/sppgextq-t8-orm-smoke-2026-05-29.txt`
+  row #5). pgJDBC's `preferQueryMode=simple` (and a handful of
+  PostGIS / pgvector helpers) inject `::int8` / `::text` /
+  `::numeric(15,2)` type-cast operators into SQL text; `kessel-sql`'s
+  lexer rejected `:` with `42601 unexpected char ':'`. The arc adds
+  `cast_stripper::strip_pg_casts(sql) -> String` — a single-pass
+  state-machine scanner that strips `::IDENT[(args)]` while preserving
+  cast-like text inside single-quoted strings (with doubled-quote
+  escape), `--` line comments, and `/* ... */` block comments. The
+  strip wires in at `dispatch::dispatch_query` entry BEFORE
+  `is_effectively_empty` / `contains_multiple_statements` /
+  `pg_catalog::catalog_query_hook` / `engine.apply_sql`. The
+  extended-query Execute path inherits the strip because it routes
+  through `dispatch_query` after parameter substitution (covers the
+  rare `Bind($1=42) → "SELECT $1::int8"` → `"SELECT 42::int8"` case).
+  V1 is "strip + hope" — the engine's existing type-checker handles
+  implicit coercion at INSERT / WHERE comparison sites; the engine
+  doesn't lose anything because the cast text was redundant under
+  our type system (the column type already gives the target type
+  via `describe_table`). **HEADLINE — `psql -c 'SELECT 1::int8'`
+  on vulcan returns `1`** (was `42601 syntax_error` pre-arc);
+  `SELECT * FROM t WHERE id = 1::int8` returns the matching row;
+  `INSERT INTO t (id, n) VALUES (3::int8, 'three'::text)` persists.
+  +26 pg-gateway lib KATs (24 `cast_stripper::tests::*` covering
+  K-CAST-1..15 + parameterised types + uppercase + underscore +
+  unterminated-block-safe + JDBC-exact-shape + 2 `dispatch::tests::
+  sppgextqcast_*` integration KATs). Named V2 follow-ups:
+  `SP-PG-EXTQ-CAST-VALIDATE` (well-typed check), `SP-PG-EXTQ-CAST-
+  NESTED` (`(a::int)::text`), `SP-PG-EXTQ-CAST-MULTIWORD-TYPE`
+  (`TIMESTAMP WITH TIME ZONE`), `SP-PG-JDBC-SMOKE` (install javac
+  on vulcan + real pgJDBC round-trip), `SP-SQL-AST-CAST-NODE` (make
+  kessel-sql parse `::` as a real cast operator). Smoke transcript:
+  `docs/superpowers/sppgextqcast-t3-smoke-2026-06-02.txt`. **Arc
+  closed — TaskList #359 ready for completion.**
 - **Track A.0 — PostgreSQL Extended Query binary-format RESULTS (SP-PG-EXTQ-BIN-RESULTS V1 SHIPPED at T3).**
   Symmetric companion to SP-PG-EXTQ-BIN V1 — closes the asterisk on the
   asyncpg row of the USAGE §9 ORM matrix. asyncpg / JDBC default extended

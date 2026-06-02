@@ -1,0 +1,79 @@
+{{- /*
+SP-Cloud-Cluster T7 — alerting rules.
+
+Renders a `monitoring.coreos.com/v1` PrometheusRule that wraps the
+two failure modes a 3- or 5-replica VSR cluster operator should
+actually be paged on:
+
+  1. KesselDBClusterReplicaDown   — `up{} == 0` for >30s. The
+     Prometheus-injected `up` time-series is 1 when the scrape
+     succeeded and 0 when it failed; this catches kubelet-killed +
+     CrashLoopBackoff + network-partitioned pods.
+
+  2. KesselDBNoPrimary            — `sum(kesseldb_is_primary)` over
+     all replicas == 0 for >60s. The is-primary gauge is 1 on the
+     current view's primary and 0 on every backup; the sum across
+     all replicas in a healthy cluster is exactly 1. Zero means VSR
+     has not converged on a leader (in-flight view-change or
+     quorum loss). The 60s `for` window is longer than a normal
+     view-change (≤5s with default `cluster.viewChangeTimeout`).
+
+  3. KesselDBViewChangeStorm      — `delta(kesseldb_view_number[5m])
+     > 5`. `kesseldb_view_number` is a monotonic gauge incremented
+     once per view-change; >5 view-changes in 5 minutes signals a
+     thrashing cluster (network jitter exceeding view-change
+     timeout, or repeated primary kills). V1 does NOT emit a
+     dedicated `kesseldb_view_changes_total` counter; the gauge
+     delta is the V1 surrogate. The named V2 follow-up arc
+     SP-Cloud-Cluster-METRICS-EXPAND ships a proper counter +
+     histogram for replica lag.
+
+The PrometheusRule is gated on the same two flags as the
+ServiceMonitor PLUS `.Values.monitoring.prometheus.rules.enabled`
+(default true) so an operator can scrape WITHOUT alerting.
+*/}}
+{{- if and .Values.cluster.enabled .Values.monitoring.prometheus.enabled .Values.monitoring.prometheus.rules.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "kesseldb.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kesseldb.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.prometheus.rules.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: kesseldb.cluster
+      rules:
+        - alert: KesselDBClusterReplicaDown
+          expr: up{job=~".*{{ include "kesseldb.fullname" . }}.*"} == 0
+          for: 30s
+          labels:
+            severity: critical
+            arc: sp-cloud-cluster
+          annotations:
+            summary: "KesselDB replica {{`{{ $labels.instance }}`}} is down"
+            description: "KesselDB pod {{`{{ $labels.instance }}`}} has not been scrapeable for at least 30s. Check `kubectl get pods -l app.kubernetes.io/instance={{ .Release.Name }}` and pod logs. If the replica is permanently lost, the cluster continues serving from the surviving f+1 replicas (VSR tolerates 1 failure at N=3, 2 at N=5)."
+
+        - alert: KesselDBNoPrimary
+          expr: sum(kesseldb_is_primary{job=~".*{{ include "kesseldb.fullname" . }}.*"}) == 0
+          for: 60s
+          labels:
+            severity: critical
+            arc: sp-cloud-cluster
+          annotations:
+            summary: "KesselDB cluster {{ .Release.Name }} has no primary"
+            description: "No replica in the {{ .Release.Name }} cluster reports kesseldb_is_primary=1 for at least 60s. A healthy 3- or 5-replica VSR cluster should always have exactly one primary; sum==0 means view-change has not converged (network partition, quorum loss, or all-pods-down). Writes will return UNAVAILABLE until a primary is elected."
+
+        - alert: KesselDBViewChangeStorm
+          expr: delta(kesseldb_view_number{job=~".*{{ include "kesseldb.fullname" . }}.*"}[5m]) > 5
+          for: 5m
+          labels:
+            severity: warning
+            arc: sp-cloud-cluster
+          annotations:
+            summary: "KesselDB cluster {{ .Release.Name }} is view-changing repeatedly"
+            description: "Replica {{`{{ $labels.instance }}`}} observed more than 5 view-changes in the last 5 minutes. This usually means primary heartbeats are not arriving within `cluster.viewChangeTimeout` (default 5s) — check inter-pod network latency, node pressure, and consider raising the timeout for cross-zone deploys. V1 surrogate metric: `kesseldb_view_number` is a per-replica monotonic gauge; a dedicated counter ships under SP-Cloud-Cluster-METRICS-EXPAND."
+{{- end }}

@@ -1,0 +1,58 @@
+{{- /*
+SP-Cloud-Cluster T7 — Prometheus scrape target.
+
+Renders a `monitoring.coreos.com/v1` ServiceMonitor when BOTH:
+  - .Values.cluster.enabled  (cluster mode is on — the alert rules
+    below are about VSR failover, which is only meaningful when
+    multi-replica), AND
+  - .Values.monitoring.prometheus.enabled  (opt-in; off by default so
+    chart installs in clusters WITHOUT the Prometheus Operator CRDs
+    do not 404 on `kind: ServiceMonitor`).
+
+The selector matches the chart's standard selector labels so the
+existing client ClusterIP Service (templates/service.yaml) becomes
+the scrape source — that Service publishes the `http` port (6533)
+that serves `/v1/metrics`. We deliberately scrape the CLIENT Service
+(not the headless peer Service): the per-pod headless A-records
+DO publish 6533, but they also publish 5432 + 6534, and a single
+ServiceMonitor endpoint can only target one named port. The client
+ClusterIP fronts every replica's HTTP gateway, so each scrape lands
+on a different pod via the standard kube-proxy round-robin — every
+pod's `kesseldb_is_primary` / `kesseldb_view_number` / etc. is
+observable in the scraped time-series.
+
+V1 honestly emits these metrics (see crates/kessel-http-gateway/
+src/metrics_writer.rs):
+  - kesseldb_ops_total{kind}              counter
+  - kesseldb_inflight                     gauge
+  - kesseldb_last_op_number               gauge
+  - kesseldb_view_number                  gauge (monotonic per replica)
+  - kesseldb_is_primary                   gauge (0 or 1)
+  - kesseldb_http_requests_total{path,status}  counter
+The PrometheusRule below uses ONLY those metrics + `up{}` (added by
+Prometheus itself for every scrape target). Metrics naming
+`kesseldb_view_changes_total` / `kesseldb_cluster_replica_lag_seconds`
+do NOT exist in V1 and are named V2 follow-up
+SP-Cloud-Cluster-METRICS-EXPAND in the design spec.
+*/}}
+{{- if and .Values.cluster.enabled .Values.monitoring.prometheus.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "kesseldb.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kesseldb.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.prometheus.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "kesseldb.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: http
+      path: /v1/metrics
+      interval: {{ .Values.monitoring.prometheus.interval | default "30s" }}
+      scrapeTimeout: {{ .Values.monitoring.prometheus.scrapeTimeout | default "10s" }}
+{{- end }}

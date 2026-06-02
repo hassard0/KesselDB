@@ -267,6 +267,63 @@ cluster:
   podManagementPolicy: Parallel
 
 # ─────────────────────────────────────────────────────────────────────
+# Monitoring — Prometheus Operator ServiceMonitor + PrometheusRule
+# (SP-Cloud-Cluster T7).
+#
+# Emits prometheus-operator CRDs (monitoring.coreos.com/v1
+# ServiceMonitor + PrometheusRule) pointing at KesselDB's HTTP
+# gateway `/v1/metrics` endpoint (port 6533).
+#
+# Gated on BOTH:
+#   - .Values.cluster.enabled              — the canned alert rules
+#     are VSR-failover-shaped, only meaningful in cluster mode.
+#   - .Values.monitoring.prometheus.enabled — OFF by default so the
+#     chart installs in clusters WITHOUT prometheus-operator CRDs
+#     without 404-ing on unknown `kind: ServiceMonitor` /
+#     `kind: PrometheusRule`.
+#
+# V1 emitted metrics (see crates/kessel-http-gateway/src/metrics_writer.rs):
+#   kesseldb_ops_total{kind}                      counter
+#   kesseldb_inflight                             gauge
+#   kesseldb_last_op_number                       gauge
+#   kesseldb_view_number                          gauge (monotonic per replica)
+#   kesseldb_is_primary                           gauge (0 or 1)
+#   kesseldb_http_requests_total{path,status}     counter
+#
+# The V1 PrometheusRule wraps three alerts driven by those metrics
+# plus the Prometheus-injected `up{}` (scrape success). A dedicated
+# `kesseldb_view_changes_total` counter + cross-replica
+# `kesseldb_replica_lag_seconds` histogram are NAMED V2 follow-up
+# SP-Cloud-Cluster-METRICS-EXPAND in the design spec. The V1 rule
+# uses `delta(kesseldb_view_number[5m])` as the surrogate.
+# ─────────────────────────────────────────────────────────────────────
+monitoring:
+  prometheus:
+    # OFF by default; opt-in. Set to `true` to emit ServiceMonitor +
+    # PrometheusRule. REQUIRES the Prometheus Operator CRDs installed
+    # in the cluster (`monitoring.coreos.com/v1`).
+    enabled: false
+    # Scrape interval. Prometheus default is 15s; 30s is gentler on
+    # the gateway HTTP path and matches the typical operator default.
+    interval: 30s
+    # Per-scrape timeout. MUST be < interval.
+    scrapeTimeout: 10s
+    # Extra labels on the ServiceMonitor object itself. Some
+    # prometheus-operator installations select ServiceMonitors by a
+    # `release: <operator-release>` label (e.g. kube-prometheus-stack
+    # defaults to `release: prometheus`). Set that label here.
+    additionalLabels: {}
+    rules:
+      # Emit the PrometheusRule alongside the ServiceMonitor. Set
+      # `false` to scrape WITHOUT shipping the canned alerts (e.g.
+      # you maintain your own alert catalog).
+      enabled: true
+      # Extra labels on the PrometheusRule object — useful when the
+      # operator's rule selector requires `prometheus: kube-prometheus`
+      # or a custom team label.
+      additionalLabels: {}
+
+# ─────────────────────────────────────────────────────────────────────
 # Naming overrides (standard helm convention).
 # ─────────────────────────────────────────────────────────────────────
 nameOverride: ""

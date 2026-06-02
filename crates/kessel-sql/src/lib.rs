@@ -626,8 +626,32 @@ pub fn compile_stmt(sql: &str, cat: &Catalog) -> Result<Stmt, SqlError> {
             return Ok(Stmt::Explain(plan_string(&inner, cat)));
         }
     }
+    compile_stmt_from_tokens(lex(sql)?, sql, cat, &[])
+}
+
+/// SP-PG-EXTQ-PARSED T2 — body of `compile_stmt` extracted so the
+/// `compile_stmt_with_params` entry point can share it. Takes the
+/// pre-(re)lexed token vec, the original SQL string (for the
+/// fall-through `compile_from_tokens` call), the catalog, and the
+/// bound params slice (so the UPDATE fall-through path can re-rewrite
+/// — but the typical V1 shape is empty params on the bare path).
+///
+/// The compile path forks into UPDATE (the dedicated `Stmt::Update`
+/// shape that `compile` itself rejects) and everything else (which
+/// delegates to `compile_from_tokens`). Both paths see the SAME
+/// pre-rewritten token vec — no double-rewrite, no parameter shape
+/// drift between paths.
+fn compile_stmt_from_tokens(
+    toks: Vec<Tok>,
+    _sql: &str,
+    cat: &Catalog,
+    _params: &[Option<Value>],
+) -> Result<Stmt, SqlError> {
+    // Try the UPDATE arm first. If the first keyword isn't UPDATE we
+    // fall through to `compile_from_tokens` which handles every other
+    // statement type.
     {
-        let mut p = P { t: lex(sql)?, i: 0, cat };
+        let mut p = P { t: toks.clone(), i: 0, cat };
         if p.kw("UPDATE") {
             let tname = p.ident()?;
             p.expect_kw("ID")?;
@@ -670,15 +694,146 @@ pub fn compile_stmt(sql: &str, cat: &Catalog) -> Result<Stmt, SqlError> {
             });
         }
     }
-    Ok(Stmt::Op(compile(sql, cat)?))
+    Ok(Stmt::Op(compile_from_tokens(toks, cat)?))
 }
 
 /// Compile one SQL statement to an `Op`. `cat` is needed for everything
 /// except `CREATE TABLE`. `UPDATE` is rejected here (use `compile_stmt` +
 /// a server that can read-modify-write).
 pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
+    compile_from_tokens(lex(sql)?, cat)
+}
+
+/// SP-PG-EXTQ-PARSED T2 — like `compile`, but accepts a slice of bound
+/// `Option<Value>` parameters. Any `$N` placeholder in the SQL
+/// resolves to `params[n-1]` at the TOKEN level — the bound value is
+/// NEVER concatenated into SQL text, closing the SP-PG-EXTQ V1 §11
+/// weak-spot #1 attack surface. Per the design spec §3.1 rewrite
+/// rules: `Some(Value::Int(i))` → `Tok::Int(i)`, `Some(Value::Uint(u))`
+/// → `Tok::Int(u as i128)` (errors on overflow), `Some(Value::Blob(b))`
+/// → `Tok::Str(utf8-lossy-cast)`, `Some(Value::Null)` / `None` →
+/// `Tok::Ident("NULL")`. Out-of-bounds `$N` returns `SqlError`. The
+/// rewritten token stream is handed to the existing parser unchanged —
+/// the compiled `Op` is byte-identical to what you'd get from the
+/// equivalent SQL with literal values in place of the placeholders.
+pub fn compile_with_params(
+    sql: &str,
+    cat: &Catalog,
+    params: &[Option<Value>],
+) -> Result<Op, SqlError> {
+    let toks = rewrite_param_tokens(lex(sql)?, params)?;
+    compile_from_tokens(toks, cat)
+}
+
+/// SP-PG-EXTQ-PARSED T2 — like `compile_stmt`, but accepts a slice of
+/// bound `Option<Value>` parameters. Same token-rewrite shape as
+/// `compile_with_params`; works for the UPDATE path that
+/// `compile_stmt` handles in addition to the everything-else
+/// `compile` path. EXPLAIN inside compile_stmt_with_params just
+/// delegates to compile_stmt_with_params recursively against the
+/// inner statement (params apply to the inner statement, same as
+/// any other compile path).
+pub fn compile_stmt_with_params(
+    sql: &str,
+    cat: &Catalog,
+    params: &[Option<Value>],
+) -> Result<Stmt, SqlError> {
+    // EXPLAIN <stmt> — compile the inner statement and describe its plan
+    // WITHOUT executing it. Same prefix-handling as `compile_stmt`.
+    let t = sql.trim_start();
+    if t.len() >= 8 && t[..7].eq_ignore_ascii_case("EXPLAIN") {
+        let rest = t[7..].trim_start();
+        if rest.is_empty() {
+            return Err("EXPLAIN needs a statement".into());
+        }
+        let inner = compile_stmt_with_params(rest, cat, params)?;
+        return Ok(Stmt::Explain(plan_string(&inner, cat)));
+    }
+    let toks = rewrite_param_tokens(lex(sql)?, params)?;
+    compile_stmt_from_tokens(toks, sql, cat, params)
+}
+
+/// SP-PG-EXTQ-PARSED T2 — token-level rewrite of `Tok::Param(n)` to
+/// the concrete token for `params[n-1]`. Per design spec §3.1:
+///
+/// - `Some(Value::Int(i))` → `Tok::Int(i)`.
+/// - `Some(Value::Uint(u))` → `Tok::Int(u as i128)` if it fits,
+///   else `SqlError`.
+/// - `Some(Value::Blob(b))` → `Tok::Str(utf8-lossy-cast)`. The bytes
+///   are LITERAL string content; the parser will route them to
+///   `lit_to_value` which already accepts string-shaped numerics
+///   for numeric columns (SP-PG-SQL-PAREN-VALUES coercion).
+/// - `Some(Value::Null)` or `None` → `Tok::Ident("NULL")`. The
+///   parser already accepts the bare `NULL` keyword in literal
+///   positions.
+/// - `n == 0` → defensive `SqlError` (the lexer already rejects
+///   `\$0` so this branch is unreachable in practice).
+/// - `n > params.len()` → `SqlError::unbound parameter \$N`.
+///
+/// SECURITY: the bound value's bytes never enter the SQL text. They
+/// enter as a typed `Value`, get materialized as a typed `Tok`,
+/// and emerge in the program as the original `Value` — no
+/// concatenation, no quoting, no escape rules.
+fn rewrite_param_tokens(
+    toks: Vec<Tok>,
+    params: &[Option<Value>],
+) -> Result<Vec<Tok>, SqlError> {
+    let mut out = Vec::with_capacity(toks.len());
+    for tok in toks {
+        match tok {
+            Tok::Param(n) => {
+                if n == 0 {
+                    return Err(
+                        "unreachable: `$0` should have been rejected at lex time".into(),
+                    );
+                }
+                let idx = (n as usize).saturating_sub(1);
+                if idx >= params.len() {
+                    return Err(format!(
+                        "unbound parameter `${n}` (only {bound} bound)",
+                        bound = params.len()
+                    ));
+                }
+                match &params[idx] {
+                    None | Some(Value::Null) => {
+                        out.push(Tok::Ident("NULL".to_string()));
+                    }
+                    Some(Value::Int(i)) => out.push(Tok::Int(*i)),
+                    Some(Value::Uint(u)) => {
+                        if *u > i128::MAX as u128 {
+                            return Err(format!(
+                                "parameter `${n}` value {u} overflows i128 (V1 limit)"
+                            ));
+                        }
+                        out.push(Tok::Int(*u as i128));
+                    }
+                    Some(Value::Blob(b)) => {
+                        // utf8-lossy is correct for V1: the parser
+                        // accepts the string in literal positions
+                        // (numeric coercion via lit_to_value for
+                        // numeric columns; bytes pass-through for
+                        // CHAR/BYTES). The bytes NEVER touch SQL
+                        // text — they become a single `Tok::Str`
+                        // operand carried verbatim into `Lit::Str`.
+                        out.push(Tok::Str(
+                            String::from_utf8_lossy(b).into_owned(),
+                        ));
+                    }
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    Ok(out)
+}
+
+/// SP-PG-EXTQ-PARSED T2 — body of `compile` extracted so
+/// `compile_with_params` can share it. The lex step happens in the
+/// caller; this function takes the (possibly pre-rewritten) token
+/// vec and runs the existing parser dispatch path against it.
+fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
     let mut p = P {
-        t: lex(sql)?,
+        t: toks,
         i: 0,
         cat,
     };
@@ -4726,5 +4881,329 @@ mod tests {
             err.contains("digit"),
             "expected the lexer to name the missing digit, got `{err}`"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // SP-PG-EXTQ-PARSED T2 KATs — `compile_with_params` typed-param
+    // threading. The bound `Value` enters as a typed token (NOT a
+    // SQL-text concatenation) and emerges in the program as the
+    // same `Value`. Closes the SP-PG-EXTQ V1 §11 weak-spot #1 attack
+    // surface for every typed-path-eligible parameter.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Headline regression: `compile_with_params(sql_with_$N, params)`
+    /// emits the same `Op` as `compile(sql_with_literal_in_place_of_$N)`.
+    /// Byte-equal proof that the typed-param path is a drop-in for the
+    /// literal-substituted shape (which is what the gateway's text-
+    /// substitution path produces today).
+    #[test]
+    fn t2parsed_compile_with_params_byte_equal_to_literal_substitution() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (id I64 NOT NULL)");
+        let cat = sm.catalog();
+        let via_params = compile_with_params(
+            "SELECT * FROM t WHERE id = $1",
+            cat,
+            &[Some(Value::Int(42))],
+        )
+        .expect("compile_with_params ok");
+        let via_literal = compile(
+            "SELECT * FROM t WHERE id = 42",
+            cat,
+        )
+        .expect("compile literal ok");
+        // Op enum is structurally comparable; byte-equal on the
+        // serialized form (which the engine sees).
+        assert_eq!(format!("{via_params:?}"), format!("{via_literal:?}"));
+    }
+
+    /// HEADLINE SECURITY KAT — a quote-injection attempt produces an
+    /// Op whose bound value is a `Value::Blob` operand at the EQ
+    /// comparison, NOT a SQL string that the parser would re-parse.
+    /// The `DROP TABLE` never reaches the engine because the bound
+    /// bytes were carried through the AST as a typed value, never
+    /// concatenated into SQL text.
+    ///
+    /// This is the V1 §11 weak-spot #1 fix verified by KAT: even if
+    /// a future SQL extension or a regex-shaped scanner bug breaks
+    /// the existing text-substitution path's `'` → `''` doubling,
+    /// THIS path stays safe because it never escapes a quote — it
+    /// never enters a quote at all.
+    #[test]
+    fn t2parsed_quote_injection_attempt_does_not_inject_sql() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (id I64 NOT NULL, name CHAR(64) NOT NULL)");
+        let cat = sm.catalog();
+        // The classic bobby-tables payload as a bound string param.
+        let payload = b"'; DROP TABLE t; --";
+        let via_params = compile_with_params(
+            "SELECT * FROM t WHERE name = $1",
+            cat,
+            &[Some(Value::Blob(payload.to_vec()))],
+        )
+        .expect("compile_with_params ok — the bound value is a typed Value");
+        // The bound value must survive verbatim as the EQ rhs operand.
+        // Any SQL injection would re-parse `; DROP TABLE t; --` and
+        // produce a different Op (likely an Op::DropType or a parse
+        // error). The CORRECT outcome is a Query/QueryRows Op whose
+        // program operand contains the payload bytes as-is.
+        match via_params {
+            Op::QueryRows { program, .. } => {
+                // The program byte stream contains a literal Bytes-push
+                // for the payload. Search for the payload bytes inside
+                // the program — if they appear, the bound value
+                // survived as a typed operand.
+                let prog_has_payload = program
+                    .windows(payload.len())
+                    .any(|w| w == payload);
+                assert!(
+                    prog_has_payload,
+                    "expected bound payload bytes to survive verbatim \
+                     in the program operand; instead got program = {program:?}",
+                );
+            }
+            other => panic!(
+                "expected Op::QueryRows with the payload bytes carried \
+                 as a typed operand; got {other:?} which suggests the \
+                 injected SQL took effect (SECURITY REGRESSION)",
+            ),
+        }
+    }
+
+    /// `$1, $2` ordering preserved — each param resolves to its own
+    /// slot, multi-param case.
+    #[test]
+    fn t2parsed_compile_with_params_multi_position_ordering() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (a I64 NOT NULL, b I64 NOT NULL)");
+        let cat = sm.catalog();
+        let via_params = compile_with_params(
+            "SELECT * FROM t WHERE a = $1 AND b = $2",
+            cat,
+            &[Some(Value::Int(10)), Some(Value::Int(20))],
+        )
+        .expect("ok");
+        let via_literal = compile(
+            "SELECT * FROM t WHERE a = 10 AND b = 20",
+            cat,
+        )
+        .expect("ok");
+        assert_eq!(format!("{via_params:?}"), format!("{via_literal:?}"));
+    }
+
+    /// Same `$N` referenced multiple times resolves to the same value
+    /// at each occurrence (mirror's the gateway's `$N` repeat semantics).
+    #[test]
+    fn t2parsed_compile_with_params_same_index_used_twice() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (a I64 NOT NULL, b I64 NOT NULL)");
+        let cat = sm.catalog();
+        let via_params = compile_with_params(
+            "SELECT * FROM t WHERE a = $1 OR b = $1",
+            cat,
+            &[Some(Value::Int(42))],
+        )
+        .expect("ok");
+        let via_literal = compile(
+            "SELECT * FROM t WHERE a = 42 OR b = 42",
+            cat,
+        )
+        .expect("ok");
+        assert_eq!(format!("{via_params:?}"), format!("{via_literal:?}"));
+    }
+
+    /// NULL injection via `None`. The token rewrite emits
+    /// `Tok::Ident("NULL")` which the parser accepts in literal
+    /// positions. Mirrors the gateway substitute's bare-NULL
+    /// keyword shape.
+    #[test]
+    fn t2parsed_compile_with_params_null_injects_as_null_keyword() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (a I64 NOT NULL)");
+        let cat = sm.catalog();
+        // `WHERE a IS NULL` is the supported predicate form; with the
+        // rewritten `Tok::Ident("NULL")` injected at the literal slot,
+        // the parser sees `WHERE a IS NULL` which compiles to the
+        // IS_NULL opcode against `a`.
+        let via_params = compile_with_params(
+            "SELECT * FROM t WHERE a IS $1",
+            cat,
+            &[None],
+        );
+        // Either path (Ok with IS_NULL program, or Err if the parser
+        // can't handle `IS NULL` from the rewritten token) is valid;
+        // we lock the Ok shape that mirrors the gateway substitute.
+        match via_params {
+            Ok(Op::QueryRows { program, .. }) => {
+                // The program should start with the IS_NULL opcode (2)
+                // for the field `a`. The exact byte shape: [2,
+                // field_id_lo, field_id_hi].
+                assert_eq!(program.first(), Some(&2u8),
+                    "expected IS_NULL opcode at the start of the program, got {program:?}");
+            }
+            other => panic!("expected Ok(QueryRows) with IS_NULL program, got {other:?}"),
+        }
+    }
+
+    /// Out-of-bounds `$N` returns `SqlError::unbound parameter $N`.
+    #[test]
+    fn t2parsed_compile_with_params_out_of_bounds_index_rejected() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (id I64 NOT NULL)");
+        let cat = sm.catalog();
+        let err = compile_with_params(
+            "SELECT * FROM t WHERE id = $3",
+            cat,
+            &[Some(Value::Int(1)), Some(Value::Int(2))],
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("$3") && err.contains("unbound"),
+            "expected the error to name the unbound parameter index, got `{err}`"
+        );
+    }
+
+    /// SQL with `$N` but compile (no params) fails because the
+    /// parser doesn't accept `Tok::Param` in any value position.
+    /// Lock: `compile()` is the bare path; only `compile_with_params`
+    /// can rewrite `Tok::Param`.
+    #[test]
+    fn t2parsed_compile_without_params_rejects_dollar_n() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (id I64 NOT NULL)");
+        let cat = sm.catalog();
+        let err = compile(
+            "SELECT * FROM t WHERE id = $1",
+            cat,
+        )
+        .unwrap_err();
+        // The exact error message comes from the parser's `_ =>
+        // Err("...")` arm in `cmp_expr` / `term`; we only assert
+        // that SOME error happens (compile didn't silently produce
+        // an incoherent Op).
+        assert!(
+            !err.is_empty(),
+            "expected a non-empty error for $N without bound params"
+        );
+    }
+
+    /// `compile_with_params` of SQL WITHOUT any `$N` should be a
+    /// no-op pass-through — byte-equal to `compile`.
+    #[test]
+    fn t2parsed_compile_with_params_no_placeholders_byte_equal_to_compile() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (id I64 NOT NULL)");
+        let cat = sm.catalog();
+        let via_params = compile_with_params(
+            "SELECT * FROM t WHERE id = 99",
+            cat,
+            &[],
+        ).expect("ok");
+        let via_compile = compile(
+            "SELECT * FROM t WHERE id = 99",
+            cat,
+        ).expect("ok");
+        assert_eq!(format!("{via_params:?}"), format!("{via_compile:?}"));
+    }
+
+    /// `$N` inside INSERT VALUES — pgJDBC / asyncpg / SQLAlchemy
+    /// all emit Bind with `INSERT INTO t (a, b) VALUES ($1, $2)`.
+    /// The typed-param path produces the same Op as the literal-
+    /// substituted form.
+    #[test]
+    fn t2parsed_compile_with_params_insert_values() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (a I64 NOT NULL, b CHAR(64) NOT NULL)");
+        let cat = sm.catalog();
+        let via_params = compile_with_params(
+            "INSERT INTO t ID 5 (a, b) VALUES ($1, $2)",
+            cat,
+            &[Some(Value::Int(42)), Some(Value::Blob(b"hello".to_vec()))],
+        ).expect("ok");
+        let via_literal = compile(
+            "INSERT INTO t ID 5 (a, b) VALUES (42, 'hello')",
+            cat,
+        ).expect("ok");
+        assert_eq!(format!("{via_params:?}"), format!("{via_literal:?}"));
+    }
+
+    /// `$N` mixed with bare literals in the same WHERE — the param
+    /// resolves at its slot; the literal stays literal.
+    #[test]
+    fn t2parsed_compile_with_params_mixed_with_bare_literals() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (a I64 NOT NULL, b I64 NOT NULL)");
+        let cat = sm.catalog();
+        let via_params = compile_with_params(
+            "SELECT * FROM t WHERE a = $1 AND b = 7",
+            cat,
+            &[Some(Value::Int(42))],
+        ).expect("ok");
+        let via_literal = compile(
+            "SELECT * FROM t WHERE a = 42 AND b = 7",
+            cat,
+        ).expect("ok");
+        assert_eq!(format!("{via_params:?}"), format!("{via_literal:?}"));
+    }
+
+    /// `Value::Uint(u128)` parameter coerces to `Tok::Int(i128)`
+    /// when it fits in the signed range.
+    #[test]
+    fn t2parsed_compile_with_params_uint_value_coerces_to_int_token() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (id U64 NOT NULL)");
+        let cat = sm.catalog();
+        let via_params = compile_with_params(
+            "SELECT * FROM t WHERE id = $1",
+            cat,
+            &[Some(Value::Uint(123u128))],
+        ).expect("ok");
+        let via_literal = compile(
+            "SELECT * FROM t WHERE id = 123",
+            cat,
+        ).expect("ok");
+        assert_eq!(format!("{via_params:?}"), format!("{via_literal:?}"));
+    }
+
+    /// `compile_stmt_with_params` threads params through the UPDATE
+    /// path that bare `compile_stmt` handles. Stmt doesn't impl Debug
+    /// so we destructure both into `Stmt::Update { type_id, id, sets }`
+    /// and compare field-by-field.
+    #[test]
+    fn t2parsed_compile_stmt_with_params_update_set() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (a I64 NOT NULL)");
+        // Seed a row so the UPDATE has a target.
+        run(&mut sm, 2, "INSERT INTO t ID 7 (a) VALUES (1)");
+        let cat = sm.catalog();
+        let via_params = compile_stmt_with_params(
+            "UPDATE t ID 7 SET a = $1",
+            cat,
+            &[Some(Value::Int(99))],
+        ).expect("ok");
+        let via_literal = compile_stmt(
+            "UPDATE t ID 7 SET a = 99",
+            cat,
+        ).expect("ok");
+        match (via_params, via_literal) {
+            (
+                Stmt::Update { type_id: t1, id: i1, sets: s1 },
+                Stmt::Update { type_id: t2, id: i2, sets: s2 },
+            ) => {
+                assert_eq!(t1, t2);
+                assert_eq!(i1, i2);
+                assert_eq!(s1.len(), s2.len());
+                for ((f1, v1), (f2, v2)) in s1.iter().zip(s2.iter()) {
+                    assert_eq!(f1, f2);
+                    // Value impls PartialEq for the simple variants
+                    // we exercise (Int, Uint, Blob).
+                    assert_eq!(v1, v2);
+                }
+            }
+            (a, b) => {
+                let _ = a; let _ = b;
+                panic!("expected both compile paths to produce Stmt::Update");
+            }
+        }
     }
 }

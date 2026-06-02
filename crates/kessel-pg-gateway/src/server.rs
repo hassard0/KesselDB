@@ -812,6 +812,16 @@ pub fn run_session<
                                     "binary-format parameter at position {position} requires a Parse-time type OID hint (V1 cannot decode without it)"
                                 ),
                             ),
+                            crate::extq::ExtqError::BinaryResultEncodeFailed {
+                                position,
+                                type_oid,
+                                reason,
+                            } => (
+                                "0A000",
+                                format!(
+                                    "binary-format result column at position {position} (type OID {type_oid}): {reason}"
+                                ),
+                            ),
                         };
                         // Same "stay alive" contract as the T1
                         // branch — emit ErrorResponse + RFQ and

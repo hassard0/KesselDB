@@ -342,6 +342,20 @@ pub enum ExtqError {
     /// OID hints with binary format; psycopg3 too. So this rejection
     /// is defensive — it catches a (rare) misbehaving client.
     BinaryFormatRequiresTypeOidHint { position: usize },
+    /// SP-PG-EXTQ-BIN-RESULTS T2 — a column in the Execute response
+    /// couldn't be re-encoded into the portal's requested binary
+    /// format. Carries the 0-based column position, the column's PG
+    /// type OID, and a human-readable reason (which for unsupported
+    /// types includes the V2 follow-up arc name —
+    /// `SP-PG-EXTQ-BIN-NUMERIC` for NUMERIC, `SP-PG-EXTQ-BIN-EXTRA`
+    /// for JSONB/UUID/ARRAY/etc). Maps to SQLSTATE `0A000
+    /// feature_not_supported`. Per spec §3 + §6 the dispatcher also
+    /// sets `error_state = true` so the pipeline skips until Sync.
+    BinaryResultEncodeFailed {
+        position: usize,
+        type_oid: u32,
+        reason: String,
+    },
 }
 
 /// Outcome of dispatching one extq message. T2+ widens the
@@ -983,12 +997,18 @@ fn dispatch_execute<E: EngineApply + ?Sized>(
 
     // 1. Portal lookup. Capture what we need before the engine call
     //    so we don't hold the borrow.
-    let (stmt_name, exec_state, row_description_sent) =
+    //    SP-PG-EXTQ-BIN-RESULTS T2 — also capture `result_formats` so
+    //    the post-`dispatch_query` step can rewrite RowDescription +
+    //    DataRow frames into binary format when the client requested
+    //    `result_formats=[1]` (asyncpg/JDBC default). For all-text
+    //    portals the rewrite step is a zero-cost passthrough.
+    let (stmt_name, exec_state, row_description_sent, result_formats) =
         match state.portals.get(&portal_name) {
             Some(p) => (
                 p.stmt_name.clone(),
                 p.exec_state.clone(),
                 p.row_description_sent,
+                p.result_formats.clone(),
             ),
             None => return set_err(state, ExtqError::UnknownPortal { name: portal_name }),
         };
@@ -1020,7 +1040,7 @@ fn dispatch_execute<E: EngineApply + ?Sized>(
 
     // Decide which path: first-time execute (substitute + dispatch
     // + buffer) vs re-Execute on Buffered/Exhausted.
-    let buffered_rows: Vec<Vec<u8>>;
+    let mut buffered_rows: Vec<Vec<u8>>;
     let mut prelude: Vec<u8>; // RowDescription + ErrorResponse-if-any (NEVER includes RFQ)
     let command_complete_bytes: Vec<u8>;
     let cursor: usize;
@@ -1099,6 +1119,86 @@ fn dispatch_execute<E: EngineApply + ?Sized>(
             buffered_rows = split.data_rows;
             command_complete_bytes = split.command_complete;
             cursor = 0;
+
+            // SP-PG-EXTQ-BIN-RESULTS T2 — if the portal requested
+            // binary RESULTS (the asyncpg/JDBC default), rewrite
+            // RowDescription's per-field format_code slot + every
+            // buffered DataRow's per-column bytes in lockstep. NULL
+            // columns + all-text formats pass through unchanged
+            // (`rewrite_*` early-out at the format check). The
+            // rewritten DataRows get buffered so re-Execute serves
+            // binary directly without re-encoding.
+            let needs_binary_results = result_formats
+                .iter()
+                .any(|&f| f == crate::proto::FORMAT_CODE_BINARY);
+            if needs_binary_results && !buffered_rows.is_empty() {
+                // Type OIDs from the dispatch_query-emitted RowDescription.
+                // Skip the rewrite if the prelude doesn't lead with T —
+                // INSERT/UPDATE/DELETE portals have no RowDescription
+                // and no DataRows to rewrite anyway.
+                if !prelude.is_empty() && prelude[0] == b'T' {
+                    let type_oids =
+                        match binary_results::extract_type_oids_from_row_description(&prelude)
+                        {
+                            Some(oids) => oids,
+                            None => Vec::new(),
+                        };
+                    // Rewrite each DataRow per-column. On any per-column
+                    // encode failure (NUMERIC binary / unknown OID) set
+                    // error_state + emit the SQLSTATE 0A000 ErrorResponse.
+                    let mut rewritten_rows: Vec<Vec<u8>> =
+                        Vec::with_capacity(buffered_rows.len());
+                    for (_row_idx, row) in buffered_rows.iter().enumerate() {
+                        match binary_results::rewrite_data_row_with_formats(
+                            row,
+                            &result_formats,
+                            &type_oids,
+                        ) {
+                            Ok(new_row) => rewritten_rows.push(new_row),
+                            Err(binary_results::BinaryRewriteError::Encode {
+                                position,
+                                error,
+                            }) => {
+                                let (type_oid, reason) = match error {
+                                    binary_results::BinaryEncodeError::BadValue {
+                                        type_oid,
+                                        reason,
+                                    } => (type_oid, reason),
+                                    binary_results::BinaryEncodeError::Unsupported {
+                                        type_oid,
+                                        arc,
+                                    } => (
+                                        type_oid,
+                                        format!(
+                                            "binary result format for type OID {type_oid} \
+                                             not supported in V1: {arc}"
+                                        ),
+                                    ),
+                                };
+                                return set_err(
+                                    state,
+                                    ExtqError::BinaryResultEncodeFailed {
+                                        position,
+                                        type_oid,
+                                        reason,
+                                    },
+                                );
+                            }
+                            Err(binary_results::BinaryRewriteError::MalformedDataRow) => {
+                                // Should never happen — frames come from
+                                // our own encoder. Defensive passthrough.
+                                rewritten_rows.push(row.clone());
+                            }
+                        }
+                    }
+                    buffered_rows = rewritten_rows;
+                    // Rewrite RowDescription format codes in lockstep.
+                    prelude = binary_results::rewrite_row_description_with_formats(
+                        &prelude,
+                        &result_formats,
+                    );
+                }
+            }
 
             // Persist into the portal for future re-Execute.
             if let Some(portal) = state.portals.get_mut(&portal_name) {
@@ -4471,5 +4571,327 @@ mod tests {
         // ps NOT dropped because Close was skipped.
         assert!(state.get_statement("ps").is_some());
         assert!(state.in_error_state());
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // SP-PG-EXTQ-BIN-RESULTS T2 KATs — dispatch_execute now flips
+    // RowDescription + DataRow per-column bytes when the portal
+    // requested binary RESULTS. asyncpg/JDBC default mode sets
+    // `result_formats=[1]` and expects binary bytes; V1 used to send
+    // text DataRows (which mis-decode with "insufficient data in
+    // buffer" — the T3 transcript shape).
+    //
+    // Strategy: build a portal with result_formats=[1] over a
+    // canned-int8 engine, drive an Execute, and inspect the emitted
+    // bytes for the binary INT8 shape (8 bytes BE per column) +
+    // RowDescription format_code slot flipped to 1.
+    // ───────────────────────────────────────────────────────────────
+
+    /// HEADLINE T2 KAT: a SELECT through a portal with
+    /// `result_formats=[1]` (all binary) emits DataRows whose INT8
+    /// column is 8 bytes BE (not text "1"/"2"/etc) AND a RowDescription
+    /// whose per-field format_code is 1 (not 0). Closes the asyncpg
+    /// "insufficient data in buffer" failure shape.
+    #[test]
+    fn t2binr_dispatch_execute_with_binary_result_formats_emits_binary_data_row() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(&mut state, "ps_sel", "SELECT * FROM t", vec![]);
+        let bind = proto::ExtqMessage::Bind {
+            portal: "p_sel".to_string(),
+            stmt: "ps_sel".to_string(),
+            param_formats: vec![],
+            param_values: vec![],
+            // asyncpg/JDBC default: "every column binary".
+            result_formats: vec![FORMAT_CODE_BINARY],
+        };
+        let engine = build_canned_rows(2);
+        try_dispatch_extq(&mut state, &engine, bind);
+        let exec = proto::ExtqMessage::Execute {
+            portal: "p_sel".to_string(),
+            max_rows: 0,
+        };
+        match try_dispatch_extq(&mut state, &engine, exec) {
+            ExtqOutcome::Bytes(bytes) => {
+                // RowDescription tag first.
+                assert_eq!(bytes[0], b'T');
+                // Verify the format_code slot of the (single) field is 1.
+                // Layout: 'T'(1) + length(4) + field_count(2) + "id\0"(3)
+                //   + table_oid(4) + col_attr(2) + type_oid(4) + type_size(2)
+                //   + type_modifier(4) + format_code(2)
+                // format_code slot starts at offset 7 + 3 + 16 = 26.
+                let format_slot = 26;
+                assert_eq!(
+                    &bytes[format_slot..format_slot + 2],
+                    &[0x00, 0x01],
+                    "RowDescription format_code MUST be 1 (binary) when portal requested binary"
+                );
+                // Find the DataRow frames + verify INT8 columns are 8 bytes.
+                // Walk frames to find each `D`.
+                let mut i = 0;
+                let mut data_row_count = 0;
+                while i + 5 <= bytes.len() {
+                    let tag = bytes[i];
+                    let frame_len = u32::from_be_bytes([
+                        bytes[i + 1],
+                        bytes[i + 2],
+                        bytes[i + 3],
+                        bytes[i + 4],
+                    ]) as usize;
+                    let frame_total = 1 + frame_len;
+                    if tag == b'D' {
+                        // Parse DataRow: col_count u16 at offset 5, then per-col [len:i32, bytes].
+                        let col_count = u16::from_be_bytes([bytes[i + 5], bytes[i + 6]]);
+                        assert_eq!(col_count, 1);
+                        let col_len = i32::from_be_bytes([
+                            bytes[i + 7],
+                            bytes[i + 8],
+                            bytes[i + 9],
+                            bytes[i + 10],
+                        ]);
+                        assert_eq!(
+                            col_len, 8,
+                            "INT8 binary column MUST be 8 bytes (got {col_len})"
+                        );
+                        data_row_count += 1;
+                    }
+                    i += frame_total;
+                }
+                assert_eq!(data_row_count, 2, "should have 2 DataRow frames");
+            }
+            other => panic!("expected Bytes, got {other:?}"),
+        }
+    }
+
+    /// T2 KAT: a SELECT with `result_formats=[]` (V1 default, all text)
+    /// goes through the existing text-DataRow path — byte-equal to the
+    /// pre-T2 behavior. Lock against regression in the additive post-
+    /// processor path.
+    #[test]
+    fn t2binr_dispatch_execute_with_empty_result_formats_is_text_passthrough() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(&mut state, "ps_sel", "SELECT * FROM t", vec![]);
+        let bind = proto::ExtqMessage::Bind {
+            portal: "p_sel".to_string(),
+            stmt: "ps_sel".to_string(),
+            param_formats: vec![],
+            param_values: vec![],
+            result_formats: vec![], // empty = all text (V1 default)
+        };
+        let engine = build_canned_rows(1);
+        try_dispatch_extq(&mut state, &engine, bind);
+        let exec = proto::ExtqMessage::Execute {
+            portal: "p_sel".to_string(),
+            max_rows: 0,
+        };
+        match try_dispatch_extq(&mut state, &engine, exec) {
+            ExtqOutcome::Bytes(bytes) => {
+                // RowDescription format_code slot is 0 (text).
+                let format_slot = 26;
+                assert_eq!(&bytes[format_slot..format_slot + 2], &[0x00, 0x00]);
+                // INT8 text "1" → 1 byte column.
+                // Walk to first D frame; col_len at offset 7.
+                let mut i = 0;
+                while i + 5 <= bytes.len() {
+                    if bytes[i] == b'D' {
+                        let col_len = i32::from_be_bytes([
+                            bytes[i + 7],
+                            bytes[i + 8],
+                            bytes[i + 9],
+                            bytes[i + 10],
+                        ]);
+                        // Text format for "1" → 1 byte.
+                        assert_eq!(col_len, 1, "text INT8 '1' MUST be 1 byte");
+                        // The actual byte is ASCII '1' = 0x31.
+                        assert_eq!(bytes[i + 11], b'1');
+                        return;
+                    }
+                    let frame_len = u32::from_be_bytes([
+                        bytes[i + 1],
+                        bytes[i + 2],
+                        bytes[i + 3],
+                        bytes[i + 4],
+                    ]) as usize;
+                    i += 1 + frame_len;
+                }
+                panic!("no DataRow found");
+            }
+            other => panic!("expected Bytes, got {other:?}"),
+        }
+    }
+
+    /// T2 KAT: a SELECT with `result_formats=[0]` (explicit all-text)
+    /// is byte-equal to `result_formats=[]`. Locks the PG length
+    /// convention (single 0 code = all text).
+    #[test]
+    fn t2binr_dispatch_execute_with_single_text_format_is_passthrough() {
+        let mut state = SessionState::new();
+        // Run twice — once with empty, once with [0] — and compare.
+        let run = |formats: Vec<u16>| -> Vec<u8> {
+            let mut state = SessionState::new();
+            seed_stmt_with_sql(&mut state, "ps", "SELECT * FROM t", vec![]);
+            let bind = proto::ExtqMessage::Bind {
+                portal: "p".to_string(),
+                stmt: "ps".to_string(),
+                param_formats: vec![],
+                param_values: vec![],
+                result_formats: formats,
+            };
+            let engine = build_canned_rows(3);
+            try_dispatch_extq(&mut state, &engine, bind);
+            let exec = proto::ExtqMessage::Execute {
+                portal: "p".to_string(),
+                max_rows: 0,
+            };
+            match try_dispatch_extq(&mut state, &engine, exec) {
+                ExtqOutcome::Bytes(b) => b,
+                other => panic!("expected Bytes, got {other:?}"),
+            }
+        };
+        let _ = &mut state;
+        let bytes_empty = run(vec![]);
+        let bytes_zero = run(vec![FORMAT_CODE_TEXT]);
+        assert_eq!(bytes_empty, bytes_zero);
+    }
+
+    /// T2 KAT: a re-Execute on a Buffered portal that was first-
+    /// Executed with binary results emits binary DataRows from the
+    /// buffer (without re-encoding). Locks that the binary-encoded
+    /// rows persist in `ExecState::Buffered`.
+    #[test]
+    fn t2binr_dispatch_re_execute_buffered_keeps_binary_rows() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(&mut state, "ps_sel", "SELECT * FROM t", vec![]);
+        let bind = proto::ExtqMessage::Bind {
+            portal: "p_sel".to_string(),
+            stmt: "ps_sel".to_string(),
+            param_formats: vec![],
+            param_values: vec![],
+            result_formats: vec![FORMAT_CODE_BINARY],
+        };
+        let engine = build_canned_rows(4);
+        try_dispatch_extq(&mut state, &engine, bind);
+
+        // FIRST Execute(max_rows=2) — flips 2 rows to binary, buffers them.
+        let exec1 = proto::ExtqMessage::Execute {
+            portal: "p_sel".to_string(),
+            max_rows: 2,
+        };
+        let _ = try_dispatch_extq(&mut state, &engine, exec1);
+
+        // SECOND Execute(max_rows=2) — should emit the remaining 2 rows
+        // from the buffer. Each INT8 column MUST still be 8 bytes BE.
+        let exec2 = proto::ExtqMessage::Execute {
+            portal: "p_sel".to_string(),
+            max_rows: 2,
+        };
+        match try_dispatch_extq(&mut state, &engine, exec2) {
+            ExtqOutcome::Bytes(bytes) => {
+                // No RowDescription on the re-Execute.
+                assert_ne!(bytes[0], b'T');
+                // Find DataRows + verify col_len = 8.
+                let mut i = 0;
+                let mut d_count = 0;
+                while i + 5 <= bytes.len() {
+                    if bytes[i] == b'D' {
+                        let col_len = i32::from_be_bytes([
+                            bytes[i + 7],
+                            bytes[i + 8],
+                            bytes[i + 9],
+                            bytes[i + 10],
+                        ]);
+                        assert_eq!(col_len, 8, "buffered re-Execute MUST keep binary INT8 8-byte");
+                        d_count += 1;
+                    }
+                    let frame_len = u32::from_be_bytes([
+                        bytes[i + 1],
+                        bytes[i + 2],
+                        bytes[i + 3],
+                        bytes[i + 4],
+                    ]) as usize;
+                    i += 1 + frame_len;
+                }
+                assert_eq!(d_count, 2);
+            }
+            other => panic!("expected Bytes, got {other:?}"),
+        }
+    }
+
+    /// T2 KAT: an empty SELECT (0 rows) with binary results still emits
+    /// the binary RowDescription + CommandComplete; the rewrite step
+    /// short-circuits when `buffered_rows.is_empty()`.
+    #[test]
+    fn t2binr_dispatch_execute_empty_result_set_with_binary_formats_no_crash() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(&mut state, "ps_sel", "SELECT * FROM t", vec![]);
+        let bind = proto::ExtqMessage::Bind {
+            portal: "p_sel".to_string(),
+            stmt: "ps_sel".to_string(),
+            param_formats: vec![],
+            param_values: vec![],
+            result_formats: vec![FORMAT_CODE_BINARY],
+        };
+        let engine = build_canned_rows(0);
+        try_dispatch_extq(&mut state, &engine, bind);
+        let exec = proto::ExtqMessage::Execute {
+            portal: "p_sel".to_string(),
+            max_rows: 0,
+        };
+        match try_dispatch_extq(&mut state, &engine, exec) {
+            ExtqOutcome::Bytes(bytes) => {
+                // RowDescription present.
+                assert_eq!(bytes[0], b'T');
+                // CommandComplete carries SELECT 0.
+                assert!(bytes.windows(b"SELECT 0\0".len()).any(|w| w == b"SELECT 0\0"));
+                // No D frames.
+                assert_eq!(bytes.iter().filter(|&&b| b == b'D').count(), 0);
+            }
+            other => panic!("expected Bytes, got {other:?}"),
+        }
+    }
+
+    /// T2 KAT: an INSERT through a binary-result portal succeeds — no
+    /// DataRows, no RowDescription, just CommandComplete. The
+    /// post-processor's `buffered_rows.is_empty()` guard short-circuits.
+    #[test]
+    fn t2binr_dispatch_execute_insert_with_binary_result_formats_succeeds() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(
+            &mut state,
+            "ps_ins",
+            "INSERT INTO t (id) VALUES (1)",
+            vec![],
+        );
+        let bind = proto::ExtqMessage::Bind {
+            portal: "p_ins".to_string(),
+            stmt: "ps_ins".to_string(),
+            param_formats: vec![],
+            param_values: vec![],
+            result_formats: vec![FORMAT_CODE_BINARY],
+        };
+        struct InsertEngine;
+        impl EngineApply for InsertEngine {
+            fn apply_sql(&self, _sql: &str) -> OpResult {
+                OpResult::Ok
+            }
+            fn describe_table(&self, _name: &str) -> Option<Vec<crate::engine::PgColumn>> {
+                None
+            }
+        }
+        try_dispatch_extq(&mut state, &InsertEngine, bind);
+        let exec = proto::ExtqMessage::Execute {
+            portal: "p_ins".to_string(),
+            max_rows: 0,
+        };
+        match try_dispatch_extq(&mut state, &InsertEngine, exec) {
+            ExtqOutcome::Bytes(bytes) => {
+                // No D frames — INSERT doesn't produce rows.
+                assert_eq!(bytes.iter().filter(|&&b| b == b'D').count(), 0);
+                // CommandComplete tag visible.
+                assert!(bytes.windows(b"INSERT".len()).any(|w| w == b"INSERT"));
+                // Not error_state.
+                assert!(!state.in_error_state());
+            }
+            other => panic!("expected Bytes, got {other:?}"),
+        }
     }
 }

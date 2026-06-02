@@ -901,7 +901,28 @@ fn row_description_or_no_data_for_sql<E: EngineApply + ?Sized>(
     // Same trim shape `dispatch_query` uses: strip a trailing `;` and
     // surrounding whitespace so a client `SELECT * FROM t;` matches.
     let trimmed = sql.trim().trim_end_matches(';').trim();
-    let table_name = match kessel_sql::select_star_table(trimmed) {
+    // SP-CHAR-PAD-COMPARE V1 (2026-06-02) Describe enabler — `$N`
+    // placeholders make `kessel-sql::lex` reject with `unexpected
+    // char '$'`, so `select_star_table` returns None and we end up
+    // emitting NoData even for a `SELECT * FROM t WHERE name = $1`.
+    // asyncpg caches the Describe(S) field count as 0 and then errors
+    // on Execute's DataRow with "result row N cols != described 0".
+    // Substitute placeholders with literal NULL for the table-name
+    // probe ONLY — the actual SQL run at Execute time uses the real
+    // parameter values via `substitute_text_format_params`. Safe
+    // because `select_star_table` only needs the first 4 tokens
+    // (`SELECT * FROM <ident>`) and `NULL` lexes as an Ident there.
+    let probe_sql = {
+        let n = substitute::count_placeholders(trimmed);
+        if n == 0 {
+            trimmed.to_string()
+        } else {
+            let dummy_params: Vec<Option<&[u8]>> = vec![None; n];
+            substitute::substitute_text_format_params(trimmed, &dummy_params)
+                .unwrap_or_else(|_| trimmed.to_string())
+        }
+    };
+    let table_name = match kessel_sql::select_star_table(&probe_sql) {
         Some(t) => t,
         None => return response::encode_no_data(),
     };
@@ -2695,6 +2716,54 @@ mod tests {
         assert!(!state.in_error_state());
         assert_eq!(state.statement_count(), 1);
         assert_eq!(state.portal_count(), 0);
+    }
+
+    /// SP-CHAR-PAD-COMPARE V1 (2026-06-02) — Describe 'S' on a
+    /// parameterized `SELECT * FROM t WHERE …` (with `$N` placeholders)
+    /// must emit a real RowDescription, not NoData. Pre-arc:
+    /// `kessel-sql::lex` choked on `$` so `select_star_table` returned
+    /// None → NoData → asyncpg cached "0 columns" → Execute's
+    /// DataRow tripped "result row N cols != described 0". The
+    /// `row_description_or_no_data_for_sql` helper now substitutes
+    /// `$N` with literal NULL for the table-name probe ONLY.
+    #[test]
+    fn spcharpadcompare_describe_statement_with_dollar_placeholders_emits_row_desc() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(
+            &mut state,
+            "psp",
+            "SELECT * FROM t WHERE name = $1",
+            vec![25 /* text */],
+        );
+        let msg = proto::ExtqMessage::Describe {
+            target: DESCRIBE_TARGET_STATEMENT,
+            name: "psp".to_string(),
+        };
+        match try_dispatch_extq(&mut state, &CannedTwoColEngine, msg) {
+            ExtqOutcome::Bytes(bytes) => {
+                let expected_pd = response::encode_parameter_description(&[25]);
+                assert!(bytes.starts_with(&expected_pd));
+                // RowDescription with the CannedTwoColEngine columns
+                // (id INT8, name CHAR(64)) MUST appear — NOT NoData.
+                let rd_expected = crate::response::encode_row_description(&[
+                    FieldMeta {
+                        name: "id".into(),
+                        type_oid: field_kind_to_oid(FieldKind::I64),
+                    },
+                    FieldMeta {
+                        name: "name".into(),
+                        type_oid: field_kind_to_oid(FieldKind::Char(64)),
+                    },
+                ]);
+                assert_eq!(
+                    &bytes[expected_pd.len()..],
+                    rd_expected.as_slice(),
+                    "Describe(S) on `WHERE name = $1` MUST emit RowDescription, \
+                     not NoData (else asyncpg ProtocolError on Execute's DataRow)"
+                );
+            }
+            other => panic!("expected Bytes(PD + RowDescription), got {other:?}"),
+        }
     }
 
     /// Spec §4: Describe 'S' on a NON-SELECT statement (INSERT here)

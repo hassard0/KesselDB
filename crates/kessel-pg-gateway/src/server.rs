@@ -368,6 +368,21 @@ pub fn run_session<
     // CopyFail return to Idle. A `COPY <table> TO STDOUT` is handled
     // inline inside the Q-dispatch branch — it never enters In state.
     let mut copy_state = crate::copy::CopyState::Idle;
+    // ─── SP-PG-COPY-ABORT-DONE-TAIL §3 — abort-tail drain flag ─────
+    // PG §55.2.7: after an ErrorResponse aborts a CopyData stream,
+    // the client may still send trailing `CopyData` / `CopyDone` /
+    // `CopyFail` frames before it observes the error. Real PG
+    // silently drains those frames. V1 here mirrors that: when this
+    // flag is set, the top-level dispatch loop reads and discards
+    // any `d`/`c`/`f` frame without emitting bytes. `c` and `f` clear
+    // the flag (they're the protocol-defined tail frames); `d` keeps
+    // it set (more pre-error bytes may follow). Any other tag (e.g.
+    // a follow-up `Q`) falls through to the normal dispatch arms
+    // WITHOUT clearing the flag — a pipelined `Q` followed by a
+    // delayed `c` would still drain correctly. In practice
+    // psql/libpq always emit `CopyDone` before any next `Q`, so the
+    // flag clears immediately.
+    let mut expecting_copy_tail = false;
     // ─── Query loop ───────────────────────────────────────────────
     loop {
         let mut tag_buf = [0u8; 1];
@@ -450,6 +465,16 @@ pub fn run_session<
                             stream.write_all(&bytes)?;
                             stream.flush()?;
                             // copy_state already swapped to Idle.
+                            // SP-PG-COPY-ABORT-DONE-TAIL §1: the
+                            // client may still be streaming trailing
+                            // CopyData/CopyDone/CopyFail bytes that
+                            // were already queued before it observed
+                            // our ErrorResponse. Arm the drain flag
+                            // so the top-level dispatch silently
+                            // absorbs those frames per PG §55.2.7
+                            // instead of rejecting them with a
+                            // spurious 08P01 protocol_violation.
+                            expecting_copy_tail = true;
                         }
                     }
                     continue;
@@ -475,6 +500,10 @@ pub fn run_session<
                     };
                     stream.write_all(&resp)?;
                     stream.flush()?;
+                    // SP-PG-COPY-ABORT-DONE-TAIL §3: a successful
+                    // CopyDone consumes any stale drain expectation
+                    // from a prior aborted COPY on this connection.
+                    expecting_copy_tail = false;
                     continue;
                 }
                 crate::proto::FE_COPY_FAIL => {
@@ -486,6 +515,9 @@ pub fn run_session<
                     let resp = crate::copy::dispatch::finalize_copy_in_failure(reason);
                     stream.write_all(&resp)?;
                     stream.flush()?;
+                    // SP-PG-COPY-ABORT-DONE-TAIL §3: a CopyFail
+                    // similarly consumes any stale drain expectation.
+                    expecting_copy_tail = false;
                     continue;
                 }
                 crate::proto::FE_TERMINATE => {
@@ -508,6 +540,45 @@ pub fn run_session<
                     stream.write_all(&resp)?;
                     stream.flush()?;
                     continue;
+                }
+            }
+        }
+
+        // ─── SP-PG-COPY-ABORT-DONE-TAIL §3 — abort-tail drain ─────
+        // After a CopyData failure transitioned us back to Idle, the
+        // client may still be flushing trailing CopyData / CopyDone /
+        // CopyFail frames that were already on the wire before it
+        // observed our ErrorResponse. Real PG silently absorbs those
+        // frames per §55.2.7. When the drain flag is armed, do the
+        // same: read the body (already done above) and skip the
+        // top-level dispatch entirely. `c` (CopyDone) and `f`
+        // (CopyFail) are the protocol-defined tail frames and clear
+        // the flag; trailing `d` (CopyData) keeps the flag set —
+        // more pre-error bytes may follow. The body has already been
+        // fully read by the loop preamble, so the drain is a pure
+        // discard — zero wire output.
+        if expecting_copy_tail {
+            match tag {
+                crate::proto::FE_COPY_DATA => {
+                    // Tail CopyData — keep draining, more frames may
+                    // follow before the client's writer notices the
+                    // ErrorResponse and switches to CopyDone/CopyFail.
+                    continue;
+                }
+                crate::proto::FE_COPY_DONE | crate::proto::FE_COPY_FAIL => {
+                    // Protocol-defined tail — drain complete, return
+                    // to pristine Idle.
+                    expecting_copy_tail = false;
+                    continue;
+                }
+                _ => {
+                    // Non-COPY tag (e.g. follow-up Q or Terminate) —
+                    // fall through to the normal dispatch arms below.
+                    // The flag stays set so a delayed `c`/`f` after a
+                    // pipelined Q is still drained correctly. The
+                    // flag clears at the next legitimate
+                    // CopyDone/CopyFail/COPY-start synchronization
+                    // point.
                 }
             }
         }
@@ -555,6 +626,13 @@ pub fn run_session<
                                     stream.write_all(&bytes)?;
                                     stream.flush()?;
                                     copy_state = crate::copy::CopyState::In(state);
+                                    // SP-PG-COPY-ABORT-DONE-TAIL §3:
+                                    // starting a fresh COPY discards
+                                    // any stale tail-drain expectation
+                                    // from a prior aborted COPY — the
+                                    // new exchange has its own
+                                    // CopyDone/CopyFail framing.
+                                    expecting_copy_tail = false;
                                 }
                                 crate::copy::dispatch::CopyInStartOutcome::Failed { bytes } => {
                                     stream.write_all(&bytes)?;
@@ -3789,5 +3867,325 @@ mod tests {
         }
         let out = &pipe.outbound;
         assert!(out.windows(5).any(|w| w == b"08P01"));
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // SP-PG-COPY-ABORT-DONE-TAIL — KATs locking the abort-tail drain.
+    //
+    // Pre-arc bug: an ErrorResponse mid-CopyData reset state to Idle,
+    // but the client's already-queued CopyDone (`c` = 0x63) then fell
+    // through to the top-level `other => unsupported message tag`
+    // arm, emitting a spurious 08P01 + closing the connection. Real
+    // PG silently drains tail CopyData/CopyDone/CopyFail frames per
+    // §55.2.7. These KATs lock that drain shape end-to-end through
+    // the run_session loop.
+    // ────────────────────────────────────────────────────────────────
+
+    /// SP-PG-COPY-ABORT-DONE-TAIL HEADLINE: a CopyData parse failure
+    /// emits ErrorResponse + RFQ, then the client's trailing CopyDone
+    /// is silently drained (no spurious 08P01), then a follow-up Q
+    /// works on the SAME connection (no reconnect).
+    #[test]
+    fn t_abort_tail_drain_copydone_after_csv_error_keeps_connection_alive() {
+        let token = b"kessel-bearer-token";
+        let cols = vec![
+            crate::engine::PgColumn {
+                name: "id".into(),
+                kind: kessel_catalog::FieldKind::I64,
+                nullable: false,
+            },
+            crate::engine::PgColumn {
+                name: "name".into(),
+                kind: kessel_catalog::FieldKind::Char(32),
+                nullable: false,
+            },
+        ];
+        let engine = CopyTestEngine {
+            cols,
+            applied: std::sync::Mutex::new(Vec::new()),
+            select_row_bytes: Vec::new(),
+        };
+
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&build_q_frame("COPY t FROM STDIN"));
+        // Bad row — 3 fields for a 2-column table triggers
+        // process_copy_data Failed with 22023 + RFQ.
+        extra.extend_from_slice(&build_copy_data_frame(b"1\ttoo\tmany\n"));
+        // The pre-bug-fix observed shape: psql now sends CopyDone
+        // because it already had it queued before observing the
+        // error. The drain MUST swallow this without 08P01.
+        extra.extend_from_slice(&build_copy_done_frame());
+        // Follow-up Q on the same connection — proves the connection
+        // stayed alive (no reconnect needed).
+        extra.extend_from_slice(&build_q_frame("SELECT * FROM t"));
+        extra.extend_from_slice(&build_x_frame());
+
+        let inbound = build_authed_inbound(token, "clientN", "serverN", "test", &extra);
+        let mut pipe = Pipe::new(inbound);
+        run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("session stays alive across the abort + drain");
+
+        let out = &pipe.outbound;
+        // The original row-parse error fires once.
+        assert!(
+            out.windows(5).any(|w| w == b"22023"),
+            "expected 22023 invalid_text_representation for the bad row"
+        );
+        // The spurious "unsupported message tag" must NOT appear. The
+        // post-fix substring 'unsupported message tag' is the
+        // canonical V1-bug marker that this arc closes.
+        assert!(
+            !out.windows(b"unsupported message tag".len())
+                .any(|w| w == b"unsupported message tag"),
+            "the spurious 'unsupported message tag' from the abort-tail bug must NOT appear"
+        );
+        // The follow-up SELECT was dispatched — engine captured it.
+        let applied = engine.applied.lock().unwrap();
+        let select_count = applied
+            .iter()
+            .filter(|s| s.to_ascii_uppercase().starts_with("SELECT"))
+            .count();
+        assert_eq!(
+            select_count, 1,
+            "follow-up SELECT must succeed on the SAME connection (no reconnect)"
+        );
+    }
+
+    /// SP-PG-COPY-ABORT-DONE-TAIL: CopyFail tail after an abort is
+    /// also silently drained. Same shape as the HEADLINE but the
+    /// trailing frame is `f` instead of `c`.
+    #[test]
+    fn t_abort_tail_drain_copyfail_after_csv_error_keeps_connection_alive() {
+        let token = b"kessel-bearer-token";
+        let cols = vec![
+            crate::engine::PgColumn {
+                name: "id".into(),
+                kind: kessel_catalog::FieldKind::I64,
+                nullable: false,
+            },
+            crate::engine::PgColumn {
+                name: "name".into(),
+                kind: kessel_catalog::FieldKind::Char(32),
+                nullable: false,
+            },
+        ];
+        let engine = CopyTestEngine {
+            cols,
+            applied: std::sync::Mutex::new(Vec::new()),
+            select_row_bytes: Vec::new(),
+        };
+
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&build_q_frame("COPY t FROM STDIN"));
+        extra.extend_from_slice(&build_copy_data_frame(b"1\ttoo\tmany\n"));
+        // CopyFail tail with a stale reason — the bug-fix drain
+        // discards this without emitting another ErrorResponse (the
+        // 22023 from the row parse already fired).
+        extra.extend_from_slice(&build_copy_fail_frame("client noticed too late"));
+        extra.extend_from_slice(&build_q_frame("SELECT * FROM t"));
+        extra.extend_from_slice(&build_x_frame());
+
+        let inbound = build_authed_inbound(token, "clientN", "serverN", "test", &extra);
+        let mut pipe = Pipe::new(inbound);
+        run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("session stays alive across abort + CopyFail tail drain");
+
+        let out = &pipe.outbound;
+        assert!(
+            out.windows(5).any(|w| w == b"22023"),
+            "the original row-parse error must fire"
+        );
+        // 57014 is the SQLSTATE finalize_copy_in_failure emits for a
+        // CopyFail. After our drain, that path is NOT taken — the
+        // CopyFail is silently absorbed, not surfaced. (If the drain
+        // didn't catch it we'd see 57014 here AND a spurious 08P01.)
+        assert!(
+            !out.windows(5).any(|w| w == b"57014"),
+            "drained CopyFail tail must NOT surface a 57014 query_canceled"
+        );
+        assert!(
+            !out.windows(b"unsupported message tag".len())
+                .any(|w| w == b"unsupported message tag"),
+            "no spurious 'unsupported message tag' from the drain"
+        );
+        let applied = engine.applied.lock().unwrap();
+        let select_count = applied
+            .iter()
+            .filter(|s| s.to_ascii_uppercase().starts_with("SELECT"))
+            .count();
+        assert_eq!(
+            select_count, 1,
+            "follow-up SELECT must succeed on the same connection"
+        );
+    }
+
+    /// SP-PG-COPY-ABORT-DONE-TAIL: when the client has multiple
+    /// CopyData frames in flight at the moment of the error, every
+    /// trailing CopyData is drained until the closing CopyDone.
+    #[test]
+    fn t_abort_tail_drain_multiple_copydata_after_error_keeps_connection_alive() {
+        let token = b"kessel-bearer-token";
+        let cols = vec![
+            crate::engine::PgColumn {
+                name: "id".into(),
+                kind: kessel_catalog::FieldKind::I64,
+                nullable: false,
+            },
+            crate::engine::PgColumn {
+                name: "name".into(),
+                kind: kessel_catalog::FieldKind::Char(32),
+                nullable: false,
+            },
+        ];
+        let engine = CopyTestEngine {
+            cols,
+            applied: std::sync::Mutex::new(Vec::new()),
+            select_row_bytes: Vec::new(),
+        };
+
+        let mut extra = Vec::new();
+        extra.extend_from_slice(&build_q_frame("COPY t FROM STDIN"));
+        // Bad row triggers Failed → 22023 + RFQ. Drain flag armed.
+        extra.extend_from_slice(&build_copy_data_frame(b"1\ttoo\tmany\n"));
+        // Two more CopyData frames the client had queued before
+        // observing the error. Both MUST be silently drained.
+        extra.extend_from_slice(&build_copy_data_frame(b"2\tstill\tin-flight\n"));
+        extra.extend_from_slice(&build_copy_data_frame(b"3\talso\tin-flight\n"));
+        // CopyDone end-of-stream — drain completes.
+        extra.extend_from_slice(&build_copy_done_frame());
+        // Follow-up Q — connection alive.
+        extra.extend_from_slice(&build_q_frame("SELECT * FROM t"));
+        extra.extend_from_slice(&build_x_frame());
+
+        let inbound = build_authed_inbound(token, "clientN", "serverN", "test", &extra);
+        let mut pipe = Pipe::new(inbound);
+        run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        )
+        .expect("session stays alive across abort + multi-CopyData drain");
+
+        let out = &pipe.outbound;
+        // Exactly ONE 22023 ErrorResponse — the second + third
+        // drained CopyData frames did NOT re-emit an error.
+        let err_22023_count = out
+            .windows(5)
+            .filter(|w| *w == b"22023")
+            .count();
+        assert_eq!(
+            err_22023_count, 1,
+            "exactly ONE 22023 from the first bad row — drained tail must NOT re-emit"
+        );
+        assert!(
+            !out.windows(b"unsupported message tag".len())
+                .any(|w| w == b"unsupported message tag"),
+            "no spurious 'unsupported message tag' from any drained frame"
+        );
+        let applied = engine.applied.lock().unwrap();
+        let select_count = applied
+            .iter()
+            .filter(|s| s.to_ascii_uppercase().starts_with("SELECT"))
+            .count();
+        assert_eq!(select_count, 1, "follow-up SELECT works");
+    }
+
+    /// SP-PG-COPY-ABORT-DONE-TAIL: a stray CopyDone in pristine Idle
+    /// (no preceding abort) is still rejected with `08P01` — the
+    /// drain only activates when the flag was armed by an abort.
+    /// Preserves the defensive shape against a truly broken client.
+    #[test]
+    fn t_stray_copydone_in_pristine_idle_still_rejected_08p01() {
+        let token = b"kessel-bearer-token";
+        let cols = vec![crate::engine::PgColumn {
+            name: "id".into(),
+            kind: kessel_catalog::FieldKind::I64,
+            nullable: false,
+        }];
+        let engine = CopyTestEngine {
+            cols,
+            applied: std::sync::Mutex::new(Vec::new()),
+            select_row_bytes: Vec::new(),
+        };
+
+        let mut extra = Vec::new();
+        // Stray CopyDone with NO preceding COPY FROM and NO abort
+        // context — drain flag is false, so V1 behavior applies.
+        extra.extend_from_slice(&build_copy_done_frame());
+        extra.extend_from_slice(&build_x_frame());
+
+        let inbound = build_authed_inbound(token, "clientN", "serverN", "test", &extra);
+        let mut pipe = Pipe::new(inbound);
+        match run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        ) {
+            Err(PgError::UnexpectedMessageDuringAuth { tag }) => {
+                assert_eq!(tag, b'c');
+            }
+            other => panic!(
+                "expected UnexpectedMessageDuringAuth(b'c'), got {other:?}"
+            ),
+        }
+        let out = &pipe.outbound;
+        assert!(
+            out.windows(5).any(|w| w == b"08P01"),
+            "pristine-Idle stray CopyDone must still emit 08P01"
+        );
+    }
+
+    /// SP-PG-COPY-ABORT-DONE-TAIL: same defensive shape for CopyFail.
+    #[test]
+    fn t_stray_copyfail_in_pristine_idle_still_rejected_08p01() {
+        let token = b"kessel-bearer-token";
+        let cols = vec![crate::engine::PgColumn {
+            name: "id".into(),
+            kind: kessel_catalog::FieldKind::I64,
+            nullable: false,
+        }];
+        let engine = CopyTestEngine {
+            cols,
+            applied: std::sync::Mutex::new(Vec::new()),
+            select_row_bytes: Vec::new(),
+        };
+
+        let mut extra = Vec::new();
+        // Stray CopyFail with no preceding abort context.
+        extra.extend_from_slice(&build_copy_fail_frame("spurious"));
+        extra.extend_from_slice(&build_x_frame());
+
+        let inbound = build_authed_inbound(token, "clientN", "serverN", "test", &extra);
+        let mut pipe = Pipe::new(inbound);
+        match run_session(
+            &mut pipe,
+            Some(token),
+            || "serverN".to_string(),
+            &engine,
+        ) {
+            Err(PgError::UnexpectedMessageDuringAuth { tag }) => {
+                assert_eq!(tag, b'f');
+            }
+            other => panic!(
+                "expected UnexpectedMessageDuringAuth(b'f'), got {other:?}"
+            ),
+        }
+        let out = &pipe.outbound;
+        assert!(
+            out.windows(5).any(|w| w == b"08P01"),
+            "pristine-Idle stray CopyFail must still emit 08P01"
+        );
     }
 }

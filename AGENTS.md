@@ -19,9 +19,9 @@ history. Every claim is backed by the test suite.
 
 ```bash
 cargo build --workspace                          # all crates, no external deps, no native steps
-cargo test  --workspace                          # 2018 default tests
-cargo test  --workspace --features pg-gateway    # 2046 (adds SP-PG + SP-PG-CAT + SP-PG-EXTQ V1)
-cargo test  --workspace --features pg-gateway,http-gateway,kessel-http-gateway/test-server   # 2079 — full matrix
+cargo test  --workspace                          # 2063 default tests
+cargo test  --workspace --features pg-gateway    # 2074 (adds SP-PG + SP-PG-CAT + SP-PG-EXTQ V1 + V2 hardening + SP-PG-COPY V1)
+cargo test  --workspace --features pg-gateway,http-gateway,kessel-http-gateway/test-server   # 2078 — full matrix
 
 cargo run --release --bin kesseldb -- 127.0.0.1:7878 ./data   # single open node, binary protocol only
 
@@ -70,8 +70,12 @@ default.
 - **WebSocket** — `/v1/ws` upgrade, `kessel-op-v1` subprotocol, binary
   frames carrying `Op::encode()` payloads. Same `http-gateway` feature.
   See `docs/USAGE.md` §10 → WebSocket.
-- **PostgreSQL Frontend/Backend v3.0** — Simple Query + SCRAM-SHA-256 +
-  Bearer↔SCRAM bridge. `--features pg-gateway`. See `docs/USAGE.md` §9.
+- **PostgreSQL Frontend/Backend v3.0** — Simple Query + Extended Query
+  (Parse/Bind/Describe/Execute/Sync/Close/Flush, binary params + binary
+  results) + SCRAM-SHA-256 + Bearer↔SCRAM bridge + COPY FROM/TO STDIN
+  (text + CSV + binary formats). Real-driver verified on vulcan: psycopg2
+  ✓ SQLAlchemy 2.0 ✓ psycopg3 ✓ asyncpg ✓ pgJDBC 42.7.4 ✓ (both simple
+  AND extended modes). `--features pg-gateway`. See `docs/USAGE.md` §9.
 
 ## Repo map
 

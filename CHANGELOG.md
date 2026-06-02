@@ -164,8 +164,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning [Se
 
 ### Tests
 
-- 2063 default / 2074 with `--features pg-gateway` / 2078 with all
-  gateway features (vulcan-measured at HEAD around `f2a18e5`).
+- **2442 default / 2470 with `--features pg-gateway` / 2503 with all
+  gateway features** (vulcan-measured 2026-06-02 at HEAD `f2a18e5`, fresh
+  full sweep; the prior 2063 / 2074 / 2078 figures had drifted from the
+  actual workspace count).
 
 ## [1.0.0] — 2026-05-28
 

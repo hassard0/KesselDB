@@ -5,8 +5,11 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 ## Current capabilities (2026-06-02)
 
 What a node running on today's `main` actually does. Every line below is
-covered by the workspace test suite (2063 default / 2074 with
-`--features pg-gateway` / 2078 with all gateway features).
+covered by the workspace test suite (**2442 default / 2470 with
+`--features pg-gateway` / 2503 with all gateway features** —
+vulcan-measured 2026-06-02 at HEAD `f2a18e5`, fresh full sweep; the
+prior 2063 / 2074 / 2078 figures were delta-derived from an earlier base
+measurement and had drifted from the actual workspace count).
 
 **Coherent state of the union (2026-06-02):**
 

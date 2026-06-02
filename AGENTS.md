@@ -19,9 +19,9 @@ history. Every claim is backed by the test suite.
 
 ```bash
 cargo build --workspace                          # all crates, no external deps, no native steps
-cargo test  --workspace                          # 2063 default tests
-cargo test  --workspace --features pg-gateway    # 2074 (adds SP-PG + SP-PG-CAT + SP-PG-EXTQ V1 + V2 hardening + SP-PG-COPY V1)
-cargo test  --workspace --features pg-gateway,http-gateway,kessel-http-gateway/test-server   # 2078 — full matrix
+cargo test  --workspace                          # 2442 default tests
+cargo test  --workspace --features pg-gateway    # 2470 (adds SP-PG + SP-PG-CAT + SP-PG-EXTQ V1 + V2 hardening + SP-PG-COPY V1)
+cargo test  --workspace --features pg-gateway,http-gateway,kessel-http-gateway/test-server   # 2503 — full matrix
 
 cargo run --release --bin kesseldb -- 127.0.0.1:7878 ./data   # single open node, binary protocol only
 

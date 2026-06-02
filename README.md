@@ -6,7 +6,7 @@
 
 *"It's the database that made the Kessel Run in 12 parsecs."*
 
-`2063 default tests green / 2074 with --features pg-gateway / 2078 with all gateway features` · `0 external dependencies in the kernel` · `Rust 1.95+` · single‑binary
+`2442 default tests green / 2470 with --features pg-gateway / 2503 with all gateway features` · `0 external dependencies in the kernel` · `Rust 1.95+` · single‑binary
 
 **Tonight's headlines** (2026‑06‑02):
 - **14.93M ops/sec point reads at K=8 sharded (sub‑µs p50)** — SP‑Perf‑A‑SHARD‑APPLY V1 (2026‑05‑30) wires K independent per‑shard sub‑engines, breaks the ~5M single‑shard `RwLock`‑reader ceiling honestly diagnosed in T6/T7. Vulcan get‑by‑id sweep at K=8: **14.93M ops/sec (3.19× the K=1 baseline)**; K=16 climbs to 16.72M. SP‑Perf‑A‑SHARD‑SCAN + SP‑Perf‑A‑SHARD‑SCAN‑FASTPATH + SP‑Perf‑A‑SHARD‑SCAN‑POOL‑SCALEOUT + SP‑Perf‑A‑SHARD‑SCAN‑LOCAL‑INDEX‑FUSION close the scan‑side companions — every scan workload at K=4 scales POSITIVELY, find‑by parity restored end‑to‑end without the `--pool-workers` flag. See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §13 + §14 + §14b–14d.
@@ -150,8 +150,8 @@ all. Determinism is a feature, not an aspiration.
   protocol byte‑untouched; zero external (non‑workspace) deps on the
   gateway crate. See `docs/USAGE.md` §9 PostgreSQL clients.
 - **Deterministic & verifiable** — the whole engine is a seedable state
-  machine; the test suite (2063 default / 2074 with `--features pg-gateway`
-  / 2078 with all gateway features) includes seeded partition/fault
+  machine; the test suite (2442 default / 2470 with `--features pg-gateway`
+  / 2503 with all gateway features) includes seeded partition/fault
   simulation, multi‑replica Jepsen, hand‑derived KATs against published
   spec text for every codec, the SP‑A 85‑seed K‑invariance sweep, the
   SP‑PG‑CAT synthetic‑peer suite verifying each GUI tool's verbatim
@@ -206,7 +206,7 @@ for the layout + the matrix of supported env vars.
 git clone https://github.com/hassard0/KesselDB && cd KesselDB
 cargo build --release                                # default — binary protocol only
 cargo build --release --features pg-gateway,http-gateway   # all wire surfaces
-cargo test  --workspace --release                    # workspace gate: 2063 default tests
+cargo test  --workspace --release                    # workspace gate: 2442 default tests
 ```
 
 ### Start a node
@@ -583,8 +583,8 @@ Honest boundaries (documented, not hidden):
   `Delete`); cross‑shard scatter‑gather *reads*/SQL text routing is a
   separate, later concern from cross‑shard *transactions*.
 
-Every claim in this repository is backed by the test suite (2063 default /
-2074 with `--features pg-gateway` / 2078 with all gateway features); the docs
+Every claim in this repository is backed by the test suite (2442 default /
+2470 with `--features pg-gateway` / 2503 with all gateway features); the docs
 call out exactly what is proven versus roadmap. The four **strategic‑tier
 items S1–S4** (TLA+/model‑checked safety, serializable MVCC/SI, Jepsen
 linearizability under partition, deterministic WASM UDFs) are all **shipped**
@@ -612,12 +612,12 @@ linearizability under partition, deterministic WASM UDFs) are all **shipped**
 
 ```bash
 cargo build                 # all kernel crates, zero external deps
-cargo test --workspace      # 2063 default tests (seeded partition/fault sim,
+cargo test --workspace      # 2442 default tests (seeded partition/fault sim,
                             # Jepsen linearizability, MVCC TLA+ refinement,
                             # pyarrow Parquet round-trips, WASM-MVP KATs,
                             # SP-A 85-seed K-invariance sweep)
-cargo test --workspace --features pg-gateway                # 2074 (adds SP-PG + SP-PG-CAT + SP-PG-EXTQ V1 + V2 hardening + SP-PG-COPY V1)
-cargo test --workspace --features pg-gateway,http-gateway,kessel-http-gateway/test-server   # 2078 — full matrix
+cargo test --workspace --features pg-gateway                # 2470 (adds SP-PG + SP-PG-CAT + SP-PG-EXTQ V1 + V2 hardening + SP-PG-COPY V1)
+cargo test --workspace --features pg-gateway,http-gateway,kessel-http-gateway/test-server   # 2503 — full matrix
 cargo run -p kessel-bench --release -- --help               # benchmarks
 
 # Strategic-tier rigor artifacts:

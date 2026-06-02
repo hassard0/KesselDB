@@ -330,6 +330,59 @@ at dispatch entry, JDBC simple-mode unblocked.
   tracker close). Progress tracker → SHARD-SCAN-LOCAL-INDEX-FUSION V1
   SHIPPED — DONE_WITH_CONCERNS (spec perf target not met; structural
   floor named). **TaskList #363 ready.**
+- **Track A.-1.4 — PostgreSQL Extended Query binary-format NUMERIC (SP-PG-EXTQ-BIN-NUMERIC V1 SHIPPED at T4 — 2026-06-02).**
+  Closes the V2 follow-up named in the SP-PG-EXTQ-BIN V1 design spec
+  §2.2 and the SP-PG-EXTQ-BIN-RESULTS V1 design spec §2.2 — both V1
+  arcs deferred NUMERIC because the PG binary wire shape is base-10000
+  variable-length-digit (sign + dscale + weight + N i16 digits) and
+  bug-prone. This arc ships a pure-Rust NUMERIC codec covering the
+  V1 range `|value| < 10^18` with ≤18 fractional digits — the typical
+  ORM `decimal.Decimal` / `BigDecimal` / `sqlx::Decimal` shape (i64-
+  sized amounts, currency, percentages, fractional rates). New module
+  `crates/kessel-pg-gateway/src/extq/binary_numeric.rs`:
+  `decode_numeric_binary(bytes) -> Result<String, BinaryNumericError>`
+  parses the PG `numeric_send` wire and reconstructs the canonical
+  decimal string PG's `numeric_out` emits; `encode_numeric_binary` is
+  the inverse. Pure i128 accumulator (no bignum dep). Wired into both
+  `extq::substitute::decode_binary_param` (Bind path) and
+  `extq::binary_results::encode_binary_value` (Execute result path);
+  `binary_format_supported_for_oid` + `binary_result_supported_for_oid`
+  predicates now include PG_TYPE_NUMERIC. Out-of-range rejects with
+  `SP-PG-EXTQ-BIN-NUMERIC-BIGNUM` follow-up arc name; NaN rejects with
+  `SP-PG-EXTQ-BIN-NUMERIC-NAN`; `+Inf`/`-Inf` (PG 14+) rejects with
+  `SP-PG-EXTQ-BIN-NUMERIC-INF`. COPY-BIN's NUMERIC pre-reject is
+  preserved (explicit `oid == PG_TYPE_NUMERIC` check layered before
+  the `binary_format_supported_for_oid` consultation so
+  `SP-PG-COPY-BIN-NUMERIC` remains a clean independently-enablable
+  follow-up). **HEADLINE — psycopg2 + asyncpg `Decimal` round-trip
+  on vulcan PASS**: `[(1, Decimal('42')), (2, Decimal('100')),
+  (3, Decimal('0')), (4, Decimal('-7')), (5, Decimal('999999999'))]`
+  decode end-to-end through the new NUMERIC binary codec on the
+  RESULT side; asyncpg's binary-RESULT path (the failure shape that
+  motivated SP-PG-EXTQ-BIN-RESULTS) now also succeeds for NUMERIC
+  columns. +29 KATs (+23 binary_numeric module covering every
+  canonical example + every rejection branch + 1000-iteration random
+  rational round-trip identity sweep; +6 wiring KATs — substitute +
+  binary_results integration + Bind admission flip). Named V2
+  follow-ups: `SP-PG-EXTQ-BIN-NUMERIC-BIGNUM` (arbitrary-precision —
+  PG NUMERIC is essentially unbounded; needs bignum dep or
+  arbitrary-precision integer type), `SP-PG-EXTQ-BIN-NUMERIC-NAN`
+  (NaN binary — engine has no native NaN representation),
+  `SP-PG-EXTQ-BIN-NUMERIC-INF` (`+Infinity`/`-Infinity` binary — same
+  engine limitation), `SP-PG-COPY-BIN-NUMERIC` (NUMERIC inside COPY
+  binary framing — different recovery semantics). Commits: `c637519`
+  (T1+T2 design spec + codec + 23 KATs), `07c5ddb` (T3 wiring into
+  substitute + binary_results + COPY-BIN admission preservation +
+  6 wiring KATs), `27b87f7` (T4 vulcan smoke + USAGE update + smoke
+  script + transcript). Workspace tests: `kessel-pg-gateway` lib
+  +29 KATs net. seed-7 GREEN; zero new external deps;
+  `#![forbid(unsafe_code)]` honored; HTTP/1.1 + WS + binary +
+  PG-wire-Simple + PG-wire-Extended (text + binary params + binary
+  RESULTS) surfaces byte-untouched for every previously-supported
+  type (NUMERIC was V1-Unsupported, so the new path is strictly
+  additive). Smoke transcript:
+  `docs/superpowers/sppgextqbinnumeric-t4-smoke-2026-06-02.txt`.
+  **Arc closed — TaskList #367 ready for completion.**
 - **Track A.-2 — CHAR(N) padding-aware equality + range (SP-CHAR-PAD-COMPARE V1 SHIPPED at T2 — 2026-06-02).**
   Closes the V2 follow-up named in the SP-PG-EXTQ-BIN-RESULTS T3
   smoke (`docs/superpowers/sppgextqbinr-t3-smoke-2026-06-01.txt`

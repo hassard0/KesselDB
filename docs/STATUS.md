@@ -10,6 +10,44 @@ covered by the workspace test suite (2048 default / 2059 with
 
 **Tonight's delivery (2026-06-01) — coherent state of the union:**
 
+- **Track A.0 — PostgreSQL Extended Query binary-format RESULTS (SP-PG-EXTQ-BIN-RESULTS V1 SHIPPED at T3).**
+  Symmetric companion to SP-PG-EXTQ-BIN V1 — closes the asterisk on the
+  asyncpg row of the USAGE §9 ORM matrix. asyncpg / JDBC default extended
+  mode / sqlx request `result_formats=[1]` (every column binary) at Bind
+  time; V1 (pre-arc) emitted text DataRow and the drivers mis-decoded
+  with "insufficient data in buffer". This arc adds `extq::binary_results`
+  with an `encode_binary_value` per-OID encoder (mirror of the V1 BIN
+  decoder), `rewrite_data_row_with_formats` that re-encodes each
+  buffered DataRow per the PG length conventions (0 codes = all text,
+  1 code = all-same, N codes = per-column), and
+  `rewrite_row_description_with_formats` that flips the per-field
+  `format_code` slot in RowDescription in lockstep. `dispatch_execute`
+  runs the rewrite after `split_dispatch_query_bytes`; NULL columns
+  + text columns pass through unchanged; the post-processor is zero-
+  cost for the existing text-only path (every prior text-format KAT
+  passes byte-for-byte). Rewritten DataRows persist in
+  `ExecState::Buffered` so re-Execute serves binary directly without
+  re-encoding. New `ExtqError::BinaryResultEncodeFailed` variant maps
+  to SQLSTATE `0A000` with the V2 follow-up arc name (NUMERIC →
+  `SP-PG-EXTQ-BIN-NUMERIC`; JSONB/UUID/ARRAY → `SP-PG-EXTQ-BIN-
+  EXTRA`). Pure-Rust `days_from_civil` (inverse of V1's
+  `civil_from_days`; Howard Hinnant public-domain) for the
+  TIMESTAMPTZ encode; no new external deps. **HEADLINE — asyncpg 0.31
+  `conn.fetch("SELECT * FROM t")` now PASSES on vulcan; the 2-row
+  round-trip returned `[(42, 'first'), (43, 'second')]` decoded as
+  native Python types**, confirming binary RowDescription + binary
+  DataRow are coherent on the wire. The BIN T3 asterisk is REMOVED
+  from USAGE §9. +45 pg-gateway lib KATs (T1 binary encoder +
+  rewriters + parse helpers + round-trip identity +39; T2
+  dispatch_execute post-processing + 6). Smoke transcript:
+  `docs/superpowers/sppgextqbinr-t3-smoke-2026-06-01.txt`. Named V2
+  follow-ups: `SP-PG-EXTQ-BIN-NUMERIC` (binary NUMERIC),
+  `SP-PG-EXTQ-BIN-EXTRA` (JSONB/UUID/ARRAY), `SP-PG-EXTQ-CAST`
+  (gateway-side `::int8` cast rewrite — for parameterized INSERT into
+  INT), `SP-CHAR-PAD-COMPARE` (engine-side EQ-on-Char NUL-padding
+  fix surfaced by the T3 smoke), `SP-PG-JDBC-SMOKE` (JDBC round-trip
+  once vulcan has JDK). **Arc closed — TaskList #356 ready for
+  completion.**
 - **Track A.1 — PostgreSQL Extended Query binary-format params (SP-PG-EXTQ-BIN V1 SHIPPED at T3).**
   Lifts the V1 SP-PG-EXTQ §4 / §11 weak-spot #1 binary-format-parameter
   rejection for the common PG scalar types (INT2/INT4/INT8/FLOAT4/FLOAT8/

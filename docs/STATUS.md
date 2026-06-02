@@ -143,6 +143,74 @@ at dispatch entry, JDBC simple-mode unblocked.
   Progress tracker:
   `docs/superpowers/specs/2026-06-02-kesseldb-subproject-sppgextqparsed-progress.md`
   → V1 CLOSED. **TaskList #374 ready for completion.**
+- **Track K cont. — SP-Cloud-Cluster-METRICS-EXPAND (2026-06-02,
+  V1 ARC CLOSED — proper `kesseldb_view_changes_total` counter +
+  `kesseldb_replica_lag_opnum` gauge + cluster-mode `/v1/metrics`
+  HTTP endpoint + PrometheusRule rewrite).** Closes the named V2
+  follow-up that the SP-Cloud-Cluster V1 T7 ship explicitly called
+  out — the `delta(kesseldb_view_number[5m]) > 5` surrogate
+  miscounts across replica restarts because the view-number gauge
+  resets. **T1**: `kessel-vsr::Replica` gains
+  `view_changes_total: u64` (bumped via a centralized
+  `advance_view_to` helper that funnels every previous
+  `self.view = ...` site — 6 in total) and `last_primary_op_seen: u64`
+  (captured from inbound `Msg::Prepare`, reset on view change).
+  Public accessors `view_changes_total()` + `replica_lag_opnum()`
+  (returns 0 on primary; `saturating_sub(op_number())` on backup).
+  2 new vsr KATs + 27/27 existing tests stay green. **T2**:
+  `MetricsSnapshot` grows `view_changes_total` + `replica_lag_opnum`
+  fields (additive); `metrics_writer::render` emits 2 new HELP/TYPE/
+  sample blocks; single-node `EngineHandle` emits both as 0
+  honestly. `cluster::Node::metrics_probe()` returns a
+  `ClusterMetricsSnapshot` via a new `Ev::MetricsProbe` event.
+  `cluster::serve_metrics_http(listener, node)` is a minimal
+  HTTP/1.1 server (no keep-alive, no body parsing) that serves
+  `GET /v1/metrics` (Prometheus text v0.0.4) + `GET /v1/health`
+  (JSON liveness) + 404 for anything else. `run_cluster_cfg`
+  honors `KESSELDB_HTTP_ADDR` to bind the metrics endpoint as a
+  sibling listener; SQL/Op gateway surfaces in cluster mode
+  remain a documented V2 follow-up (the same one
+  SP-Cloud-Cluster V1 named). 1 new cluster KAT covers the
+  rendered surface across all three replicas. **T3**:
+  `PrometheusRule.yaml` swaps `delta(kesseldb_view_number[5m]) > 5`
+  for `rate(kesseldb_view_changes_total[5m]) > 1` — proper
+  counter shape that survives replica restart via Prometheus's
+  standard counter-reset detection in `rate()`. Adds
+  `KesselDBReplicaLag` alert (`kesseldb_replica_lag_opnum > 100`
+  for 60s, severity warning); the gauge resets to 0 on every view
+  change so planned failover does NOT page. `values.yaml`
+  comment block updated to drop the V1 surrogate caveat.
+  **T4 vulcan verification**: 3-replica cluster spawn (HTTP on
+  :6330/:6331/:6332, client on :6540/:6541/:6542, peer on
+  :6532/:6533/:6534 — the brief's `127.0.0.1:653$i` client
+  mapping collided with peer addrs on loopback so distinct ports
+  were used). Pre-kill: all 3 replicas show
+  `view_changes_total=0`, view=0; replica 0 is primary. **`kill`
+  the primary → sleep 4 → re-scrape**: replica 1 is now primary
+  in view 1 with `view_changes_total=1` (THE HEADLINE); replica
+  2 still backup in view 1 with `view_changes_total=1` as well.
+  `/v1/health` returns the expected JSON; unknown paths return
+  HTTP 404. **Honest limits**: (a) `replica_lag_opnum` accuracy
+  is bounded by Prepare cadence — a quiet primary leaves the
+  gauge stale at the last Prepare's op_number; (b)
+  `view_changes_total` is per-process and resets on replica
+  restart, which Prometheus's `rate()` handles via counter-reset
+  detection; (c) the cluster-mode HTTP endpoint serves
+  observability only (SQL/Op gateway in cluster mode is still a
+  V2 follow-up). **Invariants preserved**: default single-pod
+  path byte-identical when `KESSELDB_HTTP_ADDR` is unset (the
+  default); HTTP/1.1 single-node gateway SQL/Op surfaces byte-
+  untouched (this arc only added 2 fields, both 0 in single-node
+  mode); WS + binary + PG-wire surfaces byte-untouched;
+  `#![forbid(unsafe_code)]` honored; zero new external deps.
+  **KAT delta**: +3 net (2 vsr + 1 cluster). Two commits:
+  `92f17ae` (T1+T2 — vsr counter + cluster /v1/metrics endpoint),
+  `25ac248` (T3 — PrometheusRule swap to proper counter + new
+  ReplicaLag alert). Progress tracker:
+  `docs/superpowers/specs/2026-06-02-kesseldb-subproject-spcloudcluster-metricsexpand-progress.md`.
+  Vulcan transcript:
+  `docs/superpowers/spcloudcluster-metricsexpand-vulcan-2026-06-02.txt`.
+  **TaskList #379 ready for completion (V1 arc DONE).**
 - **Track K cont. — SP-Cloud-Cluster T7+T8 (2026-06-02, V1 ARC
   CLOSED — Prometheus ServiceMonitor + PrometheusRule + USAGE +
   README + STATUS).** Closes the SP-Cloud-Cluster V1 arc. T7 adds
@@ -808,6 +876,66 @@ at dispatch entry, JDBC simple-mode unblocked.
   additive). Smoke transcript:
   `docs/superpowers/sppgcopybinnumeric-t3-smoke-2026-06-02.txt`.
   **Arc closed — TaskList #370 ready for completion.**
+- **Track A.-1.6 — PostgreSQL Extended Query binary-format NUMERIC special values (SP-PG-EXTQ-BIN-NUMERIC-NAN-INF V1 SHIPPED at T4 — 2026-06-02).**
+  Closes the two V2 follow-ups named in SP-PG-EXTQ-BIN-NUMERIC V1
+  (2026-06-02) design spec §2.2 — `SP-PG-EXTQ-BIN-NUMERIC-NAN` and
+  `SP-PG-EXTQ-BIN-NUMERIC-INF` — as a single combined arc. The V1
+  finite-NUMERIC codec rejected the 3 PG reserved sign codes (NaN
+  `0xC000`, +Infinity `0xD000`, -Infinity `0xF000`) with
+  `BinaryNumericError::NaN` / `BadSign` and the dispatcher surfaced
+  `0A000 SP-PG-EXTQ-BIN-NUMERIC-{NAN,INF}` on the wire. This arc lifts
+  the rejection at the codec layer: `decode_numeric_binary` now
+  returns `Ok("NaN")` / `Ok("Infinity")` / `Ok("-Infinity")` for the
+  3 special sign codes (canonical PG `numeric_out` strings);
+  `encode_numeric_binary` accepts the same strings (case-insensitive
+  plus short `inf` aliases per PG's `numeric_in`) and emits the
+  canonical 8-byte all-zero-data wire frame `[0, 0, sign_BE, 0]`. New
+  `NUMERIC_PINF` / `NUMERIC_NINF` sign-code constants in
+  `binary_numeric.rs`; new `encode_special(sign) -> Vec<u8>` helper.
+  `BinaryNumericError::NaN` variant preserved for source compatibility
+  but no longer constructed by the codec; the dispatcher boundary
+  arm in `extq::substitute::decode_numeric` is kept as a defensive
+  fallback. Malformed wires (special sign + non-zero `ndigits`) still
+  reject via `BadSign` as a protocol violation; unknown sign codes
+  (not POS/NEG/NAN/PINF/NINF) still reject via `BadSign`. **HEADLINE —
+  psycopg2 + asyncpg `Decimal('NaN')` / `Decimal('Infinity')` /
+  `Decimal('-Infinity')` on vulcan: codec-layer PASS**. Both drivers
+  now send the wire frames through to the codec and the codec
+  accepts them; the downstream INSERT rejection is engine-level
+  (`FieldKind::I128` has no native NaN/Inf representation —
+  kessel-sql rejects `'NaN'` as a literal for an I128 column with
+  `DatatypeMismatch: literal/column type mismatch`) or asyncpg-side
+  (client-side encoder type-mismatch on its inferred parameter
+  type). Neither failure mode names the codec arc — the codec layer
+  is no longer the failure point. +12 KATs net (+9 binary_numeric
+  module covering all 3 specials × decode + encode + case-insensitive
+  variants + round-trip identity + malformed-special-wire reject +
+  unknown-sign reject + non-special look-alike reject; +2 substitute
+  dispatcher KATs for +Inf / -Inf decode; +1 binary_results KAT for
+  all 3 specials encoded through the dispatcher boundary). 2 V1
+  rejection KATs flipped to acceptance KATs (`t2_decode_nan_rejected`
+  → `t2sp_decode_nan_returns_nan_string`,
+  `t3num_decode_numeric_nan_rejects_with_followup_arc` →
+  `t3num_decode_numeric_nan_returns_nan_string_through_codec`).
+  Workspace tests: `kessel-pg-gateway::extq::binary_numeric` 25 → 37
+  (+12); `kessel-pg-gateway` lib total 850 → 862. **Engine-level
+  storage of NUMERIC specials remains a deliberately-deferred
+  follow-up** — no arc name yet because the engine-design decision
+  (new `FieldKind::Numeric` variant vs side-channel
+  `is_special` flag) hasn't been made; preserved as a clean,
+  independently-enablable arc when a downstream surface needs it.
+  Commits: `cbfdf24` (T1+T2 design spec + codec change + 12 KATs net),
+  `94920a0` (T3 vulcan smoke + USAGE update + smoke script +
+  transcript), plus this commit (T4 — STATUS row + arc closure).
+  seed-7 GREEN; default tree-grep EMPTY; zero new external deps;
+  `#![forbid(unsafe_code)]` honored; HTTP/1.1 + WS + binary +
+  PG-wire-Simple + PG-wire-Extended (text + binary params + binary
+  RESULTS) surfaces byte-untouched for every finite NUMERIC value
+  (the new specials path is strictly additive — V1 finite wire
+  frames decode byte-identically; V1 finite encode output is
+  byte-equal). Smoke transcript:
+  `docs/superpowers/sppgextqbinnumericnaninf-t3-smoke-2026-06-02.txt`.
+  **Arc closed — TaskList #380 ready for completion.**
 - **Track A.-2 — CHAR(N) padding-aware equality + range (SP-CHAR-PAD-COMPARE V1 SHIPPED at T2 — 2026-06-02).**
   Closes the V2 follow-up named in the SP-PG-EXTQ-BIN-RESULTS T3
   smoke (`docs/superpowers/sppgextqbinr-t3-smoke-2026-06-01.txt`

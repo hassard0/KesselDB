@@ -95,8 +95,12 @@ After this arc:
 Optional / V2 follow-ups (each its own arc):
 
 - **SP-PG-EXTQ-BIN-NUMERIC-BIGNUM (V2)** — arbitrary-precision NUMERIC.
-- **SP-PG-EXTQ-BIN-NUMERIC-NAN (V2)** — NaN binary support.
-- **SP-PG-EXTQ-BIN-NUMERIC-INF (V2)** — ±Infinity binary (PG 14+).
+- ~~**SP-PG-EXTQ-BIN-NUMERIC-NAN (V2)**~~ — **CLOSED at V1
+  (2026-06-02) by SP-PG-EXTQ-BIN-NUMERIC-NAN-INF** (combined with INF) —
+  see `2026-06-02-kesseldb-subproject-sppgextqbinnumericnaninf-progress.md`.
+- ~~**SP-PG-EXTQ-BIN-NUMERIC-INF (V2)**~~ — **CLOSED at V1
+  (2026-06-02) by SP-PG-EXTQ-BIN-NUMERIC-NAN-INF** (combined with NAN) —
+  see `2026-06-02-kesseldb-subproject-sppgextqbinnumericnaninf-progress.md`.
 - ~~**SP-PG-COPY-BIN-NUMERIC (preserved)**~~ — **CLOSED at V1
   (2026-06-02)** — see
   `2026-06-02-kesseldb-subproject-sppgcopybinnumeric-progress.md`.

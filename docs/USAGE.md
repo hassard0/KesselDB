@@ -1981,6 +1981,33 @@ The remaining residual ORM gaps are:
   `SP-PG-EXTQ-CAST-VALIDATE-LITERAL` (validate literal casts too),
   `SP-PG-EXTQ-CAST-VALIDATE-CATEGORY-CROSS` (accept the cross-
   category casts PG itself accepts, e.g. TEXT '42' → INT8).
+- ~~SP-PG-EXTQ-CAST-VALIDATE V1 + COMPAT only validate `$N::TYPE`
+  casts — a `LITERAL::TYPE` cast (e.g. `SELECT 'hello'::int8`) is
+  silently stripped, so a cross-category literal cast that PG would
+  reject slips through whenever the value doesn't reach a typed
+  column.~~ → **CLOSED 2026-06-02 by SP-PG-EXTQ-CAST-VALIDATE-LITERAL
+  V1** — `cast_stripper::find_literal_cast_mismatch(sql)` classifies
+  the literal immediately before each `::` (bare integer → INT4/INT8,
+  bare float → FLOAT8, quoted string → TEXT, `true`/`false` → BOOL,
+  `NULL` → anytype) and compares its `types::oid_category` against the
+  cast type's category. The dispatchers (`dispatch_query`,
+  `dispatch_query_with_params`, `extq::dispatch_parse`) call it BEFORE
+  the strip rewrites the SQL; a cross-category literal cast rejects
+  with `42846 cannot_coerce` via the same wire frame the `$N`
+  validator uses, while `NULL::TYPE` accepts unconditionally (the
+  canonical typed-NULL idiom). Within-category casts (`1::int8`,
+  `'hello'::text`, `true::bool`, `-1::int8`) and `strip_pg_casts`'s
+  byte output are unchanged. **vulcan-verified** psql smoke
+  (`docs/superpowers/sppgextqcastvalidateliteral-t3-smoke-2026-06-02.txt`):
+  `1::int8` / `'hello'::text` accept; HEADLINE `'world'::int8`
+  (TEXT→INT8) and `true::int8` (BOOL→INT8) reject with the literal-
+  cast 42846 message; `NULL::int8` is NOT rejected by the validator.
+  +28 KATs (cast_stripper::tests + extq::tests). V2 follow-ups named:
+  `SP-PG-EXTQ-CAST-VALIDATE-LITERAL-EXPR` (literal casts inside
+  expressions, `(1+2)::int8`),
+  `SP-PG-EXTQ-CAST-VALIDATE-LITERAL-DATEPARSE` (`'2024-01-01'::date`),
+  `SP-PG-EXTQ-CAST-VALIDATE-LITERAL-NUMSTR` (`'42'::int8`),
+  `SP-PG-EXTQ-CAST-VALIDATE-LITERAL-MULTIWORD` (multi-word type names).
 
 #### Pipelining throughput (T8, 2026-05-29)
 
@@ -2024,6 +2051,8 @@ and post higher numbers; that's V2 `SP-PG-EXTQ-PIPELINE-BATCH`.
 - SP-PG-EXTQ-CAST-VALIDATE smoke transcript (V1 SHIPPED — HEADLINE: $N cast OID mismatch returns 42846 cannot_coerce via psycopg3 PQ-layer): `docs/superpowers/sppgextqcastvalidate-t3-smoke-2026-06-02.txt`
 - SP-PG-EXTQ-CAST-VALIDATE-COMPAT design spec: `docs/superpowers/specs/2026-06-02-kesseldb-sppgextqcastvalidatecompat-design.md`
 - SP-PG-EXTQ-CAST-VALIDATE-COMPAT smoke transcript (V1 SHIPPED — HEADLINE: pgJDBC INT4 param + INT8 cast accepted; cross-category TEXT + INT8 still rejects with 42846): `docs/superpowers/sppgextqcastvalidatecompat-t3-smoke-2026-06-02.txt`
+- SP-PG-EXTQ-CAST-VALIDATE-LITERAL design spec: `docs/superpowers/specs/2026-06-02-kesseldb-sppgextqcastvalidateliteral-design.md`
+- SP-PG-EXTQ-CAST-VALIDATE-LITERAL smoke transcript (V1 SHIPPED — HEADLINE: literal `'world'::int8` / `true::int8` reject with 42846; `1::int8` / `'hello'::text` accept; `NULL::int8` passes): `docs/superpowers/sppgextqcastvalidateliteral-t3-smoke-2026-06-02.txt`
 
 ### SP-PG-COPY — `COPY FROM STDIN` / `COPY TO STDOUT` bulk load (V1 SHIPPED 2026-05-30)
 

@@ -1,0 +1,35 @@
+=== SP-PG-EXTQ-CAST-VALIDATE-LITERAL T3 vulcan smoke ===
+Date: 2026-06-02T22:21:50Z
+HEAD: 02df4a0b837eea48709497fa513709e650acf140
+
+--- 1. CREATE TABLE (regression guard for V1 + COMPAT path) ---
+CREATE TABLE
+
+--- 2. INSERT with within-category literal casts (ACCEPT) ---
+INSERT 0 1
+
+--- 3. SELECT with within-category WHERE 1::int8 (regression guard) ---
+ id |   n   
+----+-------
+  1 | hello
+(1 row)
+
+
+--- 4. SELECT with within-category WHERE 'hello'::text (regression guard) ---
+ id |   n   
+----+-------
+  1 | hello
+(1 row)
+
+
+--- 5. HEADLINE: SELECT 'world'::int8 (cross-category — MUST reject 42846) ---
+ERROR:  cannot cast literal of category 'S' (OID 25) to type with OID 20 (category 'N')
+
+--- 6. true::int8 (BOOL→INT cross-category — MUST reject 42846) ---
+ERROR:  cannot cast literal of category 'B' (OID 16) to type with OID 20 (category 'N')
+
+--- 7. NULL::int8 (anytype — MUST not surface 42846 at gateway) ---
+ERROR:  sql: expected `FROM`
+(Note: engine-level error is OK — the literal validator did not reject; the message is NOT '42846 cannot_coerce')
+
+=== End of smoke ===

@@ -10,7 +10,13 @@ covered by the workspace test suite (2063 default / 2074 with
 KATs from the SP-CHAR-PAD-COMPARE V1 arc landed 2026-06-02 on top of
 +26 from the SP-PG-EXTQ-CAST V1 arc landed earlier the same day.
 SP-PG-JDBC-SMOKE (2026-06-02) is a verification-only arc that closes
-the JDBC residual; +0 KATs. SP-WHERE-VM-Specialise V1 (landed
+the JDBC residual; +0 KATs. SP-PG-EXTQ-DESCRIBE-VERSION V1 (landed
+2026-06-02) adds +18 KATs (15 lib + 3 dispatcher-integration) in
+`kessel-pg-gateway`. SP-PG-SQL-PAREN-VALUES V1 (landed 2026-06-02)
+adds +2 KAT functions / +13 assertions in `kessel-sql` (43 → 45 tests)
+closing the last residual the SP-PG-JDBC-SMOKE T2 transcript named —
+pgJDBC simple-mode `PreparedStatement` INSERT + WHERE round-trip
+end-to-end through the real driver. SP-WHERE-VM-Specialise V1 (landed
 2026-06-01) adds +17 KATs (15 kessel-expr lib + 2 kessel-sm
 SM-level) — the per-row WHERE evaluator now compiles to a closure
 once per query, cutting the dominant TPC-H Q1/Q6 wall-time cost.
@@ -189,6 +195,63 @@ once per query, cutting the dominant TPC-H Q1/Q6 wall-time cost.
   arc closure + progress tracker). Progress tracker
   `docs/superpowers/specs/2026-06-02-kesseldb-subproject-sppgextqdescribeversion-progress.md`
   → V1 SHIPPED. **TaskList #366 ready.**
+- **Track A.-1.3 — pgJDBC simple-mode `PreparedStatement` INSERT paren-wrapped VALUES (SP-PG-SQL-PAREN-VALUES V1 SHIPPED at T3 — 2026-06-02).**
+  Closes the first of two residual gaps SP-PG-JDBC-SMOKE T2 named:
+  simple-mode `PreparedStatement` INSERT failed because pgJDBC wraps
+  every substituted parameter in expression-grouping parens
+  (`VALUES (('42'::int8), ('hello-jdbc'))`). After the
+  SP-PG-EXTQ-CAST T2 stripper drops the `::int8` casts the
+  kessel-sql VALUES tuple parser saw
+  `VALUES (('42'), ('hello-jdbc'))` and errored with `expected
+  value`. PG treats `(LITERAL)` as expression grouping equivalent to
+  `LITERAL`; the VALUES tuple parser now does too. **HEADLINE —
+  pgJDBC simple-mode `PreparedStatement` INSERT + SELECT WHERE id =
+  ? round-trip end-to-end via real pgJDBC 42.7.4 on vulcan**:
+  `ALL TESTS PASS` for the full simple-mode CRUD chain (CREATE TABLE,
+  PreparedStatement INSERT setLong+setString, SELECT *,
+  PreparedStatement SELECT WHERE id = ?, SELECT version()). Transcript
+  at `docs/superpowers/sppgsqlparenvalues-t3-smoke-2026-06-02.txt`.
+  T1+T2 fix in `crates/kessel-sql/src/lib.rs`:
+  (a) VALUES tuple value parser walks a `while p.peek() ==
+  Some(Tok::Punct('('))` loop before each bare literal — depth-
+  counted (anti-stack-bomb cap at 9 levels: depth==8 accepted,
+  depth==9 rejected with `too many nested parens in VALUES`); the
+  closing `)`s are matched 1:1 by a trailing `for _ in 0..depth`
+  loop. When depth==0 (every prior KAT shape) the loop is a no-op so
+  the bare path is byte-identical pre-arc.
+  (b) `id` pseudo-column resolution + `lit_to_value` for numeric
+  column kinds coerce `Lit::Str("NN")` → numeric when the string
+  parses as a clean decimal `i128`. Mirrors the `'42'::int8`
+  semantic that the SP-PG-EXTQ-CAST stripper drops; without this
+  the post-strip `('42')` would compare String vs Int8 forever.
+  (c) WHERE term parser: new `term_hinted(p, ot, Option<FieldKind>)`
+  variant. `cmp_expr` derives the LHS column's `FieldKind` from the
+  `LOAD_FIELD=1` opcode shape and passes it as a hint to the RHS
+  `term_hinted`. When the column is numeric AND the literal is a
+  string-shaped int, the literal is pushed as Int instead of bytes.
+  Non-numeric columns (Char/Bytes/Ref) preserve byte semantics —
+  regression-guarded by K-PVAL-W3 (`WHERE name = 'hello'` still
+  matches the stored bytes). The paren-grouping in the WHERE was
+  already handled by the existing `(expr)` recursion in `term`.
+  KAT delta: **+2** test functions / **+13** assertions —
+  `paren_wrapped_values_literals` covers K-PVAL-1..10 (bare path
+  regression, 1/3/8-level paren accept, 9-level reject, mixed paren
+  +bare, multi-row paren VALUES, unbalanced paren rejection,
+  pseudo-id Str→Int coerce); `paren_wrapped_where_numeric_coercion`
+  covers K-PVAL-W1..3 (paren-wrapped + bare Str→Int on numeric LHS;
+  non-numeric LHS byte-regression). Total `kessel-sql` test count:
+  43 → 45. seed-7 GREEN; zero new external deps;
+  `#![forbid(unsafe_code)]` honored; HTTP/1.1 + WS + binary + PG-
+  wire surfaces byte-untouched (this is engine-side; the gateway
+  boundary is untouched). USAGE.md §9 ORM matrix JDBC row flipped
+  from "PASS\* + one residual gap (SP-PG-SQL-PAREN-VALUES)" to plain
+  "PASS — full CRUD in both modes". Three commits: `0558743` (T1+T2
+  — design spec + VALUES paren parser + KATs), `4bbb5d2` (T2 KAT
+  schema fix), `56fb59b` (T2 second-half — Str→numeric coercion +
+  WHERE term hint + T3 vulcan smoke + USAGE flip), plus this commit
+  (T4 — STATUS + arc closure + progress tracker). Progress tracker
+  `docs/superpowers/specs/2026-06-02-kesseldb-subproject-sppgsqlparenvalues-progress.md`
+  → V1 SHIPPED. **TaskList #365 ready.**
 - **Track L cont. — SP-Perf-A-SHARD-SCAN-LOCAL-INDEX-FUSION (2026-06-02,
   V1 SHIPPED — DONE_WITH_CONCERNS).** Closes the in-scope follow-up the
   TINY-INLINE forensics named: bypass `scatter_serial`'s `apply_op`

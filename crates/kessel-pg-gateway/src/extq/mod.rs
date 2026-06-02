@@ -389,6 +389,26 @@ pub enum ExtqError {
         /// `text`).
         actual: u32,
     },
+    /// SP-PG-EXTQ-CAST-VALIDATE-LITERAL T2 — a `LITERAL::TYPE` cast in
+    /// the Parse'd SQL has a literal whose natural type-category
+    /// disagrees with the cast type's category (e.g. `'hello'::int8`
+    /// — TEXT 'S' vs INT8 'N'). V1 + COMPAT only validated `$N::TYPE`
+    /// casts; this variant closes the literal-cast silent-strip hole.
+    /// Maps to SQLSTATE `42846 cannot_coerce`. Per spec §6 the
+    /// dispatcher also sets `error_state = true` so the pipeline
+    /// skips until Sync.
+    LiteralCastMismatch {
+        /// Inferred natural PG OID of the literal (e.g. 25 TEXT for
+        /// `'hello'`).
+        literal_oid: u32,
+        /// PG OID the SQL cast declared.
+        cast_oid: u32,
+        /// PG `typcategory` byte of the literal (see
+        /// `types::oid_category`).
+        literal_category: char,
+        /// PG `typcategory` byte of the cast type.
+        cast_category: char,
+    },
 }
 
 /// Outcome of dispatching one extq message. T2+ widens the
@@ -581,6 +601,22 @@ fn dispatch_parse(
     // silently.
     if !name.is_empty() && state.statements.contains_key(&name) {
         return ExtqOutcome::Failed(ExtqError::PreparedStatementAlreadyExists { name });
+    }
+
+    // SP-PG-EXTQ-CAST-VALIDATE-LITERAL T2 — reject any `LITERAL::TYPE`
+    // cast whose literal's natural type-category disagrees with the
+    // cast type's category (e.g. `'hello'::int8`) at Parse time.
+    // Surfaces `42846 cannot_coerce` BEFORE the SQL reaches Bind.
+    // First-mismatch-wins ordering matches the V1 + COMPAT `$N`
+    // validator's behaviour.
+    if let Some(m) = crate::cast_stripper::find_literal_cast_mismatch(&sql) {
+        state.error_state = true;
+        return ExtqOutcome::Failed(ExtqError::LiteralCastMismatch {
+            literal_oid: m.literal_oid,
+            cast_oid: m.cast_oid,
+            literal_category: m.literal_category,
+            cast_category: m.cast_category,
+        });
     }
 
     // SP-PG-EXTQ-CAST-VALIDATE T2 — extract the `$N::TYPE` cast pairs
@@ -5790,5 +5826,84 @@ mod tests {
             ExtqOutcome::Bytes(b) => assert_eq!(b, vec![b'2', 0, 0, 0, 4]),
             other => panic!("literal-cast Bind should succeed, got {other:?}"),
         }
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // SP-PG-EXTQ-CAST-VALIDATE-LITERAL T2 KATs — close the literal-
+    // cast silent-strip hole at the extq dispatch layer. Same
+    // SQLSTATE (42846 cannot_coerce) + error-state-set + skip-until-
+    // Sync invariants as the V1 + COMPAT `$N` validator.
+    // ───────────────────────────────────────────────────────────────
+
+    /// HEADLINE — Parse(`SELECT 'hello'::int8`) rejects with the new
+    /// `LiteralCastMismatch` variant at Parse time (BEFORE any Bind).
+    /// Closes the V1 + COMPAT silent-strip hole that `find_literal_
+    /// cast_mismatch` now plugs.
+    #[test]
+    fn cast_validate_literal_t2_parse_rejects_cross_category_with_42846() {
+        let mut state = SessionState::new();
+        let parse = proto::ExtqMessage::Parse {
+            name: "p".to_string(),
+            sql: "SELECT 'hello'::int8".to_string(),
+            param_oids: vec![],
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, parse) {
+            ExtqOutcome::Failed(ExtqError::LiteralCastMismatch {
+                literal_oid,
+                cast_oid,
+                literal_category,
+                cast_category,
+            }) => {
+                assert_eq!(literal_oid, PG_TYPE_TEXT);
+                assert_eq!(cast_oid, PG_TYPE_INT8);
+                assert_eq!(literal_category, 'S');
+                assert_eq!(cast_category, 'N');
+            }
+            other => panic!(
+                "expected LiteralCastMismatch at Parse time, got {other:?}"
+            ),
+        }
+        assert!(state.in_error_state());
+        // Statement MUST NOT have been installed (Parse rejected
+        // before the insert).
+        assert!(state.get_statement("p").is_none());
+    }
+
+    /// Regression — Parse(`SELECT 1::int8`) accepts (within-category).
+    /// Parent arc's psql smoke shape MUST still work.
+    #[test]
+    fn cast_validate_literal_t2_parse_accepts_int_cast_to_int8() {
+        let mut state = SessionState::new();
+        let parse = proto::ExtqMessage::Parse {
+            name: "p".to_string(),
+            sql: "SELECT 1::int8".to_string(),
+            param_oids: vec![],
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, parse) {
+            ExtqOutcome::Bytes(b) => {
+                // ParseComplete is `1 [length=4]`.
+                assert_eq!(b, vec![b'1', 0, 0, 0, 4]);
+            }
+            other => panic!("literal int cast must accept, got {other:?}"),
+        }
+        assert!(!state.in_error_state());
+        assert!(state.get_statement("p").is_some());
+    }
+
+    /// `NULL::TYPE` accepts unconditionally — Parse(`SELECT NULL::int8`)
+    /// produces ParseComplete, NOT a LiteralCastMismatch.
+    #[test]
+    fn cast_validate_literal_t2_parse_accepts_null_cast() {
+        let mut state = SessionState::new();
+        let parse = proto::ExtqMessage::Parse {
+            name: "p".to_string(),
+            sql: "SELECT NULL::int8".to_string(),
+            param_oids: vec![],
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, parse) {
+            ExtqOutcome::Bytes(b) => assert_eq!(b, vec![b'1', 0, 0, 0, 4]),
+            other => panic!("NULL cast must accept, got {other:?}"),
+        }
+        assert!(!state.in_error_state());
     }
 }

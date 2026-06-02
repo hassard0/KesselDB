@@ -917,6 +917,23 @@ pub fn run_session<
                                     pg_index = position + 1,
                                 ),
                             ),
+                            crate::extq::ExtqError::LiteralCastMismatch {
+                                literal_oid,
+                                cast_oid,
+                                literal_category,
+                                cast_category,
+                            } => (
+                                // SP-PG-EXTQ-CAST-VALIDATE-LITERAL T2 —
+                                // close the literal-cast silent-strip
+                                // hole the parent arc named as a
+                                // follow-up. Same SQLSTATE as
+                                // `CastOidMismatch` (the canonical
+                                // "cast not allowed" code).
+                                "42846",
+                                format!(
+                                    "cannot cast literal of category '{literal_category}' (OID {literal_oid}) to type with OID {cast_oid} (category '{cast_category}')"
+                                ),
+                            ),
                         };
                         // Same "stay alive" contract as the T1
                         // branch — emit ErrorResponse + RFQ and

@@ -215,6 +215,316 @@ pub fn strip_pg_casts_tracked(sql: &str) -> (String, Vec<(usize, u32)>) {
     (s, casts)
 }
 
+/// SP-PG-EXTQ-CAST-VALIDATE-LITERAL — describes a single cross-category
+/// literal cast detected by `find_literal_cast_mismatch`. The same data
+/// shape feeds both the simple-query dispatcher's `42846 cannot_coerce`
+/// renderer and the extended-query `ExtqError::LiteralCastMismatch`
+/// variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiteralCastMismatch {
+    /// Inferred natural PG OID of the literal preceding the `::`
+    /// operator. Picked by `classify_literal_natural_oid` from the
+    /// literal's shape (digits / quoted string / bool keyword / etc.).
+    pub literal_oid: u32,
+    /// PG OID the SQL cast declared (after the `::TYPE` identifier).
+    pub cast_oid: u32,
+    /// PG `typcategory` byte of the literal (see `types::oid_category`).
+    pub literal_category: char,
+    /// PG `typcategory` byte of the cast type.
+    pub cast_category: char,
+}
+
+/// SP-PG-EXTQ-CAST-VALIDATE-LITERAL — scan `sql` for any
+/// `LITERAL::TYPE` patterns whose literal natural category disagrees
+/// with the cast type's category. Returns the FIRST mismatch (first-
+/// mismatch-wins ordering — same as the `$N` validator) or `None` if
+/// every literal cast is within-category, the literal is `NULL`, or
+/// there are no literal casts at all.
+///
+/// V1 simplifications:
+/// - Only the bytes IMMEDIATELY before `::` are classified (not
+///   arbitrary expressions). `(1+2)::int8` falls through to V1's
+///   "strip + hope" because the `)` token has no natural type.
+/// - `NULL::TYPE` is always accepted (PG `NULL` is the canonical
+///   typed-NULL idiom; the literal has no natural type).
+/// - `$N::TYPE` is NEVER classified as a literal — the V1 + COMPAT
+///   `$N` validator covers it at Bind time.
+/// - String → date / string → numeric conversions PG accepts via its
+///   input-function machinery (e.g. `'42'::int8`, `'2024-01-01'::date`)
+///   are conservatively rejected here as cross-category. Lift in
+///   `SP-PG-EXTQ-CAST-VALIDATE-LITERAL-NUMSTR` /
+///   `SP-PG-EXTQ-CAST-VALIDATE-LITERAL-DATEPARSE`.
+///
+/// Called by `dispatch::dispatch_query`, `dispatch::dispatch_query_
+/// with_params`, and `extq::dispatch_parse` BEFORE running the strip;
+/// a `Some` result short-circuits the dispatch with a `42846
+/// cannot_coerce` ErrorResponse.
+pub fn find_literal_cast_mismatch(sql: &str) -> Option<LiteralCastMismatch> {
+    let bytes = sql.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    // `just_closed_string` tracks whether the byte we just appended to
+    // `out` closes a single-quoted string literal. We need this because
+    // by the time the scanner sees `::`, the closing `'` is already in
+    // `out` and the lookback at that byte sees a single `'` (which
+    // could be the open OR close of a string — only the state tells us).
+    let mut just_closed_string = false;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        // Single-quoted string literal — copy through to the closing
+        // quote, handling the doubled-quote escape `''` per PG §4.1.2.1.
+        // After the closing quote, set `just_closed_string = true` so
+        // the next `::` detection knows the preceding byte ends a TEXT
+        // literal (natural OID 25).
+        if b == b'\'' {
+            out.push(b);
+            i += 1;
+            let mut closed = false;
+            while i < bytes.len() {
+                let c = bytes[i];
+                out.push(c);
+                i += 1;
+                if c == b'\'' {
+                    // Doubled-quote: stay in the string.
+                    if i < bytes.len() && bytes[i] == b'\'' {
+                        out.push(b'\'');
+                        i += 1;
+                    } else {
+                        closed = true;
+                        break;
+                    }
+                }
+            }
+            just_closed_string = closed;
+            continue;
+        }
+
+        // Line comment `--` — copy through to the next newline. Inside
+        // a comment we can't be classifying a literal so `just_closed_string`
+        // is reset on any byte we emit here.
+        if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            just_closed_string = false;
+            while i < bytes.len() {
+                let c = bytes[i];
+                out.push(c);
+                i += 1;
+                if c == b'\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        // Block comment `/* ... */` — copy through.
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            just_closed_string = false;
+            out.push(bytes[i]);
+            out.push(bytes[i + 1]);
+            i += 2;
+            while i < bytes.len() {
+                if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    out.push(bytes[i]);
+                    out.push(bytes[i + 1]);
+                    i += 2;
+                    break;
+                }
+                out.push(bytes[i]);
+                i += 1;
+            }
+            continue;
+        }
+
+        // The cast itself: `::IDENT[(args)]`.
+        if b == b':' && i + 1 < bytes.len() && bytes[i + 1] == b':' {
+            // SP-PG-EXTQ-CAST-VALIDATE-LITERAL — classify the bytes
+            // immediately before the `::`. `just_closed_string` carries
+            // the only context the lookback needs that `out` alone can't
+            // give (since `'` is symmetric).
+            let literal_oid =
+                classify_literal_natural_oid(&out, just_closed_string);
+            // Reset the string-just-closed flag now that we've consumed
+            // it for the classification. Any further `'` will re-arm it.
+            just_closed_string = false;
+
+            i += 2; // skip `::`
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            let type_name_start = i;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
+            {
+                i += 1;
+            }
+            let type_name = &bytes[type_name_start..i];
+            // Skip the optional `(args)` for parameterised types.
+            if i < bytes.len() && bytes[i] == b'(' {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b')' {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+            }
+            // Now check for a literal-cast mismatch.
+            if let (Some(lit_oid), Some(cast_oid)) =
+                (literal_oid, type_name_to_oid(type_name))
+            {
+                // `lit_oid == 0` is the NULL sentinel — always accept.
+                if lit_oid != 0 {
+                    let lit_cat = crate::types::oid_category(lit_oid);
+                    let cast_cat = crate::types::oid_category(cast_oid);
+                    if lit_cat != cast_cat {
+                        return Some(LiteralCastMismatch {
+                            literal_oid: lit_oid,
+                            cast_oid,
+                            literal_category: lit_cat,
+                            cast_category: cast_cat,
+                        });
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Default: copy the byte through. Any non-`'` byte resets the
+        // string-just-closed flag — only an IMMEDIATELY-following `::`
+        // counts as a literal-cast on a string.
+        if !b.is_ascii_whitespace() {
+            just_closed_string = false;
+        }
+        out.push(b);
+        i += 1;
+    }
+    None
+}
+
+/// SP-PG-EXTQ-CAST-VALIDATE-LITERAL — classify the natural PG type
+/// OID of the literal IMMEDIATELY before the `::` cast operator,
+/// using only the bytes already emitted to the strip scanner's output
+/// buffer (`out`) plus the `just_closed_string` flag.
+///
+/// Returns:
+/// - `Some(0)` if the literal is `NULL` (case-insensitive). Caller
+///   special-cases zero as "anytype" and accepts unconditionally.
+/// - `Some(PG_TYPE_BOOL)` for `true` / `false` (case-insensitive).
+/// - `Some(PG_TYPE_TEXT)` if the byte preceding the `::` closes a
+///   single-quoted string literal (signalled by the caller via
+///   `just_closed_string`).
+/// - `Some(PG_TYPE_INT4)` for a bare integer fitting in i32.
+/// - `Some(PG_TYPE_INT8)` for a bare integer that overflows i32.
+/// - `Some(PG_TYPE_FLOAT8)` for a numeric literal containing a `.`.
+/// - `None` for anything else (identifier, `)`, `$N` placeholder, etc.
+///   `$N` returns `None` here — the V1 + COMPAT validator covers it
+///   at Bind time, and classifying it as a literal would double-record.
+fn classify_literal_natural_oid(
+    out: &[u8],
+    just_closed_string: bool,
+) -> Option<u32> {
+    // 1. String literal — the previous byte closed a single-quoted
+    //    string. We can short-circuit because the closing `'` is the
+    //    last byte in `out` and it can't be anything else.
+    if just_closed_string {
+        return Some(crate::proto::PG_TYPE_TEXT);
+    }
+
+    if out.is_empty() {
+        return None;
+    }
+
+    let last = out[out.len() - 1];
+
+    // 2. Identifier / keyword — last byte is an ASCII letter, digit, or
+    //    underscore, AND walking backwards we find a non-identifier
+    //    byte. Read it case-insensitively and match `NULL` / `TRUE` /
+    //    `FALSE`. (Digit-only suffix is handled below by the numeric
+    //    branch.)
+    if last.is_ascii_alphabetic() || last == b'_' {
+        // Walk back to the start of the identifier.
+        let mut j = out.len();
+        while j > 0
+            && (out[j - 1].is_ascii_alphanumeric() || out[j - 1] == b'_')
+        {
+            j -= 1;
+        }
+        let ident = &out[j..];
+        // Match case-insensitive against the known literal keywords.
+        if eq_ignore_ascii_case(ident, b"null") {
+            return Some(0); // anytype sentinel
+        }
+        if eq_ignore_ascii_case(ident, b"true")
+            || eq_ignore_ascii_case(ident, b"false")
+        {
+            return Some(crate::proto::PG_TYPE_BOOL);
+        }
+        // Other identifiers (column names, function names) are NOT
+        // classifiable literals — fall through to "no classification".
+        return None;
+    }
+
+    // 3. Bare integer / float — last byte is an ASCII digit. Walk back
+    //    over digits + optional single `.`. If we hit `$` first, it's
+    //    a `$N` placeholder — return None so the `$N` validator owns
+    //    it (V1 + COMPAT path).
+    if last.is_ascii_digit() {
+        let mut j = out.len();
+        let mut has_dot = false;
+        while j > 0 {
+            let c = out[j - 1];
+            if c.is_ascii_digit() {
+                j -= 1;
+            } else if c == b'.' && !has_dot {
+                has_dot = true;
+                j -= 1;
+            } else {
+                break;
+            }
+        }
+        // If the byte BEFORE the digits is `$`, it's a placeholder.
+        if j > 0 && out[j - 1] == b'$' {
+            return None;
+        }
+        // Bare numeric literal. Float if it contains a `.`.
+        if has_dot {
+            return Some(crate::proto::PG_TYPE_FLOAT8);
+        }
+        // Integer — INT4 if it fits in i32, INT8 otherwise. Use a
+        // signed parse so we don't accidentally over-allocate for
+        // i32::MAX + 1 etc.
+        let digits = &out[j..];
+        match std::str::from_utf8(digits).ok().and_then(|s| s.parse::<i64>().ok())
+        {
+            Some(n) if (i32::MIN as i64..=i32::MAX as i64).contains(&n) => {
+                Some(crate::proto::PG_TYPE_INT4)
+            }
+            Some(_) => Some(crate::proto::PG_TYPE_INT8),
+            // Overflow (very large multi-digit number) → INT8 still
+            // works as a category-only signal; we just bucket it as
+            // 'N' (numeric). pick INT8 so the OID is in the table.
+            None => Some(crate::proto::PG_TYPE_INT8),
+        }
+    } else {
+        None
+    }
+}
+
+/// ASCII case-insensitive byte slice equality. Tiny helper so we don't
+/// pull `std::ascii::AsciiExt` flows or allocate for case folding.
+fn eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    for (x, y) in a.iter().zip(b.iter()) {
+        if x.to_ascii_lowercase() != y.to_ascii_lowercase() {
+            return false;
+        }
+    }
+    true
+}
+
 /// SP-PG-EXTQ-CAST-VALIDATE T2 — inspect the tail of the strip
 /// scanner's output buffer for a `$N` placeholder immediately preceding
 /// the current position. Returns `Some(N - 1)` (zero-based parameter
@@ -692,5 +1002,212 @@ mod tests {
                 "type-name OID lookup failed for {sql:?}"
             );
         }
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-EXTQ-CAST-VALIDATE-LITERAL KATs — `find_literal_cast_mismatch`
+    // ───────────────────────────────────────────────────────────────────
+
+    /// Within-category numeric literal cast accepts. `1` is INT4 ('N'),
+    /// `int8` is INT8 ('N') — same category, no mismatch.
+    #[test]
+    fn literal_int_cast_accepts_within_numeric_category() {
+        assert_eq!(find_literal_cast_mismatch("SELECT 1::int8"), None);
+        assert_eq!(find_literal_cast_mismatch("SELECT 42::int4"), None);
+        assert_eq!(find_literal_cast_mismatch("SELECT 100::numeric"), None);
+    }
+
+    /// HEADLINE: cross-category 'S' string literal cast into 'N' numeric
+    /// rejects. This is the V1 silent-strip hole this arc closes —
+    /// previously `SELECT 'hello'::int8` stripped to `SELECT 'hello'`
+    /// and the gateway didn't notice the bogus declaration.
+    #[test]
+    fn literal_string_cast_into_numeric_rejects() {
+        let m = find_literal_cast_mismatch("SELECT 'hello'::int8")
+            .expect("expected literal mismatch for 'hello'::int8");
+        assert_eq!(m.literal_oid, crate::proto::PG_TYPE_TEXT);
+        assert_eq!(m.cast_oid, crate::proto::PG_TYPE_INT8);
+        assert_eq!(m.literal_category, 'S');
+        assert_eq!(m.cast_category, 'N');
+    }
+
+    /// Float literal `1.5` is FLOAT8 ('N'); casting to INT8 ('N') is
+    /// same-category narrowing — accept at the gateway. The engine
+    /// type-checker handles any runtime overflow.
+    #[test]
+    fn literal_float_cast_into_numeric_accepts() {
+        assert_eq!(find_literal_cast_mismatch("SELECT 1.5::int8"), None);
+        assert_eq!(find_literal_cast_mismatch("SELECT 3.14::float4"), None);
+    }
+
+    /// `'hello'::text` is the canonical string-typed string literal —
+    /// 'S' ↔ 'S' accepts.
+    #[test]
+    fn literal_string_to_text_accepts() {
+        assert_eq!(find_literal_cast_mismatch("SELECT 'hello'::text"), None);
+        assert_eq!(find_literal_cast_mismatch("SELECT 'x'::varchar"), None);
+    }
+
+    /// Bool literals (`true` / `false`) cast to BOOL accept. Case-
+    /// insensitive on the keyword.
+    #[test]
+    fn literal_bool_to_bool_accepts() {
+        assert_eq!(find_literal_cast_mismatch("SELECT true::bool"), None);
+        assert_eq!(find_literal_cast_mismatch("SELECT false::boolean"), None);
+        assert_eq!(find_literal_cast_mismatch("SELECT TRUE::bool"), None);
+    }
+
+    /// `NULL::TYPE` accepts unconditionally regardless of cast type.
+    /// PG `NULL` is the canonical typed-NULL idiom (e.g. RowDescription
+    /// emit, COALESCE shape). Case-insensitive on the keyword.
+    #[test]
+    fn literal_null_cast_always_accepts() {
+        for sql in [
+            "SELECT NULL::int8",
+            "SELECT NULL::text",
+            "SELECT NULL::bytea",
+            "SELECT NULL::bool",
+            "SELECT NULL::timestamptz",
+            "SELECT null::int4",      // lowercase
+            "SELECT Null::numeric",   // mixed case
+        ] {
+            assert_eq!(
+                find_literal_cast_mismatch(sql),
+                None,
+                "NULL cast must always accept: {sql:?}"
+            );
+        }
+    }
+
+    /// `true::int8` is 'B' vs 'N' — cross-category mismatch.
+    #[test]
+    fn literal_bool_to_int_rejects() {
+        let m = find_literal_cast_mismatch("SELECT true::int8")
+            .expect("expected literal mismatch for true::int8");
+        assert_eq!(m.literal_oid, crate::proto::PG_TYPE_BOOL);
+        assert_eq!(m.cast_oid, crate::proto::PG_TYPE_INT8);
+        assert_eq!(m.literal_category, 'B');
+        assert_eq!(m.cast_category, 'N');
+    }
+
+    /// SQL has no `::` — no mismatch. Pure passthrough.
+    #[test]
+    fn literal_pure_passthrough_no_casts() {
+        assert_eq!(find_literal_cast_mismatch(""), None);
+        assert_eq!(
+            find_literal_cast_mismatch("SELECT 1 FROM t WHERE id = 42"),
+            None
+        );
+        assert_eq!(
+            find_literal_cast_mismatch("SELECT 'hello' FROM t"),
+            None
+        );
+    }
+
+    /// `$N::TYPE` is a placeholder cast — NOT classified as a literal.
+    /// The V1 + COMPAT `$N` validator owns this case at Bind time;
+    /// classifying it here would double-report.
+    #[test]
+    fn literal_dollar_param_cast_not_classified_as_literal() {
+        assert_eq!(find_literal_cast_mismatch("SELECT $1::int8"), None);
+        assert_eq!(
+            find_literal_cast_mismatch("WHERE id = $1::int8 AND n = $2::text"),
+            None
+        );
+        // Even a "would-be-mismatch" param ($1 declared param OID is
+        // unknown to this helper) doesn't fire — the lookback returns
+        // None because `$` is the byte before the digits.
+        assert_eq!(
+            find_literal_cast_mismatch("SELECT $1::bool"),
+            None
+        );
+    }
+
+    /// Mixed shape — `'hello'::int8 AND $1::text`. The string-literal
+    /// mismatch fires FIRST (before the `$N` validator runs at Bind
+    /// time). First-mismatch-wins ordering matches the V1 + COMPAT
+    /// `$N` validator's behaviour.
+    #[test]
+    fn literal_mismatch_first_wins_over_dollar_param() {
+        let m = find_literal_cast_mismatch(
+            "SELECT * FROM t WHERE n = 'hello'::int8 AND id = $1::text",
+        )
+        .expect("expected literal mismatch to fire before $N");
+        assert_eq!(m.literal_oid, crate::proto::PG_TYPE_TEXT);
+        assert_eq!(m.cast_oid, crate::proto::PG_TYPE_INT8);
+    }
+
+    /// String with PG-doubled-quote escape (`'O''Reilly'`) — still
+    /// classifies as TEXT. The `''` doesn't terminate the string
+    /// scanner per PG §4.1.2.1.
+    #[test]
+    fn literal_string_with_doubled_quote_classified_as_text() {
+        let m = find_literal_cast_mismatch("SELECT 'O''Reilly'::int8")
+            .expect("doubled-quote string is still TEXT");
+        assert_eq!(m.literal_oid, crate::proto::PG_TYPE_TEXT);
+        assert_eq!(m.cast_oid, crate::proto::PG_TYPE_INT8);
+    }
+
+    /// String literal cast INSIDE a string is NOT a real cast — the
+    /// scanner skips the entire literal. Locked here because a refactor
+    /// that drops the string-context handling would silently start
+    /// rejecting safe queries.
+    #[test]
+    fn literal_cast_inside_string_not_detected() {
+        // The entire `SELECT '$1::int8 inside'` is one TEXT literal —
+        // no `::` appears outside the string.
+        assert_eq!(
+            find_literal_cast_mismatch("SELECT '$1::int8 inside'"),
+            None
+        );
+        // And cast text inside a string literal followed by a real
+        // outside cast: the outside one classifies the closing `'`
+        // as a TEXT literal natural type.
+        let m = find_literal_cast_mismatch("SELECT 'a::b'::int8")
+            .expect("outside cast on a TEXT literal");
+        assert_eq!(m.literal_oid, crate::proto::PG_TYPE_TEXT);
+        assert_eq!(m.cast_oid, crate::proto::PG_TYPE_INT8);
+    }
+
+    /// Big integer (> i32::MAX) classifies as INT8 — same 'N' category
+    /// as INT8 cast, so no mismatch.
+    #[test]
+    fn literal_big_integer_classifies_as_int8_and_accepts_int8_cast() {
+        // 3_000_000_000 > i32::MAX = 2_147_483_647.
+        assert_eq!(
+            find_literal_cast_mismatch("SELECT 3000000000::int8"),
+            None
+        );
+        // And big-int into TEXT cast still rejects (cross-category).
+        let m =
+            find_literal_cast_mismatch("SELECT 3000000000::text")
+                .expect("big int into text rejects");
+        assert_eq!(m.literal_oid, crate::proto::PG_TYPE_INT8);
+        assert_eq!(m.cast_oid, crate::proto::PG_TYPE_TEXT);
+    }
+
+    /// Unknown type name (e.g. `weirdtype`) yields no mismatch — same
+    /// V1 "fall back to strip + hope for unknown types" decision the
+    /// `$N` validator made.
+    #[test]
+    fn literal_unknown_type_name_falls_through() {
+        assert_eq!(
+            find_literal_cast_mismatch("SELECT 'hello'::weirdtype"),
+            None
+        );
+    }
+
+    /// Comment context — cast-like text inside `--` or `/* */` does
+    /// NOT trigger the validator.
+    #[test]
+    fn literal_cast_inside_comment_not_detected() {
+        assert_eq!(
+            find_literal_cast_mismatch("-- 'hello'::int8 in line comment\nSELECT 1"),
+            None
+        );
+        assert_eq!(
+            find_literal_cast_mismatch("/* 'hello'::int8 in block */ SELECT 1"),
+            None
+        );
     }
 }

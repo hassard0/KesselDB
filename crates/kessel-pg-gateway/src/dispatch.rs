@@ -82,6 +82,14 @@ pub fn dispatch_query_with_params<E: EngineApply + ?Sized>(
     params: &[Option<Value>],
     engine: &E,
 ) -> Vec<u8> {
+    // SP-PG-EXTQ-CAST-VALIDATE-LITERAL T2 — reject any `LITERAL::TYPE`
+    // cast whose literal's natural type-category disagrees with the
+    // cast type's category (e.g. `'hello'::int8`) BEFORE the strip
+    // rewrites the SQL. Closes the V1 silent-strip hole that V1 +
+    // COMPAT only covered for `$N::TYPE` placeholder casts.
+    if let Some(mismatch) = crate::cast_stripper::find_literal_cast_mismatch(sql) {
+        return literal_cast_mismatch_response_then_rfq(&mismatch);
+    }
     let stripped = crate::cast_stripper::strip_pg_casts(sql);
     let sql = stripped.as_str();
     let mut out = Vec::new();
@@ -217,6 +225,14 @@ pub fn dispatch_query_with_params<E: EngineApply + ?Sized>(
 /// The caller (the query loop in `server::run_session`) writes the
 /// returned bytes to the TCP stream verbatim.
 pub fn dispatch_query<E: EngineApply + ?Sized>(sql: &str, engine: &E) -> Vec<u8> {
+    // SP-PG-EXTQ-CAST-VALIDATE-LITERAL T2 — reject cross-category
+    // literal casts (e.g. `'hello'::int8`) BEFORE the strip rewrites
+    // the SQL. The validator is a no-op when the SQL has no `::` or
+    // every cast is within-category, so every prior K-CAST KAT still
+    // passes byte-for-byte.
+    if let Some(mismatch) = crate::cast_stripper::find_literal_cast_mismatch(sql) {
+        return literal_cast_mismatch_response_then_rfq(&mismatch);
+    }
     // SP-PG-EXTQ-CAST T2 — strip PG `::TYPE[(args)]` type-cast
     // operator before any downstream dispatch. The strip is a no-op
     // for SQL without `::` so every prior text-only KAT still passes
@@ -421,6 +437,24 @@ pub fn error_response_then_rfq(severity: &str, sqlstate: &str, message: &str) ->
     out.extend_from_slice(&encode_error_response(severity, sqlstate, message));
     out.extend_from_slice(&encode_ready_for_query(b'I'));
     out
+}
+
+/// SP-PG-EXTQ-CAST-VALIDATE-LITERAL T2 — render a `LiteralCastMismatch`
+/// to the canonical `42846 cannot_coerce` ErrorResponse + RFQ pair
+/// the simple-query dispatchers return. Shares the wire shape with
+/// the V1 `CastOidMismatch` renderer in `server.rs` (only the message
+/// text differs: literal-shape names instead of parameter index).
+pub fn literal_cast_mismatch_response_then_rfq(
+    mismatch: &crate::cast_stripper::LiteralCastMismatch,
+) -> Vec<u8> {
+    let message = format!(
+        "cannot cast literal of category '{lit_cat}' (OID {lit_oid}) to type with OID {cast_oid} (category '{cast_cat}')",
+        lit_cat = mismatch.literal_category,
+        lit_oid = mismatch.literal_oid,
+        cast_oid = mismatch.cast_oid,
+        cast_cat = mismatch.cast_category,
+    );
+    error_response_then_rfq(SEVERITY_ERROR, "42846", &message)
 }
 
 /// Decode the row stream produced by `OpResult::Got` (which is

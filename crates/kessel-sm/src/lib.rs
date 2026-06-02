@@ -1601,6 +1601,29 @@ impl<V: Vfs> StateMachine<V> {
         let uncond = program
             == kessel_expr::Program::new().push_int(1).bytes().as_slice();
 
+        // SP-WHERE-VM-Specialise T2 — compile the WHERE program ONCE
+        // into a closure that captures pre-resolved field offsets +
+        // comparison ops. The closure is byte-equal to
+        // `kessel_expr::eval(program, &ot, rec)` per row (KAT-locked
+        // by `compile_filter_byte_equal_to_interpreter_over_random_rows`
+        // and the SM-level equivalence KAT below). On compile failure
+        // (Unsupported opcode, Malformed) we fall back to the
+        // interpreter per-row — same observable behavior as pre-arc.
+        //
+        // For the TPC-H Q6 4-predicate WHERE (Load >= a AND Load < b
+        // AND Load >= c AND Load < d), the compiled closure is ~4
+        // field reads + 4 i128 comparisons + && short-circuits —
+        // replacing ~80 Vec push/pop ops + 4 layout recomputes + 4
+        // linear field-id scans per row in the interpreter.
+        let filter_fn: Option<kessel_expr::FilterFn> = if uncond {
+            None
+        } else {
+            kessel_expr::compile_filter(program, &ot).ok()
+        };
+        // Cloneable program slice for the interpreter fallback path
+        // (when compile_filter returns Err on Unsupported opcodes).
+        let program_for_fallback: &[u8] = program;
+
         type ScalarAcc = (i128, i128, Option<i128>, Option<i128>);
 
         // Per-row fold update — used by both the serial small-scan
@@ -1608,10 +1631,15 @@ impl<V: Vfs> StateMachine<V> {
         // streaming-equivalence holds trivially).
         let fold_one = |acc: &mut ScalarAcc, rec: &[u8]| -> Result<(), String> {
             if !uncond {
-                match kessel_expr::eval(program, &ot, rec) {
-                    Ok(true) => {}
-                    Ok(false) => return Ok(()),
-                    Err(e) => return Err(format!("agg program: {e:?}")),
+                let keep = match &filter_fn {
+                    Some(f) => f(rec),
+                    None => match kessel_expr::eval(program_for_fallback, &ot, rec) {
+                        Ok(b) => b,
+                        Err(e) => return Err(format!("agg program: {e:?}")),
+                    },
+                };
+                if !keep {
+                    return Ok(());
                 }
             }
             acc.0 += 1;

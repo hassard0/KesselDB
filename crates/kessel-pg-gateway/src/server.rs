@@ -822,6 +822,23 @@ pub fn run_session<
                                     "binary-format result column at position {position} (type OID {type_oid}): {reason}"
                                 ),
                             ),
+                            crate::extq::ExtqError::CastOidMismatch {
+                                position,
+                                declared,
+                                actual,
+                            } => (
+                                // SP-PG-EXTQ-CAST-VALIDATE T2 — close
+                                // the V1 SP-PG-EXTQ-CAST "strip + hope"
+                                // silent-coercion vector. PG SQLSTATE
+                                // `42846 cannot_coerce` per
+                                // `errcodes.txt` is the canonical
+                                // "cast not allowed" code.
+                                "42846",
+                                format!(
+                                    "cannot cast parameter ${pg_index} from type with OID {actual} to declared cast type OID {declared}",
+                                    pg_index = position + 1,
+                                ),
+                            ),
                         };
                         // Same "stay alive" contract as the T1
                         // branch — emit ErrorResponse + RFQ and

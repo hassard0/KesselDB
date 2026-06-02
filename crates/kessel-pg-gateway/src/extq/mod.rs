@@ -187,6 +187,16 @@ pub struct PreparedStmt {
     /// type hints) or partial. V1 ignores at Bind/Execute but echoes
     /// them in Describe 'S' → ParameterDescription replies (T4).
     pub param_oids: Vec<u32>,
+    /// SP-PG-EXTQ-CAST-VALIDATE T2 — pairs of
+    /// `(zero_based_param_index, declared_cast_oid)` extracted from
+    /// the SQL text at Parse time by
+    /// `cast_stripper::strip_pg_casts_tracked`. Empty for SQL
+    /// without `$N::TYPE` casts (the common case). Consumed by
+    /// `dispatch_bind` to reject any mismatch between the bound
+    /// parameter OID and the declared cast OID with
+    /// `42846 cannot_coerce` (closing the V1 SP-PG-EXTQ-CAST "strip
+    /// + hope" silent-coercion attack vector).
+    pub param_casts: Vec<(usize, u32)>,
 }
 
 /// A portal (Bind output) — a prepared statement plus a binding of
@@ -357,6 +367,27 @@ pub enum ExtqError {
         position: usize,
         type_oid: u32,
         reason: String,
+    },
+    /// SP-PG-EXTQ-CAST-VALIDATE T2 — the bound parameter at this
+    /// position had a Parse-time type OID that disagrees with the
+    /// `::TYPE` cast declared for the same `$N` in the SQL text.
+    /// Closes the V1 SP-PG-EXTQ-CAST "strip + hope" silent-coercion
+    /// vector — a client that Binds a TEXT-typed `$1` against SQL
+    /// `... WHERE id = $1::int8` now gets a clean rejection instead
+    /// of a silent coerce-via-strip. Maps to SQLSTATE `42846
+    /// cannot_coerce` per spec §3 + PG `errcodes.txt`. Per spec §6
+    /// the dispatcher also sets `error_state = true` so the pipeline
+    /// skips until Sync.
+    CastOidMismatch {
+        /// Zero-based parameter index (matching `PreparedStmt.
+        /// param_oids` storage).
+        position: usize,
+        /// PG type OID declared by the `::TYPE` cast in the SQL text
+        /// (e.g. `20` for `::int8`).
+        declared: u32,
+        /// PG type OID actually supplied at Parse time (e.g. `25` for
+        /// `text`).
+        actual: u32,
     },
 }
 
@@ -552,9 +583,18 @@ fn dispatch_parse(
         return ExtqOutcome::Failed(ExtqError::PreparedStatementAlreadyExists { name });
     }
 
+    // SP-PG-EXTQ-CAST-VALIDATE T2 — extract the `$N::TYPE` cast pairs
+    // from the SQL text so `dispatch_bind` can validate each bound
+    // parameter's OID against the declared cast OID. The stored `sql`
+    // stays the ORIGINAL (un-stripped) text; the downstream dispatcher
+    // strips it again at `dispatch_query` entry. Empty for SQL
+    // without `$N::TYPE` casts (the common case; the call is cheap +
+    // pre-allocates only as much as it strips).
+    let (_, param_casts) = crate::cast_stripper::strip_pg_casts_tracked(&sql);
+
     state
         .statements
-        .insert(name, PreparedStmt { sql, param_oids });
+        .insert(name, PreparedStmt { sql, param_oids, param_casts });
     ExtqOutcome::Bytes(response::encode_parse_complete())
 }
 
@@ -627,10 +667,18 @@ fn dispatch_bind(
     //    next mutations. SP-PG-EXTQ-BIN T2 — the OIDs are now used at
     //    Bind time (not just Execute) so the binary-format admission
     //    check can verify each binary parameter has a supported type.
-    let (expected_param_count, prep_param_oids) = match state.statements.get(&stmt) {
-        Some(prep) => (prep.param_oids.len(), prep.param_oids.clone()),
-        None => return set_err(state, ExtqError::UnknownStatement { name: stmt }),
-    };
+    //    SP-PG-EXTQ-CAST-VALIDATE T2 — also capture `param_casts` so
+    //    the validator step below can reject mismatched param OIDs
+    //    with `42846 cannot_coerce`.
+    let (expected_param_count, prep_param_oids, prep_param_casts) =
+        match state.statements.get(&stmt) {
+            Some(prep) => (
+                prep.param_oids.len(),
+                prep.param_oids.clone(),
+                prep.param_casts.clone(),
+            ),
+            None => return set_err(state, ExtqError::UnknownStatement { name: stmt }),
+        };
 
     // 2. Binary-format admission per PG length conventions (§4) +
     //    SP-PG-EXTQ-BIN T2 per-position OID dispatch. The length
@@ -679,6 +727,39 @@ fn dispatch_bind(
                 actual: param_values.len(),
             },
         );
+    }
+
+    // SP-PG-EXTQ-CAST-VALIDATE T2 — validate every tracked
+    // `$N::TYPE` cast against the Parse-supplied parameter OID at
+    // the same position. Closes the V1 "strip + hope" silent-
+    // coercion vector: a client that Binds a TEXT-typed `$1`
+    // against SQL `... WHERE id = $1::int8` now gets a clean
+    // `42846 cannot_coerce` rejection instead of a silent strip-
+    // and-coerce.
+    //
+    // V1 of THIS arc enforces STRICT OID equality. V2
+    // `SP-PG-EXTQ-CAST-VALIDATE-COMPAT` could relax this to PG's
+    // type-category compatibility table.
+    //
+    // Skip rule: when Parse omitted the OID hint for this position
+    // (= 0 = "infer"), we DON'T reject — the omitted hint is the
+    // client's explicit signal "trust the SQL". asyncpg / psycopg3
+    // exercise this path; pgJDBC / psycopg2 always set both sides.
+    for &(index, declared_oid) in &prep_param_casts {
+        let actual_oid = prep_param_oids.get(index).copied().unwrap_or(0);
+        if actual_oid == 0 {
+            continue;
+        }
+        if actual_oid != declared_oid {
+            return set_err(
+                state,
+                ExtqError::CastOidMismatch {
+                    position: index,
+                    declared: declared_oid,
+                    actual: actual_oid,
+                },
+            );
+        }
     }
 
     // 4. Portal-name cap + collision. Fresh-name rule mirrors
@@ -1989,7 +2070,11 @@ mod tests {
         for i in 0..(MAX_PREPARED_STATEMENTS_PER_CONN - 1) {
             state.statements.insert(
                 format!("seed_{i}"),
-                PreparedStmt { sql: String::new(), param_oids: vec![] },
+                PreparedStmt {
+                    sql: String::new(),
+                    param_oids: vec![],
+                    param_casts: vec![],
+                },
             );
         }
         assert_eq!(state.statement_count(), MAX_PREPARED_STATEMENTS_PER_CONN - 1);
@@ -2038,12 +2123,17 @@ mod tests {
             PreparedStmt {
                 sql: "OLD".to_string(),
                 param_oids: vec![],
+                param_casts: vec![],
             },
         );
         for i in 0..(MAX_PREPARED_STATEMENTS_PER_CONN - 1) {
             state.statements.insert(
                 format!("named_{i}"),
-                PreparedStmt { sql: String::new(), param_oids: vec![] },
+                PreparedStmt {
+                    sql: String::new(),
+                    param_oids: vec![],
+                    param_casts: vec![],
+                },
             );
         }
         assert_eq!(state.statement_count(), MAX_PREPARED_STATEMENTS_PER_CONN);
@@ -5398,5 +5488,199 @@ mod tests {
         // Empty params still uses the typed path (with empty slice).
         assert_eq!(engine.typed_count(), 1);
         assert_eq!(engine.text_count(), 0);
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // SP-PG-EXTQ-CAST-VALIDATE T2 KATs — close the V1 SP-PG-EXTQ-CAST
+    // "strip + hope" silent-coercion vector.
+    // ───────────────────────────────────────────────────────────────
+
+    /// Parse with SQL containing `$1::int8` populates
+    /// `PreparedStmt.param_casts` with `[(0, 20)]`. Locks the
+    /// `dispatch_parse` integration with `cast_stripper::
+    /// strip_pg_casts_tracked`.
+    #[test]
+    fn cast_validate_t2_dispatch_parse_stores_cast_tracking() {
+        let mut state = SessionState::new();
+        let msg = proto::ExtqMessage::Parse {
+            name: "p".to_string(),
+            sql: "SELECT * FROM t WHERE id = $1::int8".to_string(),
+            param_oids: vec![PG_TYPE_INT8],
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
+            ExtqOutcome::Bytes(_) => {}
+            other => panic!("Parse should succeed, got {other:?}"),
+        }
+        let stored = state.get_statement("p").expect("p installed");
+        // Stored SQL is the ORIGINAL (un-stripped) text per spec §3.
+        assert_eq!(stored.sql, "SELECT * FROM t WHERE id = $1::int8");
+        assert_eq!(stored.param_oids, vec![PG_TYPE_INT8]);
+        // Tracking pair recorded: $1 (zero-based 0) -> INT8 (20).
+        assert_eq!(stored.param_casts, vec![(0, PG_TYPE_INT8)]);
+    }
+
+    /// HEADLINE: Bind with mismatched OID returns `42846 cannot_coerce`.
+    /// Parse(`SELECT * FROM t WHERE id = $1::int8`, param_oids=[TEXT])
+    /// + Bind → `ExtqError::CastOidMismatch { position: 0,
+    /// declared: 20, actual: 25 }`. Pre-arc this was a silent
+    /// strip-and-coerce; this arc closes the silent-coercion vector.
+    #[test]
+    fn cast_validate_t2_dispatch_bind_rejects_oid_mismatch_with_42846() {
+        let mut state = SessionState::new();
+        let parse = proto::ExtqMessage::Parse {
+            name: "p".to_string(),
+            sql: "SELECT * FROM t WHERE id = $1::int8".to_string(),
+            param_oids: vec![PG_TYPE_TEXT], // 25 — mismatches the cast (20).
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, parse) {
+            ExtqOutcome::Bytes(_) => {}
+            other => panic!("Parse should succeed, got {other:?}"),
+        }
+        let bind = proto::ExtqMessage::Bind {
+            portal: String::new(),
+            stmt: "p".to_string(),
+            param_formats: vec![FORMAT_CODE_TEXT],
+            param_values: vec![Some(b"42".to_vec())],
+            result_formats: vec![FORMAT_CODE_TEXT],
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, bind) {
+            ExtqOutcome::Failed(ExtqError::CastOidMismatch {
+                position,
+                declared,
+                actual,
+            }) => {
+                assert_eq!(position, 0);
+                assert_eq!(declared, PG_TYPE_INT8);
+                assert_eq!(actual, PG_TYPE_TEXT);
+            }
+            other => panic!("expected CastOidMismatch, got {other:?}"),
+        }
+        // Spec §6 — error_state engaged so subsequent pipelined
+        // messages skip until Sync.
+        assert!(state.in_error_state());
+        // Portal NOT installed.
+        assert_eq!(state.portal_count(), 0);
+    }
+
+    /// Bind with a matching declared OID succeeds. Locks the
+    /// happy-path: a client that pins `$1` as int8 AND writes
+    /// `$1::int8` in the SQL gets a clean BindComplete (no false-
+    /// positive rejection).
+    #[test]
+    fn cast_validate_t2_dispatch_bind_accepts_oid_match() {
+        let mut state = SessionState::new();
+        let parse = proto::ExtqMessage::Parse {
+            name: "p".to_string(),
+            sql: "SELECT * FROM t WHERE id = $1::int8".to_string(),
+            param_oids: vec![PG_TYPE_INT8],
+        };
+        try_dispatch_extq(&mut state, &NoSchemaEngine, parse);
+        let bind = proto::ExtqMessage::Bind {
+            portal: String::new(),
+            stmt: "p".to_string(),
+            param_formats: vec![FORMAT_CODE_TEXT],
+            param_values: vec![Some(b"42".to_vec())],
+            result_formats: vec![FORMAT_CODE_TEXT],
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, bind) {
+            ExtqOutcome::Bytes(b) => assert_eq!(b, vec![b'2', 0, 0, 0, 4]),
+            other => panic!("matching cast should succeed, got {other:?}"),
+        }
+        assert!(!state.in_error_state());
+        assert_eq!(state.portal_count(), 1);
+    }
+
+    /// When Parse omitted the OID hint for the cast position
+    /// (`param_oids[index] == 0`), the validator skips — the omitted
+    /// hint is the client's explicit signal "trust the SQL".
+    /// asyncpg / psycopg3 exercise this path.
+    #[test]
+    fn cast_validate_t2_dispatch_bind_skips_validation_when_parse_omitted_oid() {
+        let mut state = SessionState::new();
+        let parse = proto::ExtqMessage::Parse {
+            name: "p".to_string(),
+            sql: "SELECT * FROM t WHERE id = $1::int8".to_string(),
+            param_oids: vec![], // No OID hints — validator skips.
+        };
+        try_dispatch_extq(&mut state, &NoSchemaEngine, parse);
+        let bind = proto::ExtqMessage::Bind {
+            portal: String::new(),
+            stmt: "p".to_string(),
+            param_formats: vec![FORMAT_CODE_TEXT],
+            param_values: vec![Some(b"42".to_vec())],
+            result_formats: vec![FORMAT_CODE_TEXT],
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, bind) {
+            ExtqOutcome::Bytes(b) => assert_eq!(b, vec![b'2', 0, 0, 0, 4]),
+            other => panic!("omitted-OID Bind should succeed, got {other:?}"),
+        }
+        assert!(!state.in_error_state());
+    }
+
+    /// Multi-cast SQL: the FIRST mismatch wins (deterministic
+    /// rejection at the first divergent position). Locks the order-
+    /// independent error contract so a future re-ordering of the
+    /// validation loop can't silently shift which position the error
+    /// reports.
+    #[test]
+    fn cast_validate_t2_dispatch_bind_first_mismatch_reports_42846() {
+        let mut state = SessionState::new();
+        let parse = proto::ExtqMessage::Parse {
+            name: "p".to_string(),
+            // $1 declared as int8, $2 declared as text.
+            // Parse gives both as TEXT — both mismatch but the FIRST
+            // (position 0) is the one we report.
+            sql: "SELECT * FROM t WHERE a = $1::int8 AND b = $2::int8"
+                .to_string(),
+            param_oids: vec![PG_TYPE_TEXT, PG_TYPE_TEXT],
+        };
+        try_dispatch_extq(&mut state, &NoSchemaEngine, parse);
+        let bind = proto::ExtqMessage::Bind {
+            portal: String::new(),
+            stmt: "p".to_string(),
+            param_formats: vec![FORMAT_CODE_TEXT, FORMAT_CODE_TEXT],
+            param_values: vec![Some(b"1".to_vec()), Some(b"2".to_vec())],
+            result_formats: vec![FORMAT_CODE_TEXT],
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, bind) {
+            ExtqOutcome::Failed(ExtqError::CastOidMismatch { position, .. }) => {
+                assert_eq!(position, 0, "first-mismatch-wins");
+            }
+            other => panic!("expected CastOidMismatch, got {other:?}"),
+        }
+    }
+
+    /// Literal cast (`1::int8`) — no `$N` placeholder, so no tracking
+    /// pair, so the validator is a no-op. Regression guard for the
+    /// parent SP-PG-EXTQ-CAST arc — its psql smoke shape (`SELECT 1
+    /// FROM t WHERE id = 1::int8`) MUST still flow through the strip
+    /// without triggering the validator.
+    #[test]
+    fn cast_validate_t2_dispatch_literal_cast_does_not_trigger_validator() {
+        let mut state = SessionState::new();
+        let parse = proto::ExtqMessage::Parse {
+            name: "p".to_string(),
+            sql: "SELECT * FROM t WHERE id = 1::int8".to_string(),
+            param_oids: vec![], // No params at all.
+        };
+        try_dispatch_extq(&mut state, &NoSchemaEngine, parse);
+        let stored = state.get_statement("p").expect("p installed");
+        // Tracking vec is empty because literal cast has no $N.
+        assert!(
+            stored.param_casts.is_empty(),
+            "literal cast must NOT track: {:?}",
+            stored.param_casts
+        );
+        let bind = proto::ExtqMessage::Bind {
+            portal: String::new(),
+            stmt: "p".to_string(),
+            param_formats: vec![],
+            param_values: vec![],
+            result_formats: vec![],
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, bind) {
+            ExtqOutcome::Bytes(b) => assert_eq!(b, vec![b'2', 0, 0, 0, 4]),
+            other => panic!("literal-cast Bind should succeed, got {other:?}"),
+        }
     }
 }

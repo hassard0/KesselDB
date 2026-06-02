@@ -282,20 +282,23 @@ cluster:
 #     without 404-ing on unknown `kind: ServiceMonitor` /
 #     `kind: PrometheusRule`.
 #
-# V1 emitted metrics (see crates/kessel-http-gateway/src/metrics_writer.rs):
+# Emitted metrics (see crates/kessel-http-gateway/src/metrics_writer.rs
+# for the single-node surface, and crates/kesseldb-server/src/cluster.rs
+# `render_cluster_metrics_text` for the cluster-mode endpoint):
 #   kesseldb_ops_total{kind}                      counter
 #   kesseldb_inflight                             gauge
 #   kesseldb_last_op_number                       gauge
 #   kesseldb_view_number                          gauge (monotonic per replica)
 #   kesseldb_is_primary                           gauge (0 or 1)
-#   kesseldb_http_requests_total{path,status}     counter
+#   kesseldb_view_changes_total                   counter  (SP-Cloud-Cluster-METRICS-EXPAND)
+#   kesseldb_replica_lag_opnum                    gauge    (SP-Cloud-Cluster-METRICS-EXPAND)
+#   kesseldb_http_requests_total{path,status}     counter  (single-node gateway only)
 #
-# The V1 PrometheusRule wraps three alerts driven by those metrics
-# plus the Prometheus-injected `up{}` (scrape success). A dedicated
-# `kesseldb_view_changes_total` counter + cross-replica
-# `kesseldb_replica_lag_seconds` histogram are NAMED V2 follow-up
-# SP-Cloud-Cluster-METRICS-EXPAND in the design spec. The V1 rule
-# uses `delta(kesseldb_view_number[5m])` as the surrogate.
+# The PrometheusRule wraps four alerts driven by those metrics plus
+# the Prometheus-injected `up{}` (scrape success):
+# ClusterReplicaDown / NoPrimary / ViewChangeStorm (rate-based using
+# the proper counter shipped by SP-Cloud-Cluster-METRICS-EXPAND, not
+# the V1 gauge-delta surrogate) / ReplicaLag.
 # ─────────────────────────────────────────────────────────────────────
 monitoring:
   prometheus:

@@ -1,9 +1,9 @@
 {{- /*
-SP-Cloud-Cluster T7 — alerting rules.
+SP-Cloud-Cluster T7 + SP-Cloud-Cluster-METRICS-EXPAND — alerting rules.
 
-Renders a `monitoring.coreos.com/v1` PrometheusRule that wraps the
-two failure modes a 3- or 5-replica VSR cluster operator should
-actually be paged on:
+Renders a `monitoring.coreos.com/v1` PrometheusRule covering four
+failure modes a 3- or 5-replica VSR cluster operator should actually
+be paged on:
 
   1. KesselDBClusterReplicaDown   — `up{} == 0` for >30s. The
      Prometheus-injected `up` time-series is 1 when the scrape
@@ -18,15 +18,29 @@ actually be paged on:
      quorum loss). The 60s `for` window is longer than a normal
      view-change (≤5s with default `cluster.viewChangeTimeout`).
 
-  3. KesselDBViewChangeStorm      — `delta(kesseldb_view_number[5m])
-     > 5`. `kesseldb_view_number` is a monotonic gauge incremented
-     once per view-change; >5 view-changes in 5 minutes signals a
-     thrashing cluster (network jitter exceeding view-change
-     timeout, or repeated primary kills). V1 does NOT emit a
-     dedicated `kesseldb_view_changes_total` counter; the gauge
-     delta is the V1 surrogate. The named V2 follow-up arc
-     SP-Cloud-Cluster-METRICS-EXPAND ships a proper counter +
-     histogram for replica lag.
+  3. KesselDBViewChangeStorm      — `rate(kesseldb_view_changes_total[5m])
+     > 1`. `kesseldb_view_changes_total` is a monotonic per-process
+     counter bumped on every view advance (SP-Cloud-Cluster-METRICS-
+     EXPAND). A rate of >1 view-change/sec sustained for 5 minutes
+     signals a thrashing cluster (network jitter exceeding view-
+     change timeout, or repeated primary kills). Replaces the V1
+     surrogate `delta(kesseldb_view_number[5m]) > 5` — the surrogate
+     was vulnerable to replica restarts (the gauge resets) but the
+     counter survives via Prometheus's standard counter-reset
+     detection (replica restart still triggers a reset, but `rate()`
+     handles that explicitly).
+
+  4. KesselDBReplicaLag           — `kesseldb_replica_lag_opnum > 100`
+     for 60s. `kesseldb_replica_lag_opnum` is 0 on the primary and
+     a best-effort op-count lag on backups (derived from the
+     primary's op_number embedded in inbound Prepare messages).
+     Lag persistently >100 means a backup is failing to catch up
+     — most likely under a sustained network partition or a slow
+     disk on the backup. NOTE: this gauge resets to 0 on every view
+     change (the previous primary's op_number is no longer
+     meaningful), so a transient blip after a planned failover
+     does NOT page; the 60s `for` window is comfortably longer
+     than a view-change.
 
 The PrometheusRule is gated on the same two flags as the
 ServiceMonitor PLUS `.Values.monitoring.prometheus.rules.enabled`
@@ -68,12 +82,22 @@ spec:
             description: "No replica in the {{ .Release.Name }} cluster reports kesseldb_is_primary=1 for at least 60s. A healthy 3- or 5-replica VSR cluster should always have exactly one primary; sum==0 means view-change has not converged (network partition, quorum loss, or all-pods-down). Writes will return UNAVAILABLE until a primary is elected."
 
         - alert: KesselDBViewChangeStorm
-          expr: delta(kesseldb_view_number{job=~".*{{ include "kesseldb.fullname" . }}.*"}[5m]) > 5
+          expr: rate(kesseldb_view_changes_total{job=~".*{{ include "kesseldb.fullname" . }}.*"}[5m]) > 1
           for: 5m
           labels:
             severity: warning
             arc: sp-cloud-cluster
           annotations:
             summary: "KesselDB cluster {{ .Release.Name }} is view-changing repeatedly"
-            description: "Replica {{`{{ $labels.instance }}`}} observed more than 5 view-changes in the last 5 minutes. This usually means primary heartbeats are not arriving within `cluster.viewChangeTimeout` (default 5s) — check inter-pod network latency, node pressure, and consider raising the timeout for cross-zone deploys. V1 surrogate metric: `kesseldb_view_number` is a per-replica monotonic gauge; a dedicated counter ships under SP-Cloud-Cluster-METRICS-EXPAND."
+            description: "Replica {{`{{ $labels.instance }}`}} sustains a view-change rate >1/sec averaged over 5 minutes (`rate(kesseldb_view_changes_total[5m])`). This usually means primary heartbeats are not arriving within `cluster.viewChangeTimeout` (default 5s) — check inter-pod network latency, node pressure, and consider raising the timeout for cross-zone deploys. The counter is monotonic-per-process and resets on replica restart; Prometheus's standard counter-reset detection in `rate()` handles that cleanly."
+
+        - alert: KesselDBReplicaLag
+          expr: kesseldb_replica_lag_opnum{job=~".*{{ include "kesseldb.fullname" . }}.*"} > 100
+          for: 60s
+          labels:
+            severity: warning
+            arc: sp-cloud-cluster
+          annotations:
+            summary: "KesselDB replica {{`{{ $labels.instance }}`}} is lagging the primary"
+            description: "Replica {{`{{ $labels.instance }}`}} reports `kesseldb_replica_lag_opnum` > 100 sustained for at least 60s — the backup is falling behind the primary's op_number by >100 ops. Most common cause is a sustained network partition between this pod and the primary; less commonly, a slow disk on the backup. The gauge resets to 0 on every view change (the previous primary's op_number is no longer meaningful) so a brief blip during a planned failover does NOT page."
 {{- end }}

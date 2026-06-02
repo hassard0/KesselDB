@@ -74,6 +74,11 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
 
+use crate::proto::{
+    PG_TYPE_BOOL, PG_TYPE_BYTEA, PG_TYPE_FLOAT4, PG_TYPE_FLOAT8, PG_TYPE_INT2, PG_TYPE_INT4,
+    PG_TYPE_INT8, PG_TYPE_NUMERIC, PG_TYPE_TEXT, PG_TYPE_TIMESTAMPTZ, PG_TYPE_VARCHAR,
+};
+
 /// Errors the substitution can return. All map to SQLSTATE `08P01
 /// protocol_violation` at the dispatcher boundary — they indicate
 /// a client bug (mismatch between Parse SQL + Bind value count).
@@ -85,6 +90,300 @@ pub enum SubstituteError {
     /// count. Carries `index` (the requested 1-based index) and
     /// `available` (the portal's `param_values.len()`).
     ParamIndexOutOfBounds { index: usize, available: usize },
+}
+
+/// SP-PG-EXTQ-BIN T1 — errors from `decode_binary_param`. Each carries
+/// enough context for the dispatcher to render a precise client-facing
+/// SQLSTATE + message (the unsupported variants name the V2 follow-up
+/// arc so operators can grep for the gap).
+#[derive(Debug, PartialEq, Eq)]
+pub enum BinaryDecodeError {
+    /// Wire byte count doesn't match the declared type's fixed-size
+    /// requirement. Maps to SQLSTATE `08P01 protocol_violation` —
+    /// the client mismatched its type OID with the bound bytes.
+    /// Carries `type_oid`, the expected byte count, and the actual.
+    WrongLength {
+        type_oid: u32,
+        expected: usize,
+        actual: usize,
+    },
+    /// The bytes decode as a value that isn't valid for the declared
+    /// type — e.g. BOOL byte that's neither 0x00 nor 0x01, or a TEXT
+    /// payload that isn't valid UTF-8. Maps to SQLSTATE `22P02
+    /// invalid_text_representation` (same code PG uses).
+    BadValue { type_oid: u32, reason: &'static str },
+    /// V1 doesn't support this type in binary format yet. Carries
+    /// `type_oid` + the V2 follow-up arc name. Maps to SQLSTATE
+    /// `0A000 feature_not_supported` so clients fall back gracefully.
+    Unsupported { type_oid: u32, arc: &'static str },
+}
+
+/// SP-PG-EXTQ-BIN T1 — decode a binary-format parameter into the SQL-
+/// literal representation the substitute helper will splice into the
+/// rewritten SQL.
+///
+/// **Returns:** the BARE literal text (NOT single-quoted). The caller
+/// is responsible for wrapping in `'...'` and applying single-quote
+/// doubling for text-shaped output. The caller also adds the
+/// `::bytea` / `::timestamptz` SQL-cast suffix for the binary-only
+/// types whose literal text doesn't parse without a cast hint.
+///
+/// **Per-type contracts** (per PG §55.8 binary representations):
+///
+/// | type | OID | input bytes | output literal |
+/// |---|---|---|---|
+/// | BOOL | 16 | 1 byte 0x00/0x01 | `false` / `true` |
+/// | BYTEA | 17 | raw bytes | `\xHEX` (lowercase hex; caller wraps `'\\xHEX'::bytea`) |
+/// | INT2 | 21 | 2 bytes BE i16 | decimal string |
+/// | INT4 | 23 | 4 bytes BE i32 | decimal string |
+/// | INT8 | 20 | 8 bytes BE i64 | decimal string |
+/// | TEXT | 25 | UTF-8 | bare string (caller wraps `'...'` + escapes `'`) |
+/// | VARCHAR | 1043 | UTF-8 | bare string |
+/// | FLOAT4 | 700 | 4 bytes IEEE-754 BE | `{:?}` (round-trip-precise) |
+/// | FLOAT8 | 701 | 8 bytes IEEE-754 BE | `{:?}` (round-trip-precise) |
+/// | TIMESTAMPTZ | 1184 | 8 bytes BE i64 µs since 2000-01-01 UTC | ISO `YYYY-MM-DD HH:MM:SS.ffffff+00` (caller wraps `'...'::timestamptz`) |
+/// | NUMERIC | 1700 | varlena base-10000 | `BinaryDecodeError::Unsupported { arc: "SP-PG-EXTQ-BIN-NUMERIC" }` |
+/// | other | any | any | `BinaryDecodeError::Unsupported { arc: "SP-PG-EXTQ-BIN-EXTRA" }` |
+///
+/// **Why bare literals?** The caller already runs the resulting SQL
+/// through KesselDB's SQL parser, which accepts unquoted integer +
+/// float + bool literals natively. For TEXT/VARCHAR/BYTEA/TIMESTAMPTZ
+/// the literal text needs quoting (and for BYTEA/TIMESTAMPTZ a cast
+/// hint), but that's the SUBSTITUTE layer's responsibility — keeping
+/// the decoder pure (bytes → string, no SQL formatting) makes it
+/// trivially testable.
+pub fn decode_binary_param(bytes: &[u8], type_oid: u32) -> Result<String, BinaryDecodeError> {
+    match type_oid {
+        PG_TYPE_BOOL => decode_bool(bytes),
+        PG_TYPE_INT2 => decode_int2(bytes),
+        PG_TYPE_INT4 => decode_int4(bytes),
+        PG_TYPE_INT8 => decode_int8(bytes),
+        PG_TYPE_FLOAT4 => decode_float4(bytes),
+        PG_TYPE_FLOAT8 => decode_float8(bytes),
+        PG_TYPE_TEXT | PG_TYPE_VARCHAR => decode_text(bytes, type_oid),
+        PG_TYPE_BYTEA => Ok(decode_bytea(bytes)),
+        PG_TYPE_TIMESTAMPTZ => decode_timestamptz(bytes),
+        PG_TYPE_NUMERIC => Err(BinaryDecodeError::Unsupported {
+            type_oid,
+            arc: "SP-PG-EXTQ-BIN-NUMERIC",
+        }),
+        _ => Err(BinaryDecodeError::Unsupported {
+            type_oid,
+            arc: "SP-PG-EXTQ-BIN-EXTRA",
+        }),
+    }
+}
+
+/// True iff `type_oid` is one V1's `decode_binary_param` accepts
+/// (used by `dispatch_bind` to admit binary params for supported
+/// OIDs and reject the rest at Bind time, BEFORE the portal stores).
+pub fn binary_format_supported_for_oid(type_oid: u32) -> bool {
+    matches!(
+        type_oid,
+        PG_TYPE_BOOL
+            | PG_TYPE_INT2
+            | PG_TYPE_INT4
+            | PG_TYPE_INT8
+            | PG_TYPE_FLOAT4
+            | PG_TYPE_FLOAT8
+            | PG_TYPE_TEXT
+            | PG_TYPE_VARCHAR
+            | PG_TYPE_BYTEA
+            | PG_TYPE_TIMESTAMPTZ
+    )
+}
+
+/// V2 follow-up arc name for a given unsupported binary type OID.
+/// Used in dispatcher error messages so clients (and operators
+/// reading logs) see exactly which arc unlocks the gap.
+pub fn unsupported_binary_arc_for_oid(type_oid: u32) -> &'static str {
+    if type_oid == PG_TYPE_NUMERIC {
+        "SP-PG-EXTQ-BIN-NUMERIC"
+    } else {
+        "SP-PG-EXTQ-BIN-EXTRA"
+    }
+}
+
+fn decode_bool(bytes: &[u8]) -> Result<String, BinaryDecodeError> {
+    if bytes.len() != 1 {
+        return Err(BinaryDecodeError::WrongLength {
+            type_oid: PG_TYPE_BOOL,
+            expected: 1,
+            actual: bytes.len(),
+        });
+    }
+    match bytes[0] {
+        0x00 => Ok("false".to_string()),
+        0x01 => Ok("true".to_string()),
+        _ => Err(BinaryDecodeError::BadValue {
+            type_oid: PG_TYPE_BOOL,
+            reason: "BOOL binary byte must be 0x00 or 0x01",
+        }),
+    }
+}
+
+fn decode_int2(bytes: &[u8]) -> Result<String, BinaryDecodeError> {
+    if bytes.len() != 2 {
+        return Err(BinaryDecodeError::WrongLength {
+            type_oid: PG_TYPE_INT2,
+            expected: 2,
+            actual: bytes.len(),
+        });
+    }
+    let n = i16::from_be_bytes([bytes[0], bytes[1]]);
+    Ok(n.to_string())
+}
+
+fn decode_int4(bytes: &[u8]) -> Result<String, BinaryDecodeError> {
+    if bytes.len() != 4 {
+        return Err(BinaryDecodeError::WrongLength {
+            type_oid: PG_TYPE_INT4,
+            expected: 4,
+            actual: bytes.len(),
+        });
+    }
+    let n = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    Ok(n.to_string())
+}
+
+fn decode_int8(bytes: &[u8]) -> Result<String, BinaryDecodeError> {
+    if bytes.len() != 8 {
+        return Err(BinaryDecodeError::WrongLength {
+            type_oid: PG_TYPE_INT8,
+            expected: 8,
+            actual: bytes.len(),
+        });
+    }
+    let n = i64::from_be_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]);
+    Ok(n.to_string())
+}
+
+fn decode_float4(bytes: &[u8]) -> Result<String, BinaryDecodeError> {
+    if bytes.len() != 4 {
+        return Err(BinaryDecodeError::WrongLength {
+            type_oid: PG_TYPE_FLOAT4,
+            expected: 4,
+            actual: bytes.len(),
+        });
+    }
+    let f = f32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    // {:?} on f32 gives the shortest round-trip-precise decimal —
+    // matches Postgres's extra_float_digits=3 behavior closely enough
+    // for the SQL parser to accept and re-encode losslessly.
+    Ok(format!("{f:?}"))
+}
+
+fn decode_float8(bytes: &[u8]) -> Result<String, BinaryDecodeError> {
+    if bytes.len() != 8 {
+        return Err(BinaryDecodeError::WrongLength {
+            type_oid: PG_TYPE_FLOAT8,
+            expected: 8,
+            actual: bytes.len(),
+        });
+    }
+    let f = f64::from_be_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]);
+    Ok(format!("{f:?}"))
+}
+
+fn decode_text(bytes: &[u8], type_oid: u32) -> Result<String, BinaryDecodeError> {
+    std::str::from_utf8(bytes)
+        .map(|s| s.to_string())
+        .map_err(|_| BinaryDecodeError::BadValue {
+            type_oid,
+            reason: "TEXT/VARCHAR binary bytes must be valid UTF-8",
+        })
+}
+
+fn decode_bytea(bytes: &[u8]) -> String {
+    // PG bytea text format: `\xHEX` (lowercase). The caller wraps in
+    // single quotes + `::bytea` cast suffix.
+    let mut s = String::with_capacity(2 + bytes.len() * 2);
+    s.push('\\');
+    s.push('x');
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Convert PG binary TIMESTAMPTZ (i64 microseconds since
+/// 2000-01-01 00:00:00 UTC) to an ISO-8601 timestamp string with
+/// `+00` timezone suffix. PG's binary epoch is 30 years later than
+/// the Unix epoch (946684800 seconds), so we offset before formatting.
+///
+/// V1 ships a pure-Rust implementation (no chrono dep) to honor the
+/// zero-dep stance. The algorithm: split microseconds → seconds +
+/// subsecond microseconds; offset to Unix epoch; civil-from-days
+/// algorithm (Howard Hinnant date.h algorithm — patent-free, in
+/// public domain) to extract Y/M/D from the day count; format.
+fn decode_timestamptz(bytes: &[u8]) -> Result<String, BinaryDecodeError> {
+    if bytes.len() != 8 {
+        return Err(BinaryDecodeError::WrongLength {
+            type_oid: PG_TYPE_TIMESTAMPTZ,
+            expected: 8,
+            actual: bytes.len(),
+        });
+    }
+    let pg_micros = i64::from_be_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]);
+    // PG epoch = 2000-01-01 00:00:00 UTC. Unix epoch = 1970-01-01.
+    // Difference = 946684800 seconds = 946684800_000_000 µs.
+    const PG_EPOCH_OFFSET_MICROS: i64 = 946_684_800_000_000;
+    let unix_micros = pg_micros.checked_add(PG_EPOCH_OFFSET_MICROS).ok_or(
+        BinaryDecodeError::BadValue {
+            type_oid: PG_TYPE_TIMESTAMPTZ,
+            reason: "TIMESTAMPTZ binary overflows i64 microseconds",
+        },
+    )?;
+    // Split into seconds + microsecond remainder, normalizing for
+    // negative values (pre-1970 timestamps).
+    let (sec, micro) = if unix_micros >= 0 {
+        (unix_micros / 1_000_000, (unix_micros % 1_000_000) as u32)
+    } else {
+        // Floor division so the micro remainder is non-negative.
+        let q = unix_micros / 1_000_000;
+        let r = unix_micros % 1_000_000;
+        if r == 0 {
+            (q, 0u32)
+        } else {
+            (q - 1, (r + 1_000_000) as u32)
+        }
+    };
+    // Days since Unix epoch (1970-01-01).
+    let days = sec.div_euclid(86_400);
+    let sec_of_day = sec.rem_euclid(86_400) as u32;
+    let hh = sec_of_day / 3600;
+    let mm = (sec_of_day % 3600) / 60;
+    let ss = sec_of_day % 60;
+    let (y, m, d) = civil_from_days(days);
+    Ok(format!(
+        "{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}.{micro:06}+00"
+    ))
+}
+
+/// Howard Hinnant "civil_from_days" — convert days-since-1970-01-01
+/// to (year, month, day). Public domain. Correct for all i64 days
+/// (covers years -5,879,610 .. +5,879,611 — wildly beyond any real
+/// timestamp). Source: https://howardhinnant.github.io/date_algorithms.html
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    // Algorithm assumes the proleptic Gregorian calendar; March-based
+    // year so the leap day is at the end of the year.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let y_adj = if m <= 2 { y + 1 } else { y };
+    (y_adj, m, d)
 }
 
 /// Substitute `$N` placeholders in `sql` with the corresponding
@@ -565,5 +864,298 @@ mod tests {
         let params: Vec<Option<&[u8]>> = vec![Some(b"X")];
         let out = substitute_text_format_params(sql, &params).expect("ok");
         assert_eq!(out, "SELECT 'O''Brien', 'X'");
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-EXTQ-BIN T1 KATs — `decode_binary_param` per PG §55.8
+    // binary representations. Each KAT pins one supported PG type's
+    // decode shape against a canonical wire byte pattern.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// INT8 binary `[0x00 .. 0x00 0x64]` → SQL literal `100`.
+    #[test]
+    fn t1bin_decode_int8_binary_positive() {
+        let bytes = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64];
+        let out = decode_binary_param(&bytes, PG_TYPE_INT8).expect("ok");
+        assert_eq!(out, "100");
+    }
+
+    /// INT8 binary all-ones (-1 as i64) → SQL literal `-1`.
+    #[test]
+    fn t1bin_decode_int8_binary_negative() {
+        let bytes = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        let out = decode_binary_param(&bytes, PG_TYPE_INT8).expect("ok");
+        assert_eq!(out, "-1");
+    }
+
+    /// INT4 binary `0xFFFFFFFF` → SQL literal `-1`.
+    #[test]
+    fn t1bin_decode_int4_binary_negative() {
+        let bytes = [0xFF, 0xFF, 0xFF, 0xFF];
+        let out = decode_binary_param(&bytes, PG_TYPE_INT4).expect("ok");
+        assert_eq!(out, "-1");
+    }
+
+    /// INT2 binary 42 (`0x002A`) → SQL literal `42`.
+    #[test]
+    fn t1bin_decode_int2_binary() {
+        let bytes = [0x00, 0x2A];
+        let out = decode_binary_param(&bytes, PG_TYPE_INT2).expect("ok");
+        assert_eq!(out, "42");
+    }
+
+    /// BOOL binary `0x01` → SQL literal `true`.
+    #[test]
+    fn t1bin_decode_bool_true() {
+        let out = decode_binary_param(&[0x01], PG_TYPE_BOOL).expect("ok");
+        assert_eq!(out, "true");
+    }
+
+    /// BOOL binary `0x00` → SQL literal `false`.
+    #[test]
+    fn t1bin_decode_bool_false() {
+        let out = decode_binary_param(&[0x00], PG_TYPE_BOOL).expect("ok");
+        assert_eq!(out, "false");
+    }
+
+    /// BOOL binary with an invalid byte rejects with `BadValue`.
+    #[test]
+    fn t1bin_decode_bool_invalid_byte_rejects() {
+        let err = decode_binary_param(&[0x02], PG_TYPE_BOOL).unwrap_err();
+        match err {
+            BinaryDecodeError::BadValue { type_oid, .. } => {
+                assert_eq!(type_oid, PG_TYPE_BOOL);
+            }
+            other => panic!("expected BadValue, got {other:?}"),
+        }
+    }
+
+    /// FLOAT8 binary of π → SQL literal `3.141592653589793` (the
+    /// round-trip-precise shortest decimal Rust's `{:?}` produces).
+    #[test]
+    fn t1bin_decode_float8_pi() {
+        let bytes = std::f64::consts::PI.to_be_bytes();
+        let out = decode_binary_param(&bytes, PG_TYPE_FLOAT8).expect("ok");
+        assert_eq!(out, "3.141592653589793");
+    }
+
+    /// FLOAT4 binary of 1.5 → SQL literal `1.5`.
+    #[test]
+    fn t1bin_decode_float4() {
+        let bytes = 1.5f32.to_be_bytes();
+        let out = decode_binary_param(&bytes, PG_TYPE_FLOAT4).expect("ok");
+        assert_eq!(out, "1.5");
+    }
+
+    /// TEXT binary UTF-8 → bare UTF-8 string (caller wraps in quotes
+    /// + escapes single-quotes — decoder returns the raw string).
+    #[test]
+    fn t1bin_decode_text_utf8() {
+        let bytes = b"hello";
+        let out = decode_binary_param(bytes, PG_TYPE_TEXT).expect("ok");
+        assert_eq!(out, "hello");
+    }
+
+    /// TEXT binary with an embedded `'` → bare UTF-8 (caller does
+    /// the `'`→`''` doubling; decoder is escape-agnostic).
+    #[test]
+    fn t1bin_decode_text_with_quote_returns_raw() {
+        let bytes = b"hello'world";
+        let out = decode_binary_param(bytes, PG_TYPE_TEXT).expect("ok");
+        assert_eq!(out, "hello'world");
+    }
+
+    /// VARCHAR binary is the same shape as TEXT.
+    #[test]
+    fn t1bin_decode_varchar_utf8() {
+        let bytes = b"vcr";
+        let out = decode_binary_param(bytes, PG_TYPE_VARCHAR).expect("ok");
+        assert_eq!(out, "vcr");
+    }
+
+    /// TEXT binary with invalid UTF-8 bytes rejects with `BadValue`.
+    #[test]
+    fn t1bin_decode_text_invalid_utf8_rejects() {
+        let bytes = [0xFF, 0xFE, 0xFD];
+        let err = decode_binary_param(&bytes, PG_TYPE_TEXT).unwrap_err();
+        match err {
+            BinaryDecodeError::BadValue { type_oid, .. } => {
+                assert_eq!(type_oid, PG_TYPE_TEXT);
+            }
+            other => panic!("expected BadValue, got {other:?}"),
+        }
+    }
+
+    /// BYTEA binary `[0xDE, 0xAD]` → PG bytea text literal `\xdead`.
+    #[test]
+    fn t1bin_decode_bytea_hex() {
+        let out = decode_binary_param(&[0xDE, 0xAD], PG_TYPE_BYTEA).expect("ok");
+        assert_eq!(out, "\\xdead");
+    }
+
+    /// BYTEA empty bytes → bare `\x`.
+    #[test]
+    fn t1bin_decode_bytea_empty() {
+        let out = decode_binary_param(&[], PG_TYPE_BYTEA).expect("ok");
+        assert_eq!(out, "\\x");
+    }
+
+    /// TIMESTAMPTZ binary microseconds since PG epoch (2000-01-01 UTC)
+    /// → ISO timestamp string with `+00` suffix. The reference value
+    /// `2026-06-01 12:34:56.789012+00` is 832077296789012 µs after the
+    /// PG epoch (precomputed from the same algorithm).
+    #[test]
+    fn t1bin_decode_timestamptz_iso() {
+        // Compute the expected micros: seconds since PG epoch
+        // (2000-01-01 00:00:00 UTC) for 2026-06-01 12:34:56 UTC, then
+        // add 789012 µs of fractional seconds.
+        let days_2000_to_2026_06_01 = days_between_2000_and(2026, 6, 1);
+        let secs = days_2000_to_2026_06_01 as i64 * 86_400 + 12 * 3600 + 34 * 60 + 56;
+        let micros = secs * 1_000_000 + 789_012;
+        let bytes = micros.to_be_bytes();
+        let out = decode_binary_param(&bytes, PG_TYPE_TIMESTAMPTZ).expect("ok");
+        assert_eq!(out, "2026-06-01 12:34:56.789012+00");
+    }
+
+    /// TIMESTAMPTZ binary 0 µs since PG epoch → `2000-01-01 00:00:00.000000+00`.
+    #[test]
+    fn t1bin_decode_timestamptz_zero_is_pg_epoch() {
+        let bytes = 0i64.to_be_bytes();
+        let out = decode_binary_param(&bytes, PG_TYPE_TIMESTAMPTZ).expect("ok");
+        assert_eq!(out, "2000-01-01 00:00:00.000000+00");
+    }
+
+    /// TIMESTAMPTZ binary wrong length rejects with `WrongLength`.
+    #[test]
+    fn t1bin_decode_timestamptz_wrong_length_rejects() {
+        let err = decode_binary_param(&[0x00], PG_TYPE_TIMESTAMPTZ).unwrap_err();
+        match err {
+            BinaryDecodeError::WrongLength {
+                type_oid,
+                expected,
+                actual,
+            } => {
+                assert_eq!(type_oid, PG_TYPE_TIMESTAMPTZ);
+                assert_eq!(expected, 8);
+                assert_eq!(actual, 1);
+            }
+            other => panic!("expected WrongLength, got {other:?}"),
+        }
+    }
+
+    /// NUMERIC binary explicitly rejects with the named follow-up arc
+    /// `SP-PG-EXTQ-BIN-NUMERIC` so operators can grep for the gap.
+    #[test]
+    fn t1bin_decode_numeric_returns_unsupported_with_followup_arc() {
+        let err = decode_binary_param(&[0x00; 8], PG_TYPE_NUMERIC).unwrap_err();
+        match err {
+            BinaryDecodeError::Unsupported { type_oid, arc } => {
+                assert_eq!(type_oid, PG_TYPE_NUMERIC);
+                assert_eq!(arc, "SP-PG-EXTQ-BIN-NUMERIC");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    /// Unknown OIDs (e.g. JSONB 3802, UUID 2950) reject with the
+    /// generic follow-up arc `SP-PG-EXTQ-BIN-EXTRA`.
+    #[test]
+    fn t1bin_decode_unknown_oid_returns_unsupported() {
+        let err = decode_binary_param(&[0x00; 4], 3802 /* JSONB */).unwrap_err();
+        match err {
+            BinaryDecodeError::Unsupported { type_oid, arc } => {
+                assert_eq!(type_oid, 3802);
+                assert_eq!(arc, "SP-PG-EXTQ-BIN-EXTRA");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    /// INT8 binary with wrong length (7 bytes) rejects with `WrongLength`.
+    #[test]
+    fn t1bin_decode_int8_wrong_length_rejects() {
+        let err = decode_binary_param(&[0x00; 7], PG_TYPE_INT8).unwrap_err();
+        match err {
+            BinaryDecodeError::WrongLength {
+                type_oid,
+                expected,
+                actual,
+            } => {
+                assert_eq!(type_oid, PG_TYPE_INT8);
+                assert_eq!(expected, 8);
+                assert_eq!(actual, 7);
+            }
+            other => panic!("expected WrongLength, got {other:?}"),
+        }
+    }
+
+    /// `binary_format_supported_for_oid` accepts the V1 supported set
+    /// and rejects NUMERIC + unknown OIDs. Locked so a future drift
+    /// (e.g. forgetting TIMESTAMPTZ in the helper) can't silently
+    /// accept-then-fail-at-decode.
+    #[test]
+    fn t1bin_binary_format_supported_for_oid_matches_decoder() {
+        // Supported.
+        for oid in [
+            PG_TYPE_BOOL,
+            PG_TYPE_INT2,
+            PG_TYPE_INT4,
+            PG_TYPE_INT8,
+            PG_TYPE_FLOAT4,
+            PG_TYPE_FLOAT8,
+            PG_TYPE_TEXT,
+            PG_TYPE_VARCHAR,
+            PG_TYPE_BYTEA,
+            PG_TYPE_TIMESTAMPTZ,
+        ] {
+            assert!(
+                binary_format_supported_for_oid(oid),
+                "OID {oid} should be supported",
+            );
+        }
+        // Unsupported.
+        assert!(!binary_format_supported_for_oid(PG_TYPE_NUMERIC));
+        assert!(!binary_format_supported_for_oid(3802 /* JSONB */));
+        assert!(!binary_format_supported_for_oid(2950 /* UUID */));
+        assert!(!binary_format_supported_for_oid(0));
+    }
+
+    /// `unsupported_binary_arc_for_oid` names the right follow-up arc
+    /// for both the NUMERIC carve-out and the generic "extra types"
+    /// bucket.
+    #[test]
+    fn t1bin_unsupported_binary_arc_naming() {
+        assert_eq!(
+            unsupported_binary_arc_for_oid(PG_TYPE_NUMERIC),
+            "SP-PG-EXTQ-BIN-NUMERIC",
+        );
+        assert_eq!(
+            unsupported_binary_arc_for_oid(3802),
+            "SP-PG-EXTQ-BIN-EXTRA",
+        );
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // Test helpers — used by TIMESTAMPTZ KATs to compute days-between
+    // dates without pulling in chrono.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// Days between PG epoch (2000-01-01) and the given (y, m, d) in
+    /// the proleptic Gregorian calendar. Uses the inverse of
+    /// `civil_from_days` (Howard Hinnant's `days_from_civil`).
+    fn days_between_2000_and(y: i64, m: u32, d: u32) -> i64 {
+        days_from_civil(y, m, d) - days_from_civil(2000, 1, 1)
+    }
+
+    /// Howard Hinnant `days_from_civil`: convert (y, m, d) → days
+    /// since 1970-01-01 in the proleptic Gregorian calendar.
+    fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = if y >= 0 { y } else { y - 399 } / 400;
+        let yoe = (y - era * 400) as u64; // [0, 399]
+        let m = m as u64;
+        let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + (d as u64) - 1; // [0, 365]
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+        era * 146_097 + doe as i64 - 719_468
     }
 }

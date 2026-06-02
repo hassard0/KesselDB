@@ -794,6 +794,24 @@ pub fn run_session<
                                 "08P01",
                                 format!("parameter substitution failed: {reason}"),
                             ),
+                            crate::extq::ExtqError::BinaryFormatUnsupportedForType {
+                                position,
+                                type_oid,
+                                arc,
+                            } => (
+                                "0A000",
+                                format!(
+                                    "binary-format parameter at position {position} has type OID {type_oid} which is not supported in V1 (V2 {arc} lifts this)"
+                                ),
+                            ),
+                            crate::extq::ExtqError::BinaryFormatRequiresTypeOidHint {
+                                position,
+                            } => (
+                                "0A000",
+                                format!(
+                                    "binary-format parameter at position {position} requires a Parse-time type OID hint (V1 cannot decode without it)"
+                                ),
+                            ),
                         };
                         // Same "stay alive" contract as the T1
                         // branch — emit ErrorResponse + RFQ and

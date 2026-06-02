@@ -319,6 +319,28 @@ pub enum ExtqError {
     /// or the Bind value count is bugged on the client side.
     /// Carries a human-readable description for the wire message.
     SubstitutionFailed { reason: String },
+    /// SP-PG-EXTQ-BIN T2 — bound parameter at this position used the
+    /// binary format code (1) AND the type OID at the same position
+    /// isn't one V1's `decode_binary_param` supports. Carries the
+    /// position, the OID, and the V2 follow-up arc that unlocks the
+    /// gap (`SP-PG-EXTQ-BIN-NUMERIC` for NUMERIC, `SP-PG-EXTQ-BIN-
+    /// EXTRA` for JSONB/UUID/ARRAY/etc). Maps to SQLSTATE `0A000
+    /// feature_not_supported`. Per spec §3 + §6 the dispatcher also
+    /// sets `error_state = true` so the pipeline skips until Sync.
+    BinaryFormatUnsupportedForType {
+        position: usize,
+        type_oid: u32,
+        arc: &'static str,
+    },
+    /// SP-PG-EXTQ-BIN T2 — bound parameter at this position used the
+    /// binary format code (1) BUT Parse omitted the type OID hint at
+    /// that position (or supplied OID 0 = "infer"). V1 needs the OID
+    /// to dispatch the binary decoder; without it, the gateway can't
+    /// safely interpret the bytes. Maps to SQLSTATE `0A000
+    /// feature_not_supported`. Empirically asyncpg/JDBC always send
+    /// OID hints with binary format; psycopg3 too. So this rejection
+    /// is defensive — it catches a (rare) misbehaving client.
+    BinaryFormatRequiresTypeOidHint { position: usize },
 }
 
 /// Outcome of dispatching one extq message. T2+ widens the
@@ -583,39 +605,48 @@ fn dispatch_bind(
         ExtqOutcome::Failed(e)
     };
 
-    // 1. Resolve statement. Capture the expected param count so we
-    //    can drop the borrow on `state.statements` before the next
-    //    mutations.
-    let expected_param_count = match state.statements.get(&stmt) {
-        Some(prep) => prep.param_oids.len(),
+    // 1. Resolve statement. Capture the expected param count + OIDs
+    //    so we can drop the borrow on `state.statements` before the
+    //    next mutations. SP-PG-EXTQ-BIN T2 — the OIDs are now used at
+    //    Bind time (not just Execute) so the binary-format admission
+    //    check can verify each binary parameter has a supported type.
+    let (expected_param_count, prep_param_oids) = match state.statements.get(&stmt) {
+        Some(prep) => (prep.param_oids.len(), prep.param_oids.clone()),
         None => return set_err(state, ExtqError::UnknownStatement { name: stmt }),
     };
 
-    // 2. Binary-format rejection per PG length conventions (§4).
-    //    Bytes through the decoder are u16 already (the codes 0/1
-    //    fit in either signed or unsigned).
-    match param_formats.len() {
-        0 => {
-            // "All text" — no rejection possible.
+    // 2. Binary-format admission per PG length conventions (§4) +
+    //    SP-PG-EXTQ-BIN T2 per-position OID dispatch. The length
+    //    conventions (0 codes = all text, 1 code = all-same, N codes
+    //    = per-position) determine the effective format per position;
+    //    each position with `FORMAT_CODE_BINARY` must have a
+    //    Parse-supplied type OID that V1's `decode_binary_param`
+    //    accepts. Unknown OID + NUMERIC reject with precise V2-arc-
+    //    pointing messages (BinaryFormatUnsupportedForType); omitted
+    //    OID hint rejects with BinaryFormatRequiresTypeOidHint.
+    let param_count = param_values.len();
+    for pos in 0..param_count {
+        let effective_format = substitute::effective_format_code(&param_formats, pos);
+        if effective_format != crate::proto::FORMAT_CODE_BINARY {
+            continue;
         }
-        1 => {
-            // "Every position the same" — reject if that single
-            // code is binary. We use position 0 in the error so the
-            // client sees the offending position.
-            if param_formats[0] == crate::proto::FORMAT_CODE_BINARY {
-                return set_err(state, ExtqError::BinaryFormatNotSupported { position: 0 });
-            }
+        // This position is binary. We need a supported OID hint.
+        let type_oid = prep_param_oids.get(pos).copied().unwrap_or(0);
+        if type_oid == 0 {
+            return set_err(
+                state,
+                ExtqError::BinaryFormatRequiresTypeOidHint { position: pos },
+            );
         }
-        _ => {
-            // "Per-position" — find the first binary code.
-            for (i, code) in param_formats.iter().enumerate() {
-                if *code == crate::proto::FORMAT_CODE_BINARY {
-                    return set_err(
-                        state,
-                        ExtqError::BinaryFormatNotSupported { position: i },
-                    );
-                }
-            }
+        if !substitute::binary_format_supported_for_oid(type_oid) {
+            return set_err(
+                state,
+                ExtqError::BinaryFormatUnsupportedForType {
+                    position: pos,
+                    type_oid,
+                    arc: substitute::unsupported_binary_arc_for_oid(type_oid),
+                },
+            );
         }
     }
 
@@ -923,7 +954,10 @@ fn dispatch_execute<E: EngineApply + ?Sized>(
         };
 
     // 2. Statement lookup. Defensive — Bind already validated.
-    let (sql, _param_oids) = match state.statements.get(&stmt_name) {
+    //    SP-PG-EXTQ-BIN T2 — param_oids are now used at Execute time
+    //    too (passed to preprocess_params so the binary-format
+    //    decoder can dispatch per-position).
+    let (sql, param_oids) = match state.statements.get(&stmt_name) {
         Some(prep) => (prep.sql.clone(), prep.param_oids.clone()),
         None => {
             return set_err(
@@ -953,17 +987,49 @@ fn dispatch_execute<E: EngineApply + ?Sized>(
 
     match exec_state {
         ExecState::Pending => {
-            // 4. Parameter substitution.
-            let param_refs: Vec<Option<&[u8]>> = match state.portals.get(&portal_name) {
-                Some(p) => p.param_values.iter().map(|v| v.as_deref()).collect(),
-                None => {
-                    return set_err(
-                        state,
-                        ExtqError::UnknownPortal { name: portal_name },
-                    );
+            // 4. Parameter substitution. SP-PG-EXTQ-BIN T2 — the
+            //    preprocess step decodes binary-format params into
+            //    SQL-literal `PreparedParam`s using the per-position
+            //    OIDs from Parse; the substitute step then walks the
+            //    SQL with the format-aware renderer. Text-only Binds
+            //    flow through unchanged (preprocess returns Text
+            //    variants for every position).
+            let (param_refs, formats): (Vec<Option<&[u8]>>, Vec<u16>) =
+                match state.portals.get(&portal_name) {
+                    Some(p) => (
+                        p.param_values.iter().map(|v| v.as_deref()).collect(),
+                        p.param_formats.clone(),
+                    ),
+                    None => {
+                        return set_err(
+                            state,
+                            ExtqError::UnknownPortal { name: portal_name },
+                        );
+                    }
+                };
+            let prepared = match substitute::preprocess_params(&param_refs, &formats, &param_oids)
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    let reason = match e {
+                        substitute::SubstituteError::ZeroParamIndex => {
+                            "SQL referenced \\$0; PG \\$N indices are 1-based"
+                                .to_string()
+                        }
+                        substitute::SubstituteError::ParamIndexOutOfBounds {
+                            index,
+                            available,
+                        } => format!(
+                            "SQL referenced \\${index} but only {available} parameters were bound"
+                        ),
+                        substitute::SubstituteError::BinaryDecode { position, reason } => {
+                            format!("binary parameter at position {pos}: {reason}", pos = position + 1)
+                        }
+                    };
+                    return set_err(state, ExtqError::SubstitutionFailed { reason });
                 }
             };
-            let rewritten = match substitute::substitute_text_format_params(&sql, &param_refs) {
+            let rewritten = match substitute::substitute_params(&sql, &prepared) {
                 Ok(s) => s,
                 Err(e) => {
                     let reason = match e {
@@ -977,6 +1043,9 @@ fn dispatch_execute<E: EngineApply + ?Sized>(
                         } => format!(
                             "SQL referenced \\${index} but only {available} parameters were bound"
                         ),
+                        substitute::SubstituteError::BinaryDecode { position, reason } => {
+                            format!("binary parameter at position {pos}: {reason}", pos = position + 1)
+                        }
                     };
                     return set_err(state, ExtqError::SubstitutionFailed { reason });
                 }
@@ -1977,11 +2046,17 @@ mod tests {
         assert!(!state.in_error_state());
     }
 
-    /// Spec §4: a Bind with a per-position binary format code at
-    /// position 1 → `BinaryFormatNotSupported { position: 1 }` →
-    /// `0A000`. V2 SP-PG-EXTQ-BIN lifts this.
+    /// SP-PG-EXTQ-BIN T2 FLIP — was T3
+    /// `t3_dispatch_bind_binary_format_per_position_rejected`. After
+    /// T2 the binary-format Bind path no longer outright rejects
+    /// every binary param — it dispatches per-position based on the
+    /// Parse-time type OID. The original test bound binary WITHOUT
+    /// supplying type-OID hints, which now hits the
+    /// `BinaryFormatRequiresTypeOidHint` arm at the first binary
+    /// position. The OID-with-supported-type happy path is locked
+    /// by the `t2bin_*` KATs below.
     #[test]
-    fn t3_dispatch_bind_binary_format_per_position_rejected() {
+    fn t3bin_dispatch_bind_per_position_binary_without_oid_hint_rejected() {
         let mut state = SessionState::new();
         seed_stmt(&mut state, "", vec![]);
         let msg = proto::ExtqMessage::Bind {
@@ -1992,20 +2067,22 @@ mod tests {
             result_formats: vec![],
         };
         match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
-            ExtqOutcome::Failed(ExtqError::BinaryFormatNotSupported { position }) => {
+            ExtqOutcome::Failed(ExtqError::BinaryFormatRequiresTypeOidHint { position }) => {
                 assert_eq!(position, 1);
             }
-            other => panic!("expected BinaryFormatNotSupported, got {other:?}"),
+            other => panic!("expected BinaryFormatRequiresTypeOidHint, got {other:?}"),
         }
         assert_eq!(state.portal_count(), 0);
         assert!(state.in_error_state());
     }
 
-    /// Spec §4 length conventions: `1` format code means "every
-    /// position the same"; if that single code is binary, the
-    /// rejection points at position 0.
+    /// SP-PG-EXTQ-BIN T2 FLIP — was T3
+    /// `t3_dispatch_bind_single_binary_format_applies_to_all`. Same
+    /// rationale as the per-position FLIP above: "1 format code = all
+    /// positions binary" without OID hints now hits the missing-OID
+    /// branch at position 0.
     #[test]
-    fn t3_dispatch_bind_single_binary_format_applies_to_all() {
+    fn t3bin_dispatch_bind_single_binary_without_oid_hint_rejected() {
         let mut state = SessionState::new();
         seed_stmt(&mut state, "", vec![]);
         let msg = proto::ExtqMessage::Bind {
@@ -2016,12 +2093,188 @@ mod tests {
             result_formats: vec![],
         };
         match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
-            ExtqOutcome::Failed(ExtqError::BinaryFormatNotSupported { position }) => {
+            ExtqOutcome::Failed(ExtqError::BinaryFormatRequiresTypeOidHint { position }) => {
                 assert_eq!(position, 0);
             }
-            other => panic!("expected BinaryFormatNotSupported, got {other:?}"),
+            other => panic!("expected BinaryFormatRequiresTypeOidHint, got {other:?}"),
         }
         assert!(state.in_error_state());
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-EXTQ-BIN T2 KATs — binary-format admission @ Bind + per-
+    // position decode @ Execute. Lifts the V1 "binary always rejects"
+    // stance for the V1-supported PG types (INT2/INT4/INT8/FLOAT4/
+    // FLOAT8/BOOL/TEXT/VARCHAR/BYTEA/TIMESTAMPTZ). NUMERIC + unknown
+    // OIDs still reject (with precise V2-follow-up arc names).
+    // ───────────────────────────────────────────────────────────────────
+
+    /// SP-PG-EXTQ-BIN T2 — a Bind with INT8 binary format + an INT8
+    /// OID hint at the same position is ACCEPTED. The portal stores
+    /// the raw binary bytes; Execute decodes them via
+    /// `decode_binary_param` (locked by separate Execute KATs).
+    #[test]
+    fn t2bin_dispatch_bind_int8_binary_with_oid_hint_accepted() {
+        let mut state = SessionState::new();
+        seed_stmt(&mut state, "pi8", vec![PG_TYPE_INT8]);
+        // Wire bytes for INT8 binary 100.
+        let int8_bytes = 100i64.to_be_bytes().to_vec();
+        let msg = proto::ExtqMessage::Bind {
+            portal: "p".to_string(),
+            stmt: "pi8".to_string(),
+            param_formats: vec![FORMAT_CODE_BINARY],
+            param_values: vec![Some(int8_bytes.clone())],
+            result_formats: vec![],
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
+            ExtqOutcome::Bytes(b) => assert_eq!(b, vec![b'2', 0, 0, 0, 4]),
+            other => panic!("expected BindComplete, got {other:?}"),
+        }
+        assert_eq!(state.portal_count(), 1);
+        let p = state.get_portal("p").expect("portal stored");
+        assert_eq!(p.param_values, vec![Some(int8_bytes)]);
+        assert_eq!(p.param_formats, vec![FORMAT_CODE_BINARY]);
+        assert!(!state.in_error_state());
+    }
+
+    /// SP-PG-EXTQ-BIN T2 — every supported PG type accepts the binary
+    /// format with a matching OID hint. The decoder happy path is
+    /// locked separately in `substitute.rs`; this KAT only verifies
+    /// the Bind admission check accepts the same set.
+    #[test]
+    fn t2bin_dispatch_bind_every_supported_oid_accepts_binary() {
+        for (oid, dummy_bytes) in [
+            (PG_TYPE_BOOL, vec![0x01u8]),
+            (PG_TYPE_BYTEA, vec![0xDEu8, 0xAD]),
+            (PG_TYPE_INT2, vec![0x00, 0x2A]),
+            (PG_TYPE_INT4, vec![0xFF, 0xFF, 0xFF, 0xFF]),
+            (PG_TYPE_INT8, vec![0; 8]),
+            (PG_TYPE_FLOAT4, vec![0x3F, 0xC0, 0x00, 0x00]), // 1.5
+            (PG_TYPE_FLOAT8, vec![0; 8]),
+            (PG_TYPE_TEXT, b"hi".to_vec()),
+            (PG_TYPE_VARCHAR, b"vc".to_vec()),
+            (PG_TYPE_TIMESTAMPTZ, vec![0; 8]),
+        ] {
+            let mut state = SessionState::new();
+            seed_stmt(&mut state, "ps", vec![oid]);
+            let msg = proto::ExtqMessage::Bind {
+                portal: "p".to_string(),
+                stmt: "ps".to_string(),
+                param_formats: vec![FORMAT_CODE_BINARY],
+                param_values: vec![Some(dummy_bytes.clone())],
+                result_formats: vec![],
+            };
+            match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
+                ExtqOutcome::Bytes(b) => assert_eq!(
+                    b,
+                    vec![b'2', 0, 0, 0, 4],
+                    "OID {oid} should accept binary"
+                ),
+                other => panic!(
+                    "expected BindComplete for OID {oid}, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// SP-PG-EXTQ-BIN T2 — NUMERIC binary at Bind is rejected with
+    /// the precise `SP-PG-EXTQ-BIN-NUMERIC` follow-up arc name so
+    /// operators can grep for the gap.
+    #[test]
+    fn t2bin_dispatch_bind_numeric_binary_rejected_with_followup_arc() {
+        let mut state = SessionState::new();
+        seed_stmt(&mut state, "pn", vec![PG_TYPE_NUMERIC]);
+        let msg = proto::ExtqMessage::Bind {
+            portal: String::new(),
+            stmt: "pn".to_string(),
+            param_formats: vec![FORMAT_CODE_BINARY],
+            param_values: vec![Some(vec![0; 8])],
+            result_formats: vec![],
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
+            ExtqOutcome::Failed(ExtqError::BinaryFormatUnsupportedForType {
+                position,
+                type_oid,
+                arc,
+            }) => {
+                assert_eq!(position, 0);
+                assert_eq!(type_oid, PG_TYPE_NUMERIC);
+                assert_eq!(arc, "SP-PG-EXTQ-BIN-NUMERIC");
+            }
+            other => panic!("expected BinaryFormatUnsupportedForType, got {other:?}"),
+        }
+        assert_eq!(state.portal_count(), 0);
+        assert!(state.in_error_state());
+    }
+
+    /// SP-PG-EXTQ-BIN T2 — unknown OIDs (e.g. JSONB 3802) reject with
+    /// the generic `SP-PG-EXTQ-BIN-EXTRA` follow-up name.
+    #[test]
+    fn t2bin_dispatch_bind_unknown_oid_binary_rejected_with_extra_arc() {
+        let mut state = SessionState::new();
+        seed_stmt(&mut state, "pu", vec![3802 /* JSONB */]);
+        let msg = proto::ExtqMessage::Bind {
+            portal: String::new(),
+            stmt: "pu".to_string(),
+            param_formats: vec![FORMAT_CODE_BINARY],
+            param_values: vec![Some(vec![0; 4])],
+            result_formats: vec![],
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
+            ExtqOutcome::Failed(ExtqError::BinaryFormatUnsupportedForType {
+                position: _,
+                type_oid,
+                arc,
+            }) => {
+                assert_eq!(type_oid, 3802);
+                assert_eq!(arc, "SP-PG-EXTQ-BIN-EXTRA");
+            }
+            other => panic!("expected BinaryFormatUnsupportedForType, got {other:?}"),
+        }
+        assert!(state.in_error_state());
+    }
+
+    /// SP-PG-EXTQ-BIN T2 — a mix of text + binary formats with proper
+    /// OID hints is accepted. The portal stores both formats verbatim;
+    /// Execute dispatches per-position.
+    #[test]
+    fn t2bin_dispatch_bind_mixed_text_and_binary_formats_accepted() {
+        let mut state = SessionState::new();
+        seed_stmt(&mut state, "pmix", vec![PG_TYPE_INT8, PG_TYPE_TEXT]);
+        let int8_bytes = 7i64.to_be_bytes().to_vec();
+        let msg = proto::ExtqMessage::Bind {
+            portal: "pm".to_string(),
+            stmt: "pmix".to_string(),
+            param_formats: vec![FORMAT_CODE_BINARY, FORMAT_CODE_TEXT],
+            param_values: vec![Some(int8_bytes), Some(b"hi".to_vec())],
+            result_formats: vec![],
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
+            ExtqOutcome::Bytes(b) => assert_eq!(b, vec![b'2', 0, 0, 0, 4]),
+            other => panic!("expected BindComplete, got {other:?}"),
+        }
+        assert!(!state.in_error_state());
+    }
+
+    /// SP-PG-EXTQ-BIN T2 — single binary format code applied to all
+    /// positions is accepted iff EVERY position has a supported OID.
+    #[test]
+    fn t2bin_dispatch_bind_single_binary_with_all_supported_oids_accepted() {
+        let mut state = SessionState::new();
+        seed_stmt(&mut state, "p2", vec![PG_TYPE_INT8, PG_TYPE_INT4]);
+        let int8_bytes = 1i64.to_be_bytes().to_vec();
+        let int4_bytes = 2i32.to_be_bytes().to_vec();
+        let msg = proto::ExtqMessage::Bind {
+            portal: String::new(),
+            stmt: "p2".to_string(),
+            param_formats: vec![FORMAT_CODE_BINARY],
+            param_values: vec![Some(int8_bytes), Some(int4_bytes)],
+            result_formats: vec![],
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, msg) {
+            ExtqOutcome::Bytes(b) => assert_eq!(b, vec![b'2', 0, 0, 0, 4]),
+            other => panic!("expected BindComplete, got {other:?}"),
+        }
     }
 
     /// Spec §3: a re-Bind with a DIFFERENT portal payload into the
@@ -2983,6 +3236,248 @@ mod tests {
         };
         let engine = SqlAssertEngine {
             expected_sql: "INSERT INTO t (x) VALUES (NULL)".to_string(),
+        };
+        try_dispatch_extq(&mut state, &engine, bind);
+        let exec = proto::ExtqMessage::Execute {
+            portal: String::new(),
+            max_rows: 0,
+        };
+        try_dispatch_extq(&mut state, &engine, exec);
+    }
+
+    /// SP-PG-EXTQ-BIN T2 — Execute with an INT8 BINARY parameter
+    /// decodes via `decode_binary_param` (NOT the text scanner) and
+    /// rewrites `$1` to an UNQUOTED `42` literal (not `'42'` — the
+    /// text path quotes everything, but binary decoded integers
+    /// substitute as bare literals so the SQL parser sees a true
+    /// integer not a string).
+    #[test]
+    fn t2bin_dispatch_execute_substitutes_int8_binary_as_bare_literal() {
+        struct SqlAssertEngine {
+            expected_sql: String,
+        }
+        impl EngineApply for SqlAssertEngine {
+            fn apply_sql(&self, sql: &str) -> OpResult {
+                let trimmed = sql.trim().trim_end_matches(';').trim();
+                assert_eq!(
+                    trimmed,
+                    self.expected_sql.as_str(),
+                    "engine should see bare-int param substituted"
+                );
+                OpResult::Got(Vec::<u8>::new().into())
+            }
+            fn describe_table(
+                &self,
+                _name: &str,
+            ) -> Option<Vec<crate::engine::PgColumn>> {
+                None
+            }
+        }
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(
+            &mut state,
+            "ps",
+            "SELECT * FROM t WHERE id = $1",
+            vec![PG_TYPE_INT8],
+        );
+        let int8_bytes = 42i64.to_be_bytes().to_vec();
+        let bind = proto::ExtqMessage::Bind {
+            portal: String::new(),
+            stmt: "ps".to_string(),
+            param_formats: vec![FORMAT_CODE_BINARY],
+            param_values: vec![Some(int8_bytes)],
+            result_formats: vec![],
+        };
+        let engine = SqlAssertEngine {
+            expected_sql: "SELECT * FROM t WHERE id = 42".to_string(),
+        };
+        try_dispatch_extq(&mut state, &engine, bind);
+        let exec = proto::ExtqMessage::Execute {
+            portal: String::new(),
+            max_rows: 0,
+        };
+        try_dispatch_extq(&mut state, &engine, exec);
+    }
+
+    /// SP-PG-EXTQ-BIN T2 — Execute with a TEXT BINARY parameter
+    /// decodes the bytes as UTF-8 and substitutes through the
+    /// quoted-text path (so single-quote doubling still applies).
+    #[test]
+    fn t2bin_dispatch_execute_substitutes_text_binary_with_quote_escape() {
+        struct SqlAssertEngine {
+            expected_sql: String,
+        }
+        impl EngineApply for SqlAssertEngine {
+            fn apply_sql(&self, sql: &str) -> OpResult {
+                let trimmed = sql.trim().trim_end_matches(';').trim();
+                assert_eq!(trimmed, self.expected_sql.as_str());
+                OpResult::Got(Vec::<u8>::new().into())
+            }
+            fn describe_table(
+                &self,
+                _name: &str,
+            ) -> Option<Vec<crate::engine::PgColumn>> {
+                None
+            }
+        }
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(
+            &mut state,
+            "ps",
+            "INSERT INTO t (name) VALUES ($1)",
+            vec![PG_TYPE_TEXT],
+        );
+        let bind = proto::ExtqMessage::Bind {
+            portal: String::new(),
+            stmt: "ps".to_string(),
+            param_formats: vec![FORMAT_CODE_BINARY],
+            param_values: vec![Some(b"O'Brien".to_vec())],
+            result_formats: vec![],
+        };
+        let engine = SqlAssertEngine {
+            expected_sql: "INSERT INTO t (name) VALUES ('O''Brien')".to_string(),
+        };
+        try_dispatch_extq(&mut state, &engine, bind);
+        let exec = proto::ExtqMessage::Execute {
+            portal: String::new(),
+            max_rows: 0,
+        };
+        try_dispatch_extq(&mut state, &engine, exec);
+    }
+
+    /// SP-PG-EXTQ-BIN T2 — Execute with a BYTEA BINARY parameter
+    /// substitutes `'\xHEX'::bytea` so the SQL parser knows the
+    /// literal's type.
+    #[test]
+    fn t2bin_dispatch_execute_substitutes_bytea_binary_with_cast() {
+        struct SqlAssertEngine {
+            expected_sql: String,
+        }
+        impl EngineApply for SqlAssertEngine {
+            fn apply_sql(&self, sql: &str) -> OpResult {
+                let trimmed = sql.trim().trim_end_matches(';').trim();
+                assert_eq!(trimmed, self.expected_sql.as_str());
+                OpResult::Got(Vec::<u8>::new().into())
+            }
+            fn describe_table(
+                &self,
+                _name: &str,
+            ) -> Option<Vec<crate::engine::PgColumn>> {
+                None
+            }
+        }
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(
+            &mut state,
+            "ps",
+            "INSERT INTO t (b) VALUES ($1)",
+            vec![PG_TYPE_BYTEA],
+        );
+        let bind = proto::ExtqMessage::Bind {
+            portal: String::new(),
+            stmt: "ps".to_string(),
+            param_formats: vec![FORMAT_CODE_BINARY],
+            param_values: vec![Some(vec![0xDE, 0xAD])],
+            result_formats: vec![],
+        };
+        let engine = SqlAssertEngine {
+            expected_sql: "INSERT INTO t (b) VALUES ('\\xdead'::bytea)"
+                .to_string(),
+        };
+        try_dispatch_extq(&mut state, &engine, bind);
+        let exec = proto::ExtqMessage::Execute {
+            portal: String::new(),
+            max_rows: 0,
+        };
+        try_dispatch_extq(&mut state, &engine, exec);
+    }
+
+    /// SP-PG-EXTQ-BIN T2 — NULL is format-agnostic: a binary-format
+    /// position with `Option::None` value (the wire `length=-1`
+    /// sentinel) substitutes as bare `NULL` regardless of the
+    /// declared type OID.
+    #[test]
+    fn t2bin_dispatch_execute_null_binary_renders_as_null() {
+        struct SqlAssertEngine {
+            expected_sql: String,
+        }
+        impl EngineApply for SqlAssertEngine {
+            fn apply_sql(&self, sql: &str) -> OpResult {
+                let trimmed = sql.trim().trim_end_matches(';').trim();
+                assert_eq!(trimmed, self.expected_sql.as_str());
+                OpResult::Got(Vec::<u8>::new().into())
+            }
+            fn describe_table(
+                &self,
+                _name: &str,
+            ) -> Option<Vec<crate::engine::PgColumn>> {
+                None
+            }
+        }
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(
+            &mut state,
+            "ps",
+            "INSERT INTO t (id) VALUES ($1)",
+            vec![PG_TYPE_INT8],
+        );
+        let bind = proto::ExtqMessage::Bind {
+            portal: String::new(),
+            stmt: "ps".to_string(),
+            param_formats: vec![FORMAT_CODE_BINARY],
+            param_values: vec![None],
+            result_formats: vec![],
+        };
+        let engine = SqlAssertEngine {
+            expected_sql: "INSERT INTO t (id) VALUES (NULL)".to_string(),
+        };
+        try_dispatch_extq(&mut state, &engine, bind);
+        let exec = proto::ExtqMessage::Execute {
+            portal: String::new(),
+            max_rows: 0,
+        };
+        try_dispatch_extq(&mut state, &engine, exec);
+    }
+
+    /// SP-PG-EXTQ-BIN T2 regression-lock: the existing TEXT-format
+    /// substitution path is byte-equal after the refactor (a Bind
+    /// with empty `param_formats` still produces single-quoted
+    /// `'42'`, NOT the bare-int `42` that binary INT8 would).
+    #[test]
+    fn t2bin_dispatch_execute_text_format_path_unchanged() {
+        struct SqlAssertEngine {
+            expected_sql: String,
+        }
+        impl EngineApply for SqlAssertEngine {
+            fn apply_sql(&self, sql: &str) -> OpResult {
+                let trimmed = sql.trim().trim_end_matches(';').trim();
+                assert_eq!(trimmed, self.expected_sql.as_str());
+                OpResult::Got(Vec::<u8>::new().into())
+            }
+            fn describe_table(
+                &self,
+                _name: &str,
+            ) -> Option<Vec<crate::engine::PgColumn>> {
+                None
+            }
+        }
+        let mut state = SessionState::new();
+        // No OID hints, no format codes — pure text-format flow.
+        seed_stmt_with_sql(
+            &mut state,
+            "ps",
+            "INSERT INTO t (id) VALUES ($1)",
+            vec![],
+        );
+        let bind = proto::ExtqMessage::Bind {
+            portal: String::new(),
+            stmt: "ps".to_string(),
+            param_formats: vec![],
+            param_values: vec![Some(b"42".to_vec())],
+            result_formats: vec![],
+        };
+        let engine = SqlAssertEngine {
+            expected_sql: "INSERT INTO t (id) VALUES ('42')".to_string(),
         };
         try_dispatch_extq(&mut state, &engine, bind);
         let exec = proto::ExtqMessage::Execute {

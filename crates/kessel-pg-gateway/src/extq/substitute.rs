@@ -90,6 +90,12 @@ pub enum SubstituteError {
     /// count. Carries `index` (the requested 1-based index) and
     /// `available` (the portal's `param_values.len()`).
     ParamIndexOutOfBounds { index: usize, available: usize },
+    /// SP-PG-EXTQ-BIN T2 — preprocessing a binary parameter into its
+    /// SQL-literal form failed. Carries position (1-based for client
+    /// readability) and a human-readable reason from
+    /// `BinaryDecodeError`. Maps to SQLSTATE `08P01 protocol_
+    /// violation` at the dispatcher.
+    BinaryDecode { position: usize, reason: String },
 }
 
 /// SP-PG-EXTQ-BIN T1 — errors from `decode_binary_param`. Each carries
@@ -386,6 +392,159 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (y_adj, m, d)
 }
 
+/// SP-PG-EXTQ-BIN T2 — one prepared parameter value, ready for
+/// substitution. The variants represent the three distinct flavors:
+/// - `Null` — wire length=-1 sentinel; renders as bare `NULL`.
+/// - `Text(bytes)` — text-format wire bytes; substitute wraps in
+///   single quotes + applies `'`→`''` doubling.
+/// - `Raw(sql)` — a pre-rendered SQL fragment (e.g. an INT8 binary
+///   decoded to `100` or a BYTEA binary decoded + wrapped as
+///   `'\xDEAD'::bytea`). Substitute splices verbatim — NO quoting,
+///   NO escaping. The caller is responsible for producing valid SQL.
+///
+/// This variant exists so the binary-format path can route through
+/// the same `$N` scanner as the text path without the scanner
+/// needing to know about per-param format codes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreparedParam {
+    Null,
+    Text(Vec<u8>),
+    Raw(String),
+}
+
+/// SP-PG-EXTQ-BIN T2 — substitute `$N` placeholders with the format-
+/// aware rendered parameters. Each entry of `params` carries its own
+/// rendering rule (Null / Text / Raw). The scanner is shared with
+/// the text-only path; only the per-param renderer differs.
+pub fn substitute_params(
+    sql: &str,
+    params: &[PreparedParam],
+) -> Result<String, SubstituteError> {
+    substitute_inner(sql, params.len(), |out, i| {
+        render_prepared_param(out, &params[i])
+    })
+}
+
+/// SP-PG-EXTQ-BIN T2 — preprocess raw wire params + per-position
+/// format codes + Parse-time type OIDs into the discriminated
+/// `Vec<PreparedParam>` the new `substitute_params` consumes.
+///
+/// **Inputs:**
+/// - `params: Option<&[u8]>` per position (None = SQL NULL).
+/// - `formats: &[u16]` per PG length conventions (0 codes = all text,
+///   1 code = all-same, N codes = per-position).
+/// - `type_oids: &[u32]` from `PreparedStmt.param_oids` (may be
+///   shorter than params; missing positions default to OID 0).
+///
+/// **Per-position rule:**
+/// - format text + value None → `Null`.
+/// - format text + value Some(b) → `Text(b)` (substitute wraps in
+///   quotes + escapes).
+/// - format binary + value None → `Null` (PG semantics: NULL is
+///   format-agnostic — `length=-1` sentinel overrides the format
+///   code).
+/// - format binary + value Some(b) → `decode_binary_param(b, oid)`
+///   into a SQL literal, wrapped per type rules:
+///   - integer/float/bool: `Raw(literal)` (no quotes, no cast).
+///   - text/varchar: `Text(literal-bytes)` (substitute handles
+///     quoting + escaping).
+///   - bytea: `Raw('\xHEX'::bytea)`.
+///   - timestamptz: `Raw('ISO+00'::timestamptz)`.
+///
+/// Returns a `Vec<PreparedParam>` ready for `substitute_params`.
+/// `BinaryDecodeError` propagates as `SubstituteError::BinaryDecode`.
+pub fn preprocess_params(
+    params: &[Option<&[u8]>],
+    formats: &[u16],
+    type_oids: &[u32],
+) -> Result<Vec<PreparedParam>, SubstituteError> {
+    let mut out = Vec::with_capacity(params.len());
+    for (i, value) in params.iter().enumerate() {
+        let format = effective_format_code(formats, i);
+        let bytes = match value {
+            None => {
+                out.push(PreparedParam::Null);
+                continue;
+            }
+            Some(b) => *b,
+        };
+        if format == crate::proto::FORMAT_CODE_TEXT {
+            out.push(PreparedParam::Text(bytes.to_vec()));
+            continue;
+        }
+        // Binary path.
+        let type_oid = type_oids.get(i).copied().unwrap_or(0);
+        let literal = decode_binary_param(bytes, type_oid).map_err(|e| {
+            SubstituteError::BinaryDecode {
+                position: i,
+                reason: render_binary_error(&e),
+            }
+        })?;
+        let rendered = render_binary_decoded(type_oid, &literal);
+        out.push(rendered);
+    }
+    Ok(out)
+}
+
+/// SP-PG-EXTQ-BIN T2 — compute the effective format code for position
+/// `i` per the PG length conventions:
+/// - 0 codes  = all text  → 0
+/// - 1 code   = all-same  → formats[0]
+/// - N codes  = per-pos   → formats[i] (out-of-range falls back to 0)
+///
+/// Shared between `dispatch_bind` (binary-format admission check at
+/// Bind time) and `preprocess_params` (per-position decode dispatch
+/// at Execute time). Single-sourcing the convention here means a
+/// future PG length-convention change updates BOTH dispatch paths in
+/// one place.
+pub fn effective_format_code(formats: &[u16], i: usize) -> u16 {
+    match formats.len() {
+        0 => crate::proto::FORMAT_CODE_TEXT,
+        1 => formats[0],
+        _ => formats.get(i).copied().unwrap_or(crate::proto::FORMAT_CODE_TEXT),
+    }
+}
+
+/// SP-PG-EXTQ-BIN T2 — pick the right wire-SQL wrapper for a
+/// decoded binary literal based on its type OID.
+fn render_binary_decoded(type_oid: u32, literal: &str) -> PreparedParam {
+    match type_oid {
+        // Integers, floats, bool — bare unquoted literal.
+        PG_TYPE_INT2 | PG_TYPE_INT4 | PG_TYPE_INT8 | PG_TYPE_FLOAT4 | PG_TYPE_FLOAT8
+        | PG_TYPE_BOOL => PreparedParam::Raw(literal.to_string()),
+        // Text / Varchar — single-quoted with `'`→`''` doubling
+        // (route through the existing Text renderer so the escape
+        // logic isn't duplicated).
+        PG_TYPE_TEXT | PG_TYPE_VARCHAR => PreparedParam::Text(literal.as_bytes().to_vec()),
+        // Bytea — needs explicit cast so the SQL parser accepts the
+        // `\xHEX` shape.
+        PG_TYPE_BYTEA => PreparedParam::Raw(format!("'{literal}'::bytea")),
+        // Timestamptz — same shape with `::timestamptz` cast.
+        PG_TYPE_TIMESTAMPTZ => PreparedParam::Raw(format!("'{literal}'::timestamptz")),
+        // Should never reach here — the Bind-time admission check
+        // already rejected unsupported OIDs. Defensive: emit Raw.
+        _ => PreparedParam::Raw(literal.to_string()),
+    }
+}
+
+fn render_binary_error(e: &BinaryDecodeError) -> String {
+    match e {
+        BinaryDecodeError::WrongLength {
+            type_oid,
+            expected,
+            actual,
+        } => format!(
+            "binary parameter of type OID {type_oid}: expected {expected} bytes, got {actual}"
+        ),
+        BinaryDecodeError::BadValue { type_oid, reason } => {
+            format!("binary parameter of type OID {type_oid}: {reason}")
+        }
+        BinaryDecodeError::Unsupported { type_oid, arc } => {
+            format!("binary parameter of type OID {type_oid} not supported in V1: {arc}")
+        }
+    }
+}
+
 /// Substitute `$N` placeholders in `sql` with the corresponding
 /// bound parameter values from `params` (0-indexed: `$1` → `params[0]`).
 ///
@@ -410,6 +569,30 @@ pub fn substitute_text_format_params(
     sql: &str,
     params: &[Option<&[u8]>],
 ) -> Result<String, SubstituteError> {
+    substitute_inner(sql, params.len(), |out, idx| render_param(out, params[idx]))
+}
+
+/// SP-PG-EXTQ-BIN T2 — shared scanner used by both
+/// `substitute_text_format_params` (text-only path) and
+/// `substitute_params` (format-aware path). The scanner walks the
+/// SQL text exactly as before, skipping single-quoted strings, double-
+/// quoted identifiers, line comments, block comments, and dollar-
+/// quoted strings. On `$N` (1-based) placeholder, it calls back into
+/// the supplied `render` closure with the output buffer + 0-based
+/// index — the caller is responsible for emitting the parameter's
+/// SQL representation.
+///
+/// Splitting the scanner from the renderer is what lets the binary-
+/// format path reuse 100% of the substitution logic without
+/// duplicating any of the lexer state.
+fn substitute_inner<F>(
+    sql: &str,
+    param_count: usize,
+    mut render: F,
+) -> Result<String, SubstituteError>
+where
+    F: FnMut(&mut String, usize),
+{
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len() + 16);
     let mut i = 0usize;
@@ -586,13 +769,13 @@ pub fn substitute_text_format_params(
                 if n == 0 {
                     return Err(SubstituteError::ZeroParamIndex);
                 }
-                if n > params.len() {
+                if n > param_count {
                     return Err(SubstituteError::ParamIndexOutOfBounds {
                         index: n,
-                        available: params.len(),
+                        available: param_count,
                     });
                 }
-                render_param(&mut out, params[n - 1]);
+                render(&mut out, n - 1);
                 i = digit_end;
                 continue;
             }
@@ -643,6 +826,28 @@ fn render_param(out: &mut String, value: Option<&[u8]>) {
             }
             out.push('\'');
         }
+    }
+}
+
+/// SP-PG-EXTQ-BIN T2 — emit one `PreparedParam` into the output
+/// string. Mirrors `render_param` for the Text/Null variants but adds
+/// the Raw variant that splices a pre-rendered SQL fragment verbatim.
+fn render_prepared_param(out: &mut String, value: &PreparedParam) {
+    match value {
+        PreparedParam::Null => out.push_str("NULL"),
+        PreparedParam::Text(bytes) => {
+            out.push('\'');
+            for &b in bytes {
+                if b == b'\'' {
+                    out.push('\'');
+                    out.push('\'');
+                } else {
+                    out.push(b as char);
+                }
+            }
+            out.push('\'');
+        }
+        PreparedParam::Raw(sql) => out.push_str(sql),
     }
 }
 
@@ -1132,6 +1337,184 @@ mod tests {
         assert_eq!(
             unsupported_binary_arc_for_oid(3802),
             "SP-PG-EXTQ-BIN-EXTRA",
+        );
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-EXTQ-BIN T2 KATs — `substitute_params` + `preprocess_params`
+    // unified per-format dispatch. The text path is regression-locked
+    // against the existing `substitute_text_format_params` to make
+    // sure the refactor doesn't drift; the binary paths exercise each
+    // V1-supported type's full pipeline (preprocess + render).
+    // ───────────────────────────────────────────────────────────────────
+
+    /// Backward-compat lock: `substitute_params` on an all-Text input
+    /// produces byte-equal output to `substitute_text_format_params`
+    /// on the same params. Locks against post-refactor drift.
+    #[test]
+    fn t2bin_substitute_params_text_path_byte_equal_to_text_only() {
+        let sql = "INSERT INTO t (a, b, c) VALUES ($1, $2, $3)";
+        let raw: Vec<Option<&[u8]>> =
+            vec![Some(b"hi"), None, Some(b"O'Brien")];
+        let via_text = substitute_text_format_params(sql, &raw).expect("ok");
+        let prepared = vec![
+            PreparedParam::Text(b"hi".to_vec()),
+            PreparedParam::Null,
+            PreparedParam::Text(b"O'Brien".to_vec()),
+        ];
+        let via_unified = substitute_params(sql, &prepared).expect("ok");
+        assert_eq!(via_text, via_unified);
+    }
+
+    /// `Raw` variant splices verbatim — no quoting, no escaping. The
+    /// caller (preprocess_params) is responsible for the SQL shape.
+    #[test]
+    fn t2bin_substitute_params_raw_splices_verbatim() {
+        let sql = "SELECT $1, $2";
+        let prepared = vec![
+            PreparedParam::Raw("42".to_string()),
+            PreparedParam::Raw("'\\xdead'::bytea".to_string()),
+        ];
+        let out = substitute_params(sql, &prepared).expect("ok");
+        assert_eq!(out, "SELECT 42, '\\xdead'::bytea");
+    }
+
+    /// `preprocess_params` of a single INT8 binary value with the
+    /// correct OID hint produces a `Raw("100")` (bare integer literal,
+    /// no quotes).
+    #[test]
+    fn t2bin_preprocess_int8_binary_renders_as_raw_integer() {
+        let raw_bytes = 100i64.to_be_bytes();
+        let params: Vec<Option<&[u8]>> = vec![Some(&raw_bytes[..])];
+        let formats = vec![crate::proto::FORMAT_CODE_BINARY];
+        let oids = vec![PG_TYPE_INT8];
+        let prepared = preprocess_params(&params, &formats, &oids).expect("ok");
+        assert_eq!(prepared, vec![PreparedParam::Raw("100".to_string())]);
+    }
+
+    /// `preprocess_params` of a TEXT binary value with an embedded `'`
+    /// routes through the Text variant so the substitute layer's
+    /// `'`→`''` doubling applies.
+    #[test]
+    fn t2bin_preprocess_text_binary_routes_through_text_variant_for_escape() {
+        let payload = b"O'Brien";
+        let params: Vec<Option<&[u8]>> = vec![Some(payload)];
+        let formats = vec![crate::proto::FORMAT_CODE_BINARY];
+        let oids = vec![PG_TYPE_TEXT];
+        let prepared = preprocess_params(&params, &formats, &oids).expect("ok");
+        assert_eq!(prepared, vec![PreparedParam::Text(b"O'Brien".to_vec())]);
+        // Confirm the substitute layer doubles the embedded quote.
+        let out = substitute_params("SELECT $1", &prepared).expect("ok");
+        assert_eq!(out, "SELECT 'O''Brien'");
+    }
+
+    /// `preprocess_params` of a BYTEA binary value wraps the
+    /// `\xHEX` literal with the `::bytea` cast suffix so the SQL
+    /// parser sees a properly-typed literal.
+    #[test]
+    fn t2bin_preprocess_bytea_binary_wraps_with_cast_suffix() {
+        let payload = [0xCAu8, 0xFE];
+        let params: Vec<Option<&[u8]>> = vec![Some(&payload[..])];
+        let formats = vec![crate::proto::FORMAT_CODE_BINARY];
+        let oids = vec![PG_TYPE_BYTEA];
+        let prepared = preprocess_params(&params, &formats, &oids).expect("ok");
+        assert_eq!(
+            prepared,
+            vec![PreparedParam::Raw("'\\xcafe'::bytea".to_string())]
+        );
+    }
+
+    /// `preprocess_params` of a TIMESTAMPTZ binary value (0 µs since
+    /// PG epoch) wraps the ISO literal with `::timestamptz`.
+    #[test]
+    fn t2bin_preprocess_timestamptz_binary_wraps_with_cast_suffix() {
+        let payload = 0i64.to_be_bytes();
+        let params: Vec<Option<&[u8]>> = vec![Some(&payload[..])];
+        let formats = vec![crate::proto::FORMAT_CODE_BINARY];
+        let oids = vec![PG_TYPE_TIMESTAMPTZ];
+        let prepared = preprocess_params(&params, &formats, &oids).expect("ok");
+        assert_eq!(
+            prepared,
+            vec![PreparedParam::Raw(
+                "'2000-01-01 00:00:00.000000+00'::timestamptz".to_string()
+            )]
+        );
+    }
+
+    /// `preprocess_params` of a NULL value at a binary-format
+    /// position renders as `PreparedParam::Null` regardless of the
+    /// declared type OID (PG semantics: length=-1 sentinel is format-
+    /// agnostic).
+    #[test]
+    fn t2bin_preprocess_null_binary_renders_as_null_regardless_of_oid() {
+        let params: Vec<Option<&[u8]>> = vec![None];
+        let formats = vec![crate::proto::FORMAT_CODE_BINARY];
+        let oids = vec![PG_TYPE_INT8];
+        let prepared = preprocess_params(&params, &formats, &oids).expect("ok");
+        assert_eq!(prepared, vec![PreparedParam::Null]);
+    }
+
+    /// `preprocess_params` of an invalid binary payload (BOOL byte
+    /// neither 0x00 nor 0x01) propagates as `SubstituteError::
+    /// BinaryDecode { position: 0, reason: ... }`.
+    #[test]
+    fn t2bin_preprocess_invalid_binary_payload_returns_substitute_error() {
+        let params: Vec<Option<&[u8]>> = vec![Some(&[0x02u8][..])];
+        let formats = vec![crate::proto::FORMAT_CODE_BINARY];
+        let oids = vec![PG_TYPE_BOOL];
+        let err = preprocess_params(&params, &formats, &oids).unwrap_err();
+        match err {
+            SubstituteError::BinaryDecode { position, .. } => {
+                assert_eq!(position, 0);
+            }
+            other => panic!("expected BinaryDecode, got {other:?}"),
+        }
+    }
+
+    /// `effective_format_code` honors PG length conventions:
+    /// 0 codes → text, 1 code → all-same, N codes → per-position.
+    #[test]
+    fn t2bin_effective_format_code_length_conventions() {
+        // 0 codes — every position is text.
+        assert_eq!(
+            effective_format_code(&[], 0),
+            crate::proto::FORMAT_CODE_TEXT
+        );
+        assert_eq!(
+            effective_format_code(&[], 99),
+            crate::proto::FORMAT_CODE_TEXT
+        );
+        // 1 code — same code applies everywhere.
+        assert_eq!(
+            effective_format_code(&[crate::proto::FORMAT_CODE_BINARY], 0),
+            crate::proto::FORMAT_CODE_BINARY
+        );
+        assert_eq!(
+            effective_format_code(&[crate::proto::FORMAT_CODE_BINARY], 5),
+            crate::proto::FORMAT_CODE_BINARY
+        );
+        // N codes — per-position.
+        let formats = vec![
+            crate::proto::FORMAT_CODE_TEXT,
+            crate::proto::FORMAT_CODE_BINARY,
+            crate::proto::FORMAT_CODE_TEXT,
+        ];
+        assert_eq!(
+            effective_format_code(&formats, 0),
+            crate::proto::FORMAT_CODE_TEXT
+        );
+        assert_eq!(
+            effective_format_code(&formats, 1),
+            crate::proto::FORMAT_CODE_BINARY
+        );
+        assert_eq!(
+            effective_format_code(&formats, 2),
+            crate::proto::FORMAT_CODE_TEXT
+        );
+        // Out-of-range falls back to text.
+        assert_eq!(
+            effective_format_code(&formats, 99),
+            crate::proto::FORMAT_CODE_TEXT
         );
     }
 

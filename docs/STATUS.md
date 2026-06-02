@@ -6,20 +6,52 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 
 What a node running on today's `main` actually does. Every line below is
 covered by the workspace test suite (2063 default / 2074 with
-`--features pg-gateway` / 2078 with all gateway features) plus +15
-KATs from the SP-CHAR-PAD-COMPARE V1 arc landed 2026-06-02 on top of
-+26 from the SP-PG-EXTQ-CAST V1 arc landed earlier the same day.
-SP-PG-JDBC-SMOKE (2026-06-02) is a verification-only arc that closes
-the JDBC residual; +0 KATs. SP-PG-EXTQ-DESCRIBE-VERSION V1 (landed
-2026-06-02) adds +18 KATs (15 lib + 3 dispatcher-integration) in
-`kessel-pg-gateway`. SP-PG-SQL-PAREN-VALUES V1 (landed 2026-06-02)
-adds +2 KAT functions / +13 assertions in `kessel-sql` (43 → 45 tests)
-closing the last residual the SP-PG-JDBC-SMOKE T2 transcript named —
-pgJDBC simple-mode `PreparedStatement` INSERT + WHERE round-trip
-end-to-end through the real driver. SP-WHERE-VM-Specialise V1 (landed
-2026-06-01) adds +17 KATs (15 kessel-expr lib + 2 kessel-sm
-SM-level) — the per-row WHERE evaluator now compiles to a closure
-once per query, cutting the dominant TPC-H Q1/Q6 wall-time cost.
+`--features pg-gateway` / 2078 with all gateway features).
+
+**Coherent state of the union (2026-06-02):**
+
+- **Performance.** Sharded apply path (SP-Perf-A-SHARD-APPLY) delivers
+  **14.93M ops/sec at K=8** (3.19× the K=1 baseline, sub-µs p50);
+  scan-side companions (SP-Perf-A-SHARD-SCAN / -FASTPATH / -POOL-SCALEOUT /
+  -LOCAL-INDEX-FUSION) close the scan + find-by side. The OLTP-bracket
+  losses (RO, RW) are CLOSED — KesselDB now beats Postgres on **6 of 8
+  cross-DB workloads** (only TPC-H Q1+Q6 remain, both with their named
+  follow-up arc SP-JIT-Aggregate). TPC-H Q6 design floor (≥400 q/s) AND
+  stretch (≥500 q/s) both EXCEEDED via the 5-arc Analytic-Plan →
+  Analytic-Plan-MULTI → Hash-Agg → Hash-Agg-Tune → WHERE-VM-Specialise
+  chain (cumulative +39.95× lift; 123× → 3.07× vs Postgres).
+- **PostgreSQL ORM compatibility.** SP-PG-EXTQ V1 (Extended Query) +
+  V2 hardening (SP-PG-EXTQ-BIN + SP-PG-EXTQ-BIN-RESULTS + SP-PG-EXTQ-CAST +
+  SP-PG-EXTQ-DESCRIBE-VERSION + SP-PG-SQL-PAREN-VALUES + SP-CHAR-PAD-COMPARE)
+  closed every PARTIAL row on the ORM compat matrix. psycopg2 ✓
+  SQLAlchemy 2.0 ✓ psycopg3 ✓ asyncpg ✓ pgJDBC ✓ (real-driver verified on
+  vulcan in both simple AND extended modes by SP-PG-JDBC-SMOKE).
+- **PG COPY.** SP-PG-COPY V1 (text) + SP-PG-COPY-CSV V1 + SP-PG-COPY-BIN
+  V1 deliver the wire shape every `pg_dump`/`pgloader`/`pg_bulkload`/
+  Airbyte/Fivetran/Stitch binary-bulk-loader hard-requires.
+  SP-PG-COPY-BULKAPPLY V1 lifts ingest **181.9×** (~285 → 51,840 rows/sec).
+- **Cloud deploy.** SP-DX-superior (Dockerfile + ghcr.io/hassard0/kesseldb
+  + embedded Rust example + CLI error-class hints) + SP-Cloud-Deploy
+  (Helm chart + fly.toml) shipped, kind-verified end-to-end on vulcan.
+- **Correctness.** SP-CLUSTER-FLAKE T2 root-cause fix: `Node::submit*`
+  retries transient `ViewChange` → `Unavailable` the same way
+  production `ClusterClient` does. The long-standing CI flake is GONE.
+
+Latest arc deliveries on top of that baseline (most-recent first):
+SP-WHERE-VM-Specialise V1 (2026-06-01, +17 KATs) — per-row WHERE
+evaluator compiles to a closure once per query, cutting the dominant
+TPC-H Q1/Q6 wall-time cost. SP-PG-SQL-PAREN-VALUES V1 (2026-06-02,
++2 KAT functions / +13 assertions in kessel-sql) — closing the last
+residual the SP-PG-JDBC-SMOKE T2 transcript named (pgJDBC simple-mode
+`PreparedStatement` INSERT + WHERE round-trip through the real driver).
+SP-PG-EXTQ-DESCRIBE-VERSION V1 (2026-06-02, +18 KATs) — gateway emits
+RowDescription for the scalar SELECTs that pgJDBC probes at connect.
+SP-PG-JDBC-SMOKE V1 (2026-06-02, +0 KATs — verification-only) — real
+pgJDBC 42.7.4 on vulcan: CRUD chain PASS in both modes. SP-CHAR-PAD-COMPARE
+V1 (2026-06-02, +15 KATs) — engine-side CHAR(N) trailing-NUL/space
+insignificance fix surfaced by SP-PG-EXTQ-BIN-RESULTS smoke.
+SP-PG-EXTQ-CAST V1 (2026-06-02, +26 KATs) — `::TYPE[(args)]` stripper
+at dispatch entry, JDBC simple-mode unblocked.
 
 **Tonight's delivery (2026-06-02) — coherent state of the union:**
 
@@ -1630,20 +1662,23 @@ or `U128`/`I128` columns — a deliberate non-goal (`MIN`/`MAX` over
 all of these is delivered, SP93; `SUM`/`AVG` stay numeric-≤8B and
 return an honest `SchemaError` otherwise),
 cross-shard `Aggregate` / `GroupAggregate` combine, SQL-text routing,
-streamed sorted-merge over indexes, and `FindBy` / `FindByComposite`
-scatter (the rest of the SP96 sub-arc after SP-A: SP-B aggregate
-combine → SP-C sorted k-way merge → SP-D group merge → SP-E SQL-text
-routing; cross-shard `Join` and a cross-shard consistent snapshot
-are explicit documented non-goals; **SP-A scatter-scan reads for
-`Select`/`QueryRows`/`SelectFields`/`SelectSorted` SHIPPED — see
-ARCHITECTURE.md §"Cross-shard reads (SP-A)"**), async per-shard
-pull-drive (efficiency, not correctness), index-write throughput
-optimization,
-disk-fault-during-view-change, membership reconfiguration, transport
-TLS as a non-opt-in default. (A dependency-free Python reference SDK
-ships in `clients/python/`, SP89; SDKs for further languages are
-straightforward over the documented protocol and welcome but not
-tracked here.)
+streamed sorted-merge over indexes (the rest of the SP96 sub-arc after
+SP-A: SP-B aggregate combine → SP-C sorted k-way merge → SP-D group merge
+→ SP-E SQL-text routing; cross-shard `Join` and a cross-shard consistent
+snapshot are explicit documented non-goals; **SP-A scatter-scan reads
+for `Select`/`QueryRows`/`SelectFields`/`SelectSorted` SHIPPED — see
+ARCHITECTURE.md §"Cross-shard reads (SP-A)"**, and **SP-A FindBy /
+FindByComposite scatter via OidConcat SHIPPED at T11** — see the SP-A
+narrative below for the K-invariance lock), async per-shard pull-drive
+(efficiency, not correctness), JIT codegen for the per-row aggregate
+inner loop (named SP-JIT-Aggregate; closes the residual 2.17× Q1 /
+3.07× Q6 gap), replicated VSR clustering on k8s + Fly.io (named
+SP-Cloud-Cluster; V1 cloud-deploy is single-pod / single-VM by design),
+index-write throughput optimization, disk-fault-during-view-change,
+membership reconfiguration, transport TLS as a non-opt-in default.
+(A dependency-free Python reference SDK ships in `clients/python/`,
+SP89; SDKs for further languages are straightforward over the
+documented protocol and welcome but not tracked here.)
 
 **External sources:** HTTPS is now supported via the optional
 `external-sources-tls` build feature (shipped SP99); automatic pruning of rows deleted upstream

@@ -87,8 +87,8 @@ no native build steps.
 git clone https://github.com/hassard0/KesselDB && cd KesselDB
 cargo build --release                                # default — binary protocol only, no gateway code linked
 cargo build --release --features pg-gateway,http-gateway   # all wire surfaces
-cargo test --workspace                               # 2018 default tests
-cargo test --workspace --features pg-gateway         # 2046 (adds SP-PG + SP-PG-CAT + SP-PG-EXTQ V1)
+cargo test --workspace                               # 2063 default tests
+cargo test --workspace --features pg-gateway         # 2074 (adds SP-PG + SP-PG-CAT + SP-PG-EXTQ V1 + V2 hardening + SP-PG-COPY V1)
 cargo test --workspace --features pg-gateway,http-gateway,kessel-http-gateway/test-server   # 2043 — full matrix
 ```
 

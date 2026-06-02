@@ -1573,6 +1573,25 @@ above). Some advanced introspection paths remain V2-deferred:
   Drizzle / Prisma / JDBC default-EXTQ paths connect at the wire
   level. Full ORM-suite formal verification is SP-PG-EXTQ T8 / T11 /
   T12 (post-V1.1).
+- **Typed-parameter compile path** (SP-PG-EXTQ-PARSED, 2026-06-02).
+  kessel-sql's lexer now recognizes `$N` (1..99) as a `Tok::Param`
+  variant; the new `compile_with_params(sql, cat, params: &[Option<Value>])`
+  entry point threads typed `Value`s through the parser WITHOUT ever
+  concatenating them into SQL text. Closes the SP-PG-EXTQ V1 §11
+  weak-spot #1 attack surface (SQL-text-substitution `'`→`''`
+  escaping) for every typed-path-eligible parameter — the bound
+  bytes enter as a typed `Value`, get carried verbatim through the
+  AST, and emerge in the program as the same `Value`. Adversarial
+  KAT locked: a quote-injection payload like `'; DROP TABLE t; --`
+  in a bound parameter survives as a `Value::Blob` operand at the
+  EQ comparison; the engine never sees the injected SQL.
+  Gateway-side classifier (`preprocess_typed_params`) selects the
+  typed path for int/text/bytea/bool params and falls back to the
+  existing text-substitution path for FLOAT/TIMESTAMPTZ/NUMERIC
+  (which still need the cast-wrapper shape `'ISO'::timestamptz`).
+  V1 disposition: typed path is opt-in (KAT-only); default remains
+  text-substitution to avoid a silent compat regression. Follow-up
+  `SP-PG-EXTQ-PARSED-DEFAULT` flips the default after soak.
 - **One statement per `Q`** → `psql \copy ...; SELECT ...` rejected
   with `42601` syntax_error. Send statements one at a time. V2.
 - **Text format only** → every column rendered as PG text;

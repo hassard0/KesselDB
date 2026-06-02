@@ -41,9 +41,13 @@ measurement and had drifted from the actual workspace count).
   production `ClusterClient` does. The long-standing CI flake is GONE.
 
 Latest arc deliveries on top of that baseline (most-recent first):
-SP-WHERE-VM-Specialise V1 (2026-06-01, +17 KATs) — per-row WHERE
-evaluator compiles to a closure once per query, cutting the dominant
-TPC-H Q1/Q6 wall-time cost. SP-PG-SQL-PAREN-VALUES V1 (2026-06-02,
+SP-PG-EXTQ-PARSED V1 (2026-06-02, +31 KATs) — kessel-sql `$N`
+parameter token + `compile_with_params` typed-param threading +
+gateway classifier; closes the V1 §11 weak-spot #1 SQL-text-
+substitution attack surface. SP-WHERE-VM-Specialise V1 (2026-06-01,
++17 KATs) — per-row WHERE evaluator compiles to a closure once per
+query, cutting the dominant TPC-H Q1/Q6 wall-time cost.
+SP-PG-SQL-PAREN-VALUES V1 (2026-06-02,
 +2 KAT functions / +13 assertions in kessel-sql) — closing the last
 residual the SP-PG-JDBC-SMOKE T2 transcript named (pgJDBC simple-mode
 `PreparedStatement` INSERT + WHERE round-trip through the real driver).
@@ -58,6 +62,58 @@ at dispatch entry, JDBC simple-mode unblocked.
 
 **Tonight's delivery (2026-06-02) — coherent state of the union:**
 
+- **Track O — SP-PG-EXTQ-PARSED (2026-06-02, V1 SHIPPED).** Closes
+  the SP-PG-EXTQ V1 §11 weak-spot #1 attack surface (SQL-text
+  parameter substitution + `'`→`''` escape brittleness) for every
+  typed-path-eligible parameter. **kessel-sql lexer** gains
+  `Tok::Param(u16)` recognizing `$1..$99` as 1-based positional
+  placeholders (T1, +7 KATs); `$0` rejected (PG semantics), `$100+`
+  rejected (V1 cap), bare `$` rejected (lexer is strict; the
+  gateway-side scanner stays permissive). **kessel-sql parser**
+  gains `compile_with_params(sql, cat, params: &[Option<Value>])` +
+  `compile_stmt_with_params(...)` entry points; the rewrite happens
+  at the TOKEN level after lex / before parse — bound `Value`s
+  enter as typed tokens (Int → `Tok::Int`, Blob → `Tok::Str`, Null
+  → `Tok::Ident("NULL")`) and never get concatenated into SQL text
+  (T2, +12 KATs covering INSERT VALUES / WHERE / UPDATE SET / multi-
+  param ordering / same-`$N`-twice / NULL injection / out-of-bounds
+  rejection / no-placeholders pass-through / mixed bare-literal /
+  `Value::Uint` coercion / the **HEADLINE SECURITY KAT** — a quote-
+  injection payload like `'; DROP TABLE t; --` in a bound parameter
+  survives as a `Value::Blob` operand at the EQ comparison; the
+  engine never sees the injected SQL because the bound bytes were
+  carried through the AST verbatim). Internal refactor: `compile()`
+  + `compile_stmt()` bodies extracted into `compile_from_tokens` /
+  `compile_stmt_from_tokens` so params + bare paths share one parser
+  dispatch (no double-rewrite, no shape drift). **kessel-pg-gateway
+  classifier** gains `preprocess_typed_params(params, formats, oids)
+  -> Option<Vec<Option<Value>>>` — returns `Some(...)` only when
+  every parameter can be typed cleanly; `None` signals graceful
+  fallback to the existing text-substitution path. Per-OID routing
+  (INT2/4/8 / BOOL / TEXT/VARCHAR/BYTEA → typed; FLOAT4/8 /
+  TIMESTAMPTZ / NUMERIC → fallback). T3 +12 KATs locking the
+  classifier contract, including the gateway-end-to-end HEADLINE
+  KAT (payload routes through gateway → kessel-sql → program). **V1
+  disposition**: typed path is opt-in (KAT-only exercise); default
+  `dispatch_execute` still uses the text-substitution path so we
+  don't risk a silent compat regression. Follow-up
+  `SP-PG-EXTQ-PARSED-DEFAULT` flips the default after soak. **Two
+  V2+ follow-ups named**: SP-PG-EXTQ-PARSED-INFER (Parse-time OID-
+  driven type inference), SP-PG-EXTQ-PARSED-CACHE (pre-compiled
+  AST cache to avoid re-lex/re-parse on every Execute). **vulcan-
+  verified**: kessel-sql lib 64/64 (45 baseline + 7 T1 + 12 T2);
+  kessel-pg-gateway lib 841/841 (829 baseline + 12 T3); workspace
+  `cargo build --features pg-gateway` clean. **HTTP/1.1 + WS +
+  binary + PG-wire surfaces byte-untouched** (engine-side
+  improvement; the gateway routes through the same dispatch path
+  by default). `#![forbid(unsafe_code)]` honored; zero new external
+  deps. Three commits: `d4d6366` (T1 design + lexer + 7 KATs),
+  `fd7fdd1` (T2 compile_with_params + 12 KATs), `de9dbea` (T3
+  gateway classifier + 12 KATs). Design:
+  `docs/superpowers/specs/2026-06-02-kesseldb-sppgextqparsed-design.md`.
+  Progress tracker:
+  `docs/superpowers/specs/2026-06-02-kesseldb-subproject-sppgextqparsed-progress.md`
+  → V1 CLOSED. **TaskList #374 ready for completion.**
 - **Track K cont. — SP-Cloud-Cluster T1 (2026-06-02, T1 SCAFFOLD
   LANDED; T2-T8 MULTI-ARC CONTINUATION QUEUED).** Multi-pod replicated
   VSR clustering — the production-deploy story on top of SP-Cloud-Deploy

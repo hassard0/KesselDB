@@ -41,20 +41,35 @@ measurement and had drifted from the actual workspace count).
   production `ClusterClient` does. The long-standing CI flake is GONE.
 
 Latest arc deliveries on top of that baseline (most-recent first):
+SP-PG-EXTQ-PARSED-BYTEA-TYPED V1 (2026-06-02, +10 KATs) — typed-
+path BYTEA support preserves arbitrary raw bytes (including non-
+UTF8 sequences like 0xFF/0xFE/0x80/isolated continuation bytes).
+kessel-sql gains `Tok::Bytes(Vec<u8>)` + `Lit::Bytes(Vec<u8>)`
+variants; `rewrite_param_tokens` routes `Value::Blob(b)` through
+`Tok::Bytes` (NO UTF-8 round-trip — the prior path's
+`String::from_utf8_lossy(b)` corrupted any byte the UTF-8 grammar
+doesn't accept). `preprocess_binary_value(PG_TYPE_BYTEA, _)`
+returns `Some(Value::Blob(bytes.to_vec()))` so BYTEA-binary
+uniformly flows through the typed path with INT/BOOL/TEXT/VARCHAR.
+**vulcan-verified**: psycopg3 binary-format INSERT round-trips
+non-UTF8 payloads (`fffefd8090a0b0c0`, `00...00`, `deadbeefcafebabe`)
+byte-equal; psycopg2 text-format CHAR path regression-free.
+HEADLINE: non-UTF8 BYTEA bytes survive the typed path verbatim
+(was: corrupted by `from_utf8_lossy` to U+FFFD replacement chars).
 SP-PG-EXTQ-PARSED-DEFAULT V1 (2026-06-02, +11 KATs) — typed-param
 path becomes the gateway DEFAULT. `dispatch_execute` now routes
 through `apply_sql_with_params` whenever every bound parameter is
 typed-eligible; the text-substitution path stays as the fallback
-for FLOAT/TIMESTAMPTZ/NUMERIC + BYTEA binary. New
-`PARAMETERIZED_SQL_TAG = 0xF3` admin frame carries `(sql, params)`
-to the engine thread where `compile_stmt_with_params` runs against
-the live catalog. **vulcan-verified**: psycopg2 + asyncpg +
-psycopg3 smoke regression-free; quote-injection wire test confirms
-the table is NOT dropped (`"; DROP TABLE inj_smoke; --` stored
-verbatim, post-injection INSERT succeeds → 2 rows visible).
-HEADLINE: closes the SP-PG-EXTQ V1 §11 weak-spot #1 attack surface
-at the DISPATCH layer (V1 closed it at the kessel-sql + classifier
-layer only).
+for FLOAT/TIMESTAMPTZ/NUMERIC (post BYTEA-TYPED, BYTEA binary
+also flows through the typed path). New `PARAMETERIZED_SQL_TAG =
+0xF3` admin frame carries `(sql, params)` to the engine thread
+where `compile_stmt_with_params` runs against the live catalog.
+**vulcan-verified**: psycopg2 + asyncpg + psycopg3 smoke
+regression-free; quote-injection wire test confirms the table is
+NOT dropped (`"; DROP TABLE inj_smoke; --` stored verbatim, post-
+injection INSERT succeeds → 2 rows visible). HEADLINE: closes the
+SP-PG-EXTQ V1 §11 weak-spot #1 attack surface at the DISPATCH
+layer (V1 closed it at the kessel-sql + classifier layer only).
 SP-PG-EXTQ-PARSED V1 (2026-06-02, +31 KATs) — kessel-sql `$N`
 parameter token + `compile_with_params` typed-param threading +
 gateway classifier; closes the V1 §11 weak-spot #1 SQL-text-

@@ -42,8 +42,8 @@ fallback for FLOAT/TIMESTAMPTZ/NUMERIC + BYTEA-binary.
 - **SP-PG-EXTQ-PARSED-CACHE** — pre-compiled prepared-statement AST
   cache (deferred from V1).
 - **SP-PG-EXTQ-PARSED-BYTEA-TYPED** — typed-path support for BYTEA
-  binary (currently falls back to text path because the rewrite uses
-  `String::from_utf8_lossy` which corrupts non-UTF8 byte sequences).
+  binary. **CLOSED 2026-06-02** by the same-named arc; non-UTF8
+  bytes now round-trip byte-equal through the typed path.
 
 ## References
 

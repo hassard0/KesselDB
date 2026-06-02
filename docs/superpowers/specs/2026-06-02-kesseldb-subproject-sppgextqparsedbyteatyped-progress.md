@@ -1,7 +1,19 @@
 # SP-PG-EXTQ-PARSED-BYTEA-TYPED — typed-path BYTEA support that preserves arbitrary bytes — SP-arc Progress Tracker
 
 Date created: 2026-06-02
-**Status: IN PROGRESS.**
+**Status: CLOSED — V1 SHIPPED at T4 (2026-06-02).** The typed-param
+path now uniformly carries BYTEA values (and every other
+`Value::Blob`-bound parameter) without the prior
+`String::from_utf8_lossy` UTF-8 round-trip that corrupted non-UTF8
+byte sequences. kessel-sql's new `Tok::Bytes(Vec<u8>)` +
+`Lit::Bytes(Vec<u8>)` variants thread raw bytes through the parser
+into `lit_to_value` losslessly; the gateway's
+`preprocess_binary_value(PG_TYPE_BYTEA, _)` now returns
+`Some(Value::Blob(bytes.to_vec()))` (was `None`, forcing the text-
+substitute fallback). **vulcan-verified**: psycopg3 binary-format
+INSERT of payloads `fffefd8090a0b0c0`, `0000000000000000`,
+`deadbeefcafebabe` all round-trip byte-equal. **TaskList #378 ready
+for completion.**
 
 Design spec: `docs/superpowers/specs/2026-06-02-kesseldb-sppgextqparsedbyteatyped-design.md`
 Parent SP-arc: SP-PG-EXTQ-PARSED-DEFAULT V1 (closed 2026-06-02).
@@ -22,9 +34,9 @@ through the typed path uniformly with INT/BOOL/TEXT/VARCHAR.
 
 | T# | Scope | Status | Commit |
 |---|---|---|---|
-| **T1+T2** | Design spec + progress tracker + `Tok::Bytes` + `Lit::Bytes` + `rewrite_param_tokens` re-route + value-position parser arms + `lit_to_value` Lit::Bytes route + `preprocess_binary_value` BYTEA admission + KATs locking lossless non-UTF8 round-trip. | PENDING | — |
-| **T3** | vulcan psycopg2 smoke: non-UTF8 BYTES bind → store → SELECT round-trip with byte-equal verification. | PENDING | — |
-| **T4** | USAGE §9 note + STATUS row + progress tracker → CLOSED. | PENDING | — |
+| **T1+T2** | Design spec + progress tracker + `Tok::Bytes` + `Lit::Bytes` + `rewrite_param_tokens` re-route + value-position parser arms + `lit_to_value` Lit::Bytes route + `preprocess_binary_value` BYTEA admission + KATs locking lossless non-UTF8 round-trip. +10 KATs (6 kessel-sql + 4 kessel-pg-gateway). | **DONE** | `7ae8042` |
+| **T3** | vulcan psycopg3 binary-format BYTEA smoke: non-UTF8 BYTES bind → store → SELECT round-trip with byte-equal verification (3 payloads). | **DONE** | (no commit — verification-only; transcript in `docs/superpowers/sppgextqparsedbyteatyped-t3-smoke-2026-06-02.txt`) |
+| **T4** | USAGE §9 note + STATUS row + progress tracker → CLOSED. | **DONE** | (this slice) |
 
 ## Out-of-scope (named V2+ follow-ups)
 
@@ -43,3 +55,4 @@ through the typed path uniformly with INT/BOOL/TEXT/VARCHAR.
 - Token rewriter: `crates/kessel-sql/src/lib.rs::rewrite_param_tokens`
 - Classifier: `crates/kessel-pg-gateway/src/extq/substitute.rs::preprocess_binary_value`
 - Codec values: `crates/kessel-codec/src/lib.rs::Value`
+- vulcan smoke transcript: `docs/superpowers/sppgextqparsedbyteatyped-t3-smoke-2026-06-02.txt`

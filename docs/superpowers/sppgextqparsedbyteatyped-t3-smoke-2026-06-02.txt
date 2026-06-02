@@ -1,0 +1,58 @@
+SP-PG-EXTQ-PARSED-BYTEA-TYPED T3 — vulcan smoke transcript (2026-06-02)
+========================================================================
+
+HEADLINE: non-UTF8 BYTEA bytes round-trip byte-equal through the typed
+path (the prior `String::from_utf8_lossy` path would have replaced
+0xFF/0xFE/0xFD/0x80/etc. with the U+FFFD replacement character).
+
+Build:
+  ssh admin@192.168.4.178 \
+    "cd ~/KesselDB && CARGO_TARGET_DIR=/tmp/kdb-target-byteatyped \
+     cargo build --release --bin kesseldb --features pg-gateway"
+
+  → Finished `release` profile [optimized] target(s) in 27.01s.
+
+Run:
+  ssh admin@192.168.4.178 \
+    "rm -rf /tmp/kdb-byteatyped-data; cd ~/KesselDB && \
+     KESSELDB_TOKEN=admin KESSELDB_PG_ADDR=127.0.0.1:5532 \
+     nohup /tmp/kdb-target-byteatyped/release/kesseldb \
+       127.0.0.1:6532 /tmp/kdb-byteatyped-data \
+     >/tmp/kdb-byteatyped.log 2>&1 & disown"
+
+  → KesselDB listening on 127.0.0.1:6532, data dir
+    /tmp/kdb-byteatyped-data, pg=127.0.0.1:5532
+
+Smoke (psycopg3 binary-format BYTEA + psycopg2 text-format CHAR
+regression check):
+
+  === psycopg3 binary-format BYTEA round-trip (non-UTF8 bytes) ===
+    [non_utf8_canary] input hex:  fffefd8090a0b0c0
+    [all_zero]        input hex:  0000000000000000
+    [deadbeef]        input hex:  deadbeefcafebabe
+    [non_utf8_canary] stored hex: fffefd8090a0b0c0 EQUAL: True
+    [all_zero]        stored hex: 0000000000000000 EQUAL: True
+    [deadbeef]        stored hex: deadbeefcafebabe EQUAL: True
+    HEADLINE: all non-UTF8 BYTEA bytes round-trip byte-equal: True
+
+  === psycopg2 text-format CHAR still works (regression check) ===
+    text path: (1, 'Alice')
+
+Verification:
+  - The 0xFF byte (always invalid UTF-8) survives verbatim. Prior to
+    this arc, `String::from_utf8_lossy([0xFF])` produced the 3-byte
+    UTF-8 replacement-character sequence `\xEF\xBF\xBD`, corrupting
+    every non-UTF8 input.
+  - The 0x80, 0x90, 0xA0, 0xB0, 0xC0 isolated continuation bytes all
+    survive verbatim.
+  - The 0x00 byte at start of buffer (would have been mishandled by
+    some string-based code paths) survives verbatim.
+  - The text-format string path is regression-free — psycopg2's
+    default CHAR insert + SELECT still works the same way.
+
+Stop:
+  ssh admin@192.168.4.178 "pkill -f 'kdb-target-byteatyped'"
+
+Status: DONE — typed-path BYTEA preserves arbitrary bytes including
+non-UTF8 sequences. Closes the V2 follow-up named in
+SP-PG-EXTQ-PARSED-DEFAULT V1's design spec §2.2.

@@ -1605,8 +1605,19 @@ above). Some advanced introspection paths remain V2-deferred:
   only). Vulcan-verified with psycopg2 + asyncpg + psycopg3 round-
   trip + quote-injection wire test (`"; DROP TABLE inj_smoke; --`
   stored verbatim, table NOT dropped). Fallback to text-substitute
-  path remains for FLOAT/TIMESTAMPTZ/NUMERIC + BYTEA binary
-  (parameter shapes the typed path cannot represent cleanly).
+  path remains for FLOAT/TIMESTAMPTZ/NUMERIC (parameter shapes the
+  typed path cannot represent cleanly without widening `Value`).
+- **BYTEA-binary preserves arbitrary bytes through the typed path**
+  (SP-PG-EXTQ-PARSED-BYTEA-TYPED, 2026-06-02). kessel-sql's
+  `Tok::Bytes(Vec<u8>)` + `Lit::Bytes(Vec<u8>)` variants thread raw
+  bytes (including non-UTF8 sequences like 0xFF, 0xFE, isolated
+  continuation bytes 0x80-0xBF) from a bound `Value::Blob`
+  parameter through to the storage layer byte-equal. Drops the
+  prior `String::from_utf8_lossy(b).into_owned()` call in
+  `rewrite_param_tokens` that corrupted non-UTF8 bytes before they
+  reached storage. Vulcan-verified with psycopg3 binary-format
+  BYTEA round-trip of payloads `fffefd8090a0b0c0`, `00...00`, and
+  `deadbeefcafebabe` — all bytes survive verbatim.
 - **One statement per `Q`** → `psql \copy ...; SELECT ...` rejected
   with `42601` syntax_error. Send statements one at a time. V2.
 - **Text format only** → every column rendered as PG text;

@@ -31,10 +31,16 @@ helpers using the same `::` cast syntax) can:
 
 **Out-of-scope (named, deferred — each is its own arc):**
 
-- **`SP-PG-EXTQ-CAST-VALIDATE` (V2)** — verify the stripped cast
-  was well-typed against the target column / param slot. V1 is
-  "strip + hope" because the engine's type-checker already covers
-  the common cases.
+- ~~**`SP-PG-EXTQ-CAST-VALIDATE` (V2)** — verify the stripped cast
+  was well-typed against the target column / param slot.~~ →
+  **CLOSED 2026-06-02 by SP-PG-EXTQ-CAST-VALIDATE V1**
+  (`docs/superpowers/specs/2026-06-02-kesseldb-sppgextqcastvalidate-design.md`).
+  `cast_stripper::strip_pg_casts_tracked` returns the
+  `(stripped_sql, Vec<($N_index, declared_oid)>)` tracking vec;
+  `PreparedStmt.param_casts` stores the pairs at Parse time;
+  `dispatch_bind` rejects any bound-OID-vs-declared-OID mismatch
+  with `42846 cannot_coerce`. vulcan psycopg3 PQ-layer 3-case smoke
+  proves end-to-end + literal-cast paths regression-free.
 - **`SP-PG-EXTQ-CAST-NESTED` (V2)** — handle `(a::int)::text`
   correctly via parenthesis-depth tracking. V1's one-level cap is
   fine for pgJDBC emits.

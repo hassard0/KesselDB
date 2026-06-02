@@ -2,8 +2,13 @@
 
 Date created: 2026-06-02
 
-Status: IN-PROGRESS — T1+T2 design + cast-tracking + validator landing
-this commit.
+**Status: CLOSED — V1 SHIPPED at T2 (2026-06-02).** The HEADLINE
+shape — Parse(`SELECT ... WHERE id = $1::int8`, param_oids=[25/* TEXT */])
++ Bind('42') — now returns `42846 cannot_coerce` with message
+`cannot cast parameter $1 from type with OID 25 to declared cast
+type OID 20` (was: silent strip-and-coerce). Verified via
+psycopg3 PQ-layer smoke on vulcan. TaskList #382 ready for
+completion.
 
 Design spec: `docs/superpowers/specs/2026-06-02-kesseldb-sppgextqcastvalidate-design.md`
 Parent SP-arc: SP-PG-EXTQ-CAST V1 (closed 2026-06-02 at T2). The
@@ -40,12 +45,13 @@ mismatches reject with `42846 cannot_coerce`."
 
 | T# | Scope | Status | Commit |
 |---|---|---|---|
-| **T1** | Design spec + this progress tracker. | DONE (folded into T2 commit) | — |
-| **T2** | `cast_stripper::strip_pg_casts_tracked` + `PreparedStmt.param_casts` + `dispatch_parse` integration + `dispatch_bind` validator + `ExtqError::CastOidMismatch` + server.rs renderer + KATs. | IN-PROGRESS | — |
-| **T3** | vulcan psql literal-cast regression smoke transcript + USAGE §9 update flagging V1 "strip + hope" → V2 "strip + validate". | QUEUED | — |
-| **T4** | STATUS row + parent SP-PG-EXTQ-CAST progress tracker follow-up entry → CLOSED + this progress tracker → CLOSED. | QUEUED | — |
+| **T1** | Design spec + this progress tracker. | **DONE** (folded into T2 commit) | `ad3743c` |
+| **T2** | `cast_stripper::strip_pg_casts_tracked` + `PreparedStmt.param_casts` + `dispatch_parse` integration + `dispatch_bind` validator + `ExtqError::CastOidMismatch` + server.rs renderer + KATs. | **DONE** | `ad3743c` |
+| **T3** | vulcan psycopg3 PQ-layer 3-case smoke transcript (matching OID succeeds / HEADLINE 42846 mismatch / omitted-OID skip) + USAGE §9 update flipping the parent arc's "V1 is strip + hope" residual gap to CLOSED. | **DONE** | `525969e` |
+| **T4** | STATUS row + parent SP-PG-EXTQ-CAST progress tracker follow-up entry → CLOSED + this progress tracker → CLOSED. | **DONE** | (this commit) |
 
-KAT delta target: +8-12 (cast_stripper module + extq dispatch).
+KAT delta: +17 (11 `cast_stripper::tests::tracked_*` + 6
+`extq::tests::cast_validate_t2_*`).
 
 ## Headline
 

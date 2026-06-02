@@ -41,6 +41,31 @@ measurement and had drifted from the actual workspace count).
   production `ClusterClient` does. The long-standing CI flake is GONE.
 
 Latest arc deliveries on top of that baseline (most-recent first):
+SP-PG-EXTQ-CAST-VALIDATE V1 (2026-06-02, +17 KATs) — closes the V1
+SP-PG-EXTQ-CAST "strip + hope" silent-coercion attack vector.
+`cast_stripper::strip_pg_casts_tracked(sql) -> (String,
+Vec<(usize, u32)>)` extends the V1 stripper with a tracking vec
+pairing each stripped `$N::TYPE` cast with the type's PG OID;
+`PreparedStmt.param_casts` stores the pairs at Parse time;
+`dispatch_bind` rejects any mismatch between the bound parameter
+OID and the declared cast OID with `ExtqError::CastOidMismatch`
+which `server.rs` renders to SQLSTATE `42846 cannot_coerce`.
+Skip-rule for asyncpg / psycopg3 default shape: when Parse omitted
+the OID hint at that position (`= 0 = infer`), the validator
+skips — the omitted hint is the client's explicit "trust the SQL"
+signal. **vulcan-verified** via psycopg3 PQ-layer 3-case smoke
+(`docs/superpowers/sppgextqcastvalidate-t3-smoke-2026-06-02.txt`):
+matching OID succeeds, mismatched OID rejects with exact 42846 +
+message naming both OIDs ('cannot cast parameter $1 from type with
+OID 25 to declared cast type OID 20'), omitted-OID skip-rule
+works. Literal-cast psql shapes (parent arc regression-guard) PASS
+byte-for-byte. HEADLINE: the silent-coercion vector the parent arc
+explicitly flagged ("V1 scope is strip + hope") is CLOSED. V2
+follow-ups named: `SP-PG-EXTQ-CAST-VALIDATE-COMPAT` (PG type-
+category compatibility table instead of strict OID equality),
+`SP-PG-EXTQ-CAST-VALIDATE-LITERAL` (also validate literal casts,
+not just $N), `SP-PG-EXTQ-CAST-VALIDATE-MULTIWORD` (recognise
+multi-word PG type names like `TIMESTAMP WITH TIME ZONE`).
 SP-PG-COPY-CSV-NUMERIC V1 (2026-06-02, +21 KATs) — text + CSV COPY
 into a NUMERIC-OID column (kessel-sql `I128`/`U128`/`Fixed` → PG OID
 1700) now validates the canonical PG decimal grammar at the gateway

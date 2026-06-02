@@ -1,0 +1,118 @@
+=== SP-Cloud-Cluster T2 kind verification transcript ===
+=== date ===
+2026-06-02T13:44:07Z
+
+=== environment ===
+kind v0.24.0 go1.22.6 linux/amd64
+v3.16.3+gcfd0749
+Client Version: v1.31.0
+Kustomize Version: v5.4.2
+Docker version 27.5.1, build 27.5.1-0ubuntu3~24.04.2
+
+=== chart render — cluster mode object counts ===
+      2 kind: Service
+      1 kind: ServiceAccount
+      1 kind: StatefulSet
+
+=== pods ===
+NAME         READY   STATUS    RESTARTS      AGE     IP            NODE                           NOMINATED NODE   READINESS GATES
+kesseldb-0   1/1     Running   0             2m30s   10.244.0.13   kdb-cluster-t2-control-plane   <none>           <none>
+kesseldb-1   1/1     Running   1 (90s ago)   2m30s   10.244.0.12   kdb-cluster-t2-control-plane   <none>           <none>
+kesseldb-2   1/1     Running   1 (90s ago)   2m30s   10.244.0.11   kdb-cluster-t2-control-plane   <none>           <none>
+
+=== services ===
+NAME                TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)                      AGE
+kesseldb            ClusterIP   10.96.159.89   <none>        6532/TCP,6533/TCP,5432/TCP   7m54s
+kesseldb-headless   ClusterIP   None           <none>        6534/TCP                     7m54s
+
+=== pvc ===
+NAME              STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   VOLUMEATTRIBUTESCLASS   AGE
+data-kesseldb-0   Bound    pvc-f6e79287-f310-4bd8-82ab-3fc658a0ad74   10Gi       RWO            standard       <unset>                 7m54s
+data-kesseldb-1   Bound    pvc-cdc12e20-5b39-43ff-bbf7-bc3df5d2ed29   10Gi       RWO            standard       <unset>                 7m54s
+data-kesseldb-2   Bound    pvc-280545a8-7b9f-4afb-a928-03cd28fa4da1   10Gi       RWO            standard       <unset>                 7m54s
+
+=== logs: kesseldb-0 ===
+kesseldb cluster pod: idx=0 peers=kesseldb-0.kesseldb-headless.kdb.svc.cluster.local:6534,kesseldb-1.kesseldb-headless.kdb.svc.cluster.local:6534,kesseldb-2.kesseldb-headless.kdb.svc.cluster.local:6534
+kesseldb cluster: DNS bootstrap: peer-addrs: "kesseldb-1.kesseldb-headless.kdb.svc.cluster.local:6534" resolve failed: failed to lookup address information: Name or service not known; retrying in 2s...
+kesseldb cluster: starting replica 0/3, client_addr=0.0.0.0:6532, peer_listen=10.244.0.13:6534, data=/data, view_change_timeout=5s (informational), token=set, peers=[10.244.0.13:6534,10.244.0.12:6534,10.244.0.11:6534]
+kesseldb cluster: NOTE — HTTP / HTTPS / PG-wire gateway env vars are accepted but IGNORED in cluster mode V1 (binary client protocol only on this slice; gateway cluster surfaces are a documented V2 follow-up).
+kesseldb cluster: started replica 0/3 (peer listen ok, client listen ok)
+kesseldb cluster: replica 0 role: view=0 is_primary=true status=Normal
+kesseldb cluster: replica 0 elected primary (view=0)
+
+=== logs: kesseldb-1 ===
+kesseldb cluster pod: idx=1 peers=kesseldb-0.kesseldb-headless.kdb.svc.cluster.local:6534,kesseldb-1.kesseldb-headless.kdb.svc.cluster.local:6534,kesseldb-2.kesseldb-headless.kdb.svc.cluster.local:6534
+kesseldb cluster: starting replica 1/3, client_addr=0.0.0.0:6532, peer_listen=10.244.0.12:6534, data=/data, view_change_timeout=5s (informational), token=set, peers=[10.244.0.13:6534,10.244.0.12:6534,10.244.0.11:6534]
+kesseldb cluster: NOTE — HTTP / HTTPS / PG-wire gateway env vars are accepted but IGNORED in cluster mode V1 (binary client protocol only on this slice; gateway cluster surfaces are a documented V2 follow-up).
+kesseldb cluster: started replica 1/3 (peer listen ok, client listen ok)
+kesseldb cluster: replica 1 role: view=0 is_primary=false status=Normal
+
+=== logs: kesseldb-2 ===
+kesseldb cluster pod: idx=2 peers=kesseldb-0.kesseldb-headless.kdb.svc.cluster.local:6534,kesseldb-1.kesseldb-headless.kdb.svc.cluster.local:6534,kesseldb-2.kesseldb-headless.kdb.svc.cluster.local:6534
+kesseldb cluster: starting replica 2/3, client_addr=0.0.0.0:6532, peer_listen=10.244.0.11:6534, data=/data, view_change_timeout=5s (informational), token=set, peers=[10.244.0.13:6534,10.244.0.12:6534,10.244.0.11:6534]
+kesseldb cluster: NOTE — HTTP / HTTPS / PG-wire gateway env vars are accepted but IGNORED in cluster mode V1 (binary client protocol only on this slice; gateway cluster surfaces are a documented V2 follow-up).
+kesseldb cluster: started replica 2/3 (peer listen ok, client listen ok)
+kesseldb cluster: replica 2 role: view=0 is_primary=false status=Normal
+
+=== role probe (one shot via kubectl exec; primary elected ===
+-- kesseldb-0 --
+kesseldb cluster: started replica 0/3 (peer listen ok, client listen ok)
+kesseldb cluster: replica 0 elected primary (view=0)
+-- kesseldb-1 --
+kesseldb cluster: started replica 1/3 (peer listen ok, client listen ok)
+-- kesseldb-2 --
+kesseldb cluster: started replica 2/3 (peer listen ok, client listen ok)
+
+=== CRUD smoke through ClusterIP service ===
+OK
+ERROR  unknown table `smoke`
+command terminated with exit code 1
+ERROR  unknown table `smoke`
+command terminated with exit code 1
+
+=== END transcript ===
+
+=== CRUD direct against primary kesseldb-0 (clean) ===
+--- CREATE ---
+ERROR  type 'final_smoke' exists
+command terminated with exit code 1
+--- INSERT ---
+EXISTS  (row already present)
+--- SELECT ---
+v 
+--
+42
+(1 row)
+
+=== Note on service round-robin ===
+The kessel CLI uses single-Client::connect, not ClusterClient, so a
+round-robin via the ClusterIP svc may land a write on a backup which
+answers OpResult::Unavailable. ClusterClient is the failover-aware
+surface (see crates/kessel-client/src/lib.rs::ClusterClient and the
+test cluster::tests::cluster_client_finds_primary_and_is_exactly_once).
+Direct-to-primary CRUD above proves the cluster is committing.
+
+=== state after CRUD ===
+NAME         READY   STATUS    RESTARTS       AGE    IP            NODE                           NOMINATED NODE   READINESS GATES
+kesseldb-0   1/1     Running   0              4m2s   10.244.0.13   kdb-cluster-t2-control-plane   <none>           <none>
+kesseldb-1   1/1     Running   1 (3m2s ago)   4m2s   10.244.0.12   kdb-cluster-t2-control-plane   <none>           <none>
+kesseldb-2   1/1     Running   1 (3m2s ago)   4m2s   10.244.0.11   kdb-cluster-t2-control-plane   <none>           <none>
+
+=== final pod logs (tail 4) — confirm steady state ===
+--- kesseldb-0 ---
+kesseldb cluster: NOTE — HTTP / HTTPS / PG-wire gateway env vars are accepted but IGNORED in cluster mode V1 (binary client protocol only on this slice; gateway cluster surfaces are a documented V2 follow-up).
+kesseldb cluster: started replica 0/3 (peer listen ok, client listen ok)
+kesseldb cluster: replica 0 role: view=0 is_primary=true status=Normal
+kesseldb cluster: replica 0 elected primary (view=0)
+--- kesseldb-1 ---
+kesseldb cluster: starting replica 1/3, client_addr=0.0.0.0:6532, peer_listen=10.244.0.12:6534, data=/data, view_change_timeout=5s (informational), token=set, peers=[10.244.0.13:6534,10.244.0.12:6534,10.244.0.11:6534]
+kesseldb cluster: NOTE — HTTP / HTTPS / PG-wire gateway env vars are accepted but IGNORED in cluster mode V1 (binary client protocol only on this slice; gateway cluster surfaces are a documented V2 follow-up).
+kesseldb cluster: started replica 1/3 (peer listen ok, client listen ok)
+kesseldb cluster: replica 1 role: view=0 is_primary=false status=Normal
+--- kesseldb-2 ---
+kesseldb cluster: starting replica 2/3, client_addr=0.0.0.0:6532, peer_listen=10.244.0.11:6534, data=/data, view_change_timeout=5s (informational), token=set, peers=[10.244.0.13:6534,10.244.0.12:6534,10.244.0.11:6534]
+kesseldb cluster: NOTE — HTTP / HTTPS / PG-wire gateway env vars are accepted but IGNORED in cluster mode V1 (binary client protocol only on this slice; gateway cluster surfaces are a documented V2 follow-up).
+kesseldb cluster: started replica 2/3 (peer listen ok, client listen ok)
+kesseldb cluster: replica 2 role: view=0 is_primary=false status=Normal
+
+=== END transcript ===

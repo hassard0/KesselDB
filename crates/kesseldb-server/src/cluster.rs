@@ -47,6 +47,11 @@ enum Ev {
     Peer { from: usize, msg: Msg },
     Tick,
     Probe(SyncSender<(u32, u64, u64)>),
+    /// SP-Cloud-Cluster T2 — read this replica's role for operational
+    /// logging (`view`, `is_primary`, `status`). Used by the binary
+    /// startup loop to emit "elected primary" log lines so an operator
+    /// can see the cluster reached the steady state.
+    RoleProbe(SyncSender<(u64, bool, &'static str)>),
 }
 
 /// What to do when a linearized op's result comes back.
@@ -266,6 +271,18 @@ impl Node {
             return (0, 0, 0);
         }
         prx.recv().unwrap_or((0, 0, 0))
+    }
+
+    /// SP-Cloud-Cluster T2 — `(view, is_primary, status)` for operational
+    /// logging. Lets the binary's main loop emit a one-shot
+    /// "elected primary" message when the cluster has reached the
+    /// steady state. Status is one of `"Normal"` / `"ViewChange"`.
+    pub fn role_probe(&self) -> (u64, bool, &'static str) {
+        let (ptx, prx) = sync_channel(1);
+        if self.tx.send(Ev::RoleProbe(ptx)).is_err() {
+            return (0, false, "Down");
+        }
+        prx.recv().unwrap_or((0, false, "Down"))
     }
 }
 
@@ -619,6 +636,14 @@ pub fn spawn_node(
                         replica.committed(),
                     ));
                 }
+                Ev::RoleProbe(ptx) => {
+                    // Replica::probe returns (view, is_primary, status,
+                    // commit, op_number, max_view_seen); we only need the
+                    // first three for the operational role log.
+                    let (view, is_primary, status, _c, _o, _m) =
+                        replica.probe();
+                    let _ = ptx.send((view, is_primary, status));
+                }
             }
         }
     });
@@ -635,7 +660,42 @@ pub fn spawn_node(
     }
 }
 
-fn handle_client_conn(mut s: TcpStream, node: Arc<Node>) {
+/// Constant-time byte slice compare — same primitive as the single-node
+/// listener's auth path. Reproduced locally so the cluster module stays a
+/// self-contained surface (no `pub(crate)` leak from `lib.rs`).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut acc: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc |= x ^ y;
+    }
+    acc == 0
+}
+
+/// SP-Cloud-Cluster T2 — auth handshake mirror of `lib.rs::authenticate`.
+/// `None` token = open mode (no handshake expected). `Some(t)` = the first
+/// frame on every connection must be `[0xFC] ++ t`. Reply is `Ok` on
+/// success, `Unauthorized` on mismatch (then the caller closes).
+fn cluster_authenticate(s: &mut TcpStream, token: &Option<Vec<u8>>) -> bool {
+    let Some(tok) = token else { return true };
+    let frame = match read_frame(s) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    // Match `lib.rs::AUTH_TAG` = 0xFC verbatim; the cluster path stays the
+    // same wire surface as the single-node path so existing clients work.
+    let ok = frame.first() == Some(&0xFC) && ct_eq(&frame[1..], tok);
+    let reply = if ok { OpResult::Ok } else { OpResult::Unauthorized };
+    let _ = write_frame(s, &reply.encode());
+    ok
+}
+
+fn handle_client_conn(mut s: TcpStream, node: Arc<Node>, token: Option<Vec<u8>>) {
+    if !cluster_authenticate(&mut s, &token) {
+        return; // rejected; Unauthorized reply already written
+    }
     loop {
         let req = match read_frame(&mut s) {
             Ok(r) => r,
@@ -657,12 +717,27 @@ fn handle_client_conn(mut s: TcpStream, node: Arc<Node>) {
 /// Serve the ordinary client protocol (`kessel-client`, incl. `sql()`) for
 /// this cluster node, one thread per connection. Connect clients to the
 /// primary: replies are emitted there (failover client-reply routing is a
-/// documented follow-up).
+/// documented follow-up). Open-mode — no auth handshake.
 pub fn serve_clients(listener: TcpListener, node: Arc<Node>) {
+    serve_clients_cfg(listener, node, None)
+}
+
+/// SP-Cloud-Cluster T2 — auth-capable variant of `serve_clients`. When
+/// `token` is `Some(t)`, every accepted connection's first frame must be
+/// `[0xFC] ++ t`; otherwise the connection is rejected. When `token` is
+/// `None`, behaviour is identical to `serve_clients`. Wire surface matches
+/// the single-node `serve_cfg` path so existing `kessel-client` /
+/// `ClusterClient` instances work unchanged against either deployment.
+pub fn serve_clients_cfg(
+    listener: TcpListener,
+    node: Arc<Node>,
+    token: Option<Vec<u8>>,
+) {
     for stream in listener.incoming().flatten() {
         let _ = stream.set_nodelay(true); // no Nagle (see lib.rs serve_cfg)
         let n = node.clone();
-        std::thread::spawn(move || handle_client_conn(stream, n));
+        let tok = token.clone();
+        std::thread::spawn(move || handle_client_conn(stream, n, tok));
     }
 }
 

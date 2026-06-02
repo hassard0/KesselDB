@@ -2056,6 +2056,126 @@ pub fn run_cfg(
     Ok(())
 }
 
+/// SP-Cloud-Cluster T2 — multi-replica VSR runtime entrypoint. This is
+/// the cluster-mode analogue of `run_cfg`: instead of spawning a single
+/// `EngineHandle`, it binds a peer-listen socket, constructs a
+/// `cluster::Node` via `cluster::spawn_node` (which owns the
+/// `kessel_vsr::Replica<DirVfs>` on a single non-`Send` engine thread),
+/// and exposes the same binary client protocol on `client_addr` via
+/// `cluster::serve_clients_cfg`.
+///
+/// `self_idx` is this pod's index into `peer_addrs` (0..N-1).
+/// `peer_addrs[self_idx]` is the LISTEN address for the peer transport
+/// on this pod; the other entries are the dial targets the writer
+/// threads connect to. Open-mode and token-mode auth both follow the
+/// single-node wire (first frame `[0xFC] ++ token`) so existing
+/// `kessel-client` / `ClusterClient` instances work unchanged.
+///
+/// Refuses to start with a typed io error if `peer_addrs.len()` is
+/// less than 3 or is even — VSR requires odd N >= 3 (the underlying
+/// `Replica::new` panics on even N; we fail loudly here instead so
+/// the operator sees a clean error). `self_idx` must be in range.
+///
+/// V1 scope (this slice — T2 wire-up):
+///   - Binary client protocol only (no HTTP gateway / no PG-wire on
+///     the cluster path; those are V2 cluster gateway surfaces).
+///   - Open or token auth; TLS / mTLS deferred.
+///   - Per-pod data dir; replication via `cluster.rs` real-TCP transport.
+pub fn run_cluster_cfg(
+    client_addr: impl ToSocketAddrs,
+    peer_listen_addr: impl ToSocketAddrs,
+    data_dir: impl AsRef<Path>,
+    self_idx: usize,
+    peer_addrs: Vec<std::net::SocketAddr>,
+    cfg: ServerConfig,
+) -> io::Result<()> {
+    let n = peer_addrs.len();
+    if n < 3 || n % 2 == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "cluster: peer-addrs count must be odd and >= 3, got {n} \
+                 (legal values are 3 or 5 — VSR is fixed-size)"
+            ),
+        ));
+    }
+    if self_idx >= n {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "cluster: replica-idx {self_idx} out of range for an \
+                 {n}-node cluster (must be in 0..{n})"
+            ),
+        ));
+    }
+    let peer_listener = TcpListener::bind(peer_listen_addr)?;
+    let client_listener = TcpListener::bind(client_addr)?;
+    let node = cluster::spawn_node(
+        self_idx,
+        peer_listener,
+        peer_addrs,
+        data_dir.as_ref().to_path_buf(),
+    )?;
+    let node = std::sync::Arc::new(node);
+    eprintln!(
+        "kesseldb cluster: started replica {self_idx}/{n} \
+         (peer listen ok, client listen ok)"
+    );
+
+    // Spawn a small role-logger that polls Node::role_probe every 500 ms
+    // and prints a one-shot "elected primary" / "became backup of view N"
+    // line whenever the (view, is_primary) tuple changes. Operators can
+    // grep this in `kubectl logs` to verify the cluster reached the
+    // steady state. Bounded log volume: at most one line per role
+    // transition (which is rare in steady state).
+    let role_node = node.clone();
+    std::thread::spawn(move || {
+        let mut last: Option<(u64, bool, &'static str)> = None;
+        loop {
+            let cur = role_node.role_probe();
+            match last {
+                None => {
+                    eprintln!(
+                        "kesseldb cluster: replica {self_idx} role: \
+                         view={} is_primary={} status={}",
+                        cur.0, cur.1, cur.2
+                    );
+                    if cur.1 && cur.2 == "Normal" {
+                        eprintln!(
+                            "kesseldb cluster: replica {self_idx} \
+                             elected primary (view={})",
+                            cur.0
+                        );
+                    }
+                }
+                Some(prev) if prev != cur => {
+                    eprintln!(
+                        "kesseldb cluster: replica {self_idx} role \
+                         changed: view {}->{} is_primary {}->{} \
+                         status {}->{}",
+                        prev.0, cur.0, prev.1, cur.1, prev.2, cur.2
+                    );
+                    if cur.1 && cur.2 == "Normal" && !(prev.1 && prev.2 == "Normal") {
+                        eprintln!(
+                            "kesseldb cluster: replica {self_idx} \
+                             elected primary (view={})",
+                            cur.0
+                        );
+                    }
+                }
+                _ => {}
+            }
+            last = Some(cur);
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    });
+
+    // Block forever serving the client protocol; on shutdown the OS
+    // tears down all sockets + threads.
+    cluster::serve_clients_cfg(client_listener, node, cfg.token.clone());
+    Ok(())
+}
+
 // SP141 — EngineApply bridge: lets the gateway dispatch into the existing
 // engine via the same single-threaded apply path used by the binary
 // listener. apply_op_with_session goes through session_frame so the engine's

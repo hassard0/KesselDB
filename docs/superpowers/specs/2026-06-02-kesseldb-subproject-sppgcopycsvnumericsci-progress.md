@@ -1,8 +1,15 @@
 # SP-PG-COPY-CSV-NUMERIC-SCI — scientific notation in text/CSV COPY NUMERIC — SP-arc Progress Tracker
 
 Date created: 2026-06-02
-**Status: T1 SHIPPING — `parse_scientific_notation` helper + scientific
-branch in `validate_numeric_text` + KATs (this commit).**
+**Status: CLOSED — V1 SHIPPED at T3 (2026-06-02).** Real psql 16
+vulcan smoke on ports 5532/6532 confirms text + CSV COPY into a
+NUMERIC-OID column accepts the scientific-notation grammar,
+expands the mantissa+exponent into canonical decimal text BEFORE
+the row reaches the engine, and surfaces precise `22P02
+invalid_text_representation` errors on malformed input
+(out-of-range exponent, missing exponent, multiple exponent
+markers, non-integer exponent, trailing-dot mantissa with V2-arc
+name). TaskList #385 ready for completion.
 
 Design spec: `docs/superpowers/specs/2026-06-02-kesseldb-sppgcopycsvnumericsci-design.md`
 
@@ -45,9 +52,9 @@ reject with a precise `22P02` naming the reason."
 
 | T# | Scope | Status | Commit |
 |---|---|---|---|
-| **T1** | Design spec + `parse_scientific_notation` + scientific branch + KATs. | **DONE** | (this commit) |
-| **T2** | Real psql 16 vulcan smoke + USAGE §9 expansion. | pending | |
-| **T3** | STATUS row + tracker → CLOSED + TaskList #385 ready. | pending | |
+| **T1+T2** | Design spec + `parse_scientific_notation` + scientific branch + KATs. | **DONE** | `62bdea7` |
+| **T2 docs** | Real psql 16 vulcan smoke + USAGE update. | **DONE** | `48bca5c` |
+| **T3** | STATUS row + tracker → CLOSED + TaskList #385 ready. | **DONE** | (this commit) |
 
 ## T1 — what landed (2026-06-02)
 
@@ -61,8 +68,44 @@ reject with a precise `22P02` naming the reason."
   returns the expanded form; on `Ok(None)` falls through to the
   V1 finite-decimal path; on `Err(...)` returns the precise
   variant.
-- KATs (~14): canonical scientific forms (positive + negative
-  exponents + signed mantissas + case-insensitive E + leading-dot
-  mantissa), out-of-range exponent, missing exponent, multiple
-  exponent markers, malformed exponent sign, non-integer exponent,
-  bare `e10` (no mantissa), trailing-dot mantissa rejection.
+- KATs (20 new + 2 pre-existing V1 tests updated): canonical
+  scientific forms (positive + negative exponents + signed
+  mantissas + case-insensitive E + leading-dot mantissa),
+  out-of-range exponent, missing exponent, multiple exponent
+  markers, malformed exponent sign, non-integer exponent, bare
+  `e10` (no mantissa), trailing-dot mantissa rejection,
+  negative-zero canonicalisation. All 962 kessel-pg-gateway lib
+  tests pass.
+
+## T2 — landed (commit `48bca5c`)
+
+Real psql 16 vulcan smoke on port 5532/6532 (no sibling-agent
+collision this time). Smoke transcript:
+`docs/superpowers/sppgcopycsvnumericsci-t2-smoke-2026-06-02.txt`.
+
+Confirmed (validator scope):
+- 4-row CSV happy path: `1e10` → `10000000000`, `6e3` → `6000`,
+  `-3.14e2` → `-314`, `1.5e3` → `1500`. All ingested via
+  `COPY ... WITH (FORMAT csv, HEADER)` and observable in
+  `SELECT * FROM sci_smoke ORDER BY id`.
+- Validator-layer rejection: `1e1000` surfaces precise
+  `22P02 malformed (exponent out of range)`; `1e` surfaces
+  `22P02 malformed (missing exponent)`.
+
+Honest engine-boundary documentation:
+- Fractional-result scientific (`1.5e-3` → validator `0.0015`)
+  passes the validator cleanly; kessel-sql I128 storage only
+  accepts integer values → engine "sql: expected value" error.
+  Same pre-existing gap V1 SP-PG-COPY-CSV-NUMERIC transcript
+  documented for NaN/Infinity. V2 arc: `SP-PG-COPY-NUMERIC-BIGNUM`.
+
+USAGE.md updated (T2 commit): new
+"SP-PG-COPY-CSV-NUMERIC-SCI — scientific notation (V1 SHIPPED
+2026-06-02)" subsection under SP-PG-COPY-CSV-NUMERIC with
+examples + grammar + rejection messages + V2-arc references.
+
+## T3 — landed (this commit)
+
+- STATUS.md row added under "Latest arc deliveries".
+- Tracker → CLOSED (this file).
+- TaskList #385 ready.

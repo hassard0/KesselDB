@@ -41,6 +41,44 @@ measurement and had drifted from the actual workspace count).
   production `ClusterClient` does. The long-standing CI flake is GONE.
 
 Latest arc deliveries on top of that baseline (most-recent first):
+SP-PG-COPY-CSV-NUMERIC-SCI V1 (2026-06-02, +20 KATs) — text + CSV
+COPY into a NUMERIC-OID column (kessel-sql `I128`/`U128`/`Fixed` →
+PG OID 1700) now accepts scientific notation and expands the
+exponent into the canonical PG decimal text BEFORE the row reaches
+the engine. Grammar `[+-]?(\d+(\.\d+)?|\.\d+)[eE][+-]?\d+` (mantissa
+with integer/integer+fractional/leading-dot-fractional + `e`/`E`
+case-insensitive + signed integer exponent). New
+`copy::csv::parse_scientific_notation` helper hand-rolls the
+decimal-point-shift expansion (no bigint dep): `1e10` →
+`"10000000000"`; `1.5e-3` → `"0.0015"`; `6.022e23` →
+`"602200000000000000000000"`; `-3.14e2` → `"-314"`. The new branch
+runs FIRST in `validate_numeric_text` so any `e`/`E`-bearing input
+routes through expansion; non-scientific inputs skip at zero cost.
+`|exp|>100` cap surfaces as `Malformed("exponent out of range")`
+to prevent pathological digit-string allocation. Missing exponent
+(`1e`), multiple exponent markers (`1ee2`), malformed sign
+(`1e+-3`), non-integer exponent (`1e1.5`) reject as `Malformed`
+with precise reason. Trailing-dot mantissa (`5.e2`) is the named
+follow-up arc `SP-PG-COPY-CSV-NUMERIC-SCI-TRAILDOT` (no ORM /
+spreadsheet emits it in practice — rejection message carries the
+arc name). The pre-existing `CsvNumericError::ScientificNotation`
+variant is preserved for back-compat but is now unreachable from
+`validate_numeric_text`. **vulcan-verified** (port 5532/6532, fresh
+`/tmp/kdb-target-csvnumsci` build): 4-row CSV happy path (`1e10` /
+`6e3` / `-3.14e2` / `1.5e3`) ingests and round-trips cleanly through
+the engine; validator-layer `1e1000` rejects with
+`22P02 malformed (exponent out of range)`; `1e` rejects with
+`22P02 malformed (missing exponent)`. Honest engine-boundary doc:
+fractional-result scientific (`1.5e-3` → `0.0015`) passes the
+validator but the kessel-sql I128 storage layer only accepts
+integer values (same pre-existing gap V1 NaN/Infinity hits; V2 arc
+`SP-PG-COPY-NUMERIC-BIGNUM`). HEADLINE: scientific notation from
+ORM exports + spreadsheet auto-formatted CSV exports
+(`pg_dump --csv`, R `write.csv()`, `np.savetxt`, Excel/Sheets `Save
+As CSV`) ingests cleanly for the |exp|≤100 integer-yielding band
+— the V1 SP-PG-COPY-CSV-NUMERIC arc's named follow-up gap is
+CLOSED. Smoke transcript:
+`docs/superpowers/sppgcopycsvnumericsci-t2-smoke-2026-06-02.txt`.
 SP-PG-COPY-ABORT-DONE-TAIL V1 (2026-06-02, +5 KATs) — closes the
 pre-existing protocol-violation tail surfaced as a footnote in the
 SP-PG-COPY-CSV-NUMERIC T2 smoke. PG §55.2.7: when an ErrorResponse

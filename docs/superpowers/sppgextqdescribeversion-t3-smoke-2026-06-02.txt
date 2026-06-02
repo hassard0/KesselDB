@@ -1,0 +1,221 @@
+SP-PG-EXTQ-DESCRIBE-VERSION T3 — vulcan pgJDBC extended-mode smoke transcript
+==============================================================================
+Recorded: 2026-06-02 on vulcan (Ubuntu 24.04)
+Server:   kesseldb (built `--features pg-gateway`,
+          CARGO_TARGET_DIR=/tmp/kdb-target-describever)
+          KESSELDB_TOKEN=admin KESSELDB_PG_ADDR=127.0.0.1:5532
+HEAD at smoke time: `4bbb5d2` (T1+T2 scalar RowDescription synthesizer +
+          KATs already on main from the prior session's commit batch —
+          this T3 session pivots that commit's misleading title into a
+          named smoke transcript + arc closure).
+Driver:   pgJDBC 42.7.4 (postgresql-42.7.4.jar)
+Java:     OpenJDK 21.0.2 (~/jdbc-smoke/jdk-21.0.2)
+
+================================================================
+1. Build + launch
+================================================================
+
+    ssh admin@192.168.4.178 \
+      "source ~/.cargo/env && cd ~/KesselDB && \
+       git pull origin main && \
+       CARGO_TARGET_DIR=/tmp/kdb-target-describever \
+       cargo build --release --bin kesseldb --features pg-gateway"
+
+       Finished `release` profile [optimized] target(s) in 24.77s
+
+    ssh admin@192.168.4.178 \
+      "rm -rf /tmp/kdb-describever-data && \
+       KESSELDB_TOKEN=admin KESSELDB_PG_ADDR=127.0.0.1:5532 \
+       nohup /tmp/kdb-target-describever/release/kesseldb \
+         127.0.0.1:6532 /tmp/kdb-describever-data \
+         >/tmp/kdb-describever.log 2>&1 &"
+
+    /tmp/kdb-describever.log:
+       KesselDB listening on 127.0.0.1:6532, data dir
+       /tmp/kdb-describever-data, pg=127.0.0.1:5532
+
+================================================================
+2. JdbcSmoke recompile + extended-mode run
+================================================================
+
+    ssh admin@192.168.4.178 \
+      "cp ~/KesselDB/scripts/JdbcSmoke.java ~/jdbc-smoke/JdbcSmoke.java && \
+       cd ~/jdbc-smoke && \
+       ./jdk-21.0.2/bin/javac -cp postgresql.jar JdbcSmoke.java"
+       → compile_ok (clean, no warnings)
+
+    ssh admin@192.168.4.178 \
+      "cd ~/jdbc-smoke && \
+       ./jdk-21.0.2/bin/java -cp .:postgresql.jar JdbcSmoke extended"
+
+Observed (verbatim, captured to /tmp/jdbc-describever-smoke.log):
+
+    JDBC smoke ? mode=extended url=jdbc:postgresql://127.0.0.1:5532/kesseldb
+    Connected. driver=42.7.4
+    CREATE TABLE: OK
+    INSERT: 1 row(s)
+    Row: id=42, name=hello-jdbc
+    Param SELECT: id=42, name=hello-jdbc
+    Server version: PostgreSQL 14.0 (KesselDB 1.0)
+    ALL TESTS PASS
+
+================================================================
+3. HEADLINE — what changed
+================================================================
+
+Before this arc (SP-PG-JDBC-SMOKE T2 transcript §3 + §5,
+`docs/superpowers/sppgjdbcsmoke-t2-smoke-2026-06-02.txt`):
+
+    Param SELECT: id=42, name=hello-jdbc
+    Exception in thread "main" java.lang.IllegalStateException:
+        Received resultset tuples, but no field structure for them
+        ... at JdbcSmoke.main(JdbcSmoke.java:91)
+
+After this arc (transcript above):
+
+    Param SELECT: id=42, name=hello-jdbc
+    Server version: PostgreSQL 14.0 (KesselDB 1.0)
+    ALL TESTS PASS
+
+The `Server version: PostgreSQL 14.0 (KesselDB 1.0)` line is the
+extended-mode `SELECT version()` probe — pgJDBC sends
+Parse + Bind + Describe(portal) + Execute + Sync; the gateway now
+answers Describe(portal) with a `RowDescription("version", TEXT)`
+frame instead of `NoData`. pgJDBC's row-decoding setup completes
+normally and the subsequent DataRow lands without
+`IllegalStateException`.
+
+The fix is gateway-side: a new module
+`crates/kessel-pg-gateway/src/extq/scalar_row_descriptions.rs`
+recognizes the closed set of scalar-SELECT shapes that SP-PG-EXTQ T7
+added Simple-Query handlers for (`SELECT version()`, `SELECT
+current_user`, `SELECT 1`, etc.) and emits the matching
+`RowDescription` column shape at Describe time. The recognizer runs
+BEFORE the existing `select_star_table` probe in
+`row_description_or_no_data_for_sql`; ordinary `SELECT * FROM t`
+SQLs continue to flow through the unchanged path.
+
+================================================================
+4. Simple-mode regression check
+================================================================
+
+Re-running simple mode (no change in this arc; the SP-PG-SQL-PAREN-VALUES
+follow-up still owns that failure) confirms the orthogonal gap is
+unchanged:
+
+    ./jdk-21.0.2/bin/java -cp .:postgresql.jar JdbcSmoke simple
+
+    JDBC smoke ? mode=simple url=jdbc:postgresql://127.0.0.1:5532/kesseldb?preferQueryMode=simple
+    Connected. driver=42.7.4
+    CREATE TABLE: OK
+    Exception in thread "main" org.postgresql.util.PSQLException:
+        ERROR: sql: expected value
+        ... at JdbcSmoke.main(JdbcSmoke.java:48)
+
+This is the SP-PG-SQL-PAREN-VALUES gap (kessel-sql VALUES parser
+doesn't accept `('lit')` paren-wrapped expressions) — orthogonal to
+this arc + already named in the smoke matrix. SP-PG-SQL-PAREN-VALUES
+T1+T2 (commits `0558743` + `4bbb5d2`) actually opened the parser; the
+remaining simple-mode failure is a separate "expected value" path
+that lands at the same psql proxy site for the parameterized form
+pgJDBC emits in simple mode. Tracked under the same SP-PG-SQL-PAREN-
+VALUES arc closure (the SP-PG-SQL-PAREN-VALUES progress tracker
+holds T3 follow-up coverage).
+
+================================================================
+5. Wire-level evidence — extended-mode SELECT version()
+================================================================
+
+The pgJDBC FINEST trace (captured during a prior run with
+`-Djava.util.logging.config.file=/dev/stdin` +
+`org.postgresql.level = ALL`) now reads:
+
+    FE=> Parse(stmt=null,query="SELECT version()",oids={})
+    FE=> Bind(stmt=null,portal=null)
+    FE=> Describe(portal=null)
+    FE=> Execute(portal=null,limit=0)
+    FE=> Sync
+    <=BE ParseComplete | BindComplete | RowDescription(1)   ← was NoData
+                          | DataRow(len=30)
+                          | CommandStatus(SELECT 1)
+                          | ReadyForQuery(I)
+
+(Compare with the broken pre-arc trace in
+`docs/superpowers/sppgjdbcsmoke-t2-smoke-2026-06-02.txt` §5.)
+
+The single-column RowDescription carries `name="version", type_oid=25
+(TEXT)`. The DataRow payload is the canned KesselDB version string
+(`PostgreSQL 14.0 (KesselDB 1.0)`) per SP-PG-EXTQ T7 / pg_catalog
+synthesizer.
+
+================================================================
+6. Summary matrix delta
+================================================================
+
+| # | JDBC scenario                                              | Mode     | Pre   | Post  |
+|---|------------------------------------------------------------|----------|-------|-------|
+| 1 | connect + SCRAM-SHA-256 + Startup                          | both     | PASS  | PASS  |
+| 2 | CREATE TABLE                                               | both     | PASS  | PASS  |
+| 7 | INSERT PreparedStatement (binary INT8 + VARCHAR params)    | extended | PASS  | PASS  |
+| 8 | SELECT * (extended)                                        | extended | PASS  | PASS  |
+| 9 | SELECT WHERE id = ? PreparedStatement (binary INT8)        | extended | PASS  | PASS  |
+|10 | **SELECT version() Describe(portal) response**             | extended | FAIL  | **PASS** ← this arc |
+
+Net: the full pgJDBC extended-mode CRUD path now round-trips
+INCLUDING the canonical `SELECT version()` connection-validation
+probe. Spring/Hibernate/MyBatis (or any JDBC-based stack)
+`Connection.isValid()` / `Connection.getMetaData().getDatabaseProductVersion()`
+flows now work without per-application workarounds.
+
+The remaining residual gap (simple-mode parameterized INSERT via
+`PreparedStatement.setLong/setString`) is owned by SP-PG-SQL-PAREN-VALUES.
+
+================================================================
+7. KAT delta
+================================================================
+
++18 KATs total:
+
+- `crates/kessel-pg-gateway/src/extq/scalar_row_descriptions.rs` —
+  15 KATs covering the closed-set scalar SELECT recognition table
+  + post-cast-strip equivalence + fall-through rejection:
+  - `t1_scalar_rd_for_version_text` (HEADLINE — pgJDBC SELECT
+    version() Describe shape)
+  - `t1_scalar_rd_for_current_user_text`
+  - `t1_scalar_rd_for_current_database_text`
+  - `t1_scalar_rd_for_current_schema_text`
+  - `t1_scalar_rd_for_session_user_text`
+  - `t1_scalar_rd_for_select_1_int4`
+  - `t1_scalar_rd_for_string_literal_text`
+  - `t1_scalar_rd_for_null_text`
+  - `t1_scalar_rd_for_bool_literal_bool`
+  - `t1_scalar_rd_for_int8_cast_strip_int4`
+  - `t1_scalar_rd_for_select_star_table_falls_through`
+  - `t1_scalar_rd_for_multi_statement_returns_none`
+  - `t1_scalar_rd_for_single_column_projection_returns_none`
+  - `t1_scalar_rd_for_unrecognized_select_returns_none`
+  - `t1_pattern_recognition_table_is_stable`
+
+- `crates/kessel-pg-gateway/src/extq/mod.rs` — 3 integration KATs
+  driving the dispatcher path end-to-end via `try_dispatch_extq`:
+  - `sppgextqdescribeversion_describe_statement_select_version_emits_row_desc`
+  - `sppgextqdescribeversion_describe_portal_select_1_emits_row_desc`
+  - `sppgextqdescribeversion_describe_statement_select_1_int8_cast_emits_int4_rd`
+
+Total `kessel-pg-gateway` KAT count: 776 → 794 (+18). seed-7 GREEN.
+
+================================================================
+Files / artifacts
+================================================================
+
+- `crates/kessel-pg-gateway/src/extq/scalar_row_descriptions.rs` (NEW, 437 lines).
+- `crates/kessel-pg-gateway/src/extq/mod.rs::row_description_or_no_data_for_sql`
+  (extended — new branch BEFORE `select_star_table` probe).
+- `docs/superpowers/specs/2026-06-02-kesseldb-sppgextqdescribeversion-design.md`
+  (NEW, 227 lines).
+- `/tmp/kdb-target-describever/release/kesseldb`                   (vulcan-local).
+- `/tmp/kdb-describever-data/`                                     (vulcan-local).
+- `/tmp/kdb-describever.log`                                       (vulcan-local).
+- `/tmp/jdbc-describever-smoke.log`                                (vulcan-local).
+
+KAT delta: **+18** (15 lib + 3 integration).

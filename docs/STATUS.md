@@ -129,6 +129,66 @@ once per query, cutting the dominant TPC-H Q1/Q6 wall-time cost.
   Progress tracker → SP-PG-JDBC-SMOKE V1 SHIPPED — DONE_WITH_CONCERNS
   (CRUD core is real-driver-PASS; two residual gaps each have a
   precise follow-up arc name). **TaskList #364 ready.**
+- **Track A.-1.2 — pgJDBC extended-mode `SELECT version()` Describe synthesizer (SP-PG-EXTQ-DESCRIBE-VERSION V1 SHIPPED at T3 — 2026-06-02).**
+  Closes the second of two residual gaps SP-PG-JDBC-SMOKE T2 named:
+  extended-mode `SELECT version()` was answering `Describe(portal)` /
+  `Describe(statement)` with `NoData` because the gateway's
+  `extq::row_description_or_no_data_for_sql` only recognized
+  `SELECT * FROM <table>` shapes — every other SELECT (including the
+  scalar SELECTs that SP-PG-EXTQ T7 added Simple-Query handlers for)
+  fell through to NoData. pgJDBC treats `NoData` as authoritative
+  ("this query returns nothing") and raised
+  `IllegalStateException: Received resultset tuples, but no field
+  structure for them` when the subsequent `DataRow` arrived. **HEADLINE
+  — pgJDBC extended-mode `SELECT version()` round-trips end-to-end via
+  real pgJDBC 42.7.4 on vulcan**: `ALL TESTS PASS` including the
+  `Server version: PostgreSQL 14.0 (KesselDB 1.0)` probe line
+  (`docs/superpowers/sppgextqdescribeversion-t3-smoke-2026-06-02.txt`).
+  Fix: new module `crates/kessel-pg-gateway/src/extq/scalar_row_descriptions.rs`
+  with a closed-set whitelist of scalar SELECT patterns + per-pattern
+  column shape, mirroring the recognition table in
+  `pg_catalog::synthesize::synthesize_helper_function` (locked by
+  `t1_pattern_recognition_table_is_stable`). Recognizes
+  `SELECT version()` / `SELECT pg_catalog.version()` → ("version", TEXT),
+  `SELECT current_user` / `user` → ("current_user", TEXT),
+  `SELECT current_database()` / `current_catalog` → ("current_database", TEXT),
+  `SELECT current_schema[()]` → ("current_schema", TEXT),
+  `SELECT session_user` → ("session_user", TEXT),
+  `SELECT 1` → ("?column?", INT4),
+  `SELECT 'literal'` → ("?column?", TEXT),
+  `SELECT NULL` → ("?column?", TEXT),
+  `SELECT true` / `SELECT false` → ("bool", BOOL),
+  `SELECT 1::int8` (post `cast_stripper::strip_pg_casts`) → ("?column?", INT4).
+  The matcher runs BEFORE the existing `select_star_table` probe in
+  `row_description_or_no_data_for_sql`; `SELECT * FROM t` continues to
+  flow through the unchanged path. RowDescription bytes here are
+  byte-equal to the T frame at the head of
+  `single_text_row("version", _)` / `single_int_row("?column?", INT4, _)`
+  / `single_bool_row("bool", _)` in the Simple-Query synthesizer (so
+  pgJDBC's symmetry check between Simple Query + Extended-Query
+  Describe holds). V1 out-of-scope: arbitrary expressions
+  (`SELECT 1 + 2`) → V2 `SP-PG-EXTQ-DESCRIBE-EXPR`; multi-projection
+  SELECTs without FROM (`SELECT version(), current_user`) → V2
+  `SP-PG-EXTQ-DESCRIBE-MULTI-PROJ`; single-column projection
+  (`SELECT col FROM t`) → V2 `SP-A T14`. KAT delta: **+18** (15 lib KATs
+  in `extq::scalar_row_descriptions` covering the closed pattern set +
+  post-cast-strip equivalence + fall-through rejection + locked
+  pattern-recognition table; 3 integration KATs in `extq::mod` driving
+  the dispatcher path end-to-end via `try_dispatch_extq` for
+  `SELECT version()`, `SELECT 1`, and `SELECT 1::int8`). Total
+  `kessel-pg-gateway` test count: 776 → 794. seed-7 GREEN; zero new
+  external deps; `#![forbid(unsafe_code)]` honored; HTTP/1.1 + WS +
+  binary + PG-wire surfaces byte-untouched (this is gateway-side; the
+  engine boundary is untouched). USAGE.md §9 ORM matrix JDBC row
+  flipped from "PASS\*\* + two residual gaps" to "PASS\* + one
+  residual gap (SP-PG-SQL-PAREN-VALUES)". Commit:
+  `4bbb5d2` (T1+T2 — design spec + `scalar_row_descriptions.rs` +
+  18 KATs + dispatcher wire-up; the commit message reads
+  "SP-PG-SQL-PAREN-VALUES T2 KAT fix" but the diff covers both arcs),
+  plus this commit (T3 — smoke transcript + USAGE flip + STATUS +
+  arc closure + progress tracker). Progress tracker
+  `docs/superpowers/specs/2026-06-02-kesseldb-subproject-sppgextqdescribeversion-progress.md`
+  → V1 SHIPPED. **TaskList #366 ready.**
 - **Track L cont. — SP-Perf-A-SHARD-SCAN-LOCAL-INDEX-FUSION (2026-06-02,
   V1 SHIPPED — DONE_WITH_CONCERNS).** Closes the in-scope follow-up the
   TINY-INLINE forensics named: bypass `scatter_serial`'s `apply_op`

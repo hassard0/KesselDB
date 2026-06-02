@@ -3083,7 +3083,8 @@ mod tests {
         // expected pseudo row-id.
         let assert_create = |sql: &str, want_id: u128, want_v: i64,
                              want_name: &str| {
-            let op = compile(sql, &cat).expect("compile paren VALUES");
+            let op = compile(sql, &cat)
+                .unwrap_or_else(|e| panic!("compile `{sql}`: {e}"));
             match op {
                 Op::Create { id, record, .. } => {
                     assert_eq!(
@@ -3156,19 +3157,26 @@ mod tests {
         );
 
         // K-PVAL-5: 8-level paren depth accepted on the first
-        // position; bare on others. Cap boundary.
+        // position; bare on the others. Cap boundary. 8 levels of
+        // expression-grouping `(` …`)` wrap the value `1`; the outer
+        // tuple `(` adds the 9th open. Closes balance: 8 grouping
+        // `)`s match the 8 grouping `(`s; the final `)` closes the
+        // outer tuple.
         assert_create(
             "INSERT INTO t (id, v, name) VALUES \
-             ((((((((1)))))))), 2, 'a')",
+             (((((((((1)))))))), 2, 'a')",
             1,
             2,
             "a",
         );
 
         // K-PVAL-6: 9-level paren depth rejected (anti-stack-bomb).
+        // 9 grouping `(`s before `1` + outer tuple `(` = 10 total
+        // opens before `1`; the parser hits the depth cap at 9
+        // grouping levels.
         let e = compile(
             "INSERT INTO t (id, v, name) VALUES \
-             (((((((((1))))))))), 2, 'a')",
+             ((((((((((1))))))))), 2, 'a')",
             &cat,
         )
         .expect_err("9-level paren depth must reject");

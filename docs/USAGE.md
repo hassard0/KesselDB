@@ -1790,7 +1790,7 @@ smoke-2026-05-29.txt` for the original T8 baseline.
 | SQLAlchemy 2.0  | PASS     | T8 closes the `use_native_hstore=False` caveat     |
 | psycopg3 3.3.4  | PASS     | SP-PG-EXTQ-BIN T3 — DEFAULT cursor (NOT ClientCursor) works end-to-end |
 | asyncpg 0.31.0  | PASS     | SP-PG-EXTQ-BIN-RESULTS T3 — fetch() round-trip works end-to-end (binary params + binary results) |
-| JDBC 42.7       | PASS\*\* | SP-PG-JDBC-SMOKE T2 — real pgJDBC 42.7.4 + OpenJDK 21 against KesselDB on vulcan. **Extended (default) mode PASS** for CRUD: CREATE TABLE, parameterized INSERT (binary INT8 + VARCHAR), SELECT \*, parameterized SELECT WHERE id = ? (binary INT8 param + binary INT8 result). **Simple mode (`preferQueryMode=simple`) PASS for literal SQL** including `WHERE id = 42::int8` (SP-PG-EXTQ-CAST T2 cast-stripper works end-to-end through the real driver). Two residual gaps: (a) simple-mode `PreparedStatement` INSERT fails because pgJDBC wraps each substituted param in extra parens (`VALUES (('42'::int8), ('hello-jdbc'))`) which kessel-sql's VALUES parser rejects — V2 `SP-PG-SQL-PAREN-VALUES`; (b) extended-mode `SELECT version()` fails because the gateway responds to `Describe(portal)` with `NoData` before sending `RowDescription` — V2 `SP-PG-EXTQ-DESCRIBE-VERSION`. See `docs/superpowers/sppgjdbcsmoke-t2-smoke-2026-06-02.txt` |
+| JDBC 42.7       | PASS\*  | SP-PG-EXTQ-DESCRIBE-VERSION T3 (2026-06-02) — real pgJDBC 42.7.4 + OpenJDK 21 against KesselDB on vulcan. **Extended (default) mode PASS** for the full CRUD path INCLUDING `SELECT version()`: CREATE TABLE, parameterized INSERT (binary INT8 + VARCHAR), SELECT \*, parameterized SELECT WHERE id = ? (binary INT8 param + binary INT8 result), `SELECT version()` (the gateway now emits a `RowDescription("version", TEXT)` in response to `Describe(portal)` instead of `NoData`). **Simple mode (`preferQueryMode=simple`) PASS for literal SQL** including `WHERE id = 42::int8` (SP-PG-EXTQ-CAST T2 cast-stripper works end-to-end through the real driver). One residual gap remains: simple-mode `PreparedStatement` INSERT fails because pgJDBC wraps each substituted param in extra parens (`VALUES (('42'::int8), ('hello-jdbc'))`) — V2 `SP-PG-SQL-PAREN-VALUES`. See `docs/superpowers/sppgextqdescribeversion-t3-smoke-2026-06-02.txt` |
 | pgx (Go)        | n/a      | Go runtime not on vulcan (V2 `SP-PG-GO-SMOKE`)     |
 | Drizzle (Node)  | n/a      | Node runtime not on vulcan (V2 `SP-PG-NODE-SMOKE`) |
 | Prisma (Node)   | n/a      | Node runtime not on vulcan (V2 `SP-PG-NODE-SMOKE`) |
@@ -1832,10 +1832,18 @@ The remaining residual ORM gaps are:
   (`docs/superpowers/sppgjdbcsmoke-t2-smoke-2026-06-02.txt`) — JDBC
   simple-mode `WHERE id = 42::int8` round-trips end-to-end through
   the actual pgJDBC 42.7.4 driver against KesselDB. The cast-stripper
-  is closed end-to-end; the two residual JDBC gaps that smoke
-  surfaced (simple-mode `PreparedStatement` paren-wrapped VALUES;
-  extended-mode `SELECT version()` Describe/NoData ordering) are
-  distinct new arcs `SP-PG-SQL-PAREN-VALUES` + `SP-PG-EXTQ-DESCRIBE-VERSION`.
+  is closed end-to-end; one residual JDBC gap remains
+  (simple-mode `PreparedStatement` paren-wrapped VALUES) tracked under
+  the distinct `SP-PG-SQL-PAREN-VALUES` arc. ~~Extended-mode
+  `SELECT version()` Describe/NoData ordering~~ → **CLOSED 2026-06-02
+  by SP-PG-EXTQ-DESCRIBE-VERSION V1** — the gateway's
+  `extq::row_description_or_no_data_for_sql` helper now recognizes
+  the closed set of scalar SELECTs that SP-PG-EXTQ T7 added
+  Simple-Query handlers for (`SELECT version()`, `SELECT current_user`,
+  `SELECT 1`, etc.) and emits the matching `RowDescription` at
+  Describe time instead of `NoData`. pgJDBC extended-mode
+  `SELECT version()` round-trips end-to-end via real pgJDBC 42.7.4
+  on vulcan (`docs/superpowers/sppgextqdescribeversion-t3-smoke-2026-06-02.txt`).
 - ~~Parameterized SELECT with a CHAR(N) WHERE clause may match zero rows
   because the engine's EQ-on-Char doesn't ignore trailing NUL padding
   on the storage side; lifts in `SP-CHAR-PAD-COMPARE` (engine-side).~~

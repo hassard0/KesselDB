@@ -12,87 +12,160 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning [Se
   `E` (Execute) / `S` (Sync) / `C` (Close) / `H` (Flush). Per-connection
   `SessionState` with named + unnamed prepared statements + portals up
   to `MAX_PREPARED_STATEMENTS_PER_CONN = MAX_PORTALS_PER_CONN = 4096`.
-  Parse stores SQL VERBATIM; Bind validates parameter formats (text only;
-  binary rejected with `0A000` — V2 SP-PG-EXTQ-BIN) and parameter count
-  vs Parse's OID hints; Describe 'S' emits ParameterDescription +
-  RowDescription/NoData; Describe 'P' emits RowDescription/NoData;
-  Execute substitutes `$N` text-format parameters and dispatches
-  through `EngineApply::apply_sql`; `max_rows > 0` emits
-  `PortalSuspended` with buffered cursor pagination; Sync emits
-  `ReadyForQuery('I')` and clears the per-connection `error_state`;
-  Close drops named statements/portals; Flush triggers an outbound
-  flush. **End-to-end verification**: real `psycopg2.connect(...)` +
-  `cur.execute("…WHERE id = %s", (42,))` returns rows on vulcan.
-  SQLAlchemy / Drizzle / Prisma / JDBC default-EXTQ paths unblocked
-  at the wire level; full ORM-suite formal smoke (T8/T11/T12) is the
-  post-V1.1 follow-up.
-- **Cross-DB benchmark suite (SP-Bench-Suite T1-T3)** — KesselDB vs
+  Real `psycopg2.connect(...)` + `cur.execute("…WHERE id = %s", (42,))`
+  returns rows on vulcan.
+- **PostgreSQL Extended Query binary-format parameters (SP-PG-EXTQ-BIN
+  V1, 2026-06-01)** — binary Bind admission for the 10 V1 supported PG
+  scalar types (INT2/INT4/INT8/FLOAT4/FLOAT8/BOOL/TEXT/VARCHAR/BYTEA/
+  TIMESTAMPTZ). Decodes each binary param at Execute time into a SQL
+  literal that flows through the existing substitute layer. Closes the
+  T8 PARTIAL gap for asyncpg + psycopg3 DEFAULT cursor.
+- **PostgreSQL Extended Query binary-format RESULTS (SP-PG-EXTQ-BIN-RESULTS
+  V1, 2026-06-01)** — symmetric DataRow + RowDescription post-processor
+  for portals with `result_formats=[1]`. Re-encodes each buffered DataRow
+  per-column into PG binary format. asyncpg `conn.fetch(...)` round-trips
+  end-to-end on vulcan.
+- **PostgreSQL JDBC simple-mode `::cast` rewrite (SP-PG-EXTQ-CAST V1,
+  2026-06-02)** — `cast_stripper::strip_pg_casts(sql) -> String`
+  single-pass state-machine scanner strips `::TYPE[(args)]` while
+  preserving cast-like text inside strings/comments. Wires in at
+  `dispatch_query` entry; covers both Simple Query and Extended Query
+  Execute paths.
+- **pgJDBC extended-mode `SELECT version()` Describe synthesizer
+  (SP-PG-EXTQ-DESCRIBE-VERSION V1, 2026-06-02)** —
+  `extq::scalar_row_descriptions` with closed-set whitelist of scalar
+  SELECT patterns (`SELECT version()`, `SELECT current_user`,
+  `SELECT 1`, etc.) emits matching RowDescription at Describe time
+  instead of `NoData`. pgJDBC extended-mode `SELECT version()` round-trips
+  via real pgJDBC 42.7.4 on vulcan.
+- **pgJDBC simple-mode paren-wrapped VALUES (SP-PG-SQL-PAREN-VALUES V1,
+  2026-06-02)** — kessel-sql's VALUES tuple parser now accepts
+  `(LITERAL)` paren-wrapped literals up to depth 8 (anti-stack-bomb
+  cap at 9). Same arc adds `Str → numeric` coercion in the WHERE term
+  parser when the LHS is a numeric column (PG's `'42'::int8` semantic
+  preserved across the cast strip). Real pgJDBC simple-mode
+  `PreparedStatement` INSERT + SELECT WHERE id=? round-trip
+  end-to-end on vulcan.
+- **CHAR(N) padding-aware comparison (SP-CHAR-PAD-COMPARE V1, 2026-06-02)**
+  — engine-side fix in `kessel-expr` EQ/NE/LT/LE/GT/GE for `Value::Bytes`
+  and `kessel-sm::cmp_field` for `Char(_) | Bytes(_)`: `right_trim_char_pad`
+  drops trailing NUL (0x00) + space (0x20) before compare. PG SQL §9.20
+  semantic generalised to NUL (engine stores fixed-width values
+  NUL-padded). asyncpg `WHERE name = $1` against CHAR(N) now returns
+  matching rows on vulcan.
+- **Real pgJDBC end-to-end smoke (SP-PG-JDBC-SMOKE V1, 2026-06-02)** —
+  user-space OpenJDK 21 + pgJDBC 42.7.4 + scripts/JdbcSmoke.java harness
+  drives KesselDB on vulcan. Full CRUD PASS in both simple AND extended
+  modes: CREATE TABLE, `PreparedStatement` INSERT (`setLong`+`setString`),
+  SELECT *, `PreparedStatement` SELECT WHERE id=?, `SELECT version()`.
+- **PostgreSQL COPY FROM STDIN / COPY TO STDOUT (SP-PG-COPY V1,
+  2026-05-30)** — text-format end-to-end for both directions. Per-connection
+  CopyIn state machine: CopyData / CopyDone / CopyFail handled while in
+  CopyIn; any other tag = `08P01` + state clear + STAY ALIVE. Unlocks
+  `pg_dump` restore, `sysbench prepare`, and `psql \copy` workflows.
+- **PostgreSQL COPY CSV format (SP-PG-COPY-CSV V1, 2026-06-01)** —
+  `WITH (FORMAT csv [, DELIMITER 'X'] [, QUOTE 'X'] [, ESCAPE 'X']
+  [, NULL 'string'] [, HEADER])` for both directions. RFC 4180 +
+  PG superset; doubled-quote escape; embedded-delimiter/quote/newline
+  quoting; record-oriented parser reassembles quoted-newline records
+  across CopyData frame boundaries. Unlocks `pg_dump --csv`,
+  `psql \copy ... CSV HEADER`, every spreadsheet/pandas analyst on-ramp.
+- **PostgreSQL COPY binary format (SP-PG-COPY-BIN V1, 2026-06-02)** —
+  `WITH (FORMAT binary)` per PG §55.2.7. 19-byte signature header +
+  per-row length-prefixed field values + 2-byte i16 -1 EOD marker. Same
+  10 supported types as SP-PG-EXTQ-BIN-RESULTS via reuse of
+  `encode_binary_value` (TO) and `decode_binary_param` (FROM). Unlocks
+  `pg_dump --format=custom`, JDBC `CopyManager`, `pg_bulkload`,
+  `pgloader`, Stitch, Fivetran, Airbyte binary bulk-loaders.
+- **PostgreSQL COPY bulk-apply throughput (SP-PG-COPY-BULKAPPLY V1,
+  2026-05-30)** — COPY FROM STDIN now buffers up to `COPY_BATCH_SIZE`
+  rows (default 1024, env-overridable via `KESSELDB_COPY_BATCH_SIZE`)
+  and flushes each batch as ONE multi-row `INSERT INTO t (cols) VALUES
+  (...), ...` which kessel-sql compiles to `Op::Txn { ops: Vec<Op::Create> }`.
+  One apply round-trip + one WAL fsync per batch instead of one per row.
+- **Cross-DB benchmark suite (SP-Bench-Suite T1-T4)** — KesselDB vs
   Postgres + SQLite + TigerBeetle reproducible head-to-head harness at
-  `tools/bench-compare/`. Workloads: YCSB-A (50/50 read/update), YCSB-B
-  (95/5), YCSB-C (100% reads), sysbench OLTP read-only / write-only /
-  read-write. Wins AND losses published verbatim in
-  `docs/BENCHMARKS.md` — KesselDB wins YCSB-A/B/C and sysbench WO
-  decisively; loses sysbench RO and RW to Postgres / SQLite because
-  `Op::Txn` apply-lock serializes RO inner ops.
-- **Perf-A read-pool bypass (SP-Perf-A T1-T7)** — parallel-read dispatch
-  via `read_only_op(&self, ...)` through `Arc<RwLock<StateMachine>>`
-  (T2); in-process apply skips encode/decode roundtrip (T6 Fix A);
-  `OpResult::Got` carries `Arc<[u8]>` instead of `Vec<u8>` (T6 Fix B);
-  storage memtable + SSTable cached blocks + transaction overlay lifted
-  to `Arc<[u8]>` (T7). Measured: **~4.75M ops/sec at N=16 cores,
-  p50 < 1 µs, p99 ~3 µs** on the vulcan reference server. Storage
-  point-read ceiling honestly diagnosed at ~5M ops/sec (`RwLock`
-  reader CAS ping-pong); next arc named SP-Perf-A-SHARD.
+  `tools/bench-compare/`. Workloads: YCSB-A/B/C, sysbench OLTP RO/WO/RW,
+  TPC-H Q1+Q6. Wins AND losses published verbatim in `docs/BENCHMARKS.md`.
+- **Helm chart + Fly.io deploy (SP-Cloud-Deploy, 2026-05-30)** — Helm
+  chart at `deploy/helm/kesseldb/` (single-pod ReadWriteOnce PVC,
+  ClusterIP service); `fly.toml` at `deploy/fly/`. Helm chart verified
+  end-to-end on vulcan (kind v0.24.0 + Kubernetes v1.31.0 + helm v3.16.3).
+- **Multi-arch Docker image + DX polish (SP-DX-superior V1, 2026-05-29)**
+  — `ghcr.io/hassard0/kesseldb:latest` multi-arch (`linux/amd64` +
+  `linux/arm64`) ~77 MiB stripped, pushed on every `v*` tag via
+  `release.yml`. Did-you-mean SQL suggestions on `unknown table` /
+  `unknown column` (zero-dep edit-distance + inlined column-list head);
+  `kessel` CLI differentiates connection-refused / wrong-token /
+  DNS-failure / timeout with env-var-pointing hints; embedded example
+  at `crates/kesseldb-server/examples/embedded.rs`.
+
+### Performance
+
+- **SP-Perf-A-SHARD-APPLY V1 (2026-05-30)** — K independent per-shard
+  sub-engines (each its own `Arc<RwLock<StateMachine>>` + apply thread +
+  WAL + SSTables, rooted at `data_dir/shard-<i>/`); routes every Op via
+  `hash(make_key(type_id, oid)) % K`. Opt-in via `ServerConfig.shard_count
+  = Some(K)`. Vulcan get-by-id sweep (10K rows, 16 workers, 10s):
+  K=baseline 4.68M ops/s → K=2 7.30M → K=4 11.08M → **K=8 14.93M
+  (3.19× — breaks the ~5M `RwLock`-reader ceiling)** → K=16 16.72M.
+- **SP-Perf-A-SHARD-SCAN + -FASTPATH + -POOL-SCALEOUT + -LOCAL-INDEX-FUSION
+  (2026-05-30 → 2026-06-02)** — scan-side companions to SHARD-APPLY.
+  K-invariance for scatter-gather scan ops; find-by perf at K≥2
+  recovered by 105×; every scan workload at K=4 scales POSITIVELY;
+  sharded find-by parity without requiring `--pool-workers`.
+- **SP-Perf-A-TXN-RO V1 (2026-05-29)** — static all-RO `Op::Txn`
+  classification routes through the Perf-A read-pool bypass. N=16 lift
+  **42.6×** (680 → 28,977 tx/s); KesselDB now **5.7× Postgres** at N=16
+  oltp-RO.
+- **SP-Perf-A-TXN-RW V1 (2026-05-30)** — driver-level split-phase
+  dispatch on (R*, W*)-shape Txns. Read prefix routes via TXN-RO bypass,
+  write suffix via `sm.write().apply`. N=16 lift **14.43×** (712 → 10,273
+  tx/s); KesselDB now **2.66× Postgres + 2.60× SQLite** at N=16 oltp-RW.
+- **SP-Analytic-Plan + -MULTI + SP-Hash-Agg + -Tune + SP-WHERE-VM-Specialise
+  V1 (2026-05-29 → 2026-06-01)** — five sequential arcs for the TPC-H
+  Q1/Q6 losses. Cumulative gap-closing: **Q1 18× → 2.17×**, **Q6 123× → 3.07×**.
+  Q6 design floor (≥400 q/s) + stretch (≥500 q/s) both EXCEEDED.
+  Next: **SP-JIT-Aggregate**.
+- Sub-µs p50 read latency at N=16 (Perf-A T2 + T7); 4.75M ops/sec
+  single-shard parallel-read; 53,409 tx/s sysbench WO at N=8
+  (**5.2× Postgres**); 51,840 rows/sec PG COPY FROM STDIN (**181.9×**
+  lift via SP-PG-COPY-BULKAPPLY).
 
 ### Fixed
 
 - **Cluster test flakes (SP-CLUSTER-FLAKE T2, root-cause fix)** —
   `Node::submit*` / `apply_raw` now retry transient `ViewChange` →
   `Unavailable` the same way production `ClusterClient` does. The fix
-  lives in the production code path, not a test relaxation, so any
-  call site that previously saw an intermittent transient
-  `Unavailable` during a view-change is now automatically retried.
-  Closes the long-standing CI intermittent surfaced by stress runs.
-
-### Performance
-
-- Sub-µs p50 read latency at N=16 (Perf-A T2 + T7).
-- 4.75M ops/sec parallel-read ceiling (YCSB-C N=16 — ≈ 40× SQLite,
-  ≈ 57× Postgres).
-- sysbench OLTP write-only N=8 = 53,409 tx/s — 5.2× Postgres at
-  the same N.
+  lives in the production code path, not a test relaxation. Closes the
+  long-standing CI intermittent surfaced by stress runs.
 
 ### Compatibility
 
-- psycopg2 / psycopg3 / asyncpg connect via SCRAM-SHA-256 and run
-  parameterized queries through Extended Query (verified on vulcan).
-- SQLAlchemy `create_engine(...)` + `text(... :id ...)` parameterized
-  SELECT works end-to-end (the formal ORM-suite shape is the T11
-  follow-up).
-- Drizzle / Prisma / JDBC default-EXTQ paths unblocked at the wire
-  level (formal driver smoke is T8/T12).
+- psycopg2 ✓ SQLAlchemy 2.0 ✓ psycopg3 ✓ asyncpg ✓ all PASS on vulcan
+  with default settings (no `ClientCursor` workaround needed).
+- pgJDBC 42.7.4 ✓ — real-driver verified on vulcan in **both simple
+  AND extended modes**: CREATE TABLE, `PreparedStatement` INSERT
+  (`setLong`+`setString`), SELECT *, `PreparedStatement` SELECT WHERE
+  id=?, `SELECT version()`.
+- pgx (Go), Drizzle/Prisma (Node), sqlx (Rust) — runtime not on vulcan
+  smoke host; tracked as V2 `SP-PG-GO-SMOKE` / `SP-PG-NODE-SMOKE` /
+  `SP-SQLX-SMOKE`. Same binary Bind + binary RESULTS unlock shape
+  as asyncpg / JDBC.
 
 ### Documentation
 
-- README rewritten above the fold with the three night-headlines
-  (Postgres ORM compat / 4.8M ops/sec parallel reads / honest cross-DB
-  benches); compatibility matrix promoted; performance table adds
-  parallel-read row + cross-DB headline table; next-arc named.
-- STATUS preamble bumped to 2026-05-29 with a 4-track recap of
-  tonight's deliveries.
-- ARCHITECTURE: PG-wire section gains the SP-PG-EXTQ V1 paragraph;
-  storage section adds the T7 Arc<[u8]> read-fast-path note; atomic
-  transactions gains the honest Op::Txn apply-lock perf boundary
-  paragraph; V2 follow-ups list trimmed (Extended Query removed).
-- USAGE §9 reflects EXTQ V1 — psycopg2 parameterized + SQLAlchemy
-  samples; "Simple Query only" limitation dropped.
-- BENCHMARKS already published §3-§3e (sysbench OLTP) + §11-§12
-  (Perf-A T6/T7) as part of the night's commits.
+- README rewritten above the fold with the 2026-06-02 headlines
+  (14.93M ops/sec sharded reads + real ORM compat + 6/8 cross-DB wins +
+  COPY in 3 formats + Helm/Fly).
+- STATUS preamble bumped to 2026-06-02 with the coherent state-of-the-union.
+- USAGE §9 ORM matrix flipped to all-PASS rows.
+- BENCHMARKS summary table refreshed with the post-WHERE-VM headlines.
 
 ### Tests
 
-- 1974 default / 2002 with `--features pg-gateway` / 2035 with all
-  gateway features (vulcan-measured at HEAD `546e79a`).
+- 2063 default / 2074 with `--features pg-gateway` / 2078 with all
+  gateway features (vulcan-measured at HEAD around `f2a18e5`).
 
 ## [1.0.0] — 2026-05-28
 

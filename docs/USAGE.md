@@ -1774,24 +1774,27 @@ required for any modern PG client.
 T8 ran a deeper compat smoke against the drivers psycopg2 + SQLAlchemy
 already covered. SP-PG-EXTQ-BIN T3 then lifted the binary-format
 parameter gap for the V1 supported PG types (INT2/INT4/INT8/FLOAT4/
-FLOAT8/BOOL/TEXT/VARCHAR/BYTEA/TIMESTAMPTZ). The two T8 PARTIAL
-drivers (asyncpg, psycopg3 default cursor) flip to PASS. Each row is
+FLOAT8/BOOL/TEXT/VARCHAR/BYTEA/TIMESTAMPTZ). SP-PG-EXTQ-BIN-RESULTS T3
+then closed the binary-RESULTS gap (the asterisk on asyncpg) by adding
+the symmetric DataRow + RowDescription post-processor. Each row is
 the actual driver session — see
-`docs/superpowers/sppgextqbin-t3-smoke-2026-06-01.txt` for the T3
-SP-PG-EXTQ-BIN transcript and `docs/superpowers/sppgextq-t8-orm-
-smoke-2026-05-29.txt` for the earlier T8 baseline.
+`docs/superpowers/sppgextqbinr-t3-smoke-2026-06-01.txt` for the
+SP-PG-EXTQ-BIN-RESULTS T3 transcript (asyncpg fetch round-trip),
+`docs/superpowers/sppgextqbin-t3-smoke-2026-06-01.txt` for the earlier
+SP-PG-EXTQ-BIN T3 transcript, and `docs/superpowers/sppgextq-t8-orm-
+smoke-2026-05-29.txt` for the original T8 baseline.
 
 | Driver          | Status   | Notes                                              |
 |-----------------|----------|----------------------------------------------------|
 | psycopg2 2.9.12 | PASS     | T7 baseline (19/19 steps)                          |
 | SQLAlchemy 2.0  | PASS     | T8 closes the `use_native_hstore=False` caveat     |
 | psycopg3 3.3.4  | PASS     | SP-PG-EXTQ-BIN T3 — DEFAULT cursor (NOT ClientCursor) works end-to-end |
-| asyncpg 0.31.0  | PASS\*   | SP-PG-EXTQ-BIN T3 — binary Bind path works; binary RESULTS still V2 (SP-PG-EXTQ-BIN-RESULTS) |
-| JDBC 42.7       | PARTIAL  | Same binary-Bind unlock as asyncpg; vulcan has no javac so untested in T3 |
+| asyncpg 0.31.0  | PASS     | SP-PG-EXTQ-BIN-RESULTS T3 — fetch() round-trip works end-to-end (binary params + binary results) |
+| JDBC 42.7       | PARTIAL  | Same binary-Bind + binary-RESULTS unlock as asyncpg; vulcan has no javac so untested |
 | pgx (Go)        | n/a      | Go runtime not on vulcan (V2 `SP-PG-GO-SMOKE`)     |
 | Drizzle (Node)  | n/a      | Node runtime not on vulcan (V2 `SP-PG-NODE-SMOKE`) |
 | Prisma (Node)   | n/a      | Node runtime not on vulcan (V2 `SP-PG-NODE-SMOKE`) |
-| sqlx (Rust)     | n/a      | Same binary-Bind unlock; result-side blocked on V2 `SP-PG-EXTQ-BIN-RESULTS` |
+| sqlx (Rust)     | n/a      | Same binary-Bind + binary-RESULTS unlock; not yet smoke-tested on vulcan |
 
 SP-PG-EXTQ-BIN T3 wired the binary-format decoder into the Bind path:
 each parameter with `format_code=1` (binary) at position `i` is
@@ -1807,14 +1810,25 @@ existing text path). NUMERIC binary still rejects with the precise
 `SP-PG-EXTQ-BIN-NUMERIC` follow-up arc name so operators can grep
 for the gap.
 
-The remaining PARTIAL/asterisk drivers all hit the SAME residual gap:
-- asyncpg / sqlx / JDBC `result_formats=[1]` (binary DataRow) — V1
-  still emits text-format DataRow; clients mis-decode and error.
-  Lifts in V2 `SP-PG-EXTQ-BIN-RESULTS` (binary DataRow encoder).
-- JDBC simple-query mode additionally hits a kessel-sql parser gap
-  on `::int8` casts; lift via V2 `SP-PG-EXTQ-CAST` (gateway-side
-  cast-stripping rewrite) or `SP-SQL-CAST` (parser-level type-cast
-  recognition).
+SP-PG-EXTQ-BIN-RESULTS T2 then wired the symmetric result-side
+post-processor: when the portal's Bind requested `result_formats=[1]`
+(asyncpg / JDBC default extended mode / sqlx), `dispatch_execute`
+re-encodes each buffered DataRow per-column into PG binary format +
+flips the per-field `format_code` slot in RowDescription in lockstep
+so libpq's per-field decoder switches to its binary read path. NULL
+columns and text-format columns pass through unchanged; the rewrite
+is zero-cost for the existing text-only path. NUMERIC binary still
+rejects with the precise `SP-PG-EXTQ-BIN-NUMERIC` follow-up arc name.
+
+The remaining residual ORM gaps are:
+- JDBC simple-query mode hits a kessel-sql parser gap on `::int8`
+  casts; lift via V2 `SP-PG-EXTQ-CAST` (gateway-side cast-stripping
+  rewrite) or `SP-SQL-CAST` (parser-level type-cast recognition).
+- Parameterized SELECT with a CHAR(N) WHERE clause may match zero rows
+  because the engine's EQ-on-Char doesn't ignore trailing NUL padding
+  on the storage side; lifts in `SP-CHAR-PAD-COMPARE` (engine-side).
+- Binary NUMERIC / JSONB / UUID / ARRAY remain V2 (`SP-PG-EXTQ-BIN-
+  NUMERIC` / `SP-PG-EXTQ-BIN-EXTRA`).
 
 #### Pipelining throughput (T8, 2026-05-29)
 

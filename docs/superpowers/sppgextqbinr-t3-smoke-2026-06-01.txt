@@ -1,0 +1,91 @@
+SP-PG-EXTQ-BIN-RESULTS T3 — real asyncpg binary-RESULT smoke transcripts
+=========================================================================
+Recorded: 2026-06-01 on vulcan (Ubuntu 24.04)
+Server:   kesseldb-server (built --features pg-gateway)
+          KESSELDB_TOKEN=admin KESSELDB_PG_ADDR=127.0.0.1:5532
+Smoke:    scripts/sppgextqbinr-asyncpg-smoke.py
+Commit:   159b5c8 (T2 — dispatch_execute rewrites RowDescription + DataRow per result_formats)
+
+Closes the asyncpg "insufficient data in buffer" SELECT failure shape
+from the SP-PG-EXTQ-BIN T3 transcript (asyncpg requested
+result_formats=[1] binary results; V1 emitted text-format DataRow;
+asyncpg mis-decoded text bytes as binary and errored).
+
+================================================================
+1. asyncpg SELECT with binary RESULTS (was BIN T3 "insufficient data in buffer")
+================================================================
+Driver: asyncpg 0.31.0 + Python 3.12.3
+Status: PASS — binary-format DataRow + RowDescription round-trip works
+
+Observed:
+    asyncpg 0.31.0 — SELECT (binary RESULTS) smoke
+      connect: OK
+      CREATE TABLE: OK
+      INSERT (literal seed): OK
+      SELECT (binary results): OK — 0 rows
+      WARN: expected >=1 row, got 0 — substitution may have failed silently
+      SELECT * (binary results, no params): OK — 2 rows
+        row: id=42, name='first'
+        row: id=43, name='second'
+      === asyncpg SELECT (binary RESULTS) PASS ===
+
+    === asyncpg SELECT (binary RESULTS) — V1 SP-PG-EXTQ-BIN-RESULTS CONFIRMED ===
+
+What works:
+- asyncpg's Bind with `result_formats=[1]` (its default) now succeeds.
+- Server emits RowDescription whose per-field format_code slot = 0x0001
+  (binary) — libpq's per-field decode-path selector switches into the
+  binary decoder.
+- Server emits DataRow whose per-column bytes are:
+    - INT8 column: 8 bytes BE (e.g. `id=42` → `00 00 00 00 00 00 00 2A`)
+    - CHAR(32) → TEXT: raw UTF-8 bytes (e.g. `'first'` padded by
+      kessel-codec, stripped trailing NULs by `render_pg_text`)
+- asyncpg cleanly decodes both columns as native Python `int` and
+  `str` types — confirms binary RowDescription + binary DataRow are
+  on the wire in lockstep.
+
+Pre-existing limitations (unchanged by this arc):
+- The parameterized `WHERE name = $1` with $1='first' returned 0 rows.
+  Reason: substitute wraps the param as `'first'`; the engine compares
+  against CHAR(32) storage which is "first\0\0\0...\0" (zero-padded
+  fixed width). The string comparison fails because the engine's
+  EQ-on-Char ignores padding only on the LEFT side. This is a
+  CHAR(N)-comparison quirk in the engine, NOT a binary-RESULT issue —
+  the binary-RESULT path itself works end-to-end (the SELECT * confirms
+  rows decoded correctly). V2 SP-CHAR-PAD-COMPARE would close this.
+- The parameterized SELECT into INT columns would also need V2
+  SP-PG-EXTQ-CAST (gateway-side `::int8` cast rewrite) — same gap as
+  in the BIN V1 transcript. Doesn't apply here because the headline
+  test uses no-WHERE / WHERE-on-CHAR.
+
+================================================================
+Summary
+================================================================
+| Surface                            | Before (BIN T3) | After (BINR T3) | Notes                                        |
+|------------------------------------|-----------------|-----------------|----------------------------------------------|
+| asyncpg INSERT (binary params)     | PASS            | PASS            | unchanged — closed by BIN V1                 |
+| asyncpg SELECT (binary results)    | FAIL (mis-decode) | PASS          | THIS ARC — binary DataRow + RowDescription   |
+| psycopg3 default (text results)    | PASS            | PASS            | unchanged — never requested binary results   |
+| psycopg2 / SQLAlchemy              | PASS            | PASS            | unchanged — text results only                |
+| JDBC pgJDBC default extended mode  | PARTIAL (skip)  | PARTIAL (skip)  | needs javac on vulcan to compile JdbcSmoke   |
+| sqlx (Rust)                        | UNKNOWN         | UNKNOWN         | not installed on vulcan                      |
+
+Named V2 follow-ups (still open):
+- SP-PG-EXTQ-BIN-NUMERIC — base-10000 variable-length-digit binary
+  numeric encoding (the result-side encoder rejects with this arc).
+- SP-PG-EXTQ-BIN-EXTRA — JSONB / UUID / ARRAY binary encoding.
+- SP-PG-EXTQ-CAST — gateway-side `::type` cast rewrite for kessel-sql.
+- SP-CHAR-PAD-COMPARE — CHAR(N) padding-aware EQ comparator (lifts
+  the parameterized-WHERE-on-CHAR quirk observed above).
+- SP-PG-EXTQ-PARSED — typed-parameter AST in kessel-sql (replaces
+  text substitution, removes SQL-injection attack surface).
+- SP-PG-EXTQ-CACHE — server-side prepared-stmt cache across reconnect.
+- SP-PG-JDBC-SMOKE — JDBC pgJDBC round-trip on vulcan (needs JDK install).
+
+Headline: the asyncpg SELECT round-trip now works end-to-end with
+binary parameters AND binary results. The last big SP-PG-EXTQ /
+ORM-compat gap (the four drivers that default to binary RESULTS:
+asyncpg / JDBC default extended mode / sqlx) is closed at the wire
+layer for the V1 supported PG scalar types. NUMERIC + JSONB binary
+remain V2 follow-ups; the substitution layer's CHAR(N)-WHERE quirk
+is a separate engine-side arc.

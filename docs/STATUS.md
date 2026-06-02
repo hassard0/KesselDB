@@ -41,6 +41,37 @@ measurement and had drifted from the actual workspace count).
   production `ClusterClient` does. The long-standing CI flake is GONE.
 
 Latest arc deliveries on top of that baseline (most-recent first):
+SP-PG-EXTQ-CAST-VALIDATE-COMPAT V1 (2026-06-02, +14 KATs) — relaxes
+SP-PG-EXTQ-CAST-VALIDATE's V1 strict OID equality to PG's
+`pg_type.dat::typcategory` compatibility table. V1 strict equality
+was correct against the V1 contract but wrong against real ORM
+behaviour: pgJDBC's default `Long` binding sends INT8 but a Java
+`int` against an `::int8` cast sends INT4 + INT8 mismatched at the
+wire; psycopg3 has the same shape for Python `int`. PG itself
+accepts these widenings. New helpers `types::oid_category(oid) ->
+char` (returns 'N' numeric / 'S' string / 'B' bool / 'D' date-time
+/ 'U' unknown-or-bytea) + `types::oid_castable(param_oid, cast_oid)
+-> bool` (strict equality + omitted-OID skip + intra-category
+widening). `extq::dispatch_bind`'s validator swaps strict `!=` for
+`!oid_castable(...)`; error variant + state set + first-mismatch-
+wins ordering byte-untouched. Cross-category mismatches (TEXT vs
+INT8, BOOL vs INT8, BYTEA vs TEXT) STILL reject with the same
+`ExtqError::CastOidMismatch` → `42846 cannot_coerce` wire frame so
+the V1 silent-coercion vector stays closed; only intra-category
+pairs newly accept. **vulcan-verified** via psycopg3 PQ-layer
+5-case smoke
+(`docs/superpowers/sppgextqcastvalidatecompat-t3-smoke-2026-06-02.txt`):
+HEADLINE INT4 param + INT8 cast accepted; symmetric INT8 + INT4
+also accepted; TEXT + VARCHAR accepted; cross-category TEXT + INT8
+still rejects with the exact V1 message ("cannot cast parameter $1
+from type with OID 25 to declared cast type OID 20");
+strict-equality INT8 + INT8 base case still works. V2 follow-ups
+named: `SP-PG-EXTQ-CAST-VALIDATE-COMPAT-RANGE` (overflow-check
+param value vs cast-type range, e.g. INT4 value 100000 vs INT2
+cast), `SP-PG-EXTQ-CAST-VALIDATE-LITERAL` (also relax-and-validate
+literal casts), `SP-PG-EXTQ-CAST-VALIDATE-CATEGORY-CROSS` (accept
+SOME cross-category casts PG itself accepts, e.g. TEXT '42' →
+INT8).
 SP-PG-EXTQ-CAST-VALIDATE V1 (2026-06-02, +17 KATs) — closes the V1
 SP-PG-EXTQ-CAST "strip + hope" silent-coercion attack vector.
 `cast_stripper::strip_pg_casts_tracked(sql) -> (String,

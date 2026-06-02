@@ -2,7 +2,13 @@
 
 Date created: 2026-06-02
 
-**Status: IN-PROGRESS.**
+**Status: CLOSED — V1 SHIPPED at T3 (2026-06-02).** The HEADLINE
+shape — Parse(`INSERT INTO compat (id, n) VALUES ($1::int8, $2)`,
+param_oids=[INT4 (23), TEXT (25)]) + Bind text "42" — now ACCEPTS
+(was: 42846 cannot_coerce). Verified via psycopg3 PQ-layer smoke
+on vulcan. Cross-category TEXT + INT8 cast still rejects with the
+exact V1 wire message so the silent-coercion vector stays closed.
+TaskList #384 ready for completion.
 
 Design spec: `docs/superpowers/specs/2026-06-02-kesseldb-sppgextqcastvalidatecompat-design.md`
 Parent SP-arc: SP-PG-EXTQ-CAST-VALIDATE V1 (closed 2026-06-02). The
@@ -40,16 +46,23 @@ mismatches rejected with `42846 cannot_coerce`."
 
 | T# | Scope | Status | Commit |
 |---|---|---|---|
-| **T1** | Design spec + this progress tracker. | DONE (folded into T2 commit) | — |
-| **T2** | `types::oid_category` + `types::oid_castable` + `dispatch_bind` widening + KATs. | — | — |
-| **T3** | vulcan psycopg smoke (INT4 + INT8 cast accepted; cross-category still rejects) + USAGE §9 note. | — | — |
-| **T4** | STATUS row + parent SP-PG-EXTQ-CAST-VALIDATE progress tracker follow-up → CLOSED + this progress tracker CLOSED. | — | — |
+| **T1** | Design spec + this progress tracker. | **DONE** (folded into T2 commit) | `d6f2031` |
+| **T2** | `types::oid_category` + `types::oid_castable` + `dispatch_bind` widening + KATs. | **DONE** | `d6f2031` |
+| **T3** | vulcan psycopg3 PQ-layer 5-case smoke (INT4+INT8 / INT8+INT4 / TEXT+VARCHAR accept; TEXT+INT8 cross-category reject; INT8+INT8 strict equality) + USAGE §9 note. | **DONE** | `6b4ae00` |
+| **T4** | STATUS row + parent SP-PG-EXTQ-CAST-VALIDATE progress tracker follow-up → CLOSED + this progress tracker CLOSED. | **DONE** | (this commit) |
 
-KAT delta target: +8-12.
+KAT delta: +14 (11 `types::tests::cast_compat_*` + 3
+`extq::tests::cast_validate_compat_t2_*`). All 919 pg-gateway
+library tests pass.
 
-## Headline (in-flight)
+## Headline (shipped)
 
-Parse(`INSERT INTO t VALUES ($1::int8, $2)`, param_oids=[INT4, TEXT])
-+ Bind succeeds (was: `42846 cannot_coerce`). Cross-category
-mismatch (TEXT param + INT8 cast) STILL rejects with the same
-`ExtqError::CastOidMismatch` + 42846 wire frame.
+Parse(`INSERT INTO compat (id, n) VALUES ($1::int8, $2)`,
+param_oids=[INT4 (23), TEXT (25)]) + Bind text "42" now ACCEPTS
+on vulcan (was: `42846 cannot_coerce`). pgJDBC's default
+Java-`int` against `::int8` cast — and psycopg3's Python-`int`
+against `::int8` cast — both close the false-rejection gap.
+Cross-category mismatch (TEXT param + INT8 cast) STILL rejects
+with the exact V1 wire message ("cannot cast parameter $1 from
+type with OID 25 to declared cast type OID 20") so the silent-
+coercion vector stays closed; only intra-category widenings open.

@@ -34,8 +34,17 @@ mismatches reject with `42846 cannot_coerce`."
 
 ## Out-of-scope (named, deferred)
 
-- **`SP-PG-EXTQ-CAST-VALIDATE-COMPAT`** — replace strict OID equality
-  with PG's type-category compatibility table.
+- ~~**`SP-PG-EXTQ-CAST-VALIDATE-COMPAT`** — replace strict OID equality
+  with PG's type-category compatibility table.~~ → **CLOSED
+  2026-06-02 by SP-PG-EXTQ-CAST-VALIDATE-COMPAT V1.** `types::
+  oid_category` + `types::oid_castable` ship the PG `typcategory`
+  widening (any 'N'-OID pair, any 'S'-OID pair etc. accept;
+  cross-category still rejects with the same 42846 wire frame so
+  the V1 silent-coercion vector stays closed). Verified via
+  psycopg3 PQ-layer 5-case smoke on vulcan
+  (`docs/superpowers/sppgextqcastvalidatecompat-t3-smoke-2026-06-02.txt`)
+  — HEADLINE pgJDBC INT4+INT8 pattern accepts; cross-category
+  TEXT+INT8 still rejects with the exact V1 error message.
 - **`SP-PG-EXTQ-CAST-VALIDATE-LITERAL`** — also validate `::TYPE`
   casts on literals (not just `$N`).
 - **`SP-PG-EXTQ-CAST-VALIDATE-MULTIWORD`** — recognise multi-word

@@ -88,6 +88,13 @@ spec:
             - name: postgres
               containerPort: {{ .Values.service.postgres.targetPort }}
               protocol: TCP
+            # SP-Cloud-Cluster T2 — dedicated VSR peer-transport port.
+            # The binary listens on this port for incoming peer dials
+            # AND on `service.binary.targetPort` for client traffic;
+            # the two listeners are separate sockets on the same pod.
+            - name: peer
+              containerPort: {{ .Values.cluster.peerPort | default 6534 }}
+              protocol: TCP
           env:
             {{- if .Values.env.httpAddr }}
             - name: KESSELDB_HTTP_ADDR

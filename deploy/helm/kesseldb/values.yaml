@@ -243,7 +243,18 @@ cluster:
   # fullname (e.g. "kesseldb"), `{idx}` to the ordinal (0..N-1),
   # `{namespace}` to the release namespace. Defaults match the
   # headless Service name ({fullname}-headless).
-  peerAddressTemplate: "{name}-{idx}.{name}-headless.{namespace}.svc.cluster.local:6532"
+  #
+  # SP-Cloud-Cluster T2: peer transport runs on a SEPARATE port from
+  # the client binary surface so the binary doesn't bind-collide on
+  # the same pod (the binary listens on `cluster.peerPort` for peer
+  # dials AND on `service.binary.targetPort` for client traffic).
+  # Default 6534 is below the well-known/registered ranges KesselDB
+  # uses (6532 binary, 6533 HTTP, 5432 PG) and IANA-unassigned.
+  peerAddressTemplate: "{name}-{idx}.{name}-headless.{namespace}.svc.cluster.local:6534"
+  # Pod container port for VSR peer traffic. MUST match the port in
+  # `peerAddressTemplate` (the chart does not cross-validate; the
+  # binary's startup log shows the resolved peer addresses).
+  peerPort: 6534
   # View-change timeout — how long a backup waits without hearing
   # from the primary before initiating a view-change. Default 5s
   # matches the engine's Replica default; tune higher for higher-

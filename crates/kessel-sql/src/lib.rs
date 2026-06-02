@@ -26,6 +26,14 @@ enum Tok {
     Plus,
     Minus,
     Star,
+    /// SP-PG-EXTQ-PARSED T1 — `$N` 1-based positional parameter
+    /// placeholder. `N` is in the range [1, 99]. Recognized by the
+    /// lexer; T2 wires `compile_with_params` to resolve to a typed
+    /// `Value` BEFORE the parser runs (no SQL text concatenation;
+    /// closes the SP-PG-EXTQ V1 §11 weak-spot #1 attack surface).
+    /// Until T2 lands, a `Tok::Param` reaching the parser falls
+    /// through to the existing `_ => Err(...)` arms.
+    Param(u16),
 }
 
 fn lex(s: &str) -> Result<Vec<Tok>, SqlError> {
@@ -68,6 +76,42 @@ fn lex(s: &str) -> Result<Vec<Tok>, SqlError> {
                 i += 1;
             }
             out.push(Tok::Ident(s[start..i].to_string()));
+        } else if c == '$' {
+            // SP-PG-EXTQ-PARSED T1 — `$N` positional-parameter
+            // placeholder. Greedy decimal-digit scan after the `$`.
+            // V1 caps N at 99 (matches the SP-PG-EXTQ-BIN T2 SQL-
+            // text scanner; `MAX_PARAMETERS_PER_BIND` on the wire
+            // is 65535 but the practical ORM cap is well below 99
+            // and the cap lets us keep `n: u16` without overflow
+            // worry). `$0` is rejected (PG `$N` is 1-based). Bare
+            // `$` with no following digit is rejected — the lexer
+            // is strict so a typo doesn't silently become an
+            // identifier. The gateway-side text scanner is
+            // permissive (passes bare `$` through verbatim) because
+            // it processes pre-parsed SQL bytes; here we're the
+            // parser-side authority.
+            let start = i;
+            i += 1;
+            let digit_start = i;
+            while i < b.len() && (b[i] as char).is_ascii_digit() {
+                i += 1;
+            }
+            if i == digit_start {
+                return Err(format!(
+                    "expected digit after `$` (got `{}`)",
+                    &s[start..(digit_start + 1).min(b.len())]
+                ));
+            }
+            let n: u32 = s[digit_start..i].parse().map_err(|_| {
+                "bad parameter index after `$`".to_string()
+            })?;
+            if n == 0 {
+                return Err("`$0` is invalid (PG `$N` indices are 1-based)".into());
+            }
+            if n > 99 {
+                return Err(format!("`${n}` exceeds the V1 limit of 99 parameters per statement"));
+            }
+            out.push(Tok::Param(n as u16));
         } else {
             match c {
                 '(' | ')' | ',' | ';' | '.' => {
@@ -4584,5 +4628,103 @@ mod tests {
             OpResult::Got(b) => assert_eq!(i128::from_le_bytes(<[u8;16]>::try_from(b.as_ref()).unwrap()), 4),
             o => panic!("{o:?}"),
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // SP-PG-EXTQ-PARSED T1 — lexer recognizes `$N` as `Tok::Param(N)`.
+    // T1 ships JUST the lexer (the parser still rejects `Tok::Param`
+    // because no value-position acceptance exists yet — that's T2);
+    // these KATs lock the lexical shape so T2 can build on it without
+    // worrying the lexer accidentally drifts. Companion design spec:
+    // `docs/superpowers/specs/2026-06-02-kesseldb-sppgextqparsed-design.md`
+    // §3.1 token-rewrite shape.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// `$1` lexes as `Tok::Param(1)`.
+    #[test]
+    fn t1parsed_lex_dollar_one() {
+        let toks = lex("SELECT $1").expect("lex ok");
+        assert_eq!(
+            toks,
+            vec![Tok::Ident("SELECT".to_string()), Tok::Param(1)]
+        );
+    }
+
+    /// `$N` in a WHERE predicate position lexes as `Tok::Param(N)`.
+    #[test]
+    fn t1parsed_lex_dollar_in_where_position() {
+        let toks =
+            lex("SELECT * FROM t WHERE id = $1").expect("lex ok");
+        // The relevant suffix is `id = $1` → Ident, Cmp("="), Param(1).
+        assert!(toks.contains(&Tok::Param(1)));
+        // Locate the `=` index and assert the next tok is the Param.
+        let cmp_idx = toks
+            .iter()
+            .position(|t| matches!(t, Tok::Cmp("=")))
+            .expect("`=` present");
+        assert_eq!(toks[cmp_idx + 1], Tok::Param(1));
+    }
+
+    /// `$10` lexes greedily as `Tok::Param(10)` (NOT `$1` followed by
+    /// literal `0`). Mirrors the gateway substitute scanner.
+    #[test]
+    fn t1parsed_lex_two_digit_index() {
+        let toks = lex("SELECT $10").expect("lex ok");
+        assert_eq!(
+            toks,
+            vec![Tok::Ident("SELECT".to_string()), Tok::Param(10)]
+        );
+    }
+
+    /// `$1, $2` ordering preserved — the multi-position case.
+    #[test]
+    fn t1parsed_lex_multiple_params_in_order() {
+        let toks = lex("SELECT $1, $2").expect("lex ok");
+        assert_eq!(
+            toks,
+            vec![
+                Tok::Ident("SELECT".to_string()),
+                Tok::Param(1),
+                Tok::Punct(','),
+                Tok::Param(2)
+            ]
+        );
+    }
+
+    /// `$0` is rejected — PG `$N` indices are 1-based. The error
+    /// message names the V1 weak-spot so a future contributor sees
+    /// why the strictness exists.
+    #[test]
+    fn t1parsed_lex_zero_index_rejected() {
+        let err = lex("SELECT $0").unwrap_err();
+        assert!(
+            err.contains("1-based") || err.contains("`$0`"),
+            "expected the lexer error to name the 1-based rule, got `{err}`"
+        );
+    }
+
+    /// `$100` exceeds the V1 cap.
+    #[test]
+    fn t1parsed_lex_overlimit_index_rejected() {
+        let err = lex("SELECT $100").unwrap_err();
+        assert!(
+            err.contains("99"),
+            "expected the lexer error to name the V1 cap, got `{err}`"
+        );
+    }
+
+    /// Bare `$` with no following digit is rejected — defensive against
+    /// typos and unbound dollar-sign uses in SQL (PG itself doesn't
+    /// have a use for bare `$` outside `$N` and dollar-quoted strings).
+    /// The gateway-side text scanner is permissive (passes bare `$`
+    /// through verbatim) because it processes pre-parsed SQL bytes;
+    /// here we are the parser-side authority and reject the ambiguity.
+    #[test]
+    fn t1parsed_lex_bare_dollar_with_no_digit_rejected() {
+        let err = lex("SELECT $").unwrap_err();
+        assert!(
+            err.contains("digit"),
+            "expected the lexer to name the missing digit, got `{err}`"
+        );
     }
 }

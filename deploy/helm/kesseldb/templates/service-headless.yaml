@@ -28,8 +28,12 @@ spec:
   selector:
     {{- include "kesseldb.selectorLabels" . | nindent 4 }}
   ports:
-    - name: binary
-      port: {{ .Values.service.binary.port }}
-      targetPort: {{ .Values.service.binary.targetPort }}
+    # SP-Cloud-Cluster T2: the headless Service carries the VSR peer
+    # transport port. Client traffic still uses the regular ClusterIP
+    # Service (binary 6532 / HTTP 6533 / PG 5432) — operators connect
+    # there, never to the headless Service.
+    - name: peer
+      port: {{ .Values.cluster.peerPort | default 6534 }}
+      targetPort: {{ .Values.cluster.peerPort | default 6534 }}
       protocol: TCP
 {{- end -}}

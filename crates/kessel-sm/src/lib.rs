@@ -10144,6 +10144,157 @@ mod tests {
         }
     }
 
+    // ========================================================================
+    // SP-WHERE-VM-Specialise T3 — aggregate_numeric_scan with compile_filter
+    //
+    // The per-row WHERE evaluator switched from `kessel_expr::eval`
+    // (stack-VM interpreter) to a `kessel_expr::compile_filter`
+    // closure built once per query, with the interpreter as fallback
+    // when compilation declines (Unsupported opcode, Malformed).
+    // These KATs lock byte-equivalence between the closure-driven
+    // result and a hand-computed model on a non-trivial WHERE shape
+    // — proving the wire-up at the SM boundary preserves the
+    // determinism oracle.
+
+    /// SP-WHERE-VM-Specialise T3: scalar aggregate with a non-trivial
+    /// WHERE program (compiled via compile_filter on the parallel
+    /// path) matches the closed-form model. Runs at scale crossing
+    /// MIN_PARALLEL_ROWS so the parallel-fold + closure-shared-across-
+    /// workers paths exercise.
+    #[test]
+    fn sp_where_vm_specialise_aggregate_with_filter_eq_model() {
+        use kessel_expr::Program;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: q_type_def() });
+        const N: u64 = 10_000;
+        for i in 0..N {
+            sm.apply(
+                10 + i,
+                Op::Create {
+                    type_id: 1,
+                    id: ObjectId::from_u128(i as u128),
+                    record: qrec(((i % 7) as u32) + 1, 0, (i + 1) as u32),
+                },
+            );
+        }
+        // WHERE v >= 2000 AND v < 8000 AND owner >= 2 AND owner <= 5.
+        // The 4-deep conjunction matches the TPC-H Q6 WHERE shape;
+        // compile_filter specialises every node.
+        let prog = Program::new()
+            .load(3).push_int(2000).ge()
+            .load(3).push_int(8000).lt().and()
+            .load(1).push_int(2).ge().and()
+            .load(1).push_int(5).le().and()
+            .bytes();
+        // Hand-compute the expected accumulators against the same
+        // population rule used to seed the SM.
+        let mut count: i128 = 0;
+        let mut sum: i128 = 0;
+        let mut mn: Option<i128> = None;
+        let mut mx: Option<i128> = None;
+        for i in 0..N {
+            let owner = ((i % 7) as u32) + 1;
+            let v = (i + 1) as u32;
+            if v >= 2000 && v < 8000 && owner >= 2 && owner <= 5 {
+                count += 1;
+                sum += v as i128;
+                let vi = v as i128;
+                mn = Some(mn.map_or(vi, |m: i128| m.min(vi)));
+                mx = Some(mx.map_or(vi, |m: i128| m.max(vi)));
+            }
+        }
+        let expected_avg = if count == 0 { 0 } else { sum / count };
+        let agg = |sm: &StateMachine<MemVfs>, kind: u8| -> i128 {
+            match sm.read_only_op(Op::Aggregate {
+                type_id: 1,
+                program: prog.clone(),
+                kind,
+                field_id: 3,
+                range_preds: vec![],
+            }) {
+                OpResult::Got(b) => {
+                    let mut le = [0u8; 16];
+                    le.copy_from_slice(&b[..16]);
+                    i128::from_le_bytes(le)
+                }
+                o => panic!("specialised agg kind={kind}: {o:?}"),
+            }
+        };
+        assert_eq!(agg(&sm, 0), count, "COUNT(specialised) == model");
+        assert_eq!(agg(&sm, 1), sum, "SUM(specialised) == model");
+        assert_eq!(agg(&sm, 2), mn.unwrap_or(0), "MIN(specialised) == model");
+        assert_eq!(agg(&sm, 3), mx.unwrap_or(0), "MAX(specialised) == model");
+        assert_eq!(agg(&sm, 4), expected_avg, "AVG(specialised) == model");
+        // 5 reruns lock determinism across closure-share + worker scheduling.
+        for kind in 0..=4u8 {
+            let first = agg(&sm, kind);
+            for _ in 1..5 {
+                assert_eq!(
+                    first,
+                    agg(&sm, kind),
+                    "specialised scalar-agg kind={kind} must be deterministic"
+                );
+            }
+        }
+    }
+
+    /// SP-WHERE-VM-Specialise T3: when the WHERE program contains an
+    /// opcode `compile_filter` declines to specialise (here: ADD),
+    /// the per-row callsite falls back to `kessel_expr::eval` and
+    /// produces byte-identical results. This locks the "interpreter
+    /// remains the oracle on fallback" contract.
+    #[test]
+    fn sp_where_vm_specialise_aggregate_falls_back_to_interpreter_on_unsupported() {
+        use kessel_expr::Program;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: q_type_def() });
+        const N: u64 = 9_500;
+        for i in 0..N {
+            sm.apply(
+                10 + i,
+                Op::Create {
+                    type_id: 1,
+                    id: ObjectId::from_u128(i as u128),
+                    record: qrec(((i % 4) as u32) + 1, 0, (i + 1) as u32),
+                },
+            );
+        }
+        // WHERE (v + 1) > 5000 — uses ADD, which compile_filter
+        // declines as Unsupported. Caller falls back to eval().
+        // (kessel_expr::compile_filter returns Err(Unsupported{op_name:"ADD"})
+        // which the SM-level shim catches with .ok() → None → fallback.)
+        let prog = Program::new()
+            .load(3).push_int(1).add()
+            .push_int(5000).gt()
+            .bytes();
+        let mut expected: i128 = 0;
+        for i in 0..N {
+            let v = (i + 1) as i128;
+            if (v + 1) > 5000 {
+                expected += 1;
+            }
+        }
+        let got = match sm.read_only_op(Op::Aggregate {
+            type_id: 1,
+            program: prog.clone(),
+            kind: 0,
+            field_id: 3,
+            range_preds: vec![],
+        }) {
+            OpResult::Got(b) => {
+                let mut le = [0u8; 16];
+                le.copy_from_slice(&b[..16]);
+                i128::from_le_bytes(le)
+            }
+            o => panic!("fallback agg COUNT: {o:?}"),
+        };
+        assert_eq!(
+            got, expected,
+            "ADD-in-WHERE compile_filter Unsupported -> interpreter fallback must \
+             yield the same COUNT as the hand-computed model"
+        );
+    }
+
     #[test]
     fn group_aggregate_is_readonly_and_deterministic() {
         use kessel_expr::Program;

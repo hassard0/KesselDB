@@ -1859,6 +1859,8 @@ and post higher numbers; that's V2 `SP-PG-EXTQ-PIPELINE-BATCH`.
 - SP-PG-COPY progress (V1 SHIPPED at T4 — pg_dump / sysbench / `\copy` bulk-load): `docs/superpowers/specs/2026-05-30-kesseldb-subproject-sppgcopy-progress.md`
 - SP-PG-COPY-BULKAPPLY design spec: `docs/superpowers/specs/2026-05-30-kesseldb-sppgcopybulkapply-design.md`
 - SP-PG-COPY-BULKAPPLY progress (V1 SHIPPED — 181.9× COPY throughput lift via per-batch Op::Txn fold): `docs/superpowers/specs/2026-05-30-kesseldb-subproject-sppgcopybulkapply-progress.md`
+- SP-PG-COPY-CSV design spec: `docs/superpowers/specs/2026-06-01-kesseldb-sppgcopycsv-design.md`
+- SP-PG-COPY-CSV progress (V1 SHIPPED at T2 — CSV format with quoting / HEADER / custom DELIMITER+QUOTE+ESCAPE+NULL): `docs/superpowers/specs/2026-06-01-kesseldb-subproject-sppgcopycsv-progress.md`
 
 ### SP-PG-COPY — `COPY FROM STDIN` / `COPY TO STDOUT` bulk load (V1 SHIPPED 2026-05-30)
 
@@ -1951,11 +1953,61 @@ nullable columns then applies. This means a NOT NULL column
 receiving `\N` surfaces as a clean `23502 not_null_violation`
 error at ingest time (matching PG).
 
+### SP-PG-COPY-CSV — CSV format (V1 SHIPPED 2026-06-01)
+
+CSV format unlocks `pg_dump --csv` + every spreadsheet/analyst
+on-ramp (Excel, Sheets, R, `pandas.read_csv`). RFC 4180 grammar
+with the PG superset (HEADER + custom DELIMITER / QUOTE / ESCAPE /
+NULL).
+
+```bash
+# COPY FROM CSV with HEADER (the pg_dump --csv default shape)
+psql -h kesseldb -p 5532 -U test -d kesseldb -c \
+  "COPY users FROM STDIN WITH (FORMAT csv, HEADER)" < users.csv
+# → COPY 1000  (the header row is skipped)
+
+# COPY TO CSV with HEADER — exports a spreadsheet-openable file
+psql -h kesseldb -p 5532 -U test -d kesseldb -c \
+  "COPY users TO STDOUT WITH (FORMAT csv, HEADER)" > users.csv
+
+# Embedded comma / embedded quote / NULL all round-trip byte-equal:
+#   1,"Alice, the brave"        ← quoted because of the embedded comma
+#   2,"Bob ""the builder"""     ← doubled-quote escape inside the value
+#   3,Charlie                   ← bare unquoted
+#   4,                          ← empty unquoted = NULL (default)
+
+# Custom delimiter + NULL marker for CSVs exported from Sheets etc.
+psql -h kesseldb -p 5532 -U test -d kesseldb -c \
+  "COPY t FROM STDIN WITH (FORMAT csv, HEADER, DELIMITER ';', NULL '<NA>')" \
+  < euro-style.csv
+# → ';' splits fields; '<NA>' decodes as NULL
+```
+
+V1 CSV codec honors per PG §SQL-COPY CSV defaults: delimiter `,`,
+quote `"`, escape = quote (so `""` is the doubled-quote escape;
+configure a distinct `ESCAPE 'X'` to use the alternate single-char
+escape shape), NULL = empty unquoted (a quoted empty `""` stays
+empty-string, distinct from NULL). HEADER on input consumes the
+first record; on output emits a first record containing the resolved
+column names. The CSV record parser is multi-line aware — a quoted
+field containing literal newlines reassembles correctly across
+CopyData frame boundaries via the carry buffer.
+
+Rejected CSV options surface precise V2-pointing errors:
+
+```text
+ERROR:  COPY csv option FORCE_QUOTE not supported in V1 (SP-PG-COPY-CSV-FORCEQUOTE / SP-PG-COPY-CSV-ENCODING)
+ERROR:  COPY csv DELIMITER must be a single character (got '||')
+```
+
+CSV format inherits the SP-PG-COPY-BULKAPPLY V1 batching throughput
++ NULL-row fallback semantics — the codec is a payload concern only.
+Smoke transcript: `docs/superpowers/sppgcopycsv-t2-smoke-2026-06-01.txt`.
+
 Rejected variants surface precise V2-pointing error messages:
 
 ```text
 ERROR:  COPY binary format not supported in V1 (SP-PG-COPY-BIN)
-ERROR:  COPY csv format not supported in V1 (SP-PG-COPY-CSV)
 ERROR:  COPY FROM/TO file path not supported in V1; use STDIN/STDOUT (SP-PG-COPY-FILE)
 ERROR:  COPY FROM/TO PROGRAM not supported (permanent security restriction)
 ```
@@ -1963,8 +2015,11 @@ ERROR:  COPY FROM/TO PROGRAM not supported (permanent security restriction)
 V2 follow-ups (each its own SP-arc):
 
 - `SP-PG-COPY-BIN` — binary format (`WITH (FORMAT binary)`).
-- `SP-PG-COPY-CSV` — CSV format with quoting + `HEADER` + custom
-  delimiters.
+- `SP-PG-COPY-CSV-FORCEQUOTE` — `FORCE_QUOTE (cols)` / `FORCE_NOT_NULL` /
+  `FORCE_NULL` column-scoped CSV modifiers.
+- `SP-PG-COPY-CSV-ENCODING` — non-UTF-8 CSV input/output encodings.
+- `SP-PG-COPY-CSV-HEADER-MATCH` — PG-15+ `HEADER MATCH` (validate input
+  header against table schema).
 - `SP-PG-COPY-BULKAPPLY-WHOLECOPY` — whole-COPY atomicity (one
   Op::Txn covers every row) for full PG-compatible
   all-or-nothing semantics. Gated on an engine-side streaming-Txn

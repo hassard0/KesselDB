@@ -101,6 +101,27 @@ covered by the workspace test suite (2048 default / 2059 with
   `pg_dump` restore, `sysbench prepare`, and `psql \copy` workflows. Smoke
   transcript: `docs/superpowers/sppgcopy-t4-smoke-2026-05-30.txt`. **Arc
   closed — TaskList #350 ready for completion.**
+- **Track A.2.1 — PostgreSQL COPY CSV format (SP-PG-COPY-CSV V1 SHIPPED — 2026-06-01).**
+  `WITH (FORMAT csv [, DELIMITER 'X'] [, QUOTE 'X'] [, ESCAPE 'X'] [, NULL 'string']
+  [, HEADER])` accepted for both COPY FROM STDIN and COPY TO STDOUT. CSV codec is
+  hand-rolled (no `csv` crate — preserves the SP-PG-COPY no-extra-deps invariant);
+  RFC 4180 + PG superset: doubled-quote escape, embedded-delimiter/quote/newline
+  quoting, empty-unquoted = NULL, empty-quoted = empty-string (distinct), custom
+  NULL marker, record-oriented parser reassembles quoted-newline records across
+  CopyData frame boundaries. HEADER on input drops the first record; on output emits
+  the column names as a leading CopyData. Inherits SP-PG-COPY-BULKAPPLY V1 batching
+  + NULL-fallback semantics — CSV is just a different payload codec at the
+  dispatcher. **HEADLINE on vulcan: psql 16 COPY FROM CSV HEADER (3 rows including
+  embedded comma + doubled-quote escape) + COPY TO CSV HEADER round-trip byte-equal.
+  Custom DELIMITER ';' + NULL '<NA>' verified end-to-end.** Unlocks `pg_dump --csv`,
+  `psql \copy ... CSV HEADER`, and every spreadsheet/pandas analyst on-ramp. FORCE_QUOTE
+  / FORCE_NOT_NULL / FORCE_NULL → precise `0A000` with V2 arc names
+  (`SP-PG-COPY-CSV-FORCEQUOTE`); non-UTF-8 ENCODING → `0A000`
+  (`SP-PG-COPY-CSV-ENCODING`); HEADER MATCH (PG-15+) → V2
+  `SP-PG-COPY-CSV-HEADER-MATCH`. Smoke transcript:
+  `docs/superpowers/sppgcopycsv-t2-smoke-2026-06-01.txt`. KAT delta: +24
+  (`copy::csv::*` + `copy::dispatch::csv_*` + `copy::command::csv_*`). **Arc closed —
+  TaskList #358 ready for completion.**
 - **Track A.3 — PostgreSQL COPY throughput (SP-PG-COPY-BULKAPPLY V1 SHIPPED — 2026-05-30).**
   COPY FROM STDIN now buffers up to `COPY_BATCH_SIZE` rows (default 1024,
   env-overridable via `KESSELDB_COPY_BATCH_SIZE`) and flushes each batch as

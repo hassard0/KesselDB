@@ -1,0 +1,83 @@
+SP-PG-COPY-CSV T2 — real psql 16 smoke on vulcan (2026-06-01)
+==============================================================
+
+Setup
+-----
+Server: /tmp/kdb-target-copycsv/release/kesseldb (built from main @ commit 2d2b414)
+Listener: 127.0.0.1:5534 (PG-wire) / 127.0.0.1:6534 (binary)
+Client: PostgreSQL 16 psql
+
+Test 1: COPY FROM CSV with HEADER + embedded comma + doubled quote
+-------------------------------------------------------------------
+$ cat /tmp/csv-data.csv
+id,name
+1,"Alice, the brave"
+2,"Bob ""the builder"""
+3,Charlie
+
+$ psql -c "CREATE TABLE csv_smoke (id BIGINT, name CHAR(64))"
+CREATE TABLE
+
+$ psql -c "COPY csv_smoke FROM STDIN WITH (FORMAT csv, HEADER)" < /tmp/csv-data.csv
+COPY 3
+
+$ psql -c "SELECT * FROM csv_smoke ORDER BY id"
+ id |       name        
+----+-------------------
+  1 | Alice, the brave
+  2 | Bob "the builder"
+  3 | Charlie
+(3 rows)
+
+VERIFIED: embedded comma in quoted field preserved.
+VERIFIED: doubled-quote escape decoded as a literal embedded ".
+VERIFIED: HEADER row skipped (only 3 data rows ingested).
+
+Test 2: COPY TO CSV with HEADER — round-trip byte-equality
+-----------------------------------------------------------
+$ psql -c "COPY csv_smoke TO STDOUT WITH (FORMAT csv, HEADER)"
+id,name
+1,"Alice, the brave"
+2,"Bob ""the builder"""
+3,Charlie
+
+VERIFIED: header row emitted on output.
+VERIFIED: embedded comma triggers quoting.
+VERIFIED: embedded quote emitted as doubled "".
+VERIFIED: byte-equal to the input file.
+
+Test 3: custom DELIMITER ';' + custom NULL '<NA>' marker
+---------------------------------------------------------
+$ cat /tmp/csv-data2.csv
+id;name
+4;<NA>
+5;real value
+
+$ psql -c "COPY csv_nulltest FROM STDIN WITH (FORMAT csv, HEADER, DELIMITER ';', NULL '<NA>')" < /tmp/csv-data2.csv
+COPY 2
+
+$ psql -c "SELECT * FROM csv_nulltest"
+ id |    name    
+----+------------
+  4 | 
+  5 | real value
+(2 rows)
+
+VERIFIED: '<NA>' decoded as NULL (row 4's name is NULL).
+VERIFIED: ';' delimiter honored.
+VERIFIED: HEADER skipped under custom-options shape.
+
+$ psql -c "COPY csv_nulltest TO STDOUT WITH (FORMAT csv, HEADER, DELIMITER ';', NULL '<NA>')"
+id;name
+4;<NA>
+5;real value
+
+VERIFIED: NULL → '<NA>' (the configured marker) on output.
+VERIFIED: ';' delimiter on output.
+VERIFIED: custom-options round-trip byte-equal.
+
+Headline question
+-----------------
+Q: Does psql COPY CSV with quoted+escaped fields work end-to-end?
+A: YES. Three independent KATs verify quoted+escaped fields, custom
+   options, NULL handling, and round-trip byte-equality.

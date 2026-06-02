@@ -2722,4 +2722,388 @@ mod tests {
         drop(e4);
         let _ = std::fs::remove_dir_all(&dir4);
     }
+
+    // ====================================================================
+    // SP-Perf-A-SHARD-XTXN end-to-end KATs
+    // ====================================================================
+    //
+    // These tests SPAWN a real K=4 sharded engine and drive Op::Txn
+    // through the public EngineHandle API. Coverage:
+    //
+    //   1. Single-shard Op::Txn at K=4 writes via the correct shard
+    //      AND a subsequent GetById round-trips to the SAME shard
+    //      (read-your-writes preserved).
+    //   2. Multi-shard Op::Txn at K=4 returns SchemaError WITHOUT
+    //      modifying any shard's storage (applied_ops counters
+    //      unchanged from pre-call snapshot).
+    //   3. K=1/K=4/K=8 byte-equal determinism oracle for single-shard
+    //      Op::Txn (extends the T3 SP-Perf-A oracle to cover Op::Txn).
+    //   4. Cross-K behavior split: a workload that's single-shard at
+    //      K=1 (always) AND single-shard at K=4 (by construction)
+    //      returns identical OpResult; a workload that's single-shard
+    //      at K=1 but multi-shard at K=4 returns Ok at K=1 and
+    //      SchemaError at K=4 (the V1 reject behavior, documented).
+
+    /// Headline XTXN end-to-end: K=4 single-shard Op::Txn round-trips
+    /// correctly. Two rows with the same (type_id, id) → same shard →
+    /// the txn writes both rows atomically to that shard, and a
+    /// subsequent GetById reads them back.
+    #[test]
+    fn xtxn_e2e_single_shard_txn_writes_and_reads_back_k4() {
+        let (engine, dir) = spawn_sharded(4, "xtxn-e2e-single");
+        let ot = build_test_schema(&engine);
+
+        // Find a (type_id=1, id) pair whose primary key falls on
+        // shard s; then build a 3-op Op::Txn that:
+        //   Create(id_a) + Update(id_a) + GetById(id_a) — all same
+        //   (type_id, id) → same shard.
+        let id_a = ObjectId::from_u128(7);
+        let s = shard_of_key(&make_key_inline(1, &id_a.0), 4);
+        assert!(s < 4);
+
+        let rec_create = codec_encode(&ot, &[Value::Uint(10)]).unwrap();
+        let rec_update = codec_encode(&ot, &[Value::Uint(99)]).unwrap();
+
+        // Per-shard applied_ops snapshot before the txn.
+        let sharded = engine
+            .sharded
+            .as_ref()
+            .expect("K=4 engine has dispatcher");
+        let pre: Vec<u64> = sharded
+            .all_shards()
+            .iter()
+            .map(|e| e.applied_ops_snapshot())
+            .collect();
+
+        let txn = Op::Txn {
+            ops: vec![
+                Op::Create {
+                    type_id: 1,
+                    id: id_a,
+                    record: rec_create,
+                },
+                Op::Update {
+                    type_id: 1,
+                    id: id_a,
+                    record: rec_update.clone(),
+                },
+            ],
+        };
+        let r = engine.apply(txn);
+        assert!(
+            matches!(r, OpResult::Ok),
+            "single-shard Op::Txn at K=4 must succeed: {r:?}"
+        );
+
+        // Read it back — MUST route to shard s AND see the Update.
+        let get_r = engine.apply(Op::GetById { type_id: 1, id: id_a });
+        match get_r {
+            OpResult::Got(bytes) => {
+                let vals = kessel_codec::decode(&ot, &bytes).unwrap();
+                assert!(
+                    matches!(vals[0], Value::Uint(v) if v == 99),
+                    "read-your-writes broken: expected v=99, got {vals:?}"
+                );
+            }
+            other => panic!("GetById after txn → {other:?}, expected Got(99)"),
+        }
+
+        // Only shard `s` should have its applied_ops bump (Create +
+        // Update = 2 ops, but they're applied INSIDE the apply-Txn arm
+        // which counts as one Op::Txn for the outer counter). The
+        // OTHER shards' applied_ops MUST be unchanged from pre.
+        let post: Vec<u64> = sharded
+            .all_shards()
+            .iter()
+            .map(|e| e.applied_ops_snapshot())
+            .collect();
+        for i in 0..4 {
+            if i == s {
+                assert!(
+                    post[i] > pre[i],
+                    "shard {i} (owning shard) applied_ops did not bump"
+                );
+            } else {
+                assert_eq!(
+                    post[i], pre[i],
+                    "shard {i} (non-owning) applied_ops bumped from {} to {} \
+                     — txn leaked across shards",
+                    pre[i], post[i]
+                );
+            }
+        }
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// HEADLINE XTXN safety lock: K=4 multi-shard Op::Txn returns
+    /// SchemaError carrying the cross-shard message AND no shard's
+    /// storage is touched (applied_ops snapshot unchanged across
+    /// every shard). This is the no-data-loss invariant — V1's
+    /// reject path MUST be reject-before-apply.
+    #[test]
+    fn xtxn_e2e_cross_shard_rejects_without_writes_k4() {
+        let (engine, dir) = spawn_sharded(4, "xtxn-e2e-cross");
+        let ot = build_test_schema(&engine);
+
+        // Find two ids whose make_key lands on distinct shards.
+        let mut a: Option<ObjectId> = None;
+        let mut b: Option<ObjectId> = None;
+        let mut shard_a: Option<usize> = None;
+        for i in 0u128..1024 {
+            let id = ObjectId::from_u128(i);
+            let s = shard_of_key(&make_key_inline(1, &id.0), 4);
+            if a.is_none() {
+                a = Some(id);
+                shard_a = Some(s);
+            } else if shard_a != Some(s) {
+                b = Some(id);
+                break;
+            }
+        }
+        let id_a = a.expect("a");
+        let id_b = b.expect("b — fxhash MUST distribute at K=4");
+
+        let rec_a = codec_encode(&ot, &[Value::Uint(1)]).unwrap();
+        let rec_b = codec_encode(&ot, &[Value::Uint(2)]).unwrap();
+
+        let sharded = engine
+            .sharded
+            .as_ref()
+            .expect("K=4 engine has dispatcher");
+        let pre: Vec<u64> = sharded
+            .all_shards()
+            .iter()
+            .map(|e| e.applied_ops_snapshot())
+            .collect();
+
+        // Multi-shard Op::Txn — V1 MUST reject.
+        let txn = Op::Txn {
+            ops: vec![
+                Op::Create {
+                    type_id: 1,
+                    id: id_a,
+                    record: rec_a,
+                },
+                Op::Create {
+                    type_id: 1,
+                    id: id_b,
+                    record: rec_b,
+                },
+            ],
+        };
+        let r = engine.apply(txn);
+        match r {
+            OpResult::SchemaError(msg) => {
+                assert!(
+                    msg.starts_with("cross-shard transaction not supported"),
+                    "wrong reject message: {msg:?}"
+                );
+                assert!(
+                    msg.contains("SP-Perf-A-SHARD-XTXN-2PC"),
+                    "reject must name the V2 follow-up: {msg:?}"
+                );
+            }
+            other => panic!("expected SchemaError, got {other:?}"),
+        }
+
+        // CRITICAL: no shard's applied_ops counter changed — proves
+        // the reject was applied BEFORE any per-shard apply_raw.
+        let post: Vec<u64> = sharded
+            .all_shards()
+            .iter()
+            .map(|e| e.applied_ops_snapshot())
+            .collect();
+        assert_eq!(
+            post, pre,
+            "DATA LOSS RISK: cross-shard reject leaked writes to some shard"
+        );
+
+        // Further check: GetById on both ids returns NotFound (rejected
+        // txn means neither row was written).
+        let get_a = engine.apply(Op::GetById { type_id: 1, id: id_a });
+        let get_b = engine.apply(Op::GetById { type_id: 1, id: id_b });
+        assert!(
+            matches!(get_a, OpResult::NotFound),
+            "row a leaked after reject: {get_a:?}"
+        );
+        assert!(
+            matches!(get_b, OpResult::NotFound),
+            "row b leaked after reject: {get_b:?}"
+        );
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// K=1/K=4/K=8 byte-equal determinism oracle for single-shard
+    /// Op::Txn. For every (type_id, id) we craft a 2-op Op::Txn
+    /// (Create + GetById on the same id, so same shard at every K).
+    /// At K=1 the txn returns Ok and Get sees the value. At K=4 and
+    /// K=8 the SAME txn returns the SAME OpResult — the single-shard
+    /// fast path preserves byte-equality across K. This extends the
+    /// SP-Perf-A T3 oracle to cover Op::Txn at K>=2.
+    #[test]
+    fn xtxn_oracle_k1_k4_k8_single_shard_txn_byte_equal() {
+        // K=1 (unsharded) control.
+        let cfg_k1 = ServerConfig {
+            shard_count: None,
+            read_workers: Some(0),
+            ..ServerConfig::default()
+        };
+        let dir1 = fresh_dir("xtxn-oracle-k1");
+        let e1 = spawn_engine_cfg(&dir1, &cfg_k1).expect("k1");
+        let (e4, dir4) = spawn_sharded(4, "xtxn-oracle-k4");
+        let (e8, dir8) = spawn_sharded(8, "xtxn-oracle-k8");
+
+        let ot = build_test_schema(&e1);
+        let _ = build_test_schema(&e4);
+        let _ = build_test_schema(&e8);
+
+        // Single-shard txns: each txn touches ONE (type_id, id) only.
+        // The id varies across rows but every inner op of a SINGLE
+        // txn shares the same id → same shard at every K.
+        let mut diffs = 0usize;
+        for i in 0..50u128 {
+            let id = ObjectId::from_u128(i);
+            let rec = codec_encode(&ot, &[Value::Uint(i * 7)]).unwrap();
+            let txn = Op::Txn {
+                ops: vec![Op::Create {
+                    type_id: 1,
+                    id,
+                    record: rec,
+                }],
+            };
+            let r1 = e1.apply(txn.clone());
+            let r4 = e4.apply(txn.clone());
+            let r8 = e8.apply(txn);
+            if r1 != r4 || r1 != r8 {
+                diffs += 1;
+                if diffs <= 3 {
+                    eprintln!("DIVERGE i={i} k1={r1:?} k4={r4:?} k8={r8:?}");
+                }
+            }
+        }
+        // Also exercise an empty txn at every K.
+        let empty = Op::Txn { ops: vec![] };
+        assert_eq!(e1.apply(empty.clone()), e4.apply(empty.clone()));
+        assert_eq!(e1.apply(empty.clone()), e8.apply(empty));
+
+        // And a multi-op same-id txn (Create + Update + GetById).
+        let id = ObjectId::from_u128(999);
+        let rec_a = codec_encode(&ot, &[Value::Uint(1)]).unwrap();
+        let rec_b = codec_encode(&ot, &[Value::Uint(2)]).unwrap();
+        let multi_op = Op::Txn {
+            ops: vec![
+                Op::Create {
+                    type_id: 1,
+                    id,
+                    record: rec_a,
+                },
+                Op::Update {
+                    type_id: 1,
+                    id,
+                    record: rec_b,
+                },
+                Op::GetById { type_id: 1, id },
+            ],
+        };
+        let r1 = e1.apply(multi_op.clone());
+        let r4 = e4.apply(multi_op.clone());
+        let r8 = e8.apply(multi_op);
+        assert_eq!(r1, r4, "multi-op same-id txn diverged K=1 vs K=4");
+        assert_eq!(r1, r8, "multi-op same-id txn diverged K=1 vs K=8");
+
+        assert_eq!(
+            diffs, 0,
+            "SHARD-XTXN single-shard oracle FAILED: {diffs} divergences"
+        );
+
+        drop(e1);
+        drop(e4);
+        drop(e8);
+        let _ = std::fs::remove_dir_all(&dir1);
+        let _ = std::fs::remove_dir_all(&dir4);
+        let _ = std::fs::remove_dir_all(&dir8);
+    }
+
+    /// Cross-K split behavior: a workload that's single-shard at K=1
+    /// (always true; K=1 has one shard) becomes multi-shard at K=4
+    /// when its inner ops target different ids that fxhash to
+    /// distinct shards. K=1 returns Ok; K=4 returns SchemaError. This
+    /// is the V1 ARC's documented limitation — clients that mix
+    /// unrelated keys in one txn get an honest error at K>=2 instead
+    /// of silent data loss.
+    #[test]
+    fn xtxn_oracle_k1_ok_k4_rejects_cross_shard_txn() {
+        let cfg_k1 = ServerConfig {
+            shard_count: None,
+            read_workers: Some(0),
+            ..ServerConfig::default()
+        };
+        let dir1 = fresh_dir("xtxn-split-k1");
+        let e1 = spawn_engine_cfg(&dir1, &cfg_k1).expect("k1");
+        let (e4, dir4) = spawn_sharded(4, "xtxn-split-k4");
+
+        let _ = build_test_schema(&e1);
+        let _ = build_test_schema(&e4);
+
+        // Find two ids on distinct K=4 shards.
+        let mut a: Option<ObjectId> = None;
+        let mut b: Option<ObjectId> = None;
+        let mut shard_a: Option<usize> = None;
+        for i in 0u128..1024 {
+            let id = ObjectId::from_u128(i);
+            let s = shard_of_key(&make_key_inline(1, &id.0), 4);
+            if a.is_none() {
+                a = Some(id);
+                shard_a = Some(s);
+            } else if shard_a != Some(s) {
+                b = Some(id);
+                break;
+            }
+        }
+        let id_a = a.expect("a");
+        let id_b = b.expect("b");
+
+        let txn = Op::Txn {
+            ops: vec![
+                Op::Create {
+                    type_id: 1,
+                    id: id_a,
+                    record: vec![0u8; 8],
+                },
+                Op::Create {
+                    type_id: 1,
+                    id: id_b,
+                    record: vec![0u8; 8],
+                },
+            ],
+        };
+
+        // K=1: succeeds (one shard, no cross-shard issue).
+        let r1 = e1.apply(txn.clone());
+        assert!(
+            matches!(r1, OpResult::Ok),
+            "K=1 cross-id txn should succeed: {r1:?}"
+        );
+
+        // K=4: rejected with the typed cross-shard SchemaError.
+        let r4 = e4.apply(txn);
+        match r4 {
+            OpResult::SchemaError(msg) => {
+                assert!(
+                    msg.starts_with("cross-shard transaction not supported"),
+                    "wrong reject message: {msg:?}"
+                );
+            }
+            other => panic!("K=4 cross-shard txn should reject: {other:?}"),
+        }
+
+        drop(e1);
+        drop(e4);
+        let _ = std::fs::remove_dir_all(&dir1);
+        let _ = std::fs::remove_dir_all(&dir4);
+    }
 }

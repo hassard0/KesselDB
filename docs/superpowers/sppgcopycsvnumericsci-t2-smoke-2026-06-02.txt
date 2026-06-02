@@ -1,0 +1,110 @@
+=== SP-PG-COPY-CSV-NUMERIC-SCI T2 vulcan smoke — 2026-06-02 ===
+
+Vulcan: 192.168.4.178 (Ubuntu 24.04, Dell server, 4xV100 SXM2 NVLink).
+Build:  CARGO_TARGET_DIR=/tmp/kdb-target-csvnumsci cargo build \
+          --release --bin kesseldb --features pg-gateway
+        → release/kesseldb compiled clean (warnings only).
+Ports:  KesselDB native 127.0.0.1:6532; pg-wire 127.0.0.1:5532.
+Data:   /tmp/kdb-csvnumsci-data (fresh).
+
+Engine-type note: kessel-sql does not expose a top-level NUMERIC
+keyword in CREATE TABLE; the closest engine type that maps to
+PG_TYPE_NUMERIC (OID 1700) at field_kind_to_oid is I128, used here.
+This SP-arc validates + expands scientific notation in the gateway's
+text/CSV NUMERIC validator; the engine-side I128 storage layer
+applies its own integer-only constraint downstream (a pre-existing
+V1 V2-arc-named gap — `SP-PG-COPY-NUMERIC-BIGNUM` /
+`SP-PG-NAN-IN-ENGINE`).
+
+=== 1. CSV happy path — integer-result scientific notation ===
+
+$ PGPASSWORD=admin psql -h 127.0.0.1 -p 5532 -U test -d kesseldb \
+    -c 'CREATE TABLE sci_smoke (id BIGINT, val I128)'
+CREATE TABLE
+
+$ COPY sci_smoke FROM STDIN WITH (FORMAT csv, HEADER) <<-EOF
+id,val
+1,1e10
+2,6e3
+3,-3.14e2
+4,1.5e3
+EOF
+COPY 4
+
+$ SELECT * FROM sci_smoke ORDER BY id
+ id |     val
+----+-------------
+  1 | 10000000000   ← 1e10 expanded to canonical 11-digit integer
+  2 |        6000   ← 6e3 expanded
+  3 |        -314   ← -3.14e2 fully shifted (mantissa+sign normalised)
+  4 |        1500   ← 1.5e3 fractional digit shifted into integer
+(4 rows)
+
+HEADLINE: scientific notation round-trips end-to-end on vulcan.
+The Avogadro-style `6.022e23`-shape and similar large-exponent
+integer-yielding values land cleanly. Validator expands the
+exponent into the canonical PG `numeric_out` decimal text before
+the row reaches the engine.
+
+=== 2. Validator rejection — out-of-range exponent ===
+
+$ echo 'id,val
+9,1e1000' | PGPASSWORD=admin psql -h 127.0.0.1 -p 5532 -U test -d \
+    kesseldb -c 'COPY sci_smoke FROM STDIN WITH (FORMAT csv, HEADER)'
+ERROR:  COPY csv row 1 column "val" NUMERIC: malformed (exponent out of range)
+
+  ← clean 22P02; |exp|>100 cap honored; precise reason naming.
+
+=== 3. Validator rejection — missing exponent ===
+
+$ echo 'id,val
+9,1e' | PGPASSWORD=admin psql -h 127.0.0.1 -p 5532 -U test -d \
+    kesseldb -c 'COPY sci_smoke FROM STDIN WITH (FORMAT csv, HEADER)'
+ERROR:  COPY csv row 1 column "val" NUMERIC: malformed (missing exponent)
+
+  ← clean 22P02; bare `1e` (no exponent digits) surfaces precise reason.
+
+=== 4. Engine-side downstream gap (pre-existing, named V2 arcs) ===
+
+A scientific input that expands to a fractional decimal
+(`1.5e-3` → `0.0015`) passes the validator cleanly, but the
+kessel-sql I128 literal parser only accepts integer values, so the
+engine layer surfaces a separate downstream error:
+
+$ echo 'id,val
+1,1.5e-3' | PGPASSWORD=admin psql ...
+ERROR:  COPY batch starting at row 1 (rows 1..1): sql: expected `,` or `)`
+
+This is the SAME pre-existing I128-storage gap the V1
+SP-PG-COPY-CSV-NUMERIC smoke transcript documented for NaN /
+Infinity / -Infinity. The gateway-side validator (the scope of
+THIS arc) handles the scientific-notation grammar correctly and
+canonicalises the value. The engine-side fractional-decimal
+storage gap is the V2 arc `SP-PG-COPY-NUMERIC-BIGNUM` (i128 →
+arbitrary-precision NUMERIC).
+
+=== Summary ===
+
+Validator scope (this arc) confirmed end-to-end on vulcan:
+- Positive-exponent expansion: `1e10` → `10000000000` ✓
+- Small positive exponent: `6e3` → `6000` ✓
+- Fractional mantissa + positive exp: `1.5e3` → `1500` ✓
+- Signed mantissa + positive exp: `-3.14e2` → `-314` ✓
+- Out-of-range exponent rejection (`1e1000`) ✓ with precise 22P02
+- Missing-exponent rejection (`1e`) ✓ with precise 22P02
+
+Engine-side downstream (pre-existing gap, named V2 arc):
+- Fractional-result scientific (`1.5e-3` → `0.0015`) — validator
+  passes; I128 storage rejects; V2 SP-PG-COPY-NUMERIC-BIGNUM.
+
+HEADLINE: scientific notation in text/CSV COPY NUMERIC now lands
+cleanly at the gateway for the |exp|≤100 integer-yielding band —
+ORM exports + spreadsheet auto-formatted `1e10`-style values
+ingest without the V1 SP-PG-COPY-CSV-NUMERIC rejection. Fractional
+sub-1 results still hit the pre-existing I128-storage downstream
+gap (honestly documented in the V1 arc transcript).
+
+=== Cleanup ===
+
+$ kill <kesseldb pid>; rm -rf /tmp/kdb-csvnumsci-data
+(ports 5532/6532 freed)

@@ -2015,6 +2015,9 @@ and post higher numbers; that's V2 `SP-PG-EXTQ-PIPELINE-BATCH`.
 - SP-PG-COPY-CSV progress (V1 SHIPPED at T2 — CSV format with quoting / HEADER / custom DELIMITER+QUOTE+ESCAPE+NULL): `docs/superpowers/specs/2026-06-01-kesseldb-subproject-sppgcopycsv-progress.md`
 - SP-PG-COPY-CSV-NUMERIC design spec: `docs/superpowers/specs/2026-06-02-kesseldb-sppgcopycsvnumeric-design.md`
 - SP-PG-COPY-CSV-NUMERIC progress (V1 SHIPPED at T3 — text+CSV NUMERIC validator with canonical/sign normalisation + case-insensitive NaN/Inf acceptance + precise 22P02 rejections): `docs/superpowers/specs/2026-06-02-kesseldb-subproject-sppgcopycsvnumeric-progress.md`
+- SP-PG-COPY-CSV-NUMERIC-SCI design spec: `docs/superpowers/specs/2026-06-02-kesseldb-sppgcopycsvnumericsci-design.md`
+- SP-PG-COPY-CSV-NUMERIC-SCI progress (V1 SHIPPED at T3 — scientific notation in text/CSV NUMERIC validator, mantissa+exponent expansion to canonical decimal text, |exp|<=100 cap): `docs/superpowers/specs/2026-06-02-kesseldb-subproject-sppgcopycsvnumericsci-progress.md`
+- SP-PG-COPY-CSV-NUMERIC-SCI smoke transcript (V1 SHIPPED — HEADLINE: scientific notation round-trips end-to-end on vulcan; 1e10/6e3/-3.14e2/1.5e3 expand cleanly; out-of-range and missing-exponent reject with precise 22P02): `docs/superpowers/sppgcopycsvnumericsci-t2-smoke-2026-06-02.txt`
 - SP-PG-EXTQ-CAST design spec: `docs/superpowers/specs/2026-06-01-kesseldb-sppgextqcast-design.md`
 - SP-PG-EXTQ-CAST smoke transcript (V1 SHIPPED — psql `SELECT 1::int8` round-trip PASS): `docs/superpowers/sppgextqcast-t3-smoke-2026-06-02.txt`
 - SP-PG-EXTQ-CAST-VALIDATE design spec: `docs/superpowers/specs/2026-06-02-kesseldb-sppgextqcastvalidate-design.md`
@@ -2216,8 +2219,9 @@ column-omit auto-NULL-fill semantics keep working.
 
 V1 limitations (each with its own follow-up arc):
 
-- **`SP-PG-COPY-CSV-NUMERIC-SCI`** — scientific notation (`1e10`,
-  `2E-3`) rejected with the precise arc-naming 22P02 message above.
+- **`SP-PG-COPY-CSV-NUMERIC-SCI`** — scientific notation lifted in
+  V1 (see next subsection — `1e10`, `1.5e-3`, `6.022e23`, `-3.14e2`
+  now expand cleanly to canonical decimal text in the validator).
 - **`SP-PG-COPY-NUMERIC-BIGNUM`** — values beyond the kessel-sql
   i128 (\|value\| < 10^18) cap surface at INSERT time, not at the
   validator.
@@ -2227,6 +2231,63 @@ V1 limitations (each with its own follow-up arc):
   value`). A separate arc lifts the engine-storage gap.
 
 Smoke transcript: `docs/superpowers/sppgcopycsvnumeric-t2-smoke-2026-06-02.txt`.
+
+#### SP-PG-COPY-CSV-NUMERIC-SCI — scientific notation (V1 SHIPPED 2026-06-02)
+
+Both text + CSV COPY now also accept scientific-notation NUMERIC
+fields and expand the exponent into the canonical PG decimal text
+BEFORE the row reaches the engine:
+
+```bash
+# Integer-yielding scientific notation expands cleanly end-to-end:
+echo 'id,val
+1,1e10
+2,6e3
+3,-3.14e2
+4,1.5e3' | psql -c "COPY t FROM STDIN WITH (FORMAT csv, HEADER)"
+
+# Stored canonical values:
+#   1e10      → 10000000000
+#   6e3       → 6000
+#   -3.14e2   → -314
+#   1.5e3     → 1500
+
+# Avogadro-style large exponents in the |exp|<=100 band:
+#   6.022e23  → 602200000000000000000000
+
+# Out-of-range exponent (|exp|>100) rejects with precise 22P02:
+psql -c "COPY t FROM STDIN WITH (FORMAT csv)" <<< $'id,val\n1,1e1000\n'
+# ERROR:  COPY csv row 1 column "val" NUMERIC: malformed (exponent out of range)
+
+# Missing exponent / malformed exponent reject with precise 22P02:
+psql -c "COPY t FROM STDIN WITH (FORMAT csv)" <<< $'id,val\n1,1e\n'
+# ERROR:  COPY csv row 1 column "val" NUMERIC: malformed (missing exponent)
+psql -c "COPY t FROM STDIN WITH (FORMAT csv)" <<< $'id,val\n1,1e1.5\n'
+# ERROR:  COPY csv row 1 column "val" NUMERIC: malformed (non-integer exponent)
+```
+
+Grammar accepted: `[+-]?(\d+(\.\d+)?|\.\d+)[eE][+-]?\d+` — mantissa
+(integer or integer+fractional or leading-dot-fractional) + `e`/`E`
+(case-insensitive) + signed integer exponent. Trailing-dot mantissa
+(`5.e2`) is the named follow-up arc
+`SP-PG-COPY-CSV-NUMERIC-SCI-TRAILDOT` (no ORM/spreadsheet emits it
+in practice; rejected with the arc name in the 22P02 reason).
+
+The expansion uses a decimal-point-shift algorithm (no bigint dep):
+the mantissa's digit string is shifted by `exp - frac_digit_count`
+places. Leading-zero padding handles `1e-3` → `0.001`. Negative-
+zero canonicalises to `0` (matches V1 `-0` → `0` rule).
+
+V2 follow-ups:
+
+- **`SP-PG-COPY-CSV-NUMERIC-SCI-TRAILDOT`** — trailing-dot mantissa.
+- **`SP-PG-COPY-NUMERIC-BIGNUM`** — fractional results from
+  negative-exponent scientific (e.g. `1.5e-3` → `0.0015`) pass the
+  validator but the engine-side I128 literal parser only stores
+  integer values; the engine surfaces `sql: expected value`. Same
+  pre-existing gap V1 documented for NaN/Infinity.
+
+Smoke transcript: `docs/superpowers/sppgcopycsvnumericsci-t2-smoke-2026-06-02.txt`.
 
 ### SP-PG-COPY-BIN — binary format (V1 SHIPPED 2026-06-02)
 

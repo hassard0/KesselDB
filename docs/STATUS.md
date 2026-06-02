@@ -9,9 +9,54 @@ covered by the workspace test suite (2063 default / 2074 with
 `--features pg-gateway` / 2078 with all gateway features) plus +15
 KATs from the SP-CHAR-PAD-COMPARE V1 arc landed 2026-06-02 on top of
 +26 from the SP-PG-EXTQ-CAST V1 arc landed earlier the same day.
+SP-PG-JDBC-SMOKE (2026-06-02) is a verification-only arc that closes
+the JDBC residual; +0 KATs.
 
 **Tonight's delivery (2026-06-02) — coherent state of the union:**
 
+- **Track A.-1.1 — pgJDBC end-to-end smoke against KesselDB (SP-PG-JDBC-SMOKE V1 SHIPPED at T2 — 2026-06-02).**
+  Verification-only arc that closes the residual the SP-PG-EXTQ-CAST
+  T3 transcript named: vulcan still had openjdk-21-jre but no `javac`
+  (sudo apt requires a password the classifier cannot supply), so the
+  cast-stripper proof from SP-PG-EXTQ-CAST T3 had run via psql proxy
+  only. T2 installs a standalone OpenJDK 21 in user-space
+  (`~/jdbc-smoke/jdk-21.0.2`, no sudo needed — direct download from
+  download.java.net) + downloads pgJDBC 42.7.4 + drives the new
+  `scripts/JdbcSmoke.java` harness against KesselDB pg-gateway in two
+  modes. **HEADLINE — extended (default) JDBC mode PASS for CRUD core
+  on vulcan**: `CREATE TABLE`, parameterized `INSERT` (binary INT8 +
+  VARCHAR params), `SELECT *`, parameterized `SELECT WHERE id = ?`
+  (binary INT8 param + binary INT8 result column) all round-trip
+  end-to-end through real pgJDBC. SP-PG-EXTQ-BIN +
+  SP-PG-EXTQ-BIN-RESULTS are now real-driver-verified, not just
+  asyncpg-verified. **Simple mode (`?preferQueryMode=simple`) PASS
+  for literal SQL** including the headline `WHERE id = 42::int8` —
+  SP-PG-EXTQ-CAST T2 cast-stripper works end-to-end through the
+  actual driver, not just the psql proxy. Two residual gaps surfaced
+  (each its own new V2 follow-up arc, distinct from the cast-stripper
+  arc): (a) `SP-PG-SQL-PAREN-VALUES` — simple-mode `PreparedStatement`
+  INSERT fails because pgJDBC wraps each substituted param in extra
+  parens (`VALUES (('42'::int8), ('hello-jdbc'))`); the cast strip
+  works fine, but kessel-sql's VALUES parser (lib.rs ~L1193) rejects
+  parenthesized expressions with `expected value`. Reproduces in psql
+  with the same paren shape; orthogonal to cast stripping. (b)
+  `SP-PG-EXTQ-DESCRIBE-VERSION` — extended-mode `SELECT version()`
+  causes the gateway to answer `Describe(portal)` with `NoData` before
+  sending `RowDescription` + `DataRow`; pgJDBC treats `NoData` as
+  authoritative and raises `IllegalStateException` when DataRow
+  arrives. Bug in the gateway's portal-Describe routing for built-in
+  scalar-function SELECTs. **USAGE §9 ORM matrix**: JDBC row pivoted
+  from "PSQL-proxy PASS** + javac install needed" to verbatim
+  per-scenario PASS/FAIL with both new follow-up arcs named. **Test
+  surface unchanged**: this is a verification arc; no source under
+  `crates/` touched, KAT delta +0. `#![forbid(unsafe_code)]` honored;
+  HTTP/1.1 + WS + binary + PG-wire surfaces byte-untouched. Commits:
+  `3642165` (T1 — `scripts/JdbcSmoke.java` checked in), `d2eba95` (T2
+  — USAGE.md + transcript `docs/superpowers/sppgjdbcsmoke-t2-smoke-
+  2026-06-02.txt`), plus this commit (T3 — STATUS + arc closure).
+  Progress tracker → SP-PG-JDBC-SMOKE V1 SHIPPED — DONE_WITH_CONCERNS
+  (CRUD core is real-driver-PASS; two residual gaps each have a
+  precise follow-up arc name). **TaskList #364 ready.**
 - **Track L cont. — SP-Perf-A-SHARD-SCAN-LOCAL-INDEX-FUSION (2026-06-02,
   V1 SHIPPED — DONE_WITH_CONCERNS).** Closes the in-scope follow-up the
   TINY-INLINE forensics named: bypass `scatter_serial`'s `apply_op`

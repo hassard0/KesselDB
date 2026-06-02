@@ -319,12 +319,27 @@ fn main() {
                 .collect::<Vec<_>>()
                 .join(","),
         );
-        if cfg.http_addr.is_some() || cfg.http_tls_addr.is_some() || cfg.pg_addr.is_some() {
+        if cfg.http_tls_addr.is_some() || cfg.pg_addr.is_some() {
             eprintln!(
-                "kesseldb cluster: NOTE — HTTP / HTTPS / PG-wire gateway \
-                 env vars are accepted but IGNORED in cluster mode V1 \
-                 (binary client protocol only on this slice; gateway \
-                 cluster surfaces are a documented V2 follow-up)."
+                "kesseldb cluster: NOTE — HTTPS / PG-wire gateway env \
+                 vars are accepted but IGNORED in cluster mode V1 \
+                 (cluster gateway surfaces for those are a documented \
+                 V2 follow-up)."
+            );
+        }
+        if cfg.http_addr.is_some() {
+            // SP-Cloud-Cluster-METRICS-EXPAND — in cluster mode,
+            // KESSELDB_HTTP_ADDR enables a metrics-only HTTP
+            // endpoint (`/v1/metrics` + `/v1/health`). SQL/Op
+            // gateway surfaces are still NOT served on this path
+            // — that's a V2 follow-up. Documented in main.rs
+            // module docs.
+            eprintln!(
+                "kesseldb cluster: KESSELDB_HTTP_ADDR={addr:?} — \
+                 enabling cluster-mode metrics HTTP endpoint \
+                 (paths: /v1/metrics, /v1/health). SQL/Op gateway \
+                 surfaces are NOT served on this path in V1.",
+                addr = cfg.http_addr.unwrap()
             );
         }
         // Use 0.0.0.0:<peer_port> so the bind matches every routable

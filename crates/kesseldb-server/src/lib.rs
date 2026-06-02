@@ -2344,6 +2344,37 @@ pub fn run_cluster_cfg(
         }
     });
 
+    // SP-Cloud-Cluster-METRICS-EXPAND — when KESSELDB_HTTP_ADDR is set
+    // in cluster mode, spin up a metrics-only HTTP listener served by
+    // `cluster::serve_metrics_http`. The full HTTP/1.1 gateway
+    // (SQL/Op surfaces) is still NOT wired on the cluster path (V2
+    // follow-up — gateway-on-Node); this minimal endpoint exists so
+    // Prometheus has a real scrape target in cluster mode. Honest
+    // about the limits: only `/v1/metrics` + `/v1/health` are served
+    // here. SQL/Op routes return 404.
+    if let Some(http_addr) = cfg.http_addr {
+        match TcpListener::bind(http_addr) {
+            Ok(http_listener) => {
+                let http_node = node.clone();
+                std::thread::spawn(move || {
+                    cluster::serve_metrics_http(http_listener, http_node);
+                });
+                eprintln!(
+                    "kesseldb cluster: replica {self_idx} \
+                     metrics HTTP endpoint listening on {http_addr} \
+                     (paths: /v1/metrics, /v1/health)"
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "kesseldb cluster: replica {self_idx} \
+                     could not bind metrics HTTP on {http_addr}: {e} \
+                     (continuing without HTTP metrics endpoint)"
+                );
+            }
+        }
+    }
+
     // Block forever serving the client protocol; on shutdown the OS
     // tears down all sockets + threads.
     cluster::serve_clients_cfg(client_listener, node, cfg.token.clone());
@@ -2433,6 +2464,13 @@ impl kessel_http_gateway::EngineApply for EngineHandle {
             last_op_number: total_applied,
             view_number: 0,    // single-node V1; cluster wiring is follow-up
             is_primary: true,
+            // SP-Cloud-Cluster-METRICS-EXPAND — single-node deploys
+            // never view-change and never lag (there's no primary
+            // peer to lag against). The cluster-mode metrics
+            // endpoint built directly on `cluster::Node::metrics_probe`
+            // is what carries the populated VSR-side surface.
+            view_changes_total: 0,
+            replica_lag_opnum: 0,
             // SP144H T2: pull the per-(path, status) snapshot from the
             // shared 4×16 atomic matrix. The matrix is bumped by the
             // gateway accept loop on every emitted response.

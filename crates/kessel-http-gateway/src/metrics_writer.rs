@@ -30,6 +30,14 @@ pub fn render(snap: &MetricsSnapshot) -> String {
     s.push_str("# TYPE kesseldb_is_primary gauge\n");
     s.push_str(&format!("kesseldb_is_primary {}\n", if snap.is_primary { 1 } else { 0 }));
 
+    s.push_str("# HELP kesseldb_view_changes_total Monotonic per-process count of view advances on this replica.\n");
+    s.push_str("# TYPE kesseldb_view_changes_total counter\n");
+    s.push_str(&format!("kesseldb_view_changes_total {}\n", snap.view_changes_total));
+
+    s.push_str("# HELP kesseldb_replica_lag_opnum Op-number lag from the primary (0 on primary; >=0 on backups).\n");
+    s.push_str("# TYPE kesseldb_replica_lag_opnum gauge\n");
+    s.push_str(&format!("kesseldb_replica_lag_opnum {}\n", snap.replica_lag_opnum));
+
     s.push_str("# HELP kesseldb_http_requests_total HTTP gateway requests by path and status.\n");
     s.push_str("# TYPE kesseldb_http_requests_total counter\n");
     for row in &snap.http_requests_total {
@@ -55,16 +63,22 @@ mod tests {
             last_op_number: 0,
             view_number: 0,
             is_primary: true,
+            view_changes_total: 0,
+            replica_lag_opnum: 0,
             http_requests_total: Vec::new(),
         };
         let text = render(&snap);
-        // Six HELP/TYPE blocks, all gauges/counters at 0 or absent.
+        // Every HELP/TYPE block present, all gauges/counters at 0.
         assert!(text.contains("# HELP kesseldb_ops_total"));
         assert!(text.contains("# TYPE kesseldb_ops_total counter"));
         assert!(text.contains("kesseldb_inflight 0\n"));
         assert!(text.contains("kesseldb_last_op_number 0\n"));
         assert!(text.contains("kesseldb_view_number 0\n"));
         assert!(text.contains("kesseldb_is_primary 1\n"));
+        assert!(text.contains("kesseldb_view_changes_total 0\n"));
+        assert!(text.contains("# TYPE kesseldb_view_changes_total counter"));
+        assert!(text.contains("kesseldb_replica_lag_opnum 0\n"));
+        assert!(text.contains("# TYPE kesseldb_replica_lag_opnum gauge"));
         assert!(text.contains("# HELP kesseldb_http_requests_total"));
     }
 
@@ -78,6 +92,8 @@ mod tests {
             last_op_number: 100,
             view_number: 3,
             is_primary: false,
+            view_changes_total: 5,
+            replica_lag_opnum: 12,
             http_requests_total: vec![
                 HttpRequestCounter { path: "/v1/health", status: "200", count: 5 },
             ],
@@ -88,6 +104,8 @@ mod tests {
         assert!(text.contains("kesseldb_last_op_number 100\n"));
         assert!(text.contains("kesseldb_view_number 3\n"));
         assert!(text.contains("kesseldb_is_primary 0\n"));
+        assert!(text.contains("kesseldb_view_changes_total 5\n"));
+        assert!(text.contains("kesseldb_replica_lag_opnum 12\n"));
         assert!(text.contains("kesseldb_http_requests_total{path=\"/v1/health\",status=\"200\"} 5\n"));
     }
 }

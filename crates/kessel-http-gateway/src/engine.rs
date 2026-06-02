@@ -78,6 +78,21 @@ pub struct MetricsSnapshot {
     pub last_op_number: u64,
     pub view_number: u64,
     pub is_primary: bool,
+    /// SP-Cloud-Cluster-METRICS-EXPAND — monotonic per-process count of
+    /// view advances on this replica. Lets Prometheus alert on
+    /// `rate(kesseldb_view_changes_total[5m]) > N` (the proper
+    /// view-change-storm shape, replacing the V1 surrogate
+    /// `delta(kesseldb_view_number[5m])` which doesn't survive replica
+    /// restart). Single-node V1: 0 (no view changes ever happen).
+    pub view_changes_total: u64,
+    /// SP-Cloud-Cluster-METRICS-EXPAND — this replica's op-number lag
+    /// behind the primary; 0 on the primary and on single-node
+    /// deployments. Computed as
+    /// `max(0, last_primary_op_seen - op_number)` on backups, where
+    /// `last_primary_op_seen` is captured from inbound Prepare
+    /// messages. Documented as a best-effort gauge (Prepare cadence
+    /// bounds accuracy).
+    pub replica_lag_opnum: u64,
     /// HTTP-side counters indexed by (path, status). Path is one of the four
     /// known route strings; status is the decimal HTTP code as `&str`. Bounded
     /// cardinality.

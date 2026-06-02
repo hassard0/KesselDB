@@ -52,6 +52,24 @@ enum Ev {
     /// startup loop to emit "elected primary" log lines so an operator
     /// can see the cluster reached the steady state.
     RoleProbe(SyncSender<(u64, bool, &'static str)>),
+    /// SP-Cloud-Cluster-METRICS-EXPAND — read every metric the
+    /// Prometheus surface needs in one engine-thread round-trip:
+    /// (view, is_primary, op_number, view_changes_total, replica_lag_opnum).
+    /// Single round-trip keeps the `/v1/metrics` handler O(1) and
+    /// avoids stale snapshots split across two probes.
+    MetricsProbe(SyncSender<ClusterMetricsSnapshot>),
+}
+
+/// SP-Cloud-Cluster-METRICS-EXPAND — point-in-time snapshot of the
+/// replica-local VSR metrics surface, returned by `Node::metrics_probe()`
+/// and consumed by the cluster-mode `/v1/metrics` HTTP endpoint.
+#[derive(Clone, Copy, Debug)]
+pub struct ClusterMetricsSnapshot {
+    pub view: u64,
+    pub is_primary: bool,
+    pub op_number: u64,
+    pub view_changes_total: u64,
+    pub replica_lag_opnum: u64,
 }
 
 /// What to do when a linearized op's result comes back.
@@ -283,6 +301,24 @@ impl Node {
             return (0, false, "Down");
         }
         prx.recv().unwrap_or((0, false, "Down"))
+    }
+
+    /// SP-Cloud-Cluster-METRICS-EXPAND — Prometheus-shaped snapshot of
+    /// the replica-local VSR metrics surface. One engine-thread
+    /// round-trip; returns all-zero defaults if the engine has stopped.
+    pub fn metrics_probe(&self) -> ClusterMetricsSnapshot {
+        let (ptx, prx) = sync_channel(1);
+        let dflt = ClusterMetricsSnapshot {
+            view: 0,
+            is_primary: false,
+            op_number: 0,
+            view_changes_total: 0,
+            replica_lag_opnum: 0,
+        };
+        if self.tx.send(Ev::MetricsProbe(ptx)).is_err() {
+            return dflt;
+        }
+        prx.recv().unwrap_or(dflt)
     }
 }
 
@@ -644,6 +680,21 @@ pub fn spawn_node(
                         replica.probe();
                     let _ = ptx.send((view, is_primary, status));
                 }
+                Ev::MetricsProbe(ptx) => {
+                    // SP-Cloud-Cluster-METRICS-EXPAND — single
+                    // engine-thread round-trip for the full
+                    // /v1/metrics surface in cluster mode.
+                    let (view, is_primary, _st, _c, op_number, _m) =
+                        replica.probe();
+                    let snap = ClusterMetricsSnapshot {
+                        view,
+                        is_primary,
+                        op_number,
+                        view_changes_total: replica.view_changes_total(),
+                        replica_lag_opnum: replica.replica_lag_opnum(),
+                    };
+                    let _ = ptx.send(snap);
+                }
             }
         }
     });
@@ -738,6 +789,101 @@ pub fn serve_clients_cfg(
         let n = node.clone();
         let tok = token.clone();
         std::thread::spawn(move || handle_client_conn(stream, n, tok));
+    }
+}
+
+/// SP-Cloud-Cluster-METRICS-EXPAND — render the cluster-mode
+/// Prometheus text body for the calling replica. Free function so
+/// the test can call it without standing up a TCP listener.
+pub fn render_cluster_metrics_text(snap: &ClusterMetricsSnapshot) -> String {
+    let mut s = String::with_capacity(1024);
+    s.push_str("# HELP kesseldb_last_op_number Highest applied op_number on this replica.\n");
+    s.push_str("# TYPE kesseldb_last_op_number gauge\n");
+    s.push_str(&format!("kesseldb_last_op_number {}\n", snap.op_number));
+    s.push_str("# HELP kesseldb_view_number Current VSR view number.\n");
+    s.push_str("# TYPE kesseldb_view_number gauge\n");
+    s.push_str(&format!("kesseldb_view_number {}\n", snap.view));
+    s.push_str("# HELP kesseldb_is_primary 1 if this replica is the primary in the current view.\n");
+    s.push_str("# TYPE kesseldb_is_primary gauge\n");
+    s.push_str(&format!("kesseldb_is_primary {}\n", if snap.is_primary { 1 } else { 0 }));
+    s.push_str("# HELP kesseldb_view_changes_total Monotonic per-process count of view advances on this replica.\n");
+    s.push_str("# TYPE kesseldb_view_changes_total counter\n");
+    s.push_str(&format!("kesseldb_view_changes_total {}\n", snap.view_changes_total));
+    s.push_str("# HELP kesseldb_replica_lag_opnum Op-number lag from the primary (0 on primary; >=0 on backups).\n");
+    s.push_str("# TYPE kesseldb_replica_lag_opnum gauge\n");
+    s.push_str(&format!("kesseldb_replica_lag_opnum {}\n", snap.replica_lag_opnum));
+    s
+}
+
+/// SP-Cloud-Cluster-METRICS-EXPAND — minimal HTTP/1.1 endpoint that
+/// serves `GET /v1/metrics` (Prometheus text) and `GET /v1/health`
+/// (one-line liveness JSON) from a `cluster::Node`. The cluster-mode
+/// V1 still doesn't run the full `kessel-http-gateway` (SQL/Op surfaces
+/// aren't wired on the cluster path — that's a documented V2 follow-up),
+/// but operators need real Prometheus scrape targets, so this
+/// dedicated metrics-only HTTP listener fills the gap.
+///
+/// Single-threaded per connection (one short-lived request → one
+/// response → close). No keep-alive. No body parsing. The body of a
+/// metrics scrape is small (<2 KB) so this is fine for monitoring.
+/// Unknown methods/paths get a tiny `404` so a misconfigured scrape
+/// is loudly visible.
+pub fn serve_metrics_http(listener: TcpListener, node: Arc<Node>) {
+    use std::io::{Read, Write};
+    for stream in listener.incoming().flatten() {
+        let _ = stream.set_nodelay(true);
+        let node = node.clone();
+        std::thread::spawn(move || {
+            let mut s = stream;
+            // Read at most 4 KB of request line + headers; we don't
+            // care about the body, just the request line.
+            let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+            let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
+            let mut buf = [0u8; 4096];
+            let n = match s.read(&mut buf) {
+                Ok(n) if n > 0 => n,
+                _ => return,
+            };
+            // Parse the first line: "GET /v1/metrics HTTP/1.1\r\n..."
+            let head = std::str::from_utf8(&buf[..n]).unwrap_or("");
+            let first = head.split("\r\n").next().unwrap_or("");
+            let mut it = first.split_ascii_whitespace();
+            let method = it.next().unwrap_or("");
+            let path = it.next().unwrap_or("");
+            let (status_line, content_type, body) = match (method, path) {
+                ("GET", "/v1/metrics") => {
+                    let snap = node.metrics_probe();
+                    (
+                        "HTTP/1.1 200 OK",
+                        "text/plain; version=0.0.4; charset=utf-8",
+                        render_cluster_metrics_text(&snap),
+                    )
+                }
+                ("GET", "/v1/health") => {
+                    let snap = node.metrics_probe();
+                    let role = if snap.is_primary { "primary" } else { "backup" };
+                    let body = format!(
+                        "{{\"primary\":{},\"view\":{},\"op_number\":{},\"role\":\"{}\"}}",
+                        snap.is_primary, snap.view, snap.op_number, role
+                    );
+                    ("HTTP/1.1 200 OK", "application/json", body)
+                }
+                _ => (
+                    "HTTP/1.1 404 Not Found",
+                    "text/plain; charset=utf-8",
+                    "not found\n".to_string(),
+                ),
+            };
+            let resp = format!(
+                "{status}\r\nContent-Type: {ct}\r\nContent-Length: {len}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                status = status_line,
+                ct = content_type,
+                len = body.len(),
+                body = body,
+            );
+            let _ = s.write_all(resp.as_bytes());
+        });
     }
 }
 
@@ -1392,6 +1538,104 @@ mod tests {
                 );
             }
             other => panic!("expected 16-byte i128 SUM reply, got {other:?}"),
+        }
+
+        for d in &dirs {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// SP-Cloud-Cluster-METRICS-EXPAND — `Node::metrics_probe()`
+    /// returns a sane snapshot on a freshly-spawned 3-node cluster,
+    /// and `render_cluster_metrics_text` emits all five expected
+    /// metric names in canonical Prometheus text format.
+    #[test]
+    fn cluster_metrics_endpoint_renders_canonical_prometheus_text() {
+        let n = 3;
+        let listeners: Vec<TcpListener> = (0..n)
+            .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect();
+        let addrs: Vec<SocketAddr> =
+            listeners.iter().map(|l| l.local_addr().unwrap()).collect();
+        let mut nodes = Vec::new();
+        let mut dirs = Vec::new();
+        for (i, l) in listeners.into_iter().enumerate() {
+            let dir = std::env::temp_dir()
+                .join(format!("kesseldb-metrics-{}-{i}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            dirs.push(dir.clone());
+            nodes.push(spawn_node(i, l, addrs.clone(), dir).unwrap());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Push at least one op through so op_number > 0 on the primary.
+        let primary = &nodes[0];
+        assert_eq!(
+            submit_with_retry(primary, Op::CreateType {
+                def: encode_type_def(
+                    "t",
+                    &[Field {
+                        field_id: 0,
+                        name: "v".into(),
+                        kind: FieldKind::U64,
+                        nullable: false,
+                    }],
+                ),
+            }),
+            OpResult::TypeCreated(1)
+        );
+        assert!(
+            wait_converged(&nodes, 1),
+            "cluster must converge before metrics check"
+        );
+
+        // Probe each replica and verify the rendered text contains
+        // every expected metric line.
+        for (i, node) in nodes.iter().enumerate() {
+            let snap = node.metrics_probe();
+            let text = render_cluster_metrics_text(&snap);
+            for needle in [
+                "# HELP kesseldb_last_op_number",
+                "# TYPE kesseldb_last_op_number gauge",
+                "kesseldb_last_op_number ",
+                "# HELP kesseldb_view_number",
+                "# TYPE kesseldb_view_number gauge",
+                "kesseldb_view_number ",
+                "# HELP kesseldb_is_primary",
+                "# TYPE kesseldb_is_primary gauge",
+                "kesseldb_is_primary ",
+                "# HELP kesseldb_view_changes_total",
+                "# TYPE kesseldb_view_changes_total counter",
+                "kesseldb_view_changes_total ",
+                "# HELP kesseldb_replica_lag_opnum",
+                "# TYPE kesseldb_replica_lag_opnum gauge",
+                "kesseldb_replica_lag_opnum ",
+            ] {
+                assert!(
+                    text.contains(needle),
+                    "replica {i} metrics text missing {needle:?}; full output:\n{text}"
+                );
+            }
+            // Primary (idx 0 in view 0) MUST emit is_primary=1 and
+            // replica_lag_opnum=0 (lag is always 0 on primary).
+            if i == 0 {
+                assert!(text.contains("kesseldb_is_primary 1\n"),
+                    "primary {i} must have is_primary=1: {text}");
+                assert!(text.contains("kesseldb_replica_lag_opnum 0\n"),
+                    "primary {i} must have replica_lag_opnum=0: {text}");
+            } else {
+                assert!(text.contains("kesseldb_is_primary 0\n"),
+                    "backup {i} must have is_primary=0: {text}");
+            }
+            // Fresh cluster has had at most 0 view changes if it
+            // settled on view 0 directly — assert the counter is
+            // present and parseable as u64. (No assertion on
+            // value: the warm-up MAY have triggered a transient
+            // view change if a backup timed out the primary before
+            // the first heartbeat — that's why a dedicated counter
+            // exists in the first place; here we just verify the
+            // surface is present.)
+            assert!(snap.view_changes_total < u64::MAX);
         }
 
         for d in &dirs {

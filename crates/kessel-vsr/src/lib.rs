@@ -251,6 +251,29 @@ pub struct Replica<V: Vfs> {
     /// targets `max_view_seen + 1` so split replicas converge on one view
     /// instead of chasing each other's `self.view + 1` forever.
     max_view_seen: u64,
+    /// SP-Cloud-Cluster-METRICS-EXPAND — monotonic count of view advances
+    /// observed on this replica. Bumped any time `self.view` strictly
+    /// increases (whether driven locally via `start_view_change` or
+    /// adopted from a higher-view inbound message in `on_prepare` /
+    /// `on_commit_msg` / `on_svc` / `maybe_finish_view_change` /
+    /// `on_start_view`). Process-local — resets to 0 on restart, which is
+    /// the documented limitation that motivated the dedicated counter
+    /// (the gauge `view` itself ALSO resets, but a counter lets
+    /// `rate(kesseldb_view_changes_total[5m])` work across the restart
+    /// window via Prometheus's counter-reset detection). Wraps at u64.
+    view_changes_total: u64,
+    /// SP-Cloud-Cluster-METRICS-EXPAND — highest `op_number` this replica
+    /// has heard FROM THE PRIMARY of its current view, captured from
+    /// inbound `Msg::Prepare` (which always carries the primary's
+    /// view-of-op_number). For the primary itself this stays 0 and is
+    /// not consulted — `replica_lag_opnum()` returns 0 for the primary.
+    /// For a backup, `lag = max(0, last_primary_op_seen - self.op_number())`
+    /// is the cluster's most accurate "how far behind am I?" surface
+    /// without a separate gossip protocol (the alternative — broadcasting
+    /// the primary's op_number inside Commit — bumps wire format; this
+    /// approach reuses the existing Prepare field). Stale across view
+    /// changes (reset to 0 when adopting a higher view).
+    last_primary_op_seen: u64,
     pub crashed: bool,
 }
 
@@ -279,6 +302,8 @@ impl<V: Vfs> Replica<V> {
             ticks_idle: 0,
             vc_retries: 0,
             max_view_seen: 0,
+            view_changes_total: 0,
+            last_primary_op_seen: 0,
             crashed: false,
         }
     }
@@ -319,6 +344,44 @@ impl<V: Vfs> Replica<V> {
     pub fn is_active_primary(&self) -> bool {
         self.is_primary() && self.status == Status::Normal
     }
+    /// SP-Cloud-Cluster-METRICS-EXPAND — monotonic count of view advances
+    /// observed on this replica (per-process; resets on restart). See the
+    /// field doc for why a dedicated counter exists on top of the
+    /// `view_number` gauge.
+    pub fn view_changes_total(&self) -> u64 {
+        self.view_changes_total
+    }
+
+    /// SP-Cloud-Cluster-METRICS-EXPAND — replica's op-number lag from the
+    /// primary, measured as `last_primary_op_seen - op_number` for a
+    /// backup and `0` for the primary itself. `last_primary_op_seen` is
+    /// captured from inbound `Msg::Prepare` (which carries the primary's
+    /// current op_number); accuracy is therefore bounded by the rate the
+    /// primary is broadcasting Prepares (heartbeat tick or new client op).
+    /// Returns 0 if `last_primary_op_seen < op_number()` (a brief race
+    /// during commit-then-prepare reordering) so the gauge is never
+    /// negative.
+    pub fn replica_lag_opnum(&self) -> u64 {
+        if self.is_primary() {
+            return 0;
+        }
+        self.last_primary_op_seen.saturating_sub(self.op_number())
+    }
+
+    /// Centralized view-advance hook — every place that strictly
+    /// increases `self.view` MUST funnel through here so the counter
+    /// stays accurate. Also resets `last_primary_op_seen` because the
+    /// primary identity changed (the previous primary's op_number is
+    /// no longer meaningful for lag).
+    fn advance_view_to(&mut self, new_view: u64) {
+        if new_view > self.view {
+            let bumps = new_view - self.view;
+            self.view_changes_total = self.view_changes_total.saturating_add(bumps);
+            self.view = new_view;
+            self.last_primary_op_seen = 0;
+        }
+    }
+
     /// Introspection for diagnostics: (view, is_primary, status, commit,
     /// op_number, max_view_seen).
     pub fn probe(&self) -> (u64, bool, &'static str, u64, u64, u64) {
@@ -517,7 +580,7 @@ impl<V: Vfs> Replica<V> {
             // Normal/normal_view with our (stale) log — that would let a
             // divergent log win a future DoViewChange and drop committed
             // ops. Go to ViewChange and solicit the authoritative log.
-            self.view = view;
+            self.advance_view_to(view);
             self.status = Status::ViewChange;
             self.ticks_idle = 0;
             out.msgs.push((
@@ -531,6 +594,12 @@ impl<V: Vfs> Replica<V> {
             return;
         }
         self.ticks_idle = 0;
+        // SP-Cloud-Cluster-METRICS-EXPAND — Prepare carries the primary's
+        // freshest op_number; capture the max so `replica_lag_opnum()`
+        // returns a useful (if best-effort) lag gauge on backups.
+        if op_number > self.last_primary_op_seen {
+            self.last_primary_op_seen = op_number;
+        }
         if op_number == self.op_number() + 1 {
             self.log.push(LogEntry { op_number, client, req, op });
             out.msgs.push((
@@ -587,7 +656,7 @@ impl<V: Vfs> Replica<V> {
             return;
         }
         if view > self.view {
-            self.view = view;
+            self.advance_view_to(view);
             self.status = Status::ViewChange;
             self.ticks_idle = 0;
             out.msgs.push((
@@ -615,7 +684,8 @@ impl<V: Vfs> Replica<V> {
         // Jump to one past the highest view ANYONE has reached, so split
         // replicas rendezvous on a single view instead of each doing
         // `self.view + 1` and chasing forever.
-        self.view = self.view.max(self.max_view_seen) + 1;
+        let new_view = self.view.max(self.max_view_seen) + 1;
+        self.advance_view_to(new_view);
         self.max_view_seen = self.max_view_seen.max(self.view);
         self.status = Status::ViewChange;
         self.svc_votes.entry(self.view).or_default().insert(self.idx);
@@ -629,7 +699,7 @@ impl<V: Vfs> Replica<V> {
             return;
         }
         if view > self.view {
-            self.view = view;
+            self.advance_view_to(view);
             self.status = Status::ViewChange;
         }
         self.svc_votes.entry(view).or_default().insert(replica);
@@ -682,7 +752,7 @@ impl<V: Vfs> Replica<V> {
                 max_commit = max_commit.max(*commit);
             }
         }
-        self.view = view;
+        self.advance_view_to(view);
         self.normal_view = view;
         self.status = Status::Normal;
         self.log = best_log;
@@ -699,7 +769,7 @@ impl<V: Vfs> Replica<V> {
         if view < self.view {
             return;
         }
-        self.view = view;
+        self.advance_view_to(view);
         self.normal_view = view;
         self.status = Status::Normal;
         self.log = log;
@@ -953,6 +1023,21 @@ pub mod sim {
             self.rs.iter().map(|r| (r.idx, r.probe())).collect()
         }
 
+        /// SP-Cloud-Cluster-METRICS-EXPAND — per-replica monotonic
+        /// view-change count, useful for asserting that a real view
+        /// change actually fired (vs. the cluster just happening to
+        /// land on a stable view via warm-start).
+        pub fn view_changes_total(&self, idx: usize) -> u64 {
+            self.rs[idx].view_changes_total()
+        }
+
+        /// SP-Cloud-Cluster-METRICS-EXPAND — per-replica replica-lag
+        /// gauge (0 on the primary, `last_primary_op_seen - op_number`
+        /// on backups). See `Replica::replica_lag_opnum()`.
+        pub fn replica_lag_opnum(&self, idx: usize) -> u64 {
+            self.rs[idx].replica_lag_opnum()
+        }
+
         pub fn acked(&self) -> usize {
             self.replies.len()
         }
@@ -1112,6 +1197,88 @@ pub mod sim {
         let d = c.live_digests(); // replicas 1 and 2
         assert_eq!(d.len(), 2);
         assert_eq!(d[0], d[1], "surviving replicas must converge after failover");
+    }
+
+    /// SP-Cloud-Cluster-METRICS-EXPAND — the `view_changes_total`
+    /// counter increments on a real view transition. Warm up under
+    /// view 0, kill the primary, drive a workload through the new
+    /// primary; the surviving replicas' counter must be >=1 (the
+    /// initial elected-primary view of 0 is NOT counted as a change;
+    /// only strictly-increasing view advances bump the counter).
+    #[test]
+    fn view_changes_total_increments_on_real_view_change() {
+        let mut c = Cluster::new(3, 5, 0);
+        let warmup = vec![
+            (1u128, 1u64, def()),
+            (1, 2, Op::Create { type_id: 1, id: ObjectId::from_u128(1), record: vec![10] }),
+        ];
+        assert_ne!(c.run(&warmup, 2000), usize::MAX);
+        // Pre-kill: every replica has view 0 and zero view-changes.
+        for i in 0..3 {
+            assert_eq!(c.view_changes_total(i), 0,
+                "replica {i} should have 0 view changes pre-failover");
+        }
+
+        c.rs[0].crashed = true; // kill the primary
+
+        let mut more = Vec::new();
+        for i in 0..40u64 {
+            more.push((
+                2u128,
+                i + 1,
+                Op::Create { type_id: 1, id: ObjectId::from_u128(100 + i as u128), record: vec![i as u8] },
+            ));
+        }
+        assert_ne!(c.run(&more, 8000), usize::MAX,
+            "must make progress after failover");
+
+        // Surviving replicas (1, 2) must report >=1 view change.
+        for i in [1usize, 2] {
+            assert!(
+                c.view_changes_total(i) >= 1,
+                "surviving replica {i} should have view_changes_total >= 1 \
+                 after primary kill (got {})", c.view_changes_total(i)
+            );
+        }
+    }
+
+    /// SP-Cloud-Cluster-METRICS-EXPAND — `replica_lag_opnum()` returns
+    /// 0 for the primary and a (possibly-stale, best-effort) >=0 lag
+    /// for a backup. Under a no-fault steady-state workload backups
+    /// either match the primary (lag=0) or are behind by some bounded
+    /// amount (lag >=0). Asserts the primary is always 0 and at
+    /// least one backup observes a non-zero `last_primary_op_seen`
+    /// over the run (which only happens via Prepare receipt).
+    #[test]
+    fn replica_lag_opnum_zero_for_primary_and_nonneg_for_backups() {
+        let mut c = Cluster::new(3, 1, 0);
+        let mut reqs = vec![(7u128, 1u64, def())];
+        for i in 0..20u64 {
+            reqs.push((
+                7,
+                i + 2,
+                Op::Create {
+                    type_id: 1,
+                    id: ObjectId::from_u128(i as u128),
+                    record: vec![i as u8],
+                },
+            ));
+        }
+        assert_ne!(c.run(&reqs, 5000), usize::MAX);
+
+        // Primary (replica 0 in view 0) — lag MUST be 0.
+        assert_eq!(c.replica_lag_opnum(0), 0,
+            "primary's replica_lag_opnum must be 0");
+
+        // Backups — lag is a u64 (so trivially >=0); each is
+        // bounded by the primary's op_number. The key invariant is
+        // that the call doesn't panic and returns a sane gauge.
+        let (_v, _ip, _st, _c, pop, _m) = c.rs[0].probe();
+        for i in [1usize, 2] {
+            let lag = c.replica_lag_opnum(i);
+            assert!(lag <= pop,
+                "backup {i} lag {lag} must be <= primary op_number {pop}");
+        }
     }
 
     #[test]

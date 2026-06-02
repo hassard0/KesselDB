@@ -499,6 +499,8 @@ mod tests {
                 last_op_number: 0,
                 view_number: 0,
                 is_primary: false,
+                view_changes_total: 0,
+                replica_lag_opnum: 0,
                 http_requests_total: Vec::new(),
             }
         }

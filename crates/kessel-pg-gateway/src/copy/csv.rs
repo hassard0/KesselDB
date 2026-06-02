@@ -362,11 +362,15 @@ fn field_needs_quoting(bytes: &[u8], options: &CsvOptions) -> bool {
 // Companion design spec:
 // `docs/superpowers/specs/2026-06-02-kesseldb-sppgcopycsvnumeric-design.md`
 //
-// Scope: V1 covers finite decimals + NaN + ±Infinity. Scientific
-// notation is rejected with a precise V2-arc-pointing message
-// (`SP-PG-COPY-CSV-NUMERIC-SCI`). Arbitrary-precision values
-// beyond the kessel-sql i128 cap surface at INSERT time
-// (`SP-PG-COPY-NUMERIC-BIGNUM`).
+// Scope: V1 covers finite decimals + NaN + ±Infinity. V2
+// SP-PG-COPY-CSV-NUMERIC-SCI (2026-06-02) lifts the
+// scientific-notation rejection by parsing the mantissa+exponent
+// and expanding into the canonical decimal text. Arbitrary-
+// precision values beyond the kessel-sql i128 cap surface at INSERT
+// time (`SP-PG-COPY-NUMERIC-BIGNUM`).
+//
+// Companion SCI design spec:
+// `docs/superpowers/specs/2026-06-02-kesseldb-sppgcopycsvnumericsci-design.md`
 
 /// Errors `validate_numeric_text` can return. All map at the caller
 /// to PG SQLSTATE `22P02 invalid_text_representation`.
@@ -380,9 +384,15 @@ pub enum CsvNumericError {
     /// signs, sign-without-digits, …). `reason` is a static phrase
     /// suitable for inclusion in the user-facing message.
     Malformed { reason: &'static str },
-    /// Scientific notation rejected — V2 SP-PG-COPY-CSV-NUMERIC-SCI.
-    /// Distinct from `BadByte` so the caller can surface the
-    /// follow-up arc name in the rejection message.
+    /// Scientific notation rejected — V1 SP-PG-COPY-CSV-NUMERIC
+    /// reserved this variant for V2 SP-PG-COPY-CSV-NUMERIC-SCI to
+    /// surface in the rejection message. After SCI V1 landed
+    /// (2026-06-02), well-formed scientific notation expands to
+    /// canonical decimal text and this variant is unreachable from
+    /// `validate_numeric_text` — preserved for back-compat with any
+    /// downstream pattern-match. Malformed scientific input surfaces
+    /// as `Malformed { reason }` (out-of-range exponent, missing
+    /// exponent, etc.) or `BadByte` (non-digit in exponent).
     ScientificNotation,
 }
 
@@ -397,14 +407,17 @@ pub enum CsvNumericError {
 /// - Case-insensitive specials: `NaN` / `Infinity` / `-Infinity` —
 ///   accepted in any case (`nan`, `INF`, `+inf`, `-Infinity`, …) and
 ///   returned in the canonical PG mixed-case form.
+/// - Scientific notation (SP-PG-COPY-CSV-NUMERIC-SCI V1, 2026-06-02):
+///   `[+-]?(\d+(\.\d+)?|\.\d+)[eE][+-]?\d+` — mantissa + signed
+///   integer exponent (`1e10`, `1.5E-3`, `6.022e+23`, `-3.14e2`,
+///   `.5e2`). The exponent is expanded into the canonical decimal
+///   text by shifting the mantissa's decimal point. Exponents with
+///   `|exp| > 100` reject as Malformed("exponent out of range") to
+///   avoid pathological digit-string allocation.
 ///
-/// **Returns:** the canonical-form string. For finite values: the
-/// sign-normalised decimal text (NOT scientific). For specials: one
-/// of the three canonical strings.
-///
-/// **V1 out-of-scope** (rejects with the named variant):
-/// - Scientific notation (`1e10`) → `ScientificNotation` → V2
-///   `SP-PG-COPY-CSV-NUMERIC-SCI`.
+/// **Returns:** the canonical-form string. For finite values
+/// (decimal or scientific): the sign-normalised expanded decimal
+/// text. For specials: one of the three canonical strings.
 pub fn validate_numeric_text(s: &str) -> Result<String, CsvNumericError> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
@@ -419,6 +432,16 @@ pub fn validate_numeric_text(s: &str) -> Result<String, CsvNumericError> {
         }
         "-infinity" | "-inf" => return Ok("-Infinity".to_string()),
         _ => {}
+    }
+    // ── SP-PG-COPY-CSV-NUMERIC-SCI V1 (2026-06-02) ──────────────
+    // Try the scientific-notation branch first. Returns:
+    //  - Ok(Some(canonical)) if the input matches the scientific
+    //    grammar and the exponent shift produced a valid decimal.
+    //  - Ok(None) if the input doesn't contain e/E at all (fall
+    //    through to the canonical-decimal grammar below).
+    //  - Err(...) if the input contains e/E but is malformed.
+    if let Some(canonical) = parse_scientific_notation(trimmed)? {
+        return Ok(canonical);
     }
     // ── Finite decimal grammar ───────────────────────────────────
     let bytes = trimmed.as_bytes();
@@ -463,6 +486,9 @@ pub fn validate_numeric_text(s: &str) -> Result<String, CsvNumericError> {
                 });
             }
             b'e' | b'E' => {
+                // Unreachable in practice — parse_scientific_notation
+                // above swallows every e/E-bearing input. Kept as a
+                // defensive default.
                 return Err(CsvNumericError::ScientificNotation);
             }
             other => {
@@ -488,6 +514,259 @@ pub fn validate_numeric_text(s: &str) -> Result<String, CsvNumericError> {
         .all(|&b| b == b'0' || b == b'.');
     let prefix = if sign == b'-' && !is_all_zero { "-" } else { "" };
     Ok(format!("{prefix}{digits_str}"))
+}
+
+/// SP-PG-COPY-CSV-NUMERIC-SCI V1 (2026-06-02) — try to parse `s` as
+/// scientific notation and return the canonical decimal form.
+///
+/// Returns:
+/// - `Ok(Some(canonical))` if `s` matches the scientific grammar
+///   AND the exponent shift produced a valid decimal.
+/// - `Ok(None)` if `s` doesn't contain `e`/`E` at all (caller falls
+///   through to the canonical-decimal grammar).
+/// - `Err(CsvNumericError)` if `s` contains `e`/`E` but the mantissa
+///   or exponent is malformed.
+///
+/// Grammar (after the special-string preamble has already handled
+/// NaN/Inf):
+///   mantissa ::= [+-]?(\d+(\.\d+)?|\.\d+)
+///   exponent ::= [+-]?\d+
+///   sci      ::= mantissa [eE] exponent
+///
+/// The expansion algorithm shifts the mantissa's implicit decimal
+/// point by `exp - (mantissa_frac_digits)`. See design spec §4.
+fn parse_scientific_notation(s: &str) -> Result<Option<String>, CsvNumericError> {
+    // Fast-path: no e/E means "not scientific" — fall through.
+    let e_pos = match s.bytes().position(|b| b == b'e' || b == b'E') {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    // Hard-reject a second `e`/`E` anywhere in the tail.
+    if s.bytes().skip(e_pos + 1).any(|b| b == b'e' || b == b'E') {
+        return Err(CsvNumericError::Malformed {
+            reason: "multiple exponent markers",
+        });
+    }
+
+    let mantissa = &s[..e_pos];
+    let exp_str = &s[e_pos + 1..];
+
+    if mantissa.is_empty() {
+        // Bare `e10` — no mantissa.
+        return Err(CsvNumericError::BadByte {
+            position: 0,
+            byte: s.as_bytes()[0],
+        });
+    }
+    if exp_str.is_empty() {
+        return Err(CsvNumericError::Malformed {
+            reason: "missing exponent",
+        });
+    }
+
+    // ── Parse exponent ────────────────────────────────────────
+    // Allow optional leading sign + ASCII digits only.
+    let exp_bytes = exp_str.as_bytes();
+    let (exp_sign, exp_digits_start) = match exp_bytes[0] {
+        b'+' => (1i32, 1usize),
+        b'-' => (-1i32, 1usize),
+        b'0'..=b'9' => (1i32, 0usize),
+        _ => {
+            return Err(CsvNumericError::Malformed {
+                reason: "malformed exponent",
+            });
+        }
+    };
+    if exp_digits_start >= exp_bytes.len() {
+        return Err(CsvNumericError::Malformed {
+            reason: "malformed exponent",
+        });
+    }
+    let mut exp_val: i32 = 0;
+    for &b in &exp_bytes[exp_digits_start..] {
+        match b {
+            b'0'..=b'9' => {
+                let d = (b - b'0') as i32;
+                // Saturate-detect by comparison against the cap so a
+                // pathological `1e9999999999` rejects cleanly.
+                if exp_val > 1_000 {
+                    return Err(CsvNumericError::Malformed {
+                        reason: "exponent out of range",
+                    });
+                }
+                exp_val = exp_val * 10 + d;
+            }
+            b'+' | b'-' => {
+                return Err(CsvNumericError::Malformed {
+                    reason: "malformed exponent",
+                });
+            }
+            b'.' => {
+                return Err(CsvNumericError::Malformed {
+                    reason: "non-integer exponent",
+                });
+            }
+            _ => {
+                return Err(CsvNumericError::Malformed {
+                    reason: "malformed exponent",
+                });
+            }
+        }
+    }
+    let exp_signed = exp_sign * exp_val;
+    if exp_signed.abs() > 100 {
+        return Err(CsvNumericError::Malformed {
+            reason: "exponent out of range",
+        });
+    }
+
+    // ── Parse mantissa ────────────────────────────────────────
+    // Grammar: [+-]?(\d+(\.\d+)?|\.\d+).
+    // Trailing-dot (`5.`) is out-of-scope (SP-PG-COPY-CSV-NUMERIC-SCI-TRAILDOT).
+    let mbytes = mantissa.as_bytes();
+    let (mant_sign, mant_body_start) = match mbytes[0] {
+        b'+' => ('+', 1usize),
+        b'-' => ('-', 1usize),
+        _ => ('+', 0usize),
+    };
+    if mant_body_start >= mbytes.len() {
+        return Err(CsvNumericError::Malformed {
+            reason: "sign without digits",
+        });
+    }
+    let body = &mbytes[mant_body_start..];
+
+    // Walk the body — count int digits + frac digits + position of dot.
+    let mut int_digits: Vec<u8> = Vec::new();
+    let mut frac_digits: Vec<u8> = Vec::new();
+    let mut saw_dot = false;
+    for (off, &b) in body.iter().enumerate() {
+        match b {
+            b'0'..=b'9' => {
+                if saw_dot {
+                    frac_digits.push(b);
+                } else {
+                    int_digits.push(b);
+                }
+            }
+            b'.' => {
+                if saw_dot {
+                    return Err(CsvNumericError::Malformed {
+                        reason: "multiple decimal points",
+                    });
+                }
+                saw_dot = true;
+            }
+            b'+' | b'-' => {
+                return Err(CsvNumericError::Malformed {
+                    reason: "multiple signs",
+                });
+            }
+            other => {
+                return Err(CsvNumericError::BadByte {
+                    position: mant_body_start + off,
+                    byte: other,
+                });
+            }
+        }
+    }
+    if int_digits.is_empty() && frac_digits.is_empty() {
+        return Err(CsvNumericError::Malformed {
+            reason: "no digits",
+        });
+    }
+    // Trailing-dot mantissa (`5.` with no fractional digits) is the
+    // V2 SP-PG-COPY-CSV-NUMERIC-SCI-TRAILDOT shape — out of scope.
+    if saw_dot && frac_digits.is_empty() {
+        return Err(CsvNumericError::Malformed {
+            reason:
+                "trailing-dot mantissa in scientific notation not supported in V1 (SP-PG-COPY-CSV-NUMERIC-SCI-TRAILDOT)",
+        });
+    }
+
+    // ── Expand ───────────────────────────────────────────────
+    // D = concat(int_digits, frac_digits) — the integer value of
+    // the mantissa scaled by 10^frac_digits.len(). The decimal point
+    // in the final value is exp_signed - frac_digits.len() places to
+    // the right of D's tail. Equivalently: shift D's implicit
+    // decimal point K places where K = exp_signed - frac_digits.len().
+    let mut all_digits: Vec<u8> = Vec::with_capacity(int_digits.len() + frac_digits.len());
+    all_digits.extend_from_slice(&int_digits);
+    all_digits.extend_from_slice(&frac_digits);
+    let k: i32 = exp_signed - (frac_digits.len() as i32);
+
+    // Build canonical digit string with the dot in the right place.
+    // body_canonical = render(all_digits, k).
+    let body_canonical = render_shifted(&all_digits, k);
+
+    // ── Sign canonicalisation ────────────────────────────────
+    // Drop a leading '+'; keep '-' iff value isn't all-zeros (so
+    // `-0e0` canonicalises to `0`, matching V1).
+    let all_zero = body_canonical
+        .as_bytes()
+        .iter()
+        .all(|&b| b == b'0' || b == b'.');
+    let prefix = if mant_sign == '-' && !all_zero {
+        "-"
+    } else {
+        ""
+    };
+    Ok(Some(format!("{prefix}{body_canonical}")))
+}
+
+/// Render `digits` as a decimal string with the implicit decimal
+/// point shifted `k` places to the right (positive `k` appends zeros;
+/// negative `k` inserts a dot, padding with leading zeros if needed).
+///
+/// Leading-zero suppression: the integer part is trimmed to its
+/// canonical form (`0` for a pure-zero integer; otherwise no leading
+/// zeros). The fractional part is preserved verbatim.
+fn render_shifted(digits: &[u8], k: i32) -> String {
+    if digits.is_empty() {
+        return "0".to_string();
+    }
+    if k >= 0 {
+        // Append k zeros — pure integer result.
+        let mut out: Vec<u8> = Vec::with_capacity(digits.len() + k as usize);
+        out.extend_from_slice(digits);
+        for _ in 0..k {
+            out.push(b'0');
+        }
+        // Strip leading zeros (preserve a single 0).
+        let trimmed = strip_leading_zeros(&out);
+        return String::from_utf8(trimmed.to_vec()).expect("ASCII digits");
+    }
+    // k < 0: insert a dot |k| places from the right.
+    let shift = (-k) as usize;
+    if shift < digits.len() {
+        let split = digits.len() - shift;
+        let int_part = strip_leading_zeros(&digits[..split]);
+        let frac_part = &digits[split..];
+        let mut out: Vec<u8> = Vec::with_capacity(int_part.len() + 1 + frac_part.len());
+        out.extend_from_slice(int_part);
+        out.push(b'.');
+        out.extend_from_slice(frac_part);
+        return String::from_utf8(out).expect("ASCII digits");
+    }
+    // shift >= digits.len(): result is 0.<pad><digits>
+    let pad = shift - digits.len();
+    let mut out: Vec<u8> = Vec::with_capacity(2 + pad + digits.len());
+    out.extend_from_slice(b"0.");
+    for _ in 0..pad {
+        out.push(b'0');
+    }
+    out.extend_from_slice(digits);
+    String::from_utf8(out).expect("ASCII digits")
+}
+
+/// Strip leading ASCII `0` bytes from the slice; preserve a single
+/// `0` if the result would otherwise be empty.
+fn strip_leading_zeros(d: &[u8]) -> &[u8] {
+    let mut i = 0;
+    while i + 1 < d.len() && d[i] == b'0' {
+        i += 1;
+    }
+    &d[i..]
 }
 
 /// Validate a CSV option's value is exactly one byte. Used by the
@@ -905,16 +1184,42 @@ mod tests {
         assert_eq!(validate_numeric_text("-INF").unwrap(), "-Infinity");
     }
 
-    /// SP-PG-COPY-CSV-NUMERIC T1: garbage rejects with BadByte at
-    /// the offending position.
+    /// SP-PG-COPY-CSV-NUMERIC T1: garbage rejects.
+    ///
+    /// Note: post-SP-PG-COPY-CSV-NUMERIC-SCI (2026-06-02), inputs
+    /// containing `e`/`E` route through the scientific-notation
+    /// branch first. `"hello"` has `e` at position 1, so the SCI
+    /// parser interprets `h` as the mantissa and `llo` as a
+    /// malformed exponent — surfacing `Malformed { reason:
+    /// "malformed exponent" }` instead of the pre-SCI V1 BadByte at
+    /// position 0. Both forms map to `22P02
+    /// invalid_text_representation` at the dispatcher; the rejection
+    /// is still surfaced cleanly. We also assert a pure-digits-with-
+    /// garbage input (`"42x"`) still surfaces the original BadByte.
     #[test]
     fn t1_numeric_validate_garbage_rejects() {
+        // `hello` now flows through the SCI branch (because `e` is
+        // present); SCI surfaces a Malformed exponent error.
         match validate_numeric_text("hello") {
-            Err(CsvNumericError::BadByte { position, byte }) => {
-                assert_eq!(position, 0);
-                assert_eq!(byte, b'h');
+            Err(CsvNumericError::Malformed { reason }) => {
+                assert!(
+                    reason.contains("exponent") || reason.contains("mantissa"),
+                    "reason = {reason}"
+                );
             }
-            other => panic!("expected BadByte at 0, got {other:?}"),
+            Err(CsvNumericError::BadByte { .. }) => {
+                // Acceptable too — equivalent 22P02 at the dispatcher.
+            }
+            other => panic!("expected rejection for 'hello', got {other:?}"),
+        }
+        // A pure-non-e garbage input still hits the canonical-decimal
+        // BadByte at the original position.
+        match validate_numeric_text("42x") {
+            Err(CsvNumericError::BadByte { position, byte }) => {
+                assert_eq!(position, 2);
+                assert_eq!(byte, b'x');
+            }
+            other => panic!("expected BadByte at 2 for '42x', got {other:?}"),
         }
     }
 
@@ -938,20 +1243,14 @@ mod tests {
         assert_eq!(validate_numeric_text("   "), Err(CsvNumericError::Empty));
     }
 
-    /// SP-PG-COPY-CSV-NUMERIC T1: scientific notation rejects with
-    /// the precise `ScientificNotation` variant (so the caller can
-    /// name the V2 arc `SP-PG-COPY-CSV-NUMERIC-SCI` in the
-    /// user-facing message).
+    /// SP-PG-COPY-CSV-NUMERIC-SCI T1 (2026-06-02) — V1 rejected
+    /// scientific notation; the SCI V2 arc lifted that to canonical
+    /// decimal expansion. The original V1 inputs now expand cleanly.
+    /// See KATs `t1_sci_*` below for the full grammar coverage.
     #[test]
-    fn t1_numeric_validate_scientific_notation_rejects() {
-        assert_eq!(
-            validate_numeric_text("1e10"),
-            Err(CsvNumericError::ScientificNotation)
-        );
-        assert_eq!(
-            validate_numeric_text("2E-3"),
-            Err(CsvNumericError::ScientificNotation)
-        );
+    fn t1_numeric_validate_scientific_notation_v1_inputs_now_expand() {
+        assert_eq!(validate_numeric_text("1e10").unwrap(), "10000000000");
+        assert_eq!(validate_numeric_text("2E-3").unwrap(), "0.002");
     }
 
     /// SP-PG-COPY-CSV-NUMERIC T1: multiple signs (e.g. `--5`) reject
@@ -1001,5 +1300,197 @@ mod tests {
     fn t1_numeric_validate_negative_zero_canonicalises() {
         assert_eq!(validate_numeric_text("-0").unwrap(), "0");
         assert_eq!(validate_numeric_text("-0.00").unwrap(), "0.00");
+    }
+
+    // ─── SP-PG-COPY-CSV-NUMERIC-SCI V1 KATs (2026-06-02) ────────────────
+    //
+    // Companion design spec:
+    // `docs/superpowers/specs/2026-06-02-kesseldb-sppgcopycsvnumericsci-design.md`
+    //
+    // Scientific notation parsed + expanded into canonical decimal text.
+    // V1 grammar: [+-]?(\d+(\.\d+)?|\.\d+)[eE][+-]?\d+ with |exp|<=100.
+
+    /// SCI T1: `1e10` expands to `"10000000000"` (Avogadro-style integer).
+    #[test]
+    fn t1_sci_integer_mantissa_positive_exp() {
+        assert_eq!(validate_numeric_text("1e10").unwrap(), "10000000000");
+    }
+
+    /// SCI T1: `1e-3` expands to `"0.001"` (negative exponent, leading-
+    /// zero pad).
+    #[test]
+    fn t1_sci_integer_mantissa_negative_exp() {
+        assert_eq!(validate_numeric_text("1e-3").unwrap(), "0.001");
+    }
+
+    /// SCI T1: `1.5e2` expands to `"150"` (fractional mantissa, decimal
+    /// shifted out).
+    #[test]
+    fn t1_sci_fractional_mantissa_positive_exp() {
+        assert_eq!(validate_numeric_text("1.5e2").unwrap(), "150");
+    }
+
+    /// SCI T1: `1.5e-2` expands to `"0.015"` (fractional mantissa,
+    /// negative exponent, leading-zero pad).
+    #[test]
+    fn t1_sci_fractional_mantissa_negative_exp() {
+        assert_eq!(validate_numeric_text("1.5e-2").unwrap(), "0.015");
+    }
+
+    /// SCI T1: `6.022e23` expands to the 24-digit Avogadro number
+    /// representation (canonical PG `numeric_out` form).
+    #[test]
+    fn t1_sci_avogadro_number_expands() {
+        assert_eq!(
+            validate_numeric_text("6.022e23").unwrap(),
+            "602200000000000000000000"
+        );
+    }
+
+    /// SCI T1: `-3.14e2` expands to `"-314"` (signed mantissa, decimal
+    /// fully shifted out).
+    #[test]
+    fn t1_sci_signed_mantissa_expands() {
+        assert_eq!(validate_numeric_text("-3.14e2").unwrap(), "-314");
+    }
+
+    /// SCI T1: `+1.5e+3` expands to `"1500"` (explicit positive sign on
+    /// both mantissa and exponent — both stripped).
+    #[test]
+    fn t1_sci_explicit_positive_signs_stripped() {
+        assert_eq!(validate_numeric_text("+1.5e+3").unwrap(), "1500");
+    }
+
+    /// SCI T1: uppercase `E` exponent marker accepted (case-insensitive).
+    #[test]
+    fn t1_sci_uppercase_exponent_marker() {
+        assert_eq!(validate_numeric_text("1E10").unwrap(), "10000000000");
+    }
+
+    /// SCI T1: mixed-case `1.5E-3` expands to `"0.0015"`.
+    #[test]
+    fn t1_sci_mixed_case_uppercase_e() {
+        assert_eq!(validate_numeric_text("1.5E-3").unwrap(), "0.0015");
+    }
+
+    /// SCI T1: `1e0` expands to `"1"` (exp=0 is a no-op shift).
+    #[test]
+    fn t1_sci_exp_zero_is_identity() {
+        assert_eq!(validate_numeric_text("1e0").unwrap(), "1");
+    }
+
+    /// SCI T1: `0e0` expands to `"0"` (zero mantissa + zero exp).
+    #[test]
+    fn t1_sci_zero_mantissa_zero_exp() {
+        assert_eq!(validate_numeric_text("0e0").unwrap(), "0");
+    }
+
+    /// SCI T1: leading-dot mantissa `.5e2` expands to `"50"`.
+    #[test]
+    fn t1_sci_leading_dot_mantissa() {
+        assert_eq!(validate_numeric_text(".5e2").unwrap(), "50");
+    }
+
+    /// SCI T1: out-of-range exponent (|exp| > 100) rejects as Malformed
+    /// with `"exponent out of range"`.
+    #[test]
+    fn t1_sci_exponent_out_of_range_rejects() {
+        match validate_numeric_text("1e1000") {
+            Err(CsvNumericError::Malformed { reason }) => {
+                assert!(
+                    reason.contains("exponent out of range"),
+                    "reason = {reason}"
+                );
+            }
+            other => panic!("expected Malformed for 1e1000, got {other:?}"),
+        }
+        // Negative side too.
+        match validate_numeric_text("1e-200") {
+            Err(CsvNumericError::Malformed { reason }) => {
+                assert!(reason.contains("exponent out of range"));
+            }
+            other => panic!("expected Malformed for 1e-200, got {other:?}"),
+        }
+    }
+
+    /// SCI T1: bare `e10` (no mantissa) rejects (BadByte at position 0
+    /// — the `e` is illegal as a first byte).
+    #[test]
+    fn t1_sci_bare_e_no_mantissa_rejects() {
+        match validate_numeric_text("e10") {
+            Err(CsvNumericError::BadByte { position, byte }) => {
+                assert_eq!(position, 0);
+                assert_eq!(byte, b'e');
+            }
+            other => panic!("expected BadByte at 0, got {other:?}"),
+        }
+    }
+
+    /// SCI T1: `1e` (no exponent digits) rejects as Malformed with
+    /// `"missing exponent"`.
+    #[test]
+    fn t1_sci_missing_exponent_digits_rejects() {
+        match validate_numeric_text("1e") {
+            Err(CsvNumericError::Malformed { reason }) => {
+                assert!(reason.contains("missing exponent"), "reason = {reason}");
+            }
+            other => panic!("expected Malformed for 1e, got {other:?}"),
+        }
+    }
+
+    /// SCI T1: multiple exponent markers `1ee2` reject as Malformed.
+    #[test]
+    fn t1_sci_multiple_exponent_markers_reject() {
+        match validate_numeric_text("1ee2") {
+            Err(CsvNumericError::Malformed { reason }) => {
+                assert!(reason.contains("multiple exponent markers"));
+            }
+            other => panic!("expected Malformed for 1ee2, got {other:?}"),
+        }
+    }
+
+    /// SCI T1: malformed exponent sign `1e+-3` rejects as Malformed.
+    #[test]
+    fn t1_sci_malformed_exponent_sign_rejects() {
+        match validate_numeric_text("1e+-3") {
+            Err(CsvNumericError::Malformed { reason }) => {
+                assert!(reason.contains("malformed exponent"));
+            }
+            other => panic!("expected Malformed for 1e+-3, got {other:?}"),
+        }
+    }
+
+    /// SCI T1: non-integer exponent `1e1.5` rejects as Malformed.
+    #[test]
+    fn t1_sci_non_integer_exponent_rejects() {
+        match validate_numeric_text("1e1.5") {
+            Err(CsvNumericError::Malformed { reason }) => {
+                assert!(reason.contains("non-integer exponent"));
+            }
+            other => panic!("expected Malformed for 1e1.5, got {other:?}"),
+        }
+    }
+
+    /// SCI T1: trailing-dot mantissa `5.e2` is the named follow-up arc
+    /// `SP-PG-COPY-CSV-NUMERIC-SCI-TRAILDOT` — rejected with that arc
+    /// name in the message.
+    #[test]
+    fn t1_sci_trailing_dot_mantissa_named_followup() {
+        match validate_numeric_text("5.e2") {
+            Err(CsvNumericError::Malformed { reason }) => {
+                assert!(
+                    reason.contains("SP-PG-COPY-CSV-NUMERIC-SCI-TRAILDOT"),
+                    "reason = {reason}"
+                );
+            }
+            other => panic!("expected Malformed for 5.e2, got {other:?}"),
+        }
+    }
+
+    /// SCI T1: negative zero with a scientific suffix canonicalises to
+    /// `"0"` (matches V1 `-0` → `0` semantics).
+    #[test]
+    fn t1_sci_negative_zero_canonicalises() {
+        assert_eq!(validate_numeric_text("-0e5").unwrap(), "0");
     }
 }

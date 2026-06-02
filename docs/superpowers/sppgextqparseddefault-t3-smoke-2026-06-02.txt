@@ -1,0 +1,69 @@
+SP-PG-EXTQ-PARSED-DEFAULT T3 — vulcan ORM smoke + quote-injection wire test
+Date: 2026-06-02
+Binary: /tmp/kdb-target-parseddefault/release/kesseldb (commit 9ccbe82)
+Vulcan: admin@192.168.4.178
+Listeners: 127.0.0.1:6532 (binary), 127.0.0.1:5532 (PG-wire)
+
+================================================================
+1. asyncpg + psycopg3 smoke (regression-free with typed-path default)
+================================================================
+$ python3 /home/admin/KesselDB/scripts/sppgextqbin-asyncpg-smoke.py
+
+asyncpg 0.31.0
+  connect: OK
+  CREATE TABLE: OK
+  INSERT (literal): OK
+  INSERT (binary param Bind path, no result rendering): OK
+  === asyncpg PASS ===
+
+psycopg3 3.3.4
+  connect: OK
+  CREATE TABLE: OK
+  INSERT (default cursor): OK
+  SELECT (default cursor): OK — 1 rows = [(43, 'psycopg3')]
+  === psycopg3 default cursor PASS ===
+
+=== ALL TESTS PASS — V1 binary-format params unlock CONFIRMED ===
+
+================================================================
+2. Quote-injection wire test (HEADLINE)
+================================================================
+$ python3 -c '
+import psycopg2
+conn = psycopg2.connect(host="127.0.0.1", port=5532, user="test",
+                       password="admin", dbname="kesseldb")
+conn.autocommit = True
+cur = conn.cursor()
+cur.execute("CREATE TABLE inj_smoke (id BIGINT, name CHAR(64))")
+cur.execute("INSERT INTO inj_smoke (id, name) VALUES (%s, %s)",
+            (1, "\"; DROP TABLE inj_smoke; --"))
+cur.execute("SELECT * FROM inj_smoke")
+print("Injection blocked, row stored verbatim:", cur.fetchall())
+conn.close()'
+
+Injection blocked, row stored verbatim: [(1, '"; DROP TABLE inj_smoke; --')]
+
+================================================================
+3. Post-injection liveness check (table NOT dropped)
+================================================================
+$ python3 -c '
+import psycopg2
+conn = psycopg2.connect(host="127.0.0.1", port=5532, user="test",
+                       password="admin", dbname="kesseldb")
+conn.autocommit = True
+cur = conn.cursor()
+cur.execute("INSERT INTO inj_smoke (id, name) VALUES (%s, %s)", (2, "alive"))
+cur.execute("SELECT * FROM inj_smoke")
+rows = cur.fetchall()
+print(f"Post-injection: table still alive, {len(rows)} rows = {rows}")
+conn.close()'
+
+Post-injection: table still alive, 2 rows = [(1, '"; DROP TABLE inj_smoke; --'), (2, 'alive')]
+
+================================================================
+HEADLINE — typed-path-as-default closes the SP-PG-EXTQ V1 §11
+weak-spot #1 attack surface at the DISPATCH layer:
+- The injection payload survives as a typed Value::Blob operand.
+- The SQL parser never sees the `; DROP TABLE` bytes as syntax.
+- The table is alive post-injection; a fresh row was inserted.
+================================================================

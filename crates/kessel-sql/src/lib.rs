@@ -384,6 +384,21 @@ fn kind_of(name: &str, arg: Option<i128>) -> Result<FieldKind, SqlError> {
         "INTEGER" | "INT" => FieldKind::I32,
         "SMALLINT" => FieldKind::I16,
         "BOOLEAN" => FieldKind::Bool,
+        // SP-PG-ORM-SQLALCHEMY — `VARCHAR(n)` DDL alias. A SQLAlchemy
+        // `Column(String(32))` (and Django/Rails/Diesel string columns)
+        // renders `VARCHAR(32)` in `CREATE TABLE`, which previously hit
+        // the `unknown type` arm and broke the entire ORM `create_all`
+        // DDL path. Aliased to `Char(n)` — the existing fixed-width CHAR
+        // FieldKind — same on-wire layout, same MVCC semantics, and the
+        // gateway already encodes the result/cast OID as `varchar` (1043)
+        // on the read side (`cast_stripper` / `binary_results`). The
+        // CHAR-pad vs VARCHAR-trim semantic difference is the named
+        // follow-up `SP-PG-DDL-VARCHAR-NATIVE` (true variable-length
+        // storage); for fixed-bound `String(n)` columns the alias is a
+        // faithful match. Multi-word `CHARACTER VARYING` and bare
+        // unbounded `VARCHAR`/`TEXT` are NOT handled here (single-token,
+        // `(n)`-required) — named follow-up `SP-PG-DDL-VARCHAR-UNBOUNDED`.
+        "VARCHAR" => FieldKind::Char(arg.ok_or("VARCHAR needs (n)")? as u16),
         other => return Err(format!("unknown type `{other}`")),
     })
 }
@@ -2512,6 +2527,31 @@ mod tests {
         assert!(matches!(kind_of("I64", None), Ok(FieldKind::I64)));
         assert!(matches!(kind_of("I32", None), Ok(FieldKind::I32)));
         assert!(matches!(kind_of("BOOL", None), Ok(FieldKind::Bool)));
+    }
+
+    /// SP-PG-ORM-SQLALCHEMY — `VARCHAR(n)` DDL alias. SQLAlchemy's
+    /// `Column(String(32))` renders `VARCHAR(32)` in the `create_all`
+    /// DDL; pre-fix this hit `unknown type \`VARCHAR\``. Now aliased to
+    /// the fixed-width `Char(n)` FieldKind (same on-wire layout). Bare
+    /// `VARCHAR` without `(n)` is a clear error (named follow-up
+    /// `SP-PG-DDL-VARCHAR-UNBOUNDED`).
+    #[test]
+    fn pg_varchar_alias_maps_to_char() {
+        assert!(matches!(
+            kind_of("VARCHAR", Some(32)),
+            Ok(FieldKind::Char(32))
+        ));
+        assert!(matches!(
+            kind_of("varchar", Some(255)),
+            Ok(FieldKind::Char(255))
+        ));
+        // `(n)` is required — bare VARCHAR is rejected with a precise reason.
+        assert!(kind_of("VARCHAR", None)
+            .unwrap_err()
+            .to_string()
+            .contains("VARCHAR needs (n)"));
+        // The native CHAR(n) spelling is untouched (pure addition).
+        assert!(matches!(kind_of("CHAR", Some(8)), Ok(FieldKind::Char(8))));
     }
 
     #[test]

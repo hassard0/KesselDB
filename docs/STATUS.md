@@ -5,12 +5,60 @@ Honest milestone tracker. Updated every milestone. "Done" means code + tests com
 ## Current capabilities (2026-06-02)
 
 What a node running on today's `main` actually does. Every line below is
-covered by the workspace test suite (2048 default / 2059 with
-`--features pg-gateway` / 2063 with all gateway features) plus +26 KATs
-from the SP-PG-EXTQ-CAST V1 arc landed 2026-06-02.
+covered by the workspace test suite (2063 default / 2074 with
+`--features pg-gateway` / 2078 with all gateway features) plus +15
+KATs from the SP-CHAR-PAD-COMPARE V1 arc landed 2026-06-02 on top of
++26 from the SP-PG-EXTQ-CAST V1 arc landed earlier the same day.
 
 **Tonight's delivery (2026-06-02) — coherent state of the union:**
 
+- **Track A.-2 — CHAR(N) padding-aware equality + range (SP-CHAR-PAD-COMPARE V1 SHIPPED at T2 — 2026-06-02).**
+  Closes the V2 follow-up named in the SP-PG-EXTQ-BIN-RESULTS T3
+  smoke (`docs/superpowers/sppgextqbinr-t3-smoke-2026-06-01.txt`
+  §47-55). asyncpg's parameterized `WHERE name = $1` against a
+  CHAR(32) column returned 0 rows even when the row existed; the
+  smoke transcript flagged it as "the engine's EQ-on-Char doesn't
+  ignore trailing NUL padding". The actual root cause re-diagnosis
+  (design §1) was in `kessel-expr`: `Value::Bytes(Vec<u8>)`
+  PartialEq is length-sensitive, so a 32-byte NUL-padded stored
+  CHAR(32) value did not compare equal to a 5-byte bare literal
+  pushed via `PUSH_BYTES`. Fix: new `pub fn right_trim_char_pad`
+  in `kessel-expr` drops trailing NUL (0x00) + space (0x20); applied
+  in the `EQ`/`NE` opcodes for `Value::Bytes × Value::Bytes`, the
+  `ord!` macro Bytes arm (`LT`/`LE`/`GT`/`GE`), and the
+  `compile_filter::materialise_cmp` bytes×bytes closure (so the
+  specialised path stays byte-equal to `eval` — the determinism
+  oracle). `kessel-sm::cmp_field` split the `Char(_) | Bytes(_)`
+  arm from `Ref | OverflowRef` and applies the same trim for the
+  former (Ref / OverflowRef stay full-byte — ObjectId trailing NULs
+  are significant). Storage / indexes / hashing UNCHANGED — only
+  the comparison layer trims, so existing data + replicas don't
+  need migration and the determinism contract holds (the trim only
+  ADDS matches, never removes — strictly more permissive). The
+  trim semantic is PG SQL §9.20 (trailing-space insignificance),
+  generalised to NUL because the engine stores fixed-width values
+  NUL-padded per `kessel-codec::raw_from_value`. A small Describe
+  enabler in `kessel-pg-gateway::row_description_or_no_data_for_sql`
+  substitutes `$N` placeholders with literal NULL for the
+  table-name probe — closes the asyncpg
+  `ProtocolError: the number of columns in the result row (2) is
+  different from what was described (0)` that the engine fix
+  unmasked (pre-arc the 0-rows result hid the column-count
+  mismatch). **HEADLINE — asyncpg 0.31.0
+  `conn.fetch("SELECT * FROM t WHERE name = $1", "hello")` on
+  vulcan now returns `[Record(id=42, name='hello')]`** (was `0
+  rows` + WARN pre-arc); BETWEEN / NE / range comparison also
+  pass; psycopg2 simple-query path regression-free (negative case
+  `WHERE name = 'nope'` still returns 0 rows — proves the trim
+  doesn't over-match). +15 KATs (+9 kessel-expr / +5 kessel-sm /
+  +1 kessel-pg-gateway). Named V2 follow-ups:
+  `SP-CHAR-PAD-LIKE` (PG `LIKE` against CHAR(N) — separate semantic
+  decision), `SP-PG-EXTQ-PARSED` (typed-parameter AST — replaces
+  text-substitute, removes the lex-on-`$` Describe gap),
+  `SP-PG-VARCHAR-NATIVE` (distinct codec for variable-length
+  VARCHAR(N)). Smoke transcript:
+  `docs/superpowers/spcharpadcompare-t3-smoke-2026-06-02.txt`.
+  **Arc closed — TaskList #361 ready for completion.**
 - **Track A.-1 — PostgreSQL JDBC simple-mode `::cast` rewrite (SP-PG-EXTQ-CAST V1 SHIPPED at T2 — 2026-06-02).**
   Closes the V2 follow-up named in the SP-PG-EXTQ T8 ORM compat
   matrix (`docs/superpowers/sppgextq-t8-orm-smoke-2026-05-29.txt`

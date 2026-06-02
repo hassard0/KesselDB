@@ -52,6 +52,7 @@
 pub mod binary_results;
 pub mod proto;
 pub mod response;
+pub mod scalar_row_descriptions;
 pub mod substitute;
 
 use crate::engine::EngineApply;
@@ -898,6 +899,18 @@ fn row_description_or_no_data_for_sql<E: EngineApply + ?Sized>(
     engine: &E,
     sql: &str,
 ) -> Vec<u8> {
+    // SP-PG-EXTQ-DESCRIBE-VERSION (2026-06-02) — scalar SELECT
+    // recognizer. Runs BEFORE the `select_star_table` probe so that
+    // `SELECT version()` + companion scalar SELECTs that SP-PG-EXTQ T7
+    // added Simple-Query handlers for emit the matching RowDescription
+    // here, not NoData. Without this, pgJDBC's extended-mode Describe
+    // step treats the SELECT as "returns no rows" and bails when the
+    // subsequent DataRow arrives. See
+    // `crates/kessel-pg-gateway/src/extq/scalar_row_descriptions.rs`
+    // for the full recognized pattern table + KAT corpus.
+    if let Some(bytes) = scalar_row_descriptions::row_description_for_scalar_select(sql) {
+        return bytes;
+    }
     // Same trim shape `dispatch_query` uses: strip a trailing `;` and
     // surrounding whitespace so a client `SELECT * FROM t;` matches.
     let trimmed = sql.trim().trim_end_matches(';').trim();
@@ -2761,6 +2774,118 @@ mod tests {
                     "Describe(S) on `WHERE name = $1` MUST emit RowDescription, \
                      not NoData (else asyncpg ProtocolError on Execute's DataRow)"
                 );
+            }
+            other => panic!("expected Bytes(PD + RowDescription), got {other:?}"),
+        }
+    }
+
+    /// SP-PG-EXTQ-DESCRIBE-VERSION V1 (2026-06-02) HEADLINE — Describe
+    /// 'S' on a stored `SELECT version()` MUST emit ParameterDescription
+    /// + a 1-column RowDescription ("version", TEXT). Pre-arc this
+    /// returned NoData → pgJDBC's extended-mode `SELECT version()` probe
+    /// hit `IllegalStateException: Received resultset tuples, but no
+    /// field structure for them` on Execute's DataRow.
+    #[test]
+    fn sppgextqdescribeversion_describe_statement_select_version_emits_row_desc() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(&mut state, "psv", "SELECT version()", vec![]);
+        let msg = proto::ExtqMessage::Describe {
+            target: DESCRIBE_TARGET_STATEMENT,
+            name: "psv".to_string(),
+        };
+        match try_dispatch_extq(&mut state, &CannedTwoColEngine, msg) {
+            ExtqOutcome::Bytes(bytes) => {
+                // ParameterDescription with count=0 first (no $N
+                // placeholders in `SELECT version()`).
+                let empty_pd = response::encode_parameter_description(&[]);
+                assert!(
+                    bytes.starts_with(&empty_pd),
+                    "first {} bytes must be empty ParameterDescription",
+                    empty_pd.len()
+                );
+                // RowDescription("version", TEXT) MUST follow — NOT
+                // NoData. This is the headline assertion that closes
+                // the SP-PG-JDBC-SMOKE T2 §5 transcript bug.
+                let rd_expected =
+                    crate::response::encode_row_description(&[FieldMeta {
+                        name: "version".into(),
+                        type_oid: crate::proto::PG_TYPE_TEXT,
+                    }]);
+                assert_eq!(
+                    &bytes[empty_pd.len()..],
+                    rd_expected.as_slice(),
+                    "Describe(S) on `SELECT version()` MUST emit RowDescription, \
+                     not NoData (else pgJDBC raises IllegalStateException on Execute's DataRow)"
+                );
+            }
+            other => panic!("expected Bytes(PD + RowDescription), got {other:?}"),
+        }
+        assert!(!state.in_error_state());
+    }
+
+    /// SP-PG-EXTQ-DESCRIBE-VERSION V1 (2026-06-02) — Describe 'P' on a
+    /// portal whose stmt is `SELECT 1` MUST emit RowDescription
+    /// ("?column?", INT4). Closes the scalar-int SELECT Describe gap
+    /// that prevented SQLAlchemy's `do_ping()` from completing in
+    /// extended-mode (the simple-mode path is already handled by
+    /// pg_catalog::synthesize_helper_function).
+    #[test]
+    fn sppgextqdescribeversion_describe_portal_select_1_emits_row_desc() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(&mut state, "ps1", "SELECT 1", vec![]);
+        let bind = proto::ExtqMessage::Bind {
+            portal: "pt1".to_string(),
+            stmt: "ps1".to_string(),
+            param_formats: vec![],
+            param_values: vec![],
+            result_formats: vec![],
+        };
+        match try_dispatch_extq(&mut state, &CannedTwoColEngine, bind) {
+            ExtqOutcome::Bytes(_) => {}
+            other => panic!("seed Bind should succeed, got {other:?}"),
+        }
+        let desc = proto::ExtqMessage::Describe {
+            target: DESCRIBE_TARGET_PORTAL,
+            name: "pt1".to_string(),
+        };
+        match try_dispatch_extq(&mut state, &CannedTwoColEngine, desc) {
+            ExtqOutcome::Bytes(bytes) => {
+                // First byte is RowDescription 'T' — NOT NoData 'n'.
+                assert_eq!(bytes[0], b'T');
+                let rd_expected =
+                    crate::response::encode_row_description(&[FieldMeta {
+                        name: "?column?".into(),
+                        type_oid: crate::proto::PG_TYPE_INT4,
+                    }]);
+                assert_eq!(bytes, rd_expected);
+            }
+            other => panic!("expected Bytes(RowDescription), got {other:?}"),
+        }
+    }
+
+    /// SP-PG-EXTQ-DESCRIBE-VERSION V1 (2026-06-02) — `SELECT 1::int8`
+    /// (post cast-strip → `SELECT 1`) emits the same Describe shape as
+    /// `SELECT 1`. Locks the SP-PG-EXTQ-CAST x SP-PG-EXTQ-DESCRIBE-
+    /// VERSION interaction so a future cast-stripper refactor cannot
+    /// silently regress the JDBC simple-mode-then-extended-mode path.
+    #[test]
+    fn sppgextqdescribeversion_describe_statement_select_1_int8_cast_emits_int4_rd() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(&mut state, "psc", "SELECT 1::int8", vec![]);
+        let msg = proto::ExtqMessage::Describe {
+            target: DESCRIBE_TARGET_STATEMENT,
+            name: "psc".to_string(),
+        };
+        match try_dispatch_extq(&mut state, &CannedTwoColEngine, msg) {
+            ExtqOutcome::Bytes(bytes) => {
+                let empty_pd = response::encode_parameter_description(&[]);
+                assert!(bytes.starts_with(&empty_pd));
+                let rd_expected =
+                    crate::response::encode_row_description(&[FieldMeta {
+                        name: "?column?".into(),
+                        type_oid: crate::proto::PG_TYPE_INT4,
+                    }]);
+                assert_eq!(&bytes[empty_pd.len()..], rd_expected.as_slice());
             }
             other => panic!("expected Bytes(PD + RowDescription), got {other:?}"),
         }

@@ -3066,17 +3066,21 @@ mod tests {
     fn paren_wrapped_values_literals() {
         let cat = {
             let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            // `id` is the pseudo row-id pulled from the VALUES tuple;
+            // the only declared fields are `v` (I64) and `name`
+            // (nullable CHAR(16)). This matches the convention used
+            // throughout the rest of the INSERT KATs in this module.
             run(
                 &mut sm,
                 1,
-                "CREATE TABLE t (id I64 NOT NULL, v I64 NOT NULL, \
-                 name CHAR(16))",
+                "CREATE TABLE t (v I64 NOT NULL, name CHAR(16))",
             );
             sm.catalog().clone()
         };
 
         // Helper — compile then assert this is an Op::Create whose
-        // record decodes to the expected (id, v, name) tuple.
+        // record decodes to the expected (v, name) tuple with the
+        // expected pseudo row-id.
         let assert_create = |sql: &str, want_id: u128, want_v: i64,
                              want_name: &str| {
             let op = compile(sql, &cat).expect("compile paren VALUES");
@@ -3090,12 +3094,12 @@ mod tests {
                     let ot = cat.get(1).unwrap();
                     let v = kessel_codec::decode(ot, &record)
                         .expect("decode");
-                    let got_v = match v[1] {
+                    let got_v = match v[0] {
                         Value::Int(i) => i as i64,
-                        _ => panic!("v not Int for `{sql}`: {:?}", v[1]),
+                        _ => panic!("v not Int for `{sql}`: {:?}", v[0]),
                     };
                     assert_eq!(got_v, want_v, "v for `{sql}`");
-                    let got_name = match &v[2] {
+                    let got_name = match &v[1] {
                         Value::Blob(b) => {
                             // Char(16) is NUL-padded; trim the
                             // padding for the comparison.
@@ -3109,7 +3113,7 @@ mod tests {
                         Value::Null => String::new(),
                         _ => panic!(
                             "name not Blob/Null for `{sql}`: {:?}",
-                            v[2]
+                            v[1]
                         ),
                     };
                     assert_eq!(got_name, want_name, "name for `{sql}`");

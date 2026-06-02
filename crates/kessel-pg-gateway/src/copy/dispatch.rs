@@ -23,7 +23,10 @@ use crate::copy::binary::{
     BinaryDecoder, BinaryState,
 };
 use crate::copy::command::{ParsedCopy, RejectReason};
-use crate::copy::csv::{encode_csv_record, parse_csv_record, CsvOptions, CsvParseError};
+use crate::copy::csv::{
+    encode_csv_record, parse_csv_record, validate_numeric_text, CsvNumericError, CsvOptions,
+    CsvParseError,
+};
 use crate::copy::proto::{
     copy_tag, encode_copy_data, encode_copy_done, encode_copy_in_response,
     encode_copy_in_response_binary, encode_copy_out_response,
@@ -37,6 +40,7 @@ use crate::error::{encode_error_response, SEVERITY_ERROR};
 use crate::extq::binary_results::{encode_binary_value, BinaryEncodeError};
 use crate::extq::substitute::{binary_format_supported_for_oid, decode_binary_param};
 use crate::response::{encode_command_complete, encode_ready_for_query};
+use crate::proto::PG_TYPE_NUMERIC;
 use crate::types::field_kind_to_oid;
 
 /// Outcome of starting a COPY FROM STDIN exchange.
@@ -260,7 +264,16 @@ fn process_copy_data_text<E: EngineApply + ?Sized>(
             continue;
         }
         match parse_text_row_bytes(line, state.column_count as usize) {
-            Ok(fields) => {
+            Ok(mut fields) => {
+                // SP-PG-COPY-CSV-NUMERIC (2026-06-02) — validate +
+                // canonicalise NUMERIC columns BEFORE adding to the
+                // BULKAPPLY pending buffer. NULL fields pass through
+                // unchanged.
+                if let Err(fail_bytes) =
+                    validate_numeric_fields(&mut fields, &state, "text")
+                {
+                    return CopyDataOutcome::Failed { bytes: fail_bytes };
+                }
                 // SP-PG-COPY-BULKAPPLY V1 — buffer instead of dispatch.
                 state.pending_rows.push(fields);
                 if state.pending_rows.len() >= state.batch_size {
@@ -292,6 +305,89 @@ fn process_copy_data_text<E: EngineApply + ?Sized>(
     // Save the trailing incomplete bytes back into the carry.
     state.carry = bytes[consumed..].to_vec();
     CopyDataOutcome::Continue { state }
+}
+
+/// SP-PG-COPY-CSV-NUMERIC (2026-06-02) — walk a row's fields, and for
+/// every column whose PG type OID is `PG_TYPE_NUMERIC` (1700), run
+/// `validate_numeric_text` on the field's UTF-8 contents. On success,
+/// replace the field bytes with the canonical form (sign-normalised
+/// decimals; canonical mixed-case `NaN`/`Infinity`/`-Infinity`). On
+/// failure, return the ErrorResponse + RFQ bytes (caller emits +
+/// transitions to Idle).
+///
+/// NULL fields pass through unchanged so the column-omit auto-NULL
+/// fill semantics (SP-PG-COPY V1) keep working.
+///
+/// `format_label` is "text" or "csv" — embedded in the error message
+/// so the operator can tell which dispatch path surfaced the
+/// validation failure.
+fn validate_numeric_fields(
+    fields: &mut [Option<Vec<u8>>],
+    state: &CopyInState,
+    format_label: &str,
+) -> Result<(), Vec<u8>> {
+    let failing_row = state.rows_ingested + state.pending_rows.len() as u64 + 1;
+    for (i, f) in fields.iter_mut().enumerate() {
+        let kind = match state.column_kinds.get(i) {
+            Some(k) => *k,
+            None => continue,
+        };
+        if field_kind_to_oid(kind) != PG_TYPE_NUMERIC {
+            continue;
+        }
+        let Some(bytes) = f.as_ref() else { continue };
+        let s = match std::str::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => {
+                let col_name = state
+                    .columns
+                    .as_ref()
+                    .and_then(|c| c.get(i).cloned())
+                    .unwrap_or_else(|| format!("column_{i}"));
+                return Err(error_response_then_rfq(
+                    "22P02",
+                    &format!(
+                        "COPY {format_label} row {failing_row} column \"{col_name}\" NUMERIC: field is not valid UTF-8"
+                    ),
+                ));
+            }
+        };
+        match validate_numeric_text(s) {
+            Ok(canonical) => {
+                *f = Some(canonical.into_bytes());
+            }
+            Err(e) => {
+                let col_name = state
+                    .columns
+                    .as_ref()
+                    .and_then(|c| c.get(i).cloned())
+                    .unwrap_or_else(|| format!("column_{i}"));
+                let detail = match e {
+                    CsvNumericError::Empty => {
+                        "empty value (use \\N for NULL in text format, empty unquoted for CSV)"
+                            .to_string()
+                    }
+                    CsvNumericError::BadByte { position, byte } => {
+                        format!("bad byte 0x{byte:02X} at position {position}")
+                    }
+                    CsvNumericError::Malformed { reason } => {
+                        format!("malformed ({reason})")
+                    }
+                    CsvNumericError::ScientificNotation => {
+                        "scientific notation not supported in V1 (SP-PG-COPY-CSV-NUMERIC-SCI)"
+                            .to_string()
+                    }
+                };
+                return Err(error_response_then_rfq(
+                    "22P02",
+                    &format!(
+                        "COPY {format_label} row {failing_row} column \"{col_name}\" NUMERIC: {detail}"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// **SP-PG-COPY-CSV V1** — CSV-format CopyData processor. Uses the
@@ -328,10 +424,18 @@ fn process_copy_data_csv<E: EngineApply + ?Sized>(
                 // Convert Option<String> → Option<Vec<u8>> for the
                 // existing BULKAPPLY pipeline (per-row + multi-row
                 // INSERT synthesizers both consume Vec<Option<Vec<u8>>>).
-                let row: Vec<Option<Vec<u8>>> = fields
+                let mut row: Vec<Option<Vec<u8>>> = fields
                     .into_iter()
                     .map(|f| f.map(|s| s.into_bytes()))
                     .collect();
+                // SP-PG-COPY-CSV-NUMERIC (2026-06-02) — validate +
+                // canonicalise NUMERIC columns BEFORE adding to the
+                // BULKAPPLY pending buffer.
+                if let Err(fail_bytes) =
+                    validate_numeric_fields(&mut row, &state, "csv")
+                {
+                    return CopyDataOutcome::Failed { bytes: fail_bytes };
+                }
                 state.pending_rows.push(row);
                 if state.pending_rows.len() >= state.batch_size {
                     if let Some(fail_bytes) = flush_pending_batch(&mut state, engine) {

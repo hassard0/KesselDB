@@ -346,6 +346,150 @@ fn field_needs_quoting(bytes: &[u8], options: &CsvOptions) -> bool {
     false
 }
 
+// ─── SP-PG-COPY-CSV-NUMERIC (2026-06-02) ────────────────────────────
+//
+// Canonical-form validator for the text/CSV NUMERIC column type
+// (PG OID 1700). PG's text/CSV NUMERIC representation is the bare
+// decimal string the `numeric_out` function emits — `42`,
+// `12345.6789`, `-3.14`, `0.0001`. PG 14+ also accepts the special
+// values `NaN`, `Infinity`, `-Infinity` case-insensitively, and
+// normalises to the canonical mixed-case form. This validator
+// covers both surfaces so text + CSV COPY into a NUMERIC column
+// accepts the full grammar without dropping garbage through to the
+// kessel-sql layer (which would surface a confusing generic
+// parse_error).
+//
+// Companion design spec:
+// `docs/superpowers/specs/2026-06-02-kesseldb-sppgcopycsvnumeric-design.md`
+//
+// Scope: V1 covers finite decimals + NaN + ±Infinity. Scientific
+// notation is rejected with a precise V2-arc-pointing message
+// (`SP-PG-COPY-CSV-NUMERIC-SCI`). Arbitrary-precision values
+// beyond the kessel-sql i128 cap surface at INSERT time
+// (`SP-PG-COPY-NUMERIC-BIGNUM`).
+
+/// Errors `validate_numeric_text` can return. All map at the caller
+/// to PG SQLSTATE `22P02 invalid_text_representation`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CsvNumericError {
+    /// Empty string (or all-whitespace after trim).
+    Empty,
+    /// Non-decimal byte at the given (0-based) byte position.
+    BadByte { position: usize, byte: u8 },
+    /// Structural malformation (multiple decimal points, multiple
+    /// signs, sign-without-digits, …). `reason` is a static phrase
+    /// suitable for inclusion in the user-facing message.
+    Malformed { reason: &'static str },
+    /// Scientific notation rejected — V2 SP-PG-COPY-CSV-NUMERIC-SCI.
+    /// Distinct from `BadByte` so the caller can surface the
+    /// follow-up arc name in the rejection message.
+    ScientificNotation,
+}
+
+/// SP-PG-COPY-CSV-NUMERIC T1 — validate a text/CSV NUMERIC field's
+/// contents and return the canonical PG form.
+///
+/// **Accepted shapes:**
+/// - Finite decimals: `[+-]?(\d+(\.\d*)?|\.\d+)`. Sign normalised
+///   (`+42` → `42`); leading-dot (`.5`) and trailing-dot (`5.`)
+///   tolerated per PG; leading zeros preserved verbatim (the
+///   downstream kessel-sql parser normalises).
+/// - Case-insensitive specials: `NaN` / `Infinity` / `-Infinity` —
+///   accepted in any case (`nan`, `INF`, `+inf`, `-Infinity`, …) and
+///   returned in the canonical PG mixed-case form.
+///
+/// **Returns:** the canonical-form string. For finite values: the
+/// sign-normalised decimal text (NOT scientific). For specials: one
+/// of the three canonical strings.
+///
+/// **V1 out-of-scope** (rejects with the named variant):
+/// - Scientific notation (`1e10`) → `ScientificNotation` → V2
+///   `SP-PG-COPY-CSV-NUMERIC-SCI`.
+pub fn validate_numeric_text(s: &str) -> Result<String, CsvNumericError> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err(CsvNumericError::Empty);
+    }
+    // ── Special-string preamble (case-insensitive) ──────────────
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
+        "nan" => return Ok("NaN".to_string()),
+        "infinity" | "+infinity" | "inf" | "+inf" => {
+            return Ok("Infinity".to_string());
+        }
+        "-infinity" | "-inf" => return Ok("-Infinity".to_string()),
+        _ => {}
+    }
+    // ── Finite decimal grammar ───────────────────────────────────
+    let bytes = trimmed.as_bytes();
+    let mut i = 0usize;
+    let mut sign = b'+';
+    if bytes[0] == b'+' || bytes[0] == b'-' {
+        sign = bytes[0];
+        i += 1;
+        if i >= bytes.len() {
+            return Err(CsvNumericError::Malformed {
+                reason: "sign without digits",
+            });
+        }
+    }
+    let digits_start = i;
+    let mut saw_int_digit = false;
+    let mut saw_dot = false;
+    let mut saw_frac_digit = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'0'..=b'9' => {
+                if saw_dot {
+                    saw_frac_digit = true;
+                } else {
+                    saw_int_digit = true;
+                }
+                i += 1;
+            }
+            b'.' => {
+                if saw_dot {
+                    return Err(CsvNumericError::Malformed {
+                        reason: "multiple decimal points",
+                    });
+                }
+                saw_dot = true;
+                i += 1;
+            }
+            b'+' | b'-' => {
+                return Err(CsvNumericError::Malformed {
+                    reason: "multiple signs",
+                });
+            }
+            b'e' | b'E' => {
+                return Err(CsvNumericError::ScientificNotation);
+            }
+            other => {
+                return Err(CsvNumericError::BadByte {
+                    position: i,
+                    byte: other,
+                });
+            }
+        }
+    }
+    if !saw_int_digit && !saw_frac_digit {
+        return Err(CsvNumericError::Malformed {
+            reason: "no digits",
+        });
+    }
+    // Canonical form: drop a leading '+'; keep a leading '-' iff the
+    // value isn't all-zeros (so -0 becomes 0 — PG's numeric_out
+    // canonical form has no negative zero).
+    let digits_str = &trimmed[digits_start..];
+    let is_all_zero = digits_str
+        .as_bytes()
+        .iter()
+        .all(|&b| b == b'0' || b == b'.');
+    let prefix = if sign == b'-' && !is_all_zero { "-" } else { "" };
+    Ok(format!("{prefix}{digits_str}"))
+}
+
 /// Validate a CSV option's value is exactly one byte. Used by the
 /// `command::parse_with_options` extension to surface a clean error
 /// when the operator wrote e.g. `DELIMITER '||'`.
@@ -665,5 +809,197 @@ mod tests {
         assert_eq!(validate_single_byte("DELIMITER", "|").unwrap(), b'|');
         assert!(validate_single_byte("DELIMITER", "||").is_err());
         assert!(validate_single_byte("QUOTE", "").is_err());
+    }
+
+    // ─── SP-PG-COPY-CSV-NUMERIC validator KATs ──────────────────────────
+    //
+    // Companion design spec:
+    // `docs/superpowers/specs/2026-06-02-kesseldb-sppgcopycsvnumeric-design.md`
+
+    /// SP-PG-COPY-CSV-NUMERIC T1: bare integer.
+    #[test]
+    fn t1_numeric_validate_bare_integer() {
+        assert_eq!(validate_numeric_text("42").unwrap(), "42");
+    }
+
+    /// SP-PG-COPY-CSV-NUMERIC T1: signed finite decimal.
+    #[test]
+    fn t1_numeric_validate_signed_decimal() {
+        assert_eq!(validate_numeric_text("-3.14").unwrap(), "-3.14");
+    }
+
+    /// SP-PG-COPY-CSV-NUMERIC T1: large finite decimal.
+    #[test]
+    fn t1_numeric_validate_large_decimal() {
+        assert_eq!(validate_numeric_text("12345.6789").unwrap(), "12345.6789");
+    }
+
+    /// SP-PG-COPY-CSV-NUMERIC T1: small fractional.
+    #[test]
+    fn t1_numeric_validate_small_fractional() {
+        assert_eq!(validate_numeric_text("0.0001").unwrap(), "0.0001");
+    }
+
+    /// SP-PG-COPY-CSV-NUMERIC T1: leading `+` is stripped (sign
+    /// normalised to canonical PG form).
+    #[test]
+    fn t1_numeric_validate_strips_leading_plus() {
+        assert_eq!(validate_numeric_text("+42").unwrap(), "42");
+    }
+
+    /// SP-PG-COPY-CSV-NUMERIC T1: leading-dot fractional accepted
+    /// (PG tolerates this — `.5` ≡ `0.5`).
+    #[test]
+    fn t1_numeric_validate_leading_dot_fractional() {
+        assert_eq!(validate_numeric_text(".5").unwrap(), ".5");
+    }
+
+    /// SP-PG-COPY-CSV-NUMERIC T1: trailing-dot accepted (PG tolerates
+    /// `5.` as `5.0`).
+    #[test]
+    fn t1_numeric_validate_trailing_dot() {
+        assert_eq!(validate_numeric_text("5.").unwrap(), "5.");
+    }
+
+    /// SP-PG-COPY-CSV-NUMERIC T1: NaN case-insensitive accepted
+    /// (lowercase form).
+    #[test]
+    fn t1_numeric_validate_nan_lowercase() {
+        assert_eq!(validate_numeric_text("nan").unwrap(), "NaN");
+    }
+
+    /// SP-PG-COPY-CSV-NUMERIC T1: NaN canonical mixed-case
+    /// round-trips identity.
+    #[test]
+    fn t1_numeric_validate_nan_canonical() {
+        assert_eq!(validate_numeric_text("NaN").unwrap(), "NaN");
+    }
+
+    /// SP-PG-COPY-CSV-NUMERIC T1: NaN UPPERCASE accepted.
+    #[test]
+    fn t1_numeric_validate_nan_uppercase() {
+        assert_eq!(validate_numeric_text("NAN").unwrap(), "NaN");
+    }
+
+    /// SP-PG-COPY-CSV-NUMERIC T1: Infinity case-insensitive
+    /// (lowercase + alias `inf` + `+inf`).
+    #[test]
+    fn t1_numeric_validate_infinity_variants() {
+        assert_eq!(validate_numeric_text("infinity").unwrap(), "Infinity");
+        assert_eq!(validate_numeric_text("INFINITY").unwrap(), "Infinity");
+        assert_eq!(validate_numeric_text("Infinity").unwrap(), "Infinity");
+        assert_eq!(validate_numeric_text("+Infinity").unwrap(), "Infinity");
+        assert_eq!(validate_numeric_text("inf").unwrap(), "Infinity");
+        assert_eq!(validate_numeric_text("+inf").unwrap(), "Infinity");
+        assert_eq!(validate_numeric_text("INF").unwrap(), "Infinity");
+    }
+
+    /// SP-PG-COPY-CSV-NUMERIC T1: -Infinity case-insensitive
+    /// (lowercase + alias `-inf`).
+    #[test]
+    fn t1_numeric_validate_neg_infinity_variants() {
+        assert_eq!(validate_numeric_text("-infinity").unwrap(), "-Infinity");
+        assert_eq!(validate_numeric_text("-Infinity").unwrap(), "-Infinity");
+        assert_eq!(validate_numeric_text("-INFINITY").unwrap(), "-Infinity");
+        assert_eq!(validate_numeric_text("-inf").unwrap(), "-Infinity");
+        assert_eq!(validate_numeric_text("-INF").unwrap(), "-Infinity");
+    }
+
+    /// SP-PG-COPY-CSV-NUMERIC T1: garbage rejects with BadByte at
+    /// the offending position.
+    #[test]
+    fn t1_numeric_validate_garbage_rejects() {
+        match validate_numeric_text("hello") {
+            Err(CsvNumericError::BadByte { position, byte }) => {
+                assert_eq!(position, 0);
+                assert_eq!(byte, b'h');
+            }
+            other => panic!("expected BadByte at 0, got {other:?}"),
+        }
+    }
+
+    /// SP-PG-COPY-CSV-NUMERIC T1: multiple decimal points reject as
+    /// Malformed.
+    #[test]
+    fn t1_numeric_validate_multi_dot_rejects() {
+        match validate_numeric_text("1.2.3") {
+            Err(CsvNumericError::Malformed { reason }) => {
+                assert!(reason.contains("decimal"));
+            }
+            other => panic!("expected Malformed for multi-dot, got {other:?}"),
+        }
+    }
+
+    /// SP-PG-COPY-CSV-NUMERIC T1: empty string rejects with Empty.
+    #[test]
+    fn t1_numeric_validate_empty_rejects() {
+        assert_eq!(validate_numeric_text(""), Err(CsvNumericError::Empty));
+        // Whitespace-only also rejects as Empty (trim).
+        assert_eq!(validate_numeric_text("   "), Err(CsvNumericError::Empty));
+    }
+
+    /// SP-PG-COPY-CSV-NUMERIC T1: scientific notation rejects with
+    /// the precise `ScientificNotation` variant (so the caller can
+    /// name the V2 arc `SP-PG-COPY-CSV-NUMERIC-SCI` in the
+    /// user-facing message).
+    #[test]
+    fn t1_numeric_validate_scientific_notation_rejects() {
+        assert_eq!(
+            validate_numeric_text("1e10"),
+            Err(CsvNumericError::ScientificNotation)
+        );
+        assert_eq!(
+            validate_numeric_text("2E-3"),
+            Err(CsvNumericError::ScientificNotation)
+        );
+    }
+
+    /// SP-PG-COPY-CSV-NUMERIC T1: multiple signs (e.g. `--5`) reject
+    /// as Malformed.
+    #[test]
+    fn t1_numeric_validate_multi_sign_rejects() {
+        match validate_numeric_text("--5") {
+            Err(CsvNumericError::Malformed { reason }) => {
+                assert!(reason.contains("sign"));
+            }
+            other => panic!("expected Malformed for multi-sign, got {other:?}"),
+        }
+    }
+
+    /// SP-PG-COPY-CSV-NUMERIC T1: sign-without-digits rejects.
+    #[test]
+    fn t1_numeric_validate_lone_sign_rejects() {
+        match validate_numeric_text("+") {
+            Err(CsvNumericError::Malformed { reason }) => {
+                assert!(reason.contains("digits"));
+            }
+            other => panic!("expected Malformed for lone sign, got {other:?}"),
+        }
+        match validate_numeric_text("-") {
+            Err(CsvNumericError::Malformed { reason }) => {
+                assert!(reason.contains("digits"));
+            }
+            other => panic!("expected Malformed for lone sign, got {other:?}"),
+        }
+    }
+
+    /// SP-PG-COPY-CSV-NUMERIC T1: lone dot rejects as Malformed
+    /// (no digits on either side).
+    #[test]
+    fn t1_numeric_validate_lone_dot_rejects() {
+        match validate_numeric_text(".") {
+            Err(CsvNumericError::Malformed { reason }) => {
+                assert!(reason.contains("digits"));
+            }
+            other => panic!("expected Malformed for lone dot, got {other:?}"),
+        }
+    }
+
+    /// SP-PG-COPY-CSV-NUMERIC T1: negative zero canonicalises to
+    /// `0` (PG's numeric_out canonical form has no negative zero).
+    #[test]
+    fn t1_numeric_validate_negative_zero_canonicalises() {
+        assert_eq!(validate_numeric_text("-0").unwrap(), "0");
+        assert_eq!(validate_numeric_text("-0.00").unwrap(), "0.00");
     }
 }

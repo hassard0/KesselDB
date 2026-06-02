@@ -97,7 +97,9 @@ Optional / V2 follow-ups (each its own arc):
 - **SP-PG-EXTQ-BIN-NUMERIC-BIGNUM (V2)** — arbitrary-precision NUMERIC.
 - **SP-PG-EXTQ-BIN-NUMERIC-NAN (V2)** — NaN binary support.
 - **SP-PG-EXTQ-BIN-NUMERIC-INF (V2)** — ±Infinity binary (PG 14+).
-- **SP-PG-COPY-BIN-NUMERIC (preserved)** — NUMERIC inside COPY frames.
+- ~~**SP-PG-COPY-BIN-NUMERIC (preserved)**~~ — **CLOSED at V1
+  (2026-06-02)** — see
+  `2026-06-02-kesseldb-subproject-sppgcopybinnumeric-progress.md`.
 
 ## T1+T2 — what landed (2026-06-02, commit `c637519`)
 

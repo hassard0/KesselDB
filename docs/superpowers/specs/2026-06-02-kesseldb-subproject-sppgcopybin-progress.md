@@ -247,7 +247,10 @@ consistent.
 ## V2 follow-ups (each its own arc — listed here for the SP-PG
 parent arc's running follow-up index)
 
-- **`SP-PG-COPY-BIN-NUMERIC`** — binary NUMERIC encoding.
+- ~~**`SP-PG-COPY-BIN-NUMERIC`**~~ — **CLOSED at V1 (2026-06-02)** —
+  see `2026-06-02-kesseldb-subproject-sppgcopybinnumeric-progress.md`.
+  Reuses the SP-PG-EXTQ-BIN-NUMERIC codec; dispatch wire-up only,
+  no new codec.
 - **`SP-PG-COPY-BIN-OID`** — optional OID-column flag bit.
 - **`SP-PG-COPY-BIN-EXTRA`** — UUID / JSONB / ARRAY binary encoding.
 - **`SP-PG-COPY-BIN-DIRECT`** — typed parameter binding (skip the

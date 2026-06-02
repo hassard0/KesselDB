@@ -383,6 +383,51 @@ at dispatch entry, JDBC simple-mode unblocked.
   additive). Smoke transcript:
   `docs/superpowers/sppgextqbinnumeric-t4-smoke-2026-06-02.txt`.
   **Arc closed — TaskList #367 ready for completion.**
+- **Track A.-1.5 — PostgreSQL COPY binary-format NUMERIC (SP-PG-COPY-BIN-NUMERIC V1 SHIPPED at T3 — 2026-06-02).**
+  Closes the V2 follow-up named in SP-PG-COPY-BIN V1 (2026-06-02) and
+  deliberately preserved through SP-PG-EXTQ-BIN-NUMERIC V1 (2026-06-02)
+  — both arcs documented the COPY-BIN-NUMERIC pre-reject as a clean,
+  independently-enablable follow-up because COPY's per-row framing has
+  different recovery semantics from extended-query Bind/Execute. This
+  arc removes the explicit `oid == PG_TYPE_NUMERIC` pre-reject arms in
+  `copy/dispatch.rs::dispatch_copy_in_start` + `dispatch_copy_to`,
+  leaving the standard `binary_format_supported_for_oid` consultation
+  in place. The predicate already returns `true` for `PG_TYPE_NUMERIC`
+  after SP-PG-EXTQ-BIN-NUMERIC T3, and the per-row encode/decode call
+  sites in `process_copy_data_binary` + the COPY-TO binary branch
+  already dispatch through `extq::substitute::decode_binary_param` /
+  `extq::binary_results::encode_binary_value`, both of which delegate
+  to `extq::binary_numeric::{decode_numeric_binary, encode_numeric_binary}`
+  for NUMERIC. **No new codec lands.** **HEADLINE on vulcan: psql
+  16.14 COPY NUMERIC binary round-trip PASS**: CREATE TABLE
+  `num_bin (id I64, amount I128)` + INSERT 4 rows (42, 100,
+  999999999, 0) + `COPY num_bin TO STDOUT WITH (FORMAT binary)`
+  emits 135 bytes (canonical PGCOPY signature + 4 binary rows with
+  `numeric_send`-shape NUMERIC payloads + EOD `ff ff`) + `COPY
+  num_bin2 FROM STDIN WITH (FORMAT binary)` returns `COPY 4` + SELECT
+  shows the same row set + re-export `md5sum` match
+  (`18e15ae0e38be860d4b10a45412ff8eb`) byte-equal to original.
+  Negative-value sub-smoke: INSERT (5, -7) round-trips through COPY
+  TO + COPY FROM into a third table with the negative preserved
+  (sign=0x4000). +7 KATs (`t1num_*` in `copy::dispatch::tests`):
+  encoder/decoder byte-equality vs the underlying codec, admission
+  flip on both FROM and TO directions, single-row TO emits canonical
+  bytes for the NUMERIC payload, single-row FROM ingests row with
+  bare-decimal INSERT synthesis, and a 6-value round-trip identity
+  through both dispatch call sites. NUMERIC out-of-range / NaN /
+  +Infinity continue to reject at the per-row codec layer with the
+  inherited `SP-PG-EXTQ-BIN-NUMERIC-{BIGNUM,NAN,INF}` arc names;
+  UUID / JSONB / ARRAY columns continue to pre-reject at COPY-start
+  with the unchanged `SP-PG-COPY-BIN-EXTRA` arc name. Workspace
+  tests: `kessel-pg-gateway` lib 822 -> 829 (+7). Commits: `0e52104`
+  (T1+T2 design spec + dispatch wire-up + 7 KATs), `97a613c` (T3
+  vulcan smoke + USAGE update + smoke transcript). seed-7 GREEN;
+  zero new external deps; `#![forbid(unsafe_code)]` honored;
+  HTTP/1.1 + WS + binary + PG-wire surfaces byte-untouched (NUMERIC
+  was V1-Unsupported on COPY-BIN, so the new path is strictly
+  additive). Smoke transcript:
+  `docs/superpowers/sppgcopybinnumeric-t3-smoke-2026-06-02.txt`.
+  **Arc closed — TaskList #370 ready for completion.**
 - **Track A.-2 — CHAR(N) padding-aware equality + range (SP-CHAR-PAD-COMPARE V1 SHIPPED at T2 — 2026-06-02).**
   Closes the V2 follow-up named in the SP-PG-EXTQ-BIN-RESULTS T3
   smoke (`docs/superpowers/sppgextqbinr-t3-smoke-2026-06-01.txt`
@@ -586,10 +631,11 @@ at dispatch entry, JDBC simple-mode unblocked.
   end-of-data marker. **Same 10 supported types as SP-PG-EXTQ-BIN-RESULTS** (BOOL,
   INT2/INT4/INT8, FLOAT4/FLOAT8, TEXT/VARCHAR, BYTEA, TIMESTAMPTZ) via direct
   reuse of `extq::binary_results::encode_binary_value` (TO) and
-  `extq::substitute::decode_binary_param` (FROM). Tables with NUMERIC / UUID /
-  JSONB / ARRAY columns pre-rejected at COPY-start with precise V2-arc-pointing
-  `0A000` messages (`SP-PG-COPY-BIN-NUMERIC` / `SP-PG-COPY-BIN-EXTRA`); session
-  stays alive. Inherits SP-PG-COPY-BULKAPPLY V1 batching throughput (binary
+  `extq::substitute::decode_binary_param` (FROM). **NUMERIC since closed
+  through SP-PG-COPY-BIN-NUMERIC V1 (2026-06-02 — Track A.-1.5).**
+  Tables with UUID / JSONB / ARRAY columns continue to pre-reject at
+  COPY-start with precise V2-arc-pointing `0A000` messages
+  (`SP-PG-COPY-BIN-EXTRA`); session stays alive. Inherits SP-PG-COPY-BULKAPPLY V1 batching throughput (binary
   values are decoded back to text before the existing per-row INSERT synthesizer
   — trade-off named in design §9.1 as the V2 `SP-PG-COPY-BIN-DIRECT` lift).
   **HEADLINE on vulcan: psql 16.14 `CREATE TABLE` + INSERT seed + `COPY t TO

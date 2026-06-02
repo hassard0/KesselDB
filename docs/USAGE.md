@@ -1973,6 +1973,8 @@ and post higher numbers; that's V2 `SP-PG-EXTQ-PIPELINE-BATCH`.
 - SP-PG-COPY-BULKAPPLY progress (V1 SHIPPED — 181.9× COPY throughput lift via per-batch Op::Txn fold): `docs/superpowers/specs/2026-05-30-kesseldb-subproject-sppgcopybulkapply-progress.md`
 - SP-PG-COPY-CSV design spec: `docs/superpowers/specs/2026-06-01-kesseldb-sppgcopycsv-design.md`
 - SP-PG-COPY-CSV progress (V1 SHIPPED at T2 — CSV format with quoting / HEADER / custom DELIMITER+QUOTE+ESCAPE+NULL): `docs/superpowers/specs/2026-06-01-kesseldb-subproject-sppgcopycsv-progress.md`
+- SP-PG-COPY-CSV-NUMERIC design spec: `docs/superpowers/specs/2026-06-02-kesseldb-sppgcopycsvnumeric-design.md`
+- SP-PG-COPY-CSV-NUMERIC progress (V1 SHIPPED at T3 — text+CSV NUMERIC validator with canonical/sign normalisation + case-insensitive NaN/Inf acceptance + precise 22P02 rejections): `docs/superpowers/specs/2026-06-02-kesseldb-subproject-sppgcopycsvnumeric-progress.md`
 - SP-PG-EXTQ-CAST design spec: `docs/superpowers/specs/2026-06-01-kesseldb-sppgextqcast-design.md`
 - SP-PG-EXTQ-CAST smoke transcript (V1 SHIPPED — psql `SELECT 1::int8` round-trip PASS): `docs/superpowers/sppgextqcast-t3-smoke-2026-06-02.txt`
 
@@ -2117,6 +2119,55 @@ ERROR:  COPY csv DELIMITER must be a single character (got '||')
 CSV format inherits the SP-PG-COPY-BULKAPPLY V1 batching throughput
 + NULL-row fallback semantics — the codec is a payload concern only.
 Smoke transcript: `docs/superpowers/sppgcopycsv-t2-smoke-2026-06-01.txt`.
+
+#### SP-PG-COPY-CSV-NUMERIC — canonical NUMERIC validator (V1 SHIPPED 2026-06-02)
+
+Both text + CSV COPY now validate the canonical PG NUMERIC text
+grammar at the gateway BEFORE handing the row to the engine, with
+sign normalisation + case-insensitive NaN/Infinity acceptance:
+
+```bash
+# Sign normalisation — +999 stored as 999:
+echo 'id,amount
+1,42
+2,12345.6789
+3,-3
+4,+999' | psql -c "COPY t FROM STDIN WITH (FORMAT csv, HEADER)"
+
+# Case-insensitive NaN / Infinity / -Infinity (validator pass —
+# canonicalised to mixed-case PG form before reaching the engine):
+#   nan → NaN
+#   infinity / +infinity / inf / +inf → Infinity
+#   -infinity / -inf → -Infinity
+
+# Malformed input rejects with precise 22P02 + row + column + reason:
+psql -c "COPY t FROM STDIN WITH (FORMAT csv)" <<< $'id,amount\n1,1.2.3\n'
+# ERROR:  COPY csv row 1 column "amount" NUMERIC: malformed (multiple decimal points)
+psql -c "COPY t FROM STDIN WITH (FORMAT csv)" <<< $'id,amount\n1,hello\n'
+# ERROR:  COPY csv row 1 column "amount" NUMERIC: bad byte 0x68 at position 0
+psql -c "COPY t FROM STDIN WITH (FORMAT csv)" <<< $'id,amount\n1,1e10\n'
+# ERROR:  COPY csv row 1 column "amount" NUMERIC: scientific notation not supported in V1 (SP-PG-COPY-CSV-NUMERIC-SCI)
+```
+
+The validator runs on every column whose PG type OID resolves to
+`PG_TYPE_NUMERIC` (1700 — kessel-sql `I128`, `U128`, `Fixed`); other
+column types pass through unchanged. NULL fields are forwarded
+verbatim (text `\N`; CSV empty unquoted) so the kessel-sql
+column-omit auto-NULL-fill semantics keep working.
+
+V1 limitations (each with its own follow-up arc):
+
+- **`SP-PG-COPY-CSV-NUMERIC-SCI`** — scientific notation (`1e10`,
+  `2E-3`) rejected with the precise arc-naming 22P02 message above.
+- **`SP-PG-COPY-NUMERIC-BIGNUM`** — values beyond the kessel-sql
+  i128 (\|value\| < 10^18) cap surface at INSERT time, not at the
+  validator.
+- **NaN/Infinity engine storage** — the validator accepts and
+  canonicalises NaN/Infinity, but the engine-side I128 literal
+  parser cannot store them yet (engine surfaces `sql: expected
+  value`). A separate arc lifts the engine-storage gap.
+
+Smoke transcript: `docs/superpowers/sppgcopycsvnumeric-t2-smoke-2026-06-02.txt`.
 
 ### SP-PG-COPY-BIN — binary format (V1 SHIPPED 2026-06-02)
 

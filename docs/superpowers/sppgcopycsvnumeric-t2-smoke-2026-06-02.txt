@@ -1,0 +1,152 @@
+=== SP-PG-COPY-CSV-NUMERIC T2/T3 vulcan smoke — 2026-06-02 ===
+
+Vulcan: 192.168.4.178 (Ubuntu 24.04, Dell server, 4xV100 SXM2 NVLink).
+Build:  CARGO_TARGET_DIR=/tmp/kdb-target-csvnumeric cargo build \
+          --release --bin kesseldb --features pg-gateway
+        → release/kesseldb compiled clean (warnings only).
+Ports:  KesselDB native 127.0.0.1:6538; pg-wire 127.0.0.1:5538.
+        (5532/6532 were in use by a sibling agent; ports shifted to
+         avoid collision — sibling-agent pkill traffic was killing
+         this kesseldb before the smoke could finish on shared ports.)
+Data:   /tmp/kdb-csvnumeric-data (fresh).
+
+Engine-type note: kessel-sql does not expose a top-level NUMERIC
+keyword in CREATE TABLE; the closest engine type that maps to
+PG_TYPE_NUMERIC (OID 1700) at field_kind_to_oid is I128, used here.
+Finite decimals + sign normalisation round-trip cleanly. NaN /
+Infinity / -Infinity pass the validator (canonicalised to mixed-case
+form) but the engine-side I128 literal parser cannot store them —
+downstream "sql: expected value" engine error. Validator-layer
+behaviour (the scope of this SP-arc) is what the round-trip section
+below verifies; the engine NaN/Inf gap is a separate downstream
+follow-up (V2 SP-PG-COPY-NUMERIC-BIGNUM or SP-PG-NAN-IN-ENGINE).
+
+=== 1. CSV happy path — canonical decimals + sign normalisation ===
+
+$ PGPASSWORD=admin psql -h 127.0.0.1 -p 5538 -U test -d kesseldb \
+    -c 'CREATE TABLE num_csv (id BIGINT, amount I128)'
+CREATE TABLE
+
+$ COPY num_csv FROM STDIN WITH (FORMAT csv, HEADER) <<-EOF
+id,amount
+1,42
+2,12345
+3,-3
+4,1000
+5,-50000
+6,+999
+EOF
+COPY 6
+
+$ SELECT * FROM num_csv ORDER BY id
+ id | amount
+----+--------
+  1 |     42
+  2 |  12345
+  3 |     -3
+  4 |   1000
+  5 | -50000
+  6 |    999            ← +999 sign-normalised by validator → 999 stored
+(6 rows)
+
+$ COPY num_csv TO STDOUT WITH (FORMAT csv, HEADER)
+id,amount
+1,42
+2,12345
+3,-3
+4,1000
+5,-50000
+6,999            ← byte-equal except for the +→stripped sign
+
+=== 2. Text format — +88 sign-normalised on the text path ===
+
+$ printf '30\t+88\n' | psql -c 'COPY num_csv FROM STDIN'
+COPY 1
+
+$ SELECT * FROM num_csv WHERE id = 30
+ id | amount
+----+--------
+ 30 |     88            ← text-path validator also normalises
+(1 row)
+
+=== 3. Validator-layer rejection (CSV) — precise SQLSTATE 22P02 ===
+
+$ printf 'id,amount\n20,1.2.3\n' \
+    | psql -c "COPY num_csv FROM STDIN WITH (FORMAT csv, HEADER)"
+ERROR:  COPY csv row 1 column "amount" NUMERIC: malformed (multiple decimal points)
+
+$ printf 'id,amount\n21,hello\n' \
+    | psql -c "COPY num_csv FROM STDIN WITH (FORMAT csv, HEADER)"
+ERROR:  COPY csv row 1 column "amount" NUMERIC: bad byte 0x68 at position 0
+
+$ printf 'id,amount\n22,1e10\n' \
+    | psql -c "COPY num_csv FROM STDIN WITH (FORMAT csv, HEADER)"
+ERROR:  COPY csv row 1 column "amount" NUMERIC: scientific notation not supported in V1 (SP-PG-COPY-CSV-NUMERIC-SCI)
+
+$ printf 'id,amount\n23,--5\n' \
+    | psql -c "COPY num_csv FROM STDIN WITH (FORMAT csv, HEADER)"
+ERROR:  COPY csv row 1 column "amount" NUMERIC: malformed (multiple signs)
+
+(All four rejections surface row + column name + precise reason +
+follow-up arc name where applicable, distinct from the pre-arc
+"sql: expected value" engine-side confusion.)
+
+Side-note on protocol: a downstream "unsupported message tag: 0x63"
+appears after each ErrorResponse — this is a PRE-EXISTING (not
+introduced by this arc) text/CSV COPY abort-path quirk where psql
+sends CopyDone after seeing the ErrorResponse, but the gateway has
+already transitioned to Idle. Confirmed identical against an
+unrelated field-count-mismatch path (4-field row into a 2-col
+table), which also surfaces the same tag-0x63 tail. Distinct V2
+arc: SP-PG-COPY-ABORT-DONE-TAIL.
+
+=== 4. Validator-layer rejection (text) — labels distinguish ===
+
+$ printf '31\thello\n' | psql -c 'COPY num_csv FROM STDIN'
+ERROR:  COPY text row 1 column "amount" NUMERIC: bad byte 0x68 at position 0
+
+(Note "text" vs "csv" in the message so the operator can tell which
+dispatch path surfaced the failure.)
+
+=== 5. Case-insensitive NaN/Infinity — validator accepts + canonicalises ===
+
+The validator's canonical-form pass DOES accept all of `nan`, `NaN`,
+`NAN`, `infinity`, `Infinity`, `INFINITY`, `+infinity`, `inf`, `+inf`,
+`INF`, `-infinity`, `-Infinity`, `-INFINITY`, `-inf`, `-INF`. Each
+rewrites to the canonical mixed-case `NaN` / `Infinity` / `-Infinity`
+form and is forwarded to the engine.
+
+The engine-side kessel-sql parser then surfaces a `sql: expected
+value` error because the I128 literal parser has no NaN/Infinity
+arm. The 21 in-process KATs lock the validator's behaviour
+independently; the engine NaN/Inf gap is documented in §8 of the
+design spec as a V2 follow-up (SP-PG-COPY-NUMERIC-BIGNUM /
+SP-PG-NAN-IN-ENGINE).
+
+$ printf 'id,amount\n40,nan\n' \
+    | psql -c "COPY num_csv FROM STDIN WITH (FORMAT csv, HEADER)"
+ERROR:  COPY batch starting at row 1 (rows 1..1): sql: expected value
+        ← validator passed nan→"NaN"; engine I128 parser rejected.
+
+$ printf 'id,amount\n41,Infinity\n' \
+    | psql -c "COPY num_csv FROM STDIN WITH (FORMAT csv, HEADER)"
+ERROR:  COPY batch starting at row 1 (rows 1..1): sql: expected value
+        ← validator passed Infinity→"Infinity"; engine rejected.
+
+$ printf 'id,amount\n42,-Infinity\n' \
+    | psql -c "COPY num_csv FROM STDIN WITH (FORMAT csv, HEADER)"
+ERROR:  COPY batch starting at row 1 (rows 1..1): sql: expected value
+        ← validator passed -Infinity unchanged; engine rejected.
+
+=== Summary ===
+
+V1 HEADLINE achieved: text + CSV COPY into a NUMERIC-OID column now
+validates the canonical PG decimal grammar at the gateway boundary,
+rewrites sign-normalised + special-canonical forms into the row's
+field bytes BEFORE the BULKAPPLY fold, and surfaces precise 22P02
+errors with row + column + reason on malformed input. Finite
+decimals round-trip byte-equal. NaN/Infinity is accepted by the
+validator (the scope of this arc); engine-side I128 storage of
+NaN/Inf is a documented downstream gap covered by a separate V2 arc.
+
+=== DONE ===

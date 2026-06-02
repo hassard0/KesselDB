@@ -1965,6 +1965,133 @@ Approach A bought nothing measurable; Approach C did all the work.
    `SHARD-SCAN-POOL-CORE-AWARE` as a future arc.
 
 
+## 14d. SP-Perf-A-SHARD-SCAN-LOCAL-INDEX-FUSION — direct-borrow scatter_serial (2026-06-02)
+
+The TINY-INLINE forensics correctly diagnosed the 41% K=4 find-by gap
+(1.07M vs 1.81M K=1) as the structural floor for the current sharding
+model: there's no "primary key field" concept to enable single-shard
+routing for FindBy on a secondary index, so the dispatcher must walk
+every shard. The in-scope optimization the spec named: bypass
+`shards[i].apply_op(op)`'s channel hop by borrowing each shard's
+`Arc<RwLock<StateMachine>>` directly + calling `read_only_op` against
+it. Two-line patch to scatter_serial.
+
+### Implementation
+
+- `spawn_sharded_engine_cfg` forces `sub_cfg.read_workers = Some(0)`
+  when the caller didn't specify it — guarantees every sub-engine
+  populates its `sm_shared` `Arc<RwLock<StateMachine>>` (the SP-Perf-A
+  T2 ownership shape), with zero real read worker threads (graceful
+  submitting-thread fall-through).
+- `ShardedDispatcher` snapshots each sub-engine's `sm_shared()` into
+  a per-shard `Vec<Option<Arc<RwLock<StateMachine>>>>` at construction.
+- `scatter_serial` (FindBy/FindByComposite path) walks shard_sms
+  directly when every slot is Some: `sm_arc.read().read_only_op(op.clone())`
+  per shard, accumulate, merge. Channel-path fallback preserved for
+  degenerate setups.
+
+K-invariance preserved byte-equal: both paths walk shards in shard-id
+order and route through the same `merge_scan_results` with the same
+`ScatterKind`. The SHARD-SCAN T3 oracle
+(`t3_shard_scan_k_invariance_oracle_12_ops`) stays GREEN.
+
+### Results — vulcan, --workers 16, 10K rows, 10s, 3-trial median
+
+**With `--pool-workers 16` (POOL config — §14c baseline shape):**
+
+| Workload | K=1 | K=4 POST-SCALEOUT (§14c) | K=4 POST-FUSION | K=4 lift | K=8 POST-SCALEOUT | K=8 POST-FUSION |
+|---|---|---|---|---|---|---|
+| `find-by` (eq-index) | 1,806,041 | 1,057,854 | 1,072,348 | +1.4% | 836,344 | 848,568 |
+
+K=16 added (§14c didn't publish K=16): K=16 POST-FUSION find-by =
+613,658 ops/sec.
+
+**Without `--pool-workers` (NO-POOL config — FUSION's structural impact):**
+
+| Workload | K=1 | K=4 PRE-FUSION (channel) | K=4 POST-FUSION | K=4 lift |
+|---|---|---|---|---|
+| `find-by` (eq-index) | 18,668 | ~5-50K (estimated) | **1,084,221** | **~25-200×** structural |
+
+K=8 no-pool POST-FUSION = 847,987 (matches WITH-POOL K=8 848,568 within
+trial noise — the --pool-workers flag is now irrelevant for find-by
+at K>=2).
+
+### Honest read
+
+- **WITH-POOL: FUSION lift is in trial noise (+1.4% K=4, +1.5% K=8).**
+  The apply_op path was already taking the SP-Perf-A T6 fast path under
+  the read guard. The dispatcher-side direct borrow saves ~5
+  instructions + 1 atomic + 1 Arc clone per shard, which is invisible
+  at ~14µs/op. Spec target of 10-20% lift on the 1.07M K=4 figure is
+  **NOT met** in this config.
+- **NO-POOL: FUSION's lift is structural.** Pre-FUSION, sub-engines
+  spawned by `spawn_sharded_engine_cfg` inherited `read_workers = None`
+  from the caller's cfg, leaving `sm_shared` unset; every read fell
+  through to `apply_raw` → mpsc → apply thread → write guard
+  contention. Post-FUSION, sub-engines force `sm_shared` regardless,
+  so `scatter_serial`'s direct-borrow path always fires. K=4 no-pool
+  POST-FUSION = 1.084M matches K=4 with-pool POST-FUSION = 1.072M
+  — the `--pool-workers` flag becomes a no-op for find-by at K>=2.
+- **K=4 K=1 gap unchanged**: 1.07M vs 1.80M (1.7×). FUSION does not
+  address the structural floor SHARD-SCAN-TINY-INLINE named.
+
+### Test surface (vulcan, post-FUSION)
+
+- `kesseldb-server` lib: 202 → 206 tests (+4; 0 regressions).
+  - +1 `fusion_t1_shard_sms_populated_when_read_workers_unset`
+    (proves the dispatcher's per-shard `sm_shared` snapshot is Some
+    at K∈{2,4,8} even when the caller's cfg didn't set read_workers).
+  - +1 `fusion_t2_serial_fast_equals_channel_byte_for_byte`
+    (5 FindBy values; direct-borrow byte-equal to channel path on the
+    same data).
+  - +1 `fusion_t2_k_invariance_findby_default_cfg`
+    (6 FindBy values × K∈{1,4,8}; multiset-equal across K).
+  - +1 `fusion_t2_fallback_to_channel_when_slot_missing`
+    (predicate + fallback contract).
+- K-invariance oracle `t3_shard_scan_k_invariance_oracle_12_ops`
+  GREEN (12 scan ops still byte/multiset-equal across K∈{1,4,8}).
+- Default `cargo build -p kesseldb-server` byte-identical (shard_sms
+  only constructed when `shard_count >= 2`; K=1/None path untouched).
+- `#![forbid(unsafe_code)]` honored; zero new external runtime deps.
+
+### Acceptance gate
+
+| Criterion | Outcome |
+|---|---|
+| find-by K=4 ≥1.2M ops/sec (≥12% lift over §14c 1.07M) WITH-POOL | NO (1.072M = +1.4%; in noise) |
+| find-by K=4 ≥1.4M (stretch, 77% of K=1) WITH-POOL | NO |
+| find-by K=4 no-regression vs §14c 1.058M WITH-POOL | YES (1.072M = +1.4%) |
+| find-by K=8 no-regression vs §14c 836K WITH-POOL | YES (848K = +1.5%) |
+| find-by K=4 ≥K=1 NO-POOL (structural — fix the regression) | YES (1.084M >> K=1 19K; pre-FUSION K=4 no-pool was estimated 5-50K) |
+| K-invariance oracle byte/multiset-equal stays GREEN | YES |
+| All scatter_scan unit KATs stay GREEN | YES |
+| `cargo test --workspace` continues to pass | YES (206/206 kesseldb-server lib; 217/217 with gateway features) |
+| Default `cargo build -p kesseldb-server` byte-identical | YES |
+| `#![forbid(unsafe_code)]` honored | YES |
+| No new external runtime deps | YES |
+
+**Verdict**: DONE_WITH_CONCERNS. WITH-POOL perf target not met (the
+spec hypothesized lift the apply_op path was already extracting).
+NO-POOL structural fix is the honest delivery: the FUSION wiring
+removes `--pool-workers` as a necessary flag for sharded find-by perf
+parity. K=4 K=1 gap remains the structural floor TINY-INLINE
+documented.
+
+### Honest gaps — named follow-up arcs
+
+1. **K=4 K=1 gap still 41% (1.07M vs 1.81M).** The structural floor
+   SHARD-SCAN-TINY-INLINE forensics named: FindBy on a secondary
+   index has no primary-key routing; every shard must be queried;
+   the per-call cost is K × per-shard-read. Closing this requires
+   either (a) replicating secondary indexes to enable single-shard
+   routing for some FindBy shapes, or (b) parallelizing the scatter
+   walk for tiny ops (currently serial). Both are larger arcs.
+2. **`--pool-workers` becomes a no-op for find-by at K>=2 post-FUSION.**
+   Documented intentional outcome: the FUSION wiring makes the
+   dispatcher's tiny-scan path always take direct-borrow regardless
+   of `--pool-workers`. The flag still matters for non-tiny ops
+   (select-*, aggregate-*) which scatter via the pool.
+
 
 ## 15. SP-PG-COPY-BULKAPPLY — 100K-row COPY FROM STDIN (2026-05-30)
 

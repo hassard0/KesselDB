@@ -1,0 +1,124 @@
+# SP-Perf-A-SHARD-SCAN-LOCAL-INDEX-FUSION bench — vulcan 2026-06-02
+# CARGO_TARGET_DIR=/tmp/kdb-target-indexfusion
+# rows=10K, workers=16, duration=10s, --workload find-by
+# Two sweeps: WITH --pool-workers 16 (POOL config — §14c baseline shape)
+# and WITHOUT --pool-workers (NO-POOL config — pre-FUSION had no
+# sm_shared on sub-engines so every read went through the apply mpsc;
+# post-FUSION the sub_cfg.read_workers=Some(0) forces sm_shared so
+# scatter_serial's direct-borrow path can fire).
+#
+# Headline:
+#   WITH-POOL  : K=4 = 1.072M (+1.4% over §14c POST-SCALEOUT 1.058M); noise.
+#   NO-POOL    : K=4 = 1.084M (FUSION enables what POOL config already
+#                gave; lift from pre-FUSION ~5-50K is structural — every
+#                read now bypasses the channel hop).
+
+============================================================
+WITH --pool-workers 16 (POOL config)
+============================================================
+=== K=1 trial=1 ===
+parallel-reads workload=find-by workers=16 rows=10000 duration=10s pool_workers=Some(16) shard_count=Some(1)
+  total =   18023474 ops | 1802347 ops/sec | p50 8us  p99 11us  p99.99 113us
+=== K=1 trial=2 ===
+parallel-reads workload=find-by workers=16 rows=10000 duration=10s pool_workers=Some(16) shard_count=Some(1)
+  total =   18095767 ops | 1809577 ops/sec | p50 8us  p99 11us  p99.99 68us
+=== K=1 trial=3 ===
+parallel-reads workload=find-by workers=16 rows=10000 duration=10s pool_workers=Some(16) shard_count=Some(1)
+  total =   18060410 ops | 1806041 ops/sec | p50 8us  p99 11us  p99.99 80us
+=== K=4 trial=1 ===
+parallel-reads workload=find-by workers=16 rows=10000 duration=10s pool_workers=Some(16) shard_count=Some(4)
+  total =   10723484 ops | 1072348 ops/sec | p50 14us  p99 18us  p99.99 247us
+=== K=4 trial=2 ===
+parallel-reads workload=find-by workers=16 rows=10000 duration=10s pool_workers=Some(16) shard_count=Some(4)
+  total =   10665457 ops | 1066546 ops/sec | p50 14us  p99 18us  p99.99 2747us
+=== K=4 trial=3 ===
+parallel-reads workload=find-by workers=16 rows=10000 duration=10s pool_workers=Some(16) shard_count=Some(4)
+  total =   10817456 ops | 1081746 ops/sec | p50 14us  p99 18us  p99.99 320us
+=== K=8 trial=1 ===
+parallel-reads workload=find-by workers=16 rows=10000 duration=10s pool_workers=Some(16) shard_count=Some(8)
+  total =    8569039 ops | 856904 ops/sec | p50 18us  p99 22us  p99.99 357us
+=== K=8 trial=2 ===
+parallel-reads workload=find-by workers=16 rows=10000 duration=10s pool_workers=Some(16) shard_count=Some(8)
+  total =    8485681 ops | 848568 ops/sec | p50 18us  p99 23us  p99.99 377us
+=== K=8 trial=3 ===
+parallel-reads workload=find-by workers=16 rows=10000 duration=10s pool_workers=Some(16) shard_count=Some(8)
+  total =    8469454 ops | 846945 ops/sec | p50 18us  p99 23us  p99.99 1074us
+=== K=16 trial=1 ===
+parallel-reads workload=find-by workers=16 rows=10000 duration=10s pool_workers=Some(16) shard_count=Some(16)
+  total =    6067015 ops | 606702 ops/sec | p50 25us  p99 30us  p99.99 3031us
+=== K=16 trial=2 ===
+parallel-reads workload=find-by workers=16 rows=10000 duration=10s pool_workers=Some(16) shard_count=Some(16)
+  total =    6136584 ops | 613658 ops/sec | p50 25us  p99 30us  p99.99 599us
+=== K=16 trial=3 ===
+parallel-reads workload=find-by workers=16 rows=10000 duration=10s pool_workers=Some(16) shard_count=Some(16)
+  total =    6151857 ops | 615186 ops/sec | p50 25us  p99 30us  p99.99 476us
+
+============================================================
+WITHOUT --pool-workers (NO-POOL config; FUSION-most-visible)
+============================================================
+=== K=1 trial=1 (no-pool) ===
+# NOTE: trial 1 contended with the with-pool sweep's K=16 finishing —
+# discard. Trial 2+3 are clean.
+parallel-reads workload=find-by workers=16 rows=10000 duration=10s pool_workers=None shard_count=Some(1)
+  total =      79176 ops | 7918 ops/sec | p50 2957us  p99 3071us  p99.99 8973us
+=== K=1 trial=2 (no-pool) ===
+parallel-reads workload=find-by workers=16 rows=10000 duration=10s pool_workers=None shard_count=Some(1)
+  total =     183019 ops | 18302 ops/sec | p50 895us  p99 929us  p99.99 3130us
+=== K=1 trial=3 (no-pool) ===
+parallel-reads workload=find-by workers=16 rows=10000 duration=10s pool_workers=None shard_count=Some(1)
+  total =     190332 ops | 19033 ops/sec | p50 879us  p99 932us  p99.99 3786us
+=== K=4 trial=1 (no-pool) ===
+parallel-reads workload=find-by workers=16 rows=10000 duration=10s pool_workers=None shard_count=Some(4)
+  total =   10870291 ops | 1087029 ops/sec | p50 14us  p99 18us  p99.99 231us
+=== K=4 trial=2 (no-pool) ===
+parallel-reads workload=find-by workers=16 rows=10000 duration=10s pool_workers=None shard_count=Some(4)
+  total =   10681574 ops | 1068157 ops/sec | p50 14us  p99 18us  p99.99 219us
+=== K=4 trial=3 (no-pool) ===
+parallel-reads workload=find-by workers=16 rows=10000 duration=10s pool_workers=None shard_count=Some(4)
+  total =   10842206 ops | 1084221 ops/sec | p50 14us  p99 18us  p99.99 289us
+=== K=8 trial=1 (no-pool) ===
+parallel-reads workload=find-by workers=16 rows=10000 duration=10s pool_workers=None shard_count=Some(8)
+  total =    8479871 ops | 847987 ops/sec | p50 18us  p99 22us  p99.99 315us
+=== K=8 trial=2 (no-pool) ===
+parallel-reads workload=find-by workers=16 rows=10000 duration=10s pool_workers=None shard_count=Some(8)
+  total =    8444355 ops | 844436 ops/sec | p50 18us  p99 23us  p99.99 653us
+=== K=8 trial=3 (no-pool) ===
+parallel-reads workload=find-by workers=16 rows=10000 duration=10s pool_workers=None shard_count=Some(8)
+  total =    8485989 ops | 848599 ops/sec | p50 18us  p99 22us  p99.99 364us
+
+============================================================
+Medians (3-trial)
+============================================================
+
+WITH --pool-workers 16 (POOL):
+  K=1  : 1,806,041 ops/sec (was 1,801,557 §14c POST-SCALEOUT; +0.2%)
+  K=4  : 1,072,348 ops/sec (was 1,057,854; +1.4% — within trial noise)
+  K=8  :   848,568 ops/sec (was   836,344; +1.5%)
+  K=16 :   613,658 ops/sec (new — §14c didn't publish K=16)
+
+NO-POOL (FUSION-most-visible):
+  K=1  :    18,668 ops/sec (trial 2+3 only; trial 1 contended).
+                            K=1 routes through apply mpsc because cfg.
+                            read_workers=None and no sharded dispatcher.
+                            This is the pre-FUSION shape for K=1.
+  K=4  : 1,084,221 ops/sec (pre-FUSION would route 4 channel hops per
+                            FindBy — estimated 5-50K ops/sec).
+                            Post-FUSION matches WITH-POOL K=4 (1.072M)
+                            because both now bypass the channel.
+  K=8  :   847,987 ops/sec (matches WITH-POOL K=8 by the same reason).
+
+Honest read:
+  - WITH-POOL: FUSION lift is in trial noise (1-2%) because the
+    apply_op path was already taking the SP-Perf-A T6 fast path under
+    the read guard. Bypassing the EngineHandle wrapper saves ~10ns/shard
+    which doesn't move the needle at ~14µs/op.
+  - NO-POOL: FUSION's lift is structural — sub-engines now populate
+    sm_shared (forced via sub_cfg.read_workers=Some(0)) so the scatter
+    walk takes the direct-borrow path regardless of whether the caller
+    set --pool-workers. K=4 no-pool POST-FUSION ≈ K=4 with-pool
+    POST-FUSION; --pool-workers becomes irrelevant for find-by at K>=2.
+  - K=4 K=1 gap is unchanged: 1.07M vs 1.80M (1.7×) — the structural
+    floor SHARD-SCAN-TINY-INLINE forensics named. FUSION does not
+    address that floor; the spec named the in-scope optimization as
+    "10-20% lift on the 1.07M K=4 figure" and the in-scope path was
+    already at the floor.

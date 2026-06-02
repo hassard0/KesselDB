@@ -159,6 +159,30 @@ from the SP-PG-EXTQ-CAST V1 arc landed 2026-06-02.
   `docs/superpowers/sppgcopycsv-t2-smoke-2026-06-01.txt`. KAT delta: +24
   (`copy::csv::*` + `copy::dispatch::csv_*` + `copy::command::csv_*`). **Arc closed —
   TaskList #358 ready for completion.**
+- **Track A.2.2 — PostgreSQL COPY binary format (SP-PG-COPY-BIN V1 SHIPPED — 2026-06-02).**
+  `WITH (FORMAT binary)` accepted for both COPY FROM STDIN and COPY TO STDOUT.
+  Per PG §55.2.7: 19-byte signature header (`PGCOPY\n\xff\r\n\0` + 4-byte flags +
+  4-byte header extension length), per-row 2-byte BE i16 field count + per-field
+  4-byte BE i32 length (`-1` = NULL) + binary-encoded value, 2-byte BE i16 `-1`
+  end-of-data marker. **Same 10 supported types as SP-PG-EXTQ-BIN-RESULTS** (BOOL,
+  INT2/INT4/INT8, FLOAT4/FLOAT8, TEXT/VARCHAR, BYTEA, TIMESTAMPTZ) via direct
+  reuse of `extq::binary_results::encode_binary_value` (TO) and
+  `extq::substitute::decode_binary_param` (FROM). Tables with NUMERIC / UUID /
+  JSONB / ARRAY columns pre-rejected at COPY-start with precise V2-arc-pointing
+  `0A000` messages (`SP-PG-COPY-BIN-NUMERIC` / `SP-PG-COPY-BIN-EXTRA`); session
+  stays alive. Inherits SP-PG-COPY-BULKAPPLY V1 batching throughput (binary
+  values are decoded back to text before the existing per-row INSERT synthesizer
+  — trade-off named in design §9.1 as the V2 `SP-PG-COPY-BIN-DIRECT` lift).
+  **HEADLINE on vulcan: psql 16.14 `CREATE TABLE` + INSERT seed + `COPY t TO
+  STDOUT WITH (FORMAT binary)` to file + `COPY t2 FROM STDIN WITH (FORMAT binary)`
+  into fresh table + `SELECT *` → same row set + re-export byte-equal (`md5sum`
+  match `d4df79da...`).** Unlocks `pg_dump --format=custom` restore, JDBC
+  `CopyManager.copyIn(PGCopyOutputStream...)`, `pg_bulkload`, `pgloader`, Stitch,
+  Fivetran, Airbyte binary bulk-loaders. Smoke transcript:
+  `docs/superpowers/sppgcopybin-t3-smoke-2026-06-02.txt`. KAT delta: +31
+  (`copy::binary::*` + `copy::proto::binv1_*` + `copy::command::t1_parse_copy_binary_format_accepted_in_v1`
+  + `server::tests::t2_run_session_copy_binary_format_accepted_v1`). **Arc closed —
+  TaskList #360 ready for completion.**
 - **Track A.3 — PostgreSQL COPY throughput (SP-PG-COPY-BULKAPPLY V1 SHIPPED — 2026-05-30).**
   COPY FROM STDIN now buffers up to `COPY_BATCH_SIZE` rows (default 1024,
   env-overridable via `KESSELDB_COPY_BATCH_SIZE`) and flushes each batch as

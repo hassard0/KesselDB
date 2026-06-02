@@ -24,7 +24,8 @@ Wins, losses, and the one-line cause for each:
 
 | Workload | KesselDB vs Postgres | Note |
 |---|---|---|
-| YCSB-C (uniform reads, N=16) | **57× faster** (4.75M vs 82K ops/s) | Headline read perf |
+| **Sharded point-read, K=8, N=16** | **14.93M ops/sec** (3.19× the K=1 baseline) | SP-Perf-A-SHARD-APPLY breaks the ~5M `RwLock`-reader ceiling — see §13 |
+| YCSB-C (uniform reads, N=16) | **57× faster** (4.75M vs 82K ops/s) | Headline single-shard read perf |
 | YCSB-B (95/5 mixed, N=16) | **7.1× faster** (576K vs 81K ops/s) | Realistic web workload |
 | YCSB-A (50/50 mixed, N=16) | marginal win (80K vs 74K ops/s) | Mixed workload — write-lock bites at 50% |
 | sysbench OLTP write-only (N=8) | **5.2× faster** (53K vs 10K tx/s) | Write-heavy transactions |
@@ -34,9 +35,9 @@ Wins, losses, and the one-line cause for each:
 | TPC-H Q1 — multi-aggregate GROUP BY (N=4) | **LOSES** (85.82 vs 186 q/s; SP-WHERE-VM-Specialise lift 1.35×, cumulative 5-arc lift 9.71×) | Gap closed from 18× to 2.17×; SP-WHERE-VM-Specialise cut per-row VM dispatch; residual = aggregate-fold inner loop — SP-JIT-Aggregate next |
 | TPC-H Q6 — SUM with WHERE (N=4) | **LOSES** (548.87 vs 1,686 q/s; SP-WHERE-VM-Specialise lift 2.78×, cumulative 5-arc lift 39.95×) | Gap closed from 123× to 3.07×; spec floor (≥400 q/s) EXCEEDED + stretch (≥500) ALSO EXCEEDED — SP-JIT-Aggregate next |
 
-KesselDB **wins 6 of 8 published workloads** and loses 2 (both TPC-H
-analytical shapes). Both transaction-bracket losses called out in the
-prior revisions are now closed:
+KesselDB **wins 6 of 8 published cross-DB workloads** (the SHARD-APPLY
+row is the internal sharded ceiling — see §13). Both transaction-bracket
+losses called out in the prior revisions are now closed:
 
 1. **sysbench OLTP RO** — was LOSING N=16 by 7.5× to Postgres. Closed
    by **SP-Perf-A-TXN-RO (2026-05-29) SHIPPED**: static all-RO `Op::Txn`

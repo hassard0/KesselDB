@@ -727,12 +727,15 @@ SHIPPED and delivered the predicted lift, validating the diagnosis.
   4 workers × N=4 queries = 16 in-flight worker threads). The exact
   saving matches the spec's modelled "1.5-2× per row × N workers"
   band — measured at the high end.
-- **KesselDB N=4 still loses to SQLite N=1** at 548.87 vs 253 = **2.17×
-  KesselDB win** (was 0.78× LOSS post-Tune — bottleneck flipped).
-  SQLite's covering-index scan on a single thread is no longer the
-  constant-factor winner; KesselDB N=1 alone (149.85 q/s) closes the
-  gap to 0.59× (was 0.13× post-Tune). KesselDB N=4 vs SQLite N=4 =
-  548.87 / 87.94 = **6.24× KesselDB win** (was 2.25× post-Tune).
+- **KesselDB N=4 now WINS vs SQLite N=1** at 548.87 vs 253 = **2.17×
+  KesselDB win** (was 0.78× LOSS post-Tune — relative ranking
+  FLIPPED). KesselDB N=1 alone (149.85 q/s) still loses to SQLite N=1
+  (252.94 q/s = 0.59× KesselDB; was 0.13× post-Tune — closing fast).
+  SQLite's covering-index scan on a single thread remains the per-
+  thread champion for Q6, but the per-query saving from the WHERE-VM
+  closure means KesselDB's 4-way concurrency now lifts it over the
+  SQLite N=1 ceiling. KesselDB N=4 vs SQLite N=4 = 548.87 / 87.94 =
+  **6.24× KesselDB win** (was 2.25× post-Tune).
 - **TigerBeetle**: refused. No SQL aggregate primitive.
 
 **What changed under the hood (SP-Hash-Agg T1-T4):**

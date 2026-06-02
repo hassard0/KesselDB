@@ -35,7 +35,7 @@ see §V2+ follow-ups in the design spec).
 | **T5** | Real cluster smoke — CRUD via `kubectl exec` to any pod (clients connect through the regular ClusterIP, which can route to any pod; ClusterClient retries against primary on `Unavailable`); kill the primary (`kubectl delete pod kesseldb-0`) and verify view-change elects a new primary within view-change timeout; verify the SSTables + WAL state survives + replays from the rejoined pod. | **DONE** | `0d95405` |
 | T6 | Fly.io multi-region cluster deploy — per-region `[mounts]` + per-machine env-var `KESSELDB_CLUSTER_REPLICA_IDX` mapping. Fly Machines do NOT have stable headless-DNS; peer addresses use `<machine-id>.vm.<app>.internal` or per-machine private 6PN address (TBD in T6 design). | **DEFERRED V2** (needs Fly account) | — |
 | **T7** | Monitoring — Prometheus Operator CRDs (ServiceMonitor + PrometheusRule) as opt-in Helm templates gated on `cluster.enabled AND monitoring.prometheus.enabled` (default OFF). Three canned alerts (ClusterReplicaDown, NoPrimary, ViewChangeStorm) driven by the V1-emitted metric surface from `crates/kessel-http-gateway/src/metrics_writer.rs`. Honest naming: a dedicated `kesseldb_view_changes_total` counter is V2 (named SP-Cloud-Cluster-METRICS-EXPAND); the V1 rule uses `delta(kesseldb_view_number[5m])` as surrogate. | **DONE** | `501dd6a` |
-| **T8** | Arc closure — STATUS Track row + this tracker close + USAGE §11.5 sub-section ("Prometheus monitoring" + expanded V1-limits list naming every V2 follow-up) + README Deploy table extension (Kubernetes cluster row with `--set cluster.enabled=true --set cluster.replicas=3` one-liner). | **DONE** | `<T8>` |
+| **T8** | Arc closure — STATUS Track row + this tracker close + USAGE §11.5 sub-section ("Prometheus monitoring" + expanded V1-limits list naming every V2 follow-up) + README Deploy table extension (Kubernetes cluster row with `--set cluster.enabled=true --set cluster.replicas=3` one-liner). | **DONE** | `04f0014` |
 
 ## T7+T8 ship — what landed (ARC CLOSURE)
 
@@ -81,7 +81,7 @@ Files modified (1):
   ~40 inline comment lines documenting the V1 emitted metric
   surface + the V1 metric-naming caveat + V2 follow-up arc.
 
-### T8 — USAGE + README + STATUS + tracker close (`<T8>`)
+### T8 — USAGE + README + STATUS + tracker close (`04f0014`)
 
 Files modified (4):
 

@@ -181,7 +181,7 @@ at dispatch entry, JDBC simple-mode unblocked.
   untouched; `#![forbid(unsafe_code)]` honored (n/a — YAML +
   Markdown only); zero new external deps. **KAT delta**: +0
   (YAML + docs only). Two commits: `501dd6a` (T7 chart additions +
-  values block), `<T8>` (USAGE + README + STATUS + progress
+  values block), `04f0014` (USAGE + README + STATUS + progress
   tracker close). Progress tracker:
   `docs/superpowers/specs/2026-06-02-kesseldb-subproject-spcloudcluster-progress.md`
   — V1 CLOSED, T6 + METRICS-EXPAND + GEO + SHARD + BACKUP +

@@ -30,13 +30,28 @@
 //!
 //! ## What this module does NOT do (V2+ / out-of-scope)
 //!
-//! - NaN (`sign == 0xC000`) decodes reject with `BinaryNumericError::NaN`
-//!   → `SP-PG-EXTQ-BIN-NUMERIC-NAN`.
-//! - `+Infinity` / `-Infinity` (PG 14+ sign codes 0xD000 / 0xF000)
-//!   reject with `BinaryNumericError::BadSign` →
-//!   `SP-PG-EXTQ-BIN-NUMERIC-INF`.
 //! - The codec is NOT used by COPY BIN's per-row encoder. COPY BIN
 //!   keeps its independent `SP-PG-COPY-BIN-NUMERIC` deferral.
+//!
+//! ## SP-PG-EXTQ-BIN-NUMERIC-NAN-INF (2026-06-02) extension
+//!
+//! V1's NaN reject (`BinaryNumericError::NaN`) and ±Infinity reject
+//! (`BinaryNumericError::BadSign { sign: 0xD000 | 0xF000 }`) are
+//! REMOVED. The codec now recognizes the 3 PG special sign codes:
+//!
+//! - `sign == 0xC000` (NUMERIC_NAN) → decode to `"NaN"` / encode from
+//!   `"NaN"` (case-insensitive).
+//! - `sign == 0xD000` (NUMERIC_PINF) → decode to `"Infinity"` / encode
+//!   from `"Infinity"` / `"+Infinity"` / `"inf"` / `"+inf"`
+//!   (case-insensitive).
+//! - `sign == 0xF000` (NUMERIC_NINF) → decode to `"-Infinity"` /
+//!   encode from `"-Infinity"` / `"-inf"` (case-insensitive).
+//!
+//! Each special value carries the canonical 8-byte wire frame
+//! `00 00 00 00 SS SS 00 00` (ndigits=0, weight=0, sign=SSSS,
+//! dscale=0). The `BinaryNumericError::NaN` variant is preserved
+//! for source compatibility but no longer constructed by the
+//! decoder.
 
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
@@ -47,6 +62,10 @@ pub(crate) const NUMERIC_POS: u16 = 0x0000;
 pub(crate) const NUMERIC_NEG: u16 = 0x4000;
 /// PG NUMERIC sign code for NaN.
 pub(crate) const NUMERIC_NAN: u16 = 0xC000;
+/// PG NUMERIC sign code for `+Infinity` (PG 14+).
+pub(crate) const NUMERIC_PINF: u16 = 0xD000;
+/// PG NUMERIC sign code for `-Infinity` (PG 14+).
+pub(crate) const NUMERIC_NINF: u16 = 0xF000;
 
 /// V1 cap: integer magnitude < 10^18 (`i64::MAX` is ~9.22e18; we
 /// constrain to 10^18 so the i128 accumulator can safely combine
@@ -71,14 +90,17 @@ pub enum BinaryNumericError {
     /// Wire bytes declared `ndigits=N` but the buffer only carried
     /// `M < 2*N` digit bytes. Maps to SQLSTATE `08P01`.
     Truncated { ndigits: usize, available: usize },
-    /// `sign=0xC000` (NaN). Maps to SQLSTATE `22023` with the
-    /// `SP-PG-EXTQ-BIN-NUMERIC-NAN` follow-up arc name.
+    /// `sign=0xC000` (NaN). **Deprecated 2026-06-02 by
+    /// SP-PG-EXTQ-BIN-NUMERIC-NAN-INF** — the decoder now returns
+    /// `Ok("NaN")` for this sign code. The variant is preserved for
+    /// source compatibility; callers matching on it remain valid but
+    /// the match arm is unreachable in practice. Maps to SQLSTATE
+    /// `22023` if ever constructed by future code.
     NaN,
-    /// Unknown sign code (not POS/NEG/NAN). Includes the PG 14+
-    /// `+Inf`/`-Inf` codes which V1 doesn't support. Maps to SQLSTATE
-    /// `08P01` (or `0A000` at the caller boundary, with the
-    /// `SP-PG-EXTQ-BIN-NUMERIC-INF` follow-up arc name for the
-    /// infinity codes specifically).
+    /// Unknown sign code (not POS/NEG/NAN/PINF/NINF). Maps to SQLSTATE
+    /// `08P01 protocol_violation`. After SP-PG-EXTQ-BIN-NUMERIC-NAN-INF
+    /// the PG 14+ `+Inf`/`-Inf` codes (`0xD000` / `0xF000`) are
+    /// recognized directly and no longer surface as `BadSign`.
     BadSign { sign: u16 },
     /// Per-digit value out of [0, 9999]. Maps to SQLSTATE `08P01`.
     BadDigit { position: usize, value: i16 },
@@ -121,12 +143,17 @@ pub fn decode_numeric_binary(bytes: &[u8]) -> Result<String, BinaryNumericError>
     let weight = i16::from_be_bytes([bytes[2], bytes[3]]);
     let sign = u16::from_be_bytes([bytes[4], bytes[5]]);
     let dscale = i16::from_be_bytes([bytes[6], bytes[7]]);
-    // Sign dispatch.
-    if sign == NUMERIC_NAN {
-        return Err(BinaryNumericError::NaN);
-    }
-    if sign != NUMERIC_POS && sign != NUMERIC_NEG {
-        return Err(BinaryNumericError::BadSign { sign });
+    // SP-PG-EXTQ-BIN-NUMERIC-NAN-INF (2026-06-02): special-sign
+    // dispatch. The 3 PG special sign codes carry an empty digit
+    // array (ndigits=0); any non-zero ndigits with a special sign is
+    // a protocol violation and rejects via `BadSign` so the caller
+    // can surface the malformed shape distinctly from a finite value.
+    match sign {
+        NUMERIC_POS | NUMERIC_NEG => { /* fall through to finite path */ }
+        NUMERIC_NAN if ndigits == 0 => return Ok("NaN".to_string()),
+        NUMERIC_PINF if ndigits == 0 => return Ok("Infinity".to_string()),
+        NUMERIC_NINF if ndigits == 0 => return Ok("-Infinity".to_string()),
+        _ => return Err(BinaryNumericError::BadSign { sign }),
     }
     if ndigits < 0 {
         return Err(BinaryNumericError::WrongLength { actual: bytes.len() });
@@ -301,6 +328,25 @@ pub fn encode_numeric_binary(decimal_str: &str) -> Result<Vec<u8>, BinaryNumeric
             input: decimal_str.to_string(),
             reason: "empty string".into(),
         });
+    }
+    // SP-PG-EXTQ-BIN-NUMERIC-NAN-INF (2026-06-02): special-string
+    // preamble. PG's `numeric_in` accepts case-insensitive variants
+    // (`"nan"`, `"NAN"`, `"infinity"`, `"INF"`, `"+inf"`, `"-inf"`,
+    // etc.) and normalizes to the canonical mixed-case form. We
+    // mirror that here so any client driver's input form decodes
+    // back to a canonical wire frame. Each special emits the
+    // 8-byte all-zero-data header with the matching sign code.
+    {
+        let lower = s.to_ascii_lowercase();
+        let special_sign = match lower.as_str() {
+            "nan" => Some(NUMERIC_NAN),
+            "infinity" | "+infinity" | "inf" | "+inf" => Some(NUMERIC_PINF),
+            "-infinity" | "-inf" => Some(NUMERIC_NINF),
+            _ => None,
+        };
+        if let Some(sign) = special_sign {
+            return Ok(encode_special(sign));
+        }
     }
     // Lex sign.
     let (sign, rest) = match s.as_bytes()[0] {
@@ -525,6 +571,18 @@ fn pow10000(exp: u32) -> Option<i128> {
     Some(acc)
 }
 
+/// SP-PG-EXTQ-BIN-NUMERIC-NAN-INF (2026-06-02): emit the canonical
+/// 8-byte all-zero-data header for one of the 3 PG special sign
+/// codes (`NUMERIC_NAN` / `NUMERIC_PINF` / `NUMERIC_NINF`).
+fn encode_special(sign: u16) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8);
+    out.extend_from_slice(&0i16.to_be_bytes()); // ndigits = 0
+    out.extend_from_slice(&0i16.to_be_bytes()); // weight = 0
+    out.extend_from_slice(&sign.to_be_bytes());
+    out.extend_from_slice(&0i16.to_be_bytes()); // dscale = 0
+    out
+}
+
 fn format_zero(dscale: i16) -> String {
     if dscale <= 0 {
         "0".to_string()
@@ -627,16 +685,73 @@ mod tests {
         assert_eq!(decode_numeric_binary(&bytes).unwrap(), "0.0001");
     }
 
-    /// Decode NaN sign rejected.
+    /// SP-PG-EXTQ-BIN-NUMERIC-NAN-INF: NaN sign decodes to "NaN" string.
+    /// V1 rejected this; the NAN-INF arc lifts the rejection.
     #[test]
-    fn t2_decode_nan_rejected() {
+    fn t2sp_decode_nan_returns_nan_string() {
         let bytes = [
             0x00, 0x00, // ndigits=0
             0x00, 0x00, // weight=0
             0xC0, 0x00, // sign=NAN
             0x00, 0x00, // dscale=0
         ];
-        assert_eq!(decode_numeric_binary(&bytes), Err(BinaryNumericError::NaN));
+        assert_eq!(decode_numeric_binary(&bytes).unwrap(), "NaN");
+    }
+
+    /// SP-PG-EXTQ-BIN-NUMERIC-NAN-INF: +Infinity sign decodes to "Infinity".
+    #[test]
+    fn t2sp_decode_pos_infinity_returns_infinity_string() {
+        let bytes = [
+            0x00, 0x00, // ndigits=0
+            0x00, 0x00, // weight=0
+            0xD0, 0x00, // sign=PINF
+            0x00, 0x00, // dscale=0
+        ];
+        assert_eq!(decode_numeric_binary(&bytes).unwrap(), "Infinity");
+    }
+
+    /// SP-PG-EXTQ-BIN-NUMERIC-NAN-INF: -Infinity decodes to "-Infinity".
+    #[test]
+    fn t2sp_decode_neg_infinity_returns_minus_infinity_string() {
+        let bytes = [
+            0x00, 0x00, // ndigits=0
+            0x00, 0x00, // weight=0
+            0xF0, 0x00, // sign=NINF
+            0x00, 0x00, // dscale=0
+        ];
+        assert_eq!(decode_numeric_binary(&bytes).unwrap(), "-Infinity");
+    }
+
+    /// SP-PG-EXTQ-BIN-NUMERIC-NAN-INF: malformed wire (NaN sign + non-zero
+    /// ndigits) still rejects with `BadSign`. Defensive — PG's
+    /// `numeric_send` always emits ndigits=0 for specials; a wire with
+    /// `sign=NAN` and `ndigits=1` is a protocol violation.
+    #[test]
+    fn t2sp_decode_nan_with_nonzero_ndigits_rejects() {
+        let bytes = [
+            0x00, 0x01, // ndigits=1 (invalid for NaN!)
+            0x00, 0x00, // weight=0
+            0xC0, 0x00, // sign=NAN
+            0x00, 0x00, // dscale=0
+            0x00, 0x2A, // digit[0]=42 (should not be present)
+        ];
+        match decode_numeric_binary(&bytes) {
+            Err(BinaryNumericError::BadSign { sign }) => assert_eq!(sign, 0xC000),
+            other => panic!("expected BadSign for malformed NaN, got {other:?}"),
+        }
+    }
+
+    /// V1 invariant preserved: unknown sign codes (not POS/NEG/NAN/PINF/NINF)
+    /// still reject with `BadSign` after the NAN-INF arc.
+    #[test]
+    fn t2sp_decode_unknown_sign_still_rejects() {
+        let bytes = [
+            0x00, 0x00, 0x00, 0x00, 0xA0, 0x00, 0x00, 0x00, // sign=0xA000
+        ];
+        match decode_numeric_binary(&bytes) {
+            Err(BinaryNumericError::BadSign { sign }) => assert_eq!(sign, 0xA000),
+            other => panic!("expected BadSign for unknown sign, got {other:?}"),
+        }
     }
 
     /// Decode bad sign rejected.
@@ -925,6 +1040,103 @@ mod tests {
             let decoded = decode_numeric_binary(&bytes).expect("decode");
             assert_eq!(decoded, composed_signed, "round-trip mismatch");
         }
+    }
+
+    // ── SP-PG-EXTQ-BIN-NUMERIC-NAN-INF encoder KATs ─────────────────
+
+    /// Encode "NaN" → canonical 8-byte wire with sign=0xC000.
+    #[test]
+    fn t2sp_encode_nan_returns_canonical_bytes() {
+        assert_eq!(
+            encode_numeric_binary("NaN").unwrap(),
+            vec![0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00]
+        );
+    }
+
+    /// Encode "Infinity" → canonical 8-byte wire with sign=0xD000.
+    #[test]
+    fn t2sp_encode_pos_infinity_returns_canonical_bytes() {
+        assert_eq!(
+            encode_numeric_binary("Infinity").unwrap(),
+            vec![0x00, 0x00, 0x00, 0x00, 0xD0, 0x00, 0x00, 0x00]
+        );
+    }
+
+    /// Encode "-Infinity" → canonical 8-byte wire with sign=0xF000.
+    #[test]
+    fn t2sp_encode_neg_infinity_returns_canonical_bytes() {
+        assert_eq!(
+            encode_numeric_binary("-Infinity").unwrap(),
+            vec![0x00, 0x00, 0x00, 0x00, 0xF0, 0x00, 0x00, 0x00]
+        );
+    }
+
+    /// Encoder accepts case-insensitive specials + short aliases
+    /// ("inf" / "+inf" / "-inf"), mirroring PG's `numeric_in`.
+    #[test]
+    fn t2sp_encode_special_case_insensitive() {
+        let nan_bytes = vec![0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00];
+        for s in ["nan", "NAN", "NaN", "nAn"] {
+            assert_eq!(
+                encode_numeric_binary(s).unwrap(),
+                nan_bytes,
+                "NaN case-insensitive mismatch for {s:?}"
+            );
+        }
+        let pinf_bytes = vec![0x00, 0x00, 0x00, 0x00, 0xD0, 0x00, 0x00, 0x00];
+        for s in ["infinity", "INFINITY", "Infinity", "+Infinity", "+INFINITY", "inf", "INF", "+inf", "+INF"] {
+            assert_eq!(
+                encode_numeric_binary(s).unwrap(),
+                pinf_bytes,
+                "+Inf case-insensitive mismatch for {s:?}"
+            );
+        }
+        let ninf_bytes = vec![0x00, 0x00, 0x00, 0x00, 0xF0, 0x00, 0x00, 0x00];
+        for s in ["-infinity", "-INFINITY", "-Infinity", "-inf", "-INF"] {
+            assert_eq!(
+                encode_numeric_binary(s).unwrap(),
+                ninf_bytes,
+                "-Inf case-insensitive mismatch for {s:?}"
+            );
+        }
+    }
+
+    /// Round-trip: encode(decode(bytes)) == bytes and
+    /// decode(encode(canonical_string)) == canonical_string for the
+    /// 3 special values.
+    #[test]
+    fn t2sp_round_trip_specials() {
+        let cases: &[(&str, [u8; 8])] = &[
+            ("NaN",       [0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00]),
+            ("Infinity",  [0x00, 0x00, 0x00, 0x00, 0xD0, 0x00, 0x00, 0x00]),
+            ("-Infinity", [0x00, 0x00, 0x00, 0x00, 0xF0, 0x00, 0x00, 0x00]),
+        ];
+        for (canonical_str, canonical_bytes) in cases {
+            // String → bytes → string.
+            let bytes = encode_numeric_binary(canonical_str).unwrap();
+            assert_eq!(&bytes[..], &canonical_bytes[..], "encode({canonical_str:?})");
+            let decoded = decode_numeric_binary(&bytes).unwrap();
+            assert_eq!(decoded, *canonical_str, "decode round-trip for {canonical_str:?}");
+            // Bytes → string → bytes.
+            let s = decode_numeric_binary(canonical_bytes).unwrap();
+            let re_encoded = encode_numeric_binary(&s).unwrap();
+            assert_eq!(&re_encoded[..], &canonical_bytes[..], "encode round-trip for {canonical_str:?}");
+        }
+    }
+
+    /// Defensive: a non-numeric input that *looks* like an extra word
+    /// stays a `BadDecimalString` (the special-string preamble matches
+    /// EXACTLY — no partial / prefix / suffix match).
+    #[test]
+    fn t2sp_encode_non_special_still_rejects_as_bad_decimal_string() {
+        assert!(matches!(
+            encode_numeric_binary("infinitypls"),
+            Err(BinaryNumericError::BadDecimalString { .. })
+        ));
+        assert!(matches!(
+            encode_numeric_binary("not-a-number"),
+            Err(BinaryNumericError::BadDecimalString { .. })
+        ));
     }
 
     /// dscale preserved on zero: "0.00" round-trips with dscale=2.

@@ -472,6 +472,10 @@ fn decode_bytea(bytes: &[u8]) -> String {
 fn decode_numeric(bytes: &[u8]) -> Result<String, BinaryDecodeError> {
     use crate::extq::binary_numeric::{decode_numeric_binary, BinaryNumericError};
     decode_numeric_binary(bytes).map_err(|e| match e {
+        // SP-PG-EXTQ-BIN-NUMERIC-NAN-INF (2026-06-02): the codec no
+        // longer constructs `NaN` — the special sign codes (NAN /
+        // PINF / NINF) now decode to canonical strings. Arm kept as
+        // a defensive fallback for source compatibility.
         BinaryNumericError::NaN => BinaryDecodeError::Unsupported {
             type_oid: PG_TYPE_NUMERIC,
             arc: "SP-PG-EXTQ-BIN-NUMERIC-NAN",
@@ -1635,20 +1639,33 @@ mod tests {
         assert_eq!(out, "42");
     }
 
-    /// SP-PG-EXTQ-BIN-NUMERIC T3 — NUMERIC binary NaN sign rejects with
-    /// the `SP-PG-EXTQ-BIN-NUMERIC-NAN` follow-up arc name (so operators
-    /// can grep for the gap on the V2 path).
+    /// SP-PG-EXTQ-BIN-NUMERIC-NAN-INF (2026-06-02) — NaN binary sign
+    /// decodes to canonical `"NaN"` string via the dispatcher boundary.
+    /// V1 rejected this; the NAN-INF arc lifts the rejection at both
+    /// the codec layer AND this dispatcher boundary.
     #[test]
-    fn t3num_decode_numeric_nan_rejects_with_followup_arc() {
+    fn t3num_decode_numeric_nan_returns_nan_string_through_codec() {
         let bytes = [0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00];
-        let err = decode_binary_param(&bytes, PG_TYPE_NUMERIC).unwrap_err();
-        match err {
-            BinaryDecodeError::Unsupported { type_oid, arc } => {
-                assert_eq!(type_oid, PG_TYPE_NUMERIC);
-                assert_eq!(arc, "SP-PG-EXTQ-BIN-NUMERIC-NAN");
-            }
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
+        let out = decode_binary_param(&bytes, PG_TYPE_NUMERIC).unwrap();
+        assert_eq!(out, "NaN");
+    }
+
+    /// SP-PG-EXTQ-BIN-NUMERIC-NAN-INF: +Infinity binary sign decodes to
+    /// canonical `"Infinity"` string via the dispatcher boundary.
+    #[test]
+    fn t3num_decode_numeric_pos_infinity_returns_infinity_string_through_codec() {
+        let bytes = [0x00, 0x00, 0x00, 0x00, 0xD0, 0x00, 0x00, 0x00];
+        let out = decode_binary_param(&bytes, PG_TYPE_NUMERIC).unwrap();
+        assert_eq!(out, "Infinity");
+    }
+
+    /// SP-PG-EXTQ-BIN-NUMERIC-NAN-INF: -Infinity binary sign decodes to
+    /// canonical `"-Infinity"` string via the dispatcher boundary.
+    #[test]
+    fn t3num_decode_numeric_neg_infinity_returns_minus_infinity_string_through_codec() {
+        let bytes = [0x00, 0x00, 0x00, 0x00, 0xF0, 0x00, 0x00, 0x00];
+        let out = decode_binary_param(&bytes, PG_TYPE_NUMERIC).unwrap();
+        assert_eq!(out, "-Infinity");
     }
 
     /// SP-PG-EXTQ-BIN-NUMERIC T3 — out-of-range NUMERIC (≥10^18 integer

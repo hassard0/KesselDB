@@ -889,6 +889,20 @@ mod tests {
         );
     }
 
+    /// SP-PG-EXTQ-BIN-NUMERIC-NAN-INF (2026-06-02) — NUMERIC binary
+    /// special-string encoding flows through the codec at the dispatcher
+    /// boundary. `"NaN"` / `"Infinity"` / `"-Infinity"` each emit the
+    /// canonical 8-byte all-zero-data header with the matching sign code.
+    #[test]
+    fn t3num_encode_numeric_specials_through_codec() {
+        let nan_out = encode_binary_value(b"NaN", PG_TYPE_NUMERIC).expect("nan");
+        assert_eq!(nan_out, vec![0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00]);
+        let pinf_out = encode_binary_value(b"Infinity", PG_TYPE_NUMERIC).expect("+inf");
+        assert_eq!(pinf_out, vec![0x00, 0x00, 0x00, 0x00, 0xD0, 0x00, 0x00, 0x00]);
+        let ninf_out = encode_binary_value(b"-Infinity", PG_TYPE_NUMERIC).expect("-inf");
+        assert_eq!(ninf_out, vec![0x00, 0x00, 0x00, 0x00, 0xF0, 0x00, 0x00, 0x00]);
+    }
+
     /// SP-PG-EXTQ-BIN-NUMERIC T3 — out-of-range NUMERIC encode rejects
     /// with the `SP-PG-EXTQ-BIN-NUMERIC-BIGNUM` follow-up arc.
     #[test]

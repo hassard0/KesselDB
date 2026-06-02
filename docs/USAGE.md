@@ -1941,6 +1941,18 @@ The remaining residual ORM gaps are:
   transcript: `docs/superpowers/spcharpadcompare-t3-smoke-2026-06-02.txt`.
 - Binary NUMERIC / JSONB / UUID / ARRAY remain V2 (`SP-PG-EXTQ-BIN-
   NUMERIC` / `SP-PG-EXTQ-BIN-EXTRA`).
+- ~~SP-PG-EXTQ-CAST V1 is "strip + hope" — a Bind whose declared
+  param OID disagrees with the SQL's `$N::TYPE` cast silently
+  coerces.~~ → **CLOSED 2026-06-02 by SP-PG-EXTQ-CAST-VALIDATE V1** —
+  `cast_stripper::strip_pg_casts_tracked` returns `(stripped_sql,
+  Vec<($N_index, declared_oid)>)`; `PreparedStmt.param_casts` stores
+  the pairs at Parse time; `dispatch_bind` rejects any mismatch
+  between the bound parameter OID and the declared cast OID with
+  `42846 cannot_coerce`. Closes the silent-coercion attack vector
+  the parent arc's "V1 scope is strip + hope" note explicitly
+  flagged. Literal casts (no `$N`) bypass the validator so the
+  parent arc's psql shapes still PASS. Smoke:
+  `docs/superpowers/sppgextqcastvalidate-t3-smoke-2026-06-02.txt`.
 
 #### Pipelining throughput (T8, 2026-05-29)
 
@@ -1977,6 +1989,8 @@ and post higher numbers; that's V2 `SP-PG-EXTQ-PIPELINE-BATCH`.
 - SP-PG-COPY-CSV-NUMERIC progress (V1 SHIPPED at T3 — text+CSV NUMERIC validator with canonical/sign normalisation + case-insensitive NaN/Inf acceptance + precise 22P02 rejections): `docs/superpowers/specs/2026-06-02-kesseldb-subproject-sppgcopycsvnumeric-progress.md`
 - SP-PG-EXTQ-CAST design spec: `docs/superpowers/specs/2026-06-01-kesseldb-sppgextqcast-design.md`
 - SP-PG-EXTQ-CAST smoke transcript (V1 SHIPPED — psql `SELECT 1::int8` round-trip PASS): `docs/superpowers/sppgextqcast-t3-smoke-2026-06-02.txt`
+- SP-PG-EXTQ-CAST-VALIDATE design spec: `docs/superpowers/specs/2026-06-02-kesseldb-sppgextqcastvalidate-design.md`
+- SP-PG-EXTQ-CAST-VALIDATE smoke transcript (V1 SHIPPED — HEADLINE: $N cast OID mismatch returns 42846 cannot_coerce via psycopg3 PQ-layer): `docs/superpowers/sppgextqcastvalidate-t3-smoke-2026-06-02.txt`
 
 ### SP-PG-COPY — `COPY FROM STDIN` / `COPY TO STDOUT` bulk load (V1 SHIPPED 2026-05-30)
 

@@ -1,0 +1,114 @@
+SP-PG-EXTQ-CAST-VALIDATE T3 — vulcan smoke transcript — 2026-06-02
+=================================================================
+
+Setup (verbatim, run on vulcan 192.168.4.178):
+
+  pkill -f kesseldb 2>/dev/null || true
+  cd ~/KesselDB
+  git pull origin main
+  CARGO_TARGET_DIR=/tmp/kdb-target-castvalid \
+      cargo build --release --bin kesseldb --features pg-gateway
+  rm -rf /tmp/kdb-castvalid-data
+  KESSELDB_TOKEN=admin KESSELDB_PG_ADDR=127.0.0.1:5532 \
+      nohup /tmp/kdb-target-castvalid/release/kesseldb 127.0.0.1:6532 \
+      /tmp/kdb-castvalid-data >/tmp/kdb-castvalid.log 2>&1 &
+
+  PGPASSWORD=admin psql -h 127.0.0.1 -p 5532 -U test -d kesseldb -c \
+      'CREATE TABLE cast_v_smoke (id BIGINT, n CHAR(32))'
+  # → CREATE TABLE
+
+  PGPASSWORD=admin psql -h 127.0.0.1 -p 5532 -U test -d kesseldb -c \
+      "INSERT INTO cast_v_smoke (id, n) VALUES (1, 'hello')"
+  # → INSERT 0 1
+
+────────────────────────────────────────────────────────────────────
+PART 1 — REGRESSION-GUARD (parent SP-PG-EXTQ-CAST arc shapes)
+────────────────────────────────────────────────────────────────────
+
+PGPASSWORD=admin psql -h 127.0.0.1 -p 5532 -U test -d kesseldb -c \
+    'SELECT * FROM cast_v_smoke WHERE id = 1::int8'
+
+ id |   n
+----+-------
+  1 | hello
+(1 row)
+
+→ PASS — literal cast (no $N) still works post-arc. V1 of THIS arc
+  only validates $N casts; literal-cast paths bypass the validator
+  entirely so the parent SP-PG-EXTQ-CAST regression is locked.
+
+PGPASSWORD=admin psql -h 127.0.0.1 -p 5532 -U test -d kesseldb -c \
+    'SELECT 1::int8'
+
+ ?column?
+----------
+        1
+(1 row)
+
+→ PASS — scalar literal cast still works.
+
+────────────────────────────────────────────────────────────────────
+PART 2 — HEADLINE: $N::TYPE validator end-to-end via psycopg3 PQ-layer
+────────────────────────────────────────────────────────────────────
+
+The shape psql can't exercise (PostgreSQL's psql doesn't speak the
+extended-query protocol manually) requires raw Parse/Bind. We use
+psycopg3's PQ-layer to send Prepare(sql, param_types) +
+ExecPrepared(values) — the same wire shape pgJDBC / asyncpg /
+SQLAlchemy use for prepared statements with explicit type hints.
+
+  python3 scripts/sppgextqcastvalidate-smoke.py
+
+  matching OID succeeds: PASS
+  HEADLINE — mismatched OID returns 42846: PASS: 'ERROR:  cannot cast parameter $1 from type with OID 25 to declared cast type OID 20\n'
+  omitted OID skips validation: PASS
+
+Per-case breakdown:
+
+1. Parse('SELECT * FROM cast_v_smoke WHERE id = $1::int8',
+        param_types=[20 /* INT8 */])
+   + ExecPrepared(['1'])
+   → TUPLES_OK + 1 row.
+   → PASS: matching OID accepts.
+
+2. HEADLINE.
+   Parse('SELECT * FROM cast_v_smoke WHERE id = $1::int8',
+         param_types=[25 /* TEXT */])
+   + ExecPrepared(['42'])
+   → ErrorResponse SQLSTATE=42846 cannot_coerce
+     message=ERROR:  cannot cast parameter $1 from type with OID 25
+             to declared cast type OID 20
+   → PASS: mismatched OID rejects with 42846 cannot_coerce, naming
+           both OIDs for operator diagnosis.
+
+   Pre-arc behaviour (SP-PG-EXTQ-CAST V1 "strip + hope"):
+     - cast_stripper drops "::int8" → SQL becomes
+       "SELECT * FROM cast_v_smoke WHERE id = $1"
+     - substitute renders $1 = "'42'" via the TEXT path
+     - engine type-checker coerces '42' to BIGINT silently
+     - row returns
+   The silent coercion was the V1 attack-vector this arc closes.
+
+3. Parse('SELECT * FROM cast_v_smoke WHERE id = $1::int8',
+        param_types=[]  /* no OID hints — asyncpg / psycopg3 default */)
+   + ExecPrepared(['1'])
+   → TUPLES_OK + 1 row.
+   → PASS: omitted-OID skip rule works. The validator only fires
+     when Parse explicitly declared an OID at that position; an
+     omitted hint is the client's explicit "trust the SQL" signal.
+
+────────────────────────────────────────────────────────────────────
+Cleanup
+────────────────────────────────────────────────────────────────────
+
+  ssh admin@192.168.4.178 "kill -9 $(pgrep -f /tmp/kdb-target-castvalid)"
+
+────────────────────────────────────────────────────────────────────
+Verdict
+────────────────────────────────────────────────────────────────────
+
+HEADLINE: $N cast tracking + Bind mismatch returns 42846 — GREEN.
+PASS @ 3/3 cases. Closes the SP-PG-EXTQ-CAST V1 "strip + hope"
+silent-coercion vector while preserving every existing literal-cast
+path the parent arc unlocked for pgJDBC simple-mode + PostGIS /
+pgvector helpers.

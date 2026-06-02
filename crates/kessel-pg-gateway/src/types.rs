@@ -53,8 +53,9 @@
 #![allow(dead_code)]
 
 use crate::proto::{
-    PG_TYPE_BOOL, PG_TYPE_BYTEA, PG_TYPE_INT2, PG_TYPE_INT4, PG_TYPE_INT8,
-    PG_TYPE_NUMERIC, PG_TYPE_TEXT, PG_TYPE_TIMESTAMPTZ,
+    PG_TYPE_BOOL, PG_TYPE_BYTEA, PG_TYPE_FLOAT4, PG_TYPE_FLOAT8, PG_TYPE_INT2,
+    PG_TYPE_INT4, PG_TYPE_INT8, PG_TYPE_NUMERIC, PG_TYPE_TEXT, PG_TYPE_TIMESTAMPTZ,
+    PG_TYPE_VARCHAR,
 };
 use kessel_catalog::FieldKind;
 
@@ -137,6 +138,117 @@ pub fn type_size_for_oid(oid: u32) -> i16 {
         PG_TYPE_BYTEA | PG_TYPE_TEXT | PG_TYPE_NUMERIC => -1,
         _ => -1,
     }
+}
+
+// ───────────────────────────────────────────────────────────────────
+// SP-PG-EXTQ-CAST-VALIDATE-COMPAT — PG type-category compatibility
+// (relax strict OID equality for `$N::TYPE` cast validation).
+//
+// V1 SP-PG-EXTQ-CAST-VALIDATE enforced STRICT OID equality between
+// the Bind-supplied param OID and the SQL's `::TYPE` cast OID. That
+// rejection is correct against the V1 contract but wrong against
+// real ORM behaviour: pgJDBC's default `Long` binding sends INT8,
+// but a Java `int` against an `::int8` cast sends INT4 + INT8
+// mismatched at the wire; psycopg3 has the same behaviour for
+// Python `int` → INT4 against `::int8` casts. PG itself accepts
+// these widenings via its `pg_type.dat::typcategory` table.
+//
+// V1 of THIS arc adds two helpers:
+//   - `oid_category(oid)` returns the PG `typcategory` byte for the
+//     V1 type OID set.
+//   - `oid_castable(param_oid, cast_oid)` returns true iff the cast
+//     should be accepted: strict-equality + omitted-OID-skip +
+//     within-category widening.
+// `dispatch_bind`'s validator swaps strict equality for the helper;
+// the error variant + state set + first-mismatch-wins ordering are
+// byte-untouched.
+//
+// V2 follow-ups named: `SP-PG-EXTQ-CAST-VALIDATE-COMPAT-RANGE`
+// (overflow-check param value vs cast-type range),
+// `SP-PG-EXTQ-CAST-VALIDATE-LITERAL` (relax-and-validate literal
+// casts too), `SP-PG-EXTQ-CAST-VALIDATE-CATEGORY-CROSS` (accept the
+// cross-category casts PG itself accepts, e.g. TEXT '42' → INT8).
+// ───────────────────────────────────────────────────────────────────
+
+/// SP-PG-EXTQ-CAST-VALIDATE-COMPAT — returns the PG `typcategory`
+/// byte for the V1 type OID set. Unknown OIDs return `'U'` (user-
+/// defined / unknown) — they form their own degenerate category and
+/// only compare-equal to themselves under `oid_castable`.
+///
+/// Categories per `pg_type.dat`:
+/// - `'N'` numeric: int2 / int4 / int8 / float4 / float8 / numeric.
+/// - `'S'` string: text / varchar / bpchar.
+/// - `'B'` boolean: bool.
+/// - `'D'` date/time: timestamptz / time / timestamp.
+/// - `'U'` user-defined / unknown / binary: bytea + any OID this V1
+///   doesn't recognise. We deliberately keep bytea isolated in `'U'`
+///   so the validator effect is "bytea ↔ bytea only" (PG itself
+///   groups bytea with `'B'` bit-string, but V1 of this arc plays
+///   it safe — widening bytea would touch the binary-format admission
+///   plumbing in `dispatch_bind`).
+pub fn oid_category(oid: u32) -> char {
+    match oid {
+        PG_TYPE_BOOL => 'B',
+        // bytea — isolated in 'U' so it only compares-equal to itself.
+        PG_TYPE_BYTEA => 'U',
+        // All numeric OIDs share the 'N' category. PG itself treats
+        // INT2/INT4/INT8/FLOAT4/FLOAT8/NUMERIC as a coercion family
+        // (widening + narrowing both legal at the type-check layer;
+        // narrowing overflow is a 22003 at compute time, not at
+        // typecheck).
+        PG_TYPE_INT2
+        | PG_TYPE_INT4
+        | PG_TYPE_INT8
+        | PG_TYPE_FLOAT4
+        | PG_TYPE_FLOAT8
+        | PG_TYPE_NUMERIC => 'N',
+        // Text-family OIDs share 'S'. Includes the canonical `bpchar`
+        // OID (1042) so a `::bpchar` cast against a TEXT param doesn't
+        // false-reject (rare but pg_dump-style flows emit it).
+        PG_TYPE_TEXT | PG_TYPE_VARCHAR | 1042 => 'S',
+        // Date/time family share 'D'. timestamptz + time + timestamp;
+        // date (1082) + interval (1186) deferred to a future arc until
+        // KesselDB has FieldKinds for them.
+        PG_TYPE_TIMESTAMPTZ | 1083 | 1114 => 'D',
+        _ => 'U',
+    }
+}
+
+/// SP-PG-EXTQ-CAST-VALIDATE-COMPAT — returns true iff a Bind whose
+/// param has `param_oid` should be accepted against a SQL cast to
+/// `cast_oid`.
+///
+/// Truth table (in evaluation order):
+///   1. `param_oid == cast_oid` → true (V1 strict equality is the
+///      base case; locked here so a V2 relax doesn't regress the
+///      V1 happy path).
+///   2. `param_oid == 0` → true (Parse omitted the OID hint at this
+///      position — V1 skip rule preserved for asyncpg / psycopg3
+///      default shape).
+///   3. `oid_category(param_oid) == oid_category(cast_oid)` → true
+///      (the V2 widening: any pair of OIDs sharing a `typcategory`
+///      byte is mutually castable at the gateway level; the
+///      engine type-checker is the final arbiter for any actual
+///      coercion errors at compute time).
+///   4. Otherwise → false (cross-category mismatch; caller surfaces
+///      `ExtqError::CastOidMismatch` → SQLSTATE `42846 cannot_coerce`).
+///
+/// Used by `extq::dispatch_bind` to replace V1's strict
+/// `actual_oid != declared_oid` check. The skip-and-strict cases
+/// collapse into this helper so the dispatch-side loop stays a
+/// single comparison.
+pub fn oid_castable(param_oid: u32, cast_oid: u32) -> bool {
+    if param_oid == cast_oid {
+        return true;
+    }
+    // V1 skip rule — Parse omitted the OID hint at this position.
+    // The omitted hint is the client's explicit signal "trust the
+    // SQL"; asyncpg / psycopg3 default flow lands here.
+    if param_oid == 0 {
+        return true;
+    }
+    // V2 widening — intra-category compatibility table.
+    oid_category(param_oid) == oid_category(cast_oid)
 }
 
 #[cfg(test)]
@@ -312,5 +424,171 @@ mod tests {
         // Unknown OIDs default to -1 (safest — libpq treats unknown
         // as variable-length).
         assert_eq!(type_size_for_oid(99999), -1);
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // SP-PG-EXTQ-CAST-VALIDATE-COMPAT KATs — lock the type-category
+    // table + the `oid_castable` widening rules. Cross-category
+    // rejection MUST stay locked or the V1 silent-coercion vector
+    // re-opens; intra-category acceptance MUST stay locked or
+    // pgJDBC INT4-against-INT8 binds regress to V1 strict rejection.
+    // ───────────────────────────────────────────────────────────────
+
+    /// `oid_category` returns 'N' for every V1 numeric OID. PG groups
+    /// int2/int4/int8/float4/float8/numeric in the same coercion
+    /// family at the type-check layer.
+    #[test]
+    fn cast_compat_oid_category_numeric_family() {
+        assert_eq!(oid_category(PG_TYPE_INT2), 'N');
+        assert_eq!(oid_category(PG_TYPE_INT4), 'N');
+        assert_eq!(oid_category(PG_TYPE_INT8), 'N');
+        assert_eq!(oid_category(PG_TYPE_FLOAT4), 'N');
+        assert_eq!(oid_category(PG_TYPE_FLOAT8), 'N');
+        assert_eq!(oid_category(PG_TYPE_NUMERIC), 'N');
+    }
+
+    /// `oid_category` returns 'S' for every V1 string OID
+    /// (text/varchar/bpchar).
+    #[test]
+    fn cast_compat_oid_category_string_family() {
+        assert_eq!(oid_category(PG_TYPE_TEXT), 'S');
+        assert_eq!(oid_category(PG_TYPE_VARCHAR), 'S');
+        assert_eq!(oid_category(1042 /* bpchar */), 'S');
+    }
+
+    /// `oid_category` returns 'B' for bool, 'D' for date/time OIDs,
+    /// 'U' for bytea + unknown OIDs.
+    #[test]
+    fn cast_compat_oid_category_isolated_and_unknown() {
+        assert_eq!(oid_category(PG_TYPE_BOOL), 'B');
+        // Date/time family.
+        assert_eq!(oid_category(PG_TYPE_TIMESTAMPTZ), 'D');
+        assert_eq!(oid_category(1083 /* time */), 'D');
+        assert_eq!(oid_category(1114 /* timestamp */), 'D');
+        // Bytea stays in 'U' so it only ↔ bytea (and other 'U' OIDs).
+        assert_eq!(oid_category(PG_TYPE_BYTEA), 'U');
+        // Unknown OIDs fall through to 'U'.
+        assert_eq!(oid_category(99999), 'U');
+        assert_eq!(oid_category(0), 'U');
+    }
+
+    /// HEADLINE: INT4 param + INT8 cast — V1 strict rejected; V2
+    /// accepts (same 'N' category). This is the pgJDBC default
+    /// binding shape that the V1 strict equality false-rejected.
+    #[test]
+    fn cast_compat_int4_param_int8_cast_accepted() {
+        assert!(oid_castable(PG_TYPE_INT4, PG_TYPE_INT8));
+    }
+
+    /// INT8 param + INT4 cast — symmetric to the headline case
+    /// (still 'N' ↔ 'N').
+    #[test]
+    fn cast_compat_int8_param_int4_cast_accepted() {
+        assert!(oid_castable(PG_TYPE_INT8, PG_TYPE_INT4));
+    }
+
+    /// INT8 param + FLOAT8 cast — int-to-float widening within
+    /// the 'N' category. Real psycopg `int` + `::float8` pattern.
+    #[test]
+    fn cast_compat_int8_param_float8_cast_accepted() {
+        assert!(oid_castable(PG_TYPE_INT8, PG_TYPE_FLOAT8));
+    }
+
+    /// INT4 param + NUMERIC cast — numeric is also 'N', so widening
+    /// to arbitrary precision passes the gateway typecheck.
+    #[test]
+    fn cast_compat_int4_param_numeric_cast_accepted() {
+        assert!(oid_castable(PG_TYPE_INT4, PG_TYPE_NUMERIC));
+    }
+
+    /// TEXT param + VARCHAR cast — same 'S' category. pgJDBC
+    /// `setString` against `::varchar(N)` casts.
+    #[test]
+    fn cast_compat_text_param_varchar_cast_accepted() {
+        assert!(oid_castable(PG_TYPE_TEXT, PG_TYPE_VARCHAR));
+        // Symmetric.
+        assert!(oid_castable(PG_TYPE_VARCHAR, PG_TYPE_TEXT));
+    }
+
+    /// TEXT param + INT8 cast — cross-category ('S' vs 'N'). This is
+    /// the V1 silent-coercion vector — V2 MUST still reject so the
+    /// closed attack surface stays closed.
+    #[test]
+    fn cast_compat_text_param_int8_cast_rejected() {
+        assert!(!oid_castable(PG_TYPE_TEXT, PG_TYPE_INT8));
+    }
+
+    /// BOOL param + INT8 cast — 'B' vs 'N' cross-category rejection.
+    #[test]
+    fn cast_compat_bool_param_int8_cast_rejected() {
+        assert!(!oid_castable(PG_TYPE_BOOL, PG_TYPE_INT8));
+    }
+
+    /// BYTEA param + TEXT cast — 'U' (bytea) vs 'S' cross-category
+    /// rejection. Keeps the binary-format admission boundary intact.
+    #[test]
+    fn cast_compat_bytea_param_text_cast_rejected() {
+        assert!(!oid_castable(PG_TYPE_BYTEA, PG_TYPE_TEXT));
+    }
+
+    /// Same OID on both sides — V1 strict equality is the base case.
+    /// `oid_castable` MUST preserve V1 happy-path acceptance for
+    /// every same-OID input.
+    #[test]
+    fn cast_compat_strict_equality_base_case() {
+        for &oid in &[
+            PG_TYPE_BOOL,
+            PG_TYPE_BYTEA,
+            PG_TYPE_INT2,
+            PG_TYPE_INT4,
+            PG_TYPE_INT8,
+            PG_TYPE_TEXT,
+            PG_TYPE_VARCHAR,
+            PG_TYPE_FLOAT4,
+            PG_TYPE_FLOAT8,
+            PG_TYPE_NUMERIC,
+            PG_TYPE_TIMESTAMPTZ,
+        ] {
+            assert!(
+                oid_castable(oid, oid),
+                "same-OID ({}, {}) MUST be castable",
+                oid,
+                oid
+            );
+        }
+    }
+
+    /// Omitted OID hint (`param_oid == 0`) → V1 skip rule preserved.
+    /// asyncpg / psycopg3 default flow lands here — the validator
+    /// MUST NOT reject regardless of the cast OID.
+    #[test]
+    fn cast_compat_omitted_oid_hint_skips_validation() {
+        for &cast_oid in &[
+            PG_TYPE_INT8,
+            PG_TYPE_TEXT,
+            PG_TYPE_BOOL,
+            PG_TYPE_BYTEA,
+            PG_TYPE_NUMERIC,
+            PG_TYPE_VARCHAR,
+            PG_TYPE_TIMESTAMPTZ,
+        ] {
+            assert!(
+                oid_castable(0, cast_oid),
+                "omitted param OID hint (0) MUST skip validation \
+                 even against cast OID {cast_oid}"
+            );
+        }
+    }
+
+    /// Unknown param OID + KNOWN-typed cast OID rejects (the V1
+    /// "trust nothing about unknown types" stance is preserved
+    /// because `'U' != 'N' / 'S' / 'B' / 'D'`). Same-unknown
+    /// (degenerate 'U' ↔ 'U') accepts via strict equality.
+    #[test]
+    fn cast_compat_unknown_oid_vs_known_rejected() {
+        assert!(!oid_castable(99999, PG_TYPE_INT8));
+        assert!(!oid_castable(99999, PG_TYPE_TEXT));
+        // Same unknown ↔ same unknown is accepted via strict equality.
+        assert!(oid_castable(99999, 99999));
     }
 }

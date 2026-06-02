@@ -737,20 +737,26 @@ fn dispatch_bind(
     // `42846 cannot_coerce` rejection instead of a silent strip-
     // and-coerce.
     //
-    // V1 of THIS arc enforces STRICT OID equality. V2
-    // `SP-PG-EXTQ-CAST-VALIDATE-COMPAT` could relax this to PG's
-    // type-category compatibility table.
+    // SP-PG-EXTQ-CAST-VALIDATE-COMPAT V1 (2026-06-02) — strict OID
+    // equality is too strict for real ORMs: pgJDBC's default `Long`
+    // binding sends INT8 but a Java `int` against an `::int8` cast
+    // sends INT4 + INT8 mismatched at the wire (psycopg3 has the
+    // same shape for Python `int`). PG itself accepts these
+    // widenings via its `pg_type.dat::typcategory` table. We swap
+    // the strict equality + skip-rule pair for `oid_castable`,
+    // which encodes BOTH rules + the V2 widening (intra-category
+    // pairs accept). Cross-category mismatches (`'S'` vs `'N'`,
+    // `'B'` vs `'N'`, `'U'` vs `'S'`) still reject — the silent-
+    // coercion vector stays closed.
     //
-    // Skip rule: when Parse omitted the OID hint for this position
-    // (= 0 = "infer"), we DON'T reject — the omitted hint is the
-    // client's explicit signal "trust the SQL". asyncpg / psycopg3
-    // exercise this path; pgJDBC / psycopg2 always set both sides.
+    // V2 follow-ups: `SP-PG-EXTQ-CAST-VALIDATE-COMPAT-RANGE`
+    // (overflow-check the param value vs the cast-type range, e.g.
+    // INT4 value 100000 vs INT2 cast), `SP-PG-EXTQ-CAST-VALIDATE-
+    // CATEGORY-CROSS` (accept SOME cross-category casts PG itself
+    // accepts, e.g. TEXT '42' → INT8).
     for &(index, declared_oid) in &prep_param_casts {
         let actual_oid = prep_param_oids.get(index).copied().unwrap_or(0);
-        if actual_oid == 0 {
-            continue;
-        }
-        if actual_oid != declared_oid {
+        if !crate::types::oid_castable(actual_oid, declared_oid) {
             return set_err(
                 state,
                 ExtqError::CastOidMismatch {
@@ -5648,6 +5654,108 @@ mod tests {
             }
             other => panic!("expected CastOidMismatch, got {other:?}"),
         }
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // SP-PG-EXTQ-CAST-VALIDATE-COMPAT KATs — lock the widening at the
+    // dispatch_bind layer (the type-level helper KATs live in
+    // `crate::types::tests::cast_compat_*`). These KATs exercise
+    // try_dispatch_extq end-to-end so a regression in the call site
+    // (e.g. accidentally re-introducing the strict `!=` check) trips
+    // here too. Naming convention `cast_validate_compat_t2_*` so they
+    // sort next to the V1 strict-mode KATs above.
+    // ───────────────────────────────────────────────────────────────
+
+    /// HEADLINE — pgJDBC pattern: INT4 param + `::int8` cast. V1
+    /// strict rejected with 42846; V2 COMPAT accepts as same-'N'-
+    /// category widening.
+    #[test]
+    fn cast_validate_compat_t2_int4_param_int8_cast_accepted_end_to_end() {
+        let mut state = SessionState::new();
+        let parse = proto::ExtqMessage::Parse {
+            name: "p".to_string(),
+            sql: "SELECT * FROM t WHERE id = $1::int8".to_string(),
+            param_oids: vec![PG_TYPE_INT4], // 23 — widens to int8 cast (20).
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, parse) {
+            ExtqOutcome::Bytes(_) => {}
+            other => panic!("Parse should succeed, got {other:?}"),
+        }
+        let bind = proto::ExtqMessage::Bind {
+            portal: String::new(),
+            stmt: "p".to_string(),
+            param_formats: vec![FORMAT_CODE_TEXT],
+            param_values: vec![Some(b"42".to_vec())],
+            result_formats: vec![FORMAT_CODE_TEXT],
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, bind) {
+            ExtqOutcome::Bytes(b) => assert_eq!(b, vec![b'2', 0, 0, 0, 4]),
+            other => panic!("INT4 + INT8 cast should accept under COMPAT, got {other:?}"),
+        }
+        assert!(!state.in_error_state());
+        assert_eq!(state.portal_count(), 1);
+    }
+
+    /// TEXT + VARCHAR widening — same 'S' category. pgJDBC
+    /// `setString` against `::varchar(N)` casts.
+    #[test]
+    fn cast_validate_compat_t2_text_param_varchar_cast_accepted_end_to_end() {
+        let mut state = SessionState::new();
+        let parse = proto::ExtqMessage::Parse {
+            name: "p".to_string(),
+            sql: "SELECT * FROM t WHERE name = $1::varchar".to_string(),
+            param_oids: vec![PG_TYPE_TEXT], // 25 — widens to varchar cast (1043).
+        };
+        try_dispatch_extq(&mut state, &NoSchemaEngine, parse);
+        let bind = proto::ExtqMessage::Bind {
+            portal: String::new(),
+            stmt: "p".to_string(),
+            param_formats: vec![FORMAT_CODE_TEXT],
+            param_values: vec![Some(b"compat".to_vec())],
+            result_formats: vec![FORMAT_CODE_TEXT],
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, bind) {
+            ExtqOutcome::Bytes(b) => assert_eq!(b, vec![b'2', 0, 0, 0, 4]),
+            other => panic!("TEXT + VARCHAR cast should accept under COMPAT, got {other:?}"),
+        }
+        assert!(!state.in_error_state());
+    }
+
+    /// Cross-category mismatch (TEXT param + INT8 cast) STILL
+    /// rejects under COMPAT. The V1 silent-coercion vector stays
+    /// closed — only intra-category widenings open.
+    #[test]
+    fn cast_validate_compat_t2_text_param_int8_cast_still_rejects_with_42846() {
+        let mut state = SessionState::new();
+        let parse = proto::ExtqMessage::Parse {
+            name: "p".to_string(),
+            sql: "SELECT * FROM t WHERE id = $1::int8".to_string(),
+            param_oids: vec![PG_TYPE_TEXT], // 'S' vs 'N' — must still reject.
+        };
+        try_dispatch_extq(&mut state, &NoSchemaEngine, parse);
+        let bind = proto::ExtqMessage::Bind {
+            portal: String::new(),
+            stmt: "p".to_string(),
+            param_formats: vec![FORMAT_CODE_TEXT],
+            param_values: vec![Some(b"42".to_vec())],
+            result_formats: vec![FORMAT_CODE_TEXT],
+        };
+        match try_dispatch_extq(&mut state, &NoSchemaEngine, bind) {
+            ExtqOutcome::Failed(ExtqError::CastOidMismatch {
+                position,
+                declared,
+                actual,
+            }) => {
+                assert_eq!(position, 0);
+                assert_eq!(declared, PG_TYPE_INT8);
+                assert_eq!(actual, PG_TYPE_TEXT);
+            }
+            other => panic!(
+                "cross-category TEXT/INT8 MUST still reject under COMPAT, got {other:?}"
+            ),
+        }
+        assert!(state.in_error_state());
+        assert_eq!(state.portal_count(), 0);
     }
 
     /// Literal cast (`1::int8`) — no `$N` placeholder, so no tracking

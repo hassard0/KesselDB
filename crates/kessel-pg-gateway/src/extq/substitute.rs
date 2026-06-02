@@ -771,8 +771,9 @@ fn preprocess_text_value(bytes: &[u8], type_oid: u32) -> Option<kessel_codec::Va
         PG_TYPE_TEXT | PG_TYPE_VARCHAR | PG_TYPE_BYTEA => {
             // Text/varchar/bytea text format is already string-shaped
             // bytes — Value::Blob carries them through to the parser
-            // which will produce a `Lit::Str` and route to lit_to_value
-            // for the target column kind.
+            // which (post SP-PG-EXTQ-PARSED-BYTEA-TYPED) routes via
+            // `Tok::Bytes` → `Lit::Bytes` → `lit_to_value` for the
+            // target column kind. Non-UTF8 bytes preserved verbatim.
             Some(Value::Blob(bytes.to_vec()))
         }
         // FLOAT4/FLOAT8/TIMESTAMPTZ/NUMERIC text-format SHAPES need a
@@ -818,13 +819,15 @@ fn preprocess_binary_value(bytes: &[u8], type_oid: u32) -> Option<kessel_codec::
                 _ => None,
             }
         }
-        // SP-PG-EXTQ-PARSED-DEFAULT T2 — BYTEA BINARY route needs the
-        // `'\xHEX'::bytea` cast wrapper that only the text-substitution
-        // path emits (kessel-sql's `rewrite_param_tokens` does a
-        // utf8-lossy cast of the bytes into `Tok::Str` which is wrong
-        // for non-UTF8 byte sequences). Fall back so the V1 cast-
-        // wrapper path renders the literal correctly.
-        PG_TYPE_BYTEA => None,
+        // SP-PG-EXTQ-PARSED-BYTEA-TYPED T2 — BYTEA binary now flows
+        // through the typed path. kessel-sql's `rewrite_param_tokens`
+        // emits `Tok::Bytes(b)` for the `Value::Blob` shape (no
+        // UTF-8 round-trip) and value-position parsers route it
+        // through `Lit::Bytes` → `lit_to_value` → `Value::Blob` for
+        // CHAR/BYTES/Ref columns. The bytes never enter SQL text
+        // and arbitrary byte sequences (including 0x00, 0xFF, and
+        // isolated UTF-8 continuation bytes) round-trip byte-equal.
+        PG_TYPE_BYTEA => Some(Value::Blob(bytes.to_vec())),
         PG_TYPE_TEXT | PG_TYPE_VARCHAR => {
             // Validate UTF-8 to match the text-substitution path's
             // error shape — if invalid, fall back so the existing
@@ -2185,5 +2188,125 @@ mod tests {
         let oids: Vec<u32> = vec![PG_TYPE_NUMERIC];
         let typed = preprocess_typed_params(&params, &formats, &oids);
         assert!(typed.is_none());
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // SP-PG-EXTQ-PARSED-BYTEA-TYPED T2 KATs — BYTEA-binary route admits
+    // arbitrary raw bytes through the typed path (post-bug-fix shape).
+    // The prior V1 disposition returned `None` and forced the text-
+    // substitution fallback because `kessel_sql::rewrite_param_tokens`
+    // corrupted non-UTF8 bytes through `String::from_utf8_lossy`. With
+    // the fix in `rewrite_param_tokens` (`Tok::Bytes` + `Lit::Bytes`),
+    // BYTEA-binary is now uniformly typed.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// BYTEA binary `[0x00, 0xFF]` → `Some(Value::Blob([0x00, 0xFF]))`.
+    /// The prior shape returned `None` (typed-path carve-out); now the
+    /// typed path accepts BYTEA verbatim.
+    #[test]
+    fn t2byteatyped_preprocess_binary_bytea_returns_value_blob() {
+        let raw: Vec<u8> = vec![0x00, 0xFF];
+        let params: Vec<Option<&[u8]>> = vec![Some(&raw[..])];
+        let formats: Vec<u16> = vec![crate::proto::FORMAT_CODE_BINARY];
+        let oids: Vec<u32> = vec![PG_TYPE_BYTEA];
+        let typed = preprocess_typed_params(&params, &formats, &oids)
+            .expect("BYTEA binary now flows through typed path");
+        assert_eq!(typed, vec![Some(kessel_codec::Value::Blob(raw))]);
+    }
+
+    /// BYTEA binary `[0xDE, 0xAD, 0xBE, 0xEF]` (a common non-UTF8
+    /// payload) round-trips as `Value::Blob` byte-equal.
+    #[test]
+    fn t2byteatyped_preprocess_binary_bytea_non_utf8_payload_preserved() {
+        let raw: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let params: Vec<Option<&[u8]>> = vec![Some(&raw[..])];
+        let formats: Vec<u16> = vec![crate::proto::FORMAT_CODE_BINARY];
+        let oids: Vec<u32> = vec![PG_TYPE_BYTEA];
+        let typed = preprocess_typed_params(&params, &formats, &oids)
+            .expect("BYTEA binary now typed-eligible");
+        assert_eq!(
+            typed,
+            vec![Some(kessel_codec::Value::Blob(raw))],
+        );
+    }
+
+    /// BYTEA binary with empty bytes `[]` → `Some(Value::Blob([]))`.
+    /// Edge case: the empty-payload shape still routes through the
+    /// typed path (previously fell back to text-substitute path).
+    #[test]
+    fn t2byteatyped_preprocess_binary_bytea_empty_payload() {
+        let raw: Vec<u8> = vec![];
+        let params: Vec<Option<&[u8]>> = vec![Some(&raw[..])];
+        let formats: Vec<u16> = vec![crate::proto::FORMAT_CODE_BINARY];
+        let oids: Vec<u32> = vec![PG_TYPE_BYTEA];
+        let typed = preprocess_typed_params(&params, &formats, &oids)
+            .expect("empty BYTEA accepted");
+        assert_eq!(
+            typed,
+            vec![Some(kessel_codec::Value::Blob(raw))],
+        );
+    }
+
+    /// End-to-end: gateway classifier + kessel-sql `compile_with_params`
+    /// round-trips arbitrary non-UTF8 bytes through to the program
+    /// operand. This is the gateway-layer regression-lock for the
+    /// `from_utf8_lossy` bug fix.
+    #[test]
+    fn t2byteatyped_gateway_bytea_binary_non_utf8_round_trip_to_program() {
+        let raw: Vec<u8> = vec![0xFF, 0xFE, 0xFD, 0x00, 0x80];
+        let params: Vec<Option<&[u8]>> = vec![Some(&raw[..])];
+        let formats: Vec<u16> = vec![crate::proto::FORMAT_CODE_BINARY];
+        let oids: Vec<u32> = vec![PG_TYPE_BYTEA];
+        let typed = preprocess_typed_params(&params, &formats, &oids)
+            .expect("BYTEA binary typed-eligible");
+        // End-to-end via kessel-sql compile_with_params.
+        use kessel_catalog::Catalog;
+        use kessel_proto::Op;
+        let mut ot = kessel_catalog::ObjectType::from_def(
+            "b".to_string(),
+            vec![
+                kessel_catalog::Field {
+                    field_id: 1,
+                    name: "id".to_string(),
+                    kind: kessel_catalog::FieldKind::I64,
+                    nullable: false,
+                },
+                kessel_catalog::Field {
+                    field_id: 2,
+                    name: "data".to_string(),
+                    kind: kessel_catalog::FieldKind::Bytes(8),
+                    nullable: false,
+                },
+            ],
+        );
+        ot.type_id = 1;
+        let mut cat = Catalog::default();
+        cat.types.push(ot);
+        let op = kessel_sql::compile_with_params(
+            "SELECT * FROM b WHERE data = $1",
+            &cat,
+            &typed,
+        )
+        .expect("compile_with_params ok");
+        match op {
+            Op::QueryRows { program, .. } => {
+                let has = program.windows(raw.len()).any(|w| w == raw.as_slice());
+                assert!(
+                    has,
+                    "expected non-UTF8 BYTEA bytes {raw:?} to appear \
+                     verbatim in the program operand; got {program:?}",
+                );
+                // The UTF-8 replacement bytes (lossy regression) must
+                // NOT appear.
+                let lossy = program.windows(3).any(|w| w == [0xEF, 0xBF, 0xBD]);
+                assert!(
+                    !lossy,
+                    "UTF-8 replacement bytes 0xEF 0xBF 0xBD appeared in \
+                     program — indicates the lossy-UTF8 regression took \
+                     effect; got {program:?}",
+                );
+            }
+            other => panic!("expected QueryRows; got {other:?}"),
+        }
     }
 }

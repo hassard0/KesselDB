@@ -3713,18 +3713,37 @@ mod tests {
         try_dispatch_extq(&mut state, &engine, exec);
     }
 
-    /// SP-PG-EXTQ-BIN T2 — Execute with a BYTEA BINARY parameter
-    /// substitutes `'\xHEX'::bytea` so the SQL parser knows the
-    /// literal's type.
+    /// SP-PG-EXTQ-PARSED-BYTEA-TYPED T2 — Execute with a BYTEA BINARY
+    /// parameter now routes through the TYPED path (no more
+    /// `'\xHEX'::bytea` cast-wrapper text substitution). The raw
+    /// bytes flow as `Value::Blob` through `apply_sql_with_params`
+    /// to the engine; the original SQL string is delivered
+    /// unmutated. Prior to this arc the text-substitution fallback
+    /// emitted `INSERT INTO t (b) VALUES ('\xdead')`; this KAT
+    /// locks the new typed-path behavior.
     #[test]
     fn t2bin_dispatch_execute_substitutes_bytea_binary_with_cast() {
-        struct SqlAssertEngine {
-            expected_sql: String,
+        struct ByteaTypedAssertEngine {
+            captured: std::sync::Mutex<
+                Vec<(String, Vec<Option<kessel_codec::Value>>)>,
+            >,
         }
-        impl EngineApply for SqlAssertEngine {
-            fn apply_sql(&self, sql: &str) -> OpResult {
-                let trimmed = sql.trim().trim_end_matches(';').trim();
-                assert_eq!(trimmed, self.expected_sql.as_str());
+        impl EngineApply for ByteaTypedAssertEngine {
+            fn apply_sql(&self, _sql: &str) -> OpResult {
+                panic!(
+                    "BYTEA binary must route through the typed path \
+                     (apply_sql_with_params), not the text path",
+                );
+            }
+            fn apply_sql_with_params(
+                &self,
+                sql: &str,
+                params: &[Option<kessel_codec::Value>],
+            ) -> OpResult {
+                self.captured
+                    .lock()
+                    .unwrap()
+                    .push((sql.to_string(), params.to_vec()));
                 OpResult::Got(Vec::<u8>::new().into())
             }
             fn describe_table(
@@ -3748,16 +3767,8 @@ mod tests {
             param_values: vec![Some(vec![0xDE, 0xAD])],
             result_formats: vec![],
         };
-        // SP-PG-EXTQ-CAST: the substitute layer still emits the
-        // `::bytea` cast hint for parser-typed-literal reasons, but
-        // the gateway dispatch entry now strips `::TYPE` before the
-        // engine sees the SQL (so the engine receives the bare
-        // `'\xdead'` literal). Update the engine expectation to the
-        // post-strip form — `kessel-sql` actually rejects `::` so
-        // the strip is the form the engine can parse.
-        let engine = SqlAssertEngine {
-            expected_sql: "INSERT INTO t (b) VALUES ('\\xdead')"
-                .to_string(),
+        let engine = ByteaTypedAssertEngine {
+            captured: std::sync::Mutex::new(Vec::new()),
         };
         try_dispatch_extq(&mut state, &engine, bind);
         let exec = proto::ExtqMessage::Execute {
@@ -3765,6 +3776,22 @@ mod tests {
             max_rows: 0,
         };
         try_dispatch_extq(&mut state, &engine, exec);
+        // Verify the typed call carried the SQL unmutated + the
+        // BYTEA bytes as a `Value::Blob`.
+        let captured = engine.captured.lock().unwrap();
+        assert_eq!(
+            captured.len(),
+            1,
+            "exactly one typed-path call expected"
+        );
+        let (sql, params) = &captured[0];
+        assert_eq!(sql, "INSERT INTO t (b) VALUES ($1)");
+        assert_eq!(params.len(), 1);
+        assert_eq!(
+            params[0],
+            Some(kessel_codec::Value::Blob(vec![0xDE, 0xAD])),
+            "BYTEA bytes must flow through typed path as Value::Blob",
+        );
     }
 
     /// SP-PG-EXTQ-BIN T2 — NULL is format-agnostic: a binary-format

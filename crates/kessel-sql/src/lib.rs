@@ -21,6 +21,14 @@ enum Tok {
     Ident(String),
     Int(i128),
     Str(String),
+    /// SP-PG-EXTQ-PARSED-BYTEA-TYPED T2 — raw-bytes literal that
+    /// preserves arbitrary byte sequences (including non-UTF8) for
+    /// param-bound BYTES/CHAR column values. NOT producible by the
+    /// lexer (no surface syntax binds to it); reserved exclusively
+    /// for the `rewrite_param_tokens` blob path. Value-position
+    /// parsers (INSERT VALUES, UPDATE SET, WHERE comparison RHS)
+    /// accept it alongside `Tok::Str` and route to `Lit::Bytes`.
+    Bytes(Vec<u8>),
     Punct(char),  // ( ) , * ;
     Cmp(&'static str), // = != < <= > >=
     Plus,
@@ -671,6 +679,10 @@ fn compile_stmt_from_tokens(
                 let lit = match p.next() {
                     Some(Tok::Int(n)) => Lit::Int(n),
                     Some(Tok::Str(s)) => Lit::Str(s),
+                    // SP-PG-EXTQ-PARSED-BYTEA-TYPED T2 — accept the
+                    // raw-bytes shape emitted by the param-rewriter
+                    // for `Value::Blob` bindings.
+                    Some(Tok::Bytes(b)) => Lit::Bytes(b),
                     _ => return Err("expected value".into()),
                 };
                 let f = ot
@@ -711,11 +723,13 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
 /// weak-spot #1 attack surface. Per the design spec §3.1 rewrite
 /// rules: `Some(Value::Int(i))` → `Tok::Int(i)`, `Some(Value::Uint(u))`
 /// → `Tok::Int(u as i128)` (errors on overflow), `Some(Value::Blob(b))`
-/// → `Tok::Str(utf8-lossy-cast)`, `Some(Value::Null)` / `None` →
-/// `Tok::Ident("NULL")`. Out-of-bounds `$N` returns `SqlError`. The
-/// rewritten token stream is handed to the existing parser unchanged —
-/// the compiled `Op` is byte-identical to what you'd get from the
-/// equivalent SQL with literal values in place of the placeholders.
+/// → `Tok::Bytes(b)` (SP-PG-EXTQ-PARSED-BYTEA-TYPED T2 — raw bytes
+/// preserved verbatim, NO UTF-8 round-trip), `Some(Value::Null)` /
+/// `None` → `Tok::Ident("NULL")`. Out-of-bounds `$N` returns
+/// `SqlError`. The rewritten token stream is handed to the existing
+/// parser unchanged — the compiled `Op` is byte-identical to what
+/// you'd get from the equivalent SQL with literal values in place of
+/// the placeholders.
 pub fn compile_with_params(
     sql: &str,
     cat: &Catalog,
@@ -759,10 +773,13 @@ pub fn compile_stmt_with_params(
 /// - `Some(Value::Int(i))` → `Tok::Int(i)`.
 /// - `Some(Value::Uint(u))` → `Tok::Int(u as i128)` if it fits,
 ///   else `SqlError`.
-/// - `Some(Value::Blob(b))` → `Tok::Str(utf8-lossy-cast)`. The bytes
-///   are LITERAL string content; the parser will route them to
-///   `lit_to_value` which already accepts string-shaped numerics
-///   for numeric columns (SP-PG-SQL-PAREN-VALUES coercion).
+/// - `Some(Value::Blob(b))` → `Tok::Bytes(b)` (SP-PG-EXTQ-PARSED-
+///   BYTEA-TYPED T2 — preserves arbitrary bytes including non-UTF8
+///   sequences). The parser's value-position arms accept
+///   `Tok::Bytes` alongside `Tok::Str` and route to `Lit::Bytes`
+///   which `lit_to_value` materializes as `Value::Blob` for
+///   CHAR/BYTES/Ref columns, or attempts UTF-8 + decimal coercion
+///   for numeric columns (mirrors the SP-PG-SQL-PAREN-VALUES path).
 /// - `Some(Value::Null)` or `None` → `Tok::Ident("NULL")`. The
 ///   parser already accepts the bare `NULL` keyword in literal
 ///   positions.
@@ -808,16 +825,19 @@ fn rewrite_param_tokens(
                         out.push(Tok::Int(*u as i128));
                     }
                     Some(Value::Blob(b)) => {
-                        // utf8-lossy is correct for V1: the parser
-                        // accepts the string in literal positions
-                        // (numeric coercion via lit_to_value for
-                        // numeric columns; bytes pass-through for
-                        // CHAR/BYTES). The bytes NEVER touch SQL
-                        // text — they become a single `Tok::Str`
-                        // operand carried verbatim into `Lit::Str`.
-                        out.push(Tok::Str(
-                            String::from_utf8_lossy(b).into_owned(),
-                        ));
+                        // SP-PG-EXTQ-PARSED-BYTEA-TYPED T2 — emit a
+                        // `Tok::Bytes` so non-UTF8 byte sequences are
+                        // preserved verbatim. The prior V1 shape did
+                        // `String::from_utf8_lossy(b)` here, which
+                        // corrupts any byte outside the valid-UTF-8
+                        // grammar (0xC0-0xC1, 0xF5-0xFF, isolated
+                        // continuation bytes 0x80-0xBF) BEFORE the
+                        // bytes reach the storage layer. The new
+                        // `Tok::Bytes` shape carries the bytes through
+                        // to `Lit::Bytes` → `lit_to_value` which
+                        // produces `Value::Blob` byte-for-byte. Bytes
+                        // still NEVER touch SQL text.
+                        out.push(Tok::Bytes(b.clone()));
                     }
                 }
             }
@@ -1409,6 +1429,11 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
                 match p.next() {
                     Some(Tok::Int(n)) => raw.push(Lit::Int(n)),
                     Some(Tok::Str(s)) => raw.push(Lit::Str(s)),
+                    // SP-PG-EXTQ-PARSED-BYTEA-TYPED T2 — accept the
+                    // raw-bytes shape emitted by the param-rewriter
+                    // for `Value::Blob` bindings (non-UTF8 byte
+                    // preservation through INSERT VALUES).
+                    Some(Tok::Bytes(b)) => raw.push(Lit::Bytes(b)),
                     _ => return Err("expected value".into()),
                 }
                 for _ in 0..depth {
@@ -1444,6 +1469,18 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
                         .parse::<i128>()
                         .map(|n| n as u128)
                         .map_err(|_| {
+                            "`id` must be an integer".to_string()
+                        })?,
+                    // SP-PG-EXTQ-PARSED-BYTEA-TYPED T2 — `id` bound
+                    // via `Value::Blob` (e.g. psycopg2 `Binary(b"42")`)
+                    // routes through `Tok::Bytes` → `Lit::Bytes`.
+                    // Accept the same UTF-8 + decimal parse the
+                    // `Lit::Str` path takes; reject non-numeric bytes.
+                    Lit::Bytes(b) => std::str::from_utf8(b)
+                        .ok()
+                        .and_then(|s| s.parse::<i128>().ok())
+                        .map(|n| n as u128)
+                        .ok_or_else(|| {
                             "`id` must be an integer".to_string()
                         })?,
                 },
@@ -1534,6 +1571,11 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
 enum Lit {
     Int(i128),
     Str(String),
+    /// SP-PG-EXTQ-PARSED-BYTEA-TYPED T2 — raw bytes from a bound
+    /// `Value::Blob` parameter. Threads non-UTF8 byte sequences
+    /// through to `lit_to_value` without the UTF-8 round-trip that
+    /// `Lit::Str` requires.
+    Bytes(Vec<u8>),
 }
 
 fn lit_to_value(l: &Lit, k: FieldKind) -> Result<Value, SqlError> {
@@ -1565,6 +1607,43 @@ fn lit_to_value(l: &Lit, k: FieldKind) -> Result<Value, SqlError> {
             if s.parse::<u128>().is_ok() =>
         {
             Value::Uint(s.parse::<u128>().unwrap())
+        }
+        // SP-PG-EXTQ-PARSED-BYTEA-TYPED T2 — raw bytes from a
+        // `Value::Blob` parameter binding. For CHAR/BYTES/Ref
+        // columns the bytes flow through verbatim (NO UTF-8 round-
+        // trip — this is the bug-fix headline: `String::from_utf8_
+        // lossy` in the prior path corrupted non-UTF8 bytes here).
+        (Lit::Bytes(b), Char(_) | Bytes(_) | Ref | OverflowRef) => {
+            Value::Blob(b.clone())
+        }
+        // For numeric column kinds, attempt UTF-8 + decimal parse so
+        // a pyscopg2 `cursor.execute("INSERT ... VALUES (%s)",
+        // (b"42",))` bound to an integer column still works the same
+        // way `Lit::Str("42")` does. Mismatches fall through to the
+        // generic error.
+        (Lit::Bytes(b), I8 | I16 | I32 | I64 | I128 | Fixed { .. })
+            if std::str::from_utf8(b).ok()
+                .and_then(|s| s.parse::<i128>().ok())
+                .is_some() =>
+        {
+            Value::Int(
+                std::str::from_utf8(b)
+                    .unwrap()
+                    .parse::<i128>()
+                    .unwrap(),
+            )
+        }
+        (Lit::Bytes(b), U8 | U16 | U32 | U64 | U128 | Bool | Timestamp)
+            if std::str::from_utf8(b).ok()
+                .and_then(|s| s.parse::<u128>().ok())
+                .is_some() =>
+        {
+            Value::Uint(
+                std::str::from_utf8(b)
+                    .unwrap()
+                    .parse::<u128>()
+                    .unwrap(),
+            )
         }
         _ => return Err("literal/column type mismatch".into()),
     })
@@ -1650,6 +1729,33 @@ fn extract_range_preds(
                 }
             }
         }
+        // SP-PG-EXTQ-PARSED-BYTEA-TYPED T2 — same range-hint shape but
+        // for a raw-bytes literal from a `Value::Blob` parameter
+        // binding. Preserves non-UTF8 bytes through the index hint.
+        if let (Tok::Ident(c), Tok::Cmp(cmp), Tok::Bytes(b)) =
+            (&span[i], &span[i + 1], &span[i + 2])
+        {
+            let rop = match *cmp {
+                ">" => Some(0u8),
+                ">=" => Some(1u8),
+                "<" => Some(2u8),
+                "<=" => Some(3u8),
+                _ => None,
+            };
+            if let (Some(rop), Some(f)) =
+                (rop, ot.fields.iter().find(|f| &f.name == c))
+            {
+                if ot.ordered.contains(&f.field_id)
+                    && matches!(
+                        f.kind,
+                        kessel_catalog::FieldKind::Char(_)
+                            | kessel_catalog::FieldKind::Bytes(_)
+                    )
+                {
+                    out.push((f.field_id, rop, b.clone()));
+                }
+            }
+        }
         i += 1;
     }
     out
@@ -1718,6 +1824,10 @@ fn try_query_rows(p: &mut P) -> Option<Op> {
                                     n.to_le_bytes()[..w.min(16)].to_vec()
                                 }
                                 Tok::Str(s) => s.clone().into_bytes(),
+                                // SP-PG-EXTQ-PARSED-BYTEA-TYPED T2 —
+                                // raw-bytes from a `Value::Blob` param
+                                // binding; preserves non-UTF8 bytes.
+                                Tok::Bytes(b) => b.clone(),
                                 _ => {
                                     i += 1;
                                     continue;
@@ -2290,6 +2400,9 @@ fn term_hinted(
             let single_lit = match (p.peek().cloned(), p.t.get(save + 1).cloned()) {
                 (Some(Tok::Int(_)), Some(Tok::Punct(')'))) => true,
                 (Some(Tok::Str(_)), Some(Tok::Punct(')'))) => true,
+                // SP-PG-EXTQ-PARSED-BYTEA-TYPED T2 — `Tok::Bytes` is
+                // a bare-literal value the same way `Tok::Str` is.
+                (Some(Tok::Bytes(_)), Some(Tok::Punct(')'))) => true,
                 _ => false,
             };
             if single_lit {
@@ -2319,6 +2432,30 @@ fn term_hinted(
                 }
             }
             Ok(Program::new().push_bytes(s.as_bytes()))
+        }
+        // SP-PG-EXTQ-PARSED-BYTEA-TYPED T2 — raw-bytes literal from
+        // a `Value::Blob` parameter binding. Numeric coercion still
+        // applies IF the bytes happen to parse as UTF-8 + decimal
+        // (matches the `Tok::Str` numeric-coercion shape so a
+        // psycopg2 `cursor.execute("...WHERE x = %s", (b"42",))`
+        // bound to a numeric column still works); else push the
+        // bytes as a verbatim bytes literal.
+        Some(Tok::Bytes(b)) => {
+            use FieldKind::*;
+            let numeric = matches!(
+                hint,
+                Some(I8 | I16 | I32 | I64 | I128
+                    | U8 | U16 | U32 | U64 | U128
+                    | Bool | Timestamp | Fixed { .. })
+            );
+            if numeric {
+                if let Ok(s) = std::str::from_utf8(&b) {
+                    if let Ok(n) = s.parse::<i128>() {
+                        return Ok(Program::new().push_int(n));
+                    }
+                }
+            }
+            Ok(Program::new().push_bytes(&b))
         }
         Some(Tok::Ident(name)) => {
             let f = ot
@@ -5163,6 +5300,223 @@ mod tests {
             cat,
         ).expect("ok");
         assert_eq!(format!("{via_params:?}"), format!("{via_literal:?}"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // SP-PG-EXTQ-PARSED-BYTEA-TYPED T2 KATs — `Value::Blob` parameter
+    // bindings flow through `Tok::Bytes` → `Lit::Bytes` → `Value::Blob`
+    // without the UTF-8 round-trip that the V1 `Tok::Str(from_utf8_lossy)`
+    // path imposed. The headline guarantee: non-UTF8 byte sequences
+    // (0xFF, 0xFE, isolated continuation bytes) round-trip byte-equal
+    // through the parser into the engine's storage layer.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Helper: pull the first `Op::Create`'s encoded record out of an
+    /// Op tree. Single-row INSERTs in this SQL surface always wrap in
+    /// `Op::Txn { ops: [Op::Create { record, .. }] }`.
+    fn extract_create_record(op: &Op) -> Vec<u8> {
+        match op {
+            Op::Create { record, .. } => record.clone(),
+            Op::Txn { ops, .. } => ops
+                .iter()
+                .find_map(|o| match o {
+                    Op::Create { record, .. } => Some(record.clone()),
+                    _ => None,
+                })
+                .expect("expected an Op::Create inside Op::Txn"),
+            other => panic!("expected Op::Create or Op::Txn; got {other:?}"),
+        }
+    }
+
+    /// Headline byte-preservation KAT: a `Value::Blob` containing
+    /// non-UTF8 bytes (0x00, 0xFF, 0xFE, 0xFD) bound to a `$1` in an
+    /// INSERT VALUES clause produces an `Op::Create` whose stored
+    /// record carries those exact bytes verbatim.
+    #[test]
+    fn t2byteatyped_value_blob_non_utf8_bytes_preserved_through_insert() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (id I64 NOT NULL, data BYTES(8) NOT NULL)");
+        let cat = sm.catalog();
+        let payload: Vec<u8> = vec![0x00, 0xFF, 0xFE, 0xFD, 0xAB, 0xCD, 0xEF, 0x80];
+        let op = compile_with_params(
+            "INSERT INTO t (id, data) VALUES ($1, $2)",
+            cat,
+            &[Some(Value::Int(1)), Some(Value::Blob(payload.clone()))],
+        )
+        .expect("compile_with_params ok");
+        // The resulting Op::Create carries the payload bytes verbatim
+        // in the encoded record body. Search for the byte sequence in
+        // the encoded form. (Single-row INSERT may wrap in Op::Txn.)
+        let record_bytes = extract_create_record(&op);
+        let has_payload = record_bytes
+            .windows(payload.len())
+            .any(|w| w == payload.as_slice());
+        assert!(
+            has_payload,
+            "expected payload bytes {payload:?} to appear verbatim \
+             in the encoded record {record_bytes:?}",
+        );
+    }
+
+    /// `rewrite_param_tokens` direct: `Value::Blob` with non-UTF8
+    /// bytes produces `Tok::Bytes` (NOT `Tok::Str` with lossy
+    /// conversion). Pins the new variant on the typed-path output.
+    #[test]
+    fn t2byteatyped_rewrite_param_tokens_emits_tok_bytes_for_blob() {
+        // SQL with a single `$1` placeholder. The lexer emits
+        // `Tok::Param(1)`; the rewriter replaces it.
+        let toks = lex("SELECT $1").expect("lex ok");
+        let payload: Vec<u8> = vec![0xFF, 0xFE, 0xFD];
+        let rewritten = rewrite_param_tokens(
+            toks,
+            &[Some(Value::Blob(payload.clone()))],
+        )
+        .expect("rewrite ok");
+        // Find the rewritten param token.
+        let bytes_tok = rewritten
+            .iter()
+            .find(|t| matches!(t, Tok::Bytes(_)));
+        assert!(
+            bytes_tok.is_some(),
+            "expected `Tok::Bytes` in rewritten stream {rewritten:?}",
+        );
+        if let Some(Tok::Bytes(b)) = bytes_tok {
+            assert_eq!(*b, payload, "Tok::Bytes must carry the exact bytes");
+        }
+        // No `Tok::Str` should appear (the lossy-UTF8 regression).
+        let str_tok = rewritten.iter().find(|t| matches!(t, Tok::Str(_)));
+        assert!(
+            str_tok.is_none(),
+            "Tok::Str must NOT appear (would indicate lossy-UTF8 regression); \
+             got {rewritten:?}",
+        );
+    }
+
+    /// WHERE clause: `data = $1` with a non-UTF8 `Value::Blob` bound
+    /// produces a program operand carrying those exact bytes. The
+    /// match-against-stored-row path is byte-equal to a literal
+    /// hex-bytes comparison.
+    #[test]
+    fn t2byteatyped_where_eq_non_utf8_bytes_program_has_payload() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (id I64 NOT NULL, data BYTES(4) NOT NULL)");
+        let cat = sm.catalog();
+        let payload: Vec<u8> = vec![0xCA, 0xFE, 0xBA, 0xBE];
+        let op = compile_with_params(
+            "SELECT * FROM t WHERE data = $1",
+            cat,
+            &[Some(Value::Blob(payload.clone()))],
+        )
+        .expect("compile_with_params ok");
+        match op {
+            Op::QueryRows { program, .. } => {
+                let has = program.windows(payload.len()).any(|w| w == payload);
+                assert!(
+                    has,
+                    "expected payload {payload:?} in program {program:?}",
+                );
+            }
+            other => panic!("expected QueryRows; got {other:?}"),
+        }
+    }
+
+    /// Verbatim `0xFF` byte (always invalid UTF-8 start) survives
+    /// through the typed-path round-trip. This is the canary bug-
+    /// fix proof: the prior `String::from_utf8_lossy(b)` path would
+    /// replace `0xFF` with `U+FFFD REPLACEMENT CHARACTER`
+    /// (`0xEF 0xBF 0xBD` as UTF-8), corrupting the data.
+    #[test]
+    fn t2byteatyped_lone_ff_byte_not_replaced_by_utf8_replacement() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (id I64 NOT NULL, data BYTES(1) NOT NULL)");
+        let cat = sm.catalog();
+        let payload: Vec<u8> = vec![0xFF];
+        let op = compile_with_params(
+            "INSERT INTO t (id, data) VALUES ($1, $2)",
+            cat,
+            &[Some(Value::Int(1)), Some(Value::Blob(payload.clone()))],
+        )
+        .expect("compile_with_params ok");
+        // The U+FFFD UTF-8 replacement bytes are `0xEF 0xBF 0xBD`.
+        // They must NOT appear in the encoded record (they would
+        // indicate the lossy-UTF8 regression took effect).
+        let record_bytes = extract_create_record(&op);
+        let replacement_appears = record_bytes
+            .windows(3)
+            .any(|w| w == [0xEF, 0xBF, 0xBD]);
+        assert!(
+            !replacement_appears,
+            "the U+FFFD replacement bytes must NOT appear in the record \
+             (indicates lossy-UTF8 regression); record = {record_bytes:?}",
+        );
+        // The 0xFF byte itself must appear at SOME offset (the data
+        // payload).
+        assert!(
+            record_bytes.contains(&0xFF),
+            "expected the 0xFF payload byte to appear verbatim in the \
+             record {record_bytes:?}",
+        );
+    }
+
+    /// `Value::Blob(b"42")` (valid UTF-8 ASCII decimal) bound to a
+    /// numeric column still works — the UTF-8 + decimal coercion
+    /// in `lit_to_value` for `Lit::Bytes` matches the `Lit::Str`
+    /// path's SP-PG-SQL-PAREN-VALUES coercion. Locks the backward-
+    /// compatible shape so existing psycopg2-binary-int patterns
+    /// don't regress.
+    #[test]
+    fn t2byteatyped_blob_bytes_numeric_coerces_for_int_columns() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (id I64 NOT NULL, n I64 NOT NULL)");
+        let cat = sm.catalog();
+        let via_params = compile_with_params(
+            "INSERT INTO t (id, n) VALUES ($1, $2)",
+            cat,
+            &[
+                Some(Value::Blob(b"1".to_vec())),
+                Some(Value::Blob(b"42".to_vec())),
+            ],
+        )
+        .expect("compile_with_params ok");
+        let via_literal = compile(
+            "INSERT INTO t (id, n) VALUES (1, 42)",
+            cat,
+        )
+        .expect("compile literal ok");
+        assert_eq!(format!("{via_params:?}"), format!("{via_literal:?}"));
+    }
+
+    /// UPDATE SET via `Tok::Bytes` route — the same UPDATE path that
+    /// `compile_stmt_with_params` handles. Non-UTF8 bytes survive
+    /// into the `Stmt::Update` sets vec.
+    #[test]
+    fn t2byteatyped_compile_stmt_update_set_blob_preserves_bytes() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (id I64 NOT NULL, data BYTES(4) NOT NULL)");
+        run(&mut sm, 2, "INSERT INTO t ID 7 (id, data) VALUES (7, 'init')");
+        let cat = sm.catalog();
+        let payload: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let stmt = compile_stmt_with_params(
+            "UPDATE t ID 7 SET data = $1",
+            cat,
+            &[Some(Value::Blob(payload.clone()))],
+        )
+        .expect("compile_stmt_with_params ok");
+        match stmt {
+            Stmt::Update { sets, .. } => {
+                let (_fid, v) = sets.first().expect("one SET");
+                match v {
+                    Value::Blob(b) => assert_eq!(
+                        b,
+                        &payload,
+                        "Stmt::Update::sets must carry the exact payload \
+                         bytes; got {b:?} vs payload {payload:?}",
+                    ),
+                    other => panic!("expected Value::Blob; got {other:?}"),
+                }
+            }
+            _ => panic!("expected Stmt::Update"),
+        }
     }
 
     /// `compile_stmt_with_params` threads params through the UPDATE

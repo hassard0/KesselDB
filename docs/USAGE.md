@@ -2012,17 +2012,65 @@ CSV format inherits the SP-PG-COPY-BULKAPPLY V1 batching throughput
 + NULL-row fallback semantics — the codec is a payload concern only.
 Smoke transcript: `docs/superpowers/sppgcopycsv-t2-smoke-2026-06-01.txt`.
 
+### SP-PG-COPY-BIN — binary format (V1 SHIPPED 2026-06-02)
+
+PG binary COPY per §55.2.7 — `WITH (FORMAT binary)`. The wire format
+every `pg_dump --format=custom` restore + every JDBC
+`CopyManager.copyIn(PGCopyOutputStream...)` + every modern ETL
+binary-bulk-loader (`pg_bulkload`, `pgloader`, Stitch, Fivetran,
+Airbyte) hard-requires. After this arc shipped, those workflows succeed
+against KesselDB end-to-end.
+
+```bash
+# COPY TO STDOUT binary — emits the canonical PGCOPY\n\xff\r\n\0
+# signature header + length-prefixed binary values + 0xff 0xff EOD.
+psql -h kesseldb -p 5532 -U test -d kesseldb -c \
+  "COPY users TO STDOUT WITH (FORMAT binary)" > users.bin
+hexdump -C users.bin | head -2
+# 00000000  50 47 43 4f 50 59 0a ff  0d 0a 00 00 00 00 00 00  |PGCOPY..........|
+# 00000010  00 00 00 00 02 00 00 00  08 ...
+
+# COPY FROM STDIN binary — round-trips into a fresh table.
+psql -h kesseldb -p 5532 -U test -d kesseldb -c \
+  "COPY users2 FROM STDIN WITH (FORMAT binary)" < users.bin
+# → COPY 3
+```
+
+V1 supports the same 10 column types as SP-PG-EXTQ-BIN (param/result
+binary): BOOL, INT2/INT4/INT8, FLOAT4/FLOAT8, TEXT/VARCHAR, BYTEA,
+TIMESTAMPTZ. Tables with NUMERIC / UUID / JSONB / ARRAY columns are
+pre-rejected at COPY-start with a precise V2-arc-pointing message:
+
+```text
+ERROR:  COPY binary: column "amount" type OID 1700 not supported in V1 (SP-PG-COPY-BIN-NUMERIC)
+```
+
+The binary codec reuses the existing SP-PG-EXTQ-BIN-RESULTS encoder
+(`encode_binary_value`) and SP-PG-EXTQ-BIN param decoder
+(`decode_binary_param`) verbatim — only the framing layer
+(`copy::binary` — 19-byte signature header, per-row length-prefixed
+field values, 2-byte i16 -1 end-of-data marker) is new. Inherits the
+SP-PG-COPY-BULKAPPLY V1 batching throughput.
+
+Smoke transcript: `docs/superpowers/sppgcopybin-t3-smoke-2026-06-02.txt`.
+
 Rejected variants surface precise V2-pointing error messages:
 
 ```text
-ERROR:  COPY binary format not supported in V1 (SP-PG-COPY-BIN)
 ERROR:  COPY FROM/TO file path not supported in V1; use STDIN/STDOUT (SP-PG-COPY-FILE)
 ERROR:  COPY FROM/TO PROGRAM not supported (permanent security restriction)
 ```
 
 V2 follow-ups (each its own SP-arc):
 
-- `SP-PG-COPY-BIN` — binary format (`WITH (FORMAT binary)`).
+- `SP-PG-COPY-BIN-NUMERIC` — binary NUMERIC encoding (the most complex
+  per-type binary format in the PG protocol).
+- `SP-PG-COPY-BIN-OID` — the optional OID-column flag bit (legacy PG
+  ≤11 `WITH OIDS` tables).
+- `SP-PG-COPY-BIN-EXTRA` — binary UUID / JSONB / ARRAY encoding.
+- `SP-PG-COPY-BIN-DIRECT` — bypass the per-value binary→text round
+  trip with typed parameter binding (5-10× throughput win for binary-
+  heavy workloads).
 - `SP-PG-COPY-CSV-FORCEQUOTE` — `FORCE_QUOTE (cols)` / `FORCE_NOT_NULL` /
   `FORCE_NULL` column-scoped CSV modifiers.
 - `SP-PG-COPY-CSV-ENCODING` — non-UTF-8 CSV input/output encodings.

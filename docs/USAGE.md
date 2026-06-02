@@ -2075,6 +2075,21 @@ or extended-query message works normally — the connection STAYS
 ALIVE across COPY errors (matching the SP-PG-EXTQ tolerant
 probe-then-fall-back contract).
 
+**Abort-tail drain (SP-PG-COPY-ABORT-DONE-TAIL V1, 2026-06-02):**
+when a per-row error mid-CopyData emits `ErrorResponse + RFQ` and
+transitions back to Idle, the client may still be flushing trailing
+`CopyData` / `CopyDone` / `CopyFail` frames it had already queued
+before observing the error. Per PG §55.2.7 the server silently
+drains those tail frames without emitting any additional response.
+KesselDB does the same: the connection stays alive, the tail bytes
+are absorbed without a spurious `unsupported message tag` `08P01`,
+and the next Query (`SELECT` / `COPY` / extq `Parse` / etc.)
+succeeds on the SAME TCP connection. A stray `c` / `f` in pristine
+Idle with no preceding abort still rejects with `08P01` (defensive
+shape against a truly broken client). Vulcan psql 16 smoke
+transcript:
+`docs/superpowers/sppgcopyaborttail-t3-smoke-2026-06-02.txt`.
+
 **Throughput** (on vulcan, 100K rows of `(BIGINT, CHAR(64))`, 2026-05-30):
 **~51,840 rows/sec** with SP-PG-COPY-BULKAPPLY (default
 `KESSELDB_COPY_BATCH_SIZE=1024`). The V1 per-row baseline was

@@ -1,0 +1,103 @@
+=== SP-PG-COPY-ABORT-DONE-TAIL T3 vulcan smoke — 2026-06-02 ===
+
+Vulcan: 192.168.4.178 (Ubuntu 24.04, Dell server, 4xV100 SXM2 NVLink).
+Build:  CARGO_TARGET_DIR=/tmp/kdb-target-copyabort cargo build \
+          --release --bin kesseldb --features pg-gateway
+        → release/kesseldb compiled clean (warnings only).
+Ports:  KesselDB native 127.0.0.1:6538; pg-wire 127.0.0.1:5538.
+        (Same port pair the SP-PG-COPY-CSV-NUMERIC smoke used, to
+         avoid colliding with any other agent on 5532/6532.)
+Data:   /tmp/kdb-copyabort-data (fresh).
+HEAD:   5c6156d feat(kessel-pg-gateway): SP-PG-COPY-ABORT-DONE-TAIL
+        T1+T2 — drain trailing CopyDone/CopyFail after a COPY abort.
+
+=== 1. Setup ===
+
+$ ssh admin@192.168.4.178 "PGPASSWORD=admin psql -h 127.0.0.1 -p 5538 \
+    -U test -d kesseldb -c 'CREATE TABLE abort_smoke (id BIGINT, n CHAR(32))'"
+CREATE TABLE
+
+=== 2. Malformed-CSV COPY: error fires, no spurious 'unsupported message tag' ===
+
+$ printf 'id,n\n1,hello\nnot-a-number,world\n' | \
+    PGPASSWORD=admin psql -h 127.0.0.1 -p 5538 -U test -d kesseldb -c \
+    "COPY abort_smoke FROM STDIN WITH (FORMAT csv, HEADER)"
+ERROR:  COPY batch starting at row 1 (rows 1..2): sql: expected value
+
+(The kessel-sql parser rejects `not-a-number` as a BIGINT literal at
+the BULKAPPLY batch-flush step. The 22023 error is the existing V1
+behavior. Pre-fix this same error response triggered the abort-tail
+bug — psql sent CopyDone (c=0x63) and the gateway emitted
+`unsupported message tag: 0x63` and dropped the connection.)
+
+=== 3. Post-fix verification: NO `unsupported message tag` in the log ===
+
+$ ssh admin@192.168.4.178 "grep -i 'unsupported message tag\\|0x63\\|0x66\\|panic' \
+    /tmp/kdb-copyabort.log || echo 'no bug markers in log'"
+no bug markers in log
+
+(Pre-fix this would have produced ≥1 `unsupported message tag: 0x63`
+line per COPY abort, and the connection would have closed.)
+
+=== 4. HEADLINE: a single psql session running SELECT + bad COPY + SELECT
+        on the SAME connection completes without reconnect ===
+
+$ PGPASSWORD=admin psql -h 127.0.0.1 -p 5538 -U test -d kesseldb <<'EOF'
+SELECT 1;
+\copy abort_smoke FROM PROGRAM 'printf ''id,n\n1,hello\nnot-a-number,world\n''' WITH (FORMAT csv, HEADER);
+SELECT * FROM abort_smoke;
+EOF
+ ?column?
+----------
+        1
+(1 row)
+
+ERROR:  COPY batch starting at row 1 (rows 1..2): sql: expected value
+ id | n
+----+---
+(0 rows)
+
+(Single-session psql: the SELECT-before AND the SELECT-after both
+ran successfully on the SAME connection. The middle COPY error did
+NOT close the socket. Pre-fix the third statement would have
+surfaced `connection to server was lost` and psql would have either
+reconnected or exited 2.)
+
+=== 5. Cross-check: connection-level SELECT after error works ===
+
+$ PGPASSWORD=admin psql -h 127.0.0.1 -p 5538 -U test -d kesseldb \
+    -c 'SELECT * FROM abort_smoke'
+ id | n
+----+---
+(0 rows)
+
+(0 rows because the failed COPY batch rolled back — same as PG.)
+
+=== Teardown ===
+
+$ ssh admin@192.168.4.178 "pkill -f 'target/release/kesseldb' || true"
+
+=== Summary ===
+
+V1 HEADLINE achieved: an ErrorResponse mid-CopyData now leaves the
+connection alive and silently drains the client's trailing
+CopyDone / CopyFail / CopyData frames per PG §55.2.7. The
+pre-existing `unsupported message tag: 0x63` artefact flagged in
+the SP-PG-COPY-CSV-NUMERIC §3 footnote is GONE — confirmed both
+in the gateway log (zero `unsupported message tag` lines) and in
+a single-session psql round-trip where SELECT + bad COPY +
+SELECT all complete on the same TCP connection.
+
+Same drain shape applies to:
+- CopyFail tail after an error (KAT
+  t_abort_tail_drain_copyfail_after_csv_error_keeps_connection_alive).
+- Multiple in-flight CopyData frames between the error and the
+  closing CopyDone (KAT
+  t_abort_tail_drain_multiple_copydata_after_error_keeps_connection_alive).
+
+Defensive behavior preserved: a stray CopyDone / CopyFail in
+pristine Idle (no preceding abort) still rejects with 08P01
+(KATs t_stray_copydone_in_pristine_idle_still_rejected_08p01 and
+t_stray_copyfail_in_pristine_idle_still_rejected_08p01).
+
+=== DONE ===

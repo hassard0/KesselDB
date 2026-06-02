@@ -1,8 +1,14 @@
 # SP-PG-COPY-CSV-NUMERIC — text/CSV COPY NUMERIC validator — SP-arc Progress Tracker
 
 Date created: 2026-06-02
-**Status: T1 IN-FLIGHT — validator + KATs landed; T2 vulcan smoke
-pending; T3 STATUS + USAGE + closure pending.**
+**Status: CLOSED — V1 SHIPPED at T3 (2026-06-02).** Real psql 16
+smoke on vulcan (port 5538/6538 — collision-avoiding) confirms text
++ CSV COPY into a NUMERIC-OID column accepts the full canonical PG
+decimal grammar + case-insensitive NaN/Infinity, rewrites canonical
+forms into the row before the BULKAPPLY fold, and surfaces precise
+`22P02 invalid_text_representation` errors on malformed input with
+row + column + reason + V2-arc-name where applicable. TaskList #381
+ready for completion.
 
 Design spec: `docs/superpowers/specs/2026-06-02-kesseldb-sppgcopycsvnumeric-design.md`
 
@@ -49,9 +55,9 @@ row + column + reason."
 
 | T# | Scope | Status | Commit |
 |---|---|---|---|
-| **T1** | Design spec + `validate_numeric_text` + `CsvNumericError` + dispatcher wiring + KATs. | **DONE** | (this commit) |
-| **T2** | Real psql 16 vulcan smoke + USAGE §9 expansion + smoke transcript. | pending | — |
-| **T3** | STATUS row + tracker → CLOSED + TaskList #381 ready. | pending | — |
+| **T1** | Design spec + `validate_numeric_text` + `CsvNumericError` + dispatcher wiring + KATs. | **DONE** | `e9e8adb` |
+| **T2** | Real psql 16 vulcan smoke + USAGE §9 expansion + smoke transcript. | **DONE** | `2001074` |
+| **T3** | STATUS row + tracker → CLOSED + TaskList #381 ready. | **DONE** | (this commit) |
 
 ## T1 — what landed (2026-06-02)
 
@@ -66,23 +72,39 @@ row + column + reason."
   case-insensitive NaN/Inf, scientific notation rejection, empty,
   garbage, multi-dot, multi-sign.
 
-## T2 — pending
+## T2 — landed (commit `2001074`)
 
-- Spin a fresh `kesseldb` on vulcan with
-  `CARGO_TARGET_DIR=/tmp/kdb-target-csvnumeric`.
-- `psql -h 127.0.0.1 -p 5532 -U test -d kesseldb` —
-  `CREATE TABLE num_csv (id BIGINT, amount NUMERIC); COPY num_csv
-  FROM STDIN WITH (FORMAT csv, HEADER)` with the 6 canonical shapes
-  (42, 12345.6789, -3.14, NaN, Infinity, -Infinity).
-- Round-trip via `COPY num_csv TO STDOUT WITH (FORMAT csv, HEADER)`
-  and confirm byte-equal output.
-- Capture transcript at
-  `docs/superpowers/sppgcopycsvnumeric-t2-smoke-2026-06-02.txt`.
-- USAGE §9 — add a CSV NUMERIC subsection naming the validator +
-  accepted forms + rejected forms.
+Real psql 16 vulcan smoke on port 5538/6538 (sibling-agent collision
+on default 5532/6532 forced a port shift). Smoke transcript:
+`docs/superpowers/sppgcopycsvnumeric-t2-smoke-2026-06-02.txt`.
 
-## T3 — pending
+Confirmed (validator scope):
+- CSV happy path with sign normalisation (`+999` → `999` stored).
+- Text-format happy path with same normalisation (`+88` → `88`).
+- CSV → text round-trip byte-equal except for sign canonicalisation.
+- Validator-layer rejection: 4 CSV shapes (`1.2.3`, `hello`, `1e10`,
+  `--5`) + 1 text shape (`hello`) surface precise `22P02` with row
+  + column name + reason + V2-arc-name where applicable.
 
-- STATUS row under "Current capabilities (2026-06-02)".
-- Tracker → CLOSED.
+Honest documentation of downstream limitations (out-of-scope for
+this arc but tested):
+- NaN / Infinity / -Infinity pass the validator (canonicalised to
+  mixed-case) but engine-side I128 storage can't hold them →
+  downstream "sql: expected value" engine error. V2 arc:
+  `SP-PG-COPY-NUMERIC-BIGNUM` / `SP-PG-NAN-IN-ENGINE`.
+- Pre-existing protocol artefact "unsupported message tag: 0x63"
+  appears after every text/CSV COPY error (psql sends CopyDone
+  after seeing ErrorResponse but gateway already in Idle). Same
+  tail confirmed on a field-count-mismatch failure; not introduced
+  by this arc. V2 arc: `SP-PG-COPY-ABORT-DONE-TAIL`.
+
+USAGE.md updated (this commit folded into T3) — new
+"SP-PG-COPY-CSV-NUMERIC — canonical NUMERIC validator" subsection
+under SP-PG-COPY-CSV with examples + rejection messages + spec
+links.
+
+## T3 — landed (this commit)
+
+- STATUS.md row added under "Current capabilities (2026-06-02)".
+- Tracker → CLOSED (this file).
 - TaskList #381 ready.

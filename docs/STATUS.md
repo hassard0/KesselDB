@@ -41,6 +41,37 @@ measurement and had drifted from the actual workspace count).
   production `ClusterClient` does. The long-standing CI flake is GONE.
 
 Latest arc deliveries on top of that baseline (most-recent first):
+SP-PG-COPY-CSV-NUMERIC V1 (2026-06-02, +21 KATs) — text + CSV COPY
+into a NUMERIC-OID column (kessel-sql `I128`/`U128`/`Fixed` → PG OID
+1700) now validates the canonical PG decimal grammar at the gateway
+BEFORE the row reaches the BULKAPPLY fold. New
+`copy::csv::validate_numeric_text` accepts canonical signed decimals
+(with sign normalisation: `+42` → `42`; `-0` → `0`), leading-dot /
+trailing-dot tolerated per PG, and case-insensitive specials (`nan`,
+`NaN`, `Infinity`, `INFINITY`, `+infinity`, `inf`, `+inf`,
+`-infinity`, `-inf`) canonicalising to the PG mixed-case form.
+Malformed inputs (`1.2.3`, `hello`, `--5`, lone-sign, lone-dot,
+empty/whitespace, scientific notation) reject with a precise `22P02
+invalid_text_representation` naming the failing row + column +
+reason + V2-arc where applicable (`SP-PG-COPY-CSV-NUMERIC-SCI` for
+scientific notation). `validate_numeric_fields` dispatcher helper
+runs the validator on every NUMERIC column of every parsed row in
+BOTH `process_copy_data_text` AND `process_copy_data_csv`, rewriting
+the field bytes to the canonical form on success so the synthesized
+INSERT VALUES carries the normalised representation. NULL fields
+pass through unchanged. **vulcan-verified** (port 5538/6538 — port
+collision with sibling agent forced a shift): 6-row CSV happy path
+(42 / 12345 / -3 / 1000 / -50000 / `+999`→999) round-trips byte-equal
+through `COPY ... TO STDOUT WITH (FORMAT csv, HEADER)`; validator-
+layer rejections surface the precise messages above; engine-side
+NaN/Inf I128 storage gap honestly named as a downstream V2 arc
+(`SP-PG-COPY-NUMERIC-BIGNUM` / `SP-PG-NAN-IN-ENGINE`). HEADLINE:
+text/CSV NUMERIC validation gap closes — `pg_dump --csv` of NUMERIC
+columns + analyst CSV uploads with case-insensitive specials work
+to the validator boundary; malformed shapes surface clean
+SQLSTATE-tagged errors instead of confusing generic kessel-sql
+parse failures. Smoke transcript:
+`docs/superpowers/sppgcopycsvnumeric-t2-smoke-2026-06-02.txt`.
 SP-PG-EXTQ-PARSED-BYTEA-TYPED V1 (2026-06-02, +10 KATs) — typed-
 path BYTEA support preserves arbitrary raw bytes (including non-
 UTF8 sequences like 0xFF/0xFE/0x80/isolated continuation bytes).

@@ -45,8 +45,19 @@ mismatches reject with `42846 cannot_coerce`."
   (`docs/superpowers/sppgextqcastvalidatecompat-t3-smoke-2026-06-02.txt`)
   — HEADLINE pgJDBC INT4+INT8 pattern accepts; cross-category
   TEXT+INT8 still rejects with the exact V1 error message.
-- **`SP-PG-EXTQ-CAST-VALIDATE-LITERAL`** — also validate `::TYPE`
-  casts on literals (not just `$N`).
+- ~~**`SP-PG-EXTQ-CAST-VALIDATE-LITERAL`** — also validate `::TYPE`
+  casts on literals (not just `$N`).~~ → **CLOSED 2026-06-02 by
+  SP-PG-EXTQ-CAST-VALIDATE-LITERAL V1.**
+  `cast_stripper::find_literal_cast_mismatch` classifies the literal
+  immediately before each `::` (int → INT4/INT8, float → FLOAT8,
+  quoted string → TEXT, `true`/`false` → BOOL, `NULL` → anytype) and
+  rejects cross-category literal casts with `42846 cannot_coerce`
+  BEFORE the strip — closing the silent-strip hole where
+  `SELECT 'hello'::int8` slipped through whenever the value didn't
+  reach a typed column. vulcan-verified
+  (`docs/superpowers/sppgextqcastvalidateliteral-t3-smoke-2026-06-02.txt`):
+  `'world'::int8` / `true::int8` reject; `1::int8` / `'hello'::text`
+  accept; `NULL::int8` passes.
 - **`SP-PG-EXTQ-CAST-VALIDATE-MULTIWORD`** — recognise multi-word
   PG type names like `TIMESTAMP WITH TIME ZONE`.
 

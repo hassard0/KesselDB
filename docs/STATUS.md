@@ -103,6 +103,41 @@ three on the SAME TCP connection (pre-fix the third statement
 surfaced `connection to server was lost`). HEADLINE: ETL loops
 batching multiple COPY commands no longer pay a reconnect-per-error
 cliff on noisy inputs. **TaskList #383 ready for completion.**
+SP-PG-EXTQ-CAST-VALIDATE-LITERAL V1 (2026-06-02, +28 KATs) — extends
+cast-validation from `$N::TYPE` placeholders to `LITERAL::TYPE` casts,
+closing the silent-strip hole the parent arcs left open: V1+COMPAT only
+tracked the declared OID when a `$N` preceded `::`, so a cross-category
+literal cast like `SELECT 'hello'::int8` was stripped to `SELECT 'hello'`
+and slipped through whenever the value never reached a typed column. New
+`cast_stripper::find_literal_cast_mismatch(sql) ->
+Option<LiteralCastMismatch>` does a single string/comment-aware pass and
+classifies the literal immediately before each `::` (bare integer →
+INT4/INT8 by magnitude, bare float → FLOAT8, single-quoted string with
+`''` escape → TEXT, `true`/`false` → BOOL, `NULL` → anytype sentinel;
+`$N` and arbitrary expressions are skipped as not-a-literal), then
+compares the literal's `types::oid_category` against the cast type's.
+The three dispatch entries (`dispatch_query`,
+`dispatch_query_with_params`, `extq::dispatch_parse`) call it BEFORE the
+strip rewrites the SQL; a cross-category mismatch surfaces
+`ExtqError::LiteralCastMismatch { literal_oid, cast_oid,
+literal_category, cast_category }` → SQLSTATE `42846 cannot_coerce` via
+the same wire frame the `$N` validator uses, while `NULL::TYPE` accepts
+unconditionally (canonical typed-NULL idiom). `strip_pg_casts` +
+`strip_pg_casts_tracked` byte outputs are unchanged — the validator is
+purely additive, so every existing CAST / CAST-VALIDATE / COMPAT KAT
+passes byte-for-byte. **vulcan-verified** psql smoke
+(`docs/superpowers/sppgextqcastvalidateliteral-t3-smoke-2026-06-02.txt`):
+within-category `1::int8` + `'hello'::text` accept; HEADLINE
+cross-category `'world'::int8` (TEXT→INT8) and `true::int8` (BOOL→INT8)
+reject with the literal-cast 42846 message; `NULL::int8` is NOT rejected
+by the validator (engine-level error only). Full pg-gateway lib sweep
+962/962 green on vulcan at HEAD `02df4a0`. **TaskList #386 ready for
+completion.** V2 follow-ups named:
+`SP-PG-EXTQ-CAST-VALIDATE-LITERAL-EXPR` (literal casts inside
+expressions, `(1+2)::int8`),
+`SP-PG-EXTQ-CAST-VALIDATE-LITERAL-DATEPARSE` (`'2024-01-01'::date`),
+`SP-PG-EXTQ-CAST-VALIDATE-LITERAL-NUMSTR` (`'42'::int8`),
+`SP-PG-EXTQ-CAST-VALIDATE-LITERAL-MULTIWORD` (multi-word type names).
 SP-PG-EXTQ-CAST-VALIDATE-COMPAT V1 (2026-06-02, +14 KATs) — relaxes
 SP-PG-EXTQ-CAST-VALIDATE's V1 strict OID equality to PG's
 `pg_type.dat::typcategory` compatibility table. V1 strict equality

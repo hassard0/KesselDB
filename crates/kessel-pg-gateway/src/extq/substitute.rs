@@ -674,6 +674,167 @@ pub fn preprocess_params(
     Ok(out)
 }
 
+/// SP-PG-EXTQ-PARSED T3 — preprocess wire params into typed
+/// `Option<kessel_codec::Value>` slots ready for
+/// `kessel_sql::compile_with_params`. Returns `Some(Vec<...>)` only
+/// when EVERY parameter can be represented cleanly as a typed
+/// `Value`; otherwise returns `None` so the caller falls back to
+/// the existing text-substitution path.
+///
+/// Per design spec §3.3, the typed-path-eligible cases for V1 are:
+///
+/// - NULL (length=-1) → `Some(None)`. Format-agnostic.
+/// - text format + INT2/INT4/INT8 OID → `Value::Int(n)` if the
+///   text bytes parse as i128, else `Value::Blob` (the parser's
+///   SP-PG-SQL-PAREN-VALUES coercion will route the bytes back to
+///   an int for the numeric column).
+/// - text format + BOOL OID → `Value::Uint(0|1)` for `"true"`/
+///   `"t"`/`"f"`/`"false"`/`"1"`/`"0"`. Anything else → fallback.
+/// - text format + TEXT/VARCHAR OID → `Value::Blob(bytes.to_vec())`.
+/// - text format + no OID (oid==0) or unknown OID → `Value::Blob`
+///   (let the parser route by column context).
+/// - binary format + INT2/INT4/INT8 OID → decode → `Value::Int(n)`.
+/// - binary format + BOOL OID → `Value::Uint(0|1)`.
+/// - binary format + BYTEA OID → `Value::Blob(bytes.to_vec())`.
+/// - binary format + TEXT/VARCHAR OID → `Value::Blob(bytes.to_vec())`
+///   (the binary path's text decoder is a UTF-8 validate + clone;
+///   we skip the validate here because kessel-sql accepts arbitrary
+///   bytes in Blob and would error at insert time if the column
+///   needs UTF-8).
+/// - binary format + FLOAT4/FLOAT8/TIMESTAMPTZ/NUMERIC → return
+///   `None` overall. The text-substitution path's binary-decoder +
+///   cast-wrapper shape (`'ISO'::timestamptz`, etc.) is the only
+///   one that compiles cleanly today; V1 doesn't widen `Value` to
+///   carry float / timestamp types yet.
+///
+/// **Returning `None` is a graceful fallback signal — it means the
+/// gateway should keep using the existing `preprocess_params` text-
+/// substitution path for this Bind. The default V1 disposition is
+/// to keep the text path as the default and ONLY route through the
+/// typed path when an env knob opts in (so we don't risk a silent
+/// compat regression).
+pub fn preprocess_typed_params(
+    params: &[Option<&[u8]>],
+    formats: &[u16],
+    type_oids: &[u32],
+) -> Option<Vec<Option<kessel_codec::Value>>> {
+    let mut out: Vec<Option<kessel_codec::Value>> =
+        Vec::with_capacity(params.len());
+    for (i, value) in params.iter().enumerate() {
+        let format = effective_format_code(formats, i);
+        let bytes = match value {
+            None => {
+                out.push(None);
+                continue;
+            }
+            Some(b) => *b,
+        };
+        let type_oid = type_oids.get(i).copied().unwrap_or(0);
+        let v = if format == crate::proto::FORMAT_CODE_TEXT {
+            preprocess_text_value(bytes, type_oid)?
+        } else {
+            preprocess_binary_value(bytes, type_oid)?
+        };
+        out.push(Some(v));
+    }
+    Some(out)
+}
+
+/// SP-PG-EXTQ-PARSED T3 — text-format → typed `Value` routing.
+/// Returns `None` (so the caller falls back to text-substitution)
+/// for OIDs the typed path doesn't cover cleanly yet.
+fn preprocess_text_value(bytes: &[u8], type_oid: u32) -> Option<kessel_codec::Value> {
+    use kessel_codec::Value;
+    match type_oid {
+        PG_TYPE_INT2 | PG_TYPE_INT4 | PG_TYPE_INT8 => {
+            // Try parsing as an int; on failure fall back to Blob so
+            // SP-PG-SQL-PAREN-VALUES's text→int coercion still runs
+            // at the parser layer. NEVER falls back to None: the
+            // typed path can express either flavor.
+            let s = std::str::from_utf8(bytes).ok()?;
+            if let Ok(n) = s.parse::<i128>() {
+                Some(Value::Int(n))
+            } else {
+                Some(Value::Blob(bytes.to_vec()))
+            }
+        }
+        PG_TYPE_BOOL => {
+            // PG's text-format BOOL accepts t/f/true/false/1/0 (case-
+            // insensitive). Other shapes → fall back.
+            let s = std::str::from_utf8(bytes).ok()?;
+            match s.trim().to_ascii_lowercase().as_str() {
+                "t" | "true" | "1" => Some(Value::Uint(1)),
+                "f" | "false" | "0" => Some(Value::Uint(0)),
+                _ => None,
+            }
+        }
+        PG_TYPE_TEXT | PG_TYPE_VARCHAR | PG_TYPE_BYTEA => {
+            // Text/varchar/bytea text format is already string-shaped
+            // bytes — Value::Blob carries them through to the parser
+            // which will produce a `Lit::Str` and route to lit_to_value
+            // for the target column kind.
+            Some(Value::Blob(bytes.to_vec()))
+        }
+        // FLOAT4/FLOAT8/TIMESTAMPTZ/NUMERIC text-format SHAPES need a
+        // SQL-cast wrapper (`'1.5'::float8`, `'ISO'::timestamptz`)
+        // that only the text-substitution path emits. Fall back.
+        PG_TYPE_FLOAT4 | PG_TYPE_FLOAT8 | PG_TYPE_TIMESTAMPTZ | PG_TYPE_NUMERIC => None,
+        // Unknown OID — the parser's lit_to_value will route by
+        // column kind. Pass through as Blob.
+        _ => Some(Value::Blob(bytes.to_vec())),
+    }
+}
+
+/// SP-PG-EXTQ-PARSED T3 — binary-format → typed `Value` routing.
+/// Reuses the canonical PG-binary-format decoders from
+/// `decode_binary_param` but only for the OIDs whose decoded form
+/// can be expressed cleanly as a `Value`. FLOAT/TIMESTAMPTZ/NUMERIC
+/// stay on the text-substitution path.
+fn preprocess_binary_value(bytes: &[u8], type_oid: u32) -> Option<kessel_codec::Value> {
+    use kessel_codec::Value;
+    match type_oid {
+        PG_TYPE_INT2 => {
+            if bytes.len() != 2 { return None; }
+            Some(Value::Int(i16::from_be_bytes([bytes[0], bytes[1]]) as i128))
+        }
+        PG_TYPE_INT4 => {
+            if bytes.len() != 4 { return None; }
+            Some(Value::Int(i32::from_be_bytes(
+                [bytes[0], bytes[1], bytes[2], bytes[3]],
+            ) as i128))
+        }
+        PG_TYPE_INT8 => {
+            if bytes.len() != 8 { return None; }
+            Some(Value::Int(i64::from_be_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3],
+                bytes[4], bytes[5], bytes[6], bytes[7],
+            ]) as i128))
+        }
+        PG_TYPE_BOOL => {
+            if bytes.len() != 1 { return None; }
+            match bytes[0] {
+                0x00 => Some(Value::Uint(0)),
+                0x01 => Some(Value::Uint(1)),
+                _ => None,
+            }
+        }
+        PG_TYPE_BYTEA => Some(Value::Blob(bytes.to_vec())),
+        PG_TYPE_TEXT | PG_TYPE_VARCHAR => {
+            // Validate UTF-8 to match the text-substitution path's
+            // error shape — if invalid, fall back so the existing
+            // text path's `BinaryDecode` error fires with its full
+            // SQLSTATE context.
+            std::str::from_utf8(bytes).ok()?;
+            Some(Value::Blob(bytes.to_vec()))
+        }
+        // FLOAT/TIMESTAMPTZ/NUMERIC binary forms need text-substitution
+        // path's cast wrappers. Fall back.
+        PG_TYPE_FLOAT4 | PG_TYPE_FLOAT8 | PG_TYPE_TIMESTAMPTZ | PG_TYPE_NUMERIC => None,
+        // Unknown OID — fall back.
+        _ => None,
+    }
+}
+
 /// SP-PG-EXTQ-BIN T2 — compute the effective format code for position
 /// `i` per the PG length conventions:
 /// - 0 codes  = all text  → 0
@@ -1791,5 +1952,232 @@ mod tests {
         let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + (d as u64) - 1; // [0, 365]
         let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
         era * 146_097 + doe as i64 - 719_468
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-EXTQ-PARSED T3 KATs — `preprocess_typed_params` classifies
+    // wire params into `Option<Value>` slots ready for kessel-sql's
+    // `compile_with_params`, OR returns `None` to signal fallback to
+    // the text-substitution path. The default V1 disposition keeps the
+    // text path as default; these KATs lock the classifier's per-OID
+    // routing so a future flip can rely on the contract.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// pgJDBC's `setInt(1, 42)` arrives as text-format bytes `b"42"`
+    /// with INT8 OID. Classifier returns `Some(Value::Int(42))`.
+    #[test]
+    fn t3parsed_preprocess_typed_text_int_returns_value_int() {
+        let params: Vec<Option<&[u8]>> = vec![Some(b"42")];
+        let formats: Vec<u16> = vec![]; // 0 codes = all text
+        let oids: Vec<u32> = vec![PG_TYPE_INT8];
+        let typed = preprocess_typed_params(&params, &formats, &oids)
+            .expect("typed path accepts the int param");
+        assert_eq!(
+            typed,
+            vec![Some(kessel_codec::Value::Int(42))]
+        );
+    }
+
+    /// psycopg2's `cursor.execute("...", (b"hello",))` arrives as
+    /// text-format bytes with TEXT OID. Classifier returns
+    /// `Some(Value::Blob(b"hello"))`.
+    #[test]
+    fn t3parsed_preprocess_typed_text_blob_returns_value_blob() {
+        let params: Vec<Option<&[u8]>> = vec![Some(b"hello")];
+        let formats: Vec<u16> = vec![];
+        let oids: Vec<u32> = vec![PG_TYPE_TEXT];
+        let typed = preprocess_typed_params(&params, &formats, &oids)
+            .expect("typed path accepts the text param");
+        assert_eq!(
+            typed,
+            vec![Some(kessel_codec::Value::Blob(b"hello".to_vec()))]
+        );
+    }
+
+    /// NULL (length=-1) → `Some(None)`. Format-agnostic.
+    #[test]
+    fn t3parsed_preprocess_typed_null_returns_some_none() {
+        let params: Vec<Option<&[u8]>> = vec![None];
+        let formats: Vec<u16> = vec![crate::proto::FORMAT_CODE_BINARY];
+        let oids: Vec<u32> = vec![PG_TYPE_INT8];
+        let typed = preprocess_typed_params(&params, &formats, &oids)
+            .expect("typed path accepts NULL");
+        assert_eq!(typed, vec![None]);
+    }
+
+    /// Binary-format INT8 decodes to a typed `Value::Int`.
+    #[test]
+    fn t3parsed_preprocess_typed_binary_int8_returns_value_int() {
+        let raw = 100i64.to_be_bytes();
+        let params: Vec<Option<&[u8]>> = vec![Some(&raw[..])];
+        let formats: Vec<u16> = vec![crate::proto::FORMAT_CODE_BINARY];
+        let oids: Vec<u32> = vec![PG_TYPE_INT8];
+        let typed = preprocess_typed_params(&params, &formats, &oids)
+            .expect("typed path accepts binary INT8");
+        assert_eq!(typed, vec![Some(kessel_codec::Value::Int(100))]);
+    }
+
+    /// FLOAT8 falls back to the text-substitution path because the
+    /// kessel-codec `Value` enum doesn't carry a float variant in V1.
+    /// `preprocess_typed_params` returns `None` overall so the
+    /// dispatcher routes through `preprocess_params` (the text path).
+    #[test]
+    fn t3parsed_preprocess_typed_float8_falls_back_to_text_path() {
+        let raw = 1.5f64.to_be_bytes();
+        let params: Vec<Option<&[u8]>> = vec![Some(&raw[..])];
+        let formats: Vec<u16> = vec![crate::proto::FORMAT_CODE_BINARY];
+        let oids: Vec<u32> = vec![PG_TYPE_FLOAT8];
+        let typed = preprocess_typed_params(&params, &formats, &oids);
+        assert!(
+            typed.is_none(),
+            "FLOAT8 should fall back to text path; got {typed:?}"
+        );
+    }
+
+    /// TIMESTAMPTZ falls back too (cast-wrapper is text-path-only in
+    /// V1).
+    #[test]
+    fn t3parsed_preprocess_typed_timestamptz_falls_back_to_text_path() {
+        let raw = 0i64.to_be_bytes();
+        let params: Vec<Option<&[u8]>> = vec![Some(&raw[..])];
+        let formats: Vec<u16> = vec![crate::proto::FORMAT_CODE_BINARY];
+        let oids: Vec<u32> = vec![PG_TYPE_TIMESTAMPTZ];
+        let typed = preprocess_typed_params(&params, &formats, &oids);
+        assert!(typed.is_none());
+    }
+
+    /// Mixed-types Bind where ONE param is typed-path-eligible (INT8)
+    /// and another isn't (FLOAT8): classifier returns `None` overall
+    /// so the WHOLE Bind routes through the text path. Prevents the
+    /// dispatcher from running a half-typed half-text shape that
+    /// would need two code paths.
+    #[test]
+    fn t3parsed_preprocess_typed_mixed_one_unsupported_returns_none() {
+        let int8 = 42i64.to_be_bytes();
+        let f8 = 1.5f64.to_be_bytes();
+        let params: Vec<Option<&[u8]>> = vec![Some(&int8[..]), Some(&f8[..])];
+        let formats: Vec<u16> = vec![
+            crate::proto::FORMAT_CODE_BINARY,
+            crate::proto::FORMAT_CODE_BINARY,
+        ];
+        let oids: Vec<u32> = vec![PG_TYPE_INT8, PG_TYPE_FLOAT8];
+        let typed = preprocess_typed_params(&params, &formats, &oids);
+        assert!(typed.is_none(), "mixed-types should fall back");
+    }
+
+    /// HEADLINE SECURITY KAT — the quote-injection attempt at the
+    /// gateway boundary. `preprocess_typed_params` accepts the
+    /// payload as a `Value::Blob`; downstream `kessel_sql::
+    /// compile_with_params` will pass it through to the program as a
+    /// typed operand. The DROP TABLE bytes never enter the SQL text.
+    #[test]
+    fn t3parsed_preprocess_typed_quote_injection_payload_becomes_value_blob() {
+        let payload = b"'; DROP TABLE t; --";
+        let params: Vec<Option<&[u8]>> = vec![Some(payload)];
+        let formats: Vec<u16> = vec![];
+        let oids: Vec<u32> = vec![PG_TYPE_TEXT];
+        let typed = preprocess_typed_params(&params, &formats, &oids)
+            .expect("typed path accepts the text param");
+        assert_eq!(
+            typed,
+            vec![Some(kessel_codec::Value::Blob(payload.to_vec()))]
+        );
+        // End-to-end: feed through kessel-sql's compile_with_params
+        // and verify the program carries the payload bytes verbatim
+        // (the same security shape as the kessel-sql T2 KAT, but
+        // routed through the gateway's classifier).
+        use kessel_catalog::Catalog;
+        use kessel_proto::Op;
+        // Build a minimal catalog with a `name CHAR(64)` column so
+        // the SELECT compiles. The KesselDB CREATE TABLE compiler
+        // populates the catalog directly; here we hand-assemble a
+        // Catalog with one ObjectType via `from_def` (the public
+        // helper for synthetic schema construction).
+        let mut ot = kessel_catalog::ObjectType::from_def(
+            "t".to_string(),
+            vec![
+                kessel_catalog::Field {
+                    field_id: 1,
+                    name: "id".to_string(),
+                    kind: kessel_catalog::FieldKind::I64,
+                    nullable: false,
+                },
+                kessel_catalog::Field {
+                    field_id: 2,
+                    name: "name".to_string(),
+                    kind: kessel_catalog::FieldKind::Char(64),
+                    nullable: false,
+                },
+            ],
+        );
+        ot.type_id = 1;
+        let mut cat = Catalog::default();
+        cat.types.push(ot);
+        let op = kessel_sql::compile_with_params(
+            "SELECT * FROM t WHERE name = $1",
+            &cat,
+            &typed,
+        )
+        .expect("compile_with_params ok");
+        match op {
+            Op::QueryRows { program, .. } => {
+                let prog_has_payload =
+                    program.windows(payload.len()).any(|w| w == payload);
+                assert!(
+                    prog_has_payload,
+                    "the gateway-classified Value::Blob payload must \
+                     reach the program operand verbatim; got program \
+                     bytes = {program:?}"
+                );
+            }
+            other => panic!(
+                "expected Op::QueryRows; got {other:?} (SECURITY \
+                 REGRESSION — bound bytes may have been re-parsed as \
+                 SQL)"
+            ),
+        }
+    }
+
+    /// Empty params input → empty typed slice. Defensive against the
+    /// no-`$N` case.
+    #[test]
+    fn t3parsed_preprocess_typed_empty_params_returns_empty_vec() {
+        let typed = preprocess_typed_params(&[], &[], &[])
+            .expect("empty params is a trivial typed Bind");
+        assert!(typed.is_empty());
+    }
+
+    /// pgJDBC `setBoolean(1, true)` text-format `"t"` with BOOL OID
+    /// → `Value::Uint(1)`.
+    #[test]
+    fn t3parsed_preprocess_typed_text_bool_t_returns_value_uint_one() {
+        let params: Vec<Option<&[u8]>> = vec![Some(b"t")];
+        let formats: Vec<u16> = vec![];
+        let oids: Vec<u32> = vec![PG_TYPE_BOOL];
+        let typed = preprocess_typed_params(&params, &formats, &oids)
+            .expect("BOOL text 't' is typed-eligible");
+        assert_eq!(typed, vec![Some(kessel_codec::Value::Uint(1))]);
+    }
+
+    /// pgJDBC `setBoolean(1, false)` text-format `"false"` → `Value::Uint(0)`.
+    #[test]
+    fn t3parsed_preprocess_typed_text_bool_false_returns_value_uint_zero() {
+        let params: Vec<Option<&[u8]>> = vec![Some(b"false")];
+        let formats: Vec<u16> = vec![];
+        let oids: Vec<u32> = vec![PG_TYPE_BOOL];
+        let typed = preprocess_typed_params(&params, &formats, &oids)
+            .expect("BOOL text 'false' is typed-eligible");
+        assert_eq!(typed, vec![Some(kessel_codec::Value::Uint(0))]);
+    }
+
+    /// NUMERIC falls back (the text-substitution path's quoted-decimal
+    /// shape is the only one that compiles cleanly today).
+    #[test]
+    fn t3parsed_preprocess_typed_numeric_falls_back_to_text_path() {
+        let params: Vec<Option<&[u8]>> = vec![Some(b"3.14")];
+        let formats: Vec<u16> = vec![];
+        let oids: Vec<u32> = vec![PG_TYPE_NUMERIC];
+        let typed = preprocess_typed_params(&params, &formats, &oids);
+        assert!(typed.is_none());
     }
 }

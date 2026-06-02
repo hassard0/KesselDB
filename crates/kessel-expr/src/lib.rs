@@ -1410,64 +1410,46 @@ mod tests {
         // ADD in WHERE — V1 declines (caller falls back to interpreter).
         let code = Program::new().load(1).push_int(1).add().push_int(2).eq().bytes();
         let o = ot();
-        match compile_filter(&code, &o) {
-            Err(CompileError::Unsupported { op_name: "ADD" }) => {}
-            other => panic!("expected Unsupported(ADD), got {other:?}"),
-        }
+        let err = compile_filter(&code, &o).err().expect("expected Err");
+        assert_eq!(err, CompileError::Unsupported { op_name: "ADD" }, "got {err:?}");
         // SHA256
         let code = Program::new().push_bytes(b"x").sha256().push_bytes(b"y").eq().bytes();
-        match compile_filter(&code, &o) {
-            Err(CompileError::Unsupported { op_name: "SHA256" }) => {}
-            other => panic!("expected Unsupported(SHA256), got {other:?}"),
-        }
+        let err = compile_filter(&code, &o).err().expect("expected Err");
+        assert_eq!(err, CompileError::Unsupported { op_name: "SHA256" }, "got {err:?}");
         // LIKE
         let code = Program::new()
             .push_bytes(b"abc").push_bytes(b"a%").like().bytes();
-        match compile_filter(&code, &o) {
-            Err(CompileError::Unsupported { op_name: "LIKE" }) => {}
-            other => panic!("expected Unsupported(LIKE), got {other:?}"),
-        }
+        let err = compile_filter(&code, &o).err().expect("expected Err");
+        assert_eq!(err, CompileError::Unsupported { op_name: "LIKE" }, "got {err:?}");
     }
 
     #[test]
     fn compile_filter_rejects_malformed_programs() {
         let o = ot();
         // empty program -> no value on stack
-        match compile_filter(&[], &o) {
-            Err(CompileError::Malformed) => {}
-            other => panic!("expected Malformed, got {other:?}"),
-        }
+        let err = compile_filter(&[], &o).err().expect("expected Err");
+        assert_eq!(err, CompileError::Malformed, "got {err:?}");
         // EQ with empty stack -> underflow
-        match compile_filter(&[EQ], &o) {
-            Err(CompileError::StackUnderflow) => {}
-            other => panic!("expected StackUnderflow, got {other:?}"),
-        }
+        let err = compile_filter(&[EQ], &o).err().expect("expected Err");
+        assert_eq!(err, CompileError::StackUnderflow, "got {err:?}");
         // Truncated PUSH_INT
-        match compile_filter(&[PUSH_INT, 1, 2], &o) {
-            Err(CompileError::BadProgram) => {}
-            other => panic!("expected BadProgram, got {other:?}"),
-        }
+        let err = compile_filter(&[PUSH_INT, 1, 2], &o).err().expect("expected Err");
+        assert_eq!(err, CompileError::BadProgram, "got {err:?}");
         // Unknown opcode
-        match compile_filter(&[250u8], &o) {
-            Err(CompileError::BadProgram) => {}
-            other => panic!("expected BadProgram, got {other:?}"),
-        }
+        let err = compile_filter(&[250u8], &o).err().expect("expected Err");
+        assert_eq!(err, CompileError::BadProgram, "got {err:?}");
         // Two values left on stack -> Malformed
         let code = Program::new().push_int(1).push_int(2).bytes();
-        match compile_filter(&code, &o) {
-            Err(CompileError::Malformed) => {}
-            other => panic!("expected Malformed (2 vals), got {other:?}"),
-        }
+        let err = compile_filter(&code, &o).err().expect("expected Err");
+        assert_eq!(err, CompileError::Malformed, "got {err:?}");
     }
 
     #[test]
     fn compile_filter_unknown_field_id() {
         let code = Program::new().load(999).push_int(0).eq().bytes();
         let o = ot();
-        match compile_filter(&code, &o) {
-            Err(CompileError::UnknownField { field_id: 999 }) => {}
-            other => panic!("expected UnknownField(999), got {other:?}"),
-        }
+        let err = compile_filter(&code, &o).err().expect("expected Err");
+        assert_eq!(err, CompileError::UnknownField { field_id: 999 }, "got {err:?}");
     }
 
     #[test]

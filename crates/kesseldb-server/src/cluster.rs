@@ -1399,14 +1399,17 @@ mod tests {
         }
     }
 
-    /// SP-Cloud-Cluster T3 — the SQL path must keep working after the
-    /// PRIMARY pod disappears, which is the production failover path
-    /// `kessel --addrs ...` exercises in kind. We can't `kill -9` a
-    /// thread, so simulate primary loss by closing its client listener
-    /// — the next SQL goes to a follower, which becomes the new
-    /// primary after view-change and answers committed.
+    /// SP-Cloud-Cluster T3 — the SQL path must commit through a
+    /// FOLLOWER's client port (relay-to-primary), not just the
+    /// primary's. This is the path `kessel --addrs ...` falls onto
+    /// after a primary-kill rotation: the client's first surviving
+    /// address is a follower; the follower's server-side
+    /// `submit_with_unavailable_retry` relays to the active primary
+    /// and answers `Ok` to the client. Mirrors
+    /// `failover_retry_against_follower_returns_cached_reply` (Op
+    /// path) on the SQL surface.
     #[test]
-    fn cluster_client_sql_survives_primary_loss() {
+    fn cluster_client_sql_commits_through_follower_port() {
         use kessel_client::ClusterClient;
 
         let n = 3;
@@ -1419,15 +1422,9 @@ mod tests {
         let mut dirs = Vec::new();
         let mut client_addrs = Vec::new();
         let mut arc_nodes: Vec<Arc<Node>> = Vec::new();
-        // Hold each node's client TcpListener via a stop-token Arc so we
-        // can simulate primary-pod death by dropping its client port.
-        // (We can't shut down the engine thread mid-test without racing
-        // the data dir; just dropping the client listener stops new
-        // client traffic from landing on node 0, which the engine
-        // outside still sees as the primary until view-change fires.)
         for (i, l) in peer_ls.into_iter().enumerate() {
             let dir = std::env::temp_dir()
-                .join(format!("kesseldb-ccsqlfo-{}-{i}", std::process::id()));
+                .join(format!("kesseldb-ccsqlfp-{}-{i}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             dirs.push(dir.clone());
             let node = Arc::new(spawn_node(i, l, addrs.clone(), dir).unwrap());
@@ -1439,49 +1436,41 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(200));
 
-        let mut c = ClusterClient::new(client_addrs.clone());
+        // ONLY the follower at idx 1 is in the address list — the
+        // primary (idx 0) is unreachable client-side. ClusterClient's
+        // sql() must therefore land on the follower; the follower's
+        // server-side relay carries the SQL to the primary and the
+        // committed reply comes back through the same socket.
+        let mut c = ClusterClient::new(vec![client_addrs[1].clone()]);
 
-        // Seed the cluster while node 0 is primary.
-        assert!(matches!(
-            c.sql("CREATE TABLE t (v U64 NOT NULL)").unwrap(),
-            OpResult::TypeCreated(1)
-        ));
+        assert!(
+            matches!(
+                c.sql("CREATE TABLE t (v U64 NOT NULL)").unwrap(),
+                OpResult::TypeCreated(1)
+            ),
+            "follower-relay must commit DDL"
+        );
         assert_eq!(
             c.sql("INSERT INTO t ID 1 (v) VALUES (100)").unwrap(),
-            OpResult::Ok
+            OpResult::Ok,
+            "follower-relay must commit INSERT"
         );
-
-        // Remove node 0 from the client's address list so subsequent
-        // SQL never lands on it. The cluster then sees one missing
-        // primary — followers will answer Unavailable until they elect
-        // a new primary, at which point our SQL on the surviving
-        // addresses commits.
-        c = ClusterClient::new(vec![
-            client_addrs[1].clone(),
-            client_addrs[2].clone(),
-        ]);
-
-        // A follower's server-side retry budget is 5s. Give the engine
-        // enough wall time for both the in-cluster relay AND a possible
-        // view-change to land before our client-side budget runs out.
-        // In practice the relay path succeeds first (the primary is
-        // still alive; only the *client* lost track of it) and the
-        // follower answers Ok via the existing exactly-once relay path.
         assert_eq!(
             c.sql("INSERT INTO t ID 2 (v) VALUES (200)").unwrap(),
             OpResult::Ok,
-            "follower-relay must commit when primary is reachable engine-side \
-             but unreachable client-side"
+            "follower-relay must commit second INSERT"
         );
 
-        // Read-back also via a follower address.
+        // SELECT SUM through the follower also returns the committed
+        // total — the read goes through the same `[0xFE] ++ sql`
+        // path and lands on the primary via relay.
         let r = c.sql("SELECT SUM(v) FROM t").unwrap();
         match r {
             OpResult::Got(b) if b.len() == 16 => {
                 assert_eq!(
                     i128::from_le_bytes(b[..16].try_into().unwrap()),
                     300,
-                    "SUM(v) over the two rows inserted across the failover"
+                    "SUM(v) over the two inserted rows = 100 + 200"
                 );
             }
             other => panic!("expected 16-byte i128 SUM reply, got {other:?}"),

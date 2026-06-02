@@ -41,6 +41,30 @@ measurement and had drifted from the actual workspace count).
   production `ClusterClient` does. The long-standing CI flake is GONE.
 
 Latest arc deliveries on top of that baseline (most-recent first):
+SP-PG-COPY-ABORT-DONE-TAIL V1 (2026-06-02, +5 KATs) — closes the
+pre-existing protocol-violation tail surfaced as a footnote in the
+SP-PG-COPY-CSV-NUMERIC T2 smoke. PG §55.2.7: when an ErrorResponse
+mid-CopyData aborts the COPY, the client may still flush trailing
+`CopyData` / `CopyDone` (`c`=0x63) / `CopyFail` (`f`=0x66) frames
+queued before observing the error. V1 dispatched those tail bytes
+through the top-level `other => unsupported message tag` arm,
+emitting a spurious `08P01` and CLOSING the connection per
+`UnexpectedMessageDuringAuth`. Real PG silently drains tail frames.
+Fix: an `expecting_copy_tail: bool` local in `server::run_session`
+armed when `process_copy_data` returns `Failed`; the top-level
+dispatch silently discards `d` / `c` / `f` while armed (`c` and
+`f` clear it; a fresh COPY-FROM start also clears it to prevent
+stale-flag leaks). Defensive `08P01` for stray `c` / `f` in
+pristine Idle preserved. **vulcan-verified** via psql 16 smoke
+(`docs/superpowers/sppgcopyaborttail-t3-smoke-2026-06-02.txt`):
+malformed-CSV `COPY abort_smoke FROM STDIN` fires the existing
+22023 batch-flush error with zero `unsupported message tag` lines
+in the gateway log, AND a single psql session running `SELECT 1` +
+`\copy` with bad CSV + `SELECT * FROM abort_smoke` completes all
+three on the SAME TCP connection (pre-fix the third statement
+surfaced `connection to server was lost`). HEADLINE: ETL loops
+batching multiple COPY commands no longer pay a reconnect-per-error
+cliff on noisy inputs. **TaskList #383 ready for completion.**
 SP-PG-EXTQ-CAST-VALIDATE-COMPAT V1 (2026-06-02, +14 KATs) — relaxes
 SP-PG-EXTQ-CAST-VALIDATE's V1 strict OID equality to PG's
 `pg_type.dat::typcategory` compatibility table. V1 strict equality

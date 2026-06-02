@@ -1,10 +1,14 @@
 # SP-PG-COPY-ABORT-DONE-TAIL — drain CopyDone/CopyFail tail after a COPY abort — SP-arc Progress Tracker
 
 Date created: 2026-06-02
-**Status: T1+T2 IN FLIGHT.** Drain-flag added to `server::run_session`;
-silent-discard arm honors PG §55.2.7 tail semantics. Defensive
-stray-`c`/`f` rejection preserved. T3 (vulcan smoke) + T4 (USAGE +
-STATUS) close the arc.
+**Status: CLOSED — V1 SHIPPED at T4 (2026-06-02).** Drain-flag in
+`server::run_session` silently discards trailing `d`/`c`/`f` after
+a `CopyDataOutcome::Failed` per PG §55.2.7. Defensive `08P01` for
+stray `c`/`f` in pristine Idle preserved. vulcan psql 16 smoke
+(`docs/superpowers/sppgcopyaborttail-t3-smoke-2026-06-02.txt`)
+confirms zero spurious `unsupported message tag` lines AND a
+single-session SELECT + bad COPY + SELECT round-trip completing
+on the SAME connection. TaskList #383 ready for completion.
 
 Design spec: `docs/superpowers/specs/2026-06-02-kesseldb-sppgcopyaborttail-design.md`
 
@@ -31,18 +35,19 @@ next Query on the same connection works without reconnection."
    follow).
 4. Defensive `c`/`f` rejection preserved when flag is false.
 
-## Slice plan
+## Slice plan — ALL CLOSED
 
-- **T1 (this commit)** — design spec + progress tracker + drain
-  flag + 5 KATs in `crates/kessel-pg-gateway/src/server.rs`.
-  Build green, all gateway tests pass.
-- **T2 (same commit batch)** — KAT integration verified;
-  in-process server-loop tests cover all 5 transitions.
-- **T3** — vulcan psql 16 smoke:
-  CREATE TABLE + COPY FROM with malformed CSV +
-  follow-up SELECT works on the same server (no reconnect).
-  Transcript at `docs/superpowers/sppgcopyaborttail-t3-smoke-2026-06-02.txt`.
-- **T4** — USAGE §9 note + STATUS row + tracker CLOSED + TaskList
+- **T1+T2 (commit `5c6156d`)** — design spec + progress tracker +
+  drain flag in `server::run_session` + 5 KATs in
+  `crates/kessel-pg-gateway/src/server.rs`. 924 pg-gateway lib
+  tests pass (was 919 + 5 new).
+- **T3 (commit `0ece79b`)** — vulcan psql 16 smoke confirms
+  malformed-CSV COPY fires the existing 22023 batch-flush error
+  with zero `unsupported message tag` lines in the gateway log,
+  AND a single-session `SELECT 1` + bad `\copy` + `SELECT * FROM
+  abort_smoke` completes all three statements on the SAME TCP
+  connection. USAGE §9 documents the abort-tail drain shape.
+- **T4 (this commit)** — STATUS row + tracker CLOSED + TaskList
   #383 ready.
 
 ## Out-of-scope (named, deferred)

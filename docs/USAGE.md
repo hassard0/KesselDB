@@ -1592,6 +1592,21 @@ above). Some advanced introspection paths remain V2-deferred:
   V1 disposition: typed path is opt-in (KAT-only); default remains
   text-substitution to avoid a silent compat regression. Follow-up
   `SP-PG-EXTQ-PARSED-DEFAULT` flips the default after soak.
+- **Typed-parameter path is now the DEFAULT** (SP-PG-EXTQ-PARSED-
+  DEFAULT, 2026-06-02). `dispatch_execute` routes through
+  `EngineApply::apply_sql_with_params(sql, params)` whenever the
+  classifier (`preprocess_typed_params`) returns `Some` — every bound
+  parameter is then carried as a typed `kessel_codec::Value` over a
+  new `PARAMETERIZED_SQL_TAG = 0xF3` admin frame; the engine thread
+  decodes + runs `compile_stmt_with_params` against the live
+  catalog. **No SQL text concatenation; no `'`→`''` escape rules.**
+  Closes the SP-PG-EXTQ V1 §11 weak-spot #1 attack surface at the
+  DISPATCH layer (V1 closed it at the kessel-sql + classifier layer
+  only). Vulcan-verified with psycopg2 + asyncpg + psycopg3 round-
+  trip + quote-injection wire test (`"; DROP TABLE inj_smoke; --`
+  stored verbatim, table NOT dropped). Fallback to text-substitute
+  path remains for FLOAT/TIMESTAMPTZ/NUMERIC + BYTEA binary
+  (parameter shapes the typed path cannot represent cleanly).
 - **One statement per `Q`** → `psql \copy ...; SELECT ...` rejected
   with `42601` syntax_error. Send statements one at a time. V2.
 - **Text format only** → every column rendered as PG text;

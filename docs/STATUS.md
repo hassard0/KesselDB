@@ -41,6 +41,20 @@ measurement and had drifted from the actual workspace count).
   production `ClusterClient` does. The long-standing CI flake is GONE.
 
 Latest arc deliveries on top of that baseline (most-recent first):
+SP-PG-EXTQ-PARSED-DEFAULT V1 (2026-06-02, +11 KATs) — typed-param
+path becomes the gateway DEFAULT. `dispatch_execute` now routes
+through `apply_sql_with_params` whenever every bound parameter is
+typed-eligible; the text-substitution path stays as the fallback
+for FLOAT/TIMESTAMPTZ/NUMERIC + BYTEA binary. New
+`PARAMETERIZED_SQL_TAG = 0xF3` admin frame carries `(sql, params)`
+to the engine thread where `compile_stmt_with_params` runs against
+the live catalog. **vulcan-verified**: psycopg2 + asyncpg +
+psycopg3 smoke regression-free; quote-injection wire test confirms
+the table is NOT dropped (`"; DROP TABLE inj_smoke; --` stored
+verbatim, post-injection INSERT succeeds → 2 rows visible).
+HEADLINE: closes the SP-PG-EXTQ V1 §11 weak-spot #1 attack surface
+at the DISPATCH layer (V1 closed it at the kessel-sql + classifier
+layer only).
 SP-PG-EXTQ-PARSED V1 (2026-06-02, +31 KATs) — kessel-sql `$N`
 parameter token + `compile_with_params` typed-param threading +
 gateway classifier; closes the V1 §11 weak-spot #1 SQL-text-

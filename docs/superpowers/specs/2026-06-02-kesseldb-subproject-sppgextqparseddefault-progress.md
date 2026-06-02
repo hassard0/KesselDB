@@ -1,14 +1,17 @@
 # SP-PG-EXTQ-PARSED-DEFAULT — flip the gateway typed-param path to default — SP-arc Progress Tracker
 
 Date created: 2026-06-02
-**Status: IN PROGRESS.** V1 typed-param path was opt-in; this arc
-flips `dispatch_execute` so the typed path becomes the default
-runtime route, with the text-substitution path remaining as a narrow
-fallback for parameter shapes the typed classifier returns `None`
-for (FLOAT4/FLOAT8/TIMESTAMPTZ/NUMERIC + BYTEA binary). HEADLINE:
-closes the SP-PG-EXTQ V1 §11 weak-spot #1 attack surface at the
-dispatch layer (V1 closed it at the kessel-sql + classifier layer
-only).
+**Status: CLOSED — V1 SHIPPED at T4 (2026-06-02).** Typed-param path
+is now the gateway DEFAULT for every bound parameter the classifier
+returns `Some` for; the text-substitution path remains as the
+fallback for FLOAT/TIMESTAMPTZ/NUMERIC + BYTEA binary. HEADLINE
+closure: the SP-PG-EXTQ V1 §11 weak-spot #1 attack surface is now
+closed at the DISPATCH layer (V1 closed it at the kessel-sql +
+classifier layer only). vulcan-verified with psycopg2 + asyncpg +
+psycopg3 smoke regression-free AND the headline quote-injection
+wire test (`"; DROP TABLE inj_smoke; --` payload stored verbatim;
+table NOT dropped; post-injection INSERT succeeds → 2 rows visible).
+**TaskList #376 ready for completion.**
 
 Design spec: `docs/superpowers/specs/2026-06-02-kesseldb-sppgextqparseddefault-design.md`
 Parent SP-arc: SP-PG-EXTQ-PARSED V1 (closed 2026-06-02 at T4).
@@ -28,9 +31,9 @@ fallback for FLOAT/TIMESTAMPTZ/NUMERIC + BYTEA-binary.
 
 | T# | Scope | Status | Commit |
 |---|---|---|---|
-| **T1+T2** | Design spec + progress tracker + `EngineApply::apply_sql_with_params` trait method + `PARAMETERIZED_SQL_TAG` constant + wire encode/decode + render_params_into_sql + EngineHandle override + dispatch flip + +11 KATs. | **(pending commit)** | |
-| **T3** | vulcan ORM smoke + injection test. | (pending) | |
-| **T4** | USAGE §9 note + STATUS row + progress tracker → CLOSED. | (pending) | |
+| **T1+T2** | Design spec + progress tracker + `EngineApply::apply_sql_with_params` trait method + `PARAMETERIZED_SQL_TAG` constant + wire encode/decode + render_params_into_sql + EngineHandle override + dispatch flip + +11 KATs (4 wire encoder + 2 render helper + 7 dispatch flip with the headline quote-injection KAT at the dispatch layer). | **DONE** | `9ccbe82` |
+| **T3** | vulcan ORM smoke + injection test. psycopg2 + asyncpg + psycopg3 smoke regression-free; quote-injection wire test confirms table NOT dropped (payload stored verbatim; post-injection INSERT succeeds → 2 rows visible). | **DONE** | (no commit — verification-only) |
+| **T4** | USAGE §9 note + STATUS row + progress tracker → CLOSED. | **DONE** | (this slice) |
 
 ## Out-of-scope (named V2+ follow-ups)
 

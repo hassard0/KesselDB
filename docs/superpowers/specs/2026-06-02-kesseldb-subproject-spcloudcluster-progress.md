@@ -1,7 +1,7 @@
 # SP-Cloud-Cluster — progress tracker
 
 Date opened: **2026-06-02**.
-Status: **OPEN — T1 SCAFFOLD + T2 BINARY WIRE-UP LANDED**; T3-T8 multi-arc continuation queued.
+Status: **OPEN — T1 SCAFFOLD + T2 BINARY WIRE-UP + T3 FAILOVER-AWARE CLI + T5 PRIMARY-KILL VERIFIED**; T6-T8 multi-arc continuation queued.
 Design spec: `docs/superpowers/specs/2026-06-02-kesseldb-spcloudcluster-design.md`
 Parent arc: SP-Cloud-Deploy (V1 SHIPPED 2026-05-30 — single-pod Helm
 chart + fly.toml + kind-verified end-to-end). This arc is the named
@@ -29,12 +29,156 @@ see §V2+ follow-ups in the design spec).
 |---|---|---|---|
 | **T1** | Design spec + Helm StatefulSet + headless Service + values.yaml `cluster:` block + entrypoint shell + gating on existing `deployment.yaml`/`pvc.yaml`. `helm lint` + `helm template` clean both default + cluster modes. (YAML + docs only.) | **DONE** | `c44d883` |
 | **T2** | `kesseldb` binary cluster-mode wire-up — `--cluster`, `--replica-idx`, `--peer-addrs` CLI flags + `KESSELDB_CLUSTER_*` env-var fallback; spawn through `kesseldb_server::cluster::spawn_node` via new `lib::run_cluster_cfg`. Refuses even/<3 N + out-of-range idx + unknown long opts with typed error message. Single-pod path byte-identical. **Bonus**: DNS-bootstrap retry loop + dedicated peer port (6534) so StatefulSet pods don't bind-collide on 6532. **Bonus**: kind-verified live (the T4 scope folded into T2 since the binary build + image + kind verify naturally clustered). | **DONE** | `b5db272` / `f34a758` / `eee966e` |
-| T3 | Headless Service DNS resolution + peer discovery extra-mile — `ClusterClient` integration on the cluster headless Service endpoint set so writes routed through the round-robin ClusterIP Service rotate past backups and land on the primary instead of falling into `OpResult::Unavailable`. (T2 covered the binary-side bootstrap-race; T3 is the client-side failover-aware wiring.) | QUEUED | — |
+| **T3** | Headless Service DNS resolution + peer discovery extra-mile — `ClusterClient` integration on the cluster headless Service endpoint set so writes routed through the round-robin ClusterIP Service rotate past backups and land on the primary instead of falling into `OpResult::Unavailable`. (T2 covered the binary-side bootstrap-race; T3 is the client-side failover-aware wiring.) | **DONE** | `233f4a2` / `7ce5250` |
 | ~~T4~~ | ~~kind-verified 3-replica cluster on vulcan — folded into T2 (above) since the binary build + image + kind verify naturally clustered.~~ | **MERGED INTO T2** | — |
-| T5 | Real cluster smoke — CRUD via `kubectl exec` to any pod (clients connect through the regular ClusterIP, which can route to any pod; ClusterClient retries against primary on `Unavailable`); kill the primary (`kubectl delete pod kesseldb-0`) and verify view-change elects a new primary within view-change timeout; verify the SSTables + WAL state survives + replays from the rejoined pod. | QUEUED | — |
+| **T5** | Real cluster smoke — CRUD via `kubectl exec` to any pod (clients connect through the regular ClusterIP, which can route to any pod; ClusterClient retries against primary on `Unavailable`); kill the primary (`kubectl delete pod kesseldb-0`) and verify view-change elects a new primary within view-change timeout; verify the SSTables + WAL state survives + replays from the rejoined pod. | **DONE** | `0d95405` |
 | T6 | Fly.io multi-region cluster deploy — per-region `[mounts]` + per-machine env-var `KESSELDB_CLUSTER_REPLICA_IDX` mapping. Fly Machines do NOT have stable headless-DNS; peer addresses use `<machine-id>.vm.<app>.internal` or per-machine private 6PN address (TBD in T6 design). | QUEUED | — |
 | T7 | Monitoring — verify `/v1/metrics` Prometheus scrape endpoint emits VSR-relevant counters (view changes per replica, last-applied op-number, lag-from-primary, primary uptime). Ship a sample `prometheus-rules.yaml` and Grafana dashboard JSON. | QUEUED | — |
 | T8 | Arc closure — STATUS Track row + this tracker close + USAGE §11.5 sub-section ("Kubernetes cluster mode") + README Deploy table extension. | QUEUED | — |
+
+## T3+T5 ship — what landed
+
+### Files changed (3 modified + 1 added)
+
+- `crates/kessel-client/src/lib.rs` — new `ClusterClient::sql(&str)`
+  method. Writes `[0xFE] ++ utf8` (the SQL wire shape `Client::sql`
+  uses), reads back `OpResult`, and on `Unavailable` / I/O error
+  rotates the address index and retries. Bounded attempts
+  (`(len(addrs) * 4).max(8)`). NOT session-framed (the cluster
+  server's session-frame path is `Op`-only, no `Op::decode` form for
+  an SQL string); cross-node exactly-once on SQL writes is therefore
+  not strictly guaranteed (documented in the doc-comment +
+  `docs/USAGE.md` §11.5 cluster-mode V1 limits).
+- `crates/kessel-client/src/bin/kessel.rs` — new `--addrs A1,A2,...`
+  flag. Parses comma-separated `HOST:PORT` list; when non-empty,
+  dispatches through `Conn::Cluster(ClusterClient::new(addrs))`
+  instead of the existing `Conn::Single(Client::connect(...))`.
+  `--addr` (singular) path is byte-identical for single-target
+  installs. The new `Conn` enum abstracts the connection so the
+  rest of the CLI (`run_one`, `print_got_text`, `print_got_json`,
+  `handle_meta`) is connection-agnostic.
+- `crates/kesseldb-server/src/cluster.rs` — 2 new KATs:
+  `cluster_client_sql_rotates_past_followers` (primary LAST in the
+  address list; `ClusterClient::sql` still lands CREATE / INSERT /
+  SELECT SUM correctly) and
+  `cluster_client_sql_commits_through_follower_port` (only a
+  FOLLOWER's client port in the address list; the follower's
+  server-side relay-to-primary commits DDL + 2× INSERT + SUM=300
+  through `[0xFE] ++ sql`). 8/8 `cluster::tests::*` green.
+- `deploy/helm/kesseldb/templates/NOTES.txt` — new CLUSTER MODE
+  section (gated on `.Values.cluster.enabled`) rendering the full
+  `kessel --addrs ...` invocation with the per-pod headless DNS
+  list + a primary-kill recovery hint. Single-pod NOTES is byte-
+  identical.
+- `docs/superpowers/spcloudcluster-t3-t5-failover-2026-06-02.txt`
+  — new file; T5 live kind verification transcript on vulcan
+  (3-pod helm install + pre-kill CRUD + `kubectl delete pod
+  kesseldb-cluster-0` + view-change + post-kill INSERT + final
+  SELECT SUM = 300).
+
+### Verification on vulcan
+
+Cluster tests (kesseldb-server lib, real-TCP cluster integration,
+`--release`):
+
+```
+running 8 tests
+test cluster::tests::sql_over_cluster_full_crud_and_rmw ... ok
+test cluster::tests::three_nodes_replicate_over_real_tcp ... ok
+test cluster::tests::cluster_client_sql_rotates_past_followers ... ok           # T3 NEW
+test cluster::tests::cluster_sql_cache_correct_across_ddl ... ok
+test cluster::tests::cluster_client_sql_commits_through_follower_port ... ok    # T3 NEW
+test cluster::tests::failover_retry_against_follower_returns_cached_reply ... ok
+test cluster::tests::cluster_client_finds_primary_and_is_exactly_once ... ok
+test cluster::tests::session_retry_is_exactly_once ... ok
+test result: ok. 8 passed; 0 failed
+```
+
+Live kind cluster + primary-kill failover (excerpted; full
+transcript at
+`docs/superpowers/spcloudcluster-t3-t5-failover-2026-06-02.txt`):
+
+```
+=== pre-kill ===
+kesseldb-cluster-0   1/1     Running   0   40s   ← PRIMARY (view=0)
+kesseldb-cluster-1   1/1     Running   0   40s
+kesseldb-cluster-2   1/1     Running   0   40s
+
+$ kubectl exec kesseldb-cluster-0 -- kessel --addrs $ADDRS \
+    'INSERT INTO failover_smoke ID 1 (id, v) VALUES (1, 100)'
+OK
+
+=== kill primary ===
+$ kubectl delete pod kesseldb-cluster-0 --grace-period=1
+pod "kesseldb-cluster-0" deleted
+
+=== view-change observed ===
+kesseldb-cluster-1: replica 1 role changed: view 0->1
+                     is_primary false->true status Normal->Normal
+kesseldb-cluster-1: replica 1 elected primary (view=1)
+
+=== post-kill INSERT via --addrs ===
+$ kubectl exec kesseldb-cluster-1 -- kessel --addrs $ADDRS \
+    'INSERT INTO failover_smoke ID 2 (id, v) VALUES (2, 200)'
+OK
+
+=== SELECT SUM after failover (THE HEADLINE) ===
+$ kubectl exec kesseldb-cluster-1 -- kessel --addrs $ADDRS \
+    'SELECT SUM(v) FROM failover_smoke'
+= 300  (16 bytes)                                ← TARGET 100+200
+```
+
+### Acceptance gate — MET (T3+T5)
+
+| Gate | Target | Actual |
+|---|---|---|
+| `kessel --addrs ...` uses ClusterClient | dispatches through `ClusterClient::sql` when multi-addr | **PASS** |
+| ClusterClient::sql rotates on Unavailable | retries against next address up to ~12× | **PASS** (`(N*4).max(8)`) |
+| ClusterClient::sql rotates on I/O error | same retry shape | **PASS** |
+| 8/8 cluster KATs green | 6 existing + 2 new T3 KATs | **PASS** (8 passed; 0 failed) |
+| kind 3-pod cluster + primary-kill | helm install, all 3 Running, `kubectl delete pod` primary | **PASS** |
+| New primary elected within view-change timeout | kesseldb-cluster-1 logs `elected primary (view=1)` | **PASS** (~8s) |
+| 2nd INSERT after primary kill returns Ok | via `kessel --addrs ...` | **PASS** |
+| Final SELECT SUM returns 300 | 100 + 200 | **PASS** (`= 300  (16 bytes)`) |
+
+### Honest T3+T5 limits (carried forward)
+
+- **Cross-node exactly-once on SQL writes is NOT strictly
+  guaranteed.** `ClusterClient::sql` uses `[0xFE] ++ utf8`, the
+  same shape `Client::sql` writes; the cluster server's
+  `apply_raw` accepts it on every node and allocates a fresh
+  engine-internal `(client_id, req=1)` per call, so a SQL
+  re-delivery after a primary kill re-executes the op rather
+  than serving a cached reply. For STRICT cross-node exactly-
+  once on writes, callers should embed `ClusterClient` directly
+  and use the `Op`-level session-framed `call(&Op)` surface,
+  which IS exactly-once via VSR's client_table (already shipped
+  + KATed at SP42). The T5 acceptance ("the cluster keeps
+  serving + SUM is correct") holds via the eventual-commit
+  semantics of the SUM read.
+- **HTTP / WS / PG-wire gateways still not served in cluster
+  mode V1.** Same V2 follow-up named at T2.
+- **kind single-node deploys all pods on one node.** Same
+  SP-Cloud-Cluster-VERIFY-MULTI-NODE V2 follow-up named at T1.
+- **Newly recreated primary pod (post-kill) initially self-claims
+  view=0 is_primary=true** before its peer transport receives the
+  view-change broadcast. Within seconds it catches up and becomes
+  a follower in view=1. Operationally invisible because the kessel
+  CLI rotates past stale `Unavailable` answers; surfaced in the
+  T5 transcript honest-notes.
+
+### Invariants preserved (T3+T5)
+
+- `kessel --addr <single>` path byte-identical (single-target
+  installs unchanged; `Conn::Single` dispatches to the existing
+  `Client::connect` + `Client::sql`).
+- HTTP/1.1 + WS + binary + PG-wire single-node surfaces untouched
+  (cluster gateway surfaces are V2 follow-up).
+- `#![forbid(unsafe_code)]` honored (no `unsafe` in any new code).
+- Existing 6 `cluster::tests::*` pass verbatim.
+- Zero new external deps.
+- KAT delta: **+2** (cluster_client_sql_rotates_past_followers,
+  cluster_client_sql_commits_through_follower_port).
 
 ## T2 ship — what landed
 

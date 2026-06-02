@@ -251,6 +251,68 @@ at dispatch entry, JDBC simple-mode unblocked.
   `docs/superpowers/specs/2026-06-02-kesseldb-subproject-spcloudcluster-progress.md`
   — T2 DONE; T3-T8 multi-arc continuation QUEUED. **TaskList #373
   T2 done; T3-T8 still queued.**
+- **Track K cont. — SP-Cloud-Cluster T3+T5 (2026-06-02, FAILOVER-
+  AWARE CLI + kind primary-kill VERIFIED).** Closes the T2 honest
+  caveat (kessel CLI uses single-`Client::connect`, so writes routed
+  via the round-robin ClusterIP Service can land on a backup and hit
+  `OpResult::Unavailable`) by wiring the failover-aware
+  `ClusterClient` already shipped at SP42 into the CLI's SQL path,
+  AND end-to-end verifying it on a kind 3-pod cluster with the
+  primary `kubectl delete`d mid-test. **CLI** (`kessel`): new
+  `--addrs A1,A2,...` flag (comma-separated cluster addresses); when
+  multi-addr, dispatches through `ClusterClient::sql` instead of
+  single `Client::sql`. The `--addr` (singular) path stays byte-
+  identical for single-target installs. **ClusterClient**: new
+  `sql(&str)` method writes `[0xFE] ++ utf8` (the same wire shape
+  `Client::sql` writes) and retries on `OpResult::Unavailable` /
+  I/O error by rotating the address index. The cluster server's
+  `apply_raw` path already accepts that shape on every node and
+  either compiles + commits (primary) or answers `Unavailable`
+  (backup unable to relay) — so the client-side rotation lands the
+  SQL on the active primary regardless of which address it dialed
+  first. **Helm chart NOTES.txt**: grew a CLUSTER MODE section
+  rendering the full `kessel --addrs ...` invocation with the
+  per-pod headless DNS list + a primary-kill recovery hint
+  (single-pod NOTES is byte-identical; gated on
+  `.Values.cluster.enabled`). **Two new cluster KATs**:
+  `cluster_client_sql_rotates_past_followers` (primary LAST in the
+  address list; `ClusterClient::sql` still lands CREATE / INSERT /
+  SELECT SUM correctly) +
+  `cluster_client_sql_commits_through_follower_port` (only a
+  FOLLOWER's client port is in the address list; the follower's
+  server-side relay-to-primary commits DDL + 2× INSERT + SUM=300
+  via `[0xFE] ++ sql`). 8/8 `cluster::tests::*` green (up from
+  6/6 at T2). **T5 live kind verify on vulcan** (kind v0.24.0 +
+  helm v3.16.3 + Docker 27.5.1, Ubuntu 24.04): fresh kind cluster,
+  helm install `cluster.enabled=true`, all 3 pods Running in <60s;
+  pre-kill INSERT(100) + SELECT SUM = 100; `kubectl delete pod
+  kesseldb-cluster-0` (the primary in view=0); within ~8s
+  `kesseldb-cluster-1` logs `elected primary (view=1)`; next
+  `kessel --addrs ...` INSERT(200) returns `Ok`; final
+  `SELECT SUM(v) FROM failover_smoke` → `= 300  (16 bytes)`
+  (100 + 200 — the headline result). Transcript:
+  `docs/superpowers/spcloudcluster-t3-t5-failover-2026-06-02.txt`.
+  **Honest T3+T5 limits**: cross-node exactly-once on SQL writes
+  is NOT guaranteed (the `[0xFE] ++ sql` path is not session-
+  framed because the cluster server's session-frame path is
+  `Op`-only — embedded callers needing strict exactly-once should
+  use `ClusterClient::call(&Op)` instead, which IS session-framed
+  and dedupes via the replica's client_table); HTTP / WS / PG-wire
+  gateways still not served in cluster mode V1 (V2 follow-up).
+  **Invariants preserved**: `kessel --addr <single>` path byte-
+  identical; HTTP/1.1 + WS + binary + PG-wire single-node surfaces
+  untouched; `#![forbid(unsafe_code)]` honored; zero new external
+  deps. **KAT delta**: +2 cluster KATs (8 total). Three commits:
+  `233f4a2` (CLI `--addrs` + `ClusterClient::sql` + Helm NOTES.txt
+  + 2 new cluster KATs), `7ce5250` (KAT fix — simplify failover
+  KAT to follower-relay shape), `0d95405` (T5 kind verification
+  transcript). USAGE §11.5 added (Kubernetes cluster mode walk-
+  through + primary-kill failover smoke). Progress tracker:
+  `docs/superpowers/specs/2026-06-02-kesseldb-subproject-spcloudcluster-progress.md`
+  — T3 DONE, T5 DONE (T4 was folded into T2 at the prior slice);
+  T6 (Fly multi-region) + T7 (Prometheus) + T8 (arc closure)
+  multi-arc continuation QUEUED. **TaskList #375 T3+T5 done; T6-T8
+  still queued.**
 - **Track M — SP-WHERE-VM-Specialise (2026-06-01, V1 SHIPPED).**
   Closes the per-row stack-VM dispatch cost SP-Hash-Agg-Tune diagnosed
   as the dominant TPC-H Q1/Q6 wall-time ceiling (V1-Tune sweep at N=4

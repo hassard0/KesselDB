@@ -2445,13 +2445,110 @@ implies the surface is accepting connections). If you have the HTTP
 gateway enabled, prefer `GET /v1/health` (returns
 `{"status":"ok","primary":true,...}` from the active engine).
 
+### 11.5 Kubernetes cluster mode (SP-Cloud-Cluster)
+
+Replicated VSR consensus (`kessel-vsr`, 3 or 5 replicas) under a
+single Helm install — survives primary-pod kill + view-change +
+elects a new primary without operator intervention.
+
+Opt-in via `--set cluster.enabled=true`:
+
+```bash
+# 1. (open mode here — set auth.secretName for token auth)
+helm install kesseldb-cluster ./deploy/helm/kesseldb \
+  --set cluster.enabled=true \
+  --set cluster.replicas=3 \
+  --set auth.secretName=
+
+# 2. Wait for every replica to be Ready.
+kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=kesseldb \
+  --timeout=120s
+# kesseldb-cluster-0 / -1 / -2 all Running.
+
+# 3. The cluster runs as a StatefulSet with stable pod DNS:
+#      kesseldb-cluster-<idx>.kesseldb-cluster-headless.<ns>.svc.cluster.local
+#    Peer traffic uses port 6534 (the headless Service publishes
+#    only that port); client traffic uses 6532 on the regular
+#    ClusterIP Service.
+
+# 4. Talk to the cluster via the failover-aware kessel CLI.
+#    --addrs takes a comma-separated address list; the CLI rotates
+#    past any node that answers UNAVAILABLE and lands the SQL on
+#    the active primary.
+ADDRS=kesseldb-cluster-0.kesseldb-cluster-headless.default.svc.cluster.local:6532,\
+      kesseldb-cluster-1.kesseldb-cluster-headless.default.svc.cluster.local:6532,\
+      kesseldb-cluster-2.kesseldb-cluster-headless.default.svc.cluster.local:6532
+
+kubectl exec kesseldb-cluster-0 -- kessel --addrs "$ADDRS" \
+  'CREATE TABLE acct (id BIGINT NOT NULL, bal BIGINT NOT NULL)'
+kubectl exec kesseldb-cluster-0 -- kessel --addrs "$ADDRS" \
+  'INSERT INTO acct ID 1 (id, bal) VALUES (1, 100)'
+kubectl exec kesseldb-cluster-0 -- kessel --addrs "$ADDRS" \
+  'SELECT SUM(bal) FROM acct'
+# = 100  (16 bytes)
+```
+
+Primary-kill failover (kind-verified end-to-end on vulcan):
+
+```bash
+# Identify the current primary from logs.
+for p in 0 1 2; do
+  echo "--- kesseldb-cluster-$p ---"
+  kubectl logs kesseldb-cluster-$p | grep -i "elected primary" | tail -1
+done
+# kesseldb-cluster-0: kesseldb cluster: replica 0 elected primary (view=0)
+
+# Kill it.
+kubectl delete pod kesseldb-cluster-0 --grace-period=1
+
+# Within view-change timeout (~5s default) a surviving replica is elected.
+sleep 8
+kubectl logs kesseldb-cluster-1 | grep -i "elected primary" | tail -1
+# kesseldb-cluster-1: kesseldb cluster: replica 1 elected primary (view=1)
+
+# Issue another write via --addrs — the CLI rotates past the deleted
+# primary's address and lands on the new primary.
+kubectl exec kesseldb-cluster-1 -- kessel --addrs "$ADDRS" \
+  'INSERT INTO acct ID 2 (id, bal) VALUES (2, 200)'
+# OK
+
+kubectl exec kesseldb-cluster-1 -- kessel --addrs "$ADDRS" \
+  'SELECT SUM(bal) FROM acct'
+# = 300  (16 bytes)   ← 100 + 200, the committed total
+```
+
+End-to-end kind transcript:
+[`docs/superpowers/spcloudcluster-t3-t5-failover-2026-06-02.txt`](superpowers/spcloudcluster-t3-t5-failover-2026-06-02.txt).
+
+Overridable values for cluster mode (full list in
+[`deploy/helm/kesseldb/values.yaml`](../deploy/helm/kesseldb/values.yaml)):
+`cluster.enabled`, `cluster.replicas` (3 or 5),
+`cluster.peerAddressTemplate`, `cluster.viewChangeTimeout`,
+`cluster.peerPort` (default 6534),
+`cluster.podManagementPolicy` (default `Parallel`).
+
+Cluster-mode V1 limits (named, not vague):
+
+- **HTTP / WS / PG-wire gateways NOT served in cluster mode V1.**
+  The cluster path serves the binary client protocol only; gateway
+  cluster surfaces are a documented V2 follow-up.
+- **Cross-node exactly-once on SQL writes is NOT guaranteed.** The
+  CLI's `--addrs` retry uses `[0xFE] ++ sql` (the same wire as
+  single-target SQL) which the cluster server's `apply_raw` path
+  accepts on every node. For STRICT cross-node exactly-once on
+  writes (replay a committed SQL after a primary kill returns the
+  cached reply rather than re-executing), embed `ClusterClient`
+  directly and call the `Op`-level session-framed `call(&Op)`
+  surface — the same shape the cluster KATs use.
+
 ### V1 cloud-deploy caveats (named, not vague)
 
-- **Single-pod / single-VM by design.** The engine is single-writer;
-  the data PVC / Fly volume is single-attach. Multi-replica VSR
-  clustering on k8s + Fly is the named **SP-Cloud-Cluster** arc
-  (StatefulSet + per-replica PVCs + headless Service + ClusterClient
-  endpoints).
+- **~~Single-pod / single-VM by design~~ Cluster mode shipped (V1).**
+  SP-Cloud-Cluster T3+T5 lands a 3 or 5 replica StatefulSet + headless
+  Service + per-replica PVC + failover-aware `kessel --addrs ...` CLI.
+  Multi-region (cross-zone WAN-tolerant view-change) is the named
+  **SP-Cloud-Cluster-GEO** follow-up; sharding × clustering is
+  **SP-Cloud-Cluster-SHARD**.
 - **No public TLS in the v1 ghcr.io image.** The image is built with
   `--features pg-gateway,http-gateway` only; `--features tls` is
   opt-in (rustls). Pair with your platform's ingress (k8s Ingress +

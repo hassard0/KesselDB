@@ -1,0 +1,128 @@
+SP-Cloud-Cluster-METRICS-EXPAND — vulcan verification transcript
+admin@192.168.4.178 — 2026-06-02
+================================================================
+
+Build (release, --features pg-gateway,http-gateway, vulcan):
+
+    $ CARGO_TARGET_DIR=/tmp/kdb-target-metricsexp \
+      cargo build --release --bin kesseldb \
+      --features pg-gateway,http-gateway 2>&1 | tail -5
+    ...
+    Compiling kessel-vsr v0.0.1 (/home/admin/KesselDB/crates/kessel-vsr)
+    Compiling kesseldb-server v0.0.1 (/home/admin/KesselDB/crates/kesseldb-server)
+    Finished `release` profile [optimized] target(s) in 27.50s
+
+3-replica cluster spawn (HTTP metrics on :6330/:6331/:6332,
+client on :6540/:6541/:6542, peer on :6532/:6533/:6534):
+
+    for i in 0 1 2; do
+      CLIENT_PORT=$((6540+i))
+      HTTP_PORT=$((6330+i))
+      KESSELDB_HTTP_ADDR=127.0.0.1:$HTTP_PORT \
+      KESSELDB_TOKEN=admin \
+      nohup /tmp/kdb-target-metricsexp/release/kesseldb \
+        --cluster --replica-idx $i \
+        --peer-addrs 127.0.0.1:6532,127.0.0.1:6533,127.0.0.1:6534 \
+        127.0.0.1:$CLIENT_PORT /tmp/kdb-metricsexp-$i \
+        </dev/null >/tmp/kdb-metricsexp-$i.log 2>&1 &
+    done
+
+NOTE — the brief's client-port mapping `127.0.0.1:653$i` collided
+with the peer-listen ports `127.0.0.1:653{2,3,4}` on the same loop-
+back (replica 2's client addr would be 6532 = replica 0's peer
+listen). Used 6540/6541/6542 for client addrs; observability shape
+is unchanged.
+
+=== PRE-KILL ===
+
+$ curl -s http://127.0.0.1:6330/v1/metrics    # replica 0 (primary, view 0)
+# HELP kesseldb_last_op_number Highest applied op_number on this replica.
+# TYPE kesseldb_last_op_number gauge
+kesseldb_last_op_number 0
+# HELP kesseldb_view_number Current VSR view number.
+# TYPE kesseldb_view_number gauge
+kesseldb_view_number 0
+# HELP kesseldb_is_primary 1 if this replica is the primary in the current view.
+# TYPE kesseldb_is_primary gauge
+kesseldb_is_primary 1
+# HELP kesseldb_view_changes_total Monotonic per-process count of view advances on this replica.
+# TYPE kesseldb_view_changes_total counter
+kesseldb_view_changes_total 0
+# HELP kesseldb_replica_lag_opnum Op-number lag from the primary (0 on primary; >=0 on backups).
+# TYPE kesseldb_replica_lag_opnum gauge
+kesseldb_replica_lag_opnum 0
+
+$ curl -s http://127.0.0.1:6331/v1/metrics    # replica 1 (backup)
+kesseldb_last_op_number 0
+kesseldb_view_number 0
+kesseldb_is_primary 0
+kesseldb_view_changes_total 0
+kesseldb_replica_lag_opnum 0
+
+$ curl -s http://127.0.0.1:6332/v1/metrics    # replica 2 (backup)
+kesseldb_last_op_number 0
+kesseldb_view_number 0
+kesseldb_is_primary 0
+kesseldb_view_changes_total 0
+kesseldb_replica_lag_opnum 0
+
+=== KILL PRIMARY ===
+
+$ kill 2703333   # replica 0 PID
+
+=== POST-KILL (after sleep 4) ===
+
+Surviving replica 1 (newly elected primary in view 1):
+
+$ curl -s http://127.0.0.1:6331/v1/metrics
+kesseldb_last_op_number 0
+kesseldb_view_number 1                  ← view advanced 0 -> 1
+kesseldb_is_primary 1                   ← elected new primary
+kesseldb_view_changes_total 1           ← THE HEADLINE: counter bumped
+kesseldb_replica_lag_opnum 0            ← 0 on primary
+
+Surviving replica 2 (still backup in view 1):
+
+$ curl -s http://127.0.0.1:6332/v1/metrics
+kesseldb_last_op_number 0
+kesseldb_view_number 1                  ← view advanced 0 -> 1
+kesseldb_is_primary 0
+kesseldb_view_changes_total 1           ← counter bumped on backup too
+kesseldb_replica_lag_opnum 0            ← lag 0 (no Prepare yet at this view)
+
+Role-transition logs from replica 1 (the new primary):
+
+  kesseldb cluster: replica 1 elected primary (view=0)            ← startup misfire (re-elected in view 1)
+  kesseldb cluster: replica 1 role: view=0 is_primary=false status=Normal
+  kesseldb cluster: replica 1 role changed: view 0->1 is_primary false->true status Normal->Normal
+  kesseldb cluster: replica 1 elected primary (view=1)            ← post-kill election
+
+=== /v1/health (liveness JSON) ===
+
+New primary (1):
+  $ curl -s http://127.0.0.1:6331/v1/health
+  {"primary":true,"view":1,"op_number":0,"role":"primary"}
+
+Backup (2):
+  $ curl -s http://127.0.0.1:6332/v1/health
+  {"primary":false,"view":1,"op_number":0,"role":"backup"}
+
+Bogus path (404):
+  $ curl -s -o - -w "HTTP %{http_code}" http://127.0.0.1:6331/bogus
+  not found
+  HTTP 404
+
+=== ACCEPTANCE GATE — MET ===
+
+  | Gate                                                         | Actual                    |
+  |--------------------------------------------------------------|---------------------------|
+  | kesseldb_view_changes_total starts at 0 on all replicas      | PASS (all 3 at 0 pre-kill) |
+  | kesseldb_view_changes_total >=1 on surviving replicas after  | PASS (both at 1 post-kill) |
+  |    primary kill                                              |                           |
+  | kesseldb_replica_lag_opnum=0 on primary                      | PASS                      |
+  | kesseldb_replica_lag_opnum>=0 on backups                     | PASS (0; primary's        |
+  |                                                              |   op_number=0 too)        |
+  | Metrics endpoint emits canonical Prometheus text format      | PASS (HELP+TYPE+sample)   |
+  | /v1/health returns liveness JSON                             | PASS                      |
+  | Unknown paths return HTTP 404                                | PASS                      |
+  | View advances 0 -> 1 after primary kill within ~4s           | PASS (~sleep 4 was enough)|

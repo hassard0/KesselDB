@@ -2573,31 +2573,40 @@ kubectl get servicemonitor,prometheusrule -l app.kubernetes.io/instance=kesseldb
 
 The ServiceMonitor scrapes the chart's client ClusterIP Service on
 the named `http` port (6533) at `/v1/metrics`. The
-`PrometheusRule` ships three alerts:
+`PrometheusRule` ships four alerts:
 
 | Alert | Expression | For | Severity |
 |---|---|---|---|
 | `KesselDBClusterReplicaDown` | `up{} == 0` | 30s | critical |
 | `KesselDBNoPrimary` | `sum(kesseldb_is_primary) == 0` | 60s | critical |
-| `KesselDBViewChangeStorm` | `delta(kesseldb_view_number[5m]) > 5` | 5m | warning |
+| `KesselDBViewChangeStorm` | `rate(kesseldb_view_changes_total[5m]) > 1` | 5m | warning |
+| `KesselDBReplicaLag` | `kesseldb_replica_lag_opnum > 100` | 60s | warning |
 
-V1-emitted metrics (from
-[`crates/kessel-http-gateway/src/metrics_writer.rs`](../crates/kessel-http-gateway/src/metrics_writer.rs)):
+Emitted metrics (from
+[`crates/kessel-http-gateway/src/metrics_writer.rs`](../crates/kessel-http-gateway/src/metrics_writer.rs)
+in single-node mode, and from
+[`crates/kesseldb-server/src/cluster.rs`](../crates/kesseldb-server/src/cluster.rs)
+`render_cluster_metrics_text` in cluster mode):
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `kesseldb_ops_total` | counter | `kind` | Ops applied since process start |
-| `kesseldb_inflight` | gauge | — | Ops currently in flight to the engine |
+| `kesseldb_ops_total` | counter | `kind` | Ops applied since process start (single-node) |
+| `kesseldb_inflight` | gauge | — | Ops currently in flight to the engine (single-node) |
 | `kesseldb_last_op_number` | gauge | — | Highest applied op_number on this replica |
-| `kesseldb_view_number` | gauge | — | Current VSR view number (monotonic) |
+| `kesseldb_view_number` | gauge | — | Current VSR view number |
 | `kesseldb_is_primary` | gauge | — | 1 if this replica is primary, 0 otherwise |
-| `kesseldb_http_requests_total` | counter | `path`, `status` | HTTP gateway requests |
+| `kesseldb_view_changes_total` | counter | — | Monotonic per-process count of view advances (SP-Cloud-Cluster-METRICS-EXPAND) |
+| `kesseldb_replica_lag_opnum` | gauge | — | Op-number lag from primary (0 on primary; >=0 on backups, SP-Cloud-Cluster-METRICS-EXPAND) |
+| `kesseldb_http_requests_total` | counter | `path`, `status` | HTTP gateway requests (single-node only) |
 
-Plus the Prometheus-injected `up{}` per scrape target. The
-`ViewChangeStorm` alert uses `delta(kesseldb_view_number[5m])` as
-the V1 surrogate for a dedicated counter; a proper
-`kesseldb_view_changes_total` + cross-replica lag histogram are
-shipped under the named V2 follow-up **SP-Cloud-Cluster-METRICS-EXPAND**.
+Plus the Prometheus-injected `up{}` per scrape target.
+`view_changes_total` is per-process and resets on replica restart
+— Prometheus's `rate()` handles counter resets explicitly via its
+reset-detection algorithm, so the `ViewChangeStorm` alert remains
+correct across restart windows. `replica_lag_opnum` accuracy is
+bounded by Prepare-message cadence — a quiet primary leaves the
+gauge stale at the last Prepare's op_number (accurate within one
+12 ms tick under load; stale during quiet).
 
 Knobs (all under `monitoring.prometheus.*`): `enabled`, `interval`
 (default `30s`), `scrapeTimeout` (default `10s`),
@@ -2608,9 +2617,13 @@ canned alerts), `rules.additionalLabels`.
 
 Cluster-mode V1 limits (named, not vague):
 
-- **HTTP / WS / PG-wire gateways NOT served in cluster mode V1.**
-  The cluster path serves the binary client protocol only; gateway
-  cluster surfaces are a documented V2 follow-up.
+- **HTTP/WS/PG-wire SQL/Op gateways NOT served in cluster mode V1.**
+  The cluster path serves the binary client protocol on the client
+  port, plus a dedicated metrics-only HTTP endpoint
+  (`/v1/metrics` + `/v1/health`, no SQL or Op surfaces) bound to
+  `KESSELDB_HTTP_ADDR` for Prometheus scrape and liveness checks.
+  Full HTTP/WS/PG SQL/Op gateway surfaces in cluster mode remain a
+  documented V2 follow-up.
 - **Cross-node exactly-once on SQL writes is NOT guaranteed.** The
   CLI's `--addrs` retry uses `[0xFE] ++ sql` (the same wire as
   single-target SQL) which the cluster server's `apply_raw` path

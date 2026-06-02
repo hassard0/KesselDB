@@ -214,12 +214,19 @@ From `crates/kessel-http-gateway/src/metrics_writer.rs`:
 | `kesseldb_http_requests_total` | counter | `path`, `status` | — |
 | `up` (Prometheus-injected) | gauge | — | **ClusterReplicaDown** |
 
-Not yet emitted (named V2 follow-up SP-Cloud-Cluster-METRICS-EXPAND):
-- `kesseldb_view_changes_total` (dedicated counter — V1 uses
-  `delta(kesseldb_view_number[5m])` as surrogate, which works for
-  the storm alert but doesn't survive replica restart cleanly).
-- `kesseldb_replica_lag_seconds` (cross-replica primary-vs-backup
-  lag histogram — useful for follower-lag SLOs, not in V1).
+Not yet emitted at V1 close (named V2 follow-up
+SP-Cloud-Cluster-METRICS-EXPAND, **SHIPPED 2026-06-02 same-day**):
+- ~~`kesseldb_view_changes_total`~~ — dedicated monotonic counter
+  now emitted; `KesselDBViewChangeStorm` alert uses
+  `rate(kesseldb_view_changes_total[5m]) > 1` (proper counter
+  shape). Tracker:
+  `docs/superpowers/specs/2026-06-02-kesseldb-subproject-spcloudcluster-metricsexpand-progress.md`.
+- ~~`kesseldb_replica_lag_opnum`~~ — per-replica lag gauge (0 on
+  primary, op-count lag on backups derived from inbound Prepare's
+  primary op_number). Drove a new `KesselDBReplicaLag` canned
+  alert. (A `kesseldb_replica_lag_seconds` histogram is still a
+  future V3+ enhancement if operators need wall-clock-time-based
+  lag SLOs, but the op-count gauge covers the V2 brief.)
 
 ### Acceptance gate — MET (T7+T8)
 

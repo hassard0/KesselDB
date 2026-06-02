@@ -3476,6 +3476,206 @@ mod tests {
         }
     }
 
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-EXTQ-PARSED-FUNCTIONS T2 — regression-lock KATs.
+    //
+    // DIAGNOSIS (Reality A): scalar-function SELECTs (`SELECT version()`,
+    // `current_database()`, `current_schema()`, `SELECT 1`, …) are
+    // intercepted by `pg_catalog::catalog_query_hook` at the TOP of BOTH
+    // dispatch entry points (`dispatch_query_with_params` AND
+    // `dispatch_query`), BEFORE the typed/text branch and BEFORE any
+    // `engine.apply_sql*` / `select_star_table` call. For 0-param SQL,
+    // `preprocess_typed_params` returns `Some(vec![])` so the typed path
+    // is taken, and that path hooks the catalog FIRST. There is NO
+    // text-fallback gap and NO engine call.
+    //
+    // These KATs lock that invariant END-TO-END through the full
+    // Extended Query machinery (Parse → Bind → Execute via
+    // `dispatch_execute`) using a panic-on-engine-call engine: any KAT
+    // that routed a scalar function into `apply_sql` /
+    // `apply_sql_with_params` would PANIC. Locks the property against a
+    // future refactor of the typed/text branch ordering that could
+    // silently send a scalar function to the engine.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// Engine that PANICS if any apply path is invoked. `describe_table`
+    /// returns `None` for everything. Used to prove the catalog hook
+    /// pre-empts scalar functions before any engine call.
+    struct PanicOnApplyEngine;
+    impl EngineApply for PanicOnApplyEngine {
+        fn apply_sql(&self, sql: &str) -> OpResult {
+            panic!(
+                "apply_sql called for scalar function SQL {sql:?} — the \
+                 catalog hook MUST pre-empt scalar functions before the \
+                 engine is ever reached"
+            );
+        }
+        fn apply_sql_with_params(
+            &self,
+            sql: &str,
+            _params: &[Option<kessel_codec::Value>],
+        ) -> OpResult {
+            panic!(
+                "apply_sql_with_params called for scalar function SQL \
+                 {sql:?} — the catalog hook MUST pre-empt scalar functions \
+                 before the typed path reaches the engine"
+            );
+        }
+        fn describe_table(&self, _name: &str) -> Option<Vec<crate::engine::PgColumn>> {
+            None
+        }
+    }
+
+    /// Drive a scalar-function SQL through the full Parse → Bind →
+    /// Execute Extended Query flow against `PanicOnApplyEngine` and
+    /// return the Execute output bytes. Panics (via the engine) if the
+    /// catalog hook fails to pre-empt.
+    fn scalar_fn_parse_bind_execute(sql: &str) -> Vec<u8> {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(&mut state, "psf", sql, vec![]);
+        let bind = proto::ExtqMessage::Bind {
+            portal: "pf".to_string(),
+            stmt: "psf".to_string(),
+            param_formats: vec![],
+            param_values: vec![],
+            result_formats: vec![],
+        };
+        match try_dispatch_extq(&mut state, &PanicOnApplyEngine, bind) {
+            ExtqOutcome::Bytes(_) => {}
+            other => panic!("Bind for {sql:?} should succeed, got {other:?}"),
+        }
+        let exec = proto::ExtqMessage::Execute {
+            portal: "pf".to_string(),
+            max_rows: 0,
+        };
+        match try_dispatch_extq(&mut state, &PanicOnApplyEngine, exec) {
+            ExtqOutcome::Bytes(bytes) => {
+                assert!(!state.in_error_state(),
+                    "scalar function {sql:?} must NOT leave the session in error state");
+                bytes
+            }
+            other => panic!("Execute for {sql:?} expected Bytes, got {other:?}"),
+        }
+    }
+
+    /// `SELECT version()` end-to-end: Parse → Bind → Execute emits
+    /// RowDescription("version") + a single DataRow carrying the canned
+    /// KesselDB version string + CommandComplete("SELECT 1"), with the
+    /// engine NEVER invoked. HEADLINE regression lock.
+    #[test]
+    fn sppgextqparsedfunctions_execute_select_version_via_hook_no_engine_call() {
+        let bytes = scalar_fn_parse_bind_execute("SELECT version()");
+        // Tag order T (RowDescription), D (DataRow), C (CommandComplete);
+        // NO Z (Sync emits RFQ).
+        assert_eq!(bytes[0], b'T', "first byte should be RowDescription");
+        assert!(!bytes.contains(&b'Z'),
+            "Execute output must NOT contain RFQ — Sync emits it");
+        assert_eq!(bytes.iter().filter(|&&b| b == b'D').count(), 1,
+            "should emit exactly one DataRow");
+        // RowDescription carries the column name "version".
+        assert!(bytes.windows(b"version\0".len()).any(|w| w == b"version\0"),
+            "RowDescription must name the column 'version'");
+        // DataRow carries the canned version string.
+        let ver = crate::pg_catalog::synthesize::KESSELDB_VERSION_STRING.as_bytes();
+        assert!(bytes.windows(ver.len()).any(|w| w == ver),
+            "DataRow must carry the canned KesselDB version string");
+        // CommandComplete is "SELECT 1".
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"),
+            "CommandComplete should carry 'SELECT 1'");
+    }
+
+    /// `SELECT current_database()` end-to-end via the catalog hook;
+    /// engine never invoked.
+    #[test]
+    fn sppgextqparsedfunctions_execute_current_database_via_hook_no_engine_call() {
+        let bytes = scalar_fn_parse_bind_execute("SELECT current_database()");
+        assert_eq!(bytes[0], b'T');
+        assert_eq!(bytes.iter().filter(|&&b| b == b'D').count(), 1);
+        assert!(bytes.windows(b"current_database\0".len())
+            .any(|w| w == b"current_database\0"),
+            "RowDescription must name the column 'current_database'");
+        let db = crate::pg_catalog::synthesize::KESSELDB_DATABASE_NAME.as_bytes();
+        assert!(bytes.windows(db.len()).any(|w| w == db),
+            "DataRow must carry the canned database name");
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+    }
+
+    /// `SELECT current_schema()` end-to-end via the catalog hook;
+    /// engine never invoked.
+    #[test]
+    fn sppgextqparsedfunctions_execute_current_schema_via_hook_no_engine_call() {
+        let bytes = scalar_fn_parse_bind_execute("SELECT current_schema()");
+        assert_eq!(bytes[0], b'T');
+        assert_eq!(bytes.iter().filter(|&&b| b == b'D').count(), 1);
+        assert!(bytes.windows(b"current_schema\0".len())
+            .any(|w| w == b"current_schema\0"),
+            "RowDescription must name the column 'current_schema'");
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+    }
+
+    /// `SELECT 1` (scalar-int) end-to-end via the catalog hook; engine
+    /// never invoked. Locks the SQLAlchemy `do_ping()` extended-mode
+    /// path through Execute (DESCRIBE-VERSION locked the Describe step;
+    /// this locks the DataRow emission too).
+    #[test]
+    fn sppgextqparsedfunctions_execute_select_1_via_hook_no_engine_call() {
+        let bytes = scalar_fn_parse_bind_execute("SELECT 1");
+        assert_eq!(bytes[0], b'T');
+        assert_eq!(bytes.iter().filter(|&&b| b == b'D').count(), 1,
+            "SELECT 1 should emit exactly one DataRow");
+        // The synthesizer names the column "?column?".
+        assert!(bytes.windows(b"?column?\0".len()).any(|w| w == b"?column?\0"),
+            "RowDescription must name the scalar-int column '?column?'");
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+    }
+
+    /// Re-Execute on a drained scalar-function portal emits a bare
+    /// CommandComplete (no duplicate DataRow, no RowDescription) and
+    /// STILL never touches the engine. Locks the buffered/exhausted
+    /// state machine for the synthesizer-served path.
+    #[test]
+    fn sppgextqparsedfunctions_reexecute_drained_scalar_portal_emits_bare_command_complete() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(&mut state, "psf", "SELECT version()", vec![]);
+        let bind = proto::ExtqMessage::Bind {
+            portal: "pf".to_string(),
+            stmt: "psf".to_string(),
+            param_formats: vec![],
+            param_values: vec![],
+            result_formats: vec![],
+        };
+        try_dispatch_extq(&mut state, &PanicOnApplyEngine, bind);
+        // FIRST Execute drains the single synthesized row.
+        let exec1 = proto::ExtqMessage::Execute {
+            portal: "pf".to_string(),
+            max_rows: 0,
+        };
+        match try_dispatch_extq(&mut state, &PanicOnApplyEngine, exec1) {
+            ExtqOutcome::Bytes(b) => {
+                assert_eq!(b.iter().filter(|&&t| t == b'D').count(), 1);
+            }
+            other => panic!("first Execute expected Bytes, got {other:?}"),
+        }
+        // SECOND Execute on the drained portal — bare CommandComplete,
+        // no DataRow, no RowDescription. Engine still never called.
+        let exec2 = proto::ExtqMessage::Execute {
+            portal: "pf".to_string(),
+            max_rows: 0,
+        };
+        match try_dispatch_extq(&mut state, &PanicOnApplyEngine, exec2) {
+            ExtqOutcome::Bytes(b) => {
+                assert_eq!(b[0], b'C',
+                    "re-Execute on a drained scalar portal must emit a bare CommandComplete");
+                assert!(!b.contains(&b'D'),
+                    "re-Execute must NOT repeat the DataRow");
+                assert!(!b.contains(&b'T'),
+                    "re-Execute must NOT repeat the RowDescription");
+            }
+            other => panic!("second Execute expected Bytes, got {other:?}"),
+        }
+        assert!(!state.in_error_state());
+    }
+
     /// Spec §7.2 max_rows pagination: Execute(max_rows=2) on a 5-row
     /// portal emits T + 2×D + PortalSuspended; the SECOND Execute
     /// emits 2×D + PortalSuspended; the THIRD emits 1×D + CommandComplete.

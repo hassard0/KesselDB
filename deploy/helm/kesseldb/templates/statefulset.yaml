@@ -1,24 +1,38 @@
-{{- if not .Values.cluster.enabled -}}
-# SP-Cloud-Deploy V1 — single-pod Deployment (the default path).
+{{- if .Values.cluster.enabled -}}
+# SP-Cloud-Cluster T1 — multi-pod StatefulSet for replicated VSR clustering.
 #
-# Renders ONLY when .Values.cluster.enabled is false (default). When
-# cluster mode is on, templates/statefulset.yaml renders instead.
+# Renders ONLY when .Values.cluster.enabled is true. The default single-pod
+# Deployment (templates/deployment.yaml) is gated off in that branch so we
+# don't deploy both shapes at once.
+#
+# Cluster shape:
+#   - N replicas (default 3, opt 5) with VSR consensus over a headless Service.
+#   - One PVC per pod via volumeClaimTemplates (every replica has the full data).
+#   - Pod hostname suffix is the replica idx (kesseldb-0 → 0).
+#   - KESSELDB_CLUSTER_PEER_ADDRS env carries every pod's DNS:6532 address.
+#
+# NB: T1 ships the YAML scaffold. The binary CLI flags `--cluster /
+# --replica-idx / --peer-addrs` are wired in T2; today's image will
+# CrashLoopBackOff on `unknown argument --cluster` (intentional —
+# clean failure mode, not stuck-pending).
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: {{ include "kesseldb.fullname" . }}
   labels:
     {{- include "kesseldb.labels" . | nindent 4 }}
 spec:
-  # V1 chart is SINGLE-POD by design — the KesselDB engine is single-writer
-  # and the data PVC is ReadWriteOnce. Running multiple replicas of this
-  # Deployment will split-brain. Multi-replica is SP-Cloud-Cluster
-  # (StatefulSet + per-replica PVCs + VSR ClusterClient endpoints).
-  replicas: 1
-  # Recreate so we don't try to mount the ReadWriteOnce PVC twice during
-  # rolling updates.
-  strategy:
-    type: Recreate
+  # VSR is fixed-size; legal values are 3 or 5. The chart does not
+  # enforce odd N or N>=3 — the binary will refuse at runtime.
+  replicas: {{ .Values.cluster.replicas }}
+  # Required for stable pod DNS via the headless Service.
+  serviceName: {{ include "kesseldb.fullname" . }}-headless
+  # VSR does not require ordered startup; parallel is faster to bootstrap.
+  podManagementPolicy: {{ .Values.cluster.podManagementPolicy | default "Parallel" }}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0
   selector:
     matchLabels:
       {{- include "kesseldb.selectorLabels" . | nindent 6 }}
@@ -47,8 +61,23 @@ spec:
         - name: kesseldb
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          args:
-            {{- toYaml .Values.args | nindent 12 }}
+          # Cluster pods derive their replica idx from the pod hostname
+          # ($HOSTNAME suffix after the last `-`). KESSELDB_CLUSTER_PEER_ADDRS
+          # is set below as the full comma-separated peer list, identical
+          # on every pod, so VSR sees a consistent membership.
+          command:
+            - "/bin/sh"
+            - "-c"
+            - |
+              set -eu
+              IDX="${HOSTNAME##*-}"
+              echo "kesseldb cluster pod: idx=$IDX peers=$KESSELDB_CLUSTER_PEER_ADDRS"
+              exec /usr/local/bin/kesseldb \
+                --cluster \
+                --replica-idx "$IDX" \
+                --peer-addrs "$KESSELDB_CLUSTER_PEER_ADDRS" \
+                0.0.0.0:6532 \
+                /data
           ports:
             - name: binary
               containerPort: {{ .Values.service.binary.targetPort }}
@@ -75,6 +104,11 @@ spec:
                   name: {{ .Values.auth.secretName | quote }}
                   key: {{ .Values.auth.secretKey | quote }}
             {{- end }}
+            # ----- Cluster-mode env (read by the binary at startup; T2) -----
+            - name: KESSELDB_CLUSTER_PEER_ADDRS
+              value: {{ include "kesseldb.clusterPeerAddrs" . | quote }}
+            - name: KESSELDB_CLUSTER_VIEW_CHANGE_TIMEOUT
+              value: {{ .Values.cluster.viewChangeTimeout | quote }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -105,14 +139,6 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
-      volumes:
-        - name: data
-        {{- if .Values.persistence.enabled }}
-          persistentVolumeClaim:
-            claimName: {{ include "kesseldb.fullname" . }}-data
-        {{- else }}
-          emptyDir: {}
-        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -125,4 +151,21 @@ spec:
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+  # Per-pod PVC; supersedes templates/pvc.yaml in cluster mode.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "kesseldb.labels" . | nindent 10 }}
+      spec:
+        accessModes:
+          {{- range .Values.persistence.accessModes }}
+          - {{ . | quote }}
+          {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size | quote }}
+        {{- if .Values.persistence.storageClassName }}
+        storageClassName: {{ .Values.persistence.storageClassName | quote }}
+        {{- end }}
 {{- end -}}

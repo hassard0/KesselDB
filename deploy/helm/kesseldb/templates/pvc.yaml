@@ -1,4 +1,9 @@
-{{- if .Values.persistence.enabled -}}
+{{- if and .Values.persistence.enabled (not .Values.cluster.enabled) -}}
+# SP-Cloud-Deploy V1 — single-pod PVC.
+#
+# Renders ONLY in single-pod mode. Cluster mode uses the StatefulSet's
+# volumeClaimTemplates (one PVC per pod, deterministically named
+# data-{fullname}-{ordinal}).
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

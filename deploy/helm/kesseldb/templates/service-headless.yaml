@@ -1,0 +1,35 @@
+{{- if .Values.cluster.enabled -}}
+# SP-Cloud-Cluster T1 — headless Service for stable per-pod DNS.
+#
+# Renders ONLY when .Values.cluster.enabled is true. This Service is
+# peer-to-peer only (VSR consensus on port 6532). Client traffic still
+# goes through the regular ClusterIP Service in service.yaml (binary
+# 6532 + HTTP 6533 + PostgreSQL 5432); operators connect to that one.
+#
+# Key knobs:
+#   - clusterIP: None — DNS-only, no virtual IP; each pod resolves to its
+#     own A record at:
+#        {{ include "kesseldb.fullname" . }}-{ord}.{{ include "kesseldb.fullname" . }}-headless.{ns}.svc.cluster.local
+#   - publishNotReadyAddresses: true — VSR pods need to talk to each
+#     other during bootstrap (before any pod is `Ready` by k8s probe
+#     standards). Without this, initial cluster bootstrap deadlocks
+#     because no pod is Ready until consensus is reached, but consensus
+#     requires DNS to resolve.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "kesseldb.fullname" . }}-headless
+  labels:
+    {{- include "kesseldb.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "kesseldb.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: binary
+      port: {{ .Values.service.binary.port }}
+      targetPort: {{ .Values.service.binary.targetPort }}
+      protocol: TCP
+{{- end -}}

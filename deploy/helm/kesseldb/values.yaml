@@ -206,6 +206,56 @@ tolerations: []
 affinity: {}
 
 # ─────────────────────────────────────────────────────────────────────
+# Cluster mode — replicated VSR consensus across N pods (V1: N=3 or 5).
+#
+# This is the SP-Cloud-Cluster opt-in. SP-Cloud-Deploy V1 single-pod
+# (Deployment + RWO PVC) remains the default; setting cluster.enabled=true
+# switches the chart to a StatefulSet + headless Service + per-pod PVCs.
+#
+# The single-pod path is BYTE-IDENTICAL when cluster.enabled=false —
+# existing SP-Cloud-Deploy V1 installs upgrade without diff.
+#
+# Cluster mode adds:
+#   - templates/statefulset.yaml          (replaces deployment.yaml)
+#   - templates/service-headless.yaml     (DNS-only Service for peer discovery)
+#   - volumeClaimTemplates                (per-pod PVC; supersedes pvc.yaml)
+#
+# The existing templates/service.yaml (ClusterIP, binary+http+postgres)
+# is STILL rendered in cluster mode and remains the client-facing
+# endpoint. Operators connect through it; replicas use the headless
+# service to talk to each other.
+#
+# T1 ships the YAML scaffold; the binary CLI flags (`--cluster /
+# --replica-idx / --peer-addrs`) are wired in T2 and the deployed
+# pods will CrashLoopBackOff on `unknown argument --cluster` against
+# today's image. That's the expected T1 failure mode.
+# ─────────────────────────────────────────────────────────────────────
+cluster:
+  # OFF by default. Existing single-pod installs are byte-identical
+  # when this stays false.
+  enabled: false
+  # VSR is fixed-size; legal values are 3 (tolerates 1 failure) or
+  # 5 (tolerates 2 failures). The chart does not enforce odd N or
+  # N>=3 — the binary will refuse to bootstrap at runtime. Documented
+  # here so the operator knows the contract.
+  replicas: 3
+  # DNS template for peer discovery. `{name}` expands to the chart
+  # fullname (e.g. "kesseldb"), `{idx}` to the ordinal (0..N-1),
+  # `{namespace}` to the release namespace. Defaults match the
+  # headless Service name ({fullname}-headless).
+  peerAddressTemplate: "{name}-{idx}.{name}-headless.{namespace}.svc.cluster.local:6532"
+  # View-change timeout — how long a backup waits without hearing
+  # from the primary before initiating a view-change. Default 5s
+  # matches the engine's Replica default; tune higher for higher-
+  # latency networks (multi-zone) and lower for tight LANs.
+  viewChangeTimeout: 5s
+  # podManagementPolicy: Parallel (default) bootstraps faster.
+  # Set to OrderedReady if you need strict-order pod creation
+  # (rare; only useful when peer addresses depend on prior pods
+  # being Ready, which VSR does not require).
+  podManagementPolicy: Parallel
+
+# ─────────────────────────────────────────────────────────────────────
 # Naming overrides (standard helm convention).
 # ─────────────────────────────────────────────────────────────────────
 nameOverride: ""

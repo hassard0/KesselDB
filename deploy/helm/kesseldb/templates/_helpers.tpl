@@ -66,3 +66,31 @@ Name of the service account to use.
 {{- default "default" .Values.serviceAccount.name -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+SP-Cloud-Cluster T1 — comma-separated peer address list.
+
+Expands `.Values.cluster.peerAddressTemplate` for each ordinal in
+[0, .Values.cluster.replicas) and joins them with `,`. The template's
+`{name}` placeholder is replaced with the chart fullname, `{idx}` with
+the ordinal, and `{namespace}` with the release namespace.
+
+Example output for fullname=kesseldb, namespace=default, replicas=3,
+default template "{name}-{idx}.{name}-headless.{namespace}.svc.cluster.local:6532":
+  kesseldb-0.kesseldb-headless.default.svc.cluster.local:6532,kesseldb-1.kesseldb-headless.default.svc.cluster.local:6532,kesseldb-2.kesseldb-headless.default.svc.cluster.local:6532
+
+Every pod in the cluster sees the SAME peer list — replica identity is
+derived from $HOSTNAME, not from the peer list.
+*/}}
+{{- define "kesseldb.clusterPeerAddrs" -}}
+{{- $fullname := include "kesseldb.fullname" . -}}
+{{- $ns := .Release.Namespace -}}
+{{- $tmpl := .Values.cluster.peerAddressTemplate -}}
+{{- $n := int .Values.cluster.replicas -}}
+{{- $parts := list -}}
+{{- range $i, $_ := until $n -}}
+  {{- $addr := $tmpl | replace "{name}" $fullname | replace "{idx}" (printf "%d" $i) | replace "{namespace}" $ns -}}
+  {{- $parts = append $parts $addr -}}
+{{- end -}}
+{{- join "," $parts -}}
+{{- end -}}

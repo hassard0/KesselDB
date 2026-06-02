@@ -12,6 +12,49 @@ KATs from the SP-CHAR-PAD-COMPARE V1 arc landed 2026-06-02 on top of
 
 **Tonight's delivery (2026-06-02) — coherent state of the union:**
 
+- **Track L cont. — SP-Perf-A-SHARD-SCAN-LOCAL-INDEX-FUSION (2026-06-02,
+  V1 SHIPPED — DONE_WITH_CONCERNS).** Closes the in-scope follow-up the
+  TINY-INLINE forensics named: bypass `scatter_serial`'s `apply_op`
+  channel hop by borrowing each shard's `Arc<RwLock<StateMachine>>`
+  directly and calling `read_only_op` against it. Implementation:
+  (i) `spawn_sharded_engine_cfg` forces `sub_cfg.read_workers = Some(0)`
+  when the caller didn't specify it — guarantees every sub-engine
+  populates its `sm_shared` snapshot (SP-Perf-A T2 ownership shape)
+  with zero real worker threads; (ii) `ShardedDispatcher` snapshots each
+  sub-engine's `sm_shared()` into a per-shard `shard_sms:
+  Vec<Option<Arc<RwLock<StateMachine>>>>`; (iii) `scatter_serial`
+  walks `shard_sms` directly when every slot is Some, falling back to
+  the apply_op channel path otherwise (degenerate test setups). K-
+  invariance preserved byte-equal: both paths walk shards in shard-id
+  order and route through the same `merge_scan_results` with the same
+  `ScatterKind`. **Vulcan bench (3-trial median, find-by, --workers 16,
+  10K rows, 10s)**: WITH-POOL config (§14c baseline shape) K=4 = 1.072M
+  ops/sec (was 1.058M POST-SCALEOUT; +1.4% — in trial noise; **spec
+  target of 10-20% lift NOT met**), K=8 = 849K (was 836K; +1.5%), K=16
+  = 614K (new). NO-POOL config K=4 = 1.084M (matches WITH-POOL K=4
+  1.072M; pre-FUSION estimated 5-50K via 4-channel-hops/call), K=8 =
+  848K (matches WITH-POOL). **Honest read**: WITH-POOL apply_op was
+  already taking the T6 fast path under the read guard — dispatcher
+  direct-borrow saves ~5 instructions + 1 atomic + 1 Arc clone per
+  shard, invisible at ~14µs/op. NO-POOL structural fix is the honest
+  delivery: FUSION wiring makes `--pool-workers` a no-op for find-by
+  at K>=2 — the dispatcher's tiny-scan path now always takes direct-
+  borrow regardless of the caller's read_workers cfg. K=4 K=1 gap (41%;
+  1.07M vs 1.81M) is unchanged — the SHARD-SCAN-TINY-INLINE-documented
+  structural floor (FindBy on a secondary index has no primary-key
+  routing; every shard must be queried). K-invariance oracle still
+  GREEN (12 scan ops byte/multiset-equal across K∈{1,4,8}). Test
+  surface: kesseldb-server lib 202 → 206 (+4 FUSION KATs: shard_sms
+  populated when read_workers unset, direct-borrow vs channel byte-
+  equal, K-invariance under default cfg, fallback contract). Default
+  `cargo build -p kesseldb-server` byte-identical (shard_sms only
+  constructed when `shard_count >= 2`); `#![forbid(unsafe_code)]`
+  honored; zero new external deps. Commits: `c6c50c6` (T1+T2 design
+  + scaffold + scatter_serial direct-borrow + 4 KATs), `e568596` (T3
+  vulcan bench + BENCHMARKS §14d), plus this commit (T4 STATUS +
+  tracker close). Progress tracker → SHARD-SCAN-LOCAL-INDEX-FUSION V1
+  SHIPPED — DONE_WITH_CONCERNS (spec perf target not met; structural
+  floor named). **TaskList #363 ready.**
 - **Track A.-2 — CHAR(N) padding-aware equality + range (SP-CHAR-PAD-COMPARE V1 SHIPPED at T2 — 2026-06-02).**
   Closes the V2 follow-up named in the SP-PG-EXTQ-BIN-RESULTS T3
   smoke (`docs/superpowers/sppgextqbinr-t3-smoke-2026-06-01.txt`

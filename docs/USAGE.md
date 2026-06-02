@@ -1790,7 +1790,7 @@ smoke-2026-05-29.txt` for the original T8 baseline.
 | SQLAlchemy 2.0  | PASS     | T8 closes the `use_native_hstore=False` caveat     |
 | psycopg3 3.3.4  | PASS     | SP-PG-EXTQ-BIN T3 — DEFAULT cursor (NOT ClientCursor) works end-to-end |
 | asyncpg 0.31.0  | PASS     | SP-PG-EXTQ-BIN-RESULTS T3 — fetch() round-trip works end-to-end (binary params + binary results) |
-| JDBC 42.7       | PARTIAL  | Same binary-Bind + binary-RESULTS unlock as asyncpg; vulcan has no javac so untested |
+| JDBC 42.7       | PASS\*\* | SP-PG-EXTQ-CAST T2 strips `::int8` / `::text` / `::numeric(N,M)` from JDBC `preferQueryMode=simple` text — psql proxy round-trip PASS (vulcan still has no javac for the real driver, V2 `SP-PG-JDBC-SMOKE`) |
 | pgx (Go)        | n/a      | Go runtime not on vulcan (V2 `SP-PG-GO-SMOKE`)     |
 | Drizzle (Node)  | n/a      | Node runtime not on vulcan (V2 `SP-PG-NODE-SMOKE`) |
 | Prisma (Node)   | n/a      | Node runtime not on vulcan (V2 `SP-PG-NODE-SMOKE`) |
@@ -1821,9 +1821,15 @@ is zero-cost for the existing text-only path. NUMERIC binary still
 rejects with the precise `SP-PG-EXTQ-BIN-NUMERIC` follow-up arc name.
 
 The remaining residual ORM gaps are:
-- JDBC simple-query mode hits a kessel-sql parser gap on `::int8`
-  casts; lift via V2 `SP-PG-EXTQ-CAST` (gateway-side cast-stripping
-  rewrite) or `SP-SQL-CAST` (parser-level type-cast recognition).
+- ~~JDBC simple-query mode hits a kessel-sql parser gap on `::int8`
+  casts~~ → **CLOSED 2026-06-02 by SP-PG-EXTQ-CAST T2** —
+  `cast_stripper::strip_pg_casts` removes `::TYPE[(args)]` from SQL
+  text at `dispatch_query` entry (preserving string/comment context).
+  psql proxy round-trip for `SELECT 1::int8` / `WHERE id = $1::int8` /
+  `INSERT ... VALUES (3::int8, 'x'::text)` verified on vulcan
+  (`docs/superpowers/sppgextqcast-t3-smoke-2026-06-02.txt`). Real
+  pgJDBC round-trip awaits `javac` install on vulcan, tracked as V2
+  `SP-PG-JDBC-SMOKE`.
 - Parameterized SELECT with a CHAR(N) WHERE clause may match zero rows
   because the engine's EQ-on-Char doesn't ignore trailing NUL padding
   on the storage side; lifts in `SP-CHAR-PAD-COMPARE` (engine-side).
@@ -1861,6 +1867,8 @@ and post higher numbers; that's V2 `SP-PG-EXTQ-PIPELINE-BATCH`.
 - SP-PG-COPY-BULKAPPLY progress (V1 SHIPPED — 181.9× COPY throughput lift via per-batch Op::Txn fold): `docs/superpowers/specs/2026-05-30-kesseldb-subproject-sppgcopybulkapply-progress.md`
 - SP-PG-COPY-CSV design spec: `docs/superpowers/specs/2026-06-01-kesseldb-sppgcopycsv-design.md`
 - SP-PG-COPY-CSV progress (V1 SHIPPED at T2 — CSV format with quoting / HEADER / custom DELIMITER+QUOTE+ESCAPE+NULL): `docs/superpowers/specs/2026-06-01-kesseldb-subproject-sppgcopycsv-progress.md`
+- SP-PG-EXTQ-CAST design spec: `docs/superpowers/specs/2026-06-01-kesseldb-sppgextqcast-design.md`
+- SP-PG-EXTQ-CAST smoke transcript (V1 SHIPPED — psql `SELECT 1::int8` round-trip PASS): `docs/superpowers/sppgextqcast-t3-smoke-2026-06-02.txt`
 
 ### SP-PG-COPY — `COPY FROM STDIN` / `COPY TO STDOUT` bulk load (V1 SHIPPED 2026-05-30)
 

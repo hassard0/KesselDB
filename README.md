@@ -389,8 +389,8 @@ including the *losses* where KesselDB does NOT win — are in
 | sysbench OLTP write‑only | **KesselDB** | **1st at every N (5.2× Postgres at N=8)** | apply‑path is fast at the inner‑op level |
 | sysbench OLTP read‑only | **KesselDB at N=8 / N=16** (SQLite still wins N=1) | **1st at every N≥8 (5.7× Postgres at N=16)** | SP‑Perf‑A‑TXN‑RO bypass — all‑RO `Op::Txn{ops}` routes through the read pool, lift 42.6× at N=16 — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3c |
 | sysbench OLTP read‑write | **KesselDB at N=8 / N=16** (SQLite still wins N=1) | **1st at every N≥8 (2.66× Postgres + 2.60× SQLite at N=16)** | SP‑Perf‑A‑TXN‑RW driver‑level split‑phase dispatch — (R*, W*)‑shape Txns split at the read/write boundary; read prefix routes via the TXN‑RO bypass (parallel), write suffix via `sm.write().apply` (serial); lift 14.4× at N=16 — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3e |
-| TPC‑H Q1 (multi‑aggregate GROUP BY) | Postgres at every N | **2nd at N=4 (beats SQLite); 3rd at N=1** | Four‑arc lift cumulative **+7.21×** (8.84 → 63.77 q/s N=4); gap vs Postgres closed **18× → 2.92×**; SP‑Hash‑Agg‑Tune V1 batched streaming +1.06× lift at N=4 — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3f |
-| TPC‑H Q6 (SUM with WHERE) | Postgres at every N | **2nd at N=4 (beats SQLite); 3rd at N=1** | Four‑arc lift cumulative **+14.38×** (13.74 → 197.55 q/s N=4); gap vs Postgres closed **123× → 8.53×**; SP‑Hash‑Agg‑Tune V1 batched streaming +1.07× lift at N=4 — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3g |
+| TPC‑H Q1 (multi‑aggregate GROUP BY) | Postgres at every N | **2nd at every N (beats SQLite at both N=1 and N=4)** | Five‑arc lift cumulative **+9.71×** (8.84 → 85.82 q/s N=4); gap vs Postgres closed **18× → 2.17×**; SP‑WHERE‑VM‑Specialise V1 closure‑built‑once‑per‑query WHERE evaluator +1.35× lift at N=4 — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3f |
+| TPC‑H Q6 (SUM with WHERE) | Postgres at every N | **2nd at every N (beats SQLite at both N=1 and N=4)** | Five‑arc lift cumulative **+39.95×** (13.74 → 548.87 q/s N=4); gap vs Postgres closed **123× → 3.07×**; SP‑WHERE‑VM‑Specialise V1 +2.78× lift at N=4 (design floor ≥400 q/s + stretch ≥500 q/s both EXCEEDED) — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3g |
 
 **Roadmap is named — published-loss closures + next throughput levers.**
 
@@ -426,22 +426,27 @@ including the *losses* where KesselDB does NOT win — are in
   Txn deferred. Next: **SP‑Perf‑A‑SHARD‑SCAN** (scatter‑merge for
   Select / Aggregate / Query so K>=2 scan ops see all data).
 - **SP‑Analytic‑Plan + SP‑Analytic‑Plan‑MULTI + SP‑Hash‑Agg +
-  SP‑Hash‑Agg‑Tune V1 SHIPPED (2026‑05‑29 → 2026‑05‑30)** — four
-  sequential arcs for the TPC‑H Q1/Q6 losses: (1) range‑pred
-  narrowing on aggregate scans via the `range_preds: Vec<(u16, u8,
-  Vec<u8>)>` interface (Q6 7.5× at N=4); (2) `Op::GroupAggregateMulti`
-  folds N aggregates in one scan (Q1 4.0× at N=4); (3) parallel hash
-  aggregate (`std::thread::scope` + per‑worker `HashMap` partials +
-  sorted‑`BTreeMap` merge) for rows ≥ 8192 (Q1 +1.46× / Q6 +1.79× at
-  N=4); (4) producer‑channel‑workers BATCHED streaming overlap
-  (`std::sync::mpsc::sync_channel` carrying `Vec<Arc<[u8]>>` batches of
-  256 rows) — workers start folding on row 1, not row LAST (Q1 +1.06×
-  / Q6 +1.07× at N=4). Cumulative gap‑closing **Q1 18× → 2.92×** and
-  **Q6 123× → 8.53×**. Next: **SP‑WHERE‑VM‑Specialise** (closure‑
-  built‑once‑per‑query that inlines field offsets + comparison ops;
-  the SP‑Hash‑Agg‑Tune sweep diagnosed per‑row VM eval as the actual
-  dominant cost) and **SP‑JIT‑Aggregate** (LLVM/cranelift codegen for
-  the per‑row inner loop, what Postgres uses).
+  SP‑Hash‑Agg‑Tune + SP‑WHERE‑VM‑Specialise V1 SHIPPED (2026‑05‑29 →
+  2026‑06‑01)** — five sequential arcs for the TPC‑H Q1/Q6 losses:
+  (1) range‑pred narrowing on aggregate scans via the
+  `range_preds: Vec<(u16, u8, Vec<u8>)>` interface (Q6 7.5× at N=4);
+  (2) `Op::GroupAggregateMulti` folds N aggregates in one scan (Q1 4.0×
+  at N=4); (3) parallel hash aggregate (`std::thread::scope` +
+  per‑worker `HashMap` partials + sorted‑`BTreeMap` merge) for rows ≥
+  8192 (Q1 +1.46× / Q6 +1.79× at N=4); (4) producer‑channel‑workers
+  BATCHED streaming overlap (`std::sync::mpsc::sync_channel` carrying
+  `Vec<Arc<[u8]>>` batches of 256 rows) — workers start folding on row 1,
+  not row LAST (Q1 +1.06× / Q6 +1.07× at N=4); (5) `compile_filter`
+  walks the WHERE bytecode ONCE per query and returns a
+  `Box<dyn Fn(&[u8]) -> bool + Send + Sync>` closure that captures
+  pre‑resolved field offsets + comparison ops + AND/OR short‑circuit
+  tree directly (Q1 +1.35× / **Q6 +2.78× at N=4** — design floor
+  ≥400 q/s + stretch ≥500 q/s both EXCEEDED; SP‑Hash‑Agg‑Tune diagnosis
+  validated end‑to‑end). Cumulative gap‑closing **Q1 18× → 2.17×** and
+  **Q6 123× → 3.07×**. Next: **SP‑JIT‑Aggregate** (LLVM/cranelift
+  codegen for the per‑row aggregate‑update inner loop, what Postgres
+  uses; closes the residual 2.17× Q1 / 3.07× Q6 gap that's now the
+  decode→update fold work, not WHERE evaluation).
 
 **Headline numbers worth quoting** (all from the same vulcan run):
 - **YCSB‑C reads, N=16**: KesselDB 4.75M ops/s — **57× Postgres**, **40× SQLite**

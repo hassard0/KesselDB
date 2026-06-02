@@ -10,10 +10,82 @@ covered by the workspace test suite (2063 default / 2074 with
 KATs from the SP-CHAR-PAD-COMPARE V1 arc landed 2026-06-02 on top of
 +26 from the SP-PG-EXTQ-CAST V1 arc landed earlier the same day.
 SP-PG-JDBC-SMOKE (2026-06-02) is a verification-only arc that closes
-the JDBC residual; +0 KATs.
+the JDBC residual; +0 KATs. SP-WHERE-VM-Specialise V1 (landed
+2026-06-01) adds +17 KATs (15 kessel-expr lib + 2 kessel-sm
+SM-level) — the per-row WHERE evaluator now compiles to a closure
+once per query, cutting the dominant TPC-H Q1/Q6 wall-time cost.
 
 **Tonight's delivery (2026-06-02) — coherent state of the union:**
 
+- **Track M — SP-WHERE-VM-Specialise (2026-06-01, V1 SHIPPED).**
+  Closes the per-row stack-VM dispatch cost SP-Hash-Agg-Tune diagnosed
+  as the dominant TPC-H Q1/Q6 wall-time ceiling (V1-Tune sweep at N=4
+  lifted only 1.06× Q1 / 1.07× Q6 vs the ≥2× modelled prediction).
+  `kessel-expr::compile_filter(ot, program)` walks the WHERE bytecode
+  ONCE per query and returns a `Box<dyn Fn(&[u8]) -> bool + Send + Sync>`
+  closure that captures pre-resolved field offsets + widths + signedness
+  + comparison ops + AND/OR short-circuit tree directly — the per-row
+  dispatch loop, layout recompute, and field-id linear-scan all
+  eliminated; Q6's 4-deep AND chain reduces to ~4 direct memory reads +
+  6 i128 comparisons + 3 `&&` short-circuits per row. Compile-time
+  fallback to interpreter for unsupported opcode shapes (ADD/SUB/MUL/
+  DIV — rare in TPC-H WHERE) via `Err(CompileError::Unsupported{
+  op_name})` returning a closure that wraps `kessel_expr::eval`;
+  byte-identical observable behavior on every row. T1 (commit `95b68cb`
+  + `1c38e31`): design spec + compile_filter API + FilterNode AST +
+  materialise builder + 15 new kessel-expr lib KATs (per-opcode shape +
+  compile-fallback + equivalence-on-random-rows). T2 (commits `40b4bef`,
+  `89b7d8c`, `e0ba6c4`): SM hot-path wiring — `aggregate_numeric_scan`
+  (Q6) + `group_aggregate_multi` (Q1) both compile the WHERE program
+  ONCE before the parallel-fold spawn and per-row invoke the closure;
+  the second commit added 2 SM-level equivalence KATs (10K-row Q6-shape
+  closure == hand-computed model for all 5 aggregate kinds × 5 reruns;
+  ADD-WHERE Unsupported → interpreter-fallback == model COUNT); the
+  third commit was diagnosed by sanity-bench (Q1 N=1 ~15.5 q/s par
+  with pre-arc) — Q1 maps to `Op::GroupAggregateMulti` NOT `Op::Aggregate`,
+  so mirroring the same wire-up in `group_aggregate_multi::fold_one` was
+  required to lift Q1. T3+T4 (commit `8f522a8`): vulcan TPC-H Q1+Q6
+  sweep (3 outer trials × bench-compare's 3 internal trials × 30s ×
+  SF=0.01 × N=1,4 × KesselDB only). **HEADLINE on vulcan**: Q1 N=1
+  17.30 → **25.50 q/s (+1.47×)**, Q1 N=4 63.77 → **85.82 q/s
+  (+1.35×)**; Q6 N=1 33.95 → **149.85 q/s (+4.41×)**, Q6 N=4 197.55 →
+  **548.87 q/s (+2.78×)**. Cumulative 5-arc lift vs pre-arc baseline
+  (SP-Bench-Suite T4): Q1 N=4 **+9.71×** (8.84 → 85.82 q/s); Q6 N=4
+  **+39.95×** (13.74 → 548.87 q/s). Gap-closing vs Postgres: Q1 N=4
+  2.92× → **2.17×**; Q6 N=4 8.53× → **3.07×**. **Spec floor delivery**:
+  Q6 N=4 design acceptance target (≥400 q/s) EXCEEDED by 37% + design
+  stretch (≥500 q/s) ALSO EXCEEDED by 10% + user-spec floor (≥350
+  inherited from SP-Hash-Agg-Tune) EXCEEDED by 57%; Q1 N=4 design
+  acceptance target (≥75 q/s) EXCEEDED by 14%. Q1 user-spec floor
+  (≥120) still MISSED (71% achieved) — the remaining cost is the
+  per-row aggregate-fold inner loop (4 measures × ~60K rows full-scan),
+  not WHERE evaluation. **The SP-Hash-Agg-Tune diagnosis is validated
+  end-to-end**: per-row WHERE-eval WAS the dominant cost on TPC-H Q1/Q6
+  shapes; the closure-built-once-per-query approach cut it as modelled
+  (Q6 sits at the high end of the spec's 1.5-2.5× modelled band). N=1
+  result is the cleanest validator — Q6 N=1 +4.41× shows the per-row
+  saving lands undiluted on a single thread, and the V1-Tune N=1
+  channel-overhead regression (-6.7%) is flipped to a +47% lift at Q1
+  N=1 because the per-query VM eval saving dwarfs the channel cost.
+  Named follow-up arc **SP-JIT-Aggregate** (LLVM/cranelift codegen for
+  the per-row aggregate-update inner loop — Postgres uses this; closes
+  the residual 2.17× Q1 / 3.07× Q6 gap). Workspace tests: kessel-expr
+  lib +15 KATs (T1), kessel-sm 160 → 162 (+2 SM-level T2 KATs); all 6
+  SP-Hash-Agg + SP-Hash-Agg-Tune KATs stay green (parallel == serial
+  fold math unchanged; closure result == eval result per row by
+  construction). seed-7 GREEN; zero new external deps (just std +
+  `Box<dyn Fn>`); `#![forbid(unsafe_code)]` honored; HTTP/1.1 + WS +
+  binary + PG-wire surfaces byte-untouched (no wire format changes —
+  the closure rewrites only the SM internal per-row evaluator).
+  Five commits: `95b68cb` (T1 design spec + compile_filter + 15 KATs),
+  `1c38e31` (T1 KAT panic format fix — FilterFn not Debug), `40b4bef`
+  (T2 aggregate_numeric_scan wire-up + interpreter fallback),
+  `89b7d8c` (T2 SM-level equivalence KATs), `e0ba6c4` (T2
+  group_aggregate_multi wire-up for Q1 hot path), plus `8f522a8` (T4
+  BENCHMARKS §3f/§3g/§1/§4 update + progress tracker), plus this
+  commit (T5 STATUS + README + tracker close). Progress tracker
+  `docs/superpowers/specs/2026-06-01-kesseldb-spwherevm-specialise-progress.md`
+  → V1 SHIPPED. **TaskList #357 ready for completion.**
 - **Track A.-1.1 — pgJDBC end-to-end smoke against KesselDB (SP-PG-JDBC-SMOKE V1 SHIPPED at T2 — 2026-06-02).**
   Verification-only arc that closes the residual the SP-PG-EXTQ-CAST
   T3 transcript named: vulcan still had openjdk-21-jre but no `javac`

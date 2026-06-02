@@ -49,6 +49,7 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
 
+pub mod binary_numeric;
 pub mod binary_results;
 pub mod proto;
 pub mod response;

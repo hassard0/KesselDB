@@ -1187,10 +1187,40 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
             p.punct('(')?;
             let mut raw = Vec::new();
             loop {
+                // SP-PG-SQL-PAREN-VALUES: pgJDBC simple-mode
+                // PreparedStatement wraps every substituted parameter in
+                // parentheses (`VALUES (('42'), ('hello'))`). After the
+                // SP-PG-EXTQ-CAST stripper drops the `::TYPE` the SQL the
+                // parser sees still contains those expression-grouping
+                // parens. PG treats `(LITERAL)` as equivalent to
+                // `LITERAL`, so admit `(LITERAL)` up to a fixed nesting
+                // depth (anti-stack-bomb cap). When `depth == 0` the
+                // bare-literal path is byte-identical to the pre-arc
+                // shape, so every prior KAT keeps passing.
+                let mut depth = 0usize;
+                while matches!(p.peek(), Some(Tok::Punct('('))) {
+                    p.i += 1;
+                    depth += 1;
+                    if depth > 8 {
+                        return Err(
+                            "too many nested parens in VALUES".into(),
+                        );
+                    }
+                }
                 match p.next() {
                     Some(Tok::Int(n)) => raw.push(Lit::Int(n)),
                     Some(Tok::Str(s)) => raw.push(Lit::Str(s)),
                     _ => return Err("expected value".into()),
+                }
+                for _ in 0..depth {
+                    match p.next() {
+                        Some(Tok::Punct(')')) => {}
+                        _ => {
+                            return Err(
+                                "expected `)` closing VALUES paren".into(),
+                            )
+                        }
+                    }
                 }
                 match p.next() {
                     Some(Tok::Punct(',')) => continue,
@@ -3020,6 +3050,174 @@ mod tests {
         let a = build();
         let b2 = build();
         assert_eq!(a.digest(), b2.digest());
+    }
+
+    /// SP-PG-SQL-PAREN-VALUES — pgJDBC simple-mode `PreparedStatement`
+    /// wraps every substituted parameter in `(…)` so the SQL the
+    /// engine sees is `INSERT INTO t (id, name) VALUES (('42'),
+    /// ('hello'))` (post SP-PG-EXTQ-CAST `::TYPE` strip). PG treats
+    /// `(LITERAL)` as equivalent to `LITERAL` (expression grouping);
+    /// the VALUES tuple parser must too. K-PVAL-1..9 lock the parser
+    /// shape: bare path unchanged, 1-/3-/8-level parens accepted,
+    /// 9-level parens rejected (anti-stack-bomb cap), mixed bare+paren
+    /// in the same tuple works, multi-row paren VALUES works, and an
+    /// unbalanced paren errors cleanly.
+    #[test]
+    fn paren_wrapped_values_literals() {
+        let cat = {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            run(
+                &mut sm,
+                1,
+                "CREATE TABLE t (id I64 NOT NULL, v I64 NOT NULL, \
+                 name CHAR(16))",
+            );
+            sm.catalog().clone()
+        };
+
+        // Helper — compile then assert this is an Op::Create whose
+        // record decodes to the expected (id, v, name) tuple.
+        let assert_create = |sql: &str, want_id: u128, want_v: i64,
+                             want_name: &str| {
+            let op = compile(sql, &cat).expect("compile paren VALUES");
+            match op {
+                Op::Create { id, record, .. } => {
+                    assert_eq!(
+                        id,
+                        ObjectId::from_u128(want_id),
+                        "row id for `{sql}`"
+                    );
+                    let ot = cat.get(1).unwrap();
+                    let v = kessel_codec::decode(ot, &record)
+                        .expect("decode");
+                    let got_v = match v[1] {
+                        Value::Int(i) => i as i64,
+                        _ => panic!("v not Int for `{sql}`: {:?}", v[1]),
+                    };
+                    assert_eq!(got_v, want_v, "v for `{sql}`");
+                    let got_name = match &v[2] {
+                        Value::Blob(b) => {
+                            // Char(16) is NUL-padded; trim the
+                            // padding for the comparison.
+                            let end = b
+                                .iter()
+                                .position(|&c| c == 0)
+                                .unwrap_or(b.len());
+                            String::from_utf8(b[..end].to_vec())
+                                .expect("utf8")
+                        }
+                        Value::Null => String::new(),
+                        _ => panic!(
+                            "name not Blob/Null for `{sql}`: {:?}",
+                            v[2]
+                        ),
+                    };
+                    assert_eq!(got_name, want_name, "name for `{sql}`");
+                }
+                o => panic!("expected Op::Create for `{sql}`, got {o:?}"),
+            }
+        };
+
+        // K-PVAL-1: bare path regression — unchanged behavior.
+        assert_create(
+            "INSERT INTO t (id, v, name) VALUES (1, 2, 'a')",
+            1,
+            2,
+            "a",
+        );
+
+        // K-PVAL-2: 1-level paren — `((1), (2), ('a'))` ≡ `(1, 2, 'a')`.
+        assert_create(
+            "INSERT INTO t (id, v, name) VALUES ((1), (2), ('a'))",
+            1,
+            2,
+            "a",
+        );
+
+        // K-PVAL-3: pgJDBC simple-mode failing case verbatim
+        // (post-strip): INT + TEXT paren-wrapped.
+        assert_create(
+            "INSERT INTO t (id, v, name) VALUES ((42), (7), ('hello'))",
+            42,
+            7,
+            "hello",
+        );
+
+        // K-PVAL-4: 3-level paren depth.
+        assert_create(
+            "INSERT INTO t (id, v, name) VALUES (((1)), ((2)), (('a')))",
+            1,
+            2,
+            "a",
+        );
+
+        // K-PVAL-5: 8-level paren depth accepted on the first
+        // position; bare on others. Cap boundary.
+        assert_create(
+            "INSERT INTO t (id, v, name) VALUES \
+             ((((((((1)))))))), 2, 'a')",
+            1,
+            2,
+            "a",
+        );
+
+        // K-PVAL-6: 9-level paren depth rejected (anti-stack-bomb).
+        let e = compile(
+            "INSERT INTO t (id, v, name) VALUES \
+             (((((((((1))))))))), 2, 'a')",
+            &cat,
+        )
+        .expect_err("9-level paren depth must reject");
+        assert!(
+            e.to_lowercase().contains("nested parens"),
+            "expected nested-parens error, got: {e}"
+        );
+
+        // K-PVAL-7: mixed paren + bare in the same tuple.
+        assert_create(
+            "INSERT INTO t (id, v, name) VALUES ((1), 2, 'a')",
+            1,
+            2,
+            "a",
+        );
+
+        // K-PVAL-8: multi-row paren VALUES — both rows land atomically.
+        let op = compile(
+            "INSERT INTO t (id, v, name) VALUES \
+             ((1), (2), ('a')), ((3), (4), ('b'))",
+            &cat,
+        )
+        .expect("compile multi-row paren VALUES");
+        match op {
+            Op::Txn { ops } => {
+                assert_eq!(ops.len(), 2, "two rows expected");
+                for (i, sub) in ops.iter().enumerate() {
+                    let want_id = if i == 0 { 1u128 } else { 3u128 };
+                    match sub {
+                        Op::Create { id, .. } => assert_eq!(
+                            *id,
+                            ObjectId::from_u128(want_id),
+                            "row {i} id"
+                        ),
+                        o => panic!("expected Op::Create, got {o:?}"),
+                    }
+                }
+            }
+            o => panic!("expected Op::Txn, got {o:?}"),
+        }
+
+        // K-PVAL-9: unbalanced opening paren rejects cleanly (the
+        // inner `(` is consumed as paren depth, `1` parses, then `,`
+        // arrives where `)` was expected).
+        let e2 = compile(
+            "INSERT INTO t (id, v, name) VALUES ((1, 2, 'a')",
+            &cat,
+        )
+        .expect_err("unbalanced paren must reject");
+        assert!(
+            !e2.is_empty(),
+            "unbalanced paren error must be non-empty"
+        );
     }
 
     /// SP70: a selective range query must be sub-linear with a RANGE

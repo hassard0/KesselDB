@@ -128,9 +128,10 @@ pub enum CopyFormat {
     /// signature header + length-prefixed per-field binary values +
     /// 2-byte i16 -1 end-of-data marker. No options struct — V1 has
     /// no binary-specific options. Same supported type set as
-    /// SP-PG-EXTQ-BIN-RESULTS (BOOL, INT2/4/8, FLOAT4/8, TEXT,
-    /// VARCHAR, BYTEA, TIMESTAMPTZ); NUMERIC is V2
-    /// SP-PG-COPY-BIN-NUMERIC.
+    /// SP-PG-EXTQ-BIN-RESULTS: BOOL, INT2/4/8, FLOAT4/8, TEXT,
+    /// VARCHAR, BYTEA, TIMESTAMPTZ, and NUMERIC (the latter wired in
+    /// at SP-PG-COPY-BIN-NUMERIC V1, 2026-06-02 — reuses the
+    /// `extq::binary_numeric` codec the EXTQ-BIN-NUMERIC arc shipped).
     Binary,
 }
 

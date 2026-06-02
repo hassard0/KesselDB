@@ -132,27 +132,19 @@ pub fn dispatch_copy_in_start<E: EngineApply + ?Sized>(
             ),
         };
     // SP-PG-COPY-BIN V1 — when the format is Binary, V1 must reject
-    // unsupported column types at COPY-start (NUMERIC / UUID / JSONB /
-    // ARRAY) because per-row decoding has no recovery path.
+    // unsupported column types at COPY-start (UUID / JSONB / ARRAY)
+    // because per-row decoding has no recovery path.
     //
-    // SP-PG-EXTQ-BIN-NUMERIC T3 — the extq path now supports NUMERIC,
-    // but the COPY-BIN-NUMERIC arc is still deferred (COPY's per-row
-    // framing has different recovery semantics). Pre-reject NUMERIC
-    // explicitly before consulting `binary_format_supported_for_oid`
-    // so the COPY follow-up arc owns its own enablement.
+    // SP-PG-COPY-BIN-NUMERIC V1 (2026-06-02) — NUMERIC is now admitted
+    // here: the SP-PG-EXTQ-BIN-NUMERIC T3 wiring made
+    // `binary_format_supported_for_oid` return true for PG_TYPE_NUMERIC,
+    // and the per-row decoder route in `process_copy_data_binary`
+    // dispatches `decode_binary_param` → `binary_numeric::decode_numeric_binary`
+    // for the NUMERIC arm. The explicit pre-reject that used to live
+    // here pointed to this arc; dropping it closes the follow-up.
     if format.is_binary() {
         for (name, kind) in chosen_columns.iter().zip(chosen_kinds.iter()) {
             let oid = field_kind_to_oid(*kind);
-            if oid == crate::proto::PG_TYPE_NUMERIC {
-                return CopyInStartOutcome::Failed {
-                    bytes: error_response_then_rfq(
-                        "0A000",
-                        &format!(
-                            "COPY binary: column \"{name}\" type OID {oid} not supported in V1 (SP-PG-COPY-BIN-NUMERIC)"
-                        ),
-                    ),
-                };
-            }
             if !binary_format_supported_for_oid(oid) {
                 return CopyInStartOutcome::Failed {
                     bytes: error_response_then_rfq(
@@ -826,25 +818,18 @@ pub fn dispatch_copy_to<E: EngineApply + ?Sized>(
     let ncols = chosen_indices.len() as u16;
 
     // SP-PG-COPY-BIN V1 — pre-reject unsupported column types at
-    // COPY-TO-start time (NUMERIC / UUID / JSONB / ARRAY). Same set as
+    // COPY-TO-start time (UUID / JSONB / ARRAY). Same set as
     // `binary_format_supported_for_oid`. Mirrors the COPY FROM pre-check.
     //
-    // SP-PG-EXTQ-BIN-NUMERIC T3 — extq path now supports NUMERIC, but
-    // COPY-BIN-NUMERIC is still a deferred follow-up arc; pre-reject
-    // NUMERIC explicitly so the COPY arc owns its own enablement.
+    // SP-PG-COPY-BIN-NUMERIC V1 (2026-06-02) — NUMERIC is now admitted:
+    // the SP-PG-EXTQ-BIN-NUMERIC codec wired into
+    // `encode_binary_value` handles `PG_TYPE_NUMERIC`, and the
+    // per-column TO encode call site in this function dispatches
+    // through it unchanged.
     if format.is_binary() {
         for (i, &idx) in chosen_indices.iter().enumerate() {
             let kind = schema_cols[idx].kind;
             let oid = field_kind_to_oid(kind);
-            if oid == crate::proto::PG_TYPE_NUMERIC {
-                return error_response_then_rfq(
-                    "0A000",
-                    &format!(
-                        "COPY binary: column \"{}\" type OID {oid} not supported in V1 (SP-PG-COPY-BIN-NUMERIC)",
-                        chosen_names[i]
-                    ),
-                );
-            }
             if !binary_format_supported_for_oid(oid) {
                 return error_response_then_rfq(
                     "0A000",
@@ -2415,5 +2400,214 @@ mod tests {
                 as usize;
         let payload = &bytes[p + 5..p + 5 + (cd_len - 4)];
         assert_eq!(payload, b"id,name\n");
+    }
+
+    // ─── SP-PG-COPY-BIN-NUMERIC V1 ───────────────────────────────────
+    //
+    // T2 integration KATs covering the dispatch-side enablement: the
+    // COPY-BIN NUMERIC pre-reject is dropped, so a table with an
+    // `I128` column (PG OID 1700) is admitted in both COPY FROM and
+    // COPY TO binary directions. The per-row codec used by the FROM
+    // decoder (`decode_binary_param`) and TO encoder (`encode_binary_value`)
+    // routes through `extq::binary_numeric::{decode_numeric_binary,
+    // encode_numeric_binary}` thanks to the SP-PG-EXTQ-BIN-NUMERIC
+    // T3 wiring.
+
+    /// SP-PG-COPY-BIN-NUMERIC T2: encoding the NUMERIC value `42`
+    /// through `encode_binary_value` (the per-column TO encoder)
+    /// produces the same wire bytes as
+    /// `extq::binary_numeric::encode_numeric_binary("42")`. Locks the
+    /// shared-codec invariant — the COPY TO path emits the canonical
+    /// PG `numeric_send` shape.
+    #[test]
+    fn t1num_encode_binary_value_numeric_42_byte_equal_to_codec() {
+        let via_dispatch = encode_binary_value(b"42", crate::proto::PG_TYPE_NUMERIC)
+            .expect("encode_binary_value NUMERIC 42");
+        let via_codec =
+            crate::extq::binary_numeric::encode_numeric_binary("42").expect("codec 42");
+        assert_eq!(
+            via_dispatch, via_codec,
+            "COPY TO NUMERIC encoder must dispatch into the same codec\
+             SP-PG-EXTQ-BIN-NUMERIC ships"
+        );
+    }
+
+    /// SP-PG-COPY-BIN-NUMERIC T2: decoding NUMERIC binary bytes for
+    /// `42` through `decode_binary_param` (the per-column FROM decoder)
+    /// returns the canonical decimal string `"42"`. Locks the
+    /// shared-codec invariant on the FROM side.
+    #[test]
+    fn t1num_decode_binary_param_numeric_42_round_trips_to_string() {
+        let bytes =
+            crate::extq::binary_numeric::encode_numeric_binary("42").expect("codec encode 42");
+        let text = decode_binary_param(&bytes, crate::proto::PG_TYPE_NUMERIC)
+            .expect("decode_binary_param NUMERIC 42");
+        assert_eq!(text, "42");
+    }
+
+    /// SP-PG-COPY-BIN-NUMERIC T2: `dispatch_copy_in_start` on a table
+    /// whose schema includes an `I128` (PG_TYPE_NUMERIC) column with
+    /// `FORMAT binary` returns `Started`. Pre-arc this returned
+    /// `Failed { 0A000 SP-PG-COPY-BIN-NUMERIC }`.
+    #[test]
+    fn t1num_dispatch_copy_in_start_binary_numeric_column_admitted() {
+        let cols = vec![
+            PgColumn { name: "id".into(), kind: FieldKind::I64, nullable: false },
+            PgColumn { name: "amount".into(), kind: FieldKind::I128, nullable: true },
+        ];
+        let eng = make_engine(cols);
+        let parsed = ParsedCopy::From {
+            table: "t".to_string(),
+            columns: None,
+            format: CopyFormat::Binary,
+        };
+        match dispatch_copy_in_start(parsed, &eng) {
+            CopyInStartOutcome::Started { bytes, .. } => {
+                // First byte = CopyInResponse `G`.
+                assert_eq!(bytes[0], b'G');
+            }
+            CopyInStartOutcome::Failed { bytes } => {
+                panic!(
+                    "expected Started for NUMERIC binary COPY FROM, got Failed: {:?}",
+                    String::from_utf8_lossy(&bytes)
+                );
+            }
+        }
+    }
+
+    /// SP-PG-COPY-BIN-NUMERIC T2: `dispatch_copy_to` on the same
+    /// shape (NUMERIC column with FORMAT binary) emits a CopyOutResponse
+    /// (`H` frame) and the canonical 19-byte PG binary header CopyData,
+    /// instead of an ErrorResponse 0A000.
+    #[test]
+    fn t1num_dispatch_copy_to_binary_numeric_column_admitted() {
+        let cols = vec![
+            PgColumn { name: "id".into(), kind: FieldKind::I64, nullable: false },
+            PgColumn { name: "amount".into(), kind: FieldKind::I128, nullable: true },
+        ];
+        // No rows — just exercise the admission path + header emit.
+        let eng = CopyTestEngine {
+            cols: cols.clone(),
+            result: std::sync::Mutex::new(Vec::new()),
+            row_bytes: Vec::new(),
+            table: "t".to_string(),
+            applied: std::sync::Mutex::new(Vec::new()),
+        };
+        let parsed = ParsedCopy::To {
+            table: "t".to_string(),
+            columns: None,
+            format: CopyFormat::Binary,
+        };
+        let bytes = dispatch_copy_to(parsed, &eng);
+        assert_ne!(
+            bytes[0], b'E',
+            "expected admission (not ErrorResponse) for NUMERIC binary COPY TO; got: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert_eq!(bytes[0], b'H', "expected CopyOutResponse `H` frame");
+    }
+
+    /// SP-PG-COPY-BIN-NUMERIC T2: COPY TO binary on a NUMERIC column
+    /// emits CopyData carrying canonical PG `numeric_send` bytes for
+    /// the row value. Single-row table with `(id BIGINT, amount I128)`
+    /// = (7, 42); the second binary-encoded field MUST byte-equal
+    /// `encode_numeric_binary("42")`.
+    #[test]
+    fn t1num_copy_to_binary_numeric_column_emits_canonical_bytes() {
+        let cols = vec![
+            PgColumn { name: "id".into(), kind: FieldKind::I64, nullable: false },
+            PgColumn { name: "amount".into(), kind: FieldKind::I128, nullable: false },
+        ];
+        let r1 = build_record(&cols, &[Value::Int(7), Value::Int(42)]);
+        let stream = build_row_stream(&[r1]);
+        let eng = CopyTestEngine {
+            cols: cols.clone(),
+            result: std::sync::Mutex::new(Vec::new()),
+            row_bytes: stream,
+            table: "t".to_string(),
+            applied: std::sync::Mutex::new(Vec::new()),
+        };
+        let parsed = ParsedCopy::To {
+            table: "t".to_string(),
+            columns: None,
+            format: CopyFormat::Binary,
+        };
+        let bytes = dispatch_copy_to(parsed, &eng);
+        // Locate the canonical NUMERIC payload for `42` and assert it
+        // appears verbatim inside the response.
+        let needle =
+            crate::extq::binary_numeric::encode_numeric_binary("42").expect("codec 42");
+        assert!(
+            bytes.windows(needle.len()).any(|w| w == needle.as_slice()),
+            "expected NUMERIC 42 wire bytes inside COPY TO binary output: {:?}",
+            bytes
+        );
+    }
+
+    /// SP-PG-COPY-BIN-NUMERIC T2: COPY FROM binary with a NUMERIC
+    /// column accepts a row carrying a canonical NUMERIC binary value
+    /// (`42`); the synthesized INSERT carries the bare decimal `42`
+    /// for the `amount` column.
+    #[test]
+    fn t1num_copy_from_binary_numeric_column_ingests_row() {
+        let cols = vec![
+            PgColumn { name: "id".into(), kind: FieldKind::I64, nullable: false },
+            PgColumn { name: "amount".into(), kind: FieldKind::I128, nullable: false },
+        ];
+        let eng = make_engine(cols);
+
+        // Build a binary COPY data frame: header + 1 row + EOD.
+        let id_bytes: [u8; 8] = 7i64.to_be_bytes();
+        let amount_bytes =
+            crate::extq::binary_numeric::encode_numeric_binary("42").expect("codec 42");
+        let row = crate::copy::binary::encode_binary_row(&[
+            Some(&id_bytes),
+            Some(&amount_bytes),
+        ]);
+        let mut stream = crate::copy::binary::encode_binary_header();
+        stream.extend_from_slice(&row);
+        stream.extend_from_slice(&crate::copy::binary::encode_binary_end_of_data());
+
+        let mut state = CopyInState::new_with_format(
+            "t".to_string(),
+            Some(vec!["id".to_string(), "amount".to_string()]),
+            2,
+            vec![FieldKind::I64, FieldKind::I128],
+            CopyFormat::Binary,
+        );
+        state.batch_size = 1; // per-row dispatch so the SQL is locked.
+        match process_copy_data(&stream, state, &eng) {
+            CopyDataOutcome::Continue { state } => {
+                assert_eq!(state.rows_ingested, 1, "one row ingested");
+                let applied = eng.applied.lock().unwrap();
+                assert_eq!(applied.len(), 1);
+                // Numeric column kinds render bare (no quotes); the
+                // synthesizer emits `42` as a decimal literal for the
+                // I128 column.
+                assert!(
+                    applied[0].contains("INSERT INTO t (id, amount) VALUES (7, 42)")
+                        || applied[0].contains("VALUES (7, 42)"),
+                    "unexpected SQL: {}",
+                    applied[0]
+                );
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
+    }
+
+    /// SP-PG-COPY-BIN-NUMERIC T2: round-trip — encode the NUMERIC
+    /// binary bytes for `42`, then decode them. The decoder yields
+    /// the canonical decimal `"42"`. Locks the shared-codec
+    /// identity at the dispatch-call-site level.
+    #[test]
+    fn t1num_round_trip_encode_then_decode_through_dispatch_codecs() {
+        let cases = ["0", "42", "1.5", "-3.14", "12345.6789", "0.0001"];
+        for s in cases {
+            let bytes = encode_binary_value(s.as_bytes(), crate::proto::PG_TYPE_NUMERIC)
+                .expect("encode");
+            let decoded = decode_binary_param(&bytes, crate::proto::PG_TYPE_NUMERIC)
+                .expect("decode");
+            assert_eq!(decoded, s, "round-trip mismatch for {s:?}");
+        }
     }
 }

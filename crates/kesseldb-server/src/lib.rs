@@ -1586,6 +1586,17 @@ pub fn spawn_sharded_engine_cfg(
     sub_cfg.http_addr = None;
     sub_cfg.http_tls_addr = None;
     sub_cfg.pg_addr = None;
+    // SP-Perf-A-SHARD-SCAN-LOCAL-INDEX-FUSION: guarantee each sub-engine
+    // populates its `sm_shared` snapshot so the dispatcher's tiny-scan
+    // fast path can borrow `Arc<RwLock<StateMachine>>` directly,
+    // bypassing the apply_op channel hop. `Some(0)` triggers the
+    // SP-Perf-A T2 ownership shape (Arc<RwLock<>>) with NO real read
+    // worker threads (graceful submitting-thread fall-through if a
+    // pool dispatch ever happens). If the caller already passed
+    // `read_workers = Some(N)` with N >= 1, that real pool is honored.
+    if sub_cfg.read_workers.is_none() {
+        sub_cfg.read_workers = Some(0);
+    }
 
     // Spawn K sub-engines, each rooted at `data_dir/shard-<i>`.
     let mut shards: Vec<EngineHandle> = Vec::with_capacity(k);

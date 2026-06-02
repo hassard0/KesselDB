@@ -1790,7 +1790,7 @@ smoke-2026-05-29.txt` for the original T8 baseline.
 | SQLAlchemy 2.0  | PASS     | T8 closes the `use_native_hstore=False` caveat     |
 | psycopg3 3.3.4  | PASS     | SP-PG-EXTQ-BIN T3 — DEFAULT cursor (NOT ClientCursor) works end-to-end |
 | asyncpg 0.31.0  | PASS     | SP-PG-EXTQ-BIN-RESULTS T3 — fetch() round-trip works end-to-end (binary params + binary results) |
-| JDBC 42.7       | PASS\*\* | SP-PG-EXTQ-CAST T2 strips `::int8` / `::text` / `::numeric(N,M)` from JDBC `preferQueryMode=simple` text — psql proxy round-trip PASS (vulcan still has no javac for the real driver, V2 `SP-PG-JDBC-SMOKE`) |
+| JDBC 42.7       | PASS\*\* | SP-PG-JDBC-SMOKE T2 — real pgJDBC 42.7.4 + OpenJDK 21 against KesselDB on vulcan. **Extended (default) mode PASS** for CRUD: CREATE TABLE, parameterized INSERT (binary INT8 + VARCHAR), SELECT \*, parameterized SELECT WHERE id = ? (binary INT8 param + binary INT8 result). **Simple mode (`preferQueryMode=simple`) PASS for literal SQL** including `WHERE id = 42::int8` (SP-PG-EXTQ-CAST T2 cast-stripper works end-to-end through the real driver). Two residual gaps: (a) simple-mode `PreparedStatement` INSERT fails because pgJDBC wraps each substituted param in extra parens (`VALUES (('42'::int8), ('hello-jdbc'))`) which kessel-sql's VALUES parser rejects — V2 `SP-PG-SQL-PAREN-VALUES`; (b) extended-mode `SELECT version()` fails because the gateway responds to `Describe(portal)` with `NoData` before sending `RowDescription` — V2 `SP-PG-EXTQ-DESCRIBE-VERSION`. See `docs/superpowers/sppgjdbcsmoke-t2-smoke-2026-06-02.txt` |
 | pgx (Go)        | n/a      | Go runtime not on vulcan (V2 `SP-PG-GO-SMOKE`)     |
 | Drizzle (Node)  | n/a      | Node runtime not on vulcan (V2 `SP-PG-NODE-SMOKE`) |
 | Prisma (Node)   | n/a      | Node runtime not on vulcan (V2 `SP-PG-NODE-SMOKE`) |
@@ -1828,8 +1828,14 @@ The remaining residual ORM gaps are:
   psql proxy round-trip for `SELECT 1::int8` / `WHERE id = $1::int8` /
   `INSERT ... VALUES (3::int8, 'x'::text)` verified on vulcan
   (`docs/superpowers/sppgextqcast-t3-smoke-2026-06-02.txt`). Real
-  pgJDBC round-trip awaits `javac` install on vulcan, tracked as V2
-  `SP-PG-JDBC-SMOKE`.
+  pgJDBC round-trip then verified by **SP-PG-JDBC-SMOKE T2**
+  (`docs/superpowers/sppgjdbcsmoke-t2-smoke-2026-06-02.txt`) — JDBC
+  simple-mode `WHERE id = 42::int8` round-trips end-to-end through
+  the actual pgJDBC 42.7.4 driver against KesselDB. The cast-stripper
+  is closed end-to-end; the two residual JDBC gaps that smoke
+  surfaced (simple-mode `PreparedStatement` paren-wrapped VALUES;
+  extended-mode `SELECT version()` Describe/NoData ordering) are
+  distinct new arcs `SP-PG-SQL-PAREN-VALUES` + `SP-PG-EXTQ-DESCRIBE-VERSION`.
 - ~~Parameterized SELECT with a CHAR(N) WHERE clause may match zero rows
   because the engine's EQ-on-Char doesn't ignore trailing NUL padding
   on the storage side; lifts in `SP-CHAR-PAD-COMPARE` (engine-side).~~

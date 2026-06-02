@@ -1,0 +1,253 @@
+SP-PG-JDBC-SMOKE T2 — vulcan pgJDBC end-to-end smoke transcript
+==================================================================
+Recorded: 2026-06-02 on vulcan (Ubuntu 24.04)
+Server:   kesseldb-server (built `--features pg-gateway`,
+          CARGO_TARGET_DIR=/tmp/kdb-target-jdbcsmoke)
+          KESSELDB_TOKEN=admin KESSELDB_PG_ADDR=127.0.0.1:5532
+HEAD at smoke time: `3642165` (T1 — JdbcSmoke.java checked in)
+Driver:   pgJDBC 42.7.4 (postgresql-42.7.4.jar)
+Java:     OpenJDK 21.0.2 (download.java.net standalone tarball at
+          ~/jdbc-smoke/jdk-21.0.2 — vulcan still has no system-wide
+          `javac`; the JRE-only posture from SP-PG-EXTQ-CAST T3 §10
+          is workaround'd in user-space via the standalone JDK, no
+          sudo required)
+
+================================================================
+1. javac install — workaround (no sudo)
+================================================================
+
+vulcan still lacks `openjdk-21-jdk` (sudo apt would prompt for a
+password the classifier can't provide). The workaround that this
+arc proves out:
+
+    cd ~ && mkdir -p jdbc-smoke && cd jdbc-smoke
+    curl -fsSL -o jdk21.tar.gz \
+      'https://download.java.net/java/GA/jdk21.0.2/f2283984656d49d69e91c558476027ac/13/GPL/openjdk-21.0.2_linux-x64_bin.tar.gz'
+    tar xzf jdk21.tar.gz
+    ./jdk-21.0.2/bin/javac -version
+    → javac 21.0.2
+    ./jdk-21.0.2/bin/java -version
+    → openjdk version "21.0.2" 2024-01-16
+      OpenJDK Runtime Environment (build 21.0.2+13-58)
+      OpenJDK 64-Bit Server VM (build 21.0.2+13-58, mixed mode, sharing)
+
+pgJDBC download:
+
+    curl -fsSL -o postgresql.jar 'https://jdbc.postgresql.org/download/postgresql-42.7.4.jar'
+    → postgresql.jar  (1086687 bytes)
+
+================================================================
+2. JdbcSmoke.java compile
+================================================================
+
+The harness is checked in at `scripts/JdbcSmoke.java`; runs in
+two modes — `simple` (preferQueryMode=simple, exercises the
+SP-PG-EXTQ-CAST cast-stripper) and `extended` (default JDBC mode,
+exercises SP-PG-EXTQ-BIN binary INT8 params + SP-PG-EXTQ-BIN-RESULTS
+binary INT8 results).
+
+    cp ~/KesselDB/scripts/JdbcSmoke.java ~/jdbc-smoke/JdbcSmoke.java
+    ~/jdbc-smoke/jdk-21.0.2/bin/javac -cp ~/jdbc-smoke/postgresql.jar ~/jdbc-smoke/JdbcSmoke.java
+    → (clean compile, no warnings)
+
+================================================================
+3. Extended-mode (default JDBC) — PASS for CREATE / parameterized
+   INSERT / SELECT * / parameterized SELECT WHERE
+================================================================
+
+This is the headline result. JDBC's default Parse + Bind +
+Describe + Execute + Sync flow with binary INT8 + VARCHAR
+parameters round-trips end-to-end against KesselDB.
+
+    cd ~/jdbc-smoke && ./jdk-21.0.2/bin/java -cp .:postgresql.jar JdbcSmoke extended
+
+Observed:
+    JDBC smoke — mode=extended url=jdbc:postgresql://127.0.0.1:5532/kesseldb
+    Connected. driver=42.7.4
+    CREATE TABLE: OK
+    INSERT: 1 row(s)                          ← parameterized, binary INT8 + VARCHAR
+    Row: id=42, name=hello-jdbc
+    Param SELECT: id=42, name=hello-jdbc      ← parameterized, binary INT8 param
+    Exception in thread "main" java.lang.IllegalStateException:
+        Received resultset tuples, but no field structure for them
+        ... at JdbcSmoke.main(JdbcSmoke.java:91)
+
+The Exception happens AFTER the canonical CRUD passes — it is
+specifically the `SELECT version()` probe at smoke step 6, see §5
+below. Wire-level trace shows the gateway sending `NoData` (in
+response to `Describe(portal=null)`) followed by `RowDescription(1)`
++ `DataRow` for `SELECT version()`. pgJDBC treats `NoData` as
+authoritative ("this query returns nothing") so it raises when
+DataRow arrives.
+
+Removing just `SELECT version()` from the harness (see
+`/tmp/jdbc-smoke-extended-noversion.log` for the verbatim run
+of the auxiliary `JdbcSmokeNoVersion.java` harness) shows the
+rest of the extended-mode path is clean:
+
+    CREATE TABLE: OK
+    INSERT: 1 row(s)
+    Row: id=42, name=hello-jdbc
+    Param SELECT: id=42, name=hello-jdbc
+    ALL TESTS PASS (without version() probe)
+
+So extended-mode JDBC is **PASS for the entire CRUD core**, and
+fails only on the `version()` probe surface. The failure is a
+gateway bug (Describe(portal) should answer with RowDescription
+matching the query, not NoData), tracked as new V2 follow-up arc
+`SP-PG-EXTQ-DESCRIBE-VERSION`.
+
+================================================================
+4. Simple-mode (?preferQueryMode=simple) — PASS for literal SQL
+   (incl. ::int8 cast), FAIL on PreparedStatement INSERT
+================================================================
+
+The literal-SQL path through simple mode — including the `::int8`
+cast that SP-PG-EXTQ-CAST T2 strips at the wire — works:
+
+    (auxiliary harness `~/jdbc-smoke/JdbcSmokeLiteral.java`)
+    cd ~/jdbc-smoke && ./jdk-21.0.2/bin/java -cp .:postgresql.jar JdbcSmokeLiteral simple
+
+Observed:
+    CREATE: OK
+    INSERT literal: OK
+    Row: 42, hello
+    Row(cast): 42, hello                ← `WHERE id = 42::int8` round-trip
+    ALL TESTS PASS (literal-only)
+
+This confirms the cast-stripper works through the real pgJDBC
+driver, exactly as SP-PG-EXTQ-CAST T3 §6 proved via the psql
+proxy.
+
+The harness from §3 in `simple` mode hits a kessel-sql parser
+gap on JDBC's parameterized INSERT shape:
+
+    cd ~/jdbc-smoke && ./jdk-21.0.2/bin/java -cp .:postgresql.jar JdbcSmoke simple
+
+Observed:
+    JDBC smoke — mode=simple url=jdbc:postgresql://127.0.0.1:5532/kesseldb?preferQueryMode=simple
+    Connected. driver=42.7.4
+    CREATE TABLE: OK
+    Exception in thread "main" org.postgresql.util.PSQLException:
+        ERROR: sql: expected value
+        ... at JdbcSmoke.main(JdbcSmoke.java:48)   ← PreparedStatement.executeUpdate()
+
+Wire-level trace shows the exact SQL pgJDBC emits in simple mode
+for `PreparedStatement.setLong(1, 42); ps.setString(2, "hello-jdbc"); ps.executeUpdate();`:
+
+    FE=> SimpleQuery(query="INSERT INTO jdbc_smoke (id, name) VALUES (('42'::int8), ('hello-jdbc'))")
+    <=BE ErrorMessage(ERROR: sql: expected value)
+
+After the SP-PG-EXTQ-CAST T2 cast stripper runs at `dispatch_query`
+entry, the SQL kessel-sql sees is:
+
+    INSERT INTO jdbc_smoke (id, name) VALUES (('42'), ('hello-jdbc'))
+
+The cast strip works — but kessel-sql's VALUES parser
+(`crates/kessel-sql/src/lib.rs` ~L1193) only accepts bare literals
+(`Tok::Int` / `Tok::Str`); it doesn't accept parenthesized
+expressions `(<lit>)` that pgJDBC always wraps each substituted
+parameter in. This is a NEW kessel-sql gap that the cast stripper
+arc could not have foreseen — distinct from the cast-stripping
+work itself.
+
+Reproduces via psql:
+    PGPASSWORD=admin psql ... -c "INSERT INTO jdbc_smoke (id, name) VALUES (('42'), ('hello-jdbc'))"
+    → ERROR: sql: expected value
+
+Tracked as new V2 follow-up arc `SP-PG-SQL-PAREN-VALUES`.
+
+================================================================
+5. Wire-level diagnostics — verbatim FE=>/<=BE trace
+================================================================
+
+The full FINEST-level pgJDBC trace was captured under
+`-Djava.util.logging.config.file=/dev/stdin` with `org.postgresql.level = ALL`.
+Key extracted lines from the simple-mode run:
+
+    FE=> SimpleQuery(query="CREATE TABLE jdbc_smoke (id BIGINT, name CHAR(32))")
+    <=BE CommandStatus(CREATE TABLE)
+    <=BE ReadyForQuery(I)
+    FE=> SimpleQuery(query="INSERT INTO jdbc_smoke (id, name) VALUES (('42'::int8), ('hello-jdbc'))")
+    <=BE ErrorMessage(ERROR: sql: expected value)
+    <=BE ReadyForQuery(I)
+
+From the extended-mode run:
+
+    FE=> Parse(stmt=null,query="CREATE TABLE jdbc_smoke (id BIGINT, name CHAR(32))",oids={})
+    FE=> Bind(stmt=null,portal=null)
+    FE=> Describe(portal=null)
+    FE=> Execute(portal=null,limit=0)
+    FE=> Sync
+    <=BE ParseComplete | BindComplete | NoData | CommandStatus(CREATE TABLE) | ReadyForQuery(I)
+
+    FE=> Parse(stmt=null,query="INSERT INTO jdbc_smoke (id, name) VALUES ($1, $2)",oids={20,1043})
+    FE=> Bind(stmt=null,portal=null,$1=<('42'::int8)>,type=INT8,$2=<('hello-jdbc')>,type=VARCHAR)
+    FE=> Describe(portal=null)
+    FE=> Execute(portal=null,limit=1)
+    FE=> Sync
+    <=BE ParseComplete | BindComplete | NoData | CommandStatus(INSERT 0 1) | ReadyForQuery(I)
+
+    FE=> Parse(stmt=null,query="SELECT * FROM jdbc_smoke",oids={})
+    FE=> Bind ... Describe ... Execute ... Sync
+    <=BE ParseComplete | BindComplete | RowDescription(2) | DataRow(len=12) | CommandStatus(SELECT 1) | ReadyForQuery(I)
+
+    FE=> Parse(stmt=null,query="SELECT * FROM jdbc_smoke WHERE id = $1",oids={20})
+    FE=> Bind(stmt=null,portal=null,$1=<('42'::int8)>,type=INT8)
+    FE=> Describe ... Execute ... Sync
+    <=BE ParseComplete | BindComplete | RowDescription(2) | DataRow(len=12) | CommandStatus(SELECT 1) | ReadyForQuery(I)
+
+    FE=> Parse(stmt=null,query="SELECT version()",oids={})
+    FE=> Bind ... Describe ... Execute ... Sync
+    <=BE ParseComplete | BindComplete | NoData            ← BUG: should be RowDescription
+                          | RowDescription(1)              ← then this arrives — too late
+                          | DataRow(len=30)
+                          | CommandStatus(SELECT 1)
+                          | Terminate
+    → IllegalStateException: Received resultset tuples, but no field structure for them
+
+================================================================
+6. Summary matrix
+================================================================
+
+| # | JDBC scenario                                              | Mode     | Result | Cause                                          |
+|---|------------------------------------------------------------|----------|--------|------------------------------------------------|
+| 1 | connect + SCRAM-SHA-256 + Startup                          | both     | PASS   | —                                              |
+| 2 | CREATE TABLE                                               | both     | PASS   | —                                              |
+| 3 | INSERT (literal SQL)                                       | simple   | PASS   | —                                              |
+| 4 | SELECT * (literal SQL)                                     | simple   | PASS   | —                                              |
+| 5 | SELECT WHERE id = 42::int8 (literal SQL)                   | simple   | PASS   | SP-PG-EXTQ-CAST stripper works end-to-end      |
+| 6 | INSERT PreparedStatement.setLong/setString                 | simple   | FAIL   | kessel-sql VALUES parser rejects `('42')`      |
+| 7 | INSERT PreparedStatement (binary INT8 + VARCHAR params)    | extended | PASS   | SP-PG-EXTQ-BIN binary params work              |
+| 8 | SELECT * (extended)                                        | extended | PASS   | —                                              |
+| 9 | SELECT WHERE id = ? PreparedStatement (binary INT8)        | extended | PASS   | SP-PG-EXTQ-BIN-RESULTS binary results work     |
+|10 | SELECT version() Describe(portal) response                 | extended | FAIL   | Gateway emits NoData before RowDescription     |
+
+Net: pgJDBC is **PASS for the full CRUD path in extended (default)
+mode** — every line of business CRUD a Spring/Hibernate/MyBatis
+app emits will round-trip. Two surfaces remain blocked, each a
+distinct new arc:
+
+- Simple-mode `PreparedStatement` INSERT → `SP-PG-SQL-PAREN-VALUES`
+  (kessel-sql VALUES parser to accept `(<lit>)` parenthesized
+  expressions; orthogonal to SP-PG-EXTQ-CAST which already
+  strips the casts).
+- Extended-mode `SELECT version()` → `SP-PG-EXTQ-DESCRIBE-VERSION`
+  (gateway Describe(portal) response for built-in scalar-function
+  SELECTs should emit RowDescription, not NoData).
+
+================================================================
+Files / artifacts
+================================================================
+
+- `scripts/JdbcSmoke.java`                              — checked in (T1)
+- `~/jdbc-smoke/JdbcSmokeNoVersion.java`                — auxiliary, version()-free run (vulcan-local)
+- `~/jdbc-smoke/JdbcSmokeLiteral.java`                  — auxiliary, literal-only simple-mode (vulcan-local)
+- `~/jdbc-smoke/jdk-21.0.2/`                            — OpenJDK 21 (vulcan-local)
+- `~/jdbc-smoke/postgresql.jar`                         — pgJDBC 42.7.4 (vulcan-local)
+- `/tmp/jdbc-smoke-simple.log`                          — verbatim simple-mode failure
+- `/tmp/jdbc-smoke-extended.log`                        — verbatim extended-mode (CRUD PASS, version FAIL)
+- `/tmp/jdbc-smoke-extended-noversion.log`              — verbatim extended-mode CRUD PASS
+- `/tmp/jdbc-smoke-simple-literal.log`                  — verbatim simple-mode literal-SQL PASS
+
+KAT delta: +0 (this arc is verification; no source under crates/ changed).

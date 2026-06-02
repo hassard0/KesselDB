@@ -1967,6 +1967,20 @@ impl<V: Vfs> StateMachine<V> {
         let uncond = program
             == kessel_expr::Program::new().push_int(1).bytes().as_slice();
 
+        // SP-WHERE-VM-Specialise T2 — compile the WHERE program ONCE
+        // into a closure (see aggregate_numeric_scan for the matching
+        // rationale). Eliminates the per-row stack-VM dispatch + Vec
+        // push/pop for the TPC-H Q1 hot path (60K rows × 4 workers ×
+        // ~25-opcode WHERE = 6M dispatches per query collapse to
+        // ~direct field reads + comparisons). Falls back to
+        // kessel_expr::eval per row on Unsupported / Malformed.
+        let filter_fn: Option<kessel_expr::FilterFn> = if uncond {
+            None
+        } else {
+            kessel_expr::compile_filter(program, &ot).ok()
+        };
+        let program_for_fallback: &[u8] = program;
+
         // Per-row fold update — closure shape that mutates a local
         // HashMap partial in-place. Used by both the serial
         // small-scan fast path and the parallel streaming workers
@@ -1975,10 +1989,15 @@ impl<V: Vfs> StateMachine<V> {
                         rec: &[u8]|
          -> Result<(), String> {
             if !uncond {
-                match kessel_expr::eval(program, &ot, rec) {
-                    Ok(true) => {}
-                    Ok(false) => return Ok(()),
-                    Err(e) => return Err(format!("group-multi program: {e:?}")),
+                let keep = match &filter_fn {
+                    Some(f) => f(rec),
+                    None => match kessel_expr::eval(program_for_fallback, &ot, rec) {
+                        Ok(b) => b,
+                        Err(e) => return Err(format!("group-multi program: {e:?}")),
+                    },
+                };
+                if !keep {
+                    return Ok(());
                 }
             }
             let gkey = match rec.get(gpos.0..gpos.0 + gpos.1) {

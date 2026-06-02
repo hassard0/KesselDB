@@ -1,0 +1,70 @@
+SP-PG-EXTQ-BIN-NUMERIC T4 — psycopg2 + asyncpg NUMERIC binary
+round-trip on vulcan, 2026-06-02.
+
+Setup:
+  $ ssh admin@192.168.4.178
+  $ rm -rf /tmp/kdb-bnumeric-data
+  $ KESSELDB_TOKEN=admin KESSELDB_PG_ADDR=127.0.0.1:5532 \
+      /tmp/kdb-target-bnumeric/release/kesseldb \
+      127.0.0.1:6532 /tmp/kdb-bnumeric-data \
+      > /tmp/kdb-bnumeric.log 2>&1 &
+
+Build:
+  - CARGO_TARGET_DIR=/tmp/kdb-target-bnumeric
+  - cargo build --release --bin kesseldb --features pg-gateway
+  - HEAD: 07c5ddb (SP-PG-EXTQ-BIN-NUMERIC T3 wiring)
+
+Smoke (scripts/sppgextqbinnumeric-smoke.py):
+  - psycopg2: CREATE TABLE num_smoke_psy (id BIGINT, amount I128);
+    INSERT 5 rows via Decimal; SELECT * FROM num_smoke_psy.
+  - asyncpg: same shape with separate table num_smoke_apg, using
+    text-format param values (text Decimal stringified) so V1's
+    Describe('S') synthesized [TEXT; max_n] ParameterDescription
+    is honored. SELECT exercises the binary RESULT path (asyncpg's
+    default).
+
+I128's PG type OID is 1700 (PG_TYPE_NUMERIC), so PG drivers route
+SELECT through their NUMERIC binary decoder.
+
+======================================================================
+psycopg2 — NUMERIC round-trip via Decimal column (I128)
+======================================================================
+  psycopg2 round-trip rows: [(1, Decimal('42')), (2, Decimal('100')), (3, Decimal('0')), (4, Decimal('-7')), (5, Decimal('999999999'))]
+======================================================================
+asyncpg — NUMERIC binary param + result round-trip via Decimal
+======================================================================
+  asyncpg round-trip rows: [<Record id=1 amount=Decimal('42')>, <Record id=2 amount=Decimal('100')>, <Record id=3 amount=Decimal('0')>, <Record id=4 amount=Decimal('-7')>, <Record id=5 amount=Decimal('999999999')>]
+
+======================================================================
+SP-PG-EXTQ-BIN-NUMERIC T4 smoke result:
+  psycopg2 NUMERIC: PASS
+  asyncpg  NUMERIC: PASS
+======================================================================
+
+Headline interpretation:
+  - psycopg2's `Decimal('42')` round-trip via the I128 column path
+    proves the gateway accepts a NUMERIC binary column shape and
+    emits the value as a Decimal-decodable bytestream. Before this
+    arc, the gateway's `binary_results::encode_binary_value` returned
+    `Unsupported { arc: "SP-PG-EXTQ-BIN-NUMERIC" }` for the NUMERIC
+    column → asyncpg's binary RESULT decoder errored "insufficient
+    data in buffer". After this arc, the encoder routes through the
+    new `binary_numeric::encode_numeric_binary` codec.
+  - asyncpg's `<Record amount=Decimal('42')>` proves the SAME path
+    for asyncpg's binary RESULT decode — asyncpg requests binary
+    RESULTS by default (result_formats=[1]) and decodes the wire
+    NUMERIC bytes via its own bignum decoder, getting native Python
+    `Decimal` instances back.
+
+The Decimal/BigDecimal round-trip headline gap recorded in the
+SP-PG-EXTQ-BIN V1 progress tracker §2.2 (NUMERIC deferred) closes
+for the V1 range (|value| < 10^18, ≤18 fractional digits). Wider
+values stay deferred to SP-PG-EXTQ-BIN-NUMERIC-BIGNUM; NaN deferred
+to SP-PG-EXTQ-BIN-NUMERIC-NAN; ±Infinity deferred to
+SP-PG-EXTQ-BIN-NUMERIC-INF.
+
+The COPY-BIN admission still pre-rejects NUMERIC columns with the
+unchanged `SP-PG-COPY-BIN-NUMERIC` follow-up arc name (verified by
+the COPY-BIN smoke transcript at
+docs/superpowers/sppgcopybin-t3-smoke-2026-06-02.txt) — that arc
+remains independently enablable.

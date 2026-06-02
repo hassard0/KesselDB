@@ -1806,9 +1806,7 @@ quoted + `'`→`''`-escaped for text, `'\xHEX'::bytea` for bytea, etc).
 Describe('S') synthesizes ParameterDescription from the SQL's `$N`
 count when Parse omitted OID hints (V1 emits PG_TYPE_TEXT for each
 position; clients encode text-as-binary which routes through the
-existing text path). NUMERIC binary still rejects with the precise
-`SP-PG-EXTQ-BIN-NUMERIC` follow-up arc name so operators can grep
-for the gap.
+existing text path).
 
 SP-PG-EXTQ-BIN-RESULTS T2 then wired the symmetric result-side
 post-processor: when the portal's Bind requested `result_formats=[1]`
@@ -1817,8 +1815,27 @@ re-encodes each buffered DataRow per-column into PG binary format +
 flips the per-field `format_code` slot in RowDescription in lockstep
 so libpq's per-field decoder switches to its binary read path. NULL
 columns and text-format columns pass through unchanged; the rewrite
-is zero-cost for the existing text-only path. NUMERIC binary still
-rejects with the precise `SP-PG-EXTQ-BIN-NUMERIC` follow-up arc name.
+is zero-cost for the existing text-only path.
+
+**SP-PG-EXTQ-BIN-NUMERIC (2026-06-02) — Decimal/BigDecimal round-trip
+unlocked.** The V1 BIN + BIN-RESULTS arcs deferred NUMERIC binary
+because the PG wire shape is base-10000 variable-length-digit (sign +
+dscale + weight + N i16 digits) and bug-prone. This follow-up arc
+ships a pure-Rust NUMERIC codec in `crates/kessel-pg-gateway/src/extq/
+binary_numeric.rs` (`decode_numeric_binary` + `encode_numeric_binary`
++ `BinaryNumericError`) covering `|value| < 10^18` with ≤18 fractional
+digits — the typical ORM Decimal/BigDecimal range. Wired into both
+`extq::substitute::decode_binary_param` (Bind path) and
+`extq::binary_results::encode_binary_value` (Execute result path). The
+`binary_format_supported_for_oid` / `binary_result_supported_for_oid`
+predicates now include PG_TYPE_NUMERIC (OID 1700). Wider values reject
+with the precise `SP-PG-EXTQ-BIN-NUMERIC-BIGNUM` follow-up; NaN
+rejects with `SP-PG-EXTQ-BIN-NUMERIC-NAN`. Vulcan smoke transcript:
+`docs/superpowers/sppgextqbinnumeric-t4-smoke-2026-06-02.txt`
+(psycopg2 + asyncpg both decode `Decimal('42')` / `Decimal('-7')` /
+`Decimal('999999999')` from kesseldb-emitted NUMERIC binary DataRow).
+COPY binary's NUMERIC pre-reject remains independent
+(`SP-PG-COPY-BIN-NUMERIC` is its own follow-up).
 
 The remaining residual ORM gaps are:
 - ~~JDBC simple-query mode hits a kessel-sql parser gap on `::int8`

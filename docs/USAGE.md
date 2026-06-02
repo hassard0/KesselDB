@@ -1834,8 +1834,10 @@ rejects with `SP-PG-EXTQ-BIN-NUMERIC-NAN`. Vulcan smoke transcript:
 `docs/superpowers/sppgextqbinnumeric-t4-smoke-2026-06-02.txt`
 (psycopg2 + asyncpg both decode `Decimal('42')` / `Decimal('-7')` /
 `Decimal('999999999')` from kesseldb-emitted NUMERIC binary DataRow).
-COPY binary's NUMERIC pre-reject remains independent
-(`SP-PG-COPY-BIN-NUMERIC` is its own follow-up).
+COPY binary NUMERIC also works end-to-end after
+**SP-PG-COPY-BIN-NUMERIC V1 (2026-06-02)** — the same codec routes
+through the COPY-BIN admission + per-row encode/decode paths
+(`docs/superpowers/sppgcopybinnumeric-t3-smoke-2026-06-02.txt`).
 
 The remaining residual ORM gaps are:
 - ~~JDBC simple-query mode hits a kessel-sql parser gap on `::int8`
@@ -2088,13 +2090,17 @@ psql -h kesseldb -p 5532 -U test -d kesseldb -c \
 # → COPY 3
 ```
 
-V1 supports the same 10 column types as SP-PG-EXTQ-BIN (param/result
-binary): BOOL, INT2/INT4/INT8, FLOAT4/FLOAT8, TEXT/VARCHAR, BYTEA,
-TIMESTAMPTZ. Tables with NUMERIC / UUID / JSONB / ARRAY columns are
-pre-rejected at COPY-start with a precise V2-arc-pointing message:
+V1 supports the same 11 column types as SP-PG-EXTQ-BIN + SP-PG-EXTQ-BIN-
+NUMERIC (param/result binary): BOOL, INT2/INT4/INT8, FLOAT4/FLOAT8,
+TEXT/VARCHAR, BYTEA, TIMESTAMPTZ, and **NUMERIC** (the latter shipped at
+SP-PG-COPY-BIN-NUMERIC V1, 2026-06-02 — reuses the
+`extq::binary_numeric` codec the EXTQ-BIN-NUMERIC arc shipped, for
+`|value| < 10^18` with ≤18 fractional digits). Tables with UUID /
+JSONB / ARRAY columns are pre-rejected at COPY-start with a precise
+V2-arc-pointing message:
 
 ```text
-ERROR:  COPY binary: column "amount" type OID 1700 not supported in V1 (SP-PG-COPY-BIN-NUMERIC)
+ERROR:  COPY binary: column "data" type OID 3802 not supported in V1 (SP-PG-COPY-BIN-EXTRA)
 ```
 
 The binary codec reuses the existing SP-PG-EXTQ-BIN-RESULTS encoder
@@ -2104,7 +2110,11 @@ The binary codec reuses the existing SP-PG-EXTQ-BIN-RESULTS encoder
 field values, 2-byte i16 -1 end-of-data marker) is new. Inherits the
 SP-PG-COPY-BULKAPPLY V1 batching throughput.
 
-Smoke transcript: `docs/superpowers/sppgcopybin-t3-smoke-2026-06-02.txt`.
+Smoke transcripts:
+- `docs/superpowers/sppgcopybin-t3-smoke-2026-06-02.txt` (V1 — 10 types)
+- `docs/superpowers/sppgcopybinnumeric-t3-smoke-2026-06-02.txt`
+  (SP-PG-COPY-BIN-NUMERIC — NUMERIC round-trip incl. negative + byte-equal
+  re-export md5 match).
 
 Rejected variants surface precise V2-pointing error messages:
 
@@ -2115,8 +2125,8 @@ ERROR:  COPY FROM/TO PROGRAM not supported (permanent security restriction)
 
 V2 follow-ups (each its own SP-arc):
 
-- `SP-PG-COPY-BIN-NUMERIC` — binary NUMERIC encoding (the most complex
-  per-type binary format in the PG protocol).
+- ~~`SP-PG-COPY-BIN-NUMERIC`~~ — **CLOSED at V1 (2026-06-02)** — binary
+  NUMERIC routes through the SP-PG-EXTQ-BIN-NUMERIC codec.
 - `SP-PG-COPY-BIN-OID` — the optional OID-column flag bit (legacy PG
   ≤11 `WITH OIDS` tables).
 - `SP-PG-COPY-BIN-EXTRA` — binary UUID / JSONB / ARRAY encoding.

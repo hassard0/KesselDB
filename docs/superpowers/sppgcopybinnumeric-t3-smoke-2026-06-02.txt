@@ -1,0 +1,195 @@
+SP-PG-COPY-BIN-NUMERIC T3 — psql 16.14 binary COPY NUMERIC round-trip
+on vulcan, 2026-06-02.
+
+Setup:
+  - HEAD: 0e52104 (SP-PG-COPY-BIN-NUMERIC T1+T2 — wire NUMERIC codec
+    into COPY-BIN encode + decode)
+  - Build: CARGO_TARGET_DIR=/tmp/kdb-target-copybnum
+    cargo build --release --bin kesseldb --features pg-gateway
+    → release/kesseldb compiled in 24.85s
+  - Launch: KESSELDB_TOKEN=admin KESSELDB_PG_ADDR=127.0.0.1:5532
+    /tmp/kdb-target-copybnum/release/kesseldb 127.0.0.1:6532
+    /tmp/kdb-copybnum-data
+  - Client: PostgreSQL 16.14 psql.
+
+Workspace tests on vulcan (release):
+  $ CARGO_TARGET_DIR=/tmp/kdb-target-copybnum cargo test --release \
+      -p kessel-pg-gateway --lib
+  Result: 829 passed; 0 failed; 0 ignored.
+  (+7 vs the post-T5 SP-PG-EXTQ-BIN-NUMERIC baseline of 822 — all
+   7 new t1num_* KATs pass.)
+
+The 7 new KATs:
+  - t1num_encode_binary_value_numeric_42_byte_equal_to_codec
+  - t1num_decode_binary_param_numeric_42_round_trips_to_string
+  - t1num_dispatch_copy_in_start_binary_numeric_column_admitted
+  - t1num_dispatch_copy_to_binary_numeric_column_admitted
+  - t1num_copy_to_binary_numeric_column_emits_canonical_bytes
+  - t1num_copy_from_binary_numeric_column_ingests_row
+  - t1num_round_trip_encode_then_decode_through_dispatch_codecs
+
+======================================================================
+psql 16.14 — schema + INSERT seed
+======================================================================
+  $ PGPASSWORD=admin psql -h 127.0.0.1 -p 5532 -U test -d kesseldb \
+      -c 'CREATE TABLE num_bin (id I64, amount I128)'
+  CREATE TABLE
+
+  $ PGPASSWORD=admin psql ... -c \
+      "INSERT INTO num_bin (id, amount) VALUES (1, 42), (2, 100),
+       (3, 999999999), (4, 0)"
+  INSERT 0 4
+
+  $ PGPASSWORD=admin psql ... -c 'SELECT * FROM num_bin'
+   id |  amount
+  ----+-----------
+    1 |        42
+    2 |       100
+    3 | 999999999
+    4 |         0
+  (4 rows)
+
+(Note: the column is declared `I128` in kessel-sql; `field_kind_to_oid`
+maps `FieldKind::I128` to `PG_TYPE_NUMERIC` (1700), so the value's
+wire shape and binary admission path is the PG NUMERIC code path.)
+
+======================================================================
+COPY TO STDOUT binary — emits canonical PG `numeric_send` shape
+======================================================================
+  $ PGPASSWORD=admin psql ... -c \
+      "COPY num_bin TO STDOUT WITH (FORMAT binary)" > /tmp/num-bin-export.bin
+  $ ls -la /tmp/num-bin-export.bin
+  -rw-r--r-- 1 admin admin 135 Jun  2 07:35 /tmp/num-bin-export.bin
+
+  $ hexdump -C /tmp/num-bin-export.bin
+  00000000  50 47 43 4f 50 59 0a ff  0d 0a 00 00 00 00 00 00  |PGCOPY..........|
+  00000010  00 00 00 00 02 00 00 00  08 00 00 00 00 00 00 00  |................|
+  00000020  01 00 00 00 0a 00 01 00  00 00 00 00 00 00 2a 00  |..............*.|
+  00000030  02 00 00 00 08 00 00 00  00 00 00 00 02 00 00 00  |................|
+  00000040  0a 00 01 00 00 00 00 00  00 00 64 00 02 00 00 00  |..........d.....|
+  00000050  08 00 00 00 00 00 00 00  03 00 00 00 0e 00 03 00  |................|
+  00000060  02 00 00 00 00 00 09 27  0f 27 0f 00 02 00 00 00  |.......'.'......|
+  00000070  08 00 00 00 00 00 00 00  04 00 00 00 08 00 00 00  |................|
+  00000080  00 00 00 00 00 ff ff                              |.......|
+  00000087
+
+Wire layout (annotated):
+  - bytes 0..11   = PGCOPY signature `PGCOPY\n\xff\r\n\0`
+  - bytes 11..15  = flags = 0
+  - bytes 15..19  = ext_len = 0
+  - row 1 (id=1, amount=42):
+      2 fields
+      col 0 length = 8 → BE i64 = 1
+      col 1 length = 10 → NUMERIC `00 01 00 00 00 00 00 00 00 2a`
+        = ndigits=1, weight=0, sign=POS, dscale=0, digit[0]=0x002a = 42
+  - row 2 (id=2, amount=100): NUMERIC `00 01 00 00 00 00 00 00 00 64`
+      = ndigits=1, digit[0]=100
+  - row 3 (id=3, amount=999999999): NUMERIC `00 03 00 02 00 00 00 00
+      00 09 27 0f 27 0f` = ndigits=3, weight=2, digits=[9, 9999, 9999]
+      = 9*10^8 + 9999*10^4 + 9999 = 999,999,999
+  - row 4 (id=4, amount=0): NUMERIC `00 00 00 00 00 00 00 00` (all-zero
+      header = canonical zero)
+  - EOD marker = `ff ff`
+
+======================================================================
+COPY FROM STDIN binary into a fresh table — round-trip
+======================================================================
+  $ PGPASSWORD=admin psql ... -c 'CREATE TABLE num_bin2 (id I64, amount I128)'
+  CREATE TABLE
+  $ PGPASSWORD=admin psql ... -c \
+      "COPY num_bin2 FROM STDIN WITH (FORMAT binary)" \
+      < /tmp/num-bin-export.bin
+  COPY 4
+  $ PGPASSWORD=admin psql ... -c 'SELECT * FROM num_bin2 ORDER BY id'
+   id |  amount
+  ----+-----------
+    1 |        42
+    2 |       100
+    3 | 999999999
+    4 |         0
+  (4 rows)
+
+All 4 NUMERIC values preserved verbatim through the FROM → engine →
+SELECT → TO codec pipeline. Pre-arc this exact request returned
+`ERROR: COPY binary: column "amount" type OID 1700 not supported in
+V1 (SP-PG-COPY-BIN-NUMERIC)`.
+
+======================================================================
+Byte-equal re-export check
+======================================================================
+  $ PGPASSWORD=admin psql ... -c \
+      "COPY num_bin2 TO STDOUT WITH (FORMAT binary)" > /tmp/num-bin-reexport.bin
+  $ md5sum /tmp/num-bin-export.bin /tmp/num-bin-reexport.bin
+  18e15ae0e38be860d4b10a45412ff8eb  /tmp/num-bin-export.bin
+  18e15ae0e38be860d4b10a45412ff8eb  /tmp/num-bin-reexport.bin
+  $ diff -q /tmp/num-bin-export.bin /tmp/num-bin-reexport.bin
+  (no output — files byte-equal)
+
+======================================================================
+Negative-value round-trip
+======================================================================
+  $ PGPASSWORD=admin psql ... -c \
+      "INSERT INTO num_bin (id, amount) VALUES (5, -7)"
+  INSERT 0 1
+  $ PGPASSWORD=admin psql ... -c \
+      "COPY num_bin TO STDOUT WITH (FORMAT binary)" > /tmp/num-bin-export5.bin
+  $ PGPASSWORD=admin psql ... -c 'CREATE TABLE num_bin3 (id I64, amount I128)'
+  CREATE TABLE
+  $ PGPASSWORD=admin psql ... -c \
+      "COPY num_bin3 FROM STDIN WITH (FORMAT binary)" \
+      < /tmp/num-bin-export5.bin
+  COPY 5
+  $ PGPASSWORD=admin psql ... -c 'SELECT * FROM num_bin3 ORDER BY id'
+   id |  amount
+  ----+-----------
+    1 |        42
+    2 |       100
+    3 | 999999999
+    4 |         0
+    5 |        -7
+  (5 rows)
+
+Negative NUMERIC values (sign=0x4000) round-trip through the new
+admission + per-row codec wiring.
+
+======================================================================
+SP-PG-COPY-BIN-NUMERIC T3 smoke result:
+  COPY TO binary NUMERIC: PASS
+  COPY FROM binary NUMERIC: PASS
+  Byte-equal re-export: PASS (md5 match 18e15ae0e38be860d4b10a45412ff8eb)
+  Negative round-trip: PASS
+======================================================================
+
+Headline interpretation:
+  - The COPY TO binary output for a NUMERIC column carries the
+    canonical PG `numeric_send` wire shape that every PG-protocol-
+    aware client (psql, pgJDBC, asyncpg, psycopg2, pg_dump --format=
+    custom) decodes natively.
+  - The COPY FROM binary path through `process_copy_data_binary`
+    routes each NUMERIC field's binary bytes through
+    `extq::substitute::decode_binary_param`, which dispatches into
+    `extq::binary_numeric::decode_numeric_binary` (the codec shipped
+    by SP-PG-EXTQ-BIN-NUMERIC V1). Decoded values flow into the
+    existing BULKAPPLY V1 multi-row INSERT synthesis path with bare
+    decimal rendering (`I128`/`Fixed` column kinds → "bare token"
+    branch in `synthesize_insert_sql`).
+  - The COPY TO binary path through `dispatch_copy_to`'s binary branch
+    calls `extq::binary_results::encode_binary_value` per column,
+    which dispatches into `extq::binary_numeric::encode_numeric_binary`
+    for NUMERIC. Encoded bytes are wrapped in the existing
+    `encode_binary_row` framing.
+  - The SP-PG-COPY-BIN V1 "COPY binary: column X type OID 1700 not
+    supported in V1 (SP-PG-COPY-BIN-NUMERIC)" reject is gone for
+    NUMERIC; UUID / JSONB / ARRAY columns continue to pre-reject via
+    `binary_format_supported_for_oid` returning false, with the
+    unchanged `SP-PG-COPY-BIN-EXTRA` arc name.
+
+The SP-PG-COPY-BIN-NUMERIC follow-up arc named in
+`docs/superpowers/specs/2026-06-02-kesseldb-subproject-sppgcopybin-progress.md`
+§50-56 (V2 follow-ups) is now CLOSED for the V1 NUMERIC range
+(`|value| < 10^18`, ≤18 fractional digits). Out-of-range values reject
+at the per-row codec layer with the inherited
+`SP-PG-EXTQ-BIN-NUMERIC-BIGNUM` arc name; NaN with
+`SP-PG-EXTQ-BIN-NUMERIC-NAN`; ±Infinity (PG 14+) with
+`SP-PG-EXTQ-BIN-NUMERIC-INF`. UUID/JSONB/ARRAY columns remain
+pre-rejected with `SP-PG-COPY-BIN-EXTRA`.

@@ -44,6 +44,7 @@
 #![allow(dead_code)]
 
 pub mod command;
+pub mod csv;
 pub mod dispatch;
 pub mod proto;
 pub mod text;
@@ -109,6 +110,34 @@ pub enum CopyState {
     In(CopyInState),
 }
 
+/// SP-PG-COPY-CSV V1 — wire-format selector for a `COPY ... FROM/TO
+/// STDIN/STDOUT` exchange. The dispatcher branches on this to pick the
+/// row codec (`text` vs `csv`).
+///
+/// Spec §2.3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyFormat {
+    /// PG text format — tab-separated, `\N` NULL, backslash escapes.
+    /// SP-PG-COPY V1 default.
+    Text,
+    /// PG CSV format — RFC 4180 + PG superset (HEADER + custom
+    /// DELIMITER / QUOTE / ESCAPE / NULL options). SP-PG-COPY-CSV V1.
+    Csv(csv::CsvOptions),
+}
+
+impl Default for CopyFormat {
+    fn default() -> Self {
+        CopyFormat::Text
+    }
+}
+
+impl CopyFormat {
+    /// True iff this is a CSV-format COPY (any options).
+    pub fn is_csv(&self) -> bool {
+        matches!(self, CopyFormat::Csv(_))
+    }
+}
+
 /// Per-connection state for an in-flight `COPY <table> FROM STDIN`
 /// exchange. Spec §3.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +186,15 @@ pub struct CopyInState {
     /// row in the currently-pending batch. Used to build the
     /// "in batch starting at row N" tag on engine-error responses.
     pub batch_start_row: u64,
+    /// **SP-PG-COPY-CSV V1** — wire format for this COPY exchange.
+    /// `Text` is the SP-PG-COPY V1 default; `Csv(options)` engages the
+    /// CSV codec with the resolved options.
+    pub format: CopyFormat,
+    /// **SP-PG-COPY-CSV V1** — set to true when this is a CSV-format
+    /// COPY with `HEADER` and the first incoming record hasn't been
+    /// consumed-and-discarded yet. The dispatcher flips this to false
+    /// after dropping the header row.
+    pub pending_header: bool,
 }
 
 impl CopyInState {
@@ -176,12 +214,35 @@ impl CopyInState {
     /// **SP-PG-COPY-BULKAPPLY V1** — also initialises the per-batch
     /// fold fields: `pending_rows` empty, `batch_size` resolved from
     /// the env (or `COPY_BATCH_SIZE` default), `batch_start_row = 1`.
+    ///
+    /// **SP-PG-COPY-CSV V1** — defaults `format` to Text + `pending_header`
+    /// to false. Use `new_with_format` for CSV variants.
     pub fn new_with_kinds(
         table: String,
         columns: Option<Vec<String>>,
         column_count: u16,
         column_kinds: Vec<kessel_catalog::FieldKind>,
     ) -> Self {
+        Self::new_with_format(
+            table,
+            columns,
+            column_count,
+            column_kinds,
+            CopyFormat::Text,
+        )
+    }
+
+    /// **SP-PG-COPY-CSV V1** — fully-explicit constructor including
+    /// the wire format. The dispatcher uses this so a CSV-format
+    /// `COPY FROM STDIN` enters CopyIn with the right codec configured.
+    pub fn new_with_format(
+        table: String,
+        columns: Option<Vec<String>>,
+        column_count: u16,
+        column_kinds: Vec<kessel_catalog::FieldKind>,
+        format: CopyFormat,
+    ) -> Self {
+        let pending_header = matches!(&format, CopyFormat::Csv(o) if o.header);
         Self {
             table,
             columns,
@@ -192,6 +253,8 @@ impl CopyInState {
             pending_rows: Vec::new(),
             batch_size: resolve_copy_batch_size(),
             batch_start_row: 1,
+            format,
+            pending_header,
         }
     }
 }

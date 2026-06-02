@@ -19,12 +19,13 @@
 #![allow(dead_code)]
 
 use crate::copy::command::{ParsedCopy, RejectReason};
+use crate::copy::csv::{encode_csv_record, parse_csv_record, CsvOptions, CsvParseError};
 use crate::copy::proto::{
     copy_tag, encode_copy_data, encode_copy_done, encode_copy_in_response,
     encode_copy_out_response,
 };
 use crate::copy::text::{encode_text_row, is_end_of_data_marker, parse_text_row_bytes};
-use crate::copy::{CopyInState, MAX_COPY_DATA_BUFFER};
+use crate::copy::{CopyFormat, CopyInState, MAX_COPY_DATA_BUFFER};
 use crate::dispatch;
 use crate::engine::EngineApply;
 use crate::error::{encode_error_response, SEVERITY_ERROR};
@@ -63,8 +64,8 @@ pub fn dispatch_copy_in_start<E: EngineApply + ?Sized>(
     parsed: ParsedCopy,
     engine: &E,
 ) -> CopyInStartOutcome {
-    let (table, columns) = match parsed {
-        ParsedCopy::From { table, columns } => (table, columns),
+    let (table, columns, format) = match parsed {
+        ParsedCopy::From { table, columns, format } => (table, columns, format),
         ParsedCopy::To { .. } => {
             // Defensive — the caller should have routed COPY TO via
             // `dispatch_copy_to`. Return a 0A000 if it didn't.
@@ -124,7 +125,13 @@ pub fn dispatch_copy_in_start<E: EngineApply + ?Sized>(
         };
     let ncols = chosen_columns.len() as u16;
     let bytes = encode_copy_in_response(ncols);
-    let state = CopyInState::new_with_kinds(table, Some(chosen_columns), ncols, chosen_kinds);
+    let state = CopyInState::new_with_format(
+        table,
+        Some(chosen_columns),
+        ncols,
+        chosen_kinds,
+        format,
+    );
     CopyInStartOutcome::Started { bytes, state }
 }
 
@@ -177,6 +184,22 @@ pub fn process_copy_data<E: EngineApply + ?Sized>(
     }
     state.carry.extend_from_slice(data);
 
+    // SP-PG-COPY-CSV V1 — branch on the format. CSV uses a record-
+    // oriented parser (a record can span multiple physical lines when
+    // it contains quoted newlines); text uses the existing line-
+    // oriented parser.
+    if state.format.is_csv() {
+        process_copy_data_csv(state, engine)
+    } else {
+        process_copy_data_text(state, engine)
+    }
+}
+
+/// Text-format CopyData processor — original SP-PG-COPY V1 path.
+fn process_copy_data_text<E: EngineApply + ?Sized>(
+    mut state: CopyInState,
+    engine: &E,
+) -> CopyDataOutcome {
     let mut start = 0usize;
     let bytes = std::mem::take(&mut state.carry);
     let mut consumed = 0usize;
@@ -229,6 +252,83 @@ pub fn process_copy_data<E: EngineApply + ?Sized>(
     // Save the trailing incomplete bytes back into the carry.
     state.carry = bytes[consumed..].to_vec();
     CopyDataOutcome::Continue { state }
+}
+
+/// **SP-PG-COPY-CSV V1** — CSV-format CopyData processor. Uses the
+/// record-oriented `parse_csv_record` so a CSV record containing
+/// quoted newlines is reassembled correctly across CopyData frame
+/// boundaries (the carry buffer holds the partial record).
+///
+/// HEADER mode: the first complete record after COPY-start is consumed
+/// and discarded (V1 doesn't validate the header against the schema —
+/// HEADER MATCH is V2 `SP-PG-COPY-CSV-HEADER-MATCH`).
+fn process_copy_data_csv<E: EngineApply + ?Sized>(
+    mut state: CopyInState,
+    engine: &E,
+) -> CopyDataOutcome {
+    let opts = match &state.format {
+        CopyFormat::Csv(o) => o.clone(),
+        _ => unreachable!("caller branched on is_csv"),
+    };
+    let bytes = std::mem::take(&mut state.carry);
+    let mut pos = 0usize;
+    let expected = state.column_count as usize;
+
+    loop {
+        // HEADER consumption: parse the next record with expected=0
+        // (no field-count enforcement) and drop it.
+        let parse_expected = if state.pending_header { 0 } else { expected };
+        match parse_csv_record(&bytes, pos, &opts, parse_expected) {
+            Ok(Some((fields, next_pos))) => {
+                pos = next_pos;
+                if state.pending_header {
+                    state.pending_header = false;
+                    continue;
+                }
+                // Convert Option<String> → Option<Vec<u8>> for the
+                // existing BULKAPPLY pipeline (per-row + multi-row
+                // INSERT synthesizers both consume Vec<Option<Vec<u8>>>).
+                let row: Vec<Option<Vec<u8>>> = fields
+                    .into_iter()
+                    .map(|f| f.map(|s| s.into_bytes()))
+                    .collect();
+                state.pending_rows.push(row);
+                if state.pending_rows.len() >= state.batch_size {
+                    if let Some(fail_bytes) = flush_pending_batch(&mut state, engine) {
+                        return CopyDataOutcome::Failed { bytes: fail_bytes };
+                    }
+                }
+            }
+            Ok(None) => {
+                // Partial record — save the trailing bytes into the
+                // carry and wait for more data.
+                state.carry = bytes[pos..].to_vec();
+                return CopyDataOutcome::Continue { state };
+            }
+            Err(e) => {
+                let failing_row =
+                    state.rows_ingested + state.pending_rows.len() as u64 + 1;
+                state.pending_rows.clear();
+                let msg = match e {
+                    CsvParseError::FieldCountMismatch { expected, actual } => {
+                        format!("COPY row {failing_row} CSV field count mismatch: expected {expected}, got {actual}")
+                    }
+                    CsvParseError::UnterminatedQuote => {
+                        format!("COPY row {failing_row} CSV: unterminated quoted field")
+                    }
+                    CsvParseError::TrailingEscape => {
+                        format!("COPY row {failing_row} CSV: trailing escape with no value")
+                    }
+                    CsvParseError::NotUtf8 => {
+                        format!("COPY row {failing_row} CSV: field is not valid UTF-8")
+                    }
+                };
+                return CopyDataOutcome::Failed {
+                    bytes: error_response_then_rfq("22023", &msg),
+                };
+            }
+        }
+    }
 }
 
 /// **SP-PG-COPY-BULKAPPLY V1** — drain `state.pending_rows` as one
@@ -441,8 +541,8 @@ pub fn dispatch_copy_to<E: EngineApply + ?Sized>(
     parsed: ParsedCopy,
     engine: &E,
 ) -> Vec<u8> {
-    let (table, columns) = match parsed {
-        ParsedCopy::To { table, columns } => (table, columns),
+    let (table, columns, format) = match parsed {
+        ParsedCopy::To { table, columns, format } => (table, columns, format),
         ParsedCopy::From { .. } => {
             return error_response_then_rfq(
                 "0A000",
@@ -466,13 +566,18 @@ pub fn dispatch_copy_to<E: EngineApply + ?Sized>(
             );
         }
     };
-    // Validate supplied column list against the schema.
-    let chosen_indices: Vec<usize> = match columns.as_ref() {
+    // Validate supplied column list against the schema. Capture the
+    // chosen column names too — used for the CSV HEADER row.
+    let (chosen_indices, chosen_names): (Vec<usize>, Vec<String>) = match columns.as_ref() {
         Some(cols) => {
-            let mut out = Vec::with_capacity(cols.len());
+            let mut idxs = Vec::with_capacity(cols.len());
+            let mut names = Vec::with_capacity(cols.len());
             for c in cols {
                 match schema_cols.iter().position(|s| s.name == *c) {
-                    Some(idx) => out.push(idx),
+                    Some(idx) => {
+                        idxs.push(idx);
+                        names.push(c.clone());
+                    }
                     None => {
                         return error_response_then_rfq(
                             "42703",
@@ -483,9 +588,13 @@ pub fn dispatch_copy_to<E: EngineApply + ?Sized>(
                     }
                 }
             }
-            out
+            (idxs, names)
         }
-        None => (0..schema_cols.len()).collect(),
+        None => {
+            let idxs: Vec<usize> = (0..schema_cols.len()).collect();
+            let names: Vec<String> = schema_cols.iter().map(|s| s.name.clone()).collect();
+            (idxs, names)
+        }
     };
     let ncols = chosen_indices.len() as u16;
 
@@ -503,10 +612,23 @@ pub fn dispatch_copy_to<E: EngineApply + ?Sized>(
     // from the DataRow frames.
     let rows = extract_data_rows(&resp);
 
-    // Build CopyOutResponse + N × CopyData + CopyDone +
-    // CommandComplete("COPY N") + RFQ.
+    // Build CopyOutResponse + (optional CSV header row) + N × CopyData
+    // + CopyDone + CommandComplete("COPY N") + RFQ.
     let mut out = Vec::new();
     out.extend_from_slice(&encode_copy_out_response(ncols));
+
+    // SP-PG-COPY-CSV V1 — emit HEADER row first if requested.
+    if let CopyFormat::Csv(opts) = &format {
+        if opts.header {
+            let header_refs: Vec<Option<&str>> = chosen_names
+                .iter()
+                .map(|n| Some(n.as_str()))
+                .collect();
+            let payload = encode_csv_record(&header_refs, opts);
+            out.extend_from_slice(&encode_copy_data(&payload));
+        }
+    }
+
     let mut emitted = 0u64;
     for row in &rows {
         // Project the chosen columns from the full row, borrowing
@@ -515,13 +637,32 @@ pub fn dispatch_copy_to<E: EngineApply + ?Sized>(
             .iter()
             .map(|&i| row.get(i).and_then(|c| c.as_deref()))
             .collect();
-        let payload = encode_text_row(&projected_refs);
+        let payload = match &format {
+            CopyFormat::Text => encode_text_row(&projected_refs),
+            CopyFormat::Csv(opts) => {
+                // Convert byte refs → str refs for the CSV encoder.
+                // Lossy-decode on non-UTF-8 (matches the CSV parser
+                // contract).
+                let str_refs: Vec<Option<String>> = projected_refs
+                    .iter()
+                    .map(|o| {
+                        o.map(|b| String::from_utf8_lossy(b).into_owned())
+                    })
+                    .collect();
+                let str_opt_refs: Vec<Option<&str>> =
+                    str_refs.iter().map(|o| o.as_deref()).collect();
+                encode_csv_record(&str_opt_refs, opts)
+            }
+        };
         out.extend_from_slice(&encode_copy_data(&payload));
         emitted += 1;
     }
     out.extend_from_slice(&encode_copy_done());
     out.extend_from_slice(&encode_command_complete(&copy_tag(emitted)));
     out.extend_from_slice(&encode_ready_for_query(b'I'));
+    // Defensively silence unused-import warning when no CSV path is
+    // exercised at the call site.
+    let _ = CsvOptions::default;
     out
 }
 
@@ -556,7 +697,12 @@ fn reject_sqlstate(reason: &RejectReason) -> &'static str {
         | RejectReason::UnknownFormat { .. }
         | RejectReason::FileAccess
         | RejectReason::ProgramAccess
-        | RejectReason::UnknownSource => "0A000",
+        | RejectReason::UnknownSource
+        | RejectReason::UnsupportedCsvOption { .. } => "0A000",
+        // SP-PG-COPY-CSV V1 — invalid CSV option value (e.g. multi-byte
+        // DELIMITER) is a SQL-shape error, not a capability gap. Maps
+        // to the canonical `22023 invalid_parameter_value`.
+        RejectReason::InvalidCsvOptionValue { .. } => "22023",
     }
 }
 
@@ -581,6 +727,14 @@ fn reject_message(reason: &RejectReason) -> String {
         }
         RejectReason::UnknownSource => {
             "COPY source/destination must be STDIN or STDOUT".to_string()
+        }
+        RejectReason::UnsupportedCsvOption { option } => {
+            format!(
+                "COPY csv option {option} not supported in V1 (SP-PG-COPY-CSV-FORCEQUOTE / SP-PG-COPY-CSV-ENCODING)"
+            )
+        }
+        RejectReason::InvalidCsvOptionValue { option, value } => {
+            format!("COPY csv {option} must be a single character (got '{value}')")
         }
     }
 }
@@ -968,6 +1122,7 @@ mod tests {
         let parsed = ParsedCopy::From {
             table: "t".to_string(),
             columns: None,
+            format: CopyFormat::Text,
         };
         match dispatch_copy_in_start(parsed, &eng) {
             CopyInStartOutcome::Started { bytes, state } => {
@@ -994,6 +1149,7 @@ mod tests {
         let parsed = ParsedCopy::From {
             table: "ghost".to_string(),
             columns: None,
+            format: CopyFormat::Text,
         };
         match dispatch_copy_in_start(parsed, &eng) {
             CopyInStartOutcome::Failed { bytes } => {
@@ -1016,6 +1172,7 @@ mod tests {
         let parsed = ParsedCopy::From {
             table: "t".to_string(),
             columns: Some(vec!["missing".to_string()]),
+            format: CopyFormat::Text,
         };
         match dispatch_copy_in_start(parsed, &eng) {
             CopyInStartOutcome::Failed { bytes } => {
@@ -1570,6 +1727,7 @@ mod tests {
         let parsed = ParsedCopy::To {
             table: "t".to_string(),
             columns: None,
+            format: CopyFormat::Text,
         };
         let bytes = dispatch_copy_to(parsed, &eng);
         // First byte = 'H'.
@@ -1607,6 +1765,7 @@ mod tests {
         let parsed = ParsedCopy::To {
             table: "t".to_string(),
             columns: None,
+            format: CopyFormat::Text,
         };
         let bytes = dispatch_copy_to(parsed, &eng);
 
@@ -1659,6 +1818,7 @@ mod tests {
         let parsed = ParsedCopy::To {
             table: "ghost".to_string(),
             columns: None,
+            format: CopyFormat::Text,
         };
         let bytes = dispatch_copy_to(parsed, &eng);
         assert_eq!(bytes[0], b'E');
@@ -1685,9 +1845,249 @@ mod tests {
         let parsed = ParsedCopy::To {
             table: "t".to_string(),
             columns: None,
+            format: CopyFormat::Text,
         };
         let bytes = dispatch_copy_to(parsed, &eng);
         // The payload should be `7\t\N\n`.
         assert!(bytes.windows(b"7\t\\N\n".len()).any(|w| w == b"7\t\\N\n"));
+    }
+
+    // ─── SP-PG-COPY-CSV V1 ──────────────────────────────────────────────
+
+    /// SP-PG-COPY-CSV T1: COPY FROM with FORMAT csv + HEADER drops the
+    /// header row and ingests the data rows through the per-row /
+    /// multi-row pipeline. With batch_size=1 the SQL synthesis is the
+    /// V1 baseline shape (lockable in the assertion).
+    #[test]
+    fn csv_t1_copy_from_csv_with_header_skips_header_and_ingests() {
+        let cols = vec![
+            PgColumn { name: "id".into(), kind: FieldKind::I64, nullable: false },
+            PgColumn { name: "name".into(), kind: FieldKind::Char(32), nullable: true },
+        ];
+        let eng = make_engine(cols);
+        let csv_opts = CsvOptions {
+            header: true,
+            ..CsvOptions::default()
+        };
+        let mut state = CopyInState::new_with_format(
+            "t".to_string(),
+            Some(vec!["id".to_string(), "name".to_string()]),
+            2,
+            vec![FieldKind::I64, FieldKind::Char(32)],
+            CopyFormat::Csv(csv_opts),
+        );
+        state.batch_size = 1;
+        let data = b"id,name\n1,hello\n2,\"hello, world\"\n";
+        match process_copy_data(data, state, &eng) {
+            CopyDataOutcome::Continue { state } => {
+                assert_eq!(state.rows_ingested, 2);
+                let applied = eng.applied.lock().unwrap();
+                assert_eq!(applied.len(), 2);
+                // Schema-aware: id is numeric (bare), name is CHAR (quoted).
+                assert!(
+                    applied[0].contains("VALUES (1, 'hello')"),
+                    "unexpected SQL: {}",
+                    applied[0]
+                );
+                // Embedded comma in the quoted CSV field must survive.
+                assert!(
+                    applied[1].contains("'hello, world'"),
+                    "unexpected SQL: {}",
+                    applied[1]
+                );
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
+    }
+
+    /// SP-PG-COPY-CSV T1: COPY FROM CSV with an embedded-quote row
+    /// decodes the doubled-quote escape correctly.
+    #[test]
+    fn csv_t1_copy_from_csv_doubled_quote_decoded() {
+        let cols = vec![
+            PgColumn { name: "id".into(), kind: FieldKind::I64, nullable: false },
+            PgColumn { name: "name".into(), kind: FieldKind::Char(32), nullable: true },
+        ];
+        let eng = make_engine(cols);
+        let mut state = CopyInState::new_with_format(
+            "t".to_string(),
+            Some(vec!["id".to_string(), "name".to_string()]),
+            2,
+            vec![FieldKind::I64, FieldKind::Char(32)],
+            CopyFormat::Csv(CsvOptions::default()),
+        );
+        state.batch_size = 1;
+        // `"Bob ""the builder"""` → `Bob "the builder"`
+        let data = b"1,\"Bob \"\"the builder\"\"\"\n";
+        match process_copy_data(data, state, &eng) {
+            CopyDataOutcome::Continue { state } => {
+                assert_eq!(state.rows_ingested, 1);
+                let applied = eng.applied.lock().unwrap();
+                // kessel-sql quotes strings with `'` and doubles
+                // embedded `'`. The CSV-decoded value `Bob "the builder"`
+                // contains no single quotes so renders verbatim inside
+                // the SQL literal.
+                assert!(
+                    applied[0].contains(r#"'Bob "the builder"'"#),
+                    "unexpected SQL: {}",
+                    applied[0]
+                );
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
+    }
+
+    /// SP-PG-COPY-CSV T1: empty unquoted CSV field is NULL; the
+    /// dispatcher drops it (kessel-sql NULL-omit trick).
+    #[test]
+    fn csv_t1_copy_from_csv_empty_unquoted_is_null() {
+        let cols = vec![
+            PgColumn { name: "id".into(), kind: FieldKind::I64, nullable: false },
+            PgColumn { name: "name".into(), kind: FieldKind::Char(32), nullable: true },
+        ];
+        let eng = make_engine(cols);
+        let mut state = CopyInState::new_with_format(
+            "t".to_string(),
+            Some(vec!["id".to_string(), "name".to_string()]),
+            2,
+            vec![FieldKind::I64, FieldKind::Char(32)],
+            CopyFormat::Csv(CsvOptions::default()),
+        );
+        state.batch_size = 1;
+        let data = b"1,\n";
+        match process_copy_data(data, state, &eng) {
+            CopyDataOutcome::Continue { state } => {
+                assert_eq!(state.rows_ingested, 1);
+                let applied = eng.applied.lock().unwrap();
+                // The NULL `name` field is dropped — only id is present.
+                assert!(
+                    applied[0].contains("INSERT INTO t (id) VALUES (1)"),
+                    "unexpected SQL: {}",
+                    applied[0]
+                );
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
+    }
+
+    /// SP-PG-COPY-CSV T1: a CSV record with a newline INSIDE a quoted
+    /// field is reassembled across a frame boundary via the carry
+    /// buffer.
+    #[test]
+    fn csv_t1_copy_from_csv_quoted_newline_carries_across_frames() {
+        let cols = vec![PgColumn {
+            name: "v".into(),
+            kind: FieldKind::Char(64),
+            nullable: false,
+        }];
+        let eng = make_engine(cols);
+        let mut state = CopyInState::new_with_format(
+            "t".to_string(),
+            Some(vec!["v".to_string()]),
+            1,
+            vec![FieldKind::Char(64)],
+            CopyFormat::Csv(CsvOptions::default()),
+        );
+        state.batch_size = 1;
+        // First frame: opens a quoted field that doesn't close.
+        let data1 = b"\"line1\n";
+        let state = match process_copy_data(data1, state, &eng) {
+            CopyDataOutcome::Continue { state } => state,
+            other => panic!("expected Continue, got {other:?}"),
+        };
+        assert_eq!(state.rows_ingested, 0); // record incomplete
+        assert!(!state.carry.is_empty());
+        // Second frame: closes the quote + ends the record.
+        let data2 = b"line2\"\n";
+        match process_copy_data(data2, state, &eng) {
+            CopyDataOutcome::Continue { state } => {
+                assert_eq!(state.rows_ingested, 1);
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
+        let applied = eng.applied.lock().unwrap();
+        assert_eq!(applied.len(), 1);
+        // The reassembled value is "line1\nline2".
+        assert!(
+            applied[0].contains("'line1\nline2'"),
+            "unexpected SQL: {}",
+            applied[0]
+        );
+    }
+
+    /// SP-PG-COPY-CSV T1: COPY TO with FORMAT csv emits CSV-encoded
+    /// CopyData rows (comma-separated, quoted when needed).
+    #[test]
+    fn csv_t1_copy_to_csv_emits_csv_payload() {
+        let cols = vec![
+            PgColumn { name: "id".into(), kind: FieldKind::I64, nullable: false },
+            PgColumn { name: "name".into(), kind: FieldKind::Char(32), nullable: true },
+        ];
+        // Row with an embedded comma needs to round-trip as a quoted
+        // CSV field.
+        let r1 = build_record(
+            &cols,
+            &[Value::Int(1), Value::Blob(b"hello, world\0\0\0\0".to_vec())],
+        );
+        let stream = build_row_stream(&[r1]);
+        let eng = CopyTestEngine {
+            cols: cols.clone(),
+            result: std::sync::Mutex::new(Vec::new()),
+            row_bytes: stream,
+            table: "t".to_string(),
+            applied: std::sync::Mutex::new(Vec::new()),
+        };
+        let parsed = ParsedCopy::To {
+            table: "t".to_string(),
+            columns: None,
+            format: CopyFormat::Csv(CsvOptions::default()),
+        };
+        let bytes = dispatch_copy_to(parsed, &eng);
+        assert_eq!(bytes[0], b'H');
+        // The emitted CopyData payload must contain the quoted CSV
+        // representation of `hello, world`.
+        assert!(
+            bytes.windows(b"\"hello, world\"".len())
+                .any(|w| w == b"\"hello, world\""),
+            "expected quoted CSV field in CopyData payload"
+        );
+        assert!(bytes.windows(b"COPY 1\0".len()).any(|w| w == b"COPY 1\0"));
+    }
+
+    /// SP-PG-COPY-CSV T1: COPY TO with FORMAT csv + HEADER emits a
+    /// first CopyData containing the column names as a CSV record.
+    #[test]
+    fn csv_t1_copy_to_csv_with_header_emits_column_names_first() {
+        let cols = vec![
+            PgColumn { name: "id".into(), kind: FieldKind::I64, nullable: false },
+            PgColumn { name: "name".into(), kind: FieldKind::Char(32), nullable: true },
+        ];
+        let eng = CopyTestEngine {
+            cols: cols.clone(),
+            result: std::sync::Mutex::new(Vec::new()),
+            row_bytes: Vec::new(),
+            table: "t".to_string(),
+            applied: std::sync::Mutex::new(Vec::new()),
+        };
+        let csv_opts = CsvOptions {
+            header: true,
+            ..CsvOptions::default()
+        };
+        let parsed = ParsedCopy::To {
+            table: "t".to_string(),
+            columns: None,
+            format: CopyFormat::Csv(csv_opts),
+        };
+        let bytes = dispatch_copy_to(parsed, &eng);
+        assert_eq!(bytes[0], b'H');
+        // The first CopyData after H carries `id,name\n`.
+        let h_len = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as usize;
+        let p = 1 + h_len;
+        assert_eq!(bytes[p], b'd');
+        let cd_len =
+            u32::from_be_bytes([bytes[p + 1], bytes[p + 2], bytes[p + 3], bytes[p + 4]])
+                as usize;
+        let payload = &bytes[p + 5..p + 5 + (cd_len - 4)];
+        assert_eq!(payload, b"id,name\n");
     }
 }

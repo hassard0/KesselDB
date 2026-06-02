@@ -31,20 +31,30 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
 
+use crate::copy::csv::{self, CsvOptions};
+use crate::copy::CopyFormat;
+
 /// The recognized V1-supported COPY commands + the V2-only rejection
 /// kinds the recognizer surfaces so the dispatcher can emit precise
 /// error messages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedCopy {
-    /// `COPY <table> [(cols)] FROM STDIN [WITH (FORMAT text)]`.
+    /// `COPY <table> [(cols)] FROM STDIN [WITH (FORMAT text|csv, ...)]`.
+    ///
+    /// **SP-PG-COPY-CSV V1** — `format` carries the wire format. Text
+    /// is the SP-PG-COPY V1 default; Csv engages the CSV codec with
+    /// the resolved options (DELIMITER / QUOTE / ESCAPE / NULL /
+    /// HEADER).
     From {
         table: String,
         columns: Option<Vec<String>>,
+        format: CopyFormat,
     },
-    /// `COPY <table> [(cols)] TO STDOUT [WITH (FORMAT text)]`.
+    /// `COPY <table> [(cols)] TO STDOUT [WITH (FORMAT text|csv, ...)]`.
     To {
         table: String,
         columns: Option<Vec<String>>,
+        format: CopyFormat,
     },
     /// A COPY command V1 can't serve. The dispatcher renders the
     /// reason into the canonical `0A000` ErrorResponse message.
@@ -60,12 +70,24 @@ pub enum RejectReason {
     /// `WITH (FORMAT binary)` — V1 doesn't ship binary format
     /// (SP-PG-COPY-BIN).
     BinaryFormat,
-    /// `WITH (FORMAT csv)` — V1 doesn't ship CSV format
-    /// (SP-PG-COPY-CSV).
+    /// `WITH (FORMAT csv)` — V1 SP-PG-COPY shipped text only; the CSV
+    /// codec lands in SP-PG-COPY-CSV (this arc). Reserved for any
+    /// future restriction where CSV is unavailable; SP-PG-COPY-CSV V1
+    /// accepts CSV directly via `ParsedCopy::From/To { format:
+    /// CopyFormat::Csv(...) }`.
     CsvFormat,
     /// `WITH (FORMAT <unknown>)` — neither text nor a V2-named
     /// format. Carries the offending format name for diagnostics.
     UnknownFormat { format: String },
+    /// **SP-PG-COPY-CSV V1** — `WITH (FORMAT csv, FORCE_QUOTE ...)` /
+    /// `FORCE_NOT_NULL ...` / `FORCE_NULL ...`. These are column-
+    /// scoped modifiers V1 doesn't yet implement; V2
+    /// `SP-PG-COPY-CSV-FORCEQUOTE` lifts.
+    UnsupportedCsvOption { option: String },
+    /// **SP-PG-COPY-CSV V1** — `WITH (FORMAT csv, DELIMITER '||')`
+    /// or any single-byte option with a multi-byte value. Carries the
+    /// option name for diagnostics.
+    InvalidCsvOptionValue { option: String, value: String },
     /// `COPY ... FROM '/path/to/file'` or `... TO '/path/to/file'`
     /// — server-side file access. Hard pass without an opt-in
     /// operator surface (SP-PG-COPY-FILE).
@@ -161,42 +183,258 @@ pub fn parse_copy_command(sql: &str) -> Option<ParsedCopy> {
         return Some(ParsedCopy::Rejected { reason: RejectReason::UnknownSource });
     }
 
-    // Optional WITH (FORMAT text|csv|binary) — V1 accepts text +
-    // rejects others.
-    if !rest.is_empty() {
-        // Tolerant: accept `WITH (...)` clause and check FORMAT.
-        if let Some(format_clause) = extract_format_clause(rest) {
-            match format_clause.to_ascii_uppercase().as_str() {
-                "TEXT" => {} // V1 default; explicit text is fine
-                "BINARY" => {
-                    return Some(ParsedCopy::Rejected {
-                        reason: RejectReason::BinaryFormat,
-                    });
-                }
-                "CSV" => {
-                    return Some(ParsedCopy::Rejected {
-                        reason: RejectReason::CsvFormat,
-                    });
-                }
-                other => {
-                    return Some(ParsedCopy::Rejected {
-                        reason: RejectReason::UnknownFormat {
-                            format: other.to_string(),
-                        },
-                    });
-                }
-            }
+    // Optional WITH (FORMAT text|csv|binary, ...) — SP-PG-COPY V1
+    // accepts text; SP-PG-COPY-CSV V1 lifts CSV; binary stays V2.
+    let format = if !rest.is_empty() {
+        match parse_with_options(rest) {
+            Ok(f) => f,
+            Err(reason) => return Some(ParsedCopy::Rejected { reason }),
         }
-        // Other WITH options (HEADER / DELIMITER / FREEZE / etc.) —
-        // V1 silently ignores anything that isn't FORMAT. A future
-        // V2 SP-PG-COPY-CSV may surface these.
-    }
+    } else {
+        CopyFormat::Text
+    };
 
     if from_stdin {
-        Some(ParsedCopy::From { table, columns })
+        Some(ParsedCopy::From {
+            table,
+            columns,
+            format,
+        })
     } else {
-        Some(ParsedCopy::To { table, columns })
+        Some(ParsedCopy::To {
+            table,
+            columns,
+            format,
+        })
     }
+}
+
+/// **SP-PG-COPY-CSV V1** — parse the `WITH (...)` option clause into a
+/// `CopyFormat`. Accepts:
+///
+/// - `WITH (FORMAT text)` → `CopyFormat::Text`
+/// - `WITH (FORMAT csv [, DELIMITER 'X'] [, QUOTE 'X'] [, ESCAPE 'X']
+///   [, NULL 'string'] [, HEADER [true|false]])` → `CopyFormat::Csv(...)`
+/// - `WITH (FORMAT binary)` → `Err(BinaryFormat)`
+/// - `WITH (FORMAT <unknown>)` → `Err(UnknownFormat)`
+/// - No FORMAT key OR no WITH clause → `CopyFormat::Text` (V1 default)
+///
+/// Other recognized CSV options:
+/// - `FORCE_QUOTE ...` → `Err(UnsupportedCsvOption)` (V2)
+/// - `FORCE_NOT_NULL ...` → `Err(UnsupportedCsvOption)` (V2)
+/// - `FORCE_NULL ...` → `Err(UnsupportedCsvOption)` (V2)
+/// - `ENCODING 'utf16'` → `Err(UnsupportedCsvOption)` (V2)
+/// - `FREEZE` → silently accepted (no-op, KesselDB has no
+///   visibility map)
+///
+/// Unknown options outside CSV: silently dropped (matches V1
+/// SP-PG-COPY tolerant stance).
+pub(crate) fn parse_with_options(s: &str) -> Result<CopyFormat, RejectReason> {
+    let opts = tokenize_options(s);
+    // First pass: find FORMAT to decide the codec.
+    let mut format_name: Option<String> = None;
+    for (k, v) in &opts {
+        if k.eq_ignore_ascii_case("FORMAT") {
+            format_name = Some(v.clone().unwrap_or_default());
+        }
+    }
+    let fmt = format_name.unwrap_or_else(|| "text".to_string());
+    match fmt.to_ascii_uppercase().as_str() {
+        "TEXT" => Ok(CopyFormat::Text),
+        "BINARY" => Err(RejectReason::BinaryFormat),
+        "CSV" => {
+            let mut csv_opts = CsvOptions::default();
+            for (k, v) in &opts {
+                let key = k.to_ascii_uppercase();
+                match key.as_str() {
+                    "FORMAT" => {}
+                    "FREEZE" => {} // silent no-op
+                    "DELIMITER" => {
+                        let value = v.clone().unwrap_or_default();
+                        csv_opts.delimiter = csv::validate_single_byte("DELIMITER", &value)
+                            .map_err(|_| RejectReason::InvalidCsvOptionValue {
+                                option: "DELIMITER".to_string(),
+                                value,
+                            })?;
+                    }
+                    "QUOTE" => {
+                        let value = v.clone().unwrap_or_default();
+                        csv_opts.quote = csv::validate_single_byte("QUOTE", &value).map_err(
+                            |_| RejectReason::InvalidCsvOptionValue {
+                                option: "QUOTE".to_string(),
+                                value,
+                            },
+                        )?;
+                        // Default escape tracks quote unless explicitly set.
+                        csv_opts.escape = csv_opts.quote;
+                    }
+                    "ESCAPE" => {
+                        let value = v.clone().unwrap_or_default();
+                        csv_opts.escape = csv::validate_single_byte("ESCAPE", &value).map_err(
+                            |_| RejectReason::InvalidCsvOptionValue {
+                                option: "ESCAPE".to_string(),
+                                value,
+                            },
+                        )?;
+                    }
+                    "NULL" => {
+                        csv_opts.null_marker = v.clone().unwrap_or_default();
+                    }
+                    "HEADER" => {
+                        // PG: HEADER [boolean]. Bare HEADER = true.
+                        // Accept: HEADER, HEADER true, HEADER false,
+                        // HEADER on, HEADER off.
+                        csv_opts.header = match v.as_deref() {
+                            None => true,
+                            Some(val) => {
+                                let u = val.to_ascii_uppercase();
+                                matches!(u.as_str(), "TRUE" | "ON" | "1" | "YES" | "MATCH")
+                            }
+                        };
+                    }
+                    "FORCE_QUOTE" | "FORCE_NOT_NULL" | "FORCE_NULL" => {
+                        return Err(RejectReason::UnsupportedCsvOption {
+                            option: key,
+                        });
+                    }
+                    "ENCODING" => {
+                        let value = v.clone().unwrap_or_default();
+                        // V1 accepts only UTF-8 / unicode aliases.
+                        let u = value.to_ascii_uppercase();
+                        if !matches!(u.as_str(), "UTF8" | "UTF-8" | "UNICODE" | "") {
+                            return Err(RejectReason::UnsupportedCsvOption {
+                                option: format!("ENCODING '{value}'"),
+                            });
+                        }
+                    }
+                    _ => {
+                        // Unknown option — silently ignored (matches
+                        // V1 SP-PG-COPY tolerant stance).
+                    }
+                }
+            }
+            Ok(CopyFormat::Csv(csv_opts))
+        }
+        other => Err(RejectReason::UnknownFormat {
+            format: other.to_string(),
+        }),
+    }
+}
+
+/// Tokenize the `WITH (...)` body (or bare option list) into
+/// `(key, optional_value)` pairs. Lenient — accepts:
+///
+/// - `WITH (FORMAT csv, HEADER, DELIMITER '|')`
+/// - `WITH FORMAT csv` (legacy bare form)
+/// - `FORMAT csv HEADER true` (whitespace-separated)
+/// - `CSV HEADER` (psql's classic `\copy` form — V1 doesn't recognize
+///   the bare `CSV` keyword as FORMAT csv since the dispatcher already
+///   sees the explicit `WITH (FORMAT ...)` shape from psql `\copy` →
+///   server-side `COPY` translation; left for V2 if a client needs it).
+fn tokenize_options(s: &str) -> Vec<(String, Option<String>)> {
+    // Strip a leading WITH (case-insensitive).
+    let mut t = s.trim_start();
+    if t.len() >= 4 && t[..4].eq_ignore_ascii_case("WITH") {
+        let after = &t[4..];
+        if after
+            .chars()
+            .next()
+            .map(|c| c.is_whitespace() || c == '(')
+            .unwrap_or(false)
+        {
+            t = after.trim_start();
+        }
+    }
+    // If wrapped in parens, strip them.
+    let body = if let Some(inside) = t.strip_prefix('(') {
+        match inside.rfind(')') {
+            Some(end) => &inside[..end],
+            None => inside,
+        }
+    } else {
+        t
+    };
+
+    // Split on commas at top level (no nested parens in CSV options
+    // V1 — FORCE_QUOTE (col1, col2) shape rejected before we get here,
+    // but be defensive against nested parens by tracking depth).
+    let mut pairs: Vec<(String, Option<String>)> = Vec::new();
+    let mut buf = String::new();
+    let mut depth = 0i32;
+    let mut in_quote = false;
+    for c in body.chars() {
+        if in_quote {
+            buf.push(c);
+            if c == '\'' {
+                in_quote = false;
+            }
+            continue;
+        }
+        match c {
+            '\'' => {
+                in_quote = true;
+                buf.push(c);
+            }
+            '(' => {
+                depth += 1;
+                buf.push(c);
+            }
+            ')' => {
+                depth -= 1;
+                buf.push(c);
+            }
+            ',' if depth == 0 => {
+                if !buf.trim().is_empty() {
+                    pairs.push(split_key_value(buf.trim()));
+                }
+                buf.clear();
+            }
+            _ => buf.push(c),
+        }
+    }
+    if !buf.trim().is_empty() {
+        pairs.push(split_key_value(buf.trim()));
+    }
+    pairs
+}
+
+/// Split a single option's text into `(key, optional_value)`. The key
+/// is the first word; the value is everything after (with surrounding
+/// quotes stripped if present).
+fn split_key_value(s: &str) -> (String, Option<String>) {
+    let s = s.trim();
+    // Find the first whitespace OR start of `'`.
+    let mut split_at = s.len();
+    for (i, c) in s.char_indices() {
+        if c.is_whitespace() {
+            split_at = i;
+            break;
+        }
+    }
+    let key = s[..split_at].to_string();
+    let rest = s[split_at..].trim();
+    if rest.is_empty() {
+        return (key, None);
+    }
+    // Strip surrounding single quotes if present.
+    let value = if let Some(stripped) = rest.strip_prefix('\'') {
+        if let Some(end) = stripped.find('\'') {
+            stripped[..end].to_string()
+        } else {
+            stripped.to_string()
+        }
+    } else {
+        // Bare token — value is up to next whitespace / comma / ).
+        let mut end = rest.len();
+        for (i, c) in rest.char_indices() {
+            if c.is_whitespace() || c == ',' || c == ')' {
+                end = i;
+                break;
+            }
+        }
+        rest[..end].to_string()
+    };
+    (key, Some(value))
 }
 
 /// Split `s` into (first word, rest). The first word is everything
@@ -354,9 +592,10 @@ mod tests {
     #[test]
     fn t1_parse_copy_t_from_stdin() {
         match parse_copy_command("COPY t FROM STDIN") {
-            Some(ParsedCopy::From { table, columns }) => {
+            Some(ParsedCopy::From { table, columns, format }) => {
                 assert_eq!(table, "t");
                 assert_eq!(columns, None);
+                assert_eq!(format, CopyFormat::Text);
             }
             other => panic!("expected From, got {other:?}"),
         }
@@ -367,9 +606,10 @@ mod tests {
     #[test]
     fn t1_parse_copy_t_to_stdout() {
         match parse_copy_command("COPY t TO STDOUT") {
-            Some(ParsedCopy::To { table, columns }) => {
+            Some(ParsedCopy::To { table, columns, format }) => {
                 assert_eq!(table, "t");
                 assert_eq!(columns, None);
+                assert_eq!(format, CopyFormat::Text);
             }
             other => panic!("expected To, got {other:?}"),
         }
@@ -379,7 +619,7 @@ mod tests {
     #[test]
     fn t1_parse_copy_t_columns_from_stdin() {
         match parse_copy_command("COPY users (id, name, email) FROM STDIN") {
-            Some(ParsedCopy::From { table, columns }) => {
+            Some(ParsedCopy::From { table, columns, .. }) => {
                 assert_eq!(table, "users");
                 assert_eq!(
                     columns,
@@ -435,7 +675,10 @@ mod tests {
     #[test]
     fn t1_parse_copy_explicit_text_format_accepted() {
         match parse_copy_command("COPY t FROM STDIN WITH (FORMAT text)") {
-            Some(ParsedCopy::From { table, .. }) => assert_eq!(table, "t"),
+            Some(ParsedCopy::From { table, format, .. }) => {
+                assert_eq!(table, "t");
+                assert_eq!(format, CopyFormat::Text);
+            }
             other => panic!("expected From, got {other:?}"),
         }
     }
@@ -450,12 +693,72 @@ mod tests {
         }
     }
 
-    /// SP-PG-COPY T1: `WITH (FORMAT csv)` → `RejectReason::CsvFormat`.
+    /// SP-PG-COPY-CSV T1: `WITH (FORMAT csv)` → `ParsedCopy::From {
+    /// format: Csv(default options) }` (no longer rejected — V1 lifts).
     #[test]
-    fn t1_parse_copy_csv_format_rejected() {
+    fn csv_t1_parse_copy_csv_format_accepted_with_defaults() {
         match parse_copy_command("COPY t FROM STDIN WITH (FORMAT csv)") {
-            Some(ParsedCopy::Rejected { reason: RejectReason::CsvFormat }) => {}
-            other => panic!("expected Rejected(CsvFormat), got {other:?}"),
+            Some(ParsedCopy::From { format: CopyFormat::Csv(opts), .. }) => {
+                assert_eq!(opts.delimiter, b',');
+                assert_eq!(opts.quote, b'"');
+                assert_eq!(opts.escape, b'"');
+                assert!(opts.null_marker.is_empty());
+                assert!(!opts.header);
+            }
+            other => panic!("expected From with Csv format, got {other:?}"),
+        }
+    }
+
+    /// SP-PG-COPY-CSV T1: HEADER flag honored.
+    #[test]
+    fn csv_t1_parse_csv_header_flag() {
+        match parse_copy_command("COPY t FROM STDIN WITH (FORMAT csv, HEADER)") {
+            Some(ParsedCopy::From { format: CopyFormat::Csv(opts), .. }) => {
+                assert!(opts.header);
+            }
+            other => panic!("expected From with Csv+HEADER, got {other:?}"),
+        }
+    }
+
+    /// SP-PG-COPY-CSV T1: custom DELIMITER, QUOTE, NULL.
+    #[test]
+    fn csv_t1_parse_csv_custom_options() {
+        match parse_copy_command(
+            "COPY t TO STDOUT WITH (FORMAT csv, DELIMITER ';', QUOTE '\"', NULL 'NULL', HEADER true)",
+        ) {
+            Some(ParsedCopy::To { format: CopyFormat::Csv(opts), .. }) => {
+                assert_eq!(opts.delimiter, b';');
+                assert_eq!(opts.quote, b'"');
+                assert_eq!(opts.null_marker, "NULL");
+                assert!(opts.header);
+            }
+            other => panic!("expected To with Csv+custom, got {other:?}"),
+        }
+    }
+
+    /// SP-PG-COPY-CSV T1: invalid DELIMITER (multi-byte) rejected.
+    #[test]
+    fn csv_t1_parse_invalid_delimiter_rejected() {
+        match parse_copy_command("COPY t FROM STDIN WITH (FORMAT csv, DELIMITER '||')") {
+            Some(ParsedCopy::Rejected {
+                reason: RejectReason::InvalidCsvOptionValue { option, .. },
+            }) => {
+                assert_eq!(option, "DELIMITER");
+            }
+            other => panic!("expected Rejected(InvalidCsvOptionValue), got {other:?}"),
+        }
+    }
+
+    /// SP-PG-COPY-CSV T1: FORCE_QUOTE option rejected (V2).
+    #[test]
+    fn csv_t1_parse_force_quote_rejected_v2() {
+        match parse_copy_command("COPY t TO STDOUT WITH (FORMAT csv, FORCE_QUOTE (id, name))") {
+            Some(ParsedCopy::Rejected {
+                reason: RejectReason::UnsupportedCsvOption { option },
+            }) => {
+                assert_eq!(option, "FORCE_QUOTE");
+            }
+            other => panic!("expected Rejected(UnsupportedCsvOption FORCE_QUOTE), got {other:?}"),
         }
     }
 
@@ -512,15 +815,15 @@ mod tests {
         }
     }
 
-    /// SP-PG-COPY T1: WITH clause with FORMAT alongside other options
-    /// — V1 picks up FORMAT, silently ignores the others.
+    /// SP-PG-COPY-CSV T1: a WITH clause with CSV format + HEADER true
+    /// is fully accepted (was rejected pre-CSV V1).
     #[test]
     fn t1_parse_copy_with_format_among_other_options() {
-        // CSV-shaped WITH clause — V1 should still detect CSV format
-        // and reject it precisely.
         match parse_copy_command("COPY t FROM STDIN WITH (FORMAT csv, HEADER true)") {
-            Some(ParsedCopy::Rejected { reason: RejectReason::CsvFormat }) => {}
-            other => panic!("expected Rejected(CsvFormat), got {other:?}"),
+            Some(ParsedCopy::From { format: CopyFormat::Csv(opts), .. }) => {
+                assert!(opts.header);
+            }
+            other => panic!("expected From with Csv+HEADER, got {other:?}"),
         }
     }
 

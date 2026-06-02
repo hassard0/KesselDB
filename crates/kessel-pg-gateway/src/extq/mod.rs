@@ -1102,53 +1102,77 @@ fn dispatch_execute<E: EngineApply + ?Sized>(
                         );
                     }
                 };
-            let prepared = match substitute::preprocess_params(&param_refs, &formats, &param_oids)
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    let reason = match e {
-                        substitute::SubstituteError::ZeroParamIndex => {
-                            "SQL referenced \\$0; PG \\$N indices are 1-based"
-                                .to_string()
-                        }
-                        substitute::SubstituteError::ParamIndexOutOfBounds {
-                            index,
-                            available,
-                        } => format!(
-                            "SQL referenced \\${index} but only {available} parameters were bound"
-                        ),
-                        substitute::SubstituteError::BinaryDecode { position, reason } => {
-                            format!("binary parameter at position {pos}: {reason}", pos = position + 1)
-                        }
-                    };
-                    return set_err(state, ExtqError::SubstitutionFailed { reason });
-                }
-            };
-            let rewritten = match substitute::substitute_params(&sql, &prepared) {
-                Ok(s) => s,
-                Err(e) => {
-                    let reason = match e {
-                        substitute::SubstituteError::ZeroParamIndex => {
-                            "SQL referenced \\$0; PG \\$N indices are 1-based"
-                                .to_string()
-                        }
-                        substitute::SubstituteError::ParamIndexOutOfBounds {
-                            index,
-                            available,
-                        } => format!(
-                            "SQL referenced \\${index} but only {available} parameters were bound"
-                        ),
-                        substitute::SubstituteError::BinaryDecode { position, reason } => {
-                            format!("binary parameter at position {pos}: {reason}", pos = position + 1)
-                        }
-                    };
-                    return set_err(state, ExtqError::SubstitutionFailed { reason });
-                }
+
+            // SP-PG-EXTQ-PARSED-DEFAULT T2 — TRY THE TYPED PATH FIRST.
+            // `preprocess_typed_params` classifies each bound param as
+            // either typed-eligible (INT2/4/8, BOOL, TEXT/VARCHAR,
+            // BYTEA — text + binary format) or falls-back-to-text
+            // (FLOAT4/8, TIMESTAMPTZ, NUMERIC). When EVERY param is
+            // typed-eligible, the dispatcher routes through
+            // `dispatch_query_with_params` which calls
+            // `engine.apply_sql_with_params(sql, typed_params)` — the
+            // bound values reach the engine as typed `Value`s; NO SQL
+            // text concatenation. Closes the V1 weak-spot #1 attack
+            // surface at the dispatch layer. When ANY param can't be
+            // typed cleanly, falls back to V1 text-substitution path
+            // (byte-untouched).
+            let typed_params =
+                substitute::preprocess_typed_params(&param_refs, &formats, &param_oids);
+
+            let dispatched: Vec<u8> = if let Some(typed) = typed_params {
+                // TYPED PATH — security headline.
+                crate::dispatch::dispatch_query_with_params(&sql, &typed, engine)
+            } else {
+                // FALLBACK PATH — V1 text-substitution. Byte-untouched
+                // from the V1 dispatcher behavior.
+                let prepared = match substitute::preprocess_params(&param_refs, &formats, &param_oids)
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let reason = match e {
+                            substitute::SubstituteError::ZeroParamIndex => {
+                                "SQL referenced \\$0; PG \\$N indices are 1-based"
+                                    .to_string()
+                            }
+                            substitute::SubstituteError::ParamIndexOutOfBounds {
+                                index,
+                                available,
+                            } => format!(
+                                "SQL referenced \\${index} but only {available} parameters were bound"
+                            ),
+                            substitute::SubstituteError::BinaryDecode { position, reason } => {
+                                format!("binary parameter at position {pos}: {reason}", pos = position + 1)
+                            }
+                        };
+                        return set_err(state, ExtqError::SubstitutionFailed { reason });
+                    }
+                };
+                let rewritten = match substitute::substitute_params(&sql, &prepared) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let reason = match e {
+                            substitute::SubstituteError::ZeroParamIndex => {
+                                "SQL referenced \\$0; PG \\$N indices are 1-based"
+                                    .to_string()
+                            }
+                            substitute::SubstituteError::ParamIndexOutOfBounds {
+                                index,
+                                available,
+                            } => format!(
+                                "SQL referenced \\${index} but only {available} parameters were bound"
+                            ),
+                            substitute::SubstituteError::BinaryDecode { position, reason } => {
+                                format!("binary parameter at position {pos}: {reason}", pos = position + 1)
+                            }
+                        };
+                        return set_err(state, ExtqError::SubstitutionFailed { reason });
+                    }
+                };
+                crate::dispatch::dispatch_query(&rewritten, engine)
             };
 
-            // 5a. First-time Execute — run through the existing
-            //     Simple Query pipeline + split the result.
-            let dispatched = crate::dispatch::dispatch_query(&rewritten, engine);
+            // 5a. First-time Execute — split the result of the dispatcher
+            //     into prelude / data_rows / command_complete.
             let split = split_dispatch_query_bytes(&dispatched);
             prelude = split.prelude;
             buffered_rows = split.data_rows;
@@ -5104,5 +5128,248 @@ mod tests {
             }
             other => panic!("expected Bytes, got {other:?}"),
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // SP-PG-EXTQ-PARSED-DEFAULT T2 KATs — dispatch-layer flip from the
+    // V1 text-substitution default to the typed-param default.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// A `EngineApply` that records every `apply_sql` AND
+    /// `apply_sql_with_params` call so a KAT can verify the dispatcher
+    /// routed through the typed-param path (NOT the text path). Default
+    /// trait impl of `apply_sql_with_params` would forward to
+    /// `apply_sql` after rendering — this engine overrides to keep the
+    /// path distinction observable.
+    struct ParamTrackingEngine {
+        text_calls: std::sync::Mutex<Vec<String>>,
+        typed_calls: std::sync::Mutex<Vec<(String, Vec<Option<kessel_codec::Value>>)>>,
+    }
+    impl ParamTrackingEngine {
+        fn new() -> Self {
+            Self {
+                text_calls: std::sync::Mutex::new(Vec::new()),
+                typed_calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn text_count(&self) -> usize {
+            self.text_calls.lock().unwrap().len()
+        }
+        fn typed_count(&self) -> usize {
+            self.typed_calls.lock().unwrap().len()
+        }
+        fn last_typed(&self) -> Option<(String, Vec<Option<kessel_codec::Value>>)> {
+            self.typed_calls.lock().unwrap().last().cloned()
+        }
+    }
+    impl EngineApply for ParamTrackingEngine {
+        fn apply_sql(&self, sql: &str) -> OpResult {
+            self.text_calls.lock().unwrap().push(sql.to_string());
+            // Pretend every apply is a write that succeeded.
+            OpResult::Ok
+        }
+        fn apply_sql_with_params(
+            &self,
+            sql: &str,
+            params: &[Option<kessel_codec::Value>],
+        ) -> OpResult {
+            self.typed_calls
+                .lock()
+                .unwrap()
+                .push((sql.to_string(), params.to_vec()));
+            OpResult::Ok
+        }
+        fn describe_table(
+            &self,
+            _name: &str,
+        ) -> Option<Vec<crate::engine::PgColumn>> {
+            None
+        }
+    }
+
+    /// SP-PG-EXTQ-PARSED-DEFAULT T2 — HEADLINE: the dispatcher routes
+    /// through `apply_sql_with_params` whenever every bound param is
+    /// typed-eligible. The text path is NEVER called.
+    #[test]
+    fn parsed_default_t2_dispatch_routes_through_typed_path_for_int_params() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(
+            &mut state,
+            "ps",
+            "INSERT INTO t (id) VALUES ($1)",
+            vec![crate::proto::PG_TYPE_INT8],
+        );
+        let bind = proto::ExtqMessage::Bind {
+            portal: "p".to_string(),
+            stmt: "ps".to_string(),
+            param_formats: vec![],
+            param_values: vec![Some(b"42".to_vec())],
+            result_formats: vec![],
+        };
+        let engine = ParamTrackingEngine::new();
+        try_dispatch_extq(&mut state, &engine, bind);
+        let exec = proto::ExtqMessage::Execute {
+            portal: "p".to_string(),
+            max_rows: 0,
+        };
+        try_dispatch_extq(&mut state, &engine, exec);
+        // HEADLINE — typed path was called; text path was NOT.
+        assert_eq!(engine.typed_count(), 1, "typed path must be called");
+        assert_eq!(engine.text_count(), 0, "text path must NOT be called");
+        // The typed call carries the SQL UNMUTATED + the typed Int value.
+        let (sql, params) = engine.last_typed().unwrap();
+        assert_eq!(sql, "INSERT INTO t (id) VALUES ($1)");
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0], Some(kessel_codec::Value::Int(42)));
+    }
+
+    /// SP-PG-EXTQ-PARSED-DEFAULT T2 — psycopg2 / asyncpg / JDBC text-
+    /// format string binds route through the typed path as
+    /// `Value::Blob` operands. The TEXT OID hint is enough to
+    /// classify; the bytes stay typed.
+    #[test]
+    fn parsed_default_t2_dispatch_routes_through_typed_path_for_text_params() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(
+            &mut state,
+            "ps",
+            "INSERT INTO t (id, name) VALUES ($1, $2)",
+            vec![crate::proto::PG_TYPE_INT8, crate::proto::PG_TYPE_TEXT],
+        );
+        let bind = proto::ExtqMessage::Bind {
+            portal: "p".to_string(),
+            stmt: "ps".to_string(),
+            param_formats: vec![],
+            param_values: vec![
+                Some(b"7".to_vec()),
+                Some(b"O'Brien".to_vec()),
+            ],
+            result_formats: vec![],
+        };
+        let engine = ParamTrackingEngine::new();
+        try_dispatch_extq(&mut state, &engine, bind);
+        let exec = proto::ExtqMessage::Execute {
+            portal: "p".to_string(),
+            max_rows: 0,
+        };
+        try_dispatch_extq(&mut state, &engine, exec);
+        assert_eq!(engine.typed_count(), 1);
+        assert_eq!(engine.text_count(), 0);
+        let (_, params) = engine.last_typed().unwrap();
+        // O'Brien bytes survive verbatim as a Blob — no `'`→`''` doubling.
+        assert_eq!(
+            params[1],
+            Some(kessel_codec::Value::Blob(b"O'Brien".to_vec()))
+        );
+    }
+
+    /// SP-PG-EXTQ-PARSED-DEFAULT T2 — HEADLINE SECURITY: a quote-
+    /// injection payload at the dispatch layer. The bytes reach the
+    /// engine as a typed `Value::Blob`; the SQL text is NEVER
+    /// concatenated with the payload. The DROP TABLE NEVER reaches
+    /// the parser.
+    #[test]
+    fn parsed_default_t2_dispatch_quote_injection_payload_stays_typed() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(
+            &mut state,
+            "ps",
+            "INSERT INTO inj (id, name) VALUES ($1, $2)",
+            vec![crate::proto::PG_TYPE_INT8, crate::proto::PG_TYPE_TEXT],
+        );
+        let payload = b"\"; DROP TABLE inj; --".to_vec();
+        let bind = proto::ExtqMessage::Bind {
+            portal: "p".to_string(),
+            stmt: "ps".to_string(),
+            param_formats: vec![],
+            param_values: vec![
+                Some(b"1".to_vec()),
+                Some(payload.clone()),
+            ],
+            result_formats: vec![],
+        };
+        let engine = ParamTrackingEngine::new();
+        try_dispatch_extq(&mut state, &engine, bind);
+        let exec = proto::ExtqMessage::Execute {
+            portal: "p".to_string(),
+            max_rows: 0,
+        };
+        try_dispatch_extq(&mut state, &engine, exec);
+        // Typed path took the call; text path did NOT.
+        assert_eq!(engine.typed_count(), 1);
+        assert_eq!(engine.text_count(), 0);
+        let (sql, params) = engine.last_typed().unwrap();
+        // SQL is the ORIGINAL — `$2` placeholder intact, no injection
+        // in the SQL text.
+        assert_eq!(sql, "INSERT INTO inj (id, name) VALUES ($1, $2)");
+        assert!(!sql.contains("DROP"));
+        // The payload is carried as a typed Blob operand.
+        assert_eq!(
+            params[1],
+            Some(kessel_codec::Value::Blob(payload))
+        );
+    }
+
+    /// SP-PG-EXTQ-PARSED-DEFAULT T2 — fallback path: when ANY bound
+    /// param can't be typed cleanly (FLOAT / TIMESTAMPTZ / NUMERIC),
+    /// the dispatcher falls back to V1 text-substitution. The text
+    /// path is exercised; typed path is NOT.
+    #[test]
+    fn parsed_default_t2_dispatch_falls_back_to_text_for_float() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(
+            &mut state,
+            "ps",
+            "INSERT INTO t (id, score) VALUES ($1, $2)",
+            vec![crate::proto::PG_TYPE_INT8, crate::proto::PG_TYPE_FLOAT8],
+        );
+        let bind = proto::ExtqMessage::Bind {
+            portal: "p".to_string(),
+            stmt: "ps".to_string(),
+            param_formats: vec![],
+            param_values: vec![
+                Some(b"1".to_vec()),
+                Some(b"3.14".to_vec()),
+            ],
+            result_formats: vec![],
+        };
+        let engine = ParamTrackingEngine::new();
+        try_dispatch_extq(&mut state, &engine, bind);
+        let exec = proto::ExtqMessage::Execute {
+            portal: "p".to_string(),
+            max_rows: 0,
+        };
+        try_dispatch_extq(&mut state, &engine, exec);
+        // FLOAT8 routes through the text fallback.
+        assert_eq!(engine.text_count(), 1);
+        assert_eq!(engine.typed_count(), 0);
+    }
+
+    /// SP-PG-EXTQ-PARSED-DEFAULT T2 — empty-params SQL routes through
+    /// the typed path with an empty params slice (the default impl
+    /// would short-circuit to `apply_sql` — but the gateway always
+    /// calls `apply_sql_with_params`, so the override is exercised
+    /// even with empty params).
+    #[test]
+    fn parsed_default_t2_dispatch_empty_params_still_uses_typed_path() {
+        let mut state = SessionState::new();
+        seed_stmt_with_sql(&mut state, "ps", "INSERT INTO t (id) VALUES (1)", vec![]);
+        let bind = proto::ExtqMessage::Bind {
+            portal: "p".to_string(),
+            stmt: "ps".to_string(),
+            param_formats: vec![],
+            param_values: vec![],
+            result_formats: vec![],
+        };
+        let engine = ParamTrackingEngine::new();
+        try_dispatch_extq(&mut state, &engine, bind);
+        let exec = proto::ExtqMessage::Execute {
+            portal: "p".to_string(),
+            max_rows: 0,
+        };
+        try_dispatch_extq(&mut state, &engine, exec);
+        // Empty params still uses the typed path (with empty slice).
+        assert_eq!(engine.typed_count(), 1);
+        assert_eq!(engine.text_count(), 0);
     }
 }

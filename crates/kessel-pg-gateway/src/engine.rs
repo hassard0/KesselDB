@@ -251,6 +251,40 @@ pub trait EngineApply: Send + Sync + 'static {
     /// routing.
     fn apply_sql(&self, sql: &str) -> OpResult;
 
+    /// SP-PG-EXTQ-PARSED-DEFAULT T1 — apply SQL with typed bound
+    /// parameters. The bound `params` slice corresponds to the SQL's
+    /// `$1..$N` placeholders (position-indexed); each value enters as
+    /// a typed `kessel_codec::Value` and emerges in the program as
+    /// the same typed `Value` — NO SQL text concatenation, NO `'`->`''`
+    /// escape rules, NO quoting. The engine impl is required to route
+    /// through `kessel_sql::compile_stmt_with_params` (NOT
+    /// `compile_stmt` + text rewrite).
+    ///
+    /// **Default impl** falls back to `apply_sql` after rendering the
+    /// `params` inline via a simple, conservative text substitution.
+    /// This is the V1 text-substitute path's shape (single-quote
+    /// doubling for Blobs, bare literal for Ints, `NULL` for Nones).
+    /// The default keeps the trait backward-compatible — every
+    /// existing `EngineApply` impl works unchanged at the cost of NOT
+    /// closing the SP-PG-EXTQ V1 weak-spot #1 attack surface. The
+    /// gateway's `dispatch_execute` flips through this method; the
+    /// real impl on `EngineHandle` overrides with the typed-path
+    /// security closure.
+    ///
+    /// **Empty `params`** → identical to `apply_sql(sql)` — the
+    /// helper short-circuits.
+    fn apply_sql_with_params(
+        &self,
+        sql: &str,
+        params: &[Option<kessel_codec::Value>],
+    ) -> OpResult {
+        if params.is_empty() {
+            return self.apply_sql(sql);
+        }
+        let rendered = render_params_into_sql(sql, params);
+        self.apply_sql(&rendered)
+    }
+
     /// Look up a table's columns by name. Returns `None` if no table
     /// with that name exists. Used by the gateway to emit
     /// `RowDescription` BEFORE a SELECT runs.
@@ -364,6 +398,147 @@ pub trait EngineApply: Send + Sync + 'static {
     /// this method MUST NOT mutate engine state.
     fn list_constraints_for_table(&self, _table_name: &str) -> Vec<ConstraintMetadata> {
         Vec::new()
+    }
+}
+
+/// SP-PG-EXTQ-PARSED-DEFAULT T1 — render typed `params` into a SQL
+/// string by walking the `$N` placeholders. Used by the default impl
+/// of `EngineApply::apply_sql_with_params` for engines that don't
+/// override (back-compat path). Engines that DO override (notably
+/// `kesseldb-server::EngineHandle` via the `pg-gateway` feature)
+/// bypass this entirely and route through `compile_stmt_with_params`
+/// on the engine thread — which is where the real security closure
+/// happens.
+///
+/// Rendering rules (mirror V1 `substitute_text_format_params` for the
+/// typed-param subset):
+/// - `None`             → `NULL`.
+/// - `Some(Null)`       → `NULL`.
+/// - `Some(Int(i))`     → bare decimal literal.
+/// - `Some(Uint(u))`    → bare decimal literal.
+/// - `Some(Blob(b))`    → single-quoted `'`-escaped string. UTF-8-
+///   lossy cast so non-UTF8 bytes still render (V1 KATs lock the
+///   `O'Brien` adversarial cases — the `'` doubling is the same rule
+///   the text path uses).
+///
+/// Walks the SQL byte-by-byte respecting quoted regions (single
+/// quotes, double quotes, line comments, block comments) so `$N`
+/// tokens INSIDE quoted regions are left literal.
+///
+/// **Security caveat** (acknowledged): this default-impl rendering
+/// path is the V1 attack surface. Engines that care about the
+/// SP-PG-EXTQ V1 weak-spot #1 closure MUST override
+/// `apply_sql_with_params`. The gateway's `dispatch_execute` flips
+/// to the typed path whenever `preprocess_typed_params` returns
+/// `Some` AND the engine impl overrides — which the in-tree
+/// `EngineHandle` does.
+pub fn render_params_into_sql(
+    sql: &str,
+    params: &[Option<kessel_codec::Value>],
+) -> String {
+    let mut out = String::with_capacity(sql.len() + params.len() * 8);
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        // Single-quoted string region.
+        if c == b'\'' {
+            out.push(c as char);
+            i += 1;
+            while i < bytes.len() {
+                let b = bytes[i];
+                out.push(b as char);
+                i += 1;
+                if b == b'\'' {
+                    if i < bytes.len() && bytes[i] == b'\'' {
+                        out.push('\'');
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+            }
+            continue;
+        }
+        // Double-quoted identifier region.
+        if c == b'"' {
+            out.push(c as char);
+            i += 1;
+            while i < bytes.len() {
+                let b = bytes[i];
+                out.push(b as char);
+                i += 1;
+                if b == b'"' {
+                    break;
+                }
+            }
+            continue;
+        }
+        // Line comment `-- ...` to EOL.
+        if c == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+            continue;
+        }
+        // Block comment `/* ... */`.
+        if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            out.push_str("/*");
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+            if i + 1 < bytes.len() {
+                out.push_str("*/");
+                i += 2;
+            }
+            continue;
+        }
+        // `$N` placeholder.
+        if c == b'$' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+            let start = i + 1;
+            let mut end = start;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            let digits = std::str::from_utf8(&bytes[start..end]).unwrap_or("0");
+            let n: usize = digits.parse().unwrap_or(0);
+            if n >= 1 && n <= params.len() {
+                let v = &params[n - 1];
+                out.push_str(&render_typed_value(v.as_ref()));
+                i = end;
+                continue;
+            }
+        }
+        out.push(c as char);
+        i += 1;
+    }
+    out
+}
+
+/// SP-PG-EXTQ-PARSED-DEFAULT T1 — render a single typed `Value` as a
+/// SQL literal. See `render_params_into_sql` for the rule table.
+fn render_typed_value(v: Option<&kessel_codec::Value>) -> String {
+    match v {
+        None | Some(kessel_codec::Value::Null) => "NULL".to_string(),
+        Some(kessel_codec::Value::Int(i)) => i.to_string(),
+        Some(kessel_codec::Value::Uint(u)) => u.to_string(),
+        Some(kessel_codec::Value::Blob(b)) => {
+            let s = String::from_utf8_lossy(b);
+            let mut out = String::with_capacity(s.len() + 2);
+            out.push('\'');
+            for c in s.chars() {
+                if c == '\'' {
+                    out.push_str("''");
+                } else {
+                    out.push(c);
+                }
+            }
+            out.push('\'');
+            out
+        }
     }
 }
 
@@ -694,5 +869,37 @@ mod tests {
         assert_eq!(tables[1].name, "orders");
         assert_eq!(tables[0].kind, TableKind::Ordinary);
         assert_eq!(tables[1].field_count, 5);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // SP-PG-EXTQ-PARSED-DEFAULT T1 — render_params_into_sql KAT
+    // ──────────────────────────────────────────────────────────────────
+
+    /// SP-PG-EXTQ-PARSED-DEFAULT T1 — basic rule table for the
+    /// fallback-impl renderer. Int → bare literal; Blob → `'`-escaped;
+    /// None/Null → bare `NULL`.
+    #[test]
+    fn parsed_default_t1_render_basic_rules() {
+        let sql = "INSERT INTO t (i, s, n) VALUES ($1, $2, $3)";
+        let params = vec![
+            Some(kessel_codec::Value::Int(42)),
+            Some(kessel_codec::Value::Blob(b"O'Brien".to_vec())),
+            None,
+        ];
+        let r = render_params_into_sql(sql, &params);
+        assert_eq!(
+            r,
+            "INSERT INTO t (i, s, n) VALUES (42, 'O''Brien', NULL)"
+        );
+    }
+
+    /// SP-PG-EXTQ-PARSED-DEFAULT T1 — `$N` inside quoted regions is
+    /// left literal (matches V1 text-substitute walker behavior).
+    #[test]
+    fn parsed_default_t1_render_skips_inside_quotes() {
+        let sql = "SELECT '$1', $1 FROM t";
+        let params = vec![Some(kessel_codec::Value::Int(7))];
+        let r = render_params_into_sql(sql, &params);
+        assert_eq!(r, "SELECT '$1', 7 FROM t");
     }
 }

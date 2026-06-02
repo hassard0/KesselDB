@@ -61,6 +61,155 @@ use kessel_catalog::FieldKind;
 use kessel_codec::{value_from_raw, Value};
 use kessel_proto::OpResult;
 
+/// SP-PG-EXTQ-PARSED-DEFAULT T2 — like `dispatch_query`, but routes
+/// the engine call through `EngineApply::apply_sql_with_params`
+/// instead of `apply_sql`. The bound `params` slice corresponds to
+/// the SQL's `$1..$N` placeholders; each value enters as a typed
+/// `kessel_codec::Value` and emerges in the program as the same
+/// typed `Value` — NO SQL text concatenation, NO `'`->`''` escape
+/// rules, NO quoting. The byte-sequence shape (RowDescription /
+/// DataRow* / CommandComplete / RFQ) is IDENTICAL to `dispatch_query`
+/// — the only difference is the engine dispatch boundary.
+///
+/// Used by `extq::dispatch_execute` when
+/// `preprocess_typed_params` classified every bound parameter as
+/// typed-path-eligible. The text-substitution path remains as the
+/// fallback (`dispatch_query` against an SQL-rewritten string) for
+/// FLOAT4/FLOAT8/TIMESTAMPTZ/NUMERIC parameters the typed path
+/// cannot represent cleanly.
+pub fn dispatch_query_with_params<E: EngineApply + ?Sized>(
+    sql: &str,
+    params: &[Option<Value>],
+    engine: &E,
+) -> Vec<u8> {
+    let stripped = crate::cast_stripper::strip_pg_casts(sql);
+    let sql = stripped.as_str();
+    let mut out = Vec::new();
+    if is_effectively_empty(sql) {
+        out.extend_from_slice(&encode_empty_query_response());
+        out.extend_from_slice(&encode_ready_for_query(b'I'));
+        return out;
+    }
+    if contains_multiple_statements(sql) {
+        out.extend_from_slice(&encode_error_response(
+            SEVERITY_ERROR,
+            "42601",
+            "multi-statement Q not supported in V1",
+        ));
+        out.extend_from_slice(&encode_ready_for_query(b'I'));
+        return out;
+    }
+    // pg_catalog interceptor doesn't take params; route through hook.
+    if let Some(bytes) = crate::pg_catalog::catalog_query_hook(sql, engine) {
+        return bytes;
+    }
+    let sql_trimmed = sql.trim().trim_end_matches(';').trim();
+    let select_table = kessel_sql::select_star_table(sql_trimmed);
+    // SP-PG-EXTQ-PARSED-DEFAULT T2 — engine call via the typed-param
+    // path. NO SQL text rewrite; the bound values reach the engine
+    // as typed `Value`s. Closes the V1 weak-spot #1 attack surface
+    // at the dispatch layer.
+    let result = engine.apply_sql_with_params(sql_trimmed, params);
+    let affected_rows: u64 = match &result {
+        OpResult::Ok | OpResult::TxCommitted { .. } => 1,
+        _ => 0,
+    };
+    match result {
+        OpResult::Got(row_bytes) => {
+            let table_name = match select_table {
+                Some(n) => n,
+                None => {
+                    return error_response_then_rfq(
+                        SEVERITY_ERROR,
+                        "0A000",
+                        "V1 PG-wire only renders `SELECT * FROM <table>`",
+                    );
+                }
+            };
+            let cols = match engine.describe_table(&table_name) {
+                Some(c) => c,
+                None => {
+                    return error_response_then_rfq(
+                        SEVERITY_ERROR,
+                        "42P01",
+                        &format!("unknown table \"{table_name}\""),
+                    );
+                }
+            };
+            let fields: Vec<FieldMeta> = cols
+                .iter()
+                .map(|c| FieldMeta {
+                    name: c.name.clone(),
+                    type_oid: field_kind_to_oid(c.kind),
+                })
+                .collect();
+            out.extend_from_slice(&encode_row_description(&fields));
+            let row_count = match emit_data_rows(&row_bytes, &cols, &mut out) {
+                Ok(n) => n,
+                Err(msg) => {
+                    out.extend_from_slice(&encode_error_response(
+                        SEVERITY_ERROR,
+                        "XX000",
+                        &format!("row decode failed: {msg}"),
+                    ));
+                    out.extend_from_slice(&encode_ready_for_query(b'I'));
+                    return out;
+                }
+            };
+            out.extend_from_slice(&encode_command_complete(&select_tag(row_count)));
+            out.extend_from_slice(&encode_ready_for_query(b'I'));
+            out
+        }
+        OpResult::Ok | OpResult::TypeCreated(_) | OpResult::TxCommitted { .. } => {
+            let count = if leading_keyword_is(sql_trimmed, "INSERT") {
+                let from_engine = affected_rows;
+                let from_sql = count_insert_values(sql_trimmed);
+                from_engine.max(from_sql)
+            } else {
+                affected_rows
+            };
+            let tag = cmd_complete_tag_for_sql(sql_trimmed, count);
+            out.extend_from_slice(&encode_command_complete(&tag));
+            out.extend_from_slice(&encode_ready_for_query(b'I'));
+            out
+        }
+        OpResult::NotFound => {
+            if leading_keyword_is(sql_trimmed, "SELECT") {
+                if let Some(table_name) = select_table {
+                    if let Some(cols) = engine.describe_table(&table_name) {
+                        let fields: Vec<FieldMeta> = cols
+                            .iter()
+                            .map(|c| FieldMeta {
+                                name: c.name.clone(),
+                                type_oid: field_kind_to_oid(c.kind),
+                            })
+                            .collect();
+                        out.extend_from_slice(&encode_row_description(&fields));
+                    }
+                }
+                out.extend_from_slice(&encode_command_complete(&select_tag(0)));
+                out.extend_from_slice(&encode_ready_for_query(b'I'));
+                out
+            } else {
+                error_response_then_rfq(
+                    SEVERITY_ERROR,
+                    "42P01",
+                    "not found",
+                )
+            }
+        }
+        other => {
+            if let Some((sev, state, msg)) = op_result_to_sqlstate(&other) {
+                out.extend_from_slice(&encode_error_response(sev, state, &msg));
+            } else {
+                out.extend_from_slice(&encode_command_complete(&select_tag(0)));
+            }
+            out.extend_from_slice(&encode_ready_for_query(b'I'));
+            out
+        }
+    }
+}
+
 /// Run a single Simple Query end-to-end. Returns the full byte
 /// sequence to emit to the wire (one or more PG backend messages
 /// concatenated, ending with `ReadyForQuery('I')`).

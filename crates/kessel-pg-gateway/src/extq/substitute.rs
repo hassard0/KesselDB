@@ -818,7 +818,13 @@ fn preprocess_binary_value(bytes: &[u8], type_oid: u32) -> Option<kessel_codec::
                 _ => None,
             }
         }
-        PG_TYPE_BYTEA => Some(Value::Blob(bytes.to_vec())),
+        // SP-PG-EXTQ-PARSED-DEFAULT T2 — BYTEA BINARY route needs the
+        // `'\xHEX'::bytea` cast wrapper that only the text-substitution
+        // path emits (kessel-sql's `rewrite_param_tokens` does a
+        // utf8-lossy cast of the bytes into `Tok::Str` which is wrong
+        // for non-UTF8 byte sequences). Fall back so the V1 cast-
+        // wrapper path renders the literal correctly.
+        PG_TYPE_BYTEA => None,
         PG_TYPE_TEXT | PG_TYPE_VARCHAR => {
             // Validate UTF-8 to match the text-substitution path's
             // error shape — if invalid, fall back so the existing

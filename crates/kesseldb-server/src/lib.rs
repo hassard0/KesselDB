@@ -98,6 +98,114 @@ pub const LIST_INDEXES_TAG: u8 = 0xF5;
 /// read-only.
 pub const LIST_CONSTRAINTS_TAG: u8 = 0xF4;
 
+/// SP-PG-EXTQ-PARSED-DEFAULT T1 admin: SQL with typed bound
+/// parameters. Frame = `[0xF3][u32 LE sql_len][sql bytes][u32 LE
+/// param_count][param_count × ParamSlot]` where `ParamSlot` is a
+/// tagged union: `0x00` = None (SQL NULL), `0x01 [i128 LE]` =
+/// Value::Int, `0x02 [u128 LE]` = Value::Uint, `0x03 [u32 LE
+/// blob_len][bytes]` = Value::Blob, `0x04` = Value::Null. Bound
+/// values reach the engine as typed `kessel_codec::Value`s; NO SQL
+/// text concatenation. Engine apply path runs
+/// `kessel_sql::compile_stmt_with_params` against the live catalog.
+pub const PARAMETERIZED_SQL_TAG: u8 = 0xF3;
+
+/// SP-PG-EXTQ-PARSED-DEFAULT T1 — encode `(sql, params)` into a
+/// `PARAMETERIZED_SQL_TAG` admin frame.
+pub fn encode_parameterized_sql(
+    sql: &str,
+    params: &[Option<kessel_codec::Value>],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 4 + sql.len() + 4 + params.len() * 17);
+    out.push(PARAMETERIZED_SQL_TAG);
+    out.extend_from_slice(&(sql.len() as u32).to_le_bytes());
+    out.extend_from_slice(sql.as_bytes());
+    out.extend_from_slice(&(params.len() as u32).to_le_bytes());
+    for p in params {
+        match p {
+            None => out.push(0x00),
+            Some(kessel_codec::Value::Int(i)) => {
+                out.push(0x01);
+                out.extend_from_slice(&i.to_le_bytes());
+            }
+            Some(kessel_codec::Value::Uint(u)) => {
+                out.push(0x02);
+                out.extend_from_slice(&u.to_le_bytes());
+            }
+            Some(kessel_codec::Value::Blob(b)) => {
+                out.push(0x03);
+                out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                out.extend_from_slice(b);
+            }
+            Some(kessel_codec::Value::Null) => out.push(0x04),
+        }
+    }
+    out
+}
+
+/// SP-PG-EXTQ-PARSED-DEFAULT T1 — decode a `PARAMETERIZED_SQL_TAG`
+/// admin frame body (the bytes AFTER the leading `0xF3` tag) into
+/// `(sql, params)`. Returns `None` on any structural error.
+pub fn decode_parameterized_sql(
+    body: &[u8],
+) -> Option<(String, Vec<Option<kessel_codec::Value>>)> {
+    let mut p = 0usize;
+    if body.len() < 4 {
+        return None;
+    }
+    let sql_len = u32::from_le_bytes(body[p..p + 4].try_into().ok()?) as usize;
+    p += 4;
+    if body.len() < p + sql_len + 4 {
+        return None;
+    }
+    let sql = std::str::from_utf8(&body[p..p + sql_len]).ok()?.to_string();
+    p += sql_len;
+    let param_count = u32::from_le_bytes(body[p..p + 4].try_into().ok()?) as usize;
+    p += 4;
+    let mut params: Vec<Option<kessel_codec::Value>> = Vec::with_capacity(param_count);
+    for _ in 0..param_count {
+        if p >= body.len() {
+            return None;
+        }
+        let kind = body[p];
+        p += 1;
+        match kind {
+            0x00 => params.push(None),
+            0x01 => {
+                if body.len() < p + 16 {
+                    return None;
+                }
+                let i = i128::from_le_bytes(body[p..p + 16].try_into().ok()?);
+                p += 16;
+                params.push(Some(kessel_codec::Value::Int(i)));
+            }
+            0x02 => {
+                if body.len() < p + 16 {
+                    return None;
+                }
+                let u = u128::from_le_bytes(body[p..p + 16].try_into().ok()?);
+                p += 16;
+                params.push(Some(kessel_codec::Value::Uint(u)));
+            }
+            0x03 => {
+                if body.len() < p + 4 {
+                    return None;
+                }
+                let bl = u32::from_le_bytes(body[p..p + 4].try_into().ok()?) as usize;
+                p += 4;
+                if body.len() < p + bl {
+                    return None;
+                }
+                let bytes = body[p..p + bl].to_vec();
+                p += bl;
+                params.push(Some(kessel_codec::Value::Blob(bytes)));
+            }
+            0x04 => params.push(Some(kessel_codec::Value::Null)),
+            _ => return None,
+        }
+    }
+    Some((sql, params))
+}
+
 /// Operational status of a running node.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServerStats {
@@ -446,7 +554,73 @@ fn apply_one_inner(
     n: &mut u64,
     frame: &[u8],
 ) -> OpResult {
-    let op = if frame.first() == Some(&0xFE) {
+    // SP-PG-EXTQ-PARSED-DEFAULT T1 — parameterized SQL admin frame.
+    // Decode `(sql, params)` and run `compile_stmt_with_params` against
+    // the live catalog. The bound values enter as typed
+    // `kessel_codec::Value`s — NO SQL text concatenation, NO `'`->`''`
+    // escape rules, NO quoting. Closes the SP-PG-EXTQ V1 weak-spot
+    // #1 attack surface at the dispatch layer.
+    let op = if frame.first() == Some(&PARAMETERIZED_SQL_TAG) {
+        let (sql, params) = match decode_parameterized_sql(&frame[1..]) {
+            Some(t) => t,
+            None => {
+                return OpResult::SchemaError(
+                    "parameterized sql: malformed frame".into(),
+                );
+            }
+        };
+        match kessel_sql::compile_stmt_with_params(&sql, sm.catalog(), &params) {
+            Ok(kessel_sql::Stmt::Op(o)) => Some(o),
+            Ok(kessel_sql::Stmt::Update { type_id, id, sets }) => {
+                let oid = kessel_proto::ObjectId::from_u128(id);
+                let cur = sm.apply(*n, Op::GetById { type_id, id: oid });
+                *n += 1;
+                let rec = match cur {
+                    OpResult::Got(r) => r,
+                    other => return other,
+                };
+                let ot = match sm.catalog().get(type_id) {
+                    Some(t) => t.clone(),
+                    None => {
+                        return OpResult::SchemaError(
+                            "parameterized update: no type".into(),
+                        );
+                    }
+                };
+                let mut vals = match kessel_codec::decode(&ot, &rec) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return OpResult::SchemaError(format!(
+                            "parameterized update decode: {e:?}"
+                        ));
+                    }
+                };
+                for (fid, v) in sets {
+                    if let Some(i) =
+                        ot.fields.iter().position(|f| f.field_id == fid)
+                    {
+                        vals[i] = v;
+                    }
+                }
+                match kessel_codec::encode(&ot, &vals) {
+                    Ok(record) => Some(Op::Update { type_id, id: oid, record }),
+                    Err(e) => {
+                        return OpResult::SchemaError(format!(
+                            "parameterized update encode: {e:?}"
+                        ));
+                    }
+                }
+            }
+            Ok(kessel_sql::Stmt::Explain(plan)) => {
+                return OpResult::Got(plan.into_bytes().into());
+            }
+            Err(e) => {
+                return OpResult::SchemaError(format!(
+                    "parameterized sql: {e}"
+                ));
+            }
+        }
+    } else if frame.first() == Some(&0xFE) {
         let sql = match std::str::from_utf8(&frame[1..]) {
             Ok(s) => s,
             Err(_) => {
@@ -2281,6 +2455,25 @@ impl kessel_pg_gateway::EngineApply for EngineHandle {
         let mut f = vec![0xFE];
         f.extend_from_slice(sql.as_bytes());
         self.apply_raw(f)
+    }
+    /// SP-PG-EXTQ-PARSED-DEFAULT T1 — override the default
+    /// text-substitution fallback with the real typed-param path: send
+    /// a `PARAMETERIZED_SQL_TAG` admin frame whose decode on the
+    /// engine thread runs `compile_stmt_with_params` against the
+    /// live catalog. Closes the SP-PG-EXTQ V1 weak-spot #1 attack
+    /// surface at the dispatch layer for every bound value that the
+    /// gateway's `preprocess_typed_params` classifier returns `Some`
+    /// for.
+    fn apply_sql_with_params(
+        &self,
+        sql: &str,
+        params: &[Option<kessel_codec::Value>],
+    ) -> kessel_proto::OpResult {
+        if params.is_empty() {
+            return self.apply_sql(sql);
+        }
+        let frame = encode_parameterized_sql(sql, params);
+        self.apply_raw(frame)
     }
     fn describe_table(
         &self,
@@ -4352,5 +4545,115 @@ mod tests {
             Op::AdvanceWatermark { low_water_mark: 10 },
             "IT-3: submitted op must be AdvanceWatermark{{ low_water_mark: 10 }}"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // SP-PG-EXTQ-PARSED-DEFAULT T1 KATs — wire encoder/decoder
+    // round-trip for the new `PARAMETERIZED_SQL_TAG = 0xF3` admin
+    // frame. The frame carries `(sql, params: &[Option<Value>])`
+    // through to the engine thread where decode + run
+    // `compile_stmt_with_params` against the live catalog. KATs
+    // here are pure unit tests on the encoder/decoder pair — engine
+    // dispatch integration is tested via the kessel-pg-gateway
+    // gateway KATs + the vulcan ORM smoke (T3).
+    // ──────────────────────────────────────────────────────────────────
+
+    /// SP-PG-EXTQ-PARSED-DEFAULT T1 — empty params encode + decode
+    /// round-trip. The frame contains just the SQL string + a zero
+    /// param count.
+    #[test]
+    fn parsed_default_t1_wire_encode_decode_empty_params() {
+        let sql = "SELECT 1";
+        let params: Vec<Option<kessel_codec::Value>> = vec![];
+        let frame = encode_parameterized_sql(sql, &params);
+        assert_eq!(frame[0], PARAMETERIZED_SQL_TAG);
+        // Body: [u32 sql_len=8][8 bytes "SELECT 1"][u32 param_count=0]
+        let (decoded_sql, decoded_params) =
+            decode_parameterized_sql(&frame[1..]).expect("decode ok");
+        assert_eq!(decoded_sql, sql);
+        assert!(decoded_params.is_empty());
+    }
+
+    /// SP-PG-EXTQ-PARSED-DEFAULT T1 — every typed `Value` variant
+    /// round-trips byte-equal. Also exercises NULL (`None`) + explicit
+    /// `Value::Null` distinctly so the wire kind bytes don't collide.
+    #[test]
+    fn parsed_default_t1_wire_round_trip_all_variants() {
+        let sql = "INSERT INTO t (id, name, age, flag, opt) VALUES ($1, $2, $3, $4, $5)";
+        let params: Vec<Option<kessel_codec::Value>> = vec![
+            Some(kessel_codec::Value::Int(42)),
+            Some(kessel_codec::Value::Blob(b"hello".to_vec())),
+            Some(kessel_codec::Value::Uint(u128::MAX)),
+            Some(kessel_codec::Value::Null),
+            None,
+        ];
+        let frame = encode_parameterized_sql(sql, &params);
+        assert_eq!(frame[0], PARAMETERIZED_SQL_TAG);
+        let (decoded_sql, decoded_params) =
+            decode_parameterized_sql(&frame[1..]).expect("decode ok");
+        assert_eq!(decoded_sql, sql);
+        assert_eq!(decoded_params.len(), 5);
+        assert_eq!(decoded_params[0], Some(kessel_codec::Value::Int(42)));
+        assert_eq!(
+            decoded_params[1],
+            Some(kessel_codec::Value::Blob(b"hello".to_vec()))
+        );
+        assert_eq!(
+            decoded_params[2],
+            Some(kessel_codec::Value::Uint(u128::MAX))
+        );
+        assert_eq!(decoded_params[3], Some(kessel_codec::Value::Null));
+        assert_eq!(decoded_params[4], None);
+    }
+
+    /// SP-PG-EXTQ-PARSED-DEFAULT T1 — the headline security KAT at
+    /// the wire layer. A quote-injection payload (`"; DROP TABLE t;
+    /// --`) round-trips as a `Value::Blob` operand — the bytes
+    /// remain typed, never enter the SQL text. Engine-side
+    /// `compile_stmt_with_params` will materialize them as a `Tok::
+    /// Str` carried into `Lit::Str` — the DROP TABLE NEVER reaches
+    /// the parser as syntax.
+    #[test]
+    fn parsed_default_t1_wire_quote_injection_payload_is_typed_blob() {
+        let sql = "SELECT * FROM t WHERE name = $1";
+        let payload = b"\"; DROP TABLE t; --".to_vec();
+        let params: Vec<Option<kessel_codec::Value>> = vec![
+            Some(kessel_codec::Value::Blob(payload.clone())),
+        ];
+        let frame = encode_parameterized_sql(sql, &params);
+        let (decoded_sql, decoded_params) =
+            decode_parameterized_sql(&frame[1..]).expect("decode ok");
+        // SQL text was NOT mutated — the placeholder is still `$1`.
+        assert_eq!(decoded_sql, sql);
+        assert!(!decoded_sql.contains("DROP"));
+        // The bound value is a Blob operand carrying the literal
+        // bytes — not concatenated into SQL.
+        match &decoded_params[0] {
+            Some(kessel_codec::Value::Blob(b)) => assert_eq!(b, &payload),
+            other => panic!("expected Blob, got {other:?}"),
+        }
+    }
+
+    /// SP-PG-EXTQ-PARSED-DEFAULT T1 — malformed-frame decode returns
+    /// `None`. Three shapes: truncated sql_len, truncated sql bytes,
+    /// invalid param kind byte. The engine apply path translates
+    /// `None` into a `SchemaError("parameterized sql: malformed
+    /// frame")`.
+    #[test]
+    fn parsed_default_t1_wire_malformed_frame_decodes_to_none() {
+        // Truncated sql_len.
+        assert!(decode_parameterized_sql(&[0u8; 2]).is_none());
+        // sql_len claims 100 bytes, body only has 3.
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&100u32.to_le_bytes());
+        bad.extend_from_slice(b"abc");
+        assert!(decode_parameterized_sql(&bad).is_none());
+        // Valid sql, valid param_count=1, then an invalid param kind 0xFF.
+        let mut bad2 = Vec::new();
+        bad2.extend_from_slice(&3u32.to_le_bytes());
+        bad2.extend_from_slice(b"sql");
+        bad2.extend_from_slice(&1u32.to_le_bytes());
+        bad2.push(0xFF);
+        assert!(decode_parameterized_sql(&bad2).is_none());
     }
 }

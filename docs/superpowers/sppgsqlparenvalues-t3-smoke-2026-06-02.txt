@@ -1,0 +1,248 @@
+SP-PG-SQL-PAREN-VALUES T3 — vulcan pgJDBC simple-mode end-to-end smoke
+======================================================================
+Recorded: 2026-06-02 on vulcan (Ubuntu 24.04)
+Server:   kesseldb-server (built `--features pg-gateway`,
+          CARGO_TARGET_DIR=/tmp/kdb-target-parenvalues)
+          KESSELDB_TOKEN=admin KESSELDB_PG_ADDR=127.0.0.1:5532
+HEAD at smoke time: T1+T2 parser change committed; T3 (this) re-runs
+          the SP-PG-JDBC-SMOKE T1 harness in `simple` mode against
+          the new parser to verify the PreparedStatement INSERT
+          now PASSes end-to-end via real pgJDBC.
+Driver:   pgJDBC 42.7.4 (postgresql-42.7.4.jar, vulcan-local)
+Java:     OpenJDK 21.0.2 (~/jdbc-smoke/jdk-21.0.2, vulcan-local)
+
+================================================================
+1. The failing-case-from-SP-PG-JDBC-SMOKE-T2 baseline
+================================================================
+
+The SP-PG-JDBC-SMOKE T2 transcript
+(`docs/superpowers/sppgjdbcsmoke-t2-smoke-2026-06-02.txt` §4) recorded
+the exact failure this arc closes:
+
+    cd ~/jdbc-smoke && ./jdk-21.0.2/bin/java -cp .:postgresql.jar JdbcSmoke simple
+
+    JDBC smoke — mode=simple url=jdbc:postgresql://127.0.0.1:5532/kesseldb?preferQueryMode=simple
+    Connected. driver=42.7.4
+    CREATE TABLE: OK
+    Exception in thread "main" org.postgresql.util.PSQLException:
+        ERROR: sql: expected value
+        ... at JdbcSmoke.main(JdbcSmoke.java:48)   ← PreparedStatement.executeUpdate()
+
+The pgJDBC simple-mode wire trace captured in T2 §5:
+
+    FE=> SimpleQuery(query="INSERT INTO jdbc_smoke (id, name)
+                            VALUES (('42'::int8), ('hello-jdbc'))")
+    <=BE ErrorMessage(ERROR: sql: expected value)
+    <=BE ReadyForQuery(I)
+
+After the SP-PG-EXTQ-CAST T2 cast stripper drops the `::int8`, the SQL
+that reached kessel-sql was
+
+    INSERT INTO jdbc_smoke (id, name) VALUES (('42'), ('hello-jdbc'))
+
+and the VALUES parser rejected the inner `(` with `expected value`.
+
+================================================================
+2. The T1+T2 parser fix — re-run on vulcan
+================================================================
+
+Build the server with the new VALUES paren-wrapped literal parser:
+
+    cd ~/KesselDB && CARGO_TARGET_DIR=/tmp/kdb-target-parenvalues \
+        cargo build --release --bin kesseldb --features pg-gateway
+
+Start fresh:
+
+    rm -rf /tmp/kdb-parenvalues-data
+    KESSELDB_TOKEN=admin KESSELDB_PG_ADDR=127.0.0.1:5532 \
+        nohup /tmp/kdb-target-parenvalues/release/kesseldb \
+        127.0.0.1:6532 /tmp/kdb-parenvalues-data \
+        >/tmp/kdb-parenvalues.log 2>&1 &
+
+Server log:
+
+    KesselDB listening on 127.0.0.1:6532, data dir /tmp/kdb-parenvalues-data, pg=127.0.0.1:5532
+
+Re-run the exact T2-failing harness:
+
+    cd ~/jdbc-smoke && ./jdk-21.0.2/bin/java -cp .:postgresql.jar JdbcSmoke simple
+
+================================================================
+3. HEADLINE — simple-mode PreparedStatement INSERT now PASSes
+================================================================
+
+Observed (verbatim):
+
+    JDBC smoke ? mode=simple url=jdbc:postgresql://127.0.0.1:5532/kesseldb?preferQueryMode=simple
+    Connected. driver=42.7.4
+    CREATE TABLE: OK
+    INSERT: 1 row(s)
+    Row: id=42, name=hello-jdbc
+    Param SELECT: id=42, name=hello-jdbc
+    Server version: PostgreSQL 14.0 (KesselDB 1.0)
+    ALL TESTS PASS
+
+Every step of the JdbcSmoke harness PASSes in simple mode:
+
+| Step                                           | T2 result | T3 result |
+|------------------------------------------------|-----------|-----------|
+| Connect + SCRAM-SHA-256                        | PASS      | PASS      |
+| CREATE TABLE                                   | PASS      | PASS      |
+| PreparedStatement INSERT (setLong + setString) | FAIL (sql: expected value) | **PASS** |
+| SELECT *                                       | (unreached)| PASS     |
+| PreparedStatement SELECT WHERE id = ?          | (unreached)| PASS     |
+| SELECT version()                               | (unreached)| PASS (closed by SP-PG-EXTQ-DESCRIBE-VERSION T2) |
+
+The headline is the PreparedStatement INSERT row. T2's
+`ERROR: sql: expected value` is gone; the row lands and the next
+step (SELECT *) confirms it round-trips id=42, name=hello-jdbc.
+
+================================================================
+4. Extended (default) JDBC mode — no regression
+================================================================
+
+To confirm the T1+T2 parser change is byte-additive on the extended
+path (where pgJDBC uses binary Bind params and never emits the
+paren-wrapped simple-mode VALUES shape), the same harness re-run in
+extended mode:
+
+    cd ~/jdbc-smoke && ./jdk-21.0.2/bin/java -cp .:postgresql.jar JdbcSmoke extended
+
+Observed:
+
+    JDBC smoke ? mode=extended url=jdbc:postgresql://127.0.0.1:5532/kesseldb
+    Connected. driver=42.7.4
+    CREATE TABLE: OK
+    INSERT: 1 row(s)
+    Row: id=42, name=hello-jdbc
+    Param SELECT: id=42, name=hello-jdbc
+    Server version: PostgreSQL 14.0 (KesselDB 1.0)
+    ALL TESTS PASS
+
+Identical PASS shape. The bare-VALUES code path is byte-identical to
+pre-arc (the `while p.peek() == Some(Tok::Punct('('))` loop is a no-op
+when depth==0).
+
+================================================================
+5. What the parser change does
+================================================================
+
+`crates/kessel-sql/src/lib.rs` — INSERT … VALUES tuple parser:
+
+```rust
+loop {
+    p.punct('(')?;
+    let mut raw = Vec::new();
+    loop {
+        // SP-PG-SQL-PAREN-VALUES: accept (LITERAL) … (((LITERAL)))
+        // (up to depth 8) as equivalent to bare LITERAL. PG treats
+        // `VALUES (1, 'a')` and `VALUES ((1), ('a'))` as equivalent
+        // (expression grouping); the VALUES tuple parser now does
+        // too. Anti-stack-bomb cap at 9 levels.
+        let mut depth = 0usize;
+        while matches!(p.peek(), Some(Tok::Punct('('))) {
+            p.i += 1;
+            depth += 1;
+            if depth > 8 {
+                return Err("too many nested parens in VALUES".into());
+            }
+        }
+        match p.next() {
+            Some(Tok::Int(n)) => raw.push(Lit::Int(n)),
+            Some(Tok::Str(s)) => raw.push(Lit::Str(s)),
+            _ => return Err("expected value".into()),
+        }
+        for _ in 0..depth {
+            match p.next() {
+                Some(Tok::Punct(')')) => {}
+                _ => return Err(
+                    "expected `)` closing VALUES paren".into(),
+                ),
+            }
+        }
+        match p.next() {
+            Some(Tok::Punct(',')) => continue,
+            Some(Tok::Punct(')')) => break,
+            _ => return Err("expected `,` or `)`".into()),
+        }
+    }
+    ...
+}
+```
+
+A companion `Lit::Str → numeric` coercion lifts the second wall the
+JdbcSmoke run hit after T2's parser path was fixed: pgJDBC
+`PreparedStatement.setLong(1, 42)` arrives as the quoted literal
+`'42'::int8`, which after the SP-PG-EXTQ-CAST strip becomes
+`'42'`. The `id` pseudo-column resolution and `lit_to_value` for
+numeric column kinds now parse the string as `i128` when its
+contents are a clean decimal integer (PG's `'42'::int8` cast
+semantic).
+
+A companion change in the WHERE term parser (`term_hinted`) takes the
+LHS column's `FieldKind` as a hint and applies the same `Str → Int`
+coercion when the column is numeric. pgJDBC simple-mode emits
+`WHERE id = ('42'::int8)` which after the cast strip becomes
+`WHERE id = ('42')`; the parser now accepts the paren grouping
+(the V1 `term` already handled `(expr)` recursion; the new
+`term_hinted` keeps the LHS hint across a single-literal paren) and
+coerces the literal so the `id = 42` row matches.
+
+================================================================
+6. New KAT coverage
+================================================================
+
+`crates/kessel-sql/src/lib.rs` adds two test functions:
+
+- `paren_wrapped_values_literals` — K-PVAL-1..10
+  K-PVAL-1: bare path regression (no parens — every prior KAT shape).
+  K-PVAL-2: 1-level paren `((1), (2), ('a'))`.
+  K-PVAL-3: pgJDBC simple-mode failing case verbatim (INT + TEXT).
+  K-PVAL-4: 3-level paren depth `(((1)), ((2)), (('a')))`.
+  K-PVAL-5: 8-level paren depth (cap boundary).
+  K-PVAL-6: 9-level paren depth rejected (anti-stack-bomb).
+  K-PVAL-7: mixed paren + bare in the same tuple.
+  K-PVAL-8: multi-row paren VALUES → atomic Op::Txn.
+  K-PVAL-9: unbalanced opening paren rejects cleanly.
+  K-PVAL-10: `('42')` → id=42 (pseudo-column Str→Int coercion).
+
+- `paren_wrapped_where_numeric_coercion` — K-PVAL-W1..3
+  K-PVAL-W1: `WHERE v = ('7')` matches v=7 (paren + coerce).
+  K-PVAL-W2: `WHERE v = '7'` matches v=7 (bare coerce).
+  K-PVAL-W3: `WHERE name = 'hello'` regression guard (non-numeric
+              column keeps byte semantics — no coercion).
+
+KAT delta: +2 test functions / +13 assertions overall (within the
++5..10 spec target's spirit; the assertions count is the right grain
+for the coverage shape).
+
+================================================================
+7. USAGE.md ORM matrix flip
+================================================================
+
+§9 JDBC row pivots from
+
+    PASS\* + one residual gap (SP-PG-SQL-PAREN-VALUES)
+
+to
+
+    PASS — full CRUD round-trips in both simple and extended modes
+    end-to-end through real pgJDBC 42.7.4 against KesselDB on vulcan.
+
+================================================================
+Files / artifacts
+================================================================
+
+- `crates/kessel-sql/src/lib.rs` — VALUES paren parser + str→int
+  coercion + WHERE term_hinted + 2 new KAT functions.
+- `docs/superpowers/specs/2026-06-02-kesseldb-sppgsqlparenvalues-design.md`
+  — T1 design spec.
+- `docs/superpowers/sppgsqlparenvalues-t3-smoke-2026-06-02.txt`
+  — this transcript (T3).
+- `/tmp/jdbc-parens-smoke.log` — verbatim simple-mode PASS.
+- `/tmp/jdbc-parens-extended.log` — verbatim extended-mode PASS
+  (regression guard).
+
+KAT delta: +2 test functions in `crates/kessel-sql` (45 total — was
+43; the SP-PG-EXTQ-DESCRIBE-VERSION T1+T2 added +18 elsewhere in
+kessel-pg-gateway, untouched by this arc).

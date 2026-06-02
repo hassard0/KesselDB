@@ -1790,7 +1790,7 @@ smoke-2026-05-29.txt` for the original T8 baseline.
 | SQLAlchemy 2.0  | PASS     | T8 closes the `use_native_hstore=False` caveat     |
 | psycopg3 3.3.4  | PASS     | SP-PG-EXTQ-BIN T3 — DEFAULT cursor (NOT ClientCursor) works end-to-end |
 | asyncpg 0.31.0  | PASS     | SP-PG-EXTQ-BIN-RESULTS T3 — fetch() round-trip works end-to-end (binary params + binary results) |
-| JDBC 42.7       | PASS\*  | SP-PG-EXTQ-DESCRIBE-VERSION T3 (2026-06-02) — real pgJDBC 42.7.4 + OpenJDK 21 against KesselDB on vulcan. **Extended (default) mode PASS** for the full CRUD path INCLUDING `SELECT version()`: CREATE TABLE, parameterized INSERT (binary INT8 + VARCHAR), SELECT \*, parameterized SELECT WHERE id = ? (binary INT8 param + binary INT8 result), `SELECT version()` (the gateway now emits a `RowDescription("version", TEXT)` in response to `Describe(portal)` instead of `NoData`). **Simple mode (`preferQueryMode=simple`) PASS for literal SQL** including `WHERE id = 42::int8` (SP-PG-EXTQ-CAST T2 cast-stripper works end-to-end through the real driver). One residual gap remains: simple-mode `PreparedStatement` INSERT fails because pgJDBC wraps each substituted param in extra parens (`VALUES (('42'::int8), ('hello-jdbc'))`) — V2 `SP-PG-SQL-PAREN-VALUES`. See `docs/superpowers/sppgextqdescribeversion-t3-smoke-2026-06-02.txt` |
+| JDBC 42.7       | PASS    | SP-PG-SQL-PAREN-VALUES T3 (2026-06-02) — real pgJDBC 42.7.4 + OpenJDK 21 against KesselDB on vulcan. **Full CRUD PASS in both simple AND extended modes**: CREATE TABLE, `PreparedStatement` INSERT (`setLong` + `setString`), SELECT \*, `PreparedStatement` SELECT `WHERE id = ?`, `SELECT version()`. In extended mode pgJDBC uses binary Bind (SP-PG-EXTQ-BIN) + binary result columns (SP-PG-EXTQ-BIN-RESULTS); in simple mode pgJDBC substitutes the param client-side and emits the post-strip shape `VALUES (('42'), ('hello-jdbc'))` / `WHERE id = ('42')` which the kessel-sql VALUES tuple parser + WHERE term parser now accept (paren-wrapped literals up to depth 8 + `Str → numeric` coercion on numeric column LHS). Smoke: `docs/superpowers/sppgsqlparenvalues-t3-smoke-2026-06-02.txt`. |
 | pgx (Go)        | n/a      | Go runtime not on vulcan (V2 `SP-PG-GO-SMOKE`)     |
 | Drizzle (Node)  | n/a      | Node runtime not on vulcan (V2 `SP-PG-NODE-SMOKE`) |
 | Prisma (Node)   | n/a      | Node runtime not on vulcan (V2 `SP-PG-NODE-SMOKE`) |
@@ -1832,18 +1832,26 @@ The remaining residual ORM gaps are:
   (`docs/superpowers/sppgjdbcsmoke-t2-smoke-2026-06-02.txt`) — JDBC
   simple-mode `WHERE id = 42::int8` round-trips end-to-end through
   the actual pgJDBC 42.7.4 driver against KesselDB. The cast-stripper
-  is closed end-to-end; one residual JDBC gap remains
-  (simple-mode `PreparedStatement` paren-wrapped VALUES) tracked under
-  the distinct `SP-PG-SQL-PAREN-VALUES` arc. ~~Extended-mode
-  `SELECT version()` Describe/NoData ordering~~ → **CLOSED 2026-06-02
-  by SP-PG-EXTQ-DESCRIBE-VERSION V1** — the gateway's
-  `extq::row_description_or_no_data_for_sql` helper now recognizes
-  the closed set of scalar SELECTs that SP-PG-EXTQ T7 added
-  Simple-Query handlers for (`SELECT version()`, `SELECT current_user`,
-  `SELECT 1`, etc.) and emits the matching `RowDescription` at
-  Describe time instead of `NoData`. pgJDBC extended-mode
-  `SELECT version()` round-trips end-to-end via real pgJDBC 42.7.4
-  on vulcan (`docs/superpowers/sppgextqdescribeversion-t3-smoke-2026-06-02.txt`).
+  is closed end-to-end. ~~Simple-mode `PreparedStatement` paren-
+  wrapped VALUES~~ → **CLOSED 2026-06-02 by SP-PG-SQL-PAREN-VALUES
+  V1** — `kessel-sql`'s VALUES tuple parser now accepts
+  `(LITERAL)` paren-wrapped literals up to depth 8 (anti-stack-bomb
+  cap at 9 levels), and the same arc adds `Str → numeric` coercion
+  in the WHERE term parser when the LHS is a numeric column (PG's
+  `'42'::int8` semantic preserved across the cast strip). Real
+  pgJDBC simple-mode `PreparedStatement` INSERT + SELECT `WHERE id =
+  ?` round-trip end-to-end on vulcan
+  (`docs/superpowers/sppgsqlparenvalues-t3-smoke-2026-06-02.txt`).
+  ~~Extended-mode `SELECT version()` Describe/NoData ordering~~ →
+  **CLOSED 2026-06-02 by SP-PG-EXTQ-DESCRIBE-VERSION V1** — the
+  gateway's `extq::row_description_or_no_data_for_sql` helper now
+  recognizes the closed set of scalar SELECTs that SP-PG-EXTQ T7
+  added Simple-Query handlers for (`SELECT version()`,
+  `SELECT current_user`, `SELECT 1`, etc.) and emits the matching
+  `RowDescription` at Describe time instead of `NoData`. pgJDBC
+  extended-mode `SELECT version()` round-trips end-to-end via real
+  pgJDBC 42.7.4 on vulcan
+  (`docs/superpowers/sppgextqdescribeversion-t3-smoke-2026-06-02.txt`).
 - ~~Parameterized SELECT with a CHAR(N) WHERE clause may match zero rows
   because the engine's EQ-on-Char doesn't ignore trailing NUL padding
   on the storage side; lifts in `SP-CHAR-PAD-COMPARE` (engine-side).~~

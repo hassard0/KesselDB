@@ -1231,12 +1231,22 @@ pub fn compile(sql: &str, cat: &Catalog) -> Result<Op, SqlError> {
             if cols.len() != raw.len() {
                 return Err("column/value count mismatch".into());
             }
-            // Resolve the row id for this tuple.
+            // Resolve the row id for this tuple. SP-PG-SQL-PAREN-VALUES:
+            // accept `Lit::Str` whose contents parse as a decimal integer
+            // (PG simple-mode `PreparedStatement.setLong(1, 42)` arrives
+            // post-SP-PG-EXTQ-CAST-strip as the quoted literal `'42'`,
+            // and the engine's type-checker for the `id` pseudo-column
+            // must coerce that the way PG would coerce `'42'::int8`).
             let id = match (legacy_id, id_pos) {
                 (Some(n), _) => n,
                 (None, Some(ip)) => match &raw[ip] {
                     Lit::Int(n) => *n as u128,
-                    _ => return Err("`id` must be an integer".into()),
+                    Lit::Str(s) => s
+                        .parse::<i128>()
+                        .map(|n| n as u128)
+                        .map_err(|_| {
+                            "`id` must be an integer".to_string()
+                        })?,
                 },
                 _ => unreachable!(),
             };
@@ -1338,6 +1348,25 @@ fn lit_to_value(l: &Lit, k: FieldKind) -> Result<Value, SqlError> {
             Value::Blob(s.clone().into_bytes())
         }
         (Lit::Int(n), Ref) => Value::Blob((*n as u128).to_le_bytes().to_vec()),
+        // SP-PG-SQL-PAREN-VALUES: pgJDBC simple-mode
+        // `PreparedStatement.setLong(1, 42)` arrives as the quoted
+        // literal `'42'::int8`; the SP-PG-EXTQ-CAST T2 stripper drops
+        // the `::int8` cast, leaving `Lit::Str("42")`. PG would coerce
+        // that to int8 via the cast text; here we coerce it the same
+        // way for the numeric column kinds when the string is a clean
+        // decimal integer. Mismatches (non-numeric string, overflow)
+        // fall through to the existing `literal/column type mismatch`
+        // error.
+        (Lit::Str(s), I8 | I16 | I32 | I64 | I128 | Fixed { .. })
+            if s.parse::<i128>().is_ok() =>
+        {
+            Value::Int(s.parse::<i128>().unwrap())
+        }
+        (Lit::Str(s), U8 | U16 | U32 | U64 | U128 | Bool | Timestamp)
+            if s.parse::<u128>().is_ok() =>
+        {
+            Value::Uint(s.parse::<u128>().unwrap())
+        }
         _ => return Err("literal/column type mismatch".into()),
     })
 }
@@ -1990,7 +2019,16 @@ fn cmp_expr(p: &mut P, ot: &ObjectType) -> Result<Program, SqlError> {
         return Err("expected IN, BETWEEN or LIKE after NOT".into());
     } else if let Some(Tok::Cmp(c)) = p.peek().cloned() {
         p.i += 1;
-        let rhs = term(p, ot)?;
+        // SP-PG-SQL-PAREN-VALUES: if LHS is a bare load of a numeric
+        // column (LOAD_FIELD=1 followed by field_id_lo/hi), hint the
+        // RHS term parser to coerce a `'NN'`-shaped string literal
+        // to the matching numeric kind. pgJDBC simple-mode emits
+        // `WHERE id = ('42'::int8)`; after the SP-PG-EXTQ-CAST T2
+        // strip the kessel-sql lexer sees `WHERE id = ('42')`, which
+        // without the hint would push the bytes `b"42"` and the EQ
+        // opcode would compare Int×Bytes (always false).
+        let hint = lhs_numeric_kind_hint(&lb, ot);
+        let rhs = term_hinted(p, ot, hint)?;
         let mut raw = lb.clone();
         raw.extend_from_slice(&rhs.bytes());
         raw.push(match c {
@@ -2016,14 +2054,73 @@ fn cmp_expr(p: &mut P, ot: &ObjectType) -> Result<Program, SqlError> {
 }
 
 fn term(p: &mut P, ot: &ObjectType) -> Result<Program, SqlError> {
+    term_hinted(p, ot, None)
+}
+
+/// SP-PG-SQL-PAREN-VALUES: WHERE-term parser with an optional numeric
+/// column-kind hint. When the surrounding `cmp_expr` knows its LHS is
+/// a bare load of a numeric column AND the RHS is a string literal
+/// whose contents parse as a decimal integer, the literal is pushed
+/// as an int — matching PG's `'42'::int8` coercion that the
+/// SP-PG-EXTQ-CAST stripper drops at the wire. Without the hint
+/// (today's behaviour for non-comparison contexts: IN-tuple values,
+/// BETWEEN bounds, LIKE patterns, nested parens) the literal is
+/// pushed as bytes, preserving every prior WHERE KAT byte-for-byte.
+fn term_hinted(
+    p: &mut P,
+    ot: &ObjectType,
+    hint: Option<FieldKind>,
+) -> Result<Program, SqlError> {
     match p.next() {
         Some(Tok::Punct('(')) => {
+            // Inside a parenthesised expression the hint still applies —
+            // pgJDBC simple-mode emits `WHERE id = ('42'::int8)`, which
+            // after the SP-PG-EXTQ-CAST strip becomes `WHERE id = ('42')`.
+            // The `(` consumes here; the recursive `or_expr` walks into
+            // a fresh `cmp_expr`/`term` chain that doesn't know about
+            // the outer LHS column, so we re-enter `term_hinted` after
+            // `or_expr` would have returned. The simplest faithful
+            // implementation: if the parenthesised inner is a single
+            // bare literal (no operators inside), apply the hint at
+            // this level by peeking ahead.
+            //
+            // Detect that single-literal shape: `(LITERAL)` only —
+            // anything else (operators, nested `(`, identifiers, etc)
+            // falls back to the generic or_expr path.
+            let save = p.i;
+            let single_lit = match (p.peek().cloned(), p.t.get(save + 1).cloned()) {
+                (Some(Tok::Int(_)), Some(Tok::Punct(')'))) => true,
+                (Some(Tok::Str(_)), Some(Tok::Punct(')'))) => true,
+                _ => false,
+            };
+            if single_lit {
+                let inner = term_hinted(p, ot, hint)?;
+                p.punct(')')?;
+                return Ok(inner);
+            }
             let inner = or_expr(p, ot)?;
             p.punct(')')?;
             Ok(inner)
         }
         Some(Tok::Int(n)) => Ok(Program::new().push_int(n)),
-        Some(Tok::Str(s)) => Ok(Program::new().push_bytes(s.as_bytes())),
+        Some(Tok::Str(s)) => {
+            // Coerce to int IF the column kind is numeric and the
+            // string is a clean decimal integer. Mirrors the
+            // SP-PG-EXTQ-CAST-stripped `'NN'::int8` shape.
+            use FieldKind::*;
+            let numeric = matches!(
+                hint,
+                Some(I8 | I16 | I32 | I64 | I128
+                    | U8 | U16 | U32 | U64 | U128
+                    | Bool | Timestamp | Fixed { .. })
+            );
+            if numeric {
+                if let Ok(n) = s.parse::<i128>() {
+                    return Ok(Program::new().push_int(n));
+                }
+            }
+            Ok(Program::new().push_bytes(s.as_bytes()))
+        }
         Some(Tok::Ident(name)) => {
             let f = ot
                 .fields
@@ -2034,6 +2131,23 @@ fn term(p: &mut P, ot: &ObjectType) -> Result<Program, SqlError> {
         }
         _ => Err("bad WHERE term".into()),
     }
+}
+
+/// SP-PG-SQL-PAREN-VALUES helper: if `lb` is a bare `LOAD_FIELD` (the
+/// 3-byte opcode shape emitted by `Program::load(field_id)`), look up
+/// that column's `FieldKind` and return it; otherwise return None.
+/// Used by `cmp_expr` to hint the RHS `term_hinted` parser to coerce
+/// a string literal to the matching numeric kind.
+fn lhs_numeric_kind_hint(lb: &[u8], ot: &ObjectType) -> Option<FieldKind> {
+    // LOAD_FIELD opcode = 1; field_id is little-endian u16 at lb[1..3].
+    if lb.len() != 3 || lb[0] != 1 {
+        return None;
+    }
+    let fid = u16::from_le_bytes([lb[1], lb[2]]);
+    ot.fields
+        .iter()
+        .find(|f| f.field_id == fid)
+        .map(|f| f.kind)
 }
 
 #[cfg(test)]
@@ -3229,6 +3343,91 @@ mod tests {
         assert!(
             !e2.is_empty(),
             "unbalanced paren error must be non-empty"
+        );
+
+        // K-PVAL-10: pseudo `id` resolution accepts a `Lit::Str` whose
+        // contents parse as a decimal integer — pgJDBC simple-mode
+        // emits `VALUES (('42'::int8), …)` which after SP-PG-EXTQ-CAST
+        // is `VALUES (('42'), …)`. The id resolution path now coerces
+        // `'42'` → 42 to land the right pseudo row-id.
+        assert_create(
+            "INSERT INTO t (id, v, name) VALUES (('42'), 7, 'hello')",
+            42,
+            7,
+            "hello",
+        );
+    }
+
+    /// SP-PG-SQL-PAREN-VALUES — when the WHERE-clause LHS is a numeric
+    /// column and the RHS is a string literal whose contents parse as
+    /// a decimal integer (the post-SP-PG-EXTQ-CAST shape of pgJDBC
+    /// simple-mode `WHERE id = ('42'::int8)`), the SQL compiler
+    /// coerces the literal to the matching int. K-PVAL-W1..3 lock the
+    /// shape: bare paren-wrapped int literal works, mixed numeric
+    /// column types are coerced, and a non-numeric column with a
+    /// numeric-shaped string preserves byte semantics (no coercion).
+    #[test]
+    fn paren_wrapped_where_numeric_coercion() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        // Schema declares `v` (I64) + `name` (CHAR(16)); `id` is the
+        // pseudo row-id only (not a queryable column).
+        run(
+            &mut sm,
+            1,
+            "CREATE TABLE t (v I64 NOT NULL, name CHAR(16))",
+        );
+        // Insert pseudo id=42, v=7, name='hello'.
+        assert_eq!(
+            run(
+                &mut sm,
+                2,
+                "INSERT INTO t (id, v, name) VALUES (42, 7, 'hello')"
+            ),
+            OpResult::Ok
+        );
+        // K-PVAL-W1: paren-wrapped string-shaped int literal matches.
+        // This is the exact pgJDBC simple-mode emit shape after the
+        // SP-PG-EXTQ-CAST strip drops the `::int8` cast.
+        let res = run(&mut sm, 3, "SELECT * FROM t WHERE v = ('7')");
+        let bytes = match &res {
+            OpResult::Got(b) => b.clone(),
+            other => panic!("expected Got, got {other:?}"),
+        };
+        // At least one row in the result set (length-prefixed records).
+        assert!(
+            bytes.len() > 4,
+            "WHERE v = ('7') should match v=7; got empty result \
+             ({} bytes)",
+            bytes.len()
+        );
+
+        // K-PVAL-W2: bare string-shaped int literal also coerces.
+        let res2 = run(&mut sm, 4, "SELECT * FROM t WHERE v = '7'");
+        let bytes2 = match &res2 {
+            OpResult::Got(b) => b.clone(),
+            other => panic!("expected Got, got {other:?}"),
+        };
+        assert!(
+            bytes2.len() > 4,
+            "WHERE v = '7' should match v=7; got empty result \
+             ({} bytes)",
+            bytes2.len()
+        );
+
+        // K-PVAL-W3: non-numeric column (name CHAR(16)) keeps byte
+        // semantics — the string literal stays as bytes, no coercion.
+        // The row stored 'hello'; WHERE name = 'hello' must still
+        // match (regression guard for the CHAR comparison path).
+        let res3 = run(&mut sm, 5, "SELECT * FROM t WHERE name = 'hello'");
+        let bytes3 = match &res3 {
+            OpResult::Got(b) => b.clone(),
+            other => panic!("expected Got, got {other:?}"),
+        };
+        assert!(
+            bytes3.len() > 4,
+            "WHERE name = 'hello' regression: expected match, got \
+             empty result ({} bytes)",
+            bytes3.len()
         );
     }
 

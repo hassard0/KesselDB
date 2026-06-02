@@ -330,6 +330,57 @@ at dispatch entry, JDBC simple-mode unblocked.
   tracker close). Progress tracker → SHARD-SCAN-LOCAL-INDEX-FUSION V1
   SHIPPED — DONE_WITH_CONCERNS (spec perf target not met; structural
   floor named). **TaskList #363 ready.**
+- **Track L cont. — SP-Perf-A-SHARD-XTXN (2026-06-02, V1 SHIPPED —
+  DONE).** Closes the V1 routing bug SHARD-APPLY shipped: `route_op`
+  unconditionally mapped every `Op::Txn{ops}` to
+  `ShardRoute::ShardZero`, which silently wrote to shard 0 when inner
+  ops targeted keys hashing to other shards (silent data loss on
+  Create; false NotFound on Update / Delete / GetById / GetBlob).
+  New classifier shape in `crates/kesseldb-server/src/sharded_engine.rs`:
+  (1) new `ShardRoute::CrossShardReject { shards_touched }` variant
+  carrying the typed reject reason (≥2 = multi-shard span; 0 =
+  scan-shape inner op with no extractable primary key); (2)
+  `extract_txn_inner_pkey_shard(op, k)` helper returning `Some(shard)`
+  only for point-data inner ops (Create / Update / UpdateSet / Delete
+  / GetById / GetBlob), `None` for scan-shape, DDL, sequencer, admin,
+  nested Txn; (3) `classify_txn(ops, k)` walks every inner op —
+  **empty → `Single(0)`**, **all single shard → `Single(s)` fast path**,
+  **multi-shard or scan-shape → `CrossShardReject`**; (4) `route_op`
+  Op::Txn arm calls `classify_txn` at K≥2; K=1 still short-circuits
+  to `Single(0)` (byte-identical). Dispatcher `apply_raw` matches the
+  new route and returns `OpResult::SchemaError("cross-shard
+  transaction not supported in V1 (see SP-Perf-A-SHARD-XTXN-2PC): N
+  shards touched")` **WITHOUT invoking any shard's `apply_raw`** —
+  KAT-locked no-data-loss invariant. K=1 deployments byte-identical
+  (every key folds to shard 0 → classifier returns `Single(0)`).
+  **Vulcan verification (2026-06-02, HEAD `1338649`)**: `cargo test
+  -p kesseldb-server --release --lib sharded_engine -- --test-threads=1`
+  = 34/34 module tests PASS (8.60s) including all 11 new XTXN KATs;
+  `cargo build --release --test parallel_reads_oracle` clean (20.39s).
+  Full 100K-op × 16-variant × parallel-vs-serial determinism oracle
+  skipped (already verified by SHARD-SCAN-LOCAL-INDEX-FUSION on
+  2026-06-02; running it on a loaded vulcan box gives no new signal).
+  **No BENCHMARKS.md row** — single-shard `Op::Txn` is the common
+  case for sysbench OLTP, already captured by SP-Perf-A-TXN-RO (5.7×
+  vs Postgres at N=16) + SP-Perf-A-TXN-RW (2.66× vs Postgres at N=16);
+  XTXN routes the same workload to the same shard with byte-equal
+  perf on K=1 and on single-shard K≥2 txns. KAT delta: kesseldb-server
+  lib 204 → 215 (+11; T2 +7 classifier + T3 +4 e2e incl. headline
+  no-data-loss + cross-K split). V2 follow-up named:
+  **SP-Perf-A-SHARD-XTXN-2PC** (multi-shard atomic via
+  prepare/decide/commit phases over the XSHARD keyspace). Commits:
+  `9a71c7b` (T1 design spec — 408 LoC), `850ef8b` (T2 — classifier +
+  dispatcher arm + 7 KATs, 418 / -20 LoC), `1338649` (T3 — end-to-end
+  KATs + oracle extension, +384 LoC), plus this commit (T4+T5 —
+  vulcan verification + STATUS row + arc closure). HTTP/1.1 + WS +
+  binary + PG-wire surfaces byte-untouched; `#![forbid(unsafe_code)]`
+  honored; zero new external deps; pure routing logic. Progress
+  tracker → V1 SHIPPED — DONE
+  (`docs/superpowers/specs/2026-06-02-kesseldb-spperfa-shard-xtxn-progress.md`).
+  Parent SHARD progress tracker
+  (`docs/superpowers/specs/2026-05-30-kesseldb-spperfa-shard-progress.md`)
+  SHARD-XTXN follow-up row CLOSED by this arc. **TaskList #369
+  ready.**
 - **Track A.-1.4 — PostgreSQL Extended Query binary-format NUMERIC (SP-PG-EXTQ-BIN-NUMERIC V1 SHIPPED at T4 — 2026-06-02).**
   Closes the V2 follow-up named in the SP-PG-EXTQ-BIN V1 design spec
   §2.2 and the SP-PG-EXTQ-BIN-RESULTS V1 design spec §2.2 — both V1

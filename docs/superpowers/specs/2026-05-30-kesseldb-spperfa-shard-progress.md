@@ -60,11 +60,11 @@ See design spec §3 + §9 for the full scoping rationale + roadmap.
 | **SP-Perf-A-SHARD-APPLY-WAL** | V1 reuses each sub-engine's existing per-shard WAL (each sub-engine is a vanilla `StateMachine` with its own `data_dir/shard-<i>/wal`, recovers independently via `StateMachine::open`). The "per-shard WAL fsync contention" concern named in the dispatch doesn't apply because each sub-engine has its OWN WAL on its own data dir — no shared fsync to contend on. **CLOSED by virtue of T1's per-shard sub-engine shape.** | (subsumed) |
 | **SP-Perf-A-SHARD-READ** | `read_pool` workers dispatch reads to their shard's read-lock. V1 already enables per-sub-engine `read_workers` so reads go through each sub-engine's existing T6 in-process fast path; SHARD-READ as a separate arc is now about making the OUTER router-shell read pool shard-aware (skipping the dispatcher overhead). **Named, not started; would lift the K=16 1.12× ceiling further.** | Named, not started | — |
 | **SP-Perf-A-SHARD-SCAN** | In-process scatter-merge for fan-out scan ops; reuse `scatter_scan` merge contract. **V1 SHARD-APPLY routes scans to shard 0 ONLY — incorrect for spread data.** This arc is the production-correctness fix for scan ops at K>=2. | Named, not started | — |
-| **SP-Perf-A-SHARD-XTXN** | Cross-shard atomic txns via XSHARD keyspace 2PC. V1 routes Op::Txn to shard 0 only. | Named, not started | — |
+| **SP-Perf-A-SHARD-XTXN** | Cross-shard atomic txns via XSHARD keyspace 2PC. V1 routes Op::Txn to shard 0 only. | **V1 SHIPPED 2026-06-02** — classifier rejects multi-shard; single-shard fast-path routes to owning shard; +11 KATs; tracker `2026-06-02-kesseldb-spperfa-shard-xtxn-progress.md`. V2 atomic multi-shard via `SP-Perf-A-SHARD-XTXN-2PC`. | `9a71c7b` / `850ef8b` / `1338649` |
 | **SP-Perf-A-SHARD-BENCH** | Multi-workload K=N sweep on vulcan (YCSB-A/B/C, sysbench OLTP, TPC-H). T5 shipped the YCSB-C cell; the full matrix is its own arc. | Named, not started (T5 = YCSB-C only) | — |
 | **SP-Perf-A-SHARD-READ** | `read_pool` workers dispatch reads to their shard's read-lock. | Named, not started | — |
 | **SP-Perf-A-SHARD-SCAN** | In-process scatter-merge for fan-out scan ops; reuse `scatter_scan` merge contract. | Named, not started | — |
-| **SP-Perf-A-SHARD-XTXN** | Cross-shard atomic txns via XSHARD keyspace 2PC. | Named, not started | — |
+| **SP-Perf-A-SHARD-XTXN** | Cross-shard atomic txns via XSHARD keyspace 2PC. | **V1 SHIPPED 2026-06-02** — single-shard fast-path + multi-shard reject (no data loss). | `9a71c7b` / `850ef8b` / `1338649` |
 | **SP-Perf-A-SHARD-BENCH** | Measured K=N vs K=1 on vulcan; closes (or falsifies) the ≥2× lift hypothesis. | Named, not started | — |
 
 ## Honest framing

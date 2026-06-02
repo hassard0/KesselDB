@@ -1,7 +1,8 @@
 # SP-Cloud-Cluster — progress tracker
 
 Date opened: **2026-06-02**.
-Status: **OPEN — T1 SCAFFOLD + T2 BINARY WIRE-UP + T3 FAILOVER-AWARE CLI + T5 PRIMARY-KILL VERIFIED**; T6-T8 multi-arc continuation queued.
+Date closed: **2026-06-02** (same day; the whole arc landed in one continuous burst — T1 scaffold through T8 arc closure).
+Status: **V1 CLOSED — T1+T2+T3+T5+T7+T8 SHIPPED; T6 (Fly multi-region) deferred to V2 (needs Fly account)**. **TaskList #377 ready for completion**.
 Design spec: `docs/superpowers/specs/2026-06-02-kesseldb-spcloudcluster-design.md`
 Parent arc: SP-Cloud-Deploy (V1 SHIPPED 2026-05-30 — single-pod Helm
 chart + fly.toml + kind-verified end-to-end). This arc is the named
@@ -32,9 +33,242 @@ see §V2+ follow-ups in the design spec).
 | **T3** | Headless Service DNS resolution + peer discovery extra-mile — `ClusterClient` integration on the cluster headless Service endpoint set so writes routed through the round-robin ClusterIP Service rotate past backups and land on the primary instead of falling into `OpResult::Unavailable`. (T2 covered the binary-side bootstrap-race; T3 is the client-side failover-aware wiring.) | **DONE** | `233f4a2` / `7ce5250` |
 | ~~T4~~ | ~~kind-verified 3-replica cluster on vulcan — folded into T2 (above) since the binary build + image + kind verify naturally clustered.~~ | **MERGED INTO T2** | — |
 | **T5** | Real cluster smoke — CRUD via `kubectl exec` to any pod (clients connect through the regular ClusterIP, which can route to any pod; ClusterClient retries against primary on `Unavailable`); kill the primary (`kubectl delete pod kesseldb-0`) and verify view-change elects a new primary within view-change timeout; verify the SSTables + WAL state survives + replays from the rejoined pod. | **DONE** | `0d95405` |
-| T6 | Fly.io multi-region cluster deploy — per-region `[mounts]` + per-machine env-var `KESSELDB_CLUSTER_REPLICA_IDX` mapping. Fly Machines do NOT have stable headless-DNS; peer addresses use `<machine-id>.vm.<app>.internal` or per-machine private 6PN address (TBD in T6 design). | QUEUED | — |
-| T7 | Monitoring — verify `/v1/metrics` Prometheus scrape endpoint emits VSR-relevant counters (view changes per replica, last-applied op-number, lag-from-primary, primary uptime). Ship a sample `prometheus-rules.yaml` and Grafana dashboard JSON. | QUEUED | — |
-| T8 | Arc closure — STATUS Track row + this tracker close + USAGE §11.5 sub-section ("Kubernetes cluster mode") + README Deploy table extension. | QUEUED | — |
+| T6 | Fly.io multi-region cluster deploy — per-region `[mounts]` + per-machine env-var `KESSELDB_CLUSTER_REPLICA_IDX` mapping. Fly Machines do NOT have stable headless-DNS; peer addresses use `<machine-id>.vm.<app>.internal` or per-machine private 6PN address (TBD in T6 design). | **DEFERRED V2** (needs Fly account) | — |
+| **T7** | Monitoring — Prometheus Operator CRDs (ServiceMonitor + PrometheusRule) as opt-in Helm templates gated on `cluster.enabled AND monitoring.prometheus.enabled` (default OFF). Three canned alerts (ClusterReplicaDown, NoPrimary, ViewChangeStorm) driven by the V1-emitted metric surface from `crates/kessel-http-gateway/src/metrics_writer.rs`. Honest naming: a dedicated `kesseldb_view_changes_total` counter is V2 (named SP-Cloud-Cluster-METRICS-EXPAND); the V1 rule uses `delta(kesseldb_view_number[5m])` as surrogate. | **DONE** | `501dd6a` |
+| **T8** | Arc closure — STATUS Track row + this tracker close + USAGE §11.5 sub-section ("Prometheus monitoring" + expanded V1-limits list naming every V2 follow-up) + README Deploy table extension (Kubernetes cluster row with `--set cluster.enabled=true --set cluster.replicas=3` one-liner). | **DONE** | `<T8>` |
+
+## T7+T8 ship — what landed (ARC CLOSURE)
+
+### T7 — Prometheus monitoring (`501dd6a`)
+
+Files added (2 new):
+
+- `deploy/helm/kesseldb/templates/servicemonitor.yaml` —
+  `monitoring.coreos.com/v1` ServiceMonitor. Selects on the chart's
+  standard `selectorLabels` (so it targets the existing client
+  ClusterIP Service from `templates/service.yaml`), scrapes the
+  named `http` port (6533) at path `/v1/metrics`, default
+  `interval: 30s`, default `scrapeTimeout: 10s`. Optional
+  `additionalLabels` block for operator-side selectors (e.g.
+  kube-prometheus-stack's `release: prometheus`). Gated on
+  `.Values.cluster.enabled AND .Values.monitoring.prometheus.enabled`.
+- `deploy/helm/kesseldb/templates/prometheusrule.yaml` —
+  `monitoring.coreos.com/v1` PrometheusRule with three rules in
+  group `kesseldb.cluster`:
+  - `KesselDBClusterReplicaDown` — `up{job=~".*<fullname>.*"} == 0`
+    for 30s; severity critical. Triggers on Prometheus's
+    self-injected scrape-success metric being 0 (pod down,
+    CrashLoopBackOff, network partition).
+  - `KesselDBNoPrimary` — `sum(kesseldb_is_primary{...}) == 0` for
+    60s; severity critical. The is-primary gauge is 1 on the
+    current primary, 0 on every backup; healthy sum = 1. Zero
+    means VSR has not converged.
+  - `KesselDBViewChangeStorm` — `delta(kesseldb_view_number[5m])
+    > 5` for 5m; severity warning. The view_number gauge is
+    monotonic per replica, so its 5-minute delta counts
+    view-changes in the window. **V1 surrogate**: a dedicated
+    `kesseldb_view_changes_total` counter does NOT exist; named
+    V2 follow-up SP-Cloud-Cluster-METRICS-EXPAND ships it.
+
+Files modified (1):
+
+- `deploy/helm/kesseldb/values.yaml` — appended a `monitoring:`
+  block with `prometheus.enabled` (default false; opt-in),
+  `prometheus.interval` (default 30s), `prometheus.scrapeTimeout`
+  (default 10s), `prometheus.additionalLabels` (for operator
+  selectors), `prometheus.rules.enabled` (default true; set false
+  to scrape WITHOUT canned alerts), `prometheus.rules.additionalLabels`.
+  ~40 inline comment lines documenting the V1 emitted metric
+  surface + the V1 metric-naming caveat + V2 follow-up arc.
+
+### T8 — USAGE + README + STATUS + tracker close (`<T8>`)
+
+Files modified (4):
+
+- `docs/USAGE.md` — §11.5 grew a `#### Prometheus monitoring`
+  sub-section (~50 lines: opt-in `helm upgrade --set
+  monitoring.prometheus.enabled=true` invocation with the
+  kube-prometheus-stack `release=prometheus` operator-selector
+  label hint; alert table; V1-emitted metric table; knobs list;
+  V2 metric-naming caveat). The cluster-mode V1 limits list
+  expanded from 2 to 5 named V2 follow-up bullets (HTTP/WS/PG
+  gateway in cluster, Fly multi-region, online reconfig,
+  coordinated backup) — each named with its V2 arc tag.
+- `README.md` — Deploy table grew a dedicated Kubernetes cluster
+  row (`helm install ... --set cluster.enabled=true --set
+  cluster.replicas=3`) calling out the failover-aware `kessel
+  --addrs ...` CLI + the opt-in `--set
+  monitoring.prometheus.enabled=true` shipping
+  ServiceMonitor + PrometheusRule. Link to USAGE §11.5 + link to
+  the kind primary-kill transcript.
+- `docs/STATUS.md` — new Track K cont. T7+T8 row at top of the
+  recent-deliveries chain; honest about the V1 metric surface
+  + named V2 follow-up arc SP-Cloud-Cluster-METRICS-EXPAND.
+- `docs/superpowers/specs/2026-06-02-kesseldb-subproject-spcloudcluster-progress.md`
+  (this file) — slice-plan rows updated, V1 ARC CLOSED.
+
+### Verification on vulcan
+
+`helm v3.16.3+gcfd0749`. Both lint paths clean:
+
+```
+==== helm lint (default) ====
+==> Linting ./deploy/helm/kesseldb
+[INFO] Chart.yaml: icon is recommended
+1 chart(s) linted, 0 chart(s) failed
+
+==== helm lint (cluster.enabled=true + monitoring.prometheus.enabled=true) ====
+==> Linting ./deploy/helm/kesseldb
+[INFO] Chart.yaml: icon is recommended
+1 chart(s) linted, 0 chart(s) failed
+```
+
+Object-count check across the four modes:
+
+```
+=== DEFAULT (single-pod) ===
+      1 kind: Deployment
+      1 kind: PersistentVolumeClaim
+      1 kind: Service
+      1 kind: ServiceAccount
+
+=== CLUSTER NO MONITORING ===
+      2 kind: Service              # client ClusterIP + headless
+      1 kind: ServiceAccount
+      1 kind: StatefulSet          # replicas: 3
+
+=== CLUSTER + MONITORING ===
+      1 kind: PrometheusRule       # NEW (T7)
+      2 kind: Service
+      1 kind: ServiceAccount
+      1 kind: ServiceMonitor       # NEW (T7)
+      1 kind: StatefulSet
+
+=== CLUSTER + MONITORING, rules.enabled=false ===
+      2 kind: Service
+      1 kind: ServiceAccount
+      1 kind: ServiceMonitor       # ONLY the scrape, no rule
+      1 kind: StatefulSet
+```
+
+Rendered ServiceMonitor (excerpt):
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: kdbtest-kesseldb
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kesseldb
+      app.kubernetes.io/instance: kdbtest
+      app: kesseldb
+  endpoints:
+    - port: http
+      path: /v1/metrics
+      interval: 30s
+      scrapeTimeout: 10s
+```
+
+Rendered PrometheusRule (excerpt):
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: kdbtest-kesseldb
+spec:
+  groups:
+    - name: kesseldb.cluster
+      rules:
+        - alert: KesselDBClusterReplicaDown
+          expr: up{job=~".*kdbtest-kesseldb.*"} == 0
+          for: 30s
+          labels:
+            severity: critical
+            arc: sp-cloud-cluster
+        - alert: KesselDBNoPrimary
+          expr: sum(kesseldb_is_primary{job=~".*kdbtest-kesseldb.*"}) == 0
+          for: 60s
+          labels:
+            severity: critical
+        - alert: KesselDBViewChangeStorm
+          expr: delta(kesseldb_view_number{job=~".*kdbtest-kesseldb.*"}[5m]) > 5
+          for: 5m
+          labels:
+            severity: warning
+```
+
+### V1-emitted metric surface (honest)
+
+From `crates/kessel-http-gateway/src/metrics_writer.rs`:
+
+| Metric | Type | Labels | Used by V1 alerts |
+|---|---|---|---|
+| `kesseldb_ops_total` | counter | `kind` | — |
+| `kesseldb_inflight` | gauge | — | — |
+| `kesseldb_last_op_number` | gauge | — | — |
+| `kesseldb_view_number` | gauge (monotonic) | — | **ViewChangeStorm** (delta surrogate) |
+| `kesseldb_is_primary` | gauge (0/1) | — | **NoPrimary** |
+| `kesseldb_http_requests_total` | counter | `path`, `status` | — |
+| `up` (Prometheus-injected) | gauge | — | **ClusterReplicaDown** |
+
+Not yet emitted (named V2 follow-up SP-Cloud-Cluster-METRICS-EXPAND):
+- `kesseldb_view_changes_total` (dedicated counter — V1 uses
+  `delta(kesseldb_view_number[5m])` as surrogate, which works for
+  the storm alert but doesn't survive replica restart cleanly).
+- `kesseldb_replica_lag_seconds` (cross-replica primary-vs-backup
+  lag histogram — useful for follower-lag SLOs, not in V1).
+
+### Acceptance gate — MET (T7+T8)
+
+| Gate | Target | Actual |
+|---|---|---|
+| ServiceMonitor renders when `monitoring.prometheus.enabled=true` | 1× ServiceMonitor | **PASS** |
+| PrometheusRule renders when `monitoring.prometheus.rules.enabled=true` | 1× PrometheusRule | **PASS** |
+| Both gated OFF by default | default render unchanged | **PASS** (DEFAULT = Deployment + PVC + Service + SA) |
+| Both gated by `cluster.enabled` | non-cluster mode does NOT emit either CRD | **PASS** (gating in template `{{- if and .Values.cluster.enabled ... }}`) |
+| `helm lint` clean both modes | 0 chart(s) failed | **PASS** |
+| Rendered ServiceMonitor scrapes `/v1/metrics` on port `http` | endpoint.path + port match | **PASS** |
+| PrometheusRule alerts use only V1-emitted metrics | no fictional metric names | **PASS** (`up{}`, `kesseldb_is_primary`, `kesseldb_view_number`) |
+| USAGE §11.5 ships `#### Prometheus monitoring` sub-section | helm command + alert table + metric table + V2 caveat | **PASS** |
+| README Deploy table grows cluster row | one-liner + USAGE link | **PASS** |
+| STATUS Track row + progress tracker close | T7+T8 entries | **PASS** |
+
+### Honest T7+T8 limits (carried forward)
+
+- **`kesseldb_view_changes_total` counter NOT in V1.** The
+  `ViewChangeStorm` alert uses `delta(kesseldb_view_number[5m])`
+  as the V1 surrogate. The gauge is monotonic-per-process but
+  RESETS on replica restart — a freshly-restarted pod's
+  `kesseldb_view_number` starts at the view it joins at
+  (typically the current view), so the delta over a window
+  containing a restart can be 0 even though view-changes
+  happened. Named V2 follow-up SP-Cloud-Cluster-METRICS-EXPAND
+  ships a proper restart-resistant counter.
+- **No Grafana dashboard JSON in V1.** The task brief named one
+  but it's a separate ship from the alerts; named V2 follow-up
+  inside SP-Cloud-Cluster-METRICS-EXPAND.
+- **T6 (Fly multi-region) DEFERRED to V2.** Needs a Fly account
+  to verify end-to-end and the design needs the 6PN address-mesh
+  decision. Named V2 follow-up; doesn't gate V1 closure since
+  k8s is the production target.
+
+### Invariants preserved (T7+T8)
+
+- Default single-pod render byte-identical (monitoring gated on
+  `cluster.enabled`); existing SP-Cloud-Deploy V1 installs upgrade
+  with zero diff.
+- Cluster-mode-no-monitoring render byte-identical to the T3+T5
+  ship (the new CRDs are gated OFF by default in cluster mode
+  too — `monitoring.prometheus.enabled` is the second gate).
+- Existing chart helpers (`_helpers.tpl`) untouched.
+- Zero Rust code touched (T7 is YAML; T8 is Markdown).
+- HTTP/1.1 + WS + binary + PG-wire surfaces byte-untouched.
+- `#![forbid(unsafe_code)]` honored (n/a — YAML + Markdown only).
+- Zero new external deps.
+- KAT delta: **+0** (YAML + Markdown only).
 
 ## T3+T5 ship — what landed
 

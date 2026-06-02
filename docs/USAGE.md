@@ -2527,6 +2527,67 @@ Overridable values for cluster mode (full list in
 `cluster.peerPort` (default 6534),
 `cluster.podManagementPolicy` (default `Parallel`).
 
+#### Prometheus monitoring (SP-Cloud-Cluster T7)
+
+The chart can emit prometheus-operator CRDs
+(`monitoring.coreos.com/v1` `ServiceMonitor` + `PrometheusRule`)
+that point your Prometheus install at KesselDB's `/v1/metrics`
+endpoint and ship three canned alerts on the cluster failure modes
+that matter. The CRDs are OFF by default — the chart installs
+cleanly in clusters without prometheus-operator — opt in with
+`--set monitoring.prometheus.enabled=true`:
+
+```bash
+helm upgrade kesseldb-cluster ./deploy/helm/kesseldb \
+  --set cluster.enabled=true \
+  --set cluster.replicas=3 \
+  --set monitoring.prometheus.enabled=true \
+  --set monitoring.prometheus.additionalLabels.release=prometheus
+# The `release=prometheus` label matches the default kube-prometheus-stack
+# ServiceMonitor selector. Skip it if your operator selects on
+# something else.
+
+# Verify the CRDs landed:
+kubectl get servicemonitor,prometheusrule -l app.kubernetes.io/instance=kesseldb-cluster
+#   servicemonitor.monitoring.coreos.com/kesseldb-cluster   30s   <created>
+#   prometheusrule.monitoring.coreos.com/kesseldb-cluster   30s   <created>
+```
+
+The ServiceMonitor scrapes the chart's client ClusterIP Service on
+the named `http` port (6533) at `/v1/metrics`. The
+`PrometheusRule` ships three alerts:
+
+| Alert | Expression | For | Severity |
+|---|---|---|---|
+| `KesselDBClusterReplicaDown` | `up{} == 0` | 30s | critical |
+| `KesselDBNoPrimary` | `sum(kesseldb_is_primary) == 0` | 60s | critical |
+| `KesselDBViewChangeStorm` | `delta(kesseldb_view_number[5m]) > 5` | 5m | warning |
+
+V1-emitted metrics (from
+[`crates/kessel-http-gateway/src/metrics_writer.rs`](../crates/kessel-http-gateway/src/metrics_writer.rs)):
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `kesseldb_ops_total` | counter | `kind` | Ops applied since process start |
+| `kesseldb_inflight` | gauge | — | Ops currently in flight to the engine |
+| `kesseldb_last_op_number` | gauge | — | Highest applied op_number on this replica |
+| `kesseldb_view_number` | gauge | — | Current VSR view number (monotonic) |
+| `kesseldb_is_primary` | gauge | — | 1 if this replica is primary, 0 otherwise |
+| `kesseldb_http_requests_total` | counter | `path`, `status` | HTTP gateway requests |
+
+Plus the Prometheus-injected `up{}` per scrape target. The
+`ViewChangeStorm` alert uses `delta(kesseldb_view_number[5m])` as
+the V1 surrogate for a dedicated counter; a proper
+`kesseldb_view_changes_total` + cross-replica lag histogram are
+shipped under the named V2 follow-up **SP-Cloud-Cluster-METRICS-EXPAND**.
+
+Knobs (all under `monitoring.prometheus.*`): `enabled`, `interval`
+(default `30s`), `scrapeTimeout` (default `10s`),
+`additionalLabels` (ServiceMonitor object labels — used by some
+operator releases to select which ServiceMonitors to honour),
+`rules.enabled` (default `true` — set false to scrape WITHOUT the
+canned alerts), `rules.additionalLabels`.
+
 Cluster-mode V1 limits (named, not vague):
 
 - **HTTP / WS / PG-wire gateways NOT served in cluster mode V1.**
@@ -2540,6 +2601,21 @@ Cluster-mode V1 limits (named, not vague):
   cached reply rather than re-executing), embed `ClusterClient`
   directly and call the `Op`-level session-framed `call(&Op)`
   surface — the same shape the cluster KATs use.
+- **Fly.io multi-region cluster deploy NOT in V1.** Fly Machines
+  don't have stable headless-Service-style DNS; per-region cluster
+  deploy uses a different transport (`<machine-id>.vm.<app>.internal`).
+  Named V2 follow-up: **SP-Cloud-Cluster-GEO** (multi-region) and
+  the upstream **SP-Cloud-Cluster T6** Fly slice (single-region,
+  6PN address mesh).
+- **Online cluster reconfiguration (add/remove replicas without
+  restart) NOT in V1.** Static N is the V1 contract. Named V2
+  follow-up: **SP-Cloud-Cluster-RECONFIG** (requires upstream
+  `kessel-vsr` membership-change support).
+- **Coordinated cluster-wide backup NOT in V1.** Per-pod PVC
+  snapshots are uncoordinated (every replica has every byte, so
+  any one snapshot is recoverable; a quiesce-at-op-number
+  cluster-wide snapshot is a separate design). Named V2 follow-up:
+  **SP-Cloud-Cluster-BACKUP**.
 
 ### V1 cloud-deploy caveats (named, not vague)
 

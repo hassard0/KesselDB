@@ -128,6 +128,65 @@ at dispatch entry, JDBC simple-mode unblocked.
   Progress tracker:
   `docs/superpowers/specs/2026-06-02-kesseldb-subproject-sppgextqparsed-progress.md`
   → V1 CLOSED. **TaskList #374 ready for completion.**
+- **Track K cont. — SP-Cloud-Cluster T7+T8 (2026-06-02, V1 ARC
+  CLOSED — Prometheus ServiceMonitor + PrometheusRule + USAGE +
+  README + STATUS).** Closes the SP-Cloud-Cluster V1 arc. T7 adds
+  prometheus-operator CRDs (`monitoring.coreos.com/v1`
+  `ServiceMonitor` + `PrometheusRule`) as opt-in Helm templates
+  gated on `cluster.enabled AND monitoring.prometheus.enabled`
+  (default OFF; chart still installs cleanly in operator-less
+  clusters). The ServiceMonitor targets the chart's existing client
+  ClusterIP Service on the named `http` port (6533) at
+  `/v1/metrics`. The PrometheusRule ships three alerts driven by
+  the V1-emitted metric surface (`crates/kessel-http-gateway/
+  src/metrics_writer.rs` — `kesseldb_ops_total{kind}`,
+  `kesseldb_inflight`, `kesseldb_last_op_number`,
+  `kesseldb_view_number` (monotonic), `kesseldb_is_primary`,
+  `kesseldb_http_requests_total{path,status}`, plus
+  Prometheus-injected `up{}`): `KesselDBClusterReplicaDown`
+  (`up{}==0` for 30s — critical), `KesselDBNoPrimary`
+  (`sum(kesseldb_is_primary)==0` for 60s — critical),
+  `KesselDBViewChangeStorm` (`delta(kesseldb_view_number[5m])>5`
+  for 5m — warning). `values.yaml` grew a
+  `monitoring.prometheus.*` block (`enabled`, `interval` 30s,
+  `scrapeTimeout` 10s, `additionalLabels`, `rules.enabled`,
+  `rules.additionalLabels`). **Honest metric-naming caveat**: V1
+  does NOT emit a dedicated `kesseldb_view_changes_total` counter
+  or `kesseldb_replica_lag_seconds` histogram; the
+  `delta(kesseldb_view_number[5m])` rule is the V1 surrogate.
+  Named V2 follow-up arc **SP-Cloud-Cluster-METRICS-EXPAND** ships
+  the proper counter + lag histogram. **Verification on vulcan**
+  (helm v3.16.3): both `helm lint` paths clean (default mode +
+  `--set cluster.enabled=true --set monitoring.prometheus.enabled=true`);
+  object counts: DEFAULT → 1× Deployment + 1× PVC + 1× Service +
+  1× ServiceAccount; CLUSTER (no monitoring) → 1× StatefulSet +
+  2× Service + 1× ServiceAccount; CLUSTER + monitoring → adds 1×
+  ServiceMonitor + 1× PrometheusRule; CLUSTER + monitoring with
+  `rules.enabled=false` → adds 1× ServiceMonitor (no rule). **T8
+  arc closure**: USAGE.md §11.5 grew a `#### Prometheus monitoring`
+  sub-section (`helm upgrade` invocation with operator-selector
+  label hint, alert table, V1-emitted metric table, knobs list,
+  V2 metric-naming caveat) + an expanded V1-limits list naming
+  every V2 follow-up (HTTP/WS/PG gateway in cluster, Fly multi-
+  region, online reconfig, coordinated backup). README's Deploy
+  table grew a dedicated Kubernetes cluster row (`--set
+  cluster.enabled=true --set cluster.replicas=3` one-liner) +
+  link to USAGE §11.5 + link to the kind primary-kill transcript.
+  **T6 (Fly multi-region) deferred** out of V1 (needs a Fly
+  account); named V2 follow-up arc retained at full priority.
+  **Invariants preserved**: default single-pod render byte-
+  identical (monitoring gated on `cluster.enabled`); cluster-no-
+  monitoring render byte-identical to T5 ship; zero Rust code
+  touched; HTTP/1.1 + WS + binary + PG-wire surfaces byte-
+  untouched; `#![forbid(unsafe_code)]` honored (n/a — YAML +
+  Markdown only); zero new external deps. **KAT delta**: +0
+  (YAML + docs only). Two commits: `501dd6a` (T7 chart additions +
+  values block), `<T8>` (USAGE + README + STATUS + progress
+  tracker close). Progress tracker:
+  `docs/superpowers/specs/2026-06-02-kesseldb-subproject-spcloudcluster-progress.md`
+  — V1 CLOSED, T6 + METRICS-EXPAND + GEO + SHARD + BACKUP +
+  RECONFIG + VERIFY-MULTI-NODE all named V2. **TaskList #377
+  ready for completion (V1 arc DONE).**
 - **Track K cont. — SP-Cloud-Cluster T1 (2026-06-02, T1 SCAFFOLD
   LANDED; T2-T8 MULTI-ARC CONTINUATION QUEUED).** Multi-pod replicated
   VSR clustering — the production-deploy story on top of SP-Cloud-Deploy

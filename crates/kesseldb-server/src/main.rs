@@ -148,6 +148,16 @@ fn parse_args(raw: Vec<String>) -> Result<Args, String> {
 /// Resolve `host:port` strings into `SocketAddr`s. Each entry must
 /// resolve to exactly one socket addr — if DNS returns multiple
 /// (IPv4 + IPv6), we take the first. Empty list returns an error.
+///
+/// SP-Cloud-Cluster T2 — k8s StatefulSet bootstrap race: when the
+/// first pod starts, its own headless-Service DNS record can take
+/// 10-30 s to appear (CoreDNS hasn't published it yet). A naive
+/// `to_socket_addrs` errors immediately. We retry every 2 s for up to
+/// 120 s and bail with a clean error only if the entire window
+/// elapses. Once at least the pod's own ordinal resolves, the binary
+/// moves on — the cluster transport (`cluster::spawn_node`)
+/// internally redials missing peers lazily, so transient mid-bootstrap
+/// failures self-heal there.
 fn resolve_peer_addrs(raw: &str) -> Result<Vec<SocketAddr>, String> {
     let parts: Vec<&str> = raw
         .split(',')
@@ -157,17 +167,42 @@ fn resolve_peer_addrs(raw: &str) -> Result<Vec<SocketAddr>, String> {
     if parts.is_empty() {
         return Err("peer-addrs: empty list".into());
     }
-    let mut out = Vec::with_capacity(parts.len());
-    for p in parts {
-        let mut iter = p
-            .to_socket_addrs()
-            .map_err(|e| format!("peer-addrs: {p:?} resolve failed: {e}"))?;
-        let addr = iter
-            .next()
-            .ok_or_else(|| format!("peer-addrs: {p:?} resolved to nothing"))?;
-        out.push(addr);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let mut out = Vec::with_capacity(parts.len());
+        let mut first_err: Option<String> = None;
+        for p in &parts {
+            match p.to_socket_addrs() {
+                Ok(mut iter) => match iter.next() {
+                    Some(addr) => out.push(addr),
+                    None => {
+                        first_err = Some(format!(
+                            "peer-addrs: {p:?} resolved to nothing"
+                        ));
+                        break;
+                    }
+                },
+                Err(e) => {
+                    first_err =
+                        Some(format!("peer-addrs: {p:?} resolve failed: {e}"));
+                    break;
+                }
+            }
+        }
+        if first_err.is_none() && out.len() == parts.len() {
+            return Ok(out);
+        }
+        let err = first_err.unwrap_or_else(|| "peer-addrs: unknown error".into());
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "{err} (after 120s of retries — DNS still unhealthy?)"
+            ));
+        }
+        eprintln!(
+            "kesseldb cluster: DNS bootstrap: {err}; retrying in 2s..."
+        );
+        std::thread::sleep(std::time::Duration::from_secs(2));
     }
-    Ok(out)
 }
 
 fn main() {

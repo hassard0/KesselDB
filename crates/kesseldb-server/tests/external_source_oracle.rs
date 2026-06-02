@@ -274,7 +274,11 @@ fn refresh_oracle_materializes_idempotent_upserts_and_atomic_abort() {
 /// the materialized row state (record bytes + scan order).
 fn select_blob(shard: &mut Client) -> Vec<u8> {
     match shard.sql("SELECT * FROM feed").expect("select wire") {
-        OpResult::Got(b) => b,
+        // SP-Perf-A T7: OpResult::Got now carries Arc<[u8]>; this test
+        // compares deterministic blob fingerprints as Vec<u8>, so convert
+        // once at the boundary. The Arc-share fast path is exercised by
+        // the in-process read tests; here we just need owned bytes.
+        OpResult::Got(b) => b.to_vec(),
         o => panic!("SELECT * FROM feed: {o:?}"),
     }
 }

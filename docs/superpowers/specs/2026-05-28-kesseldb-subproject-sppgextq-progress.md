@@ -82,10 +82,13 @@ real streaming cursors (SP-A T14 streaming-rows). See design spec §2.2.
 
 Optional / V2 follow-ups (each its own arc):
 
-- **SP-PG-EXTQ-BIN (V2)** — binary-format parameters (format code 1).
-  ~2 slices. int / float / bool / text / timestamp first; numeric
-  last (PG binary numeric is base-10000 variable-length-digit and
-  bug-prone).
+- **SP-PG-EXTQ-BIN (V2 — CLOSED 2026-06-01 at T3)** — binary-format
+  parameters (format code 1). V1 shipped for the common scalars
+  (INT2/INT4/INT8/FLOAT4/FLOAT8/BOOL/TEXT/VARCHAR/BYTEA/TIMESTAMPTZ);
+  asyncpg + psycopg3 DEFAULT cursor now PASS on vulcan. NUMERIC
+  binary still rejects (V2 SP-PG-EXTQ-BIN-NUMERIC). Binary RESULTS
+  emit is the next arc (V2 SP-PG-EXTQ-BIN-RESULTS). See
+  `docs/superpowers/specs/2026-06-01-kesseldb-subproject-sppgextqbin-progress.md`.
 - **SP-PG-EXTQ-CACHE (V2)** — server-side prepared-statement cache
   that survives reconnect. Almost no ORM relies on this — they all
   re-Parse on reconnect — but libpq supports it and a future

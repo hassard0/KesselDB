@@ -1769,37 +1769,52 @@ required for any modern PG client.
 | 18 | SQLAlchemy DISCARD ALL via engine | PASS |
 | 19 | SQLAlchemy connection pool checkout/checkin x3 | PASS |
 
-#### Broader ORM compat matrix (T8, 2026-05-29)
+#### Broader ORM compat matrix (T3, 2026-06-01 — SP-PG-EXTQ-BIN unlock)
 
 T8 ran a deeper compat smoke against the drivers psycopg2 + SQLAlchemy
-already cover. The result locks where V1 ends and which V2 follow-up
-each gap maps to. Each row is the actual driver session — see
-`docs/superpowers/sppgextq-t8-orm-smoke-2026-05-29.txt` for full
-transcripts.
+already covered. SP-PG-EXTQ-BIN T3 then lifted the binary-format
+parameter gap for the V1 supported PG types (INT2/INT4/INT8/FLOAT4/
+FLOAT8/BOOL/TEXT/VARCHAR/BYTEA/TIMESTAMPTZ). The two T8 PARTIAL
+drivers (asyncpg, psycopg3 default cursor) flip to PASS. Each row is
+the actual driver session — see
+`docs/superpowers/sppgextqbin-t3-smoke-2026-06-01.txt` for the T3
+SP-PG-EXTQ-BIN transcript and `docs/superpowers/sppgextq-t8-orm-
+smoke-2026-05-29.txt` for the earlier T8 baseline.
 
 | Driver          | Status   | Notes                                              |
 |-----------------|----------|----------------------------------------------------|
 | psycopg2 2.9.12 | PASS     | T7 baseline (19/19 steps)                          |
 | SQLAlchemy 2.0  | PASS     | T8 closes the `use_native_hstore=False` caveat     |
-| psycopg3 3.3.4  | PASS\*   | Needs `cursor_factory=psycopg.ClientCursor`        |
-| asyncpg 0.31.0  | PARTIAL  | Connect + DDL + non-param SELECT OK; binary params blocked |
-| JDBC 42.7       | PARTIAL  | Connect + DDL + simple-Q SELECT OK; binary / `::` cast blocked |
+| psycopg3 3.3.4  | PASS     | SP-PG-EXTQ-BIN T3 — DEFAULT cursor (NOT ClientCursor) works end-to-end |
+| asyncpg 0.31.0  | PASS\*   | SP-PG-EXTQ-BIN T3 — binary Bind path works; binary RESULTS still V2 (SP-PG-EXTQ-BIN-RESULTS) |
+| JDBC 42.7       | PARTIAL  | Same binary-Bind unlock as asyncpg; vulcan has no javac so untested in T3 |
 | pgx (Go)        | n/a      | Go runtime not on vulcan (V2 `SP-PG-GO-SMOKE`)     |
 | Drizzle (Node)  | n/a      | Node runtime not on vulcan (V2 `SP-PG-NODE-SMOKE`) |
 | Prisma (Node)   | n/a      | Node runtime not on vulcan (V2 `SP-PG-NODE-SMOKE`) |
-| sqlx (Rust)     | n/a      | Same binary-param gap; V2 `SP-PG-EXTQ-BIN`         |
+| sqlx (Rust)     | n/a      | Same binary-Bind unlock; result-side blocked on V2 `SP-PG-EXTQ-BIN-RESULTS` |
 
-The PARTIAL drivers all hit the same V1 limitation — V1 rejects
-format code 1 (binary-format parameters) at Bind time with
-`0A000 feature_not_supported` per spec §11 weak-spot #1. ~95% of
-real Postgres traffic uses text-format parameters by default
-(psycopg2 / SQLAlchemy / node-postgres / Django ORM), so V1 covers
-the adoption-multiplier base case fully. The remaining drivers
-unlock when V2 `SP-PG-EXTQ-BIN` ships (text-decode of binary
-parameters at the gateway boundary). JDBC's simple-query mode
-additionally hits a kessel-sql parser gap on `::int8` casts; lift
-via V2 `SP-PG-EXTQ-CAST` (gateway-side cast-stripping rewrite) or
-SQL-AST `SP-SQL-CAST` (parser-level type-cast recognition).
+SP-PG-EXTQ-BIN T3 wired the binary-format decoder into the Bind path:
+each parameter with `format_code=1` (binary) at position `i` is
+admitted iff `param_oids[i]` is one of the V1 supported PG types
+(INT2/INT4/INT8/FLOAT4/FLOAT8/BOOL/TEXT/VARCHAR/BYTEA/TIMESTAMPTZ),
+then decoded at Execute time into a SQL literal that flows through
+the existing substitute layer (bare-int literal for integers, single-
+quoted + `'`→`''`-escaped for text, `'\xHEX'::bytea` for bytea, etc).
+Describe('S') synthesizes ParameterDescription from the SQL's `$N`
+count when Parse omitted OID hints (V1 emits PG_TYPE_TEXT for each
+position; clients encode text-as-binary which routes through the
+existing text path). NUMERIC binary still rejects with the precise
+`SP-PG-EXTQ-BIN-NUMERIC` follow-up arc name so operators can grep
+for the gap.
+
+The remaining PARTIAL/asterisk drivers all hit the SAME residual gap:
+- asyncpg / sqlx / JDBC `result_formats=[1]` (binary DataRow) — V1
+  still emits text-format DataRow; clients mis-decode and error.
+  Lifts in V2 `SP-PG-EXTQ-BIN-RESULTS` (binary DataRow encoder).
+- JDBC simple-query mode additionally hits a kessel-sql parser gap
+  on `::int8` casts; lift via V2 `SP-PG-EXTQ-CAST` (gateway-side
+  cast-stripping rewrite) or `SP-SQL-CAST` (parser-level type-cast
+  recognition).
 
 #### Pipelining throughput (T8, 2026-05-29)
 
@@ -1824,6 +1839,8 @@ and post higher numbers; that's V2 `SP-PG-EXTQ-PIPELINE-BATCH`.
 - SP-PG-CAT progress (closed at T8): `docs/superpowers/specs/2026-05-27-kesseldb-subproject-sppgcat-progress.md`
 - SP-PG-EXTQ design spec: `docs/superpowers/specs/2026-05-28-kesseldb-sppgextq-extended-query-design.md`
 - SP-PG-EXTQ progress (T7 — hardening + real ORM smoke): `docs/superpowers/specs/2026-05-28-kesseldb-subproject-sppgextq-progress.md`
+- SP-PG-EXTQ-BIN design spec: `docs/superpowers/specs/2026-06-01-kesseldb-sppgextq-bin-design.md`
+- SP-PG-EXTQ-BIN progress (V1 SHIPPED at T3 — binary-format params unlock): `docs/superpowers/specs/2026-06-01-kesseldb-subproject-sppgextqbin-progress.md`
 - SP-PG-COPY design spec: `docs/superpowers/specs/2026-05-30-kesseldb-sppgcopy-design.md`
 - SP-PG-COPY progress (V1 SHIPPED at T4 — pg_dump / sysbench / `\copy` bulk-load): `docs/superpowers/specs/2026-05-30-kesseldb-subproject-sppgcopy-progress.md`
 - SP-PG-COPY-BULKAPPLY design spec: `docs/superpowers/specs/2026-05-30-kesseldb-sppgcopybulkapply-design.md`

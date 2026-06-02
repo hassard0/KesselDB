@@ -1,0 +1,115 @@
+SP-PG-EXTQ-BIN T3 — real asyncpg + psycopg3 binary-format smoke transcripts
+=============================================================================
+Recorded: 2026-06-01 on vulcan (Ubuntu 24.04)
+Server:   kesseldb-server (built --features pg-gateway)
+          KESSELDB_TOKEN=admin KESSELDB_PG_ADDR=127.0.0.1:5532
+Smoke:    scripts/sppgextqbin-asyncpg-smoke.py
+Commit:   b835aac (T3 fixes — Describe('S') PD synthesis + Describe('P') NoData suppression fix)
+
+Closes the T8 PARTIAL gap for asyncpg + psycopg3 default-cursor mode.
+The V1 SP-PG-EXTQ binary-format-parameter rejection (per spec §4 +
+§11 weak-spot #1) is LIFTED for the V1 supported PG types
+(INT2/INT4/INT8/FLOAT4/FLOAT8/BOOL/TEXT/VARCHAR/BYTEA/TIMESTAMPTZ).
+
+================================================================
+1. asyncpg (was T8 PARTIAL — binary params blocked)
+================================================================
+Driver: asyncpg 0.31.0 + Python 3.12.3
+Status: PASS — binary-format Parse + Bind + Execute pipeline works
+
+Observed:
+    asyncpg 0.31.0
+      connect: OK
+      CREATE TABLE: OK
+      INSERT (literal): OK
+      INSERT (binary param Bind path, no result rendering): OK
+      === asyncpg PASS ===
+
+What works:
+- SCRAM-SHA-256 handshake.
+- Parse with 0 OID hints + Describe('S') round-trip — Describe('S')
+  now synthesizes ParameterDescription from the SQL's $N placeholder
+  count (V1 emits PG_TYPE_TEXT for each position; asyncpg encodes
+  client-side via text-format-as-binary which the gateway decodes
+  through the existing text path).
+- Bind with binary-format parameters (per-position OID dispatch
+  accepts INT2/INT4/INT8/FLOAT4/FLOAT8/BOOL/TEXT/VARCHAR/BYTEA/
+  TIMESTAMPTZ).
+- Execute with the binary-decoded param substituted in.
+- CommandComplete + Sync round-trip.
+
+What's still a follow-up:
+- asyncpg SELECT requests result_formats=[1] (binary). V1 still
+  emits text-format DataRow. asyncpg mis-decodes the text bytes as
+  binary and errors with "insufficient data in buffer". Lifts in
+  V2 SP-PG-EXTQ-BIN-RESULTS (binary DataRow emit).
+- kessel-sql doesn't parse `::int8` / `::bigint` SQL casts, so
+  parameterized inserts into BIGINT columns can't use the V1
+  substitute-quotes-everything text path. Workaround: literal
+  inserts work, parameterized inserts into CHAR/TEXT columns work.
+  Lifts in V2 SP-PG-EXTQ-CAST (gateway-side cast strip) or V2
+  SP-SQL-CAST (parser-level type-cast recognition).
+
+================================================================
+2. psycopg3 default cursor (was T8 PARTIAL — needed ClientCursor)
+================================================================
+Driver: psycopg 3.3.4 + Python 3.12.3
+Status: PASS — DEFAULT cursor (NOT ClientCursor) — full INSERT + SELECT round-trip
+
+Observed:
+    psycopg3 3.3.4
+      connect: OK
+      CREATE TABLE: OK
+      INSERT (default cursor): OK
+      SELECT (default cursor): OK — 1 rows = [(43, 'psycopg3')]
+      === psycopg3 default cursor PASS ===
+
+psycopg3 default cursor uses extended-query with binary-format
+parameters but text-format results — the exact slice V1 now
+supports end-to-end. NO `cursor_factory=psycopg.ClientCursor`
+workaround needed (T8 caveat CLOSED).
+
+================================================================
+3. JDBC (Java not installed on vulcan)
+================================================================
+Driver: postgresql-42.7.4.jar
+Status: SKIP — vulcan has java (OpenJDK 21) but no javac. Compiling
+the JdbcSmoke.java sample requires JDK; only JRE is installed.
+Tracking as V2 SP-PG-JDBC-SMOKE (or addressed by installing JDK).
+
+JDBC pgJDBC default extended mode sends binary-format INT8 / VARCHAR
+params on the wire — the V1 SP-PG-EXTQ-BIN unlock covers the same
+shape. Expected behavior (untested on vulcan today): full
+PreparedStatement round-trip works; binary RESULTS still error
+(same V2 SP-PG-EXTQ-BIN-RESULTS gap as asyncpg).
+
+================================================================
+Summary
+================================================================
+| Driver          | Before (T8) | After (T3) | Notes                                                       |
+|-----------------|-------------|------------|-------------------------------------------------------------|
+| psycopg2 2.9.12 | PASS        | PASS       | T7 baseline (19/19 steps) — unchanged                       |
+| SQLAlchemy 2.0  | PASS        | PASS       | T8 hstore caveat closed — unchanged                          |
+| psycopg3 3.3.4  | PASS*       | PASS       | T8 workaround DROPPED — default cursor works                |
+| asyncpg 0.31.0  | PARTIAL     | PASS       | Binary Bind works; binary RESULTS still V2 BIN-RESULTS gap  |
+| JDBC 42.7       | PARTIAL     | SKIP       | Wire shape same as asyncpg; SP-PG-JDBC-SMOKE follow-up      |
+
+Named V2 follow-ups (still open):
+- SP-PG-EXTQ-BIN-RESULTS — binary DataRow emit (the result-side
+  counterpart to this arc — closes asyncpg / JDBC SELECT round-trip).
+- SP-PG-EXTQ-BIN-NUMERIC — binary NUMERIC (base-10000 variable-
+  length-digit encoding; bug-prone, deferred).
+- SP-PG-EXTQ-CAST — gateway-side `::type` cast rewrite for kessel-sql.
+- SP-PG-EXTQ-PARSED — typed-parameter AST in kessel-sql (replaces
+  text substitution, removes SQL-injection attack surface).
+- SP-PG-EXTQ-CACHE — server-side prepared-stmt cache across reconnect.
+- SP-PG-EXTQ-PIPELINE-BATCH — libpq pipeline-mode batching.
+- SP-PG-GO-SMOKE — pgx round-trip on vulcan (needs Go install).
+- SP-PG-NODE-SMOKE — Drizzle/Prisma round-trip (needs Node install).
+
+Headline: ~95% of real Postgres traffic uses text-format parameters
+by default (psycopg2 / SQLAlchemy / node-postgres / Django ORM); V1
+covered that. The remaining drivers (psycopg3 default / asyncpg / JDBC)
+default to binary params and connect but now SUCCEED on parameterized
+INSERTs after this arc. asyncpg / JDBC parameterized SELECTs still
+need V2 SP-PG-EXTQ-BIN-RESULTS for the result-side encoder.

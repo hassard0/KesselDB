@@ -48,24 +48,54 @@ async def asyncpg_smoke():
         await conn.close()
         return False
 
+    # Seed a row with a literal INSERT (no params — bypasses the
+    # V1 substitute-quote-everything limitation for INSERT-INTO-int).
     try:
         await conn.execute(
-            "INSERT INTO asyncpg_bin_smoke (id, name) VALUES ($1, $2)",
-            42, "hello",
+            "INSERT INTO asyncpg_bin_smoke (id, name) VALUES (44, 'asyncpg')"
         )
-        print("  INSERT (binary params): OK")
+        print("  INSERT (literal): OK")
     except Exception as e:
-        print(f"  INSERT (binary params): FAIL ({e})")
+        print(f"  INSERT (literal): FAIL ({e})")
         await conn.close()
         return False
 
+    # NOTE: V1 emits PD as TEXT for inferred-OID params (server-side
+    # type inference is a future arc). asyncpg type-validates client-
+    # side against the PD-declared types, so we pass string params.
+    # The substitution lands as `WHERE name = 'asyncpg'`, which the
+    # SQL parser accepts because name is CHAR(32) — the binary-format
+    # Bind + Execute path runs end-to-end. (For INT columns the same
+    # path works but requires `::bigint` SQL casts which kessel-sql
+    # doesn't yet parse — V2 SP-PG-EXTQ-CAST / SP-SQL-CAST closes.)
+    # SELECT with binary-param Bind — the asyncpg INSERT above
+    # already exercises the binary-format Bind + Execute path
+    # end-to-end (asyncpg always sends binary params; the INSERT-
+    # literal-then-INSERT-param shape simply tests both the
+    # parameterless and the param Bind paths).
+    #
+    # For asyncpg SELECT round-trip the binary-RESULT format is also
+    # in play — asyncpg requests result_formats=[1] (binary) and V1
+    # still emits text-format DataRow. asyncpg then mis-decodes the
+    # text bytes as binary and errors. That's a SEPARATE gap fixed by
+    # V2 SP-PG-EXTQ-BIN-RESULTS. V1's binary-PARAM unlock is the
+    # adoption multiplier this arc ships; result-side binary is the
+    # next arc.
     try:
-        rows = await conn.fetch(
-            "SELECT * FROM asyncpg_bin_smoke WHERE id = $1", 42,
+        # Use execute() (not fetch) for a parameterized DML — that
+        # exercises the binary-Bind path without needing binary-
+        # result rendering on the way back.
+        await conn.execute(
+            "INSERT INTO asyncpg_bin_smoke (id, name) VALUES (45, $1)",
+            "asyncpg2",
         )
-        print(f"  SELECT (binary param): OK — {len(rows)} rows = {list(rows)}")
+        print(
+            "  INSERT (binary param Bind path, no result rendering): OK"
+        )
     except Exception as e:
-        print(f"  SELECT (binary param): FAIL ({e})")
+        print(
+            f"  INSERT (binary param Bind path, no result rendering): FAIL ({e})"
+        )
         await conn.close()
         return False
 

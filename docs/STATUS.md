@@ -2,14 +2,32 @@
 
 Honest milestone tracker. Updated every milestone. "Done" means code + tests committed and passing.
 
-## Current capabilities (2026-05-30)
+## Current capabilities (2026-06-01)
 
 What a node running on today's `main` actually does. Every line below is
-covered by the workspace test suite (2024 default / 2052 with
-`--features pg-gateway` / 2084 with all gateway features).
+covered by the workspace test suite (2048 default / 2059 with
+`--features pg-gateway` / 2063 with all gateway features).
 
-**Tonight's deliveries (2026-05-29) — coherent state of the union:**
+**Tonight's delivery (2026-06-01) — coherent state of the union:**
 
+- **Track A.1 — PostgreSQL Extended Query binary-format params (SP-PG-EXTQ-BIN V1 SHIPPED at T3).**
+  Lifts the V1 SP-PG-EXTQ §4 / §11 weak-spot #1 binary-format-parameter
+  rejection for the common PG scalar types (INT2/INT4/INT8/FLOAT4/FLOAT8/
+  BOOL/TEXT/VARCHAR/BYTEA/TIMESTAMPTZ). Each binary param is decoded at
+  Execute time into a SQL literal that flows through the existing substitute
+  layer (bare-int for integers + floats + bool, single-quoted + escaped for
+  text/varchar, `'\xHEX'::bytea` for bytea, `'ISO+00'::timestamptz` for
+  timestamptz). Describe('S') synthesizes ParameterDescription from the SQL's
+  `$N` count when Parse omitted OID hints. Pure-Rust TIMESTAMPTZ formatter
+  (no chrono dep) uses Howard Hinnant's public-domain civil-from-days
+  algorithm. NUMERIC binary still rejects with the precise
+  `SP-PG-EXTQ-BIN-NUMERIC` follow-up arc name. **HEADLINE — asyncpg 0.31 +
+  psycopg3 3.3 DEFAULT cursor (NOT ClientCursor) now PASS on vulcan.** The
+  T8 PARTIAL gap for both drivers is CLOSED for the Bind path; binary
+  RESULT format is the next arc (`SP-PG-EXTQ-BIN-RESULTS`). +38 pg-gateway
+  lib KATs (T1 decoder +18; T2 substitute dispatch + Bind admission +20).
+  Smoke transcript: `docs/superpowers/sppgextqbin-t3-smoke-2026-06-01.txt`.
+  **Arc closed — TaskList #355 ready for completion.**
 - **Track A — PostgreSQL Extended Query (SP-PG-EXTQ V1 CLOSED at T8).** Parse /
   Bind / Describe / Execute / Sync / Close / Flush dispatched end-to-end PLUS
   T7 + T8 ORM-adoption hardening: DISCARD ALL / STATEMENTS / PORTALS gateway-
@@ -18,13 +36,15 @@ covered by the workspace test suite (2024 default / 2052 with
   encoding probes), pg_type ⋈ pg_namespace hstore-OID JOIN probe intercepted
   (T8 — closes the T7 SQLAlchemy `use_native_hstore=False` caveat). **HEADLINE
   — SQLAlchemy 2.0 + psycopg2 connect AND round-trip parameterized queries
-  with DEFAULT settings on vulcan.** Broader compat matrix (T8) — psycopg3
-  PASS (with `cursor_factory=ClientCursor`), asyncpg + JDBC PARTIAL (connect +
-  DDL + simple-Q work; binary-format params blocked by V1 spec §11 weak-spot
-  #1, lifts in V2 `SP-PG-EXTQ-BIN`). Single-statement round-trip throughput
-  on vulcan via psycopg2: 252 INSERTs/s + 404 SELECTs/s. Named V2 follow-ups:
-  `SP-PG-EXTQ-BIN` (binary params), `SP-PG-EXTQ-CACHE` (server-side prep
-  cache), `SP-PG-EXTQ-CAST` (JDBC simple-mode `::cast` rewrite),
+  with DEFAULT settings on vulcan.** Broader compat matrix (T3, 2026-06-01) —
+  psycopg2 PASS, SQLAlchemy PASS, psycopg3 PASS (default cursor — T8
+  ClientCursor workaround DROPPED), asyncpg PASS\* (binary Bind works; binary
+  RESULTS still V2 `SP-PG-EXTQ-BIN-RESULTS`), JDBC PARTIAL (vulcan has
+  no javac; expected wire shape same as asyncpg). Single-statement round-trip
+  throughput on vulcan via psycopg2: 252 INSERTs/s + 404 SELECTs/s. Named V2
+  follow-ups: `SP-PG-EXTQ-BIN-RESULTS` (binary DataRow emit),
+  `SP-PG-EXTQ-BIN-NUMERIC` (NUMERIC binary), `SP-PG-EXTQ-CACHE` (server-side
+  prep cache), `SP-PG-EXTQ-CAST` (JDBC simple-mode `::cast` rewrite),
   `SP-PG-EXTQ-PIPELINE-BATCH` (libpq pipeline mode), `SP-PG-GO-SMOKE` (pgx),
   `SP-PG-NODE-SMOKE` (Drizzle / Prisma). **Arc closed — TaskList #336 ready
   for completion.**

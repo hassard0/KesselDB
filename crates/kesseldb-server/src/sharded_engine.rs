@@ -130,20 +130,130 @@ pub fn shard_of_key(key: &[u8], k: usize) -> usize {
 /// in sequence (catalog state stays byte-identical across shards).
 ///
 /// `ShardZero` — op that doesn't have a single owning key AND isn't a
-/// scan-shape (Txn, XSHARD admin frames). Routes to shard 0 only —
-/// the SHARD-XTXN follow-up arc unwinds this for Op::Txn.
+/// scan-shape (XSHARD admin frames). Routes to shard 0 only.
 ///
 /// `Scatter(kind)` — SP-Perf-A-SHARD-SCAN: scan-shape op that needs
 /// to fan out to every shard. The `ScatterKind` discriminator picks
 /// the merge strategy (Unordered concat / Sorted heap-merge / OidConcat
 /// union / OidSortedUnion sort+dedup / AggregateMerge / ...). The
 /// router calls `scatter_and_merge` with N `InProcShardCaller`s.
+///
+/// `CrossShardReject` — SP-Perf-A-SHARD-XTXN V1: an Op::Txn{ops}
+/// whose inner ops' primary keys span ≥ 2 shards (OR include a scan-
+/// shape inner op with no extractable primary key). V1 has no cross-
+/// shard 2PC; rejecting cleanly with a typed `OpResult::SchemaError`
+/// is the honest deliverable. V2 `SP-Perf-A-SHARD-XTXN-2PC` will
+/// replace this with real cross-shard coordination. `shards` carries
+/// the number of distinct shards touched (>= 2 for the multi-shard
+/// case; 0 when an inner op was scan-shape with no primary key).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShardRoute {
     Single(usize),
     Broadcast,
     ShardZero,
     Scatter(ScatterKind),
+    CrossShardReject { shards_touched: usize },
+}
+
+/// SP-Perf-A-SHARD-XTXN: classify a SINGLE inner op of an `Op::Txn`
+/// by its primary key. Returns `Some(shard_id)` for point-data ops
+/// (Create / Update / UpdateSet / Delete / GetById / GetBlob);
+/// returns `None` for scan-shape ops (FindBy / Select / Aggregate /
+/// Describe / Query / ...), DDL ops (which shouldn't appear inside a
+/// txn anyway — apply-Txn rejects them up-front), and other ops that
+/// don't have a single owning shard.
+///
+/// V1 conservative policy:
+///   - Sequencer ops (SeqRead / SeqAppend / SeqAppendOnce) → None.
+///     They live on a fixed shard standalone, but their interaction
+///     with txn boundaries is complex (SeqRead is rejected inside a
+///     txn by apply-Txn; SeqAppend writes to the seq keyspace).
+///   - Describe → None. Standalone Describe routes by type to a
+///     deterministic shard, but a Describe inside a txn is unusual
+///     and V1 punts.
+///
+/// The OUTER classifier (`route_op` Op::Txn arm) treats `None` for
+/// any inner op as "must reject the whole txn" — V1 cannot decide
+/// without a primary key whether the txn is single-shard.
+///
+/// At K=1 every inner op trivially classifies to shard 0; callers
+/// should special-case K=1 before invoking this helper.
+#[inline]
+pub fn extract_txn_inner_pkey_shard(op: &Op, k: usize) -> Option<usize> {
+    debug_assert!(k >= 1);
+    match op {
+        // Point-data WRITE ops — primary key = (type_id, id).
+        Op::Create { type_id, id, .. }
+        | Op::Update { type_id, id, .. }
+        | Op::UpdateSet { type_id, id, .. }
+        | Op::Delete { type_id, id } => {
+            Some(shard_of_key(&make_key_inline(*type_id, &id.0), k))
+        }
+        // Point-data READ ops — same primary key shape.
+        Op::GetById { type_id, id } => {
+            Some(shard_of_key(&make_key_inline(*type_id, &id.0), k))
+        }
+        // GetBlob — overflow keyspace (matches the standalone
+        // GetBlob route).
+        Op::GetBlob { handle } => {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&handle.to_le_bytes());
+            Some(shard_of_key(&make_key_inline(0xFFFF_FFFF, &id), k))
+        }
+        // Everything else — no single owning shard (scan-shape,
+        // DDL, sequencer, admin, nested Txn). Classifier returns
+        // None; outer `route_op` rejects.
+        _ => None,
+    }
+}
+
+/// SP-Perf-A-SHARD-XTXN: classify an `Op::Txn{ops}` by walking every
+/// inner op's primary-key shard. Returns:
+///
+///   - `Single(0)` for an empty txn (`ops.is_empty()`) — apply-Txn's
+///     loop is a no-op + commit_txn → `Ok` on shard 0.
+///   - `Single(s)` if every keyed inner op maps to the same shard
+///     `s` AND no inner op is scan-shape.
+///   - `CrossShardReject { shards_touched }` if the inner ops span
+///     ≥ 2 shards, OR any inner op is scan-shape (no extractable
+///     primary key). The `shards_touched` field reports how many
+///     distinct shards were observed (0 if a scan-shape inner op
+///     short-circuited the walk before any keys were collected).
+///
+/// Caller (`route_op`) special-cases K=1 to `Single(0)` before
+/// invoking this; this function assumes K >= 2.
+fn classify_txn(ops: &[Op], k: usize) -> ShardRoute {
+    debug_assert!(k >= 2);
+    if ops.is_empty() {
+        // Empty txn — apply-Txn is a begin/commit pair with no inner
+        // op. Routes to shard 0 (any shard would do; shard 0 is the
+        // canonical choice consistent with the K=1 collapse).
+        return ShardRoute::Single(0);
+    }
+    let mut seen: Option<usize> = None;
+    for inner in ops {
+        match extract_txn_inner_pkey_shard(inner, k) {
+            Some(s) => match seen {
+                None => seen = Some(s),
+                Some(prev) if prev == s => {} // same shard — fast path holds
+                Some(_) => {
+                    // Two distinct shards observed — reject.
+                    return ShardRoute::CrossShardReject {
+                        shards_touched: 2,
+                    };
+                }
+            },
+            None => {
+                // Scan-shape (or otherwise non-classifiable) inner op.
+                // V1 cannot prove single-shard; reject defensively.
+                return ShardRoute::CrossShardReject {
+                    shards_touched: 0,
+                };
+            }
+        }
+    }
+    // All inner ops keyed AND landed on the same shard.
+    ShardRoute::Single(seen.expect("non-empty txn must observe at least one key"))
 }
 
 /// Compute the shard route for an op against a K-shard cluster. `K=1`
@@ -302,12 +412,21 @@ pub fn route_op(op: &Op, k: usize) -> ShardRoute {
         // wrong results at K>=2; documented).
         Op::Join { .. } => ShardRoute::ShardZero,
 
-        // ----- Op::Txn / cross-shard admin (V1 → ShardZero) -----
-        // SHARD-XTXN is the follow-up arc that handles cross-shard
-        // transactions. V1 keeps single-shard txn semantics on
-        // shard 0.
-        Op::Txn { .. }
-        | Op::CommitTx { .. }
+        // ----- SP-Perf-A-SHARD-XTXN: Op::Txn classified by inner-op
+        // primary-key shard span. Single-shard txns route to their
+        // owning shard's apply thread (full atomic via that shard's
+        // apply-Txn arm); multi-shard txns reject with a typed
+        // SchemaError. V2 SP-Perf-A-SHARD-XTXN-2PC closes the multi-
+        // shard atomicity gap via prepare/commit phases.
+        Op::Txn { ops } => classify_txn(ops, k),
+
+        // ----- Cross-shard admin / XSHARD ops (V1 → ShardZero) -----
+        // CommitTx + XshardApply + XshardDecide + XshardCommit are the
+        // cluster-router 2PC frames. In the in-process sharding world
+        // they have no external coordinator; routing to shard 0 keeps
+        // them on a single state machine. V2 SHARD-XTXN-2PC may
+        // repurpose these for in-process 2PC.
+        Op::CommitTx { .. }
         | Op::XshardApply { .. }
         | Op::XshardDecide { .. }
         | Op::XshardCommit { .. }
@@ -539,6 +658,25 @@ impl ShardedDispatcher {
                 first_result.expect("broadcast: K >= 2 by invariant")
             }
             ShardRoute::Scatter(kind) => self.scatter_dispatch(&op, kind),
+            ShardRoute::CrossShardReject { shards_touched } => {
+                // SP-Perf-A-SHARD-XTXN V1: Op::Txn whose inner ops
+                // span multiple shards (or include a scan-shape inner
+                // op with no extractable primary key). V1 has no
+                // cross-shard 2PC; the only safe answer is a typed
+                // SchemaError BEFORE any shard's storage is touched.
+                // No shard's `apply_raw` is invoked here, so the
+                // applied_ops counters stay unchanged — KAT-locked.
+                let why = if shards_touched == 0 {
+                    "scan-shape inner op (no extractable primary key)"
+                        .to_string()
+                } else {
+                    format!("{shards_touched} distinct shards touched")
+                };
+                OpResult::SchemaError(format!(
+                    "cross-shard transaction not supported in V1 \
+                     (see SP-Perf-A-SHARD-XTXN-2PC): {why}"
+                ))
+            }
         }
     }
 
@@ -990,22 +1128,282 @@ mod tests {
     }
 
     #[test]
-    fn route_op_k4_txn_routes_to_shard_zero() {
+    fn route_op_k4_join_routes_to_shard_zero() {
         // SP-Perf-A-SHARD-SCAN: scan ops now Scatter (was ShardZero).
-        // Op::Txn + Op::Join + XSHARD ops still route to shard 0 (V1
-        // SHARD-XTXN/SHARD-JOIN are separate arcs).
-        for op in [
-            Op::Txn { ops: vec![] },
-            Op::Join {
-                left_type: 1,
-                right_type: 2,
-                left_field: 1,
-                right_field: 1,
+        // Op::Join remains on shard 0 (SHARD-JOIN is a separate arc;
+        // V1 returns shard-0-only results at K>=2; documented).
+        // Op::Txn is now classified by SP-Perf-A-SHARD-XTXN — see
+        // the dedicated XTXN tests below.
+        let op = Op::Join {
+            left_type: 1,
+            right_type: 2,
+            left_field: 1,
+            right_field: 1,
+            limit: 10,
+        };
+        assert_eq!(route_op(&op, 4), ShardRoute::ShardZero, "{op:?}");
+    }
+
+    // ====================================================================
+    // SP-Perf-A-SHARD-XTXN classifier KATs
+    // ====================================================================
+    //
+    // These tests exercise `extract_txn_inner_pkey_shard` + `classify_txn`
+    // + `route_op` for the new Op::Txn classification. End-to-end
+    // dispatch tests (single-shard write/read round-trip; cross-shard
+    // reject + no-data-loss) live in the SHARD-XTXN end-to-end module
+    // further below.
+
+    #[test]
+    fn xtxn_empty_txn_routes_to_single_zero_at_k4() {
+        // Empty Op::Txn always routes to Single(0) — apply-Txn at
+        // shard 0 returns Ok after a no-op begin/commit. Matches K=1
+        // collapse behavior.
+        let op = Op::Txn { ops: vec![] };
+        assert_eq!(route_op(&op, 4), ShardRoute::Single(0));
+        assert_eq!(route_op(&op, 1), ShardRoute::Single(0));
+    }
+
+    #[test]
+    fn xtxn_single_inner_op_routes_to_owning_shard_k4() {
+        // Single-op Op::Txn classifies as the inner op's owning shard.
+        let id = ObjectId::from_u128(0xCAFEBABE);
+        let expected_shard =
+            shard_of_key(&make_key_inline(7, &id.0), 4);
+        let txn = Op::Txn {
+            ops: vec![Op::Create {
+                type_id: 7,
+                id,
+                record: vec![1, 2, 3],
+            }],
+        };
+        assert_eq!(
+            route_op(&txn, 4),
+            ShardRoute::Single(expected_shard),
+            "single-op txn must route to inner op's owning shard"
+        );
+    }
+
+    #[test]
+    fn xtxn_multi_op_same_shard_routes_to_that_shard_k4() {
+        // Two ops on the SAME (type_id, id) → same shard → Single(s).
+        let id = ObjectId::from_u128(99);
+        let expected =
+            shard_of_key(&make_key_inline(1, &id.0), 4);
+        let txn = Op::Txn {
+            ops: vec![
+                Op::Create {
+                    type_id: 1,
+                    id,
+                    record: vec![1],
+                },
+                Op::Update {
+                    type_id: 1,
+                    id,
+                    record: vec![2],
+                },
+                Op::GetById { type_id: 1, id },
+            ],
+        };
+        assert_eq!(route_op(&txn, 4), ShardRoute::Single(expected));
+    }
+
+    #[test]
+    fn xtxn_multi_op_distinct_shards_rejects_k4() {
+        // Find two object-ids whose make_key hashes to different
+        // shards at K=4. Brute-force search to keep the test
+        // independent of the FxHash output (the function is
+        // deterministic but the specific shard each id lands on is
+        // a property of the hash, not the test).
+        let mut found_a: Option<ObjectId> = None;
+        let mut found_b: Option<ObjectId> = None;
+        let mut shard_a: Option<usize> = None;
+        for i in 0u128..1024 {
+            let id = ObjectId::from_u128(i);
+            let s = shard_of_key(&make_key_inline(1, &id.0), 4);
+            if found_a.is_none() {
+                found_a = Some(id);
+                shard_a = Some(s);
+            } else if shard_a != Some(s) {
+                found_b = Some(id);
+                break;
+            }
+        }
+        let a = found_a.expect("found_a");
+        let b = found_b.expect("found_b — K=4 fxhash MUST distribute");
+        let txn = Op::Txn {
+            ops: vec![
+                Op::Create {
+                    type_id: 1,
+                    id: a,
+                    record: vec![],
+                },
+                Op::Create {
+                    type_id: 1,
+                    id: b,
+                    record: vec![],
+                },
+            ],
+        };
+        match route_op(&txn, 4) {
+            ShardRoute::CrossShardReject { shards_touched } => {
+                assert_eq!(
+                    shards_touched, 2,
+                    "two distinct shards must report shards_touched=2"
+                );
+            }
+            other => panic!("expected CrossShardReject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn xtxn_inner_scan_shape_op_rejects_k4() {
+        // Op::Txn with a scan-shape inner op (e.g. Describe / FindBy /
+        // Select) has no extractable primary key → V1 reject.
+        let scans: Vec<Op> = vec![
+            Op::Describe { type_id: 1 },
+            Op::FindBy {
+                type_id: 1,
+                field_id: 1,
+                value: vec![1, 2],
+            },
+            Op::Select {
+                type_id: 1,
+                program: vec![],
                 limit: 10,
             },
-        ] {
-            assert_eq!(route_op(&op, 4), ShardRoute::ShardZero, "{op:?}");
+            Op::Query {
+                type_id: 1,
+                preds: vec![],
+            },
+            Op::Aggregate {
+                type_id: 1,
+                program: vec![],
+                kind: 0,
+                field_id: 1,
+                range_preds: vec![],
+            },
+        ];
+        for scan in scans {
+            let txn = Op::Txn {
+                ops: vec![
+                    Op::Create {
+                        type_id: 1,
+                        id: ObjectId::from_u128(1),
+                        record: vec![],
+                    },
+                    scan.clone(),
+                ],
+            };
+            match route_op(&txn, 4) {
+                ShardRoute::CrossShardReject { shards_touched } => {
+                    assert_eq!(
+                        shards_touched, 0,
+                        "scan-shape inner op should report shards_touched=0; inner={scan:?}"
+                    );
+                }
+                other => panic!(
+                    "expected CrossShardReject for scan inner op {scan:?}, got {other:?}"
+                ),
+            }
         }
+    }
+
+    #[test]
+    fn xtxn_k1_always_single_zero_regardless_of_inner_shape() {
+        // K=1 short-circuits: every Op::Txn classifies Single(0),
+        // even multi-op with scan-shape inners. K=1 is the
+        // unsharded collapse and apply-Txn on shard 0 handles it
+        // exactly as the pre-SHARD engine did.
+        let txns: Vec<Op> = vec![
+            Op::Txn { ops: vec![] },
+            Op::Txn {
+                ops: vec![Op::Describe { type_id: 1 }],
+            },
+            Op::Txn {
+                ops: vec![
+                    Op::Create {
+                        type_id: 1,
+                        id: ObjectId::from_u128(1),
+                        record: vec![],
+                    },
+                    Op::Create {
+                        type_id: 1,
+                        id: ObjectId::from_u128(0xFFFF),
+                        record: vec![],
+                    },
+                ],
+            },
+        ];
+        for t in txns {
+            assert_eq!(route_op(&t, 1), ShardRoute::Single(0), "K=1 txn {t:?}");
+        }
+    }
+
+    #[test]
+    fn xtxn_extract_helper_classifies_point_ops() {
+        // The helper itself: point-data ops return Some(shard);
+        // scan-shape ops return None.
+        let id = ObjectId::from_u128(42);
+        assert!(extract_txn_inner_pkey_shard(
+            &Op::Create { type_id: 1, id, record: vec![] },
+            4
+        )
+        .is_some());
+        assert!(extract_txn_inner_pkey_shard(
+            &Op::Update { type_id: 1, id, record: vec![] },
+            4
+        )
+        .is_some());
+        assert!(extract_txn_inner_pkey_shard(
+            &Op::UpdateSet { type_id: 1, id, sets: vec![] },
+            4
+        )
+        .is_some());
+        assert!(extract_txn_inner_pkey_shard(
+            &Op::Delete { type_id: 1, id },
+            4
+        )
+        .is_some());
+        assert!(extract_txn_inner_pkey_shard(
+            &Op::GetById { type_id: 1, id },
+            4
+        )
+        .is_some());
+        assert!(extract_txn_inner_pkey_shard(
+            &Op::GetBlob { handle: 0xDEAD },
+            4
+        )
+        .is_some());
+        // Scan-shape and non-classifiable → None.
+        assert!(extract_txn_inner_pkey_shard(
+            &Op::Describe { type_id: 1 },
+            4
+        )
+        .is_none());
+        assert!(extract_txn_inner_pkey_shard(
+            &Op::FindBy {
+                type_id: 1,
+                field_id: 1,
+                value: vec![],
+            },
+            4
+        )
+        .is_none());
+        assert!(extract_txn_inner_pkey_shard(
+            &Op::Select {
+                type_id: 1,
+                program: vec![],
+                limit: 1,
+            },
+            4
+        )
+        .is_none());
+        assert!(extract_txn_inner_pkey_shard(
+            &Op::SeqRead { from: 0, limit: 10 },
+            4
+        )
+        .is_none());
     }
 
     #[test]

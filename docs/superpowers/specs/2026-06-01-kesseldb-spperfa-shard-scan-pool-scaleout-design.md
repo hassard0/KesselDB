@@ -83,10 +83,22 @@ carry shard-id + dispatch-table indexing.
 
 ---
 
-### 2. Recommendation: start with Approach A
+### 2. Recommendation: start with Approach A (V1 T1), escalate to C if needed (V1 T2/T4)
 
 Smallest change. If it doesn't recover the regression, escalate to B
 (per-dispatcher replicas) or C (shared queue) in T4.
+
+**Update 2026-06-01 (post-T3 bench):** Approach A SHIPPED in T1 and
+proved **insufficient** on vulcan. K=4 numbers for select-limit /
+select-sorted / aggregate-sum were UNCHANGED from POST-FASTPATH:
+949 vs 958 (select-limit), 214 vs 214 (select-sorted), 941 vs 937
+(aggregate-sum). The bottleneck was per-worker throughput, not
+channel backpressure — 16 dispatchers always serialize through 4
+workers no matter how big the per-worker queue is. T2/T4 escalated
+to **Approach C** (M shared workers, per-shard dispatch closures
+held in `Arc<Vec<Box<dyn Fn>>>`, work items carry `shard_id`).
+Approach C delivered every workload at K=4 scaling positively with
+K (see §14c in BENCHMARKS.md).
 
 Picking `POOL_BOUND = 64`:
 

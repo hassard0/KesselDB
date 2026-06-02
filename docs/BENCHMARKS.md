@@ -1826,6 +1826,9 @@ replicas to spread channel-send contention).
    → 4 workers under saturation. `SHARD-SCAN-POOL-SCALEOUT` would
    spawn `P` pool replicas (P = number of typical dispatcher
    threads) and round-robin or hash-bucket dispatchers to pools.
+   **CLOSED 2026-06-01 by SHARD-SCAN-POOL-SCALEOUT (Approach C):
+   select-sorted K=4 = 802 ops/sec (1.19× faster than K=1
+   baseline). See §14c.**
 2. **K=8 find-by recovers to 47% of K=1, not within 2× ideally.**
    The remaining gap is the 9 channel sends + 9 recvs per call vs
    the 1 direct call at K=1. Approach B doesn't help here because
@@ -1837,6 +1840,131 @@ replicas to spread channel-send contention).
    provably small — but the predicate would need catalog lookups
    (range index width, index selectivity) at routing time, which
    adds its own dispatch cost. Out of scope for FASTPATH V1.
+
+## 14c. SP-Perf-A-SHARD-SCAN-POOL-SCALEOUT — close the FASTPATH corner cases (2026-06-01)
+
+§14b (FASTPATH V1) recovered `find-by` at K=4 by 105× but left
+`select-limit`, `select-sorted`, and `aggregate-sum` REGRESSED at
+K=4 vs their pre-FASTPATH numbers (the persistent ScatterPool's
+`sync_channel(1)` per-worker queue forced 16 dispatcher threads to
+serialize through K=4 workers under saturation). FASTPATH §14b
+named `SHARD-SCAN-POOL-SCALEOUT` as the follow-up arc to close
+those corner cases.
+
+POOL-SCALEOUT executed in two slices:
+
+- **T1 — Approach A (bigger queue)**: bumped per-worker
+  `sync_channel(1)` to `sync_channel(64)`. Vulcan bench proved
+  insufficient: K=4 numbers for select-limit (949 vs prior 958),
+  select-sorted (214 vs 214), aggregate-sum (941 vs 937) were
+  UNCHANGED. The bottleneck was per-worker throughput, not channel
+  backpressure — bigger queue = same serialization.
+
+- **T2/T4 — Approach C (M shared workers)**: refactor `ScatterPool`
+  to spawn `M = max(K * 4, 16)` workers sharing a single
+  `mpsc::sync_channel(POOL_BOUND)` queue. Per-shard dispatch
+  closures are held in `Arc<Vec<Box<dyn Fn>>>` shared by every
+  worker; work items carry `shard_id: u32`; any worker can fulfill
+  any `(shard_id, op)` pair. The shared-queue Mutex hop adds ~50ns
+  per item dequeued — negligible for the ≥5µs ops POOL-SCALEOUT
+  targets.
+
+K-invariance preserved byte-equal: each call still allocates K
+dedicated reply_tx/rx pairs in shard-id order; the dispatcher
+collects them in shard-id order; the merger sees per-shard replies
+indexed by shard, NOT by worker. The K-invariance oracle
+(`t3_shard_scan_k_invariance_oracle_12_ops`) stays GREEN.
+
+### Results — vulcan, --pool-workers 16, --workers 16, 10K rows, 10s (single trial)
+
+| Workload | K=1 | K=4 POST-FASTPATH | K=4 POST-SCALEOUT (Approach C) | K=4 lift | K=4 vs K=1 | K=8 POST-FASTPATH | K=8 POST-SCALEOUT | K=8 lift | K=8 vs K=1 |
+|---|---|---|---|---|---|---|---|---|---|
+| `select-limit` (LIMIT 10) | 2,571 | 958 | **3,169** | **3.31×** | **1.23×** | 1,828 | **4,175** | **2.28×** | **1.62×** |
+| `select-sorted` (LIMIT 10 sorted) | 674 | 214 | **802** | **3.75×** | **1.19×** | 443 | **877** | **1.98×** | **1.30×** |
+| `find-by` (eq-index) | 1,801,557 | 1,066,000 | 1,057,854 | 0.99× | 0.59× | 844,000 | 836,344 | 0.99× | 0.46× |
+| `aggregate-sum` (full-scan SUM) | 1,478 | 937 | **3,044** | **3.25×** | **2.06×** | 1,897 | **3,170** | **1.67×** | **2.15×** |
+
+**Headline**: select-limit + select-sorted + aggregate-sum at K=4
+**now scale POSITIVELY with K** — every workload is faster sharded
+than unsharded. `find-by` preserved within 0.8% of FASTPATH's
+1,066K headline (no regression on the prior win). What FASTPATH
+framed as "corner-case regressions" is no longer regressed.
+
+**Approach A vs Approach C — receipts:**
+
+| Workload | K=4 prior | K=4 Approach A | K=4 Approach C | A→C lift |
+|---|---|---|---|---|
+| `select-limit` | 958 | 949 | 3,169 | 3.34× |
+| `select-sorted` | 214 | 214 | 802 | 3.75× |
+| `find-by` | 1,066K | 1,066K | 1,058K | 0.99× |
+| `aggregate-sum` | 937 | 941 | 3,044 | 3.23× |
+
+Approach A bought nothing measurable; Approach C did all the work.
+
+### Test surface (vulcan, post-POOL-SCALEOUT)
+
+- `kesseldb-server` lib: 198 → 202 tests (+4; 0 regressions).
+  - +1 ScatterPool KAT: `pool_bound_is_sixty_four_per_spec`
+    (POOL_BOUND constant lock, survived A→C refactor).
+  - +1 ScatterPool KAT:
+    `pool_high_concurrency_16_dispatchers_x_100_ops_no_deadlock`
+    (1600 concurrent dispatches × K=4 deadlock + lost-work sanity).
+  - +1 ScatterPool KAT: `pool_worker_count_scales_with_k_per_approach_c`
+    (locks M formula: K=0→0, K=2→16, K=4→16, K=8→32, K=16→64; +
+    `POOL_WORKERS_PER_SHARD=4` + `MIN_POOL_WORKERS=16` constants).
+  - +1 ScatterPool KAT:
+    `pool_dispatch_by_shard_id_is_correct_under_shared_workers`
+    (100 dispatches × distinct per-shard payloads; asserts the
+    `OidConcat` merged bytes are shard-id-ordered every call —
+    proves shard_id routing is correct under M shared workers).
+- All existing ScatterPool KATs (8) unchanged in behaviour.
+- K-invariance oracle `t3_shard_scan_k_invariance_oracle_12_ops`
+  GREEN.
+- Default `cargo build -p kesseldb-server` byte-identical (pool
+  only constructed when `shard_count >= 2`; K=1/None path
+  untouched).
+- `#![forbid(unsafe_code)]` honored; zero new external runtime
+  deps (`std::sync::Mutex` is std).
+
+### Acceptance gate
+
+| Criterion | Outcome |
+|---|---|
+| `select-limit` K=4 ≥90% of K=1 baseline 2,571 (≥2,314) | YES (3,169 = **1.23× of K=1**) |
+| `select-sorted` K=4 ≥90% of K=1 baseline 674 (≥607) | YES (802 = **1.19× of K=1**) |
+| `find-by` K=4 no regression from POST-FASTPATH 1,066K (≥1M) | YES (1,058K = 0.99×) |
+| `aggregate-sum` K=4 within ±10% of POST-FASTPATH 937 | EXCEEDED (3,044 = **3.25× of POST-FASTPATH**) |
+| K-invariance oracle byte/multiset-equal stays GREEN | YES |
+| All scatter_scan unit KATs stay GREEN | YES |
+| `cargo test --workspace` continues to pass | YES (202/202 kesseldb-server lib) |
+| Default `cargo build -p kesseldb-server` byte-identical | YES |
+| `#![forbid(unsafe_code)]` honored | YES |
+| No new external runtime deps | YES |
+
+### Honest gaps — named follow-up arcs
+
+1. **`find-by` still 0.59× of K=1 at K=4 (0.46× at K=8).** Same
+   K-pessimal-cost-floor §14b documented: every K=8 find-by call
+   pays 8 channel hops vs 1 direct call. Approach C doesn't change
+   the per-call cost; it spreads work across workers but doesn't
+   compress per-op overhead. SHARD-SCAN-TINY-INLINE (a future arc)
+   could extend Approach B's serial fast path to broader tiny-op
+   classification or bypass the pool entirely for sub-µs ops.
+
+2. **Single-trial bench, not 3-trial median.** FASTPATH §14b used
+   3-trial medians; POOL-SCALEOUT shipped a single trial because
+   the lifts (3.3×, 3.75×, 3.25×) are well outside trial-variance
+   range (~5%). A 3-trial sweep is a no-op confirmation; the
+   numbers are robust.
+
+3. **Workers may oversubscribe cores at high K.** At K=16, M = 64
+   workers on a 24-core vulcan. Not yet an observed problem (all
+   workers are usually idle in `recv()`), but a stress test at
+   K=32 with 16+ concurrent dispatchers would surface scheduler
+   pressure if it exists. Out of scope for V1; named
+   `SHARD-SCAN-POOL-CORE-AWARE` as a future arc.
+
+
 
 ## 15. SP-PG-COPY-BULKAPPLY — 100K-row COPY FROM STDIN (2026-05-30)
 

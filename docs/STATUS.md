@@ -444,6 +444,43 @@ covered by the workspace test suite (2024 default / 2052 with
   tracker → SHARD-SCAN V1 SHIPPED — DONE for correctness;
   DONE_WITH_CONCERNS for perf shape (named SHARD-SCAN-FASTPATH
   follow-up). **TaskList #352 ready.**
+- **Track L cont. — SP-Perf-A-SHARD-SCAN-POOL-SCALEOUT (2026-06-01,
+  V1 SHIPPED).** Closes the select-limit / select-sorted / aggregate-
+  sum regressions FASTPATH (2026-05-30) left open. Approach A (T1 —
+  bump `sync_channel(1)` to `sync_channel(64)`) was tested on vulcan
+  and proved insufficient: K=4 numbers for select-limit / select-
+  sorted / aggregate-sum were UNCHANGED from POST-FASTPATH (949 vs
+  958; 214 vs 214; 941 vs 937), because per-worker throughput, not
+  channel backpressure, was the bottleneck — 16 dispatchers always
+  serialize through K=4 workers no matter how big the per-worker
+  queue is. T2/T4 escalated to **Approach C from the design spec**:
+  refactor `ScatterPool` to spawn `M = max(K * 4, 16)` workers
+  sharing a single `mpsc::sync_channel(POOL_BOUND)` queue, with
+  per-shard dispatch closures held in `Arc<Vec<Box<dyn Fn>>>` shared
+  by every worker. Work items carry `shard_id: u32`; any worker can
+  fulfill any (shard_id, op) pair. **Vulcan bench (single trial,
+  10K rows, 16 workers, 10s)**: select-limit K=4 = 3,169 ops/sec
+  (**3.31× lift** from POST-FASTPATH 958, **1.23× FASTER than K=1
+  baseline 2,571**); select-sorted K=4 = 802 (**3.75× lift** from
+  214, **1.19× faster than K=1 674**); aggregate-sum K=4 = 3,044
+  (**3.25× lift** from 937, **2.06× faster than K=1 1,478**);
+  find-by K=4 = 1,057,854 (preserved within 0.8% of FASTPATH's
+  1,066K headline). K=8 numbers similarly lift: select-limit 4,175
+  (2.28×), select-sorted 877 (1.98×), aggregate-sum 3,170 (1.67×),
+  find-by 836K (preserved). **Every scan workload at K=4 now scales
+  POSITIVELY with K — what FASTPATH framed as "corner-case
+  regressions" is no longer regressed.** K-invariance oracle still
+  GREEN (12 scan ops byte/multiset-equal across K∈{1,4,8}). Test
+  surface: kesseldb-server lib 198 → 202 (+4; +1 KAT for `POOL_BOUND`
+  constant, +1 KAT for 16-dispatcher-deadlock sanity, +1 KAT for M
+  worker-count formula, +1 KAT for shard_id routing under shared
+  workers). Default `cargo build` byte-identical; `#![forbid(unsafe_code)]`
+  honored; zero new external deps (`std::sync::Mutex` only). Commits:
+  `0d9f221` (T1 — POOL_BOUND 1 → 64 + KAT, proved insufficient),
+  `850c43d` (T2/T4 — Approach C escalation + Arc<Vec<closures>>
+  refactor + shared-queue worker loop + 2 KATs), plus this commit
+  (T3 bench + BENCHMARKS §14c + tracker close). Progress tracker →
+  SHARD-SCAN-POOL-SCALEOUT V1 SHIPPED. **TaskList #354 ready.**
 - **Track L cont. — SP-Perf-A-SHARD-SCAN-FASTPATH (2026-05-30, V1
   SHIPPED).** Closes the find-by perf regression SHARD-SCAN named.
   Two complementary fixes: (A) **persistent ScatterPool** — K

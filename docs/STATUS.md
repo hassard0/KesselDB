@@ -58,6 +58,62 @@ at dispatch entry, JDBC simple-mode unblocked.
 
 **Tonight's delivery (2026-06-02) — coherent state of the union:**
 
+- **Track K cont. — SP-Cloud-Cluster T1 (2026-06-02, T1 SCAFFOLD
+  LANDED; T2-T8 MULTI-ARC CONTINUATION QUEUED).** Multi-pod replicated
+  VSR clustering — the production-deploy story on top of SP-Cloud-Deploy
+  V1's single-pod foundation. T1 ships the design spec + Helm chart
+  StatefulSet + headless Service + values.yaml `cluster:` block; T2
+  wires the binary CLI flags (`--cluster` / `--replica-idx` /
+  `--peer-addrs`) through to `kesseldb_server::cluster::spawn_node`;
+  T3-T8 are kind verify + cluster smoke (primary-kill + view-change) +
+  Fly.io multi-region + monitoring + arc closure. **Design**:
+  `docs/superpowers/specs/2026-06-02-kesseldb-spcloudcluster-design.md`
+  (11 sections incl. V1 IN/OUT, Helm shape, env vars, pod entrypoint,
+  acceptance, 10-weak-spot self-review, V2+ follow-up arcs — GEO /
+  SHARD / BACKUP / RECONFIG / VERIFY-MULTI-NODE — all named). **Helm
+  additions**: `templates/statefulset.yaml` (new — conditional on
+  `cluster.enabled`; replicas=3 default, podManagementPolicy=Parallel,
+  serviceName=`{fullname}-headless`, volumeClaimTemplates supersede
+  the single-pod PVC, entrypoint shell derives `$IDX` from
+  `${HOSTNAME##*-}`); `templates/service-headless.yaml` (new —
+  `clusterIP: None` + `publishNotReadyAddresses: true` for VSR bootstrap
+  before any pod is k8s-Ready); `values.yaml` extended with a `cluster:`
+  block (enabled=false default / replicas=3 / peerAddressTemplate
+  `{name}-{idx}.{name}-headless.{namespace}.svc.cluster.local:6532` /
+  viewChangeTimeout=5s / podManagementPolicy=Parallel);
+  `_helpers.tpl` extended with a `kesseldb.clusterPeerAddrs` helper
+  that expands the DNS template across `0..replicas` and joins with
+  `,`; `templates/deployment.yaml` + `templates/pvc.yaml` gated so they
+  ONLY render in single-pod mode (cluster mode uses StatefulSet +
+  volumeClaimTemplates). **Verified on vulcan (helm v3.16.3)**:
+  `helm lint` 0 chart(s) failed in BOTH default + cluster modes;
+  default render produces 1× Deployment + 1× PVC + 1× Service + 1×
+  ServiceAccount (BYTE-IDENTICAL to SP-Cloud-Deploy V1 — existing
+  installs upgrade with no diff); cluster render produces 1×
+  StatefulSet + 2× Service (client ClusterIP + headless) + 1×
+  ServiceAccount + 0× Deployment + 0× PVC. `KESSELDB_CLUSTER_PEER_ADDRS`
+  env correctly expanded at both N=3 (3 stable DNS addrs) and N=5
+  (5 addrs). Headless service emits the required
+  `clusterIP: None` + `publishNotReadyAddresses: true` knobs.
+  Open-mode branch (`auth.secretName=""`) still correctly drops
+  `KESSELDB_TOKEN` env in cluster mode. **T1 caveats (intentional,
+  named, not vague)**: today's image will CrashLoopBackOff on
+  `unknown argument --cluster` (clean failure mode, NOT stuck-pending
+  — the binary CLI wire-up is T2); no live kind verify in T1 (no kind
+  cluster running on vulcan at T1 time; deferred to T4 with the
+  T2-extended binary; `helm lint` + `helm template` already prove the
+  YAML scaffold is well-formed); Fly.io path is separate (Fly Machines
+  don't have stable headless-Service-style DNS — T6 ships a Fly-specific
+  transport using `<machine-id>.vm.<app>.internal` or 6PN addresses).
+  **Zero Rust code touched** (YAML + Markdown only); workspace test
+  count unchanged; default `cargo build` byte-identical; HTTP/1.1 + WS
+  + binary + PG-wire surfaces byte-untouched; `#![forbid(unsafe_code)]`
+  honored (no Rust changes); zero new external deps. Two commits this
+  slice: `c44d883` (T1 design spec + Helm scaffold + progress tracker)
+  + this commit (T1 STATUS row). Progress tracker:
+  `docs/superpowers/specs/2026-06-02-kesseldb-subproject-spcloudcluster-progress.md`
+  — T1 DONE; T2-T8 multi-arc continuation QUEUED. **TaskList #371 T1
+  done; T2-T8 queued for multi-week arc continuation.**
 - **Track M — SP-WHERE-VM-Specialise (2026-06-01, V1 SHIPPED).**
   Closes the per-row stack-VM dispatch cost SP-Hash-Agg-Tune diagnosed
   as the dominant TPC-H Q1/Q6 wall-time ceiling (V1-Tune sweep at N=4

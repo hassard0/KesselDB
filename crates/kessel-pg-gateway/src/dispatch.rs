@@ -269,7 +269,24 @@ pub fn dispatch_query<E: EngineApply + ?Sized>(sql: &str, engine: &E) -> Vec<u8>
             // rows`). Closes the V1 `SELECT *`-only render weak-spot.
             render_select_got(&row_bytes, sql_trimmed, select_table.clone(), engine)
         }
-        OpResult::Ok | OpResult::TypeCreated(_) | OpResult::TxCommitted { .. } => {
+        // SP-PG-SERIAL-RETURNING: an `INSERT … RETURNING …` succeeded.
+        // When the engine assigned a serial id it returns `Created { id }`;
+        // an explicit-id INSERT returns `Ok`. Either way, if the SQL had a
+        // RETURNING clause, emit RowDescription + DataRow(returned values)
+        // + CommandComplete instead of a bare CommandComplete.
+        ref ok_variant @ (OpResult::Ok | OpResult::Created { .. })
+            if kessel_sql::insert_returning(sql_trimmed).is_some() =>
+        {
+            let assigned_id = match ok_variant {
+                OpResult::Created { id } => Some(*id),
+                _ => None,
+            };
+            render_insert_returning(sql_trimmed, assigned_id, engine)
+        }
+        OpResult::Ok
+        | OpResult::TypeCreated(_)
+        | OpResult::TxCommitted { .. }
+        | OpResult::Created { .. } => {
             // Non-SELECT success. T9: pick the CommandComplete tag
             // via `cmd_complete_tag_for_sql` — handles DDL +
             // transaction-control keywords + leading-comment stripping
@@ -456,6 +473,151 @@ fn render_select_got<E: EngineApply + ?Sized>(
     out.extend_from_slice(&encode_command_complete(&select_tag(row_count)));
     out.extend_from_slice(&encode_ready_for_query(b'I'));
     out
+}
+
+/// SP-PG-SERIAL-RETURNING: render an `INSERT … RETURNING col1, col2, …`
+/// reply. The INSERT already committed; here we surface the requested
+/// columns as a single DataRow (V1 = single-row INSERT, the SQLAlchemy
+/// unit-of-work default; multi-row RETURNING is `SP-PG-RETURNING-MULTIROW`).
+///
+/// We resolve the row's id (the engine-assigned serial value when
+/// `assigned_id` is `Some`, else the explicit id parsed from the INSERT
+/// SQL), read the just-written row back via the engine's standard
+/// `SELECT * FROM <table> WHERE id = <id>` path, and project the RETURNING
+/// columns from it — so EVERY returnable column (the assigned id AND
+/// client-supplied columns like `name`) renders uniformly with the same
+/// decode machinery as a normal SELECT. Emits RowDescription + DataRow +
+/// CommandComplete("INSERT 0 1") + ReadyForQuery.
+fn render_insert_returning<E: EngineApply + ?Sized>(
+    sql_trimmed: &str,
+    assigned_id: Option<u128>,
+    engine: &E,
+) -> Vec<u8> {
+    let (table, ret_cols) = match kessel_sql::insert_returning(sql_trimmed) {
+        Some(t) => t,
+        None => {
+            // Should not happen (guarded by the caller), but be safe.
+            let mut out = Vec::new();
+            out.extend_from_slice(&encode_command_complete("INSERT 0 1"));
+            out.extend_from_slice(&encode_ready_for_query(b'I'));
+            return out;
+        }
+    };
+    // Resolve the row id: the engine-assigned serial, else the explicit
+    // `id` from the INSERT SQL.
+    let id = match assigned_id.or_else(|| insert_explicit_id(sql_trimmed)) {
+        Some(i) => i,
+        None => {
+            return error_response_then_rfq(
+                SEVERITY_ERROR,
+                "XX000",
+                "RETURNING: could not resolve the inserted row id",
+            );
+        }
+    };
+    // Read the row back through the engine's normal SELECT path.
+    let read_sql = format!("SELECT * FROM {table} WHERE id = {id}");
+    let row_bytes = match engine.apply_sql(&read_sql) {
+        OpResult::Got(b) => b,
+        _ => {
+            return error_response_then_rfq(
+                SEVERITY_ERROR,
+                "XX000",
+                "RETURNING: failed to read back the inserted row",
+            );
+        }
+    };
+    let table_cols = match engine.describe_table(&table) {
+        Some(c) => c,
+        None => {
+            return error_response_then_rfq(
+                SEVERITY_ERROR,
+                "42P01",
+                &format!("unknown table \"{table}\""),
+            );
+        }
+    };
+    let proj_cols = match resolve_projection(&ret_cols, &table_cols) {
+        Some(c) => c,
+        None => {
+            return error_response_then_rfq(
+                SEVERITY_ERROR,
+                "42703",
+                &format!("RETURNING column does not exist in \"{table}\" {ret_cols:?}"),
+            );
+        }
+    };
+    // Decode the full record, then pick the projected cells in
+    // RETURNING order.
+    let full_layout = compute_record_layout(&table_cols);
+    let mut out = Vec::new();
+    let fields: Vec<FieldMeta> = proj_cols
+        .iter()
+        .map(|c| FieldMeta { name: c.name.clone(), type_oid: field_kind_to_oid(c.kind) })
+        .collect();
+    out.extend_from_slice(&encode_row_description(&fields));
+    // The read-back row stream is the length-prefixed `[u32 len][rec]`
+    // shape (Op::Select) OR a bare record (Op::GetById). Decode the
+    // first record either way.
+    let rec: &[u8] = if row_bytes.len() >= 4 {
+        let len = u32::from_le_bytes(row_bytes[0..4].try_into().unwrap()) as usize;
+        if 4 + len <= row_bytes.len() && decode_record(&row_bytes[4..4 + len], &table_cols, &full_layout).is_some() {
+            &row_bytes[4..4 + len]
+        } else {
+            &row_bytes[..]
+        }
+    } else {
+        &row_bytes[..]
+    };
+    let decoded = match decode_record(rec, &table_cols, &full_layout) {
+        Some(cells) => cells,
+        None => {
+            return error_response_then_rfq(
+                SEVERITY_ERROR,
+                "XX000",
+                "RETURNING: inserted row decode failed",
+            );
+        }
+    };
+    // Map each RETURNING column to its position in the full table schema.
+    let mut row_cells: Vec<Option<&[u8]>> = Vec::with_capacity(proj_cols.len());
+    for c in &proj_cols {
+        let idx = table_cols.iter().position(|tc| tc.name == c.name);
+        match idx.and_then(|i| decoded.get(i)) {
+            Some(cell) => row_cells.push(cell.as_deref()),
+            None => row_cells.push(None),
+        }
+    }
+    out.extend_from_slice(&encode_data_row(&row_cells));
+    out.extend_from_slice(&encode_command_complete("INSERT 0 1"));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
+/// SP-PG-SERIAL-RETURNING: extract the explicit `id` value from an
+/// `INSERT INTO t (… id …) VALUES (… n …)` so `RETURNING id` works on a
+/// non-serial table too. Returns `None` if the INSERT omits `id` (the
+/// serial-autoincrement path supplies the assigned id instead) or the SQL
+/// shape isn't recognized. Reuses the kessel-sql lexer indirectly via a
+/// minimal scan; falls back to `None` (the caller errors cleanly).
+fn insert_explicit_id(sql: &str) -> Option<u128> {
+    // Compile is not available here (no catalog); do a lexer-free,
+    // conservative parse of `( <cols> ) VALUES ( <vals> )` to find the
+    // `id` column's value. We only need the single-row case.
+    let lower = sql.to_ascii_lowercase();
+    let cols_start = lower.find('(')? + 1;
+    let cols_end = sql[cols_start..].find(')')? + cols_start;
+    let cols: Vec<String> = sql[cols_start..cols_end]
+        .split(',')
+        .map(|s| s.trim().trim_matches('"').to_ascii_lowercase())
+        .collect();
+    let id_pos = cols.iter().position(|c| c == "id")?;
+    let vstart_rel = lower[cols_end..].find("values")?;
+    let vals_open = lower[cols_end + vstart_rel..].find('(')? + cols_end + vstart_rel + 1;
+    let vals_close = sql[vals_open..].find(')')? + vals_open;
+    let vals: Vec<&str> = sql[vals_open..vals_close].split(',').map(|s| s.trim()).collect();
+    let raw = vals.get(id_pos)?.trim_matches('\'').trim_matches('"').trim();
+    raw.parse::<i128>().ok().map(|n| n as u128)
 }
 
 /// Helper: build `ErrorResponse + ReadyForQuery('I')` into a fresh

@@ -326,7 +326,11 @@ pub trait EngineApply: Send + Sync + 'static {
     fn apply_sql_with_count(&self, sql: &str) -> (OpResult, u64) {
         let r = self.apply_sql(sql);
         let count = match &r {
-            OpResult::Ok | OpResult::TxCommitted { .. } => 1,
+            // SP-PG-SERIAL-RETURNING: an autoincrement INSERT returns
+            // `Created { id }` — still exactly one affected row.
+            OpResult::Ok
+            | OpResult::TxCommitted { .. }
+            | OpResult::Created { .. } => 1,
             _ => 0,
         };
         (r, count)

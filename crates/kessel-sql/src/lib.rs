@@ -1012,26 +1012,27 @@ pub fn join_projection(sql: &str) -> Option<(Vec<JoinProjCol>, bool)> {
     // SP-PG-SQL-MULTI-JOIN chain: scan the remaining tokens for further
     // `[INNER] JOIN <table> [[AS] <alias>]` segments so a 3+-table aliased join
     // contributes every table to the alias map. We only need to capture each
-    // joined table's name + alias here (the ON conditions live downstream and
-    // don't affect the projection-qualifier resolution).
-    loop {
-        // Peek for a JOIN keyword without consuming non-JOIN tokens.
-        let is_join = match it.peek() {
-            Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("JOIN") => {
-                it.next();
-                true
-            }
-            Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("INNER") => {
-                it.next();
-                match it.next() {
-                    Some(Tok::Ident(j)) if j.eq_ignore_ascii_case("JOIN") => true,
-                    _ => return None,
+    // joined table's name + alias here; the ON predicates (and any trailing
+    // WHERE/ORDER BY/…) are skipped — they don't affect the projection-qualifier
+    // resolution. We advance one token at a time, treating a top-level JOIN /
+    // INNER JOIN keyword as the start of the next table segment.
+    while let Some(tok) = it.next() {
+        let is_inner_join = match tok {
+            Tok::Ident(k) if k.eq_ignore_ascii_case("JOIN") => true,
+            Tok::Ident(k) if k.eq_ignore_ascii_case("INNER") => {
+                // `INNER` must be immediately followed by `JOIN`.
+                match it.peek() {
+                    Some(Tok::Ident(j)) if j.eq_ignore_ascii_case("JOIN") => {
+                        it.next();
+                        true
+                    }
+                    _ => false,
                 }
             }
             _ => false,
         };
-        if !is_join {
-            break;
+        if !is_inner_join {
+            continue; // an ON-clause / WHERE / … token — skip it.
         }
         let ct = match it.next()? {
             Tok::Ident(t) => t.clone(),
@@ -7998,11 +7999,16 @@ mod tests {
         ).unwrap();
         assert_eq!(fullw, aliasedw, "aliased WHERE+ORDER BY must compile identically");
 
-        // 5. Errors: unknown qualifier, duplicate alias, alias shadowing a table.
+        // 5. Errors at compile: an unknown ON qualifier, a duplicate alias, and
+        // an alias shadowing another table's name all error cleanly rather than
+        // mis-resolving. (A bad *projection* qualifier is caught at the gateway
+        // `join_projection`/`render_join_result` layer, since the engine's
+        // `Op::Join` discards the projection — verified in
+        // `join_projection_resolves_aliases`.)
         assert!(compile(
-            "SELECT x.name FROM users u JOIN posts p ON u.id = p.user_id",
+            "SELECT u.name, p.title FROM users u JOIN posts p ON x.id = p.user_id",
             &cat,
-        ).is_err(), "unknown qualifier must error, not mis-resolve");
+        ).is_err(), "unknown ON qualifier must error, not mis-resolve");
         assert!(compile(
             "SELECT u.name FROM users u JOIN posts u ON u.id = u.user_id",
             &cat,
@@ -8055,6 +8061,15 @@ mod tests {
             "SELECT * FROM users u JOIN posts p ON u.id = p.user_id",
         ).unwrap();
         assert!(star2);
+        // An unknown projection qualifier ⇒ None (the gateway then renders the
+        // standard 42703 column-does-not-exist error rather than mis-resolving).
+        assert!(join_projection(
+            "SELECT x.name FROM users u JOIN posts p ON u.id = p.user_id",
+        ).is_none(), "unknown projection qualifier must not resolve");
+        // A duplicate alias ⇒ None (clean rejection, not a mis-render).
+        assert!(join_projection(
+            "SELECT u.name FROM users u JOIN posts u ON u.id = u.user_id",
+        ).is_none(), "duplicate alias must not resolve");
     }
 
     #[test]

@@ -311,9 +311,20 @@ Column types: `U8 U16 U32 U64`, `I8 I16 I32 I64`, `BYTES`, `BOOL`.
 INSERT INTO <t> ID <n> (<cols>) VALUES (<vals>)            -- legacy single-row
 INSERT INTO <t> (id, <cols>) VALUES (<v>)[, (<v>)]*       -- Postgres-shaped;
                                                           -- multi-row = 1 atomic op
+INSERT INTO <t> (<cols>) VALUES (<v>) [RETURNING <c>,..]  -- autoincrement: omit the
+                                                          --   BIGSERIAL PK id; the
+                                                          --   engine assigns it
+                                                          --   deterministically and
+                                                          --   RETURNING reads it back
 UPDATE <t> ID <n> SET <col> = <val> [, ...]      -- server‑side read‑modify‑write
 DELETE FROM <t> WHERE <col> = <val>
 ```
+
+For a `CREATE TABLE <t> (id BIGSERIAL PRIMARY KEY, ...)`, an INSERT that
+OMITS `id` autoincrements: the engine assigns the next per-table sequence
+value (deterministic + replicated — the counter lives in the state
+digest, advanced only on the apply thread). `INSERT … RETURNING id`
+returns the assigned id (the SQLAlchemy/ORM autoincrement default).
 
 ### Queries
 
@@ -1408,14 +1419,54 @@ the PG-wire layer; `col = ANY (ARRAY[…])` desugars to `IN (…)`. A
 qualified query compiles to the BYTE-IDENTICAL Op as its bare equivalent
 (determinism preserved).
 
-**Residual follow-ups** (NOT needed for this explicit-PK CRUD model):
-`SP-PG-SERIAL` / `SP-PG-RETURNING` (server-generated autoincrement PK +
-`INSERT … RETURNING id` — only when a model OMITS the PK), `SP-PG-SQL-
-UPDATE-WHERE-GENERAL` (non-PK / multi-row UPDATE/DELETE WHERE),
-`SP-PG-SQL-QUALIFIER-STRICT` (strict qualifier validation),
-`SP-PG-SQL-FROM-ALIAS`, `SP-PG-SQL-ANY-SUBQUERY`,
+**Residual follow-ups**: `SP-PG-SQL-UPDATE-WHERE-GENERAL` (non-PK /
+multi-row UPDATE/DELETE WHERE), `SP-PG-SQL-QUALIFIER-STRICT` (strict
+qualifier validation), `SP-PG-SQL-FROM-ALIAS`, `SP-PG-SQL-ANY-SUBQUERY`,
 `SP-PG-ORM-RELATIONSHIPS` / `SP-PG-ORM-ALEMBIC`. Verified transcript:
 `docs/superpowers/sppgsqlormparse-t5-smoke-2026-06-02.txt`.
+
+#### Autoincrement models (`BIGSERIAL` / `INSERT … RETURNING`) — 2026-06-02
+
+Real ORM models overwhelmingly use **autoincrement**: the application
+declares `id = Column(BigInteger, primary_key=True, autoincrement=True)`,
+NEVER supplies `id`, and the ORM reads the DB-assigned id back via `INSERT
+… RETURNING id`. `SP-PG-SERIAL-RETURNING` lights this up end-to-end:
+
+```sql
+CREATE TABLE widgets (id BIGSERIAL PRIMARY KEY, name VARCHAR(32));
+INSERT INTO widgets (name) VALUES ('gadget') RETURNING id;   -- → 1
+INSERT INTO widgets (name) VALUES ('sprocket') RETURNING id; -- → 2
+INSERT INTO widgets (name) VALUES ('z') RETURNING id, name;  -- → (3, 'z')
+```
+
+- A `BIGSERIAL`/`SERIAL`/`SMALLSERIAL` column that is the PRIMARY KEY
+  becomes a **deterministic autoincrement**: an INSERT that omits the id
+  is assigned the next per-table sequence value by the engine. The id is
+  the row's ObjectId (so by-PK `SELECT`/`UPDATE`/`DELETE WHERE id = n`
+  address it) AND is stored in the `id` column (so `SELECT id` reads it).
+- **Determinism**: the sequence counter lives in the replicated state
+  digest and advances ONLY on the deterministic apply thread, in
+  op-number order — every replica computes the identical gap-free
+  sequence, and a crash + WAL replay resumes it exactly. No RNG, no
+  wall-clock.
+- **`RETURNING`**: `INSERT … RETURNING col1, col2, …` emits a result row
+  with the requested columns (the assigned id and/or client-supplied
+  values), on both the Simple- and Extended-Query paths.
+
+SQLAlchemy autoincrement model (no explicit id), `w.id` read back after
+`session.commit()` — full CRUD **6/6** on vulcan. Transcript:
+`docs/superpowers/sppgserialreturning-t5-smoke-2026-06-02.txt`.
+
+> Tip: SQLAlchemy 2.0's batched `insertmanyvalues` optimization emits a
+> multi-row `INSERT … SELECT (VALUES …) ORDER BY … RETURNING` shape that
+> is out of V1 scope (named `SP-PG-RETURNING-MULTIROW`). Pass
+> `create_engine(url, use_insertmanyvalues=False)` to get the classic
+> per-row `INSERT … VALUES (…) RETURNING id` (the dominant shape).
+
+**V1 out-of-scope** (named follow-ups): `SP-PG-SQL-RETURNING-DML`
+(UPDATE/DELETE RETURNING), `SP-PG-SEQUENCE-DDL` (`CREATE SEQUENCE` /
+`nextval`/`setval`), `SP-PG-SERIAL-NONPK` (a SERIAL column that is not
+the PK), `SP-PG-RETURNING-MULTIROW`, `SP-PG-RETURNING-STAR`.
 
 ### Supported GUI / admin tools
 

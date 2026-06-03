@@ -7,6 +7,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning [Se
 
 ### Added
 
+- **Deterministic autoincrement + `INSERT … RETURNING` (SP-PG-SERIAL-
+  RETURNING V1, 2026-06-02)** — closes the two coupled follow-ups
+  `SP-PG-SERIAL` + `SP-PG-RETURNING` together. A `BIGSERIAL`/`SERIAL`
+  PRIMARY KEY column now autoincrements: an INSERT that omits the id is
+  assigned the next per-table sequence value by the engine, and `INSERT
+  … RETURNING id` reads it back. The sequence counter lives in the
+  replicated state digest (reserved keyspace `0xFFFF_FFF4`) and advances
+  ONLY on the deterministic apply thread in op-number order ⇒ every
+  replica computes the identical gap-free sequence, crash + WAL replay
+  resumes it exactly (no RNG, no wall-clock; 3-replica byte-identity
+  proven). New `OpResult::Created { id }`; gateway renders RETURNING on
+  both the simple- and extended-query paths. A SQLAlchemy 2.0
+  autoincrement model declared WITHOUT an explicit id does full CRUD on
+  vulcan and reads `w.id` back after commit — autoincrement smoke 6/6.
+  Out-of-scope follow-ups: UPDATE/DELETE RETURNING, `CREATE SEQUENCE`,
+  non-PK SERIAL, multi-row RETURNING.
 - **PostgreSQL Extended Query protocol (SP-PG-EXTQ V1, 2026-05-29)** —
   full V1 message set `P` (Parse) / `B` (Bind) / `D` (Describe) /
   `E` (Execute) / `S` (Sync) / `C` (Close) / `H` (Flush). Per-connection

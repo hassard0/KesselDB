@@ -41,7 +41,13 @@ measurement and had drifted from the actual workspace count).
   (`create_all` DDL → multi-row INSERT → qualified-column SELECT/filter →
   by-PK UPDATE/DELETE) now passes **7/7 end-to-end** (was 2/8) — qualified
   columns (`t.col`), explicit projection-list render, and `= ANY (ARRAY[…])`
-  all lit.
+  all lit. SP-PG-SERIAL-RETURNING (2026-06-02) closes the last big gap:
+  **deterministic autoincrement** (`BIGSERIAL`/`SERIAL` PK) + `INSERT …
+  RETURNING id`. An ORM model declared WITHOUT an explicit id (the
+  real-world default — `autoincrement=True`) now does full CRUD and reads
+  the DB-assigned id back: SQLAlchemy autoincrement smoke **6/6** on vulcan.
+  The sequence counter lives IN THE DIGEST, advanced only on the apply
+  thread ⇒ replicated + crash-safe (3-replica byte-identity proven).
 - **PG COPY.** SP-PG-COPY V1 (text) + SP-PG-COPY-CSV V1 + SP-PG-COPY-BIN
   V1 deliver the wire shape every `pg_dump`/`pgloader`/`pg_bulkload`/
   Airbyte/Fivetran/Stitch binary-bulk-loader hard-requires.
@@ -54,6 +60,35 @@ measurement and had drifted from the actual workspace count).
   production `ClusterClient` does. The long-standing CI flake is GONE.
 
 Latest arc deliveries on top of that baseline (most-recent first):
+SP-PG-SERIAL-RETURNING V1 (2026-06-02, +~30 KATs, DONE) — closes the
+two coupled named follow-ups SP-PG-SERIAL (deterministic autoincrement)
++ SP-PG-RETURNING (return server-assigned values) TOGETHER. Real ORM
+models overwhelmingly use AUTOINCREMENT: the app omits `id`, the DB
+assigns it, and the ORM reads it back via `INSERT … RETURNING id`. (1)
+**Determinism** — a per-type sequence counter lives in a reserved,
+digest-covered storage keyspace (`0xFFFF_FFF4`), advanced ONLY on the
+single deterministic apply thread in op-number order (the proven SP79
+sequencer pattern) ⇒ every replica computes the identical gap-free
+sequence; WAL-backed ⇒ crash + replay resumes it exactly. 3-replica
+byte-identity digest + seed-7 oracle green. (2) **Catalog** — a
+`serial_pk` + `serial_field_id` flag rides a second backward-compat
+trailer in the type-def blob (no-serial types encode byte-identically).
+(3) **SM** — a serial INSERT carries a `SERIAL_SENTINEL` id; the SM
+assigns the next counter value as the ObjectId AND patches it into the
+stored `id` field so `SELECT id` reads it back; returns
+`OpResult::Created { id }`. The counter advances only on the
+successful-write path (a rejected insert consumes no value; PG-matching
+gap semantics on abort). (4) **kessel-sql** — `CREATE TABLE … id
+BIGSERIAL PRIMARY KEY` flags the serial PK; an INSERT omitting the id
+autoincrements; `RETURNING` parsed; `col AS alias` projection
+accept-skipped (unblocks SQLAlchemy's refresh SELECT). (5) **gateway** —
+`INSERT … RETURNING …` emits RowDescription + DataRow(assigned values) +
+CommandComplete on BOTH simple- and extended-query paths. HEADLINE:
+SQLAlchemy autoincrement model (no explicit id) — `w.id` reads back 1
+and 2 after commit; full CRUD 6/6 on vulcan (port 5543). V1 out-of-scope
+(named): UPDATE/DELETE RETURNING, CREATE SEQUENCE DDL, non-PK SERIAL,
+multi-row RETURNING. Smoke transcript:
+`docs/superpowers/sppgserialreturning-t5-smoke-2026-06-02.txt`.
 SP-PG-EXTQ-PARSED-FUNCTIONS V1 (2026-06-02, +5 KATs, regression-lock
 only) — DIAGNOSIS arc. Investigated the named follow-up "scalar-function
 SELECTs (`SELECT version()` / `current_database()` / `current_schema()` /

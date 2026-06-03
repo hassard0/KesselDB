@@ -50,7 +50,7 @@ Smoke transcript (after): `docs/superpowers/sppgsqlormparse-t5-smoke-2026-06-02.
 
 | Arc | Notes |
 |---|---|
-| `SP-PG-SERIAL` / `SP-PG-RETURNING` | server-generated autoincrement PK + `INSERT … RETURNING id` (only when a model OMITS the PK; this model supplies explicit ids). |
+| ~~`SP-PG-SERIAL` / `SP-PG-RETURNING`~~ | **CLOSED 2026-06-02** by SP-PG-SERIAL-RETURNING — deterministic autoincrement PK + `INSERT … RETURNING id`; SQLAlchemy autoincrement model (no explicit id) full CRUD 6/6. Tracker: `2026-06-02-kesseldb-subproject-sppgserialreturning-progress.md`. |
 | `SP-PG-SQL-UPDATE-WHERE-GENERAL` | non-PK / multi-row UPDATE/DELETE WHERE (needs a server-side scan-resolve-RMW). V1 covers `WHERE id = <int>`. |
 | `SP-PG-SQL-QUALIFIER-STRICT` | strict qualifier validation (reject `wrong_table.id`); V1 lenient. |
 | `SP-PG-SQL-FROM-ALIAS` | parse/bind `FROM t AS x` aliases. |

@@ -2244,7 +2244,7 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
                         }
                     }
                 }
-                skip_referential_actions(p);
+                skip_referential_actions(&mut p);
                 match p.next() {
                     Some(Tok::Punct(',')) => continue,
                     Some(Tok::Punct(')')) => break,
@@ -2380,7 +2380,7 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
                             }
                         }
                     }
-                    skip_referential_actions(p);
+                    skip_referential_actions(&mut p);
                     continue;
                 }
                 break;

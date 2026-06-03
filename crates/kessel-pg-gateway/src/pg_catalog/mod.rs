@@ -1504,6 +1504,46 @@ mod tests {
         assert_eq!(&bytes[bytes.len() - 6..], &[b'Z', 0, 0, 0, 5, b'I']);
     }
 
+    /// SP-PG-SQL-ORM-PARSE T4 — the SQLAlchemy `create_all` table-
+    /// existence probe (`SELECT pg_class.relname ... WHERE relname = '<t>'
+    /// AND relkind = ANY (ARRAY[...]) ...`) hits the hook. For a table
+    /// that EXISTS, the synthesizer emits 1 row (`SELECT 1`); for a
+    /// missing table, 0 rows (`SELECT 0`) so create_all proceeds to
+    /// CREATE TABLE.
+    #[test]
+    fn ormparse_t4_create_all_relname_probe_fires() {
+        let eng = t4_test_engine(); // has a `users` table
+        let probe = |t: &str| {
+            format!(
+                "SELECT pg_catalog.pg_class.relname \
+                 FROM pg_catalog.pg_class JOIN pg_catalog.pg_namespace \
+                 ON pg_catalog.pg_namespace.oid = pg_catalog.pg_class.relnamespace \
+                 WHERE pg_catalog.pg_class.relname = '{t}' \
+                 AND pg_catalog.pg_class.relkind = ANY (ARRAY['r', 'p', 'f', 'v', 'm']) \
+                 AND pg_catalog.pg_table_is_visible(pg_catalog.pg_class.oid) \
+                 AND pg_catalog.pg_namespace.nspname != 'pg_catalog'"
+            )
+        };
+        // Existing table → 1 row.
+        let res = catalog_query_hook(&probe("users"), &eng);
+        assert!(res.is_some(), "create_all probe MUST hit the hook");
+        let bytes = res.unwrap();
+        assert_eq!(bytes[0], b'T');
+        assert!(
+            bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"),
+            "existing table probe must emit SELECT 1 (1 relname row)"
+        );
+        assert!(bytes.windows(5).any(|w| w == b"users"));
+        // Missing table → 0 rows (create_all then creates it).
+        let res2 = catalog_query_hook(&probe("not_there"), &eng);
+        assert!(res2.is_some());
+        let bytes2 = res2.unwrap();
+        assert!(
+            bytes2.windows(b"SELECT 0\0".len()).any(|w| w == b"SELECT 0\0"),
+            "missing table probe must emit SELECT 0"
+        );
+    }
+
     /// **Pattern match — unqualified pg_attribute** also fires.
     #[test]
     fn t4_pg_attribute_select_star_unqualified() {

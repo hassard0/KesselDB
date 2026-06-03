@@ -6031,6 +6031,69 @@ mod tests {
         );
     }
 
+    /// SP-PG-SQL-ORM-PARSE T4 — `col = ANY (ARRAY[v1, v2, v3])` desugars
+    /// to `col IN (v1, v2, v3)` ≡ OR-of-eq, compiling to the
+    /// BYTE-IDENTICAL Op as the explicit IN list.
+    #[test]
+    fn ormparse_any_array_desugars_to_in() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (k U32 NOT NULL)");
+        let cat = sm.catalog();
+        let any =
+            compile("SELECT * FROM t WHERE k = ANY(ARRAY[1,2,3])", cat)
+                .expect("ANY(ARRAY[...]) compiles");
+        let in_list =
+            compile("SELECT * FROM t WHERE k IN (1,2,3)", cat)
+                .expect("IN list compiles");
+        assert_eq!(
+            any.encode(),
+            in_list.encode(),
+            "= ANY(ARRAY[...]) must compile byte-identically to IN (...)"
+        );
+    }
+
+    /// `= ANY (ARRAY[...])` with a single element + with string literals
+    /// (the create_all `relkind = ANY (ARRAY['r','p'])` shape) both
+    /// parse and match their IN equivalents.
+    #[test]
+    fn ormparse_any_array_strings_and_singleton() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (s CHAR(4) NOT NULL)");
+        let cat = sm.catalog();
+        let any = compile(
+            "SELECT * FROM t WHERE s = ANY (ARRAY['r', 'p'])",
+            cat,
+        )
+        .expect("string ANY(ARRAY) compiles");
+        let in_list =
+            compile("SELECT * FROM t WHERE s IN ('r', 'p')", cat)
+                .expect("string IN compiles");
+        assert_eq!(any.encode(), in_list.encode());
+        // Singleton.
+        assert!(compile(
+            "SELECT * FROM t WHERE s = ANY(ARRAY['x'])",
+            cat
+        )
+        .is_ok());
+    }
+
+    /// The lexer no longer rejects `[`; a bare/garbage `[` outside
+    /// `ARRAY[...]` still produces a clean parse error (not a panic).
+    #[test]
+    fn ormparse_bracket_lexes_not_unexpected_char() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (k U32 NOT NULL)");
+        let cat = sm.catalog();
+        // `[` no longer "unexpected char '['" — it tokenizes; the parser
+        // then rejects the malformed shape with a grammar error.
+        let err = compile("SELECT * FROM t WHERE k = [1,2]", cat)
+            .unwrap_err();
+        assert!(
+            !err.contains("unexpected char '['"),
+            "`[` must lex (no unexpected-char error); got: {err}"
+        );
+    }
+
     /// `select_columns` (the gateway's projection detector) accepts the
     /// qualified shape and returns the BARE column names in order, so the
     /// RowDescription matches the engine's projected output.

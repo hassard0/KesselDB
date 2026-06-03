@@ -1,0 +1,30 @@
+# KesselDB Final Benchmark Sweep — Consolidated medians (2026-06-02)
+# Host: vulcan (192.168.4.178); HEAD 58c92bd; binaries in /tmp/kdb-target-finalbench/release/
+# Methodology: bench-compare --db kesseldb,postgres --trials 3 (median). SQLite SKIPPED this sweep:
+#   vulcan root fs was 100% full (95MB free) so SQLite's on-disk /tmp DB hit 'database or disk is full'.
+#   KesselDB (MemVfs, in-process) + Postgres (docker bench-pg :5533, own volume) unaffected.
+#   Prior-arc SQLite columns preserved as historical in BENCHMARKS.md §3-§3g.
+# Load: sibling ORM-parse agent's cargo active during OLTP runs (load ~6); YCSB + sharded captured quieter (load 0.1-2.5).
+#
+# === Sharded point-read get-by-id (rows=10000, --pool-workers 16, --workers 16, 10s, 3 trials) ===
+#   K=1   4,905,221 ops/sec   (baseline)
+#   K=4  11,364,338 ops/sec   2.32x
+#   K=8  14,706,405 ops/sec   3.00x   <-- HEADLINE
+#   K=16 16,241,289 ops/sec   3.31x
+#   (matches published §13: 4.68M / 11.08M / 14.93M / 16.72M within noise)
+#
+# === Cross-DB YCSB/OLTP (median ops|tx/sec, KesselDB vs Postgres) ===
+#   ycsb-c   N=16  KDB 5,271,914  PG 82,701   63.75x WIN
+#   ycsb-a   N=16  KDB    86,384  PG 74,785    1.16x WIN
+#   ycsb-b   N=16  KDB   573,576  PG 79,037    7.26x WIN
+#   oltp-RO  N=16  KDB    30,646  PG  5,094    6.02x WIN
+#   oltp-WO  N=8   KDB    50,687  PG 10,331    4.91x WIN
+#   oltp-RW  N=16  KDB     8,852  PG  3,853    2.30x WIN
+#
+# === TPC-H (median q/s, sf=0.01, 30s, N=1,4) ===
+#   tpch-q1  N=4   KDB 86.17    PG 185.76   PG 2.16x faster (KDB LOSE)
+#   tpch-q6  N=4   KDB 544.59   PG 1682.98  PG 3.09x faster (KDB LOSE); floor>=400 + stretch>=500 MET
+#
+# Tally: KesselDB wins 6 of 8 cross-DB workloads vs Postgres.
+# Raw JSON: /tmp/finalbench-{ycsb-c,ycsb-a,ycsb-b,oltp-read-only,oltp-write-only,oltp-read-write,tpch-q1,tpch-q6}.json
+#           /tmp/finalbench-sharded-pointreads.txt

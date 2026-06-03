@@ -1,0 +1,11 @@
+# KesselDB Final Benchmark Sweep — Sharded point-reads (get-by-id)
+# Date: 2026-06-02  Host: vulcan (192.168.4.178)  HEAD: 58c92bd
+# Binary: /tmp/kdb-target-finalbench/release/kessel-bench
+# Run shape: parallel-reads --workers 16 --shard-count K --rows 10000 --duration 10 --pool-workers 16
+# Methodology matches docs/BENCHMARKS.md §13 (rows=10000, pool-workers=16). 3 trials each, median reported.
+# Load: vulcan quiet (load avg ~0.1-2.5); sibling ORM-parse agent on a different target dir + ports, never killed.
+#
+# K=1  trials: 4905221, 4911656, 4875880   median 4,905,221 ops/sec   p50 2us p99 7us
+# K=4  trials: 11364338, 11085673, 11475922 median 11,364,338 ops/sec p50 1us p99 3us
+# K=8  trials: 14706405, 14505816, 14734263 median 14,706,405 ops/sec p50 0us p99 1-2us   <-- HEADLINE
+# K=16 trials: 16274487, 16241289, 15530634 median 16,241,289 ops/sec p50 0us p99 1us

@@ -41,6 +41,36 @@ measurement and had drifted from the actual workspace count).
   production `ClusterClient` does. The long-standing CI flake is GONE.
 
 Latest arc deliveries on top of that baseline (most-recent first):
+SP-PG-EXTQ-PARSED-FUNCTIONS V1 (2026-06-02, +5 KATs, regression-lock
+only) — DIAGNOSIS arc. Investigated the named follow-up "scalar-function
+SELECTs (`SELECT version()` / `current_database()` / `current_schema()` /
+`SELECT 1`) still fall back to the text-substitute path under the
+typed-default regime." VERDICT: **Reality A — the follow-up is
+REDUNDANT.** Scalar functions are intercepted by
+`pg_catalog::catalog_query_hook` at the TOP of BOTH dispatch entry
+points (`dispatch_query_with_params` AND `dispatch_query`) BEFORE the
+typed/text branch and BEFORE any `engine.apply_sql*` / `select_star_table`
+call. For 0-param SQL `preprocess_typed_params` returns `Some(vec![])`,
+so the typed path is taken — and that path hooks the catalog FIRST,
+serving the synthesized `RowDescription + DataRow + CommandComplete`
+directly. No text concatenation, no engine round-trip, no correctness or
+security gap. The DESCRIBE-VERSION + CAT arcs already closed this; the
+named follow-up was speculative. Arc ships +5 end-to-end regression-lock
+KATs (Parse → Bind → Execute for version/current_database/current_schema/
+SELECT 1 + re-Execute exhaustion) driven against a **panic-on-engine-call**
+test engine — a regression that routed a scalar function into
+`apply_sql`/`apply_sql_with_params` would PANIC. Frame counting walks
+the 4-byte length prefix (raw tag-byte counting was unsound — the version
+string "KesselDB 1.0" carries a literal `D`). **vulcan-verified** (port
+5541/6541, psycopg3 3.3.4 Extended Query, both auto and explicit
+`prepare=True`): `version()`→'PostgreSQL 14.0 (KesselDB 1.0)',
+`current_database()`→'kesseldb', `current_schema()`→'public',
+`SELECT 1`→1. Full gateway suite 967 passed / 0 failed. Out-of-scope
+named follow-up: `SP-PG-EXTQ-PARSED-FUNCTIONS-PARAM` (gateway-evaluated
+PARAMETERIZED scalar functions `upper($1)`/`length($1)` — YAGNI; no ORM
+connect-probe issues them, and today they hit honest kessel-sql
+rejection, not a silent wrong answer). Smoke transcript:
+`docs/superpowers/sppgextqparsedfunctions-t3-smoke-2026-06-02.txt`.
 SP-PG-ORM-SQLALCHEMY V1 (2026-06-02, +1 KAT, DONE_WITH_CONCERNS) — the
 INTEGRATION validation of tonight's ~46 PG-wire arcs: a REAL SQLAlchemy
 2.0 **declarative-ORM** CRUD workload (NOT raw `cursor.execute`) run

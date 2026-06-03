@@ -1,0 +1,51 @@
+SP-PG-EXTQ-PARSED-FUNCTIONS T3 — vulcan psycopg3 Extended-Query scalar-function smoke
+Date: 2026-06-02
+Host: vulcan (admin@192.168.4.178)
+Build: CARGO_TARGET_DIR=/tmp/kdb-target-parsedfn cargo build --release --bin kesseldb --features pg-gateway
+       -> Finished `release` in 27.28s
+Server: KESSELDB_TOKEN=admin KESSELDB_PG_ADDR=127.0.0.1:5541
+        /tmp/kdb-target-parsedfn/release/kesseldb 127.0.0.1:6541 /tmp/kdb-parsedfn-data
+        -> "KesselDB listening on 127.0.0.1:6541, ... pg=127.0.0.1:5541"
+Client: psycopg 3.3.4 (psycopg3 uses the Extended Query protocol — Parse/Bind/Execute — by default)
+
+DIAGNOSIS CONTEXT (Reality A): scalar-function SELECTs are intercepted by
+pg_catalog::catalog_query_hook at the TOP of dispatch_query_with_params (the
+typed-default path) BEFORE any engine.apply_sql* / select_star_table call.
+This smoke confirms the end-to-end answer over a real psycopg3 Extended Query
+session, complementing the +5 in-process regression-lock KATs.
+
+─────────────────────────────────────────────────────────────────────
+Run 1 — default cursor.execute (extended query):
+
+  version():            [('PostgreSQL 14.0 (KesselDB 1.0)',)]
+  current_database():   [('kesseldb',)]
+  current_schema():     [('public',)]
+  SELECT 1:             [(1,)]
+  OK
+
+Run 2 — explicit prepare=True (forces server-side prepared / extended query):
+
+  SELECT version()          -> [('PostgreSQL 14.0 (KesselDB 1.0)',)]
+  SELECT current_database() -> [('kesseldb',)]
+  SELECT current_schema()   -> [('public',)]
+  SELECT 1                  -> [(1,)]
+  prepared(extended-query) OK
+─────────────────────────────────────────────────────────────────────
+
+RESULT: PASS. All four scalar-function SELECTs answer correctly over psycopg3
+Extended Query (both auto and explicit-prepare modes). No engine round-trip is
+needed for these — the catalog synthesizer serves them directly. No
+text-fallback gap. Confirms the named SP-PG-EXTQ-PARSED-FUNCTIONS follow-up is
+redundant; this arc ships regression locks only.
+
+In-process KAT evidence (vulcan, `cargo test -p kessel-pg-gateway`):
+  sppgextqparsedfunctions_execute_select_version_via_hook_no_engine_call ... ok
+  sppgextqparsedfunctions_execute_current_database_via_hook_no_engine_call ... ok
+  sppgextqparsedfunctions_execute_current_schema_via_hook_no_engine_call ... ok
+  sppgextqparsedfunctions_execute_select_1_via_hook_no_engine_call ... ok
+  sppgextqparsedfunctions_reexecute_drained_scalar_portal_emits_bare_command_complete ... ok
+  -> uses a panic-on-engine-call test engine: a regression that routed a scalar
+     function into apply_sql / apply_sql_with_params would PANIC.
+  Full gateway suite: 967 passed; 0 failed.
+
+Server cleanly stopped; port 5541 freed.

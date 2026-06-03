@@ -1,7 +1,16 @@
 # SP-PG-EXTQ-PARSED-FUNCTIONS — close the scalar-function text-fallback gap — SP-arc Progress Tracker
 
 Date created: 2026-06-02
-**Status: IN PROGRESS — T1 design + diagnosis landed.**
+**Status: CLOSED — V1 SHIPPED at T4 (2026-06-02). Regression-lock only;
+the named follow-up was REDUNDANT (Reality A).** +5 end-to-end
+Parse → Bind → Execute KATs lock that scalar-function SELECTs are
+answered by the catalog synthesizer and NEVER reach the engine (proven
+via a panic-on-engine-call test engine). Full gateway suite 967 passed /
+0 failed on vulcan. psycopg3 3.3.4 Extended-Query smoke (port 5541/6541,
+both auto + explicit `prepare=True`): `version()` /
+`current_database()` / `current_schema()` / `SELECT 1` all answer
+correctly. No behavior delta — src logic byte-untouched; tests + docs
+only. **TaskList ready for completion.**
 
 ## DIAGNOSIS headline: Reality A — the named follow-up is REDUNDANT
 
@@ -36,10 +45,10 @@ honest "redundant follow-up" closure.
 
 | T# | Scope | Status | Commit |
 |---|---|---|---|
-| **T1** | Design spec + diagnosis + progress tracker. | **DONE** | (this slice) |
-| **T2** | +5–7 end-to-end regression-lock KATs in `extq/mod.rs`. | TODO | — |
-| **T3** | vulcan psycopg3 Extended-Query smoke. | TODO | — |
-| **T4** | STATUS row + tracker → CLOSED + smoke transcript. | TODO | — |
+| **T1** | Design spec + diagnosis + progress tracker. | **DONE** | `60994cc` |
+| **T2** | +5 end-to-end regression-lock KATs in `extq/mod.rs` (version/current_database/current_schema/SELECT 1 via Parse→Bind→Execute + re-Execute exhaustion; panic-on-engine-call engine; length-prefix frame walk). | **DONE** | `bea7512` + `9b4d57f` (frame-walker fix) |
+| **T3** | vulcan psycopg3 3.3.4 Extended-Query smoke (port 5541/6541): version/current_database/current_schema/SELECT 1 all PASS, auto + `prepare=True`. Full gateway suite 967 passed. | **DONE** | (verification-only; transcript `docs/superpowers/sppgextqparsedfunctions-t3-smoke-2026-06-02.txt`) |
+| **T4** | STATUS row + tracker → CLOSED + smoke transcript. | **DONE** | (this slice) |
 
 ## Out-of-scope (named follow-up)
 

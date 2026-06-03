@@ -2334,4 +2334,114 @@ mod tests {
         assert!(bytes.iter().any(|&b| b == b'E'));
         assert!(bytes.windows(5).any(|w| w == b"42703"));
     }
+
+    // ---- SP-PG-SERIAL-RETURNING (T4) ----
+
+    /// A mock engine for INSERT...RETURNING: the INSERT returns
+    /// `Created { id }`; any later SELECT (the gateway's read-back)
+    /// returns the canned row stream so RETURNING can project columns.
+    struct ReturningEngine {
+        cols: Vec<PgColumn>,
+        row_stream: Vec<u8>,
+        assigned: u128,
+        table: String,
+    }
+    impl EngineApply for ReturningEngine {
+        fn apply_sql(&self, sql: &str) -> OpResult {
+            let kw = sql.trim_start().split_whitespace().next().unwrap_or("");
+            if kw.eq_ignore_ascii_case("INSERT") {
+                OpResult::Created { id: self.assigned }
+            } else {
+                // read-back SELECT
+                OpResult::Got(self.row_stream.clone().into())
+            }
+        }
+        fn describe_table(&self, name: &str) -> Option<Vec<PgColumn>> {
+            if name == self.table { Some(self.cols.clone()) } else { None }
+        }
+    }
+
+    fn returning_cols() -> Vec<PgColumn> {
+        vec![
+            PgColumn { name: "id".into(), kind: FieldKind::I64, nullable: false },
+            PgColumn { name: "name".into(), kind: FieldKind::Char(8), nullable: true },
+        ]
+    }
+
+    /// Headline: `INSERT … RETURNING id` emits RowDescription + a DataRow
+    /// carrying the engine-assigned id + CommandComplete + RFQ.
+    #[test]
+    fn insert_returning_id_emits_datarow_with_assigned_id() {
+        let cols = returning_cols();
+        let rec = build_record(&cols, &[Value::Int(7), Value::Blob(b"gadget\0\0".to_vec())]);
+        let eng = ReturningEngine {
+            cols,
+            row_stream: build_row_stream(&[rec]),
+            assigned: 7,
+            table: "widgets".into(),
+        };
+        let bytes = dispatch_query(
+            "INSERT INTO widgets (name) VALUES ('gadget') RETURNING id",
+            &eng,
+        );
+        // RowDescription 'T', a DataRow 'D', the assigned id "7" in text,
+        // CommandComplete "INSERT 0 1", and RFQ 'Z'.
+        assert!(bytes.iter().any(|&b| b == b'T'), "expected RowDescription");
+        assert!(bytes.iter().any(|&b| b == b'D'), "expected DataRow");
+        assert!(bytes.windows(1).any(|w| w == b"7"), "expected assigned id 7 in the DataRow");
+        assert!(
+            bytes.windows(b"INSERT 0 1\0".len()).any(|w| w == b"INSERT 0 1\0"),
+            "expected CommandComplete INSERT 0 1"
+        );
+        assert!(bytes.iter().any(|&b| b == b'Z'), "expected ReadyForQuery");
+    }
+
+    /// `RETURNING id, name` returns BOTH the assigned id and the
+    /// client-supplied column (read back from the row).
+    #[test]
+    fn insert_returning_id_and_name_emits_both_columns() {
+        let cols = returning_cols();
+        let rec = build_record(&cols, &[Value::Int(3), Value::Blob(b"alice\0\0\0".to_vec())]);
+        let eng = ReturningEngine {
+            cols,
+            row_stream: build_row_stream(&[rec]),
+            assigned: 3,
+            table: "widgets".into(),
+        };
+        let bytes = dispatch_query(
+            "INSERT INTO widgets (name) VALUES ('alice') RETURNING id, name",
+            &eng,
+        );
+        assert!(bytes.iter().any(|&b| b == b'T'));
+        assert!(bytes.iter().any(|&b| b == b'D'));
+        assert!(bytes.windows(1).any(|w| w == b"3"), "assigned id");
+        assert!(
+            bytes.windows(b"alice".len()).any(|w| w == b"alice"),
+            "client-supplied name"
+        );
+    }
+
+    /// Regression: a plain INSERT (no RETURNING) still emits a BARE
+    /// CommandComplete (no RowDescription / DataRow).
+    #[test]
+    fn plain_insert_without_returning_is_bare_command_complete() {
+        let cols = returning_cols();
+        let eng = ReturningEngine {
+            cols,
+            row_stream: Vec::new(),
+            assigned: 1,
+            table: "widgets".into(),
+        };
+        let bytes = dispatch_query(
+            "INSERT INTO widgets (name) VALUES ('x')",
+            &eng,
+        );
+        // No RowDescription / DataRow; just CommandComplete + RFQ.
+        assert!(!bytes.iter().any(|&b| b == b'T'), "no RowDescription for plain INSERT");
+        assert!(!bytes.iter().any(|&b| b == b'D'), "no DataRow for plain INSERT");
+        assert!(
+            bytes.windows(b"INSERT 0 1\0".len()).any(|w| w == b"INSERT 0 1\0"),
+            "expected CommandComplete INSERT 0 1"
+        );
+    }
 }

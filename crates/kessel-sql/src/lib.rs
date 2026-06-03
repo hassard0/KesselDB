@@ -636,10 +636,10 @@ pub fn insert_returning(sql: &str) -> Option<(String, Vec<String>)> {
     }
     // SP-PG-RETURNING-MULTIROW-STAR: `RETURNING *` → the star sentinel
     // `["*"]`. The gateway expands it to every table column (the assigned
-    // id pseudo-column + all declared fields) via `describe_table`. We
-    // detect the `*` as a single `Tok::Punct('*')` immediately after
+    // id pseudo-column + all declared fields) via `describe_table`. The
+    // lexer emits `*` as `Tok::Star`; we detect it immediately after
     // RETURNING (optionally followed by a trailing `;` the lexer dropped).
-    if matches!(it.peek(), Some(Tok::Punct('*'))) {
+    if matches!(it.peek(), Some(Tok::Star)) {
         it.next();
         // `RETURNING *` must be the whole clause (no `*, col` mixing in V1).
         if it.peek().is_none() {

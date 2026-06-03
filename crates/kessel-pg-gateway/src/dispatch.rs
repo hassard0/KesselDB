@@ -120,6 +120,8 @@ pub fn dispatch_query_with_params<E: EngineApply + ?Sized>(
     let result = engine.apply_sql_with_params(sql_trimmed, params);
     let affected_rows: u64 = match &result {
         OpResult::Ok | OpResult::TxCommitted { .. } | OpResult::Created { .. } => 1,
+        // SP-PG-RETURNING-MULTIROW-STAR: a batched INSERT surfaces N ids.
+        OpResult::CreatedMany { ids } => ids.len() as u64,
         _ => 0,
     };
     match result {
@@ -131,23 +133,28 @@ pub fn dispatch_query_with_params<E: EngineApply + ?Sized>(
             // `select_star_table` (whole row).
             render_select_got(&row_bytes, sql_trimmed, select_table.clone(), engine)
         }
-        // SP-PG-SERIAL-RETURNING: Extended-Query `INSERT … RETURNING …`
-        // (SQLAlchemy 2.0's autoincrement flush rides this path). Mirror
-        // the simple-query handling: surface the assigned id + project the
-        // RETURNING columns.
-        ref ok_variant @ (OpResult::Ok | OpResult::Created { .. })
+        // SP-PG-SERIAL-RETURNING / -MULTIROW-STAR: Extended-Query
+        // `INSERT … RETURNING …` (SQLAlchemy 2.0's autoincrement flush
+        // rides this path; by DEFAULT it batches multiple rows into one
+        // statement → `CreatedMany`). Mirror the simple-query handling:
+        // surface the assigned id(s) + project the RETURNING columns.
+        ref ok_variant @ (OpResult::Ok
+            | OpResult::Created { .. }
+            | OpResult::CreatedMany { .. })
             if kessel_sql::insert_returning(sql_trimmed).is_some() =>
         {
-            let assigned_id = match ok_variant {
-                OpResult::Created { id } => Some(*id),
-                _ => None,
+            let assigned_ids = match ok_variant {
+                OpResult::Created { id } => vec![*id],
+                OpResult::CreatedMany { ids } => ids.clone(),
+                _ => Vec::new(),
             };
-            render_insert_returning(sql_trimmed, assigned_id, engine)
+            render_insert_returning(sql_trimmed, &assigned_ids, engine)
         }
         OpResult::Ok
         | OpResult::TypeCreated(_)
         | OpResult::TxCommitted { .. }
-        | OpResult::Created { .. } => {
+        | OpResult::Created { .. }
+        | OpResult::CreatedMany { .. } => {
             let count = if leading_keyword_is(sql_trimmed, "INSERT") {
                 let from_engine = affected_rows;
                 let from_sql = count_insert_values(sql_trimmed);
@@ -290,19 +297,23 @@ pub fn dispatch_query<E: EngineApply + ?Sized>(sql: &str, engine: &E) -> Vec<u8>
         // an explicit-id INSERT returns `Ok`. Either way, if the SQL had a
         // RETURNING clause, emit RowDescription + DataRow(returned values)
         // + CommandComplete instead of a bare CommandComplete.
-        ref ok_variant @ (OpResult::Ok | OpResult::Created { .. })
+        ref ok_variant @ (OpResult::Ok
+            | OpResult::Created { .. }
+            | OpResult::CreatedMany { .. })
             if kessel_sql::insert_returning(sql_trimmed).is_some() =>
         {
-            let assigned_id = match ok_variant {
-                OpResult::Created { id } => Some(*id),
-                _ => None,
+            let assigned_ids = match ok_variant {
+                OpResult::Created { id } => vec![*id],
+                OpResult::CreatedMany { ids } => ids.clone(),
+                _ => Vec::new(),
             };
-            render_insert_returning(sql_trimmed, assigned_id, engine)
+            render_insert_returning(sql_trimmed, &assigned_ids, engine)
         }
         OpResult::Ok
         | OpResult::TypeCreated(_)
         | OpResult::TxCommitted { .. }
-        | OpResult::Created { .. } => {
+        | OpResult::Created { .. }
+        | OpResult::CreatedMany { .. } => {
             // Non-SELECT success. T9: pick the CommandComplete tag
             // via `cmd_complete_tag_for_sql` — handles DDL +
             // transaction-control keywords + leading-comment stripping
@@ -491,22 +502,24 @@ fn render_select_got<E: EngineApply + ?Sized>(
     out
 }
 
-/// SP-PG-SERIAL-RETURNING: render an `INSERT … RETURNING col1, col2, …`
-/// reply. The INSERT already committed; here we surface the requested
-/// columns as a single DataRow (V1 = single-row INSERT, the SQLAlchemy
-/// unit-of-work default; multi-row RETURNING is `SP-PG-RETURNING-MULTIROW`).
+/// SP-PG-SERIAL-RETURNING / -MULTIROW-STAR: render an
+/// `INSERT … RETURNING <cols | *>` reply. The INSERT already committed;
+/// here we surface the requested columns as N DataRows (one per inserted
+/// row), so SQLAlchemy's DEFAULT `use_insertmanyvalues` batched insert
+/// (`VALUES (…),(…),(…) RETURNING id`) gets every assigned id back.
 ///
-/// We resolve the row's id (the engine-assigned serial value when
-/// `assigned_id` is `Some`, else the explicit id parsed from the INSERT
-/// SQL), read the just-written row back via the engine's standard
-/// `SELECT * FROM <table> WHERE id = <id>` path, and project the RETURNING
-/// columns from it — so EVERY returnable column (the assigned id AND
-/// client-supplied columns like `name`) renders uniformly with the same
-/// decode machinery as a normal SELECT. Emits RowDescription + DataRow +
-/// CommandComplete("INSERT 0 1") + ReadyForQuery.
+/// `assigned_ids` carries the engine-assigned serial ids in insertion
+/// order (one per row for `Created`/`CreatedMany`; empty for an
+/// explicit-id INSERT, in which case the single explicit `id` is parsed
+/// from the SQL). `RETURNING *` (the `["*"]` star sentinel from
+/// `kessel_sql::insert_returning`) expands to EVERY table column in
+/// declared order. Each row is read back via the engine's normal
+/// `SELECT * FROM <table> WHERE id = <id>` path and projected with the
+/// same decode machinery as a normal SELECT. Emits RowDescription +
+/// N×DataRow + CommandComplete("INSERT 0 N") + ReadyForQuery.
 fn render_insert_returning<E: EngineApply + ?Sized>(
     sql_trimmed: &str,
-    assigned_id: Option<u128>,
+    assigned_ids: &[u128],
     engine: &E,
 ) -> Vec<u8> {
     let (table, ret_cols) = match kessel_sql::insert_returning(sql_trimmed) {
@@ -519,30 +532,6 @@ fn render_insert_returning<E: EngineApply + ?Sized>(
             return out;
         }
     };
-    // Resolve the row id: the engine-assigned serial, else the explicit
-    // `id` from the INSERT SQL.
-    let id = match assigned_id.or_else(|| insert_explicit_id(sql_trimmed)) {
-        Some(i) => i,
-        None => {
-            return error_response_then_rfq(
-                SEVERITY_ERROR,
-                "XX000",
-                "RETURNING: could not resolve the inserted row id",
-            );
-        }
-    };
-    // Read the row back through the engine's normal SELECT path.
-    let read_sql = format!("SELECT * FROM {table} WHERE id = {id}");
-    let row_bytes = match engine.apply_sql(&read_sql) {
-        OpResult::Got(b) => b,
-        _ => {
-            return error_response_then_rfq(
-                SEVERITY_ERROR,
-                "XX000",
-                "RETURNING: failed to read back the inserted row",
-            );
-        }
-    };
     let table_cols = match engine.describe_table(&table) {
         Some(c) => c,
         None => {
@@ -553,59 +542,98 @@ fn render_insert_returning<E: EngineApply + ?Sized>(
             );
         }
     };
-    let proj_cols = match resolve_projection(&ret_cols, &table_cols) {
-        Some(c) => c,
-        None => {
-            return error_response_then_rfq(
-                SEVERITY_ERROR,
-                "42703",
-                &format!("RETURNING column does not exist in \"{table}\" {ret_cols:?}"),
-            );
+    // SP-PG-RETURNING-MULTIROW-STAR: `RETURNING *` (the `["*"]` sentinel)
+    // expands to EVERY table column in declared order. Otherwise project
+    // the explicit RETURNING list.
+    let is_star = ret_cols.len() == 1 && ret_cols[0] == "*";
+    let proj_cols = if is_star {
+        table_cols.clone()
+    } else {
+        match resolve_projection(&ret_cols, &table_cols) {
+            Some(c) => c,
+            None => {
+                return error_response_then_rfq(
+                    SEVERITY_ERROR,
+                    "42703",
+                    &format!("RETURNING column does not exist in \"{table}\" {ret_cols:?}"),
+                );
+            }
         }
     };
-    // Decode the full record, then pick the projected cells in
-    // RETURNING order.
+    // Resolve the per-row ids: the engine-assigned serials (one per row),
+    // else the single explicit `id` from the INSERT SQL.
+    let ids: Vec<u128> = if assigned_ids.is_empty() {
+        match insert_explicit_id(sql_trimmed) {
+            Some(i) => vec![i],
+            None => {
+                return error_response_then_rfq(
+                    SEVERITY_ERROR,
+                    "XX000",
+                    "RETURNING: could not resolve the inserted row id",
+                );
+            }
+        }
+    } else {
+        assigned_ids.to_vec()
+    };
     let full_layout = compute_record_layout(&table_cols);
     let mut out = Vec::new();
+    // ONE RowDescription for all rows (same projection shape per row).
     let fields: Vec<FieldMeta> = proj_cols
         .iter()
         .map(|c| FieldMeta { name: c.name.clone(), type_oid: field_kind_to_oid(c.kind) })
         .collect();
     out.extend_from_slice(&encode_row_description(&fields));
-    // The read-back row stream is the length-prefixed `[u32 len][rec]`
-    // shape (Op::Select) OR a bare record (Op::GetById). Decode the
-    // first record either way.
-    let rec: &[u8] = if row_bytes.len() >= 4 {
-        let len = u32::from_le_bytes(row_bytes[0..4].try_into().unwrap()) as usize;
-        if 4 + len <= row_bytes.len() && decode_record(&row_bytes[4..4 + len], &table_cols, &full_layout).is_some() {
-            &row_bytes[4..4 + len]
+    // One DataRow per inserted row — read each back + project.
+    for id in &ids {
+        let read_sql = format!("SELECT * FROM {table} WHERE id = {id}");
+        let row_bytes = match engine.apply_sql(&read_sql) {
+            OpResult::Got(b) => b,
+            _ => {
+                return error_response_then_rfq(
+                    SEVERITY_ERROR,
+                    "XX000",
+                    "RETURNING: failed to read back the inserted row",
+                );
+            }
+        };
+        // The read-back row stream is the length-prefixed `[u32 len][rec]`
+        // shape (Op::Select) OR a bare record (Op::GetById). Decode the
+        // first record either way.
+        let rec: &[u8] = if row_bytes.len() >= 4 {
+            let len = u32::from_le_bytes(row_bytes[0..4].try_into().unwrap()) as usize;
+            if 4 + len <= row_bytes.len()
+                && decode_record(&row_bytes[4..4 + len], &table_cols, &full_layout).is_some()
+            {
+                &row_bytes[4..4 + len]
+            } else {
+                &row_bytes[..]
+            }
         } else {
             &row_bytes[..]
+        };
+        let decoded = match decode_record(rec, &table_cols, &full_layout) {
+            Some(cells) => cells,
+            None => {
+                return error_response_then_rfq(
+                    SEVERITY_ERROR,
+                    "XX000",
+                    "RETURNING: inserted row decode failed",
+                );
+            }
+        };
+        // Map each projected column to its position in the full schema.
+        let mut row_cells: Vec<Option<&[u8]>> = Vec::with_capacity(proj_cols.len());
+        for c in &proj_cols {
+            let idx = table_cols.iter().position(|tc| tc.name == c.name);
+            match idx.and_then(|i| decoded.get(i)) {
+                Some(cell) => row_cells.push(cell.as_deref()),
+                None => row_cells.push(None),
+            }
         }
-    } else {
-        &row_bytes[..]
-    };
-    let decoded = match decode_record(rec, &table_cols, &full_layout) {
-        Some(cells) => cells,
-        None => {
-            return error_response_then_rfq(
-                SEVERITY_ERROR,
-                "XX000",
-                "RETURNING: inserted row decode failed",
-            );
-        }
-    };
-    // Map each RETURNING column to its position in the full table schema.
-    let mut row_cells: Vec<Option<&[u8]>> = Vec::with_capacity(proj_cols.len());
-    for c in &proj_cols {
-        let idx = table_cols.iter().position(|tc| tc.name == c.name);
-        match idx.and_then(|i| decoded.get(i)) {
-            Some(cell) => row_cells.push(cell.as_deref()),
-            None => row_cells.push(None),
-        }
+        out.extend_from_slice(&encode_data_row(&row_cells));
     }
-    out.extend_from_slice(&encode_data_row(&row_cells));
-    out.extend_from_slice(&encode_command_complete("INSERT 0 1"));
+    out.extend_from_slice(&encode_command_complete(&format!("INSERT 0 {}", ids.len())));
     out.extend_from_slice(&encode_ready_for_query(b'I'));
     out
 }
@@ -2448,5 +2476,172 @@ mod tests {
         );
         // The bare reply is small (CommandComplete + ReadyForQuery only).
         assert!(bytes.len() < 32, "bare reply should be small, got {}", bytes.len());
+    }
+
+    // ---- SP-PG-RETURNING-MULTIROW-STAR (T4) ----
+
+    /// A mock engine for the multi-row autoincrement INSERT … RETURNING
+    /// shape: the INSERT returns `CreatedMany { ids }`; each read-back
+    /// SELECT `… WHERE id = N` returns the record keyed by N so the
+    /// gateway projects the right row for each id.
+    struct MultiRowReturningEngine {
+        cols: Vec<PgColumn>,
+        rows_by_id: std::collections::BTreeMap<u128, Vec<u8>>,
+        ids: Vec<u128>,
+        table: String,
+    }
+    impl EngineApply for MultiRowReturningEngine {
+        fn apply_sql(&self, sql: &str) -> OpResult {
+            let kw = sql.trim_start().split_whitespace().next().unwrap_or("");
+            if kw.eq_ignore_ascii_case("INSERT") {
+                OpResult::CreatedMany { ids: self.ids.clone() }
+            } else {
+                // read-back SELECT — parse the `id = N` from the WHERE.
+                let id = sql
+                    .rsplit_once('=')
+                    .and_then(|(_, n)| n.trim().parse::<u128>().ok())
+                    .unwrap_or(0);
+                match self.rows_by_id.get(&id) {
+                    Some(rec) => OpResult::Got(build_row_stream(&[rec.clone()]).into()),
+                    None => OpResult::NotFound,
+                }
+            }
+        }
+        fn describe_table(&self, name: &str) -> Option<Vec<PgColumn>> {
+            if name == self.table { Some(self.cols.clone()) } else { None }
+        }
+    }
+
+    /// Headline: a batched `INSERT … VALUES (…),(…),(…) RETURNING id`
+    /// (SQLAlchemy DEFAULT use_insertmanyvalues) → ONE RowDescription +
+    /// N DataRows (each carrying the assigned id) + `INSERT 0 N`.
+    #[test]
+    fn multirow_insert_returning_id_emits_n_datarows() {
+        let cols = returning_cols();
+        let mut rows_by_id = std::collections::BTreeMap::new();
+        rows_by_id.insert(1u128, build_record(&cols, &[Value::Int(1), Value::Blob(b"a\0\0\0\0\0\0\0".to_vec())]));
+        rows_by_id.insert(2u128, build_record(&cols, &[Value::Int(2), Value::Blob(b"b\0\0\0\0\0\0\0".to_vec())]));
+        rows_by_id.insert(3u128, build_record(&cols, &[Value::Int(3), Value::Blob(b"c\0\0\0\0\0\0\0".to_vec())]));
+        let eng = MultiRowReturningEngine {
+            cols,
+            rows_by_id,
+            ids: vec![1, 2, 3],
+            table: "widgets".into(),
+        };
+        let bytes = dispatch_query(
+            "INSERT INTO widgets (name) VALUES ('a'),('b'),('c') RETURNING id",
+            &eng,
+        );
+        // Exactly ONE RowDescription, THREE DataRows.
+        assert_eq!(bytes[0], b'T', "starts with one RowDescription");
+        let datarow_count = bytes.iter().filter(|&&b| b == b'D').count();
+        // (length-prefix bytes can incidentally equal 'D'; assert at least 3
+        // DataRow message HEADERS by counting via message framing instead.)
+        let mut n_datarows = 0usize;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let tag = bytes[i];
+            if i + 5 > bytes.len() { break; }
+            let len = u32::from_be_bytes(bytes[i + 1..i + 5].try_into().unwrap()) as usize;
+            if tag == b'D' { n_datarows += 1; }
+            i += 1 + len;
+        }
+        assert_eq!(n_datarows, 3, "expected 3 DataRow messages, raw D bytes={datarow_count}");
+        // Each assigned id appears in text.
+        for id in [b"1", b"2", b"3"] {
+            assert!(bytes.windows(1).any(|w| w == id), "id {:?} in stream", id);
+        }
+        // CommandComplete INSERT 0 3.
+        assert!(
+            bytes.windows(b"INSERT 0 3\0".len()).any(|w| w == b"INSERT 0 3\0"),
+            "expected CommandComplete INSERT 0 3"
+        );
+        assert!(bytes.iter().any(|&b| b == b'Z'), "RFQ");
+    }
+
+    /// `INSERT … RETURNING *` expands to EVERY table column (id + name),
+    /// not just an explicit list — a single DataRow with all columns.
+    #[test]
+    fn insert_returning_star_emits_all_columns() {
+        let cols = returning_cols();
+        let mut rows_by_id = std::collections::BTreeMap::new();
+        rows_by_id.insert(5u128, build_record(&cols, &[Value::Int(5), Value::Blob(b"zed\0\0\0\0\0".to_vec())]));
+        let eng = MultiRowReturningEngine {
+            cols,
+            rows_by_id,
+            ids: vec![5],
+            table: "widgets".into(),
+        };
+        let bytes = dispatch_query(
+            "INSERT INTO widgets (name) VALUES ('zed') RETURNING *",
+            &eng,
+        );
+        assert_eq!(bytes[0], b'T', "RowDescription first");
+        // The RowDescription must name BOTH columns (id + name).
+        assert!(bytes.windows(b"id\0".len()).any(|w| w == b"id\0"), "id column described");
+        assert!(bytes.windows(b"name\0".len()).any(|w| w == b"name\0"), "name column described");
+        // The DataRow carries both the id (5) and the name (zed).
+        assert!(bytes.windows(1).any(|w| w == b"5"), "id value");
+        assert!(bytes.windows(b"zed".len()).any(|w| w == b"zed"), "name value");
+        assert!(
+            bytes.windows(b"INSERT 0 1\0".len()).any(|w| w == b"INSERT 0 1\0"),
+            "INSERT 0 1 for single-row RETURNING *"
+        );
+    }
+
+    /// Multi-row `RETURNING *` → N DataRows each with all columns.
+    #[test]
+    fn multirow_insert_returning_star_emits_n_datarows_all_columns() {
+        let cols = returning_cols();
+        let mut rows_by_id = std::collections::BTreeMap::new();
+        rows_by_id.insert(1u128, build_record(&cols, &[Value::Int(1), Value::Blob(b"a\0\0\0\0\0\0\0".to_vec())]));
+        rows_by_id.insert(2u128, build_record(&cols, &[Value::Int(2), Value::Blob(b"b\0\0\0\0\0\0\0".to_vec())]));
+        let eng = MultiRowReturningEngine {
+            cols,
+            rows_by_id,
+            ids: vec![1, 2],
+            table: "widgets".into(),
+        };
+        let bytes = dispatch_query(
+            "INSERT INTO widgets (name) VALUES ('a'),('b') RETURNING *",
+            &eng,
+        );
+        let mut n_datarows = 0usize;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let tag = bytes[i];
+            if i + 5 > bytes.len() { break; }
+            let len = u32::from_be_bytes(bytes[i + 1..i + 5].try_into().unwrap()) as usize;
+            if tag == b'D' { n_datarows += 1; }
+            i += 1 + len;
+        }
+        assert_eq!(n_datarows, 2, "expected 2 DataRow messages");
+        assert!(
+            bytes.windows(b"INSERT 0 2\0".len()).any(|w| w == b"INSERT 0 2\0"),
+            "INSERT 0 2"
+        );
+    }
+
+    /// Regression: single-row `RETURNING id` (the SP-PG-SERIAL-RETURNING
+    /// shape) still works through the new list-based signature.
+    #[test]
+    fn single_row_returning_id_still_works() {
+        let cols = returning_cols();
+        let rec = build_record(&cols, &[Value::Int(9), Value::Blob(b"solo\0\0\0\0".to_vec())]);
+        let eng = ReturningEngine {
+            cols,
+            row_stream: build_row_stream(&[rec]),
+            assigned: 9,
+            table: "widgets".into(),
+        };
+        let bytes = dispatch_query(
+            "INSERT INTO widgets (name) VALUES ('solo') RETURNING id",
+            &eng,
+        );
+        assert!(bytes.windows(1).any(|w| w == b"9"), "assigned id 9");
+        assert!(
+            bytes.windows(b"INSERT 0 1\0".len()).any(|w| w == b"INSERT 0 1\0"),
+            "INSERT 0 1"
+        );
     }
 }

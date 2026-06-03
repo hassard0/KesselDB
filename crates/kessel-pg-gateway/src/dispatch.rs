@@ -2014,4 +2014,146 @@ mod tests {
             "no-op cast strip must be deterministic across calls"
         );
     }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-SQL-ORM-PARSE T3 — explicit projection-list rendering.
+    // The engine's `Op::SelectFields` emits the projected columns as
+    // concatenated raw fixed-width bytes (NO record header / null
+    // bitmap); the gateway must build a RowDescription for ONLY the
+    // projected columns + decode them. These KATs lock that path.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// Build the projected row stream `[u32 len][raw fixed-width field
+    /// bytes in projection order]*` the engine's `Op::SelectFields`
+    /// emits. `proj_raw` is one row's already-concatenated projected
+    /// bytes.
+    fn build_projected_stream(rows: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for r in rows {
+            out.extend_from_slice(&(r.len() as u32).to_le_bytes());
+            out.extend_from_slice(r);
+        }
+        out
+    }
+
+    /// `SELECT id, name FROM t` returns exactly those 2 columns, in
+    /// order, with the right RowDescription + DataRows.
+    #[test]
+    fn ormparse_t3_projection_renders_named_columns() {
+        let table_cols = vec![
+            PgColumn { name: "id".into(), kind: FieldKind::I64, nullable: false },
+            PgColumn { name: "name".into(), kind: FieldKind::Char(8), nullable: true },
+            PgColumn { name: "extra".into(), kind: FieldKind::I32, nullable: true },
+        ];
+        // Projected `id, name`: i64 (8B LE) ++ char(8) padded.
+        let mut row1 = Vec::new();
+        row1.extend_from_slice(&7i64.to_le_bytes());
+        let mut nm = b"alice".to_vec();
+        nm.resize(8, 0);
+        row1.extend_from_slice(&nm);
+        let stream = build_projected_stream(&[row1]);
+        let eng = CannedEngine {
+            cols: table_cols,
+            row_bytes: stream,
+            result: std::sync::Mutex::new(None),
+            table_name: "t".into(),
+            no_schema: false,
+        };
+        let bytes = dispatch_query("SELECT id, name FROM t", &eng);
+        // RowDescription present, names id + name, and NOT extra.
+        let pos_t = bytes.iter().position(|&b| b == b'T').expect("RowDescription");
+        assert!(bytes.windows(3).any(|w| w == b"id\0"));
+        assert!(bytes.windows(5).any(|w| w == b"name\0"));
+        assert!(
+            !bytes.windows(6).any(|w| w == b"extra\0"),
+            "projection must NOT include the unprojected `extra` column"
+        );
+        // Values present.
+        assert!(bytes.windows(1).any(|w| w == b"7"));
+        assert!(bytes.windows(5).any(|w| w == b"alice"));
+        // CommandComplete("SELECT 1") + RFQ.
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+        assert_eq!(&bytes[bytes.len() - 6..], &[b'Z', 0, 0, 0, 5, b'I']);
+        let _ = pos_t;
+    }
+
+    /// `SELECT t.id, t.name FROM t` (qualified) renders identically to
+    /// the unqualified projection — the qualifier is stripped by
+    /// `select_columns`.
+    #[test]
+    fn ormparse_t3_qualified_projection_same_as_bare() {
+        let table_cols = vec![
+            PgColumn { name: "id".into(), kind: FieldKind::I64, nullable: false },
+            PgColumn { name: "name".into(), kind: FieldKind::Char(8), nullable: true },
+        ];
+        let mut row1 = Vec::new();
+        row1.extend_from_slice(&3i64.to_le_bytes());
+        let mut nm = b"bob".to_vec();
+        nm.resize(8, 0);
+        row1.extend_from_slice(&nm);
+        let stream = build_projected_stream(&[row1]);
+        let mk = || CannedEngine {
+            cols: table_cols.clone(),
+            row_bytes: stream.clone(),
+            result: std::sync::Mutex::new(None),
+            table_name: "t".into(),
+            no_schema: false,
+        };
+        let bare = dispatch_query("SELECT id, name FROM t", &mk());
+        let qual = dispatch_query("SELECT t.id, t.name FROM t", &mk());
+        assert_eq!(
+            bare, qual,
+            "qualified projection must render byte-identically to bare"
+        );
+    }
+
+    /// Projection column ORDER is preserved: `SELECT name, id FROM t`
+    /// puts `name` first in the RowDescription.
+    #[test]
+    fn ormparse_t3_projection_order_preserved() {
+        let table_cols = vec![
+            PgColumn { name: "id".into(), kind: FieldKind::I64, nullable: false },
+            PgColumn { name: "name".into(), kind: FieldKind::Char(8), nullable: true },
+        ];
+        // Projected `name, id`: char(8) ++ i64.
+        let mut row1 = Vec::new();
+        let mut nm = b"zoe".to_vec();
+        nm.resize(8, 0);
+        row1.extend_from_slice(&nm);
+        row1.extend_from_slice(&9i64.to_le_bytes());
+        let stream = build_projected_stream(&[row1]);
+        let eng = CannedEngine {
+            cols: table_cols,
+            row_bytes: stream,
+            result: std::sync::Mutex::new(None),
+            table_name: "t".into(),
+            no_schema: false,
+        };
+        let bytes = dispatch_query("SELECT name, id FROM t", &eng);
+        // In the RowDescription, `name\0` must appear BEFORE `id\0`.
+        let p_name = bytes.windows(5).position(|w| w == b"name\0").expect("name");
+        let p_id = bytes.windows(3).position(|w| w == b"id\0").expect("id");
+        assert!(p_name < p_id, "projection order name<id must be preserved");
+        assert!(bytes.windows(3).any(|w| w == b"zoe"));
+    }
+
+    /// A projection naming a non-existent column surfaces a clean
+    /// `42703 undefined_column`-style error, not a panic or wrong render.
+    #[test]
+    fn ormparse_t3_projection_unknown_column_errors() {
+        let table_cols = vec![
+            PgColumn { name: "id".into(), kind: FieldKind::I64, nullable: false },
+        ];
+        let eng = CannedEngine {
+            cols: table_cols,
+            row_bytes: build_projected_stream(&[]),
+            result: std::sync::Mutex::new(None),
+            table_name: "t".into(),
+            no_schema: false,
+        };
+        let bytes = dispatch_query("SELECT nope FROM t", &eng);
+        // ErrorResponse 'E' + the 42703 sqlstate string somewhere.
+        assert!(bytes.iter().any(|&b| b == b'E'));
+        assert!(bytes.windows(5).any(|w| w == b"42703"));
+    }
 }

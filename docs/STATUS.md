@@ -29,6 +29,12 @@ measurement and had drifted from the actual workspace count).
   closed every PARTIAL row on the ORM compat matrix. psycopg2 ✓
   SQLAlchemy 2.0 ✓ psycopg3 ✓ asyncpg ✓ pgJDBC ✓ (real-driver verified on
   vulcan in both simple AND extended modes by SP-PG-JDBC-SMOKE).
+  SP-PG-SQL-ORM-PARSE (2026-06-02) extends this to the **declarative-ORM**
+  layer: a real SQLAlchemy 2.0 declarative-model CRUD workload
+  (`create_all` DDL → multi-row INSERT → qualified-column SELECT/filter →
+  by-PK UPDATE/DELETE) now passes **7/7 end-to-end** (was 2/8) — qualified
+  columns (`t.col`), explicit projection-list render, and `= ANY (ARRAY[…])`
+  all lit.
 - **PG COPY.** SP-PG-COPY V1 (text) + SP-PG-COPY-CSV V1 + SP-PG-COPY-BIN
   V1 deliver the wire shape every `pg_dump`/`pgloader`/`pg_bulkload`/
   Airbyte/Fivetran/Stitch binary-bulk-loader hard-requires.
@@ -107,6 +113,34 @@ Closing the 3 SQL-shape arcs takes the declarative ORM from 2/8 to a
 full CRUD pass. Smoke transcript:
 `docs/superpowers/sppgormsqlalchemy-t2-smoke-2026-06-02.txt`. **TaskList
 ready for completion (DONE_WITH_CONCERNS — boundary named, not all green).**
+SP-PG-SQL-ORM-PARSE V1 (2026-06-02, +18 KATs, DONE) — closes the 3
+keystone ORM-shape blockers named above + 2 surfaced DDL-spelling gaps,
+taking the SQLAlchemy 2.0 declarative-ORM CRUD smoke from **2/8 → 7/7
+(full CRUD pass)** on vulcan. (1) **Qualified columns** (`SP-PG-SQL-
+QUALIFIED-COLS`): kessel-sql `col_ident()` accepts `table.col` in
+projection / WHERE / SET / ORDER BY / GROUP BY, stripping the qualifier
+(lenient V1); `strip_span_qualifiers` keeps the index-hint span normalized
+so a qualified query compiles BYTE-IDENTICALLY to bare (determinism
+contract). (2) **Projection render** (`SP-PG-SQL-PROJECTION-RENDER`):
+gateway `render_select_got` emits an explicit projection list (`SELECT
+c1, c2 FROM t`, incl. qualified) via `select_columns` + `emit_projected_
+rows`, not just `SELECT *`. (3) **`= ANY (ARRAY[…])`** (`SP-PG-SQL-ANY-
+ARRAY`): lexes `[`/`]`, desugars to IN→OR-of-eq (byte-identical to IN);
+pg_catalog hook recognizes SQLAlchemy's `create_all` relname-existence
+probe + synthesizes the existence answer. (EXTRA) ORM UPDATE/DELETE
+`SET … WHERE [t.]id = n` mapped to the id-based RMW; `BIGSERIAL`/`SERIAL`
+DDL aliases (→ plain int width, explicit-id model) + table-level/inline
+`PRIMARY KEY` accept-and-skip — unblocking real `create_all` DDL so every
+CRUD stage runs. All 7 ORM stages PASS end-to-end (create_all DDL,
+multi-row INSERT, qualified SELECT/filter, by-PK UPDATE+DELETE);
+1055+ kessel-sql + gateway KATs green, zero regressions, gateway log
+clean. Residual follow-ups NAMED: `SP-PG-SERIAL`/`SP-PG-RETURNING`
+(autoincrement + RETURNING — for PK-omitting models), `SP-PG-SQL-UPDATE-
+WHERE-GENERAL` (non-PK/multi-row WHERE), `SP-PG-SQL-QUALIFIER-STRICT`,
+`SP-PG-SQL-FROM-ALIAS`, `SP-PG-SQL-ANY-SUBQUERY`, `SP-PG-SQL-PROJ-EXPR`,
+`SP-PG-DDL-COMPOSITE-PK`, `SP-PG-ORM-RELATIONSHIPS`/`-ALEMBIC`. Smoke
+transcript: `docs/superpowers/sppgsqlormparse-t5-smoke-2026-06-02.txt`.
+**TaskList ready for completion (DONE).**
 SP-PG-COPY-CSV-NUMERIC-SCI V1 (2026-06-02, +20 KATs) — text + CSV
 COPY into a NUMERIC-OID column (kessel-sql `I128`/`U128`/`Fixed` →
 PG OID 1700) now accepts scientific notation and expands the

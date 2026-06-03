@@ -1382,34 +1382,40 @@ expression language) depends on which subset of catalog SQL SQLAlchemy
 emits — synthetic-peer KATs verify the connect + probe + simple
 parameterized SELECT shape.
 
-#### SQLAlchemy ORM (declarative models) — integration boundary (2026-06-02)
+#### SQLAlchemy ORM (declarative models) — full CRUD (2026-06-02)
 
-SP-PG-ORM-SQLALCHEMY ran a **real SQLAlchemy 2.0 declarative-ORM** CRUD
-workload (NOT `text()` / raw `cursor.execute`) end-to-end against KesselDB
-on vulcan to validate that tonight's cumulative PG-wire stack composes for
-the ORM layer. **Honest result: PARTIAL — the PG-wire substrate is solid
-but the declarative-ORM layer is blocked by three SQL-shape gaps.**
+A **real SQLAlchemy 2.0 declarative-ORM** CRUD workload (NOT `text()` /
+raw `cursor.execute`) now works **end-to-end** against KesselDB on vulcan.
+SP-PG-SQL-ORM-PARSE closed the three keystone ORM-shape gaps + two
+DDL-spelling gaps, taking the declarative-ORM smoke from **2/8 → 7/7
+(full CRUD pass)**:
 
-| ORM operation | Result | Boundary |
+| ORM operation | Result | Notes |
 |---|---|---|
-| `engine.connect()` + Extended Query probe | **PASS** | handshake + probe return clean |
-| `VARCHAR(n)` column DDL (`String(32)`) | **PASS** (new) | SP-PG-ORM-SQLALCHEMY added the `VARCHAR(n)`→`CHAR(n)` DDL alias; `CREATE TABLE … name VARCHAR(32)` now works |
-| `INSERT INTO t (…) VALUES (…)` | **PASS** | explicit-PK INSERT works (no RETURNING dependency) |
-| `SELECT * FROM t [WHERE …]` | **PASS** | the verified V1 PG-wire query surface |
-| `Base.metadata.create_all()` | **gap** | the inspector existence probe uses `relkind = ANY (ARRAY[…])` → parser rejects `[`. Follow-up `SP-PG-SQL-ANY-ARRAY` |
-| ORM `select(Model)` / `.where(…)` | **gap** | the ORM qualifies columns (`SELECT t.id, t.name FROM t`) and uses an explicit projection list; the parser rejects qualified `table.col` projections and the render path only emits `SELECT *`. Follow-ups `SP-PG-SQL-QUALIFIED-COLS` + `SP-PG-SQL-PROJECTION-RENDER` |
-| ORM `update(Model)` / `delete(Model)` | **gap** | qualified `WHERE t.id = $1` → `expected ID`. Follow-up `SP-PG-SQL-QUALIFIED-COLS` |
+| `engine.connect()` + Extended Query probe | **PASS** | handshake + probe clean |
+| `Base.metadata.create_all()` (DDL) | **PASS** (new) | `BIGSERIAL` PK + `VARCHAR(n)` + table-level `PRIMARY KEY (id)` all accepted; the `create_all` `relkind = ANY (ARRAY[…])` existence probe is synthesized by the pg_catalog hook |
+| `session.add(Model(...))` + commit (INSERT) | **PASS** | multi-row explicit-PK INSERT |
+| `select(Model)` → `.scalars().all()` | **PASS** (new) | qualified-column projection `SELECT t.id, t.name FROM t` parses + the gateway renders the projected columns |
+| `select(Model).where(Model.id == 1)` | **PASS** (new) | qualified parameterized `WHERE t.id = $1` |
+| `update(Model).where(...).values(...)` | **PASS** (new) | `UPDATE t SET … WHERE t.id = $1` mapped to the by-PK RMW |
+| `delete(Model).where(...)` | **PASS** (new) | `DELETE FROM t WHERE t.id = $1` |
 
-So a **raw-driver** SQLAlchemy workload (`conn.execute(text("SELECT * FROM
-t WHERE id = :id"))`) works today, but a **declarative-ORM** workload does
-not yet — the ORM emits qualified-column SELECTs, explicit projection
-lists, and `ANY(ARRAY[…])` catalog probes that the kessel-sql parser /
-PG-wire render path do not yet recognise. Closing `SP-PG-SQL-QUALIFIED-COLS`
-+ `SP-PG-SQL-PROJECTION-RENDER` + `SP-PG-SQL-ANY-ARRAY` takes this from the
-current 2/8 stages to a full declarative-ORM CRUD pass. Verified transcript:
-`docs/superpowers/sppgormsqlalchemy-t2-smoke-2026-06-02.txt`. (Relationship
-loading + Alembic autogenerate remain the separate `SP-PG-ORM-RELATIONSHIPS`
-/ `SP-PG-ORM-ALEMBIC` follow-ups.)
+The model used: `class User(Base): id = Column(BigInteger, primary_key=True);
+name = Column(String(32))`. Definition: a **qualified column** (`t.col`)
+is accepted lenient (the qualifier is stripped) in projection / WHERE /
+SET / ORDER BY / GROUP BY; an **explicit projection list** is rendered at
+the PG-wire layer; `col = ANY (ARRAY[…])` desugars to `IN (…)`. A
+qualified query compiles to the BYTE-IDENTICAL Op as its bare equivalent
+(determinism preserved).
+
+**Residual follow-ups** (NOT needed for this explicit-PK CRUD model):
+`SP-PG-SERIAL` / `SP-PG-RETURNING` (server-generated autoincrement PK +
+`INSERT … RETURNING id` — only when a model OMITS the PK), `SP-PG-SQL-
+UPDATE-WHERE-GENERAL` (non-PK / multi-row UPDATE/DELETE WHERE),
+`SP-PG-SQL-QUALIFIER-STRICT` (strict qualifier validation),
+`SP-PG-SQL-FROM-ALIAS`, `SP-PG-SQL-ANY-SUBQUERY`,
+`SP-PG-ORM-RELATIONSHIPS` / `SP-PG-ORM-ALEMBIC`. Verified transcript:
+`docs/superpowers/sppgsqlormparse-t5-smoke-2026-06-02.txt`.
 
 ### Supported GUI / admin tools
 

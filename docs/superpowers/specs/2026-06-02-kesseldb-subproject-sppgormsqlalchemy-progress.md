@@ -2,6 +2,14 @@
 
 Date created: 2026-06-02
 
+**FOLLOW-UP RESOLVED (2026-06-02): SP-PG-SQL-ORM-PARSE took this from
+2/8 → 7/7 (full declarative-ORM CRUD pass).** The three named follow-up
+arcs below (`SP-PG-SQL-QUALIFIED-COLS`, `-PROJECTION-RENDER`,
+`-ANY-ARRAY`) plus two surfaced DDL-spelling gaps (`BIGSERIAL`,
+`PRIMARY KEY (id)`) are all CLOSED. See
+`docs/superpowers/specs/2026-06-02-kesseldb-subproject-sppgsqlormparse-progress.md`
++ transcript `docs/superpowers/sppgsqlormparse-t5-smoke-2026-06-02.txt`.
+
 **Status: CLOSED — DONE_WITH_CONCERNS (2026-06-02).** The PG-wire
 SUBSTRATE composes (engine.connect + Extended Query probe PASS;
 `VARCHAR(n)` DDL, INSERT, `SELECT *`[+WHERE] all PASS), but a REAL

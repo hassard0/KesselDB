@@ -727,6 +727,9 @@ fn t3_smoke_join() {
         limit: 1 + r.below(8) as u32,
         filter: vec![],
         join_type: kessel_proto::JoinType::Inner,
+        order_by: None,
+        limit_n: None,
+        offset_n: None,
     });
 }
 

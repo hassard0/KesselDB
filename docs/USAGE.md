@@ -351,6 +351,14 @@ value (deterministic + replicated — the counter lives in the state
 digest, advanced only on the apply thread). `INSERT … RETURNING id`
 returns the assigned id (the SQLAlchemy/ORM autoincrement default).
 
+The SQL-standard autoincrement spelling `id bigint GENERATED { ALWAYS |
+BY DEFAULT } AS IDENTITY [ ( START WITH n INCREMENT BY n ) ]` is an alias
+for the same deterministic SERIAL autoincrement — this is the DDL
+**Django 6**'s default `BigAutoField` emits (it renders IDENTITY, not
+`BIGSERIAL`). The optional sequence-options group is parsed-and-ignored in
+V1 (the counter always starts at 1, increments by 1; custom start/
+increment is the named follow-up `SP-PG-IDENTITY-SEQOPTS`).
+
 ### Queries
 
 ```sql
@@ -368,6 +376,15 @@ SELECT * FROM <a> JOIN <b> ON <a.x> = <b.y> [LIMIT n]   -- inner equi‑join
 `WHERE` supports `AND`/`OR`/`NOT`, all of `= != < <= > >=`, and `IN`/`BETWEEN` (incl. `NOT IN`/`NOT BETWEEN`). `SELECT *` returns
 length‑prefixed record blobs; use `DESCRIBE <t>` to decode them against the
 schema (the client decodes the wire schema for you).
+
+Over the **PostgreSQL wire**, a single scalar aggregate
+`SELECT COUNT(*) | SUM(c) | MIN(c) | MAX(c) | AVG(c) [AS alias] FROM <t>`
+renders as one row, one column: the column is named by the `AS` alias when
+present, else the lowercase function name (`count`/`sum`/…), matching
+PostgreSQL's default output naming. This is what Django's `.count()`,
+`.exists()`, and `.aggregate()` emit (`SELECT COUNT(*) AS "__count" FROM
+"t"`). The grouped / multi-aggregate wire render is the named follow-up
+`SP-PG-AGG-MULTI-RENDER`.
 
 > **Note:** rows carry an explicit caller‑supplied `ID` (a 128‑bit key). There
 > is no auto‑increment — the engine never generates ids, because that would

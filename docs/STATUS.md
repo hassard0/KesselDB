@@ -68,6 +68,29 @@ measurement and had drifted from the actual workspace count).
   production `ClusterClient` does. The long-standing CI flake is GONE.
 
 Latest arc deliveries on top of that baseline (most-recent first):
+SP-PG-DJANGO-COMPLETE (2026-06-03, +14 KATs, DONE) — closes the TWO
+named gaps the quoted-ident arc left, taking the **Django 6 ORM to full
+CRUD 8/8** on vulcan (was 6/8). `SP-PG-DDL-IDENTITY`: the CREATE TABLE
+column-modifier run is now order-independent and accepts
+`<col> bigint GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [ ( seq opts
+) ]` — Django 6's default `BigAutoField` PK DDL — as a pure parser-front
+alias onto the proven `SP-PG-SERIAL-RETURNING` deterministic
+autoincrement counter (sequence options parsed-and-ignored in V1; no SM/
+catalog/proto change, so determinism is byte-identical to `BIGSERIAL`).
+`SP-PG-SQL-AGG-ALIAS-RENDER`: `parse_agg` captures an optional `AS
+alias`; the new `select_aggregate` text-helper detects a single scalar
+aggregate over a FROM table, and the gateway's `render_select_got`
+Shape 0 decodes the engine's 16-byte LE i128 `Op::Aggregate` result as
+RowDescription(alias or lowercase function name) + ONE DataRow +
+CommandComplete("SELECT 1") — what Django's `.count()`/`.aggregate()`
+emit (`SELECT COUNT(*) AS "__count" FROM "t"`). **HEADLINE: Django ORM
+full CRUD 8/8 — connect, schema_create (IDENTITY), INSERT autoincrement
+(pk=1), SELECT all, get-by-PK, UPDATE, DELETE + trailing `.count()`
+(remaining count=0) all PASS.** SQLAlchemy stays **7/7** (no
+regression). That is TWO production Python ORMs fully working against
+KesselDB. Determinism preserved (IDENTITY reuses the digest-covered
+apply-thread SERIAL counter; aggregate render is read-only). Transcript:
+`docs/superpowers/sppgdjangocomplete-django-smoke-2026-06-03.txt`.
 SP-PG-SQL-QUOTED-IDENT (2026-06-03, +20 KATs, DONE_WITH_CONCERNS) — the
 P0 keystone that unblocks the Django ORM. Django UNCONDITIONALLY
 double-quotes EVERY SQL identifier (`"smokeapp_author"."id"`, `"name"`)

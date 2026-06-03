@@ -6040,6 +6040,16 @@ impl<V: Vfs> StateMachine<V> {
                     }
                 }
                 self.storage.begin_txn();
+                // SP-PG-RETURNING-MULTIROW-STAR: collect each inner op's
+                // assigned serial id (the multi-row autoincrement INSERT
+                // shape). `all_created` stays true only while EVERY inner
+                // op returned `Created { id }`; a single non-Created result
+                // (e.g. an explicit-id Create returning `Ok`, or a non-
+                // Create op) drops us back to the byte-identical `Ok` path
+                // so every existing Txn KAT is unaffected.
+                let op_count = ops.len();
+                let mut assigned_ids: Vec<u128> = Vec::with_capacity(op_count);
+                let mut all_created = true;
                 for (i, o) in ops.into_iter().enumerate() {
                     let r = self.apply(op_number + i as u64, o);
                     let failed = matches!(
@@ -6056,9 +6066,23 @@ impl<V: Vfs> StateMachine<V> {
                         }
                         return r; // whole batch rolled back
                     }
+                    match r {
+                        OpResult::Created { id } => assigned_ids.push(id),
+                        _ => all_created = false,
+                    }
                 }
                 match self.storage.commit_txn() {
-                    Ok(()) => OpResult::Ok,
+                    Ok(()) => {
+                        // Surface the per-Create assigned ids ONLY when every
+                        // inner op autoincrement-assigned one (the multi-row
+                        // serial INSERT … RETURNING shape). Otherwise return
+                        // plain `Ok`, byte-identical to the pre-arc Txn result.
+                        if all_created && assigned_ids.len() == op_count && op_count > 0 {
+                            OpResult::CreatedMany { ids: assigned_ids }
+                        } else {
+                            OpResult::Ok
+                        }
+                    }
                     Err(e) => OpResult::SchemaError(format!("txn commit: {e}")),
                 }
             }
@@ -6740,6 +6764,107 @@ mod tests {
             sm.apply(3, serial_insert(b"y\0\0\0\0\0\0\0")),
             OpResult::Created { id: 1 }
         );
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-RETURNING-MULTIROW-STAR (T2) — Op::Txn surfaces each inner
+    // Create's assigned serial id via OpResult::CreatedMany, so the
+    // multi-row autoincrement `INSERT … VALUES (…),(…) RETURNING` shape
+    // SQLAlchemy emits by default gets N ids back in insertion order.
+    // ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn txn_of_three_serial_creates_returns_three_ids_in_order() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: widget_serial_def() });
+        // A multi-row INSERT compiles to ONE Op::Txn of 3 serial Creates.
+        let r = sm.apply(2, Op::Txn {
+            ops: vec![
+                serial_insert(b"a\0\0\0\0\0\0\0"),
+                serial_insert(b"b\0\0\0\0\0\0\0"),
+                serial_insert(b"c\0\0\0\0\0\0\0"),
+            ],
+        });
+        assert_eq!(
+            r,
+            OpResult::CreatedMany { ids: vec![1, 2, 3] },
+            "Txn must surface each Create's assigned id in insertion order"
+        );
+        // The rows landed at the assigned ObjectIds and the stored id
+        // field was patched (a SELECT id reads 1/2/3, not the placeholder).
+        assert_eq!(read_id_field(&mut sm, 1), Some(1));
+        assert_eq!(read_id_field(&mut sm, 2), Some(2));
+        assert_eq!(read_id_field(&mut sm, 3), Some(3));
+        // A subsequent autoincrement insert continues at 4 (the Txn
+        // advanced the counter exactly 3 times).
+        assert_eq!(
+            sm.apply(5, serial_insert(b"d\0\0\0\0\0\0\0")),
+            OpResult::Created { id: 4 }
+        );
+    }
+
+    #[test]
+    fn multirow_serial_txn_is_byte_identical_across_three_replicas() {
+        // Determinism: the multi-row Txn advances the SERIAL counter N
+        // times on the single apply thread in op-number order, so an
+        // identical op stream yields a byte-identical digest on every
+        // replica — the same guarantee as the single-row path, proven for
+        // the batched INSERT shape.
+        let drive = || {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            sm.apply(1, Op::CreateType { def: widget_serial_def() });
+            sm.apply(2, Op::Txn {
+                ops: vec![
+                    serial_insert(b"a\0\0\0\0\0\0\0"),
+                    serial_insert(b"b\0\0\0\0\0\0\0"),
+                    serial_insert(b"c\0\0\0\0\0\0\0"),
+                ],
+            });
+            sm.digest()
+        };
+        let r1 = drive();
+        let r2 = drive();
+        let r3 = drive();
+        assert_eq!(r1, r2, "replica 1 vs 2 digest (multi-row Txn)");
+        assert_eq!(r2, r3, "replica 2 vs 3 digest (multi-row Txn)");
+    }
+
+    #[test]
+    fn single_create_in_txn_still_returns_createdmany_of_one() {
+        // A single-row INSERT that nonetheless arrives as a 1-op Txn
+        // surfaces a CreatedMany of one — the gateway treats N=1 uniformly.
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: widget_serial_def() });
+        let r = sm.apply(2, Op::Txn { ops: vec![serial_insert(b"solo\0\0\0\0")] });
+        assert_eq!(r, OpResult::CreatedMany { ids: vec![1] });
+    }
+
+    #[test]
+    fn txn_with_a_non_serial_create_returns_ok_not_createdmany() {
+        // Regression: a Txn whose inner Creates do NOT autoincrement (an
+        // explicit-id Create returns Ok, not Created) keeps the
+        // byte-identical `Ok` result — CreatedMany fires ONLY when every
+        // inner op assigned a serial id.
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: widget_serial_def() });
+        let explicit = |id: u128, name: &[u8; 8]| Op::Create {
+            type_id: 1,
+            id: ObjectId::from_u128(id),
+            record: {
+                let mut r = Vec::new();
+                r.extend_from_slice(&1u32.to_le_bytes());
+                r.extend_from_slice(&2u16.to_le_bytes());
+                r.extend_from_slice(&[0u8; 8]);
+                r.extend_from_slice(&(id as i64).to_le_bytes());
+                r.extend_from_slice(name);
+                r.resize(32, 0);
+                r
+            },
+        };
+        let r = sm.apply(2, Op::Txn {
+            ops: vec![explicit(50, b"a\0\0\0\0\0\0\0"), explicit(51, b"b\0\0\0\0\0\0\0")],
+        });
+        assert_eq!(r, OpResult::Ok, "non-serial Txn must stay byte-identical Ok");
     }
 
     #[test]

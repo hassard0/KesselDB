@@ -377,6 +377,10 @@ pub fn op_result_to_sqlstate(
         | OpResult::TxCommitted { .. }
         | OpResult::WatermarkAdvanced { .. }
         | OpResult::Created { .. }
+        // SP-PG-RETURNING-MULTIROW-STAR: `CreatedMany` (multi-row
+        // autoincrement INSERT) is a success result, handled by the
+        // dispatch RETURNING path.
+        | OpResult::CreatedMany { .. }
         | OpResult::ActiveSnapshotReported { .. } => None,
 
         OpResult::Exists => Some((

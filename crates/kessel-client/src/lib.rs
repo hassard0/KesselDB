@@ -140,6 +140,11 @@ pub fn format_result(r: &OpResult) -> String {
         }
         // SP-PG-SERIAL-RETURNING: an autoincrement Create assigned this id.
         OpResult::Created { id } => format!("OK  (created, id={id})"),
+        // SP-PG-RETURNING-MULTIROW-STAR: a multi-row autoincrement INSERT
+        // assigned this ordered list of ids.
+        OpResult::CreatedMany { ids } => {
+            format!("OK  (created {} rows, ids={ids:?})", ids.len())
+        }
     }
 }
 
@@ -425,6 +430,15 @@ pub fn format_result_json(r: &OpResult) -> String {
         // SP-PG-SERIAL-RETURNING: autoincrement Create assigned id.
         OpResult::Created { id } => {
             format!(r#"{{"status":"ok","id":{id}}}"#)
+        }
+        // SP-PG-RETURNING-MULTIROW-STAR: multi-row autoincrement INSERT.
+        OpResult::CreatedMany { ids } => {
+            let list = ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(r#"{{"status":"ok","ids":[{list}]}}"#)
         }
     }
 }

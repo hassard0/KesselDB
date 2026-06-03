@@ -485,6 +485,17 @@ pub enum OpResult {
     /// Create still returns `OpResult::Ok` (byte-identical to before), so
     /// this variant fires ONLY on the autoincrement path.
     Created { id: u128 },
+    /// SP-PG-RETURNING-MULTIROW-STAR: an `Op::Txn` whose inner ops were
+    /// ALL `Op::Create`s that each returned `OpResult::Created { id }`
+    /// (the multi-row autoincrement `INSERT … VALUES (…),(…) RETURNING`
+    /// shape SQLAlchemy emits by default with `use_insertmanyvalues`).
+    /// Carries the assigned ids in insertion order so the gateway emits
+    /// one DataRow per row. A Txn that is NOT all-Create-returning-Created
+    /// still returns `OpResult::Ok` (byte-identical to before), so this
+    /// variant fires ONLY on the multi-row autoincrement INSERT path. The
+    /// ids are a deterministic function of the committed log prefix (the
+    /// SERIAL counter writes), so this carries no clock/RNG state.
+    CreatedMany { ids: Vec<u128> },
 }
 
 impl OpResult {
@@ -591,6 +602,15 @@ impl OpResult {
                 b.push(15);
                 b.extend_from_slice(&id.to_le_bytes());
             }
+            // SP-PG-RETURNING-MULTIROW-STAR: CreatedMany (16) wire encode.
+            //   wire: [u32 count (LE)] [repeat count: u128 id (LE)]
+            OpResult::CreatedMany { ids } => {
+                b.push(16);
+                codec::put_u32(&mut b, ids.len() as u32);
+                for id in ids {
+                    b.extend_from_slice(&id.to_le_bytes());
+                }
+            }
         }
         b
     }
@@ -660,6 +680,15 @@ impl OpResult {
             },
             // SP-PG-SERIAL-RETURNING: Created (15) wire decode.
             15 => OpResult::Created { id: c.u128()? },
+            // SP-PG-RETURNING-MULTIROW-STAR: CreatedMany (16) wire decode.
+            16 => {
+                let count = c.u32()? as usize;
+                let mut ids = Vec::with_capacity(count);
+                for _ in 0..count {
+                    ids.push(c.u128()?);
+                }
+                OpResult::CreatedMany { ids }
+            }
             _ => return None,
         })
     }
@@ -1883,11 +1912,32 @@ mod tests {
             OpResult::Constraint("UNIQUE x".into()),
             OpResult::Unavailable,
             OpResult::Unauthorized,
+            // SP-PG-SERIAL-RETURNING / -MULTIROW-STAR: Created + CreatedMany.
+            OpResult::Created { id: 42 },
+            OpResult::Created { id: u128::MAX },
+            OpResult::CreatedMany { ids: vec![] },
+            OpResult::CreatedMany { ids: vec![1] },
+            OpResult::CreatedMany { ids: vec![1, 2, 3, u128::MAX] },
         ] {
             assert_eq!(OpResult::decode(&r.encode()), Some(r));
         }
         assert_eq!(OpResult::decode(&[9]), None);
         assert_eq!(OpResult::decode(&[]), None);
+    }
+
+    /// SP-PG-RETURNING-MULTIROW-STAR: CreatedMany wire shape is
+    /// tag(16) + u32_le(count) + count × u128_le(id). Locks the format
+    /// so a cluster of mixed-version replicas decodes it consistently.
+    #[test]
+    fn created_many_wire_format() {
+        let r = OpResult::CreatedMany { ids: vec![7, 8] };
+        let encoded = r.encode();
+        let mut expected = vec![16u8];
+        expected.extend_from_slice(&2u32.to_le_bytes());
+        expected.extend_from_slice(&7u128.to_le_bytes());
+        expected.extend_from_slice(&8u128.to_le_bytes());
+        assert_eq!(encoded, expected);
+        assert_eq!(OpResult::decode(&encoded), Some(r));
     }
 
     // ========================================================================

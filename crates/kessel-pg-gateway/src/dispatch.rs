@@ -88,7 +88,9 @@ pub fn dispatch_query_with_params<E: EngineApply + ?Sized>(
     // rewrites the SQL. Closes the V1 silent-strip hole that V1 +
     // COMPAT only covered for `$N::TYPE` placeholder casts.
     // SP-PG-RETURNING-MULTIROW-STAR — desugar SQLAlchemy's
-    // insertmanyvalues form to plain multi-row VALUES (no-op otherwise).
+    // insertmanyvalues form to plain multi-row VALUES FIRST (before the
+    // cast validator, which would reject the `p0::VARCHAR` projection
+    // cast). No-op for any other SQL.
     let imv = crate::insertmanyvalues::rewrite_insertmanyvalues(sql);
     let sql = imv.as_deref().unwrap_or(sql);
     if let Some(mismatch) = crate::cast_stripper::find_literal_cast_mismatch(sql) {
@@ -215,6 +217,16 @@ pub fn dispatch_query_with_params<E: EngineApply + ?Sized>(
 /// The caller (the query loop in `server::run_session`) writes the
 /// returned bytes to the TCP stream verbatim.
 pub fn dispatch_query<E: EngineApply + ?Sized>(sql: &str, engine: &E) -> Vec<u8> {
+    // SP-PG-RETURNING-MULTIROW-STAR — desugar SQLAlchemy's DEFAULT
+    // `use_insertmanyvalues` form (INSERT … SELECT … FROM (VALUES …) AS
+    // sen(…) ORDER BY sen_counter RETURNING …) to the plain multi-row
+    // `INSERT … VALUES (…),(…) RETURNING …` the engine handles. This runs
+    // FIRST — BEFORE the literal-cast validator — so the `p0::VARCHAR`
+    // projection cast (which the validator would reject as a cross-
+    // category coerce) is gone before validation. No-op for any other
+    // SQL, so every existing path is byte-untouched.
+    let imv = crate::insertmanyvalues::rewrite_insertmanyvalues(sql);
+    let sql = imv.as_deref().unwrap_or(sql);
     // SP-PG-EXTQ-CAST-VALIDATE-LITERAL T2 — reject cross-category
     // literal casts (e.g. `'hello'::int8`) BEFORE the strip rewrites
     // the SQL. The validator is a no-op when the SQL has no `::` or
@@ -231,10 +243,6 @@ pub fn dispatch_query<E: EngineApply + ?Sized>(sql: &str, engine: &E) -> Vec<u8>
     // `SELECT col::int8` patterns the kessel-sql lexer rejects with
     // `42601 syntax_error`). Companion design spec:
     // `docs/superpowers/specs/2026-06-01-kesseldb-sppgextqcast-design.md`.
-    // SP-PG-RETURNING-MULTIROW-STAR — desugar SQLAlchemy's
-    // insertmanyvalues form to plain multi-row VALUES (no-op otherwise).
-    let imv = crate::insertmanyvalues::rewrite_insertmanyvalues(sql);
-    let sql = imv.as_deref().unwrap_or(sql);
     let stripped = crate::cast_stripper::strip_pg_casts(sql);
     let sql = stripped.as_str();
     let mut out = Vec::new();

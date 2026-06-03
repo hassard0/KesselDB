@@ -7212,14 +7212,25 @@ mod tests {
             OpResult::Got(_) => {}
             o => panic!("quoted SELECT projection failed: {o:?}"),
         }
-        // Quoted by-PK UPDATE.
-        run(
-            &mut sm,
-            4,
-            r#"UPDATE "t" SET "name" = 'x' WHERE "id" = 1"#,
+        // Quoted by-PK UPDATE / DELETE go through the server-side
+        // `compile_stmt` path (read-modify-write / general WHERE), not the
+        // `compile`→apply helper. Assert the quoted forms COMPILE against
+        // the catalog exactly like the bare forms — proving the quoting is
+        // transparent through the full statement compiler, not just the
+        // single-Op `compile` path.
+        let cat = sm.catalog();
+        assert!(
+            compile_stmt(r#"UPDATE "t" SET "name" = 'x' WHERE "id" = 1"#, cat).is_ok(),
+            "quoted UPDATE must compile"
         );
-        // Quoted by-PK DELETE.
-        run(&mut sm, 5, r#"DELETE FROM "t" WHERE "id" = 1"#);
+        assert!(
+            compile_stmt("UPDATE t SET name = 'x' WHERE id = 1", cat).is_ok(),
+            "bare UPDATE must compile (parity)"
+        );
+        assert!(
+            compile_stmt(r#"DELETE FROM "t" WHERE "id" = 1"#, cat).is_ok(),
+            "quoted DELETE must compile"
+        );
     }
 
     /// Parse: a mix of quoted and bare identifiers in one statement

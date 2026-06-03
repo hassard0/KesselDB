@@ -53,16 +53,39 @@ fn lex(s: &str) -> Result<Vec<Tok>, SqlError> {
         if c.is_whitespace() {
             i += 1;
         } else if c == '\'' {
+            // SP-PG-ORM-REALAPP — SQL-standard string literal with the
+            // doubled-quote escape. PG (§4.1.2.1 / SQL-92) escapes a literal
+            // single quote inside a string by DOUBLING it: `'bob''s post'`
+            // is the four-character value `bob's post`. ANY real app whose
+            // data contains an apostrophe emits this (psycopg2's own literal
+            // quoting produces `''`), so the previous lexer — which stopped
+            // at the first inner `'` — silently truncated the string and
+            // then choked on the trailing `s post'`. We now mirror the `"`
+            // delimited-identifier escape below: a doubled `''` stays in the
+            // string and appends a single `'`; a lone `'` closes it. A
+            // string with NO embedded quote is byte-identical to the
+            // pre-arc token, so every prior KAT keeps passing.
             i += 1;
             let mut st = String::new();
-            while i < b.len() && b[i] as char != '\'' {
+            loop {
+                if i >= b.len() {
+                    return Err("unterminated string".into());
+                }
+                if b[i] as char == '\'' {
+                    // Doubled `''` is an escaped literal quote — stay in the
+                    // string and append a single `'`.
+                    if i + 1 < b.len() && b[i + 1] as char == '\'' {
+                        st.push('\'');
+                        i += 2;
+                        continue;
+                    }
+                    // Lone `'` closes the string.
+                    i += 1;
+                    break;
+                }
                 st.push(b[i] as char);
                 i += 1;
             }
-            if i >= b.len() {
-                return Err("unterminated string".into());
-            }
-            i += 1;
             out.push(Tok::Str(st));
         } else if c == '"' {
             // SP-PG-SQL-QUOTED-IDENT — SQL-standard delimited identifier.
@@ -9004,5 +9027,32 @@ mod tests {
             ),
             Some(("t".to_string(), vec!["id".to_string()]))
         );
+    }
+
+    /// SP-PG-ORM-REALAPP — the SQL-standard doubled-quote escape inside a
+    /// string literal. `'bob''s post'` is the single value `bob's post`,
+    /// NOT a truncated `bob` plus a parse error. Any app whose data carries
+    /// an apostrophe emits this.
+    #[test]
+    fn doubled_quote_string_escape() {
+        assert_eq!(
+            lex("'bob''s post'").unwrap(),
+            vec![Tok::Str("bob's post".into())]
+        );
+        // Multiple escapes + an empty escaped-quote-only string.
+        assert_eq!(
+            lex("'a''b''c'").unwrap(),
+            vec![Tok::Str("a'b'c".into())]
+        );
+        assert_eq!(lex("''''").unwrap(), vec![Tok::Str("'".into())]);
+        // A plain string with no embedded quote is byte-identical to the
+        // pre-arc token (regression guard for every prior literal KAT).
+        assert_eq!(
+            lex("'hello world'").unwrap(),
+            vec![Tok::Str("hello world".into())]
+        );
+        // A trailing lone quote still closes the string cleanly; an empty
+        // string is empty.
+        assert_eq!(lex("''").unwrap(), vec![Tok::Str("".into())]);
     }
 }

@@ -611,6 +611,35 @@ fn apply_one_inner(
                     }
                 }
             }
+            Ok(kessel_sql::Stmt::UpdateWhere {
+                type_id,
+                program,
+                sets,
+                returning,
+            }) => {
+                return apply_dml_where(
+                    sm,
+                    n,
+                    type_id,
+                    program,
+                    Some(sets),
+                    returning.is_some(),
+                );
+            }
+            Ok(kessel_sql::Stmt::DeleteWhere {
+                type_id,
+                program,
+                returning,
+            }) => {
+                return apply_dml_where(
+                    sm,
+                    n,
+                    type_id,
+                    program,
+                    None,
+                    returning.is_some(),
+                );
+            }
             Ok(kessel_sql::Stmt::Explain(plan)) => {
                 return OpResult::Got(plan.into_bytes().into());
             }
@@ -668,6 +697,38 @@ fn apply_one_inner(
                     }
                 }
             }
+            // SP-PG-SQL-DML-GENERAL — general-WHERE UPDATE/DELETE: the
+            // server resolves the matching ids + applies a concrete Txn
+            // (Path A). Returns a framed (count [+ RETURNING rows]) Got.
+            Ok(kessel_sql::Stmt::UpdateWhere {
+                type_id,
+                program,
+                sets,
+                returning,
+            }) => {
+                return apply_dml_where(
+                    sm,
+                    n,
+                    type_id,
+                    program,
+                    Some(sets),
+                    returning.is_some(),
+                );
+            }
+            Ok(kessel_sql::Stmt::DeleteWhere {
+                type_id,
+                program,
+                returning,
+            }) => {
+                return apply_dml_where(
+                    sm,
+                    n,
+                    type_id,
+                    program,
+                    None,
+                    returning.is_some(),
+                );
+            }
             Ok(kessel_sql::Stmt::Explain(plan)) => {
                 return OpResult::Got(plan.into_bytes().into());
             }
@@ -690,6 +751,117 @@ fn apply_one_inner(
         }
         None => OpResult::SchemaError("malformed request frame".into()),
     }
+}
+
+/// SP-PG-SQL-DML-GENERAL — frame a general-WHERE UPDATE/DELETE result so
+/// the gateway can read the affected-row count + (optional) RETURNING
+/// rows. Layout: `[u32 affected LE][u32 nrows LE]` then `nrows ×
+/// [u32 reclen LE][record bytes]`. `nrows == 0` ⇒ no RETURNING (count
+/// only). Carried inside `OpResult::Got`; the gateway distinguishes this
+/// from a SELECT `Got` by the UPDATE/DELETE leading keyword.
+pub const DML_RESULT_TAG: u8 = 0xD3;
+pub(crate) fn frame_dml_result(affected: u32, rows: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(9 + rows.iter().map(|r| 4 + r.len()).sum::<usize>());
+    out.push(DML_RESULT_TAG);
+    out.extend_from_slice(&affected.to_le_bytes());
+    out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+    for r in rows {
+        out.extend_from_slice(&(r.len() as u32).to_le_bytes());
+        out.extend_from_slice(r);
+    }
+    out
+}
+
+/// SP-PG-SQL-DML-GENERAL (Path A) — resolve a general-WHERE UPDATE/DELETE
+/// SERVER-side and apply it as ONE concrete `Op::Txn`:
+///
+/// 1. `Op::QueryExpr { type_id, program }` → the matching object ids
+///    (already `sort_unstable`-sorted by the SM ⇒ deterministic order).
+/// 2. Build `Op::Txn` of per-id `Op::UpdateSet` (UPDATE) or `Op::Delete`
+///    (DELETE). The Txn is the REPLICATED artifact (a pure function of
+///    committed state + predicate) — same determinism as by-id RMW.
+/// 3. RETURNING: for DELETE, snapshot each matched record BEFORE the Txn
+///    (the rows are about to vanish); for UPDATE, read each record AFTER
+///    the Txn commits (post-mutation values). `want_returning` gates the
+///    read-back so a no-RETURNING statement pays nothing.
+///
+/// Returns `OpResult::Got(frame_dml_result(...))` on success, or the
+/// underlying error `OpResult` (e.g. `Constraint` on a UNIQUE violation —
+/// the Txn rolls back atomically, zero rows applied).
+fn apply_dml_where(
+    sm: &mut StateMachine<DirVfs>,
+    n: &mut u64,
+    type_id: u32,
+    program: Vec<u8>,
+    sets: Option<Vec<(u16, kessel_codec::Value)>>, // Some ⇒ UPDATE, None ⇒ DELETE
+    want_returning: bool,
+) -> OpResult {
+    // 1. Resolve matching ids (read-only scan; advances op_number like
+    //    any other read so the snapshot bracket stays consistent).
+    let ids_res = sm.apply(*n, Op::QueryExpr { type_id, program });
+    *n += 1;
+    let id_bytes = match ids_res {
+        OpResult::Got(b) => b,
+        other => return other, // SchemaError (no type / bad program), etc.
+    };
+    if id_bytes.len() % 16 != 0 {
+        return OpResult::SchemaError("dml-where: malformed id stream".into());
+    }
+    let ids: Vec<kessel_proto::ObjectId> = id_bytes
+        .chunks_exact(16)
+        .map(|c| {
+            let mut a = [0u8; 16];
+            a.copy_from_slice(c);
+            kessel_proto::ObjectId(a)
+        })
+        .collect();
+    let affected = ids.len() as u32;
+
+    // 2. For DELETE RETURNING, capture the rows BEFORE they are removed.
+    let mut returning_rows: Vec<Vec<u8>> = Vec::new();
+    let is_delete = sets.is_none();
+    if want_returning && is_delete {
+        for id in &ids {
+            match sm.apply(*n, Op::GetById { type_id, id: *id }) {
+                OpResult::Got(rec) => returning_rows.push(rec.as_ref().to_vec()),
+                _ => {}
+            }
+            *n += 1;
+        }
+    }
+
+    // 3. Build + apply the concrete Txn (the replicated artifact).
+    let inner: Vec<Op> = ids
+        .iter()
+        .map(|id| match &sets {
+            Some(s) => Op::UpdateSet { type_id, id: *id, sets: s.clone() },
+            None => Op::Delete { type_id, id: *id },
+        })
+        .collect();
+    // Empty match ⇒ no-op (PG returns `UPDATE 0`/`DELETE 0` with no
+    // state change). Skip the Txn entirely so we don't apply an empty
+    // batch.
+    if !inner.is_empty() {
+        let txn_res = sm.apply(*n, Op::Txn { ops: inner });
+        *n += 1;
+        match txn_res {
+            OpResult::Ok | OpResult::TxCommitted { .. } => {}
+            other => return other, // Constraint/SchemaError ⇒ atomic rollback
+        }
+    }
+
+    // 4. For UPDATE RETURNING, read the post-mutation rows.
+    if want_returning && !is_delete {
+        for id in &ids {
+            match sm.apply(*n, Op::GetById { type_id, id: *id }) {
+                OpResult::Got(rec) => returning_rows.push(rec.as_ref().to_vec()),
+                _ => {}
+            }
+            *n += 1;
+        }
+    }
+
+    OpResult::Got(frame_dml_result(affected, &returning_rows).into())
 }
 
 /// One request to the engine thread: an op and a one-shot reply channel.
@@ -1517,6 +1689,25 @@ pub fn spawn_engine_cfg(
                                         ),
                                         sets: raw_sets,
                                     });
+                                }
+                                // SP-PG-SQL-DML-GENERAL — general-WHERE
+                                // UPDATE/DELETE inside an explicit
+                                // multi-statement transaction needs the
+                                // matched-id set resolved against the
+                                // mid-transaction overlay (read-your-
+                                // writes), which the flatten-into-one-Txn
+                                // model here can't express. V1 rejects it;
+                                // run it as its own auto-commit statement.
+                                // (SP-PG-SQL-DML-IN-TXN follow-up.)
+                                Ok(kessel_sql::Stmt::UpdateWhere { .. })
+                                | Ok(kessel_sql::Stmt::DeleteWhere { .. }) => {
+                                    return Err(
+                                        "general-WHERE UPDATE/DELETE inside an \
+                                         explicit transaction is not yet \
+                                         supported (SP-PG-SQL-DML-IN-TXN); run \
+                                         it as a standalone statement"
+                                            .into(),
+                                    )
                                 }
                                 Ok(kessel_sql::Stmt::Explain(_)) => {
                                     return Err(

@@ -85,6 +85,22 @@ enum Cont {
         sets: Vec<(u16, Value)>,
         reply: SyncSender<OpResult>,
     },
+    /// SP-PG-SQL-DML-GENERAL — general-WHERE UPDATE/DELETE step 1: the
+    /// just-returned `Op::QueryExpr` id stream is turned into a concrete
+    /// `Op::Txn` of per-id `UpdateSet`/`Delete`, submitted as ONE
+    /// replicated op. `sets = Some` ⇒ UPDATE, `None` ⇒ DELETE.
+    DmlWhere {
+        type_id: u32,
+        sets: Option<Vec<(u16, Value)>>,
+        reply: SyncSender<OpResult>,
+    },
+    /// SP-PG-SQL-DML-GENERAL — general-WHERE UPDATE/DELETE step 2: the
+    /// concrete `Op::Txn` committed; reply with the framed affected-row
+    /// count so the gateway emits `UPDATE N` / `DELETE N`.
+    DmlWhereCommit {
+        affected: u32,
+        reply: SyncSender<OpResult>,
+    },
 }
 
 /// Patch `rec` (a decoded record) with `sets` and re-encode it into an
@@ -487,6 +503,77 @@ pub fn spawn_node(
                                 let _ = reply.send(other);
                             }
                         },
+                        // SP-PG-SQL-DML-GENERAL step 1: QueryExpr returned
+                        // the matched ids; build + submit the concrete Txn.
+                        Cont::DmlWhere { type_id, sets, reply } => match res {
+                            OpResult::Got(id_bytes) => {
+                                if id_bytes.len() % 16 != 0 {
+                                    let _ = reply.send(OpResult::SchemaError(
+                                        "dml-where: malformed id stream".into(),
+                                    ));
+                                    continue;
+                                }
+                                let ids: Vec<ObjectId> = id_bytes
+                                    .chunks_exact(16)
+                                    .map(|c| {
+                                        let mut a = [0u8; 16];
+                                        a.copy_from_slice(c);
+                                        ObjectId(a)
+                                    })
+                                    .collect();
+                                let affected = ids.len() as u32;
+                                if ids.is_empty() {
+                                    // No match ⇒ no-op; reply count 0.
+                                    let _ = reply.send(OpResult::Got(
+                                        crate::frame_dml_result(0, &[]).into(),
+                                    ));
+                                    continue;
+                                }
+                                let inner: Vec<Op> = ids
+                                    .iter()
+                                    .map(|id| match &sets {
+                                        Some(s) => Op::UpdateSet {
+                                            type_id,
+                                            id: *id,
+                                            sets: s.clone(),
+                                        },
+                                        None => Op::Delete { type_id, id: *id },
+                                    })
+                                    .collect();
+                                *iseq += 1;
+                                let c = *iseq;
+                                pending.insert(
+                                    (c, 1),
+                                    Cont::DmlWhereCommit { affected, reply },
+                                );
+                                let o2 = replica.handle(
+                                    self_idx,
+                                    Msg::Request {
+                                        client: c,
+                                        req: 1,
+                                        op: Op::Txn { ops: inner },
+                                    },
+                                );
+                                queue.push(o2);
+                            }
+                            other => {
+                                let _ = reply.send(other);
+                            }
+                        },
+                        // SP-PG-SQL-DML-GENERAL step 2: the Txn committed;
+                        // surface the affected-row count to the gateway.
+                        Cont::DmlWhereCommit { affected, reply } => match res {
+                            OpResult::Ok | OpResult::TxCommitted { .. } => {
+                                let _ = reply.send(OpResult::Got(
+                                    crate::frame_dml_result(affected, &[]).into(),
+                                ));
+                            }
+                            // Constraint/SchemaError ⇒ atomic rollback,
+                            // none applied. Forward the error verbatim.
+                            other => {
+                                let _ = reply.send(other);
+                            }
+                        },
                     }
                 }
             }
@@ -531,6 +618,8 @@ pub fn spawn_node(
                 let s = match cont {
                     Cont::Reply(s) => s,
                     Cont::Update { reply, .. } => reply,
+                    Cont::DmlWhere { reply, .. } => reply,
+                    Cont::DmlWhereCommit { reply, .. } => reply,
                 };
                 let _ = s.send(OpResult::Unavailable);
             }
@@ -619,6 +708,82 @@ pub fn spawn_node(
                                     out,
                                 );
                                 redirect(&replica, &mut pending, key);
+                            }
+                            // SP-PG-SQL-DML-GENERAL — general-WHERE
+                            // UPDATE/DELETE: linearized QueryExpr resolves
+                            // the matched ids, then the DmlWhere continuation
+                            // submits ONE concrete Op::Txn (the replicated
+                            // artifact). RETURNING in cluster mode is the
+                            // SP-PG-SQL-DML-RETURNING-CLUSTER follow-up; the
+                            // count path is supported here.
+                            Ok(Stmt::UpdateWhere {
+                                type_id,
+                                program,
+                                sets,
+                                returning,
+                            }) => {
+                                if returning.is_some() {
+                                    let _ = reply.send(OpResult::SchemaError(
+                                        "general-WHERE UPDATE … RETURNING is \
+                                         not yet supported in cluster mode \
+                                         (SP-PG-SQL-DML-RETURNING-CLUSTER)"
+                                            .into(),
+                                    ));
+                                } else {
+                                    let (out, key) = submit_internal(
+                                        &mut replica,
+                                        &mut pending,
+                                        &mut iseq,
+                                        Op::QueryExpr { type_id, program },
+                                        Cont::DmlWhere {
+                                            type_id,
+                                            sets: Some(sets),
+                                            reply,
+                                        },
+                                        Some(client),
+                                    );
+                                    process(
+                                        &mut replica,
+                                        &mut pending,
+                                        &mut iseq,
+                                        out,
+                                    );
+                                    redirect(&replica, &mut pending, key);
+                                }
+                            }
+                            Ok(Stmt::DeleteWhere {
+                                type_id,
+                                program,
+                                returning,
+                            }) => {
+                                if returning.is_some() {
+                                    let _ = reply.send(OpResult::SchemaError(
+                                        "general-WHERE DELETE … RETURNING is \
+                                         not yet supported in cluster mode \
+                                         (SP-PG-SQL-DML-RETURNING-CLUSTER)"
+                                            .into(),
+                                    ));
+                                } else {
+                                    let (out, key) = submit_internal(
+                                        &mut replica,
+                                        &mut pending,
+                                        &mut iseq,
+                                        Op::QueryExpr { type_id, program },
+                                        Cont::DmlWhere {
+                                            type_id,
+                                            sets: None,
+                                            reply,
+                                        },
+                                        Some(client),
+                                    );
+                                    process(
+                                        &mut replica,
+                                        &mut pending,
+                                        &mut iseq,
+                                        out,
+                                    );
+                                    redirect(&replica, &mut pending, key);
+                                }
                             }
                             Ok(Stmt::Explain(plan)) => {
                                 // EXPLAIN: pure planner text, no consensus.

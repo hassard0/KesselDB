@@ -3342,6 +3342,84 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
         };
         Ok(AggSpec { kind, field, qualifier, alias })
     }
+    // SP-PG-SQL-HAVING — a parsed HAVING predicate, BEFORE the aggregate is
+    // matched to a projection index. `kind` + `field` (+ `qualifier`) identify
+    // the aggregate by the same (function, arg) shape as the projection, `op`
+    // is the canonical comparison wire code, `value` the i128 literal.
+    struct RawHaving {
+        kind: u8,
+        field: Option<String>,
+        qualifier: Option<String>,
+        op: u8,
+        value: i128,
+    }
+    // SP-PG-SQL-HAVING — parse `<AGG>(arg) <cmp> <int>`. The aggregate is one
+    // of COUNT/SUM/MIN/MAX/AVG (same set as the projection); the comparison is
+    // `> >= < <= = <> !=`; the RHS is an integer/numeric literal. The aggregate
+    // is matched against (and MUST be one of) the SELECT projection's
+    // aggregates by the caller — V1 does not compute extra aggregates for a
+    // HAVING that references one not in the projection (it is cleanly rejected
+    // there with a clear error).
+    fn parse_having(p: &mut P) -> Result<RawHaving, SqlError> {
+        // <AGG> ( arg )
+        let kind = match p.next() {
+            Some(Tok::Ident(w)) => agg_kind(&w).ok_or(
+                "HAVING V1 supports only an aggregate predicate \
+                 (COUNT/SUM/MIN/MAX/AVG) — e.g. `HAVING COUNT(*) > 2`",
+            )?,
+            _ => return Err("HAVING expects an aggregate".into()),
+        };
+        p.punct('(')?;
+        let mut qualifier: Option<String> = None;
+        let field = if matches!(p.peek(), Some(Tok::Star)) {
+            p.i += 1;
+            None
+        } else {
+            let first = p.ident()?;
+            if matches!(p.peek(), Some(Tok::Punct('.'))) {
+                p.i += 1;
+                let col = p.ident()?;
+                qualifier = Some(first);
+                Some(col)
+            } else {
+                Some(first)
+            }
+        };
+        p.punct(')')?;
+        // comparison operator
+        let op = match p.next() {
+            Some(Tok::Cmp(c)) => kessel_proto::HavingPred::op_code(c)
+                .ok_or_else(|| format!("HAVING: unsupported comparison `{c}`"))?,
+            other => {
+                return Err(format!(
+                    "HAVING expects a comparison operator after the aggregate, \
+                     got {other:?}"
+                ))
+            }
+        };
+        // RHS integer/numeric literal. A negative literal lexes as Minus then
+        // Int (the lexer only emits unsigned Int); fold the sign here.
+        let neg = matches!(p.peek(), Some(Tok::Minus));
+        if neg {
+            p.i += 1;
+        }
+        let value = match p.next() {
+            Some(Tok::Int(n)) => {
+                if neg {
+                    -n
+                } else {
+                    n
+                }
+            }
+            other => {
+                return Err(format!(
+                    "HAVING comparison RHS must be an integer/numeric literal, \
+                     got {other:?}"
+                ))
+            }
+        };
+        Ok(RawHaving { kind, field, qualifier, op, value })
+    }
     let proj = if matches!(p.peek(), Some(Tok::Star)) {
         p.i += 1;
         Proj::Star
@@ -3562,8 +3640,121 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
                 };
                 aggregates.push((a.kind, fid));
             }
+            // SP-PG-SQL-HAVING — optional `HAVING <AGG>(arg) <cmp> <int>` over a
+            // JOIN group-aggregate, parsed after GROUP BY and before ORDER BY.
+            // The HAVING aggregate is matched against the combined-schema
+            // aggregate list just built (by kind + resolved combined field id),
+            // exactly as the projection aggregates were resolved. V1: it MUST
+            // match one of the projected aggregates (no extra aggregate is
+            // computed for a HAVING-only aggregate — that is cleanly rejected).
+            let having: Option<kessel_proto::HavingPred> = if p.kw("HAVING") {
+                let h_kind = match p.next() {
+                    Some(Tok::Ident(w)) => match w.to_ascii_uppercase().as_str() {
+                        "COUNT" => 0,
+                        "SUM" => 1,
+                        "MIN" => 2,
+                        "MAX" => 3,
+                        "AVG" => 4,
+                        _ => return Err(
+                            "HAVING V1 supports only an aggregate predicate \
+                             (COUNT/SUM/MIN/MAX/AVG)".into(),
+                        ),
+                    },
+                    _ => return Err("HAVING expects an aggregate".into()),
+                };
+                p.punct('(')?;
+                // arg: `*` | `[t.]col`
+                let (h_qual, h_col): (Option<String>, Option<String>) =
+                    if matches!(p.peek(), Some(Tok::Star)) {
+                        p.i += 1;
+                        (None, None)
+                    } else {
+                        let first = p.ident()?;
+                        if matches!(p.peek(), Some(Tok::Punct('.'))) {
+                            p.i += 1;
+                            let c = p.ident()?;
+                            (Some(first), Some(c))
+                        } else {
+                            (None, Some(first))
+                        }
+                    };
+                p.punct(')')?;
+                let h_op = match p.next() {
+                    Some(Tok::Cmp(c)) => kessel_proto::HavingPred::op_code(c)
+                        .ok_or_else(|| format!("HAVING: unsupported comparison `{c}`"))?,
+                    other => {
+                        return Err(format!(
+                            "HAVING expects a comparison operator, got {other:?}"
+                        ))
+                    }
+                };
+                let neg = matches!(p.peek(), Some(Tok::Minus));
+                if neg {
+                    p.i += 1;
+                }
+                let h_val: i128 = match p.next() {
+                    Some(Tok::Int(n)) => {
+                        if neg {
+                            -n
+                        } else {
+                            n
+                        }
+                    }
+                    other => {
+                        return Err(format!(
+                            "HAVING comparison RHS must be an integer literal, \
+                             got {other:?}"
+                        ))
+                    }
+                };
+                // Resolve the HAVING aggregate's arg to the same combined field
+                // id the projection aggregates use (COUNT(*) ⇒ COUNT_STAR_FIELD).
+                let h_field: u16 = match (&h_col, &h_qual) {
+                    (None, _) => kessel_proto::COUNT_STAR_FIELD,
+                    (Some(col), Some(qt)) => resolve_combined(qt, col)?,
+                    (Some(col), None) => {
+                        let matches: Vec<u16> = cot_ga
+                            .fields
+                            .iter()
+                            .filter(|f| {
+                                f.name.rsplit('.').next().map(|t| t == col).unwrap_or(false)
+                            })
+                            .map(|f| f.field_id)
+                            .collect();
+                        match matches.as_slice() {
+                            [one] => *one,
+                            [] => return Err(unknown_column_err(col, &cot_ga)),
+                            _ => {
+                                return Err(format!(
+                                    "HAVING aggregate column `{col}` is ambiguous \
+                                     across the joined tables — qualify it"
+                                ))
+                            }
+                        }
+                    }
+                };
+                let idx = aggregates
+                    .iter()
+                    .position(|(k, f)| *k == h_kind && *f == h_field);
+                match idx {
+                    Some(i) => Some(kessel_proto::HavingPred {
+                        agg_index: i as u16,
+                        op: h_op,
+                        value: h_val,
+                    }),
+                    None => {
+                        return Err(
+                            "HAVING references an aggregate not in the SELECT list \
+                             — V1 requires the HAVING aggregate to match one of the \
+                             projected aggregates".into(),
+                        )
+                    }
+                }
+            } else {
+                None
+            };
             group_aggregate =
-                Some(kessel_proto::JoinGroupAgg { group_field, aggregates });
+                Some(kessel_proto::JoinGroupAgg { group_field, aggregates, having });
         }
         // SP-PG-SQL-JOIN-QUERY: optional `ORDER BY <qualified col> [ASC|DESC]`
         // then `LIMIT n` / `OFFSET m`, composing with the optional WHERE above.
@@ -3697,6 +3888,26 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
         // SP-PG-SQL-ORM-PARSE T2 — GROUP BY column may be qualified.
         group = Some(p.col_ident()?);
     }
+    // SP-PG-SQL-HAVING — optional `HAVING <AGG>(arg) <cmp> <int>` after
+    // GROUP BY, before ORDER BY. Parse the raw aggregate spec + comparison
+    // + literal here; it is resolved against the projection's aggregate list
+    // (matched by kind + arg column) inside the `Proj::Aggs` branch below.
+    // A HAVING with NO GROUP BY is rejected (HAVING requires grouping).
+    let having_raw: Option<RawHaving> = if p.kw("HAVING") {
+        // V1: HAVING filters aggregate groups, so the projection MUST be an
+        // aggregate projection (the HAVING aggregate is matched to one of the
+        // SELECT aggregates). A HAVING over a non-aggregate SELECT is rejected.
+        if !matches!(proj, Proj::Aggs { .. }) {
+            return Err(
+                "HAVING requires an aggregate projection (e.g. \
+                 `SELECT g, COUNT(*) … GROUP BY g HAVING COUNT(*) > 2`)"
+                    .into(),
+            );
+        }
+        Some(parse_having(&mut p)?)
+    } else {
+        None
+    };
     if p.kw("ORDER") {
         p.expect_kw("BY")?;
         // SP-PG-SQL-ORM-PARSE T2 — ORDER BY column may be qualified.
@@ -3742,10 +3953,47 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
                 };
                 Ok((a.kind, af))
             };
-            // Single-aggregate back-compat path (byte-identical emit).
+            // SP-PG-SQL-HAVING — resolve a RawHaving to a wire HavingPred by
+            // matching its (kind, resolved agg field) against the SELECT's
+            // aggregate list. V1: the HAVING aggregate MUST be one of the
+            // projected aggregates (matched by kind + arg field id) — a HAVING
+            // over an aggregate NOT in the projection is cleanly rejected (we
+            // do not silently compute an extra aggregate). `resolved` mirrors
+            // the engine's per-group result order exactly, so the matched
+            // index is the engine's `agg_index`.
+            let resolve_having =
+                |raw: &RawHaving, resolved: &[(u8, u16)]| -> Result<kessel_proto::HavingPred, SqlError> {
+                    let want_field: u16 = match &raw.field {
+                        Some(c) => fid(c)?,
+                        None => 0, // COUNT(*) — field id 0 by the resolve_agg convention
+                    };
+                    let idx = resolved.iter().position(|(k, f)| {
+                        *k == raw.kind && *f == want_field
+                    });
+                    match idx {
+                        Some(i) => Ok(kessel_proto::HavingPred {
+                            agg_index: i as u16,
+                            op: raw.op,
+                            value: raw.value,
+                        }),
+                        None => Err(
+                            "HAVING references an aggregate that is not in the \
+                             SELECT list — V1 requires the HAVING aggregate to \
+                             match one of the projected aggregates (e.g. \
+                             `SELECT g, COUNT(*) … GROUP BY g HAVING COUNT(*) > 2`)"
+                                .into(),
+                        ),
+                    }
+                };
+            // Single-aggregate back-compat path (byte-identical emit when no
+            // HAVING; HAVING adds the marker-guarded trailing block only).
             if aggs.len() == 1 && leading_cols.is_empty() {
                 let (k, af) = resolve_agg(&aggs[0])?;
                 if let Some(g) = group {
+                    let having = match &having_raw {
+                        Some(raw) => Some(resolve_having(raw, &[(k, af)])?),
+                        None => None,
+                    };
                     return Ok(Op::GroupAggregate {
                         type_id: ot.type_id,
                         program,
@@ -3753,8 +4001,16 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
                         kind: k,
                         agg_field: af,
                         range_preds: agg_range_preds,
+                        having,
                     });
                 } else {
+                    if having_raw.is_some() {
+                        return Err(
+                            "HAVING requires GROUP BY (a scalar aggregate has no \
+                             groups to filter)"
+                                .into(),
+                        );
+                    }
                     return Ok(Op::Aggregate {
                         type_id: ot.type_id,
                         program,
@@ -3798,12 +4054,17 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
             for a in &aggs {
                 resolved.push(resolve_agg(a)?);
             }
+            let having = match &having_raw {
+                Some(raw) => Some(resolve_having(raw, &resolved)?),
+                None => None,
+            };
             Ok(Op::GroupAggregateMulti {
                 type_id: ot.type_id,
                 program,
                 group_field,
                 aggregates: resolved,
                 range_preds: agg_range_preds,
+                having,
             })
         }
         _ if sort.is_some() => {

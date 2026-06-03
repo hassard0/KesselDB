@@ -76,11 +76,102 @@ impl JoinType {
 pub struct JoinGroupAgg {
     pub group_field: u16,
     pub aggregates: Vec<(u8, u16)>,
+    /// SP-PG-SQL-HAVING: optional post-aggregation group filter. `None`
+    /// (default) ⇒ every group is emitted (byte-identical to a pre-HAVING
+    /// frame). When `Some`, a group is dropped unless `having.keep(results)`.
+    pub having: Option<HavingPred>,
 }
 
 /// Sentinel `field_id` paired with kind 0 (COUNT) ⇒ `COUNT(*)` (count every
 /// combined row), distinct from `COUNT(col)` which counts non-NULL values.
 pub const COUNT_STAR_FIELD: u16 = u16::MAX;
+
+/// SP-PG-SQL-HAVING: a `HAVING <agg> <cmp> <literal>` group filter applied
+/// AFTER aggregation, BEFORE order_by/limit/offset paging. `agg_index` selects
+/// which aggregate in the op's aggregate output sequence to compare (for the
+/// single-aggregate `Op::GroupAggregate` it is always 0; for the multi /
+/// join-group-aggregate it indexes into `aggregates`). `op` is the comparison
+/// (0 `>` / 1 `>=` / 2 `<` / 3 `<=` / 4 `=` / 5 `<>`), and `value` is the
+/// right-hand-side integer/numeric literal as an i128 (the same i128 the
+/// aggregate result is computed as). A group is KEPT iff
+/// `agg_result(agg_index) <op> value`.
+///
+/// The HAVING predicate is a PURE function of the already-deterministic
+/// per-group aggregate output, so applying it on the single deterministic
+/// apply thread keeps the result a pure function of the input rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HavingPred {
+    pub agg_index: u16,
+    pub op: u8,
+    pub value: i128,
+}
+
+impl HavingPred {
+    /// True iff a group whose aggregate output sequence is `agg_results`
+    /// should be KEPT. `agg_index` out of range ⇒ keep (defensive; the SQL
+    /// layer never emits an out-of-range index — it is validated at compile).
+    pub fn keep(&self, agg_results: &[i128]) -> bool {
+        let lhs = match agg_results.get(self.agg_index as usize) {
+            Some(v) => *v,
+            None => return true,
+        };
+        match self.op {
+            0 => lhs > self.value,
+            1 => lhs >= self.value,
+            2 => lhs < self.value,
+            3 => lhs <= self.value,
+            4 => lhs == self.value,
+            5 => lhs != self.value,
+            _ => true,
+        }
+    }
+
+    /// Canonical comparison wire code for an SQL comparison operator string.
+    /// `> >= < <= = <> !=` → `0 1 2 3 4 5 5`. `None` for any other operator.
+    pub fn op_code(cmp: &str) -> Option<u8> {
+        match cmp {
+            ">" => Some(0),
+            ">=" => Some(1),
+            "<" => Some(2),
+            "<=" => Some(3),
+            "=" => Some(4),
+            "<>" | "!=" => Some(5),
+            _ => None,
+        }
+    }
+}
+
+/// SP-PG-SQL-HAVING: marker-guarded encode of an optional HAVING block.
+/// `None` ⇒ writes NOTHING (byte-identical to a pre-HAVING frame). `Some` ⇒
+/// `[u8 1][u16 agg_index][u8 op][16B i128 LE value]`. A non-1 marker on decode
+/// is a forward-incompatible op (rejected), mirroring the other marker blocks.
+fn encode_having(b: &mut Vec<u8>, having: &Option<HavingPred>) {
+    if let Some(h) = having {
+        b.push(1u8); // having-block marker
+        b.extend_from_slice(&h.agg_index.to_le_bytes());
+        b.push(h.op);
+        b.extend_from_slice(&h.value.to_le_bytes());
+    }
+}
+
+/// SP-PG-SQL-HAVING: decode the optional trailing HAVING block. Absent (no
+/// remaining bytes) ⇒ `None`. Marker 1 ⇒ read the predicate. A non-1 marker is
+/// a forward-incompatible op ⇒ `Err` (surfaced as a decode failure, never
+/// silently mis-applied). Returns `Ok(None)`/`Ok(Some(_))` on success.
+fn decode_having(c: &mut codec::Cursor) -> Result<Option<HavingPred>, ()> {
+    if c.remaining() == 0 {
+        return Ok(None);
+    }
+    match c.u8() {
+        Some(1) => {
+            let agg_index = c.u16().ok_or(())?;
+            let op = c.u8().ok_or(())?;
+            let value = c.u128().ok_or(())? as i128;
+            Ok(Some(HavingPred { agg_index, op, value }))
+        }
+        _ => Err(()),
+    }
+}
 
 /// Operations applied by the deterministic state machine. Payloads are opaque
 /// bytes here so `kessel-proto` stays schema-agnostic; `kessel-catalog` /
@@ -195,6 +286,10 @@ pub enum Op {
         kind: u8,
         agg_field: u16,
         range_preds: Vec<(u16, u8, Vec<u8>)>,
+        /// SP-PG-SQL-HAVING: optional post-aggregation group filter (agg_index
+        /// is always 0 here — there is exactly one aggregate). `None` ⇒
+        /// every group emitted (byte-identical to a pre-HAVING frame).
+        having: Option<HavingPred>,
     },
     /// Schema introspection (Sub-project 34): returns the table's serialized
     /// `(name, fields)` definition so a client can decode `SELECT` rows.
@@ -432,6 +527,9 @@ pub enum Op {
         group_field: u16,
         aggregates: Vec<(u8, u16)>,
         range_preds: Vec<(u16, u8, Vec<u8>)>,
+        /// SP-PG-SQL-HAVING: optional post-aggregation group filter. `None` ⇒
+        /// every group emitted (byte-identical to a pre-HAVING frame).
+        having: Option<HavingPred>,
     },
 
     /// SP123 / S2.X: per-replica active-snapshot report — closes the
@@ -1135,6 +1233,11 @@ impl Op {
                         b.push(*kind);
                         b.extend_from_slice(&fid.to_le_bytes());
                     }
+                    // SP-PG-SQL-HAVING: marker-guarded HAVING block, INSIDE the
+                    // ga-block (only reachable when group_aggregate is Some, so a
+                    // plain/sorted/filtered join writes nothing here). Absent ⇒
+                    // a pre-HAVING join-group-aggregate frame is byte-identical.
+                    encode_having(&mut b, &ga.having);
                 }
             }
             Op::QueryRows { type_id, eq_preds, program, limit, range_preds } => {
@@ -1183,14 +1286,18 @@ impl Op {
                 }
                 codec::put_u32(&mut b, *limit);
             }
-            Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds } => {
+            Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds, having } => {
                 codec::put_u32(&mut b, *type_id);
                 codec::put_bytes(&mut b, program);
                 b.extend_from_slice(&group_field.to_le_bytes());
                 b.push(*kind);
                 b.extend_from_slice(&agg_field.to_le_bytes());
-                // SP-Analytic-Plan: trailing range hints; empty ⇒ omit.
-                if !range_preds.is_empty() {
+                // SP-PG-SQL-HAVING: a HAVING clause forces the range-preds
+                // length prefix to be written even when empty (a `0u32`) so
+                // the trailing HAVING block has a fixed offset to follow. A
+                // query with NO range hints AND NO HAVING still omits both ⇒
+                // byte-identical to the pre-HAVING/pre-range frame.
+                if !range_preds.is_empty() || having.is_some() {
                     codec::put_u32(&mut b, range_preds.len() as u32);
                     for (f, o, v) in range_preds {
                         b.extend_from_slice(&f.to_le_bytes());
@@ -1198,6 +1305,10 @@ impl Op {
                         codec::put_bytes(&mut b, v);
                     }
                 }
+                // SP-PG-SQL-HAVING: marker-guarded trailing HAVING block.
+                // Emitted only when Some ⇒ a no-HAVING frame writes NOTHING
+                // here, staying byte-identical to before this arc.
+                encode_having(&mut b, having);
             }
             // SP-Analytic-Plan-MULTI: wire tag 47.
             //   [u32 type_id]
@@ -1207,7 +1318,7 @@ impl Op {
             //   [u32 n_range_preds] { [u16 f][u8 op][u32 v_len][v] }*
             // n_range_preds is REQUIRED (no back-compat omission since
             // this variant is brand-new; reader symmetry is simpler).
-            Op::GroupAggregateMulti { type_id, program, group_field, aggregates, range_preds } => {
+            Op::GroupAggregateMulti { type_id, program, group_field, aggregates, range_preds, having } => {
                 codec::put_u32(&mut b, *type_id);
                 codec::put_bytes(&mut b, program);
                 b.extend_from_slice(&group_field.to_le_bytes());
@@ -1222,6 +1333,11 @@ impl Op {
                     b.push(*o);
                     codec::put_bytes(&mut b, v);
                 }
+                // SP-PG-SQL-HAVING: marker-guarded trailing HAVING block.
+                // Tag 47's range_preds always carried an explicit length, so
+                // the HAVING block simply follows; absent ⇒ NOTHING written
+                // (byte-identical to a pre-HAVING tag-47 frame).
+                encode_having(&mut b, having);
             }
             Op::AddCompositeIndex { type_id, fields }
             | Op::DropIndex { type_id, fields } => {
@@ -1552,7 +1668,11 @@ impl Op {
                         let f = c.u16()?;
                         aggregates.push((k, f));
                     }
-                    Some(JoinGroupAgg { group_field, aggregates })
+                    // SP-PG-SQL-HAVING: optional HAVING block INSIDE the
+                    // ga-block (only present when a group_aggregate is). Absent
+                    // ⇒ None (pre-HAVING join-group-aggregate frame).
+                    let having = decode_having(&mut c).ok()?;
+                    Some(JoinGroupAgg { group_field, aggregates, having })
                 } else {
                     None
                 };
@@ -1638,7 +1758,12 @@ impl Op {
                 } else {
                     Vec::new()
                 };
-                Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds }
+                // SP-PG-SQL-HAVING: optional trailing HAVING block. Absent ⇒
+                // None (pre-arc frame). The range-preds prefix above is written
+                // (possibly as a `0`) whenever HAVING is present, so any
+                // remaining bytes here ARE the HAVING block.
+                let having = decode_having(&mut c).ok()?;
+                Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds, having }
             }
             // SP-Analytic-Plan-MULTI: wire tag 47.
             47 => {
@@ -1662,7 +1787,11 @@ impl Op {
                 for _ in 0..m {
                     range_preds.push((c.u16()?, c.u8()?, c.bytes()?));
                 }
-                Op::GroupAggregateMulti { type_id, program, group_field, aggregates, range_preds }
+                // SP-PG-SQL-HAVING: optional trailing HAVING block. Tag 47
+                // always wrote the range-preds length, so any remaining bytes
+                // are the HAVING block. Absent ⇒ None (pre-HAVING frame).
+                let having = decode_having(&mut c).ok()?;
+                Op::GroupAggregateMulti { type_id, program, group_field, aggregates, range_preds, having }
             }
             24 => {
                 let type_id = c.u32()?;
@@ -1950,18 +2079,18 @@ mod tests {
             // aggregate (sentinel field id) over an INNER join, no filter — the
             // ga block force-writes the empty-filter + inner-tag + all-None page
             // block anchors, then the group/agg fields.
-            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 0, filter: vec![], join_type: JoinType::Inner, order_by: None, limit_n: None, offset_n: None, group_aggregate: Some(JoinGroupAgg { group_field: 0, aggregates: vec![(0, COUNT_STAR_FIELD)] }) },
+            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 0, filter: vec![], join_type: JoinType::Inner, order_by: None, limit_n: None, offset_n: None, group_aggregate: Some(JoinGroupAgg { group_field: 0, aggregates: vec![(0, COUNT_STAR_FIELD)], having: None }) },
             // SP-PG-SQL-JOIN-AGG: GROUP BY field 1, TWO aggregates (COUNT(col 3)
             // + SUM(col 4)) over a LEFT join WITH filter — every trailing region
             // present at once (filter, tag, page block, ga block).
-            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 0, filter: vec![1, 0, 0, 5, 42, 3], join_type: JoinType::Left, order_by: None, limit_n: None, offset_n: None, group_aggregate: Some(JoinGroupAgg { group_field: 1, aggregates: vec![(0, 3), (1, 4)] }) },
+            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 0, filter: vec![1, 0, 0, 5, 42, 3], join_type: JoinType::Left, order_by: None, limit_n: None, offset_n: None, group_aggregate: Some(JoinGroupAgg { group_field: 1, aggregates: vec![(0, 3), (1, 4)], having: None }) },
             Op::Aggregate { type_id: 4, program: vec![1], kind: 1, field_id: 3, range_preds: vec![] },
             // SP-Analytic-Plan: aggregate w/ range hints — new wire suffix.
             Op::Aggregate { type_id: 4, program: vec![1], kind: 1, field_id: 3, range_preds: vec![(2, 1, vec![7, 0]), (2, 3, vec![9, 0])] },
             Op::SelectFields { type_id: 4, program: vec![1], fields: vec![1, 3], limit: 5 },
-            Op::GroupAggregate { type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3, range_preds: vec![] },
+            Op::GroupAggregate { type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3, range_preds: vec![], having: None },
             // SP-Analytic-Plan: group-agg w/ range hints — new wire suffix.
-            Op::GroupAggregate { type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3, range_preds: vec![(2, 1, vec![1, 0]), (2, 3, vec![5, 0])] },
+            Op::GroupAggregate { type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3, range_preds: vec![(2, 1, vec![1, 0]), (2, 3, vec![5, 0])], having: None },
             Op::SelectSorted { type_id: 4, program: vec![1], sort_field: 3, desc: true, offset: 2, limit: 5 },
             Op::AddCompositeIndex { type_id: 4, fields: vec![1, 3] },
             Op::DropIndex { type_id: 4, fields: vec![1] },
@@ -2142,6 +2271,7 @@ mod tests {
             group_aggregate: Some(JoinGroupAgg {
                 group_field: 0,
                 aggregates: vec![(0, COUNT_STAR_FIELD), (1, 4)],
+                having: None,
             }),
         };
         let enc = op.encode();
@@ -2164,6 +2294,7 @@ mod tests {
             group_aggregate: Some(JoinGroupAgg {
                 group_field: 0,
                 aggregates: vec![(0, COUNT_STAR_FIELD)],
+                having: None,
             }),
         };
         let enc = op.encode();
@@ -2557,6 +2688,7 @@ mod tests {
             kind: 0,
             agg_field: 5,
             range_preds: vec![],
+            having: None,
         };
         let enc_g = post_g.encode();
         let mut hand_g = Vec::new();
@@ -2585,6 +2717,7 @@ mod tests {
                 Op::GroupAggregate {
                     type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3,
                     range_preds: rp.clone(),
+                    having: None,
                 },
             ] {
                 let bytes = op.encode();
@@ -2615,6 +2748,7 @@ mod tests {
                 group_field: 1,
                 aggregates: vec![(0, 0), (1, 3)],
                 range_preds: vec![],
+                having: None,
             },
             // 4 aggregates (Q1 shape: COUNT + 3 SUMs), one range_pred
             Op::GroupAggregateMulti {
@@ -2623,6 +2757,7 @@ mod tests {
                 group_field: 16,
                 aggregates: vec![(0, 0), (1, 4), (1, 5), (1, 6)],
                 range_preds: vec![(10, 3, vec![0x05, 0x35, 0x2F, 0x01])],
+                having: None,
             },
             // 5 aggregates incl. AVG (kind=4) + 2 range_preds
             Op::GroupAggregateMulti {
@@ -2631,6 +2766,7 @@ mod tests {
                 group_field: 0,
                 aggregates: vec![(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)],
                 range_preds: vec![(2, 1, vec![1, 0]), (2, 3, vec![9, 0])],
+                having: None,
             },
         ];
         for op in ops {
@@ -2672,6 +2808,7 @@ mod tests {
         let g = Op::GroupAggregate {
             type_id: 4, program: vec![9], group_field: 2, kind: 0, agg_field: 5,
             range_preds: vec![],
+            having: None,
         };
         let g_enc = g.encode();
         let mut hand_g = Vec::new();
@@ -2683,5 +2820,109 @@ mod tests {
         hand_g.push(0u8);
         hand_g.extend_from_slice(&5u16.to_le_bytes());
         assert_eq!(g_enc, hand_g, "Op::GroupAggregate wire MUST stay byte-identical");
+    }
+
+    // ========================================================================
+    // SP-PG-SQL-HAVING — wire KATs for the optional, marker-guarded HAVING
+    // block on Op::GroupAggregate (tag 22), Op::GroupAggregateMulti (tag 47),
+    // and Op::Join's JoinGroupAgg.
+    // ========================================================================
+
+    #[test]
+    fn sp_pg_sql_having_wire_round_trip_and_byte_identity() {
+        // (1) GroupAggregate with HAVING but EMPTY range_preds: the range-preds
+        // length prefix is forced to `0u32` so the HAVING block has a fixed
+        // offset, then the HAVING block follows.
+        let g = Op::GroupAggregate {
+            type_id: 4, program: vec![9], group_field: 2, kind: 0, agg_field: 5,
+            range_preds: vec![],
+            having: Some(HavingPred { agg_index: 0, op: 1, value: 3 }),
+        };
+        let enc = g.encode();
+        let mut hand = Vec::new();
+        hand.push(22u8);
+        hand.extend_from_slice(&4u32.to_le_bytes());
+        hand.extend_from_slice(&1u32.to_le_bytes());
+        hand.extend_from_slice(&[9]);
+        hand.extend_from_slice(&2u16.to_le_bytes());
+        hand.push(0u8);
+        hand.extend_from_slice(&5u16.to_le_bytes());
+        hand.extend_from_slice(&0u32.to_le_bytes()); // forced empty range_preds len
+        hand.push(1u8); // having marker
+        hand.extend_from_slice(&0u16.to_le_bytes()); // agg_index
+        hand.push(1u8); // op (>=)
+        hand.extend_from_slice(&3i128.to_le_bytes()); // value
+        assert_eq!(enc, hand, "GroupAggregate+HAVING wire layout");
+        assert_eq!(Op::decode(&enc).unwrap(), g, "GroupAggregate+HAVING round-trip");
+
+        // (2) GroupAggregate with HAVING AND non-empty range_preds.
+        let g2 = Op::GroupAggregate {
+            type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3,
+            range_preds: vec![(2u16, 1u8, vec![1, 0])],
+            having: Some(HavingPred { agg_index: 0, op: 0, value: -5 }),
+        };
+        assert_eq!(Op::decode(&g2.encode()).unwrap(), g2, "GA+rp+HAVING round-trip");
+
+        // (3) GroupAggregateMulti with HAVING (agg_index 2 of 3).
+        let m = Op::GroupAggregateMulti {
+            type_id: 7, program: vec![1, 2], group_field: 1,
+            aggregates: vec![(0, 0), (1, 3), (3, 4)],
+            range_preds: vec![],
+            having: Some(HavingPred { agg_index: 2, op: 3, value: 100 }),
+        };
+        assert_eq!(Op::decode(&m.encode()).unwrap(), m, "GroupAggregateMulti+HAVING round-trip");
+
+        // (4) Join with JoinGroupAgg + HAVING.
+        let j = Op::Join {
+            left_type: 4, right_type: 5, left_field: 1, right_field: 2,
+            limit: 0, filter: vec![], join_type: JoinType::Inner,
+            order_by: None, limit_n: None, offset_n: None,
+            group_aggregate: Some(JoinGroupAgg {
+                group_field: 1,
+                aggregates: vec![(0, COUNT_STAR_FIELD)],
+                having: Some(HavingPred { agg_index: 0, op: 5, value: 0 }),
+            }),
+        };
+        assert_eq!(Op::decode(&j.encode()).unwrap(), j, "Join+JoinGroupAgg+HAVING round-trip");
+
+        // (5) Byte-identity lock: NO HAVING + no range_preds GroupAggregate
+        // encodes to the exact pre-HAVING bytes (8-byte shorter than the
+        // HAVING-bearing frame above — no rp-len, no having block).
+        let g_none = Op::GroupAggregate {
+            type_id: 4, program: vec![9], group_field: 2, kind: 0, agg_field: 5,
+            range_preds: vec![], having: None,
+        };
+        let mut hand_none = Vec::new();
+        hand_none.push(22u8);
+        hand_none.extend_from_slice(&4u32.to_le_bytes());
+        hand_none.extend_from_slice(&1u32.to_le_bytes());
+        hand_none.extend_from_slice(&[9]);
+        hand_none.extend_from_slice(&2u16.to_le_bytes());
+        hand_none.push(0u8);
+        hand_none.extend_from_slice(&5u16.to_le_bytes());
+        assert_eq!(g_none.encode(), hand_none, "no-HAVING GroupAggregate byte-identical");
+        let j_none = Op::Join {
+            left_type: 4, right_type: 5, left_field: 1, right_field: 2,
+            limit: 0, filter: vec![], join_type: JoinType::Inner,
+            order_by: None, limit_n: None, offset_n: None,
+            group_aggregate: Some(JoinGroupAgg {
+                group_field: 1, aggregates: vec![(0, COUNT_STAR_FIELD)], having: None,
+            }),
+        };
+        // The no-HAVING join-group-aggregate must NOT carry a having marker:
+        // decode then re-encode must be stable, and the encoded length equals a
+        // freshly-built no-HAVING frame (no extra bytes).
+        let je = j_none.encode();
+        assert_eq!(Op::decode(&je).unwrap(), j_none, "no-HAVING join GA round-trips");
+        // Re-encoding the decoded op yields identical bytes (determinism).
+        assert_eq!(Op::decode(&je).unwrap().encode(), je, "no-HAVING join GA byte-stable");
+
+        // (6) A non-1 HAVING marker is rejected at decode (forward-incompat).
+        let mut bad = hand.clone();
+        let mlen = bad.len();
+        // overwrite the having marker byte (index after the 0u32 rp-len) with 2
+        let marker_idx = mlen - (1 + 2 + 1 + 16);
+        bad[marker_idx] = 2;
+        assert!(Op::decode(&bad).is_none(), "non-1 HAVING marker rejected");
     }
 }

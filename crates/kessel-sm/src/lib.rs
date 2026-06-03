@@ -1393,11 +1393,15 @@ impl<V: Vfs> StateMachine<V> {
                     }
                 }
             }
-            let mut gout = Vec::new();
-            gout.extend_from_slice(&(groups.len() as u32).to_le_bytes());
+            // SP-PG-SQL-HAVING: resolve each group's per-aggregate result
+            // sequence, then (if the join-group-aggregate carries a HAVING)
+            // drop groups whose result fails the predicate. Pure function of
+            // the deterministic accumulator ⇒ deterministic. No HAVING ⇒ every
+            // group emitted (byte-identical to a pre-HAVING frame).
+            let having = group_aggregate.and_then(|ga| ga.having);
+            let mut kept: Vec<(Vec<u8>, Vec<i128>)> = Vec::with_capacity(groups.len());
             for (k, accs) in groups {
-                gout.extend_from_slice(&(k.len() as u32).to_le_bytes());
-                gout.extend_from_slice(&k);
+                let mut results: Vec<i128> = Vec::with_capacity(accs.len());
                 for (i, (cnt, sum, mn, mx)) in accs.iter().enumerate() {
                     let res: i128 = match aspec[i].0 {
                         0 => *cnt,
@@ -1413,6 +1417,21 @@ impl<V: Vfs> StateMachine<V> {
                         }
                         _ => unreachable!("kind validated up-front"),
                     };
+                    results.push(res);
+                }
+                if let Some(h) = &having {
+                    if !h.keep(&results) {
+                        continue;
+                    }
+                }
+                kept.push((k, results));
+            }
+            let mut gout = Vec::new();
+            gout.extend_from_slice(&(kept.len() as u32).to_le_bytes());
+            for (k, results) in kept {
+                gout.extend_from_slice(&(k.len() as u32).to_le_bytes());
+                gout.extend_from_slice(&k);
+                for res in results {
                     gout.extend_from_slice(&res.to_le_bytes());
                 }
             }
@@ -2380,6 +2399,7 @@ impl<V: Vfs> StateMachine<V> {
         group_field: u16,
         aggregates: &[(u8, u16)],
         range_preds: &[(u16, u8, Vec<u8>)],
+        having: Option<&kessel_proto::HavingPred>,
     ) -> OpResult {
         if aggregates.is_empty() {
             return OpResult::SchemaError(
@@ -2714,12 +2734,14 @@ impl<V: Vfs> StateMachine<V> {
             }
         }
 
-        // Encode: [u32 ngroups] per group [u32 keylen][key][16B × n_aggs]
-        let mut out = Vec::new();
-        out.extend_from_slice(&(groups.len() as u32).to_le_bytes());
+        // Resolve each group's per-aggregate result sequence, then (if a
+        // HAVING is present) drop groups whose result fails the predicate.
+        // The result sequence is a pure function of the deterministic per-
+        // group accumulator, so HAVING filtering is itself deterministic.
+        // Encode: [u32 ngroups] per group [u32 keylen][key][16B × n_aggs].
+        let mut kept: Vec<(Vec<u8>, Vec<i128>)> = Vec::with_capacity(groups.len());
         for (k, accs) in groups {
-            out.extend_from_slice(&(k.len() as u32).to_le_bytes());
-            out.extend_from_slice(&k);
+            let mut results: Vec<i128> = Vec::with_capacity(accs.len());
             for (i, (cnt, sum, mn, mx)) in accs.iter().enumerate() {
                 let res: i128 = match aggregates[i].0 {
                     0 => *cnt,
@@ -2735,6 +2757,21 @@ impl<V: Vfs> StateMachine<V> {
                     }
                     _ => unreachable!("kind validated up-front"),
                 };
+                results.push(res);
+            }
+            if let Some(h) = having {
+                if !h.keep(&results) {
+                    continue;
+                }
+            }
+            kept.push((k, results));
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&(kept.len() as u32).to_le_bytes());
+        for (k, results) in kept {
+            out.extend_from_slice(&(k.len() as u32).to_le_bytes());
+            out.extend_from_slice(&k);
+            for res in results {
                 out.extend_from_slice(&res.to_le_bytes());
             }
         }
@@ -3436,10 +3473,10 @@ impl<V: Vfs> StateMachine<V> {
             // SP-Analytic-Plan-MULTI: multi-aggregate single-scan GROUP BY
             // (read_only_op arm; mirrors the apply arm exactly via the
             // shared `group_aggregate_multi` helper — identical bytes).
-            Op::GroupAggregateMulti { type_id, program, group_field, aggregates, range_preds } => {
-                self.group_aggregate_multi(type_id, &program, group_field, &aggregates, &range_preds)
+            Op::GroupAggregateMulti { type_id, program, group_field, aggregates, range_preds, having } => {
+                self.group_aggregate_multi(type_id, &program, group_field, &aggregates, &range_preds, having.as_ref())
             }
-            Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds } => {
+            Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds, having } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
                     None => return OpResult::SchemaError(format!("no type {type_id}")),
@@ -3538,8 +3575,12 @@ impl<V: Vfs> StateMachine<V> {
                         }
                     }
                 }
-                let mut out = Vec::new();
-                out.extend_from_slice(&(groups.len() as u32).to_le_bytes());
+                // SP-PG-SQL-HAVING: collect (key, res) first so we can apply
+                // the post-aggregation group filter (a pure function of the
+                // already-deterministic per-group result) BEFORE counting +
+                // emitting groups. No HAVING ⇒ every group kept (identical
+                // bytes to before this arc).
+                let mut kept: Vec<(Vec<u8>, i128)> = Vec::with_capacity(groups.len());
                 for (k, (cnt, sum, mn, mx)) in groups {
                     let res: i128 = match kind {
                         0 => cnt,
@@ -3559,6 +3600,16 @@ impl<V: Vfs> StateMachine<V> {
                             )
                         }
                     };
+                    if let Some(h) = &having {
+                        if !h.keep(&[res]) {
+                            continue;
+                        }
+                    }
+                    kept.push((k, res));
+                }
+                let mut out = Vec::new();
+                out.extend_from_slice(&(kept.len() as u32).to_le_bytes());
+                for (k, res) in kept {
                     out.extend_from_slice(&(k.len() as u32).to_le_bytes());
                     out.extend_from_slice(&k);
                     out.extend_from_slice(&res.to_le_bytes());
@@ -5912,10 +5963,10 @@ impl<V: Vfs> StateMachine<V> {
             // Op::GroupAggregate calls — closes the SP-Analytic-Plan T4
             // Q1 gap. Equivalence vs the N-call shape is proven by an
             // SM-level KAT (byte-equal vs N sequential GroupAggregate).
-            Op::GroupAggregateMulti { type_id, program, group_field, aggregates, range_preds } => {
-                self.group_aggregate_multi(type_id, &program, group_field, &aggregates, &range_preds)
+            Op::GroupAggregateMulti { type_id, program, group_field, aggregates, range_preds, having } => {
+                self.group_aggregate_multi(type_id, &program, group_field, &aggregates, &range_preds, having.as_ref())
             }
-            Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds } => {
+            Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds, having } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
                     None => return OpResult::SchemaError(format!("no type {type_id}")),
@@ -6020,8 +6071,12 @@ impl<V: Vfs> StateMachine<V> {
                         }
                     }
                 }
-                let mut out = Vec::new();
-                out.extend_from_slice(&(groups.len() as u32).to_le_bytes());
+                // SP-PG-SQL-HAVING: collect (key, res) first so we can apply
+                // the post-aggregation group filter (a pure function of the
+                // already-deterministic per-group result) BEFORE counting +
+                // emitting groups. No HAVING ⇒ every group kept (identical
+                // bytes to before this arc).
+                let mut kept: Vec<(Vec<u8>, i128)> = Vec::with_capacity(groups.len());
                 for (k, (cnt, sum, mn, mx)) in groups {
                     let res: i128 = match kind {
                         0 => cnt,
@@ -6041,6 +6096,16 @@ impl<V: Vfs> StateMachine<V> {
                             )
                         }
                     };
+                    if let Some(h) = &having {
+                        if !h.keep(&[res]) {
+                            continue;
+                        }
+                    }
+                    kept.push((k, res));
+                }
+                let mut out = Vec::new();
+                out.extend_from_slice(&(kept.len() as u32).to_le_bytes());
+                for (k, res) in kept {
                     out.extend_from_slice(&(k.len() as u32).to_le_bytes());
                     out.extend_from_slice(&k);
                     out.extend_from_slice(&res.to_le_bytes());
@@ -10071,17 +10136,17 @@ mod tests {
         };
         let all = Program::new().push_int(1).bytes();
         // SUM(v) GROUP BY owner -> {1:30, 2:20, 3:100} ascending key order
-        match sm.apply(20, Op::GroupAggregate { type_id: 1, program: all.clone(), group_field: 1, kind: 1, agg_field: 3, range_preds: vec![] }) {
+        match sm.apply(20, Op::GroupAggregate { type_id: 1, program: all.clone(), group_field: 1, kind: 1, agg_field: 3, range_preds: vec![], having: None }) {
             OpResult::Got(b) => assert_eq!(parse(&b), vec![(1, 30), (2, 20), (3, 100)]),
             o => panic!("{o:?}"),
         }
         // COUNT GROUP BY owner -> {1:2, 2:3, 3:1}
-        match sm.apply(21, Op::GroupAggregate { type_id: 1, program: all.clone(), group_field: 1, kind: 0, agg_field: 0, range_preds: vec![] }) {
+        match sm.apply(21, Op::GroupAggregate { type_id: 1, program: all.clone(), group_field: 1, kind: 0, agg_field: 0, range_preds: vec![], having: None }) {
             OpResult::Got(b) => assert_eq!(parse(&b), vec![(1, 2), (2, 3), (3, 1)]),
             o => panic!("{o:?}"),
         }
         // MAX(v) GROUP BY owner -> {1:20, 2:8, 3:100}
-        match sm.apply(22, Op::GroupAggregate { type_id: 1, program: all, group_field: 1, kind: 3, agg_field: 3, range_preds: vec![] }) {
+        match sm.apply(22, Op::GroupAggregate { type_id: 1, program: all, group_field: 1, kind: 3, agg_field: 3, range_preds: vec![], having: None }) {
             OpResult::Got(b) => assert_eq!(parse(&b), vec![(1, 20), (2, 8), (3, 100)]),
             o => panic!("{o:?}"),
         }
@@ -10167,6 +10232,7 @@ mod tests {
             group_field: 1,
             aggregates: aggs.clone(),
             range_preds: vec![],
+            having: None,
         }) {
             OpResult::Got(b) => b.to_vec(),
             o => panic!("multi: {o:?}"),
@@ -10183,6 +10249,7 @@ mod tests {
                 kind: *k,
                 agg_field: *f,
                 range_preds: vec![],
+                having: None,
             }) {
                 OpResult::Got(b) => parse_single(&b),
                 o => panic!("single (kind={k}, field={f}): {o:?}"),
@@ -10233,6 +10300,7 @@ mod tests {
                 group_field: 1,
                 aggregates: aggs.clone(),
                 range_preds: vec![],
+                having: None,
             },
         ) {
             OpResult::Got(b) => b.to_vec(),
@@ -10244,6 +10312,7 @@ mod tests {
             group_field: 1,
             aggregates: aggs,
             range_preds: vec![],
+            having: None,
         }) {
             OpResult::Got(b) => b.to_vec(),
             o => panic!("ro: {o:?}"),
@@ -10293,6 +10362,7 @@ mod tests {
             group_field: 1,
             aggregates: aggs.clone(),
             range_preds: vec![],
+            having: None,
         }) {
             OpResult::Got(b) => b.to_vec(),
             o => panic!("{o:?}"),
@@ -10308,6 +10378,7 @@ mod tests {
             group_field: 1,
             aggregates: aggs,
             range_preds: full_range,
+            having: None,
         }) {
             OpResult::Got(b) => b.to_vec(),
             o => panic!("{o:?}"),
@@ -10381,6 +10452,7 @@ mod tests {
                 group_field: 1,
                 aggregates: aggs.clone(),
                 range_preds: vec![],
+                having: None,
             }) {
                 OpResult::Got(b) => b.to_vec(),
                 o => panic!("multi parallel: {o:?}"),
@@ -10519,6 +10591,7 @@ mod tests {
                 group_field: 1,
                 aggregates: aggs.clone(),
                 range_preds: vec![],
+                having: None,
             },
         ) {
             OpResult::Got(b) => b.to_vec(),
@@ -10530,6 +10603,7 @@ mod tests {
             group_field: 1,
             aggregates: aggs,
             range_preds: vec![],
+            having: None,
         }) {
             OpResult::Got(b) => b.to_vec(),
             o => panic!("ro: {o:?}"),
@@ -10670,6 +10744,7 @@ mod tests {
                 group_field: 1,
                 aggregates: aggs.clone(),
                 range_preds: vec![],
+                having: None,
             }) {
                 OpResult::Got(b) => b.to_vec(),
                 o => panic!("multi streaming high-cardinality: {o:?}"),
@@ -10751,6 +10826,7 @@ mod tests {
                 group_field: 1,
                 aggregates: aggs.clone(),
                 range_preds: vec![],
+                having: None,
             },
         ) {
             OpResult::Got(b) => b.to_vec(),
@@ -10762,6 +10838,7 @@ mod tests {
             group_field: 1,
             aggregates: aggs.clone(),
             range_preds: vec![],
+            having: None,
         }) {
             OpResult::Got(b) => b.to_vec(),
             o => panic!("ro streaming: {o:?}"),
@@ -10969,6 +11046,7 @@ mod tests {
             let r = match sm.apply(99, Op::GroupAggregate {
                 type_id: 1, program: Program::new().push_int(1).bytes(),
                 group_field: 1, kind: 1, agg_field: 3, range_preds: vec![],
+                having: None,
             }) {
                 OpResult::Got(b) => b,
                 o => panic!("{o:?}"),
@@ -11107,6 +11185,7 @@ mod tests {
             let oracle = match sm.apply(2000, Op::GroupAggregate {
                 type_id: 1, program: p.clone(), group_field: 1, kind: *k, agg_field: 3,
                 range_preds: vec![],
+                having: None,
             }) {
                 OpResult::Got(b) => b.to_vec(),
                 o => panic!("oracle {label}: {o:?}"),
@@ -11117,6 +11196,7 @@ mod tests {
                     (3u16, 1u8, (*lo).to_le_bytes().to_vec()),
                     (3u16, 2u8, (*hi).to_le_bytes().to_vec()),
                 ],
+                having: None,
             }) {
                 OpResult::Got(b) => b.to_vec(),
                 o => panic!("narrowed {label}: {o:?}"),
@@ -11126,6 +11206,7 @@ mod tests {
             let oracle_ro = match sm.read_only_op(Op::GroupAggregate {
                 type_id: 1, program: p.clone(), group_field: 1, kind: *k, agg_field: 3,
                 range_preds: vec![],
+                having: None,
             }) {
                 OpResult::Got(b) => b.to_vec(),
                 o => panic!("oracle_ro {label}: {o:?}"),
@@ -11136,6 +11217,7 @@ mod tests {
                     (3u16, 1u8, (*lo).to_le_bytes().to_vec()),
                     (3u16, 2u8, (*hi).to_le_bytes().to_vec()),
                 ],
+                having: None,
             }) {
                 OpResult::Got(b) => b.to_vec(),
                 o => panic!("narrowed_ro {label}: {o:?}"),
@@ -11396,7 +11478,7 @@ mod tests {
             left_type: 1, right_type: 2, left_field: 1, right_field: 2,
             limit: 0, filter: vec![], join_type: jt,
             order_by: None, limit_n: None, offset_n: None,
-            group_aggregate: Some(kessel_proto::JoinGroupAgg { group_field, aggregates }),
+            group_aggregate: Some(kessel_proto::JoinGroupAgg { group_field, aggregates, having: None }),
         }) {
             OpResult::Got(b) => b,
             o => panic!("join-agg: {o:?}"),
@@ -11480,6 +11562,7 @@ mod tests {
                 group_aggregate: Some(kessel_proto::JoinGroupAgg {
                     group_field: 1,
                     aggregates: vec![(0, 2), (0, kessel_proto::COUNT_STAR_FIELD), (1, 3)],
+                    having: None,
                 }),
             }) {
                 OpResult::Got(b) => b.to_vec(),

@@ -280,6 +280,7 @@ pub fn run_tpch(
                             (1, fid::L_DISCOUNT),      // SUM(l_discount)
                         ],
                         range_preds: q1_range.clone(),
+                        having: None,
                     });
                     drop(g);
                     let buf = match r {

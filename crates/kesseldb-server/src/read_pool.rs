@@ -401,6 +401,7 @@ mod tests {
                 kind: 0,
                 agg_field: 0,
                 range_preds: vec![],
+                having: None,
             },
             Op::SelectSorted {
                 type_id: 1,
@@ -470,6 +471,7 @@ mod tests {
                 group_field: 0,
                 aggregates: vec![(0, 0)],
                 range_preds: vec![],
+                having: None,
             },
         ]
     }
@@ -1240,6 +1242,7 @@ mod tests {
             Op::GroupAggregate {
                 type_id: 1, program: vec![], group_field: 0,
                 kind: 0, agg_field: 0, range_preds: vec![],
+                having: None,
             },
             Op::SeqRead { from: 0, limit: 0 },
             Op::Join {

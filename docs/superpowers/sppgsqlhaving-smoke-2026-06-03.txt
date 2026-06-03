@@ -1,0 +1,74 @@
+SP-PG-SQL-HAVING — HAVING filters aggregate groups — vulcan smoke
+=================================================================
+
+Date:      2026-06-03
+Host:      vulcan (admin@192.168.4.178), isolated worktree /tmp/kdb-having-wt
+Commit:    a6ced40 (origin/main HEAD at smoke time)
+Build:     CARGO_TARGET_DIR=/tmp/kdb-t-having cargo build --release --bin kesseldb --features pg-gateway
+toolchain: rustc 1.95.0 (59807616e 2026-04-14)
+Server:    /tmp/kdb-t-having/release/kesseldb 127.0.0.1:6550 /tmp/kdb-having-data
+           (KESSELDB_PG_ADDR=127.0.0.1:5550, KESSELDB_TOKEN=admin)
+Client:    psycopg2 2.9.12 -> postgresql://test:admin@127.0.0.1:5550/kesseldb
+Script:    scripts/sppgsqlhaving-smoke.py
+
+Full workspace test suite (release) — ALL GREEN
+-----------------------------------------------
+  cargo test --workspace --release  ->  2699 passed / 0 failed
+  (incl. the determinism / jepsen oracles in kessel-vsr + the simulator:
+   large_seed_corpus_is_deterministic_and_converges, partition_corpus_is_
+   deterministic, jepsen_3replica_partition_converges_byte_identical, and
+   the 3-replica byte-identity suite — 28 passed in 1966s, 226 in 53s.)
+  New HAVING tests: kessel-proto sp_pg_sql_having_wire_round_trip_and_byte_
+  identity; kessel-sql sp_pg_sql_having_planner_attaches_predicate;
+  kessel-sm sp_pg_sql_having_filters_groups.
+
+DDL + seed (3 authors with differing book counts)
+-------------------------------------------------
+  CREATE TABLE author (id BIGINT, name CHAR(32))                  -> CREATE TABLE
+  CREATE TABLE book   (id BIGINT, aid BIGINT, title CHAR(32))     -> CREATE TABLE
+  author: tolkien (3 books), asimov (2 books), lonely (1 book)
+  book:   6 rows                                                  -> INSERT 0 1 x9
+
+Baseline (NO HAVING) — all 3 groups
+------------------------------------
+  SELECT author.name, COUNT(book.id) FROM author JOIN book
+    ON author.id = book.aid GROUP BY author.name
+
+   -> [('asimov', 2), ('lonely', 1), ('tolkien', 3)]   (3 groups)
+
+HAVING filters the groups (HEADLINE — before=3 groups each time)
+---------------------------------------------------------------
+  ... GROUP BY author.name HAVING COUNT(book.id) >  2   -> [('tolkien', 3)]            after=1
+  ... GROUP BY author.name HAVING COUNT(book.id) >= 2   -> [('asimov',2),('tolkien',3)] after=2
+  ... GROUP BY author.name HAVING COUNT(book.id) =  1   -> [('lonely', 1)]             after=1
+  ... GROUP BY author.name HAVING COUNT(book.id) <> 3   -> [('asimov',2),('lonely',1)] after=2
+  ... GROUP BY author.name HAVING COUNT(book.id) > 99   -> []                          after=0
+
+Smoke output
+------------
+# psycopg2 2.9.12 (dt dec pq3 ext lo64) -> postgresql://test:admin@127.0.0.1:5550/kesseldb
+STAGE ddl: PASS author + book created
+STAGE seed: PASS 3 authors, 6 books
+STAGE baseline_groups: PASS 3 groups (no HAVING): [('asimov', 2), ('lonely', 1), ('tolkien', 3)]
+STAGE having_gt2: PASS before=3 after=1 -> [('tolkien', 3)]
+STAGE having_ge2: PASS before=3 after=2 -> [('asimov', 2), ('tolkien', 3)]
+STAGE having_eq1: PASS before=3 after=1 -> [('lonely', 1)]
+STAGE having_ne3: PASS before=3 after=2 -> [('asimov', 2), ('lonely', 1)]
+STAGE having_none: PASS before=3 after=0 -> []
+
+=== SP-PG-SQL-HAVING SMOKE SUMMARY ===
+  PASS  ddl
+  PASS  seed
+  PASS  baseline_groups
+  PASS  having_gt2
+  PASS  having_ge2
+  PASS  having_eq1
+  PASS  having_ne3
+  PASS  having_none
+--- 8/8 stages PASS ---
+HAVING SMOKE COMPLETE
+
+Result: 8/8 stages PASS. HAVING drops exactly the groups whose aggregate
+fails the predicate (all six comparison spellings exercised: > >= = <> and
+the empty-result edge), over the real PostgreSQL wire — confirming the
+end-to-end SQL -> Op -> engine -> gateway path.

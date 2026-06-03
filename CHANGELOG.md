@@ -7,6 +7,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning [Se
 
 ### Added
 
+- **`HAVING` filters aggregate groups (SP-PG-SQL-HAVING, 2026-06-03)** — a
+  `HAVING <AGG>(...) <cmp> <literal>` clause now filters GROUPS after
+  aggregation, on the plain (`SELECT col, COUNT(*) FROM t GROUP BY col HAVING
+  COUNT(*) >= 3`) and the over-JOIN (`SELECT a.name, COUNT(b.id) FROM a JOIN b
+  ON … GROUP BY a.name HAVING COUNT(b.id) > 2`) forms. Spans all three
+  group-aggregate ops (`Op::GroupAggregate`, `Op::GroupAggregateMulti`, and
+  `Op::Join`'s `JoinGroupAgg`) via ONE additive, marker-guarded
+  `Option<HavingPred>` field — a query with NO `HAVING` produces **byte-identical
+  `Op` frames** to before, so the determinism oracles stay green. The SQL layer
+  parses `HAVING` after `GROUP BY`, matches its aggregate to a SELECTed aggregate
+  by `(function, arg)`, supports `> >= < <= = <> !=` (the lexer gained the
+  SQL-standard `<>`) and a negative literal RHS, and cleanly rejects a `HAVING`
+  aggregate not in the projection (V1). The engine applies the filter on the
+  single deterministic apply thread over the already-deterministic per-group
+  result, before order/limit paging. Gateway unchanged (fewer groups → fewer
+  rows). vulcan psql smoke: baseline 3 groups → `HAVING COUNT(book.id) > 2` →
+  **1 group**; `>= 2` → 2; `= 1` → 1; `<> 3` → 2; `> 99` → 0.
 - **CAPSTONE: realistic multi-model SQLAlchemy blog app — 8/8
   (SP-PG-ORM-REALAPP, 2026-06-03)** — a realistic THREE-model SQLAlchemy 2.0
   application (`User` 1—N `Post` 1—N `Comment`, FKs + declarative

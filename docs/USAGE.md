@@ -373,6 +373,7 @@ SELECT * FROM <t> [WHERE <expr>]                 -- =, !=, <, <=, >, >=, AND/OR/
 SELECT <c1>, <c2> FROM <t> [WHERE ...]           -- projection
 SELECT COUNT(*) | SUM(c) | MIN(c) | MAX(c) | AVG(c) FROM <t> [WHERE ...]
        [GROUP BY <col>]
+       [HAVING <AGG>(...) <cmp> <literal>]              --   filter groups by an aggregate (SP-PG-SQL-HAVING)
 SELECT * FROM <t> [WHERE ...] ORDER BY <col> [DESC] [OFFSET n] [LIMIT n]
 SELECT <proj> FROM <a> [LEFT [OUTER]] JOIN <b> ON <a.x> = <b.y>  -- equi‑join
        [WHERE <pred over a.* / b.*>]                    --   INNER (default) or LEFT; filtered (qualified cols, AND/OR/…)
@@ -380,6 +381,7 @@ SELECT <proj> FROM <a> [LEFT [OUTER]] JOIN <b> ON <a.x> = <b.y>  -- equi‑join
 SELECT <a.g>, <AGG>( * | <a.c | b.c> ) [AS alias] [, <AGG>(…) …]  -- grouped aggregate over a join
        FROM <a> [LEFT [OUTER]] JOIN <b> ON <a.x> = <b.y> [WHERE …]
        GROUP BY <a.g>                                   --   COUNT/SUM/MIN/MAX/AVG per group; one row per group
+       [HAVING <AGG>(...) <cmp> <literal>]              --   filter groups after aggregation (SP-PG-SQL-HAVING)
 ```
 
 A bare `JOIN` is an INNER equi‑join. `LEFT [OUTER] JOIN` returns EVERY left
@@ -409,8 +411,25 @@ values. For a `LEFT JOIN`, an unmatched parent (all `b.*` = NULL) makes
 `COUNT(b.id)` = 0 but `COUNT(*)` = 1 — the classic LEFT-JOIN-COUNT gotcha,
 matching PostgreSQL exactly. The group + aggregate columns may come from either
 table; qualify an aggregate arg (`COUNT(b.id)`) when the column name exists in
-both tables. (V1: one GROUP BY column; `HAVING`, multi-column GROUP BY, and
-3+-table join-agg are named follow-ups.)
+both tables. (V1: one GROUP BY column; multi-column GROUP BY and 3+-table
+join-agg are named follow-ups.)
+
+`HAVING <AGG>(...) <cmp> <literal>` (SP-PG-SQL-HAVING) filters the GROUPS *after*
+aggregation — the "only show parents with more than N children" report:
+
+```sql
+SELECT a.name, COUNT(b.id) FROM a JOIN b ON a.id = b.aid
+GROUP BY a.name HAVING COUNT(b.id) > 2
+```
+
+returns only the groups whose aggregate satisfies the predicate (here, parents
+with 3+ related rows). The HAVING aggregate MUST be one of the SELECT
+aggregates (matched by function + arg); `<cmp>` is any of `> >= < <= = <> !=`
+and the RHS is an integer/numeric literal (negative allowed). HAVING composes
+with `ORDER BY` / `LIMIT` (the groups are filtered before paging) and works on
+both the plain `GROUP BY` and the over-JOIN forms. (V1: the HAVING aggregate
+must appear in the projection — a HAVING over an aggregate not selected, or over
+the group key, is a named follow-up.)
 
 `WHERE` supports `AND`/`OR`/`NOT`, all of `= != < <= > >=`, and `IN`/`BETWEEN` (incl. `NOT IN`/`NOT BETWEEN`). `SELECT *` returns
 length‑prefixed record blobs; use `DESCRIBE <t>` to decode them against the

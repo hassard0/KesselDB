@@ -154,6 +154,30 @@ COUNT(book.id) … GROUP BY author.name` → **tolkien 2, lewis 1**. Determinism
 preserved (BTreeMap ascending key + associative fold over deterministic scan order;
 seed-7 + 3-replica oracle PASS). Named follow-ups: SP-PG-SQL-HAVING,
 SP-PG-SQL-JOIN-GROUP-MULTI, SP-PG-SQL-JOIN-AGG-3TABLE, SP-PG-SQL-JOIN-AGG-ORDERBY-AGG.
+SP-PG-SQL-HAVING (2026-06-03, +3 KATs, DONE) — `HAVING <AGG>(...) <cmp> <literal>`
+filters aggregate GROUPS after grouping (`SELECT a.name, COUNT(b.id) FROM a JOIN b
+ON … GROUP BY a.name HAVING COUNT(b.id) > 2`, and the plain `SELECT col, COUNT(*)
+FROM t GROUP BY col HAVING COUNT(*) >= 3`). Spans all three group-aggregate paths:
+`Op::GroupAggregate`, `Op::GroupAggregateMulti`, and `Op::Join`'s `JoinGroupAgg`.
+New `HavingPred { agg_index, op, value: i128 }` (`keep(results)` ==
+`results[agg_index] <op> value`) added as ONE additive, marker-guarded
+`Option<HavingPred>` field on each. Byte-identity preserved: the HAVING block is
+emitted ONLY when present (tag-22 forces the range-preds length prefix only when
+HAVING is set), so every no-HAVING frame is BYTE-IDENTICAL to pre-arc; a non-1
+HAVING marker is rejected at decode. The SQL layer parses HAVING after GROUP BY,
+matches its aggregate to a PROJECTED aggregate by (kind, arg field) → `agg_index`,
+and rejects a HAVING aggregate not in the SELECT list (V1). Lexer gained the
+SQL-standard `<>` inequality (both `<>` and `!=` map to one opcode). The engine
+applies HAVING on the single deterministic apply thread over the already-
+deterministic per-group result, BEFORE order/limit paging (a pure function of the
+input rows). Gateway needs NO change — `render_join_group_aggregate` decodes
+`[u32 ngroups]…` so fewer surviving groups render fewer rows. vulcan psql smoke
+(HAVING over JOIN): baseline 3 groups → `HAVING COUNT(book.id) > 2` → **1 group
+{tolkien:3}**; `>= 2` → 2 groups; `= 1` → {lonely:1}; `<> 3` → 2 groups; `> 99`
+→ 0 groups. Determinism preserved (seed-corpus + 3-replica byte-identity oracle
+PASS). V1 scope: the HAVING aggregate MUST be in the projection; HAVING over an
+aggregate not selected, over the group key, or on a scalar (no GROUP BY) are named
+follow-ups (SP-PG-SQL-HAVING-EXTRA-AGG, SP-PG-SQL-HAVING-KEY).
 SP-PG-ORM-REALAPP (2026-06-03, CAPSTONE, +3 KATs, DONE) — the headline
 real-world-readiness test: a realistic THREE-model SQLAlchemy 2.0 BLOG app
 (`User` 1—N `Post` 1—N `Comment`, FKs + `relationship()`, insertmanyvalues

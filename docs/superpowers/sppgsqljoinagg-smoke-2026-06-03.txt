@@ -1,0 +1,42 @@
+=== SP-PG-SQL-JOIN-AGG vulcan psql smoke (2026-06-03) ===
+# kesseldb (join-agg build), pg=127.0.0.1:5555 native=127.0.0.1:6555, CARGO_TARGET_DIR=/tmp/kdb-t-ja, fresh /tmp/kdb-ja-data2
+# build: cargo build --release --bin kesseldb --features pg-gateway
+
+--- schema + data ---
+CREATE TABLE
+CREATE TABLE
+INSERT 0 2
+INSERT 0 3
+
+--- HEADLINE: count related rows per parent -> tolkien 2, lewis 1 ---
+ author.name | count
+-------------+-------
+ lewis       |     1
+ tolkien     |     2
+(2 rows)
+
+
+--- COUNT(*) = group size ---
+ author.name | count
+-------------+-------
+ lewis       |     1
+ tolkien     |     2
+(2 rows)
+
+
+--- aggregate alias: COUNT(book.id) AS cnt ---
+ author.name | cnt
+-------------+-----
+ lewis       |   1
+ tolkien     |   2
+(2 rows)
+
+
+--- LEFT join: orphan author (no books) -> COUNT(book.id)=0 but COUNT(*)=1 (PG LEFT-JOIN-COUNT) ---
+INSERT 0 1
+ author.name | count | count
+-------------+-------+-------
+ lewis       |     1 |     1
+ orphan      |     0 |     1
+ tolkien     |     2 |     2
+(3 rows)

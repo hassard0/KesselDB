@@ -819,6 +819,180 @@ pub fn join_projection(sql: &str) -> Option<(Vec<JoinProjCol>, bool)> {
     Some((cols, is_star))
 }
 
+/// SP-PG-SQL-JOIN-AGG — one aggregate in a join-group-aggregate projection:
+/// its kind code + optional output column name (alias or the PG default like
+/// `count`). The arg column is not needed for rendering (the engine returns the
+/// computed value); only the OUTPUT name + kind matter for RowDescription.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinAggOut {
+    /// 0 COUNT / 1 SUM / 2 MIN / 3 MAX / 4 AVG.
+    pub kind: u8,
+    /// RowDescription column name (alias if given, else the PG default name).
+    pub out_name: String,
+}
+
+/// SP-PG-SQL-JOIN-AGG — the gateway-facing description of a join-group-aggregate
+/// SELECT (`SELECT a.name, COUNT(b.id) [AS c] FROM a JOIN b ON … GROUP BY a.name
+/// [ORDER BY …]`). Carries the GROUP BY column's qualifier + column (so the
+/// gateway can resolve its FieldKind via the qualifier's table schema and name
+/// the RowDescription column) + the ordered aggregate outputs. The engine result
+/// is value-only (`[u32 ngroups]…`), so this recovers the column shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinGroupAggProj {
+    /// GROUP BY column qualifier (table name) — always present (V1 requires it).
+    pub group_qualifier: String,
+    /// GROUP BY column name.
+    pub group_column: String,
+    /// One per aggregate, in projection order.
+    pub aggregates: Vec<JoinAggOut>,
+}
+
+/// SP-PG-SQL-JOIN-AGG — if `sql` is a join-group-aggregate SELECT
+/// (`SELECT <group col>, <AGG>(…)+ [AS …] FROM a [LEFT [OUTER]] JOIN b ON …
+/// [WHERE …] GROUP BY <group col> [ORDER BY …] [LIMIT …]`), return its
+/// `JoinGroupAggProj`. `None` for any other shape (the caller falls back to the
+/// existing render paths). Lexer-backed; mirrors `join_projection`.
+///
+/// The engine compiles this same SQL to `Op::Join { group_aggregate: Some(..) }`
+/// and returns the group-aggregate `[u32 ngroups][u32 keylen][key][16B × n]…`
+/// stream; this helper recovers the OUTPUT column shape (group col + agg names)
+/// so the gateway can emit a RowDescription + decode the value stream.
+pub fn join_group_aggregate(sql: &str) -> Option<JoinGroupAggProj> {
+    fn agg_code(w: &str) -> Option<u8> {
+        match w.to_ascii_uppercase().as_str() {
+            "COUNT" => Some(0),
+            "SUM" => Some(1),
+            "MIN" => Some(2),
+            "MAX" => Some(3),
+            "AVG" => Some(4),
+            _ => None,
+        }
+    }
+    let toks = lex(sql).ok()?;
+    let mut it = toks.iter().peekable();
+    match it.next()? {
+        Tok::Ident(k) if k.eq_ignore_ascii_case("SELECT") => {}
+        _ => return None,
+    }
+    // Leading group column `t.c` (V1 requires a qualifier).
+    let group_qualifier = match it.next()? {
+        Tok::Ident(q) => q.clone(),
+        _ => return None,
+    };
+    match it.next()? {
+        Tok::Punct('.') => {}
+        _ => return None, // V1: the group column must be qualified
+    }
+    let group_column = match it.next()? {
+        Tok::Ident(c) => c.clone(),
+        _ => return None,
+    };
+    // Optional `AS <alias>` on the group column — accept-and-skip (rendered by
+    // its source name, like the projection paths).
+    if matches!(it.peek(), Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("AS")) {
+        it.next();
+        match it.next()? {
+            Tok::Ident(_) => {}
+            _ => return None,
+        }
+    }
+    // Then a comma + ≥1 aggregate.
+    match it.next()? {
+        Tok::Punct(',') => {}
+        _ => return None, // a group-agg projection has the agg after the group col
+    }
+    let mut aggregates: Vec<JoinAggOut> = Vec::new();
+    loop {
+        let kind = match it.next()? {
+            Tok::Ident(w) => agg_code(w)?,
+            _ => return None,
+        };
+        match it.next()? {
+            Tok::Punct('(') => {}
+            _ => return None,
+        }
+        // arg: `*` | `[t.]col`
+        match it.next()? {
+            Tok::Star => {}
+            Tok::Ident(_) => {
+                if matches!(it.peek(), Some(Tok::Punct('.'))) {
+                    it.next();
+                    match it.next()? {
+                        Tok::Ident(_) => {}
+                        _ => return None,
+                    }
+                }
+            }
+            _ => return None,
+        }
+        match it.next()? {
+            Tok::Punct(')') => {}
+            _ => return None,
+        }
+        // optional `AS <alias>`
+        let out_name = if matches!(it.peek(), Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("AS")) {
+            it.next();
+            match it.next()? {
+                Tok::Ident(a) => a.clone(),
+                _ => return None,
+            }
+        } else {
+            agg_default_name(kind).to_string()
+        };
+        aggregates.push(JoinAggOut { kind, out_name });
+        match it.peek() {
+            Some(Tok::Punct(',')) => {
+                it.next();
+                continue;
+            }
+            _ => break,
+        }
+    }
+    if aggregates.is_empty() {
+        return None;
+    }
+    // `FROM <a> [LEFT [OUTER]] JOIN <b>` — confirm the join shape.
+    match it.next()? {
+        Tok::Ident(k) if k.eq_ignore_ascii_case("FROM") => {}
+        _ => return None,
+    }
+    match it.next()? {
+        Tok::Ident(_) => {} // left table
+        _ => return None,
+    }
+    let after_left = match it.next() {
+        Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("LEFT") => {
+            if matches!(it.peek(), Some(Tok::Ident(o)) if o.eq_ignore_ascii_case("OUTER")) {
+                it.next();
+            }
+            it.next()
+        }
+        other => other,
+    };
+    match after_left {
+        Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("JOIN") => {}
+        _ => return None,
+    }
+    // Confirm a GROUP BY appears somewhere downstream (it must, for this to be a
+    // group-aggregate; the engine compile requires it). Scan the remaining
+    // tokens for a top-level `GROUP BY`.
+    let mut saw_group = false;
+    while let Some(t) = it.next() {
+        if let Tok::Ident(k) = t {
+            if k.eq_ignore_ascii_case("GROUP") {
+                if matches!(it.peek(), Some(Tok::Ident(b)) if b.eq_ignore_ascii_case("BY")) {
+                    saw_group = true;
+                    break;
+                }
+            }
+        }
+    }
+    if !saw_group {
+        return None;
+    }
+    Some(JoinGroupAggProj { group_qualifier, group_column, aggregates })
+}
+
 /// SP-PG-SERIAL-RETURNING: if `sql` is an `INSERT INTO <table> … RETURNING
 /// col1, col2, …`, return `(table, [col1, col2, …])` so the gateway can
 /// emit a RowDescription + DataRow of the returned (e.g. engine-assigned)
@@ -3042,6 +3216,12 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
     struct AggSpec {
         kind: u8,
         field: Option<String>,
+        // SP-PG-SQL-JOIN-AGG: the aggregate arg's table qualifier, preserved so
+        // the JOIN group-aggregate path can resolve `COUNT(b.id)` against the
+        // combined `(a ++ b)` schema unambiguously even when `id` exists in both
+        // tables. `None` for `COUNT(*)` or an unqualified arg. The single-table
+        // aggregate path ignores this (it resolves against one table).
+        qualifier: Option<String>,
         // The alias is captured so `AGG(...) AS alias` parses without
         // error; the gateway's `select_aggregate` text-helper (not this
         // in-parser struct) reads it to name the RowDescription column, so
@@ -3073,13 +3253,29 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
             _ => return Err("aggregate name expected".into()),
         };
         p.punct('(')?;
+        let mut qualifier: Option<String> = None;
         let field = if matches!(p.peek(), Some(Tok::Star)) {
             p.i += 1;
             None
         } else {
             // SP-PG-SQL-ORM-PARSE T2 — aggregate arg may be qualified
-            // (`COUNT(orm_users.id)`); strip the qualifier.
-            Some(p.col_ident()?)
+            // (`COUNT(orm_users.id)`); the single-table path strips the
+            // qualifier, but SP-PG-SQL-JOIN-AGG needs it to disambiguate
+            // `COUNT(b.id)` across the two joined tables, so capture it.
+            let first = p.ident()?;
+            if matches!(p.peek(), Some(Tok::Punct('.'))) {
+                p.i += 1; // consume `.`
+                let col = p.ident()?;
+                if matches!(p.peek(), Some(Tok::Punct('.'))) {
+                    return Err(
+                        "schema-qualified column `a.b.c` not supported".into(),
+                    );
+                }
+                qualifier = Some(first);
+                Some(col)
+            } else {
+                Some(first)
+            }
         };
         p.punct(')')?;
         // SP-PG-SQL-AGG-ALIAS-RENDER — optional output alias `AS <ident>`
@@ -3091,7 +3287,7 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
         } else {
             None
         };
-        Ok(AggSpec { kind, field, alias })
+        Ok(AggSpec { kind, field, qualifier, alias })
     }
     let proj = if matches!(p.peek(), Some(Tok::Star)) {
         p.i += 1;
@@ -3212,6 +3408,110 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
         } else {
             Vec::new()
         };
+        // SP-PG-SQL-JOIN-AGG: optional `GROUP BY <qualified col>` after the
+        // optional WHERE. Present ⇒ the projection MUST be `<group col>, <agg>+`
+        // (a `Proj::Aggs`); we resolve the group column + each aggregate arg
+        // against the SAME combined `(a ++ b)` schema the engine builds and emit
+        // an `Op::Join { group_aggregate: Some(..) }`. The engine groups the
+        // combined rows + aggregates per group, returning the group-aggregate
+        // result encoding. Composes with the WHERE filter above.
+        let cot_ga = combined_join_type(&ot, &rt);
+        let resolve_combined = |qt: &str, qc: &str| -> Result<u16, SqlError> {
+            if qt != ot.name && qt != rt.name {
+                return Err(format!(
+                    "qualifier `{qt}` is not one of the joined tables `{}` / `{}`",
+                    ot.name, rt.name
+                ));
+            }
+            let cn = format!("{qt}.{qc}");
+            cot_ga
+                .fields
+                .iter()
+                .find(|f| f.name == cn)
+                .map(|f| f.field_id)
+                .ok_or_else(|| unknown_column_err(&cn, &cot_ga))
+        };
+        let mut group_aggregate: Option<kessel_proto::JoinGroupAgg> = None;
+        if p.kw("GROUP") {
+            p.expect_kw("BY")?;
+            // qualified `a.c` (V1 requires a qualifier so the combined-schema
+            // resolution is unambiguous across the two tables).
+            let gqt = p.ident()?;
+            p.punct('.')?;
+            let gqc = p.ident()?;
+            let group_field = resolve_combined(&gqt, &gqc)?;
+            // The projection must be the aggregate shape. Pull the leading group
+            // column(s) + aggregates out of `proj` (parsed up-front).
+            let (leading_cols, aggs) = match &proj {
+                Proj::Aggs { leading_cols, aggs } => (leading_cols, aggs),
+                _ => {
+                    return Err(
+                        "GROUP BY over a JOIN requires an aggregate projection \
+                         (e.g. `SELECT a.name, COUNT(b.id) … GROUP BY a.name`)"
+                            .into(),
+                    )
+                }
+            };
+            // V1: exactly one leading group column, and it must match the GROUP
+            // BY column (by its bare column name — `col_ident` already stripped
+            // the qualifier when the projection was parsed).
+            if leading_cols.len() != 1 {
+                return Err(
+                    "JOIN GROUP BY V1 supports exactly one leading group column \
+                     matching the GROUP BY column"
+                        .into(),
+                );
+            }
+            if leading_cols[0] != gqc {
+                return Err(format!(
+                    "GROUP BY column `{gqc}` must match the leading projection \
+                     column `{}`",
+                    leading_cols[0]
+                ));
+            }
+            // Resolve each aggregate's argument to a combined field id. `COUNT(*)`
+            // (no arg) ⇒ the COUNT_STAR sentinel; `COUNT(col)` / SUM / MIN / MAX /
+            // AVG carry the real combined field id. The arg may be qualified
+            // (`b.id`) — `parse_agg` stored the bare column (qualifier stripped),
+            // so we resolve it by suffix against the combined schema.
+            let mut aggregates: Vec<(u8, u16)> = Vec::with_capacity(aggs.len());
+            for a in aggs {
+                let fid = match (&a.field, &a.qualifier) {
+                    (None, _) => kessel_proto::COUNT_STAR_FIELD, // COUNT(*)
+                    // Qualified `COUNT(b.id)` → resolve the exact combined name.
+                    (Some(col), Some(qt)) => resolve_combined(qt, col)?,
+                    // Bare `COUNT(id)` → resolve by `.<col>` suffix across the
+                    // combined schema; ambiguous (in both tables) ⇒ error.
+                    (Some(col), None) => {
+                        let matches: Vec<u16> = cot_ga
+                            .fields
+                            .iter()
+                            .filter(|f| {
+                                f.name
+                                    .rsplit('.')
+                                    .next()
+                                    .map(|tail| tail == col)
+                                    .unwrap_or(false)
+                            })
+                            .map(|f| f.field_id)
+                            .collect();
+                        match matches.as_slice() {
+                            [one] => *one,
+                            [] => return Err(unknown_column_err(col, &cot_ga)),
+                            _ => {
+                                return Err(format!(
+                                    "aggregate column `{col}` is ambiguous across \
+                                     the joined tables — qualify it"
+                                ))
+                            }
+                        }
+                    }
+                };
+                aggregates.push((a.kind, fid));
+            }
+            group_aggregate =
+                Some(kessel_proto::JoinGroupAgg { group_field, aggregates });
+        }
         // SP-PG-SQL-JOIN-QUERY: optional `ORDER BY <qualified col> [ASC|DESC]`
         // then `LIMIT n` / `OFFSET m`, composing with the optional WHERE above.
         // The ORDER BY column resolves against the SAME combined `(a ++ b)`
@@ -3291,6 +3591,7 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
             order_by,
             limit_n,
             offset_n,
+            group_aggregate,
         });
     }
     // Primary-key fast path: `SELECT ... FROM t ID <n>` -> O(1) GetById
@@ -6677,6 +6978,103 @@ mod tests {
         assert_eq!(
             titles(&mut sm, 22, "SELECT a.name, b.title FROM a JOIN b ON a.id=b.aid ORDER BY b.title DESC"),
             vec!["silmarillion".to_string(), "lotr".to_string(), "hobbit".to_string()],
+        );
+    }
+
+    /// SP-PG-SQL-JOIN-AGG: `SELECT a.name, COUNT(b.id) FROM a JOIN b … GROUP BY
+    /// a.name` compiles to `Op::Join { group_aggregate: Some(..) }` with the
+    /// group + agg field ids resolved against the combined `(a ++ b)` schema.
+    /// COUNT(*) → the sentinel field id; qualified `COUNT(b.id)` disambiguates
+    /// `id` across the two tables. A bare join (no GROUP BY) stays
+    /// `group_aggregate: None` (regression).
+    #[test]
+    fn join_group_aggregate_parses() {
+        use kessel_proto::{Op, COUNT_STAR_FIELD};
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE a (id U64 NOT NULL, name CHAR(16) NOT NULL)");
+        run(&mut sm, 2, "CREATE TABLE b (id U64 NOT NULL, aid U64 NOT NULL, title CHAR(16) NOT NULL)");
+        let cat = sm.catalog().clone();
+        // Combined schema: a.id(0), a.name(1), b.id(2), b.aid(3), b.title(4).
+        // GROUP BY a.name (1), COUNT(b.id) (2).
+        match compile("SELECT a.name, COUNT(b.id) FROM a JOIN b ON a.id=b.aid GROUP BY a.name", &cat).unwrap() {
+            Op::Join { group_aggregate: Some(ga), .. } => {
+                assert_eq!(ga.group_field, 1);
+                assert_eq!(ga.aggregates, vec![(0u8, 2u16)]);
+            }
+            o => panic!("expected join-agg, got {o:?}"),
+        }
+        // COUNT(*) ⇒ sentinel field id.
+        match compile("SELECT a.name, COUNT(*) FROM a JOIN b ON a.id=b.aid GROUP BY a.name", &cat).unwrap() {
+            Op::Join { group_aggregate: Some(ga), .. } => {
+                assert_eq!(ga.aggregates, vec![(0u8, COUNT_STAR_FIELD)]);
+            }
+            o => panic!("expected join-agg COUNT(*), got {o:?}"),
+        }
+        // Multi-aggregate: COUNT(b.id), SUM(b.aid) over a LEFT join + alias.
+        match compile("SELECT a.name, COUNT(b.id) AS c, SUM(b.aid) FROM a LEFT JOIN b ON a.id=b.aid GROUP BY a.name", &cat).unwrap() {
+            Op::Join { join_type, group_aggregate: Some(ga), .. } => {
+                assert_eq!(join_type, kessel_proto::JoinType::Left);
+                assert_eq!(ga.group_field, 1);
+                assert_eq!(ga.aggregates, vec![(0u8, 2u16), (1u8, 3u16)]);
+            }
+            o => panic!("expected multi join-agg, got {o:?}"),
+        }
+        // Regression: a bare join with NO GROUP BY stays group_aggregate=None.
+        match compile("SELECT a.name, b.title FROM a JOIN b ON a.id=b.aid", &cat).unwrap() {
+            Op::Join { group_aggregate: None, .. } => {}
+            o => panic!("bare join must have no group_aggregate, got {o:?}"),
+        }
+        // A GROUP BY column that doesn't match the leading projection col errors.
+        assert!(compile("SELECT a.name, COUNT(b.id) FROM a JOIN b ON a.id=b.aid GROUP BY b.title", &cat).is_err());
+    }
+
+    /// SP-PG-SQL-JOIN-AGG end-to-end: COUNT(b.id) per author over the join,
+    /// run through the engine, returns the group-aggregate stream with the
+    /// expected per-group counts (tolkien 2, lewis 1). Groups ascending.
+    #[test]
+    fn join_group_aggregate_runs() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE a (id U64 NOT NULL, name CHAR(16) NOT NULL)");
+        run(&mut sm, 2, "CREATE TABLE b (id U64 NOT NULL, aid U64 NOT NULL, title CHAR(16) NOT NULL)");
+        run(&mut sm, 3, "INSERT INTO a ID 1 (id, name) VALUES (1, 'tolkien')");
+        run(&mut sm, 4, "INSERT INTO a ID 2 (id, name) VALUES (2, 'lewis')");
+        run(&mut sm, 5, "INSERT INTO b ID 1 (id, aid, title) VALUES (1, 1, 'lotr')");
+        run(&mut sm, 6, "INSERT INTO b ID 2 (id, aid, title) VALUES (2, 1, 'hobbit')");
+        run(&mut sm, 7, "INSERT INTO b ID 3 (id, aid, title) VALUES (3, 2, 'narnia')");
+
+        // Decode the group-aggregate result into (name, count) pairs.
+        fn counts(sm: &mut StateMachine<MemVfs>, seq: u64, sql: &str) -> Vec<(String, i128)> {
+            match run(sm, seq, sql) {
+                OpResult::Got(b) => {
+                    let ng = u32::from_le_bytes(b[0..4].try_into().unwrap()) as usize;
+                    let mut p = 4;
+                    let mut out = Vec::new();
+                    for _ in 0..ng {
+                        let kl = u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize;
+                        p += 4;
+                        let name = String::from_utf8_lossy(
+                            kessel_expr::right_trim_char_pad(&b[p..p + kl])).into_owned();
+                        p += kl;
+                        let v = i128::from_le_bytes(b[p..p + 16].try_into().unwrap());
+                        p += 16;
+                        out.push((name, v));
+                    }
+                    assert_eq!(p, b.len());
+                    out
+                }
+                o => panic!("{o:?}"),
+            }
+        }
+        // HEADLINE: count related rows per parent — tolkien 2, lewis 1 (groups
+        // ascending: lewis, tolkien).
+        assert_eq!(
+            counts(&mut sm, 20, "SELECT a.name, COUNT(b.id) FROM a JOIN b ON a.id=b.aid GROUP BY a.name"),
+            vec![("lewis".to_string(), 1), ("tolkien".to_string(), 2)],
+        );
+        // COUNT(*) = group size (same here, every combined row is matched).
+        assert_eq!(
+            counts(&mut sm, 21, "SELECT a.name, COUNT(*) FROM a JOIN b ON a.id=b.aid GROUP BY a.name"),
+            vec![("lewis".to_string(), 1), ("tolkien".to_string(), 2)],
         );
     }
 

@@ -7,6 +7,39 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning [Se
 
 ### Added
 
+- **Grouped aggregates over joins — `JOIN … GROUP BY + COUNT/SUM/MIN/MAX/AVG`
+  (SP-PG-SQL-JOIN-AGG, 2026-06-03)** — `SELECT a.name, COUNT(b.id) FROM a JOIN b
+  ON a.id=b.aid [WHERE …] GROUP BY a.name`, the dashboard/reporting query that
+  counts (or sums / …) the related rows per parent. Composes the SP22 / SP-
+  Analytic-Plan-MULTI group-aggregate fold with the combined join rows. `Op::Join`
+  gained ONE additive field `group_aggregate: Option<JoinGroupAgg>` (a combined-
+  schema `group_field` + `Vec<(kind, field_id)>` aggregate list, both referencing
+  the `(a ++ b)` layout). When set, the engine groups the surviving combined
+  `Vec<Value>` rows by the group field into a `BTreeMap` (ascending key order ⇒
+  deterministic) and folds the aggregates per group over the DECODED Values,
+  emitting the `[u32 ngroups][u32 keylen][key][16B i128 × n_aggs]` group-aggregate
+  result (the `Op::GroupAggregateMulti` shape) instead of the join row stream.
+  Because the fold runs over decoded Values, PostgreSQL NULL semantics fall out:
+  `COUNT(b.id)` on a LEFT-join unmatched parent counts 0 (the NULL b.id is not
+  counted) while `COUNT(*)` counts 1 (the combined row exists) — the classic
+  LEFT-JOIN-COUNT gotcha, exact. `COUNT(*)` is encoded with a `COUNT_STAR_FIELD`
+  sentinel field id; a qualified `COUNT(b.id)` disambiguates `id` across the two
+  tables. kessel-sql resolves the group + aggregate field ids against the same
+  combined schema the engine builds; both `apply_join` sites (main + RO-Txn
+  bypass) share the fold. The PG gateway gains the FIRST group-aggregate render
+  (`render_join_group_aggregate` + the `join_group_aggregate` text helper):
+  RowDescription = [group col (its OID), agg cols (int8)], one DataRow per group
+  (group key decoded by its FieldKind, each i128 → decimal). The wire change is
+  additive — a marker-guarded ga block appended ONLY when `group_aggregate` is
+  set, so every non-grouped join (bare / filtered / left / paginated) is byte-
+  identical to the pre-arc frame and a corrupt marker is rejected at decode.
+  Determinism (BTreeMap ascending key order + associative per-slot fold over the
+  deterministic combined-row scan order ⇒ byte-identical on every replica) —
+  VSR seed-7 + 3-replica oracle green. vulcan smoke: `SELECT author.name,
+  COUNT(book.id) … GROUP BY author.name` → `tolkien 2, lewis 1`. Named follow-ups:
+  SP-PG-SQL-HAVING, SP-PG-SQL-JOIN-GROUP-MULTI, SP-PG-SQL-JOIN-AGG-3TABLE,
+  SP-PG-SQL-JOIN-AGG-ORDERBY-AGG.
+
 - **Paginated joins — `JOIN … ORDER BY / LIMIT / OFFSET` (SP-PG-SQL-JOIN-QUERY,
   2026-06-03)** — `SELECT a.name, b.title FROM a JOIN b ON a.id=b.aid [WHERE …]
   ORDER BY b.created LIMIT 20 OFFSET 40`, the paginated-list-view shape behind

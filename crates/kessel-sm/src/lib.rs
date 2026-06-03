@@ -1103,6 +1103,7 @@ impl<V: Vfs> StateMachine<V> {
         order_by: Option<(u16, bool)>,
         limit_n: Option<u64>,
         offset_n: Option<u64>,
+        group_aggregate: Option<&kessel_proto::JoinGroupAgg>,
     ) -> OpResult {
         let lt = match self.catalog.get(left_type) {
             Some(t) => t.clone(),
@@ -1182,6 +1183,52 @@ impl<V: Vfs> StateMachine<V> {
             None => None,
         };
 
+        // SP-PG-SQL-JOIN-AGG: resolve the GROUP BY field id + each aggregate's
+        // arg field id to combined-schema indices. The group key + aggregate
+        // values are read from the DECODED combined `Vec<Value>` rows, so a
+        // LEFT-join NULL b-column is a first-class `Value::Null` (COUNT(col) /
+        // SUM / MIN / MAX / AVG skip it, COUNT(*) still counts the row).
+        // `agg_spec[i]` = (kind, Option<combined idx>); None idx ⇒ COUNT(*).
+        let ga_spec: Option<(usize, kessel_catalog::FieldKind, usize, Vec<(u8, Option<usize>)>)> =
+            match group_aggregate {
+                Some(ga) => {
+                    let gidx = match combined.iter().position(|f| f.field_id == ga.group_field) {
+                        Some(i) => i,
+                        None => {
+                            return OpResult::SchemaError(format!(
+                                "no join group field {}",
+                                ga.group_field
+                            ))
+                        }
+                    };
+                    let gkind = combined[gidx].kind;
+                    let gwidth = combined[gidx].kind.width() as usize;
+                    let mut aspec: Vec<(u8, Option<usize>)> =
+                        Vec::with_capacity(ga.aggregates.len());
+                    for (kind, fid) in &ga.aggregates {
+                        if *kind > 4 {
+                            return OpResult::SchemaError(
+                                "join-agg kind must be 0|1|2|3|4".into(),
+                            );
+                        }
+                        if *kind == 0 && *fid == kessel_proto::COUNT_STAR_FIELD {
+                            aspec.push((*kind, None)); // COUNT(*)
+                        } else {
+                            match combined.iter().position(|f| f.field_id == *fid) {
+                                Some(i) => aspec.push((*kind, Some(i))),
+                                None => {
+                                    return OpResult::SchemaError(format!(
+                                        "no join agg field {fid}"
+                                    ))
+                                }
+                            }
+                        }
+                    }
+                    Some((gidx, gkind, gwidth, aspec))
+                }
+                None => None,
+            };
+
         let mut out = Vec::with_capacity(64 + typedef.len());
         out.extend_from_slice(b"KTR1");
         out.extend_from_slice(&(typedef.len() as u32).to_le_bytes());
@@ -1191,7 +1238,10 @@ impl<V: Vfs> StateMachine<V> {
         // `limit` cap is bypassed — kessel-sql sets `limit = 0` whenever it
         // emits order_by/pagination). `collected` keeps `(row, rec)` in the
         // deterministic left-key/right-scan order = the stable-sort tiebreak.
-        let sorting = sort_spec.is_some();
+        // Collect (don't stream) when sorting OR grouping — both need the full
+        // surviving combined-row set before producing output.
+        let grouping = ga_spec.is_some();
+        let sorting = sort_spec.is_some() || grouping;
         let mut collected: Vec<(Vec<kessel_codec::Value>, Vec<u8>)> = Vec::new();
 
         let llo = make_key(left_type, &[0u8; 16]);
@@ -1289,6 +1339,84 @@ impl<V: Vfs> StateMachine<V> {
                 }
                 None => {}
             }
+        }
+
+        // SP-PG-SQL-JOIN-AGG: group the collected combined rows by the group
+        // field's Value (encoded to its raw fixed-width bytes as the BTreeMap
+        // key ⇒ deterministic ascending key order, mirroring Op::GroupAggregate)
+        // and fold the aggregates per group over the decoded Values (NULL-aware).
+        // Result encoding = the Op::GroupAggregateMulti shape:
+        // [u32 ngroups] then per group [u32 keylen][key][16B i128 LE × n_aggs].
+        if let Some((gidx, gkind, gwidth, aspec)) = ga_spec {
+            // Per-group accumulator, one (count, sum, min, max) per agg slot.
+            type Acc = (i128, i128, Option<i128>, Option<i128>);
+            let init: Vec<Acc> = (0..aspec.len()).map(|_| (0i128, 0, None, None)).collect();
+            // Fold the value of a Value into a numeric i128 (None ⇒ skip / NULL).
+            let num = |v: &kessel_codec::Value| -> Option<i128> {
+                match v {
+                    kessel_codec::Value::Uint(u) => Some(*u as i128),
+                    kessel_codec::Value::Int(i) => Some(*i),
+                    _ => None, // Null / Blob ⇒ not a numeric aggregate value
+                }
+            };
+            let mut groups: std::collections::BTreeMap<Vec<u8>, Vec<Acc>> =
+                std::collections::BTreeMap::new();
+            for (row, _) in &collected {
+                // Group key = the group field Value's raw fixed-width bytes
+                // (zero-extended to the field width so the BTreeMap order is the
+                // declared fixed-width order). A NULL group key (rare; group col
+                // is normally a non-null parent col) folds to all-zero bytes.
+                let gkey: Vec<u8> = match kessel_codec::raw_from_value(gkind, &row[gidx]) {
+                    Some(mut b) => {
+                        b.resize(gwidth, 0);
+                        b
+                    }
+                    None => vec![0u8; gwidth],
+                };
+                let entry = groups.entry(gkey).or_insert_with(|| init.clone());
+                for (i, (kind, aidx)) in aspec.iter().enumerate() {
+                    match aidx {
+                        // COUNT(*) — count every combined row in the group.
+                        None => entry[i].0 += 1,
+                        Some(idx) => {
+                            // COUNT(col): count only non-NULL; SUM/MIN/MAX/AVG:
+                            // fold the numeric value (NULL skipped — PG semantics).
+                            if let Some(v) = num(&row[*idx]) {
+                                entry[i].0 += 1;
+                                entry[i].1 = entry[i].1.wrapping_add(v);
+                                entry[i].2 = Some(entry[i].2.map_or(v, |m| m.min(v)));
+                                entry[i].3 = Some(entry[i].3.map_or(v, |m| m.max(v)));
+                            } else if *kind == 0 {
+                                // COUNT(col) on a NULL ⇒ not counted (no-op).
+                            }
+                        }
+                    }
+                }
+            }
+            let mut gout = Vec::new();
+            gout.extend_from_slice(&(groups.len() as u32).to_le_bytes());
+            for (k, accs) in groups {
+                gout.extend_from_slice(&(k.len() as u32).to_le_bytes());
+                gout.extend_from_slice(&k);
+                for (i, (cnt, sum, mn, mx)) in accs.iter().enumerate() {
+                    let res: i128 = match aspec[i].0 {
+                        0 => *cnt,
+                        1 => *sum,
+                        2 => mn.unwrap_or(0),
+                        3 => mx.unwrap_or(0),
+                        4 => {
+                            if *cnt == 0 {
+                                0
+                            } else {
+                                *sum / *cnt
+                            }
+                        }
+                        _ => unreachable!("kind validated up-front"),
+                    };
+                    gout.extend_from_slice(&res.to_le_bytes());
+                }
+            }
+            return OpResult::Got(gout.into());
         }
 
         // SP-PG-SQL-JOIN-QUERY: stable-sort the collected combined rows by the
@@ -3507,10 +3635,10 @@ impl<V: Vfs> StateMachine<V> {
                 }
                 OpResult::Got(out.into())
             }
-            Op::Join { left_type, right_type, left_field, right_field, limit, filter, join_type, order_by, limit_n, offset_n } => {
+            Op::Join { left_type, right_type, left_field, right_field, limit, filter, join_type, order_by, limit_n, offset_n, group_aggregate } => {
                 self.apply_join(
                     left_type, right_type, left_field, right_field, limit,
-                    &filter, join_type, order_by, limit_n, offset_n,
+                    &filter, join_type, order_by, limit_n, offset_n, group_aggregate.as_ref(),
                 )
             }
             // SP-Perf-A-TXN-RO: all-RO Op::Txn{ops} bypass. The
@@ -4755,10 +4883,10 @@ impl<V: Vfs> StateMachine<V> {
             // Current body uses legacy 20-byte data-row keyspace (scan_range × 2);
             // T2.C rewrites against data_row_scan(type_id, u64::MAX) for both sides
             // per Decision 4 (composite read arm, per-statement auto-commit).
-            Op::Join { left_type, right_type, left_field, right_field, limit, filter, join_type, order_by, limit_n, offset_n } => {
+            Op::Join { left_type, right_type, left_field, right_field, limit, filter, join_type, order_by, limit_n, offset_n, group_aggregate } => {
                 self.apply_join(
                     left_type, right_type, left_field, right_field, limit,
-                    &filter, join_type, order_by, limit_n, offset_n,
+                    &filter, join_type, order_by, limit_n, offset_n, group_aggregate.as_ref(),
                 )
             }
 
@@ -11175,6 +11303,7 @@ mod tests {
         match sm.apply(op, Op::Join {
             left_type: 1, right_type: 2, left_field: 1, right_field: 2,
             limit: 0, filter, join_type: jt, order_by, limit_n, offset_n,
+            group_aggregate: None,
         }) {
             OpResult::Got(b) => jq_read_pairs(&b),
             o => panic!("join: {o:?}"),
@@ -11252,6 +11381,114 @@ mod tests {
         let r = jq_join(&mut sm, 20, kessel_proto::JoinType::Inner, vec![], None, None, None);
         assert_eq!(r.len(), 3);
         assert!(r.iter().all(|(n, _)| n == "tolkien"));
+    }
+
+    // SP-PG-SQL-JOIN-AGG: run a GROUP BY + aggregate over the jq_setup join and
+    // decode the `[u32 ngroups][u32 keylen][key][16B i128 × n]…` result into
+    // (group_key_as_string, [agg i128]) pairs, groups in ascending key order.
+    // Combined schema: a.id(0), a.name(1), b.id(2), b.aid(3), b.title(4).
+    fn jq_group_agg(
+        sm: &mut StateMachine<MemVfs>, op: u64, jt: kessel_proto::JoinType,
+        group_field: u16, aggregates: Vec<(u8, u16)>,
+    ) -> Vec<(String, Vec<i128>)> {
+        let n_aggs = aggregates.len();
+        let b = match sm.apply(op, Op::Join {
+            left_type: 1, right_type: 2, left_field: 1, right_field: 2,
+            limit: 0, filter: vec![], join_type: jt,
+            order_by: None, limit_n: None, offset_n: None,
+            group_aggregate: Some(kessel_proto::JoinGroupAgg { group_field, aggregates }),
+        }) {
+            OpResult::Got(b) => b,
+            o => panic!("join-agg: {o:?}"),
+        };
+        let trim = |v: &[u8]| String::from_utf8_lossy(kessel_expr::right_trim_char_pad(v)).into_owned();
+        let ngroups = u32::from_le_bytes(b[0..4].try_into().unwrap()) as usize;
+        let mut p = 4usize;
+        let mut out = Vec::new();
+        for _ in 0..ngroups {
+            let kl = u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize;
+            p += 4;
+            // Group key is the raw fixed-width bytes of a.name (Char16) ⇒ trim.
+            let key = trim(&b[p..p + kl]);
+            p += kl;
+            let mut aggs = Vec::with_capacity(n_aggs);
+            for _ in 0..n_aggs {
+                aggs.push(i128::from_le_bytes(b[p..p + 16].try_into().unwrap()));
+                p += 16;
+            }
+            out.push((key, aggs));
+        }
+        assert_eq!(p, b.len(), "join-agg result fully consumed");
+        out
+    }
+
+    /// SP-PG-SQL-JOIN-AGG headline: COUNT(b.id) per author (INNER join). One
+    /// group (tolkien, 3 books).
+    #[test]
+    fn jagg_count_related_per_parent() {
+        let mut sm = jq_setup();
+        // GROUP BY a.name (combined 1), COUNT(b.id) (combined 2).
+        let r = jq_group_agg(&mut sm, 30, kessel_proto::JoinType::Inner, 1, vec![(0, 2)]);
+        assert_eq!(r, vec![("tolkien".to_string(), vec![3])]);
+    }
+
+    /// SP-PG-SQL-JOIN-AGG: COUNT(*) over the join = group size (3 for tolkien).
+    #[test]
+    fn jagg_count_star_group_size() {
+        let mut sm = jq_setup();
+        let r = jq_group_agg(&mut sm, 30, kessel_proto::JoinType::Inner, 1,
+            vec![(0, kessel_proto::COUNT_STAR_FIELD)]);
+        assert_eq!(r, vec![("tolkien".to_string(), vec![3])]);
+    }
+
+    /// SP-PG-SQL-JOIN-AGG: SUM(b.aid) per group (3 books all aid=1 ⇒ sum 3).
+    #[test]
+    fn jagg_sum_per_group() {
+        let mut sm = jq_setup();
+        // SUM of b.aid (combined field 3).
+        let r = jq_group_agg(&mut sm, 30, kessel_proto::JoinType::Inner, 1, vec![(1, 3)]);
+        assert_eq!(r, vec![("tolkien".to_string(), vec![3])]);
+    }
+
+    /// SP-PG-SQL-JOIN-AGG (PG LEFT-JOIN-COUNT semantics): a LEFT join includes
+    /// the orphan author. COUNT(b.id) over the orphan group = 0 (the NULL b.id
+    /// is not counted); COUNT(*) over the orphan group = 1 (the combined row
+    /// exists). Groups ascending: orphan then tolkien.
+    #[test]
+    fn jagg_left_join_count_null_vs_star() {
+        let mut sm = jq_setup();
+        // COUNT(b.id) AND COUNT(*): two aggregates per group.
+        let r = jq_group_agg(&mut sm, 30, kessel_proto::JoinType::Left, 1,
+            vec![(0, 2), (0, kessel_proto::COUNT_STAR_FIELD)]);
+        assert_eq!(r, vec![
+            ("orphan".to_string(), vec![0, 1]),   // COUNT(b.id)=0, COUNT(*)=1
+            ("tolkien".to_string(), vec![3, 3]),  // both 3 (matched)
+        ]);
+    }
+
+    /// SP-PG-SQL-JOIN-AGG determinism: the result is byte-identical across two
+    /// runs over the same committed state (pure function of state — no clock /
+    /// RNG / hash-iteration in the output order; BTreeMap ascending key order).
+    #[test]
+    fn jagg_deterministic_byte_equal_repeat() {
+        let mut sm = jq_setup();
+        let run = |sm: &mut StateMachine<MemVfs>, op: u64| -> Vec<u8> {
+            match sm.apply(op, Op::Join {
+                left_type: 1, right_type: 2, left_field: 1, right_field: 2,
+                limit: 0, filter: vec![], join_type: kessel_proto::JoinType::Left,
+                order_by: None, limit_n: None, offset_n: None,
+                group_aggregate: Some(kessel_proto::JoinGroupAgg {
+                    group_field: 1,
+                    aggregates: vec![(0, 2), (0, kessel_proto::COUNT_STAR_FIELD), (1, 3)],
+                }),
+            }) {
+                OpResult::Got(b) => b.to_vec(),
+                o => panic!("join-agg: {o:?}"),
+            }
+        };
+        let a = run(&mut sm, 30);
+        let b = run(&mut sm, 31);
+        assert_eq!(a, b, "join-agg result must be byte-deterministic");
     }
 
     fn q_v_off() -> (usize, usize) {

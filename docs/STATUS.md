@@ -133,6 +133,27 @@ lotr** (sorted + paginated). Determinism preserved (stable sort + deterministic
 scan-position tiebreak; seed-7 + 3-replica oracle PASS). Named follow-ups:
 SP-PG-SQL-JOIN-ORDERBY-MULTI, SP-PG-SQL-JOIN-ORDERBY-EXPR, SP-PG-SQL-JOIN-AGG,
 SP-PG-SQL-JOIN-NULLS-ORDER.
+SP-PG-SQL-JOIN-AGG (2026-06-03, +13 KATs, DONE) — `GROUP BY` + aggregate over a
+join (`SELECT a.name, COUNT(b.id) FROM a JOIN b ON a.id=b.aid GROUP BY a.name`),
+the dashboard "count related rows per parent" query. COMPOSES the SP22 / SP-
+Analytic-Plan-MULTI group-aggregate fold with the combined join rows: `Op::Join`
+gained ONE additive field `group_aggregate: Option<JoinGroupAgg>` (combined-schema
+`group_field` + `Vec<(kind, field_id)>`). The engine groups the surviving combined
+`Vec<Value>` rows into a BTreeMap (ascending key order ⇒ deterministic) + folds the
+aggregates per group over the DECODED Values, emitting the `[u32 ngroups]…` group-
+aggregate result (the `GroupAggregateMulti` shape). NULL semantics fall out of the
+Value fold: `COUNT(b.id)` on a LEFT-join unmatched parent counts **0** (NULL b.id
+not counted) but `COUNT(*)` counts **1** (the row exists) — exact PG LEFT-JOIN-COUNT.
+COUNT(*) uses a `COUNT_STAR_FIELD` sentinel; qualified `COUNT(b.id)` disambiguates
+`id` across tables. Both apply arms share the fold (RO-Txn == apply). The PG
+gateway gains the FIRST group-aggregate render (`render_join_group_aggregate` +
+`join_group_aggregate` text helper): RowDescription [group col OID, agg int8] + one
+DataRow per group. Additive marker-guarded ga block ⇒ every non-grouped join byte-
+identical; bad marker rejected at decode. vulcan smoke: `SELECT author.name,
+COUNT(book.id) … GROUP BY author.name` → **tolkien 2, lewis 1**. Determinism
+preserved (BTreeMap ascending key + associative fold over deterministic scan order;
+seed-7 + 3-replica oracle PASS). Named follow-ups: SP-PG-SQL-HAVING,
+SP-PG-SQL-JOIN-GROUP-MULTI, SP-PG-SQL-JOIN-AGG-3TABLE, SP-PG-SQL-JOIN-AGG-ORDERBY-AGG.
 SP-PG-DJANGO-COMPLETE (2026-06-03, +14 KATs, DONE) — closes the TWO
 named gaps the quoted-ident arc left, taking the **Django 6 ORM to full
 CRUD 8/8** on vulcan (was 6/8). `SP-PG-DDL-IDENTITY`: the CREATE TABLE

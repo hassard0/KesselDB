@@ -147,6 +147,7 @@ kessel "SELECT * FROM a JOIN b ON a.x = b.y"   # JOINs render too (self-describi
 kessel "SELECT a.n, b.t FROM a JOIN b ON a.id = b.aid WHERE b.t = 'x'"  # filtered joins (JOIN + WHERE)
 kessel "SELECT a.n, b.t FROM a LEFT JOIN b ON a.id = b.aid"  # LEFT [OUTER] JOIN — unmatched a-rows keep b.* = NULL
 kessel "SELECT a.n, b.t FROM a JOIN b ON a.id = b.aid ORDER BY b.t LIMIT 20 OFFSET 40"  # paginated join (ORDER BY + LIMIT/OFFSET)
+kessel "SELECT a.n, COUNT(b.id) FROM a JOIN b ON a.id = b.aid GROUP BY a.n"  # grouped aggregate over a join (count related per parent)
 
 # pipe a .sql file (lines starting with # or -- are comments; blanks ignored)
 cat schema.sql | cargo run -q -p kessel-client --bin kessel
@@ -376,6 +377,9 @@ SELECT * FROM <t> [WHERE ...] ORDER BY <col> [DESC] [OFFSET n] [LIMIT n]
 SELECT <proj> FROM <a> [LEFT [OUTER]] JOIN <b> ON <a.x> = <b.y>  -- equi‑join
        [WHERE <pred over a.* / b.*>]                    --   INNER (default) or LEFT; filtered (qualified cols, AND/OR/…)
        [ORDER BY <a.c | b.c> [ASC|DESC]] [LIMIT n] [OFFSET m]   --   paginate the (sorted) join
+SELECT <a.g>, <AGG>( * | <a.c | b.c> ) [AS alias] [, <AGG>(…) …]  -- grouped aggregate over a join
+       FROM <a> [LEFT [OUTER]] JOIN <b> ON <a.x> = <b.y> [WHERE …]
+       GROUP BY <a.g>                                   --   COUNT/SUM/MIN/MAX/AVG per group; one row per group
 ```
 
 A bare `JOIN` is an INNER equi‑join. `LEFT [OUTER] JOIN` returns EVERY left
@@ -390,6 +394,23 @@ sorted result — the ubiquitous paginated-list-view shape
 (`… ORDER BY b.created LIMIT 20 OFFSET 40`). For a LEFT join, an unmatched
 right (`b.*`) NULL sort value orders NULLS LAST for ASC / NULLS FIRST for DESC
 (PostgreSQL's default).
+
+`GROUP BY <a.g>` + one or more aggregates over a join is the dashboard /
+reporting query — "count (or sum / …) the related rows per parent":
+
+```sql
+SELECT a.name, COUNT(b.id) FROM a JOIN b ON a.id = b.aid GROUP BY a.name
+```
+
+returns one row per group `(group_key, agg_value+)`, groups in ascending
+group-key order. `COUNT(*)` is the group size; `COUNT(b.id)` counts the non-NULL
+`b.id` values in the group; `SUM/MIN/MAX/AVG(<col>)` fold the non-NULL numeric
+values. For a `LEFT JOIN`, an unmatched parent (all `b.*` = NULL) makes
+`COUNT(b.id)` = 0 but `COUNT(*)` = 1 — the classic LEFT-JOIN-COUNT gotcha,
+matching PostgreSQL exactly. The group + aggregate columns may come from either
+table; qualify an aggregate arg (`COUNT(b.id)`) when the column name exists in
+both tables. (V1: one GROUP BY column; `HAVING`, multi-column GROUP BY, and
+3+-table join-agg are named follow-ups.)
 
 `WHERE` supports `AND`/`OR`/`NOT`, all of `= != < <= > >=`, and `IN`/`BETWEEN` (incl. `NOT IN`/`NOT BETWEEN`). `SELECT *` returns
 length‑prefixed record blobs; use `DESCRIBE <t>` to decode them against the

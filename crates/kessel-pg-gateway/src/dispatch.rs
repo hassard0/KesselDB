@@ -502,6 +502,17 @@ fn render_select_got<E: EngineApply + ?Sized>(
     engine: &E,
 ) -> Vec<u8> {
     let mut out = Vec::new();
+    // Shape 0.4 — SP-PG-SQL-JOIN-AGG: a join-group-aggregate
+    // (`SELECT a.name, COUNT(b.id) FROM a JOIN b ON … GROUP BY a.name`). The
+    // engine's `Op::Join { group_aggregate: Some(..) }` returns the value-only
+    // group-aggregate stream (`[u32 ngroups]…`, NOT a `KTR1` join stream), so
+    // this is checked BEFORE the `KTR1` join render + the single-scalar
+    // aggregate render (both of which return None / don't match this shape).
+    // `join_group_aggregate` returns None for any non-join-group-aggregate SQL,
+    // so every existing render path is byte-untouched.
+    if let Some(jga) = kessel_sql::join_group_aggregate(sql_trimmed) {
+        return render_join_group_aggregate(row_bytes, &jga, engine);
+    }
     // Shape 0 — SP-PG-SQL-AGG-ALIAS-RENDER: a single scalar-aggregate
     // SELECT over a FROM table (`SELECT COUNT(*) AS "__count" FROM "t"` —
     // Django's `.count()`). The engine's `Op::Aggregate` returns a
@@ -805,6 +816,121 @@ fn render_join_result(
         );
     }
     out.extend_from_slice(&encode_command_complete(&select_tag(n)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
+/// SP-PG-SQL-JOIN-AGG — render a join-group-aggregate result. The engine's
+/// `Op::Join { group_aggregate: Some(..) }` returns the value-only group-
+/// aggregate stream `[u32 ngroups]` then per group
+/// `[u32 keylen][key][16B i128 LE × n_aggs]` (the `Op::GroupAggregateMulti`
+/// shape) — NOT a self-describing `KTR1` join stream — so we recover the output
+/// column shape from the SQL text (`proj`) + the GROUP BY column's table schema:
+///   1. resolve the GROUP BY column's `FieldKind` via the qualifier's table,
+///   2. RowDescription = [group col (its OID), each agg col (int8)],
+///   3. per group: decode the key bytes → Value (by the group kind) →
+///      `render_pg_text`; each 16-byte i128 → decimal text,
+///   4. emit one DataRow per group + CommandComplete("SELECT N").
+/// Groups arrive in ascending group-key order (the engine's BTreeMap), so the
+/// rendered rows are deterministic.
+fn render_join_group_aggregate<E: EngineApply + ?Sized>(
+    row_bytes: &[u8],
+    proj: &kessel_sql::JoinGroupAggProj,
+    engine: &E,
+) -> Vec<u8> {
+    // Resolve the GROUP BY column's kind via its qualifier's table.
+    let gcols = match engine.describe_table(&proj.group_qualifier) {
+        Some(c) => c,
+        None => {
+            return error_response_then_rfq(
+                SEVERITY_ERROR,
+                "42P01",
+                &format!("unknown table \"{}\"", proj.group_qualifier),
+            )
+        }
+    };
+    let gkind = match gcols
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(&proj.group_column))
+    {
+        Some(c) => c.kind,
+        None => {
+            return error_response_then_rfq(
+                SEVERITY_ERROR,
+                "42703",
+                &format!(
+                    "column \"{}\" does not exist in \"{}\"",
+                    proj.group_column, proj.group_qualifier
+                ),
+            )
+        }
+    };
+    let gwidth = gkind.width() as usize;
+
+    // RowDescription: group column (its OID) + one int8 column per aggregate.
+    let mut fields: Vec<FieldMeta> = Vec::with_capacity(1 + proj.aggregates.len());
+    fields.push(FieldMeta {
+        name: format!("{}.{}", proj.group_qualifier, proj.group_column),
+        type_oid: field_kind_to_oid(gkind),
+    });
+    for a in &proj.aggregates {
+        fields.push(FieldMeta {
+            name: a.out_name.clone(),
+            type_oid: crate::proto::PG_TYPE_INT8,
+        });
+    }
+
+    let n_aggs = proj.aggregates.len();
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+
+    // Decode `[u32 ngroups]` then per group `[u32 keylen][key][16B × n_aggs]`.
+    if row_bytes.len() < 4 {
+        return error_response_then_rfq(SEVERITY_ERROR, "XX000", "join-agg: truncated header");
+    }
+    let ngroups = u32::from_le_bytes(row_bytes[0..4].try_into().unwrap()) as usize;
+    let mut p = 4usize;
+    let mut emitted = 0u64;
+    for _ in 0..ngroups {
+        if p + 4 > row_bytes.len() {
+            return error_response_then_rfq(SEVERITY_ERROR, "XX000", "join-agg: truncated key len");
+        }
+        let klen = u32::from_le_bytes(row_bytes[p..p + 4].try_into().unwrap()) as usize;
+        p += 4;
+        let key = match row_bytes.get(p..p + klen) {
+            Some(k) => k,
+            None => {
+                return error_response_then_rfq(SEVERITY_ERROR, "XX000", "join-agg: truncated key")
+            }
+        };
+        p += klen;
+        // Decode the group key (raw fixed-width bytes) → Value → text.
+        let mut raw = key.to_vec();
+        raw.resize(gwidth, 0);
+        let gval = value_from_raw(gkind, &raw);
+        let gcell = render_pg_text(&gval, gkind);
+
+        let mut cells: Vec<Option<Vec<u8>>> = Vec::with_capacity(1 + n_aggs);
+        cells.push(Some(gcell));
+        for _ in 0..n_aggs {
+            let v = match row_bytes.get(p..p + 16) {
+                Some(b) => i128::from_le_bytes(b.try_into().unwrap()),
+                None => {
+                    return error_response_then_rfq(
+                        SEVERITY_ERROR,
+                        "XX000",
+                        "join-agg: truncated aggregate value",
+                    )
+                }
+            };
+            p += 16;
+            cells.push(Some(v.to_string().into_bytes()));
+        }
+        let refs: Vec<Option<&[u8]>> = cells.iter().map(|c| c.as_deref()).collect();
+        out.extend_from_slice(&encode_data_row(&refs));
+        emitted += 1;
+    }
+    out.extend_from_slice(&encode_command_complete(&select_tag(emitted)));
     out.extend_from_slice(&encode_ready_for_query(b'I'));
     out
 }
@@ -1706,6 +1832,53 @@ mod tests {
             out.extend_from_slice(r);
         }
         out
+    }
+
+    /// SP-PG-SQL-JOIN-AGG: a join-group-aggregate SELECT renders the group-
+    /// aggregate value stream as RowDescription([group col, agg col]) + one
+    /// DataRow per group. The CannedEngine returns the `[u32 ngroups]…` bytes;
+    /// `join_group_aggregate` recovers the column shape from the SQL, and the
+    /// group key (Char16) decodes to its trimmed text + the i128 count to text.
+    #[test]
+    fn jagg_render_count_per_parent() {
+        // Group table `author` with the CHAR(16) name column.
+        let acols = vec![
+            PgColumn { name: "id".into(), kind: FieldKind::U64, nullable: false },
+            PgColumn { name: "name".into(), kind: FieldKind::Char(16), nullable: false },
+        ];
+        // Build the engine result: 2 groups (lewis 1, tolkien 2), one COUNT.
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&2u32.to_le_bytes()); // ngroups
+        for (name, cnt) in [("lewis", 1i128), ("tolkien", 2i128)] {
+            let mut key = name.as_bytes().to_vec();
+            key.resize(16, 0); // Char(16) raw fixed-width key
+            stream.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            stream.extend_from_slice(&key);
+            stream.extend_from_slice(&cnt.to_le_bytes());
+        }
+        let eng = CannedEngine {
+            cols: acols,
+            row_bytes: stream,
+            result: std::sync::Mutex::new(None),
+            table_name: "author".into(),
+            no_schema: false,
+        };
+        let bytes = dispatch_query(
+            "SELECT author.name, COUNT(book.id) FROM author JOIN book ON author.id=book.aid GROUP BY author.name",
+            &eng,
+        );
+        // RowDescription present, two DataRows, CommandComplete SELECT 2.
+        assert!(bytes.contains(&b'T'), "RowDescription emitted");
+        // The two group names + counts appear in the DataRow payloads.
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("lewis"), "lewis group rendered");
+        assert!(s.contains("tolkien"), "tolkien group rendered");
+        assert!(s.contains("SELECT 2"), "CommandComplete SELECT 2");
+        // Order invariant: T before the two D rows before C(ommandComplete).
+        let pt = bytes.iter().position(|&b| b == b'T').unwrap();
+        let pc = bytes.iter().rposition(|&b| b == b'C').unwrap();
+        let dcount = bytes[pt..pc].iter().filter(|&&b| b == b'D').count();
+        assert!(dcount >= 2, "at least two DataRows between T and C");
     }
 
     // ───────────────────────────────────────────────────────────────────

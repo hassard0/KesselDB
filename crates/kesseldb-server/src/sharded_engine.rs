@@ -1145,6 +1145,7 @@ mod tests {
             order_by: None,
             limit_n: None,
             offset_n: None,
+            group_aggregate: None,
         };
         assert_eq!(route_op(&op, 4), ShardRoute::ShardZero, "{op:?}");
     }

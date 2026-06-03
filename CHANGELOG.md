@@ -7,6 +7,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning [Se
 
 ### Added
 
+- **Chained N-way (3+ table) INNER equi-joins (SP-PG-SQL-MULTI-JOIN,
+  2026-06-03)** — `SELECT u.name, p.title, c.body FROM users u JOIN posts p ON
+  u.id = p.user_id JOIN comments c ON p.id = c.post_id` now works end-to-end
+  over the PG wire. The planner previously handled exactly ONE `JOIN`; a second
+  `JOIN` segment failed to compile. `Op::Join` gained an additive,
+  marker-guarded `extra_joins: Vec<JoinStep>` (each step = the next table + its
+  ON `left_combined_field = right_field`). The engine's `apply_multi_join`
+  folds each step (INNER hash equi-join the running combined row set against the
+  next table), widening the self-describing `KTR1` combined schema each step;
+  `WHERE` / `ORDER BY` / `LIMIT` / `OFFSET` apply over the full N-table combined
+  schema, and `SELECT *` returns every column of every joined table. The
+  gateway's existing `render_join_result` + `join_projection` handle 3+ tables
+  with no data-path change (the combined schema just grows). **Determinism:**
+  `extra_joins` is emitted on the wire ONLY when non-empty (distinct marker `2`
+  vs. the group-aggregate marker `1`, so a 2-table or group-aggregate frame is
+  BYTE-IDENTICAL to before); the multi-join is a pure deterministic function of
+  the input tables (left-key/right-scan object-id order preserved at every
+  step). V1 is INNER chains only — mixing LEFT/RIGHT/FULL into a chain, or
+  GROUP BY over a chain, are named follow-ups (explicit errors). psql 3-table
+  smoke `scripts/sppgsqlmultijoin-smoke.py`.
 - **`ORDER BY` / `LIMIT` / `OFFSET` on a plain `GROUP BY` now take effect
   (SP-PG-SQL-GROUP-SORT-LIMIT, 2026-06-03)** — closes the V1 caveat the
   PLAIN-GROUP-RENDER arc surfaced. `SELECT g, COUNT(*) AS n FROM t GROUP BY g

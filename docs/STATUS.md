@@ -30,6 +30,13 @@ measurement and had drifted from the actual workspace count).
   under live sibling-agent load — reported honestly. SQLite not re-run
   (vulcan root fs was 100% full; KesselDB MemVfs + Postgres docker
   unaffected). Raw: `docs/benchmarks/finalbench-2026-06-02-*`.
+- **Chained N-way joins (SP-PG-SQL-MULTI-JOIN, 2026-06-03).** 3+ table
+  chained INNER equi-joins (`users JOIN posts JOIN comments`) work end-to-end
+  over the PG wire — `Op::Join` gained an additive, marker-guarded
+  `extra_joins: Vec<JoinStep>`; the engine folds each step into the combined
+  `KTR1` row set; `WHERE`/`ORDER BY`/`LIMIT`/`OFFSET`/`SELECT *` apply over the
+  full combined schema. Empty extra-joins ⇒ byte-identical to a binary join.
+  INNER chains only (LEFT-in-chain + GROUP-BY-over-chain are named follow-ups).
 - **PostgreSQL ORM compatibility.** SP-PG-EXTQ V1 (Extended Query) +
   V2 hardening (SP-PG-EXTQ-BIN + SP-PG-EXTQ-BIN-RESULTS + SP-PG-EXTQ-CAST +
   SP-PG-EXTQ-DESCRIBE-VERSION + SP-PG-SQL-PAREN-VALUES + SP-CHAR-PAD-COMPARE)

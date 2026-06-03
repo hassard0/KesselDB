@@ -46,7 +46,7 @@ all. Determinism is a feature, not an aspiration.
 ## Highlights
 
 - **Real SQL** — `CREATE TABLE`, `ALTER TABLE … ADD COLUMN` (online, no lock), `DROP TABLE`, `INSERT`, `SELECT` (filters
-  incl. `IN` / `BETWEEN` / `LIKE` / `IS [NOT] NULL` / `AND`/`OR`/`NOT`, `JOIN`, `GROUP BY`, `HAVING`,
+  incl. `IN` / `BETWEEN` / `LIKE` / `IS [NOT] NULL` / `AND`/`OR`/`NOT`, `JOIN` (INNER/LEFT, chained 3+ table), `GROUP BY`, `HAVING`,
   `ORDER BY`, `LIMIT/OFFSET`), `UPDATE`, `DELETE`,
   `COUNT/SUM/MIN/MAX/AVG`, `CREATE [UNIQUE|RANGE] INDEX`, `DESCRIBE`, `EXPLAIN`.
 - **Constraints & logic** — `NOT NULL`, `UNIQUE`, foreign keys with

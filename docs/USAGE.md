@@ -148,6 +148,7 @@ kessel "SELECT a.n, b.t FROM a JOIN b ON a.id = b.aid WHERE b.t = 'x'"  # filter
 kessel "SELECT a.n, b.t FROM a LEFT JOIN b ON a.id = b.aid"  # LEFT [OUTER] JOIN — unmatched a-rows keep b.* = NULL
 kessel "SELECT a.n, b.t FROM a JOIN b ON a.id = b.aid ORDER BY b.t LIMIT 20 OFFSET 40"  # paginated join (ORDER BY + LIMIT/OFFSET)
 kessel "SELECT a.n, COUNT(b.id) FROM a JOIN b ON a.id = b.aid GROUP BY a.n"  # grouped aggregate over a join (count related per parent)
+kessel "SELECT u.name, p.title, c.body FROM users u JOIN posts p ON u.id = p.user_id JOIN comments c ON p.id = c.post_id"  # chained 3-way INNER join (SP-PG-SQL-MULTI-JOIN)
 
 # pipe a .sql file (lines starting with # or -- are comments; blanks ignored)
 cat schema.sql | cargo run -q -p kessel-client --bin kessel
@@ -378,8 +379,9 @@ SELECT <g>, <AGG>( * | <c> ) [AS alias] [, <AGG>(…) …] FROM <t> [WHERE …] 
        [ORDER BY <agg|alias|pos|g> [ASC|DESC]] [LIMIT n] [OFFSET n]  --   engine sorts + windows groups (SP-PG-SQL-GROUP-SORT-LIMIT)
 SELECT * FROM <t> [WHERE ...] ORDER BY <col> [DESC] [OFFSET n] [LIMIT n]
 SELECT <proj> FROM <a> [LEFT [OUTER]] JOIN <b> ON <a.x> = <b.y>  -- equi‑join
-       [WHERE <pred over a.* / b.*>]                    --   INNER (default) or LEFT; filtered (qualified cols, AND/OR/…)
-       [ORDER BY <a.c | b.c> [ASC|DESC]] [LIMIT n] [OFFSET m]   --   paginate the (sorted) join
+       [JOIN <c> ON <a|b.x> = <c.y> [JOIN <d> ON …]]     --   chained N-way INNER joins, 3+ tables (SP-PG-SQL-MULTI-JOIN)
+       [WHERE <pred over any joined table's cols>]       --   INNER (default) or LEFT; filtered (qualified cols, AND/OR/…)
+       [ORDER BY <t.c> [ASC|DESC]] [LIMIT n] [OFFSET m]  --   paginate the (sorted) join
 SELECT <a.g>, <AGG>( * | <a.c | b.c> ) [AS alias] [, <AGG>(…) …]  -- grouped aggregate over a join
        FROM <a> [LEFT [OUTER]] JOIN <b> ON <a.x> = <b.y> [WHERE …]
        GROUP BY <a.g>                                   --   COUNT/SUM/MIN/MAX/AVG per group; one row per group
@@ -391,6 +393,24 @@ row; left rows with no matching right row come back with the right (`b.*`)
 columns NULL (the ORM pattern for an optional relationship, e.g. SQLAlchemy
 `isouter=True`). A `WHERE` predicate on a right (`b.*`) column of a LEFT join
 drops the unmatched rows — standard PostgreSQL semantics.
+
+**Chained N-way joins** (SP-PG-SQL-MULTI-JOIN) — 3+ tables joined in one query,
+the everyday "row + its parent + its grandparent" shape:
+
+```sql
+SELECT u.name, p.title, c.body
+  FROM users u JOIN posts p ON u.id = p.user_id
+               JOIN comments c ON p.id = c.post_id
+  WHERE u.id = 1;
+```
+
+Each additional `JOIN <table> ON <a.x> = <table.y>` segment INNER equi-joins the
+running combined row set against the next table; the combined schema widens by
+that table's columns each step (named `<table>.<col>`). `SELECT *` returns every
+column of every joined table; `WHERE` / `ORDER BY` / `LIMIT` / `OFFSET` apply
+over the full combined schema. V1 is INNER chains only — mixing `LEFT`/`RIGHT`/
+`FULL` into a chain, or `GROUP BY` over a chain, are named follow-ups (rejected
+with a clear error).
 
 `ORDER BY <qualified col>` sorts the combined join rows by ONE column from
 either table (`ASC` default / `DESC`); `LIMIT` + `OFFSET` then paginate the
@@ -1639,9 +1659,10 @@ arc a JOIN hit the "only renders `SELECT *`" error even though the engine
 joined. **V1 out-of-scope** (named follow-ups): `SP-PG-DDL-FK-ENFORCE`
 (referential-integrity enforcement — FK is parse-and-skip today),
 `SP-PG-SQL-OUTER-JOIN` (LEFT/RIGHT/FULL — `Op::Join` is inner-only),
-`SP-PG-SQL-MULTI-JOIN` (3+ tables), `SP-PG-SQL-JOIN-ALIAS`,
+`SP-PG-SQL-JOIN-ALIAS`,
 `SP-PG-SQL-JOIN-AGG`. (`SP-PG-SQL-JOIN-WHERE` — filtered joins — shipped, see
-below.) Transcript:
+below; `SP-PG-SQL-MULTI-JOIN` — chained 3+ table INNER joins — SHIPPED
+2026-06-03.) Transcript:
 `docs/superpowers/sppgormrelationships-smoke-2026-06-03.txt`.
 
 #### Real multi-model app (blog) — CAPSTONE, SP-PG-ORM-REALAPP, 2026-06-03

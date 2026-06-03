@@ -201,6 +201,7 @@ mod tests {
             composite: vec![],
             defaults: vec![],
             serial_pk: false,
+            serial_field_id: None,
         }
     }
 

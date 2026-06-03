@@ -1132,6 +1132,7 @@ mod tests {
             composite: vec![],
             defaults: vec![],
             serial_pk: false,
+            serial_field_id: None,
         }
     }
     fn rec(age: i32, bal: i64) -> Vec<u8> {
@@ -1565,6 +1566,7 @@ mod tests {
             composite: vec![],
             defaults: vec![],
             serial_pk: false,
+            serial_field_id: None,
         }
     }
 

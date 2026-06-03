@@ -596,15 +596,43 @@ fn render_select_got<E: EngineApply + ?Sized>(
             })
             .collect();
         out.extend_from_slice(&encode_row_description(&fields));
-        let row_count = match emit_projected_rows(row_bytes, &proj_cols, &mut out)
+        // SP-PG-ORM-REALAPP — a projection-list SELECT with an `ORDER BY`
+        // (`SELECT title FROM posts ORDER BY title LIMIT n`) lowers to
+        // `Op::SelectSorted`, which returns the FULL record stream (the sort
+        // wins the engine's `match` arm; the projection is dropped). The
+        // narrow `emit_projected_rows` decoder would see a full record
+        // (width = whole row) where it expects only the projected fields'
+        // width → a spurious "projected row width N != expected M". When the
+        // SQL is sorted we instead decode each FULL record against the table
+        // schema and project the requested columns by index. A non-sorted
+        // projection keeps the byte-identical narrow path.
+        let row_count = if kessel_sql::select_projection_is_sorted(sql_trimmed)
         {
-            Ok(n) => n,
-            Err(msg) => {
-                return error_response_then_rfq(
-                    SEVERITY_ERROR,
-                    "XX000",
-                    &format!("projected row decode failed: {msg}"),
-                );
+            match emit_projected_from_full_records(
+                row_bytes,
+                &table_cols,
+                &proj_cols,
+                &mut out,
+            ) {
+                Ok(n) => n,
+                Err(msg) => {
+                    return error_response_then_rfq(
+                        SEVERITY_ERROR,
+                        "XX000",
+                        &format!("sorted projection decode failed: {msg}"),
+                    );
+                }
+            }
+        } else {
+            match emit_projected_rows(row_bytes, &proj_cols, &mut out) {
+                Ok(n) => n,
+                Err(msg) => {
+                    return error_response_then_rfq(
+                        SEVERITY_ERROR,
+                        "XX000",
+                        &format!("projected row decode failed: {msg}"),
+                    );
+                }
             }
         };
         out.extend_from_slice(&encode_command_complete(&select_tag(row_count)));
@@ -1349,6 +1377,64 @@ fn emit_projected_rows(
     }
     if p != row_bytes.len() {
         return Err("trailing bytes after projected rows".to_string());
+    }
+    Ok(n)
+}
+
+/// SP-PG-ORM-REALAPP — decode a FULL-record stream (`[u32 LE len][full
+/// record]*`, the shape `Op::SelectSorted` emits) and emit ONE `DataRow` per
+/// record containing ONLY the projected columns, in projection order. Used
+/// when a projection-list SELECT carries an `ORDER BY`: the engine sorts but
+/// returns whole records (it drops the projection), so the gateway re-projects
+/// here. `table_cols` is the table's FULL schema (for the record layout +
+/// per-column decode); `proj_cols` is the projected subset in projection order
+/// (each must be a column of `table_cols`). NULL fidelity is preserved (a
+/// projected NULL renders as a real PG NULL via the record's null bitmap),
+/// which is STRICTLY better than the narrow `emit_projected_rows` path (that
+/// path has no null mask — see `SP-PG-SQL-PROJ-NULL`).
+fn emit_projected_from_full_records(
+    row_bytes: &[u8],
+    table_cols: &[PgColumn],
+    proj_cols: &[PgColumn],
+    out: &mut Vec<u8>,
+) -> Result<u64, String> {
+    let layout = compute_record_layout(table_cols);
+    // Map each projected column to its index in the full table schema (by
+    // name; matches the engine's positional field order).
+    let proj_idx: Vec<usize> = proj_cols
+        .iter()
+        .map(|pc| {
+            table_cols
+                .iter()
+                .position(|tc| tc.name == pc.name)
+                .ok_or_else(|| {
+                    format!("projected column `{}` not in table schema", pc.name)
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    let mut p = 0usize;
+    let mut n = 0u64;
+    while p + 4 <= row_bytes.len() {
+        let len =
+            u32::from_le_bytes(row_bytes[p..p + 4].try_into().unwrap()) as usize;
+        p += 4;
+        if p + len > row_bytes.len() {
+            return Err("sorted record stream truncated".to_string());
+        }
+        let rec = &row_bytes[p..p + len];
+        p += len;
+        let all_cells = decode_record(rec, table_cols, &layout)
+            .ok_or_else(|| "malformed sorted record".to_string())?;
+        // Project: pick the requested columns in projection order.
+        let projected: Vec<Option<&[u8]>> = proj_idx
+            .iter()
+            .map(|&i| all_cells[i].as_deref())
+            .collect();
+        out.extend_from_slice(&encode_data_row(&projected));
+        n += 1;
+    }
+    if p != row_bytes.len() {
+        return Err("trailing bytes after sorted records".to_string());
     }
     Ok(n)
 }

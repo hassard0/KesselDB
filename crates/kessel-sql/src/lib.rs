@@ -730,6 +730,36 @@ pub fn select_columns(sql: &str) -> Option<(String, Vec<String>)> {
     Some((table, cols))
 }
 
+/// SP-PG-ORM-REALAPP — does a single-table projection-list SELECT carry an
+/// `ORDER BY` clause? `select_columns` accepts both `SELECT c1, c2 FROM t`
+/// and `SELECT c1, c2 FROM t ORDER BY c LIMIT n` (it stops at the table name),
+/// but the engine compiles the two DIFFERENTLY: a plain projection lowers to
+/// `Op::SelectFields` (which emits a NARROW projected-byte stream), while an
+/// `ORDER BY` projection lowers to `Op::SelectSorted` (which emits the FULL
+/// record stream — the projection is dropped at the engine layer, the sort
+/// wins the `match` arm). The gateway needs to know which stream shape it got
+/// so it can decode correctly. Returns `true` IFF `sql` is a single-table
+/// projection-list SELECT (NOT `*`, NOT an aggregate, NOT a JOIN) that has a
+/// trailing `ORDER BY`. Uses the real lexer — no string heuristics.
+pub fn select_projection_is_sorted(sql: &str) -> bool {
+    // Must first be a plain single-table projection list (reuses the exact
+    // acceptance of `select_columns`; if that returns None this is not our
+    // shape and we report false).
+    if select_columns(sql).is_none() {
+        return false;
+    }
+    let toks = match lex(sql) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    // Any top-level `ORDER` keyword after the projection implies the sorted
+    // lowering. (A projection list cannot contain a bare `ORDER` column —
+    // `select_columns` would have rejected a keyword-spelled column, and the
+    // engine's catalog rejects keyword-named columns at CREATE time.)
+    toks.iter()
+        .any(|t| matches!(t, Tok::Ident(k) if k.eq_ignore_ascii_case("ORDER")))
+}
+
 /// SP-PG-ORM-RELATIONSHIPS — a JOIN projection item: the (optional) table
 /// qualifier + the column name, preserved separately so the gateway can map
 /// it onto the JOIN's combined schema (whose columns are named
@@ -9027,6 +9057,36 @@ mod tests {
             ),
             Some(("t".to_string(), vec!["id".to_string()]))
         );
+    }
+
+    /// SP-PG-ORM-REALAPP — `select_projection_is_sorted` flags the projection
+    /// + ORDER BY shape (which lowers to `Op::SelectSorted` → full records) so
+    /// the gateway decodes the right stream shape.
+    #[test]
+    fn projection_sorted_detection() {
+        assert!(select_projection_is_sorted(
+            "SELECT title FROM posts ORDER BY title LIMIT 2"
+        ));
+        assert!(select_projection_is_sorted(
+            "SELECT posts.title FROM posts ORDER BY posts.title"
+        ));
+        assert!(select_projection_is_sorted(
+            "SELECT id, title FROM posts ORDER BY title DESC"
+        ));
+        // No ORDER BY → narrow projection path (false).
+        assert!(!select_projection_is_sorted("SELECT title FROM posts"));
+        assert!(!select_projection_is_sorted(
+            "SELECT title FROM posts LIMIT 2"
+        ));
+        // SELECT * (not a projection list) → false (rendered by a different
+        // path that already handles full records).
+        assert!(!select_projection_is_sorted(
+            "SELECT * FROM posts ORDER BY title"
+        ));
+        // Aggregate → false.
+        assert!(!select_projection_is_sorted(
+            "SELECT COUNT(*) FROM posts ORDER BY title"
+        ));
     }
 
     /// SP-PG-ORM-REALAPP — the SQL-standard doubled-quote escape inside a

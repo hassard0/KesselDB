@@ -2357,6 +2357,16 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
                 // SP-PG-SQL-ORM-PARSE T2 — projection columns may be
                 // qualified (`orm_users.id`); strip the qualifier.
                 leading_cols.push(p.col_ident()?);
+                // SP-PG-SERIAL-RETURNING — a projection column may carry
+                // an output alias `col AS alias` (SQLAlchemy emits
+                // `SELECT widgets.id AS widgets_id, …` for its post-flush
+                // refresh). Accept-and-skip the alias: V1 projects + names
+                // by the SOURCE column (the engine's `Op::SelectFields`
+                // output order; result mapping is positional). A named
+                // RowDescription alias is the follow-up `SP-PG-SQL-PROJ-ALIAS`.
+                if p.kw("AS") {
+                    let _alias = p.ident()?;
+                }
             }
             if matches!(p.peek(), Some(Tok::Punct(','))) {
                 p.i += 1;
@@ -6435,6 +6445,27 @@ mod tests {
             cat
         )
         .is_ok());
+    }
+
+    /// SQLAlchemy's post-flush refresh `SELECT col AS alias … FROM t
+    /// WHERE id = n` compiles: the projection alias is accept-and-skipped
+    /// and the source columns project as usual.
+    #[test]
+    fn select_projection_with_as_alias_compiles() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE widgets (id BIGSERIAL PRIMARY KEY, name VARCHAR(8))");
+        let cat = sm.catalog();
+        // Both the parser (compile) and the gateway projection detector
+        // (select_columns) must accept the aliased shape.
+        assert!(compile(
+            "SELECT widgets.id AS widgets_id, widgets.name AS widgets_name FROM widgets WHERE widgets.id = 1",
+            cat
+        )
+        .is_ok(), "aliased projection must compile");
+        assert_eq!(
+            select_columns("SELECT widgets.id AS widgets_id, widgets.name AS widgets_name FROM widgets"),
+            Some(("widgets".to_string(), vec!["id".to_string(), "name".to_string()]))
+        );
     }
 
     /// `insert_returning` parses the clause + column list (qualified or

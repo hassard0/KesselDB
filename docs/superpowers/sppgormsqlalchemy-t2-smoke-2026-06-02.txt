@@ -1,0 +1,177 @@
+SP-PG-ORM-SQLALCHEMY T2/T3 — SQLAlchemy 2.0 declarative-ORM integration smoke
+============================================================================
+Recorded: 2026-06-02 on vulcan (Ubuntu 24.04, admin@192.168.4.178)
+Server:   kesseldb (built --features pg-gateway, CARGO_TARGET_DIR=/tmp/kdb-target-ormsa)
+          KESSELDB_TOKEN=admin KESSELDB_PG_ADDR=127.0.0.1:5540, bin 6540
+HEAD:     36119f3 (incl. SP-PG-ORM-SQLALCHEMY VARCHAR(n) DDL alias)
+Driver:   SQLAlchemy 2.0.45 + psycopg2 2.9.12 + Python 3.12.3
+Script:   scripts/sppgormsqlalchemy-smoke.py (declarative-ORM triage harness)
+
+This is the INTEGRATION validation of tonight's ~46 PG-wire arcs: a REAL
+SQLAlchemy declarative-ORM CRUD workload (NOT raw cursor.execute) run
+end-to-end. The triage harness runs each ORM stage in its own try/except
+so an early failure does not mask later stages; the goal is to pin the
+EXACT boundary of declarative-ORM support today.
+
+HEADLINE
+========
+A real SQLAlchemy 2.0 declarative-ORM workload does NOT yet compose
+end-to-end against KesselDB. The PG-wire substrate it sits on IS lit and
+verified (engine.connect + Extended Query probe PASS; VARCHAR(n) DDL,
+INSERT, and `SELECT *`[+WHERE] all PASS via psql, see below), but the
+ORM's own emitted SQL hits three independent gaps that block every
+ORM-managed operation:
+
+  G1. create_all pg_catalog existence probe uses `relkind = ANY (ARRAY[...])`
+      -> parser rejects `[` (`unexpected char '['`). Blocks ALL ORM DDL.
+  G2. ORM SELECT always qualifies columns: `SELECT t.id, t.name FROM t`
+      -> parser `expected FROM` (qualified `table.col` projection unsupported).
+      Also the PG-wire render path only emits `SELECT * FROM <table>` —
+      an explicit projection list (even unqualified `SELECT id,name FROM t`)
+      returns "V1 PG-wire only renders `SELECT * FROM <table>`".
+  G3. ORM UPDATE/DELETE qualify the WHERE column: `WHERE t.id = $1`
+      -> parser `expected ID` (qualified `table.col` in WHERE unsupported).
+
+Each gap is larger than a single surgical fix; named as follow-up arcs in T3.
+The ONE pre-named surgical fix that WAS applied (VARCHAR(n) DDL alias)
+is verified below but does not move the create_all needle because the
+catalog probe (G1) fails BEFORE any CREATE TABLE is emitted.
+
+----------------------------------------------------------------------
+PART A — full ORM smoke (scripts/sppgormsqlalchemy-smoke.py)
+----------------------------------------------------------------------
+# SQLAlchemy 2.0.45 -> postgresql+psycopg2://test:admin@127.0.0.1:5540/kesseldb
+STAGE connect: PASS engine.connect() + probe OK
+STAGE create_all_ddl: FAIL ProgrammingError: (psycopg2.errors.SyntaxErrorOrAccessRuleViolation) sql: unexpected char '['
+
+[SQL: SELECT pg_catalog.pg_class.relname
+FROM pg_catalog.pg_class JOIN pg_catalog.pg_namespace ON pg_catalog.pg_namespace.oid = pg_catalog.pg_class.relnamespace
+WHERE pg_catalog.pg_class.relname = %(table_name)s AND pg_catalog.pg_class.relkind = ANY (ARRAY[%(param_1)s, %(param_2)s, %(param_3)s, %(param_4)s, %(param_5)s]) AND pg_catalog.pg_table_is_visible(pg_catalog.pg_class.oid) AND pg_catalog.pg_namespace.nspname != %(nspname_1)s]
+[parameters: {'table_name': 'orm_users', 'param_1': 'r', 'param_2': 'p', 'param_3': 'f', 'param_4': 'v', 'param_5': 'm', 'nspname_1': 'pg_catalog'}]
+
+# create_all(VARCHAR) rejected — retrying DDL with explicit CHAR(32) mapping
+STAGE create_all_ddl_char_fallback: PASS CREATE TABLE via ORM metadata (CHAR fallback)
+    [HARNESS ARTIFACT: SQLAlchemy create_all(checkfirst=True) swallows the
+     G1 probe error internally and returns WITHOUT raising AND WITHOUT
+     emitting CREATE TABLE — so the stage records PASS but no table is
+     created. Confirmed by the next stage failing `unknown table orm_users`.]
+STAGE orm_insert: FAIL ProgrammingError: (psycopg2.errors.UndefinedTable) sql: unknown table `orm_users`
+
+[SQL: INSERT INTO orm_users (id, name) VALUES (%(id__0)s, %(name__0)s), (%(id__1)s, %(name__1)s)]
+[parameters: {'id__0': 1, 'name__0': 'alice', 'id__1': 2, 'name__1': 'bob'}]
+STAGE orm_select_all: FAIL ProgrammingError: (psycopg2.errors.SyntaxErrorOrAccessRuleViolation) sql: expected `FROM`
+
+[SQL: SELECT orm_users.id, orm_users.name
+FROM orm_users]
+STAGE orm_filter: FAIL ProgrammingError: (psycopg2.errors.SyntaxErrorOrAccessRuleViolation) sql: expected `FROM`
+
+[SQL: SELECT orm_users.id, orm_users.name
+FROM orm_users
+WHERE orm_users.id = %(id_1)s]
+STAGE orm_update: FAIL ProgrammingError: (psycopg2.errors.SyntaxErrorOrAccessRuleViolation) sql: expected `ID`
+
+[SQL: UPDATE orm_users SET name=%(name)s WHERE orm_users.id = %(id_1)s]
+STAGE orm_delete: FAIL ProgrammingError: (psycopg2.errors.SyntaxErrorOrAccessRuleViolation) sql: expected `ID`
+
+[SQL: DELETE FROM orm_users WHERE orm_users.id = %(id_1)s]
+
+=== SQLALCHEMY ORM SMOKE SUMMARY ===
+  PASS  connect
+  FAIL  create_all_ddl            (G1 — ANY(ARRAY[...]) catalog probe)
+  PASS  create_all_ddl_char_fb    (harness artifact — see note above)
+  FAIL  orm_insert                (no table — G1 upstream)
+  FAIL  orm_select_all            (G2 — qualified projection)
+  FAIL  orm_filter                (G2 — qualified projection)
+  FAIL  orm_update                (G3 — qualified WHERE)
+  FAIL  orm_delete                (G3 — qualified WHERE)
+--- 2/8 stages PASS ---
+SQLALCHEMY ORM SMOKE COMPLETE
+
+----------------------------------------------------------------------
+PART B — isolation via psql 16 (proves the substrate vs the ORM-shape gap)
+----------------------------------------------------------------------
+# VARCHAR(n) DDL — the ONE surgical fix this arc shipped — WORKS:
+$ psql -c "CREATE TABLE vtest (id BIGINT NOT NULL, name VARCHAR(32))"
+CREATE TABLE
+$ psql -c "\d vtest"
+              Table "public.vtest"
+ Column | Type | Collation | Nullable | Default
+--------+------+-----------+----------+---------
+ id     | int8 |           | not null |
+ name   | text |           |          |
+
+# INSERT — WORKS:
+$ psql -c "INSERT INTO vtest (id, name) VALUES (1, 'alice')"
+INSERT 0 1
+
+# SELECT * [+ WHERE] — WORKS (the verified V1 PG-wire surface):
+$ psql -c "SELECT * FROM vtest"
+ id | name
+----+-------
+  1 | alice
+(1 row)
+$ psql -c "SELECT * FROM vtest WHERE id = 1"
+ id | name
+----+-------
+  1 | alice
+(1 row)
+
+# G2a — explicit projection list (even UNQUALIFIED) is render-unsupported:
+$ psql -c "SELECT id, name FROM vtest"
+ERROR:  V1 PG-wire only renders `SELECT * FROM <table>`
+
+# G2b — qualified projection (the ORM's actual shape) — parser stop:
+$ psql -c "SELECT vtest.id, vtest.name FROM vtest"
+ERROR:  sql: expected `FROM`
+
+# G3 — qualified WHERE in UPDATE (ORM shape):
+$ psql -c "UPDATE vtest SET name='bob' WHERE vtest.id = 1"
+ERROR:  sql: expected `ID`
+
+# G1 — ANY(ARRAY[...]) (the create_all existence probe shape):
+$ psql -c "SELECT 1 WHERE 'r' = ANY (ARRAY['r','p'])"
+ERROR:  sql: unexpected char '['
+
+----------------------------------------------------------------------
+SURGICAL FIX SHIPPED (T2/T3, commit 36119f3)
+----------------------------------------------------------------------
+kessel-sql `kind_of`: `VARCHAR(n)` DDL alias -> `FieldKind::Char(n)`
+(mirrors the existing BIGINT/INTEGER/SMALLINT/BOOLEAN SP-PG-CAT-T8
+aliases). Pre-named in the design's fix rule (unblocks a MAJOR path:
+every SQLAlchemy/Django/Rails/Diesel string column renders VARCHAR(n)).
+KAT `pg_varchar_alias_maps_to_char` PASS on vulcan. The gateway already
+encoded the varchar OID 1043 on the read/cast side; this closes the
+write/DDL side. Bare `VARCHAR` w/o `(n)` rejects with a precise reason.
+
+----------------------------------------------------------------------
+NAMED FOLLOW-UP ARCS (gaps NOT fixed inline — each larger than surgical)
+----------------------------------------------------------------------
+SP-PG-SQL-QUALIFIED-COLS  — accept `table.col` in projection lists AND in
+                            WHERE/SET (strip the redundant single-table
+                            qualifier; JOIN already parses `t.c`). Unblocks
+                            G2b + G3 — i.e. EVERY ORM SELECT/UPDATE/DELETE.
+SP-PG-SQL-PROJECTION-RENDER — make the PG-wire render path emit an explicit
+                            projection list (`SELECT c1,c2 FROM t`), not
+                            just `SELECT *`. Unblocks G2a. (Parser already
+                            has the SP-Analytic-Plan-MULTI projection
+                            parser; the gateway render side is the gap.)
+SP-PG-SQL-ANY-ARRAY       — recognise `col = ANY (ARRAY[...])` (and the
+                            inverse `ANY(ARRAY[...]) = col`). Unblocks G1 —
+                            SQLAlchemy's create_all/inspector existence
+                            probe + IN-list lowering both use it.
+SP-PG-DDL-VARCHAR-UNBOUNDED — bare `VARCHAR`/`TEXT`/`CHARACTER VARYING`
+                            (no `(n)`, multi-word) DDL types.
+SP-PG-DDL-VARCHAR-NATIVE  — true variable-length storage (vs fixed CHAR
+                            alias) if CHAR-pad vs VARCHAR-trim semantics
+                            surface in ORM round-trips.
+SP-PG-RETURNING / SP-PG-SERIAL — server-generated/autoincrement PKs +
+                            INSERT...RETURNING (not hit here — our model
+                            uses explicit ids — but the next ORM model
+                            shape will need them).
+
+BOTTOM LINE: the PG-wire SUBSTRATE the ORM rides on is solid (connect,
+EXTQ probe, VARCHAR DDL, INSERT, SELECT*[+WHERE] all green). The DECLARATIVE
+-ORM layer is blocked by 3 SQL-SHAPE gaps in the kessel-sql parser /
+PG-wire render path — qualified columns, explicit projection rendering,
+and ANY(ARRAY[...]). Closing SP-PG-SQL-QUALIFIED-COLS + -PROJECTION-RENDER
++ -ANY-ARRAY would take this from 2/8 to a full declarative-ORM CRUD pass.

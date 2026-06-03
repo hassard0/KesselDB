@@ -41,6 +41,42 @@ measurement and had drifted from the actual workspace count).
   production `ClusterClient` does. The long-standing CI flake is GONE.
 
 Latest arc deliveries on top of that baseline (most-recent first):
+SP-PG-ORM-SQLALCHEMY V1 (2026-06-02, +1 KAT, DONE_WITH_CONCERNS) — the
+INTEGRATION validation of tonight's ~46 PG-wire arcs: a REAL SQLAlchemy
+2.0 **declarative-ORM** CRUD workload (NOT raw `cursor.execute`) run
+end-to-end on vulcan. HONEST HEADLINE: the PG-wire SUBSTRATE composes
+(engine.connect + Extended Query probe PASS; `VARCHAR(n)` DDL, INSERT,
+and `SELECT *`[+WHERE] all PASS), but the DECLARATIVE-ORM layer does NOT
+yet compose — it is blocked by three SQL-SHAPE gaps the ORM emits that
+the kessel-sql parser / PG-wire render path don't recognise: (G1)
+`create_all`'s inspector probe uses `relkind = ANY (ARRAY[…])` →
+`unexpected char '['`; (G2) every ORM SELECT qualifies columns
+(`SELECT t.id, t.name FROM t`) + uses an explicit projection list, but
+the parser rejects qualified `table.col` projections AND the render path
+only emits `SELECT *`; (G3) ORM UPDATE/DELETE qualify the WHERE column
+(`WHERE t.id = $1`) → `expected ID`. Smoke = 2/8 ORM stages PASS.
+The ONE pre-named surgical fix this arc shipped: kessel-sql `kind_of`
+`VARCHAR(n)` → `Char(n)` DDL alias (mirrors the SP-PG-CAT-T8
+BIGINT/INTEGER/SMALLINT/BOOLEAN aliases) — unblocks the DDL string-column
+path for every ORM (SQLAlchemy/Django/Rails/Diesel) + raw psql; KAT
+`pg_varchar_alias_maps_to_char` green on vulcan; verified via `CREATE
+TABLE … name VARCHAR(32)` + `\d`. The 3 ORM-shape blockers are larger
+than surgical and are NAMED as follow-ups: `SP-PG-SQL-QUALIFIED-COLS`
+(accept `table.col` in projection + WHERE/SET — unblocks G2-parse + G3),
+`SP-PG-SQL-PROJECTION-RENDER` (PG-wire render of an explicit projection
+list, not just `SELECT *` — unblocks G2-render), `SP-PG-SQL-ANY-ARRAY`
+(`col = ANY (ARRAY[…])` — unblocks G1). Plus `SP-PG-DDL-VARCHAR-UNBOUNDED`
+(bare/`CHARACTER VARYING`), `SP-PG-DDL-VARCHAR-NATIVE` (true var-length
+storage), `SP-PG-RETURNING` / `SP-PG-SERIAL` (server-generated PKs, not
+hit by the explicit-id model but needed next), `SP-PG-ORM-RELATIONSHIPS`,
+`SP-PG-ORM-ALEMBIC`. NOTE: this REFINES the earlier "SQLAlchemy 2.0 ✓"
+ORM-compat-matrix claim — that ✓ is for the **raw-driver** path
+(`conn.execute(text("SELECT * FROM t WHERE id=:id"))`), which remains
+green; the **declarative-ORM** path is the boundary documented here.
+Closing the 3 SQL-shape arcs takes the declarative ORM from 2/8 to a
+full CRUD pass. Smoke transcript:
+`docs/superpowers/sppgormsqlalchemy-t2-smoke-2026-06-02.txt`. **TaskList
+ready for completion (DONE_WITH_CONCERNS — boundary named, not all green).**
 SP-PG-COPY-CSV-NUMERIC-SCI V1 (2026-06-02, +20 KATs) — text + CSV
 COPY into a NUMERIC-OID column (kessel-sql `I128`/`U128`/`Fixed` →
 PG OID 1700) now accepts scientific notation and expands the

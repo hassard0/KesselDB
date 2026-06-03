@@ -209,6 +209,38 @@ impl<'a> P<'a> {
             _ => Err("expected identifier".into()),
         }
     }
+    /// SP-PG-SQL-ORM-PARSE T2 — a column reference that MAY be qualified
+    /// with a table name or alias: `IDENT (DOT IDENT)?`. Returns the
+    /// LAST ident (the bare column name). The qualifier is accepted and
+    /// IGNORED in V1 (lenient): `orm_users.id`, `t.id`, and bare `id`
+    /// all resolve to the column `id`. SQLAlchemy / Django / Rails ALL
+    /// qualify every column with the table name, so lenient acceptance
+    /// maximizes ORM compatibility. Strict validation (reject
+    /// `wrong_table.id`) is the named follow-up `SP-PG-SQL-QUALIFIER-
+    /// STRICT`. A bare `IDENT` with no trailing `.IDENT` is byte-
+    /// identical to the old `ident()` path, so every prior KAT that fed
+    /// unqualified columns produces the SAME compiled Op.
+    fn col_ident(&mut self) -> Result<String, SqlError> {
+        let first = self.ident()?;
+        if matches!(self.peek(), Some(Tok::Punct('.'))) {
+            self.i += 1; // consume `.`
+            // `t.col` — the qualifier `first` is the table/alias; the
+            // column is the second ident. (A third `.` — schema-
+            // qualified `db.t.col` — is not produced by the ORMs we
+            // target; reject so a typo doesn't silently swallow tokens.)
+            let col = self.ident()?;
+            if matches!(self.peek(), Some(Tok::Punct('.'))) {
+                return Err(
+                    "schema-qualified column `a.b.c` not supported (V1 \
+                     accepts `table.col` or bare `col`)"
+                        .into(),
+                );
+            }
+            Ok(col)
+        } else {
+            Ok(first)
+        }
+    }
     fn punct(&mut self, c: char) -> Result<(), SqlError> {
         match self.next() {
             Some(Tok::Punct(p)) if p == c => Ok(()),
@@ -471,11 +503,26 @@ pub fn select_columns(sql: &str) -> Option<(String, Vec<String>)> {
     loop {
         match it.next()? {
             Tok::Ident(c) if !c.eq_ignore_ascii_case("FROM") => {
+                // SP-PG-SQL-ORM-PARSE T3 — qualified projection column
+                // `table.col` (the ORM's actual shape): if a `.` follows,
+                // consume it + the bare column ident and use the column
+                // name (lenient qualifier, matches the parser's
+                // `col_ident`). The gateway renders the column by its
+                // bare name, so the RowDescription matches the engine's
+                // `Op::SelectFields` projected output order.
+                let mut col = c.clone();
+                if matches!(it.peek(), Some(Tok::Punct('.'))) {
+                    it.next(); // consume `.`
+                    match it.next()? {
+                        Tok::Ident(real) => col = real.clone(),
+                        _ => return None,
+                    }
+                }
                 // `FUNC(` ⇒ aggregate/expr — not a plain column list.
                 if matches!(it.peek(), Some(Tok::Punct('('))) {
                     return None;
                 }
-                cols.push(c.clone());
+                cols.push(col);
             }
             _ => return None, // `*`, `FROM` with no cols, etc.
         }
@@ -677,16 +724,32 @@ fn compile_stmt_from_tokens(
         let mut p = P { t: toks.clone(), i: 0, cat };
         if p.kw("UPDATE") {
             let tname = p.ident()?;
-            p.expect_kw("ID")?;
-            let id = match p.next() {
-                Some(Tok::Int(n)) => n as u128,
-                _ => return Err("UPDATE needs `ID <int>`".into()),
+            // Two row-targeting shapes:
+            //   (legacy)   UPDATE t ID <n> SET ...
+            //   (standard) UPDATE t SET ... WHERE [t.]id = <n>
+            // SQLAlchemy / Django / Rails ALL emit the standard shape
+            // (`SET ... WHERE pk = n`), qualifying the WHERE column with
+            // the table name. KesselDB rows are keyed by the `id`
+            // pseudo-column (the ObjectId), so a `WHERE id = <int>` on
+            // the primary key maps DIRECTLY to the id-based update RMW.
+            // (SP-PG-SQL-ORM-PARSE T2)
+            let legacy_id: Option<u128> = if p.kw("ID") {
+                match p.next() {
+                    Some(Tok::Int(n)) => Some(n as u128),
+                    _ => return Err("UPDATE needs `ID <int>`".into()),
+                }
+            } else {
+                None
             };
             p.expect_kw("SET")?;
             let ot = p.type_named(&tname)?.clone();
             let mut sets = Vec::new();
             loop {
-                let col = p.ident()?;
+                // SP-PG-SQL-ORM-PARSE T2 — SET target column may be
+                // qualified (`SET orm_users.name = 'x'`); strip the
+                // qualifier. (SQLAlchemy emits bare `SET name=$1` today,
+                // but accept the qualified form per the parser contract.)
+                let col = p.col_ident()?;
                 match p.next() {
                     Some(Tok::Cmp("=")) => {}
                     _ => return Err("expected `=`".into()),
@@ -714,6 +777,12 @@ fn compile_stmt_from_tokens(
                     _ => break,
                 }
             }
+            // Resolve the target id: legacy `ID <n>` already captured it;
+            // otherwise the standard shape requires `WHERE [t.]id = <n>`.
+            let id = match legacy_id {
+                Some(n) => n,
+                None => parse_where_id_eq(&mut p)?,
+            };
             return Ok(Stmt::Update {
                 type_id: ot.type_id,
                 id,
@@ -722,6 +791,67 @@ fn compile_stmt_from_tokens(
         }
     }
     Ok(Stmt::Op(compile_from_tokens(toks, cat)?))
+}
+
+/// SP-PG-SQL-ORM-PARSE T2 — parse a `WHERE [table.]id = <int>` clause
+/// and return the integer id. The standard ORM UPDATE/DELETE shapes
+/// target a row by its primary key (`WHERE orm_users.id = $1`), and
+/// KesselDB keys every row by the `id` pseudo-column (the ObjectId), so
+/// this is the by-PK row selector. The qualifier (`orm_users.`) is
+/// stripped (lenient); the column MUST be `id` (the pseudo-PK) and the
+/// comparison MUST be `=` against an integer. Anything else
+/// (non-`id` column, non-eq operator, multi-predicate WHERE) is the
+/// named follow-up `SP-PG-SQL-UPDATE-WHERE-GENERAL` (needs a server-side
+/// scan-resolve-RMW that V1 doesn't have) and returns a precise error.
+fn parse_where_id_eq(p: &mut P) -> Result<u128, SqlError> {
+    if !p.kw("WHERE") {
+        return Err(
+            "UPDATE/DELETE needs `WHERE id = <int>` (or the legacy \
+             `ID <int>`)"
+                .into(),
+        );
+    }
+    // `[table.]id` — strip the optional qualifier, require column `id`.
+    let col = p.col_ident()?;
+    if !col.eq_ignore_ascii_case("id") {
+        return Err(format!(
+            "V1 UPDATE/DELETE WHERE targets the primary key only \
+             (`WHERE id = <int>`); `{col}` is not the row id \
+             (SP-PG-SQL-UPDATE-WHERE-GENERAL)"
+        ));
+    }
+    match p.next() {
+        Some(Tok::Cmp("=")) => {}
+        _ => return Err("UPDATE/DELETE WHERE id needs `= <int>`".into()),
+    }
+    let id = match p.next() {
+        Some(Tok::Int(n)) => n as u128,
+        // pgJDBC simple-mode / cast-stripped `'42'` arrives as a string;
+        // coerce a clean decimal the same way the INSERT id path does.
+        Some(Tok::Str(s)) => s
+            .parse::<i128>()
+            .map(|n| n as u128)
+            .map_err(|_| "WHERE id must be an integer".to_string())?,
+        Some(Tok::Bytes(b)) => std::str::from_utf8(&b)
+            .ok()
+            .and_then(|s| s.parse::<i128>().ok())
+            .map(|n| n as u128)
+            .ok_or_else(|| "WHERE id must be an integer".to_string())?,
+        _ => return Err("WHERE id needs an integer value".into()),
+    };
+    // Reject a trailing AND/OR — V1 only resolves a single by-PK
+    // predicate. (A residual multi-predicate WHERE would otherwise be
+    // silently ignored, which would be a correctness footgun.)
+    if let Some(Tok::Ident(k)) = p.peek() {
+        if k.eq_ignore_ascii_case("AND") || k.eq_ignore_ascii_case("OR") {
+            return Err(
+                "V1 UPDATE/DELETE WHERE supports a single `id = <int>` \
+                 predicate (SP-PG-SQL-UPDATE-WHERE-GENERAL)"
+                    .into(),
+            );
+        }
+    }
+    Ok(id)
 }
 
 /// Compile one SQL statement to an `Op`. `cat` is needed for everything
@@ -1554,10 +1684,17 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
     if p.kw("DELETE") {
         p.expect_kw("FROM")?;
         let tname = p.ident()?;
-        p.expect_kw("ID")?;
-        let id = match p.next() {
-            Some(Tok::Int(n)) => n as u128,
-            _ => return Err("DELETE needs `ID <int>`".into()),
+        // Two row-targeting shapes (mirrors UPDATE):
+        //   (legacy)   DELETE FROM t ID <n>
+        //   (standard) DELETE FROM t WHERE [t.]id = <n>   (ORM shape)
+        // (SP-PG-SQL-ORM-PARSE T2)
+        let id = if p.kw("ID") {
+            match p.next() {
+                Some(Tok::Int(n)) => n as u128,
+                _ => return Err("DELETE needs `ID <int>`".into()),
+            }
+        } else {
+            parse_where_id_eq(&mut p)?
         };
         let ot = p.type_named(&tname)?;
         return Ok(Op::Delete {
@@ -1662,6 +1799,39 @@ fn lit_to_value(l: &Lit, k: FieldKind) -> Result<Value, SqlError> {
         }
         _ => return Err("literal/column type mismatch".into()),
     })
+}
+
+/// SP-PG-SQL-ORM-PARSE T2 — collapse qualified column references
+/// (`IDENT DOT IDENT` → the trailing column `IDENT`) in a WHERE token
+/// span so the index-hint extractors (`eq_preds` walk + range
+/// `extract_range_preds`) treat `t.id = 1` IDENTICALLY to `id = 1`.
+/// The compiled WHERE *program* is already qualifier-stripped by
+/// `term_hinted`; this makes the index *hints* match too, so a
+/// qualified query compiles to the BYTE-IDENTICAL Op as its bare
+/// equivalent (the determinism contract). A span with no `.` is
+/// returned token-for-token unchanged, so every prior hint KAT is
+/// preserved.
+fn strip_span_qualifiers(span: &[Tok]) -> Vec<Tok> {
+    let mut out: Vec<Tok> = Vec::with_capacity(span.len());
+    let mut i = 0;
+    while i < span.len() {
+        // `IDENT . IDENT` → push only the column ident, skip the
+        // qualifier + dot. Guard the lookahead so a trailing `.` (which
+        // can't legally occur in a compiled span) doesn't panic.
+        if let Tok::Ident(_) = &span[i] {
+            if i + 2 < span.len()
+                && matches!(span[i + 1], Tok::Punct('.'))
+                && matches!(span[i + 2], Tok::Ident(_))
+            {
+                out.push(span[i + 2].clone());
+                i += 3;
+                continue;
+            }
+        }
+        out.push(span[i].clone());
+        i += 1;
+    }
+    out
 }
 
 /// SP-Analytic-Plan T3: extract `(field_id, op, value)` half-range
@@ -1806,7 +1976,12 @@ fn try_query_rows(p: &mut P) -> Option<Op> {
     let program: Vec<u8> = if p.kw("WHERE") {
         let ws = p.i;
         let prog = compile_where(p, &ot).ok()?;
-        let span: &[Tok] = &p.t[ws..p.i];
+        // SP-PG-SQL-ORM-PARSE T2 — normalize qualified column refs
+        // (`t.id` → `id`) BEFORE the hint walk so a qualified WHERE
+        // emits the SAME eq/range hints as its bare equivalent (Op
+        // byte-identity / determinism contract).
+        let span_owned = strip_span_qualifiers(&p.t[ws..p.i]);
+        let span: &[Tok] = &span_owned;
         // A `col = literal` hint is only SAFE if it is a *mandatory*
         // conjunct — i.e. the WHERE has NO top-level OR/NOT/parentheses,
         // so every comparison must hold. Otherwise emit no hints (the
@@ -1926,7 +2101,9 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
             p.i += 1;
             None
         } else {
-            Some(p.ident()?)
+            // SP-PG-SQL-ORM-PARSE T2 — aggregate arg may be qualified
+            // (`COUNT(orm_users.id)`); strip the qualifier.
+            Some(p.col_ident()?)
         };
         p.punct(')')?;
         Ok(AggSpec { kind, field })
@@ -1960,7 +2137,9 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
                             .into(),
                     );
                 }
-                leading_cols.push(p.ident()?);
+                // SP-PG-SQL-ORM-PARSE T2 — projection columns may be
+                // qualified (`orm_users.id`); strip the qualifier.
+                leading_cols.push(p.col_ident()?);
             }
             if matches!(p.peek(), Some(Tok::Punct(','))) {
                 p.i += 1;
@@ -2059,8 +2238,11 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
     let (program, agg_range_preds) = if p.kw("WHERE") {
         let ws = p.i;
         let prog = compile_where(p, &ot)?;
-        let span: &[Tok] = &p.t[ws..p.i];
-        let rp = extract_range_preds(&ot, span);
+        // SP-PG-SQL-ORM-PARSE T2 — qualifier-normalize the span so an
+        // aggregate WHERE with `t.d >= LO` gains the same range hint as
+        // the bare `d >= LO` (Op byte-identity).
+        let span_owned = strip_span_qualifiers(&p.t[ws..p.i]);
+        let rp = extract_range_preds(&ot, &span_owned);
         (prog, rp)
     } else {
         (Program::new().push_int(1).bytes(), Vec::new())
@@ -2072,11 +2254,13 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
     let mut offset: u32 = 0;
     if p.kw("GROUP") {
         p.expect_kw("BY")?;
-        group = Some(p.ident()?);
+        // SP-PG-SQL-ORM-PARSE T2 — GROUP BY column may be qualified.
+        group = Some(p.col_ident()?);
     }
     if p.kw("ORDER") {
         p.expect_kw("BY")?;
-        let c = p.ident()?;
+        // SP-PG-SQL-ORM-PARSE T2 — ORDER BY column may be qualified.
+        let c = p.col_ident()?;
         let desc = p.kw("DESC");
         if !desc {
             let _ = p.kw("ASC");
@@ -2473,6 +2657,20 @@ fn term_hinted(
             Ok(Program::new().push_bytes(&b))
         }
         Some(Tok::Ident(name)) => {
+            // SP-PG-SQL-ORM-PARSE T2 — qualified column reference in a
+            // WHERE term: `table.col` / `t.col`. The lexer tokenizes
+            // `.` as `Punct('.')`; if it follows the ident, consume it
+            // plus the bare column ident and IGNORE the qualifier
+            // (lenient V1). Bare `col` (no trailing `.`) is unchanged.
+            let name = if matches!(p.peek(), Some(Tok::Punct('.'))) {
+                p.i += 1; // consume `.`
+                match p.next() {
+                    Some(Tok::Ident(col)) => col,
+                    _ => return Err("expected column after `table.`".into()),
+                }
+            } else {
+                name
+            };
             let f = ot
                 .fields
                 .iter()
@@ -5599,5 +5797,187 @@ mod tests {
                 panic!("expected both compile paths to produce Stmt::Update");
             }
         }
+    }
+
+    // ============================================================
+    // SP-PG-SQL-ORM-PARSE T2 — qualified columns (`table.col`).
+    // SQLAlchemy / Django / Rails ALWAYS qualify columns with the
+    // table name; these KATs lock the lenient-qualifier contract:
+    // `t.col` compiles to the BYTE-IDENTICAL Op as bare `col`.
+    // ============================================================
+
+    /// `SELECT t.id, t.name FROM t` parses to a projection of [id, name]
+    /// — the qualifier is stripped, and the compiled Op is identical to
+    /// the bare-column `SELECT id, name FROM t`.
+    #[test]
+    fn ormparse_qualified_projection_strips_qualifier() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE orm_users (name CHAR(32))");
+        let cat = sm.catalog();
+        let qualified = compile(
+            "SELECT orm_users.id, orm_users.name FROM orm_users",
+            cat,
+        )
+        .expect("qualified projection compiles");
+        let bare = compile("SELECT id, name FROM orm_users", cat)
+            .expect("bare projection compiles");
+        // `id` is the pseudo-PK (not a stored field), so the engine
+        // projects only `name` for both shapes — but they must be the
+        // SAME Op regardless. Compare encodings byte-for-byte.
+        assert_eq!(
+            qualified.encode(),
+            bare.encode(),
+            "qualified projection must compile byte-identically to bare"
+        );
+        // And it must be a SelectFields projection (not Select *).
+        assert!(
+            matches!(qualified, Op::SelectFields { .. }),
+            "explicit projection list must emit Op::SelectFields, got {:?}",
+            qualified.kind()
+        );
+    }
+
+    /// `SELECT * FROM t WHERE t.id = 1` — qualified WHERE column on the
+    /// PK. Must compile identically to the bare `WHERE id = 1` (same
+    /// eq-hint, same program → same Op bytes).
+    #[test]
+    fn ormparse_qualified_where_pk_byte_identical() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (n U32 NOT NULL)");
+        let cat = sm.catalog();
+        let qualified =
+            compile("SELECT * FROM t WHERE t.n = 5", cat).expect("ok");
+        let bare = compile("SELECT * FROM t WHERE n = 5", cat).expect("ok");
+        assert_eq!(
+            qualified.encode(),
+            bare.encode(),
+            "qualified WHERE must compile byte-identically to bare WHERE \
+             (determinism contract)"
+        );
+    }
+
+    /// `SELECT users.id FROM users` — qualifier equals the table name,
+    /// accepted; resolves to column `id`.
+    #[test]
+    fn ormparse_qualifier_equals_table_name_accepted() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE users (age U32 NOT NULL)");
+        let cat = sm.catalog();
+        // `users.age` qualified projection compiles (age is a real field).
+        let op = compile("SELECT users.age FROM users", cat)
+            .expect("qualifier=table name accepted");
+        assert!(matches!(op, Op::SelectFields { .. }));
+    }
+
+    /// Qualified col in WHERE with a param: `WHERE t.id = $1`.
+    /// After param substitution the qualified clause must compile
+    /// identically to the bare param clause.
+    #[test]
+    fn ormparse_qualified_where_with_param() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (n U32 NOT NULL)");
+        let cat = sm.catalog();
+        let qualified = compile_with_params(
+            "SELECT * FROM t WHERE t.n = $1",
+            cat,
+            &[Some(Value::Int(42))],
+        )
+        .expect("qualified param WHERE compiles");
+        let bare = compile_with_params(
+            "SELECT * FROM t WHERE n = $1",
+            cat,
+            &[Some(Value::Int(42))],
+        )
+        .expect("bare param WHERE compiles");
+        assert_eq!(qualified.encode(), bare.encode());
+    }
+
+    /// Bare columns still compile (regression guard): the qualifier
+    /// branch is purely additive.
+    #[test]
+    fn ormparse_bare_columns_regression() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (a U32 NOT NULL, b CHAR(8))");
+        let cat = sm.catalog();
+        assert!(compile("SELECT * FROM t", cat).is_ok());
+        assert!(compile("SELECT a, b FROM t", cat).is_ok());
+        assert!(compile("SELECT * FROM t WHERE a = 1", cat).is_ok());
+        assert!(compile("SELECT a FROM t ORDER BY a", cat).is_ok());
+        assert!(compile("SELECT COUNT(*) FROM t", cat).is_ok());
+    }
+
+    /// ORM UPDATE shape: `UPDATE t SET name=$1 WHERE t.id = $2`. The
+    /// standard `SET ... WHERE [t.]id = <n>` form maps to the id-based
+    /// `Stmt::Update`, byte-identical to the legacy `UPDATE t ID n SET`.
+    #[test]
+    fn ormparse_update_set_where_id() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (a I64 NOT NULL)");
+        run(&mut sm, 2, "INSERT INTO t ID 7 (a) VALUES (1)");
+        let cat = sm.catalog();
+        let ormstyle =
+            compile_stmt("UPDATE t SET a = 99 WHERE t.id = 7", cat)
+                .expect("ORM-style UPDATE compiles");
+        let legacy = compile_stmt("UPDATE t ID 7 SET a = 99", cat)
+            .expect("legacy UPDATE compiles");
+        match (ormstyle, legacy) {
+            (
+                Stmt::Update { type_id: t1, id: i1, sets: s1 },
+                Stmt::Update { type_id: t2, id: i2, sets: s2 },
+            ) => {
+                assert_eq!(t1, t2);
+                assert_eq!(i1, i2, "WHERE id must resolve the same row id");
+                assert_eq!(s1, s2, "SET clause must be identical");
+            }
+            _ => panic!("both must be Stmt::Update"),
+        }
+    }
+
+    /// ORM DELETE shape: `DELETE FROM t WHERE t.id = $1` maps to the
+    /// id-based Op::Delete, byte-identical to legacy `DELETE FROM t ID n`.
+    #[test]
+    fn ormparse_delete_where_id() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (a I64 NOT NULL)");
+        let cat = sm.catalog();
+        let ormstyle = compile("DELETE FROM t WHERE t.id = 3", cat)
+            .expect("ORM-style DELETE compiles");
+        let legacy =
+            compile("DELETE FROM t ID 3", cat).expect("legacy DELETE compiles");
+        assert_eq!(ormstyle.encode(), legacy.encode());
+        assert!(matches!(ormstyle, Op::Delete { .. }));
+    }
+
+    /// A non-PK WHERE in UPDATE/DELETE is a precise V1 error naming the
+    /// follow-up (not a silent wrong-row footgun).
+    #[test]
+    fn ormparse_update_where_nonpk_rejected() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (a I64 NOT NULL)");
+        let cat = sm.catalog();
+        let err = compile_stmt("UPDATE t SET a = 1 WHERE a = 2", cat)
+            .unwrap_err();
+        assert!(
+            err.contains("primary key") || err.contains("row id"),
+            "non-PK UPDATE WHERE must name the by-PK limitation, got: {err}"
+        );
+    }
+
+    /// `select_columns` (the gateway's projection detector) accepts the
+    /// qualified shape and returns the BARE column names in order, so the
+    /// RowDescription matches the engine's projected output.
+    #[test]
+    fn ormparse_select_columns_qualified() {
+        assert_eq!(
+            select_columns("SELECT t.id, t.name FROM t"),
+            Some(("t".to_string(), vec!["id".to_string(), "name".to_string()]))
+        );
+        // Bare still works (regression).
+        assert_eq!(
+            select_columns("SELECT id, name FROM t"),
+            Some(("t".to_string(), vec!["id".to_string(), "name".to_string()]))
+        );
+        // `SELECT *` is NOT a projection list → None (the star path).
+        assert_eq!(select_columns("SELECT * FROM t"), None);
     }
 }

@@ -1526,6 +1526,33 @@ vulcan. Transcript:
 `nextval`/`setval`), `SP-PG-SERIAL-NONPK` (a SERIAL column that is not
 the PK), `SP-PG-RETURNING-EXPR` (`RETURNING id + 1` / expressions).
 
+#### SQLAlchemy relationships / JOINs (multi-table FK) — 2026-06-03
+
+`SP-PG-ORM-RELATIONSHIPS` validated a real SQLAlchemy 2.0 **two-model
+FK-relationship** workload (`Author` 1—N `Book`, declarative
+`relationship()` + `ForeignKey`) — the relational core. **4/4 stages PASS**
+on vulcan:
+
+| Relationship operation | Result | Notes |
+|---|---|---|
+| `create_all()` with a FK (2 tables) | **PASS** (new) | the child table's `FOREIGN KEY(author_id) REFERENCES authors (id)` table constraint (and the inline `REFERENCES …` form) now parse — accept-and-skip, byte-identical `CreateType` |
+| relationship cascade INSERT | **PASS** | `a.books = [Book, Book]; s.add(a); commit` → parent + children flush via `INSERT … RETURNING id`; the FK column is the parent's assigned id |
+| JOIN query `select(A.x, B.y).join(B, …)` | **PASS** (new) | `SELECT authors.name, books.title FROM authors JOIN books ON authors.id = books.author_id` → the gateway renders the engine's self-describing `Op::Join` (`KTR1`) result; `SELECT *` over a JOIN works too (columns labeled by qualified `authors.id` / `books.id`) |
+| lazy-load navigation `author.books` | **PASS** | `SELECT books.* FROM books WHERE books.author_id = $1` (qualified projection + non-PK general WHERE) |
+
+The two keystone fixes: **(A)** kessel-sql now accept-and-skips FK DDL
+(table-constraint + inline `REFERENCES`, incl. `ON DELETE/UPDATE` actions);
+**(B)** the PG-wire gateway renders an inner-equi-JOIN result — it decodes
+the engine's embedded combined schema, recovers the projection from the SQL
+(`kessel_sql::join_projection`), and emits the projected columns. Before this
+arc a JOIN hit the "only renders `SELECT *`" error even though the engine
+joined. **V1 out-of-scope** (named follow-ups): `SP-PG-DDL-FK-ENFORCE`
+(referential-integrity enforcement — FK is parse-and-skip today),
+`SP-PG-SQL-OUTER-JOIN` (LEFT/RIGHT/FULL — `Op::Join` is inner-only),
+`SP-PG-SQL-JOIN-WHERE` (filtered joins), `SP-PG-SQL-MULTI-JOIN` (3+ tables),
+`SP-PG-SQL-JOIN-ALIAS`, `SP-PG-SQL-JOIN-AGG`. Transcript:
+`docs/superpowers/sppgormrelationships-smoke-2026-06-03.txt`.
+
 #### Django ORM (the other dominant Python ORM) — 2026-06-03
 
 SP-PG-ORM-DJANGO validated a real **Django 6.0 ORM** workload (models +

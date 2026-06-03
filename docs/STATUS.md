@@ -55,7 +55,12 @@ measurement and had drifted from the actual workspace count).
   `insertmanyvalues` form to plain multi-row VALUES, surfaces N assigned
   ids (`OpResult::CreatedMany`), and `RETURNING *` expands to all columns.
   DEFAULT-config CRUD **5/5** on vulcan — "pip install, point at KesselDB,
-  it just works".
+  it just works". SP-PG-ORM-RELATIONSHIPS (2026-06-03) lights up the
+  **relational core**: a real SQLAlchemy 2.0 two-model FK relationship
+  (`Author` 1—N `Book`, `relationship()` + `ForeignKey`) — FK DDL, cascade
+  insert, JOIN query, lazy-load — works **4/4** on vulcan. The gateway now
+  renders the engine's inner-equi-`Op::Join` result (qualified projection +
+  `SELECT *`); FK constraints in CREATE TABLE parse (accept-and-skip).
 - **PG COPY.** SP-PG-COPY V1 (text) + SP-PG-COPY-CSV V1 + SP-PG-COPY-BIN
   V1 deliver the wire shape every `pg_dump`/`pgloader`/`pg_bulkload`/
   Airbyte/Fivetran/Stitch binary-bulk-loader hard-requires.
@@ -68,6 +73,19 @@ measurement and had drifted from the actual workspace count).
   production `ClusterClient` does. The long-standing CI flake is GONE.
 
 Latest arc deliveries on top of that baseline (most-recent first):
+SP-PG-ORM-RELATIONSHIPS (2026-06-03, DONE) — validates a real SQLAlchemy
+2.0 multi-table FK-relationship workload (`Author` 1—N `Book`) end-to-end
+on vulcan: **4/4** (FK DDL / cascade insert / JOIN query / lazy-load). Two
+surgical fixes: kessel-sql accept-and-skips `FOREIGN KEY(col) REFERENCES
+tbl(col)` (+ inline `REFERENCES`, `ON DELETE/UPDATE`) so `create_all` of a
+child table parses; the PG-wire gateway renders the engine's
+self-describing inner-equi-`Op::Join` (`KTR1`) result — decoding the
+embedded combined schema + mapping the qualified projection
+(`SELECT authors.name, books.title …` AND `SELECT *`). The relational core
+(FKs + joins) now composes through a real ORM. Determinism preserved (VSR
+seed-7 oracle PASS; FK DDL compiles byte-identical, JOIN render is pure).
+Named follow-ups: SP-PG-DDL-FK-ENFORCE, SP-PG-SQL-OUTER-JOIN,
+SP-PG-SQL-JOIN-WHERE, SP-PG-SQL-MULTI-JOIN.
 SP-PG-DJANGO-COMPLETE (2026-06-03, +14 KATs, DONE) — closes the TWO
 named gaps the quoted-ident arc left, taking the **Django 6 ORM to full
 CRUD 8/8** on vulcan (was 6/8). `SP-PG-DDL-IDENTITY`: the CREATE TABLE

@@ -1,0 +1,131 @@
+SP-PG-ORM-RELATIONSHIPS — SQLAlchemy 2.0 multi-table FK relationship smoke (after)
+==================================================================================
+Recorded: 2026-06-03 on vulcan (Ubuntu 24.04, admin@192.168.4.178)
+Server:   kesseldb (built --features pg-gateway,
+          CARGO_TARGET_DIR=/tmp/kdb-t-rel, isolated worktree /tmp/kdb-rel-wt)
+          KESSELDB_TOKEN=admin KESSELDB_PG_ADDR=127.0.0.1:5549, native 6549
+HEAD:     3e78512 (SP-PG-ORM-RELATIONSHIPS — FK DDL parse + JOIN result render)
+Driver:   SQLAlchemy 2.0.45 + psycopg2 + Python 3.12
+Script:   scripts/sppgormrelationships-smoke.py
+
+HEADLINE
+========
+A REAL SQLAlchemy 2.0 TWO-MODEL FK-relationship workload (Author 1—N Book,
+declarative `relationship()` + `ForeignKey`, NOT raw cursor.execute) now
+composes END-TO-END against KesselDB. Every relational stage PASSES:
+
+    --- 4/4 stages PASS ---
+
+  PASS  create_all_fk_ddl   2 CREATE TABLEs, the 2nd with a FK table constraint
+  PASS  cascade_insert      a.books = [Book, Book]; s.add(a); commit  → ids 1,(1,2)
+  PASS  join_query          select(Author.name, Book.title).join(Book, …)
+  PASS  lazy_load_nav       author.books (lazy SELECT books.* WHERE author_id=$1)
+
+The relational CORE (foreign keys + inner equi-joins) composes through the ORM.
+
+----------------------------------------------------------------------
+FULL SMOKE TRANSCRIPT (scripts/sppgormrelationships-smoke.py @ :5549)
+----------------------------------------------------------------------
+# SQLAlchemy 2.0.45 -> postgresql+psycopg2://test:admin@127.0.0.1:5549/kesseldb
+STAGE create_all_fk_ddl: PASS 2 CREATE TABLE (2nd w/ FK)
+STAGE cascade_insert: PASS author id=1 book ids=[1, 2]
+STAGE join_query: PASS joined -> [('tolkien', 'hobbit'), ('tolkien', 'lotr')]
+STAGE lazy_load_nav: PASS author.books (lazy) -> ['hobbit', 'lotr']
+
+=== SQLALCHEMY RELATIONSHIPS SMOKE SUMMARY ===
+  PASS  create_all_fk_ddl
+  PASS  cascade_insert
+  PASS  join_query
+  PASS  lazy_load_nav
+--- 4/4 stages PASS ---
+RELATIONSHIPS SMOKE COMPLETE
+
+Gateway log: CLEAN — no ErrorResponse, no malformed-frame, no panic for any
+ORM-emitted statement.
+
+----------------------------------------------------------------------
+DIRECT psql VERIFICATION OF THE JOIN RENDER (both projection shapes)
+----------------------------------------------------------------------
+$ psql … -c 'SELECT authors.name, books.title FROM authors JOIN books ON authors.id = books.author_id;'
+ authors.name | books.title
+--------------+-------------
+ tolkien      | hobbit
+ tolkien      | lotr
+(2 rows)
+
+$ psql … -c 'SELECT * FROM authors JOIN books ON authors.id = books.author_id;'
+ authors.id | authors.name | books.id | books.title | books.author_id
+------------+--------------+----------+-------------+-----------------
+          1 | tolkien      |        1 | hobbit      |               1
+          1 | tolkien      |        2 | lotr        |               1
+(2 rows)
+
+The RowDescription labels columns by their QUALIFIED combined name
+(`authors.id` vs `books.id`), so same-named columns across the two joined
+tables are disambiguated — exactly what an ORM (and a human) needs.
+
+----------------------------------------------------------------------
+WHAT CLOSED EACH GAP (the two surgical fixes)
+----------------------------------------------------------------------
+FIX A — FK DDL parse (`kessel-sql`).
+  SQLAlchemy's create_all renders a child model's `ForeignKey("authors.id")`
+  as a trailing table constraint `FOREIGN KEY(author_id) REFERENCES authors
+  (id)`. The CREATE TABLE parser previously had NO handling for it (only
+  PRIMARY KEY), so the 2nd CREATE TABLE failed to parse. Now the parser
+  accept-and-skips BOTH the table-level `FOREIGN KEY (…) REFERENCES tbl [(…)]
+  [ON DELETE/UPDATE action]` constraint AND the inline column `REFERENCES …`
+  modifier. KesselDB keys every row by the `id` pseudo-PK and stores the FK
+  column as its declared type; the constraint compiles to the BYTE-IDENTICAL
+  CreateType as the table without it (locked by a unit test). V1 does NOT
+  enforce referential integrity at the SQL-DDL layer → named follow-up
+  `SP-PG-DDL-FK-ENFORCE`. Unblocked create_all_fk_ddl.
+
+FIX B — JOIN result render (`kessel-pg-gateway`) — THE KEYSTONE.
+  The engine's `Op::Join` (SP36) already joins, returning a self-describing
+  typed result `[KTR1][u32 deflen][combined typedef][ [u32 reclen][record] ]*`
+  whose embedded schema names columns `<table>.<col>`. But the gateway had
+  NO render path for it — a JOIN made `select_columns`/`select_star_table`
+  both return None, so the result hit the "only renders SELECT *" 0A000
+  error. Now `render_select_got` detects the `KTR1` magic, decodes the
+  embedded combined schema, recovers the SQL projection via the new
+  `kessel_sql::join_projection()` (the engine's Op::Join discards it),
+  resolves each qualified projection column onto the combined schema, and
+  emits RowDescription + projected DataRows. Both `SELECT a.c1, b.c2 …` and
+  `SELECT * …` over a JOIN render. Unblocked join_query.
+
+  cascade_insert + lazy_load_nav rode the ALREADY-LANDED surfaces:
+   - cascade_insert: the parent + children flush via INSERT … RETURNING id
+     (SP-PG-SERIAL-RETURNING) — the FK column `author_id` is a plain stored
+     value the ORM supplies from the parent's assigned id.
+   - lazy_load_nav: `SELECT books.* (expanded) FROM books WHERE
+     books.author_id = $1` is a qualified single-table projection with a
+     general-WHERE filter (SP-PG-SQL-ORM-PARSE + SP-PG-SQL-DML-GENERAL).
+     The non-PK WHERE (`author_id`, not `id`) resolved correctly.
+
+----------------------------------------------------------------------
+DETERMINISM
+----------------------------------------------------------------------
+Neither fix touches the engine apply path or the Op wire encoding (Fix A
+compiles to the identical CreateType; Fix B is pure render of bytes the
+engine already produced). VSR seed-7 oracle
+`large_seed_corpus_is_deterministic_and_converges` → PASS. kessel-sql 1002
+tests + kessel-pg-gateway 125 tests → all PASS (incl. the 2 new tests).
+
+----------------------------------------------------------------------
+NAMED RESIDUAL FOLLOW-UPS (out of scope this arc)
+----------------------------------------------------------------------
+SP-PG-DDL-FK-ENFORCE      — wire the parsed FK to engine Op::AddForeignKey +
+                            referential-integrity enforcement (V1 skips it).
+SP-PG-SQL-JOIN-WHERE      — `JOIN … WHERE` / filtered joins (engine Op::Join
+                            has no post-join predicate; only ON-equi today).
+SP-PG-SQL-OUTER-JOIN      — LEFT/RIGHT/FULL OUTER JOIN (Op::Join is inner-only;
+                            an unmatched author returns NO row today).
+SP-PG-SQL-MULTI-JOIN      — 3+ table joins / join chains.
+SP-PG-SQL-JOIN-ALIAS      — `FROM a AS x JOIN b AS y` table aliases.
+SP-PG-SQL-JOIN-AGG        — aggregates over a JOIN (COUNT(*)/SUM after a JOIN).
+
+BOTTOM LINE: KesselDB's relational CORE — foreign keys in DDL + inner
+equi-joins with qualified projection — now composes through a real
+SQLAlchemy 2.0 relationship workload, end-to-end, 4/4. The next keystone is
+referential-integrity ENFORCEMENT (FK is parse-and-skip today) and OUTER /
+filtered joins; both named as follow-ups.

@@ -61,6 +61,64 @@ use kessel_catalog::FieldKind;
 use kessel_codec::{value_from_raw, Value};
 use kessel_proto::OpResult;
 
+/// SP-PG-SQL-DML-GENERAL — a general-WHERE UPDATE/DELETE returns its
+/// affected-row count (and optional RETURNING rows) framed inside
+/// `OpResult::Got`, distinct from a SELECT `Got`. Layout:
+/// `[DML_RESULT_TAG][u32 affected LE][u32 nrows LE]` then `nrows ×
+/// [u32 reclen LE][record bytes]`. The engine (kesseldb-server) builds
+/// this frame via `encode_dml_result`; the gateway decodes it here. The
+/// tag byte disambiguates from a SELECT row stream (which is
+/// `[u32 reclen][record]*` with no leading tag) — the gateway only
+/// attempts the DML decode on an UPDATE/DELETE leading keyword anyway.
+pub const DML_RESULT_TAG: u8 = 0xD3;
+
+/// SP-PG-SQL-DML-GENERAL — build the DML-result frame (see
+/// `DML_RESULT_TAG`). `rows` is empty for a count-only (no-RETURNING)
+/// result. Lives in the gateway crate so the engine (which depends on
+/// it) and the gateway share ONE definition.
+pub fn encode_dml_result(affected: u32, rows: &[Vec<u8>]) -> Vec<u8> {
+    let mut out =
+        Vec::with_capacity(9 + rows.iter().map(|r| 4 + r.len()).sum::<usize>());
+    out.push(DML_RESULT_TAG);
+    out.extend_from_slice(&affected.to_le_bytes());
+    out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+    for r in rows {
+        out.extend_from_slice(&(r.len() as u32).to_le_bytes());
+        out.extend_from_slice(r);
+    }
+    out
+}
+
+/// SP-PG-SQL-DML-GENERAL — decode a DML-result frame into
+/// `(affected, rows)`. Returns `None` if `bytes` is not a DML-result
+/// frame (wrong tag or truncated) — the caller then falls back to the
+/// SELECT-`Got` path. Defensive against truncation (a malformed frame
+/// yields `None`, never a panic).
+pub fn decode_dml_result(bytes: &[u8]) -> Option<(u32, Vec<Vec<u8>>)> {
+    if bytes.first() != Some(&DML_RESULT_TAG) || bytes.len() < 9 {
+        return None;
+    }
+    let affected = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+    let nrows = u32::from_le_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]) as usize;
+    let mut rows = Vec::with_capacity(nrows);
+    let mut p = 9usize;
+    for _ in 0..nrows {
+        if p + 4 > bytes.len() {
+            return None;
+        }
+        let l = u32::from_le_bytes([
+            bytes[p], bytes[p + 1], bytes[p + 2], bytes[p + 3],
+        ]) as usize;
+        p += 4;
+        if p + l > bytes.len() {
+            return None;
+        }
+        rows.push(bytes[p..p + l].to_vec());
+        p += l;
+    }
+    Some((affected, rows))
+}
+
 /// SP-PG-EXTQ-PARSED-DEFAULT T2 — like `dispatch_query`, but routes
 /// the engine call through `EngineApply::apply_sql_with_params`
 /// instead of `apply_sql`. The bound `params` slice corresponds to
@@ -131,6 +189,17 @@ pub fn dispatch_query_with_params<E: EngineApply + ?Sized>(
         _ => 0,
     };
     match result {
+        // SP-PG-SQL-DML-GENERAL — a general-WHERE UPDATE/DELETE returns a
+        // DML-result frame (count [+ RETURNING rows]) inside `Got`. The
+        // UPDATE/DELETE leading keyword + the frame tag disambiguate it
+        // from a SELECT row stream.
+        OpResult::Got(ref row_bytes)
+            if (leading_keyword_is(sql_trimmed, "UPDATE")
+                || leading_keyword_is(sql_trimmed, "DELETE"))
+                && decode_dml_result(row_bytes).is_some() =>
+        {
+            render_dml_where_result(row_bytes, sql_trimmed, engine)
+        }
         OpResult::Got(row_bytes) => {
             // SP-PG-SQL-ORM-PARSE T3 — render an explicit projection list
             // (`SELECT c1, c2 FROM t`, incl. qualified `t.c1`) as well as
@@ -296,6 +365,17 @@ pub fn dispatch_query<E: EngineApply + ?Sized>(sql: &str, engine: &E) -> Vec<u8>
         (engine.apply_sql(sql_trimmed), 0)
     };
     match result {
+        // SP-PG-SQL-DML-GENERAL — general-WHERE UPDATE/DELETE: the engine
+        // returns a DML-result frame (count [+ RETURNING rows]) inside
+        // `Got`. Disambiguated from a SELECT row stream by the
+        // UPDATE/DELETE leading keyword + the frame tag.
+        OpResult::Got(ref row_bytes)
+            if (leading_keyword_is(sql_trimmed, "UPDATE")
+                || leading_keyword_is(sql_trimmed, "DELETE"))
+                && decode_dml_result(row_bytes).is_some() =>
+        {
+            render_dml_where_result(row_bytes, sql_trimmed, engine)
+        }
         OpResult::Got(row_bytes) => {
             // SELECT path — emit RowDescription + DataRow* +
             // CommandComplete("SELECT N") + ReadyForQuery.
@@ -650,6 +730,98 @@ fn render_insert_returning<E: EngineApply + ?Sized>(
         out.extend_from_slice(&encode_data_row(&row_cells));
     }
     out.extend_from_slice(&encode_command_complete(&format!("INSERT 0 {}", ids.len())));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
+/// SP-PG-SQL-DML-GENERAL — render a general-WHERE UPDATE/DELETE result.
+/// `row_bytes` is the DML-result frame (`decode_dml_result`-shaped). The
+/// affected count drives the CommandComplete tag (`UPDATE N` / `DELETE
+/// N`); if the SQL had a RETURNING clause, the framed rows (full records
+/// read back by the engine) are decoded + projected into DataRows.
+fn render_dml_where_result<E: EngineApply + ?Sized>(
+    row_bytes: &[u8],
+    sql_trimmed: &str,
+    engine: &E,
+) -> Vec<u8> {
+    let (affected, rows) = match decode_dml_result(row_bytes) {
+        Some(t) => t,
+        None => {
+            // Not a DML frame after all — emit a safe bare tag.
+            let tag = cmd_complete_tag_for_sql(sql_trimmed, 0);
+            return {
+                let mut out = Vec::new();
+                out.extend_from_slice(&encode_command_complete(&tag));
+                out.extend_from_slice(&encode_ready_for_query(b'I'));
+                out
+            };
+        }
+    };
+    let mut out = Vec::new();
+    // RETURNING? `dml_returning` returns the (table, cols|*) when the SQL
+    // carries a RETURNING clause; absent ⇒ count-only.
+    if let Some((table, ret_cols)) = kessel_sql::dml_returning(sql_trimmed) {
+        let table_cols = match engine.describe_table(&table) {
+            Some(c) => c,
+            None => {
+                return error_response_then_rfq(
+                    SEVERITY_ERROR,
+                    "42P01",
+                    &format!("unknown table \"{table}\""),
+                );
+            }
+        };
+        let is_star = ret_cols.len() == 1 && ret_cols[0] == "*";
+        let proj_cols = if is_star {
+            table_cols.clone()
+        } else {
+            match resolve_projection(&ret_cols, &table_cols) {
+                Some(c) => c,
+                None => {
+                    return error_response_then_rfq(
+                        SEVERITY_ERROR,
+                        "42703",
+                        &format!(
+                            "RETURNING column does not exist in \"{table}\" {ret_cols:?}"
+                        ),
+                    );
+                }
+            }
+        };
+        let full_layout = compute_record_layout(&table_cols);
+        let fields: Vec<FieldMeta> = proj_cols
+            .iter()
+            .map(|c| FieldMeta {
+                name: c.name.clone(),
+                type_oid: field_kind_to_oid(c.kind),
+            })
+            .collect();
+        out.extend_from_slice(&encode_row_description(&fields));
+        for rec in &rows {
+            let decoded = match decode_record(rec, &table_cols, &full_layout) {
+                Some(cells) => cells,
+                None => {
+                    return error_response_then_rfq(
+                        SEVERITY_ERROR,
+                        "XX000",
+                        "RETURNING: affected row decode failed",
+                    );
+                }
+            };
+            let mut row_cells: Vec<Option<&[u8]>> =
+                Vec::with_capacity(proj_cols.len());
+            for c in &proj_cols {
+                let idx = table_cols.iter().position(|tc| tc.name == c.name);
+                match idx.and_then(|i| decoded.get(i)) {
+                    Some(cell) => row_cells.push(cell.as_deref()),
+                    None => row_cells.push(None),
+                }
+            }
+            out.extend_from_slice(&encode_data_row(&row_cells));
+        }
+    }
+    let tag = cmd_complete_tag_for_sql(sql_trimmed, affected as u64);
+    out.extend_from_slice(&encode_command_complete(&tag));
     out.extend_from_slice(&encode_ready_for_query(b'I'));
     out
 }

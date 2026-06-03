@@ -330,6 +330,29 @@ impl<'a> P<'a> {
     }
 }
 
+/// SP-PG-ORM-RELATIONSHIPS — consume trailing referential-action clauses on
+/// a `REFERENCES`/`FOREIGN KEY` constraint: `ON DELETE <action>` /
+/// `ON UPDATE <action>` where `<action>` is `CASCADE`, `RESTRICT`,
+/// `NO ACTION`, `SET NULL`, or `SET DEFAULT`. KesselDB does not enforce
+/// referential integrity at the SQL-DDL layer (named follow-up
+/// `SP-PG-DDL-FK-ENFORCE`), so the actions are parsed-and-ignored. Stops at
+/// the first token that is not part of an `ON DELETE/UPDATE` clause, leaving
+/// the cursor for the caller's `,`/`)` handling.
+fn skip_referential_actions(p: &mut P<'_>) {
+    while p.kw("ON") {
+        // `DELETE` | `UPDATE`
+        let _ = p.kw("DELETE") || p.kw("UPDATE");
+        // `NO ACTION` | `SET NULL` | `SET DEFAULT` | `CASCADE` | `RESTRICT`
+        if p.kw("NO") {
+            let _ = p.kw("ACTION");
+        } else if p.kw("SET") {
+            let _ = p.kw("NULL") || p.kw("DEFAULT");
+        } else {
+            let _ = p.kw("CASCADE") || p.kw("RESTRICT");
+        }
+    }
+}
+
 /// Return the best near-match for `name` from `candidates`, or `None` if
 /// none is close enough. Zero-dep: case-insensitive prefix match wins over
 /// edit-distance ≤ 2 (Damerau-Levenshtein-lite over ASCII). Designed so
@@ -680,6 +703,100 @@ pub fn select_columns(sql: &str) -> Option<(String, Vec<String>)> {
         }
     }
     Some((table, cols))
+}
+
+/// SP-PG-ORM-RELATIONSHIPS — a JOIN projection item: the (optional) table
+/// qualifier + the column name, preserved separately so the gateway can map
+/// it onto the JOIN's combined schema (whose columns are named
+/// `<table>.<col>`). `qualifier` is `None` for a bare column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinProjCol {
+    pub qualifier: Option<String>,
+    pub column: String,
+}
+
+/// SP-PG-ORM-RELATIONSHIPS — if `sql` is an inner-equi-`JOIN` SELECT
+/// (`SELECT <proj> FROM a JOIN b ON a.x = b.y [LIMIT n]`), return its
+/// projection: `Some((cols, is_star))`. `is_star` is `true` for `SELECT *`
+/// (project EVERY combined column in schema order); otherwise `cols` is the
+/// explicit qualified projection list (`SELECT authors.name, books.title …`),
+/// each item carrying its optional `<table>` qualifier + column so the
+/// gateway can disambiguate same-named columns across the two joined tables.
+/// `None` for any non-JOIN SELECT (the caller falls back to the single-table
+/// render shapes). Uses the real lexer — no string heuristics.
+///
+/// The engine compiles a JOIN to `Op::Join` which discards the projection
+/// (it returns ALL combined columns in a self-describing `KTR1` result);
+/// this helper recovers the projection from the SQL text so the gateway can
+/// render exactly the requested columns. Aggregates / function calls in the
+/// projection ⇒ `None` (the JOIN-aggregate render is a separate follow-up).
+pub fn join_projection(sql: &str) -> Option<(Vec<JoinProjCol>, bool)> {
+    let toks = lex(sql).ok()?;
+    let mut it = toks.iter().peekable();
+    match it.next()? {
+        Tok::Ident(k) if k.eq_ignore_ascii_case("SELECT") => {}
+        _ => return None,
+    }
+    // Two projection shapes: `*` or an explicit qualified column list.
+    let mut is_star = false;
+    let mut cols: Vec<JoinProjCol> = Vec::new();
+    if matches!(it.peek(), Some(Tok::Star)) {
+        it.next();
+        is_star = true;
+        match it.next()? {
+            Tok::Ident(k) if k.eq_ignore_ascii_case("FROM") => {}
+            _ => return None,
+        }
+    } else {
+        loop {
+            let first = match it.next()? {
+                Tok::Ident(c) if !c.eq_ignore_ascii_case("FROM") => c.clone(),
+                _ => return None,
+            };
+            // Qualified `table.col`?
+            let item = if matches!(it.peek(), Some(Tok::Punct('.'))) {
+                it.next(); // consume `.`
+                match it.next()? {
+                    Tok::Ident(real) => JoinProjCol {
+                        qualifier: Some(first),
+                        column: real.clone(),
+                    },
+                    _ => return None,
+                }
+            } else {
+                JoinProjCol { qualifier: None, column: first }
+            };
+            // `FUNC(` ⇒ aggregate/expr — not a plain JOIN projection.
+            if matches!(it.peek(), Some(Tok::Punct('('))) {
+                return None;
+            }
+            // Optional output alias `col AS alias` — accept-and-skip.
+            if matches!(it.peek(), Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("AS"))
+            {
+                it.next();
+                match it.next()? {
+                    Tok::Ident(_alias) => {}
+                    _ => return None,
+                }
+            }
+            cols.push(item);
+            match it.next()? {
+                Tok::Punct(',') => continue,
+                Tok::Ident(k) if k.eq_ignore_ascii_case("FROM") => break,
+                _ => return None,
+            }
+        }
+    }
+    // FROM <table> JOIN — the JOIN keyword is what makes this a join shape.
+    match it.next()? {
+        Tok::Ident(_t) => {}
+        _ => return None,
+    }
+    match it.next() {
+        Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("JOIN") => {}
+        _ => return None, // single-table — not the JOIN shape
+    }
+    Some((cols, is_star))
 }
 
 /// SP-PG-SERIAL-RETURNING: if `sql` is an `INSERT INTO <table> … RETURNING
@@ -2087,6 +2204,53 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
                     _ => return Err("expected `,` or `)` after PRIMARY KEY".into()),
                 }
             }
+            // SP-PG-ORM-RELATIONSHIPS — table-level `FOREIGN KEY (col [,col]*)
+            // REFERENCES tbl [(col [,col]*)] [ON DELETE/UPDATE action]`
+            // constraint. SQLAlchemy's `create_all` renders a child model's
+            // `ForeignKey("authors.id")` as this trailing table constraint.
+            // KesselDB keys every row by the `id` pseudo-PK and stores the FK
+            // column as its declared type, so the constraint is metadata we
+            // accept-and-skip at the SQL-DDL layer (V1 does NOT enforce
+            // referential integrity here — that is the engine `Op::AddForeignKey`
+            // path, named follow-up `SP-PG-DDL-FK-ENFORCE`). Consume the whole
+            // `FOREIGN KEY (…) REFERENCES tbl [(…)] [ON …]` group.
+            if p.kw("FOREIGN") {
+                p.expect_kw("KEY")?;
+                p.punct('(')?;
+                loop {
+                    let _ = p.col_ident()?;
+                    match p.next() {
+                        Some(Tok::Punct(',')) => continue,
+                        Some(Tok::Punct(')')) => break,
+                        _ => return Err("expected `,` or `)` in FOREIGN KEY".into()),
+                    }
+                }
+                p.expect_kw("REFERENCES")?;
+                let _ref_tbl = p.ident()?;
+                // Optional `( col [,col]* )` referenced-column list.
+                if matches!(p.peek(), Some(Tok::Punct('('))) {
+                    p.i += 1; // consume `(`
+                    loop {
+                        let _ = p.col_ident()?;
+                        match p.next() {
+                            Some(Tok::Punct(',')) => continue,
+                            Some(Tok::Punct(')')) => break,
+                            _ => {
+                                return Err(
+                                    "expected `,` or `)` in REFERENCES column list"
+                                        .into(),
+                                )
+                            }
+                        }
+                    }
+                }
+                skip_referential_actions(p);
+                match p.next() {
+                    Some(Tok::Punct(',')) => continue,
+                    Some(Tok::Punct(')')) => break,
+                    _ => return Err("expected `,` or `)` after FOREIGN KEY".into()),
+                }
+            }
             let cname = p.ident()?;
             let tname = p.ident()?;
             let mut arg = None;
@@ -2190,6 +2354,33 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
                         "DEFAULT NULL is not supported (omit the column instead)",
                     )?;
                     defaults.push(((fields.len() + 1) as u16, raw));
+                    continue;
+                }
+                // SP-PG-ORM-RELATIONSHIPS — inline column FK modifier
+                // `REFERENCES tbl [(col)] [ON DELETE/UPDATE action]`
+                // (the per-column FK spelling some ORMs emit, e.g.
+                // `author_id BIGINT REFERENCES authors (id)`). Accept-and-skip
+                // identically to the table-level FOREIGN KEY constraint; the
+                // column is still stored as its declared `kind`.
+                if p.kw("REFERENCES") {
+                    let _ref_tbl = p.ident()?;
+                    if matches!(p.peek(), Some(Tok::Punct('('))) {
+                        p.i += 1; // consume `(`
+                        loop {
+                            let _ = p.col_ident()?;
+                            match p.next() {
+                                Some(Tok::Punct(',')) => continue,
+                                Some(Tok::Punct(')')) => break,
+                                _ => {
+                                    return Err(
+                                        "expected `,` or `)` in REFERENCES column list"
+                                            .into(),
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    skip_referential_actions(p);
                     continue;
                 }
                 break;
@@ -5903,6 +6094,92 @@ mod tests {
         ));
         // bad ON columns rejected
         assert!(compile("SELECT * FROM usr JOIN ord ON usr.uid = usr.uid", &cat).is_err());
+    }
+
+    #[test]
+    fn fk_table_constraint_ddl_parses() {
+        use kessel_proto::Op;
+        // SP-PG-ORM-RELATIONSHIPS — SQLAlchemy `create_all` renders a child
+        // model's ForeignKey as a trailing table constraint. It must parse
+        // (accept-and-skip) and compile to the SAME CreateType as the table
+        // without the FK clause (determinism: the FK produces no field).
+        let cat = Catalog::default();
+        let with_fk = compile(
+            "CREATE TABLE books (id I64 NOT NULL, title CHAR(64), author_id I64, \
+             FOREIGN KEY(author_id) REFERENCES authors (id))",
+            &cat,
+        )
+        .unwrap();
+        let without_fk = compile(
+            "CREATE TABLE books (id I64 NOT NULL, title CHAR(64), author_id I64)",
+            &cat,
+        )
+        .unwrap();
+        match (&with_fk, &without_fk) {
+            (Op::CreateType { def: a }, Op::CreateType { def: b }) => {
+                assert_eq!(a, b, "FK clause must not change the encoded type def");
+            }
+            o => panic!("expected CreateType pair, got {o:?}"),
+        }
+        // FK + referential actions (ON DELETE CASCADE) still parse.
+        assert!(matches!(
+            compile(
+                "CREATE TABLE books (id I64 NOT NULL, author_id I64, \
+                 FOREIGN KEY(author_id) REFERENCES authors (id) ON DELETE CASCADE)",
+                &cat,
+            )
+            .unwrap(),
+            Op::CreateType { .. }
+        ));
+        // Inline column REFERENCES modifier parses too.
+        match compile(
+            "CREATE TABLE books (id I64 NOT NULL, author_id I64 REFERENCES authors (id))",
+            &cat,
+        )
+        .unwrap()
+        {
+            Op::CreateType { def } => {
+                let (_n, fields) = kessel_catalog::decode_type_def(&def).unwrap();
+                let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+                assert_eq!(names, ["id", "author_id"], "FK col still stored");
+            }
+            o => panic!("{o:?}"),
+        }
+    }
+
+    #[test]
+    fn join_projection_extracts_qualified_cols() {
+        // SELECT * over a JOIN -> star projection.
+        let (cols, star) = join_projection(
+            "SELECT * FROM authors JOIN books ON authors.id = books.author_id",
+        )
+        .unwrap();
+        assert!(star);
+        assert!(cols.is_empty());
+        // Explicit qualified projection over a JOIN.
+        let (cols, star) = join_projection(
+            "SELECT authors.name, books.title FROM authors JOIN books \
+             ON authors.id = books.author_id",
+        )
+        .unwrap();
+        assert!(!star);
+        assert_eq!(
+            cols,
+            vec![
+                JoinProjCol { qualifier: Some("authors".into()), column: "name".into() },
+                JoinProjCol { qualifier: Some("books".into()), column: "title".into() },
+            ]
+        );
+        // A single-table SELECT is NOT a JOIN projection.
+        assert_eq!(join_projection("SELECT a, b FROM t"), None);
+        assert_eq!(join_projection("SELECT * FROM t"), None);
+        // Output alias accepted-and-skipped.
+        let (cols, _) = join_projection(
+            "SELECT authors.name AS an, books.title FROM authors JOIN books \
+             ON authors.id = books.author_id",
+        )
+        .unwrap();
+        assert_eq!(cols[0].column, "name");
     }
 
     #[test]

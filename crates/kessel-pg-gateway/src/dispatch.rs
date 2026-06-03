@@ -533,6 +533,22 @@ fn render_select_got<E: EngineApply + ?Sized>(
         // existing render shapes below (none will match cleanly, so the
         // client gets the standard render error rather than a panic).
     }
+    // Shape 0.5 — SP-PG-ORM-RELATIONSHIPS: an inner-equi-JOIN result. The
+    // engine's `Op::Join` returns a SELF-DESCRIBING typed result
+    // `[KTR1][u32 deflen][combined typedef][ [u32 reclen][full record] ]*`
+    // whose embedded schema names every column `<table>.<col>`. Detect the
+    // `KTR1` magic, decode the combined schema, map the SQL projection
+    // (`SELECT authors.name, books.title …` or `SELECT *`) onto it, and emit
+    // RowDescription + projected DataRows. Gated on the magic prefix so a
+    // non-JOIN result is byte-untouched.
+    if row_bytes.len() >= 8 && &row_bytes[..4] == b"KTR1" {
+        if let Some((cols, is_star)) = kessel_sql::join_projection(sql_trimmed) {
+            return render_join_result(row_bytes, &cols, is_star);
+        }
+        // Magic present but the SQL didn't parse as a JOIN projection — fall
+        // through to the standard render error (defensive; should not happen
+        // because only `Op::Join` emits `KTR1`).
+    }
     // Shape 1 — explicit projection list.
     if let Some((table_name, proj_names)) =
         kessel_sql::select_columns(sql_trimmed)
@@ -625,6 +641,170 @@ fn render_select_got<E: EngineApply + ?Sized>(
         }
     };
     out.extend_from_slice(&encode_command_complete(&select_tag(row_count)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
+/// SP-PG-ORM-RELATIONSHIPS — render an inner-equi-JOIN result. The engine's
+/// `Op::Join` emits a self-describing typed result
+/// `[KTR1][u32 deflen][combined typedef][ [u32 reclen][full record] ]*`; the
+/// embedded typedef names every column `<table>.<col>` (e.g. `authors.id`,
+/// `books.author_id`) so the two joined tables' columns are disambiguated.
+///
+/// `proj` is the SQL projection (`SELECT authors.name, books.title …`); each
+/// item carries its optional table qualifier + column. `is_star` projects
+/// EVERY combined column in schema order. We:
+///   1. decode the combined typedef → combined `PgColumn`s,
+///   2. resolve each projection item to a combined-column INDEX (qualifier
+///      disambiguates same-named columns; a bare column matches the first
+///      column of that name),
+///   3. decode each full record (the combined record layout) → all cells,
+///   4. emit RowDescription(projected cols) + one DataRow(projected cells).
+///
+/// Returns the full backend byte sequence ending in `ReadyForQuery('I')`.
+fn render_join_result(
+    row_bytes: &[u8],
+    proj: &[kessel_sql::JoinProjCol],
+    is_star: bool,
+) -> Vec<u8> {
+    // Split `[KTR1][u32 deflen][typedef][rows…]`.
+    let deflen = u32::from_le_bytes(match row_bytes.get(4..8) {
+        Some(b) => b.try_into().unwrap(),
+        None => {
+            return error_response_then_rfq(
+                SEVERITY_ERROR,
+                "XX000",
+                "JOIN result: truncated header",
+            )
+        }
+    }) as usize;
+    let typedef = match row_bytes.get(8..8 + deflen) {
+        Some(b) => b,
+        None => {
+            return error_response_then_rfq(
+                SEVERITY_ERROR,
+                "XX000",
+                "JOIN result: truncated typedef",
+            )
+        }
+    };
+    let rows = &row_bytes[8 + deflen..];
+    let (_jname, fields) = match kessel_catalog::decode_type_def(typedef) {
+        Some(t) => t,
+        None => {
+            return error_response_then_rfq(
+                SEVERITY_ERROR,
+                "XX000",
+                "JOIN result: undecodable embedded schema",
+            )
+        }
+    };
+    // Combined schema as PgColumns (names are already `<table>.<col>`).
+    let combined: Vec<PgColumn> = fields
+        .iter()
+        .map(|f| PgColumn {
+            name: f.name.clone(),
+            kind: f.kind,
+            nullable: f.nullable,
+        })
+        .collect();
+
+    // Resolve the projection to combined-column indices.
+    let proj_idx: Vec<usize> = if is_star {
+        (0..combined.len()).collect()
+    } else {
+        let mut idx = Vec::with_capacity(proj.len());
+        for item in proj {
+            // Combined column names are `<table>.<col>`. With a qualifier,
+            // match `<qualifier>.<col>` exactly; without, match the suffix
+            // `.<col>` (first table wins, mirroring `col_ident`'s lenient
+            // resolution) or a bare `<col>`.
+            let want_qualified = item
+                .qualifier
+                .as_ref()
+                .map(|q| format!("{q}.{}", item.column));
+            let pos = combined.iter().position(|c| {
+                if let Some(wq) = &want_qualified {
+                    c.name.eq_ignore_ascii_case(wq)
+                } else {
+                    c.name.eq_ignore_ascii_case(&item.column)
+                        || c.name
+                            .rsplit('.')
+                            .next()
+                            .map(|tail| tail.eq_ignore_ascii_case(&item.column))
+                            .unwrap_or(false)
+                }
+            });
+            match pos {
+                Some(p) => idx.push(p),
+                None => {
+                    let shown = want_qualified.unwrap_or_else(|| item.column.clone());
+                    return error_response_then_rfq(
+                        SEVERITY_ERROR,
+                        "42703",
+                        &format!("column \"{shown}\" does not exist in the JOIN result"),
+                    );
+                }
+            }
+        }
+        idx
+    };
+
+    let mut out = Vec::new();
+    // RowDescription names projected columns by their combined name
+    // (`authors.name`) — SQLAlchemy maps results positionally, so the exact
+    // RowDescription label does not change the ORM result; psql shows the
+    // qualified name, which is the most informative choice.
+    let fields_meta: Vec<FieldMeta> = proj_idx
+        .iter()
+        .map(|&i| FieldMeta {
+            name: combined[i].name.clone(),
+            type_oid: field_kind_to_oid(combined[i].kind),
+        })
+        .collect();
+    out.extend_from_slice(&encode_row_description(&fields_meta));
+
+    // Decode each full combined record, then project the selected cells.
+    let layout = compute_record_layout(&combined);
+    let mut p = 0usize;
+    let mut n = 0u64;
+    while p + 4 <= rows.len() {
+        let len = u32::from_le_bytes(rows[p..p + 4].try_into().unwrap()) as usize;
+        p += 4;
+        let rec = match rows.get(p..p + len) {
+            Some(r) => r,
+            None => {
+                return error_response_then_rfq(
+                    SEVERITY_ERROR,
+                    "XX000",
+                    "JOIN result: truncated record stream",
+                )
+            }
+        };
+        p += len;
+        let cells = match decode_record(rec, &combined, &layout) {
+            Some(c) => c,
+            None => {
+                return error_response_then_rfq(
+                    SEVERITY_ERROR,
+                    "XX000",
+                    "JOIN result: malformed combined record",
+                )
+            }
+        };
+        let projected: Vec<Option<&[u8]>> =
+            proj_idx.iter().map(|&i| cells[i].as_deref()).collect();
+        out.extend_from_slice(&encode_data_row(&projected));
+        n += 1;
+    }
+    if p != rows.len() {
+        return error_response_then_rfq(
+            SEVERITY_ERROR,
+            "XX000",
+            "JOIN result: trailing bytes after records",
+        );
+    }
+    out.extend_from_slice(&encode_command_complete(&select_tag(n)));
     out.extend_from_slice(&encode_ready_for_query(b'I'));
     out
 }

@@ -68,6 +68,23 @@ measurement and had drifted from the actual workspace count).
   production `ClusterClient` does. The long-standing CI flake is GONE.
 
 Latest arc deliveries on top of that baseline (most-recent first):
+SP-PG-ORM-DJANGO (2026-06-03, +1 KAT, DONE_WITH_CONCERNS) — validates a
+real **Django 6.0 ORM** workload (the OTHER dominant Python ORM) against
+KesselDB on vulcan. **HEADLINE: connect now PASSES** — a surgical
+`set_config('TimeZone', …)` connection-init intercept (mirrors the
+existing `current_setting` hook in `pg_catalog::synthesize`) clears the
+FROM-less-SELECT that Django's `_configure_timezone` issues on every
+connect, which previously killed the entire Django path before any ORM
+op ran. The ORM CRUD surface then funnels through ONE clean boundary:
+Django UNCONDITIONALLY double-quotes every identifier and kessel-sql's
+lexer rejects `"` (`unexpected char '"'`). Fed unquoted/BIGSERIAL SQL,
+every Django-shaped op (autoincrement INSERT+RETURNING, qualified
+SELECT, by-PK UPDATE/DELETE) PASSES — so the engine path is Django-ready
+and the gap is purely the SQL text shape. Smoke **2/8** stages; single
+P0 follow-up `SP-PG-SQL-QUOTED-IDENT` unblocks the rest (then
+`SP-PG-DDL-IDENTITY`, `SP-PG-SQL-AGG-ALIAS-RENDER`,
+`SP-PG-DJANGO-INTROSPECT`, `SP-PG-SAVEPOINT`). Transcript:
+`docs/superpowers/sppgormdjango-smoke-2026-06-03.txt`.
 SP-PG-RETURNING-MULTIROW-STAR V1 (2026-06-03, +20 KATs, DONE) — closes
 the **zero-config SQLAlchemy** milestone. SQLAlchemy 2.0's DEFAULT
 (`use_insertmanyvalues=True`) BATCHES a multi-object flush into ONE

@@ -68,10 +68,17 @@ Same low-risk pattern-table approach as the existing `select 1` /
 
 ## Named follow-up arcs (gaps)
 
-- **`SP-PG-SQL-QUOTED-IDENT`** (P0) — kessel-sql lexer: accept
-  `"ident"` delimited identifiers everywhere (table / column /
-  qualifier in DDL / DML / projection / WHERE / SET / ORDER BY /
-  GROUP BY / RETURNING / INSERT column list). Unblocks ~all Django ORM.
+- **`SP-PG-SQL-QUOTED-IDENT`** (P0) — **DELIVERED 2026-06-03.** kessel-sql
+  lexer now accepts `"ident"` delimited identifiers everywhere (table /
+  column / qualifier in DDL / DML / projection / WHERE / SET / ORDER BY /
+  GROUP BY / RETURNING / INSERT column list). **Django advanced 2/8 →
+  6/8** (+INSERT autoincrement+RETURNING, SELECT, get-by-PK, UPDATE — all
+  now execute; `unexpected char '"'` is gone). SQLAlchemy stays 7/7.
+  Spec: `docs/superpowers/specs/2026-06-03-kesseldb-sppgsqlquotedident-design.md`;
+  transcript: `docs/superpowers/sppgsqlquotedident-django-smoke-2026-06-03.txt`.
+  The two residual Django gaps are the P1/P2 follow-ups below (NOT
+  quoting): `SP-PG-DDL-IDENTITY` (schema_create) and
+  `SP-PG-SQL-AGG-ALIAS-RENDER` (orm_delete's trailing `.count()`).
 - **`SP-PG-DDL-IDENTITY`** (P1) — `GENERATED [BY DEFAULT|ALWAYS] AS
   IDENTITY` as a BIGSERIAL-autoincrement alias. Django 6's default
   `BigAutoField` renders IDENTITY, not BIGSERIAL.

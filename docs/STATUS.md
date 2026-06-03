@@ -68,6 +68,31 @@ measurement and had drifted from the actual workspace count).
   production `ClusterClient` does. The long-standing CI flake is GONE.
 
 Latest arc deliveries on top of that baseline (most-recent first):
+SP-PG-SQL-QUOTED-IDENT (2026-06-03, +20 KATs, DONE_WITH_CONCERNS) — the
+P0 keystone that unblocks the Django ORM. Django UNCONDITIONALLY
+double-quotes EVERY SQL identifier (`"smokeapp_author"."id"`, `"name"`)
+and kessel-sql's lexer rejected `"` with `unexpected char '"'`, so the
+Django ORM was stuck at 2/8 even though the engine/data path was proven
+Django-ready. The lexer now accepts `"ident"` as a SQL-standard
+**delimited identifier** (case-preserving, `""` escape, zero-length +
+unterminated rejected) everywhere a bare identifier works — table,
+column, qualifier, in DDL/DML/projection/WHERE/SET/RETURNING. Quoted
+idents lower to the SAME `Tok::Ident` as the bare spelling, so quoting
+is transparent at the compiled-`Op` layer and Django's quoted DDL/DML
+round-trip on the same catalog names (determinism preserved: quoted ==
+bare ⇒ same Op). The gateway-side raw-SQL scanners that don't already
+skip quoted idents (cast stripper + literal-cast validator +
+insertmanyvalues `find_kw`) were taught to skip `"…"` regions so a `'`
+or `::` INSIDE a quoted identifier can't mis-pair the scanner.
+**HEADLINE: Django ORM advanced 2/8 → 6/8 on vulcan** (+INSERT
+autoincrement+RETURNING, SELECT, get-by-PK, UPDATE — every genuine ORM
+CRUD op now executes; the `unexpected char '"'` boundary is gone).
+SQLAlchemy stays **7/7** (no regression). The two residual Django gaps
+are pre-named follow-ups, NOT quoting: `SP-PG-DDL-IDENTITY` (default PK
+`GENERATED … AS IDENTITY` DDL spelling) and `SP-PG-SQL-AGG-ALIAS-RENDER`
+(`SELECT COUNT(*) AS "__count"` — the quoted DELETE itself passes; only
+the trailing `.count()` trips). Transcript:
+`docs/superpowers/sppgsqlquotedident-django-smoke-2026-06-03.txt`.
 SP-PG-SQL-DML-GENERAL (2026-06-03, +23 KATs, DONE) — completes the
 **CRUD-with-predicates** story. UPDATE/DELETE previously worked ONLY by
 primary key (`WHERE id = n`); real apps + ORMs need arbitrary WHERE

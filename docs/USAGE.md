@@ -144,6 +144,7 @@ kessel "SELECT * FROM t ID 1"
 kessel "SELECT * FROM t WHERE owner = 100"
 kessel "SELECT owner, bal FROM acct"      # projections render too
 kessel "SELECT * FROM a JOIN b ON a.x = b.y"   # JOINs render too (self-describing)
+kessel "SELECT a.n, b.t FROM a JOIN b ON a.id = b.aid WHERE b.t = 'x'"  # filtered joins (JOIN + WHERE)
 
 # pipe a .sql file (lines starting with # or -- are comments; blanks ignored)
 cat schema.sql | cargo run -q -p kessel-client --bin kessel
@@ -370,7 +371,8 @@ SELECT <c1>, <c2> FROM <t> [WHERE ...]           -- projection
 SELECT COUNT(*) | SUM(c) | MIN(c) | MAX(c) | AVG(c) FROM <t> [WHERE ...]
        [GROUP BY <col>]
 SELECT * FROM <t> [WHERE ...] ORDER BY <col> [DESC] [OFFSET n] [LIMIT n]
-SELECT * FROM <a> JOIN <b> ON <a.x> = <b.y> [LIMIT n]   -- inner equi‑join
+SELECT <proj> FROM <a> JOIN <b> ON <a.x> = <b.y>        -- inner equi‑join
+       [WHERE <pred over a.* / b.*>] [LIMIT n]          --   filtered join (qualified cols, AND/OR/…)
 ```
 
 `WHERE` supports `AND`/`OR`/`NOT`, all of `= != < <= > >=`, and `IN`/`BETWEEN` (incl. `NOT IN`/`NOT BETWEEN`). `SELECT *` returns
@@ -1538,6 +1540,7 @@ on vulcan:
 | `create_all()` with a FK (2 tables) | **PASS** (new) | the child table's `FOREIGN KEY(author_id) REFERENCES authors (id)` table constraint (and the inline `REFERENCES …` form) now parse — accept-and-skip, byte-identical `CreateType` |
 | relationship cascade INSERT | **PASS** | `a.books = [Book, Book]; s.add(a); commit` → parent + children flush via `INSERT … RETURNING id`; the FK column is the parent's assigned id |
 | JOIN query `select(A.x, B.y).join(B, …)` | **PASS** (new) | `SELECT authors.name, books.title FROM authors JOIN books ON authors.id = books.author_id` → the gateway renders the engine's self-describing `Op::Join` (`KTR1`) result; `SELECT *` over a JOIN works too (columns labeled by qualified `authors.id` / `books.id`) |
+| **filtered JOIN** `…join(B, …).where(B.x == v)` | **PASS** (SP-PG-SQL-JOIN-WHERE) | `… JOIN books ON … WHERE books.title = $1` → `Op::Join` carries a `kessel-expr` filter over the COMBINED (a++b) schema; the engine filters joined rows in-place. Qualified cols from EITHER table (`authors.name`, `books.title`), `AND`/`OR`/`NOT`/`IN`/`BETWEEN`/`LIKE`, params, bare-col + ambiguity check |
 | lazy-load navigation `author.books` | **PASS** | `SELECT books.* FROM books WHERE books.author_id = $1` (qualified projection + non-PK general WHERE) |
 
 The two keystone fixes: **(A)** kessel-sql now accept-and-skips FK DDL
@@ -1549,9 +1552,31 @@ arc a JOIN hit the "only renders `SELECT *`" error even though the engine
 joined. **V1 out-of-scope** (named follow-ups): `SP-PG-DDL-FK-ENFORCE`
 (referential-integrity enforcement — FK is parse-and-skip today),
 `SP-PG-SQL-OUTER-JOIN` (LEFT/RIGHT/FULL — `Op::Join` is inner-only),
-`SP-PG-SQL-JOIN-WHERE` (filtered joins), `SP-PG-SQL-MULTI-JOIN` (3+ tables),
-`SP-PG-SQL-JOIN-ALIAS`, `SP-PG-SQL-JOIN-AGG`. Transcript:
+`SP-PG-SQL-MULTI-JOIN` (3+ tables), `SP-PG-SQL-JOIN-ALIAS`,
+`SP-PG-SQL-JOIN-AGG`. (`SP-PG-SQL-JOIN-WHERE` — filtered joins — shipped, see
+below.) Transcript:
 `docs/superpowers/sppgormrelationships-smoke-2026-06-03.txt`.
+
+#### Filtered joins (`JOIN … WHERE`) — SP-PG-SQL-JOIN-WHERE, 2026-06-03
+
+`SELECT a.name, b.title FROM a JOIN b ON a.id = b.a_id WHERE b.title = $1
+[AND a.name = $2]` — the most common real-app join beyond a bare join
+(SQLAlchemy `query.join(Book).filter(Book.title == x)`). `Op::Join` gained an
+**optional combined-schema filter program**: the engine joins, then runs a
+`kessel-expr` predicate per combined row, keeping only matches. `kessel-sql`
+compiles the qualified `WHERE` after the `ON` clause against the combined
+`(a-fields ++ b-fields)` schema — `a.x` resolves to the left field, `b.y` to
+the right; a bare `col` resolves by suffix with an **ambiguity error** when it
+exists in both tables. `AND`/`OR`/`NOT`/`IN`/`BETWEEN`/`LIKE` and params all
+work over the join (the full WHERE grammar runs against the combined type).
+The gateway render is reused unchanged (a filtered join just returns fewer
+combined rows). The wire change is additive (the filter is a trailing optional
+field — a bare join is byte-identical to the pre-arc frame), and the filter is
+a pure function of the combined row, so seed-7 + 3-replica determinism holds.
+**V1 out-of-scope** (named follow-ups): `SP-PG-SQL-JOIN-ORDERBY`
+(`JOIN … WHERE … ORDER BY/LIMIT` over the combined schema), plus the
+inherited OUTER / MULTI / ALIAS / AGG follow-ups. Transcript:
+`docs/superpowers/sppgsqljoinwhere-smoke-2026-06-03.txt`.
 
 #### Django ORM (the other dominant Python ORM) — 2026-06-03
 

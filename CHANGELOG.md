@@ -7,6 +7,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning [Se
 
 ### Added
 
+- **Filtered inner joins — `JOIN … WHERE` (SP-PG-SQL-JOIN-WHERE,
+  2026-06-03)** — `SELECT a.name, b.title FROM a JOIN b ON a.id = b.aid
+  WHERE b.title = $1 [AND a.name = $2]`, the most common real-app join
+  beyond bare joins (SQLAlchemy `query.join(Book).filter(Book.title == x)`).
+  `Op::Join` gained an OPTIONAL `kessel-expr` filter program over the
+  COMBINED (a-fields ++ b-fields) schema: the engine joins, then runs the
+  predicate per combined row, keeping only matches. kessel-sql compiles the
+  qualified `WHERE` after the `ON` clause against the combined layout
+  (`a.x` → left field, `b.y` → right; bare `col` by suffix with an
+  ambiguity error when present in both tables); `AND`/`OR`/`NOT`/`IN`/
+  `BETWEEN`/`LIKE` and params all work over the join. Gateway render reused
+  (a filtered join just returns fewer combined rows). The wire change is
+  additive — the filter is a trailing optional field, so a bare join is
+  byte-identical to the pre-arc frame — and the filter is a pure function of
+  the combined row, so seed-7 + 3-replica determinism holds. Filtered
+  SQLAlchemy join smoke 7/7 on vulcan.
+
 - **Zero-config SQLAlchemy: multi-row INSERT RETURNING + `RETURNING *`
   (SP-PG-RETURNING-MULTIROW-STAR V1, 2026-06-03)** — KesselDB now works
   with SQLAlchemy's OUT-OF-THE-BOX engine config (`create_engine(url)`,

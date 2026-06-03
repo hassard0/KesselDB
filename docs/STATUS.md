@@ -85,7 +85,21 @@ embedded combined schema + mapping the qualified projection
 (FKs + joins) now composes through a real ORM. Determinism preserved (VSR
 seed-7 oracle PASS; FK DDL compiles byte-identical, JOIN render is pure).
 Named follow-ups: SP-PG-DDL-FK-ENFORCE, SP-PG-SQL-OUTER-JOIN,
-SP-PG-SQL-JOIN-WHERE, SP-PG-SQL-MULTI-JOIN.
+SP-PG-SQL-MULTI-JOIN.
+SP-PG-SQL-JOIN-WHERE (2026-06-03, DONE) — filtered inner joins
+(`SELECT a.name, b.title FROM a JOIN b ON a.id = b.aid WHERE b.title = $1`),
+the most common real-app join beyond bare joins (SQLAlchemy
+`query.join(Book).filter(Book.title == x)`). `Op::Join` gained an optional
+`kessel-expr` filter program over the COMBINED (a++b) schema; the engine joins
+then filters each combined row in-place. kessel-sql compiles the qualified
+`WHERE` after the `ON` clause against the combined field layout (`a.x` → left,
+`b.y` → right; bare col by suffix with ambiguity error); `AND`/`OR`/`NOT`/
+`IN`/`BETWEEN`/`LIKE` + params all ride for free. Gateway render reused
+(fewer combined rows). Additive wire change (trailing optional filter — bare
+join byte-identical to the pre-arc frame). Filtered SQLAlchemy join smoke
+**7/7** on vulcan; determinism preserved (VSR seed-7 + 3-replica oracles
+PASS — the filter is a pure function of the combined row). Named follow-up:
+SP-PG-SQL-JOIN-ORDERBY (`JOIN … WHERE … ORDER BY/LIMIT`).
 SP-PG-DJANGO-COMPLETE (2026-06-03, +14 KATs, DONE) — closes the TWO
 named gaps the quoted-ident arc left, taking the **Django 6 ORM to full
 CRUD 8/8** on vulcan (was 6/8). `SP-PG-DDL-IDENTITY`: the CREATE TABLE

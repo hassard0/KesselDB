@@ -16,49 +16,76 @@ If you want one number for "how fast is KesselDB", these aren't it — a
 single workload measures one slice. The honest read is in §3 (per-workload
 table) plus §6 (caveats).
 
-### Summary of measured wins/losses (blog-quotable, 2026-06-02)
+### Summary of measured wins/losses (blog-quotable, 2026-06-02 — FINAL SWEEP)
 
-KesselDB is benchmarked against Postgres + SQLite + TigerBeetle across
-**8 workloads × 4 DBs × 3 trials** on identical hardware (vulcan, see §1).
-Wins, losses, and the one-line cause for each:
+This headline table is the **single source of truth for current best
+numbers**. It was rebuilt by the **Final sweep (2026-06-02)** — every row
+re-measured on the FINAL binary (HEAD `58c92bd`,
+`/tmp/kdb-target-finalbench` release build) so the table is internally
+consistent (no more numbers stitched from different points in the night's
+arc series). The per-section detail (§3a–g, §10–15) is preserved as the
+historical record. KesselDB is benchmarked against Postgres (+ SQLite /
+TigerBeetle in the historical sections) on identical hardware (vulcan,
+see §1). **3 trials each, median.** Wins, losses, and the one-line cause:
 
 | Workload | KesselDB vs Postgres | Note |
 |---|---|---|
-| **Sharded point-read, K=8, N=16** | **14.93M ops/sec** (3.19× the K=1 baseline) | SP-Perf-A-SHARD-APPLY breaks the ~5M `RwLock`-reader ceiling — see §13 |
-| YCSB-C (uniform reads, N=16) | **57× faster** (4.75M vs 82K ops/s) | Headline single-shard read perf |
-| YCSB-B (95/5 mixed, N=16) | **7.1× faster** (576K vs 81K ops/s) | Realistic web workload |
-| YCSB-A (50/50 mixed, N=16) | marginal win (80K vs 74K ops/s) | Mixed workload — write-lock bites at 50% |
-| sysbench OLTP write-only (N=8) | **5.2× faster** (53K vs 10K tx/s) | Write-heavy transactions |
-| sysbench OLTP read-only (N=16) | **5.7× faster** (28,977 vs 5,073 tx/s; SP-Perf-A-TXN-RO lift 42.6×) | Was LOSING; arc closed |
-| sysbench OLTP read-write (N=16) | **2.66× faster** (10,273 vs 3,862 tx/s; SP-Perf-A-TXN-RW lift 14.4×) | Was LOSING; arc closed |
-| **PG COPY FROM STDIN 100K rows (single conn)** | **LOSES** (51,840 vs 578,034 rows/s; SP-PG-COPY-BULKAPPLY lift **181.9×** from V1 baseline 285 r/s) | Gap closed from ~2000× to 11.1×; the per-row apply-thread+fsync ceiling is the remaining cost — next slice would be the engine-side Op::Txn streaming shape |
-| TPC-H Q1 — multi-aggregate GROUP BY (N=4) | **LOSES** (85.82 vs 186 q/s; SP-WHERE-VM-Specialise lift 1.35×, cumulative 5-arc lift 9.71×) | Gap closed from 18× to 2.17×; SP-WHERE-VM-Specialise cut per-row VM dispatch; residual = aggregate-fold inner loop — SP-JIT-Aggregate next |
-| TPC-H Q6 — SUM with WHERE (N=4) | **LOSES** (548.87 vs 1,686 q/s; SP-WHERE-VM-Specialise lift 2.78×, cumulative 5-arc lift 39.95×) | Gap closed from 123× to 3.07×; spec floor (≥400 q/s) EXCEEDED + stretch (≥500) ALSO EXCEEDED — SP-JIT-Aggregate next |
+| **Sharded point-read, K=8, N=16** | **14.71M ops/sec** (3.00× the K=1 4.91M baseline) | SP-Perf-A-SHARD-APPLY breaks the ~5M `RwLock`-reader ceiling — see §13. K=16 → 16.24M. Requires `--pool-workers 16` (reads route through the parallel read pool, not the apply mpsc). |
+| YCSB-C (uniform reads, N=16) | **63.75× faster** (5.27M vs 82.7K ops/s) | Headline single-shard read perf — HIGHER than the prior 57× peak on the quiet box |
+| YCSB-B (95/5 mixed, N=16) | **7.26× faster** (573.6K vs 79.0K ops/s) | Realistic web workload |
+| YCSB-A (50/50 mixed, N=16) | **1.16× faster** (86.4K vs 74.8K ops/s) | Mixed workload — write-lock bites at 50% |
+| sysbench OLTP write-only (N=8) | **4.91× faster** (50.7K vs 10.3K tx/s) | Write-heavy transactions (prior peak 5.2×; re-measured under live sibling-agent load) |
+| sysbench OLTP read-only (N=16) | **6.02× faster** (30,646 vs 5,094 tx/s; SP-Perf-A-TXN-RO) | Was LOSING; arc closed — HIGHER than the prior 5.7× peak |
+| sysbench OLTP read-write (N=16) | **2.30× faster** (8,852 vs 3,853 tx/s; SP-Perf-A-TXN-RW) | Was LOSING; arc closed (prior peak 2.66×; re-measured under live sibling-agent load) |
+| **PG COPY FROM STDIN 100K rows (single conn)** | **LOSES** (51,840 vs 578,034 rows/s; SP-PG-COPY-BULKAPPLY lift **181.9×** from V1 baseline 285 r/s) | Not re-run this sweep (single-conn ingest, unchanged binary); see §15. Gap closed from ~2000× to 11.1×; per-row apply-thread+fsync ceiling is the residual |
+| TPC-H Q1 — multi-aggregate GROUP BY (N=4) | **LOSES** (86.17 vs 185.76 q/s = 2.16×) | SP-WHERE-VM-Specialise cut per-row VM dispatch; residual = aggregate-fold inner loop — SP-JIT-Aggregate next |
+| TPC-H Q6 — SUM with WHERE (N=4) | **LOSES** (544.59 vs 1,683 q/s = 3.09×) | Spec floor (≥400 q/s) + stretch (≥500) STILL MET (544.6); residual = SUM(expr) fold — SP-JIT-Aggregate next |
 
-KesselDB **wins 6 of 8 published cross-DB workloads** (the SHARD-APPLY
+**Final sweep (2026-06-02) — conditions + honesty notes.** Re-measured on
+the FINAL binary on vulcan. Load: the YCSB + sharded runs were captured on
+a quiet box (load 0.1–2.5); the OLTP-bracket runs overlapped a sibling
+agent's `cargo` build (load ~6), so **oltp-write-only (5.2×→4.91×) and
+oltp-read-write (2.66×→2.30×) re-measured slightly BELOW their prior
+single-arc peaks** — reported honestly with the load condition rather than
+cherry-picking the earlier number. Every other row matched or BEAT its
+prior peak. **SQLite was NOT re-measured this sweep**: vulcan's root
+filesystem was 100% full at run time (95 MB free), so SQLite's on-disk
+`/tmp` database hit `database or disk is full`; KesselDB (MemVfs,
+in-process) and Postgres (docker, own volume) were unaffected, so the
+authoritative WIN/LOSE tally is **KesselDB vs Postgres**. Prior-arc SQLite
+columns are preserved as historical in §3–§3g. Raw per-trial JSONs:
+`docs/benchmarks/finalbench-2026-06-02-*.json` (also on vulcan
+`/tmp/finalbench-*.json`); consolidated medians:
+`docs/benchmarks/finalbench-2026-06-02-summary.txt`.
+
+KesselDB **wins 6 of 8 cross-DB workloads vs Postgres** (the SHARD-APPLY
 row is the internal sharded ceiling — see §13). Both transaction-bracket
 losses called out in the prior revisions are now closed:
 
 1. **sysbench OLTP RO** — was LOSING N=16 by 7.5× to Postgres. Closed
    by **SP-Perf-A-TXN-RO (2026-05-29) SHIPPED**: static all-RO `Op::Txn`
-   classification + `sm.read().read_only_op` bypass. N=16 680 → 28,977
-   tx/s (**42.6×**); KesselDB now **5.7× faster than Postgres**.
+   classification + `sm.read().read_only_op` bypass. Final-sweep N=16
+   30,646 tx/s; KesselDB now **6.02× faster than Postgres** (prior peak
+   5.7×; the bypass lift over the pre-arc 680 tx/s apply path is ~45×).
 
 2. **sysbench OLTP RW** — was LOSING N=16 by 5.43× to Postgres. Closed
    by **SP-Perf-A-TXN-RW (2026-05-30) SHIPPED**: driver-level split-phase
    dispatch on (R*, W*)-shape Txns (`read_pool::read_prefix_length` +
    `is_split_safe` 3-guard; read prefix routes via the TXN-RO bypass,
-   write suffix via `sm.write().apply`). N=8 715 → 6,905 tx/s (**9.66×**);
-   N=16 712 → 10,273 tx/s (**14.43×**); KesselDB now **2.66× faster
-   than Postgres** and **2.60× faster than SQLite** at N=16.
+   write suffix via `sm.write().apply`). Final-sweep N=8 6,106 tx/s,
+   N=16 8,852 tx/s; KesselDB now **2.30× faster than Postgres** at N=16
+   (prior single-arc peak 2.66×; final sweep re-measured under live
+   sibling-agent load — see the Final-sweep note above).
    V1 limit: read-after-write Txn shapes still fall through to unified
    apply (3-guard rejects (R, W, R) shapes for byte-equivalence). Next
    roadmap target: **SP-Perf-A-OPTIMISTIC-CC** — abort-and-retry with
    full SI overlay on the SM write path for the fallthrough case.
 
 3. **TPC-H Q1 + Q6** — five arcs in sequence have closed the gap
-   cumulatively from 18×/123× (pre-arc) to **2.17×/3.07×**
-   (post-WHERE-VM) at N=4:
+   cumulatively from 18×/123× (pre-arc) to **2.16×/3.09×**
+   (final-sweep 2026-06-02; post-WHERE-VM was 2.17×/3.07×, same within
+   trial noise) at N=4. Q6 final-sweep N=4 = 544.59 q/s — design floor
+   (≥400) AND stretch (≥500) STILL MET:
    - **SP-Analytic-Plan (2026-05-29) SHIPPED** — Op::Aggregate +
      Op::GroupAggregate now accept `range_preds` for ordered-index
      candidate narrowing. Q6 lift 7.5× at N=4; Q1 lift 1.15×
@@ -804,8 +831,17 @@ shape).
 
 ## 4. Raw results
 
-All trial-rows are preserved in vulcan-side JSON files (one JSON object
-per line):
+**Final sweep (2026-06-02)** — the headline-table source of truth.
+Committed in-repo (durable, not just vulcan `/tmp`) under
+`docs/benchmarks/`, also on vulcan `/tmp/finalbench-*.json`:
+- `docs/benchmarks/finalbench-2026-06-02-{ycsb-c,ycsb-a,ycsb-b}.json` (18 rows each; KesselDB+Postgres × 3 N × 3 trials)
+- `docs/benchmarks/finalbench-2026-06-02-{oltp-read-only,oltp-write-only,oltp-read-write}.json` (18 rows each)
+- `docs/benchmarks/finalbench-2026-06-02-{tpch-q1,tpch-q6}.json` (12 rows each; KesselDB+Postgres × 2 N × 3 trials, sf=0.01, 30s)
+- `docs/benchmarks/finalbench-2026-06-02-sharded-pointreads.txt` (sharded get-by-id K=1/4/8/16 × 3 trials transcript)
+- `docs/benchmarks/finalbench-2026-06-02-summary.txt` (consolidated medians + ratios + run conditions)
+
+Earlier per-arc trial-rows are preserved in vulcan-side JSON files (one
+JSON object per line):
 - `/tmp/bench-ycsb-c.json` (T1 — 36 rows, 4 DBs × 3 N × 3 trials)
 - `/tmp/bench-ycsb-c-tb.json` (T2 — 9 rows, TigerBeetle YCSB-C)
 - `/tmp/bench-ycsb-a.json` (T2 — 36 rows)

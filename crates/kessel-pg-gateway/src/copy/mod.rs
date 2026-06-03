@@ -298,6 +298,16 @@ impl CopyState {
 mod tests {
     use super::*;
 
+    // The `KESSELDB_COPY_BATCH_SIZE` tests mutate a PROCESS-GLOBAL env
+    // var; cargo runs tests in this module on parallel threads, so two of
+    // them setting/clearing the same var races (a `remove_var` in one test
+    // can clear a `set_var` another test is mid-assert on — an
+    // intermittent CI flake). Serialize every env-mutating test through
+    // this lock so they never overlap. (Poisoning is irrelevant — each
+    // test restores the env at its end; we recover the guard if a sibling
+    // panicked.)
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// SP-PG-COPY T1: a fresh `CopyState` is Idle.
     #[test]
     fn t1_copy_state_default_is_idle() {
@@ -349,9 +359,7 @@ mod tests {
     /// `COPY_BATCH_SIZE` (1024) when no env override is set.
     #[test]
     fn t1_bulkapply_default_batch_size_is_1024() {
-        // Defensive: a parallel test in this process might set the
-        // env var. Guard by clearing for this thread first. The fact
-        // that env vars are process-global means this is best-effort.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::remove_var("KESSELDB_COPY_BATCH_SIZE");
         let s = CopyInState::new("t".to_string(), None, 1);
         assert_eq!(s.batch_size, COPY_BATCH_SIZE);
@@ -363,9 +371,7 @@ mod tests {
     /// env directly so the override is honored per call.
     #[test]
     fn t1_bulkapply_env_override_changes_batch_size() {
-        // Setting + reading the env var is process-global. Use a
-        // distinctive value + scope the test to make collisions
-        // visible if they happen.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::set_var("KESSELDB_COPY_BATCH_SIZE", "256");
         let got = resolve_copy_batch_size();
         std::env::remove_var("KESSELDB_COPY_BATCH_SIZE");
@@ -378,6 +384,7 @@ mod tests {
     /// `COPY_BATCH_SIZE_MAX` clamps DOWN to the cap.
     #[test]
     fn t1_bulkapply_env_override_handles_invalid_values() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         std::env::set_var("KESSELDB_COPY_BATCH_SIZE", "0");
         assert_eq!(resolve_copy_batch_size(), COPY_BATCH_SIZE);
         std::env::set_var("KESSELDB_COPY_BATCH_SIZE", "not-a-number");

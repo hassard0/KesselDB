@@ -1140,6 +1140,7 @@ mod tests {
             left_field: 1,
             right_field: 1,
             limit: 10,
+            filter: vec![],
         };
         assert_eq!(route_op(&op, 4), ShardRoute::ShardZero, "{op:?}");
     }

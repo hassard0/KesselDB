@@ -3232,7 +3232,7 @@ impl<V: Vfs> StateMachine<V> {
                 }
                 OpResult::Got(out.into())
             }
-            Op::Join { left_type, right_type, left_field, right_field, limit } => {
+            Op::Join { left_type, right_type, left_field, right_field, limit, filter } => {
                 let lt = match self.catalog.get(left_type) {
                     Some(t) => t.clone(),
                     None => return OpResult::SchemaError(format!("no type {left_type}")),
@@ -3335,6 +3335,23 @@ impl<V: Vfs> StateMachine<V> {
                                     ))
                                 }
                             };
+                            // SP-PG-SQL-JOIN-WHERE: run the optional combined-
+                            // schema filter on the encoded combined record.
+                            // Non-matching rows are dropped (and do NOT count
+                            // against `limit` — `limit` caps emitted rows, as
+                            // with a single-table WHERE scan). Pure function of
+                            // (combined record, predicate) ⇒ deterministic.
+                            if !filter.is_empty() {
+                                match kessel_expr::eval(filter, &cot, &rec) {
+                                    Ok(true) => {}
+                                    Ok(false) => continue,
+                                    Err(e) => {
+                                        return OpResult::SchemaError(format!(
+                                            "join filter: {e:?}"
+                                        ))
+                                    }
+                                }
+                            }
                             out.extend_from_slice(
                                 &(rec.len() as u32).to_le_bytes(),
                             );
@@ -4587,7 +4604,7 @@ impl<V: Vfs> StateMachine<V> {
             // Current body uses legacy 20-byte data-row keyspace (scan_range × 2);
             // T2.C rewrites against data_row_scan(type_id, u64::MAX) for both sides
             // per Decision 4 (composite read arm, per-statement auto-commit).
-            Op::Join { left_type, right_type, left_field, right_field, limit } => {
+            Op::Join { left_type, right_type, left_field, right_field, limit, filter } => {
                 let lt = match self.catalog.get(left_type) {
                     Some(t) => t.clone(),
                     None => return OpResult::SchemaError(format!("no type {left_type}")),
@@ -4707,6 +4724,20 @@ impl<V: Vfs> StateMachine<V> {
                                     ))
                                 }
                             };
+                            // SP-PG-SQL-JOIN-WHERE: identical combined-schema
+                            // filter on the RO-Txn bypass path so a join inside
+                            // a read-only Txn filters exactly like a bare join.
+                            if !filter.is_empty() {
+                                match kessel_expr::eval(filter, &cot, &rec) {
+                                    Ok(true) => {}
+                                    Ok(false) => continue,
+                                    Err(e) => {
+                                        return OpResult::SchemaError(format!(
+                                            "join filter: {e:?}"
+                                        ))
+                                    }
+                                }
+                            }
                             out.extend_from_slice(
                                 &(rec.len() as u32).to_le_bytes(),
                             );

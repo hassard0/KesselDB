@@ -251,12 +251,21 @@ pub enum Op {
     /// Returns up to `limit` joined rows as
     /// `[u32 total][u32 left_len][left rec][right rec]*`, deterministic
     /// (left key order, then right scan order). Read-only.
+    ///
+    /// SP-PG-SQL-JOIN-WHERE: `filter` is an OPTIONAL `kessel-expr` predicate
+    /// program over the COMBINED join schema (left fields `<lt>.<col>` then
+    /// right fields `<rt>.<col>`, field ids `0..nL+nR`). When non-empty, each
+    /// combined row is kept only if `eval(filter, combined_type, combined_rec)`
+    /// is true. Empty (the default) ⇒ no filter ⇒ byte-identical to a bare
+    /// join. Encoded only when non-empty, so an older bare-join frame is a
+    /// valid prefix that decodes to an empty filter.
     Join {
         left_type: TypeId,
         right_type: TypeId,
         left_field: u16,
         right_field: u16,
         limit: u32,
+        filter: Vec<u8>,
     },
     /// Add a composite (multi-field) equality index (Sub-project 27);
     /// backfills existing rows.
@@ -966,12 +975,19 @@ impl Op {
                 b.extend_from_slice(&field_id.to_le_bytes());
                 codec::put_bytes(&mut b, name.as_bytes());
             }
-            Op::Join { left_type, right_type, left_field, right_field, limit } => {
+            Op::Join { left_type, right_type, left_field, right_field, limit, filter } => {
                 codec::put_u32(&mut b, *left_type);
                 codec::put_u32(&mut b, *right_type);
                 b.extend_from_slice(&left_field.to_le_bytes());
                 b.extend_from_slice(&right_field.to_le_bytes());
                 codec::put_u32(&mut b, *limit);
+                // SP-PG-SQL-JOIN-WHERE: optional combined-schema filter
+                // appended last. Emitted only when present, so a bare join
+                // (no WHERE) is byte-identical to the pre-arc wire frame and
+                // an older frame decodes to an empty filter.
+                if !filter.is_empty() {
+                    codec::put_bytes(&mut b, filter);
+                }
             }
             Op::QueryRows { type_id, eq_preds, program, limit, range_preds } => {
                 codec::put_u32(&mut b, *type_id);
@@ -1331,13 +1347,18 @@ impl Op {
                 field_id: c.u16()?,
                 name: String::from_utf8_lossy(&c.bytes()?).into_owned(),
             },
-            28 => Op::Join {
-                left_type: c.u32()?,
-                right_type: c.u32()?,
-                left_field: c.u16()?,
-                right_field: c.u16()?,
-                limit: c.u32()?,
-            },
+            28 => {
+                let left_type = c.u32()?;
+                let right_type = c.u32()?;
+                let left_field = c.u16()?;
+                let right_field = c.u16()?;
+                let limit = c.u32()?;
+                // SP-PG-SQL-JOIN-WHERE: optional trailing combined-schema
+                // filter. Absent (older / bare-join frame) ⇒ empty ⇒
+                // identical behaviour to before.
+                let filter = if c.remaining() > 0 { c.bytes()? } else { Vec::new() };
+                Op::Join { left_type, right_type, left_field, right_field, limit, filter }
+            }
             26 => {
                 let type_id = c.u32()?;
                 let n = c.u32()? as usize;
@@ -1695,7 +1716,10 @@ mod tests {
             Op::QueryRows { type_id: 4, eq_preds: vec![], program: vec![1], limit: 0, range_preds: vec![(2, 1, vec![7, 0]), (2, 3, vec![9, 0])] },
             Op::Describe { type_id: 4 },
             Op::DropType { type_id: 4 },
-            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9 },
+            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9, filter: vec![] },
+            // SP-PG-SQL-JOIN-WHERE: filtered join — non-empty filter program
+            // round-trips through the new optional trailing wire suffix.
+            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9, filter: vec![1, 0, 0, 5, 42, 3] },
             Op::Aggregate { type_id: 4, program: vec![1], kind: 1, field_id: 3, range_preds: vec![] },
             // SP-Analytic-Plan: aggregate w/ range hints — new wire suffix.
             Op::Aggregate { type_id: 4, program: vec![1], kind: 1, field_id: 3, range_preds: vec![(2, 1, vec![7, 0]), (2, 3, vec![9, 0])] },

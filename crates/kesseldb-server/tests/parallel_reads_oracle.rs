@@ -451,6 +451,7 @@ fn gen_random_read_op(rng: &mut Rng) -> (&'static str, Op) {
                 left_field: 2,
                 right_field: 2,
                 limit: 1 + rng.below(4) as u32,
+                filter: vec![],
             })
         }
     }
@@ -720,6 +721,7 @@ fn t3_smoke_join() {
         left_field: 2,
         right_field: 2,
         limit: 1 + r.below(8) as u32,
+        filter: vec![],
     });
 }
 
@@ -975,6 +977,7 @@ fn txn_ro_smoke_all_txn_permitted_variants_one_txn_returns_ok() {
             left_field: 2,
             right_field: 2,
             limit: 4,
+            filter: vec![],
         },
     ];
     // Bisect on divergence: run each inner op as a 1-op Txn on both

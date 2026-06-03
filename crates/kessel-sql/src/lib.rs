@@ -3167,6 +3167,18 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
             .find(|f| f.name == rf_col)
             .ok_or_else(|| unknown_column_err(&rf_col, rf_tbl))?
             .field_id;
+        // SP-PG-SQL-JOIN-WHERE: optional `WHERE <pred>` after the ON clause.
+        // The predicate filters the COMBINED join rows, so it compiles against
+        // the SAME combined schema the engine builds (left fields `<lt>.<col>`
+        // then right fields `<rt>.<col>`, field ids reassigned `0..nL+nR`).
+        // Qualified columns (`a.x`, `b.y`) resolve by the combined `<table>.
+        // <col>` name; a bare `col` resolves by suffix with an ambiguity check.
+        let filter = if p.kw("WHERE") {
+            let cot = combined_join_type(&ot, &rt);
+            compile_join_where(p, &cot, &ot.name, &rt.name)?
+        } else {
+            Vec::new()
+        };
         let mut limit = 0u32;
         if p.kw("LIMIT") {
             match p.next() {
@@ -3180,6 +3192,7 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
             left_field: lfid,
             right_field: rfid,
             limit,
+            filter,
         });
     }
     // Primary-key fast path: `SELECT ... FROM t ID <n>` -> O(1) GetById
@@ -3370,6 +3383,129 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
             limit,
         }),
     }
+}
+
+// SP-PG-SQL-JOIN-WHERE: build the COMBINED join `ObjectType` exactly as the
+// engine's `Op::Join` apply does — every left column as `<lt>.<col>` then every
+// right column as `<rt>.<col>`, field ids reassigned `0..nL+nR`. The join-WHERE
+// predicate compiles against THIS type so its field ids match the records the
+// engine encodes for the combined `KTR1` result. The two recipes are identical
+// by construction, so the predicate's field offsets line up with the engine's.
+fn combined_join_type(lt: &ObjectType, rt: &ObjectType) -> ObjectType {
+    let mut fields: Vec<Field> = Vec::with_capacity(lt.fields.len() + rt.fields.len());
+    let mut fid: u16 = 0;
+    for (src, f) in lt
+        .fields
+        .iter()
+        .map(|f| (&lt.name, f))
+        .chain(rt.fields.iter().map(|f| (&rt.name, f)))
+    {
+        fields.push(Field {
+            field_id: fid,
+            name: format!("{src}.{}", f.name),
+            kind: f.kind,
+            nullable: f.nullable,
+        });
+        fid += 1;
+    }
+    ObjectType::from_def(format!("{}+{}", lt.name, rt.name), fields)
+}
+
+// WHERE keywords that an `Ident` may legitimately be in the WHERE grammar —
+// these are NEVER column references, so the join-WHERE rewriter leaves them
+// untouched. (Values are `Int`/`Str`/`Bytes` tokens, not idents.)
+fn is_where_keyword(s: &str) -> bool {
+    matches!(
+        s.to_ascii_uppercase().as_str(),
+        "AND" | "OR" | "NOT" | "IN" | "BETWEEN" | "LIKE" | "IS" | "NULL"
+            | "ANY" | "ARRAY" | "ASC" | "DESC"
+    )
+}
+
+// SP-PG-SQL-JOIN-WHERE: compile the predicate after `JOIN … ON … WHERE` against
+// the combined schema `cot` (field names `<table>.<col>`). The shared WHERE
+// compiler (`compile_where` → `term`) resolves a column by its `f.name`, so we
+// REWRITE the predicate's column tokens to the combined names first:
+//   * qualified `a.x` (`Ident(a) '.' Ident(x)`) → single `Ident("a.x")` when
+//     `a` names one of the two joined tables (else an error — wrong qualifier);
+//   * bare `x` → the combined name `<table>.x` resolved by suffix; ambiguous
+//     (present in BOTH tables) ⇒ a precise error, mirroring PG.
+// The rewritten token region is then compiled by the EXISTING grammar against
+// `cot`, so AND / OR / NOT / IN / BETWEEN / LIKE all work over the join for free.
+fn compile_join_where(
+    p: &mut P,
+    cot: &ObjectType,
+    ltbl: &str,
+    rtbl: &str,
+) -> Result<Vec<u8>, SqlError> {
+    // The WHERE region runs from p.i up to a top-level LIMIT (the only clause
+    // that can follow a join-WHERE in V1) or end of input. Collect + rewrite.
+    let mut rewritten: Vec<Tok> = Vec::new();
+    while let Some(tok) = p.peek().cloned() {
+        // Stop at LIMIT (left for the caller to parse).
+        if let Tok::Ident(k) = &tok {
+            if k.eq_ignore_ascii_case("LIMIT") {
+                break;
+            }
+        }
+        match tok {
+            Tok::Ident(name) if !is_where_keyword(&name) => {
+                p.i += 1;
+                // Qualified `name . col`?
+                let qualified = matches!(p.peek(), Some(Tok::Punct('.')));
+                if qualified {
+                    p.i += 1; // consume `.`
+                    let col = match p.next() {
+                        Some(Tok::Ident(c)) => c,
+                        _ => return Err("expected column after `table.`".into()),
+                    };
+                    if name != ltbl && name != rtbl {
+                        return Err(format!(
+                            "join-WHERE qualifier `{name}` is not one of the \
+                             joined tables `{ltbl}` / `{rtbl}`"
+                        ));
+                    }
+                    let combined = format!("{name}.{col}");
+                    if !cot.fields.iter().any(|f| f.name == combined) {
+                        return Err(unknown_column_err(&combined, cot));
+                    }
+                    rewritten.push(Tok::Ident(combined));
+                } else {
+                    // Bare column — resolve by suffix `.<name>` with an
+                    // ambiguity check across the two joined tables.
+                    let suffix = format!(".{name}");
+                    let mut hits = cot
+                        .fields
+                        .iter()
+                        .filter(|f| f.name.ends_with(&suffix));
+                    let first = hits.next();
+                    match (first, hits.next()) {
+                        (Some(f), None) => rewritten.push(Tok::Ident(f.name.clone())),
+                        (Some(_), Some(_)) => {
+                            return Err(format!(
+                                "column `{name}` is ambiguous in join-WHERE \
+                                 (present in both `{ltbl}` and `{rtbl}`); \
+                                 qualify it as `{ltbl}.{name}` or `{rtbl}.{name}`"
+                            ))
+                        }
+                        (None, _) => return Err(unknown_column_err(&name, cot)),
+                    }
+                }
+            }
+            _ => {
+                p.i += 1;
+                rewritten.push(tok);
+            }
+        }
+    }
+    // Compile the rewritten predicate against the combined schema using the
+    // existing grammar (a fresh sub-parser over just the rewritten tokens).
+    let mut sub = P { t: rewritten, i: 0, cat: p.cat };
+    let prog = compile_where(&mut sub, cot)?;
+    if sub.i != sub.t.len() {
+        return Err("trailing tokens after join-WHERE predicate".into());
+    }
+    Ok(prog)
 }
 
 // WHERE -> kessel-expr program. Grammar: or := and (OR and)* ;
@@ -6094,6 +6230,159 @@ mod tests {
         ));
         // bad ON columns rejected
         assert!(compile("SELECT * FROM usr JOIN ord ON usr.uid = usr.uid", &cat).is_err());
+    }
+
+    /// SP-PG-SQL-JOIN-WHERE — `JOIN … ON … WHERE <pred>` compiles the
+    /// predicate against the COMBINED (a++b) schema and emits an Op::Join
+    /// carrying a non-empty `filter`, and the engine returns ONLY matching
+    /// combined rows. The bare-join path (no WHERE) still emits an empty
+    /// filter (regression).
+    #[test]
+    fn join_where_filters_combined_rows() {
+        use kessel_proto::Op;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE usr (uid U32 NOT NULL)");
+        run(&mut sm, 2, "CREATE TABLE ord (owner U32 NOT NULL, amt U32 NOT NULL)");
+        run(&mut sm, 3, "INSERT INTO usr ID 1 (uid) VALUES (1)");
+        run(&mut sm, 4, "INSERT INTO usr ID 2 (uid) VALUES (2)");
+        run(&mut sm, 6, "INSERT INTO ord ID 10 (owner, amt) VALUES (1, 100)");
+        run(&mut sm, 7, "INSERT INTO ord ID 11 (owner, amt) VALUES (1, 200)");
+        run(&mut sm, 8, "INSERT INTO ord ID 12 (owner, amt) VALUES (2, 50)");
+        let cat = sm.catalog().clone();
+
+        // Bare join (regression): empty filter.
+        match compile("SELECT * FROM usr JOIN ord ON usr.uid = ord.owner", &cat).unwrap() {
+            Op::Join { filter, .. } => assert!(filter.is_empty(), "bare join has no filter"),
+            o => panic!("expected Join, got {o:?}"),
+        }
+
+        // Helper: run a join SQL and count the combined KTR1 rows.
+        fn join_rows(sm: &mut StateMachine, seq: u64, sql: &str) -> usize {
+            match run(sm, seq, sql) {
+                OpResult::Got(b) => {
+                    assert_eq!(&b[..4], b"KTR1");
+                    let dl = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
+                    let mut p = 8 + dl;
+                    let mut rows = 0;
+                    while p + 4 <= b.len() {
+                        let rl = u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize;
+                        p += 4 + rl;
+                        rows += 1;
+                    }
+                    assert_eq!(p, b.len(), "consumed exactly");
+                    rows
+                }
+                o => panic!("{o:?}"),
+            }
+        }
+
+        // Bare join: 3 combined rows (uid1×2 + uid2×1).
+        assert_eq!(
+            join_rows(&mut sm, 20, "SELECT * FROM usr JOIN ord ON usr.uid = ord.owner"),
+            3
+        );
+        // Filter on a RIGHT-table column (qualified): only amt=200 → 1 row.
+        match compile(
+            "SELECT * FROM usr JOIN ord ON usr.uid = ord.owner WHERE ord.amt = 200",
+            &cat,
+        )
+        .unwrap()
+        {
+            Op::Join { filter, .. } => assert!(!filter.is_empty(), "filtered join carries filter"),
+            o => panic!("{o:?}"),
+        }
+        assert_eq!(
+            join_rows(
+                &mut sm,
+                21,
+                "SELECT * FROM usr JOIN ord ON usr.uid = ord.owner WHERE ord.amt = 200"
+            ),
+            1
+        );
+        // Filter on a LEFT-table column (qualified): uid=1 → 2 rows.
+        assert_eq!(
+            join_rows(
+                &mut sm,
+                22,
+                "SELECT * FROM usr JOIN ord ON usr.uid = ord.owner WHERE usr.uid = 1"
+            ),
+            2
+        );
+        // AND of a left-col and a right-col predicate → uid=1 AND amt>=200 → 1.
+        assert_eq!(
+            join_rows(
+                &mut sm,
+                23,
+                "SELECT * FROM usr JOIN ord ON usr.uid = ord.owner \
+                 WHERE usr.uid = 1 AND ord.amt >= 200"
+            ),
+            1
+        );
+        // Filter matching 0 rows → empty result.
+        assert_eq!(
+            join_rows(
+                &mut sm,
+                24,
+                "SELECT * FROM usr JOIN ord ON usr.uid = ord.owner WHERE ord.amt = 999"
+            ),
+            0
+        );
+        // Bare unambiguous column (no qualifier): `amt` lives only in ord.
+        assert_eq!(
+            join_rows(
+                &mut sm,
+                25,
+                "SELECT * FROM usr JOIN ord ON usr.uid = ord.owner WHERE amt = 50"
+            ),
+            1
+        );
+        // WHERE then LIMIT — the WHERE region stops at LIMIT and LIMIT parses.
+        match compile(
+            "SELECT * FROM usr JOIN ord ON usr.uid = ord.owner WHERE usr.uid = 1 LIMIT 1",
+            &cat,
+        )
+        .unwrap()
+        {
+            Op::Join { filter, limit, .. } => {
+                assert!(!filter.is_empty());
+                assert_eq!(limit, 1);
+            }
+            o => panic!("{o:?}"),
+        }
+        // Wrong qualifier (`foo.x` names neither table) → error.
+        assert!(compile(
+            "SELECT * FROM usr JOIN ord ON usr.uid = ord.owner WHERE foo.amt = 1",
+            &cat,
+        )
+        .is_err());
+        // Unknown qualified column → error.
+        assert!(compile(
+            "SELECT * FROM usr JOIN ord ON usr.uid = ord.owner WHERE ord.nope = 1",
+            &cat,
+        )
+        .is_err());
+    }
+
+    /// SP-PG-SQL-JOIN-WHERE — a bare column present in BOTH joined tables is
+    /// ambiguous and must error with a qualify-it hint (weak-spot #2).
+    #[test]
+    fn join_where_bare_ambiguous_column_errors() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        // Both tables carry a `tag` column → bare `tag` is ambiguous.
+        run(&mut sm, 1, "CREATE TABLE a (k U32 NOT NULL, tag U32 NOT NULL)");
+        run(&mut sm, 2, "CREATE TABLE b (k U32 NOT NULL, tag U32 NOT NULL)");
+        let cat = sm.catalog().clone();
+        let err = compile(
+            "SELECT * FROM a JOIN b ON a.k = b.k WHERE tag = 1",
+            &cat,
+        )
+        .unwrap_err();
+        assert!(err.contains("ambiguous"), "got: {err}");
+        // Qualified resolves fine.
+        assert!(matches!(
+            compile("SELECT * FROM a JOIN b ON a.k = b.k WHERE a.tag = 1", &cat).unwrap(),
+            kessel_proto::Op::Join { .. }
+        ));
     }
 
     #[test]

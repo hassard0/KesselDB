@@ -457,6 +457,19 @@ fn kind_of(name: &str, arg: Option<i128>) -> Result<FieldKind, SqlError> {
     })
 }
 
+/// SP-PG-SERIAL-RETURNING: is `tname` a SERIAL-family type name? Case-
+/// insensitive, matches the aliases handled by `kind_of`. A SERIAL
+/// column that is also the PRIMARY KEY becomes a deterministic
+/// autoincrement (the engine assigns the value); a SERIAL column that is
+/// NOT the PK is a plain integer the caller must supply (V1 — the non-PK
+/// serial case is the named follow-up `SP-PG-SERIAL-NONPK`).
+pub fn is_serial_type(tname: &str) -> bool {
+    matches!(
+        tname.to_ascii_uppercase().as_str(),
+        "BIGSERIAL" | "SERIAL8" | "SERIAL" | "SERIAL4" | "SMALLSERIAL" | "SERIAL2"
+    )
+}
+
 /// A compiled statement. Most map to a single `Op`; `UPDATE` needs a
 /// server-side read-modify-write (the engine reads the current row, applies
 /// the SET list, re-encodes) so it is its own variant. `Clone` so a
@@ -562,6 +575,73 @@ pub fn select_columns(sql: &str) -> Option<(String, Vec<String>)> {
         if k.eq_ignore_ascii_case("JOIN") {
             return None; // composite rows — different wire shape
         }
+    }
+    Some((table, cols))
+}
+
+/// SP-PG-SERIAL-RETURNING: if `sql` is an `INSERT INTO <table> … RETURNING
+/// col1, col2, …`, return `(table, [col1, col2, …])` so the gateway can
+/// emit a RowDescription + DataRow of the returned (e.g. engine-assigned)
+/// values. `None` for an INSERT without a RETURNING clause, or any non-
+/// INSERT statement (the caller then emits a bare CommandComplete). Uses
+/// the real lexer; a leading qualifier on a returned column (`t.id`) is
+/// stripped (lenient, matching `select_columns`). V1 scopes to INSERT
+/// RETURNING — UPDATE/DELETE RETURNING is `SP-PG-SQL-RETURNING-DML`.
+pub fn insert_returning(sql: &str) -> Option<(String, Vec<String>)> {
+    let toks = lex(sql).ok()?;
+    let mut it = toks.iter().peekable();
+    match it.next()? {
+        Tok::Ident(k) if k.eq_ignore_ascii_case("INSERT") => {}
+        _ => return None,
+    }
+    match it.next()? {
+        Tok::Ident(k) if k.eq_ignore_ascii_case("INTO") => {}
+        _ => return None,
+    }
+    let table = match it.next()? {
+        Tok::Ident(t) => t.clone(),
+        _ => return None,
+    };
+    // Scan forward for a top-level RETURNING keyword (the INSERT body is
+    // already validated by the parser; here we only need to locate the
+    // clause and read its column list).
+    let mut found = false;
+    for t in it.by_ref() {
+        if let Tok::Ident(k) = t {
+            if k.eq_ignore_ascii_case("RETURNING") {
+                found = true;
+                break;
+            }
+        }
+    }
+    if !found {
+        return None;
+    }
+    let mut cols = Vec::new();
+    loop {
+        let mut col = match it.next()? {
+            Tok::Ident(c) => c.clone(),
+            _ => return None,
+        };
+        // Lenient qualifier: `RETURNING t.id` → `id`.
+        if matches!(it.peek(), Some(Tok::Punct('.'))) {
+            it.next();
+            match it.next()? {
+                Tok::Ident(real) => col = real.clone(),
+                _ => return None,
+            }
+        }
+        cols.push(col);
+        match it.peek() {
+            Some(Tok::Punct(',')) => {
+                it.next();
+                continue;
+            }
+            _ => break, // end of list (or trailing `;` already lexed out)
+        }
+    }
+    if cols.is_empty() {
+        return None;
     }
     Some((table, cols))
 }
@@ -1481,6 +1561,13 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
         // SP86: per-column DEFAULT, keyed by the field id the engine
         // will assign (positional, 1-based — matches CreateType).
         let mut defaults: Vec<(u16, Vec<u8>)> = Vec::new();
+        // SP-PG-SERIAL-RETURNING: track which columns were declared with a
+        // SERIAL-family type, and which column(s) are the PRIMARY KEY
+        // (inline modifier or table-level constraint). A column that is
+        // BOTH serial AND the PK ⇒ deterministic autoincrement on the
+        // `id` pseudo-PK / ObjectId.
+        let mut serial_col_names: Vec<String> = Vec::new();
+        let mut pk_col_names: Vec<String> = Vec::new();
         loop {
             // SP-PG-SQL-ORM-PARSE T5 — table-level `PRIMARY KEY (col, ...)`
             // constraint (SQLAlchemy's `create_all` emits a trailing
@@ -1495,7 +1582,10 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
                 p.expect_kw("KEY")?;
                 p.punct('(')?;
                 loop {
-                    let _ = p.col_ident()?; // PK column name(s), skipped
+                    // SP-PG-SERIAL-RETURNING: capture the PK column name(s)
+                    // (still accept-and-skip as a stored column, but we
+                    // need the name to mark a SERIAL PK as autoincrement).
+                    pk_col_names.push(p.col_ident()?);
                     match p.next() {
                         Some(Tok::Punct(',')) => continue,
                         Some(Tok::Punct(')')) => break,
@@ -1533,6 +1623,14 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
             if p.kw("PRIMARY") {
                 p.expect_kw("KEY")?;
                 nullable = false;
+                pk_col_names.push(cname.clone());
+            }
+            // SP-PG-SERIAL-RETURNING: remember a SERIAL-typed column by
+            // name (the type itself still maps to its plain integer width
+            // via `kind_of`). A SERIAL column that is also the PK becomes
+            // a deterministic autoincrement below.
+            if is_serial_type(&tname) {
+                serial_col_names.push(cname.clone());
             }
             let kind = kind_of(&tname, arg)?;
             if p.kw("DEFAULT") {
@@ -1558,9 +1656,23 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
                 _ => return Err("expected `,` or `)`".into()),
             }
         }
+        // SP-PG-SERIAL-RETURNING: a column that is BOTH the PRIMARY KEY
+        // and declared SERIAL becomes a deterministic autoincrement on
+        // the `id` pseudo-PK / ObjectId. We pin the serial column's
+        // stored field id (1-based positional, matching CreateType's
+        // field-id assignment) so the SM patches the assigned value back
+        // into the record (a later `SELECT id` reads it). V1 supports one
+        // serial PK per table (the first PK column that is also serial).
+        let serial_field_id: Option<u16> = pk_col_names
+            .iter()
+            .find(|pk| serial_col_names.iter().any(|s| s == *pk))
+            .and_then(|pk| {
+                fields.iter().position(|f| &f.name == pk).map(|i| (i + 1) as u16)
+            });
+        let serial_pk = serial_field_id.is_some();
         return Ok(Op::CreateType {
-            def: kessel_catalog::encode_type_def_with_defaults(
-                &name, &fields, &defaults,
+            def: kessel_catalog::encode_type_def_full(
+                &name, &fields, &defaults, serial_pk, serial_field_id,
             ),
         });
     }
@@ -1596,7 +1708,16 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
             }
         }
         let id_pos = cols.iter().position(|c| c.eq_ignore_ascii_case("id"));
-        if legacy_id.is_none() && id_pos.is_none() {
+        // SP-PG-SERIAL-RETURNING: a `serial_pk` type whose INSERT omits
+        // the row id (`INSERT INTO t (name) VALUES (…)`) autoincrements:
+        // the engine assigns the id deterministically. We compile this to
+        // an `Op::Create` carrying the `SERIAL_SENTINEL` id; the SM swaps
+        // in the next per-type sequence value. The serial column's stored
+        // field (if any) is filled with a 0 placeholder that the SM
+        // patches with the assigned value.
+        let serial_auto =
+            legacy_id.is_none() && id_pos.is_none() && ot.serial_pk;
+        if legacy_id.is_none() && id_pos.is_none() && !serial_auto {
             return Err(
                 "INSERT needs a row id: either `ID <n>` or an `id` column".into(),
             );
@@ -1664,7 +1785,12 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
             // post-SP-PG-EXTQ-CAST-strip as the quoted literal `'42'`,
             // and the engine's type-checker for the `id` pseudo-column
             // must coerce that the way PG would coerce `'42'::int8`).
-            let id = match (legacy_id, id_pos) {
+            let id = if serial_auto {
+                // SERIAL autoincrement: the engine assigns the id. Carry
+                // the reserved sentinel; the SM swaps in the real value.
+                u128::MAX
+            } else {
+            match (legacy_id, id_pos) {
                 (Some(n), _) => n,
                 (None, Some(ip)) => match &raw[ip] {
                     Lit::Int(n) => *n as u128,
@@ -1688,6 +1814,7 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
                         })?,
                 },
                 _ => unreachable!(),
+            }
             };
             // Build field values in schema order (the `id` pseudo-column is
             // not a field; unlisted nullable fields => Null).
@@ -1696,10 +1823,25 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
                 match cols.iter().position(|c| *c == f.name) {
                     Some(idx) => values.push(lit_to_value(&raw[idx], f.kind)?),
                     None => {
+                        // SP-PG-SERIAL-RETURNING: the omitted SERIAL PK
+                        // column gets a non-null `0` placeholder; the SM
+                        // patches it with the assigned autoincrement value
+                        // (so it is never left NULL-violating, and a later
+                        // `SELECT id` reads the engine-assigned id).
+                        if serial_auto
+                            && Some(f.field_id) == ot.serial_field_id
+                        {
+                            values.push(
+                                kessel_codec::value_from_raw(
+                                    f.kind,
+                                    &vec![0u8; f.kind.width() as usize],
+                                ),
+                            );
+                        }
                         // SP86: an omitted column takes its DEFAULT if
                         // one was declared; else NULL (nullable) or a
                         // clean error (NOT NULL, no default).
-                        if let Some((_, d)) =
+                        else if let Some((_, d)) =
                             ot.defaults.iter().find(|(fid, _)| *fid == f.field_id)
                         {
                             values.push(kessel_codec::value_from_raw(
@@ -5098,6 +5240,7 @@ mod tests {
             triggers: vec![], ordered: vec![], composite: vec![],
             defaults: vec![],
             serial_pk: false,
+            serial_field_id: None,
         };
         // fetch the row and decode it using ONLY the described schema
         match run(&mut sm, 4, "SELECT * FROM acct ID 1") {
@@ -6215,5 +6358,93 @@ mod tests {
         );
         // `SELECT *` is NOT a projection list → None (the star path).
         assert_eq!(select_columns("SELECT * FROM t"), None);
+    }
+
+    // ---- SP-PG-SERIAL-RETURNING (T3) ----
+
+    /// `CREATE TABLE … id BIGSERIAL PRIMARY KEY` flags the type as a
+    /// deterministic-autoincrement serial PK (inline-modifier shape).
+    #[test]
+    fn serial_pk_inline_create_table_flags_the_type() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE widgets (id BIGSERIAL PRIMARY KEY, name VARCHAR(8))");
+        let t = sm.catalog().types.iter().find(|t| t.name == "widgets").unwrap();
+        assert!(t.serial_pk, "serial PK must be flagged");
+        // The serial column `id` is field 1 (first column).
+        assert_eq!(t.serial_field_id, Some(1));
+    }
+
+    /// The table-level `PRIMARY KEY (id)` constraint shape (SQLAlchemy
+    /// create_all) also flags the serial PK.
+    #[test]
+    fn serial_pk_table_constraint_create_table_flags_the_type() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE w (id BIGSERIAL NOT NULL, name VARCHAR(8), PRIMARY KEY (id))");
+        let t = sm.catalog().types.iter().find(|t| t.name == "w").unwrap();
+        assert!(t.serial_pk);
+        assert_eq!(t.serial_field_id, Some(1));
+    }
+
+    /// A plain (non-serial) PK does NOT flag autoincrement — regression
+    /// guard so ordinary tables keep requiring an explicit id.
+    #[test]
+    fn non_serial_pk_is_not_autoincrement() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE p (id I64 NOT NULL, name VARCHAR(8), PRIMARY KEY (id))");
+        let t = sm.catalog().types.iter().find(|t| t.name == "p").unwrap();
+        assert!(!t.serial_pk);
+        assert_eq!(t.serial_field_id, None);
+    }
+
+    /// An INSERT that OMITS the id on a serial_pk type compiles to an
+    /// `Op::Create` carrying the SERIAL_SENTINEL id (u128::MAX) so the SM
+    /// autoincrements. A non-serial table still errors on a missing id.
+    #[test]
+    fn serial_insert_omitting_id_compiles_to_sentinel_create() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE widgets (id BIGSERIAL PRIMARY KEY, name VARCHAR(8))");
+        let cat = sm.catalog();
+        let op = compile("INSERT INTO widgets (name) VALUES ('gadget')", cat)
+            .expect("autoincrement INSERT compiles");
+        match op {
+            Op::Create { id, .. } => {
+                assert_eq!(id, ObjectId::from_u128(u128::MAX), "must carry the serial sentinel");
+            }
+            o => panic!("expected Create, got {:?}", o.kind()),
+        }
+        // RETURNING is tolerated (the parser returns before the clause).
+        assert!(compile(
+            "INSERT INTO widgets (name) VALUES ('x') RETURNING id",
+            cat
+        )
+        .is_ok());
+    }
+
+    /// `insert_returning` parses the clause + column list (qualified or
+    /// bare), and returns None for an INSERT without RETURNING.
+    #[test]
+    fn insert_returning_parses_columns() {
+        assert_eq!(
+            insert_returning("INSERT INTO widgets (name) VALUES ('a') RETURNING id"),
+            Some(("widgets".to_string(), vec!["id".to_string()]))
+        );
+        assert_eq!(
+            insert_returning("INSERT INTO w (name) VALUES ('a') RETURNING id, name"),
+            Some(("w".to_string(), vec!["id".to_string(), "name".to_string()]))
+        );
+        // Qualified returned column is stripped (lenient).
+        assert_eq!(
+            insert_returning("INSERT INTO w (name) VALUES ('a') RETURNING w.id"),
+            Some(("w".to_string(), vec!["id".to_string()]))
+        );
+        // Trailing semicolon tolerated.
+        assert_eq!(
+            insert_returning("INSERT INTO w (name) VALUES ('a') RETURNING id;"),
+            Some(("w".to_string(), vec!["id".to_string()]))
+        );
+        // No RETURNING → None.
+        assert_eq!(insert_returning("INSERT INTO w (name) VALUES ('a')"), None);
+        // Non-INSERT → None.
+        assert_eq!(insert_returning("SELECT id FROM w"), None);
     }
 }

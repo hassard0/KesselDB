@@ -3212,11 +3212,72 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
         } else {
             Vec::new()
         };
+        // SP-PG-SQL-JOIN-QUERY: optional `ORDER BY <qualified col> [ASC|DESC]`
+        // then `LIMIT n` / `OFFSET m`, composing with the optional WHERE above.
+        // The ORDER BY column resolves against the SAME combined `(a ++ b)`
+        // schema the engine builds (field names `<table>.<col>`, ids
+        // `0..nL+nR`), so the emitted sort field id is the engine's combined
+        // field id by construction.
+        let mut order_by: Option<(u16, bool)> = None;
+        if p.kw("ORDER") {
+            p.expect_kw("BY")?;
+            // qualified `a.c` (V1 requires a qualifier so the combined-schema
+            // resolution is unambiguous across the two tables).
+            let qt = p.ident()?;
+            p.punct('.')?;
+            let qc = p.ident()?;
+            if qt != ot.name && qt != rt.name {
+                return Err(format!(
+                    "ORDER BY qualifier `{qt}` is not one of the joined tables \
+                     `{}` / `{}`",
+                    ot.name, rt.name
+                ));
+            }
+            let combined_name = format!("{qt}.{qc}");
+            let cot = combined_join_type(&ot, &rt);
+            let sfid = cot
+                .fields
+                .iter()
+                .find(|f| f.name == combined_name)
+                .ok_or_else(|| unknown_column_err(&combined_name, &cot))?
+                .field_id;
+            // optional ASC (default) / DESC
+            let desc = if p.kw("DESC") {
+                true
+            } else {
+                let _ = p.kw("ASC");
+                false
+            };
+            order_by = Some((sfid, desc));
+        }
+        // LIMIT / OFFSET (either order, PG accepts both `LIMIT n OFFSET m` and
+        // `OFFSET m LIMIT n`).
         let mut limit = 0u32;
-        if p.kw("LIMIT") {
-            match p.next() {
-                Some(Tok::Int(n)) => limit = n as u32,
-                _ => return Err("LIMIT needs int".into()),
+        let mut limit_n: Option<u64> = None;
+        let mut offset_n: Option<u64> = None;
+        loop {
+            if p.kw("LIMIT") {
+                match p.next() {
+                    Some(Tok::Int(n)) => limit_n = Some(n as u64),
+                    _ => return Err("LIMIT needs int".into()),
+                }
+            } else if p.kw("OFFSET") {
+                match p.next() {
+                    Some(Tok::Int(n)) => offset_n = Some(n as u64),
+                    _ => return Err("OFFSET needs int".into()),
+                }
+            } else {
+                break;
+            }
+        }
+        // Byte-identity: a bare `JOIN … LIMIT n` (NO ORDER BY, NO OFFSET) keeps
+        // using the legacy pre-sort `limit` field so an existing join frame is
+        // wire-unchanged. Any ORDER BY or OFFSET routes pagination to the
+        // post-sort `limit_n`/`offset_n` (legacy `limit` = 0 = unbounded
+        // pre-sort) so the full result is sorted before paginating.
+        if order_by.is_none() && offset_n.is_none() {
+            if let Some(n) = limit_n.take() {
+                limit = n as u32;
             }
         }
         return Ok(Op::Join {
@@ -3227,6 +3288,9 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
             limit,
             filter,
             join_type,
+            order_by,
+            limit_n,
+            offset_n,
         });
     }
     // Primary-key fast path: `SELECT ... FROM t ID <n>` -> O(1) GetById
@@ -3476,9 +3540,14 @@ fn compile_join_where(
     // that can follow a join-WHERE in V1) or end of input. Collect + rewrite.
     let mut rewritten: Vec<Tok> = Vec::new();
     while let Some(tok) = p.peek().cloned() {
-        // Stop at LIMIT (left for the caller to parse).
+        // Stop at a trailing clause (left for the caller to parse).
+        // SP-PG-SQL-JOIN-QUERY: ORDER / OFFSET join the pre-existing LIMIT
+        // as terminators so a `JOIN … WHERE … ORDER BY …` splits cleanly.
         if let Tok::Ident(k) = &tok {
-            if k.eq_ignore_ascii_case("LIMIT") {
+            if k.eq_ignore_ascii_case("LIMIT")
+                || k.eq_ignore_ascii_case("ORDER")
+                || k.eq_ignore_ascii_case("OFFSET")
+            {
                 break;
             }
         }
@@ -6453,6 +6522,162 @@ mod tests {
         // gateway routes them to render_join_result.
         assert!(join_projection("SELECT usr.uid, ord.amt FROM usr LEFT JOIN ord ON usr.uid = ord.owner").is_some());
         assert!(join_projection("SELECT * FROM usr LEFT OUTER JOIN ord ON usr.uid = ord.owner").is_some());
+    }
+
+    /// SP-PG-SQL-JOIN-QUERY — `JOIN … [WHERE] ORDER BY / LIMIT / OFFSET` parses
+    /// to the additive `Op::Join { order_by, limit_n, offset_n }` fields. The
+    /// ORDER BY column resolves to its id in the COMBINED `(a ++ b)` schema:
+    /// usr.uid=0, ord.owner=1, ord.amt=2.
+    #[test]
+    fn join_order_by_limit_offset_parses() {
+        use kessel_proto::{JoinType, Op};
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE usr (uid U32 NOT NULL)");
+        run(&mut sm, 2, "CREATE TABLE ord (owner U32 NOT NULL, amt U32 NOT NULL)");
+        let cat = sm.catalog().clone();
+
+        // ORDER BY a right column (ord.amt → combined field 2), default ASC.
+        match compile(
+            "SELECT usr.uid, ord.amt FROM usr JOIN ord ON usr.uid = ord.owner ORDER BY ord.amt",
+            &cat,
+        ).unwrap() {
+            Op::Join { order_by, limit_n, offset_n, limit, .. } => {
+                assert_eq!(order_by, Some((2, false)));
+                assert_eq!(limit_n, None);
+                assert_eq!(offset_n, None);
+                assert_eq!(limit, 0, "ORDER BY routes pagination off the legacy limit");
+            }
+            o => panic!("expected Join, got {o:?}"),
+        }
+
+        // ORDER BY a LEFT column DESC + LIMIT + OFFSET.
+        match compile(
+            "SELECT usr.uid, ord.amt FROM usr JOIN ord ON usr.uid = ord.owner \
+             ORDER BY usr.uid DESC LIMIT 5 OFFSET 10",
+            &cat,
+        ).unwrap() {
+            Op::Join { order_by, limit_n, offset_n, limit, .. } => {
+                assert_eq!(order_by, Some((0, true)));
+                assert_eq!(limit_n, Some(5));
+                assert_eq!(offset_n, Some(10));
+                assert_eq!(limit, 0);
+            }
+            o => panic!("{o:?}"),
+        }
+
+        // WHERE + ORDER BY + LIMIT compose (WHERE stops at ORDER).
+        match compile(
+            "SELECT usr.uid, ord.amt FROM usr JOIN ord ON usr.uid = ord.owner \
+             WHERE ord.amt > 1 ORDER BY usr.uid LIMIT 3",
+            &cat,
+        ).unwrap() {
+            Op::Join { filter, order_by, limit_n, .. } => {
+                assert!(!filter.is_empty(), "WHERE compiled");
+                assert_eq!(order_by, Some((0, false)));
+                assert_eq!(limit_n, Some(3));
+            }
+            o => panic!("{o:?}"),
+        }
+
+        // LEFT join carries ORDER BY too.
+        match compile(
+            "SELECT usr.uid, ord.amt FROM usr LEFT JOIN ord ON usr.uid = ord.owner ORDER BY ord.amt DESC",
+            &cat,
+        ).unwrap() {
+            Op::Join { join_type, order_by, .. } => {
+                assert_eq!(join_type, JoinType::Left);
+                assert_eq!(order_by, Some((2, true)));
+            }
+            o => panic!("{o:?}"),
+        }
+
+        // Regression: a bare `JOIN … LIMIT n` (NO ORDER BY / OFFSET) keeps using
+        // the legacy pre-sort `limit` field — wire-identical to the pre-arc op.
+        match compile(
+            "SELECT * FROM usr JOIN ord ON usr.uid = ord.owner LIMIT 2",
+            &cat,
+        ).unwrap() {
+            Op::Join { order_by, limit_n, offset_n, limit, .. } => {
+                assert_eq!(order_by, None);
+                assert_eq!(limit_n, None);
+                assert_eq!(offset_n, None);
+                assert_eq!(limit, 2, "bare LIMIT stays on the legacy field");
+            }
+            o => panic!("{o:?}"),
+        }
+
+        // Bare join (no trailing clauses): all new fields None, legacy limit 0.
+        match compile("SELECT * FROM usr JOIN ord ON usr.uid = ord.owner", &cat).unwrap() {
+            Op::Join { order_by, limit_n, offset_n, limit, .. } => {
+                assert_eq!((order_by, limit_n, offset_n, limit), (None, None, None, 0));
+            }
+            o => panic!("{o:?}"),
+        }
+
+        // Unknown ORDER BY column → error.
+        assert!(compile(
+            "SELECT * FROM usr JOIN ord ON usr.uid = ord.owner ORDER BY ord.nope",
+            &cat,
+        ).is_err());
+        // Wrong ORDER BY qualifier (names neither table) → error.
+        assert!(compile(
+            "SELECT * FROM usr JOIN ord ON usr.uid = ord.owner ORDER BY foo.amt",
+            &cat,
+        ).is_err());
+    }
+
+    /// SP-PG-SQL-JOIN-QUERY — end-to-end engine: ORDER BY a right column +
+    /// LIMIT paginates the SORTED combined rows. The headline shape.
+    #[test]
+    fn join_order_by_limit_runs_sorted() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE a (id U64 NOT NULL, name CHAR(16) NOT NULL)");
+        run(&mut sm, 2, "CREATE TABLE b (id U64 NOT NULL, aid U64 NOT NULL, title CHAR(16) NOT NULL)");
+        run(&mut sm, 3, "INSERT INTO a ID 1 (id, name) VALUES (1, 'tolkien')");
+        run(&mut sm, 4, "INSERT INTO b ID 1 (id, aid, title) VALUES (1, 1, 'lotr')");
+        run(&mut sm, 5, "INSERT INTO b ID 2 (id, aid, title) VALUES (2, 1, 'hobbit')");
+        run(&mut sm, 6, "INSERT INTO b ID 3 (id, aid, title) VALUES (3, 1, 'silmarillion')");
+
+        // Combined schema: a.id(0), a.name(1), b.id(2), b.aid(3), b.title(4).
+        fn titles(sm: &mut StateMachine<MemVfs>, seq: u64, sql: &str) -> Vec<String> {
+            match run(sm, seq, sql) {
+                OpResult::Got(bytes) => {
+                    assert_eq!(&bytes[..4], b"KTR1");
+                    let dl = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+                    let (jn, jf) = kessel_catalog::decode_type_def(&bytes[8..8 + dl]).unwrap();
+                    let cot = ObjectType::from_def(jn, jf);
+                    let mut p = 8 + dl;
+                    let mut out = Vec::new();
+                    while p + 4 <= bytes.len() {
+                        let rl = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+                        p += 4;
+                        let vals = kessel_codec::decode(&cot, &bytes[p..p + rl]).unwrap();
+                        p += rl;
+                        if let kessel_codec::Value::Blob(v) = &vals[4] {
+                            out.push(String::from_utf8_lossy(kessel_expr::right_trim_char_pad(v)).into_owned());
+                        }
+                    }
+                    out
+                }
+                o => panic!("{o:?}"),
+            }
+        }
+
+        // ORDER BY b.title LIMIT 2 ⇒ hobbit, lotr.
+        assert_eq!(
+            titles(&mut sm, 20, "SELECT a.name, b.title FROM a JOIN b ON a.id=b.aid ORDER BY b.title LIMIT 2"),
+            vec!["hobbit".to_string(), "lotr".to_string()],
+        );
+        // OFFSET 1 LIMIT 2 ⇒ lotr, silmarillion.
+        assert_eq!(
+            titles(&mut sm, 21, "SELECT a.name, b.title FROM a JOIN b ON a.id=b.aid ORDER BY b.title LIMIT 2 OFFSET 1"),
+            vec!["lotr".to_string(), "silmarillion".to_string()],
+        );
+        // DESC ⇒ silmarillion, lotr, hobbit.
+        assert_eq!(
+            titles(&mut sm, 22, "SELECT a.name, b.title FROM a JOIN b ON a.id=b.aid ORDER BY b.title DESC"),
+            vec!["silmarillion".to_string(), "lotr".to_string(), "hobbit".to_string()],
+        );
     }
 
     /// SP-PG-SQL-OUTER-JOIN — engine semantics. When every left row matches,

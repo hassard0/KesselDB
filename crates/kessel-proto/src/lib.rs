@@ -302,6 +302,20 @@ pub enum Op {
         /// `JoinType`. Encoded only when non-`Inner`; an older / inner frame
         /// decodes to `Inner`, byte-identical to before.
         join_type: JoinType,
+        /// SP-PG-SQL-JOIN-QUERY: optional `ORDER BY <combined-field id>`
+        /// over the COMBINED `(a ++ b)` schema. `(field_id, desc)`. `None`
+        /// (default) ⇒ no sort ⇒ rows emit in left-key/right-scan order
+        /// (byte-identical to a pre-arc join). When `Some`, the engine
+        /// stable-sorts the surviving combined rows by this field then
+        /// applies `offset_n`/`limit_n`.
+        order_by: Option<(u16, bool)>,
+        /// SP-PG-SQL-JOIN-QUERY: optional POST-sort row cap. `None` ⇒
+        /// unbounded. (The legacy `limit` field is a PRE-sort cap used by
+        /// bare `JOIN … LIMIT n`; a sorted/paginated query sets `limit = 0`
+        /// and paginates here so there is no double-cap.)
+        limit_n: Option<u64>,
+        /// SP-PG-SQL-JOIN-QUERY: optional POST-sort skip. `None` ⇒ 0.
+        offset_n: Option<u64>,
     },
     /// Add a composite (multi-field) equality index (Sub-project 27);
     /// backfills existing rows.
@@ -1019,26 +1033,59 @@ impl Op {
                 limit,
                 filter,
                 join_type,
+                order_by,
+                limit_n,
+                offset_n,
             } => {
                 codec::put_u32(&mut b, *left_type);
                 codec::put_u32(&mut b, *right_type);
                 b.extend_from_slice(&left_field.to_le_bytes());
                 b.extend_from_slice(&right_field.to_le_bytes());
                 codec::put_u32(&mut b, *limit);
-                // SP-PG-SQL-JOIN-WHERE / -OUTER-JOIN: two OPTIONAL trailing
-                // fields. The combined-schema filter (length-prefixed) comes
-                // first, then a single join-type tag byte. BOTH are emitted
-                // only when they carry non-default information, so a bare
-                // INNER join (no filter) is byte-identical to the pre-arc
-                // frame. A LEFT join with no filter still needs the tag, so
-                // an empty filter is written (len-0) ahead of the tag to keep
-                // the decode unambiguous.
+                // SP-PG-SQL-JOIN-WHERE / -OUTER-JOIN / -JOIN-QUERY: up to THREE
+                // OPTIONAL trailing regions. The combined-schema filter
+                // (length-prefixed) comes first, then a single join-type tag
+                // byte, then the sort/page block. Each is emitted only when it
+                // carries non-default information, so a bare INNER join (no
+                // filter, no pagination) is byte-identical to the pre-arc
+                // frame. A region that is absent on its own but PRECEDES a
+                // present later region is force-written as its empty/default
+                // anchor so the positional decode stays unambiguous.
                 let non_inner = *join_type != JoinType::Inner;
-                if !filter.is_empty() || non_inner {
+                let has_page =
+                    order_by.is_some() || limit_n.is_some() || offset_n.is_some();
+                if !filter.is_empty() || non_inner || has_page {
                     codec::put_bytes(&mut b, filter);
                 }
-                if non_inner {
+                if non_inner || has_page {
                     b.push(join_type.wire_tag());
+                }
+                // SP-PG-SQL-JOIN-QUERY: page block, guarded by a marker byte so
+                // an old/inner frame (no trailing bytes) decodes to all-None.
+                if has_page {
+                    b.push(1u8); // page-block marker
+                    match order_by {
+                        Some((f, desc)) => {
+                            b.push(1u8);
+                            b.extend_from_slice(&f.to_le_bytes());
+                            b.push(*desc as u8);
+                        }
+                        None => b.push(0u8),
+                    }
+                    match limit_n {
+                        Some(n) => {
+                            b.push(1u8);
+                            b.extend_from_slice(&n.to_le_bytes());
+                        }
+                        None => b.push(0u8),
+                    }
+                    match offset_n {
+                        Some(n) => {
+                            b.push(1u8);
+                            b.extend_from_slice(&n.to_le_bytes());
+                        }
+                        None => b.push(0u8),
+                    }
                 }
             }
             Op::QueryRows { type_id, eq_preds, program, limit, range_preds } => {
@@ -1418,6 +1465,25 @@ impl Op {
                 } else {
                     JoinType::Inner
                 };
+                // SP-PG-SQL-JOIN-QUERY: optional trailing sort/page block,
+                // guarded by a marker byte. Absent (older / non-paginated
+                // frame) ⇒ all-None. A non-1 marker is a forward-incompatible
+                // op ⇒ decode failure (surfaced, not silently mis-applied).
+                let (order_by, limit_n, offset_n) = if c.remaining() > 0 {
+                    if c.u8()? != 1 {
+                        return None;
+                    }
+                    let order_by = if c.u8()? != 0 {
+                        Some((c.u16()?, c.u8()? != 0))
+                    } else {
+                        None
+                    };
+                    let limit_n = if c.u8()? != 0 { Some(c.u64()?) } else { None };
+                    let offset_n = if c.u8()? != 0 { Some(c.u64()?) } else { None };
+                    (order_by, limit_n, offset_n)
+                } else {
+                    (None, None, None)
+                };
                 Op::Join {
                     left_type,
                     right_type,
@@ -1426,6 +1492,9 @@ impl Op {
                     limit,
                     filter,
                     join_type,
+                    order_by,
+                    limit_n,
+                    offset_n,
                 }
             }
             26 => {
@@ -1785,16 +1854,25 @@ mod tests {
             Op::QueryRows { type_id: 4, eq_preds: vec![], program: vec![1], limit: 0, range_preds: vec![(2, 1, vec![7, 0]), (2, 3, vec![9, 0])] },
             Op::Describe { type_id: 4 },
             Op::DropType { type_id: 4 },
-            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9, filter: vec![], join_type: JoinType::Inner },
+            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9, filter: vec![], join_type: JoinType::Inner, order_by: None, limit_n: None, offset_n: None },
             // SP-PG-SQL-JOIN-WHERE: filtered join — non-empty filter program
             // round-trips through the new optional trailing wire suffix.
-            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9, filter: vec![1, 0, 0, 5, 42, 3], join_type: JoinType::Inner },
+            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9, filter: vec![1, 0, 0, 5, 42, 3], join_type: JoinType::Inner, order_by: None, limit_n: None, offset_n: None },
             // SP-PG-SQL-OUTER-JOIN: LEFT join, no filter — the join-type tag
             // round-trips with an empty filter ahead of it.
-            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9, filter: vec![], join_type: JoinType::Left },
+            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9, filter: vec![], join_type: JoinType::Left, order_by: None, limit_n: None, offset_n: None },
             // SP-PG-SQL-OUTER-JOIN: LEFT join WITH filter — both trailing
             // fields present (filter then tag).
-            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9, filter: vec![1, 0, 0, 5, 42, 3], join_type: JoinType::Left },
+            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9, filter: vec![1, 0, 0, 5, 42, 3], join_type: JoinType::Left, order_by: None, limit_n: None, offset_n: None },
+            // SP-PG-SQL-JOIN-QUERY: ORDER BY only (asc) — page block with just
+            // the sort field, limit/offset absent.
+            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 0, filter: vec![], join_type: JoinType::Inner, order_by: Some((3, false)), limit_n: None, offset_n: None },
+            // SP-PG-SQL-JOIN-QUERY: ORDER BY DESC + LIMIT + OFFSET — all page
+            // fields present, over an INNER join with no filter.
+            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 0, filter: vec![], join_type: JoinType::Inner, order_by: Some((6, true)), limit_n: Some(20), offset_n: Some(40) },
+            // SP-PG-SQL-JOIN-QUERY: LIMIT/OFFSET with NO order_by, over a LEFT
+            // join WITH filter — every trailing region present at once.
+            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 0, filter: vec![1, 0, 0, 5, 42, 3], join_type: JoinType::Left, order_by: None, limit_n: Some(5), offset_n: Some(2) },
             Op::Aggregate { type_id: 4, program: vec![1], kind: 1, field_id: 3, range_preds: vec![] },
             // SP-Analytic-Plan: aggregate w/ range hints — new wire suffix.
             Op::Aggregate { type_id: 4, program: vec![1], kind: 1, field_id: 3, range_preds: vec![(2, 1, vec![7, 0]), (2, 3, vec![9, 0])] },
@@ -1868,6 +1946,7 @@ mod tests {
         let inner = Op::Join {
             left_type: 4, right_type: 5, left_field: 1, right_field: 2,
             limit: 9, filter: vec![], join_type: JoinType::Inner,
+            order_by: None, limit_n: None, offset_n: None,
         };
         let enc = inner.encode();
         // tag(28) + lt(u32) + rt(u32) + lf(u16) + rf(u16) + limit(u32)
@@ -1884,6 +1963,7 @@ mod tests {
         let left = Op::Join {
             left_type: 4, right_type: 5, left_field: 1, right_field: 2,
             limit: 9, filter: vec![], join_type: JoinType::Left,
+            order_by: None, limit_n: None, offset_n: None,
         };
         let enc = left.encode();
         // 17 base + 4 (empty filter len) + 1 (tag) = 22.
@@ -1899,10 +1979,60 @@ mod tests {
         let left = Op::Join {
             left_type: 4, right_type: 5, left_field: 1, right_field: 2,
             limit: 9, filter: vec![], join_type: JoinType::Left,
+            order_by: None, limit_n: None, offset_n: None,
         };
         let mut enc = left.encode();
         *enc.last_mut().unwrap() = 0x7F; // bogus tag
         assert!(Op::decode(&enc).is_none(), "unknown join-type tag must fail decode");
+    }
+
+    /// SP-PG-SQL-JOIN-QUERY regression: an INNER bare join with NO pagination
+    /// must STILL encode byte-identically to the pre-arc 17-byte frame — the
+    /// page block is omitted entirely when order_by/limit_n/offset_n are all
+    /// None, so no marker byte leaks in.
+    #[test]
+    fn join_no_pagination_wire_byte_identical() {
+        let inner = Op::Join {
+            left_type: 4, right_type: 5, left_field: 1, right_field: 2,
+            limit: 9, filter: vec![], join_type: JoinType::Inner,
+            order_by: None, limit_n: None, offset_n: None,
+        };
+        assert_eq!(inner.encode().len(), 17, "no page block ⇒ 17-byte frame");
+    }
+
+    /// SP-PG-SQL-JOIN-QUERY: a paginated INNER join (ORDER BY asc + LIMIT +
+    /// OFFSET, no filter) force-writes the empty filter + inner tag anchors,
+    /// then the page block, and round-trips exactly.
+    #[test]
+    fn paginated_join_round_trips() {
+        let op = Op::Join {
+            left_type: 4, right_type: 5, left_field: 1, right_field: 2,
+            limit: 0, filter: vec![], join_type: JoinType::Inner,
+            order_by: Some((3, false)), limit_n: Some(20), offset_n: Some(40),
+        };
+        let enc = op.encode();
+        // 17 base + 4 (empty filter len) + 1 (inner tag=0) + page block:
+        // marker(1) + has_order(1)+field(2)+desc(1) + has_limit(1)+u64(8)
+        // + has_offset(1)+u64(8) = 17 + 4 + 1 + 1 + 4 + 9 + 9 = 45.
+        assert_eq!(enc.len(), 45, "paginated join frame size");
+        assert_eq!(Op::decode(&enc).expect("decode"), op);
+    }
+
+    /// SP-PG-SQL-JOIN-QUERY: a corrupt page-block marker (non-1) is rejected at
+    /// decode — a forward-incompatible op is surfaced, not silently dropped.
+    #[test]
+    fn bad_page_block_marker_rejected() {
+        let op = Op::Join {
+            left_type: 4, right_type: 5, left_field: 1, right_field: 2,
+            limit: 0, filter: vec![], join_type: JoinType::Inner,
+            order_by: Some((3, false)), limit_n: None, offset_n: None,
+        };
+        let enc = op.encode();
+        // The marker byte sits right after the inner tag: 17 base + 4 (filter
+        // len) + 1 (tag) = index 22.
+        let mut bad = enc.clone();
+        bad[22] = 0x09; // corrupt marker
+        assert!(Op::decode(&bad).is_none(), "bad page-block marker must fail decode");
     }
 
     #[test]

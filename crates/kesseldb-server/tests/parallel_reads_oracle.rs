@@ -453,6 +453,9 @@ fn gen_random_read_op(rng: &mut Rng) -> (&'static str, Op) {
                 limit: 1 + rng.below(4) as u32,
                 filter: vec![],
                 join_type: kessel_proto::JoinType::Inner,
+                order_by: None,
+                limit_n: None,
+                offset_n: None,
             })
         }
     }
@@ -981,6 +984,9 @@ fn txn_ro_smoke_all_txn_permitted_variants_one_txn_returns_ok() {
             limit: 4,
             filter: vec![],
             join_type: kessel_proto::JoinType::Inner,
+            order_by: None,
+            limit_n: None,
+            offset_n: None,
         },
     ];
     // Bisect on divergence: run each inner op as a 1-op Txn on both

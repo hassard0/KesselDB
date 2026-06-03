@@ -642,10 +642,12 @@ pub fn insert_returning(sql: &str) -> Option<(String, Vec<String>)> {
     if matches!(it.peek(), Some(Tok::Star)) {
         it.next();
         // `RETURNING *` must be the whole clause (no `*, col` mixing in V1).
-        if it.peek().is_none() {
-            return Some((table, vec!["*".to_string()]));
+        // A trailing `;` is tolerated (the lexer keeps it as a token).
+        match it.peek() {
+            None => return Some((table, vec!["*".to_string()])),
+            Some(Tok::Punct(';')) => return Some((table, vec!["*".to_string()])),
+            _ => return None,
         }
-        return None;
     }
     let mut cols = Vec::new();
     loop {

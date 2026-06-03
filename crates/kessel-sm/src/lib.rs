@@ -6616,6 +6616,7 @@ mod tests {
                 r.extend_from_slice(&[0u8; 8]); // null bitmap: both present
                 r.extend_from_slice(&0i64.to_le_bytes()); // id placeholder
                 r.extend_from_slice(name);
+                r.resize(32, 0); // pad to record_size (next_pow2(30) = 32)
                 r
             },
         }
@@ -6725,9 +6726,11 @@ mod tests {
             record: {
                 let mut r = Vec::new();
                 r.extend_from_slice(&1u32.to_le_bytes());
-                r.extend_from_slice(&1u16.to_le_bytes());
+                r.extend_from_slice(&2u16.to_le_bytes());
                 r.extend_from_slice(&[0u8; 8]);
+                r.extend_from_slice(&100i64.to_le_bytes()); // id field
                 r.extend_from_slice(b"x\0\0\0\0\0\0\0");
+                r.resize(32, 0);
                 r
             },
         };

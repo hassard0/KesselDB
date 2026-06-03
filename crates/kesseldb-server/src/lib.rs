@@ -3971,6 +3971,138 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// SP-PG-SQL-DML-GENERAL T2 — general-WHERE UPDATE/DELETE over the
+    /// wire: multi-row mutation, 0-match no-op, index maintenance, UNIQUE
+    /// atomicity, and RETURNING — all via `Client::sql` (the same `0xFE`
+    /// SQL frame the PG gateway sends).
+    #[test]
+    fn dmlgen_general_where_over_tcp() {
+        // Decode the DML-result frame `[0xD3][u32 affected][u32 nrows]
+        // (u32 reclen, rec)*`. Mirrors the gateway's `decode_dml_result`.
+        fn decode_dml(b: &[u8]) -> (u32, Vec<Vec<u8>>) {
+            assert_eq!(b.first(), Some(&DML_RESULT_TAG), "DML result tag");
+            let affected = u32::from_le_bytes(b[1..5].try_into().unwrap());
+            let nrows = u32::from_le_bytes(b[5..9].try_into().unwrap()) as usize;
+            let mut rows = Vec::new();
+            let mut p = 9;
+            for _ in 0..nrows {
+                let l = u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize;
+                p += 4;
+                rows.push(b[p..p + l].to_vec());
+                p += l;
+            }
+            (affected, rows)
+        }
+        let dir =
+            std::env::temp_dir().join(format!("kesseldb-dmlgen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = spawn_engine(&dir).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || serve(listener, engine));
+        let mut c = Client::connect(addr).unwrap();
+
+        c.sql("CREATE TABLE acct (bal I64 NOT NULL, active I64 NOT NULL)")
+            .unwrap();
+        for (id, bal) in [(1i64, 100i64), (2, 50), (3, 200)] {
+            c.sql(&format!(
+                "INSERT INTO acct ID {id} (bal, active) VALUES ({bal}, 1)"
+            ))
+            .unwrap();
+        }
+
+        // general-WHERE UPDATE: bal < 150 matches ids 1,2 → affected 2.
+        match c.sql("UPDATE acct SET active = 0 WHERE bal < 150").unwrap() {
+            OpResult::Got(b) => {
+                let (affected, rows) = decode_dml(&b);
+                assert_eq!(affected, 2, "two rows matched bal < 150");
+                assert!(rows.is_empty(), "no RETURNING ⇒ no rows");
+            }
+            o => panic!("unexpected {o:?}"),
+        }
+        // Verify: id 3 (bal 200) still active = 1.
+        match c.sql("SELECT * FROM acct ID 3").unwrap() {
+            OpResult::Got(rec) => {
+                // active is the 2nd I64 field (offset 8..16), LE.
+                let active = i64::from_le_bytes(rec[8..16].try_into().unwrap());
+                assert_eq!(active, 1, "unmatched row untouched");
+            }
+            o => panic!("unexpected {o:?}"),
+        }
+
+        // 0-match UPDATE: bal > 9999 matches nothing → affected 0, no-op.
+        match c.sql("UPDATE acct SET active = 9 WHERE bal > 9999").unwrap() {
+            OpResult::Got(b) => assert_eq!(decode_dml(&b).0, 0),
+            o => panic!("unexpected {o:?}"),
+        }
+
+        // UPDATE ... RETURNING *: matched rows come back post-mutation.
+        match c
+            .sql("UPDATE acct SET active = 5 WHERE bal = 200 RETURNING *")
+            .unwrap()
+        {
+            OpResult::Got(b) => {
+                let (affected, rows) = decode_dml(&b);
+                assert_eq!(affected, 1);
+                assert_eq!(rows.len(), 1, "one RETURNING row");
+                let active = i64::from_le_bytes(rows[0][8..16].try_into().unwrap());
+                assert_eq!(active, 5, "RETURNING reflects the post-update value");
+            }
+            o => panic!("unexpected {o:?}"),
+        }
+
+        // general-WHERE DELETE: active = 0 matches ids 1,2 → affected 2.
+        match c.sql("DELETE FROM acct WHERE active = 0").unwrap() {
+            OpResult::Got(b) => assert_eq!(decode_dml(&b).0, 2),
+            o => panic!("unexpected {o:?}"),
+        }
+        // One row remains (id 3).
+        match c.sql("SELECT COUNT(*) FROM acct").unwrap() {
+            OpResult::Got(b) => {
+                let n = i128::from_le_bytes(<[u8; 16]>::try_from(b.as_ref()).unwrap());
+                assert_eq!(n, 1, "exactly one row survives the DELETE");
+            }
+            o => panic!("unexpected {o:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SP-PG-SQL-DML-GENERAL T2 — a general-WHERE UPDATE that would
+    /// violate a UNIQUE constraint is rejected ATOMICALLY: zero rows
+    /// applied (the whole `Op::Txn` rolls back).
+    #[test]
+    fn dmlgen_update_where_unique_violation_atomic() {
+        let dir = std::env::temp_dir()
+            .join(format!("kesseldb-dmlgen-uniq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = spawn_engine(&dir).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || serve(listener, engine));
+        let mut c = Client::connect(addr).unwrap();
+
+        c.sql("CREATE TABLE u (k I64 NOT NULL, g I64 NOT NULL)").unwrap();
+        c.sql("CREATE UNIQUE INDEX ON u (k)").unwrap();
+        c.sql("INSERT INTO u ID 1 (k, g) VALUES (10, 1)").unwrap();
+        c.sql("INSERT INTO u ID 2 (k, g) VALUES (20, 1)").unwrap();
+        // Setting BOTH rows' k to the same value (10) violates UNIQUE on k.
+        // The whole statement must roll back: neither row's k changes.
+        let res = c.sql("UPDATE u SET k = 10 WHERE g = 1").unwrap();
+        assert!(
+            matches!(res, OpResult::Constraint(_)),
+            "UNIQUE-violating general UPDATE must be a Constraint error, got {res:?}"
+        );
+        // Row 2's k must still be 20 (atomic rollback — none applied).
+        match c.sql("SELECT * FROM u ID 2").unwrap() {
+            OpResult::Got(rec) => {
+                let k = i64::from_le_bytes(rec[0..8].try_into().unwrap());
+                assert_eq!(k, 20, "row 2 unchanged after atomic rollback");
+            }
+            o => panic!("unexpected {o:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn ct_eq_is_length_safe_and_correct() {
         assert!(ct_eq(b"hunter2", b"hunter2"));

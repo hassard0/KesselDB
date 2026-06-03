@@ -634,6 +634,19 @@ pub fn insert_returning(sql: &str) -> Option<(String, Vec<String>)> {
     if !found {
         return None;
     }
+    // SP-PG-RETURNING-MULTIROW-STAR: `RETURNING *` → the star sentinel
+    // `["*"]`. The gateway expands it to every table column (the assigned
+    // id pseudo-column + all declared fields) via `describe_table`. We
+    // detect the `*` as a single `Tok::Punct('*')` immediately after
+    // RETURNING (optionally followed by a trailing `;` the lexer dropped).
+    if matches!(it.peek(), Some(Tok::Punct('*'))) {
+        it.next();
+        // `RETURNING *` must be the whole clause (no `*, col` mixing in V1).
+        if it.peek().is_none() {
+            return Some((table, vec!["*".to_string()]));
+        }
+        return None;
+    }
     let mut cols = Vec::new();
     loop {
         let mut col = match it.next()? {
@@ -6494,5 +6507,76 @@ mod tests {
         assert_eq!(insert_returning("INSERT INTO w (name) VALUES ('a')"), None);
         // Non-INSERT → None.
         assert_eq!(insert_returning("SELECT id FROM w"), None);
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-RETURNING-MULTIROW-STAR (T3) — multi-row INSERT RETURNING +
+    // `RETURNING *`.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// A multi-row INSERT compiles to ONE `Op::Txn` of N Creates (SP58),
+    /// AND `insert_returning` still locates the trailing RETURNING clause
+    /// past the multi-tuple VALUES body — so the gateway knows to surface
+    /// the per-row ids.
+    #[test]
+    fn multirow_insert_returning_parses() {
+        // Compile → Op::Txn (the multi-row INSERT shape).
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE widgets (id BIGSERIAL PRIMARY KEY, name VARCHAR(8))");
+        let cat = sm.catalog();
+        let op = compile(
+            "INSERT INTO widgets (name) VALUES ('a'),('b'),('c') RETURNING id",
+            cat,
+        )
+        .expect("multi-row INSERT RETURNING compiles");
+        match op {
+            Op::Txn { ops } => assert_eq!(ops.len(), 3, "3 Creates in the Txn"),
+            other => panic!("expected Op::Txn, got {:?}", other.kind()),
+        }
+        // The RETURNING clause is found past the multi-tuple VALUES body.
+        assert_eq!(
+            insert_returning(
+                "INSERT INTO widgets (name) VALUES ('a'),('b'),('c') RETURNING id"
+            ),
+            Some(("widgets".to_string(), vec!["id".to_string()]))
+        );
+    }
+
+    /// `RETURNING *` → the star sentinel `["*"]` the gateway expands to
+    /// every table column.
+    #[test]
+    fn insert_returning_star_yields_star_sentinel() {
+        assert_eq!(
+            insert_returning("INSERT INTO w (name) VALUES ('a') RETURNING *"),
+            Some(("w".to_string(), vec!["*".to_string()]))
+        );
+        // Trailing semicolon tolerated.
+        assert_eq!(
+            insert_returning("INSERT INTO w (name) VALUES ('a') RETURNING *;"),
+            Some(("w".to_string(), vec!["*".to_string()]))
+        );
+        // Multi-row + `RETURNING *` also yields the star sentinel.
+        assert_eq!(
+            insert_returning(
+                "INSERT INTO w (name) VALUES ('a'),('b') RETURNING *"
+            ),
+            Some(("w".to_string(), vec!["*".to_string()]))
+        );
+        // `RETURNING *, id` (star mixed with a column) is NOT supported in
+        // V1 → None (not a silent partial parse).
+        assert_eq!(
+            insert_returning("INSERT INTO w (name) VALUES ('a') RETURNING *, id"),
+            None
+        );
+    }
+
+    /// Explicit column list still parses (regression — the star branch
+    /// must not swallow the named-column path).
+    #[test]
+    fn insert_returning_explicit_list_unaffected_by_star_branch() {
+        assert_eq!(
+            insert_returning("INSERT INTO w (name) VALUES ('a') RETURNING id, name"),
+            Some(("w".to_string(), vec!["id".to_string(), "name".to_string()]))
+        );
     }
 }

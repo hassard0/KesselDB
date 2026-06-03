@@ -230,6 +230,14 @@ fn lex(s: &str) -> Result<Vec<Tok>, SqlError> {
                     out.push(Tok::Cmp("!="));
                     i += 2;
                 }
+                // SP-PG-SQL-HAVING — SQL-standard `<>` inequality (alongside the
+                // existing `!=`). Recognized BEFORE the bare `<` arm so the two
+                // characters lex as ONE comparison token. The WHERE/HAVING
+                // parsers map both `<>` and `!=` to the same comparison.
+                '<' if i + 1 < b.len() && b[i + 1] as char == '>' => {
+                    out.push(Tok::Cmp("<>"));
+                    i += 2;
+                }
                 '<' if i + 1 < b.len() && b[i + 1] as char == '=' => {
                     out.push(Tok::Cmp("<="));
                     i += 2;
@@ -4424,7 +4432,9 @@ fn cmp_expr(p: &mut P, ot: &ObjectType) -> Result<Program, SqlError> {
         raw.extend_from_slice(&rhs.bytes());
         raw.push(match c {
             "=" => 3,
-            "!=" => 4,
+            // SP-PG-SQL-HAVING — `<>` is the SQL-standard spelling of `!=`;
+            // both map to the same inequality opcode now that `<>` lexes.
+            "!=" | "<>" => 4,
             "<" => 5,
             "<=" => 6,
             ">" => 7,

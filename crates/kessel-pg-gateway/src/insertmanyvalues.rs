@@ -264,6 +264,25 @@ fn find_kw(upper: &str, kw: &str) -> Option<usize> {
             i += 1;
             continue;
         }
+        // SP-PG-SQL-QUOTED-IDENT — skip double-quoted delimited
+        // identifiers so a column/table literally named `"FROM"` /
+        // `"VALUES"` cannot false-match a structural keyword. Honours
+        // the doubled-`""` escape.
+        if c == b'"' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
         if &bytes[i..i + kwb.len()] == kwb {
             let before_ok = i == 0 || !is_ident_byte(bytes[i - 1]);
             let after_idx = i + kwb.len();
@@ -351,5 +370,33 @@ mod tests {
         let sql = "INSERT INTO t (name) SELECT p0 FROM (VALUES ('a', 0), ('b', 1)) AS s(p0, sen_counter) ORDER BY sen_counter";
         let out = rewrite_insertmanyvalues(sql).expect("rewrite");
         assert_eq!(out, "INSERT INTO t (name) VALUES ('a'), ('b')");
+    }
+
+    /// SP-PG-SQL-QUOTED-IDENT — Django's quoted INSERT (no inner SELECT)
+    /// is NOT the insertmanyvalues shape, so it's left verbatim. Locks
+    /// that quoted identifiers don't accidentally trip the rewrite.
+    #[test]
+    fn quoted_django_insert_not_rewritten() {
+        assert_eq!(
+            rewrite_insertmanyvalues(
+                r#"INSERT INTO "t" ("name") VALUES ($1) RETURNING "t"."id""#
+            ),
+            None
+        );
+    }
+
+    /// SP-PG-SQL-QUOTED-IDENT — `find_kw` skips double-quoted delimited
+    /// identifiers so a column literally named `"FROM"` cannot be
+    /// mistaken for the structural `FROM` keyword.
+    #[test]
+    fn find_kw_skips_quoted_identifier() {
+        // The only `FROM` keyword here is the real one; the quoted
+        // `"FROM"` column reference must be skipped.
+        let s = r#"SELECT "FROM" FROM t"#.to_ascii_uppercase();
+        // The real FROM is at the second occurrence; the quoted one is
+        // skipped, so the returned offset points past the quoted region.
+        let pos = find_kw(&s, "FROM").expect("real FROM found");
+        // Everything before `pos` must include the quoted `"FROM"`.
+        assert!(s[..pos].contains(r#""FROM""#));
     }
 }

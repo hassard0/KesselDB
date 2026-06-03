@@ -111,6 +111,34 @@ pub fn strip_pg_casts_tracked(sql: &str) -> (String, Vec<(usize, u32)>) {
             continue;
         }
 
+        // SP-PG-SQL-QUOTED-IDENT — double-quoted delimited identifier.
+        // Copy through to the closing `"`, honouring the doubled-`""`
+        // escape (PG §4.1.1). A cast operator can never appear INSIDE a
+        // delimited identifier, but a `'` or `::` CAN (e.g. a column
+        // literally named `"a::b"` or `"O'Brien"`); skipping the region
+        // keeps the single-quote scanner from mis-pairing on an embedded
+        // `'` and keeps a literal `::` inside the identifier from being
+        // stripped. Django double-quotes every identifier, so this path
+        // runs on every Django statement.
+        if b == b'"' {
+            out.push(b);
+            i += 1;
+            while i < bytes.len() {
+                let c = bytes[i];
+                out.push(c);
+                i += 1;
+                if c == b'"' {
+                    if i < bytes.len() && bytes[i] == b'"' {
+                        out.push(b'"');
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+
         // Line comment `--` — copy through to the next newline.
         if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
             while i < bytes.len() {
@@ -298,6 +326,32 @@ pub fn find_literal_cast_mismatch(sql: &str) -> Option<LiteralCastMismatch> {
                 }
             }
             just_closed_string = closed;
+            continue;
+        }
+
+        // SP-PG-SQL-QUOTED-IDENT — double-quoted delimited identifier.
+        // Copy through to the closing `"` (doubled-`""` escape). The
+        // closing `"` is NOT a string close, so reset the
+        // `just_closed_string` flag — a `::` immediately after a
+        // delimited identifier casts the COLUMN VALUE, not a literal, so
+        // the literal classifier must not treat it as a TEXT literal.
+        if b == b'"' {
+            out.push(b);
+            i += 1;
+            while i < bytes.len() {
+                let c = bytes[i];
+                out.push(c);
+                i += 1;
+                if c == b'"' {
+                    if i < bytes.len() && bytes[i] == b'"' {
+                        out.push(b'"');
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            just_closed_string = false;
             continue;
         }
 
@@ -1207,6 +1261,73 @@ mod tests {
         );
         assert_eq!(
             find_literal_cast_mismatch("/* 'hello'::int8 in block */ SELECT 1"),
+            None
+        );
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-SQL-QUOTED-IDENT — the cast scanners must skip double-quoted
+    // delimited identifier regions (Django double-quotes every
+    // identifier). A `::` or `'` INSIDE a quoted identifier must not be
+    // mis-parsed as a cast operator / string-literal boundary.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// The Django statement shape is pure passthrough (no real casts) —
+    /// the quoted identifiers survive byte-for-byte.
+    #[test]
+    fn strip_quoted_django_select_passthrough() {
+        let sql = r#"SELECT "smokeapp_author"."id", "smokeapp_author"."name" FROM "smokeapp_author""#;
+        assert_eq!(strip_pg_casts(sql), sql);
+    }
+
+    /// A `::cast` INSIDE a quoted identifier is NOT stripped (the
+    /// identifier `"a::b"` is a single delimited name).
+    #[test]
+    fn strip_cast_text_inside_quoted_ident_preserved() {
+        let sql = r#"SELECT "a::b" FROM t"#;
+        assert_eq!(strip_pg_casts(sql), sql);
+    }
+
+    /// A real `::cast` on a quoted COLUMN reference still strips, leaving
+    /// the quoted identifier intact.
+    #[test]
+    fn strip_real_cast_on_quoted_column() {
+        assert_eq!(
+            strip_pg_casts(r#"SELECT "id"::int8 FROM "t""#),
+            r#"SELECT "id" FROM "t""#
+        );
+    }
+
+    /// A single-quote INSIDE a quoted identifier (`"O'Brien"`) does NOT
+    /// open a string literal — without quote-skipping the scanner would
+    /// mis-pair on the `'` and swallow the rest of the SQL.
+    #[test]
+    fn strip_single_quote_inside_quoted_ident_safe() {
+        let sql = r#"SELECT "O'Brien" FROM t WHERE x = 1"#;
+        assert_eq!(strip_pg_casts(sql), sql);
+    }
+
+    /// Doubled `""` escape inside a quoted identifier is handled (the
+    /// region scanner stays inside the identifier across the `""`).
+    #[test]
+    fn strip_doubled_quote_escape_in_quoted_ident() {
+        let sql = r#"SELECT "a""b"::int8 FROM t"#;
+        assert_eq!(strip_pg_casts(sql), r#"SELECT "a""b" FROM t"#);
+    }
+
+    /// The literal-cast validator must NOT classify a `::` immediately
+    /// after a quoted identifier as a TEXT-literal cast — a quoted column
+    /// ref carries the column's type, not a literal.
+    #[test]
+    fn literal_validator_skips_quoted_ident_cast() {
+        // `"id"::int8` casts a column ref — no literal mismatch.
+        assert_eq!(
+            find_literal_cast_mismatch(r#"SELECT "id"::int8 FROM "t""#),
+            None
+        );
+        // A `'` inside a quoted identifier doesn't open a string literal.
+        assert_eq!(
+            find_literal_cast_mismatch(r#"SELECT "O'Brien"::text FROM t"#),
             None
         );
     }

@@ -1,0 +1,52 @@
+SP-PG-SQL-JOIN-WHERE — filtered inner join (JOIN … ON … WHERE) — vulcan smoke
+=============================================================================
+
+Date:     2026-06-03
+Host:     vulcan (admin@192.168.4.178), isolated worktree /tmp/kdb-oj-wt
+Commit:   2199224 (origin/main HEAD at smoke time)
+Build:    CARGO_TARGET_DIR=/tmp/kdb-t-oj cargo build --release --bin kesseldb --features pg-gateway
+toolchain: rustc 1.95.0 (59807616e 2026-04-14)
+Server:   /tmp/kdb-t-oj/release/kesseldb 127.0.0.1:6551 /tmp/kdb-oj-data  (pg=127.0.0.1:5551)
+
+Unit/integration suites (release) — ALL GREEN
+----------------------------------------------
+  kessel-sql        127 passed / 0 failed
+                      (incl. inner_equi_join,
+                             join_where_filters_combined_rows,
+                             join_where_bare_ambiguous_column_errors,
+                             join_projection_extracts_qualified_cols)
+  kessel-pg-gateway 1002 passed / 0 failed
+  kessel-sm          176 passed / 0 failed
+  kessel-vsr          28 passed / 0 failed
+                      (incl. large_seed_corpus_is_deterministic_and_converges  ← seed-7 / 3-replica determinism oracle)
+
+DDL + seed
+----------
+  CREATE TABLE a (id BIGINT, name CHAR(16))                              -> CREATE TABLE
+  CREATE TABLE b (id BIGINT, aid BIGINT, title CHAR(16))                 -> CREATE TABLE
+  INSERT INTO a (id,name)    VALUES (1,'tolkien')                        -> INSERT 0 1
+  INSERT INTO b (id,aid,title) VALUES (1,1,'hobbit'),(2,1,'lotr')        -> INSERT 0 2
+
+Unfiltered baseline (bare inner join) — both books
+--------------------------------------------------
+  SELECT a.name, b.title FROM a JOIN b ON a.id = b.aid
+
+   a.name  | b.title
+  ---------+---------
+   tolkien | hobbit
+   tolkien | lotr
+  (2 rows)
+
+Filtered inner join (HEADLINE) — WHERE b.title = 'lotr' — EXACTLY 1 ROW
+----------------------------------------------------------------------
+  SELECT a.name, b.title FROM a JOIN b ON a.id = b.aid WHERE b.title = 'lotr'
+
+   a.name  | b.title
+  ---------+---------
+   tolkien | lotr
+  (1 row)
+
+Result: PASS. The WHERE predicate over the COMBINED (a ++ b) schema filters the
+joined rows in the engine (kessel-expr program carried on Op::Join), narrowing
+the 2-row bare join to the single (tolkien, lotr) combined row. Determinism
+oracle green; PG wire / HTTP / WS / binary surfaces byte-untouched.

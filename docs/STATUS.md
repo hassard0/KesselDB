@@ -115,6 +115,24 @@ vulcan smoke: `LEFT JOIN` over `{tolkien, orphan}` × `{lotr→tolkien}` returns
 **2 rows** incl. `(orphan, NULL)`. Determinism preserved (VSR seed-7 + 3-replica
 oracle PASS — unmatched rows emit in left-key scan order). Named follow-ups:
 SP-PG-SQL-RIGHT-JOIN, SP-PG-SQL-FULL-JOIN, SP-PG-SQL-MULTI-JOIN.
+SP-PG-SQL-JOIN-QUERY (2026-06-03, +11 KATs, DONE) — `ORDER BY / LIMIT / OFFSET`
+over join results (`SELECT a.name, b.title FROM a JOIN b ON a.id=b.aid [WHERE …]
+ORDER BY b.created LIMIT 20 OFFSET 40`), the ubiquitous paginated-list-view shape.
+COMPOSES the SP23 (`Op::SelectSorted`) sort/page machinery with the combined join
+rows: `Op::Join` gained additive `order_by` / `limit_n` / `offset_n` fields; the
+engine STABLE-sorts the surviving combined rows by a qualified column (from either
+table) via a NULL-aware, kind-aware comparator (CHAR-pad-trimmed, mirroring SP23's
+`cmp_field`), then paginates. Both apply arms share ONE `apply_join` helper.
+kessel-sql resolves the qualified ORDER BY column against the combined `(a++b)`
+schema; a bare `JOIN … LIMIT n` keeps the legacy pre-sort `limit` (wire-identical),
+ORDER BY/OFFSET route to the post-sort fields. LEFT-join NULL sort values order
+NULLS LAST for ASC / NULLS FIRST for DESC (PG default). Additive page block,
+marker-guarded, absent for every non-paginated join ⇒ byte-identical; bad marker
+rejected at decode. vulcan smoke: `JOIN … ORDER BY b.title LIMIT 2` → **hobbit,
+lotr** (sorted + paginated). Determinism preserved (stable sort + deterministic
+scan-position tiebreak; seed-7 + 3-replica oracle PASS). Named follow-ups:
+SP-PG-SQL-JOIN-ORDERBY-MULTI, SP-PG-SQL-JOIN-ORDERBY-EXPR, SP-PG-SQL-JOIN-AGG,
+SP-PG-SQL-JOIN-NULLS-ORDER.
 SP-PG-DJANGO-COMPLETE (2026-06-03, +14 KATs, DONE) — closes the TWO
 named gaps the quoted-ident arc left, taking the **Django 6 ORM to full
 CRUD 8/8** on vulcan (was 6/8). `SP-PG-DDL-IDENTITY`: the CREATE TABLE

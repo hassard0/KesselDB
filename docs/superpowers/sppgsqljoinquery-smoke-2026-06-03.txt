@@ -1,0 +1,33 @@
+=== SP-PG-SQL-JOIN-QUERY vulcan psql smoke (2026-06-03) ===
+# kesseldb @ bedf22a, pg=127.0.0.1:5554 native=127.0.0.1:6554, CARGO_TARGET_DIR=/tmp/kdb-t-ja, fresh /tmp/kdb-ja-data
+# build: cargo build --release --bin kesseldb --features pg-gateway
+
+--- schema + data ---
+CREATE TABLE
+CREATE TABLE
+INSERT 0 1
+INSERT 0 3
+
+--- HEADLINE: SELECT a.name, b.title FROM a JOIN b ON a.id=b.aid ORDER BY b.title LIMIT 2  -> sorted+paginated ---
+ a.name  | b.title
+---------+---------
+ tolkien | hobbit
+ tolkien | lotr
+(2 rows)
+
+
+--- OFFSET 1 LIMIT 2 (skip first, next two) ---
+ a.name  |   b.title
+---------+--------------
+ tolkien | lotr
+ tolkien | silmarillion
+(2 rows)
+
+
+--- ORDER BY b.title DESC (descending) ---
+ a.name  |   b.title
+---------+--------------
+ tolkien | silmarillion
+ tolkien | lotr
+ tolkien | hobbit
+(3 rows)

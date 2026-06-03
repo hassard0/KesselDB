@@ -7,6 +7,35 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning [Se
 
 ### Added
 
+- **Paginated joins — `JOIN … ORDER BY / LIMIT / OFFSET` (SP-PG-SQL-JOIN-QUERY,
+  2026-06-03)** — `SELECT a.name, b.title FROM a JOIN b ON a.id=b.aid [WHERE …]
+  ORDER BY b.created LIMIT 20 OFFSET 40`, the paginated-list-view shape behind
+  every real app's list endpoint. This composes the SP23 (`Op::SelectSorted`)
+  sort/page machinery with the combined join rows. `Op::Join` gained three
+  additive fields: `order_by: Option<(field, desc)>` (a reference into the
+  COMBINED `(a ++ b)` schema), `limit_n`, and `offset_n`. The engine stable-sorts
+  the surviving combined rows by the qualified ORDER BY column (from EITHER table)
+  with a NULL-aware, kind-aware comparator (numeric by kind, CHAR-pad-trimmed —
+  mirroring SP23's `cmp_field`), reverses for `DESC`, then applies
+  `offset_n`/`limit_n`. Both apply sites (main + RO-Txn bypass) share ONE
+  `apply_join` helper so a paginated join inside a read-only Txn is byte-identical
+  to a bare one. kessel-sql parses the trailing `ORDER BY <qualified col>
+  [ASC|DESC]` + `LIMIT`/`OFFSET` after the optional `WHERE`, resolving the column
+  against the same combined schema the engine builds. A bare `JOIN … LIMIT n` (no
+  ORDER BY / OFFSET) keeps using the legacy pre-sort `limit` field so existing
+  join frames stay wire-identical; ORDER BY / OFFSET route pagination to the
+  post-sort fields. A LEFT-join unmatched right (`b.*`) NULL sort value orders
+  NULLS LAST for ASC / NULLS FIRST for DESC — PostgreSQL's default. The wire
+  change is additive: a marker-guarded page block is appended ONLY when
+  order_by/limit_n/offset_n is set, so every non-paginated join (inner / filtered
+  / left) is byte-identical to the pre-arc frame and older logs decode to all-None;
+  a corrupt marker is rejected at decode. Determinism holds (stable sort over rows
+  collected in the deterministic left-key/right-scan order ⇒ a total order with a
+  scan-position tiebreak; no clock/RNG) — VSR seed-7 + 3-replica oracle green.
+  vulcan smoke: `JOIN … ORDER BY b.title LIMIT 2` returns `hobbit, lotr` (sorted +
+  paginated). Named follow-ups: SP-PG-SQL-JOIN-ORDERBY-MULTI,
+  SP-PG-SQL-JOIN-ORDERBY-EXPR, SP-PG-SQL-JOIN-AGG, SP-PG-SQL-JOIN-NULLS-ORDER.
+
 - **`LEFT [OUTER] JOIN` — outer joins (SP-PG-SQL-OUTER-JOIN, 2026-06-03)** —
   `SELECT a.name, b.title FROM a LEFT JOIN b ON a.id = b.aid`, the join every
   real ORM emits for an OPTIONAL relationship (SQLAlchemy `isouter=True`, the

@@ -68,6 +68,25 @@ measurement and had drifted from the actual workspace count).
   production `ClusterClient` does. The long-standing CI flake is GONE.
 
 Latest arc deliveries on top of that baseline (most-recent first):
+SP-PG-SQL-DML-GENERAL (2026-06-03, +23 KATs, DONE) — completes the
+**CRUD-with-predicates** story. UPDATE/DELETE previously worked ONLY by
+primary key (`WHERE id = n`); real apps + ORMs need arbitrary WHERE
+predicates and multi-row mutation (`UPDATE users SET active = false WHERE
+last_login < $1`, `DELETE FROM t WHERE status = 'expired'`) plus
+`UPDATE … RETURNING *` (optimistic concurrency). **Path A** (no engine/
+proto surgery): the server resolves the matched ids on the leader via
+`Op::QueryExpr` (the same predicate VM SELECT uses, sorted output ⇒
+deterministic), then replicates ONE concrete `Op::Txn` of per-id
+`Op::UpdateSet`/`Op::Delete` — same determinism guarantee as the by-id
+RMW, with full per-row index/constraint/trigger maintenance and atomic
+all-or-nothing rollback (a UNIQUE violation on any matched row applies
+ZERO rows). The gateway surfaces the real `UPDATE N`/`DELETE N` count and
+renders `RETURNING <cols>|*` (post-mutation rows for UPDATE, deleted rows
+for DELETE); by-PK `WHERE id = n RETURNING *` is routed through the same
+read-back path. Cluster mode supports the count path via a
+`Cont::DmlWhere` VSR continuation. seed-7 3-replica byte-identity green.
+**HEADLINE: general-WHERE UPDATE + DELETE + RETURNING all work on vulcan
+(UPDATE 2 / DELETE 2 multi-row counts; RETURNING returns affected rows).**
 SP-PG-ORM-DJANGO (2026-06-03, +1 KAT, DONE_WITH_CONCERNS) — validates a
 real **Django 6.0 ORM** workload (the OTHER dominant Python ORM) against
 KesselDB on vulcan. **HEADLINE: connect now PASSES** — a surgical

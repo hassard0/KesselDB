@@ -316,9 +316,34 @@ INSERT INTO <t> (<cols>) VALUES (<v>) [RETURNING <c>,..]  -- autoincrement: omit
                                                           --   engine assigns it
                                                           --   deterministically and
                                                           --   RETURNING reads it back
-UPDATE <t> ID <n> SET <col> = <val> [, ...]      -- server‑side read‑modify‑write
-DELETE FROM <t> WHERE <col> = <val>
+UPDATE <t> SET <col> = <val> [, ...] WHERE <expr> [RETURNING <c>,..|*]
+                                                 -- multi-row: every row matching
+                                                 --   the WHERE predicate is mutated
+                                                 --   atomically (one logical txn)
+DELETE FROM <t> WHERE <expr> [RETURNING <c>,..|*]
+                                                 -- multi-row: every match removed
+                                                 --   atomically; RETURNING yields
+                                                 --   the deleted rows
+UPDATE <t> ID <n> SET <col> = <val> [, ...]      -- legacy by-id read‑modify‑write
 ```
+
+**General-WHERE UPDATE/DELETE.** The `WHERE` clause accepts the SAME
+predicate grammar as `SELECT` (`=`, `!=`, `<`, `<=`, `>`, `>=`, `AND`/
+`OR`/`NOT`, `IN`, `BETWEEN`, `IS [NOT] NULL`), so `UPDATE users SET
+active = 0 WHERE last_login < $1` and `DELETE FROM t WHERE status =
+'expired'` mutate every matching row in ONE atomic statement. The server
+resolves the matching rows (a deterministic scan), then applies a single
+replicated transaction of per-row mutations — so a constraint violation
+on ANY row (e.g. a `UNIQUE` collision) rolls the WHOLE statement back
+(zero rows applied). The CommandComplete tag carries the real affected
+count (`UPDATE N` / `DELETE N`). `RETURNING <cols>` / `RETURNING *`
+returns the affected rows (post-mutation for UPDATE, the deleted rows for
+DELETE) — ORMs use `UPDATE … WHERE id = $1 RETURNING *` for optimistic
+concurrency. An unguarded table-wide `UPDATE`/`DELETE` (no `WHERE`) is
+rejected in V1 (a footgun guard). V1 does a full predicate scan (no index
+narrowing yet — `SP-PG-SQL-DML-PLAN`); `UPDATE … FROM` / `DELETE …
+USING` joins, correlated subqueries, and `SET col = col + expr` are
+named follow-ups.
 
 For a `CREATE TABLE <t> (id BIGSERIAL PRIMARY KEY, ...)`, an INSERT that
 OMITS `id` autoincrements: the engine assigns the next per-table sequence
@@ -384,10 +409,14 @@ printf 'BEGIN\nINSERT INTO acct ID 9 (owner,bal) VALUES (1,1)\nCOMMIT\n' | kesse
 
 A failing statement (e.g. a duplicate id) makes `COMMIT` fail and rolls
 back every statement in the transaction; the connection stays usable.
-`COMMIT`/`ROLLBACK` without `BEGIN` is a clean error. `UPDATE` composes
-inside a transaction (it lowers to the deterministic replicated
+`COMMIT`/`ROLLBACK` without `BEGIN` is a clean error. A by-id `UPDATE`
+composes inside a transaction (it lowers to the deterministic replicated
 `Op::UpdateSet`), and read-your-writes holds for writes within the
-batch (a later statement sees an earlier one's effect).
+batch (a later statement sees an earlier one's effect). A *general-WHERE*
+`UPDATE`/`DELETE` inside an explicit `BEGIN`/`COMMIT` is rejected in V1
+(`SP-PG-SQL-DML-IN-TXN`) — its matched-id set would need to be resolved
+against the mid-transaction overlay; run it as a standalone auto-commit
+statement (which is itself atomic).
 
 **Model boundary (by design, not a TODO):** a KesselDB transaction is
 an *atomic, non-interactive write batch* — serializable by

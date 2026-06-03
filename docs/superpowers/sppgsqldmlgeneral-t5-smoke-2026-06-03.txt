@@ -1,0 +1,45 @@
+# SP-PG-SQL-DML-GENERAL T5 smoke — vulcan, single-node, ports 5546/6546
+# binary: /tmp/kdb-t-dml/release/kesseldb (origin/main)
+
+CREATE TABLE
+INSERT 0 3
+-- general-WHERE UPDATE (bal < 150 -> ids 1,2):
+UPDATE 2
+ id | bal | active 
+----+-----+--------
+  1 | 100 |      0
+  2 |  50 |      0
+  3 | 200 |      1
+(3 rows)
+
+-- general-WHERE UPDATE ... RETURNING * (bal > 150):
+ id | bal | active 
+----+-----+--------
+  3 | 200 |      9
+(1 row)
+
+UPDATE 1
+-- by-PK UPDATE ... WHERE id = 1 RETURNING * (ORM optimistic concurrency):
+ id | bal | active 
+----+-----+--------
+  1 | 111 |      0
+(1 row)
+
+UPDATE 1
+-- by-PK DELETE ... WHERE id = 2 RETURNING id, bal:
+ id | bal 
+----+-----
+  2 |  50
+(1 row)
+
+DELETE 1
+-- general-WHERE DELETE (active = 9):
+DELETE 1
+-- 0-match UPDATE (UPDATE 0, no-op):
+UPDATE 0
+-- final state (only id 1 remains, bal 111 active 0):
+ id | bal | active 
+----+-----+--------
+  1 | 111 |      0
+(1 row)
+

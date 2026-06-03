@@ -2832,4 +2832,101 @@ mod tests {
             "INSERT 0 1"
         );
     }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-SQL-DML-GENERAL T4 — UPDATE N / DELETE N counts + RETURNING
+    // ───────────────────────────────────────────────────────────────────
+
+    /// The DML-result frame round-trips through encode/decode, and a
+    /// truncated/wrong-tag buffer decodes to `None` (no panic).
+    #[test]
+    fn dmlgen_frame_round_trip() {
+        let rows = vec![vec![1u8, 2, 3], vec![9u8]];
+        let f = encode_dml_result(7, &rows);
+        assert_eq!(decode_dml_result(&f), Some((7, rows)));
+        // count-only (no rows).
+        assert_eq!(decode_dml_result(&encode_dml_result(3, &[])), Some((3, vec![])));
+        // wrong tag → None.
+        assert_eq!(decode_dml_result(&[0x00, 1, 0, 0, 0, 0, 0, 0, 0]), None);
+        // truncated → None.
+        assert_eq!(decode_dml_result(&[DML_RESULT_TAG, 1, 0]), None);
+    }
+
+    /// `UPDATE … WHERE …` (no RETURNING) → `UPDATE N` CommandComplete with
+    /// the framed affected count, no DataRows.
+    #[test]
+    fn dmlgen_update_count_tag() {
+        let eng = CannedEngine {
+            cols: vec![],
+            row_bytes: vec![],
+            result: std::sync::Mutex::new(Some(OpResult::Got(
+                encode_dml_result(2, &[]).into(),
+            ))),
+            table_name: "acct".into(),
+            no_schema: false,
+        };
+        let bytes = dispatch_query("UPDATE acct SET active = 0 WHERE bal < 150", &eng);
+        assert!(
+            bytes.windows(b"UPDATE 2\0".len()).any(|w| w == b"UPDATE 2\0"),
+            "UPDATE 2 tag, got: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    /// `DELETE FROM … WHERE …` → `DELETE N`.
+    #[test]
+    fn dmlgen_delete_count_tag() {
+        let eng = CannedEngine {
+            cols: vec![],
+            row_bytes: vec![],
+            result: std::sync::Mutex::new(Some(OpResult::Got(
+                encode_dml_result(3, &[]).into(),
+            ))),
+            table_name: "acct".into(),
+            no_schema: false,
+        };
+        let bytes = dispatch_query("DELETE FROM acct WHERE active = 0", &eng);
+        assert!(
+            bytes.windows(b"DELETE 3\0".len()).any(|w| w == b"DELETE 3\0"),
+            "DELETE 3 tag"
+        );
+    }
+
+    /// `UPDATE … RETURNING *` → RowDescription + DataRow(s) + `UPDATE N`.
+    #[test]
+    fn dmlgen_update_returning_star_emits_rows() {
+        let cols = vec![
+            PgColumn { name: "bal".into(), kind: FieldKind::I64, nullable: false },
+            PgColumn { name: "active".into(), kind: FieldKind::I64, nullable: false },
+        ];
+        // One affected row, value (bal=200, active=5) framed.
+        let rec = build_record(&cols, &[Value::Int(200), Value::Int(5)]);
+        let eng = CannedEngine {
+            cols: cols.clone(),
+            row_bytes: vec![],
+            result: std::sync::Mutex::new(Some(OpResult::Got(
+                encode_dml_result(1, &[rec]).into(),
+            ))),
+            table_name: "acct".into(),
+            no_schema: false,
+        };
+        let bytes = dispatch_query(
+            "UPDATE acct SET active = 5 WHERE bal = 200 RETURNING *",
+            &eng,
+        );
+        // Tag is UPDATE 1.
+        assert!(
+            bytes.windows(b"UPDATE 1\0".len()).any(|w| w == b"UPDATE 1\0"),
+            "UPDATE 1 tag"
+        );
+        // The returned active=5 renders as PG text "5" in a DataRow.
+        assert!(
+            bytes.windows(1).any(|w| w == b"5"),
+            "RETURNING DataRow carries the post-update active value"
+        );
+        // A RowDescription field byte 'D' (DataRow) + 'T' (RowDescription)
+        // both present (message-type bytes).
+        assert!(bytes.contains(&b'T'), "RowDescription present");
+        assert!(bytes.contains(&b'D'), "DataRow present");
+    }
 }

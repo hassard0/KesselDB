@@ -1,0 +1,118 @@
+SP-PG-SQL-ORM-PARSE T5 — SQLAlchemy 2.0 declarative-ORM CRUD smoke (after)
+=========================================================================
+Recorded: 2026-06-02 on vulcan (Ubuntu 24.04, admin@192.168.4.178)
+Server:   kesseldb (built --features pg-gateway,
+          CARGO_TARGET_DIR=/tmp/kdb-target-ormparse)
+          KESSELDB_TOKEN=admin KESSELDB_PG_ADDR=127.0.0.1:5542, native 6542
+HEAD:     ea5f6f4 (SP-PG-SQL-ORM-PARSE T2..T5)
+Driver:   SQLAlchemy 2.0.45 + psycopg2 2.9.12 + Python 3.12.3
+Script:   scripts/sppgormsqlalchemy-smoke.py (ported 5540->5542)
+
+HEADLINE
+========
+The SQLAlchemy 2.0 declarative-ORM CRUD workload now composes END-TO-END
+against KesselDB. Every meaningful ORM stage PASSES:
+
+    --- 7/7 stages PASS ---  (was 2/8 before this arc)
+
+  PASS  connect              engine.connect() + Extended-Query probe
+  PASS  create_all_ddl       Base.metadata.create_all(engine) — real DDL
+  PASS  orm_insert           session.add(User(...)) x2 + commit
+  PASS  orm_select_all       select(User).scalars().all() -> [(1,alice),(2,bob)]
+  PASS  orm_filter           select(User).where(User.id==1) -> (1,alice)
+  PASS  orm_update           update(User).where(...).values(name=bobby)
+  PASS  orm_delete           delete(User).where(...) -> remaining [(2,bobby)]
+
+(The prior run reported "2/8" with a `create_all_ddl_char_fallback`
+HARNESS-ARTIFACT stage that only fires when the real DDL fails. The real
+`create_all_ddl` now PASSES, so the fallback stage no longer runs and the
+denominator is 7 — every real CRUD stage is green. This is the full
+declarative-ORM CRUD pass the arc targeted.)
+
+----------------------------------------------------------------------
+FULL SMOKE TRANSCRIPT (scripts/sppgormsqlalchemy-smoke.py @ :5542)
+----------------------------------------------------------------------
+# SQLAlchemy 2.0.45 -> postgresql+psycopg2://test:admin@127.0.0.1:5542/kesseldb
+STAGE connect: PASS engine.connect() + probe OK
+STAGE create_all_ddl: PASS CREATE TABLE via ORM metadata
+STAGE orm_insert: PASS INSERT 2 ORM objects
+STAGE orm_select_all: PASS select(User) -> [(1, 'alice'), (2, 'bob')]
+STAGE orm_filter: PASS where(id==1) -> (1, 'alice')
+STAGE orm_update: PASS update id=2 name=bobby -> (2, 'bobby')
+STAGE orm_delete: PASS delete id=1 -> remaining [(2, 'bobby')]
+
+=== SQLALCHEMY ORM SMOKE SUMMARY ===
+  PASS  connect
+  PASS  create_all_ddl
+  PASS  orm_insert
+  PASS  orm_select_all
+  PASS  orm_filter
+  PASS  orm_update
+  PASS  orm_delete
+--- 7/7 stages PASS ---
+SQLALCHEMY ORM SMOKE COMPLETE
+
+Gateway log: clean — no ErrorResponse, no malformed-frame, no decode
+failures for any of the ORM-emitted statements.
+
+----------------------------------------------------------------------
+WHAT CLOSED EACH GAP (the three keystones + two surfaced extras)
+----------------------------------------------------------------------
+G2a — qualified columns (`orm_users.id`, `WHERE t.id = $1`).
+  kessel-sql: `col_ident()` reads `IDENT (DOT IDENT)?` and strips the
+  qualifier (lenient V1) in projection / WHERE term / SET / ORDER BY /
+  GROUP BY. `strip_span_qualifiers` normalizes the index-hint span so a
+  qualified query compiles to the BYTE-IDENTICAL Op as bare (determinism
+  contract). Unblocked orm_select_all, orm_filter, orm_update, orm_delete.
+
+G2b — explicit projection-list render (`SELECT id, name FROM t`).
+  kessel-sql already parsed it (-> Op::SelectFields); `select_columns`
+  now strips qualifiers. Gateway: `render_select_got` dispatches on
+  `select_columns` (projection) vs `select_star_table` (whole row),
+  decoding the projected raw-fixed-width row stream via
+  `emit_projected_rows`. Unblocked orm_select_all + orm_filter render.
+
+G1 — `relkind = ANY (ARRAY[...])` create_all probe.
+  kessel-sql: lexes `[`/`]`; desugars `col = ANY (ARRAY[...])` -> IN ->
+  OR-of-eq (byte-identical to IN). pg_catalog hook recognizes the
+  create_all relname-existence probe + synthesizes the existence result
+  (1 row if the table exists, else 0 -> create_all proceeds to CREATE).
+  Unblocked the create_all inspector probe.
+
+EXTRA-1 — ORM UPDATE/DELETE shape (`UPDATE t SET .. WHERE [t.]id = n` /
+  `DELETE FROM t WHERE [t.]id = n`). The ORM never uses the legacy
+  `ID <n>` syntax. `parse_where_id_eq` maps the by-PK WHERE to the
+  id-based RMW (the `id` pseudo-column is the ObjectId). Unblocked
+  orm_update + orm_delete.
+
+EXTRA-2 — DDL spelling (`BIGSERIAL`, `PRIMARY KEY (id)`). SQLAlchemy 2.0
+  renders a `BigInteger` PK as `BIGSERIAL` + a table-level `PRIMARY KEY`
+  clause. `kind_of` aliases SERIAL-family -> plain int width (explicit-id
+  model, no sequence); CREATE TABLE accept-and-skips the PRIMARY KEY
+  constraint. Unblocked create_all_ddl end-to-end (so the real CRUD
+  stages run, not the fallback artifact).
+
+----------------------------------------------------------------------
+NAMED RESIDUAL FOLLOW-UPS (out of scope this arc)
+----------------------------------------------------------------------
+SP-PG-SERIAL / SP-PG-RETURNING — server-generated autoincrement PK +
+    `INSERT ... RETURNING id` (needed when a model OMITS the PK; this
+    model supplies explicit ids so the SERIAL alias is faithful here).
+SP-PG-SQL-UPDATE-WHERE-GENERAL — non-PK / multi-row UPDATE/DELETE WHERE
+    (needs a server-side scan-resolve-RMW). V1 covers `WHERE id = <int>`.
+SP-PG-SQL-QUALIFIER-STRICT — strict qualifier validation (reject
+    `wrong_table.id`); V1 is lenient (any qualifier accepted).
+SP-PG-SQL-FROM-ALIAS — parse/bind `FROM t AS x` aliases.
+SP-PG-SQL-ANY-SUBQUERY — `= ANY (SELECT ...)` (vs array literal).
+SP-PG-SQL-PROJ-EXPR / SP-PG-SQL-PROJ-NULL — `col AS alias`, computed
+    projection expressions, true projected-NULL fidelity.
+SP-PG-SQL-JOIN-PROJ-QUAL — qualified cols in a JOIN projection that must
+    disambiguate the owning table.
+SP-PG-DDL-COMPOSITE-PK — true multi-column PRIMARY KEY index.
+SP-PG-ORM-RELATIONSHIPS / SP-PG-ORM-ALEMBIC — relationship loading /
+    joins / lazy-load + Alembic migrations.
+
+BOTTOM LINE: a real SQLAlchemy 2.0 declarative-ORM CRUD workload —
+create_all DDL, multi-row INSERT, qualified-column SELECT/filter,
+by-PK UPDATE + DELETE — now works end-to-end against KesselDB. The arc
+took it from 2/8 to a full CRUD pass.

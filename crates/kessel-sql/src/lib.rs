@@ -1482,6 +1482,34 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
         // will assign (positional, 1-based — matches CreateType).
         let mut defaults: Vec<(u16, Vec<u8>)> = Vec::new();
         loop {
+            // SP-PG-SQL-ORM-PARSE T5 — table-level `PRIMARY KEY (col, ...)`
+            // constraint (SQLAlchemy's `create_all` emits a trailing
+            // `PRIMARY KEY (id)` clause). KesselDB keys every row by the
+            // `id` pseudo-column (the ObjectId), so an explicit PK
+            // declaration is metadata we accept-and-skip rather than a
+            // column definition. Consume the whole `(col [, col]*)` group.
+            // (Composite / non-`id` PKs are honored only insofar as the
+            // row id is the ObjectId; a true multi-column PK index is the
+            // named follow-up `SP-PG-DDL-COMPOSITE-PK`.)
+            if p.kw("PRIMARY") {
+                p.expect_kw("KEY")?;
+                p.punct('(')?;
+                loop {
+                    let _ = p.col_ident()?; // PK column name(s), skipped
+                    match p.next() {
+                        Some(Tok::Punct(',')) => continue,
+                        Some(Tok::Punct(')')) => break,
+                        _ => return Err("expected `,` or `)` in PRIMARY KEY".into()),
+                    }
+                }
+                // After a table constraint, either the column list ends
+                // (`)`) or another `,`-separated item follows.
+                match p.next() {
+                    Some(Tok::Punct(',')) => continue,
+                    Some(Tok::Punct(')')) => break,
+                    _ => return Err("expected `,` or `)` after PRIMARY KEY".into()),
+                }
+            }
             let cname = p.ident()?;
             let tname = p.ident()?;
             let mut arg = None;
@@ -1496,6 +1524,14 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
             let mut nullable = true;
             if p.kw("NOT") {
                 p.expect_kw("NULL")?;
+                nullable = false;
+            }
+            // SP-PG-SQL-ORM-PARSE T5 — inline column `PRIMARY KEY`
+            // modifier (`id BIGSERIAL PRIMARY KEY`). Accept-and-skip
+            // (the row id is the ObjectId pseudo-PK); also implies NOT
+            // NULL, which we honor.
+            if p.kw("PRIMARY") {
+                p.expect_kw("KEY")?;
                 nullable = false;
             }
             let kind = kind_of(&tname, arg)?;
@@ -6060,6 +6096,40 @@ mod tests {
         let cat = Catalog::default();
         assert!(compile(
             "CREATE TABLE orm_users (id BIGSERIAL NOT NULL, name VARCHAR(32))",
+            &cat
+        )
+        .is_ok());
+    }
+
+    /// SP-PG-SQL-ORM-PARSE T5 — the EXACT `create_all` DDL shape:
+    /// table-level `PRIMARY KEY (id)` constraint is accept-and-skipped;
+    /// inline `PRIMARY KEY` modifier also accepted.
+    #[test]
+    fn ormparse_create_table_primary_key() {
+        let cat = Catalog::default();
+        // Table-level PK constraint (SQLAlchemy create_all shape).
+        let op = compile(
+            "CREATE TABLE orm_users (id BIGSERIAL NOT NULL, \
+             name VARCHAR(32), PRIMARY KEY (id))",
+            &cat,
+        )
+        .expect("table-level PRIMARY KEY compiles");
+        // The stored type has exactly the 2 declared columns (PK clause
+        // is metadata, not a 3rd column).
+        match op {
+            Op::CreateType { def } => {
+                let (nm, flds) =
+                    kessel_catalog::decode_type_def(&def).expect("decode");
+                assert_eq!(nm, "orm_users");
+                assert_eq!(flds.len(), 2, "PK clause must NOT add a column");
+                assert_eq!(flds[0].name, "id");
+                assert_eq!(flds[1].name, "name");
+            }
+            o => panic!("expected CreateType, got {:?}", o.kind()),
+        }
+        // Inline PK modifier.
+        assert!(compile(
+            "CREATE TABLE t2 (id BIGSERIAL PRIMARY KEY, v U32)",
             &cat
         )
         .is_ok());

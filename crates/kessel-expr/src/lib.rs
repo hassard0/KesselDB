@@ -1131,6 +1131,7 @@ mod tests {
             ordered: vec![],
             composite: vec![],
             defaults: vec![],
+            serial_pk: false,
         }
     }
     fn rec(age: i32, bal: i64) -> Vec<u8> {
@@ -1563,6 +1564,7 @@ mod tests {
             ordered: vec![],
             composite: vec![],
             defaults: vec![],
+            serial_pk: false,
         }
     }
 

@@ -200,6 +200,7 @@ mod tests {
             ordered: vec![],
             composite: vec![],
             defaults: vec![],
+            serial_pk: false,
         }
     }
 

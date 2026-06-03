@@ -148,6 +148,15 @@ pub struct ObjectType {
     /// length-delimited type-def blob (old blobs simply have no
     /// trailer ⇒ no defaults).
     pub defaults: Vec<(u16, Vec<u8>)>,
+    /// SP-PG-SERIAL-RETURNING: this type's primary key (the `id`
+    /// pseudo-column / ObjectId) is a deterministic autoincrement
+    /// SERIAL. When `true`, an INSERT that omits the row id is assigned
+    /// the next per-type sequence value by the state machine (a counter
+    /// in the digest, advanced only on the apply thread). Serialized in
+    /// a second backward-compatible trailer of the type-def blob after
+    /// the SP86 defaults trailer; old blobs (and non-serial types) carry
+    /// no trailer ⇒ `false`.
+    pub serial_pk: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -184,6 +193,7 @@ impl ObjectType {
             ordered: vec![],
             composite: vec![],
             defaults: vec![],
+            serial_pk: false,
         }
     }
 
@@ -307,8 +317,32 @@ pub fn encode_type_def_with_defaults(
     fields: &[Field],
     defaults: &[(u16, Vec<u8>)],
 ) -> Vec<u8> {
+    encode_type_def_full(name, fields, defaults, false)
+}
+
+/// SP-PG-SERIAL-RETURNING: like [`encode_type_def_with_defaults`] but
+/// also carries the per-type `serial_pk` flag in a SECOND backward-
+/// compatible trailer after the SP86 defaults trailer.
+///
+/// Layout (all trailers omitted when they would be empty/default, so a
+/// plain type with no defaults and no serial PK encodes BYTE-IDENTICALLY
+/// to `encode_type_def`):
+///   `name + [u16 fcount] + fields`                       (base)
+///   `[u16 ndef] ndef×([u16 fid][u16 len][bytes])`        (SP86, if ndef>0 OR serial_pk)
+///   `[u8 serial_pk]`                                      (only if serial_pk)
+///
+/// When `serial_pk` is set but there are no defaults we still write the
+/// `[u16 0]` defaults-count so the serial byte has a fixed offset; the
+/// SP86 `decode_type_defaults` reads that 0 and returns an empty list —
+/// no defaults regression.
+pub fn encode_type_def_full(
+    name: &str,
+    fields: &[Field],
+    defaults: &[(u16, Vec<u8>)],
+    serial_pk: bool,
+) -> Vec<u8> {
     let mut b = encode_type_def(name, fields);
-    if !defaults.is_empty() {
+    if !defaults.is_empty() || serial_pk {
         b.extend_from_slice(&(defaults.len() as u16).to_le_bytes());
         for (fid, raw) in defaults {
             b.extend_from_slice(&fid.to_le_bytes());
@@ -316,7 +350,45 @@ pub fn encode_type_def_with_defaults(
             b.extend_from_slice(raw);
         }
     }
+    if serial_pk {
+        b.push(1u8);
+    }
     b
+}
+
+/// SP-PG-SERIAL-RETURNING: parse the `serial_pk` flag from a type-def
+/// blob. `false` for old blobs / non-serial types (no trailer, or a
+/// defaults-only trailer with nothing after it) and on any short read —
+/// the flag is metadata, never load-bearing for decode.
+pub fn decode_type_serial_pk(b: &[u8]) -> bool {
+    let parse = || -> Option<bool> {
+        let mut p = 0usize;
+        let _ = get_str(b, &mut p)?; // name
+        let n = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
+        p += 2;
+        for _ in 0..n {
+            let fl =
+                u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
+            p += 2 + fl;
+        }
+        // No defaults trailer at all ⇒ no serial trailer ⇒ false.
+        if p >= b.len() {
+            return Some(false);
+        }
+        // Skip the SP86 defaults trailer to land on the serial byte.
+        let nd = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
+        p += 2;
+        for _ in 0..nd {
+            let _fid = b.get(p..p + 2)?;
+            p += 2;
+            let l =
+                u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
+            p += 2 + l;
+        }
+        // The serial byte follows the defaults trailer when present.
+        Some(matches!(b.get(p), Some(1u8)))
+    };
+    parse().unwrap_or(false)
 }
 
 /// Parse the SP86 defaults trailer from a type-def blob (the bytes
@@ -424,10 +496,11 @@ impl Catalog {
         for t in &self.types {
             b.extend_from_slice(&t.type_id.to_le_bytes());
             b.extend_from_slice(&t.schema_ver.to_le_bytes());
-            let def = encode_type_def_with_defaults(
+            let def = encode_type_def_full(
                 &t.name,
                 &t.fields,
                 &t.defaults,
+                t.serial_pk,
             );
             b.extend_from_slice(&(def.len() as u32).to_le_bytes());
             b.extend_from_slice(&def);
@@ -584,6 +657,7 @@ impl Catalog {
             let def_slice = b.get(p..p + dl)?;
             let (name, fields) = decode_type_def(def_slice)?;
             let defaults = decode_type_defaults(def_slice);
+            let serial_pk = decode_type_serial_pk(def_slice);
             p += dl;
             let ni = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
             p += 2;
@@ -662,6 +736,7 @@ impl Catalog {
                 ordered,
                 composite,
                 defaults,
+                serial_pk,
             });
         }
         // Optional Catalog-level external-recipe trailer. `p` is exactly
@@ -838,7 +913,7 @@ mod tests {
 
     #[test]
     fn layout_is_pure_and_deterministic() {
-        let t = ObjectType { type_id: 1, name: "transfer".into(), schema_ver: 1, fields: sample_fields(), indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![], defaults: vec![] };
+        let t = ObjectType { type_id: 1, name: "transfer".into(), schema_ver: 1, fields: sample_fields(), indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![], defaults: vec![], serial_pk: false };
         let a = t.compute_layout();
         let b = t.compute_layout();
         assert_eq!(a, b);
@@ -852,7 +927,7 @@ mod tests {
 
     #[test]
     fn appending_nullable_field_keeps_existing_offsets() {
-        let mut t = ObjectType { type_id: 1, name: "t".into(), schema_ver: 1, fields: sample_fields(), indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![], defaults: vec![] };
+        let mut t = ObjectType { type_id: 1, name: "t".into(), schema_ver: 1, fields: sample_fields(), indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![], defaults: vec![], serial_pk: false };
         let before = t.compute_layout();
         t.fields.push(Field { field_id: 5, name: "memo".into(), kind: FieldKind::Char(32), nullable: true });
         t.schema_ver += 1;
@@ -874,8 +949,8 @@ mod tests {
     fn catalog_roundtrip() {
         let mut c = Catalog::default();
         c.next_type_id = 3;
-        c.types.push(ObjectType { type_id: 1, name: "a".into(), schema_ver: 2, fields: sample_fields(), indexes: vec![3], unique: vec![3], fks: vec![(3, 9, 2)], checks: vec![vec![1, 2, 3]], triggers: vec![vec![7, 7]], ordered: vec![2], composite: vec![vec![1, 2]], defaults: vec![(1, vec![9, 0, 0, 0])] });
-        c.types.push(ObjectType { type_id: 2, name: "b".into(), schema_ver: 1, fields: vec![], indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![], defaults: vec![] });
+        c.types.push(ObjectType { type_id: 1, name: "a".into(), schema_ver: 2, fields: sample_fields(), indexes: vec![3], unique: vec![3], fks: vec![(3, 9, 2)], checks: vec![vec![1, 2, 3]], triggers: vec![vec![7, 7]], ordered: vec![2], composite: vec![vec![1, 2]], defaults: vec![(1, vec![9, 0, 0, 0])], serial_pk: false });
+        c.types.push(ObjectType { type_id: 2, name: "b".into(), schema_ver: 1, fields: vec![], indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![], defaults: vec![], serial_pk: false });
         let enc = c.encode();
         let dec = Catalog::decode(&enc).unwrap();
         assert_eq!(dec.next_type_id, 3);
@@ -896,6 +971,50 @@ mod tests {
     }
 
     #[test]
+    fn serial_pk_flag_round_trips_and_is_backward_compatible() {
+        // A serial-PK type def carries the flag in a second trailer after
+        // the SP86 defaults trailer; it survives a catalog roundtrip and
+        // does NOT disturb defaults decoding.
+        let fields = vec![Field {
+            field_id: 1,
+            name: "name".into(),
+            kind: FieldKind::Char(8),
+            nullable: true,
+        }];
+        // serial_pk = true, no defaults.
+        let blob = encode_type_def_full("widgets", &fields, &[], true);
+        assert!(decode_type_serial_pk(&blob), "serial flag must decode true");
+        assert!(decode_type_defaults(&blob).is_empty(), "no defaults regression");
+        let (n, f) = decode_type_def(&blob).unwrap();
+        assert_eq!(n, "widgets");
+        assert_eq!(f, fields, "fields still decode identically with the serial trailer");
+
+        // serial_pk = true WITH a default → both trailers present.
+        let defs = vec![(1u16, vec![0u8; 8])];
+        let blob2 = encode_type_def_full("w2", &fields, &defs, true);
+        assert!(decode_type_serial_pk(&blob2));
+        assert_eq!(decode_type_defaults(&blob2), defs);
+
+        // serial_pk = false, no defaults → BYTE-IDENTICAL to the plain
+        // encoder (no trailer at all): preserves replicated digests.
+        let plain = encode_type_def_full("p", &fields, &[], false);
+        assert_eq!(plain, encode_type_def("p", &fields));
+        assert!(!decode_type_serial_pk(&plain));
+
+        // Full catalog roundtrip preserves the flag per-type.
+        let mut c = Catalog::default();
+        c.next_type_id = 2;
+        c.types.push(ObjectType {
+            type_id: 1, name: "widgets".into(), schema_ver: 1,
+            fields, indexes: vec![], unique: vec![], fks: vec![],
+            checks: vec![], triggers: vec![], ordered: vec![],
+            composite: vec![], defaults: vec![], serial_pk: true,
+        });
+        let back = Catalog::decode(&c.encode()).unwrap();
+        assert!(back.types[0].serial_pk, "serial_pk survives the catalog roundtrip");
+    }
+
+    #[test]
     fn catalog_external_recipe_round_trips_and_is_backward_compatible() {
         let mut c = Catalog::default();
         c.types.push(ObjectType {
@@ -903,6 +1022,7 @@ mod tests {
             fields: sample_fields(), indexes: vec![], unique: vec![],
             fks: vec![], checks: vec![], triggers: vec![], ordered: vec![],
             composite: vec![], defaults: vec![],
+            serial_pk: false,
         });
         c.external.push(ExternalRecipe {
             type_id: 1, url: "http://x/y".into(), format: 0, key_field_id: 1,
@@ -952,6 +1072,7 @@ mod tests {
             fields: sample_fields(), indexes: vec![], unique: vec![],
             fks: vec![], checks: vec![], triggers: vec![], ordered: vec![],
             composite: vec![], defaults: vec![],
+            serial_pk: false,
         });
         c.external.push(ExternalRecipe {
             type_id: 1, url: "http://x".into(), format: 2, key_field_id: 1,

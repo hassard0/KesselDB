@@ -5097,6 +5097,7 @@ mod tests {
             indexes: vec![], unique: vec![], fks: vec![], checks: vec![],
             triggers: vec![], ordered: vec![], composite: vec![],
             defaults: vec![],
+            serial_pk: false,
         };
         // fetch the row and decode it using ONLY the described schema
         match run(&mut sm, 4, "SELECT * FROM acct ID 1") {

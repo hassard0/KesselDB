@@ -79,6 +79,34 @@ fn xvote_key(seq: u64) -> Key {
     make_key(XVOTE_TYPE, &id)
 }
 
+/// Reserved keyspace for per-type deterministic autoincrement SERIAL
+/// counters (SP-PG-SERIAL-RETURNING). One counter per user `type_id`,
+/// keyed by that id in the object-id slot. It is an ordinary 20-byte
+/// storage key, so it is covered by `Storage::digest` (which only skips
+/// the 28-byte MVCC keyspace) ⇒ every replica that applies the identical
+/// op stream converges bit-for-bit. The counter advances ONLY on the
+/// single deterministic apply thread (never the gateway / a read path),
+/// so the sequence is a pure function of the log prefix — no RNG, no
+/// wall-clock. WAL-backed put ⇒ crash + replay resumes it exactly.
+const SERIAL_TYPE: u32 = 0xFFFF_FFF4;
+
+fn serial_counter_key(type_id: u32) -> Key {
+    let mut id = [0u8; 16];
+    id[..4].copy_from_slice(&type_id.to_le_bytes());
+    make_key(SERIAL_TYPE, &id)
+}
+
+/// The sentinel ObjectId an autoincrement INSERT carries in its
+/// `Op::Create` to ask the SM to assign the next SERIAL value
+/// (SP-PG-SERIAL-RETURNING). It is `u128::MAX` (`[0xFF; 16]`) — a value
+/// no honest explicit-id caller would pick, and which the engine never
+/// hands out (the assigned ids start at 1 and the u64 counter can never
+/// reach u128::MAX). The gateway compiles `INSERT INTO t (name) VALUES
+/// (…)` — i.e. an INSERT that omits the row id — into a `Create` with
+/// this id ONLY for a `serial_pk` type; the SM swaps in the real id.
+pub const SERIAL_SENTINEL: kessel_proto::ObjectId =
+    kessel_proto::ObjectId([0xFFu8; 16]);
+
 /// Build a `Create`/`Update` record with an overflow trailer:
 /// `[fixed][u16 n]( [u16 field_idx][u32 len][bytes] )*`. `fixed` must be the
 /// codec-encoded fixed-width record (handles will be patched in by the SM).
@@ -3722,6 +3750,11 @@ impl<V: Vfs> StateMachine<V> {
                     // them by positional (1-based) id, which is exactly
                     // the field id assigned above.
                     defaults: kessel_catalog::decode_type_defaults(&def),
+                    // SP-PG-SERIAL-RETURNING: the serial-PK flag rides a
+                    // second backward-compat trailer in the same blob; a
+                    // `CREATE TABLE … BIGSERIAL PRIMARY KEY` from the SQL
+                    // layer sets it so omitted-id INSERTs autoincrement.
+                    serial_pk: kessel_catalog::decode_type_serial_pk(&def),
                 });
                 self.catalog.next_type_id += 1;
                 match self.persist_catalog(op_number) {
@@ -3765,6 +3798,48 @@ impl<V: Vfs> StateMachine<V> {
                 if self.catalog.get(type_id).is_none() {
                     return OpResult::SchemaError(format!("no type {type_id}"));
                 }
+                // SP-PG-SERIAL-RETURNING: deterministic autoincrement.
+                // A `serial_pk` type whose insert omits the row id carries
+                // the SERIAL_SENTINEL id. Assign the next per-type sequence
+                // value from the digest-covered counter (advanced ONLY here,
+                // on the single deterministic apply thread, strictly in
+                // op-number order ⇒ every replica converges bit-for-bit).
+                // The assigned value becomes the ObjectId (the `id`
+                // pseudo-PK IS the ObjectId). We compute it BEFORE the
+                // existence check so the rest of the arm is unchanged. The
+                // counter is written below, on the SUCCESSFUL-write path
+                // only, so a rejected insert does NOT consume a value
+                // (minimizing gaps; PG itself does not roll a sequence
+                // back on abort — documented semantics).
+                let serial_pk = self
+                    .catalog
+                    .get(type_id)
+                    .map(|t| t.serial_pk)
+                    .unwrap_or(false);
+                let assign_serial = serial_pk && id == SERIAL_SENTINEL;
+                let (id, assigned_serial) = if assign_serial {
+                    let cur = self
+                        .storage
+                        .get(&serial_counter_key(type_id))
+                        .and_then(|b| {
+                            b.get(..8)
+                                .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
+                        })
+                        .unwrap_or(0);
+                    if cur == u64::MAX {
+                        return OpResult::SchemaError(format!(
+                            "serial counter overflow for type {type_id} \
+                             (reached u64::MAX)"
+                        ));
+                    }
+                    let next = cur + 1;
+                    (
+                        kessel_proto::ObjectId::from_u128(next as u128),
+                        Some(next),
+                    )
+                } else {
+                    (id, None)
+                };
                 let key = make_key(type_id, &id.0);
                 if self.storage.get(&key).is_some() {
                     return OpResult::Exists;
@@ -3810,7 +3885,29 @@ impl<V: Vfs> StateMachine<V> {
                         if let Some(r) = rec_idx {
                             self.idx_maintain(op_number, type_id, id.0, None, Some(&r));
                         }
-                        OpResult::Ok
+                        // SP-PG-SERIAL-RETURNING: persist the advanced
+                        // counter ONLY now that the row write succeeded
+                        // (so a rejected insert never consumed a value),
+                        // then surface the assigned id to the caller. The
+                        // counter put is at the same `op_number`, in the
+                        // digest-covered reserved keyspace ⇒ replicated +
+                        // crash-safe (WAL replay resumes it). Non-serial /
+                        // explicit-id inserts skip this and return Ok,
+                        // byte-identical to before.
+                        if let Some(seq) = assigned_serial {
+                            if let Err(e) = self.storage.put(
+                                op_number,
+                                serial_counter_key(type_id),
+                                seq.to_le_bytes().to_vec(),
+                            ) {
+                                return OpResult::SchemaError(format!(
+                                    "serial counter store: {e}"
+                                ));
+                            }
+                            OpResult::Created { id: id.as_u128() }
+                        } else {
+                            OpResult::Ok
+                        }
                     }
                     Err(e) => OpResult::SchemaError(format!("store: {e}")),
                 }
@@ -6422,6 +6519,139 @@ mod tests {
         )
     }
 
+    // SP-PG-SERIAL-RETURNING: a `serial_pk` type (the `id` is the
+    // ObjectId pseudo-PK, so the only real field is `name`). Built via
+    // `encode_type_def_full(.., serial_pk = true)` exactly as the SQL
+    // CREATE TABLE path does for `id BIGSERIAL PRIMARY KEY, name CHAR(8)`.
+    fn widget_serial_def() -> Vec<u8> {
+        kessel_catalog::encode_type_def_full(
+            "widgets",
+            &[Field { field_id: 0, name: "name".into(), kind: FieldKind::Char(8), nullable: true }],
+            &[],
+            true,
+        )
+    }
+
+    // An autoincrement insert: the gateway omits the id, so the Create
+    // carries the SERIAL_SENTINEL. `name` is the single field record.
+    fn serial_insert(name: &[u8; 8]) -> Op {
+        Op::Create {
+            type_id: 1,
+            id: SERIAL_SENTINEL,
+            record: {
+                // [schema_ver u32][field_count u16][null bitmap 8B][name 8B]
+                let mut r = Vec::new();
+                r.extend_from_slice(&1u32.to_le_bytes());
+                r.extend_from_slice(&1u16.to_le_bytes());
+                r.extend_from_slice(&[0u8; 8]); // null bitmap: name present
+                r.extend_from_slice(name);
+                r
+            },
+        }
+    }
+
+    #[test]
+    fn serial_pk_flag_survives_catalog_roundtrip() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        assert!(matches!(
+            sm.apply(1, Op::CreateType { def: widget_serial_def() }),
+            OpResult::TypeCreated(_)
+        ));
+        let t = sm.catalog().types.iter().find(|t| t.name == "widgets").unwrap();
+        assert!(t.serial_pk, "serial_pk flag must persist into the catalog");
+    }
+
+    #[test]
+    fn serial_insert_assigns_1_2_3_and_returns_the_id() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: widget_serial_def() });
+        // First autoincrement insert → id 1.
+        assert_eq!(
+            sm.apply(2, serial_insert(b"gadget\0\0")),
+            OpResult::Created { id: 1 }
+        );
+        // Second → id 2, third → id 3 (gap-free, deterministic order).
+        assert_eq!(sm.apply(3, serial_insert(b"widg\0\0\0\0")), OpResult::Created { id: 2 });
+        assert_eq!(sm.apply(4, serial_insert(b"thing\0\0\0")), OpResult::Created { id: 3 });
+        // The assigned ObjectId IS the counter value: GetById(2) finds it.
+        assert!(matches!(
+            sm.apply(5, Op::GetById { type_id: 1, id: ObjectId::from_u128(2) }),
+            OpResult::Got(_)
+        ));
+        // And nothing was stored at the sentinel id.
+        assert_eq!(
+            sm.apply(6, Op::GetById { type_id: 1, id: SERIAL_SENTINEL }),
+            OpResult::NotFound
+        );
+    }
+
+    #[test]
+    fn serial_sequence_is_byte_identical_across_three_replicas() {
+        // The headline determinism guarantee: an identical op stream of
+        // autoincrement inserts produces a byte-identical digest on every
+        // replica — the counter advances only on the apply thread, in
+        // op-number order, with no RNG / wall-clock.
+        let drive = || {
+            let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+            sm.apply(1, Op::CreateType { def: widget_serial_def() });
+            sm.apply(2, serial_insert(b"a\0\0\0\0\0\0\0"));
+            sm.apply(3, serial_insert(b"b\0\0\0\0\0\0\0"));
+            sm.apply(4, serial_insert(b"c\0\0\0\0\0\0\0"));
+            sm.digest()
+        };
+        let r1 = drive();
+        let r2 = drive();
+        let r3 = drive();
+        assert_eq!(r1, r2, "replica 1 vs 2 digest");
+        assert_eq!(r2, r3, "replica 2 vs 3 digest");
+    }
+
+    #[test]
+    fn serial_counter_resumes_after_crash_and_wal_replay() {
+        let vfs = MemVfs::new();
+        {
+            let mut sm = StateMachine::open(vfs.clone()).unwrap();
+            sm.apply(1, Op::CreateType { def: widget_serial_def() });
+            assert_eq!(sm.apply(2, serial_insert(b"a\0\0\0\0\0\0\0")), OpResult::Created { id: 1 });
+            assert_eq!(sm.apply(3, serial_insert(b"b\0\0\0\0\0\0\0")), OpResult::Created { id: 2 });
+        }
+        // Reopen from the same VFS (WAL replay restores state + counter).
+        let mut sm2 = StateMachine::open(vfs).unwrap();
+        // The next insert continues at 3 — the counter survived the crash.
+        assert_eq!(
+            sm2.apply(4, serial_insert(b"c\0\0\0\0\0\0\0")),
+            OpResult::Created { id: 3 }
+        );
+    }
+
+    #[test]
+    fn serial_explicit_id_still_works_and_returns_ok() {
+        // A serial_pk type still accepts an EXPLICIT id (PG allows
+        // INSERT … (id) VALUES (n) into a serial column). It returns Ok
+        // (not Created) and does NOT advance the implicit counter, so a
+        // later autoincrement insert is unaffected by the explicit value.
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: widget_serial_def() });
+        let explicit = Op::Create {
+            type_id: 1,
+            id: ObjectId::from_u128(100),
+            record: {
+                let mut r = Vec::new();
+                r.extend_from_slice(&1u32.to_le_bytes());
+                r.extend_from_slice(&1u16.to_le_bytes());
+                r.extend_from_slice(&[0u8; 8]);
+                r.extend_from_slice(b"x\0\0\0\0\0\0\0");
+                r
+            },
+        };
+        assert_eq!(sm.apply(2, explicit), OpResult::Ok);
+        // The implicit counter is still 0 → next autoincrement is 1.
+        assert_eq!(
+            sm.apply(3, serial_insert(b"y\0\0\0\0\0\0\0")),
+            OpResult::Created { id: 1 }
+        );
+    }
+
     #[test]
     fn create_and_drop_external_source_manages_type_and_recipe() {
         use kessel_catalog::ExternalAuth;
@@ -6991,6 +7221,7 @@ mod tests {
             ordered: vec![],
             composite: vec![],
             defaults: vec![],
+            serial_pk: false,
         };
         vec![0u8; t.compute_layout().record_size]
     }
@@ -7631,6 +7862,7 @@ mod tests {
             ordered: vec![],
             composite: vec![],
             defaults: vec![],
+            serial_pk: false,
         };
         let mut b = vec![0u8; t.compute_layout().record_size];
         let o0 = t.compute_layout().offsets[0];
@@ -8096,6 +8328,7 @@ mod tests {
             ordered: vec![],
             composite: vec![],
             defaults: vec![],
+            serial_pk: false,
         }
         .compute_layout()
     }
@@ -8349,6 +8582,7 @@ mod tests {
             ],
             indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![],
             defaults: vec![],
+            serial_pk: false,
         };
         let l = ot.compute_layout();
         (l.offsets[0], l.offsets[1])
@@ -8656,6 +8890,7 @@ mod tests {
             ],
             indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![],
             defaults: vec![],
+            serial_pk: false,
         };
         let l = ot.compute_layout();
         let mut b = vec![0u8; l.record_size];
@@ -8832,6 +9067,7 @@ mod tests {
             ],
             indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![],
             defaults: vec![],
+            serial_pk: false,
         };
         let l = ot.compute_layout();
         (l.offsets[0], l.offsets[1])
@@ -8842,7 +9078,7 @@ mod tests {
             let ot = ObjectType { type_id:1,name:"rng".into(),schema_ver:1,fields:vec![
                 Field{field_id:1,name:"score".into(),kind:FieldKind::I32,nullable:false},
                 Field{field_id:2,name:"big".into(),kind:FieldKind::U64,nullable:false}],
-                indexes:vec![],unique:vec![],fks:vec![],checks:vec![],triggers:vec![],ordered:vec![],composite:vec![],defaults:vec![] };
+                indexes:vec![],unique:vec![],fks:vec![],checks:vec![],triggers:vec![],ordered:vec![],composite:vec![],defaults:vec![], serial_pk:false };
             ot.compute_layout().record_size
         }];
         b[o0..o0 + 4].copy_from_slice(&score.to_le_bytes());
@@ -10602,6 +10838,7 @@ mod tests {
             ],
             indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![],
             defaults: vec![],
+            serial_pk: false,
         };
         let l = ot.compute_layout();
         (l.offsets[2], 4)

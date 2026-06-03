@@ -477,6 +477,14 @@ pub enum OpResult {
     /// SP123 / S2.X: `Op::ReportActiveSnapshot` rejected (non-monotonic
     /// per-replica). Carries the previously-reported min for diagnostics.
     ActiveSnapshotRejected { replica_id: u32, previous_min: u64, proposed: u64 },
+    /// SP-PG-SERIAL-RETURNING: `Op::Create` succeeded AND the engine
+    /// deterministically ASSIGNED the row id from a per-type SERIAL
+    /// sequence (the caller passed the `SERIAL_SENTINEL` id on a
+    /// `serial_pk` type). Carries the assigned 128-bit id so the gateway
+    /// can render an `INSERT … RETURNING id` DataRow. A plain explicit-id
+    /// Create still returns `OpResult::Ok` (byte-identical to before), so
+    /// this variant fires ONLY on the autoincrement path.
+    Created { id: u128 },
 }
 
 impl OpResult {
@@ -577,6 +585,12 @@ impl OpResult {
                 codec::put_u64(&mut b, *previous_min);
                 codec::put_u64(&mut b, *proposed);
             }
+            // SP-PG-SERIAL-RETURNING: Created (15) wire encode.
+            //   wire: [u128 assigned id (LE)]
+            OpResult::Created { id } => {
+                b.push(15);
+                b.extend_from_slice(&id.to_le_bytes());
+            }
         }
         b
     }
@@ -644,6 +658,8 @@ impl OpResult {
                 previous_min: c.u64()?,
                 proposed: c.u64()?,
             },
+            // SP-PG-SERIAL-RETURNING: Created (15) wire decode.
+            15 => OpResult::Created { id: c.u128()? },
             _ => return None,
         })
     }
@@ -1513,6 +1529,11 @@ pub mod codec {
             let s = self.buf.get(self.pos..self.pos + 8)?;
             self.pos += 8;
             Some(u64::from_le_bytes(s.try_into().ok()?))
+        }
+        pub fn u128(&mut self) -> Option<u128> {
+            let s = self.buf.get(self.pos..self.pos + 16)?;
+            self.pos += 16;
+            Some(u128::from_le_bytes(s.try_into().ok()?))
         }
         pub fn object_id(&mut self) -> Option<ObjectId> {
             let s = self.buf.get(self.pos..self.pos + 16)?;

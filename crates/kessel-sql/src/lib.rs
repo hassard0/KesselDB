@@ -557,6 +557,23 @@ pub fn select_columns(sql: &str) -> Option<(String, Vec<String>)> {
                 if matches!(it.peek(), Some(Tok::Punct('('))) {
                     return None;
                 }
+                // SP-PG-SERIAL-RETURNING (incidental ORM unblock): a
+                // column may carry an output alias `col AS alias`
+                // (SQLAlchemy's post-flush refresh SELECT emits `SELECT
+                // widgets.id AS widgets_id, …`). Accept-and-skip the
+                // alias — V1 projects + names by the SOURCE column (the
+                // engine's projected output order is by source column;
+                // result mapping is positional). True alias-named
+                // RowDescription output is the named follow-up
+                // `SP-PG-SQL-PROJ-ALIAS`.
+                if matches!(it.peek(), Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("AS"))
+                {
+                    it.next(); // consume `AS`
+                    match it.next()? {
+                        Tok::Ident(_alias) => {}
+                        _ => return None,
+                    }
+                }
                 cols.push(col);
             }
             _ => return None, // `*`, `FROM` with no cols, etc.

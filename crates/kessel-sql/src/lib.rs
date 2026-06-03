@@ -775,6 +775,124 @@ pub fn insert_returning(sql: &str) -> Option<(String, Vec<String>)> {
     Some((table, cols))
 }
 
+/// SP-PG-SQL-AGG-ALIAS-RENDER — a single scalar-aggregate SELECT over a
+/// FROM table, as Django's `.count()` / `.exists()` / `.aggregate()`
+/// emit: `SELECT COUNT(*) AS "__count" FROM "t"` (or bare
+/// `SELECT COUNT(*) FROM t`). The gateway uses this to render the scalar
+/// (the engine's `Op::Aggregate` returns a 16-byte LE i128 in
+/// `OpResult::Got`, which has NO column name / shape the wire path can
+/// otherwise describe).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectAgg {
+    /// FROM table name.
+    pub table: String,
+    /// Aggregate kind code (0=COUNT, 1=SUM, 2=MIN, 3=MAX, 4=AVG) — the
+    /// same canonical codes the parser/engine use.
+    pub kind: u8,
+    /// Aggregate argument column (`None` for `COUNT(*)`), qualifier
+    /// stripped.
+    pub field: Option<String>,
+    /// Output column name from an `AS <alias>` clause, if any.
+    pub alias: Option<String>,
+}
+
+/// The lowercase default output column name PostgreSQL assigns an
+/// unaliased aggregate (`COUNT(*)` → `count`, `SUM(x)` → `sum`, …).
+pub fn agg_default_name(kind: u8) -> &'static str {
+    match kind {
+        0 => "count",
+        1 => "sum",
+        2 => "min",
+        3 => "max",
+        4 => "avg",
+        _ => "agg",
+    }
+}
+
+/// If `sql` is a single scalar-aggregate SELECT over a FROM table —
+/// `SELECT <AGG>( * | [t.]col ) [AS alias] FROM <table>` with NO leading
+/// projection columns, NO GROUP BY, NO JOIN — return the `SelectAgg`.
+/// `None` for anything else (multi-aggregate, GROUP BY, plain
+/// projection, `SELECT *`), so the existing render shapes are unchanged.
+/// Lexer-backed; mirrors `select_columns` / `select_star_table`.
+pub fn select_aggregate(sql: &str) -> Option<SelectAgg> {
+    fn agg_code(w: &str) -> Option<u8> {
+        match w.to_ascii_uppercase().as_str() {
+            "COUNT" => Some(0),
+            "SUM" => Some(1),
+            "MIN" => Some(2),
+            "MAX" => Some(3),
+            "AVG" => Some(4),
+            _ => None,
+        }
+    }
+    let toks = lex(sql).ok()?;
+    let mut it = toks.iter().peekable();
+    match it.next()? {
+        Tok::Ident(k) if k.eq_ignore_ascii_case("SELECT") => {}
+        _ => return None,
+    }
+    // `<AGG> (`
+    let kind = match it.next()? {
+        Tok::Ident(w) => agg_code(w)?,
+        _ => return None,
+    };
+    match it.next()? {
+        Tok::Punct('(') => {}
+        _ => return None,
+    }
+    // `*` | `[t.]col`
+    let field = match it.next()? {
+        Tok::Star => None,
+        Tok::Ident(c) => {
+            let mut col = c.clone();
+            if matches!(it.peek(), Some(Tok::Punct('.'))) {
+                it.next(); // consume `.`
+                match it.next()? {
+                    Tok::Ident(real) => col = real.clone(),
+                    _ => return None,
+                }
+            }
+            Some(col)
+        }
+        _ => return None,
+    };
+    match it.next()? {
+        Tok::Punct(')') => {}
+        _ => return None,
+    }
+    // Optional `AS <alias>`.
+    let mut alias = None;
+    if matches!(it.peek(), Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("AS")) {
+        it.next(); // consume AS
+        match it.next()? {
+            Tok::Ident(a) => alias = Some(a.clone()),
+            _ => return None,
+        }
+    }
+    // `FROM <table>` — and that must be the END (no GROUP BY / JOIN /
+    // extra projection; those keep their existing single-/multi-agg paths
+    // and are not single-scalar wire renders).
+    match it.next()? {
+        Tok::Ident(k) if k.eq_ignore_ascii_case("FROM") => {}
+        _ => return None,
+    }
+    let table = match it.next()? {
+        Tok::Ident(t) => t.clone(),
+        _ => return None,
+    };
+    // Tolerate a trailing `;` but reject any further clause (WHERE / GROUP
+    // BY / JOIN / etc.) — those are NOT the bare-scalar shape this helper
+    // renders. (A WHERE-filtered COUNT is a valid follow-up render; V1
+    // scopes the bare `.count()` / `.aggregate()` shape Django emits.)
+    match it.peek() {
+        None => {}
+        Some(Tok::Punct(';')) => {}
+        _ => return None,
+    }
+    Some(SelectAgg { table, kind, field, alias })
+}
+
 /// SP-PG-SQL-DML-GENERAL — if `sql` is an `UPDATE <table> … RETURNING
 /// <cols | *>` or `DELETE FROM <table> … RETURNING <cols | *>`, return
 /// `(table, [cols] | ["*"])` so the gateway can render the affected
@@ -2704,7 +2822,13 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
     //   `g [, g]*, A(x) [, A(y)]*` → Proj::Aggs(≥1 agg, ≥1 leading col)
     // Once an aggregate has been seen, subsequent plain identifiers are
     // an error (would imply a non-aggregated, non-GROUP-BY column).
-    struct AggSpec { kind: u8, field: Option<String> }
+    // SP-PG-SQL-AGG-ALIAS-RENDER — `alias` captures an `AS <ident>` output
+    // name (`COUNT(*) AS "__count"` — Django's `.count()`). The alias does
+    // NOT change the emitted `Op` (the Op proto carries no output name); it
+    // exists so the sibling `select_aggregate` text-helper can name the
+    // gateway RowDescription column. The single-aggregate emit stays
+    // byte-identical.
+    struct AggSpec { kind: u8, field: Option<String>, alias: Option<String> }
     enum Proj {
         Star,
         Cols(Vec<String>),
@@ -2738,7 +2862,16 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
             Some(p.col_ident()?)
         };
         p.punct(')')?;
-        Ok(AggSpec { kind, field })
+        // SP-PG-SQL-AGG-ALIAS-RENDER — optional output alias `AS <ident>`
+        // (`COUNT(*) AS "__count"`). The quoted alias lexes as an Ident
+        // after the quoted-identifier arc. Captured for the gateway's
+        // RowDescription column name; does not affect the emitted Op.
+        let alias = if p.kw("AS") {
+            Some(p.ident()?)
+        } else {
+            None
+        };
+        Ok(AggSpec { kind, field, alias })
     }
     let proj = if matches!(p.peek(), Some(Tok::Star)) {
         p.i += 1;
@@ -7103,6 +7236,98 @@ mod tests {
             select_columns("SELECT widgets.id AS widgets_id, widgets.name AS widgets_name FROM widgets"),
             Some(("widgets".to_string(), vec!["id".to_string(), "name".to_string()]))
         );
+    }
+
+    // ---- SP-PG-SQL-AGG-ALIAS-RENDER — aggregate alias parse + helper ----
+
+    /// `SELECT COUNT(*) FROM t` compiles to `Op::Aggregate` COUNT (kind 0).
+    #[test]
+    fn select_count_star_from_compiles_to_aggregate() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (id BIGSERIAL PRIMARY KEY, name VARCHAR(8))");
+        let cat = sm.catalog();
+        let op = compile("SELECT COUNT(*) FROM t", cat).expect("compile");
+        match op {
+            Op::Aggregate { kind, .. } => assert_eq!(kind, 0, "COUNT"),
+            other => panic!("expected Op::Aggregate, got {other:?}"),
+        }
+    }
+
+    /// `SELECT COUNT(*) AS "__count" FROM t` (Django's `.count()`) compiles
+    /// — the quoted alias is captured and accept-and-skipped; the emitted
+    /// Op is byte-identical to the unaliased COUNT.
+    #[test]
+    fn select_count_star_with_quoted_alias_compiles() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (id BIGSERIAL PRIMARY KEY, name VARCHAR(8))");
+        let cat = sm.catalog();
+        let aliased = compile("SELECT COUNT(*) AS \"__count\" FROM t", cat)
+            .expect("aliased COUNT compiles");
+        let bare = compile("SELECT COUNT(*) FROM t", cat).expect("bare COUNT compiles");
+        assert_eq!(
+            format!("{aliased:?}"),
+            format!("{bare:?}"),
+            "alias must not change the emitted Op"
+        );
+    }
+
+    /// `SELECT SUM("bal") AS "total" FROM "acct"` parses (quoted ident +
+    /// quoted alias).
+    #[test]
+    fn select_sum_with_alias_compiles() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE acct (id BIGSERIAL PRIMARY KEY, bal I64 NOT NULL)");
+        let cat = sm.catalog();
+        let op = compile("SELECT SUM(\"bal\") AS \"total\" FROM \"acct\"", cat)
+            .expect("SUM alias compiles");
+        match op {
+            Op::Aggregate { kind, .. } => assert_eq!(kind, 1, "SUM"),
+            other => panic!("expected Op::Aggregate, got {other:?}"),
+        }
+    }
+
+    /// `select_aggregate` detects the bare + aliased scalar-aggregate shape
+    /// and returns kind/field/alias; `None` for non-aggregate SELECTs.
+    #[test]
+    fn select_aggregate_helper_detects_shape() {
+        // Bare COUNT(*) — default name applies (alias None).
+        assert_eq!(
+            select_aggregate("SELECT COUNT(*) FROM t"),
+            Some(SelectAgg { table: "t".into(), kind: 0, field: None, alias: None })
+        );
+        // Aliased COUNT(*) (Django quotes the alias → lexes as Ident).
+        assert_eq!(
+            select_aggregate("SELECT COUNT(*) AS \"__count\" FROM \"t\""),
+            Some(SelectAgg {
+                table: "t".into(),
+                kind: 0,
+                field: None,
+                alias: Some("__count".into()),
+            })
+        );
+        // SUM over a column with qualifier + alias.
+        assert_eq!(
+            select_aggregate("SELECT SUM(acct.bal) AS total FROM acct"),
+            Some(SelectAgg {
+                table: "acct".into(),
+                kind: 1,
+                field: Some("bal".into()),
+                alias: Some("total".into()),
+            })
+        );
+        // Trailing `;` tolerated.
+        assert_eq!(
+            select_aggregate("SELECT COUNT(*) FROM t;"),
+            Some(SelectAgg { table: "t".into(), kind: 0, field: None, alias: None })
+        );
+        // NOT a scalar aggregate → None (so existing render shapes win).
+        assert_eq!(select_aggregate("SELECT * FROM t"), None);
+        assert_eq!(select_aggregate("SELECT id, name FROM t"), None);
+        // GROUP BY is the multi/grouped path, not the bare scalar shape.
+        assert_eq!(select_aggregate("SELECT COUNT(*) FROM t GROUP BY g"), None);
+        // Default-name lookup.
+        assert_eq!(agg_default_name(0), "count");
+        assert_eq!(agg_default_name(1), "sum");
     }
 
     /// `insert_returning` parses the clause + column list (qualified or

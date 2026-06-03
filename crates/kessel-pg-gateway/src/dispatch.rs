@@ -502,6 +502,37 @@ fn render_select_got<E: EngineApply + ?Sized>(
     engine: &E,
 ) -> Vec<u8> {
     let mut out = Vec::new();
+    // Shape 0 — SP-PG-SQL-AGG-ALIAS-RENDER: a single scalar-aggregate
+    // SELECT over a FROM table (`SELECT COUNT(*) AS "__count" FROM "t"` —
+    // Django's `.count()`). The engine's `Op::Aggregate` returns a
+    // 16-byte little-endian i128 scalar in `OpResult::Got`. Render it as
+    // RowDescription(1 col, named by the alias or the lowercase function
+    // name) + ONE DataRow(decimal) + CommandComplete("SELECT 1"). This is
+    // checked FIRST because `select_columns` / `select_star_table` both
+    // return None for an aggregate, which would otherwise fall through to
+    // the "0A000 only renders SELECT *" arm.
+    if let Some(agg) = kessel_sql::select_aggregate(sql_trimmed) {
+        if row_bytes.len() == 16 {
+            let scalar = i128::from_le_bytes(row_bytes.try_into().unwrap());
+            let col_name = agg
+                .alias
+                .clone()
+                .unwrap_or_else(|| kessel_sql::agg_default_name(agg.kind).to_string());
+            let fields = [FieldMeta {
+                name: col_name,
+                type_oid: crate::proto::PG_TYPE_INT8,
+            }];
+            out.extend_from_slice(&encode_row_description(&fields));
+            let text = scalar.to_string();
+            out.extend_from_slice(&encode_data_row(&[Some(text.as_bytes())]));
+            out.extend_from_slice(&encode_command_complete(&select_tag(1)));
+            out.extend_from_slice(&encode_ready_for_query(b'I'));
+            return out;
+        }
+        // Defensive: a non-16-byte aggregate result falls through to the
+        // existing render shapes below (none will match cleanly, so the
+        // client gets the standard render error rather than a panic).
+    }
     // Shape 1 — explicit projection list.
     if let Some((table_name, proj_names)) =
         kessel_sql::select_columns(sql_trimmed)
@@ -1549,6 +1580,65 @@ mod tests {
         // DataRow values present as text.
         assert!(bytes.windows(3).any(|w| w == b"100"));
         assert!(bytes.windows(3).any(|w| w == b"200"));
+    }
+
+    // ── SP-PG-SQL-AGG-ALIAS-RENDER — scalar aggregate over a FROM table ──
+
+    /// Helper: a CannedEngine whose `apply_sql` returns the given i128 LE
+    /// scalar (the `Op::Aggregate` wire shape).
+    fn agg_engine(scalar: i128) -> CannedEngine {
+        CannedEngine {
+            cols: vec![PgColumn {
+                name: "id".into(),
+                kind: FieldKind::I64,
+                nullable: false,
+            }],
+            row_bytes: scalar.to_le_bytes().to_vec(),
+            result: std::sync::Mutex::new(None),
+            table_name: "t".into(),
+            no_schema: false,
+        }
+    }
+
+    /// `SELECT COUNT(*) FROM t` → RowDescription(col "count") + ONE
+    /// DataRow(the count) + CommandComplete("SELECT 1") + RFQ.
+    #[test]
+    fn agg_count_star_renders_single_scalar_row() {
+        let eng = agg_engine(7);
+        let bytes = dispatch_query("SELECT COUNT(*) FROM t", &eng);
+        // RowDescription before DataRow before CommandComplete before RFQ.
+        let pos_t = bytes.iter().position(|&b| b == b'T').unwrap();
+        let pos_d = bytes[pos_t + 1..].iter().position(|&b| b == b'D').unwrap() + pos_t + 1;
+        let pos_c = bytes.iter().position(|&b| b == b'C').unwrap();
+        let pos_z = bytes.iter().position(|&b| b == b'Z').unwrap();
+        assert!(pos_t < pos_d && pos_d < pos_c && pos_c < pos_z);
+        // Default column name "count" (NUL-terminated) in RowDescription.
+        assert!(bytes.windows(b"count\0".len()).any(|w| w == b"count\0"));
+        // The scalar value "7" appears as a DataRow text cell.
+        assert!(bytes.windows(1).any(|w| w == b"7"));
+        // CommandComplete("SELECT 1") — exactly one row.
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+        assert_eq!(&bytes[bytes.len() - 6..], &[b'Z', 0, 0, 0, 5, b'I']);
+    }
+
+    /// An aliased aggregate names the RowDescription column by the alias
+    /// (`SELECT COUNT(*) AS "__count" FROM "t"` → column "__count").
+    #[test]
+    fn agg_count_star_alias_names_column() {
+        let eng = agg_engine(42);
+        let bytes = dispatch_query("SELECT COUNT(*) AS \"__count\" FROM \"t\"", &eng);
+        assert!(bytes.windows(b"__count\0".len()).any(|w| w == b"__count\0"));
+        assert!(bytes.windows(2).any(|w| w == b"42"));
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+    }
+
+    /// SUM over a column renders the scalar with the default name "sum".
+    #[test]
+    fn agg_sum_renders_with_default_name() {
+        let eng = agg_engine(1234);
+        let bytes = dispatch_query("SELECT SUM(bal) FROM t", &eng);
+        assert!(bytes.windows(b"sum\0".len()).any(|w| w == b"sum\0"));
+        assert!(bytes.windows(4).any(|w| w == b"1234"));
     }
 
     /// SELECT * FROM t → 0 rows → CommandComplete("SELECT 0").

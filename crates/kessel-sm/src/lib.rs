@@ -3342,7 +3342,7 @@ impl<V: Vfs> StateMachine<V> {
                             // with a single-table WHERE scan). Pure function of
                             // (combined record, predicate) ⇒ deterministic.
                             if !filter.is_empty() {
-                                match kessel_expr::eval(filter, &cot, &rec) {
+                                match kessel_expr::eval(&filter, &cot, &rec) {
                                     Ok(true) => {}
                                     Ok(false) => continue,
                                     Err(e) => {
@@ -4728,7 +4728,7 @@ impl<V: Vfs> StateMachine<V> {
                             // filter on the RO-Txn bypass path so a join inside
                             // a read-only Txn filters exactly like a bare join.
                             if !filter.is_empty() {
-                                match kessel_expr::eval(filter, &cot, &rec) {
+                                match kessel_expr::eval(&filter, &cot, &rec) {
                                     Ok(true) => {}
                                     Ok(false) => continue,
                                     Err(e) => {

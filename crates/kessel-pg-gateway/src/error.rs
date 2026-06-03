@@ -368,12 +368,15 @@ pub fn op_result_to_sqlstate(
 ) -> Option<(&'static str, &'static str, String)> {
     match r {
         // Success variants — caller should not route here.
+        // SP-PG-SERIAL-RETURNING: `Created` (autoincrement assign) is a
+        // success result, handled by the dispatch RETURNING path.
         OpResult::Ok
         | OpResult::Got(_)
         | OpResult::NotFound
         | OpResult::TypeCreated(_)
         | OpResult::TxCommitted { .. }
         | OpResult::WatermarkAdvanced { .. }
+        | OpResult::Created { .. }
         | OpResult::ActiveSnapshotReported { .. } => None,
 
         OpResult::Exists => Some((

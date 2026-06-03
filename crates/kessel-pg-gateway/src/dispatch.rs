@@ -119,7 +119,7 @@ pub fn dispatch_query_with_params<E: EngineApply + ?Sized>(
     // at the dispatch layer.
     let result = engine.apply_sql_with_params(sql_trimmed, params);
     let affected_rows: u64 = match &result {
-        OpResult::Ok | OpResult::TxCommitted { .. } => 1,
+        OpResult::Ok | OpResult::TxCommitted { .. } | OpResult::Created { .. } => 1,
         _ => 0,
     };
     match result {
@@ -131,7 +131,23 @@ pub fn dispatch_query_with_params<E: EngineApply + ?Sized>(
             // `select_star_table` (whole row).
             render_select_got(&row_bytes, sql_trimmed, select_table.clone(), engine)
         }
-        OpResult::Ok | OpResult::TypeCreated(_) | OpResult::TxCommitted { .. } => {
+        // SP-PG-SERIAL-RETURNING: Extended-Query `INSERT … RETURNING …`
+        // (SQLAlchemy 2.0's autoincrement flush rides this path). Mirror
+        // the simple-query handling: surface the assigned id + project the
+        // RETURNING columns.
+        ref ok_variant @ (OpResult::Ok | OpResult::Created { .. })
+            if kessel_sql::insert_returning(sql_trimmed).is_some() =>
+        {
+            let assigned_id = match ok_variant {
+                OpResult::Created { id } => Some(*id),
+                _ => None,
+            };
+            render_insert_returning(sql_trimmed, assigned_id, engine)
+        }
+        OpResult::Ok
+        | OpResult::TypeCreated(_)
+        | OpResult::TxCommitted { .. }
+        | OpResult::Created { .. } => {
             let count = if leading_keyword_is(sql_trimmed, "INSERT") {
                 let from_engine = affected_rows;
                 let from_sql = count_insert_values(sql_trimmed);

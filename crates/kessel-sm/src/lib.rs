@@ -10152,6 +10152,141 @@ mod tests {
         }
     }
 
+    /// SP-PG-SQL-HAVING — the HAVING predicate drops groups whose aggregate
+    /// fails the comparison, on both the single-aggregate (Op::GroupAggregate)
+    /// and multi-aggregate (Op::GroupAggregateMulti) paths. Same dataset as
+    /// `group_aggregate_sum_and_count_per_group`:
+    ///   owner 1 → count 2, sum 30; owner 2 → count 3, sum 20; owner 3 → count 1, sum 100.
+    #[test]
+    fn sp_pg_sql_having_filters_groups() {
+        use kessel_expr::Program;
+        use kessel_proto::HavingPred;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: q_type_def() });
+        let data = [(1u32, 10u32), (1, 20), (2, 5), (2, 7), (2, 8), (3, 100)];
+        for (i, (o, v)) in data.iter().enumerate() {
+            sm.apply(2 + i as u64, Op::Create {
+                type_id: 1, id: ObjectId::from_u128(i as u128), record: qrec(*o, 0, *v),
+            });
+        }
+        let parse = |b: &[u8]| -> Vec<(u32, i128)> {
+            let n = u32::from_le_bytes(b[0..4].try_into().unwrap()) as usize;
+            let mut p = 4;
+            let mut g = Vec::new();
+            for _ in 0..n {
+                let kl = u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize;
+                p += 4;
+                let key = u32::from_le_bytes(b[p..p + 4].try_into().unwrap());
+                p += kl;
+                let val = i128::from_le_bytes(b[p..p + 16].try_into().unwrap());
+                p += 16;
+                g.push((key, val));
+            }
+            g
+        };
+        // Multi-key parse (n values per group) for GroupAggregateMulti.
+        let parse_multi = |b: &[u8], n_aggs: usize| -> Vec<(u32, Vec<i128>)> {
+            let n = u32::from_le_bytes(b[0..4].try_into().unwrap()) as usize;
+            let mut p = 4;
+            let mut g = Vec::new();
+            for _ in 0..n {
+                let kl = u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize;
+                p += 4;
+                let key = u32::from_le_bytes(b[p..p + 4].try_into().unwrap());
+                p += kl;
+                let mut vals = Vec::with_capacity(n_aggs);
+                for _ in 0..n_aggs {
+                    vals.push(i128::from_le_bytes(b[p..p + 16].try_into().unwrap()));
+                    p += 16;
+                }
+                g.push((key, vals));
+            }
+            g
+        };
+        let all = Program::new().push_int(1).bytes();
+
+        // HAVING COUNT(*) >= 3 ⇒ only owner 2 (count 3) survives.
+        match sm.apply(30, Op::GroupAggregate {
+            type_id: 1, program: all.clone(), group_field: 1, kind: 0, agg_field: 0,
+            range_preds: vec![],
+            having: Some(HavingPred { agg_index: 0, op: 1, value: 3 }),
+        }) {
+            OpResult::Got(b) => assert_eq!(parse(&b), vec![(2, 3)], "only owner 2 has count>=3"),
+            o => panic!("{o:?}"),
+        }
+
+        // HAVING SUM(v) > 25 ⇒ owner 1 (30) and owner 3 (100); owner 2 (20) dropped.
+        match sm.apply(31, Op::GroupAggregate {
+            type_id: 1, program: all.clone(), group_field: 1, kind: 1, agg_field: 3,
+            range_preds: vec![],
+            having: Some(HavingPred { agg_index: 0, op: 0, value: 25 }),
+        }) {
+            OpResult::Got(b) => assert_eq!(parse(&b), vec![(1, 30), (3, 100)]),
+            o => panic!("{o:?}"),
+        }
+
+        // HAVING SUM(v) = 100 ⇒ only owner 3.
+        match sm.apply(32, Op::GroupAggregate {
+            type_id: 1, program: all.clone(), group_field: 1, kind: 1, agg_field: 3,
+            range_preds: vec![],
+            having: Some(HavingPred { agg_index: 0, op: 4, value: 100 }),
+        }) {
+            OpResult::Got(b) => assert_eq!(parse(&b), vec![(3, 100)]),
+            o => panic!("{o:?}"),
+        }
+
+        // No-HAVING result equals the pre-arc result (all groups).
+        match sm.apply(33, Op::GroupAggregate {
+            type_id: 1, program: all.clone(), group_field: 1, kind: 1, agg_field: 3,
+            range_preds: vec![], having: None,
+        }) {
+            OpResult::Got(b) => assert_eq!(parse(&b), vec![(1, 30), (2, 20), (3, 100)]),
+            o => panic!("{o:?}"),
+        }
+
+        // Multi path: [COUNT(*), SUM(v)] HAVING on agg_index 1 (SUM(v)) > 25.
+        match sm.apply(34, Op::GroupAggregateMulti {
+            type_id: 1, program: all.clone(), group_field: 1,
+            aggregates: vec![(0, 0), (1, 3)],
+            range_preds: vec![],
+            having: Some(HavingPred { agg_index: 1, op: 0, value: 25 }),
+        }) {
+            OpResult::Got(b) => assert_eq!(
+                parse_multi(&b, 2),
+                vec![(1, vec![2, 30]), (3, vec![1, 100])],
+                "owner 2 (sum 20) dropped; owners 1 and 3 keep both agg values",
+            ),
+            o => panic!("{o:?}"),
+        }
+
+        // Multi path HAVING on agg_index 0 (COUNT) < 3 ⇒ owners 1 and 3.
+        match sm.apply(35, Op::GroupAggregateMulti {
+            type_id: 1, program: all.clone(), group_field: 1,
+            aggregates: vec![(0, 0), (1, 3)],
+            range_preds: vec![],
+            having: Some(HavingPred { agg_index: 0, op: 2, value: 3 }),
+        }) {
+            OpResult::Got(b) => assert_eq!(
+                parse_multi(&b, 2),
+                vec![(1, vec![2, 30]), (3, vec![1, 100])],
+            ),
+            o => panic!("{o:?}"),
+        }
+
+        // HAVING that excludes everything ⇒ zero groups (ngroups == 0).
+        match sm.apply(36, Op::GroupAggregate {
+            type_id: 1, program: all, group_field: 1, kind: 0, agg_field: 0,
+            range_preds: vec![],
+            having: Some(HavingPred { agg_index: 0, op: 0, value: 1000 }),
+        }) {
+            OpResult::Got(b) => {
+                assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), 0);
+                assert_eq!(b.len(), 4, "empty group-agg result is just the ngroups u32");
+            }
+            o => panic!("{o:?}"),
+        }
+    }
+
     // ========================================================================
     // SP-Analytic-Plan-MULTI T2 — equivalence KAT.
     //

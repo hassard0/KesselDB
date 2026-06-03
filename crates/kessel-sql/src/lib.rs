@@ -3904,7 +3904,7 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
                     .into(),
             );
         }
-        Some(parse_having(&mut p)?)
+        Some(parse_having(p)?)
     } else {
         None
     };
@@ -5394,6 +5394,101 @@ mod tests {
         // Multi without GROUP BY (and no leading col) is rejected in V1.
         let err = compile("SELECT SUM(x), SUM(y) FROM t", sm.catalog());
         assert!(err.is_err(), "multi-agg w/o GROUP BY must error in V1");
+    }
+
+    /// SP-PG-SQL-HAVING — the SQL planner attaches a HAVING predicate to the
+    /// single-aggregate (Op::GroupAggregate), multi-aggregate
+    /// (Op::GroupAggregateMulti), and join-group-aggregate paths, matching the
+    /// HAVING aggregate to a projected aggregate by (kind, field). It rejects a
+    /// HAVING aggregate not in the SELECT list and a HAVING without grouping.
+    #[test]
+    fn sp_pg_sql_having_planner_attaches_predicate() {
+        use kessel_proto::{HavingPred, Op};
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (g U8 NOT NULL, x I64 NOT NULL)");
+
+        // Single-aggregate GROUP BY + HAVING COUNT(*) >= 3 → Op::GroupAggregate
+        // with having { agg_index: 0, op: 1 (>=), value: 3 }.
+        let op = compile(
+            "SELECT g, COUNT(*) FROM t GROUP BY g HAVING COUNT(*) >= 3",
+            sm.catalog(),
+        ).expect("compile single-agg HAVING");
+        match op {
+            Op::GroupAggregateMulti { having, .. } | // leading col => Multi
+            Op::GroupAggregate { having, .. } => {
+                assert_eq!(having, Some(HavingPred { agg_index: 0, op: 1, value: 3 }));
+            }
+            other => panic!("expected a group-aggregate, got {other:?}"),
+        }
+
+        // Plain single-agg (no leading col) GROUP BY + HAVING → Op::GroupAggregate.
+        let op = compile(
+            "SELECT SUM(x) FROM t GROUP BY g HAVING SUM(x) > 100",
+            sm.catalog(),
+        ).expect("compile plain single-agg HAVING");
+        match op {
+            Op::GroupAggregate { having, kind, .. } => {
+                assert_eq!(kind, 1, "SUM");
+                assert_eq!(having, Some(HavingPred { agg_index: 0, op: 0, value: 100 }));
+            }
+            other => panic!("expected Op::GroupAggregate, got {other:?}"),
+        }
+
+        // Multi-aggregate: HAVING on the 2nd projected aggregate → agg_index 1.
+        let op = compile(
+            "SELECT g, COUNT(*), SUM(x) FROM t GROUP BY g HAVING SUM(x) <= 50",
+            sm.catalog(),
+        ).expect("compile multi HAVING");
+        match op {
+            Op::GroupAggregateMulti { having, aggregates, .. } => {
+                assert_eq!(aggregates.len(), 2);
+                assert_eq!(having, Some(HavingPred { agg_index: 1, op: 3, value: 50 }));
+            }
+            other => panic!("expected Op::GroupAggregateMulti, got {other:?}"),
+        }
+
+        // Every comparison operator maps to the right wire code.
+        for (sql_op, code) in [(">", 0u8), (">=", 1), ("<", 2), ("<=", 3), ("=", 4), ("<>", 5), ("!=", 5)] {
+            let op = compile(
+                &format!("SELECT g, COUNT(*) FROM t GROUP BY g HAVING COUNT(*) {sql_op} 2"),
+                sm.catalog(),
+            ).unwrap_or_else(|e| panic!("compile HAVING {sql_op}: {e}"));
+            let having = match op {
+                Op::GroupAggregateMulti { having, .. } | Op::GroupAggregate { having, .. } => having,
+                other => panic!("unexpected {other:?}"),
+            };
+            assert_eq!(having.unwrap().op, code, "op `{sql_op}` → {code}");
+        }
+
+        // Negative literal RHS is supported.
+        let op = compile(
+            "SELECT g, SUM(x) FROM t GROUP BY g HAVING SUM(x) > -5",
+            sm.catalog(),
+        ).expect("compile negative RHS");
+        let having = match op {
+            Op::GroupAggregateMulti { having, .. } | Op::GroupAggregate { having, .. } => having,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(having.unwrap().value, -5);
+
+        // HAVING over an aggregate NOT in the SELECT list is rejected (V1).
+        let err = compile(
+            "SELECT g, COUNT(*) FROM t GROUP BY g HAVING SUM(x) > 1",
+            sm.catalog(),
+        );
+        assert!(err.is_err(), "HAVING agg not in projection must error, got {err:?}");
+
+        // HAVING with a non-aggregate projection is rejected.
+        let err = compile("SELECT g FROM t GROUP BY g HAVING COUNT(*) > 1", sm.catalog());
+        assert!(err.is_err(), "HAVING on non-aggregate projection must error");
+
+        // No HAVING ⇒ no predicate attached (byte-identity prerequisite).
+        let op = compile("SELECT g, COUNT(*) FROM t GROUP BY g", sm.catalog()).unwrap();
+        let having = match op {
+            Op::GroupAggregateMulti { having, .. } | Op::GroupAggregate { having, .. } => having,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(having, None, "no HAVING ⇒ None");
     }
 
     /// SP-Analytic-Plan-MULTI T3 end-to-end oracle: a multi-aggregate

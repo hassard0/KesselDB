@@ -148,7 +148,7 @@ kessel "SELECT a.n, b.t FROM a JOIN b ON a.id = b.aid WHERE b.t = 'x'"  # filter
 kessel "SELECT a.n, b.t FROM a LEFT JOIN b ON a.id = b.aid"  # LEFT [OUTER] JOIN — unmatched a-rows keep b.* = NULL
 kessel "SELECT a.n, b.t FROM a JOIN b ON a.id = b.aid ORDER BY b.t LIMIT 20 OFFSET 40"  # paginated join (ORDER BY + LIMIT/OFFSET)
 kessel "SELECT a.n, COUNT(b.id) FROM a JOIN b ON a.id = b.aid GROUP BY a.n"  # grouped aggregate over a join (count related per parent)
-kessel "SELECT u.name, p.title, c.body FROM users u JOIN posts p ON u.id = p.user_id JOIN comments c ON p.id = c.post_id"  # chained 3-way INNER join (SP-PG-SQL-MULTI-JOIN)
+kessel "SELECT users.name, posts.title, comments.body FROM users JOIN posts ON users.id = posts.user_id JOIN comments ON posts.id = comments.post_id"  # chained 3-way INNER join (SP-PG-SQL-MULTI-JOIN)
 
 # pipe a .sql file (lines starting with # or -- are comments; blanks ignored)
 cat schema.sql | cargo run -q -p kessel-client --bin kessel
@@ -398,19 +398,20 @@ drops the unmatched rows — standard PostgreSQL semantics.
 the everyday "row + its parent + its grandparent" shape:
 
 ```sql
-SELECT u.name, p.title, c.body
-  FROM users u JOIN posts p ON u.id = p.user_id
-               JOIN comments c ON p.id = c.post_id
-  WHERE u.id = 1;
+SELECT users.name, posts.title, comments.body
+  FROM users JOIN posts ON users.id = posts.user_id
+             JOIN comments ON posts.id = comments.post_id
+  WHERE users.id = 1;
 ```
 
 Each additional `JOIN <table> ON <a.x> = <table.y>` segment INNER equi-joins the
 running combined row set against the next table; the combined schema widens by
 that table's columns each step (named `<table>.<col>`). `SELECT *` returns every
 column of every joined table; `WHERE` / `ORDER BY` / `LIMIT` / `OFFSET` apply
-over the full combined schema. V1 is INNER chains only — mixing `LEFT`/`RIGHT`/
-`FULL` into a chain, or `GROUP BY` over a chain, are named follow-ups (rejected
-with a clear error).
+over the full combined schema. Columns are qualified by the full table NAME (not
+an alias — `SP-PG-SQL-JOIN-ALIAS` is a follow-up, as for the binary join). V1 is
+INNER chains only — mixing `LEFT`/`RIGHT`/`FULL` into a chain, or `GROUP BY`
+over a chain, are named follow-ups (rejected with a clear error).
 
 `ORDER BY <qualified col>` sorts the combined join rows by ONE column from
 either table (`ASC` default / `DESC`); `LIMIT` + `OFFSET` then paginate the

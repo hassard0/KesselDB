@@ -7584,8 +7584,8 @@ mod tests {
         run(&mut sm, 2, "CREATE TABLE posts (id U64 NOT NULL, user_id U64 NOT NULL, title CHAR(16) NOT NULL)");
         run(&mut sm, 3, "CREATE TABLE comments (id U64 NOT NULL, post_id U64 NOT NULL, body CHAR(16) NOT NULL)");
         let cat = sm.catalog().clone();
-        let sql = "SELECT u.name, p.title, c.body FROM users u JOIN posts p \
-                   ON u.id = p.user_id JOIN comments c ON p.id = c.post_id";
+        let sql = "SELECT users.name, posts.title, comments.body FROM users JOIN posts \
+                   ON users.id = posts.user_id JOIN comments ON posts.id = comments.post_id";
         match compile(sql, &cat).unwrap() {
             Op::Join { left_field, right_field, extra_joins, group_aggregate, .. } => {
                 // Catalog assigns field_ids starting at 1: users.id=1,
@@ -7605,7 +7605,7 @@ mod tests {
         }
         // A bare 2-table JOIN still has EMPTY extra_joins (byte-identical path).
         match compile(
-            "SELECT u.name, p.title FROM users u JOIN posts p ON u.id = p.user_id",
+            "SELECT users.name, posts.title FROM users JOIN posts ON users.id = posts.user_id",
             &cat,
         ).unwrap() {
             Op::Join { extra_joins, .. } => assert!(extra_joins.is_empty()),
@@ -7613,8 +7613,8 @@ mod tests {
         }
         // GROUP BY over a chain is rejected (named follow-up).
         assert!(compile(
-            "SELECT u.name, COUNT(c.id) FROM users u JOIN posts p ON u.id = p.user_id \
-             JOIN comments c ON p.id = c.post_id GROUP BY u.name",
+            "SELECT users.name, COUNT(comments.id) FROM users JOIN posts ON users.id = posts.user_id \
+             JOIN comments ON posts.id = comments.post_id GROUP BY users.name",
             &cat,
         ).is_err(), "GROUP BY over a multi-join must error");
     }

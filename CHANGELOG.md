@@ -8,9 +8,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning [Se
 ### Added
 
 - **Chained N-way (3+ table) INNER equi-joins (SP-PG-SQL-MULTI-JOIN,
-  2026-06-03)** — `SELECT u.name, p.title, c.body FROM users u JOIN posts p ON
-  u.id = p.user_id JOIN comments c ON p.id = c.post_id` now works end-to-end
-  over the PG wire. The planner previously handled exactly ONE `JOIN`; a second
+  2026-06-03)** — `SELECT users.name, posts.title, comments.body FROM users
+  JOIN posts ON users.id = posts.user_id JOIN comments ON posts.id =
+  comments.post_id` now works end-to-end over the PG wire (columns qualified by
+  the full table name; aliases are the `SP-PG-SQL-JOIN-ALIAS` follow-up). The
+  planner previously handled exactly ONE `JOIN`; a second
   `JOIN` segment failed to compile. `Op::Join` gained an additive,
   marker-guarded `extra_joins: Vec<JoinStep>` (each step = the next table + its
   ON `left_combined_field = right_field`). The engine's `apply_multi_join`

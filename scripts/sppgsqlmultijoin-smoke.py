@@ -5,9 +5,9 @@
 `Op::Join` was BINARY (exactly two tables). Real apps + analytics constantly
 chain joins:
 
-    SELECT u.name, p.title, c.body
-      FROM users u JOIN posts p ON u.id = p.user_id
-                   JOIN comments c ON p.id = c.post_id;
+    SELECT users.name, posts.title, comments.body
+      FROM users JOIN posts ON users.id = posts.user_id
+                 JOIN comments ON posts.id = comments.post_id;
 
 Before this arc the planner handled exactly ONE JOIN; a second JOIN failed to
 compile. This arc adds an additive, marker-guarded `extra_joins: Vec<JoinStep>`
@@ -33,7 +33,7 @@ Stages:
   2. seed           — 2 users, 3 posts, 3 comments                      [setup]
   3. three_way      — SELECT u.name, p.title, c.body  (HEADLINE)
   4. three_way_star — SELECT *  across the 3-table chain
-  5. three_way_where— filtered 3-way join (WHERE u.id = 1)
+  5. three_way_where— filtered 3-way join (WHERE users.id = 1)
 
 HEADLINE: a real 3-table chained INNER join returns the correct combined rows
 over the PG wire. On pre-arc origin/main the second JOIN failed to compile.
@@ -185,9 +185,9 @@ def run_stages():
     # HEADLINE — a real 3-table chained INNER join.
     def _three_way():
         rows = fetch(
-            "SELECT u.name, p.title, c.body "
-            "FROM users u JOIN posts p ON u.id = p.user_id "
-            "JOIN comments c ON p.id = c.post_id"
+            "SELECT users.name, posts.title, comments.body "
+            "FROM users JOIN posts ON users.id = posts.user_id "
+            "JOIN comments ON posts.id = comments.post_id"
         )
         got = sorted(norm(rows))
         expected = sorted([
@@ -205,8 +205,8 @@ def run_stages():
     def _three_way_star():
         rows = fetch(
             "SELECT * "
-            "FROM users u JOIN posts p ON u.id = p.user_id "
-            "JOIN comments c ON p.id = c.post_id"
+            "FROM users JOIN posts ON users.id = posts.user_id "
+            "JOIN comments ON posts.id = comments.post_id"
         )
         got = norm(rows)
         # 3 combined rows; each row has all columns of all 3 tables:
@@ -225,14 +225,14 @@ def run_stages():
     stage("three_way_star", _three_way_star)
 
     def _three_way_where():
-        # Filtered 3-way join: only alice's chain (u.id = 1). Same 3 rows here
+        # Filtered 3-way join: only alice's chain (users.id = 1). Same 3 rows here
         # (all combined rows belong to alice), but the WHERE must compile +
         # apply over the full 3-table combined schema.
         rows = fetch(
-            "SELECT u.name, p.title, c.body "
-            "FROM users u JOIN posts p ON u.id = p.user_id "
-            "JOIN comments c ON p.id = c.post_id "
-            "WHERE u.id = 1"
+            "SELECT users.name, posts.title, comments.body "
+            "FROM users JOIN posts ON users.id = posts.user_id "
+            "JOIN comments ON posts.id = comments.post_id "
+            "WHERE users.id = 1"
         )
         got = sorted(norm(rows))
         expected = sorted([
@@ -241,15 +241,15 @@ def run_stages():
             ("alice", "world", "wow"),
         ])
         assert got == expected, f"got {got}"
-        # And WHERE u.id = 2 (bob) → zero rows (bob's post has no comment).
+        # And WHERE users.id = 2 (bob) → zero rows (bob's post has no comment).
         rows2 = fetch(
-            "SELECT u.name, p.title, c.body "
-            "FROM users u JOIN posts p ON u.id = p.user_id "
-            "JOIN comments c ON p.id = c.post_id "
-            "WHERE u.id = 2"
+            "SELECT users.name, posts.title, comments.body "
+            "FROM users JOIN posts ON users.id = posts.user_id "
+            "JOIN comments ON posts.id = comments.post_id "
+            "WHERE users.id = 2"
         )
-        assert norm(rows2) == [], f"u.id=2 should be empty: {norm(rows2)}"
-        return f"WHERE u.id=1 → {got}; WHERE u.id=2 → []"
+        assert norm(rows2) == [], f"users.id=2 should be empty: {norm(rows2)}"
+        return f"WHERE users.id=1 → {got}; WHERE users.id=2 → []"
 
     stage("three_way_where", _three_way_where)
 

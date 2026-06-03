@@ -10,11 +10,15 @@
 chain joins:
 
 ```sql
-SELECT u.name, p.title, c.body
-  FROM users u JOIN posts p ON u.id = p.user_id
-               JOIN comments c ON p.id = c.post_id
-  WHERE u.id = 1;
+SELECT users.name, posts.title, comments.body
+  FROM users JOIN posts ON users.id = posts.user_id
+             JOIN comments ON posts.id = comments.post_id
+  WHERE users.id = 1;
 ```
+
+(Columns are qualified by the full table NAME, not an alias — table aliases in
+the FROM/JOIN clause are a named follow-up `SP-PG-SQL-JOIN-ALIAS`, the same as
+for the existing binary join.)
 
 The planner handled exactly ONE `JOIN`; a second `JOIN` segment failed to
 compile. This arc makes 3+ table chained INNER equi-joins work end-to-end over
@@ -110,5 +114,6 @@ stays byte-identical.
   - multi-join + `GROUP BY` (engine rejects `extra_joins` + `group_aggregate`;
     SQL rejects `GROUP BY` over a chain).
   - mixing `LEFT`/`RIGHT`/`FULL` into a chain (SQL rejects).
-  - table aliases beyond what the base binary join already handles, and
-    self-joins in a chain (rejected to avoid same-name ambiguity).
+  - table aliases beyond what the base binary join already handles
+    (`SP-PG-SQL-JOIN-ALIAS` — columns must be qualified by the full table name),
+    and self-joins in a chain (rejected to avoid same-name ambiguity).

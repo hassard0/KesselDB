@@ -1395,6 +1395,67 @@ pub mod sim {
         assert!(d.iter().all(|x| *x == d[0]), "constraint state diverged: {d:?}");
     }
 
+    /// SP-PG-SQL-DML-GENERAL — the replicated artifact of a general-WHERE
+    /// UPDATE/DELETE is a CONCRETE `Op::Txn` of per-id `UpdateSet`/`Delete`
+    /// (the server resolves the matched ids on the leader, then replicates
+    /// the concrete Txn). This drives that exact artifact through the
+    /// 3-replica VSR simnet and asserts byte-identical convergence — the
+    /// determinism gate for this arc.
+    #[test]
+    fn dml_general_where_txn_replicates_and_converges() {
+        let mut c = Cluster::new(3, 7, 0); // seed 7
+        let def = Op::CreateType {
+            def: encode_type_def(
+                "acct",
+                &[
+                    Field { field_id: 0, name: "bal".into(), kind: FieldKind::U32, nullable: false },
+                    Field { field_id: 0, name: "active".into(), kind: FieldKind::U32, nullable: false },
+                ],
+            ),
+        };
+        let row = |bal: u32, active: u32| {
+            let mut b = vec![0u8; 32];
+            b[14..18].copy_from_slice(&bal.to_le_bytes());
+            b[18..22].copy_from_slice(&active.to_le_bytes());
+            b
+        };
+        let mut reqs = vec![(1u128, 1u64, def)];
+        // 20 rows.
+        for i in 0..20u64 {
+            reqs.push((
+                1,
+                i + 2,
+                Op::Create {
+                    type_id: 1,
+                    id: ObjectId::from_u128(i as u128),
+                    record: row(i as u32 * 10, 1),
+                },
+            ));
+        }
+        // The concrete Txn a general-WHERE UPDATE produces: set active=0
+        // on the first 8 ids (the matched set, sorted). field_id 1 = active.
+        let upd_ops: Vec<Op> = (0..8u128)
+            .map(|id| Op::UpdateSet {
+                type_id: 1,
+                id: ObjectId::from_u128(id),
+                sets: vec![(1, 0u32.to_le_bytes().to_vec())],
+            })
+            .collect();
+        reqs.push((1, 100, Op::Txn { ops: upd_ops }));
+        // The concrete Txn a general-WHERE DELETE produces: remove ids 8..12.
+        let del_ops: Vec<Op> = (8..12u128)
+            .map(|id| Op::Delete { type_id: 1, id: ObjectId::from_u128(id) })
+            .collect();
+        reqs.push((1, 101, Op::Txn { ops: del_ops }));
+
+        assert_ne!(c.run(&reqs, 12000), usize::MAX, "DML Txns must commit");
+        let d = c.live_digests();
+        assert!(
+            d.iter().all(|x| *x == d[0]),
+            "general-WHERE DML Txn state diverged across replicas: {d:?}"
+        );
+    }
+
     #[test]
     fn foreign_key_replicates_and_converges() {
         // FK validation/rejection must be deterministic through VSR.

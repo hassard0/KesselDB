@@ -1,0 +1,58 @@
+SP-PG-SERIAL-RETURNING — T5 vulcan SQLAlchemy autoincrement smoke transcript
+============================================================================
+
+Date:    2026-06-02
+Host:    vulcan (admin@192.168.4.178)
+Binary:  /tmp/kdb-t-serial/release/kesseldb (CARGO_TARGET_DIR=/tmp/kdb-t-serial)
+Server:  KESSELDB_TOKEN=admin KESSELDB_PG_ADDR=127.0.0.1:5543  (pg=5543, native=6543)
+Script:  scripts/sppgserialreturning-smoke.py  (SQLAlchemy 2.0.45 + psycopg2)
+HEAD:    99a8713
+
+Model — NO explicit id (the real-world autoincrement default):
+
+    class Widget(Base):
+        __tablename__ = "widgets"
+        id = Column(BigInteger, primary_key=True, autoincrement=True)  # no id on insert
+        name = Column(String(32))
+
+The application never supplies `id`; the DB assigns it; SQLAlchemy reads it
+back via `INSERT INTO widgets (name) VALUES (...) RETURNING id`.
+
+(engine created with use_insertmanyvalues=False so SQLAlchemy emits the
+classic per-row `INSERT ... VALUES (...) RETURNING id` shape — the dominant
+real-world ORM insert; its batched insertmanyvalues SELECT-VALUES-ORDER BY
+form is a named follow-up SP-PG-RETURNING-MULTIROW.)
+
+------------------------------- STDOUT -------------------------------
+
+# SQLAlchemy 2.0.45 -> postgresql+psycopg2://test:admin@127.0.0.1:5543/kesseldb
+STAGE connect: PASS engine.connect() + probe OK
+STAGE create_all_ddl: PASS CREATE TABLE widgets via ORM metadata (BIGSERIAL PK)
+STAGE autoincrement_insert_returns_id: PASS assigned ids w1=1 w2=2 (read back via RETURNING)
+STAGE autoincrement_select_all: PASS select(Widget) -> [(1, 'gadget'), (2, 'sprocket')]
+STAGE autoincrement_filter_by_assigned_id: PASS get(Widget, 1) -> (1, 'gadget')
+STAGE autoincrement_delete_by_assigned_id: PASS delete id=1 -> remaining [(2, 'sprocket')]
+
+=== SQLALCHEMY AUTOINCREMENT SMOKE SUMMARY ===
+  PASS  connect
+  PASS  create_all_ddl
+  PASS  autoincrement_insert_returns_id
+  PASS  autoincrement_select_all
+  PASS  autoincrement_filter_by_assigned_id
+  PASS  autoincrement_delete_by_assigned_id
+--- 6/6 stages PASS ---
+SQLALCHEMY AUTOINCREMENT SMOKE COMPLETE
+
+--------------------- raw psycopg2 RETURNING proof --------------------
+
+    INSERT INTO widgets (name) VALUES ('zeta') RETURNING id        -> (3,)
+    INSERT INTO widgets (name) VALUES ('eta')  RETURNING id, name  -> (4, 'eta')
+    SELECT * FROM widgets  -> [(1,'gadget'),(2,'sprocket'),(3,'zeta'),(4,'eta')]
+
+The engine assigns 1,2,3,4 deterministically (gap-free), reads them back over
+the wire via RETURNING, and a single-column or multi-column RETURNING both
+work. ObjectId == counter, so by-PK SELECT/get/delete on the assigned id all
+address the row.
+
+HEADLINE: a SQLAlchemy autoincrement model — `w.id` reads back the
+DB-assigned id (1 and 2) after session.commit(). Full CRUD: 6/6.

@@ -6512,16 +6512,40 @@ mod tests {
             Stmt::UpdateWhere { program, sets, returning, .. } => {
                 assert_eq!(sets.len(), 1, "one SET");
                 assert!(returning.is_none(), "no RETURNING");
-                // The predicate program equals the SELECT `a < 150` program.
-                let sel = compile("SELECT * FROM t WHERE a < 150", cat)
-                    .expect("select compiles");
-                match sel {
-                    Op::Select { program: p2, .. } => assert_eq!(
+                assert!(!program.is_empty(), "predicate program present");
+                // Determinism: the SAME UPDATE compiles to the SAME
+                // predicate program bytes every time.
+                let again = compile_stmt("UPDATE t SET b = 0 WHERE a < 150", cat)
+                    .expect("recompiles");
+                match again {
+                    Stmt::UpdateWhere { program: p2, .. } => assert_eq!(
                         program, p2,
-                        "UPDATE WHERE predicate must byte-match the SELECT \
-                         WHERE program (determinism contract)"
+                        "general-WHERE UPDATE must compile to a byte-identical \
+                         predicate program (determinism contract)"
                     ),
-                    o => panic!("expected Op::Select, got {:?}", o.kind()),
+                    _ => panic!("expected Stmt::UpdateWhere on recompile"),
+                }
+                // The program is the SAME predicate an `Op::Select`-forcing
+                // WHERE emits: a compound predicate (`a < 150 AND b > 0`)
+                // bypasses the QueryRows fast path → Op::Select, whose
+                // program must byte-match the equivalent UPDATE.
+                let sel = compile("SELECT * FROM t WHERE a < 150 AND b > 0", cat)
+                    .expect("compound select compiles");
+                let upd = compile_stmt(
+                    "UPDATE t SET b = 0 WHERE a < 150 AND b > 0",
+                    cat,
+                )
+                .expect("compound UPDATE compiles");
+                if let (Op::Select { program: sp, .. }, Stmt::UpdateWhere { program: up, .. }) =
+                    (sel, upd)
+                {
+                    assert_eq!(
+                        sp, up,
+                        "compound UPDATE WHERE predicate must byte-match the \
+                         SELECT WHERE program"
+                    );
+                } else {
+                    panic!("expected Op::Select + Stmt::UpdateWhere");
                 }
             }
             _ => panic!("expected Stmt::UpdateWhere"),

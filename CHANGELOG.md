@@ -7,6 +7,32 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning [Se
 
 ### Added
 
+- **`ORDER BY` / `LIMIT` / `OFFSET` on a plain `GROUP BY` now take effect
+  (SP-PG-SQL-GROUP-SORT-LIMIT, 2026-06-03)** — closes the V1 caveat the
+  PLAIN-GROUP-RENDER arc surfaced. `SELECT g, COUNT(*) AS n FROM t GROUP BY g
+  ORDER BY n DESC LIMIT 5 OFFSET 1` is now sorted + windowed by the engine
+  instead of returning all groups in key order. `Op::GroupAggregate` /
+  `Op::GroupAggregateMulti` gained an additive, marker-guarded
+  `sort: Option<GroupSort>` (mirroring the HAVING marker-guard and the JOIN
+  `order_by`/`limit_n`/`offset_n`). The `ORDER BY` target may be a projected
+  aggregate (by alias `ORDER BY n`, position `ORDER BY 2`, or expression
+  `ORDER BY COUNT(*)`) or the group key (`ORDER BY g` / `ORDER BY 1`); `DESC`
+  reverses; ties break by ascending group key; `LIMIT`/`OFFSET` apply AFTER the
+  sort; `HAVING` filters BEFORE it (filter → sort → offset → limit). A shared
+  `emit_group_results` helper backs both the apply and read-only paths plus the
+  single- and multi-aggregate ops. **Determinism:** the new field is emitted on
+  the wire ONLY when present, so a no-`ORDER BY`/`LIMIT`/`OFFSET` query produces
+  BYTE-IDENTICAL `Op` frames to before; corpus / partition / 3-replica
+  byte-identity oracles stay green; every `Op::GroupAggregate{,Multi}`
+  construction site (proto/sm/sql/read_pool/sharded_engine/parallel_reads_oracle/
+  bench) was updated with `sort: None`. ORDER BY over a JOIN group-aggregate
+  remains the separate follow-up `SP-PG-SQL-JOIN-AGG-ORDERBY-AGG`. vulcan psql
+  smoke (`scripts/sppgsqlgroupsortlimit-smoke.py`): `ORDER BY COUNT(*) DESC`
+  returns **books(4), gadgets(3), toys(2), misc(1)** in descending-count order
+  (pre-fix returned all 4 in key order); `LIMIT 2` returns only the top 2;
+  `LIMIT 2 OFFSET 1` returns the right window; `ORDER BY category ASC` and
+  `HAVING + ORDER BY SUM(price) DESC + LIMIT` also PASS.
+
 - **Plain (non-JOIN) `GROUP BY` renders over the PG wire
   (SP-PG-SQL-PLAIN-GROUP-RENDER, 2026-06-03)** — `SELECT category, COUNT(*)
   [AS n] [, SUM(price), AVG(price), MIN(price), MAX(price)] FROM products
@@ -25,10 +51,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning [Se
   group key from the FROM-table schema, types aggregate OIDs COUNT/SUM → int8,
   AVG → numeric, MIN/MAX → source-column type). **Render-only — NO `Op` or
   wire-format change**, so the corpus / partition / 3-replica byte-identity
-  oracles stay green. **V1 caveat:** a trailing `ORDER BY … LIMIT … OFFSET …` on
-  a plain GROUP BY is parsed but not yet engine-applied (the group ops carry no
-  sort/limit fields) — all groups come back in ascending key order; the render
-  surfaces them faithfully (follow-on `SP-PG-SQL-GROUP-SORT-LIMIT`). vulcan psql
+  oracles stay green. **V1 caveat (now resolved by SP-PG-SQL-GROUP-SORT-LIMIT,
+  see above):** a trailing `ORDER BY … LIMIT … OFFSET …` on a plain GROUP BY was
+  parsed but not yet engine-applied — it is now sorted + windowed by the engine.
+  vulcan psql
   smoke: the headline `SELECT category, COUNT(*) FROM products GROUP BY category`
   ERRORED on pre-fix `origin/main` and renders **{books:3, gadgets:1, toys:2}**
   post-fix; multi-agg + `HAVING` also PASS.

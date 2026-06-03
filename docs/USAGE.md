@@ -375,7 +375,7 @@ SELECT COUNT(*) | SUM(c) | MIN(c) | MAX(c) | AVG(c) FROM <t> [WHERE ...]  -- sin
 SELECT <g>, <AGG>( * | <c> ) [AS alias] [, <AGG>(…) …] FROM <t> [WHERE …]  -- plain GROUP BY group-aggregate (SP-PG-SQL-PLAIN-GROUP-RENDER)
        GROUP BY <g>                                     --   COUNT/SUM/MIN/MAX/AVG per group; one row per group
        [HAVING <AGG>(...) <cmp> <literal>]              --   filter groups by an aggregate (SP-PG-SQL-HAVING)
-       [ORDER BY <col> [DESC]] [LIMIT n] [OFFSET n]     --   (parsed; V1 engine emits all groups in key order — see note)
+       [ORDER BY <agg|alias|pos|g> [ASC|DESC]] [LIMIT n] [OFFSET n]  --   engine sorts + windows groups (SP-PG-SQL-GROUP-SORT-LIMIT)
 SELECT * FROM <t> [WHERE ...] ORDER BY <col> [DESC] [OFFSET n] [LIMIT n]
 SELECT <proj> FROM <a> [LEFT [OUTER]] JOIN <b> ON <a.x> = <b.y>  -- equi‑join
        [WHERE <pred over a.* / b.*>]                    --   INNER (default) or LEFT; filtered (qualified cols, AND/OR/…)
@@ -415,11 +415,18 @@ the table schema (int key → int4/int8, text key → text); aggregate columns a
 typed COUNT/SUM → int8, AVG → numeric, MIN/MAX → the source column's type. An
 unaliased aggregate gets PostgreSQL's default name (`count`/`sum`/`avg`/`min`/
 `max`). `HAVING` (SP-PG-SQL-HAVING) filters the groups. **V1 caveat:** a trailing
-`ORDER BY … LIMIT … OFFSET …` on a plain GROUP BY is *parsed* but not yet
-applied by the engine (the group ops carry no sort/limit fields), so all groups
-come back in ascending key order regardless — the render surfaces them
-faithfully without dropping or reordering. Sort/limit pushdown for plain
-group-agg is the follow-on `SP-PG-SQL-GROUP-SORT-LIMIT`.
+`ORDER BY … LIMIT … OFFSET …` on a plain GROUP BY is now **applied by the
+engine** (SP-PG-SQL-GROUP-SORT-LIMIT). The `ORDER BY` target may be a projected
+aggregate (by alias `ORDER BY n`, by 1-based position `ORDER BY 2`, or by the
+expression `ORDER BY COUNT(*)`) or the group key column (`ORDER BY g` /
+`ORDER BY 1`); `DESC` reverses, ties break by ascending group key, and
+`LIMIT`/`OFFSET` window AFTER the sort. `HAVING` filters BEFORE the sort, so the
+pipeline is **filter → sort → offset → limit** — making top-N-per-group
+analytics (`… GROUP BY g ORDER BY COUNT(*) DESC LIMIT 5`) work. The new fields
+are additive + marker-guarded: a query with no `ORDER BY`/`LIMIT`/`OFFSET`
+produces byte-identical `Op` frames to before, so the determinism oracles are
+untouched. ORDER BY over a **JOIN** group-aggregate remains the separate
+follow-up `SP-PG-SQL-JOIN-AGG-ORDERBY-AGG`.
 
 `GROUP BY <a.g>` + one or more aggregates over a join is the dashboard /
 reporting query — "count (or sum / …) the related rows per parent":
@@ -1707,11 +1714,13 @@ group key + each aggregate's out-name + source column) and
 group key from the FROM-table schema, types aggregate OIDs per kind: COUNT/SUM →
 int8, AVG → numeric, MIN/MAX → source-column type). **Render-only** — no Op or
 wire-format change, so corpus / partition / 3-replica byte-identity is
-untouched. **V1 caveat:** a trailing `ORDER BY … LIMIT … OFFSET …` is parsed but
-not yet engine-applied for plain group-agg (the group ops carry no sort/limit
-fields) — all groups come back in ascending key order; the render surfaces them
-faithfully. Follow-on: `SP-PG-SQL-GROUP-SORT-LIMIT`. Smoke:
-`scripts/sppgsqlplaingrouprender-smoke.py`.
+untouched. **Update (SP-PG-SQL-GROUP-SORT-LIMIT):** a trailing `ORDER BY …
+LIMIT … OFFSET …` on a plain group-agg is now **engine-applied** — the group
+ops carry an additive, marker-guarded `GroupSort` (sort by a projected
+aggregate or the group key; `LIMIT`/`OFFSET` after the sort; `HAVING` filters
+first), so top-N-per-group analytics works and a no-ORDER-BY frame stays
+byte-identical. Smokes: `scripts/sppgsqlplaingrouprender-smoke.py` (render),
+`scripts/sppgsqlgroupsortlimit-smoke.py` (sort/limit/offset).
 
 #### Django ORM (the other dominant Python ORM) — 2026-06-03
 

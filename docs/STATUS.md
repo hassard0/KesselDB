@@ -194,15 +194,40 @@ no-GROUP-BY shapes, so every existing render path is byte-untouched) +
 `[u32 ngroups][u32 keylen][key][16B i128 × n_aggs]…`, types the group key from
 the FROM-table schema, types aggregate OIDs: COUNT/SUM → int8, AVG → numeric,
 MIN/MAX → source-column type). **Render-only — NO Op or wire-format change**, so
-corpus / partition / 3-replica byte-identity is untouched. V1 caveat: a trailing
-`ORDER BY … LIMIT … OFFSET …` on a plain GROUP BY is parsed but not yet
-engine-applied (the group ops carry no sort/limit fields) — the engine emits all
-groups in ascending key order and the render surfaces them faithfully; sort/limit
-pushdown is the follow-on SP-PG-SQL-GROUP-SORT-LIMIT. vulcan psql smoke
+corpus / partition / 3-replica byte-identity is untouched. V1 caveat (NOW
+RESOLVED by SP-PG-SQL-GROUP-SORT-LIMIT, below): a trailing `ORDER BY … LIMIT …
+OFFSET …` on a plain GROUP BY was parsed but not yet engine-applied — it is now
+sorted + windowed by the engine. vulcan psql smoke
 (`scripts/sppgsqlplaingrouprender-smoke.py`): the headline
 `SELECT category, COUNT(*) FROM products GROUP BY category` ERRORED on pre-fix
 origin/main and renders **{books:3, gadgets:1, toys:2}** post-fix; multi-agg
 (COUNT/SUM/AVG/MIN/MAX) + HAVING also PASS.
+SP-PG-SQL-GROUP-SORT-LIMIT (2026-06-03, +3 KATs, DONE) — `ORDER BY` / `LIMIT` /
+`OFFSET` on a PLAIN (non-JOIN) `GROUP BY` now take effect in the engine (closes
+the caveat above). `Op::GroupAggregate` / `Op::GroupAggregateMulti` gained an
+additive, marker-guarded `sort: Option<GroupSort>` (`GroupSortTarget::{Key,
+Agg(i)}` + `desc` + `limit`/`offset`), mirroring the HAVING marker-guard and the
+JOIN `order_by`/`limit_n`/`offset_n`. The `ORDER BY` target resolves to a
+projected aggregate (alias `ORDER BY n`, position `ORDER BY 2`, or expression
+`ORDER BY COUNT(*)`) or the group key (`ORDER BY g` / `ORDER BY 1`); a shared
+`emit_group_results` helper sorts by the i128 aggregate value (or raw key
+bytes), reverses for `DESC` with an ascending-key tie-break, then applies
+`OFFSET`-then-`LIMIT`, AFTER `HAVING` (filter → sort → offset → limit) on the
+single deterministic apply thread. **Byte-identity:** the sort block is emitted
+ONLY when present (tag-22 forces the range-preds length prefix + a no-HAVING
+anchor only when HAVING/sort is set), so a no-`ORDER BY`/`LIMIT`/`OFFSET` frame
+is BYTE-IDENTICAL to pre-arc; a non-1 sort marker or bad target tag is rejected
+at decode. Every `Op::GroupAggregate{,Multi}` construction site
+(proto/sm/sql/read_pool/sharded_engine/parallel_reads_oracle/bench) updated with
+`sort: None`; corpus / partition / 3-replica byte-identity oracles green. Gateway
+needs NO change — `render_plain_group_aggregate` emits DataRows in engine order.
+vulcan psql smoke (`scripts/sppgsqlgroupsortlimit-smoke.py`): `ORDER BY COUNT(*)
+DESC` → **books(4), gadgets(3), toys(2), misc(1)** (descending count, NOT key
+order — pre-fix returned all 4 in key order); `LIMIT 2` → top 2 only; `LIMIT 2
+OFFSET 1` → the right window; `ORDER BY category ASC` (key sort) + `HAVING +
+ORDER BY SUM(price) DESC + LIMIT` also PASS. V1 scope: single group column +
+single ORDER BY target; ORDER BY over a JOIN group-aggregate is the named
+follow-up SP-PG-SQL-JOIN-AGG-ORDERBY-AGG.
 SP-PG-ORM-REALAPP (2026-06-03, CAPSTONE, +3 KATs, DONE) — the headline
 real-world-readiness test: a realistic THREE-model SQLAlchemy 2.0 BLOG app
 (`User` 1—N `Post` 1—N `Comment`, FKs + `relationship()`, insertmanyvalues

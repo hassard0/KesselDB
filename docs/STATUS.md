@@ -48,6 +48,14 @@ measurement and had drifted from the actual workspace count).
   the DB-assigned id back: SQLAlchemy autoincrement smoke **6/6** on vulcan.
   The sequence counter lives IN THE DIGEST, advanced only on the apply
   thread ⇒ replicated + crash-safe (3-replica byte-identity proven).
+  SP-PG-RETURNING-MULTIROW-STAR (2026-06-03) closes the **zero-config**
+  gap: KesselDB now works with SQLAlchemy's DEFAULT engine config (no
+  `use_insertmanyvalues=False`). The DEFAULT batches a flush into ONE
+  multi-row INSERT RETURNING; the gateway desugars SQLAlchemy's
+  `insertmanyvalues` form to plain multi-row VALUES, surfaces N assigned
+  ids (`OpResult::CreatedMany`), and `RETURNING *` expands to all columns.
+  DEFAULT-config CRUD **5/5** on vulcan — "pip install, point at KesselDB,
+  it just works".
 - **PG COPY.** SP-PG-COPY V1 (text) + SP-PG-COPY-CSV V1 + SP-PG-COPY-BIN
   V1 deliver the wire shape every `pg_dump`/`pgloader`/`pg_bulkload`/
   Airbyte/Fivetran/Stitch binary-bulk-loader hard-requires.
@@ -60,6 +68,28 @@ measurement and had drifted from the actual workspace count).
   production `ClusterClient` does. The long-standing CI flake is GONE.
 
 Latest arc deliveries on top of that baseline (most-recent first):
+SP-PG-RETURNING-MULTIROW-STAR V1 (2026-06-03, +20 KATs, DONE) — closes
+the **zero-config SQLAlchemy** milestone. SQLAlchemy 2.0's DEFAULT
+(`use_insertmanyvalues=True`) BATCHES a multi-object flush into ONE
+statement and expects N rows back; the SP-PG-SERIAL-RETURNING smoke had
+to disable it (`use_insertmanyvalues=False`). (1) **proto** —
+`OpResult::CreatedMany { ids }` (tag 16, additive) carries the per-row
+assigned ids. (2) **SM** — `Op::Txn` (multi-row INSERT compiles to one
+Txn since SP58) threads each inner Create's assigned serial id back as
+`CreatedMany`; fires ONLY when every inner op autoincrement-assigned
+(else byte-identical `Ok`); the counter advances N times on the apply
+thread ⇒ deterministic (3-replica byte-identity green). (3) **kessel-sql**
+— `insert_returning` recognizes `RETURNING *` (star sentinel) and
+accept-skips `RETURNING col AS alias`. (4) **gateway** —
+`render_insert_returning` emits N DataRows (one per assigned id) +
+`INSERT 0 N`; `RETURNING *` expands to all table columns via
+`describe_table`; a new `insertmanyvalues` rewrite desugars SQLAlchemy's
+`INSERT … SELECT … FROM (VALUES …) AS sen(…) ORDER BY sen_counter
+RETURNING …` to plain multi-row VALUES — applied BEFORE the literal-cast
+validator (which would reject the `p0::VARCHAR` projection cast).
+HEADLINE: SQLAlchemy DEFAULT-config CRUD 5/5 on vulcan (port 5544).
+Smoke: `docs/superpowers/sppgreturningmultirowstar-t5-smoke-2026-06-02.txt`.
+
 SP-PG-SERIAL-RETURNING V1 (2026-06-02, +~30 KATs, DONE) — closes the
 two coupled named follow-ups SP-PG-SERIAL (deterministic autoincrement)
 + SP-PG-RETURNING (return server-assigned values) TOGETHER. Real ORM
@@ -85,10 +115,11 @@ accept-skipped (unblocks SQLAlchemy's refresh SELECT). (5) **gateway** —
 `INSERT … RETURNING …` emits RowDescription + DataRow(assigned values) +
 CommandComplete on BOTH simple- and extended-query paths. HEADLINE:
 SQLAlchemy autoincrement model (no explicit id) — `w.id` reads back 1
-and 2 after commit; full CRUD 6/6 on vulcan (port 5543). V1 out-of-scope
-(named): UPDATE/DELETE RETURNING, CREATE SEQUENCE DDL, non-PK SERIAL,
-multi-row RETURNING. Smoke transcript:
-`docs/superpowers/sppgserialreturning-t5-smoke-2026-06-02.txt`.
+and 2 after commit; full CRUD 6/6 on vulcan (port 5543). Follow-up
+multi-row RETURNING + `RETURNING *` now CLOSED by
+SP-PG-RETURNING-MULTIROW-STAR (above). V1 out-of-scope (named):
+UPDATE/DELETE RETURNING, CREATE SEQUENCE DDL, non-PK SERIAL. Smoke
+transcript: `docs/superpowers/sppgserialreturning-t5-smoke-2026-06-02.txt`.
 SP-PG-EXTQ-PARSED-FUNCTIONS V1 (2026-06-02, +5 KATs, regression-lock
 only) — DIAGNOSIS arc. Investigated the named follow-up "scalar-function
 SELECTs (`SELECT version()` / `current_database()` / `current_schema()` /

@@ -71,6 +71,6 @@ follow-up `SP-PG-SQL-PROJ-ALIAS`.
 | `SP-PG-SQL-RETURNING-DML` | UPDATE/DELETE … RETURNING (V1 scopes to INSERT RETURNING). |
 | `SP-PG-SEQUENCE-DDL` | `CREATE SEQUENCE` + `nextval`/`setval` functions. |
 | `SP-PG-SERIAL-NONPK` | a SERIAL column that is NOT the primary key (V1 assigns only the PK/ObjectId). |
-| `SP-PG-RETURNING-MULTIROW` | multi-row INSERT … RETURNING (incl. SQLAlchemy's batched `insertmanyvalues` SELECT-VALUES-ORDER BY shape). |
-| `SP-PG-RETURNING-STAR` | `RETURNING *` (all columns) vs an explicit list. |
+| `SP-PG-RETURNING-MULTIROW` | **CLOSED** by SP-PG-RETURNING-MULTIROW-STAR (2026-06-03) — incl. the SQLAlchemy `insertmanyvalues` form. |
+| `SP-PG-RETURNING-STAR` | **CLOSED** by SP-PG-RETURNING-MULTIROW-STAR (2026-06-03). |
 | `SP-PG-SQL-PROJ-ALIAS` | alias-named RowDescription output for `col AS alias`. |

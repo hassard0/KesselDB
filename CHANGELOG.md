@@ -7,6 +7,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning [Se
 
 ### Added
 
+- **Zero-config SQLAlchemy: multi-row INSERT RETURNING + `RETURNING *`
+  (SP-PG-RETURNING-MULTIROW-STAR V1, 2026-06-03)** — KesselDB now works
+  with SQLAlchemy's OUT-OF-THE-BOX engine config (`create_engine(url)`,
+  no `use_insertmanyvalues=False`). SQLAlchemy 2.0's DEFAULT
+  (`use_insertmanyvalues=True`) batches a multi-object flush into ONE
+  statement and expects N rows back. A multi-row
+  `INSERT … VALUES (…),(…) RETURNING id` now returns **N DataRows** (one
+  assigned id per row, in insertion order), and `RETURNING *` expands to
+  every table column. New additive `OpResult::CreatedMany { ids }` (tag
+  16); the `Op::Txn` apply arm threads each inner serial Create's
+  assigned id back (deterministic — N applications of the proven
+  single-row counter advance; 3-replica byte-identity green). The gateway
+  desugars SQLAlchemy's `insertmanyvalues` form
+  (`INSERT … SELECT … FROM (VALUES …) AS sen(…) ORDER BY sen_counter
+  RETURNING …`) to plain multi-row VALUES before the literal-cast
+  validator. SQLAlchemy DEFAULT-config CRUD 5/5 on vulcan. Closes the
+  named follow-ups `SP-PG-RETURNING-MULTIROW` + `SP-PG-RETURNING-STAR`.
 - **Deterministic autoincrement + `INSERT … RETURNING` (SP-PG-SERIAL-
   RETURNING V1, 2026-06-02)** — closes the two coupled follow-ups
   `SP-PG-SERIAL` + `SP-PG-RETURNING` together. A `BIGSERIAL`/`SERIAL`

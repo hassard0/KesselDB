@@ -1425,7 +1425,7 @@ qualifier validation), `SP-PG-SQL-FROM-ALIAS`, `SP-PG-SQL-ANY-SUBQUERY`,
 `SP-PG-ORM-RELATIONSHIPS` / `SP-PG-ORM-ALEMBIC`. Verified transcript:
 `docs/superpowers/sppgsqlormparse-t5-smoke-2026-06-02.txt`.
 
-#### Autoincrement models (`BIGSERIAL` / `INSERT … RETURNING`) — 2026-06-02
+#### Autoincrement models (`BIGSERIAL` / `INSERT … RETURNING`) — 2026-06-03
 
 Real ORM models overwhelmingly use **autoincrement**: the application
 declares `id = Column(BigInteger, primary_key=True, autoincrement=True)`,
@@ -1452,21 +1452,33 @@ INSERT INTO widgets (name) VALUES ('z') RETURNING id, name;  -- → (3, 'z')
 - **`RETURNING`**: `INSERT … RETURNING col1, col2, …` emits a result row
   with the requested columns (the assigned id and/or client-supplied
   values), on both the Simple- and Extended-Query paths.
+- **Multi-row `RETURNING` + `RETURNING *`** (`SP-PG-RETURNING-MULTIROW-STAR`):
+  a batched `INSERT … VALUES (…),(…),(…) RETURNING id` returns **N
+  DataRows** (one assigned id per row, in insertion order), and
+  `RETURNING *` expands to **every** table column. This closes the
+  SQLAlchemy DEFAULT-config gap (see below).
 
-SQLAlchemy autoincrement model (no explicit id), `w.id` read back after
-`session.commit()` — full CRUD **6/6** on vulcan. Transcript:
+**Zero-config SQLAlchemy (2026-06-03).** KesselDB now works with
+SQLAlchemy's **OUT-OF-THE-BOX** engine config — `create_engine(url)` with
+NO `use_insertmanyvalues=False`. SQLAlchemy 2.0's DEFAULT
+`use_insertmanyvalues=True` BATCHES a flush of multiple pending objects
+into ONE statement (its `insertmanyvalues` form:
+`INSERT … SELECT … FROM (VALUES …) AS sen(…) ORDER BY sen_counter
+RETURNING …`) and expects N rows back. The gateway desugars that form to
+the plain multi-row `INSERT … VALUES (…),(…) RETURNING …` the engine
+handles, so a batched `session.add_all([a,b,c]); session.commit()` reads
+back every DB-assigned id. SQLAlchemy DEFAULT-config CRUD: **5/5** on
+vulcan. Transcript:
+`docs/superpowers/sppgreturningmultirowstar-t5-smoke-2026-06-02.txt`.
+
+The single-row autoincrement path (`SP-PG-SERIAL-RETURNING`) is **6/6** on
+vulcan. Transcript:
 `docs/superpowers/sppgserialreturning-t5-smoke-2026-06-02.txt`.
-
-> Tip: SQLAlchemy 2.0's batched `insertmanyvalues` optimization emits a
-> multi-row `INSERT … SELECT (VALUES …) ORDER BY … RETURNING` shape that
-> is out of V1 scope (named `SP-PG-RETURNING-MULTIROW`). Pass
-> `create_engine(url, use_insertmanyvalues=False)` to get the classic
-> per-row `INSERT … VALUES (…) RETURNING id` (the dominant shape).
 
 **V1 out-of-scope** (named follow-ups): `SP-PG-SQL-RETURNING-DML`
 (UPDATE/DELETE RETURNING), `SP-PG-SEQUENCE-DDL` (`CREATE SEQUENCE` /
 `nextval`/`setval`), `SP-PG-SERIAL-NONPK` (a SERIAL column that is not
-the PK), `SP-PG-RETURNING-MULTIROW`, `SP-PG-RETURNING-STAR`.
+the PK), `SP-PG-RETURNING-EXPR` (`RETURNING id + 1` / expressions).
 
 ### Supported GUI / admin tools
 

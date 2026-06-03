@@ -1,0 +1,79 @@
+SP-PG-RETURNING-MULTIROW-STAR — T5 vulcan SQLAlchemy DEFAULT-config smoke
+=========================================================================
+
+Date:    2026-06-02
+Host:    vulcan (admin@192.168.4.178)
+Binary:  /tmp/kdb-t-mret/release/kesseldb (CARGO_TARGET_DIR=/tmp/kdb-t-mret)
+Server:  KESSELDB_TOKEN=admin KESSELDB_PG_ADDR=127.0.0.1:5544  (pg=5544, native=6544)
+Script:  scripts/sppgreturningmultirow-smoke.py  (SQLAlchemy 2.0.45 + psycopg2)
+HEAD:    dc3d256
+
+THE HEADLINE: KesselDB works with SQLAlchemy's OUT-OF-THE-BOX engine
+config. The engine is created with NO use_insertmanyvalues override —
+
+    engine = create_engine("postgresql+psycopg2://test:admin@127.0.0.1:5544/kesseldb")
+
+so SQLAlchemy 2.0's DEFAULT use_insertmanyvalues=True BATCHES a flush of
+multiple pending ORM objects into ONE statement and expects N DataRows
+(one assigned id per row, in insertion order) back.
+
+Model — NO explicit id (real-world autoincrement default):
+
+    class Widget(Base):
+        __tablename__ = "widgets"
+        id = Column(BigInteger, primary_key=True, autoincrement=True)
+        name = Column(String(32))
+
+------------------------------- STDOUT -------------------------------
+
+# SQLAlchemy 2.0.45 -> postgresql+psycopg2://127.0.0.1:5544/kesseldb  (DEFAULT config, no use_insertmanyvalues override)
+STAGE connect: PASS engine.connect() + probe OK
+STAGE create_all_ddl: PASS CREATE TABLE widgets via ORM metadata (BIGSERIAL PK)
+STAGE batched_multirow_insert_returning_id: PASS add_all([a,b,c]) batched -> assigned ids [1, 2, 3] (all read back via multi-row RETURNING)
+STAGE select_all_after_batch: PASS select(Widget) -> [(1, 'a'), (2, 'b'), (3, 'c')]
+STAGE explicit_multirow_returning_star: PASS RETURNING * -> [(4, 'x'), (5, 'y')] (all columns, 2 rows)
+
+=== SQLALCHEMY DEFAULT-CONFIG MULTIROW SMOKE SUMMARY ===
+  PASS  connect
+  PASS  create_all_ddl
+  PASS  batched_multirow_insert_returning_id
+  PASS  select_all_after_batch
+  PASS  explicit_multirow_returning_star
+--- 5/5 stages PASS ---
+MULTIROW SMOKE COMPLETE
+
+--------------------- the actual wire shape ---------------------
+
+SQLAlchemy's batched flush did NOT emit a plain multi-row VALUES INSERT.
+It emitted its insertmanyvalues form (captured on the wire via the simple
+Query protocol, literals inlined by psycopg2):
+
+  INSERT INTO widgets (name)
+  SELECT p0::VARCHAR
+  FROM (VALUES ('a', 0), ('b', 1), ('c', 2)) AS imp_sen(p0, sen_counter)
+  ORDER BY sen_counter
+  RETURNING widgets.id, widgets.id AS id__1
+
+The gateway's `insertmanyvalues::rewrite_insertmanyvalues` desugars this —
+BEFORE the literal-cast validator (which would reject the `p0::VARCHAR`
+projection cast) — into the plain multi-row form the engine already
+handles:
+
+  INSERT INTO widgets (name) VALUES ('a'), ('b'), ('c')
+  RETURNING widgets.id, widgets.id AS id__1
+
+The multi-row INSERT compiles to one Op::Txn of 3 serial Creates; the SM
+assigns ids 1/2/3 deterministically on the apply thread and surfaces them
+as OpResult::CreatedMany { ids: [1,2,3] }; the gateway emits 3 DataRows +
+CommandComplete "INSERT 0 3". SQLAlchemy threads each id back onto its
+flushed object.
+
+--------------------- raw psycopg2 RETURNING proof --------------------
+
+  INSERT INTO widgets (name) VALUES ('p'),('q') RETURNING id  -> [(3,), (4,)]   (multi-row RETURNING id)
+  INSERT INTO widgets (name) VALUES ('x'),('y') RETURNING *   -> [(1,'x'),(2,'y')] (RETURNING * = all columns, N rows)
+
+HEADLINE: SQLAlchemy with its DEFAULT engine config (no
+use_insertmanyvalues=False) does full autoincrement CRUD against KesselDB
+— a batched add_all reads back every DB-assigned id. The "pip install,
+point at KesselDB, it just works" milestone.

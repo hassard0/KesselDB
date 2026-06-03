@@ -124,49 +124,12 @@ pub fn dispatch_query_with_params<E: EngineApply + ?Sized>(
     };
     match result {
         OpResult::Got(row_bytes) => {
-            let table_name = match select_table {
-                Some(n) => n,
-                None => {
-                    return error_response_then_rfq(
-                        SEVERITY_ERROR,
-                        "0A000",
-                        "V1 PG-wire only renders `SELECT * FROM <table>`",
-                    );
-                }
-            };
-            let cols = match engine.describe_table(&table_name) {
-                Some(c) => c,
-                None => {
-                    return error_response_then_rfq(
-                        SEVERITY_ERROR,
-                        "42P01",
-                        &format!("unknown table \"{table_name}\""),
-                    );
-                }
-            };
-            let fields: Vec<FieldMeta> = cols
-                .iter()
-                .map(|c| FieldMeta {
-                    name: c.name.clone(),
-                    type_oid: field_kind_to_oid(c.kind),
-                })
-                .collect();
-            out.extend_from_slice(&encode_row_description(&fields));
-            let row_count = match emit_data_rows(&row_bytes, &cols, &mut out) {
-                Ok(n) => n,
-                Err(msg) => {
-                    out.extend_from_slice(&encode_error_response(
-                        SEVERITY_ERROR,
-                        "XX000",
-                        &format!("row decode failed: {msg}"),
-                    ));
-                    out.extend_from_slice(&encode_ready_for_query(b'I'));
-                    return out;
-                }
-            };
-            out.extend_from_slice(&encode_command_complete(&select_tag(row_count)));
-            out.extend_from_slice(&encode_ready_for_query(b'I'));
-            out
+            // SP-PG-SQL-ORM-PARSE T3 — render an explicit projection list
+            // (`SELECT c1, c2 FROM t`, incl. qualified `t.c1`) as well as
+            // the whole-row `SELECT *` shape. `render_select_got`
+            // dispatches on `select_columns` (projection) vs
+            // `select_star_table` (whole row).
+            render_select_got(&row_bytes, sql_trimmed, select_table.clone(), engine)
         }
         OpResult::Ok | OpResult::TypeCreated(_) | OpResult::TxCommitted { .. } => {
             let count = if leading_keyword_is(sql_trimmed, "INSERT") {
@@ -298,67 +261,13 @@ pub fn dispatch_query<E: EngineApply + ?Sized>(sql: &str, engine: &E) -> Vec<u8>
             // SELECT path — emit RowDescription + DataRow* +
             // CommandComplete("SELECT N") + ReadyForQuery.
             //
-            // We can ONLY render this when:
-            //  (a) the SQL parsed as a `SELECT * FROM <table>` per
-            //      `select_star_table`, AND
-            //  (b) `describe_table(<table>)` returns a schema.
-            //
-            // If either fails, V1 emits an ErrorResponse — we have
-            // bytes we can't render. (Spec §11 weak-spot — V2 ships
-            // PG-wire-side projection rendering.)
-            let table_name = match select_table {
-                Some(n) => n,
-                None => {
-                    return error_response_then_rfq(
-                        SEVERITY_ERROR,
-                        "0A000",
-                        "V1 PG-wire only renders `SELECT * FROM <table>`",
-                    );
-                }
-            };
-            let cols = match engine.describe_table(&table_name) {
-                Some(c) => c,
-                None => {
-                    return error_response_then_rfq(
-                        SEVERITY_ERROR,
-                        "42P01",
-                        &format!("unknown table \"{table_name}\""),
-                    );
-                }
-            };
-            // Build FieldMeta list for RowDescription.
-            let fields: Vec<FieldMeta> = cols
-                .iter()
-                .map(|c| FieldMeta {
-                    name: c.name.clone(),
-                    type_oid: field_kind_to_oid(c.kind),
-                })
-                .collect();
-            out.extend_from_slice(&encode_row_description(&fields));
-            // Decode row stream `[u32 LE len][record]*` and emit
-            // one DataRow per record.
-            let row_count = match emit_data_rows(&row_bytes, &cols, &mut out) {
-                Ok(n) => n,
-                Err(msg) => {
-                    // Partial output was buffered, but the byte
-                    // stream is well-framed per individual encoder
-                    // — we can't take it back, so the only sane
-                    // recovery is to emit an ErrorResponse + RFQ
-                    // and let the client discard the RowDescription
-                    // + any DataRows already buffered. (PG itself
-                    // sometimes does this; libpq handles it.)
-                    out.extend_from_slice(&encode_error_response(
-                        SEVERITY_ERROR,
-                        "XX000",
-                        &format!("row decode failed: {msg}"),
-                    ));
-                    out.extend_from_slice(&encode_ready_for_query(b'I'));
-                    return out;
-                }
-            };
-            out.extend_from_slice(&encode_command_complete(&select_tag(row_count)));
-            out.extend_from_slice(&encode_ready_for_query(b'I'));
-            out
+            // SP-PG-SQL-ORM-PARSE T3 — `render_select_got` handles BOTH
+            // the whole-row `SELECT * FROM t` shape (via
+            // `select_star_table` + the full-record `emit_data_rows`) AND
+            // an explicit projection list `SELECT c1, c2 FROM t` (incl.
+            // qualified `t.c1`, via `select_columns` + `emit_projected_
+            // rows`). Closes the V1 `SELECT *`-only render weak-spot.
+            render_select_got(&row_bytes, sql_trimmed, select_table.clone(), engine)
         }
         OpResult::Ok | OpResult::TypeCreated(_) | OpResult::TxCommitted { .. } => {
             // Non-SELECT success. T9: pick the CommandComplete tag
@@ -428,6 +337,125 @@ pub fn dispatch_query<E: EngineApply + ?Sized>(sql: &str, engine: &E) -> Vec<u8>
             out
         }
     }
+}
+
+/// SP-PG-SQL-ORM-PARSE T3 — render an `OpResult::Got` SELECT result to
+/// the wire, handling BOTH supported shapes:
+///
+///   1. **Explicit projection list** `SELECT c1, c2 FROM t` (incl.
+///      qualified `t.c1` — `kessel_sql::select_columns` strips the
+///      qualifier). The engine's `Op::SelectFields` emitted the
+///      projected columns as concatenated raw fixed-width bytes; we
+///      build a RowDescription for JUST the projected columns (in
+///      projection order) and decode via `emit_projected_rows`.
+///   2. **Whole-row** `SELECT * FROM t` (`select_star_table`). The
+///      engine emitted full on-disk records; we describe the whole
+///      table and decode via `emit_data_rows`.
+///
+/// Projection (shape 1) is checked FIRST because it's the more specific
+/// match (`select_columns` returns `None` for `SELECT *`). Returns the
+/// full backend byte sequence ending in `ReadyForQuery('I')`.
+fn render_select_got<E: EngineApply + ?Sized>(
+    row_bytes: &[u8],
+    sql_trimmed: &str,
+    select_table: Option<String>,
+    engine: &E,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    // Shape 1 — explicit projection list.
+    if let Some((table_name, proj_names)) =
+        kessel_sql::select_columns(sql_trimmed)
+    {
+        let table_cols = match engine.describe_table(&table_name) {
+            Some(c) => c,
+            None => {
+                return error_response_then_rfq(
+                    SEVERITY_ERROR,
+                    "42P01",
+                    &format!("unknown table \"{table_name}\""),
+                );
+            }
+        };
+        let proj_cols = match resolve_projection(&proj_names, &table_cols) {
+            Some(c) => c,
+            None => {
+                // A projected name isn't a column of the table.
+                return error_response_then_rfq(
+                    SEVERITY_ERROR,
+                    "42703",
+                    &format!(
+                        "column does not exist in \"{table_name}\" \
+                         (projection {proj_names:?})"
+                    ),
+                );
+            }
+        };
+        let fields: Vec<FieldMeta> = proj_cols
+            .iter()
+            .map(|c| FieldMeta {
+                name: c.name.clone(),
+                type_oid: field_kind_to_oid(c.kind),
+            })
+            .collect();
+        out.extend_from_slice(&encode_row_description(&fields));
+        let row_count = match emit_projected_rows(row_bytes, &proj_cols, &mut out)
+        {
+            Ok(n) => n,
+            Err(msg) => {
+                return error_response_then_rfq(
+                    SEVERITY_ERROR,
+                    "XX000",
+                    &format!("projected row decode failed: {msg}"),
+                );
+            }
+        };
+        out.extend_from_slice(&encode_command_complete(&select_tag(row_count)));
+        out.extend_from_slice(&encode_ready_for_query(b'I'));
+        return out;
+    }
+    // Shape 2 — whole-row `SELECT *`.
+    let table_name = match select_table {
+        Some(n) => n,
+        None => {
+            return error_response_then_rfq(
+                SEVERITY_ERROR,
+                "0A000",
+                "V1 PG-wire only renders `SELECT * FROM <table>` or an \
+                 explicit projection list `SELECT c1, c2 FROM <table>`",
+            );
+        }
+    };
+    let cols = match engine.describe_table(&table_name) {
+        Some(c) => c,
+        None => {
+            return error_response_then_rfq(
+                SEVERITY_ERROR,
+                "42P01",
+                &format!("unknown table \"{table_name}\""),
+            );
+        }
+    };
+    let fields: Vec<FieldMeta> = cols
+        .iter()
+        .map(|c| FieldMeta {
+            name: c.name.clone(),
+            type_oid: field_kind_to_oid(c.kind),
+        })
+        .collect();
+    out.extend_from_slice(&encode_row_description(&fields));
+    let row_count = match emit_data_rows(row_bytes, &cols, &mut out) {
+        Ok(n) => n,
+        Err(msg) => {
+            return error_response_then_rfq(
+                SEVERITY_ERROR,
+                "XX000",
+                &format!("row decode failed: {msg}"),
+            );
+        }
+    };
+    out.extend_from_slice(&encode_command_complete(&select_tag(row_count)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
 }
 
 /// Helper: build `ErrorResponse + ReadyForQuery('I')` into a fresh
@@ -527,6 +555,90 @@ fn emit_data_rows(
         }
         None => Err("malformed bare record".to_string()),
     }
+}
+
+/// SP-PG-SQL-ORM-PARSE T3 — decode the row stream produced by
+/// `Op::SelectFields` (an explicit projection list `SELECT c1, c2 FROM t`)
+/// and emit one `DataRow` per record into `out`. Returns the row count.
+///
+/// The projected row stream is `[u32 LE len][projected field bytes]*`
+/// where the projected bytes are the selected columns' RAW fixed-width
+/// values **concatenated in projection order** — NO record header, NO
+/// schema version, NO null-bitmap (a DIFFERENT shape from the full-record
+/// `emit_data_rows` path, which decodes the on-disk record layout with
+/// its 14-byte header + null bitmap). `proj_cols` is the projected
+/// schema in projection order (each entry carries the column's
+/// `FieldKind` so we know its fixed width + how to render it).
+///
+/// Because the engine emits raw padded fixed-width bytes with no null
+/// bitmap, a NULL projected cell is indistinguishable from its
+/// zero/empty value at this layer — V1 renders the decoded value (CHAR
+/// trailing-NUL-stripped, numerics decoded). True projected-NULL
+/// fidelity is the named follow-up `SP-PG-SQL-PROJ-NULL` (needs the
+/// projection Op to carry a per-row null mask).
+fn emit_projected_rows(
+    row_bytes: &[u8],
+    proj_cols: &[PgColumn],
+    out: &mut Vec<u8>,
+) -> Result<u64, String> {
+    let row_width: usize =
+        proj_cols.iter().map(|c| c.kind.width() as usize).sum();
+    let mut p = 0usize;
+    let mut n = 0u64;
+    while p + 4 <= row_bytes.len() {
+        let len =
+            u32::from_le_bytes(row_bytes[p..p + 4].try_into().unwrap()) as usize;
+        p += 4;
+        if p + len > row_bytes.len() {
+            return Err("projected row stream truncated".to_string());
+        }
+        let rec = &row_bytes[p..p + len];
+        p += len;
+        if len != row_width {
+            return Err(format!(
+                "projected row width {len} != expected {row_width}"
+            ));
+        }
+        let mut cells: Vec<Option<Vec<u8>>> = Vec::with_capacity(proj_cols.len());
+        let mut off = 0usize;
+        for c in proj_cols {
+            let w = c.kind.width() as usize;
+            let raw = match rec.get(off..off + w) {
+                Some(b) => b,
+                None => return Err("projected field out of range".to_string()),
+            };
+            off += w;
+            let v = value_from_raw(c.kind, raw);
+            cells.push(Some(render_pg_text(&v, c.kind)));
+        }
+        let cols_borrow: Vec<Option<&[u8]>> =
+            cells.iter().map(|c| c.as_deref()).collect();
+        out.extend_from_slice(&encode_data_row(&cols_borrow));
+        n += 1;
+    }
+    if p != row_bytes.len() {
+        return Err("trailing bytes after projected rows".to_string());
+    }
+    Ok(n)
+}
+
+/// SP-PG-SQL-ORM-PARSE T3 — resolve a projection list (`select_columns`
+/// output: bare column names in projection order) against a table's
+/// full schema (from `describe_table`), returning the projected
+/// `PgColumn`s in projection order. `None` if any projected name is not
+/// a column of the table (the caller then surfaces a clean
+/// `undefined_column` error). Column matching is case-sensitive to
+/// mirror the engine's `ot.fields` name match.
+fn resolve_projection(
+    proj_names: &[String],
+    table_cols: &[PgColumn],
+) -> Option<Vec<PgColumn>> {
+    let mut out = Vec::with_capacity(proj_names.len());
+    for name in proj_names {
+        let c = table_cols.iter().find(|c| &c.name == name)?;
+        out.push(c.clone());
+    }
+    Some(out)
 }
 
 /// Layout for one record per `cols`. Mirrors kessel-codec's record

@@ -778,6 +778,141 @@ pub struct JoinProjCol {
     pub column: String,
 }
 
+/// SP-PG-SQL-JOIN-ALIAS — a table reference in a FROM/JOIN clause: its real
+/// table name plus the optional alias it was introduced under (`users u`,
+/// `users AS u`). Used to build the alias→table map that resolves a
+/// `<alias>.<col>` qualifier back to the full `<table>.<col>` the engine's
+/// combined `KTR1` schema (and the catalog) names columns by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JoinTableRef {
+    table: String,
+    alias: Option<String>,
+}
+
+/// SP-PG-SQL-JOIN-ALIAS — resolve a column qualifier (a table name OR an alias
+/// introduced in the FROM/JOIN clause) to the FULL table name. A bare full
+/// table name resolves to itself (back-compat); an alias resolves to its table.
+/// An ambiguous match (the qualifier equals an alias AND a different table's
+/// name) or no match is a clean `Err`, never a silent mis-resolution.
+///
+/// Resolution order is unambiguous by construction because duplicate aliases /
+/// alias-shadows-table collisions are rejected when the map is built
+/// (`build_alias_map`). So at lookup time at most one entry can match either as
+/// a full table name or as an alias.
+fn resolve_join_qualifier(refs: &[JoinTableRef], qual: &str) -> Result<String, SqlError> {
+    // A full table name wins (back-compat: `users.id` keeps resolving even if
+    // some OTHER table was aliased). Exact, case-sensitive (catalog names are).
+    if refs.iter().any(|r| r.table == qual) {
+        return Ok(qual.to_string());
+    }
+    // Otherwise it must be an alias of exactly one table.
+    let mut hit: Option<&str> = None;
+    for r in refs {
+        if r.alias.as_deref() == Some(qual) {
+            if hit.is_some() {
+                // Should be unreachable (build_alias_map rejects dup aliases),
+                // but guard against a silent mis-resolution regardless.
+                return Err(format!(
+                    "join qualifier `{qual}` is ambiguous (matches multiple aliases)"
+                ));
+            }
+            hit = Some(&r.table);
+        }
+    }
+    match hit {
+        Some(t) => Ok(t.to_string()),
+        None => {
+            let known: Vec<String> = refs
+                .iter()
+                .map(|r| match &r.alias {
+                    Some(a) => format!("{} (alias {a})", r.table),
+                    None => r.table.clone(),
+                })
+                .collect();
+            Err(format!(
+                "qualifier `{qual}` does not name any table or alias in the \
+                 FROM/JOIN clause {known:?}"
+            ))
+        }
+    }
+}
+
+/// SP-PG-SQL-JOIN-ALIAS — validate a freshly-collected list of join table refs:
+/// reject a duplicate/ambiguous alias and an alias that shadows a DIFFERENT
+/// table's real name (both would let a qualifier resolve two ways). A table
+/// joined more than once under DISTINCT aliases (self-join) would also produce
+/// duplicate `<table>.<col>` names in the combined `KTR1` schema, so it is a
+/// named follow-up (rejected here, not silently mis-resolved).
+fn validate_join_refs(refs: &[JoinTableRef]) -> Result<(), SqlError> {
+    for (i, r) in refs.iter().enumerate() {
+        // Self-join (same table appears twice) — named follow-up.
+        if refs[..i].iter().any(|p| p.table == r.table) {
+            return Err(format!(
+                "table `{}` is joined more than once — self-joins with aliases \
+                 are a named follow-up (the combined schema would have duplicate \
+                 `{}.<col>` names)",
+                r.table, r.table
+            ));
+        }
+        if let Some(a) = &r.alias {
+            // Duplicate alias.
+            if refs[..i].iter().any(|p| p.alias.as_deref() == Some(a)) {
+                return Err(format!("duplicate table alias `{a}` in FROM/JOIN clause"));
+            }
+            // Alias shadows a different table's real name.
+            if refs.iter().any(|p| &p.table == a && p.table != r.table) {
+                return Err(format!(
+                    "table alias `{a}` shadows another table's name in the \
+                     FROM/JOIN clause"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// SP-PG-SQL-JOIN-ALIAS — consume an optional `[AS] <alias>` after a table name
+/// using the shared `P` parser. Returns the alias if present. `AS` is optional
+/// (PG/SQL-92: `users u` and `users AS u` are equivalent). A following keyword
+/// that begins the next clause (`ON`, `JOIN`, `INNER`/`LEFT`/`RIGHT`/`FULL`,
+/// `WHERE`, `GROUP`, `ORDER`, `LIMIT`, `OFFSET`, `ON`) is NOT an alias.
+fn parse_optional_alias(p: &mut P) -> Result<Option<String>, SqlError> {
+    if p.kw("AS") {
+        // Explicit `AS` — an alias ident MUST follow.
+        return Ok(Some(p.ident()?));
+    }
+    // Implicit alias: a bare ident that is not a clause-starting keyword.
+    if let Some(Tok::Ident(s)) = p.peek() {
+        if !is_join_clause_keyword(s) {
+            let a = p.ident()?;
+            return Ok(Some(a));
+        }
+    }
+    Ok(None)
+}
+
+/// SP-PG-SQL-JOIN-ALIAS — keywords that can follow a table name in a JOIN query
+/// and therefore are NOT an implicit table alias.
+fn is_join_clause_keyword(s: &str) -> bool {
+    matches!(
+        s.to_ascii_uppercase().as_str(),
+        "ON" | "JOIN"
+            | "INNER"
+            | "LEFT"
+            | "RIGHT"
+            | "FULL"
+            | "OUTER"
+            | "CROSS"
+            | "WHERE"
+            | "GROUP"
+            | "ORDER"
+            | "LIMIT"
+            | "OFFSET"
+            | "HAVING"
+            | "UNION"
+    )
+}
+
 /// SP-PG-ORM-RELATIONSHIPS — if `sql` is an inner-equi-`JOIN` SELECT
 /// (`SELECT <proj> FROM a JOIN b ON a.x = b.y [LIMIT n]`), return its
 /// projection: `Some((cols, is_star))`. `is_star` is `true` for `SELECT *`
@@ -850,34 +985,141 @@ pub fn join_projection(sql: &str) -> Option<(Vec<JoinProjCol>, bool)> {
             }
         }
     }
-    // FROM <table> [LEFT [OUTER]] JOIN — the JOIN keyword (optionally preceded
-    // by `LEFT [OUTER]`, SP-PG-SQL-OUTER-JOIN) is what makes this a join shape.
-    match it.next()? {
-        Tok::Ident(_t) => {}
+    // FROM <table> [[AS] <alias>] [LEFT [OUTER]] JOIN <table> [[AS] <alias>] …
+    // — the JOIN keyword (optionally preceded by `LEFT [OUTER]`,
+    // SP-PG-SQL-OUTER-JOIN) is what makes this a join shape. SP-PG-SQL-JOIN-
+    // ALIAS captures each table's optional alias into `refs` so a projection
+    // qualifier spelled with an alias (`u.name`) resolves to the FULL table
+    // name (`users.name`) the combined `KTR1` schema uses.
+    let mut refs: Vec<JoinTableRef> = Vec::new();
+    let first_table = match it.next()? {
+        Tok::Ident(t) => t.clone(),
         _ => return None,
-    }
-    // Optional `LEFT [OUTER]` before `JOIN`. The render is identical for INNER
-    // and LEFT — the combined `KTR1` schema + NULL bitmap carry the difference,
-    // so this helper only needs to detect the join shape, not its flavour.
-    let next = it.next();
-    let after_left = match next {
-        Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("LEFT") => {
-            // skip optional OUTER
-            match it.peek() {
-                Some(Tok::Ident(o)) if o.eq_ignore_ascii_case("OUTER") => {
-                    it.next();
-                }
-                _ => {}
-            }
-            it.next()
-        }
-        other => other,
     };
-    match after_left {
-        Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("JOIN") => {}
-        _ => return None, // single-table — not the JOIN shape
+    let first_alias = next_optional_alias(&mut it)?;
+    refs.push(JoinTableRef { table: first_table, alias: first_alias });
+    // First (mandatory, for a join) JOIN — optionally `LEFT [OUTER]`/`INNER`.
+    if !consume_join_kw(&mut it)? {
+        return None; // single-table — not the JOIN shape
+    }
+    // The right table of the base join + its optional alias.
+    let rtable = match it.next()? {
+        Tok::Ident(t) => t.clone(),
+        _ => return None,
+    };
+    let ralias = next_optional_alias(&mut it)?;
+    refs.push(JoinTableRef { table: rtable, alias: ralias });
+    // SP-PG-SQL-MULTI-JOIN chain: scan the remaining tokens for further
+    // `[INNER] JOIN <table> [[AS] <alias>]` segments so a 3+-table aliased join
+    // contributes every table to the alias map. We only need to capture each
+    // joined table's name + alias here (the ON conditions live downstream and
+    // don't affect the projection-qualifier resolution).
+    loop {
+        // Peek for a JOIN keyword without consuming non-JOIN tokens.
+        let is_join = match it.peek() {
+            Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("JOIN") => {
+                it.next();
+                true
+            }
+            Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("INNER") => {
+                it.next();
+                match it.next() {
+                    Some(Tok::Ident(j)) if j.eq_ignore_ascii_case("JOIN") => true,
+                    _ => return None,
+                }
+            }
+            _ => false,
+        };
+        if !is_join {
+            break;
+        }
+        let ct = match it.next()? {
+            Tok::Ident(t) => t.clone(),
+            _ => return None,
+        };
+        let ca = next_optional_alias(&mut it)?;
+        refs.push(JoinTableRef { table: ct, alias: ca });
+    }
+    // Reject ambiguous / duplicate aliases + self-joins (named follow-up).
+    if validate_join_refs(&refs).is_err() {
+        return None;
+    }
+    // Resolve every projection qualifier (alias OR full table name) to the FULL
+    // table name so it matches the combined `<table>.<col>` `KTR1` schema. A
+    // bare (unqualified) column is left untouched. An unresolvable qualifier ⇒
+    // `None` (the gateway then renders the standard 42703 column error).
+    for c in cols.iter_mut() {
+        if let Some(q) = &c.qualifier {
+            match resolve_join_qualifier(&refs, q) {
+                Ok(full) => c.qualifier = Some(full),
+                Err(_) => return None,
+            }
+        }
     }
     Some((cols, is_star))
+}
+
+/// SP-PG-SQL-JOIN-ALIAS — iterator-based `[AS] <alias>` consumer for the
+/// gateway text helpers (`join_projection`/`join_group_aggregate`), which walk
+/// a raw `Tok` iterator rather than the catalog-bound `P` parser. Mirrors
+/// `parse_optional_alias`: `AS` is optional; a clause-starting keyword is not an
+/// alias.
+fn next_optional_alias<'a, I>(it: &mut std::iter::Peekable<I>) -> Option<Option<String>>
+where
+    I: Iterator<Item = &'a Tok>,
+{
+    // Explicit `AS <ident>`.
+    if matches!(it.peek(), Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("AS")) {
+        it.next();
+        return match it.next() {
+            Some(Tok::Ident(a)) => Some(Some(a.clone())),
+            _ => None, // `AS` with no ident — malformed.
+        };
+    }
+    // Implicit alias: a bare ident that is not a clause keyword.
+    if let Some(Tok::Ident(s)) = it.peek() {
+        if !is_join_clause_keyword(s) {
+            let a = match it.next() {
+                Some(Tok::Ident(a)) => a.clone(),
+                _ => return None,
+            };
+            return Some(Some(a));
+        }
+    }
+    Some(None)
+}
+
+/// SP-PG-SQL-JOIN-ALIAS — consume an optional `LEFT [OUTER]` / `INNER` then a
+/// mandatory `JOIN`, returning `Some(true)` if a JOIN was consumed, `Some(false)`
+/// if the next token is not a join, `None` on a malformed `LEFT …`/`INNER …`.
+fn consume_join_kw<'a, I>(it: &mut std::iter::Peekable<I>) -> Option<bool>
+where
+    I: Iterator<Item = &'a Tok>,
+{
+    match it.peek() {
+        Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("JOIN") => {
+            it.next();
+            Some(true)
+        }
+        Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("INNER") => {
+            it.next();
+            match it.next() {
+                Some(Tok::Ident(j)) if j.eq_ignore_ascii_case("JOIN") => Some(true),
+                _ => None,
+            }
+        }
+        Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("LEFT") => {
+            it.next();
+            if matches!(it.peek(), Some(Tok::Ident(o)) if o.eq_ignore_ascii_case("OUTER")) {
+                it.next();
+            }
+            match it.next() {
+                Some(Tok::Ident(j)) if j.eq_ignore_ascii_case("JOIN") => Some(true),
+                _ => None,
+            }
+        }
+        _ => Some(false),
+    }
 }
 
 /// SP-PG-SQL-JOIN-AGG — one aggregate in a join-group-aggregate projection:
@@ -1012,28 +1254,39 @@ pub fn join_group_aggregate(sql: &str) -> Option<JoinGroupAggProj> {
     if aggregates.is_empty() {
         return None;
     }
-    // `FROM <a> [LEFT [OUTER]] JOIN <b>` — confirm the join shape.
+    // `FROM <a> [[AS] <alias>] [LEFT [OUTER]] JOIN <b> [[AS] <alias>]` — confirm
+    // the join shape AND capture each table's optional alias (SP-PG-SQL-JOIN-
+    // ALIAS) so the GROUP BY qualifier (`u.id`) resolves to the FULL table name
+    // (`users.id`) the gateway's `describe_table` + RowDescription expect.
     match it.next()? {
         Tok::Ident(k) if k.eq_ignore_ascii_case("FROM") => {}
         _ => return None,
     }
-    match it.next()? {
-        Tok::Ident(_) => {} // left table
+    let mut refs: Vec<JoinTableRef> = Vec::new();
+    let lt = match it.next()? {
+        Tok::Ident(t) => t.clone(),
         _ => return None,
-    }
-    let after_left = match it.next() {
-        Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("LEFT") => {
-            if matches!(it.peek(), Some(Tok::Ident(o)) if o.eq_ignore_ascii_case("OUTER")) {
-                it.next();
-            }
-            it.next()
-        }
-        other => other,
     };
-    match after_left {
-        Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("JOIN") => {}
-        _ => return None,
+    let la = next_optional_alias(&mut it)?;
+    refs.push(JoinTableRef { table: lt, alias: la });
+    if !consume_join_kw(&mut it)? {
+        return None;
     }
+    let rt = match it.next()? {
+        Tok::Ident(t) => t.clone(),
+        _ => return None,
+    };
+    let ra = next_optional_alias(&mut it)?;
+    refs.push(JoinTableRef { table: rt, alias: ra });
+    if validate_join_refs(&refs).is_err() {
+        return None;
+    }
+    // Resolve the GROUP BY column's qualifier (alias OR table name) to the FULL
+    // table name. An unresolvable qualifier ⇒ `None` (gateway falls through).
+    let group_qualifier = match resolve_join_qualifier(&refs, &group_qualifier) {
+        Ok(full) => full,
+        Err(_) => return None,
+    };
     // Confirm a GROUP BY appears somewhere downstream (it must, for this to be a
     // group-aggregate; the engine compile requires it). Scan the remaining
     // tokens for a top-level `GROUP BY`.
@@ -3686,6 +3939,27 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
     p.expect_kw("FROM")?;
     let tname = p.ident()?;
     let ot = p.type_named(&tname)?.clone();
+    // SP-PG-SQL-JOIN-ALIAS — the FROM table may carry an optional `[AS] <alias>`
+    // (`FROM users u`, `FROM users AS u`) but ONLY in a JOIN query (a single-
+    // table `SELECT * FROM users u` is a separate shape handled by the paths
+    // below, which this arc leaves byte-identical). So we speculatively consume
+    // an alias here and KEEP it only if a JOIN keyword follows; otherwise we
+    // restore the cursor so the single-table fall-through is unchanged.
+    let left_alias: Option<String> = {
+        let save = p.i;
+        let a = parse_optional_alias(p)?;
+        // A join only if `[LEFT [OUTER]|INNER] JOIN` follows the (optional) alias.
+        let join_follows = matches!(p.peek(), Some(Tok::Ident(k))
+            if k.eq_ignore_ascii_case("JOIN")
+                || k.eq_ignore_ascii_case("LEFT")
+                || k.eq_ignore_ascii_case("INNER"));
+        if join_follows {
+            a
+        } else {
+            p.i = save; // not a join — give the alias token back.
+            None
+        }
+    };
     // Equi-join: `SELECT * FROM a [LEFT [OUTER]] JOIN b ON a.x = b.y
     // [WHERE …] [LIMIT n]`. A bare `JOIN` is INNER (only matching left rows);
     // `LEFT [OUTER] JOIN` (SP-PG-SQL-OUTER-JOIN) emits EVERY left row, with
@@ -3703,6 +3977,19 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
     if let Some(join_type) = join_type {
         let rname = p.ident()?;
         let rt = p.type_named(&rname)?.clone();
+        // SP-PG-SQL-JOIN-ALIAS — the right table's optional `[AS] <alias>`.
+        let right_alias = parse_optional_alias(p)?;
+        // SP-PG-SQL-JOIN-ALIAS — the running alias→table map. Every qualifier in
+        // ON / WHERE / GROUP BY / ORDER BY is resolved THROUGH this so an alias
+        // (`u`) AND a full table name (`users`) both reach the combined
+        // `<table>.<col>` schema. The map grows as the multi-join chain is
+        // parsed. We validate it incrementally (dup alias / self-join) so an
+        // ambiguous spelling errors cleanly rather than mis-resolving.
+        let mut refs: Vec<JoinTableRef> = vec![
+            JoinTableRef { table: tname.clone(), alias: left_alias.clone() },
+            JoinTableRef { table: rname.clone(), alias: right_alias.clone() },
+        ];
+        validate_join_refs(&refs)?;
         p.expect_kw("ON")?;
         let a1 = p.ident()?;
         p.punct('.')?;
@@ -3713,6 +4000,12 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
         let a2 = p.ident()?;
         p.punct('.')?;
         let c2 = p.ident()?;
+        // SP-PG-SQL-JOIN-ALIAS — resolve each ON qualifier (alias OR table name)
+        // to the FULL table name before matching it against the two joined
+        // tables, so `ON u.id = p.user_id` works exactly like the spelled-out
+        // `ON users.id = posts.user_id`.
+        let a1 = resolve_join_qualifier(&refs, &a1)?;
+        let a2 = resolve_join_qualifier(&refs, &a2)?;
         // a1/a2 must name the two tables (either order)
         let (lf_tbl, lf_col, rf_tbl, rf_col) = if a1 == tname && a2 == rname {
             (&ot, c1, &rt, c2)
@@ -3778,11 +4071,18 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
             let cname = p.ident()?;
             if joined.iter().any(|t| t.name == cname) {
                 return Err(format!(
-                    "multi-join: table `{cname}` is already joined (self-joins / \
-                     aliases in a chain are a follow-up)"
+                    "multi-join: table `{cname}` is already joined (self-joins with \
+                     aliases are a named follow-up)"
                 ));
             }
             let ct = p.type_named(&cname)?.clone();
+            // SP-PG-SQL-JOIN-ALIAS — this chained table's optional `[AS] <alias>`.
+            // Register it in `refs` BEFORE its ON clause so the ON qualifiers
+            // (which name the new table + one already-joined table) can be
+            // spelled with aliases.
+            let calias = parse_optional_alias(p)?;
+            refs.push(JoinTableRef { table: cname.clone(), alias: calias });
+            validate_join_refs(&refs)?;
             p.expect_kw("ON")?;
             let q1 = p.ident()?;
             p.punct('.')?;
@@ -3793,6 +4093,10 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
             let q2 = p.ident()?;
             p.punct('.')?;
             let oc2 = p.ident()?;
+            // SP-PG-SQL-JOIN-ALIAS — resolve both ON qualifiers (alias OR table
+            // name) to full table names before the new-vs-already-joined check.
+            let q1 = resolve_join_qualifier(&refs, &q1)?;
+            let q2 = resolve_join_qualifier(&refs, &q2)?;
             // Exactly one side must be the NEW table `cname`; the other an
             // already-joined table.
             let (prev_tbl, prev_col, new_col) = if q2 == cname && q1 != cname {
@@ -3852,12 +4156,13 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
         let filter = if p.kw("WHERE") {
             if has_extra {
                 // SP-PG-SQL-MULTI-JOIN: resolve the WHERE over the full chain's
-                // combined schema (qualifiers may name ANY joined table).
+                // combined schema (qualifiers may name ANY joined table). SP-PG-
+                // SQL-JOIN-ALIAS threads `refs` so an alias qualifier resolves.
                 let names: Vec<&str> = joined.iter().map(|t| t.name.as_str()).collect();
-                compile_join_where_multi(p, &multi_cot, &names)?
+                compile_join_where_multi(p, &multi_cot, &names, &refs)?
             } else {
                 let cot = combined_join_type(&ot, &rt);
-                compile_join_where(p, &cot, &ot.name, &rt.name)?
+                compile_join_where(p, &cot, &ot.name, &rt.name, &refs)?
             }
         } else {
             Vec::new()
@@ -3871,6 +4176,9 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
         // result encoding. Composes with the WHERE filter above.
         let cot_ga = combined_join_type(&ot, &rt);
         let resolve_combined = |qt: &str, qc: &str| -> Result<u16, SqlError> {
+            // SP-PG-SQL-JOIN-ALIAS — resolve an alias/table-name qualifier to the
+            // FULL table name first (GROUP BY / aggregate / HAVING all flow here).
+            let qt = resolve_join_qualifier(&refs, qt)?;
             if qt != ot.name && qt != rt.name {
                 return Err(format!(
                     "qualifier `{qt}` is not one of the joined tables `{}` / `{}`",
@@ -4101,6 +4409,10 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
             let qt = p.ident()?;
             p.punct('.')?;
             let qc = p.ident()?;
+            // SP-PG-SQL-JOIN-ALIAS — resolve an alias/table-name qualifier to the
+            // FULL table name first, so `ORDER BY u.name` works like
+            // `ORDER BY users.name`.
+            let qt = resolve_join_qualifier(&refs, &qt)?;
             // SP-PG-SQL-MULTI-JOIN: resolve ORDER BY over the FULL chain schema
             // when there are extra joins (qualifier may name ANY joined table);
             // for a plain binary join this equals `combined_join_type(&ot,&rt)`.
@@ -4656,9 +4968,10 @@ fn compile_join_where(
     cot: &ObjectType,
     ltbl: &str,
     rtbl: &str,
+    refs: &[JoinTableRef],
 ) -> Result<Vec<u8>, SqlError> {
     // The binary-join case is the 2-table multi case.
-    compile_join_where_multi(p, cot, &[ltbl, rtbl])
+    compile_join_where_multi(p, cot, &[ltbl, rtbl], refs)
 }
 
 /// SP-PG-SQL-MULTI-JOIN: join-WHERE compiler generalized to N joined tables.
@@ -4672,6 +4985,7 @@ fn compile_join_where_multi(
     p: &mut P,
     cot: &ObjectType,
     tables: &[&str],
+    refs: &[JoinTableRef],
 ) -> Result<Vec<u8>, SqlError> {
     // The WHERE region runs from p.i up to a top-level LIMIT (the only clause
     // that can follow a join-WHERE in V1) or end of input. Collect + rewrite.
@@ -4699,6 +5013,9 @@ fn compile_join_where_multi(
                         Some(Tok::Ident(c)) => c,
                         _ => return Err("expected column after `table.`".into()),
                     };
+                    // SP-PG-SQL-JOIN-ALIAS — resolve an alias/table-name qualifier
+                    // to the FULL table name before matching the combined schema.
+                    let name = resolve_join_qualifier(refs, &name)?;
                     if !tables.iter().any(|t| *t == name) {
                         return Err(format!(
                             "join-WHERE qualifier `{name}` is not one of the \
@@ -7617,6 +7934,127 @@ mod tests {
              JOIN comments ON posts.id = comments.post_id GROUP BY users.name",
             &cat,
         ).is_err(), "GROUP BY over a multi-join must error");
+    }
+
+    /// SP-PG-SQL-JOIN-ALIAS: an aliased join (`FROM users u JOIN posts p ON
+    /// u.id = p.user_id`) compiles to the IDENTICAL `Op` as the spelled-out
+    /// full-table-name form — the alias is resolved away in the SQL layer, so
+    /// the wire `Op` is byte-unchanged (no determinism risk) and back-compat is
+    /// proven by Op equality. Covers binary + 3-way + WHERE + ORDER BY + `AS`.
+    #[test]
+    fn alias_join_compiles_identically_to_full_names() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE users (id U64 NOT NULL, name CHAR(16) NOT NULL)");
+        run(&mut sm, 2, "CREATE TABLE posts (id U64 NOT NULL, user_id U64 NOT NULL, title CHAR(16) NOT NULL)");
+        run(&mut sm, 3, "CREATE TABLE comments (id U64 NOT NULL, post_id U64 NOT NULL, body CHAR(16) NOT NULL)");
+        let cat = sm.catalog().clone();
+
+        // 1. Binary join: implicit alias == full names == `AS` alias.
+        let full = compile(
+            "SELECT users.name, posts.title FROM users JOIN posts ON users.id = posts.user_id",
+            &cat,
+        ).unwrap();
+        let aliased = compile(
+            "SELECT u.name, p.title FROM users u JOIN posts p ON u.id = p.user_id",
+            &cat,
+        ).unwrap();
+        let as_form = compile(
+            "SELECT u.name, p.title FROM users AS u JOIN posts AS p ON u.id = p.user_id",
+            &cat,
+        ).unwrap();
+        assert_eq!(full, aliased, "implicit alias must compile identically");
+        assert_eq!(full, as_form, "AS-alias must compile identically");
+
+        // 2. Mixed: alias on one table, full name on the other.
+        let mixed = compile(
+            "SELECT u.name, posts.title FROM users u JOIN posts ON u.id = posts.user_id",
+            &cat,
+        ).unwrap();
+        assert_eq!(full, mixed, "mixed alias/full-name must compile identically");
+
+        // 3. 3-way aliased chain == full-name chain.
+        let full3 = compile(
+            "SELECT users.name, posts.title, comments.body FROM users JOIN posts \
+             ON users.id = posts.user_id JOIN comments ON posts.id = comments.post_id",
+            &cat,
+        ).unwrap();
+        let aliased3 = compile(
+            "SELECT u.name, p.title, c.body FROM users u JOIN posts p \
+             ON u.id = p.user_id JOIN comments c ON p.id = c.post_id",
+            &cat,
+        ).unwrap();
+        assert_eq!(full3, aliased3, "3-way aliased chain must compile identically");
+
+        // 4. Aliased WHERE + ORDER BY == full-name WHERE + ORDER BY.
+        let fullw = compile(
+            "SELECT users.name, posts.title FROM users JOIN posts ON users.id = posts.user_id \
+             WHERE users.id = 1 ORDER BY posts.title",
+            &cat,
+        ).unwrap();
+        let aliasedw = compile(
+            "SELECT u.name, p.title FROM users u JOIN posts p ON u.id = p.user_id \
+             WHERE u.id = 1 ORDER BY p.title",
+            &cat,
+        ).unwrap();
+        assert_eq!(fullw, aliasedw, "aliased WHERE+ORDER BY must compile identically");
+
+        // 5. Errors: unknown qualifier, duplicate alias, alias shadowing a table.
+        assert!(compile(
+            "SELECT x.name FROM users u JOIN posts p ON u.id = p.user_id",
+            &cat,
+        ).is_err(), "unknown qualifier must error, not mis-resolve");
+        assert!(compile(
+            "SELECT u.name FROM users u JOIN posts u ON u.id = u.user_id",
+            &cat,
+        ).is_err(), "duplicate alias must error");
+        assert!(compile(
+            "SELECT users.name FROM users u JOIN posts users ON u.id = users.user_id",
+            &cat,
+        ).is_err(), "alias shadowing another table's name must error");
+    }
+
+    /// SP-PG-SQL-JOIN-ALIAS: the gateway `join_projection` text helper resolves
+    /// alias qualifiers to FULL table names so they match the `KTR1` combined
+    /// schema (`<table>.<col>`). Full-name + `AS` forms resolve too.
+    #[test]
+    fn join_projection_resolves_aliases() {
+        // Implicit alias → full table name in the JoinProjCol qualifier.
+        let (cols, star) = join_projection(
+            "SELECT u.name, p.title FROM users u JOIN posts p ON u.id = p.user_id",
+        ).unwrap();
+        assert!(!star);
+        assert_eq!(cols, vec![
+            JoinProjCol { qualifier: Some("users".into()), column: "name".into() },
+            JoinProjCol { qualifier: Some("posts".into()), column: "title".into() },
+        ]);
+        // AS form resolves the same.
+        let (cols2, _) = join_projection(
+            "SELECT u.name, p.title FROM users AS u JOIN posts AS p ON u.id = p.user_id",
+        ).unwrap();
+        assert_eq!(cols, cols2);
+        // 3-way aliased chain.
+        let (cols3, _) = join_projection(
+            "SELECT u.name, p.title, c.body FROM users u JOIN posts p ON u.id = p.user_id \
+             JOIN comments c ON p.id = c.post_id",
+        ).unwrap();
+        assert_eq!(cols3, vec![
+            JoinProjCol { qualifier: Some("users".into()), column: "name".into() },
+            JoinProjCol { qualifier: Some("posts".into()), column: "title".into() },
+            JoinProjCol { qualifier: Some("comments".into()), column: "body".into() },
+        ]);
+        // Full table names still resolve to themselves (back-compat).
+        let (colsf, _) = join_projection(
+            "SELECT users.name, posts.title FROM users JOIN posts ON users.id = posts.user_id",
+        ).unwrap();
+        assert_eq!(colsf, vec![
+            JoinProjCol { qualifier: Some("users".into()), column: "name".into() },
+            JoinProjCol { qualifier: Some("posts".into()), column: "title".into() },
+        ]);
+        // SELECT * stays a star projection.
+        let (_c, star2) = join_projection(
+            "SELECT * FROM users u JOIN posts p ON u.id = p.user_id",
+        ).unwrap();
+        assert!(star2);
     }
 
     #[test]

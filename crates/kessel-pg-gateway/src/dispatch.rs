@@ -2436,12 +2436,17 @@ mod tests {
             "INSERT INTO widgets (name) VALUES ('x')",
             &eng,
         );
-        // No RowDescription / DataRow; just CommandComplete + RFQ.
-        assert!(!bytes.iter().any(|&b| b == b'T'), "no RowDescription for plain INSERT");
-        assert!(!bytes.iter().any(|&b| b == b'D'), "no DataRow for plain INSERT");
+        // Just CommandComplete + RFQ — the bare path. Structurally: the
+        // first backend message byte is 'C' (CommandComplete), NOT 'T'
+        // (RowDescription); and there is no 'D' (DataRow) message header.
+        // We check the FIRST message tag rather than scanning every byte
+        // (length prefixes can incidentally equal ASCII 'T'/'D').
+        assert_eq!(bytes[0], b'C', "plain INSERT starts with CommandComplete");
         assert!(
             bytes.windows(b"INSERT 0 1\0".len()).any(|w| w == b"INSERT 0 1\0"),
             "expected CommandComplete INSERT 0 1"
         );
+        // The bare reply is small (CommandComplete + ReadyForQuery only).
+        assert!(bytes.len() < 32, "bare reply should be small, got {}", bytes.len());
     }
 }

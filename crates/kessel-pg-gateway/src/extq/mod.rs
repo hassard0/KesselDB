@@ -3526,6 +3526,30 @@ mod tests {
         }
     }
 
+    /// Walk a concatenated backend-message byte stream and return the
+    /// ordered list of message tags, respecting each message's 4-byte
+    /// big-endian length prefix. Counting raw tag bytes is unreliable
+    /// because payloads (e.g. the version string "KesselDB 1.0" carries
+    /// a literal 'D' byte) can collide with frame tags; this walker
+    /// only inspects true frame boundaries.
+    fn backend_frame_tags(bytes: &[u8]) -> Vec<u8> {
+        let mut tags = Vec::new();
+        let mut i = 0usize;
+        while i + 5 <= bytes.len() {
+            let tag = bytes[i];
+            let len = u32::from_be_bytes([
+                bytes[i + 1],
+                bytes[i + 2],
+                bytes[i + 3],
+                bytes[i + 4],
+            ]) as usize;
+            tags.push(tag);
+            // length covers the 4 length bytes + payload (not the tag).
+            i += 1 + len;
+        }
+        tags
+    }
+
     /// Drive a scalar-function SQL through the full Parse → Bind →
     /// Execute Extended Query flow against `PanicOnApplyEngine` and
     /// return the Execute output bytes. Panics (via the engine) if the
@@ -3565,13 +3589,13 @@ mod tests {
     #[test]
     fn sppgextqparsedfunctions_execute_select_version_via_hook_no_engine_call() {
         let bytes = scalar_fn_parse_bind_execute("SELECT version()");
-        // Tag order T (RowDescription), D (DataRow), C (CommandComplete);
-        // NO Z (Sync emits RFQ).
-        assert_eq!(bytes[0], b'T', "first byte should be RowDescription");
-        assert!(!bytes.contains(&b'Z'),
-            "Execute output must NOT contain RFQ — Sync emits it");
-        assert_eq!(bytes.iter().filter(|&&b| b == b'D').count(), 1,
-            "should emit exactly one DataRow");
+        // Frame-tag order: T (RowDescription), D (DataRow),
+        // C (CommandComplete); NO Z (Sync emits RFQ).
+        let tags = backend_frame_tags(&bytes);
+        assert_eq!(tags, vec![b'T', b'D', b'C'],
+            "scalar version() Execute must emit exactly T, D, C frames");
+        assert!(!tags.contains(&b'Z'),
+            "Execute output must NOT contain an RFQ frame — Sync emits it");
         // RowDescription carries the column name "version".
         assert!(bytes.windows(b"version\0".len()).any(|w| w == b"version\0"),
             "RowDescription must name the column 'version'");
@@ -3589,8 +3613,7 @@ mod tests {
     #[test]
     fn sppgextqparsedfunctions_execute_current_database_via_hook_no_engine_call() {
         let bytes = scalar_fn_parse_bind_execute("SELECT current_database()");
-        assert_eq!(bytes[0], b'T');
-        assert_eq!(bytes.iter().filter(|&&b| b == b'D').count(), 1);
+        assert_eq!(backend_frame_tags(&bytes), vec![b'T', b'D', b'C']);
         assert!(bytes.windows(b"current_database\0".len())
             .any(|w| w == b"current_database\0"),
             "RowDescription must name the column 'current_database'");
@@ -3605,8 +3628,7 @@ mod tests {
     #[test]
     fn sppgextqparsedfunctions_execute_current_schema_via_hook_no_engine_call() {
         let bytes = scalar_fn_parse_bind_execute("SELECT current_schema()");
-        assert_eq!(bytes[0], b'T');
-        assert_eq!(bytes.iter().filter(|&&b| b == b'D').count(), 1);
+        assert_eq!(backend_frame_tags(&bytes), vec![b'T', b'D', b'C']);
         assert!(bytes.windows(b"current_schema\0".len())
             .any(|w| w == b"current_schema\0"),
             "RowDescription must name the column 'current_schema'");
@@ -3620,9 +3642,8 @@ mod tests {
     #[test]
     fn sppgextqparsedfunctions_execute_select_1_via_hook_no_engine_call() {
         let bytes = scalar_fn_parse_bind_execute("SELECT 1");
-        assert_eq!(bytes[0], b'T');
-        assert_eq!(bytes.iter().filter(|&&b| b == b'D').count(), 1,
-            "SELECT 1 should emit exactly one DataRow");
+        assert_eq!(backend_frame_tags(&bytes), vec![b'T', b'D', b'C'],
+            "SELECT 1 should emit exactly T, D, C frames");
         // The synthesizer names the column "?column?".
         assert!(bytes.windows(b"?column?\0".len()).any(|w| w == b"?column?\0"),
             "RowDescription must name the scalar-int column '?column?'");
@@ -3652,7 +3673,8 @@ mod tests {
         };
         match try_dispatch_extq(&mut state, &PanicOnApplyEngine, exec1) {
             ExtqOutcome::Bytes(b) => {
-                assert_eq!(b.iter().filter(|&&t| t == b'D').count(), 1);
+                assert_eq!(backend_frame_tags(&b), vec![b'T', b'D', b'C'],
+                    "first Execute should drain the single synthesized row");
             }
             other => panic!("first Execute expected Bytes, got {other:?}"),
         }
@@ -3664,12 +3686,9 @@ mod tests {
         };
         match try_dispatch_extq(&mut state, &PanicOnApplyEngine, exec2) {
             ExtqOutcome::Bytes(b) => {
-                assert_eq!(b[0], b'C',
-                    "re-Execute on a drained scalar portal must emit a bare CommandComplete");
-                assert!(!b.contains(&b'D'),
-                    "re-Execute must NOT repeat the DataRow");
-                assert!(!b.contains(&b'T'),
-                    "re-Execute must NOT repeat the RowDescription");
+                assert_eq!(backend_frame_tags(&b), vec![b'C'],
+                    "re-Execute on a drained scalar portal must emit ONLY a bare \
+                     CommandComplete — no repeated DataRow or RowDescription");
             }
             other => panic!("second Execute expected Bytes, got {other:?}"),
         }

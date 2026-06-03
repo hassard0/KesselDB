@@ -138,6 +138,8 @@ pub fn format_result(r: &OpResult) -> String {
                  proposed={proposed} < previous_min={previous_min})"
             )
         }
+        // SP-PG-SERIAL-RETURNING: an autoincrement Create assigned this id.
+        OpResult::Created { id } => format!("OK  (created, id={id})"),
     }
 }
 
@@ -419,6 +421,10 @@ pub fn format_result_json(r: &OpResult) -> String {
             format!(
                 r#"{{"status":"active_snapshot_rejected","replica_id":{replica_id},"previous_min":{previous_min},"proposed":{proposed}}}"#
             )
+        }
+        // SP-PG-SERIAL-RETURNING: autoincrement Create assigned id.
+        OpResult::Created { id } => {
+            format!(r#"{{"status":"ok","id":{id}}}"#)
         }
     }
 }

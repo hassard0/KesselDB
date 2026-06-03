@@ -7672,10 +7672,13 @@ mod tests {
         assert_eq!(names, vec!["n", "sum", "avg", "min", "max"]);
         let kinds: Vec<u8> = p.aggregates.iter().map(|a| a.kind).collect();
         assert_eq!(kinds, vec![0, 1, 4, 2, 3]);
-        // MIN/MAX/SUM/AVG carry their source column for OID typing.
+        // SUM/AVG/MIN/MAX carry their source column for OID typing
+        // (indices 1=sum, 2=avg, 3=min, 4=max; 0=count has no source).
+        assert_eq!(p.aggregates[0].source_column, None);
         assert_eq!(p.aggregates[1].source_column.as_deref(), Some("price"));
+        assert_eq!(p.aggregates[2].source_column.as_deref(), Some("price"));
         assert_eq!(p.aggregates[3].source_column.as_deref(), Some("price"));
-        assert_eq!(p.aggregates[5].source_column.as_deref(), Some("price"));
+        assert_eq!(p.aggregates[4].source_column.as_deref(), Some("price"));
 
         // Qualified group column + qualified aggregate arg — qualifier stripped.
         let p = plain_group_aggregate(

@@ -1306,6 +1306,25 @@ mod tests {
             o => panic!("unexpected {o:?}"),
         }
 
+        // SP-PG-SQL-DML-GENERAL — general-WHERE UPDATE/DELETE through the
+        // VSR cluster path (the Cont::DmlWhere → concrete Op::Txn
+        // continuation). The result is the DML-result frame; affected
+        // count is the first u32 after the tag byte.
+        let dml_count = |b: &[u8]| -> u32 {
+            assert_eq!(b.first(), Some(&crate::DML_RESULT_TAG), "DML result tag");
+            u32::from_le_bytes(b[1..5].try_into().unwrap())
+        };
+        // owner = 100 matches BOTH rows (ids 1,2) → UPDATE 2.
+        match c.sql("UPDATE acct SET bal = 1 WHERE owner = 100").unwrap() {
+            OpResult::Got(b) => assert_eq!(dml_count(&b), 2, "general UPDATE count"),
+            o => panic!("unexpected {o:?}"),
+        }
+        // DELETE WHERE bal = 1 matches both → DELETE 2.
+        match c.sql("DELETE FROM acct WHERE bal = 1").unwrap() {
+            OpResult::Got(b) => assert_eq!(dml_count(&b), 2, "general DELETE count"),
+            o => panic!("unexpected {o:?}"),
+        }
+
         // All three nodes converged to one digest over the wire.
         let probe0 = node0.probe();
         assert!(

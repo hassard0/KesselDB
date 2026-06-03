@@ -4020,12 +4020,16 @@ mod tests {
             }
             o => panic!("unexpected {o:?}"),
         }
+        // Record layout: [schema_ver u32][field_count u16][null bitmap 8B]
+        // then field data. So bal (I64) starts at offset 14, active at 22.
+        const H: usize = 14;
+        let active_of = |rec: &[u8]| -> i64 {
+            i64::from_le_bytes(rec[H + 8..H + 16].try_into().unwrap())
+        };
         // Verify: id 3 (bal 200) still active = 1.
         match c.sql("SELECT * FROM acct ID 3").unwrap() {
             OpResult::Got(rec) => {
-                // active is the 2nd I64 field (offset 8..16), LE.
-                let active = i64::from_le_bytes(rec[8..16].try_into().unwrap());
-                assert_eq!(active, 1, "unmatched row untouched");
+                assert_eq!(active_of(&rec), 1, "unmatched row untouched");
             }
             o => panic!("unexpected {o:?}"),
         }
@@ -4045,8 +4049,11 @@ mod tests {
                 let (affected, rows) = decode_dml(&b);
                 assert_eq!(affected, 1);
                 assert_eq!(rows.len(), 1, "one RETURNING row");
-                let active = i64::from_le_bytes(rows[0][8..16].try_into().unwrap());
-                assert_eq!(active, 5, "RETURNING reflects the post-update value");
+                assert_eq!(
+                    active_of(&rows[0]),
+                    5,
+                    "RETURNING reflects the post-update value"
+                );
             }
             o => panic!("unexpected {o:?}"),
         }
@@ -4093,9 +4100,10 @@ mod tests {
             "UNIQUE-violating general UPDATE must be a Constraint error, got {res:?}"
         );
         // Row 2's k must still be 20 (atomic rollback — none applied).
+        // Layout: 14-byte header ([ver u32][fcount u16][bitmap 8B]) then k (I64).
         match c.sql("SELECT * FROM u ID 2").unwrap() {
             OpResult::Got(rec) => {
-                let k = i64::from_le_bytes(rec[0..8].try_into().unwrap());
+                let k = i64::from_le_bytes(rec[14..22].try_into().unwrap());
                 assert_eq!(k, 20, "row 2 unchanged after atomic rollback");
             }
             o => panic!("unexpected {o:?}"),

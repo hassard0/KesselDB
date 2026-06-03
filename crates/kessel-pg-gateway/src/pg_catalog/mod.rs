@@ -148,6 +148,13 @@ pub fn catalog_query_hook<E: EngineApply + ?Sized>(
     if matches_pg_namespace_select_star(&normalized) {
         return Some(synthesize::pg_namespace_all_rows());
     }
+    // SP-PG-SQL-ORM-PARSE T4 — SQLAlchemy `create_all(checkfirst=True)`
+    // table-existence probe (`SELECT pg_class.relname ... WHERE relname =
+    // '<t>' AND relkind = ANY (ARRAY[...]) ...`). Checked BEFORE the
+    // generic pg_class matchers because it's the more specific shape.
+    if let Some(name) = extract_create_all_relname_probe(&normalized) {
+        return Some(synthesize::create_all_relname_probe(engine, &name));
+    }
     // T3: `SELECT * FROM pg_catalog.pg_class` (one row per live table).
     if matches_pg_class_select_star(&normalized) {
         return Some(synthesize::pg_class_all_rows(engine));
@@ -577,6 +584,43 @@ fn extract_pg_type_oid_filter(normalized: &str) -> Option<u32> {
         }
     }
     None
+}
+
+/// SP-PG-SQL-ORM-PARSE T4 — recognize SQLAlchemy's
+/// `create_all(checkfirst=True)` table-existence probe and extract the
+/// probed table name. The query (post text-param substitution) is:
+///
+/// ```text
+/// select pg_catalog.pg_class.relname from pg_catalog.pg_class
+/// join pg_catalog.pg_namespace on ...
+/// where pg_catalog.pg_class.relname = '<table>'
+///   and pg_catalog.pg_class.relkind = any (array['r', 'p', ...])
+///   and pg_catalog.pg_table_is_visible(pg_catalog.pg_class.oid)
+///   and pg_catalog.pg_namespace.nspname != 'pg_catalog'
+/// ```
+///
+/// We anchor on the two distinctive fixtures — the `relname` projection
+/// over a `pg_class join pg_namespace` AND the `relkind = any (array[`
+/// existence-probe clause — then extract the `relname = '<table>'`
+/// table name. Tolerant of whitespace (the matcher runs on the
+/// `normalize_for_match` lowercased/space-collapsed form).
+fn extract_create_all_relname_probe(normalized: &str) -> Option<String> {
+    // Must be the relname-over-pg_class-join-pg_namespace shape AND carry
+    // the `relkind = any (array[` existence-probe fixture that uniquely
+    // identifies the create_all inspector probe.
+    let is_probe = normalized
+        .contains("pg_catalog.pg_class.relname")
+        && normalized.contains("pg_catalog.pg_class join pg_catalog.pg_namespace")
+        && normalized.contains("relkind = any (array[");
+    if !is_probe {
+        return None;
+    }
+    // Extract the probed table name from `relname = '<table>'`.
+    let needle = "pg_catalog.pg_class.relname = '";
+    let pos = normalized.find(needle)?;
+    let after = &normalized[pos + needle.len()..];
+    let end = after.find('\'')?;
+    Some(after[..end].to_string())
 }
 
 /// SP-PG-CAT T4 — recognize the pgJDBC `getColumns` canonical query

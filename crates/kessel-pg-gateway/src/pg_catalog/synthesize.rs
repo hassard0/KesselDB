@@ -236,6 +236,46 @@ pub fn pg_class_all_rows<E: EngineApply + ?Sized>(engine: &E) -> Vec<u8> {
     out
 }
 
+/// SP-PG-SQL-ORM-PARSE T4 — synthesize the response for SQLAlchemy's
+/// `create_all(checkfirst=True)` table-existence probe:
+///
+/// ```text
+/// SELECT pg_catalog.pg_class.relname
+/// FROM pg_catalog.pg_class JOIN pg_catalog.pg_namespace ON ...
+/// WHERE pg_catalog.pg_class.relname = '<table>'
+///   AND pg_catalog.pg_class.relkind = ANY (ARRAY['r','p','f','v','m'])
+///   AND pg_catalog.pg_table_is_visible(pg_catalog.pg_class.oid)
+///   AND pg_catalog.pg_namespace.nspname != 'pg_catalog'
+/// ```
+///
+/// Single text column `relname`. Emits ONE row (the table name) iff the
+/// table exists in the live catalog, else ZERO rows. SQLAlchemy reads
+/// the row count: present ⇒ skip CREATE; absent ⇒ emit CREATE TABLE.
+/// This unblocks `create_all` end-to-end (the prior behavior hit
+/// `unexpected char '['` on the `ARRAY[` token before any CREATE).
+pub fn create_all_relname_probe<E: EngineApply + ?Sized>(
+    engine: &E,
+    table_name: &str,
+) -> Vec<u8> {
+    let fields = vec![FieldMeta {
+        name: "relname".to_string(),
+        type_oid: PG_TYPE_TEXT,
+    }];
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+    // Existence: the engine knows the table iff `describe_table` is Some.
+    let exists = engine.describe_table(table_name).is_some();
+    let n = if exists {
+        out.extend_from_slice(&encode_data_row(&[Some(table_name.as_bytes())]));
+        1
+    } else {
+        0
+    };
+    out.extend_from_slice(&encode_command_complete(&select_tag(n)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
 // ─── Joined-result synth: psql `\dt` (design §3.4 strategy A) ────────────
 
 /// Synthesize the joined-result response for the canonical psql `\dt`

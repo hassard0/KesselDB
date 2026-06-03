@@ -122,7 +122,13 @@ fn lex(s: &str) -> Result<Vec<Tok>, SqlError> {
             out.push(Tok::Param(n as u16));
         } else {
             match c {
-                '(' | ')' | ',' | ';' | '.' => {
+                // SP-PG-SQL-ORM-PARSE T4 — `[` / `]` lexed as punctuation
+                // so `ARRAY[...]` (SQLAlchemy's `create_all` relkind probe
+                // `relkind = ANY (ARRAY['r','p',...])` + general IN-list
+                // lowering) tokenizes instead of hitting `unexpected char
+                // '['`. Bare `[`/`]` outside `ARRAY[...]` is a parse error
+                // downstream (no other grammar consumes them).
+                '(' | ')' | ',' | ';' | '.' | '[' | ']' => {
                     out.push(Tok::Punct(c));
                     i += 1;
                 }
@@ -2525,6 +2531,60 @@ fn cmp_expr(p: &mut P, ot: &ObjectType) -> Result<Program, SqlError> {
         prog
     } else if post_not {
         return Err("expected IN, BETWEEN or LIKE after NOT".into());
+    } else if matches!(p.peek(), Some(Tok::Cmp("=")))
+        && matches!(p.t.get(p.i + 1), Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("ANY"))
+    {
+        // SP-PG-SQL-ORM-PARSE T4 — `col = ANY (ARRAY[v1, v2, ...])`
+        // desugars to `col IN (v1, v2, ...)` ≡ OR-of-eq, reusing the
+        // SP56 IN lowering. SQLAlchemy emits this for IN-list filters
+        // AND for the `create_all` relkind existence probe
+        // (`relkind = ANY (ARRAY['r','p','f','v','m'])`). Only the
+        // ARRAY-literal form is desugared; `= ANY (SELECT ...)`
+        // (subquery) is the named follow-up `SP-PG-SQL-ANY-SUBQUERY`.
+        p.i += 1; // consume `=`
+        p.i += 1; // consume `ANY`
+        p.punct('(')?;
+        // `ARRAY` keyword then `[`.
+        if !p.kw("ARRAY") {
+            return Err(
+                "`= ANY (...)` expects an `ARRAY[...]` literal (subquery \
+                 ANY is SP-PG-SQL-ANY-SUBQUERY)"
+                    .into(),
+            );
+        }
+        match p.next() {
+            Some(Tok::Punct('[')) => {}
+            _ => return Err("`ANY (ARRAY` must be followed by `[`".into()),
+        }
+        // Empty `ARRAY[]` → `col = ANY (empty)` is always FALSE. Emit a
+        // constant-false program (push 0) so the row never matches —
+        // mirrors PG semantics and keeps the OR-of-eq accumulator total.
+        let mut acc: Option<Program> = None;
+        if !matches!(p.peek(), Some(Tok::Punct(']'))) {
+            loop {
+                let v = term(p, ot)?;
+                let mut raw = lb.clone();
+                raw.extend_from_slice(&v.bytes());
+                raw.push(3); // EQ
+                let eqp = Program::from_raw(raw);
+                acc = Some(match acc {
+                    None => eqp,
+                    Some(a) => splice(a, eqp, "OR"),
+                });
+                match p.peek() {
+                    Some(Tok::Punct(',')) => p.i += 1,
+                    _ => break,
+                }
+            }
+        }
+        match p.next() {
+            Some(Tok::Punct(']')) => {}
+            _ => return Err("unterminated `ARRAY[...]` (expected `]`)".into()),
+        }
+        p.punct(')')?;
+        // Empty array → constant FALSE (push int 0). The expr-VM treats
+        // a non-zero top-of-stack as true, so 0 is a guaranteed no-match.
+        acc.unwrap_or_else(|| Program::new().push_int(0))
     } else if let Some(Tok::Cmp(c)) = p.peek().cloned() {
         p.i += 1;
         // SP-PG-SQL-PAREN-VALUES: if LHS is a bare load of a numeric

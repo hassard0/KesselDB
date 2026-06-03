@@ -765,6 +765,7 @@ pub fn spawn_node(
                                 program,
                                 sets,
                                 returning,
+                                by_pk_id: _,
                             }) => {
                                 if returning.is_some() {
                                     let _ = reply.send(OpResult::SchemaError(
@@ -801,6 +802,7 @@ pub fn spawn_node(
                                 type_id,
                                 program,
                                 returning,
+                                by_pk_id: _,
                             }) => {
                                 if returning.is_some() {
                                     let _ = reply.send(OpResult::SchemaError(

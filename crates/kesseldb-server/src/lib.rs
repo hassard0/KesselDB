@@ -616,6 +616,7 @@ fn apply_one_inner(
                 program,
                 sets,
                 returning,
+                by_pk_id,
             }) => {
                 return apply_dml_where(
                     sm,
@@ -624,12 +625,14 @@ fn apply_one_inner(
                     program,
                     Some(sets),
                     returning.is_some(),
+                    by_pk_id,
                 );
             }
             Ok(kessel_sql::Stmt::DeleteWhere {
                 type_id,
                 program,
                 returning,
+                by_pk_id,
             }) => {
                 return apply_dml_where(
                     sm,
@@ -638,6 +641,7 @@ fn apply_one_inner(
                     program,
                     None,
                     returning.is_some(),
+                    by_pk_id,
                 );
             }
             Ok(kessel_sql::Stmt::Explain(plan)) => {
@@ -705,6 +709,7 @@ fn apply_one_inner(
                 program,
                 sets,
                 returning,
+                by_pk_id,
             }) => {
                 return apply_dml_where(
                     sm,
@@ -713,12 +718,14 @@ fn apply_one_inner(
                     program,
                     Some(sets),
                     returning.is_some(),
+                    by_pk_id,
                 );
             }
             Ok(kessel_sql::Stmt::DeleteWhere {
                 type_id,
                 program,
                 returning,
+                by_pk_id,
             }) => {
                 return apply_dml_where(
                     sm,
@@ -727,6 +734,7 @@ fn apply_one_inner(
                     program,
                     None,
                     returning.is_some(),
+                    by_pk_id,
                 );
             }
             Ok(kessel_sql::Stmt::Explain(plan)) => {
@@ -795,26 +803,48 @@ fn apply_dml_where(
     program: Vec<u8>,
     sets: Option<Vec<(u16, kessel_codec::Value)>>, // Some ⇒ UPDATE, None ⇒ DELETE
     want_returning: bool,
+    by_pk_id: Option<u128>,
 ) -> OpResult {
-    // 1. Resolve matching ids (read-only scan; advances op_number like
-    //    any other read so the snapshot bracket stays consistent).
-    let ids_res = sm.apply(*n, Op::QueryExpr { type_id, program });
-    *n += 1;
-    let id_bytes = match ids_res {
-        OpResult::Got(b) => b,
-        other => return other, // SchemaError (no type / bad program), etc.
+    // 1. Resolve the matching ids. For a by-PK `WHERE id = n RETURNING`
+    //    the id is already known (skip the scan); else run the predicate
+    //    scan via `Op::QueryExpr` (sorted matched ids ⇒ deterministic).
+    let ids: Vec<kessel_proto::ObjectId> = match by_pk_id {
+        Some(id) => {
+            // Confirm the row exists; absent ⇒ 0 matched (UPDATE 0).
+            let oid = kessel_proto::ObjectId::from_u128(id);
+            let exists = matches!(
+                sm.apply(*n, Op::GetById { type_id, id: oid }),
+                OpResult::Got(_)
+            );
+            *n += 1;
+            if exists {
+                vec![oid]
+            } else {
+                Vec::new()
+            }
+        }
+        None => {
+            let ids_res = sm.apply(*n, Op::QueryExpr { type_id, program });
+            *n += 1;
+            let id_bytes = match ids_res {
+                OpResult::Got(b) => b,
+                other => return other, // SchemaError (no type / bad program), etc.
+            };
+            if id_bytes.len() % 16 != 0 {
+                return OpResult::SchemaError(
+                    "dml-where: malformed id stream".into(),
+                );
+            }
+            id_bytes
+                .chunks_exact(16)
+                .map(|c| {
+                    let mut a = [0u8; 16];
+                    a.copy_from_slice(c);
+                    kessel_proto::ObjectId(a)
+                })
+                .collect()
+        }
     };
-    if id_bytes.len() % 16 != 0 {
-        return OpResult::SchemaError("dml-where: malformed id stream".into());
-    }
-    let ids: Vec<kessel_proto::ObjectId> = id_bytes
-        .chunks_exact(16)
-        .map(|c| {
-            let mut a = [0u8; 16];
-            a.copy_from_slice(c);
-            kessel_proto::ObjectId(a)
-        })
-        .collect();
     let affected = ids.len() as u32;
 
     // Convert the UPDATE SET `Value`s to the raw field bytes

@@ -495,6 +495,12 @@ pub enum Stmt {
         program: Vec<u8>,
         sets: Vec<(u16, Value)>,
         returning: Option<Vec<String>>,
+        /// SP-PG-SQL-DML-GENERAL — when `Some(id)`, the matched row set is
+        /// EXACTLY this one primary-key id (a by-PK `WHERE id = n` that
+        /// carried a RETURNING clause): the server skips the predicate
+        /// scan and mutates the single id directly. `None` ⇒ resolve the
+        /// matches by scanning `program`.
+        by_pk_id: Option<u128>,
     },
     /// SP-PG-SQL-DML-GENERAL — general-WHERE DELETE (`DELETE FROM t WHERE
     /// <pred>`, multi-row). Same Path-A shape as `UpdateWhere` but the
@@ -503,6 +509,9 @@ pub enum Stmt {
         type_id: u32,
         program: Vec<u8>,
         returning: Option<Vec<String>>,
+        /// See `UpdateWhere::by_pk_id` — `Some(id)` ⇒ delete exactly this
+        /// primary-key row (a by-PK `WHERE id = n RETURNING`).
+        by_pk_id: Option<u128>,
     },
     /// `EXPLAIN <stmt>` — a precomputed, human-readable query plan. The
     /// inner statement is *not* executed; the server just returns this
@@ -1057,6 +1066,22 @@ fn compile_stmt_from_tokens(
             let where_start = p.i;
             match parse_where_id_eq(&mut p) {
                 Ok(id) => {
+                    // by-PK fast path. If a RETURNING clause follows, route
+                    // through the (server-side, read-back-capable)
+                    // UpdateWhere path with `by_pk_id` set — the engine
+                    // skips the scan and mutates this single id, then reads
+                    // it back for RETURNING. Otherwise the plain single-row
+                    // RMW (byte-identical to before).
+                    let returning = parse_returning(&mut p)?;
+                    if let Some(ret) = returning {
+                        return Ok(Stmt::UpdateWhere {
+                            type_id: ot.type_id,
+                            program: Vec::new(),
+                            sets,
+                            returning: Some(ret),
+                            by_pk_id: Some(id),
+                        });
+                    }
                     return Ok(Stmt::Update { type_id: ot.type_id, id, sets });
                 }
                 Err(_) => {
@@ -1082,6 +1107,7 @@ fn compile_stmt_from_tokens(
                         program,
                         sets,
                         returning,
+                        by_pk_id: None,
                     });
                 }
             }
@@ -1104,7 +1130,21 @@ fn compile_stmt_from_tokens(
             if !is_legacy_id {
                 let where_start = p.i;
                 match parse_where_id_eq(&mut p) {
-                    Ok(_) => { /* by-PK: fall through below */ }
+                    Ok(id) => {
+                        // by-PK DELETE. A RETURNING clause routes through
+                        // the server-side read-back path (DeleteWhere with
+                        // `by_pk_id`); else fall through to `Op::Delete`.
+                        let returning = parse_returning(&mut p)?;
+                        if let Some(ret) = returning {
+                            return Ok(Stmt::DeleteWhere {
+                                type_id: ot.type_id,
+                                program: Vec::new(),
+                                returning: Some(ret),
+                                by_pk_id: Some(id),
+                            });
+                        }
+                        // fall through to Op::Delete below
+                    }
                     Err(_) => {
                         p.i = where_start;
                         if !p.kw("WHERE") {
@@ -1121,6 +1161,7 @@ fn compile_stmt_from_tokens(
                             type_id: ot.type_id,
                             program,
                             returning,
+                            by_pk_id: None,
                         });
                     }
                 }

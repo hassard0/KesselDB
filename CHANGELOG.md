@@ -7,6 +7,35 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning [Se
 
 ### Added
 
+- **CAPSTONE: realistic multi-model SQLAlchemy blog app — 8/8
+  (SP-PG-ORM-REALAPP, 2026-06-03)** — a realistic THREE-model SQLAlchemy 2.0
+  application (`User` 1—N `Post` 1—N `Comment`, FKs + declarative
+  `relationship()`, insertmanyvalues batching ON) exercising the full query
+  range a real app uses — FK schema, multi-level cascade insert, inner JOIN,
+  filtered JOIN, GROUP-BY-COUNT over a JOIN, paginated ORDER-BY query, lazy
+  relationship navigation, and UPDATE/DELETE — now runs END-TO-END over the PG
+  wire, **8/8 stages, every query returning real data**. Two surgical
+  correctness fixes (below) closed the only two gaps the workload surfaced.
+
+### Fixed
+
+- **SQL-standard doubled-quote string escape (SP-PG-ORM-REALAPP, 2026-06-03)**
+  — the `kessel-sql` lexer now decodes `'bob''s post'` as the value `bob's
+  post` (PG §4.1.2.1). The previous single-quote lexer stopped at the first
+  inner `'`, truncating the string and then failing to parse — which broke ANY
+  statement whose data contained an apostrophe (names, titles, prose). The fix
+  mirrors the existing `"` delimited-identifier escape (doubled `''` → one
+  `'`); a string with no embedded quote is byte-identical to the pre-fix token.
+- **`ORDER BY` over a column projection renders (SP-PG-ORM-REALAPP,
+  2026-06-03)** — `SELECT title FROM posts ORDER BY title [LIMIT n]` lowers to
+  `Op::SelectSorted`, which returns FULL records (the projection is dropped at
+  the engine layer), so the gateway's narrow projected-row decoder mismatched
+  the row width. The gateway now detects the sorted-projection shape
+  (`kessel_sql::select_projection_is_sorted`) and decodes the full records,
+  re-projecting the requested columns with proper null-bitmap NULL fidelity. A
+  non-sorted projection keeps the byte-identical narrow path. Neither fix
+  touches the engine apply path or the Op wire encoding; determinism preserved.
+
 - **Grouped aggregates over joins — `JOIN … GROUP BY + COUNT/SUM/MIN/MAX/AVG`
   (SP-PG-SQL-JOIN-AGG, 2026-06-03)** — `SELECT a.name, COUNT(b.id) FROM a JOIN b
   ON a.id=b.aid [WHERE …] GROUP BY a.name`, the dashboard/reporting query that

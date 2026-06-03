@@ -1,0 +1,166 @@
+SP-PG-ORM-REALAPP — CAPSTONE realistic multi-model SQLAlchemy app (blog) smoke
+==============================================================================
+Recorded: 2026-06-03 on vulcan (Ubuntu 24.04, admin@192.168.4.178)
+Server:   kesseldb (built --features pg-gateway,
+          CARGO_TARGET_DIR=/tmp/kdb-t-ra, isolated worktree /tmp/kdb-ra-wt)
+          KESSELDB_TOKEN=admin KESSELDB_PG_ADDR=127.0.0.1:5556, native 6556
+HEAD:     6bdd8da (SP-PG-ORM-REALAPP — doubled-quote string escape +
+          ORDER-BY-projection render fix)
+Driver:   SQLAlchemy 2.0.45 + psycopg2 + Python 3.12 (insertmanyvalues ON,
+          the realistic default)
+Script:   scripts/sppgormrealapp-smoke.py
+
+HEADLINE
+========
+A REALISTIC THREE-MODEL BLOG APPLICATION (User 1—N Post 1—N Comment, FKs +
+declarative `relationship()` with `back_populates`) — the truest end-to-end
+test of whether tonight's relational surface composes for real-world use —
+runs COMPLETELY against KesselDB through the PG wire:
+
+    --- 8/8 stages PASS ---
+
+  PASS  schema            3 CREATE TABLE, two carrying a FK table-constraint
+  PASS  cascade_seed      2 users, 3 posts, 2 comments via multi-level
+                          relationship cascade insert (insertmanyvalues batch)
+  PASS  Q1_join           list all posts + author name (inner JOIN)
+  PASS  Q2_filtered_join  posts by a specific author (JOIN … WHERE name = $1)
+  PASS  Q3_group_agg      comment count per post (GROUP BY COUNT over a JOIN)
+  PASS  Q4_paginate       recent posts (ORDER BY … LIMIT) over a projection
+  PASS  Q5_nav            relationship navigation (alice.posts, lazy SELECT)
+  PASS  Q6_update_delete  UPDATE … WHERE + DELETE … WHERE, re-count
+
+Every query returns REAL data (not vacuous empty results) — Q1 lists all
+three posts with their authors, Q3 reports `('hello world', 2)`, Q6 correctly
+shows ONE comment remaining after the DELETE. The realistic blog app is
+end-to-end ready.
+
+----------------------------------------------------------------------
+FULL SMOKE TRANSCRIPT (scripts/sppgormrealapp-smoke.py @ :5556)
+----------------------------------------------------------------------
+# SQLAlchemy 2.0.45 -> postgresql+psycopg2://test:admin@127.0.0.1:5556/kesseldb
+STAGE schema: PASS 3 CREATE TABLE (2 w/ FK)
+STAGE cascade_seed: PASS 2 users, 3 posts, 2 comments
+STAGE Q1_join: PASS posts+author -> [("bob's first post", 'bob'), ('hello world', 'alice'), ('kesseldb rocks', 'alice')]
+STAGE Q2_filtered_join: PASS alice's posts -> ['hello world', 'kesseldb rocks']
+STAGE Q3_group_agg: PASS comment counts -> [('hello world', 2)]
+STAGE Q4_paginate: PASS paginated -> ["bob's first post", 'hello world']
+STAGE Q5_nav: PASS alice.posts -> ['hello world', 'kesseldb rocks']
+STAGE Q6_update_delete: PASS after update+delete, comment count -> 1
+
+=== REALAPP (BLOG) SMOKE SUMMARY ===
+  PASS  schema
+  PASS  cascade_seed
+  PASS  Q1_join
+  PASS  Q2_filtered_join
+  PASS  Q3_group_agg
+  PASS  Q4_paginate
+  PASS  Q5_nav
+  PASS  Q6_update_delete
+--- 8/8 stages PASS ---
+REALAPP SMOKE COMPLETE
+
+Gateway log: CLEAN — no ErrorResponse, no malformed-frame, no panic for any
+ORM-emitted statement.
+
+----------------------------------------------------------------------
+TWO SURGICAL FIXES (each unblocked a major capstone path)
+----------------------------------------------------------------------
+The first smoke run surfaced TWO precise gaps; both got a small surgical fix
+(the arc's "small fix that unblocks a major path is OK" allowance), each with
+a unit test, neither touching the engine apply path or the Op wire encoding.
+
+FIX 1 — SQL-standard doubled-quote string escape `''` (`kessel-sql` lexer).
+  The seed FAILED (`cascade_seed`) the instant any value contained an
+  apostrophe: psycopg2 quotes `bob's first post` as the SQL literal
+  `'bob''s first post'` (PG §4.1.2.1 — a literal single quote is escaped by
+  DOUBLING it). The single-quote lexer stopped at the FIRST inner `'`, so it
+  truncated the string to `bob` and then choked on the trailing `s first
+  post'` → `expected ',' or ')'`. The fix mirrors the already-present `"`
+  delimited-identifier escape: a doubled `''` stays in the string and appends
+  one `'`; a lone `'` closes it. A string with NO embedded quote is
+  byte-identical to the pre-arc token (every prior literal KAT still passes).
+  THIS IS A CORRECTNESS BUG that would bite ANY app whose data contains an
+  apostrophe — names, titles, prose. Unblocked cascade_seed (and Q1/Q2/Q5
+  which read `bob's first post` back).
+
+  Diagnosed via direct psql against a BIGSERIAL table:
+    INSERT … VALUES ('bobs post', 2)        → id returned (ok)
+    INSERT … VALUES ('bob''s first post',2) → ERROR: expected `,` or `)`  (pre-fix)
+
+FIX 2 — ORDER-BY-over-a-projection render (`kessel-pg-gateway`).
+  After FIX 1, the seed + Q1/Q2/Q3/Q5/Q6 passed but Q4 surfaced a SECOND
+  gap: `SELECT posts.title FROM posts ORDER BY posts.title LIMIT 2` →
+  `projected row decode failed: projected row width 128 != expected 64`.
+  Root cause: in `kessel-sql`'s SELECT lowering, the `_ if sort.is_some()`
+  match arm fires BEFORE the `Proj::Cols(...)` arm, so ANY projection +
+  ORDER BY compiles to `Op::SelectSorted` — which emits the FULL record
+  stream (`[u32 len][full rec]*`, width 128 incl. header+bitmap+all fields),
+  DROPPING the projection at the engine layer. The gateway's narrow
+  `emit_projected_rows` decoder (which expects only the projected fields'
+  concatenated width, 64 for one VARCHAR(64)) then mismatched. Fix: the
+  gateway now detects this shape (`kessel_sql::select_projection_is_sorted`)
+  and, for a sorted projection, decodes each FULL record against the table
+  schema and re-projects the requested columns by index
+  (`emit_projected_from_full_records`). Bonus: this path uses the record's
+  null bitmap, so a projected NULL renders as a real PG NULL — STRICTLY
+  better than the narrow path (which has no null mask). A non-sorted
+  projection keeps the byte-identical narrow path. Unblocked Q4_paginate.
+
+  Isolated via direct psql (pre-fix):
+    SELECT title FROM posts                       → ok (Op::SelectFields, narrow)
+    SELECT title FROM posts LIMIT 2               → ok (Op::SelectFields, narrow)
+    SELECT title FROM posts ORDER BY title        → ERROR width 128 != 64 (sorted)
+    SELECT id,title FROM posts ORDER BY title     → ERROR width 128 != 72 (sorted)
+
+----------------------------------------------------------------------
+DIRECT psql VERIFICATION (post-fix)
+----------------------------------------------------------------------
+$ psql … -c "SELECT posts.title FROM posts ORDER BY posts.title;"
+      title
+------------------
+ bob's first post
+ hello, world!
+ kesseldb rocks
+(3 rows)
+
+$ psql … -c "SELECT title FROM posts WHERE title = 'bob''s first post';"
+      title
+------------------
+ bob's first post
+(1 row)
+
+The apostrophe round-trips through BOTH an INSERT and a WHERE-equality filter
+(the escaped `''` lexes to a single `'` on both sides), and the sorted
+projection renders the narrowed column.
+
+----------------------------------------------------------------------
+DETERMINISM
+----------------------------------------------------------------------
+Neither fix touches the engine apply path or the Op wire encoding (FIX 1 is a
+lexer-only change producing the same token for unescaped strings; FIX 2 is
+pure gateway render of bytes the engine already produced — the engine's
+Op::SelectSorted is unchanged). Confirmed on vulcan:
+  kessel-sql       135 lib tests PASS (incl. 2 new: doubled_quote_string_escape,
+                                       projection_sorted_detection)
+  kessel-pg-gateway 1003 tests PASS
+  kessel-sm        select_sorted_is_deterministic + select_sorted_orders_and_paginates PASS
+  kessel-vsr       large_seed_corpus_is_deterministic_and_converges PASS
+                   jepsen_3replica_partition_converges_byte_identical PASS
+
+----------------------------------------------------------------------
+NAMED RESIDUAL FOLLOW-UPS (out of scope this capstone)
+----------------------------------------------------------------------
+None NEW required for the blog app — it is 8/8. The pre-existing named
+follow-ups still stand (FK enforcement, OUTER/MULTI/ALIAS joins,
+projected-NULL fidelity on the narrow path, alias-named RowDescription),
+none of which the realistic blog workload exercises.
+
+BOTTOM LINE: KesselDB runs a realistic three-model SQLAlchemy 2.0 blog
+application — FK schema, multi-level relationship cascade insert (with
+insertmanyvalues batching), inner JOIN, filtered JOIN, GROUP-BY aggregate
+over a JOIN, paginated ORDER-BY query, lazy relationship navigation, and
+UPDATE/DELETE — END-TO-END, 8/8, returning real data. Two surgical
+correctness fixes (apostrophe-data string escape + ORDER-BY-projection
+render) closed the only two gaps the workload surfaced. This is the
+strongest available evidence that tonight's relational surface composes for
+real-world use.

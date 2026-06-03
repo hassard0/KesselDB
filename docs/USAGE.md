@@ -1594,6 +1594,38 @@ joined. **V1 out-of-scope** (named follow-ups): `SP-PG-DDL-FK-ENFORCE`
 below.) Transcript:
 `docs/superpowers/sppgormrelationships-smoke-2026-06-03.txt`.
 
+#### Real multi-model app (blog) — CAPSTONE, SP-PG-ORM-REALAPP, 2026-06-03
+
+The truest real-world-readiness test: a **realistic three-model SQLAlchemy
+2.0 blog application** (`User` 1—N `Post` 1—N `Comment`, FKs + declarative
+`relationship()` with `back_populates`, insertmanyvalues batching ON — the
+default) exercising the **full** query range a real app uses, back-to-back.
+**8/8 stages PASS** on vulcan, every query returning REAL data:
+
+| App operation | Result | Notes |
+|---|---|---|
+| `create_all()` — 3 tables, 2 FKs | **PASS** | FK table-constraints parse (SP-PG-ORM-RELATIONSHIPS) |
+| multi-level cascade INSERT (`user.posts=[…]`; `post.comments=[…]`) | **PASS** (new) | SQLAlchemy's `insertmanyvalues` batch + apostrophe data both flow; required the `''` string-escape fix |
+| Q1 list posts + author (JOIN) | **PASS** | inner equi-JOIN, qualified projection |
+| Q2 posts by author (filtered JOIN) | **PASS** | `JOIN … WHERE name = $1` (SP-PG-SQL-JOIN-WHERE) |
+| Q3 comment count per post (GROUP BY over JOIN) | **PASS** | `GROUP BY COUNT()` over a JOIN (SP-PG-SQL-JOIN-AGG) |
+| Q4 recent posts (ORDER BY + LIMIT) | **PASS** (new) | sorted projection — required the ORDER-BY-projection render fix |
+| Q5 relationship nav (`alice.posts`) | **PASS** | lazy `SELECT … WHERE fk = $1` |
+| Q6 `UPDATE … WHERE` + `DELETE … WHERE` | **PASS** | re-count confirms 1 comment after delete |
+
+Two **surgical correctness fixes** closed the only two gaps the workload
+surfaced: **(1)** the `kessel-sql` lexer now handles the SQL-standard
+doubled-quote string escape `'bob''s post'` → `bob's post` (the previous
+lexer truncated at the first inner `'` — this would break ANY app with an
+apostrophe in its data); **(2)** the gateway now renders a projection-list
+SELECT with `ORDER BY` (which lowers to `Op::SelectSorted`, returning FULL
+records, the projection dropped at the engine layer) by decoding the full
+records and re-projecting the requested columns (with proper NULL fidelity
+via the record's null bitmap). Neither touches the engine apply path or Op
+wire encoding; seed-7 + 3-replica determinism holds. This is the headline
+statement: **a realistic multi-model app composes end-to-end, 8/8.**
+Transcript: `docs/superpowers/sppgormrealapp-smoke-2026-06-03.txt`.
+
 #### Filtered joins (`JOIN … WHERE`) — SP-PG-SQL-JOIN-WHERE, 2026-06-03
 
 `SELECT a.name, b.title FROM a JOIN b ON a.id = b.a_id WHERE b.title = $1

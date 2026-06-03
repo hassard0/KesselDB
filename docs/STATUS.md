@@ -154,6 +154,25 @@ COUNT(book.id) … GROUP BY author.name` → **tolkien 2, lewis 1**. Determinism
 preserved (BTreeMap ascending key + associative fold over deterministic scan order;
 seed-7 + 3-replica oracle PASS). Named follow-ups: SP-PG-SQL-HAVING,
 SP-PG-SQL-JOIN-GROUP-MULTI, SP-PG-SQL-JOIN-AGG-3TABLE, SP-PG-SQL-JOIN-AGG-ORDERBY-AGG.
+SP-PG-ORM-REALAPP (2026-06-03, CAPSTONE, +3 KATs, DONE) — the headline
+real-world-readiness test: a realistic THREE-model SQLAlchemy 2.0 BLOG app
+(`User` 1—N `Post` 1—N `Comment`, FKs + `relationship()`, insertmanyvalues
+batching ON) exercising the full query range a real app uses, back-to-back.
+**8/8 stages PASS** on vulcan, every query returning REAL data: schema (3
+tables, 2 FKs) / multi-level cascade seed / Q1 JOIN / Q2 filtered JOIN / Q3
+GROUP-BY-COUNT over JOIN / Q4 ORDER-BY+LIMIT / Q5 lazy relationship nav / Q6
+UPDATE+DELETE. The first run surfaced two precise gaps, each closed by a
+SURGICAL fix (no engine apply / Op wire change): **(1)** kessel-sql lexer now
+handles the SQL-standard doubled-quote string escape `'bob''s post'` → the
+previous lexer truncated at the first inner `'`, breaking ANY app with an
+apostrophe in its data (this unblocked the seed + the JOIN reads); **(2)** the
+gateway renders a projection-list SELECT with `ORDER BY` (which lowers to
+`Op::SelectSorted`, returning FULL records with the projection dropped at the
+engine layer) by decoding the full records + re-projecting requested columns
+with proper null-bitmap NULL fidelity. Determinism preserved (kessel-sql 135
++ gateway 1003 + select_sorted_is_deterministic + VSR seed-7/3-replica
+oracles all PASS). No NEW follow-ups required — the blog app is 8/8.
+Transcript: docs/superpowers/sppgormrealapp-smoke-2026-06-03.txt.
 SP-PG-DJANGO-COMPLETE (2026-06-03, +14 KATs, DONE) — closes the TWO
 named gaps the quoted-ident arc left, taking the **Django 6 ORM to full
 CRUD 8/8** on vulcan (was 6/8). `SP-PG-DDL-IDENTITY`: the CREATE TABLE

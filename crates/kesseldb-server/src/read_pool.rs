@@ -453,6 +453,7 @@ mod tests {
                 limit_n: None,
                 offset_n: None,
                 group_aggregate: None,
+                extra_joins: vec![],
             },
             Op::AddCompositeIndex { type_id: 1, fields: vec![] },
             Op::FindByComposite { type_id: 1, fields: vec![], values: vec![] },
@@ -1253,6 +1254,7 @@ mod tests {
                 right_field: 0, limit: 0, filter: vec![],
                 join_type: kessel_proto::JoinType::Inner,
                 order_by: None, limit_n: None, offset_n: None, group_aggregate: None,
+                extra_joins: vec![],
             },
         ];
         let op = Op::Txn { ops: all_ro_inners };

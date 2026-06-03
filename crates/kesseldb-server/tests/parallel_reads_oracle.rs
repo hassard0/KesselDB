@@ -459,6 +459,7 @@ fn gen_random_read_op(rng: &mut Rng) -> (&'static str, Op) {
                 limit_n: None,
                 offset_n: None,
                 group_aggregate: None,
+                extra_joins: vec![],
             })
         }
     }
@@ -736,6 +737,7 @@ fn t3_smoke_join() {
         limit_n: None,
         offset_n: None,
         group_aggregate: None,
+        extra_joins: vec![],
     });
 }
 
@@ -999,6 +1001,7 @@ fn txn_ro_smoke_all_txn_permitted_variants_one_txn_returns_ok() {
             limit_n: None,
             offset_n: None,
             group_aggregate: None,
+            extra_joins: vec![],
         },
     ];
     // Bisect on divergence: run each inner op as a 1-op Txn on both

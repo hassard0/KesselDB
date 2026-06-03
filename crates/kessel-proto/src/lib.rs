@@ -64,6 +64,68 @@ impl JoinType {
     }
 }
 
+/// SP-PG-SQL-MULTI-JOIN: one additional `JOIN <table> ON <combined-col> =
+/// <table>.<col>` segment chained after the base binary join. Each step
+/// extends the running combined `(a ++ b ++ …)` row set by INNER equi-joining
+/// it against `right_type` on `left_combined_field == right_field`.
+///   - `right_type` is the next table's TypeId.
+///   - `left_combined_field` is a field id in the RUNNING combined schema
+///     built so far (`0..combined_width`), i.e. the `<table>.<col>` column the
+///     ON's left side resolves to (it may reference ANY already-joined table).
+///   - `right_field` is the join column's field id in `right_type`.
+/// V1 is INNER equi-join only (matching the base join's INNER path); the
+/// combined schema grows by `right_type`'s fields each step, renamed
+/// `<right_table>.<col>` with fresh sequential combined field ids.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JoinStep {
+    pub right_type: TypeId,
+    pub left_combined_field: u16,
+    pub right_field: u16,
+}
+
+/// SP-PG-SQL-MULTI-JOIN: distinct marker byte for the chained extra-join block.
+/// It shares the post-page-block position with the ga block (marker `1`); using
+/// a DIFFERENT marker (`2`) lets the decoder pick the right block WITHOUT a
+/// presence anchor — so a ga-only frame stays BYTE-IDENTICAL to a pre-arc frame
+/// (no anchor byte added) while an extra-joins frame is self-identifying. V1
+/// never emits both (multi-join + group-aggregate is a named follow-up).
+const EXTRA_JOINS_MARKER: u8 = 2;
+
+/// SP-PG-SQL-MULTI-JOIN: marker-guarded encode of the chained extra-join list.
+/// Empty ⇒ writes NOTHING (a 2-table join is byte-identical to a pre-arc
+/// frame). Non-empty ⇒ `[u8 2 marker][u16 count][ (u32 right_type)(u16
+/// left_combined_field)(u16 right_field) ]*`.
+fn encode_extra_joins(b: &mut Vec<u8>, steps: &[JoinStep]) {
+    if steps.is_empty() {
+        return;
+    }
+    b.push(EXTRA_JOINS_MARKER);
+    b.extend_from_slice(&(steps.len() as u16).to_le_bytes());
+    for s in steps {
+        codec::put_u32(b, s.right_type);
+        b.extend_from_slice(&s.left_combined_field.to_le_bytes());
+        b.extend_from_slice(&s.right_field.to_le_bytes());
+    }
+}
+
+/// SP-PG-SQL-MULTI-JOIN: read `count` chained extra-join steps. The caller has
+/// already CONSUMED the `EXTRA_JOINS_MARKER` byte (it peeked to distinguish the
+/// extra-joins block from the ga block). count==0 is malformed ⇒ `Err`.
+fn read_extra_joins_body(c: &mut codec::Cursor) -> Result<Vec<JoinStep>, ()> {
+    let n = c.u16().ok_or(())? as usize;
+    if n == 0 {
+        return Err(());
+    }
+    let mut steps = Vec::with_capacity(n);
+    for _ in 0..n {
+        let right_type = c.u32().ok_or(())?;
+        let left_combined_field = c.u16().ok_or(())?;
+        let right_field = c.u16().ok_or(())?;
+        steps.push(JoinStep { right_type, left_combined_field, right_field });
+    }
+    Ok(steps)
+}
+
 /// SP-PG-SQL-JOIN-AGG: a `GROUP BY` + aggregate spec over the COMBINED join
 /// `(a ++ b)` schema. `group_field` is the combined-schema field id to group by;
 /// `aggregates` is `Vec<(kind, field_id)>` with the canonical aggregate kind
@@ -578,6 +640,16 @@ pub enum Op {
         /// `offset_n` do NOT apply when grouping (V1; ORDER BY over the aggregate
         /// is the named follow-up SP-PG-SQL-JOIN-AGG-ORDERBY-AGG).
         group_aggregate: Option<JoinGroupAgg>,
+        /// SP-PG-SQL-MULTI-JOIN: additional chained INNER equi-join steps after
+        /// the base binary join. EMPTY (default) ⇒ a normal binary join ⇒
+        /// BYTE-IDENTICAL `Op` frame to before this arc. When non-empty, the
+        /// engine applies each step in order, INNER equi-joining the running
+        /// combined `(a ++ b ++ …)` row set against the step's table on the ON
+        /// columns, extending the combined schema each step. The `filter` /
+        /// `order_by` / `limit_n` / `offset_n` then apply over the FINAL combined
+        /// schema. (V1: chained extra joins do NOT combine with `group_aggregate`
+        /// — that is a named follow-up.)
+        extra_joins: Vec<JoinStep>,
     },
     /// Add a composite (multi-field) equality index (Sub-project 27);
     /// backfills existing rows.
@@ -1307,6 +1379,7 @@ impl Op {
                 limit_n,
                 offset_n,
                 group_aggregate,
+                extra_joins,
             } => {
                 codec::put_u32(&mut b, *left_type);
                 codec::put_u32(&mut b, *right_type);
@@ -1329,16 +1402,23 @@ impl Op {
                 // page block. When present it FORCES every earlier region as a
                 // positional anchor so the decode stays unambiguous.
                 let has_ga = group_aggregate.is_some();
-                if !filter.is_empty() || non_inner || has_page || has_ga {
+                // SP-PG-SQL-MULTI-JOIN: a FIFTH optional region (chained extra
+                // joins) positioned AFTER the page block and BEFORE the ga block.
+                // When present it FORCES the filter / join_type / page anchors so
+                // the positional decode stays unambiguous; empty ⇒ writes nothing
+                // (a 2-table join is byte-identical to a pre-arc frame).
+                let has_mj = !extra_joins.is_empty();
+                if !filter.is_empty() || non_inner || has_page || has_ga || has_mj {
                     codec::put_bytes(&mut b, filter);
                 }
-                if non_inner || has_page || has_ga {
+                if non_inner || has_page || has_ga || has_mj {
                     b.push(join_type.wire_tag());
                 }
                 // SP-PG-SQL-JOIN-QUERY: page block, guarded by a marker byte so
                 // an old/inner frame (no trailing bytes) decodes to all-None.
-                // Force-written (all-None) when a group-aggregate block follows.
-                if has_page || has_ga {
+                // Force-written (all-None) when a group-aggregate or multi-join
+                // block follows.
+                if has_page || has_ga || has_mj {
                     b.push(1u8); // page-block marker
                     match order_by {
                         Some((f, desc)) => {
@@ -1363,6 +1443,14 @@ impl Op {
                         None => b.push(0u8),
                     }
                 }
+                // SP-PG-SQL-MULTI-JOIN: chained extra-join block, AFTER the page
+                // block and sharing the post-page position with the ga block.
+                // `encode_extra_joins` writes `[2][count][steps…]` when non-empty
+                // and NOTHING when empty. Its marker byte (`2`) differs from the
+                // ga marker (`1`), so the decoder distinguishes the two WITHOUT a
+                // presence anchor ⇒ a ga-only frame stays byte-identical to a
+                // pre-arc frame. V1 never emits both blocks together.
+                encode_extra_joins(&mut b, extra_joins);
                 // SP-PG-SQL-JOIN-AGG: group-aggregate block, guarded by its own
                 // marker. Emitted only when `group_aggregate` is Some, so a join
                 // without it writes NOTHING here ⇒ byte-identical to the pre-arc
@@ -1795,33 +1883,41 @@ impl Op {
                 } else {
                     (None, None, None)
                 };
-                // SP-PG-SQL-JOIN-AGG: optional trailing group-aggregate block,
-                // guarded by a marker byte. Absent (older / non-grouped frame) ⇒
-                // None. A non-1 marker or n_aggs==0 is a forward-incompatible /
-                // malformed op ⇒ decode failure (surfaced, not mis-applied).
-                let group_aggregate = if c.remaining() > 0 {
-                    if c.u8()? != 1 {
-                        return None;
+                // SP-PG-SQL-MULTI-JOIN + SP-PG-SQL-JOIN-AGG: the post-page-block
+                // region holds AT MOST one of two mutually-exclusive (V1) blocks,
+                // distinguished by their FIRST marker byte: `2` ⇒ chained
+                // extra-joins block; `1` ⇒ group-aggregate block. Absent (older /
+                // 2-table non-grouped frame) ⇒ neither (empty extra_joins / None
+                // ga). Any other marker is a forward-incompatible op ⇒ fail.
+                let mut extra_joins: Vec<JoinStep> = Vec::new();
+                let mut group_aggregate: Option<JoinGroupAgg> = None;
+                if c.remaining() > 0 {
+                    match c.peek_u8()? {
+                        EXTRA_JOINS_MARKER => {
+                            c.u8()?; // consume the extra-joins marker
+                            extra_joins = read_extra_joins_body(&mut c).ok()?;
+                        }
+                        1 => {
+                            c.u8()?; // consume the ga-block marker
+                            let group_field = c.u16()?;
+                            let n = c.u16()? as usize;
+                            if n == 0 {
+                                return None;
+                            }
+                            let mut aggregates = Vec::with_capacity(n);
+                            for _ in 0..n {
+                                let k = c.u8()?;
+                                let f = c.u16()?;
+                                aggregates.push((k, f));
+                            }
+                            // SP-PG-SQL-HAVING: optional HAVING block INSIDE the
+                            // ga-block. Absent ⇒ None.
+                            let having = decode_having(&mut c).ok()?;
+                            group_aggregate = Some(JoinGroupAgg { group_field, aggregates, having });
+                        }
+                        _ => return None,
                     }
-                    let group_field = c.u16()?;
-                    let n = c.u16()? as usize;
-                    if n == 0 {
-                        return None;
-                    }
-                    let mut aggregates = Vec::with_capacity(n);
-                    for _ in 0..n {
-                        let k = c.u8()?;
-                        let f = c.u16()?;
-                        aggregates.push((k, f));
-                    }
-                    // SP-PG-SQL-HAVING: optional HAVING block INSIDE the
-                    // ga-block (only present when a group_aggregate is). Absent
-                    // ⇒ None (pre-HAVING join-group-aggregate frame).
-                    let having = decode_having(&mut c).ok()?;
-                    Some(JoinGroupAgg { group_field, aggregates, having })
-                } else {
-                    None
-                };
+                }
                 Op::Join {
                     left_type,
                     right_type,
@@ -1834,6 +1930,7 @@ impl Op {
                     limit_n,
                     offset_n,
                     group_aggregate,
+                    extra_joins,
                 }
             }
             26 => {
@@ -2055,6 +2152,12 @@ pub mod codec {
             self.pos += 1;
             Some(v)
         }
+        /// Read the next byte WITHOUT advancing (SP-PG-SQL-MULTI-JOIN: lets the
+        /// Op::Join decode distinguish the extra-joins block (marker 2) from the
+        /// ga block (marker 1) that share the same post-page-block position).
+        pub fn peek_u8(&self) -> Option<u8> {
+            self.buf.get(self.pos).copied()
+        }
         pub fn u16(&mut self) -> Option<u16> {
             let s = self.buf.get(self.pos..self.pos + 2)?;
             self.pos += 2;
@@ -2206,34 +2309,34 @@ mod tests {
             Op::QueryRows { type_id: 4, eq_preds: vec![], program: vec![1], limit: 0, range_preds: vec![(2, 1, vec![7, 0]), (2, 3, vec![9, 0])] },
             Op::Describe { type_id: 4 },
             Op::DropType { type_id: 4 },
-            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9, filter: vec![], join_type: JoinType::Inner, order_by: None, limit_n: None, offset_n: None, group_aggregate: None },
+            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9, filter: vec![], join_type: JoinType::Inner, order_by: None, limit_n: None, offset_n: None, group_aggregate: None, extra_joins: vec![] },
             // SP-PG-SQL-JOIN-WHERE: filtered join — non-empty filter program
             // round-trips through the new optional trailing wire suffix.
-            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9, filter: vec![1, 0, 0, 5, 42, 3], join_type: JoinType::Inner, order_by: None, limit_n: None, offset_n: None, group_aggregate: None },
+            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9, filter: vec![1, 0, 0, 5, 42, 3], join_type: JoinType::Inner, order_by: None, limit_n: None, offset_n: None, group_aggregate: None, extra_joins: vec![] },
             // SP-PG-SQL-OUTER-JOIN: LEFT join, no filter — the join-type tag
             // round-trips with an empty filter ahead of it.
-            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9, filter: vec![], join_type: JoinType::Left, order_by: None, limit_n: None, offset_n: None, group_aggregate: None },
+            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9, filter: vec![], join_type: JoinType::Left, order_by: None, limit_n: None, offset_n: None, group_aggregate: None, extra_joins: vec![] },
             // SP-PG-SQL-OUTER-JOIN: LEFT join WITH filter — both trailing
             // fields present (filter then tag).
-            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9, filter: vec![1, 0, 0, 5, 42, 3], join_type: JoinType::Left, order_by: None, limit_n: None, offset_n: None, group_aggregate: None },
+            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9, filter: vec![1, 0, 0, 5, 42, 3], join_type: JoinType::Left, order_by: None, limit_n: None, offset_n: None, group_aggregate: None, extra_joins: vec![] },
             // SP-PG-SQL-JOIN-QUERY: ORDER BY only (asc) — page block with just
             // the sort field, limit/offset absent.
-            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 0, filter: vec![], join_type: JoinType::Inner, order_by: Some((3, false)), limit_n: None, offset_n: None, group_aggregate: None },
+            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 0, filter: vec![], join_type: JoinType::Inner, order_by: Some((3, false)), limit_n: None, offset_n: None, group_aggregate: None, extra_joins: vec![] },
             // SP-PG-SQL-JOIN-QUERY: ORDER BY DESC + LIMIT + OFFSET — all page
             // fields present, over an INNER join with no filter.
-            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 0, filter: vec![], join_type: JoinType::Inner, order_by: Some((6, true)), limit_n: Some(20), offset_n: Some(40), group_aggregate: None },
+            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 0, filter: vec![], join_type: JoinType::Inner, order_by: Some((6, true)), limit_n: Some(20), offset_n: Some(40), group_aggregate: None, extra_joins: vec![] },
             // SP-PG-SQL-JOIN-QUERY: LIMIT/OFFSET with NO order_by, over a LEFT
             // join WITH filter — every trailing region present at once.
-            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 0, filter: vec![1, 0, 0, 5, 42, 3], join_type: JoinType::Left, order_by: None, limit_n: Some(5), offset_n: Some(2), group_aggregate: None },
+            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 0, filter: vec![1, 0, 0, 5, 42, 3], join_type: JoinType::Left, order_by: None, limit_n: Some(5), offset_n: Some(2), group_aggregate: None, extra_joins: vec![] },
             // SP-PG-SQL-JOIN-AGG: GROUP BY combined field 0, single COUNT(*)
             // aggregate (sentinel field id) over an INNER join, no filter — the
             // ga block force-writes the empty-filter + inner-tag + all-None page
             // block anchors, then the group/agg fields.
-            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 0, filter: vec![], join_type: JoinType::Inner, order_by: None, limit_n: None, offset_n: None, group_aggregate: Some(JoinGroupAgg { group_field: 0, aggregates: vec![(0, COUNT_STAR_FIELD)], having: None }) },
+            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 0, filter: vec![], join_type: JoinType::Inner, order_by: None, limit_n: None, offset_n: None, group_aggregate: Some(JoinGroupAgg { group_field: 0, aggregates: vec![(0, COUNT_STAR_FIELD)], having: None }), extra_joins: vec![] },
             // SP-PG-SQL-JOIN-AGG: GROUP BY field 1, TWO aggregates (COUNT(col 3)
             // + SUM(col 4)) over a LEFT join WITH filter — every trailing region
             // present at once (filter, tag, page block, ga block).
-            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 0, filter: vec![1, 0, 0, 5, 42, 3], join_type: JoinType::Left, order_by: None, limit_n: None, offset_n: None, group_aggregate: Some(JoinGroupAgg { group_field: 1, aggregates: vec![(0, 3), (1, 4)], having: None }) },
+            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 0, filter: vec![1, 0, 0, 5, 42, 3], join_type: JoinType::Left, order_by: None, limit_n: None, offset_n: None, group_aggregate: Some(JoinGroupAgg { group_field: 1, aggregates: vec![(0, 3), (1, 4)], having: None }), extra_joins: vec![] },
             Op::Aggregate { type_id: 4, program: vec![1], kind: 1, field_id: 3, range_preds: vec![] },
             // SP-Analytic-Plan: aggregate w/ range hints — new wire suffix.
             Op::Aggregate { type_id: 4, program: vec![1], kind: 1, field_id: 3, range_preds: vec![(2, 1, vec![7, 0]), (2, 3, vec![9, 0])] },
@@ -2308,6 +2411,7 @@ mod tests {
             left_type: 4, right_type: 5, left_field: 1, right_field: 2,
             limit: 9, filter: vec![], join_type: JoinType::Inner,
             order_by: None, limit_n: None, offset_n: None, group_aggregate: None,
+            extra_joins: vec![],
         };
         let enc = inner.encode();
         // tag(28) + lt(u32) + rt(u32) + lf(u16) + rf(u16) + limit(u32)
@@ -2325,6 +2429,7 @@ mod tests {
             left_type: 4, right_type: 5, left_field: 1, right_field: 2,
             limit: 9, filter: vec![], join_type: JoinType::Left,
             order_by: None, limit_n: None, offset_n: None, group_aggregate: None,
+            extra_joins: vec![],
         };
         let enc = left.encode();
         // 17 base + 4 (empty filter len) + 1 (tag) = 22.
@@ -2341,6 +2446,7 @@ mod tests {
             left_type: 4, right_type: 5, left_field: 1, right_field: 2,
             limit: 9, filter: vec![], join_type: JoinType::Left,
             order_by: None, limit_n: None, offset_n: None, group_aggregate: None,
+            extra_joins: vec![],
         };
         let mut enc = left.encode();
         *enc.last_mut().unwrap() = 0x7F; // bogus tag
@@ -2357,6 +2463,7 @@ mod tests {
             left_type: 4, right_type: 5, left_field: 1, right_field: 2,
             limit: 9, filter: vec![], join_type: JoinType::Inner,
             order_by: None, limit_n: None, offset_n: None, group_aggregate: None,
+            extra_joins: vec![],
         };
         assert_eq!(inner.encode().len(), 17, "no page block ⇒ 17-byte frame");
     }
@@ -2370,6 +2477,7 @@ mod tests {
             left_type: 4, right_type: 5, left_field: 1, right_field: 2,
             limit: 0, filter: vec![], join_type: JoinType::Inner,
             order_by: Some((3, false)), limit_n: Some(20), offset_n: Some(40), group_aggregate: None,
+            extra_joins: vec![],
         };
         let enc = op.encode();
         // 17 base + 4 (empty filter len) + 1 (inner tag=0) + page block:
@@ -2387,6 +2495,7 @@ mod tests {
             left_type: 4, right_type: 5, left_field: 1, right_field: 2,
             limit: 0, filter: vec![], join_type: JoinType::Inner,
             order_by: Some((3, false)), limit_n: None, offset_n: None, group_aggregate: None,
+            extra_joins: vec![],
         };
         let enc = op.encode();
         // The marker byte sits right after the inner tag: 17 base + 4 (filter
@@ -2405,6 +2514,7 @@ mod tests {
             left_type: 4, right_type: 5, left_field: 1, right_field: 2,
             limit: 9, filter: vec![], join_type: JoinType::Inner,
             order_by: None, limit_n: None, offset_n: None, group_aggregate: None,
+            extra_joins: vec![],
         };
         assert_eq!(inner.encode().len(), 17, "no ga block ⇒ 17-byte frame");
     }
@@ -2423,6 +2533,7 @@ mod tests {
                 aggregates: vec![(0, COUNT_STAR_FIELD), (1, 4)],
                 having: None,
             }),
+            extra_joins: vec![],
         };
         let enc = op.encode();
         // 17 base + 4 (empty filter) + 1 (inner tag) + page block all-None
@@ -2446,6 +2557,7 @@ mod tests {
                 aggregates: vec![(0, COUNT_STAR_FIELD)],
                 having: None,
             }),
+            extra_joins: vec![],
         };
         let enc = op.encode();
         // ga marker sits after: 17 base + 4 (filter) + 1 (tag) + 4 (page block
@@ -3032,6 +3144,7 @@ mod tests {
                 aggregates: vec![(0, COUNT_STAR_FIELD)],
                 having: Some(HavingPred { agg_index: 0, op: 5, value: 0 }),
             }),
+            extra_joins: vec![],
         };
         assert_eq!(Op::decode(&j.encode()).unwrap(), j, "Join+JoinGroupAgg+HAVING round-trip");
 
@@ -3058,6 +3171,7 @@ mod tests {
             group_aggregate: Some(JoinGroupAgg {
                 group_field: 1, aggregates: vec![(0, COUNT_STAR_FIELD)], having: None,
             }),
+            extra_joins: vec![],
         };
         // The no-HAVING join-group-aggregate must NOT carry a having marker:
         // decode then re-encode must be stable, and the encoded length equals a

@@ -1146,6 +1146,7 @@ mod tests {
             limit_n: None,
             offset_n: None,
             group_aggregate: None,
+            extra_joins: vec![],
         };
         assert_eq!(route_op(&op, 4), ShardRoute::ShardZero, "{op:?}");
     }

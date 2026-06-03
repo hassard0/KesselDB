@@ -1081,6 +1081,293 @@ impl<V: Vfs> StateMachine<V> {
         }
     }
 
+    /// SP-PG-SQL-MULTI-JOIN: a chained N-way (3+ table) INNER equi-join.
+    /// Builds the running combined `(a ++ b ++ c …)` row set by starting with
+    /// the base INNER equi-join of `(left_type, right_type)` then folding each
+    /// `JoinStep` (INNER equi-join the running set against the step's table on
+    /// `left_combined_field == right_field`). The combined schema grows each
+    /// step (renamed `<table>.<col>`, fresh sequential combined field ids).
+    /// Produces the SAME self-describing `KTR1` stream the binary join emits
+    /// (just wider), then applies the optional combined-schema `filter`, then
+    /// either streams in deterministic scan order (capped by the pre-sort
+    /// `limit`) or stable-sorts by the combined `order_by` field and paginates
+    /// (`offset_n`/`limit_n`). The result is a PURE deterministic function of
+    /// the input tables: left-key/right-scan order is preserved at every step
+    /// (rows scanned in object-id order, each matched against the next table in
+    /// object-id order), giving a stable total row order.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_multi_join(
+        &self,
+        left_type: u32,
+        right_type: u32,
+        left_field: u16,
+        right_field: u16,
+        limit: u32,
+        filter: &[u8],
+        _join_type: kessel_proto::JoinType,
+        order_by: Option<(u16, bool)>,
+        limit_n: Option<u64>,
+        offset_n: Option<u64>,
+        extra_joins: &[kessel_proto::JoinStep],
+    ) -> OpResult {
+        use kessel_catalog::{Field, ObjectType};
+        // Resolve a table's join field to (byte offset, width) in its record.
+        let field_pos = |ot: &ObjectType, fid: u16| -> Option<(usize, usize)> {
+            ot.fields.iter().position(|f| f.field_id == fid).map(|i| {
+                (ot.compute_layout().offsets[i], ot.fields[i].kind.width() as usize)
+            })
+        };
+        // Combined-schema index → (offset, width) using the combined layout.
+        let lt = match self.catalog.get(left_type) {
+            Some(t) => t.clone(),
+            None => return OpResult::SchemaError(format!("no type {left_type}")),
+        };
+        let rt = match self.catalog.get(right_type) {
+            Some(t) => t.clone(),
+            None => return OpResult::SchemaError(format!("no type {right_type}")),
+        };
+
+        // --- Build the base (a ++ b) combined schema + decoded-Value rows. ---
+        // Combined fields: left `<lt>.<col>` then right `<rt>.<col>`, ids 0..nL+nR.
+        let mut combined_fields: Vec<Field> =
+            Vec::with_capacity(lt.fields.len() + rt.fields.len());
+        let mut fid: u16 = 0;
+        for (src, f) in lt
+            .fields
+            .iter()
+            .map(|f| (&lt.name, f))
+            .chain(rt.fields.iter().map(|f| (&rt.name, f)))
+        {
+            combined_fields.push(Field {
+                field_id: fid,
+                name: format!("{src}.{}", f.name),
+                kind: f.kind,
+                nullable: f.nullable,
+            });
+            fid += 1;
+        }
+        let mut combined_name = format!("{}+{}", lt.name, rt.name);
+
+        // Hash the right table by its join-key bytes (INNER: only matches kept).
+        let (loff, lw) = match field_pos(&lt, left_field) {
+            Some(p) => p,
+            None => return OpResult::SchemaError("no left join field".into()),
+        };
+        let (roff, rw) = match field_pos(&rt, right_field) {
+            Some(p) => p,
+            None => return OpResult::SchemaError("no right join field".into()),
+        };
+        if lw != rw {
+            return OpResult::SchemaError("join fields must have equal width".into());
+        }
+        let mut rmap: std::collections::HashMap<Vec<u8>, Vec<Vec<kessel_codec::Value>>> =
+            std::collections::HashMap::new();
+        // Right rows in object-id (scan) order so each bucket preserves it.
+        let rlo = make_key(right_type, &[0u8; 16]);
+        let rhi = make_key(right_type, &[0xFFu8; 16]);
+        for (_, rr) in self.storage.scan_range(&rlo, &rhi) {
+            let k = match rr.get(roff..roff + rw) {
+                Some(k) => k.to_vec(),
+                None => continue,
+            };
+            let rv = match kessel_codec::decode(&rt, &rr) {
+                Ok(v) => v,
+                Err(e) => return OpResult::SchemaError(format!("join decode right: {e:?}")),
+            };
+            rmap.entry(k).or_default().push(rv);
+        }
+        // Combined rows = for each left row (object-id order), each matching
+        // right row (bucket scan order) ⇒ lv ++ rv. INNER ⇒ unmatched dropped.
+        let mut rows: Vec<Vec<kessel_codec::Value>> = Vec::new();
+        let llo = make_key(left_type, &[0u8; 16]);
+        let lhi = make_key(left_type, &[0xFFu8; 16]);
+        for (_, lr) in self.storage.scan_range(&llo, &lhi) {
+            let k = match lr.get(loff..loff + lw) {
+                Some(k) => k,
+                None => continue,
+            };
+            let lv = match kessel_codec::decode(&lt, &lr) {
+                Ok(v) => v,
+                Err(e) => return OpResult::SchemaError(format!("join decode left: {e:?}")),
+            };
+            if let Some(bucket) = rmap.get(k) {
+                for rv in bucket {
+                    let mut row = lv.clone();
+                    row.extend(rv.iter().cloned());
+                    rows.push(row);
+                }
+            }
+        }
+
+        // --- Fold each extra JOIN step onto the running combined set. ---
+        // The running combined ObjectType is rebuilt each step so codec encode
+        // (for the filter eval + output) sees the correct widening schema.
+        for (si, step) in extra_joins.iter().enumerate() {
+            let ct = match self.catalog.get(step.right_type) {
+                Some(t) => t.clone(),
+                None => {
+                    return OpResult::SchemaError(format!(
+                        "no type {} (join step {})",
+                        step.right_type, si
+                    ))
+                }
+            };
+            // Running combined ObjectType BEFORE this step (for left-key probe).
+            let running =
+                ObjectType::from_def(combined_name.clone(), combined_fields.clone());
+            // The ON left side is a combined-schema field id; resolve its index
+            // + kind so we can read the key Value from each running row.
+            let lci = match combined_fields
+                .iter()
+                .position(|f| f.field_id == step.left_combined_field)
+            {
+                Some(i) => i,
+                None => {
+                    return OpResult::SchemaError(format!(
+                        "join step {si}: no combined left field {}",
+                        step.left_combined_field
+                    ))
+                }
+            };
+            let lkind = combined_fields[lci].kind;
+            let lwidth = lkind.width() as usize;
+            let (coff, cw) = match field_pos(&ct, step.right_field) {
+                Some(p) => p,
+                None => {
+                    return OpResult::SchemaError(format!(
+                        "join step {si}: no right join field {}",
+                        step.right_field
+                    ))
+                }
+            };
+            if lwidth != cw {
+                return OpResult::SchemaError(
+                    "join step fields must have equal width".into(),
+                );
+            }
+            let _ = &running;
+            // Hash the step table by its join-key bytes (object-id scan order).
+            let mut cmap: std::collections::HashMap<Vec<u8>, Vec<Vec<kessel_codec::Value>>> =
+                std::collections::HashMap::new();
+            let clo = make_key(step.right_type, &[0u8; 16]);
+            let chi = make_key(step.right_type, &[0xFFu8; 16]);
+            for (_, cr) in self.storage.scan_range(&clo, &chi) {
+                let k = match cr.get(coff..coff + cw) {
+                    Some(k) => k.to_vec(),
+                    None => continue,
+                };
+                let cv = match kessel_codec::decode(&ct, &cr) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return OpResult::SchemaError(format!(
+                            "join step {si} decode: {e:?}"
+                        ))
+                    }
+                };
+                cmap.entry(k).or_default().push(cv);
+            }
+            // Probe each running row's left key (as raw fixed-width bytes,
+            // matching how the step table was hashed) against the step table.
+            let mut next_rows: Vec<Vec<kessel_codec::Value>> = Vec::with_capacity(rows.len());
+            for row in &rows {
+                let key: Vec<u8> = match kessel_codec::raw_from_value(lkind, &row[lci]) {
+                    Some(mut b) => {
+                        b.resize(lwidth, 0);
+                        b
+                    }
+                    None => continue, // NULL key ⇒ no INNER match
+                };
+                if let Some(bucket) = cmap.get(&key) {
+                    for cv in bucket {
+                        let mut nrow = row.clone();
+                        nrow.extend(cv.iter().cloned());
+                        next_rows.push(nrow);
+                    }
+                }
+            }
+            rows = next_rows;
+            // Extend the combined schema with the step table's fields
+            // (`<ct>.<col>`, fresh sequential combined field ids).
+            for f in &ct.fields {
+                combined_fields.push(Field {
+                    field_id: fid,
+                    name: format!("{}.{}", ct.name, f.name),
+                    kind: f.kind,
+                    nullable: f.nullable,
+                });
+                fid += 1;
+            }
+            combined_name = format!("{combined_name}+{}", ct.name);
+        }
+
+        // --- Final combined schema + encode/output. ---
+        let cot = ObjectType::from_def(combined_name.clone(), combined_fields.clone());
+        let typedef = kessel_catalog::encode_type_def(&combined_name, &combined_fields);
+
+        // Resolve the ORDER BY combined field id to (index, kind) if present.
+        let sort_spec = match order_by {
+            Some((sf, desc)) => match combined_fields.iter().position(|f| f.field_id == sf) {
+                Some(idx) => Some((idx, combined_fields[idx].kind, desc)),
+                None => {
+                    return OpResult::SchemaError(format!("no join sort field {sf}"))
+                }
+            },
+            None => None,
+        };
+        let sorting = sort_spec.is_some();
+
+        let mut out = Vec::with_capacity(64 + typedef.len());
+        out.extend_from_slice(b"KTR1");
+        out.extend_from_slice(&(typedef.len() as u32).to_le_bytes());
+        out.extend_from_slice(&typedef);
+
+        // Encode + filter each combined row; stream (pre-sort `limit`) or collect.
+        let mut collected: Vec<(Vec<kessel_codec::Value>, Vec<u8>)> = Vec::new();
+        let mut n = 0u32;
+        for row in rows {
+            if !sorting && limit != 0 && n >= limit {
+                break;
+            }
+            let rec = match kessel_codec::encode(&cot, &row) {
+                Ok(r) => r,
+                Err(e) => return OpResult::SchemaError(format!("join encode: {e:?}")),
+            };
+            if !filter.is_empty() {
+                match kessel_expr::eval(filter, &cot, &rec) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(e) => return OpResult::SchemaError(format!("join filter: {e:?}")),
+                }
+            }
+            if sorting {
+                collected.push((row, rec));
+            } else {
+                out.extend_from_slice(&(rec.len() as u32).to_le_bytes());
+                out.extend_from_slice(&rec);
+                n += 1;
+            }
+        }
+        if let Some((idx, kind, desc)) = sort_spec {
+            collected.sort_by(|x, y| Self::cmp_join_value(kind, &x.0[idx], &y.0[idx]));
+            if desc {
+                collected.reverse();
+            }
+            let skip = offset_n.unwrap_or(0) as usize;
+            let mut emitted: u64 = 0;
+            for (_, rec) in collected.into_iter().skip(skip) {
+                if let Some(cap) = limit_n {
+                    if emitted >= cap {
+                        break;
+                    }
+                }
+                out.extend_from_slice(&(rec.len() as u32).to_le_bytes());
+                out.extend_from_slice(&rec);
+                emitted += 1;
+            }
+        }
+        OpResult::Got(out.into())
+    }
+
     /// SP-PG-SQL-JOIN-QUERY (and SP-PG-SQL-JOIN-WHERE / -OUTER-JOIN): the
     /// shared inner/left equi-join body. Builds the combined `(a ++ b)` rows
     /// (matched → `lv ++ rv`; unmatched-left in LEFT mode → `lv ++ [Null;
@@ -1104,7 +1391,26 @@ impl<V: Vfs> StateMachine<V> {
         limit_n: Option<u64>,
         offset_n: Option<u64>,
         group_aggregate: Option<&kessel_proto::JoinGroupAgg>,
+        extra_joins: &[kessel_proto::JoinStep],
     ) -> OpResult {
+        // SP-PG-SQL-MULTI-JOIN: a chained N-way (3+ table) INNER equi-join.
+        // Empty `extra_joins` ⇒ the binary-join path below runs UNCHANGED
+        // (byte-identical). Non-empty ⇒ the dedicated multi-join builder
+        // produces the wider combined `(a ++ b ++ c …)` KTR1 stream, then the
+        // SAME filter / order_by / limit_n / offset_n logic applies over the
+        // final combined schema. (V1: chained joins + group_aggregate is a
+        // named follow-up — rejected here defensively.)
+        if !extra_joins.is_empty() {
+            if group_aggregate.is_some() {
+                return OpResult::SchemaError(
+                    "multi-join + GROUP BY is not supported in V1".into(),
+                );
+            }
+            return self.apply_multi_join(
+                left_type, right_type, left_field, right_field, limit, filter,
+                join_type, order_by, limit_n, offset_n, extra_joins,
+            );
+        }
         let lt = match self.catalog.get(left_type) {
             Some(t) => t.clone(),
             None => return OpResult::SchemaError(format!("no type {left_type}")),
@@ -3740,10 +4046,11 @@ impl<V: Vfs> StateMachine<V> {
                 }
                 OpResult::Got(out.into())
             }
-            Op::Join { left_type, right_type, left_field, right_field, limit, filter, join_type, order_by, limit_n, offset_n, group_aggregate } => {
+            Op::Join { left_type, right_type, left_field, right_field, limit, filter, join_type, order_by, limit_n, offset_n, group_aggregate, extra_joins } => {
                 self.apply_join(
                     left_type, right_type, left_field, right_field, limit,
                     &filter, join_type, order_by, limit_n, offset_n, group_aggregate.as_ref(),
+                    &extra_joins,
                 )
             }
             // SP-Perf-A-TXN-RO: all-RO Op::Txn{ops} bypass. The
@@ -4988,10 +5295,11 @@ impl<V: Vfs> StateMachine<V> {
             // Current body uses legacy 20-byte data-row keyspace (scan_range × 2);
             // T2.C rewrites against data_row_scan(type_id, u64::MAX) for both sides
             // per Decision 4 (composite read arm, per-statement auto-commit).
-            Op::Join { left_type, right_type, left_field, right_field, limit, filter, join_type, order_by, limit_n, offset_n, group_aggregate } => {
+            Op::Join { left_type, right_type, left_field, right_field, limit, filter, join_type, order_by, limit_n, offset_n, group_aggregate, extra_joins } => {
                 self.apply_join(
                     left_type, right_type, left_field, right_field, limit,
                     &filter, join_type, order_by, limit_n, offset_n, group_aggregate.as_ref(),
+                    &extra_joins,
                 )
             }
 
@@ -11721,6 +12029,7 @@ mod tests {
             left_type: 1, right_type: 2, left_field: 1, right_field: 2,
             limit: 0, filter, join_type: jt, order_by, limit_n, offset_n,
             group_aggregate: None,
+            extra_joins: vec![],
         }) {
             OpResult::Got(b) => jq_read_pairs(&b),
             o => panic!("join: {o:?}"),
@@ -11814,6 +12123,7 @@ mod tests {
             limit: 0, filter: vec![], join_type: jt,
             order_by: None, limit_n: None, offset_n: None,
             group_aggregate: Some(kessel_proto::JoinGroupAgg { group_field, aggregates, having: None }),
+            extra_joins: vec![],
         }) {
             OpResult::Got(b) => b,
             o => panic!("join-agg: {o:?}"),
@@ -11899,6 +12209,7 @@ mod tests {
                     aggregates: vec![(0, 2), (0, kessel_proto::COUNT_STAR_FIELD), (1, 3)],
                     having: None,
                 }),
+                extra_joins: vec![],
             }) {
                 OpResult::Got(b) => b.to_vec(),
                 o => panic!("join-agg: {o:?}"),

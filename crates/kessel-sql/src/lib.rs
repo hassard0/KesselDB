@@ -3733,6 +3733,116 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
             .find(|f| f.name == rf_col)
             .ok_or_else(|| unknown_column_err(&rf_col, rf_tbl))?
             .field_id;
+        // SP-PG-SQL-MULTI-JOIN: consume any additional chained
+        // `[INNER] JOIN <table> ON <a.x> = <b.y>` segments after the base join.
+        // Each step's ON references the NEW table on one side and an ALREADY-
+        // joined table on the other. We resolve the already-joined side to a
+        // combined-schema field id over the running `(a ++ b ++ …)` schema and
+        // the new side to the new table's own field id, emitting one `JoinStep`.
+        // V1 is INNER only (`JOIN` / `INNER JOIN`); a `LEFT`/`RIGHT`/`FULL` in
+        // the chain is a named follow-up (rejected). Tables are tracked by name
+        // (aliases in a multi-join chain are a named follow-up).
+        let mut joined: Vec<ObjectType> = vec![ot.clone(), rt.clone()];
+        let mut extra_joins: Vec<kessel_proto::JoinStep> = Vec::new();
+        // Peek for a chained JOIN (optionally `INNER JOIN`). A bare `JOIN` or
+        // `INNER JOIN` continues the INNER chain; anything else ends it.
+        loop {
+            // Detect `INNER JOIN` / `JOIN`. A `LEFT`/`RIGHT`/`FULL` here is an
+            // unsupported mixed-outer chain ⇒ explicit error.
+            let is_join = if let Some(Tok::Ident(k)) = p.peek() {
+                if k.eq_ignore_ascii_case("JOIN") {
+                    p.i += 1;
+                    true
+                } else if k.eq_ignore_ascii_case("INNER") {
+                    p.i += 1;
+                    p.expect_kw("JOIN")?;
+                    true
+                } else if k.eq_ignore_ascii_case("LEFT")
+                    || k.eq_ignore_ascii_case("RIGHT")
+                    || k.eq_ignore_ascii_case("FULL")
+                {
+                    return Err(
+                        "multi-join V1 supports only chained INNER joins \
+                         (mixing LEFT/RIGHT/FULL into a chain is a follow-up)"
+                            .into(),
+                    );
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !is_join {
+                break;
+            }
+            let cname = p.ident()?;
+            if joined.iter().any(|t| t.name == cname) {
+                return Err(format!(
+                    "multi-join: table `{cname}` is already joined (self-joins / \
+                     aliases in a chain are a follow-up)"
+                ));
+            }
+            let ct = p.type_named(&cname)?.clone();
+            p.expect_kw("ON")?;
+            let q1 = p.ident()?;
+            p.punct('.')?;
+            let oc1 = p.ident()?;
+            if !matches!(p.next(), Some(Tok::Cmp("="))) {
+                return Err("JOIN ON needs `=`".into());
+            }
+            let q2 = p.ident()?;
+            p.punct('.')?;
+            let oc2 = p.ident()?;
+            // Exactly one side must be the NEW table `cname`; the other an
+            // already-joined table.
+            let (prev_tbl, prev_col, new_col) = if q2 == cname && q1 != cname {
+                (q1, oc1, oc2)
+            } else if q1 == cname && q2 != cname {
+                (q2, oc2, oc1)
+            } else {
+                return Err(format!(
+                    "multi-join ON must reference the new table `{cname}` and one \
+                     already-joined table"
+                ));
+            };
+            // Resolve the new table's join column to its own field id.
+            let right_field = ct
+                .fields
+                .iter()
+                .find(|f| f.name == new_col)
+                .ok_or_else(|| unknown_column_err(&new_col, &ct))?
+                .field_id;
+            // Resolve the already-joined side to a combined field id over the
+            // running combined schema (the tables joined SO FAR, in order).
+            let prev_refs: Vec<&ObjectType> = joined.iter().collect();
+            let prev_combined = combined_join_type_multi(&prev_refs);
+            let prev_name = format!("{prev_tbl}.{prev_col}");
+            // The qualifier must name one of the already-joined tables.
+            if !joined.iter().any(|t| t.name == prev_tbl) {
+                return Err(format!(
+                    "multi-join ON qualifier `{prev_tbl}` is not an already-joined \
+                     table"
+                ));
+            }
+            let left_combined_field = prev_combined
+                .fields
+                .iter()
+                .find(|f| f.name == prev_name)
+                .ok_or_else(|| unknown_column_err(&prev_name, &prev_combined))?
+                .field_id;
+            extra_joins.push(kessel_proto::JoinStep {
+                right_type: ct.type_id,
+                left_combined_field,
+                right_field,
+            });
+            joined.push(ct);
+        }
+        // The combined schema spanning ALL joined tables — used to resolve the
+        // WHERE / ORDER BY columns when the chain has extra joins (for a plain
+        // 2-table join `joined == [ot, rt]`, so this equals `combined_join_type`).
+        let multi_refs: Vec<&ObjectType> = joined.iter().collect();
+        let multi_cot = combined_join_type_multi(&multi_refs);
+        let has_extra = !extra_joins.is_empty();
         // SP-PG-SQL-JOIN-WHERE: optional `WHERE <pred>` after the ON clause.
         // The predicate filters the COMBINED join rows, so it compiles against
         // the SAME combined schema the engine builds (left fields `<lt>.<col>`
@@ -3740,8 +3850,15 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
         // Qualified columns (`a.x`, `b.y`) resolve by the combined `<table>.
         // <col>` name; a bare `col` resolves by suffix with an ambiguity check.
         let filter = if p.kw("WHERE") {
-            let cot = combined_join_type(&ot, &rt);
-            compile_join_where(p, &cot, &ot.name, &rt.name)?
+            if has_extra {
+                // SP-PG-SQL-MULTI-JOIN: resolve the WHERE over the full chain's
+                // combined schema (qualifiers may name ANY joined table).
+                let names: Vec<&str> = joined.iter().map(|t| t.name.as_str()).collect();
+                compile_join_where_multi(p, &multi_cot, &names)?
+            } else {
+                let cot = combined_join_type(&ot, &rt);
+                compile_join_where(p, &cot, &ot.name, &rt.name)?
+            }
         } else {
             Vec::new()
         };
@@ -3770,6 +3887,14 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
         };
         let mut group_aggregate: Option<kessel_proto::JoinGroupAgg> = None;
         if p.kw("GROUP") {
+            // SP-PG-SQL-MULTI-JOIN: GROUP BY over a chained (3+ table) join is a
+            // named follow-up — the engine rejects multi-join + group_aggregate.
+            if has_extra {
+                return Err(
+                    "GROUP BY over a chained multi-join is not supported in V1 \
+                     (a named follow-up)".into(),
+                );
+            }
             p.expect_kw("BY")?;
             // qualified `a.c` (V1 requires a qualifier so the combined-schema
             // resolution is unambiguous across the two tables).
@@ -3976,15 +4101,21 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
             let qt = p.ident()?;
             p.punct('.')?;
             let qc = p.ident()?;
-            if qt != ot.name && qt != rt.name {
+            // SP-PG-SQL-MULTI-JOIN: resolve ORDER BY over the FULL chain schema
+            // when there are extra joins (qualifier may name ANY joined table);
+            // for a plain binary join this equals `combined_join_type(&ot,&rt)`.
+            if !joined.iter().any(|t| t.name == qt) {
+                let names: Vec<&str> = joined.iter().map(|t| t.name.as_str()).collect();
                 return Err(format!(
-                    "ORDER BY qualifier `{qt}` is not one of the joined tables \
-                     `{}` / `{}`",
-                    ot.name, rt.name
+                    "ORDER BY qualifier `{qt}` is not one of the joined tables {names:?}"
                 ));
             }
             let combined_name = format!("{qt}.{qc}");
-            let cot = combined_join_type(&ot, &rt);
+            let cot = if has_extra {
+                multi_cot.clone()
+            } else {
+                combined_join_type(&ot, &rt)
+            };
             let sfid = cot
                 .fields
                 .iter()
@@ -4042,6 +4173,7 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
             limit_n,
             offset_n,
             group_aggregate,
+            extra_joins,
         });
     }
     // Primary-key fast path: `SELECT ... FROM t ID <n>` -> O(1) GetById
@@ -4471,6 +4603,33 @@ fn combined_join_type(lt: &ObjectType, rt: &ObjectType) -> ObjectType {
     ObjectType::from_def(format!("{}+{}", lt.name, rt.name), fields)
 }
 
+/// SP-PG-SQL-MULTI-JOIN: combined schema over an ORDERED list of joined tables
+/// (`a ++ b ++ c …`). Mirrors `combined_join_type` for N tables: each column is
+/// renamed `<table>.<col>` and assigned a fresh sequential combined field id,
+/// matching the engine's `apply_multi_join` schema build EXACTLY (same order,
+/// same names, same ids). The combined type name is `a+b+c…`.
+fn combined_join_type_multi(tables: &[&ObjectType]) -> ObjectType {
+    let mut fields: Vec<Field> = Vec::new();
+    let mut fid: u16 = 0;
+    let mut name = String::new();
+    for (i, t) in tables.iter().enumerate() {
+        if i > 0 {
+            name.push('+');
+        }
+        name.push_str(&t.name);
+        for f in &t.fields {
+            fields.push(Field {
+                field_id: fid,
+                name: format!("{}.{}", t.name, f.name),
+                kind: f.kind,
+                nullable: f.nullable,
+            });
+            fid += 1;
+        }
+    }
+    ObjectType::from_def(name, fields)
+}
+
 // WHERE keywords that an `Ident` may legitimately be in the WHERE grammar —
 // these are NEVER column references, so the join-WHERE rewriter leaves them
 // untouched. (Values are `Int`/`Str`/`Bytes` tokens, not idents.)
@@ -4498,6 +4657,22 @@ fn compile_join_where(
     ltbl: &str,
     rtbl: &str,
 ) -> Result<Vec<u8>, SqlError> {
+    // The binary-join case is the 2-table multi case.
+    compile_join_where_multi(p, cot, &[ltbl, rtbl])
+}
+
+/// SP-PG-SQL-MULTI-JOIN: join-WHERE compiler generalized to N joined tables.
+/// `tables` is the ordered list of joined table names (for qualifier validation
+/// + error messages); `cot` is the combined schema spanning them all. Qualified
+/// `t.col` rewrites to the combined `<t>.<col>` (qualifier must name a joined
+/// table); a bare `col` resolves by `.<col>` suffix with an ambiguity check
+/// across ALL joined tables. Identical to the 2-table path when `tables.len()
+/// == 2`, so the binary join is unchanged.
+fn compile_join_where_multi(
+    p: &mut P,
+    cot: &ObjectType,
+    tables: &[&str],
+) -> Result<Vec<u8>, SqlError> {
     // The WHERE region runs from p.i up to a top-level LIMIT (the only clause
     // that can follow a join-WHERE in V1) or end of input. Collect + rewrite.
     let mut rewritten: Vec<Tok> = Vec::new();
@@ -4524,10 +4699,10 @@ fn compile_join_where(
                         Some(Tok::Ident(c)) => c,
                         _ => return Err("expected column after `table.`".into()),
                     };
-                    if name != ltbl && name != rtbl {
+                    if !tables.iter().any(|t| *t == name) {
                         return Err(format!(
                             "join-WHERE qualifier `{name}` is not one of the \
-                             joined tables `{ltbl}` / `{rtbl}`"
+                             joined tables {tables:?}"
                         ));
                     }
                     let combined = format!("{name}.{col}");
@@ -4537,7 +4712,7 @@ fn compile_join_where(
                     rewritten.push(Tok::Ident(combined));
                 } else {
                     // Bare column — resolve by suffix `.<name>` with an
-                    // ambiguity check across the two joined tables.
+                    // ambiguity check across ALL joined tables.
                     let suffix = format!(".{name}");
                     let mut hits = cot
                         .fields
@@ -4549,8 +4724,8 @@ fn compile_join_where(
                         (Some(_), Some(_)) => {
                             return Err(format!(
                                 "column `{name}` is ambiguous in join-WHERE \
-                                 (present in both `{ltbl}` and `{rtbl}`); \
-                                 qualify it as `{ltbl}.{name}` or `{rtbl}.{name}`"
+                                 (present in multiple joined tables {tables:?}); \
+                                 qualify it"
                             ))
                         }
                         (None, _) => return Err(unknown_column_err(&name, cot)),

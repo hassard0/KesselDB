@@ -1,0 +1,79 @@
+SP-PG-SQL-OUTER-JOIN — LEFT [OUTER] JOIN — vulcan smoke
+========================================================
+
+Date:     2026-06-03
+Host:     vulcan (admin@192.168.4.178), isolated worktree /tmp/kdb-oj-wt
+Commit:   9aebf10 (origin/main HEAD at smoke time)
+Build:    CARGO_TARGET_DIR=/tmp/kdb-t-oj cargo build --release --bin kesseldb --features pg-gateway
+toolchain: rustc 1.95.0 (59807616e 2026-04-14)
+Server:   /tmp/kdb-t-oj/release/kesseldb 127.0.0.1:6552 /tmp/kdb-oj-data2  (pg=127.0.0.1:5552)
+
+Unit/integration suites (release) — ALL GREEN
+----------------------------------------------
+  kessel-proto       20 passed / 0 failed
+                       (incl. inner_join_no_filter_wire_byte_identical  ← INNER 17-byte frame regression,
+                              left_join_no_filter_carries_tag,
+                              unknown_join_type_tag_rejected)
+  kessel-sql        129 passed / 0 failed   (was 127 → +2 OUTER-JOIN KATs)
+                       (incl. left_join_parses_to_left_join_type,
+                              left_join_emits_unmatched_left_with_null_right)
+  kessel-pg-gateway 1002 passed / 0 failed
+  kessel-sm          176 passed / 0 failed
+  kessel-vsr          28 passed / 0 failed
+                       (incl. large_seed_corpus_is_deterministic_and_converges  ← seed-7 / 3-replica determinism oracle)
+
+Full-workspace CI on commit 9aebf10: GREEN (GitHub Actions, run 26883262567).
+
+DDL + seed
+----------
+  CREATE TABLE a (id BIGINT, name CHAR(16))                       -> CREATE TABLE
+  CREATE TABLE b (id BIGINT, aid BIGINT, title CHAR(16))          -> CREATE TABLE
+  INSERT INTO a (id,name)    VALUES (1,'tolkien'),(2,'orphan')    -> INSERT 0 2
+  INSERT INTO b (id,aid,title) VALUES (1,1,'lotr')                -> INSERT 0 1
+  (tolkien has one book 'lotr'; orphan has NO book.)
+
+INNER JOIN (baseline) — orphan dropped
+--------------------------------------
+  SELECT a.name, b.title FROM a JOIN b ON a.id = b.aid
+
+   a.name  | b.title
+  ---------+---------
+   tolkien | lotr
+  (1 row)
+
+LEFT JOIN (HEADLINE) — orphan row appears with NULL title
+---------------------------------------------------------
+  SELECT a.name, b.title FROM a LEFT JOIN b ON a.id = b.aid       (\pset null '<NULL>')
+
+   a.name  | b.title
+  ---------+---------
+   tolkien | lotr
+   orphan  | <NULL>
+  (2 rows)
+
+LEFT OUTER JOIN (OUTER noise word) — identical to LEFT JOIN
+----------------------------------------------------------
+  SELECT a.name, b.title FROM a LEFT OUTER JOIN b ON a.id = b.aid
+
+   a.name  | b.title
+  ---------+---------
+   tolkien | lotr
+   orphan  | <NULL>
+  (2 rows)
+
+LEFT JOIN + WHERE on a right (b.*) column — orphan dropped (PG semantics)
+------------------------------------------------------------------------
+  SELECT a.name, b.title FROM a LEFT JOIN b ON a.id = b.aid WHERE b.title = 'lotr'
+
+   a.name  | b.title
+  ---------+---------
+   tolkien | lotr
+  (1 row)
+
+Result: PASS. HEADLINE confirmed — the unmatched left row (orphan) appears with
+NULL on the right (b.title), rendered as the PG NULL sentinel (i32 -1 on the
+wire; '<NULL>' shown via \pset). INNER drops it (1 row); LEFT/LEFT OUTER keep it
+(2 rows); a WHERE on the right column of a LEFT join drops the NULL-right
+unmatched row, matching PostgreSQL. Determinism oracle green; PG wire / HTTP /
+WS / binary surfaces byte-untouched (the join-type tag is appended only for
+non-INNER joins, so every INNER frame is byte-identical to the pre-arc wire).

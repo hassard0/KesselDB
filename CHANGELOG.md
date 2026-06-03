@@ -7,6 +7,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning [Se
 
 ### Added
 
+- **`LEFT [OUTER] JOIN` — outer joins (SP-PG-SQL-OUTER-JOIN, 2026-06-03)** —
+  `SELECT a.name, b.title FROM a LEFT JOIN b ON a.id = b.aid`, the join every
+  real ORM emits for an OPTIONAL relationship (SQLAlchemy `isouter=True`, the
+  default for a nullable FK). `Op::Join` gained a `join_type` field (Inner |
+  Left). LEFT mode emits EVERY left row; a left row with NO matching right row
+  comes back ONCE with all right (`b.*`) fields NULL. The combined `KTR1`
+  result's null bitmap carries the NULLs, so the gateway renders the PG
+  `i32 -1` NULL sentinel with ZERO render-side change (the existing
+  `decode_record` + `encode_data_row` already route NULL). kessel-sql parses
+  `LEFT [OUTER] JOIN` (OUTER is a noise word); the three join-shape detectors
+  learn the prefix so LEFT joins route to the join renderer. A `WHERE` on a
+  right (`b.*`) column of a LEFT join drops the unmatched rows — standard
+  PostgreSQL semantics. The wire change is additive: a one-byte join-type tag
+  is appended ONLY when non-Inner, so every INNER join (filtered or not) is
+  byte-identical to the pre-arc frame and older logs decode to Inner; an
+  unknown tag is rejected at decode. Determinism holds (unmatched rows emit in
+  left-key scan order; no clock/RNG) — VSR seed-7 + 3-replica oracle green.
+  vulcan smoke: `LEFT JOIN` over `{tolkien, orphan}` returns 2 rows incl.
+  `(orphan, NULL)`. Named follow-ups: SP-PG-SQL-RIGHT-JOIN,
+  SP-PG-SQL-FULL-JOIN, SP-PG-SQL-MULTI-JOIN.
+
 - **Filtered inner joins — `JOIN … WHERE` (SP-PG-SQL-JOIN-WHERE,
   2026-06-03)** — `SELECT a.name, b.title FROM a JOIN b ON a.id = b.aid
   WHERE b.title = $1 [AND a.name = $2]`, the most common real-app join

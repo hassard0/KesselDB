@@ -145,6 +145,7 @@ kessel "SELECT * FROM t WHERE owner = 100"
 kessel "SELECT owner, bal FROM acct"      # projections render too
 kessel "SELECT * FROM a JOIN b ON a.x = b.y"   # JOINs render too (self-describing)
 kessel "SELECT a.n, b.t FROM a JOIN b ON a.id = b.aid WHERE b.t = 'x'"  # filtered joins (JOIN + WHERE)
+kessel "SELECT a.n, b.t FROM a LEFT JOIN b ON a.id = b.aid"  # LEFT [OUTER] JOIN — unmatched a-rows keep b.* = NULL
 
 # pipe a .sql file (lines starting with # or -- are comments; blanks ignored)
 cat schema.sql | cargo run -q -p kessel-client --bin kessel
@@ -371,9 +372,15 @@ SELECT <c1>, <c2> FROM <t> [WHERE ...]           -- projection
 SELECT COUNT(*) | SUM(c) | MIN(c) | MAX(c) | AVG(c) FROM <t> [WHERE ...]
        [GROUP BY <col>]
 SELECT * FROM <t> [WHERE ...] ORDER BY <col> [DESC] [OFFSET n] [LIMIT n]
-SELECT <proj> FROM <a> JOIN <b> ON <a.x> = <b.y>        -- inner equi‑join
-       [WHERE <pred over a.* / b.*>] [LIMIT n]          --   filtered join (qualified cols, AND/OR/…)
+SELECT <proj> FROM <a> [LEFT [OUTER]] JOIN <b> ON <a.x> = <b.y>  -- equi‑join
+       [WHERE <pred over a.* / b.*>] [LIMIT n]          --   INNER (default) or LEFT; filtered (qualified cols, AND/OR/…)
 ```
+
+A bare `JOIN` is an INNER equi‑join. `LEFT [OUTER] JOIN` returns EVERY left
+row; left rows with no matching right row come back with the right (`b.*`)
+columns NULL (the ORM pattern for an optional relationship, e.g. SQLAlchemy
+`isouter=True`). A `WHERE` predicate on a right (`b.*`) column of a LEFT join
+drops the unmatched rows — standard PostgreSQL semantics.
 
 `WHERE` supports `AND`/`OR`/`NOT`, all of `= != < <= > >=`, and `IN`/`BETWEEN` (incl. `NOT IN`/`NOT BETWEEN`). `SELECT *` returns
 length‑prefixed record blobs; use `DESCRIBE <t>` to decode them against the

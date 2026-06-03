@@ -100,6 +100,21 @@ join byte-identical to the pre-arc frame). Filtered SQLAlchemy join smoke
 **7/7** on vulcan; determinism preserved (VSR seed-7 + 3-replica oracles
 PASS — the filter is a pure function of the combined row). Named follow-up:
 SP-PG-SQL-JOIN-ORDERBY (`JOIN … WHERE … ORDER BY/LIMIT`).
+SP-PG-SQL-OUTER-JOIN (2026-06-03, +5 KATs, DONE) — `LEFT [OUTER] JOIN`
+(`SELECT a.name, b.title FROM a LEFT JOIN b ON a.id = b.aid`), the join every
+real ORM emits for an OPTIONAL relationship (SQLAlchemy `isouter=True`). Op::Join
+gained a `join_type` (Inner | Left); LEFT mode emits EVERY left row, and a left
+row with no right match comes back ONCE with all `b.*` fields NULL. The combined
+`KTR1` null bitmap carries the NULLs, so the gateway renders the PG `i32 -1`
+sentinel with ZERO render change (decode_record + encode_data_row already handle
+NULL). kessel-sql parses `LEFT [OUTER] JOIN`; the three join-shape detectors learn
+the prefix. LEFT + WHERE on a `b.*` col drops the unmatched rows (PG semantics).
+Additive wire change (join-type tag appended only when non-Inner — every INNER
+join byte-identical to the pre-arc frame; unknown tag rejected at decode).
+vulcan smoke: `LEFT JOIN` over `{tolkien, orphan}` × `{lotr→tolkien}` returns
+**2 rows** incl. `(orphan, NULL)`. Determinism preserved (VSR seed-7 + 3-replica
+oracle PASS — unmatched rows emit in left-key scan order). Named follow-ups:
+SP-PG-SQL-RIGHT-JOIN, SP-PG-SQL-FULL-JOIN, SP-PG-SQL-MULTI-JOIN.
 SP-PG-DJANGO-COMPLETE (2026-06-03, +14 KATs, DONE) — closes the TWO
 named gaps the quoted-ident arc left, taking the **Django 6 ORM to full
 CRUD 8/8** on vulcan (was 6/8). `SP-PG-DDL-IDENTITY`: the CREATE TABLE

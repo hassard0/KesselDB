@@ -5955,8 +5955,10 @@ mod tests {
         let mut sm = StateMachine::open(MemVfs::new()).unwrap();
         run(&mut sm, 1, "CREATE TABLE t (a I64 NOT NULL)");
         let cat = sm.catalog();
-        let err = compile_stmt("UPDATE t SET a = 1 WHERE a = 2", cat)
-            .unwrap_err();
+        let err = match compile_stmt("UPDATE t SET a = 1 WHERE a = 2", cat) {
+            Ok(_) => panic!("non-PK UPDATE WHERE must be rejected"),
+            Err(e) => e,
+        };
         assert!(
             err.contains("primary key") || err.contains("row id"),
             "non-PK UPDATE WHERE must name the by-PK limitation, got: {err}"

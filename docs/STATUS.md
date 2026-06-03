@@ -13,16 +13,23 @@ measurement and had drifted from the actual workspace count).
 
 **Coherent state of the union (2026-06-02):**
 
-- **Performance.** Sharded apply path (SP-Perf-A-SHARD-APPLY) delivers
-  **14.93M ops/sec at K=8** (3.19× the K=1 baseline, sub-µs p50);
-  scan-side companions (SP-Perf-A-SHARD-SCAN / -FASTPATH / -POOL-SCALEOUT /
-  -LOCAL-INDEX-FUSION) close the scan + find-by side. The OLTP-bracket
-  losses (RO, RW) are CLOSED — KesselDB now beats Postgres on **6 of 8
-  cross-DB workloads** (only TPC-H Q1+Q6 remain, both with their named
-  follow-up arc SP-JIT-Aggregate). TPC-H Q6 design floor (≥400 q/s) AND
-  stretch (≥500 q/s) both EXCEEDED via the 5-arc Analytic-Plan →
-  Analytic-Plan-MULTI → Hash-Agg → Hash-Agg-Tune → WHERE-VM-Specialise
-  chain (cumulative +39.95× lift; 123× → 3.07× vs Postgres).
+- **Performance (final sweep 2026-06-02, median of 3).** Sharded apply
+  path (SP-Perf-A-SHARD-APPLY) delivers **14.71M ops/sec at K=8** (3.00×
+  the 4.91M K=1 baseline, sub-µs p50; K=16 → 16.24M); scan-side companions
+  (SP-Perf-A-SHARD-SCAN / -FASTPATH / -POOL-SCALEOUT / -LOCAL-INDEX-FUSION)
+  close the scan + find-by side. The OLTP-bracket losses (RO, RW) are
+  CLOSED — KesselDB beats Postgres on **6 of 8 cross-DB workloads**
+  (YCSB-C 63.75×, YCSB-B 7.26×, YCSB-A 1.16×, oltp-RO 6.02×, oltp-WO
+  4.91×, oltp-RW 2.30× — only TPC-H Q1 2.16× + Q6 3.09× remain losses,
+  both with named follow-up SP-JIT-Aggregate). TPC-H Q6 design floor
+  (≥400 q/s) AND stretch (≥500 q/s) both still MET (544.59 q/s) via the
+  5-arc Analytic-Plan → Analytic-Plan-MULTI → Hash-Agg → Hash-Agg-Tune →
+  WHERE-VM-Specialise chain. The final sweep re-measured every headline
+  row on the final binary for internal consistency; oltp-WO/RW landed
+  slightly below their prior single-arc peaks (5.2×→4.91×, 2.66×→2.30×)
+  under live sibling-agent load — reported honestly. SQLite not re-run
+  (vulcan root fs was 100% full; KesselDB MemVfs + Postgres docker
+  unaffected). Raw: `docs/benchmarks/finalbench-2026-06-02-*`.
 - **PostgreSQL ORM compatibility.** SP-PG-EXTQ V1 (Extended Query) +
   V2 hardening (SP-PG-EXTQ-BIN + SP-PG-EXTQ-BIN-RESULTS + SP-PG-EXTQ-CAST +
   SP-PG-EXTQ-DESCRIBE-VERSION + SP-PG-SQL-PAREN-VALUES + SP-CHAR-PAD-COMPARE)

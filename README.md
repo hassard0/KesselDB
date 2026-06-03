@@ -9,9 +9,9 @@
 `2442 default tests green / 2470 with --features pg-gateway / 2503 with all gateway features` · `0 external dependencies in the kernel` · `Rust 1.95+` · single‑binary
 
 **Tonight's headlines** (2026‑06‑02):
-- **14.93M ops/sec point reads at K=8 sharded (sub‑µs p50)** — SP‑Perf‑A‑SHARD‑APPLY V1 (2026‑05‑30) wires K independent per‑shard sub‑engines, breaks the ~5M single‑shard `RwLock`‑reader ceiling honestly diagnosed in T6/T7. Vulcan get‑by‑id sweep at K=8: **14.93M ops/sec (3.19× the K=1 baseline)**; K=16 climbs to 16.72M. SP‑Perf‑A‑SHARD‑SCAN + SP‑Perf‑A‑SHARD‑SCAN‑FASTPATH + SP‑Perf‑A‑SHARD‑SCAN‑POOL‑SCALEOUT + SP‑Perf‑A‑SHARD‑SCAN‑LOCAL‑INDEX‑FUSION close the scan‑side companions — every scan workload at K=4 scales POSITIVELY, find‑by parity restored end‑to‑end without the `--pool-workers` flag. See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §13 + §14 + §14b–14d.
+- **14.71M ops/sec point reads at K=8 sharded (sub‑µs p50)** — SP‑Perf‑A‑SHARD‑APPLY V1 (2026‑05‑30) wires K independent per‑shard sub‑engines, breaks the ~5M single‑shard `RwLock`‑reader ceiling honestly diagnosed in T6/T7. Vulcan get‑by‑id final sweep (2026‑06‑02) at K=8: **14.71M ops/sec (3.00× the 4.91M K=1 baseline)**; K=16 climbs to 16.24M. SP‑Perf‑A‑SHARD‑SCAN + SP‑Perf‑A‑SHARD‑SCAN‑FASTPATH + SP‑Perf‑A‑SHARD‑SCAN‑POOL‑SCALEOUT + SP‑Perf‑A‑SHARD‑SCAN‑LOCAL‑INDEX‑FUSION close the scan‑side companions — every scan workload at K=4 scales POSITIVELY, find‑by parity restored end‑to‑end without the `--pool-workers` flag. See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §13 + §14 + §14b–14d.
 - **Real PostgreSQL ORM compatibility — psycopg2 ✓ SQLAlchemy ✓ asyncpg ✓ pgJDBC ✓.** The Extended Query V1 arc set closed every PARTIAL row on the matrix this week: SP‑PG‑EXTQ‑BIN (binary params for the 10 V1 PG scalar types) + SP‑PG‑EXTQ‑BIN‑RESULTS (binary DataRow) unblocked asyncpg's default mode and pgJDBC's binary Bind path; SP‑PG‑EXTQ‑CAST stripped JDBC simple‑mode `::int8` casts at the dispatcher; SP‑PG‑EXTQ‑DESCRIBE‑VERSION synthesized RowDescription for the scalar SELECTs pgJDBC probes at connect; SP‑PG‑SQL‑PAREN‑VALUES taught the kessel‑sql parser pgJDBC's `VALUES (('42'), ('hello'))` paren‑wrapped substitution shape; SP‑CHAR‑PAD‑COMPARE fixed asyncpg's `WHERE name = $1` against `CHAR(N)` returning 0 rows. **SP‑PG‑JDBC‑SMOKE** then verified the chain end‑to‑end with real pgJDBC 42.7.4 — full CRUD PASS in **both simple AND extended modes**. See [`docs/USAGE.md`](docs/USAGE.md#broader-orm-compat-matrix-t3-2026-06-01--sp-pg-extq-bin-unlock) §9.
-- **Beats Postgres on 6 of 8 cross‑DB workloads — both transaction‑bracket losses closed.** SP‑Perf‑A‑TXN‑RO (2026‑05‑29) lifted oltp‑RO at N=16 by **42.6×** (now 5.7× faster than Postgres); SP‑Perf‑A‑TXN‑RW (2026‑05‑30) lifted oltp‑RW at N=16 by **14.43×** (now 2.66× faster than Postgres + 2.60× faster than SQLite). TPC‑H Q6 — five sequential lift arcs (Analytic‑Plan → Analytic‑Plan‑MULTI → Hash‑Agg → Hash‑Agg‑Tune → **SP‑WHERE‑VM‑Specialise** 2026‑06‑01) deliver a **cumulative +39.95× lift** (gap vs Postgres closed **123× → 3.07×**); Q1 cumulative +9.71× (gap 18× → 2.17×). Q6 design floor (≥400 q/s) AND stretch (≥500 q/s) both EXCEEDED. See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3 + §3f + §3g.
+- **Beats Postgres on 6 of 8 cross‑DB workloads — both transaction‑bracket losses closed** (final sweep 2026‑06‑02, median of 3). SP‑Perf‑A‑TXN‑RO (2026‑05‑29) made oltp‑RO at N=16 **6.02× faster than Postgres** (was LOSING); SP‑Perf‑A‑TXN‑RW (2026‑05‑30) made oltp‑RW at N=16 **2.30× faster than Postgres** (was LOSING). TPC‑H Q6 — five sequential lift arcs (Analytic‑Plan → Analytic‑Plan‑MULTI → Hash‑Agg → Hash‑Agg‑Tune → **SP‑WHERE‑VM‑Specialise** 2026‑06‑01) closed the gap vs Postgres **123× → 3.09×** (final sweep N=4 544.59 q/s); Q1 gap **18× → 2.16×**. Q6 design floor (≥400 q/s) AND stretch (≥500 q/s) both still MET. See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3 + §3f + §3g.
 - **PG COPY FROM STDIN — text + CSV + binary, ~51,840 rows/sec (181.9× lift).** SP‑PG‑COPY V1 (2026‑05‑30) shipped the text wire surface end‑to‑end; SP‑PG‑COPY‑CSV (2026‑06‑01) added RFC 4180 + PG superset (HEADER + DELIMITER/QUOTE/ESCAPE/NULL); SP‑PG‑COPY‑BIN (2026‑06‑02) added §55.2.7 binary COPY for the 10 supported PG scalar types — `pg_dump --format=custom` restore + JDBC `CopyManager` + `pg_bulkload` + `pgloader` + Stitch + Fivetran + Airbyte binary‑bulk‑loaders all unlock. SP‑PG‑COPY‑BULKAPPLY V1 lifted ingest throughput **181.9×** (~285 → 51,840 rows/sec on vulcan). See [`docs/USAGE.md`](docs/USAGE.md#sp-pg-copy--copy-from-stdin--copy-to-stdout-bulk-load-v1-shipped-2026-05-30) §9 → SP‑PG‑COPY.
 - **Cloud deploy story — Docker (ghcr.io/hassard0/kesseldb), Helm, Fly.io.** SP‑DX‑superior (2026‑05‑29) shipped the multi‑arch ~77 MiB image + did‑you‑mean SQL errors + CLI error‑class hints + embedded Rust example. SP‑Cloud‑Deploy (2026‑05‑30) added the Helm chart + `fly.toml` and verified the chart end‑to‑end on vulcan (kind v0.24.0 + Kubernetes v1.31.0 + helm v3.16.3). See [`docs/USAGE.md`](docs/USAGE.md#11-deploying-to-the-cloud) §11.
 
@@ -380,14 +380,14 @@ and cloud projections).
 | Path | Result |
 |---|---|
 | State‑machine create (in‑mem, 128 B) | ~215 K ops/s @ p50 ~2 µs |
-| **Sharded point‑read, K=8, in‑process, N=16 cores** | **~14.93 M ops/s, p50 sub‑µs** — SP‑Perf‑A‑SHARD‑APPLY (3.19× the K=1 baseline; K=16 → 16.72M ops/s) |
-| **Parallel point‑read (single shard), in‑process, N=16 cores** | **~4.75 M ops/s, p50 < 1 µs, p99 ~3 µs** — SP‑Perf‑A T2 read‑pool bypass + T7 storage `Arc<[u8]>` (zero‑memcpy reads); honestly diagnosed ~5M `RwLock`‑reader ceiling broken by sharding |
-| **YCSB‑C uniform‑random reads, N=16** | **~4.75 M ops/s — ≈ 40× SQLite, ≈ 57× Postgres** (cross‑DB headline; see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3) |
-| **sysbench OLTP read‑only, N=16** | **~28,977 tx/s — 5.7× Postgres, 15× SQLite** (SP‑Perf‑A‑TXN‑RO lift 42.6× — was LOSING) |
-| **sysbench OLTP read‑write, N=16** | **~10,273 tx/s — 2.66× Postgres, 2.60× SQLite** (SP‑Perf‑A‑TXN‑RW lift 14.43× — was LOSING) |
-| **sysbench OLTP write‑only, N=8** | **~53,409 tx/s — 5.2× Postgres, 4.2× SQLite** |
-| **TPC‑H Q6 (SUM with WHERE), N=4** | **~548.87 q/s** (5‑arc cumulative +39.95× lift; gap vs Postgres closed 123× → 3.07×; Q6 design floor ≥400 q/s + stretch ≥500 q/s both EXCEEDED) |
-| **TPC‑H Q1 (multi‑aggregate GROUP BY), N=4** | **~85.82 q/s** (5‑arc cumulative +9.71× lift; gap vs Postgres closed 18× → 2.17×) |
+| **Sharded point‑read, K=8, in‑process, N=16 cores** | **~14.71 M ops/s, p50 sub‑µs** — SP‑Perf‑A‑SHARD‑APPLY (3.00× the K=1 4.91M baseline; K=16 → 16.24M ops/s; final sweep 2026‑06‑02) |
+| **Parallel point‑read (single shard), in‑process, N=16 cores** | **~4.91 M ops/s, p50 < 1 µs, p99 ~7 µs** — SP‑Perf‑A T2 read‑pool bypass + T7 storage `Arc<[u8]>` (zero‑memcpy reads); honestly diagnosed ~5M `RwLock`‑reader ceiling broken by sharding |
+| **YCSB‑C uniform‑random reads, N=16** | **~5.27 M ops/s — ≈ 63.75× Postgres** (cross‑DB headline; final sweep, was 57× peak; see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3) |
+| **sysbench OLTP read‑only, N=16** | **~30,646 tx/s — 6.02× Postgres** (SP‑Perf‑A‑TXN‑RO; final sweep, was 5.7× peak — was LOSING) |
+| **sysbench OLTP read‑write, N=16** | **~8,852 tx/s — 2.30× Postgres** (SP‑Perf‑A‑TXN‑RW; final sweep re‑measured under sibling‑agent load, prior peak 2.66× — was LOSING) |
+| **sysbench OLTP write‑only, N=8** | **~50,687 tx/s — 4.91× Postgres** (final sweep, prior peak 5.2×) |
+| **TPC‑H Q6 (SUM with WHERE), N=4** | **~544.59 q/s** (final sweep; gap vs Postgres 3.09×; Q6 design floor ≥400 q/s + stretch ≥500 q/s both still MET) |
+| **TPC‑H Q1 (multi‑aggregate GROUP BY), N=4** | **~86.17 q/s** (final sweep; gap vs Postgres 2.16×) |
 | **PG COPY FROM STDIN, 100K rows, single conn** | **~51,840 rows/sec** — SP‑PG‑COPY‑BULKAPPLY lift 181.9× over V1 baseline 285 rows/sec; within ~11× of Postgres 16 (~578K rows/sec) |
 | Durable create, group commit (~1 K batch) | ~87 K ops/s (local NVMe) |
 | Concurrent durable, 8 clients | **~1,870 ops/s** — group commit + `TCP_NODELAY` (conservative; rises with concurrency) |
@@ -408,11 +408,11 @@ including the *losses* where KesselDB does NOT win — are in
 | YCSB‑C (100% reads, uniform, ~1 KiB rows) | **KesselDB** | 1st at every N | in‑process + SP‑Perf‑A parallel read‑pool |
 | YCSB‑B (95% reads / 5% updates) | **KesselDB** | 1st at every N | same — read‑mostly workload |
 | YCSB‑A (50/50) | **KesselDB at N=1 + N=16** | 1st N=1, ≈ tied N=8 vs Postgres, 1st N=16 | write‑side apply lock pays cost at N=8 then amortizes |
-| sysbench OLTP write‑only | **KesselDB** | **1st at every N (5.2× Postgres at N=8)** | apply‑path is fast at the inner‑op level |
-| sysbench OLTP read‑only | **KesselDB at N=8 / N=16** (SQLite still wins N=1) | **1st at every N≥8 (5.7× Postgres at N=16)** | SP‑Perf‑A‑TXN‑RO bypass — all‑RO `Op::Txn{ops}` routes through the read pool, lift 42.6× at N=16 — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3c |
-| sysbench OLTP read‑write | **KesselDB at N=8 / N=16** (SQLite still wins N=1) | **1st at every N≥8 (2.66× Postgres + 2.60× SQLite at N=16)** | SP‑Perf‑A‑TXN‑RW driver‑level split‑phase dispatch — (R*, W*)‑shape Txns split at the read/write boundary; read prefix routes via the TXN‑RO bypass (parallel), write suffix via `sm.write().apply` (serial); lift 14.4× at N=16 — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3e |
-| TPC‑H Q1 (multi‑aggregate GROUP BY) | Postgres at every N | **2nd at every N (now beats SQLite at both N=1 and N=4 post‑WHERE‑VM)** | Five‑arc lift cumulative **+9.71×** (8.84 → 85.82 q/s N=4); gap vs Postgres closed **18× → 2.17×**; SP‑WHERE‑VM‑Specialise V1 (2026‑06‑01) closure‑built‑once‑per‑query WHERE evaluator +1.35× at N=4 — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3f |
-| TPC‑H Q6 (SUM with WHERE) | Postgres at every N + SQLite at N=1 | **2nd at N=4 (6.24× SQLite at N=4); 3rd at N=1** | Five‑arc lift cumulative **+39.95×** (13.74 → 548.87 q/s N=4); gap vs Postgres closed **123× → 3.07×**; SP‑WHERE‑VM‑Specialise V1 +2.78× lift at N=4 — Q6 design floor ≥400 q/s + stretch ≥500 q/s both EXCEEDED — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3g |
+| sysbench OLTP write‑only | **KesselDB** | **1st at every N (4.91× Postgres at N=8)** | apply‑path is fast at the inner‑op level |
+| sysbench OLTP read‑only | **KesselDB at N=8 / N=16** | **1st at every N≥8 (6.02× Postgres at N=16)** | SP‑Perf‑A‑TXN‑RO bypass — all‑RO `Op::Txn{ops}` routes through the read pool — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3c |
+| sysbench OLTP read‑write | **KesselDB at N=8 / N=16** | **1st at every N≥8 (2.30× Postgres at N=16)** | SP‑Perf‑A‑TXN‑RW driver‑level split‑phase dispatch — (R*, W*)‑shape Txns split at the read/write boundary; read prefix routes via the TXN‑RO bypass (parallel), write suffix via `sm.write().apply` (serial) — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3e |
+| TPC‑H Q1 (multi‑aggregate GROUP BY) | Postgres at every N | **2nd at every N** | Final sweep N=4 86.17 q/s; gap vs Postgres **2.16×**; SP‑WHERE‑VM‑Specialise V1 (2026‑06‑01) closure‑built‑once‑per‑query WHERE evaluator cut per‑row VM dispatch — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3f |
+| TPC‑H Q6 (SUM with WHERE) | Postgres at every N | **2nd at N=4** | Final sweep N=4 544.59 q/s; gap vs Postgres **3.09×**; Q6 design floor ≥400 q/s + stretch ≥500 q/s both still MET — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3g |
 
 **Roadmap is named — published-loss closures + next throughput levers.**
 
@@ -438,10 +438,12 @@ including the *losses* where KesselDB does NOT win — are in
   `hash(make_key(type_id, oid)) % K`. Activation: opt‑in via
   `ServerConfig.shard_count = Some(K)` (default `None` =
   pre‑SHARD byte‑identical). **Vulcan get‑by‑id sweep
-  (10K rows, 16 workers, 10s):** K=baseline 4.68M ops/s → K=2
-  7.30M (1.56×) → K=4 11.08M (2.37×) → **K=8 14.93M (3.19× —
-  BREAKS the 10M ceiling)** → K=16 16.72M (3.57×). p50 latency
-  drops 3 µs → <1 µs. V1 limitations: scans/Txn route to shard 0
+  (10K rows, 16 workers, 10s, `--pool-workers 16`):** K=baseline
+  ~4.9M ops/s → K=4 ~11.4M (2.3×) → **K=8 ~14.7M (3.0× — BREAKS
+  the 10M ceiling)** → K=16 ~16.2M (3.3×) on the 2026‑06‑02 final
+  sweep (original SHARD‑APPLY arc measured 4.68M/11.08M/14.93M/16.72M
+  — same within trial noise). p50 latency drops 3 µs → <1 µs. V1
+  limitations: scans/Txn route to shard 0
   (named `SP‑Perf‑A‑SHARD‑SCAN` / `‑XTXN` follow‑ups);
   per‑type FindBy / Describe pins all rows of a type to one
   shard (per‑type lookups stay single‑shard); cross‑shard atomic
@@ -479,15 +481,16 @@ including the *losses* where KesselDB does NOT win — are in
   uses; closes the residual 2.17× Q1 / 3.07× Q6 gap that's now the
   decode→update fold work, not WHERE evaluation).
 
-**Headline numbers worth quoting** (vulcan reference server, see `docs/BENCHMARKS.md` §1):
-- **Sharded point‑read get‑by‑id, K=8, N=16 workers**: KesselDB **14.93M ops/sec** (3.19× the K=1 baseline; sub‑µs p50; SP‑Perf‑A‑SHARD‑APPLY)
-- **YCSB‑C reads, N=16**: KesselDB 4.75M ops/s — **57× Postgres**, **40× SQLite**
-- **YCSB‑B mixed (95/5), N=16**: KesselDB 576K ops/s — **7.1× Postgres**, **60× SQLite**
-- **sysbench OLTP write‑only, N=8**: KesselDB 53K tx/s — **5.2× Postgres**, **4.2× SQLite**
-- **sysbench OLTP read‑only, N=16**: KesselDB 29K tx/s — **5.7× Postgres**, **15× SQLite** (post SP‑Perf‑A‑TXN‑RO; was LOSING at 680 tx/s before this arc)
-- **sysbench OLTP read‑write, N=16**: KesselDB 10K tx/s — **2.66× Postgres**, **2.60× SQLite** (post SP‑Perf‑A‑TXN‑RW; was LOSING at 712 tx/s before this arc)
-- **TPC‑H Q6, N=4**: KesselDB 548.87 q/s — gap vs Postgres closed 123× → 3.07× (5‑arc cumulative +39.95×)
-- **PG COPY FROM STDIN, 100K rows, single conn**: KesselDB 51,840 rows/sec — 181.9× lift over V1 baseline (SP‑PG‑COPY‑BULKAPPLY)
+**Headline numbers worth quoting** (vulcan reference server, final sweep 2026‑06‑02, median of 3; see `docs/BENCHMARKS.md` §1):
+- **Sharded point‑read get‑by‑id, K=8, N=16 workers**: KesselDB **14.71M ops/sec** (3.00× the 4.91M K=1 baseline; sub‑µs p50; SP‑Perf‑A‑SHARD‑APPLY; K=16 → 16.24M)
+- **YCSB‑C reads, N=16**: KesselDB 5.27M ops/s — **63.75× Postgres**
+- **YCSB‑B mixed (95/5), N=16**: KesselDB 573.6K ops/s — **7.26× Postgres**
+- **sysbench OLTP write‑only, N=8**: KesselDB 50.7K tx/s — **4.91× Postgres**
+- **sysbench OLTP read‑only, N=16**: KesselDB 30.6K tx/s — **6.02× Postgres** (post SP‑Perf‑A‑TXN‑RO; was LOSING before this arc)
+- **sysbench OLTP read‑write, N=16**: KesselDB 8.85K tx/s — **2.30× Postgres** (post SP‑Perf‑A‑TXN‑RW; was LOSING before this arc)
+- **TPC‑H Q6, N=4**: KesselDB 544.59 q/s — gap vs Postgres 3.09× (design floor ≥400 + stretch ≥500 both still MET)
+- **KesselDB wins 6 of 8 cross‑DB workloads vs Postgres** (only TPC‑H Q1+Q6 remain losses, named follow‑up SP‑JIT‑Aggregate)
+- **PG COPY FROM STDIN, 100K rows, single conn**: KesselDB 51,840 rows/sec — 181.9× lift over V1 baseline (SP‑PG‑COPY‑BULKAPPLY; not re‑run this sweep)
 
 Every figure is reproducible from the test suite / `kessel-bench`, and
 each query accelerator is guarded by a randomized equivalence oracle

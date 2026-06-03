@@ -371,9 +371,11 @@ SELECT * FROM <t> [WHERE <expr>]                 -- =, !=, <, <=, >, >=, AND/OR/
                                                  --   col IN (a,b,..), col BETWEEN lo AND hi
                                                  --   col IS [NOT] NULL, col [NOT] LIKE 'pat%' (NOT IN / NOT BETWEEN too)
 SELECT <c1>, <c2> FROM <t> [WHERE ...]           -- projection
-SELECT COUNT(*) | SUM(c) | MIN(c) | MAX(c) | AVG(c) FROM <t> [WHERE ...]
-       [GROUP BY <col>]
+SELECT COUNT(*) | SUM(c) | MIN(c) | MAX(c) | AVG(c) FROM <t> [WHERE ...]  -- single scalar aggregate (SP-PG-SQL-AGG-ALIAS-RENDER)
+SELECT <g>, <AGG>( * | <c> ) [AS alias] [, <AGG>(…) …] FROM <t> [WHERE …]  -- plain GROUP BY group-aggregate (SP-PG-SQL-PLAIN-GROUP-RENDER)
+       GROUP BY <g>                                     --   COUNT/SUM/MIN/MAX/AVG per group; one row per group
        [HAVING <AGG>(...) <cmp> <literal>]              --   filter groups by an aggregate (SP-PG-SQL-HAVING)
+       [ORDER BY <col> [DESC]] [LIMIT n] [OFFSET n]     --   (parsed; V1 engine emits all groups in key order — see note)
 SELECT * FROM <t> [WHERE ...] ORDER BY <col> [DESC] [OFFSET n] [LIMIT n]
 SELECT <proj> FROM <a> [LEFT [OUTER]] JOIN <b> ON <a.x> = <b.y>  -- equi‑join
        [WHERE <pred over a.* / b.*>]                    --   INNER (default) or LEFT; filtered (qualified cols, AND/OR/…)
@@ -396,6 +398,28 @@ sorted result — the ubiquitous paginated-list-view shape
 (`… ORDER BY b.created LIMIT 20 OFFSET 40`). For a LEFT join, an unmatched
 right (`b.*`) NULL sort value orders NULLS LAST for ASC / NULLS FIRST for DESC
 (PostgreSQL's default).
+
+**Plain (single-table) `GROUP BY`** (SP-PG-SQL-PLAIN-GROUP-RENDER) is the
+everyday analytics / ORM aggregation — "count (or sum / avg / …) rows per
+category":
+
+```sql
+SELECT category, COUNT(*) FROM products GROUP BY category;
+SELECT category, COUNT(*) AS n, SUM(price), AVG(price), MIN(price), MAX(price)
+  FROM products GROUP BY category HAVING COUNT(*) > 1;
+```
+
+returns one row per group `(group_key, agg_value+)`, groups in ascending
+group-key order, rendered over the PG wire. The group key column is typed from
+the table schema (int key → int4/int8, text key → text); aggregate columns are
+typed COUNT/SUM → int8, AVG → numeric, MIN/MAX → the source column's type. An
+unaliased aggregate gets PostgreSQL's default name (`count`/`sum`/`avg`/`min`/
+`max`). `HAVING` (SP-PG-SQL-HAVING) filters the groups. **V1 caveat:** a trailing
+`ORDER BY … LIMIT … OFFSET …` on a plain GROUP BY is *parsed* but not yet
+applied by the engine (the group ops carry no sort/limit fields), so all groups
+come back in ascending key order regardless — the render surfaces them
+faithfully without dropping or reordering. Sort/limit pushdown for plain
+group-agg is the follow-on `SP-PG-SQL-GROUP-SORT-LIMIT`.
 
 `GROUP BY <a.g>` + one or more aggregates over a join is the dashboard /
 reporting query — "count (or sum / …) the related rows per parent":
@@ -1665,6 +1689,29 @@ a pure function of the combined row, so seed-7 + 3-replica determinism holds.
 (`JOIN … WHERE … ORDER BY/LIMIT` over the combined schema), plus the
 inherited OUTER / MULTI / ALIAS / AGG follow-ups. Transcript:
 `docs/superpowers/sppgsqljoinwhere-smoke-2026-06-03.txt`.
+
+#### Plain (single-table) GROUP BY render — SP-PG-SQL-PLAIN-GROUP-RENDER, 2026-06-03
+
+`SELECT category, COUNT(*) [AS n] [, SUM(price), AVG(price), MIN(price),
+MAX(price)] FROM products GROUP BY category [HAVING …] [ORDER BY …] [LIMIT …]`
+— the everyday analytics / ORM aggregation. The planner + state machine already
+compiled and executed plain GROUP BY (`Op::GroupAggregate` /
+`Op::GroupAggregateMulti`) and HAVING already filtered at the SM layer, but the
+**PG-wire gateway had no render branch**: `render_select_got` only routed
+group-aggregates through `render_join_group_aggregate`, which REQUIRES a JOIN, so
+a plain `SELECT g, COUNT(*) … GROUP BY g` fell through to the bottom render error
+(`0A000 only renders SELECT *`) even though the engine grouped correctly. This
+arc adds `kessel_sql::plain_group_aggregate` (recovers the output column shape:
+group key + each aggregate's out-name + source column) and
+`render_plain_group_aggregate` (decodes the value-only group stream, types the
+group key from the FROM-table schema, types aggregate OIDs per kind: COUNT/SUM →
+int8, AVG → numeric, MIN/MAX → source-column type). **Render-only** — no Op or
+wire-format change, so corpus / partition / 3-replica byte-identity is
+untouched. **V1 caveat:** a trailing `ORDER BY … LIMIT … OFFSET …` is parsed but
+not yet engine-applied for plain group-agg (the group ops carry no sort/limit
+fields) — all groups come back in ascending key order; the render surfaces them
+faithfully. Follow-on: `SP-PG-SQL-GROUP-SORT-LIMIT`. Smoke:
+`scripts/sppgsqlplaingrouprender-smoke.py`.
 
 #### Django ORM (the other dominant Python ORM) — 2026-06-03
 

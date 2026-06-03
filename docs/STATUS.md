@@ -178,6 +178,31 @@ input rows). Gateway needs NO change — `render_join_group_aggregate` decodes
 PASS). V1 scope: the HAVING aggregate MUST be in the projection; HAVING over an
 aggregate not selected, over the group key, or on a scalar (no GROUP BY) are named
 follow-ups (SP-PG-SQL-HAVING-EXTRA-AGG, SP-PG-SQL-HAVING-KEY).
+SP-PG-SQL-PLAIN-GROUP-RENDER (2026-06-03, +3 KATs, DONE) — render a PLAIN
+(non-JOIN) `GROUP BY` group-aggregate SELECT over the PG wire
+(`SELECT category, COUNT(*) [AS n] [, SUM/AVG/MIN/MAX(col)] FROM products
+GROUP BY category [HAVING …]`). The planner + SM already compiled/executed plain
+GROUP BY (`Op::GroupAggregate` / `Op::GroupAggregateMulti`) and HAVING already
+filtered at the SM layer, but the gateway's `render_select_got` only routed
+group-aggregates through `render_join_group_aggregate` (which REQUIRES a JOIN),
+so a plain group-aggregate fell through to the bottom render error
+(`0A000 only renders SELECT *`). New `kessel_sql::plain_group_aggregate(sql)
+-> Option<PlainGroupAggProj>` recognizer (returns `Some` ONLY for a plain
+group-aggregate — `None` for JOIN-agg, single scalar agg, plain projection, and
+no-GROUP-BY shapes, so every existing render path is byte-untouched) +
+`render_plain_group_aggregate` (decodes the value-only group stream
+`[u32 ngroups][u32 keylen][key][16B i128 × n_aggs]…`, types the group key from
+the FROM-table schema, types aggregate OIDs: COUNT/SUM → int8, AVG → numeric,
+MIN/MAX → source-column type). **Render-only — NO Op or wire-format change**, so
+corpus / partition / 3-replica byte-identity is untouched. V1 caveat: a trailing
+`ORDER BY … LIMIT … OFFSET …` on a plain GROUP BY is parsed but not yet
+engine-applied (the group ops carry no sort/limit fields) — the engine emits all
+groups in ascending key order and the render surfaces them faithfully; sort/limit
+pushdown is the follow-on SP-PG-SQL-GROUP-SORT-LIMIT. vulcan psql smoke
+(`scripts/sppgsqlplaingrouprender-smoke.py`): the headline
+`SELECT category, COUNT(*) FROM products GROUP BY category` ERRORED on pre-fix
+origin/main and renders **{books:3, gadgets:1, toys:2}** post-fix; multi-agg
+(COUNT/SUM/AVG/MIN/MAX) + HAVING also PASS.
 SP-PG-ORM-REALAPP (2026-06-03, CAPSTONE, +3 KATs, DONE) — the headline
 real-world-readiness test: a realistic THREE-model SQLAlchemy 2.0 BLOG app
 (`User` 1—N `Post` 1—N `Comment`, FKs + `relationship()`, insertmanyvalues

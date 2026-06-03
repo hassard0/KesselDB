@@ -7,6 +7,31 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning [Se
 
 ### Added
 
+- **Plain (non-JOIN) `GROUP BY` renders over the PG wire
+  (SP-PG-SQL-PLAIN-GROUP-RENDER, 2026-06-03)** — `SELECT category, COUNT(*)
+  [AS n] [, SUM(price), AVG(price), MIN(price), MAX(price)] FROM products
+  GROUP BY category [HAVING …]`, the everyday analytics / ORM aggregation, now
+  renders correctly over psql. The planner + state machine already
+  compiled/executed plain GROUP BY (`Op::GroupAggregate` /
+  `Op::GroupAggregateMulti`) and `HAVING` already filtered at the SM layer, but
+  the gateway's `render_select_got` only routed group-aggregates through
+  `render_join_group_aggregate` — which REQUIRES a JOIN — so a plain
+  group-aggregate fell through to the bottom render error
+  (`0A000 only renders SELECT *`) even though the engine grouped correctly. New
+  `kessel_sql::plain_group_aggregate` recognizer (returns `Some` ONLY for a
+  plain group-aggregate; `None` for JOIN-agg, single scalar agg, plain
+  projection, and no-GROUP-BY — every existing render path is byte-untouched) +
+  `render_plain_group_aggregate` (decodes the value-only group stream, types the
+  group key from the FROM-table schema, types aggregate OIDs COUNT/SUM → int8,
+  AVG → numeric, MIN/MAX → source-column type). **Render-only — NO `Op` or
+  wire-format change**, so the corpus / partition / 3-replica byte-identity
+  oracles stay green. **V1 caveat:** a trailing `ORDER BY … LIMIT … OFFSET …` on
+  a plain GROUP BY is parsed but not yet engine-applied (the group ops carry no
+  sort/limit fields) — all groups come back in ascending key order; the render
+  surfaces them faithfully (follow-on `SP-PG-SQL-GROUP-SORT-LIMIT`). vulcan psql
+  smoke: the headline `SELECT category, COUNT(*) FROM products GROUP BY category`
+  ERRORED on pre-fix `origin/main` and renders **{books:3, gadgets:1, toys:2}**
+  post-fix; multi-agg + `HAVING` also PASS.
 - **`HAVING` filters aggregate groups (SP-PG-SQL-HAVING, 2026-06-03)** — a
   `HAVING <AGG>(...) <cmp> <literal>` clause now filters GROUPS after
   aggregation, on the plain (`SELECT col, COUNT(*) FROM t GROUP BY col HAVING

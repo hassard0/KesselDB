@@ -64,6 +64,61 @@ fn lex(s: &str) -> Result<Vec<Tok>, SqlError> {
             }
             i += 1;
             out.push(Tok::Str(st));
+        } else if c == '"' {
+            // SP-PG-SQL-QUOTED-IDENT — SQL-standard delimited identifier.
+            // Django (and any client using `quote_name`) double-quotes
+            // EVERY identifier (`"smokeapp_author"."id"`, `"name"`, …).
+            // A delimited identifier is CASE-PRESERVING and may contain
+            // characters a bare identifier can't (spaces, reserved-word
+            // spellings). The escape for a literal `"` inside the
+            // identifier is a doubled `""` (PG §4.1.1 / SQL-92).
+            //
+            // We emit a plain `Tok::Ident(contents)` — byte-identical to
+            // the token a bare identifier of the same (already-correct
+            // case) name produces. Because KesselDB's catalog stores
+            // names case-sensitively and bare identifiers are NOT folded
+            // (keyword recognition is the only case-insensitive step, via
+            // `eq_ignore_ascii_case`), a quoted `"id"` and a bare `id`
+            // resolve to the SAME catalog column. This is exactly the
+            // round-trip Django needs: it quotes the SAME names in its
+            // DDL and its DML, so `CREATE TABLE "t" ("id" …)` and
+            // `INSERT INTO "t" ("id") …` agree on the identifier string.
+            //
+            // V1 limitation (documented in the design spec §3): because a
+            // quoted identifier lowers to the same `Tok::Ident` as a bare
+            // one, a delimited identifier that SPELLS a reserved keyword
+            // in a position where the grammar also accepts that keyword
+            // (`SELECT "from" FROM t` with a column literally named
+            // `from`) is not distinguishable from the keyword. No ORM
+            // emits this and KesselDB's catalog rejects keyword-spelled
+            // bare names at CREATE time, so it does not arise in practice;
+            // the strict fix is the follow-up `SP-PG-SQL-QUOTED-KEYWORD`.
+            i += 1;
+            let mut st = String::new();
+            loop {
+                if i >= b.len() {
+                    return Err("unterminated quoted identifier".into());
+                }
+                if b[i] as char == '"' {
+                    // Doubled `""` is an escaped literal quote — stay in
+                    // the identifier and append a single `"`.
+                    if i + 1 < b.len() && b[i + 1] as char == '"' {
+                        st.push('"');
+                        i += 2;
+                        continue;
+                    }
+                    // Lone `"` closes the identifier.
+                    i += 1;
+                    break;
+                }
+                st.push(b[i] as char);
+                i += 1;
+            }
+            if st.is_empty() {
+                // PG rejects `""` (a zero-length delimited identifier).
+                return Err("zero-length delimited identifier".into());
+            }
+            out.push(Tok::Ident(st));
         } else if c.is_ascii_digit() || (c == '-' && i + 1 < b.len() && (b[i + 1] as char).is_ascii_digit()
             && matches!(out.last(), None | Some(Tok::Punct('(')) | Some(Tok::Punct(',')) | Some(Tok::Cmp(_)))) {
             let start = i;
@@ -7009,6 +7064,205 @@ mod tests {
         assert_eq!(
             insert_returning("INSERT INTO w (n) VALUES ('a') RETURNING id AS x"),
             Some(("w".to_string(), vec!["id".to_string()]))
+        );
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-SQL-QUOTED-IDENT KATs — the lexer accepts SQL-standard
+    // double-quoted (delimited) identifiers everywhere a bare identifier
+    // works. Django double-quotes EVERY identifier; this is the P0
+    // keystone that unblocks the Django ORM CRUD surface.
+    // ───────────────────────────────────────────────────────────────────
+
+    /// Lexer: a quoted identifier lowers to the SAME `Tok::Ident` a bare
+    /// identifier of that (case-preserved) name produces — so every
+    /// identifier-position consumer works unchanged.
+    #[test]
+    fn quoted_ident_lexes_as_plain_ident() {
+        assert_eq!(
+            lex(r#"SELECT "id", "name" FROM "users""#).unwrap(),
+            vec![
+                Tok::Ident("SELECT".into()),
+                Tok::Ident("id".into()),
+                Tok::Punct(','),
+                Tok::Ident("name".into()),
+                Tok::Ident("FROM".into()),
+                Tok::Ident("users".into()),
+            ]
+        );
+    }
+
+    /// Lexer: a quoted-on-both-sides qualified ref `"t"."col"` lexes as
+    /// `Ident(t) . Ident(col)` — identical to the bare `t.col` stream.
+    #[test]
+    fn quoted_qualified_ref_lexes() {
+        assert_eq!(
+            lex(r#""t"."col""#).unwrap(),
+            vec![
+                Tok::Ident("t".into()),
+                Tok::Punct('.'),
+                Tok::Ident("col".into()),
+            ]
+        );
+    }
+
+    /// Lexer: a delimited identifier preserves a space (a bare identifier
+    /// can't contain one) and case.
+    #[test]
+    fn quoted_ident_preserves_space_and_case() {
+        assert_eq!(
+            lex(r#""My Col""#).unwrap(),
+            vec![Tok::Ident("My Col".into())]
+        );
+    }
+
+    /// Lexer: the doubled-`""` escape yields a single literal `"` inside
+    /// the identifier (`"a""b"` → `a"b`).
+    #[test]
+    fn quoted_ident_doubled_quote_escape() {
+        assert_eq!(
+            lex(r#""a""b""#).unwrap(),
+            vec![Tok::Ident("a\"b".into())]
+        );
+    }
+
+    /// Lexer: an unterminated quoted identifier is a clean error (not a
+    /// panic / not silently swallowing the rest of the statement).
+    #[test]
+    fn quoted_ident_unterminated_errors() {
+        assert!(lex(r#"SELECT "id FROM t"#)
+            .unwrap_err()
+            .contains("unterminated quoted identifier"));
+    }
+
+    /// Lexer: a zero-length delimited identifier `""` is rejected (PG
+    /// rejects it too).
+    #[test]
+    fn quoted_ident_zero_length_errors() {
+        assert!(lex(r#"SELECT "" FROM t"#)
+            .unwrap_err()
+            .contains("zero-length delimited identifier"));
+    }
+
+    /// Parse parity: a fully-quoted SELECT compiles to the SAME `Op` as
+    /// the bare-identifier equivalent. This is the core compat invariant —
+    /// quoting is transparent at the compiled-Op layer.
+    #[test]
+    fn quoted_select_compiles_same_op_as_bare() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE users (id BIGINT NOT NULL, name TEXT NOT NULL)");
+        let cat = sm.catalog();
+        let bare = compile("SELECT * FROM users WHERE id = 1", cat).unwrap();
+        let quoted = compile(r#"SELECT * FROM "users" WHERE "id" = 1"#, cat).unwrap();
+        assert_eq!(bare, quoted);
+        // Qualified-on-both-sides `"users"."id"` resolves the same.
+        let qualified =
+            compile(r#"SELECT * FROM "users" WHERE "users"."id" = 1"#, cat).unwrap();
+        assert_eq!(bare, qualified);
+    }
+
+    /// Parse: a quoted projection list `SELECT "id", "name" FROM "users"`
+    /// is recognized by the gateway's `select_columns` detector exactly
+    /// like the bare form.
+    #[test]
+    fn quoted_projection_detected_by_select_columns() {
+        assert_eq!(
+            select_columns(r#"SELECT "id", "name" FROM "users""#),
+            Some((
+                "users".to_string(),
+                vec!["id".to_string(), "name".to_string()]
+            ))
+        );
+        // Qualified-quoted columns strip to the bare column name.
+        assert_eq!(
+            select_columns(
+                r#"SELECT "u"."id", "u"."name" FROM "users""#
+            ),
+            Some((
+                "users".to_string(),
+                vec!["id".to_string(), "name".to_string()]
+            ))
+        );
+    }
+
+    /// Parse: quoted CREATE TABLE then quoted INSERT then quoted
+    /// SELECT/UPDATE/DELETE all round-trip on the SAME identifier strings —
+    /// the exact Django CRUD shape (minus the IDENTITY DDL spelling, which
+    /// is the separate `SP-PG-DDL-IDENTITY` follow-up).
+    #[test]
+    fn quoted_full_crud_round_trip() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        // Quoted DDL — case-preserved names stored in the catalog.
+        run(
+            &mut sm,
+            1,
+            r#"CREATE TABLE "t" ("id" BIGINT NOT NULL, "name" TEXT NOT NULL)"#,
+        );
+        // The catalog stored the UNquoted spelling (quotes are delimiters,
+        // not part of the name).
+        assert!(sm.catalog().types.iter().any(|ty| ty.name == "t"));
+        // Quoted INSERT agrees with the quoted DDL identifiers.
+        run(
+            &mut sm,
+            2,
+            r#"INSERT INTO "t" ("id", "name") VALUES (1, 'tolkien')"#,
+        );
+        // Quoted SELECT projection.
+        match run(&mut sm, 3, r#"SELECT "id", "name" FROM "t""#) {
+            OpResult::Got(_) => {}
+            o => panic!("quoted SELECT projection failed: {o:?}"),
+        }
+        // Quoted by-PK UPDATE.
+        run(
+            &mut sm,
+            4,
+            r#"UPDATE "t" SET "name" = 'x' WHERE "id" = 1"#,
+        );
+        // Quoted by-PK DELETE.
+        run(&mut sm, 5, r#"DELETE FROM "t" WHERE "id" = 1"#);
+    }
+
+    /// Parse: a mix of quoted and bare identifiers in one statement
+    /// resolves to the same columns (`SELECT "id", name FROM t`).
+    #[test]
+    fn quoted_and_bare_mix_compiles() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (id BIGINT NOT NULL, name TEXT NOT NULL)");
+        let cat = sm.catalog();
+        let all_bare = select_columns("SELECT id, name FROM t");
+        let mixed = select_columns(r#"SELECT "id", name FROM t"#);
+        assert_eq!(all_bare, mixed);
+        // And it actually compiles against the catalog.
+        assert!(compile(r#"SELECT "id", name FROM "t""#, cat).is_ok());
+    }
+
+    /// Regression: bare identifiers still lex + compile byte-identically
+    /// (the quoted-ident lexer arm must not perturb the bare path).
+    #[test]
+    fn bare_idents_unchanged_regression() {
+        assert_eq!(
+            lex("SELECT id, name FROM users").unwrap(),
+            vec![
+                Tok::Ident("SELECT".into()),
+                Tok::Ident("id".into()),
+                Tok::Punct(','),
+                Tok::Ident("name".into()),
+                Tok::Ident("FROM".into()),
+                Tok::Ident("users".into()),
+            ]
+        );
+    }
+
+    /// Parse: quoted RETURNING clause (`RETURNING "t"."id"`) — the exact
+    /// shape Django's autoincrement INSERT emits — strips to the bare
+    /// `id` column, same as the unquoted form.
+    #[test]
+    fn quoted_returning_detected() {
+        assert_eq!(
+            insert_returning(
+                r#"INSERT INTO "t" ("name") VALUES ('a') RETURNING "t"."id""#
+            ),
+            Some(("t".to_string(), vec!["id".to_string()]))
         );
     }
 }

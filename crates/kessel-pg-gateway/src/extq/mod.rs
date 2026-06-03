@@ -587,6 +587,16 @@ fn dispatch_parse(
     sql: String,
     param_oids: Vec<u32>,
 ) -> ExtqOutcome {
+    // SP-PG-RETURNING-MULTIROW-STAR — SQLAlchemy's DEFAULT
+    // `use_insertmanyvalues` batched flush emits an
+    // `INSERT … SELECT … FROM (VALUES …) AS sen(…) ORDER BY sen_counter
+    // RETURNING …` form. Desugar it to the plain multi-row
+    // `INSERT … VALUES (…),(…) RETURNING …` the engine already handles,
+    // BEFORE the literal-cast validator (which would otherwise reject the
+    // `p0::VARCHAR` projection cast). Conservative: a no-op for any other
+    // SQL, so every existing prepared-statement path is byte-untouched.
+    let sql = crate::insertmanyvalues::rewrite_insertmanyvalues(&sql)
+        .unwrap_or(sql);
     // Spec §3 + §7.1: cap check uses the FRESH-NAME rule. A Parse
     // overwriting the volatile "" slot (or replacing a name that
     // is already present — though we reject that with 42P05 below

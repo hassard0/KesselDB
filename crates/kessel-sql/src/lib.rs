@@ -664,6 +664,17 @@ pub fn insert_returning(sql: &str) -> Option<(String, Vec<String>)> {
             }
         }
         cols.push(col);
+        // SP-PG-RETURNING-MULTIROW-STAR: accept-and-skip a column alias
+        // `RETURNING t.id AS id__1` — SQLAlchemy's insertmanyvalues form
+        // emits `RETURNING widgets.id, widgets.id AS id__1`. The alias is
+        // dropped; the projection still maps to the source column.
+        if matches!(it.peek(), Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("AS")) {
+            it.next(); // consume AS
+            match it.next() {
+                Some(Tok::Ident(_)) => {} // consume the alias ident
+                _ => return None,
+            }
+        }
         match it.peek() {
             Some(Tok::Punct(',')) => {
                 it.next();
@@ -6579,6 +6590,25 @@ mod tests {
         assert_eq!(
             insert_returning("INSERT INTO w (name) VALUES ('a') RETURNING id, name"),
             Some(("w".to_string(), vec!["id".to_string(), "name".to_string()]))
+        );
+    }
+
+    /// SP-PG-RETURNING-MULTIROW-STAR: SQLAlchemy's insertmanyvalues
+    /// RETURNING clause `RETURNING widgets.id, widgets.id AS id__1`
+    /// accept-and-skips the `AS <alias>` and the qualifier — both
+    /// positions resolve to the `id` source column (SQLAlchemy maps both).
+    #[test]
+    fn insert_returning_skips_as_alias() {
+        assert_eq!(
+            insert_returning(
+                "INSERT INTO widgets (name) VALUES ('a') RETURNING widgets.id, widgets.id AS id__1"
+            ),
+            Some(("widgets".to_string(), vec!["id".to_string(), "id".to_string()]))
+        );
+        // Single aliased column.
+        assert_eq!(
+            insert_returning("INSERT INTO w (n) VALUES ('a') RETURNING id AS x"),
+            Some(("w".to_string(), vec!["id".to_string()]))
         );
     }
 }

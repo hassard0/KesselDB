@@ -68,6 +68,7 @@ pub mod dispatch;
 pub mod engine;
 pub mod error;
 pub mod extq;
+pub mod insertmanyvalues;
 pub mod pg_catalog;
 pub mod proto;
 pub mod query;

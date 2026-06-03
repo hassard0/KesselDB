@@ -87,6 +87,10 @@ pub fn dispatch_query_with_params<E: EngineApply + ?Sized>(
     // cast type's category (e.g. `'hello'::int8`) BEFORE the strip
     // rewrites the SQL. Closes the V1 silent-strip hole that V1 +
     // COMPAT only covered for `$N::TYPE` placeholder casts.
+    // SP-PG-RETURNING-MULTIROW-STAR — desugar SQLAlchemy's
+    // insertmanyvalues form to plain multi-row VALUES (no-op otherwise).
+    let imv = crate::insertmanyvalues::rewrite_insertmanyvalues(sql);
+    let sql = imv.as_deref().unwrap_or(sql);
     if let Some(mismatch) = crate::cast_stripper::find_literal_cast_mismatch(sql) {
         return literal_cast_mismatch_response_then_rfq(&mismatch);
     }
@@ -227,6 +231,10 @@ pub fn dispatch_query<E: EngineApply + ?Sized>(sql: &str, engine: &E) -> Vec<u8>
     // `SELECT col::int8` patterns the kessel-sql lexer rejects with
     // `42601 syntax_error`). Companion design spec:
     // `docs/superpowers/specs/2026-06-01-kesseldb-sppgextqcast-design.md`.
+    // SP-PG-RETURNING-MULTIROW-STAR — desugar SQLAlchemy's
+    // insertmanyvalues form to plain multi-row VALUES (no-op otherwise).
+    let imv = crate::insertmanyvalues::rewrite_insertmanyvalues(sql);
+    let sql = imv.as_deref().unwrap_or(sql);
     let stripped = crate::cast_stripper::strip_pg_casts(sql);
     let sql = stripped.as_str();
     let mut out = Vec::new();

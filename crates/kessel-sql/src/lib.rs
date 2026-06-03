@@ -5812,7 +5812,15 @@ mod tests {
     #[test]
     fn ormparse_qualified_projection_strips_qualifier() {
         let mut sm = StateMachine::open(MemVfs::new()).unwrap();
-        run(&mut sm, 1, "CREATE TABLE orm_users (name CHAR(32))");
+        // The ORM's `create_all` declares `id` as a real BIGINT column
+        // (`CREATE TABLE orm_users (id BIGINT NOT NULL, name VARCHAR(32))`),
+        // so `id` IS a projectable stored field here — exactly the
+        // shape `SELECT orm_users.id, orm_users.name` must resolve.
+        run(
+            &mut sm,
+            1,
+            "CREATE TABLE orm_users (id BIGINT NOT NULL, name CHAR(32))",
+        );
         let cat = sm.catalog();
         let qualified = compile(
             "SELECT orm_users.id, orm_users.name FROM orm_users",
@@ -5821,9 +5829,7 @@ mod tests {
         .expect("qualified projection compiles");
         let bare = compile("SELECT id, name FROM orm_users", cat)
             .expect("bare projection compiles");
-        // `id` is the pseudo-PK (not a stored field), so the engine
-        // projects only `name` for both shapes — but they must be the
-        // SAME Op regardless. Compare encodings byte-for-byte.
+        // Qualified and bare must be the SAME Op. Compare byte-for-byte.
         assert_eq!(
             qualified.encode(),
             bare.encode(),

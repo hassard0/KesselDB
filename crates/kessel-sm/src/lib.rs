@@ -2400,6 +2400,7 @@ impl<V: Vfs> StateMachine<V> {
         aggregates: &[(u8, u16)],
         range_preds: &[(u16, u8, Vec<u8>)],
         having: Option<&kessel_proto::HavingPred>,
+        sort: Option<&kessel_proto::GroupSort>,
     ) -> OpResult {
         if aggregates.is_empty() {
             return OpResult::SchemaError(
@@ -2765,6 +2766,64 @@ impl<V: Vfs> StateMachine<V> {
                 }
             }
             kept.push((k, results));
+        }
+        // SP-PG-SQL-GROUP-SORT-LIMIT: post-aggregation ORDER BY / LIMIT /
+        // OFFSET over the per-group results. `kept` is already in ascending
+        // group-key order (the pre-arc emission order) ⇒ a STABLE sort makes
+        // the tie-break deterministic (ascending key). `None` ⇒ byte-identical
+        // emit to before this arc.
+        Self::emit_group_results(kept, sort)
+    }
+
+    /// SP-PG-SQL-GROUP-SORT-LIMIT: sort (optional), paginate (optional), then
+    /// encode `kept` as the standard group-aggregate result:
+    /// `[u32 ngroups]` then per group `[u32 keylen][key][16B i128 LE × n_aggs]`.
+    /// `kept` MUST arrive in ascending group-key order (the deterministic
+    /// pre-arc order) so the stable sort's tie-break is ascending key. With
+    /// `sort == None` the order/length are untouched ⇒ byte-identical to the
+    /// pre-arc emit. The sort key is the i128 aggregate value at
+    /// `GroupSortTarget::Agg(i)` (defensive 0 if i is out of range) or the raw
+    /// group-key bytes for `Key`; `desc` reverses; LIMIT/OFFSET apply AFTER.
+    fn emit_group_results(
+        mut kept: Vec<(Vec<u8>, Vec<i128>)>,
+        sort: Option<&kessel_proto::GroupSort>,
+    ) -> OpResult {
+        if let Some(s) = sort {
+            match s.target {
+                kessel_proto::GroupSortTarget::Key => {
+                    kept.sort_by(|a, b| a.0.cmp(&b.0));
+                }
+                kessel_proto::GroupSortTarget::Agg(i) => {
+                    let idx = i as usize;
+                    kept.sort_by(|a, b| {
+                        let av = a.1.get(idx).copied().unwrap_or(0);
+                        let bv = b.1.get(idx).copied().unwrap_or(0);
+                        // Primary: the aggregate value. Tie: ascending key
+                        // (kept's incoming order is already ascending key, so a
+                        // STABLE sort would suffice — but make it explicit so
+                        // the determinism does not depend on the caller's order).
+                        av.cmp(&bv).then_with(|| a.0.cmp(&b.0))
+                    });
+                }
+            }
+            if s.desc {
+                kept.reverse();
+            }
+            // OFFSET then LIMIT, after the sort.
+            let skip = s.offset.unwrap_or(0) as usize;
+            if skip > 0 {
+                if skip >= kept.len() {
+                    kept.clear();
+                } else {
+                    kept.drain(0..skip);
+                }
+            }
+            if let Some(lim) = s.limit {
+                let lim = lim as usize;
+                if kept.len() > lim {
+                    kept.truncate(lim);
+                }
+            }
         }
         let mut out = Vec::new();
         out.extend_from_slice(&(kept.len() as u32).to_le_bytes());
@@ -3473,10 +3532,10 @@ impl<V: Vfs> StateMachine<V> {
             // SP-Analytic-Plan-MULTI: multi-aggregate single-scan GROUP BY
             // (read_only_op arm; mirrors the apply arm exactly via the
             // shared `group_aggregate_multi` helper — identical bytes).
-            Op::GroupAggregateMulti { type_id, program, group_field, aggregates, range_preds, having } => {
-                self.group_aggregate_multi(type_id, &program, group_field, &aggregates, &range_preds, having.as_ref())
+            Op::GroupAggregateMulti { type_id, program, group_field, aggregates, range_preds, having, sort } => {
+                self.group_aggregate_multi(type_id, &program, group_field, &aggregates, &range_preds, having.as_ref(), sort.as_ref())
             }
-            Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds, having } => {
+            Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds, having, sort } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
                     None => return OpResult::SchemaError(format!("no type {type_id}")),
@@ -3575,12 +3634,14 @@ impl<V: Vfs> StateMachine<V> {
                         }
                     }
                 }
-                // SP-PG-SQL-HAVING: collect (key, res) first so we can apply
+                // SP-PG-SQL-HAVING: collect (key, [res]) first so we can apply
                 // the post-aggregation group filter (a pure function of the
                 // already-deterministic per-group result) BEFORE counting +
                 // emitting groups. No HAVING ⇒ every group kept (identical
-                // bytes to before this arc).
-                let mut kept: Vec<(Vec<u8>, i128)> = Vec::with_capacity(groups.len());
+                // bytes to before this arc). SP-PG-SQL-GROUP-SORT-LIMIT: the
+                // per-group result is wrapped in a single-element Vec so the
+                // shared emit_group_results can sort/paginate uniformly.
+                let mut kept: Vec<(Vec<u8>, Vec<i128>)> = Vec::with_capacity(groups.len());
                 for (k, (cnt, sum, mn, mx)) in groups {
                     let res: i128 = match kind {
                         0 => cnt,
@@ -3605,16 +3666,9 @@ impl<V: Vfs> StateMachine<V> {
                             continue;
                         }
                     }
-                    kept.push((k, res));
+                    kept.push((k, vec![res]));
                 }
-                let mut out = Vec::new();
-                out.extend_from_slice(&(kept.len() as u32).to_le_bytes());
-                for (k, res) in kept {
-                    out.extend_from_slice(&(k.len() as u32).to_le_bytes());
-                    out.extend_from_slice(&k);
-                    out.extend_from_slice(&res.to_le_bytes());
-                }
-                OpResult::Got(out.into())
+                Self::emit_group_results(kept, sort.as_ref())
             }
             Op::FindRange { type_id, field_id, lo, hi } => {
                 let ot = match self.catalog.get(type_id) {
@@ -5963,10 +6017,10 @@ impl<V: Vfs> StateMachine<V> {
             // Op::GroupAggregate calls — closes the SP-Analytic-Plan T4
             // Q1 gap. Equivalence vs the N-call shape is proven by an
             // SM-level KAT (byte-equal vs N sequential GroupAggregate).
-            Op::GroupAggregateMulti { type_id, program, group_field, aggregates, range_preds, having } => {
-                self.group_aggregate_multi(type_id, &program, group_field, &aggregates, &range_preds, having.as_ref())
+            Op::GroupAggregateMulti { type_id, program, group_field, aggregates, range_preds, having, sort } => {
+                self.group_aggregate_multi(type_id, &program, group_field, &aggregates, &range_preds, having.as_ref(), sort.as_ref())
             }
-            Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds, having } => {
+            Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds, having, sort } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
                     None => return OpResult::SchemaError(format!("no type {type_id}")),
@@ -6071,12 +6125,13 @@ impl<V: Vfs> StateMachine<V> {
                         }
                     }
                 }
-                // SP-PG-SQL-HAVING: collect (key, res) first so we can apply
+                // SP-PG-SQL-HAVING: collect (key, [res]) first so we can apply
                 // the post-aggregation group filter (a pure function of the
                 // already-deterministic per-group result) BEFORE counting +
                 // emitting groups. No HAVING ⇒ every group kept (identical
-                // bytes to before this arc).
-                let mut kept: Vec<(Vec<u8>, i128)> = Vec::with_capacity(groups.len());
+                // bytes to before this arc). SP-PG-SQL-GROUP-SORT-LIMIT: wrap
+                // each result in a 1-elem Vec for the shared sort/paginate emit.
+                let mut kept: Vec<(Vec<u8>, Vec<i128>)> = Vec::with_capacity(groups.len());
                 for (k, (cnt, sum, mn, mx)) in groups {
                     let res: i128 = match kind {
                         0 => cnt,
@@ -6101,16 +6156,9 @@ impl<V: Vfs> StateMachine<V> {
                             continue;
                         }
                     }
-                    kept.push((k, res));
+                    kept.push((k, vec![res]));
                 }
-                let mut out = Vec::new();
-                out.extend_from_slice(&(kept.len() as u32).to_le_bytes());
-                for (k, res) in kept {
-                    out.extend_from_slice(&(k.len() as u32).to_le_bytes());
-                    out.extend_from_slice(&k);
-                    out.extend_from_slice(&res.to_le_bytes());
-                }
-                OpResult::Got(out.into())
+                Self::emit_group_results(kept, sort.as_ref())
             }
 
             Op::AddOrderedIndex { type_id, field_id } => {
@@ -10136,17 +10184,17 @@ mod tests {
         };
         let all = Program::new().push_int(1).bytes();
         // SUM(v) GROUP BY owner -> {1:30, 2:20, 3:100} ascending key order
-        match sm.apply(20, Op::GroupAggregate { type_id: 1, program: all.clone(), group_field: 1, kind: 1, agg_field: 3, range_preds: vec![], having: None }) {
+        match sm.apply(20, Op::GroupAggregate { type_id: 1, program: all.clone(), group_field: 1, kind: 1, agg_field: 3, range_preds: vec![], having: None, sort: None }) {
             OpResult::Got(b) => assert_eq!(parse(&b), vec![(1, 30), (2, 20), (3, 100)]),
             o => panic!("{o:?}"),
         }
         // COUNT GROUP BY owner -> {1:2, 2:3, 3:1}
-        match sm.apply(21, Op::GroupAggregate { type_id: 1, program: all.clone(), group_field: 1, kind: 0, agg_field: 0, range_preds: vec![], having: None }) {
+        match sm.apply(21, Op::GroupAggregate { type_id: 1, program: all.clone(), group_field: 1, kind: 0, agg_field: 0, range_preds: vec![], having: None, sort: None }) {
             OpResult::Got(b) => assert_eq!(parse(&b), vec![(1, 2), (2, 3), (3, 1)]),
             o => panic!("{o:?}"),
         }
         // MAX(v) GROUP BY owner -> {1:20, 2:8, 3:100}
-        match sm.apply(22, Op::GroupAggregate { type_id: 1, program: all, group_field: 1, kind: 3, agg_field: 3, range_preds: vec![], having: None }) {
+        match sm.apply(22, Op::GroupAggregate { type_id: 1, program: all, group_field: 1, kind: 3, agg_field: 3, range_preds: vec![], having: None, sort: None }) {
             OpResult::Got(b) => assert_eq!(parse(&b), vec![(1, 20), (2, 8), (3, 100)]),
             o => panic!("{o:?}"),
         }
@@ -10209,7 +10257,7 @@ mod tests {
         match sm.apply(30, Op::GroupAggregate {
             type_id: 1, program: all.clone(), group_field: 1, kind: 0, agg_field: 0,
             range_preds: vec![],
-            having: Some(HavingPred { agg_index: 0, op: 1, value: 3 }),
+            having: Some(HavingPred { agg_index: 0, op: 1, value: 3 }), sort: None,
         }) {
             OpResult::Got(b) => assert_eq!(parse(&b), vec![(2, 3)], "only owner 2 has count>=3"),
             o => panic!("{o:?}"),
@@ -10219,7 +10267,7 @@ mod tests {
         match sm.apply(31, Op::GroupAggregate {
             type_id: 1, program: all.clone(), group_field: 1, kind: 1, agg_field: 3,
             range_preds: vec![],
-            having: Some(HavingPred { agg_index: 0, op: 0, value: 25 }),
+            having: Some(HavingPred { agg_index: 0, op: 0, value: 25 }), sort: None,
         }) {
             OpResult::Got(b) => assert_eq!(parse(&b), vec![(1, 30), (3, 100)]),
             o => panic!("{o:?}"),
@@ -10229,7 +10277,7 @@ mod tests {
         match sm.apply(32, Op::GroupAggregate {
             type_id: 1, program: all.clone(), group_field: 1, kind: 1, agg_field: 3,
             range_preds: vec![],
-            having: Some(HavingPred { agg_index: 0, op: 4, value: 100 }),
+            having: Some(HavingPred { agg_index: 0, op: 4, value: 100 }), sort: None,
         }) {
             OpResult::Got(b) => assert_eq!(parse(&b), vec![(3, 100)]),
             o => panic!("{o:?}"),
@@ -10238,7 +10286,7 @@ mod tests {
         // No-HAVING result equals the pre-arc result (all groups).
         match sm.apply(33, Op::GroupAggregate {
             type_id: 1, program: all.clone(), group_field: 1, kind: 1, agg_field: 3,
-            range_preds: vec![], having: None,
+            range_preds: vec![], having: None, sort: None,
         }) {
             OpResult::Got(b) => assert_eq!(parse(&b), vec![(1, 30), (2, 20), (3, 100)]),
             o => panic!("{o:?}"),
@@ -10249,7 +10297,7 @@ mod tests {
             type_id: 1, program: all.clone(), group_field: 1,
             aggregates: vec![(0, 0), (1, 3)],
             range_preds: vec![],
-            having: Some(HavingPred { agg_index: 1, op: 0, value: 25 }),
+            having: Some(HavingPred { agg_index: 1, op: 0, value: 25 }), sort: None,
         }) {
             OpResult::Got(b) => assert_eq!(
                 parse_multi(&b, 2),
@@ -10264,7 +10312,7 @@ mod tests {
             type_id: 1, program: all.clone(), group_field: 1,
             aggregates: vec![(0, 0), (1, 3)],
             range_preds: vec![],
-            having: Some(HavingPred { agg_index: 0, op: 2, value: 3 }),
+            having: Some(HavingPred { agg_index: 0, op: 2, value: 3 }), sort: None,
         }) {
             OpResult::Got(b) => assert_eq!(
                 parse_multi(&b, 2),
@@ -10277,12 +10325,164 @@ mod tests {
         match sm.apply(36, Op::GroupAggregate {
             type_id: 1, program: all, group_field: 1, kind: 0, agg_field: 0,
             range_preds: vec![],
-            having: Some(HavingPred { agg_index: 0, op: 0, value: 1000 }),
+            having: Some(HavingPred { agg_index: 0, op: 0, value: 1000 }), sort: None,
         }) {
             OpResult::Got(b) => {
                 assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), 0);
                 assert_eq!(b.len(), 4, "empty group-agg result is just the ngroups u32");
             }
+            o => panic!("{o:?}"),
+        }
+    }
+
+    /// SP-PG-SQL-GROUP-SORT-LIMIT — the post-aggregation ORDER BY / LIMIT /
+    /// OFFSET reorders + truncates the per-group result of a PLAIN GROUP BY,
+    /// on BOTH the single-aggregate (`Op::GroupAggregate`) and multi-aggregate
+    /// (`Op::GroupAggregateMulti`) paths, and on BOTH `apply` and
+    /// `read_only_op`. Dataset (owner → count, sum(v)):
+    ///   owner 1 → count 2, sum 30; owner 2 → count 3, sum 20; owner 3 → count 1, sum 100.
+    /// Default (no sort) emits ascending-key order: [(1,..),(2,..),(3,..)].
+    #[test]
+    fn sp_pg_sql_group_sort_limit_reorders_and_truncates() {
+        use kessel_expr::Program;
+        use kessel_proto::{GroupSort, GroupSortTarget};
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        sm.apply(1, Op::CreateType { def: q_type_def() });
+        let data = [(1u32, 10u32), (1, 20), (2, 5), (2, 7), (2, 8), (3, 100)];
+        for (i, (o, v)) in data.iter().enumerate() {
+            sm.apply(2 + i as u64, Op::Create {
+                type_id: 1, id: ObjectId::from_u128(i as u128), record: qrec(*o, 0, *v),
+            });
+        }
+        let parse = |b: &[u8]| -> Vec<(u32, i128)> {
+            let n = u32::from_le_bytes(b[0..4].try_into().unwrap()) as usize;
+            let mut p = 4;
+            let mut g = Vec::new();
+            for _ in 0..n {
+                let kl = u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize;
+                p += 4;
+                let key = u32::from_le_bytes(b[p..p + 4].try_into().unwrap());
+                p += kl;
+                let val = i128::from_le_bytes(b[p..p + 16].try_into().unwrap());
+                p += 16;
+                g.push((key, val));
+            }
+            g
+        };
+        let parse_multi = |b: &[u8], n_aggs: usize| -> Vec<(u32, Vec<i128>)> {
+            let n = u32::from_le_bytes(b[0..4].try_into().unwrap()) as usize;
+            let mut p = 4;
+            let mut g = Vec::new();
+            for _ in 0..n {
+                let kl = u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize;
+                p += 4;
+                let key = u32::from_le_bytes(b[p..p + 4].try_into().unwrap());
+                p += kl;
+                let mut vals = Vec::with_capacity(n_aggs);
+                for _ in 0..n_aggs {
+                    vals.push(i128::from_le_bytes(b[p..p + 16].try_into().unwrap()));
+                    p += 16;
+                }
+                g.push((key, vals));
+            }
+            g
+        };
+        let all = Program::new().push_int(1).bytes();
+
+        // COUNT(*) GROUP BY owner ORDER BY COUNT(*) DESC ⇒ counts {1:2,2:3,3:1}
+        // descending by count: owner 2 (3), owner 1 (2), owner 3 (1).
+        // This is the headline: NOT ascending key order.
+        let count_desc = Op::GroupAggregate {
+            type_id: 1, program: all.clone(), group_field: 1, kind: 0, agg_field: 0,
+            range_preds: vec![], having: None,
+            sort: Some(GroupSort { target: GroupSortTarget::Agg(0), desc: true, limit: None, offset: None }),
+        };
+        match sm.apply(40, count_desc.clone()) {
+            OpResult::Got(b) => assert_eq!(parse(&b), vec![(2, 3), (1, 2), (3, 1)], "DESC count order"),
+            o => panic!("{o:?}"),
+        }
+        // read_only_op must agree byte-for-byte with apply.
+        assert_eq!(sm.read_only_op(count_desc.clone()), sm.apply(41, count_desc),
+            "apply and read_only_op agree for sort");
+
+        // ... ORDER BY COUNT(*) DESC LIMIT 2 ⇒ top 2 only: owner 2, owner 1.
+        match sm.apply(42, Op::GroupAggregate {
+            type_id: 1, program: all.clone(), group_field: 1, kind: 0, agg_field: 0,
+            range_preds: vec![], having: None,
+            sort: Some(GroupSort { target: GroupSortTarget::Agg(0), desc: true, limit: Some(2), offset: None }),
+        }) {
+            OpResult::Got(b) => assert_eq!(parse(&b), vec![(2, 3), (1, 2)], "DESC count LIMIT 2"),
+            o => panic!("{o:?}"),
+        }
+
+        // ... ORDER BY COUNT(*) DESC LIMIT 2 OFFSET 1 ⇒ window: owner 1, owner 3.
+        match sm.apply(43, Op::GroupAggregate {
+            type_id: 1, program: all.clone(), group_field: 1, kind: 0, agg_field: 0,
+            range_preds: vec![], having: None,
+            sort: Some(GroupSort { target: GroupSortTarget::Agg(0), desc: true, limit: Some(2), offset: Some(1) }),
+        }) {
+            OpResult::Got(b) => assert_eq!(parse(&b), vec![(1, 2), (3, 1)], "DESC count LIMIT 2 OFFSET 1"),
+            o => panic!("{o:?}"),
+        }
+
+        // ORDER BY key (group key) ASC is still ascending key order.
+        match sm.apply(44, Op::GroupAggregate {
+            type_id: 1, program: all.clone(), group_field: 1, kind: 0, agg_field: 0,
+            range_preds: vec![], having: None,
+            sort: Some(GroupSort { target: GroupSortTarget::Key, desc: false, limit: None, offset: None }),
+        }) {
+            OpResult::Got(b) => assert_eq!(parse(&b), vec![(1, 2), (2, 3), (3, 1)], "ORDER BY key ASC"),
+            o => panic!("{o:?}"),
+        }
+        // ORDER BY key DESC reverses to descending key.
+        match sm.apply(45, Op::GroupAggregate {
+            type_id: 1, program: all.clone(), group_field: 1, kind: 0, agg_field: 0,
+            range_preds: vec![], having: None,
+            sort: Some(GroupSort { target: GroupSortTarget::Key, desc: true, limit: None, offset: None }),
+        }) {
+            OpResult::Got(b) => assert_eq!(parse(&b), vec![(3, 1), (2, 3), (1, 2)], "ORDER BY key DESC"),
+            o => panic!("{o:?}"),
+        }
+
+        // HAVING + ORDER BY + LIMIT compose: SUM(v) GROUP BY owner
+        // HAVING SUM(v) > 25 (drops owner 2's 20) ORDER BY SUM(v) DESC LIMIT 1
+        // ⇒ owner 3 (100) only (owner 1 has 30, owner 3 has 100).
+        match sm.apply(46, Op::GroupAggregate {
+            type_id: 1, program: all.clone(), group_field: 1, kind: 1, agg_field: 3,
+            range_preds: vec![],
+            having: Some(kessel_proto::HavingPred { agg_index: 0, op: 0, value: 25 }),
+            sort: Some(GroupSort { target: GroupSortTarget::Agg(0), desc: true, limit: Some(1), offset: None }),
+        }) {
+            OpResult::Got(b) => assert_eq!(parse(&b), vec![(3, 100)], "HAVING then sort then LIMIT 1"),
+            o => panic!("{o:?}"),
+        }
+
+        // Multi path: [COUNT(*), SUM(v)] ORDER BY SUM(v) (agg index 1) DESC LIMIT 2
+        // ⇒ owner 3 (sum 100), owner 1 (sum 30).
+        let multi = Op::GroupAggregateMulti {
+            type_id: 1, program: all.clone(), group_field: 1,
+            aggregates: vec![(0, 0), (1, 3)],
+            range_preds: vec![], having: None,
+            sort: Some(GroupSort { target: GroupSortTarget::Agg(1), desc: true, limit: Some(2), offset: None }),
+        };
+        match sm.apply(47, multi.clone()) {
+            OpResult::Got(b) => assert_eq!(
+                parse_multi(&b, 2),
+                vec![(3, vec![1, 100]), (1, vec![2, 30])],
+                "multi ORDER BY SUM DESC LIMIT 2",
+            ),
+            o => panic!("{o:?}"),
+        }
+        assert_eq!(sm.read_only_op(multi.clone()), sm.apply(48, multi),
+            "multi apply and read_only_op agree for sort");
+
+        // No-sort frame is byte-identical to the pre-arc ascending-key emit.
+        let no_sort = Op::GroupAggregate {
+            type_id: 1, program: all.clone(), group_field: 1, kind: 0, agg_field: 0,
+            range_preds: vec![], having: None, sort: None,
+        };
+        match sm.apply(49, no_sort) {
+            OpResult::Got(b) => assert_eq!(parse(&b), vec![(1, 2), (2, 3), (3, 1)], "no sort = ascending key"),
             o => panic!("{o:?}"),
         }
     }
@@ -10367,7 +10567,7 @@ mod tests {
             group_field: 1,
             aggregates: aggs.clone(),
             range_preds: vec![],
-            having: None,
+            having: None, sort: None,
         }) {
             OpResult::Got(b) => b.to_vec(),
             o => panic!("multi: {o:?}"),
@@ -10384,7 +10584,7 @@ mod tests {
                 kind: *k,
                 agg_field: *f,
                 range_preds: vec![],
-                having: None,
+                having: None, sort: None,
             }) {
                 OpResult::Got(b) => parse_single(&b),
                 o => panic!("single (kind={k}, field={f}): {o:?}"),
@@ -10435,7 +10635,7 @@ mod tests {
                 group_field: 1,
                 aggregates: aggs.clone(),
                 range_preds: vec![],
-                having: None,
+                having: None, sort: None,
             },
         ) {
             OpResult::Got(b) => b.to_vec(),
@@ -10447,7 +10647,7 @@ mod tests {
             group_field: 1,
             aggregates: aggs,
             range_preds: vec![],
-            having: None,
+            having: None, sort: None,
         }) {
             OpResult::Got(b) => b.to_vec(),
             o => panic!("ro: {o:?}"),
@@ -10497,7 +10697,7 @@ mod tests {
             group_field: 1,
             aggregates: aggs.clone(),
             range_preds: vec![],
-            having: None,
+            having: None, sort: None,
         }) {
             OpResult::Got(b) => b.to_vec(),
             o => panic!("{o:?}"),
@@ -10513,7 +10713,7 @@ mod tests {
             group_field: 1,
             aggregates: aggs,
             range_preds: full_range,
-            having: None,
+            having: None, sort: None,
         }) {
             OpResult::Got(b) => b.to_vec(),
             o => panic!("{o:?}"),
@@ -10587,7 +10787,7 @@ mod tests {
                 group_field: 1,
                 aggregates: aggs.clone(),
                 range_preds: vec![],
-                having: None,
+                having: None, sort: None,
             }) {
                 OpResult::Got(b) => b.to_vec(),
                 o => panic!("multi parallel: {o:?}"),
@@ -10726,7 +10926,7 @@ mod tests {
                 group_field: 1,
                 aggregates: aggs.clone(),
                 range_preds: vec![],
-                having: None,
+                having: None, sort: None,
             },
         ) {
             OpResult::Got(b) => b.to_vec(),
@@ -10738,7 +10938,7 @@ mod tests {
             group_field: 1,
             aggregates: aggs,
             range_preds: vec![],
-            having: None,
+            having: None, sort: None,
         }) {
             OpResult::Got(b) => b.to_vec(),
             o => panic!("ro: {o:?}"),
@@ -10879,7 +11079,7 @@ mod tests {
                 group_field: 1,
                 aggregates: aggs.clone(),
                 range_preds: vec![],
-                having: None,
+                having: None, sort: None,
             }) {
                 OpResult::Got(b) => b.to_vec(),
                 o => panic!("multi streaming high-cardinality: {o:?}"),
@@ -10961,7 +11161,7 @@ mod tests {
                 group_field: 1,
                 aggregates: aggs.clone(),
                 range_preds: vec![],
-                having: None,
+                having: None, sort: None,
             },
         ) {
             OpResult::Got(b) => b.to_vec(),
@@ -10973,7 +11173,7 @@ mod tests {
             group_field: 1,
             aggregates: aggs.clone(),
             range_preds: vec![],
-            having: None,
+            having: None, sort: None,
         }) {
             OpResult::Got(b) => b.to_vec(),
             o => panic!("ro streaming: {o:?}"),
@@ -11181,7 +11381,7 @@ mod tests {
             let r = match sm.apply(99, Op::GroupAggregate {
                 type_id: 1, program: Program::new().push_int(1).bytes(),
                 group_field: 1, kind: 1, agg_field: 3, range_preds: vec![],
-                having: None,
+                having: None, sort: None,
             }) {
                 OpResult::Got(b) => b,
                 o => panic!("{o:?}"),
@@ -11320,7 +11520,7 @@ mod tests {
             let oracle = match sm.apply(2000, Op::GroupAggregate {
                 type_id: 1, program: p.clone(), group_field: 1, kind: *k, agg_field: 3,
                 range_preds: vec![],
-                having: None,
+                having: None, sort: None,
             }) {
                 OpResult::Got(b) => b.to_vec(),
                 o => panic!("oracle {label}: {o:?}"),
@@ -11331,7 +11531,7 @@ mod tests {
                     (3u16, 1u8, (*lo).to_le_bytes().to_vec()),
                     (3u16, 2u8, (*hi).to_le_bytes().to_vec()),
                 ],
-                having: None,
+                having: None, sort: None,
             }) {
                 OpResult::Got(b) => b.to_vec(),
                 o => panic!("narrowed {label}: {o:?}"),
@@ -11341,7 +11541,7 @@ mod tests {
             let oracle_ro = match sm.read_only_op(Op::GroupAggregate {
                 type_id: 1, program: p.clone(), group_field: 1, kind: *k, agg_field: 3,
                 range_preds: vec![],
-                having: None,
+                having: None, sort: None,
             }) {
                 OpResult::Got(b) => b.to_vec(),
                 o => panic!("oracle_ro {label}: {o:?}"),
@@ -11352,7 +11552,7 @@ mod tests {
                     (3u16, 1u8, (*lo).to_le_bytes().to_vec()),
                     (3u16, 2u8, (*hi).to_le_bytes().to_vec()),
                 ],
-                having: None,
+                having: None, sort: None,
             }) {
                 OpResult::Got(b) => b.to_vec(),
                 o => panic!("narrowed_ro {label}: {o:?}"),

@@ -1475,6 +1475,7 @@ mod tests {
                     agg_field: 2,
                     range_preds: vec![],
                     having: None,
+                    sort: None,
                 },
                 |k| matches!(k, ScatterKind::GroupAggregateMerge { kind: 0 }),
             ),
@@ -1486,6 +1487,7 @@ mod tests {
                     aggregates: vec![(0, 1), (1, 2)],
                     range_preds: vec![],
                     having: None,
+                    sort: None,
                 },
                 |k| matches!(k, ScatterKind::GroupAggregateMultiMerge { .. }),
             ),
@@ -2130,6 +2132,7 @@ mod tests {
             agg_field: 1,   // v
             range_preds: vec![],
             having: None,
+            sort: None,
         };
         let r1 = e1.apply(group_sum.clone());
         let r4 = e4.apply(group_sum.clone());
@@ -2147,6 +2150,7 @@ mod tests {
             aggregates: vec![(0u8, 1u16), (1u8, 1u16)], // COUNT and SUM on v
             range_preds: vec![],
             having: None,
+            sort: None,
         };
         let r1 = e1.apply(group_multi.clone());
         let r4 = e4.apply(group_multi.clone());
@@ -2351,6 +2355,7 @@ mod tests {
                 agg_field: 1,
                 range_preds: vec![],
                 having: None,
+                sort: None,
             };
             let r1 = e1.apply(op.clone());
             let r4 = e4.apply(op);

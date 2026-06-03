@@ -155,9 +155,11 @@ fn encode_having(b: &mut Vec<u8>, having: &Option<HavingPred>) {
 }
 
 /// SP-PG-SQL-HAVING: decode the optional trailing HAVING block. Absent (no
-/// remaining bytes) ⇒ `None`. Marker 1 ⇒ read the predicate. A non-1 marker is
-/// a forward-incompatible op ⇒ `Err` (surfaced as a decode failure, never
-/// silently mis-applied). Returns `Ok(None)`/`Ok(Some(_))` on success.
+/// remaining bytes) ⇒ `None`. Marker 1 ⇒ read the predicate. Marker 0 ⇒
+/// SP-PG-SQL-GROUP-SORT-LIMIT "no-HAVING anchor" (a group-sort block follows;
+/// the anchor is consumed so the sort decode can read its own marker) ⇒ `None`.
+/// Any other marker is a forward-incompatible op ⇒ `Err` (surfaced as a decode
+/// failure, never silently mis-applied). Returns `Ok(None)`/`Ok(Some(_))`.
 fn decode_having(c: &mut codec::Cursor) -> Result<Option<HavingPred>, ()> {
     if c.remaining() == 0 {
         return Ok(None);
@@ -168,6 +170,137 @@ fn decode_having(c: &mut codec::Cursor) -> Result<Option<HavingPred>, ()> {
             let op = c.u8().ok_or(())?;
             let value = c.u128().ok_or(())? as i128;
             Ok(Some(HavingPred { agg_index, op, value }))
+        }
+        // SP-PG-SQL-GROUP-SORT-LIMIT no-HAVING anchor: consumed, no predicate.
+        Some(0) => Ok(None),
+        _ => Err(()),
+    }
+}
+
+/// SP-PG-SQL-GROUP-SORT-LIMIT: write the combined HAVING + group-sort trailer
+/// so the two compose without ambiguity while preserving byte-identity for
+/// every pre-arc frame:
+///   - no HAVING, no sort ⇒ write NOTHING (pre-arc identical).
+///   - HAVING, no sort     ⇒ the existing `encode_having` block ONLY (a
+///     pre-group-sort HAVING-only frame is byte-identical).
+///   - sort present        ⇒ a HAVING-presence anchor (`encode_having` writes
+///     `[1][..]` when Some; we write a single `0` when None) FOLLOWED by the
+///     group-sort block. The `0` anchor lets `decode_having` consume the
+///     no-HAVING case and hand off to `decode_group_sort`.
+fn encode_group_trailer(b: &mut Vec<u8>, having: &Option<HavingPred>, sort: &Option<GroupSort>) {
+    match (having, sort) {
+        (_, None) => encode_having(b, having),
+        (Some(_), Some(_)) => {
+            encode_having(b, having);
+            encode_group_sort(b, sort);
+        }
+        (None, Some(_)) => {
+            b.push(0u8); // no-HAVING anchor so the sort block has a fixed offset
+            encode_group_sort(b, sort);
+        }
+    }
+}
+
+/// SP-PG-SQL-GROUP-SORT-LIMIT: a post-aggregation `ORDER BY … [ASC|DESC]
+/// [LIMIT n] [OFFSET m]` over the per-group result of a PLAIN (non-JOIN)
+/// `GROUP BY`. Applied AFTER aggregation AND AFTER any HAVING filter, on the
+/// single deterministic apply thread, over the already-deterministic per-group
+/// `(key, [agg results])` sequence — so it stays a pure function of the input
+/// rows.
+///
+/// `target` selects WHAT to sort by:
+///   - `GroupSortTarget::Key` ⇒ sort by the raw group-key bytes (`ORDER BY g`
+///     / `ORDER BY 1`).
+///   - `GroupSortTarget::Agg(i)` ⇒ sort by the i128 value of the i-th aggregate
+///     in the op's aggregate output sequence (`ORDER BY n` / `ORDER BY 2` /
+///     `ORDER BY COUNT(*)`). For the single-aggregate `Op::GroupAggregate` `i`
+///     is always 0.
+/// `desc` reverses the comparison. Ties are ALWAYS broken by ascending group
+/// key (the pre-arc emission order), giving a TOTAL deterministic order.
+/// `limit`/`offset`: `None` ⇒ unbounded / 0; applied AFTER the sort.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupSortTarget {
+    /// Sort by the raw group-key bytes (lexicographic over the fixed-width key).
+    Key,
+    /// Sort by the i128 value of aggregate slot `0`-based index.
+    Agg(u16),
+}
+
+/// SP-PG-SQL-GROUP-SORT-LIMIT: see `GroupSortTarget`. Carried (optionally) by
+/// `Op::GroupAggregate` / `Op::GroupAggregateMulti`. `None` ⇒ pre-arc behaviour
+/// (groups emitted in ascending key order, unbounded — byte-identical frame).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupSort {
+    pub target: GroupSortTarget,
+    pub desc: bool,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
+}
+
+/// SP-PG-SQL-GROUP-SORT-LIMIT: marker-guarded encode of an optional group
+/// sort/page block. `None` ⇒ writes NOTHING (byte-identical to a pre-arc
+/// frame). `Some` ⇒ `[u8 1 marker][u8 target_tag][u16 agg_index][u8 desc]
+/// [u8 has_limit][?u64 limit][u8 has_offset][?u64 offset]`. `target_tag`
+/// 0 = Key (agg_index written as 0, ignored), 1 = Agg(agg_index). A non-1
+/// marker on decode is a forward-incompatible op (rejected), mirroring
+/// `encode_having`/`decode_having`. This block is positioned AFTER the
+/// HAVING block so the two compose without ambiguity.
+fn encode_group_sort(b: &mut Vec<u8>, sort: &Option<GroupSort>) {
+    if let Some(s) = sort {
+        b.push(1u8); // group-sort-block marker
+        let (tag, agg_index) = match s.target {
+            GroupSortTarget::Key => (0u8, 0u16),
+            GroupSortTarget::Agg(i) => (1u8, i),
+        };
+        b.push(tag);
+        b.extend_from_slice(&agg_index.to_le_bytes());
+        b.push(s.desc as u8);
+        match s.limit {
+            Some(n) => {
+                b.push(1u8);
+                b.extend_from_slice(&n.to_le_bytes());
+            }
+            None => b.push(0u8),
+        }
+        match s.offset {
+            Some(n) => {
+                b.push(1u8);
+                b.extend_from_slice(&n.to_le_bytes());
+            }
+            None => b.push(0u8),
+        }
+    }
+}
+
+/// SP-PG-SQL-GROUP-SORT-LIMIT: decode the optional trailing group-sort block.
+/// Absent (no remaining bytes) ⇒ `Ok(None)`. Marker 1 ⇒ read the block. A
+/// non-1 marker, or a target tag other than 0/1, is a forward-incompatible op
+/// ⇒ `Err` (surfaced as a decode failure, never silently mis-applied).
+fn decode_group_sort(c: &mut codec::Cursor) -> Result<Option<GroupSort>, ()> {
+    if c.remaining() == 0 {
+        return Ok(None);
+    }
+    match c.u8() {
+        Some(1) => {
+            let tag = c.u8().ok_or(())?;
+            let agg_index = c.u16().ok_or(())?;
+            let desc = c.u8().ok_or(())? != 0;
+            let target = match tag {
+                0 => GroupSortTarget::Key,
+                1 => GroupSortTarget::Agg(agg_index),
+                _ => return Err(()),
+            };
+            let limit = if c.u8().ok_or(())? != 0 {
+                Some(c.u64().ok_or(())?)
+            } else {
+                None
+            };
+            let offset = if c.u8().ok_or(())? != 0 {
+                Some(c.u64().ok_or(())?)
+            } else {
+                None
+            };
+            Ok(Some(GroupSort { target, desc, limit, offset }))
         }
         _ => Err(()),
     }
@@ -290,6 +423,12 @@ pub enum Op {
         /// is always 0 here — there is exactly one aggregate). `None` ⇒
         /// every group emitted (byte-identical to a pre-HAVING frame).
         having: Option<HavingPred>,
+        /// SP-PG-SQL-GROUP-SORT-LIMIT: optional `ORDER BY … [LIMIT][OFFSET]`
+        /// over the per-group result. Applied AFTER aggregation + HAVING.
+        /// `None` ⇒ ascending-key order, unbounded (byte-identical to a
+        /// pre-arc frame). Sort target `Agg(i)` MUST have `i == 0` here (one
+        /// aggregate); `Key` sorts by group key.
+        sort: Option<GroupSort>,
     },
     /// Schema introspection (Sub-project 34): returns the table's serialized
     /// `(name, fields)` definition so a client can decode `SELECT` rows.
@@ -530,6 +669,11 @@ pub enum Op {
         /// SP-PG-SQL-HAVING: optional post-aggregation group filter. `None` ⇒
         /// every group emitted (byte-identical to a pre-HAVING frame).
         having: Option<HavingPred>,
+        /// SP-PG-SQL-GROUP-SORT-LIMIT: optional `ORDER BY … [LIMIT][OFFSET]`
+        /// over the per-group result. Applied AFTER aggregation + HAVING.
+        /// `None` ⇒ ascending-key order, unbounded (byte-identical to a
+        /// pre-arc frame). Sort target `Agg(i)` indexes into `aggregates`.
+        sort: Option<GroupSort>,
     },
 
     /// SP123 / S2.X: per-replica active-snapshot report — closes the
@@ -1286,18 +1430,19 @@ impl Op {
                 }
                 codec::put_u32(&mut b, *limit);
             }
-            Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds, having } => {
+            Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds, having, sort } => {
                 codec::put_u32(&mut b, *type_id);
                 codec::put_bytes(&mut b, program);
                 b.extend_from_slice(&group_field.to_le_bytes());
                 b.push(*kind);
                 b.extend_from_slice(&agg_field.to_le_bytes());
-                // SP-PG-SQL-HAVING: a HAVING clause forces the range-preds
-                // length prefix to be written even when empty (a `0u32`) so
-                // the trailing HAVING block has a fixed offset to follow. A
-                // query with NO range hints AND NO HAVING still omits both ⇒
-                // byte-identical to the pre-HAVING/pre-range frame.
-                if !range_preds.is_empty() || having.is_some() {
+                // SP-PG-SQL-HAVING / -GROUP-SORT-LIMIT: a HAVING clause OR a
+                // group-sort block forces the range-preds length prefix to be
+                // written even when empty (a `0u32`) so the trailing
+                // HAVING/sort blocks have a fixed offset to follow. A query
+                // with NO range hints AND NO HAVING AND NO sort still omits
+                // both ⇒ byte-identical to the pre-arc frame.
+                if !range_preds.is_empty() || having.is_some() || sort.is_some() {
                     codec::put_u32(&mut b, range_preds.len() as u32);
                     for (f, o, v) in range_preds {
                         b.extend_from_slice(&f.to_le_bytes());
@@ -1305,10 +1450,10 @@ impl Op {
                         codec::put_bytes(&mut b, v);
                     }
                 }
-                // SP-PG-SQL-HAVING: marker-guarded trailing HAVING block.
-                // Emitted only when Some ⇒ a no-HAVING frame writes NOTHING
-                // here, staying byte-identical to before this arc.
-                encode_having(&mut b, having);
+                // SP-PG-SQL-HAVING + -GROUP-SORT-LIMIT: marker-guarded trailing
+                // HAVING block then group-sort block (see encode_group_trailer).
+                // Both absent ⇒ NOTHING written here ⇒ byte-identical to before.
+                encode_group_trailer(&mut b, having, sort);
             }
             // SP-Analytic-Plan-MULTI: wire tag 47.
             //   [u32 type_id]
@@ -1318,7 +1463,7 @@ impl Op {
             //   [u32 n_range_preds] { [u16 f][u8 op][u32 v_len][v] }*
             // n_range_preds is REQUIRED (no back-compat omission since
             // this variant is brand-new; reader symmetry is simpler).
-            Op::GroupAggregateMulti { type_id, program, group_field, aggregates, range_preds, having } => {
+            Op::GroupAggregateMulti { type_id, program, group_field, aggregates, range_preds, having, sort } => {
                 codec::put_u32(&mut b, *type_id);
                 codec::put_bytes(&mut b, program);
                 b.extend_from_slice(&group_field.to_le_bytes());
@@ -1333,11 +1478,12 @@ impl Op {
                     b.push(*o);
                     codec::put_bytes(&mut b, v);
                 }
-                // SP-PG-SQL-HAVING: marker-guarded trailing HAVING block.
-                // Tag 47's range_preds always carried an explicit length, so
-                // the HAVING block simply follows; absent ⇒ NOTHING written
-                // (byte-identical to a pre-HAVING tag-47 frame).
-                encode_having(&mut b, having);
+                // SP-PG-SQL-HAVING + -GROUP-SORT-LIMIT: marker-guarded trailing
+                // HAVING block then group-sort block. Tag 47's range_preds
+                // always carried an explicit length, so these simply follow;
+                // both absent ⇒ NOTHING written (byte-identical to a
+                // pre-HAVING/pre-sort tag-47 frame).
+                encode_group_trailer(&mut b, having, sort);
             }
             Op::AddCompositeIndex { type_id, fields }
             | Op::DropIndex { type_id, fields } => {
@@ -1760,10 +1906,12 @@ impl Op {
                 };
                 // SP-PG-SQL-HAVING: optional trailing HAVING block. Absent ⇒
                 // None (pre-arc frame). The range-preds prefix above is written
-                // (possibly as a `0`) whenever HAVING is present, so any
-                // remaining bytes here ARE the HAVING block.
+                // (possibly as a `0`) whenever HAVING/sort is present, so any
+                // remaining bytes here ARE the HAVING then group-sort blocks.
                 let having = decode_having(&mut c).ok()?;
-                Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds, having }
+                // SP-PG-SQL-GROUP-SORT-LIMIT: optional trailing group-sort block.
+                let sort = decode_group_sort(&mut c).ok()?;
+                Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds, having, sort }
             }
             // SP-Analytic-Plan-MULTI: wire tag 47.
             47 => {
@@ -1789,9 +1937,11 @@ impl Op {
                 }
                 // SP-PG-SQL-HAVING: optional trailing HAVING block. Tag 47
                 // always wrote the range-preds length, so any remaining bytes
-                // are the HAVING block. Absent ⇒ None (pre-HAVING frame).
+                // are the HAVING then group-sort blocks. Absent ⇒ None.
                 let having = decode_having(&mut c).ok()?;
-                Op::GroupAggregateMulti { type_id, program, group_field, aggregates, range_preds, having }
+                // SP-PG-SQL-GROUP-SORT-LIMIT: optional trailing group-sort block.
+                let sort = decode_group_sort(&mut c).ok()?;
+                Op::GroupAggregateMulti { type_id, program, group_field, aggregates, range_preds, having, sort }
             }
             24 => {
                 let type_id = c.u32()?;
@@ -2088,9 +2238,9 @@ mod tests {
             // SP-Analytic-Plan: aggregate w/ range hints — new wire suffix.
             Op::Aggregate { type_id: 4, program: vec![1], kind: 1, field_id: 3, range_preds: vec![(2, 1, vec![7, 0]), (2, 3, vec![9, 0])] },
             Op::SelectFields { type_id: 4, program: vec![1], fields: vec![1, 3], limit: 5 },
-            Op::GroupAggregate { type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3, range_preds: vec![], having: None },
+            Op::GroupAggregate { type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3, range_preds: vec![], having: None, sort: None },
             // SP-Analytic-Plan: group-agg w/ range hints — new wire suffix.
-            Op::GroupAggregate { type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3, range_preds: vec![(2, 1, vec![1, 0]), (2, 3, vec![5, 0])], having: None },
+            Op::GroupAggregate { type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3, range_preds: vec![(2, 1, vec![1, 0]), (2, 3, vec![5, 0])], having: None, sort: None },
             Op::SelectSorted { type_id: 4, program: vec![1], sort_field: 3, desc: true, offset: 2, limit: 5 },
             Op::AddCompositeIndex { type_id: 4, fields: vec![1, 3] },
             Op::DropIndex { type_id: 4, fields: vec![1] },
@@ -2688,7 +2838,7 @@ mod tests {
             kind: 0,
             agg_field: 5,
             range_preds: vec![],
-            having: None,
+            having: None, sort: None,
         };
         let enc_g = post_g.encode();
         let mut hand_g = Vec::new();
@@ -2717,7 +2867,7 @@ mod tests {
                 Op::GroupAggregate {
                     type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3,
                     range_preds: rp.clone(),
-                    having: None,
+                    having: None, sort: None,
                 },
             ] {
                 let bytes = op.encode();
@@ -2748,7 +2898,7 @@ mod tests {
                 group_field: 1,
                 aggregates: vec![(0, 0), (1, 3)],
                 range_preds: vec![],
-                having: None,
+                having: None, sort: None,
             },
             // 4 aggregates (Q1 shape: COUNT + 3 SUMs), one range_pred
             Op::GroupAggregateMulti {
@@ -2757,7 +2907,7 @@ mod tests {
                 group_field: 16,
                 aggregates: vec![(0, 0), (1, 4), (1, 5), (1, 6)],
                 range_preds: vec![(10, 3, vec![0x05, 0x35, 0x2F, 0x01])],
-                having: None,
+                having: None, sort: None,
             },
             // 5 aggregates incl. AVG (kind=4) + 2 range_preds
             Op::GroupAggregateMulti {
@@ -2766,7 +2916,7 @@ mod tests {
                 group_field: 0,
                 aggregates: vec![(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)],
                 range_preds: vec![(2, 1, vec![1, 0]), (2, 3, vec![9, 0])],
-                having: None,
+                having: None, sort: None,
             },
         ];
         for op in ops {
@@ -2808,7 +2958,7 @@ mod tests {
         let g = Op::GroupAggregate {
             type_id: 4, program: vec![9], group_field: 2, kind: 0, agg_field: 5,
             range_preds: vec![],
-            having: None,
+            having: None, sort: None,
         };
         let g_enc = g.encode();
         let mut hand_g = Vec::new();
@@ -2836,7 +2986,7 @@ mod tests {
         let g = Op::GroupAggregate {
             type_id: 4, program: vec![9], group_field: 2, kind: 0, agg_field: 5,
             range_preds: vec![],
-            having: Some(HavingPred { agg_index: 0, op: 1, value: 3 }),
+            having: Some(HavingPred { agg_index: 0, op: 1, value: 3 }), sort: None,
         };
         let enc = g.encode();
         let mut hand = Vec::new();
@@ -2859,7 +3009,7 @@ mod tests {
         let g2 = Op::GroupAggregate {
             type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3,
             range_preds: vec![(2u16, 1u8, vec![1, 0])],
-            having: Some(HavingPred { agg_index: 0, op: 0, value: -5 }),
+            having: Some(HavingPred { agg_index: 0, op: 0, value: -5 }), sort: None,
         };
         assert_eq!(Op::decode(&g2.encode()).unwrap(), g2, "GA+rp+HAVING round-trip");
 
@@ -2868,7 +3018,7 @@ mod tests {
             type_id: 7, program: vec![1, 2], group_field: 1,
             aggregates: vec![(0, 0), (1, 3), (3, 4)],
             range_preds: vec![],
-            having: Some(HavingPred { agg_index: 2, op: 3, value: 100 }),
+            having: Some(HavingPred { agg_index: 2, op: 3, value: 100 }), sort: None,
         };
         assert_eq!(Op::decode(&m.encode()).unwrap(), m, "GroupAggregateMulti+HAVING round-trip");
 
@@ -2890,7 +3040,7 @@ mod tests {
         // HAVING-bearing frame above — no rp-len, no having block).
         let g_none = Op::GroupAggregate {
             type_id: 4, program: vec![9], group_field: 2, kind: 0, agg_field: 5,
-            range_preds: vec![], having: None,
+            range_preds: vec![], having: None, sort: None,
         };
         let mut hand_none = Vec::new();
         hand_none.push(22u8);
@@ -2924,5 +3074,123 @@ mod tests {
         let marker_idx = mlen - (1 + 2 + 1 + 16);
         bad[marker_idx] = 2;
         assert!(Op::decode(&bad).is_none(), "non-1 HAVING marker rejected");
+    }
+
+    /// SP-PG-SQL-GROUP-SORT-LIMIT — wire round-trip + byte-layout + byte-
+    /// identity KATs for the new group-sort/page block on `Op::GroupAggregate`
+    /// (tag 22) and `Op::GroupAggregateMulti` (tag 47), incl. composition with
+    /// HAVING and forward-incompat marker rejection.
+    #[test]
+    fn sp_pg_sql_group_sort_limit_wire_round_trip_and_byte_identity() {
+        // (1) GroupAggregate, NO HAVING + sort by agg index 0 DESC, LIMIT 5
+        // OFFSET 1. The range-preds length prefix is forced to `0u32`, then a
+        // no-HAVING anchor byte `0`, then the sort block.
+        let g = Op::GroupAggregate {
+            type_id: 4, program: vec![9], group_field: 2, kind: 0, agg_field: 5,
+            range_preds: vec![],
+            having: None,
+            sort: Some(GroupSort {
+                target: GroupSortTarget::Agg(0),
+                desc: true,
+                limit: Some(5),
+                offset: Some(1),
+            }),
+        };
+        let enc = g.encode();
+        let mut hand = Vec::new();
+        hand.push(22u8);
+        hand.extend_from_slice(&4u32.to_le_bytes());
+        hand.extend_from_slice(&1u32.to_le_bytes());
+        hand.extend_from_slice(&[9]);
+        hand.extend_from_slice(&2u16.to_le_bytes());
+        hand.push(0u8);
+        hand.extend_from_slice(&5u16.to_le_bytes());
+        hand.extend_from_slice(&0u32.to_le_bytes()); // forced empty range_preds len
+        hand.push(0u8); // no-HAVING anchor
+        hand.push(1u8); // group-sort marker
+        hand.push(1u8); // target tag 1 = Agg
+        hand.extend_from_slice(&0u16.to_le_bytes()); // agg_index 0
+        hand.push(1u8); // desc
+        hand.push(1u8); // has_limit
+        hand.extend_from_slice(&5u64.to_le_bytes());
+        hand.push(1u8); // has_offset
+        hand.extend_from_slice(&1u64.to_le_bytes());
+        assert_eq!(enc, hand, "GroupAggregate+sort wire layout");
+        assert_eq!(Op::decode(&enc).unwrap(), g, "GroupAggregate+sort round-trip");
+
+        // (2) GroupAggregate with HAVING AND sort by Key ASC, no LIMIT/OFFSET.
+        let g2 = Op::GroupAggregate {
+            type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3,
+            range_preds: vec![(2u16, 1u8, vec![1, 0])],
+            having: Some(HavingPred { agg_index: 0, op: 0, value: -5 }),
+            sort: Some(GroupSort {
+                target: GroupSortTarget::Key,
+                desc: false,
+                limit: None,
+                offset: None,
+            }),
+        };
+        assert_eq!(Op::decode(&g2.encode()).unwrap(), g2, "GA+rp+HAVING+sort round-trip");
+
+        // (3) GroupAggregateMulti with HAVING + sort by agg index 2 DESC LIMIT 3.
+        let m = Op::GroupAggregateMulti {
+            type_id: 7, program: vec![1, 2], group_field: 1,
+            aggregates: vec![(0, 0), (1, 3), (3, 4)],
+            range_preds: vec![],
+            having: Some(HavingPred { agg_index: 2, op: 3, value: 100 }),
+            sort: Some(GroupSort {
+                target: GroupSortTarget::Agg(2),
+                desc: true,
+                limit: Some(3),
+                offset: None,
+            }),
+        };
+        assert_eq!(Op::decode(&m.encode()).unwrap(), m, "GroupAggregateMulti+HAVING+sort round-trip");
+
+        // (4) GroupAggregateMulti, sort only (no HAVING) — anchor path.
+        let m2 = Op::GroupAggregateMulti {
+            type_id: 7, program: vec![1], group_field: 1,
+            aggregates: vec![(0, 0)],
+            range_preds: vec![],
+            having: None,
+            sort: Some(GroupSort {
+                target: GroupSortTarget::Agg(0),
+                desc: false,
+                limit: None,
+                offset: Some(2),
+            }),
+        };
+        assert_eq!(Op::decode(&m2.encode()).unwrap(), m2, "Multi sort-only round-trip");
+
+        // (5) Byte-identity lock: NO HAVING + NO sort GroupAggregate is byte-
+        // identical to the pre-arc frame (no rp-len, no anchor, no sort block).
+        let g_none = Op::GroupAggregate {
+            type_id: 4, program: vec![9], group_field: 2, kind: 0, agg_field: 5,
+            range_preds: vec![], having: None, sort: None,
+        };
+        let mut hand_none = Vec::new();
+        hand_none.push(22u8);
+        hand_none.extend_from_slice(&4u32.to_le_bytes());
+        hand_none.extend_from_slice(&1u32.to_le_bytes());
+        hand_none.extend_from_slice(&[9]);
+        hand_none.extend_from_slice(&2u16.to_le_bytes());
+        hand_none.push(0u8);
+        hand_none.extend_from_slice(&5u16.to_le_bytes());
+        assert_eq!(g_none.encode(), hand_none, "no-sort/no-HAVING GroupAggregate byte-identical");
+
+        // (6) A non-1 group-sort marker is rejected at decode (forward-incompat).
+        let mut bad = hand.clone();
+        // The sort marker is the byte right after the no-HAVING anchor: it is
+        // the 2nd byte from the rp-len/having region — easiest to find it by
+        // walking from the end (layout: marker, tag, u16, desc, 1, u64, 1, u64).
+        let sort_marker_idx = bad.len() - (1 + 1 + 2 + 1 + 1 + 8 + 1 + 8);
+        assert_eq!(bad[sort_marker_idx], 1u8, "located the sort marker");
+        bad[sort_marker_idx] = 2;
+        assert!(Op::decode(&bad).is_none(), "non-1 group-sort marker rejected");
+
+        // (7) An out-of-range target tag (not 0/1) is rejected at decode.
+        let mut bad2 = hand.clone();
+        bad2[sort_marker_idx + 1] = 9; // target tag byte
+        assert!(Op::decode(&bad2).is_none(), "bad group-sort target tag rejected");
     }
 }

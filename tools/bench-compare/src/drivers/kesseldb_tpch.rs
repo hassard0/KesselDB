@@ -281,6 +281,7 @@ pub fn run_tpch(
                         ],
                         range_preds: q1_range.clone(),
                         having: None,
+                        sort: None,
                     });
                     drop(g);
                     let buf = match r {

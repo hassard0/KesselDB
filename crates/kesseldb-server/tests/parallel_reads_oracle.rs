@@ -431,6 +431,7 @@ fn gen_random_read_op(rng: &mut Rng) -> (&'static str, Op) {
                 agg_field: 2,
                 range_preds: vec![],
                 having: None,
+                sort: None,
             })
         }
         14 => {
@@ -709,6 +710,7 @@ fn t3_smoke_group_aggregate() {
         agg_field: 2,
         range_preds: vec![],
         having: None,
+        sort: None,
     });
 }
 
@@ -983,6 +985,7 @@ fn txn_ro_smoke_all_txn_permitted_variants_one_txn_returns_ok() {
             agg_field: 2,
             range_preds: vec![],
             having: None,
+            sort: None,
         },
         Op::Join {
             left_type: 1,

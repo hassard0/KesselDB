@@ -1316,8 +1316,9 @@ pub struct PlainGroupAggProj {
 ///   [WHERE …]
 ///   GROUP BY <group col>
 ///   [HAVING …]            -- render ignores HAVING (the SM already filtered)
-///   [ORDER BY …]          -- engine emits ascending group-key order regardless
-///   [LIMIT n] [OFFSET n]  -- engine emits all groups regardless
+///   [ORDER BY …]          -- SP-PG-SQL-GROUP-SORT-LIMIT: threaded into the Op's
+///   [LIMIT n] [OFFSET n]  -- `GroupSort` and APPLIED by the engine (groups are
+///                         -- reordered + windowed; render emits in engine order)
 /// ```
 /// The leading group column may be bare (`category`) or qualified
 /// (`products.category` / `t.category`) — the qualifier is stripped. A JOIN
@@ -4113,15 +4114,63 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
     } else {
         None
     };
+    // SP-PG-SQL-GROUP-SORT-LIMIT — ORDER BY target, captured richly enough to
+    // support the plain-GROUP-BY cases: a column/alias ident, a 1-based
+    // projection position (`ORDER BY 2`), or an aggregate expression
+    // (`ORDER BY COUNT(*)` / `ORDER BY SUM(x)`). The non-aggregate
+    // (SelectSorted) path only ever uses the `Ident` form (`sort`), so this is
+    // purely additive there.
+    enum RawOrderTarget {
+        Ident(String),
+        Position(usize),
+        Agg { kind: u8, field: Option<String> },
+    }
+    let mut order_target: Option<(RawOrderTarget, bool)> = None;
     if p.kw("ORDER") {
         p.expect_kw("BY")?;
-        // SP-PG-SQL-ORM-PARSE T2 — ORDER BY column may be qualified.
-        let c = p.col_ident()?;
-        let desc = p.kw("DESC");
-        if !desc {
-            let _ = p.kw("ASC");
+        // ORDER BY 2 — projection position (1-based).
+        if let Some(Tok::Int(n)) = p.peek() {
+            let n = *n;
+            p.i += 1;
+            let desc = p.kw("DESC");
+            if !desc {
+                let _ = p.kw("ASC");
+            }
+            order_target = Some((RawOrderTarget::Position(n as usize), desc));
+        } else if matches!(p.peek(), Some(Tok::Ident(w)) if agg_kind(w).is_some())
+            && matches!(p.t.get(p.i + 1), Some(Tok::Punct('(')))
+        {
+            // ORDER BY COUNT(*) / SUM(col) — an aggregate expression. Parse the
+            // call shape (qualifier stripped — the single-table plain GROUP BY
+            // path resolves against the one table's schema).
+            let kind = match p.next() {
+                Some(Tok::Ident(w)) => agg_kind(&w).ok_or("not an aggregate")?,
+                _ => return Err("aggregate name expected in ORDER BY".into()),
+            };
+            p.punct('(')?;
+            let field = if matches!(p.peek(), Some(Tok::Star)) {
+                p.i += 1;
+                None
+            } else {
+                Some(p.col_ident()?)
+            };
+            p.punct(')')?;
+            let desc = p.kw("DESC");
+            if !desc {
+                let _ = p.kw("ASC");
+            }
+            order_target = Some((RawOrderTarget::Agg { kind, field }, desc));
+        } else {
+            // SP-PG-SQL-ORM-PARSE T2 — ORDER BY column may be qualified.
+            let c = p.col_ident()?;
+            let desc = p.kw("DESC");
+            if !desc {
+                let _ = p.kw("ASC");
+            }
+            // Keep `sort` populated for the existing SelectSorted path.
+            sort = Some((c.clone(), desc));
+            order_target = Some((RawOrderTarget::Ident(c), desc));
         }
-        sort = Some((c, desc));
     }
     if p.kw("LIMIT") {
         limit = match p.next() {
@@ -4190,6 +4239,91 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
                         ),
                     }
                 };
+            // SP-PG-SQL-GROUP-SORT-LIMIT — resolve a captured ORDER BY target
+            // into a wire `GroupSort` over a plain GROUP BY's per-group result.
+            // `group_name` is the group-key column (so an `ORDER BY g` / by its
+            // projection position resolves to the key). `resolved` is the
+            // aggregate output sequence (so `ORDER BY n`/`ORDER BY COUNT(*)` /
+            // by position resolves to an aggregate slot). The projection output
+            // order is `[group key, agg0, agg1, …]` (1-based positions). Returns
+            // `Ok(None)` when there is no ORDER BY, and an `Err` for an
+            // unresolvable target (out-of-range position, unknown alias/column,
+            // or an aggregate expr not in the SELECT list).
+            let resolve_group_sort =
+                |group_name: &str,
+                 resolved: &[(u8, u16)],
+                 agg_aliases: &[Option<String>]|
+                 -> Result<Option<kessel_proto::GroupSort>, SqlError> {
+                    let (target, desc) = match &order_target {
+                        Some(t) => t,
+                        None => return Ok(None),
+                    };
+                    let gst = match target {
+                        RawOrderTarget::Position(n) => {
+                            // 1-based: position 1 = group key, 2.. = aggregates.
+                            if *n == 0 {
+                                return Err("ORDER BY position must be ≥ 1".into());
+                            }
+                            if *n == 1 {
+                                kessel_proto::GroupSortTarget::Key
+                            } else {
+                                let ai = *n - 2;
+                                if ai >= resolved.len() {
+                                    return Err(format!(
+                                        "ORDER BY position {n} is out of range \
+                                         (projection has {} columns)",
+                                        resolved.len() + 1
+                                    ));
+                                }
+                                kessel_proto::GroupSortTarget::Agg(ai as u16)
+                            }
+                        }
+                        RawOrderTarget::Agg { kind, field } => {
+                            let want_field: u16 = match field {
+                                Some(c) => fid(c)?,
+                                None => 0,
+                            };
+                            match resolved
+                                .iter()
+                                .position(|(k, f)| *k == *kind && *f == want_field)
+                            {
+                                Some(i) => kessel_proto::GroupSortTarget::Agg(i as u16),
+                                None => {
+                                    return Err(
+                                        "ORDER BY references an aggregate that is \
+                                         not in the SELECT list (V1 requires the \
+                                         ORDER BY aggregate to match a projected \
+                                         aggregate)"
+                                            .into(),
+                                    )
+                                }
+                            }
+                        }
+                        RawOrderTarget::Ident(name) => {
+                            // Group-key column (by name) ⇒ sort by key. Else an
+                            // aggregate output alias ⇒ sort by that aggregate.
+                            if name == group_name {
+                                kessel_proto::GroupSortTarget::Key
+                            } else if let Some(i) = agg_aliases
+                                .iter()
+                                .position(|a| a.as_deref() == Some(name.as_str()))
+                            {
+                                kessel_proto::GroupSortTarget::Agg(i as u16)
+                            } else {
+                                return Err(format!(
+                                    "ORDER BY `{name}` does not match the GROUP BY \
+                                     column or any projected aggregate alias"
+                                ));
+                            }
+                        }
+                    };
+                    Ok(Some(kessel_proto::GroupSort {
+                        target: gst,
+                        desc: *desc,
+                        limit: if limit == 0 { None } else { Some(limit as u64) },
+                        offset: if offset == 0 { None } else { Some(offset as u64) },
+                    }))
+                };
             // Single-aggregate back-compat path (byte-identical emit when no
             // HAVING; HAVING adds the marker-guarded trailing block only).
             if aggs.len() == 1 && leading_cols.is_empty() {
@@ -4199,6 +4333,8 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
                         Some(raw) => Some(resolve_having(raw, &[(k, af)])?),
                         None => None,
                     };
+                    let sort_spec =
+                        resolve_group_sort(&g, &[(k, af)], &[aggs[0].alias.clone()])?;
                     return Ok(Op::GroupAggregate {
                         type_id: ot.type_id,
                         program,
@@ -4207,6 +4343,7 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
                         agg_field: af,
                         range_preds: agg_range_preds,
                         having,
+                        sort: sort_spec,
                     });
                 } else {
                     if having_raw.is_some() {
@@ -4226,17 +4363,18 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
                 }
             }
             // Multi-aggregate / leading-col path.
-            // Determine the single group field (V1: one column).
-            let group_field = match (group, leading_cols.as_slice()) {
-                (Some(g), []) => fid(&g)?,
-                (None, [c]) => fid(c)?,
+            // Determine the single group field (V1: one column) + its NAME (so
+            // SP-PG-SQL-GROUP-SORT-LIMIT can resolve `ORDER BY g` to the key).
+            let (group_field, group_name): (u16, String) = match (group, leading_cols.as_slice()) {
+                (Some(g), []) => (fid(&g)?, g),
+                (None, [c]) => (fid(c)?, c.clone()),
                 (Some(g), [c]) => {
                     if g != *c {
                         return Err(format!(
                             "GROUP BY column `{g}` must match leading projection `{c}`"
                         ));
                     }
-                    fid(&g)?
+                    (fid(&g)?, g)
                 }
                 (None, []) => {
                     // ≥2 aggs but no group field — there's no group key. V1
@@ -4263,6 +4401,9 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
                 Some(raw) => Some(resolve_having(raw, &resolved)?),
                 None => None,
             };
+            let agg_aliases: Vec<Option<String>> =
+                aggs.iter().map(|a| a.alias.clone()).collect();
+            let sort_spec = resolve_group_sort(&group_name, &resolved, &agg_aliases)?;
             Ok(Op::GroupAggregateMulti {
                 type_id: ot.type_id,
                 program,
@@ -4270,6 +4411,7 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
                 aggregates: resolved,
                 range_preds: agg_range_preds,
                 having,
+                sort: sort_spec,
             })
         }
         _ if sort.is_some() => {
@@ -5601,6 +5743,111 @@ mod tests {
         // Multi without GROUP BY (and no leading col) is rejected in V1.
         let err = compile("SELECT SUM(x), SUM(y) FROM t", sm.catalog());
         assert!(err.is_err(), "multi-agg w/o GROUP BY must error in V1");
+    }
+
+    /// SP-PG-SQL-GROUP-SORT-LIMIT — the SQL planner threads ORDER BY / LIMIT /
+    /// OFFSET on a PLAIN GROUP BY into the new `GroupSort` on
+    /// `Op::GroupAggregate` / `Op::GroupAggregateMulti`, resolving the ORDER BY
+    /// target by alias, by position, by aggregate expr, and by the group key.
+    #[test]
+    fn sp_pg_sql_group_sort_limit_planner_attaches_sort() {
+        use kessel_proto::{GroupSortTarget, Op};
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (g U8 NOT NULL, x I64 NOT NULL)");
+
+        // Single-agg + GROUP BY, ORDER BY the aggregate alias DESC LIMIT 5 OFFSET 1.
+        let op = compile(
+            "SELECT g, COUNT(*) AS n FROM t GROUP BY g ORDER BY n DESC LIMIT 5 OFFSET 1",
+            sm.catalog(),
+        ).expect("compile alias-order");
+        // (`g, COUNT(*)` is leading-col + 1 agg ⇒ Op::GroupAggregateMulti.)
+        match op {
+            Op::GroupAggregateMulti { sort, .. } => {
+                let s = sort.expect("sort threaded");
+                assert_eq!(s.target, GroupSortTarget::Agg(0), "alias n ⇒ agg 0");
+                assert!(s.desc, "DESC");
+                assert_eq!(s.limit, Some(5));
+                assert_eq!(s.offset, Some(1));
+            }
+            other => panic!("expected Multi+sort, got {other:?}"),
+        }
+
+        // ORDER BY position 2 (the aggregate) ASC.
+        let op = compile(
+            "SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY 2",
+            sm.catalog(),
+        ).expect("compile position-order");
+        match op {
+            Op::GroupAggregateMulti { sort, .. } => {
+                let s = sort.expect("sort threaded");
+                assert_eq!(s.target, GroupSortTarget::Agg(0), "position 2 ⇒ agg 0");
+                assert!(!s.desc, "ASC default");
+            }
+            other => panic!("expected Multi+sort, got {other:?}"),
+        }
+
+        // ORDER BY the aggregate EXPRESSION COUNT(*) DESC, single-aggregate path.
+        let op = compile(
+            "SELECT COUNT(*) FROM t GROUP BY g ORDER BY COUNT(*) DESC LIMIT 2",
+            sm.catalog(),
+        ).expect("compile aggexpr-order");
+        match op {
+            Op::GroupAggregate { sort, .. } => {
+                let s = sort.expect("sort threaded");
+                assert_eq!(s.target, GroupSortTarget::Agg(0));
+                assert!(s.desc);
+                assert_eq!(s.limit, Some(2));
+            }
+            other => panic!("expected GroupAggregate+sort, got {other:?}"),
+        }
+
+        // ORDER BY the group key column ⇒ sort by Key.
+        let op = compile(
+            "SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY g",
+            sm.catalog(),
+        ).expect("compile key-order");
+        match op {
+            Op::GroupAggregateMulti { sort, .. } => {
+                assert_eq!(sort.expect("sort").target, GroupSortTarget::Key, "ORDER BY g ⇒ key");
+            }
+            other => panic!("expected Multi+sort, got {other:?}"),
+        }
+
+        // ORDER BY position 1 ⇒ the group key.
+        let op = compile(
+            "SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY 1 DESC",
+            sm.catalog(),
+        ).expect("compile pos1");
+        match op {
+            Op::GroupAggregateMulti { sort, .. } => {
+                let s = sort.expect("sort");
+                assert_eq!(s.target, GroupSortTarget::Key);
+                assert!(s.desc);
+            }
+            other => panic!("expected Multi+sort, got {other:?}"),
+        }
+
+        // No ORDER BY ⇒ sort is None (byte-identical to pre-arc emit).
+        let op = compile("SELECT COUNT(*) FROM t GROUP BY g", sm.catalog())
+            .expect("compile no-order");
+        match op {
+            Op::GroupAggregate { sort, .. } => assert!(sort.is_none(), "no ORDER BY ⇒ no sort"),
+            other => panic!("expected GroupAggregate, got {other:?}"),
+        }
+
+        // ORDER BY an aggregate NOT in the SELECT list is rejected.
+        let err = compile(
+            "SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY SUM(x)",
+            sm.catalog(),
+        );
+        assert!(err.is_err(), "ORDER BY non-projected aggregate must error");
+
+        // ORDER BY out-of-range position is rejected.
+        let err = compile(
+            "SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY 9",
+            sm.catalog(),
+        );
+        assert!(err.is_err(), "ORDER BY out-of-range position must error");
     }
 
     /// SP-PG-SQL-HAVING — the SQL planner attaches a HAVING predicate to the

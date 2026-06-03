@@ -513,6 +513,22 @@ fn render_select_got<E: EngineApply + ?Sized>(
     if let Some(jga) = kessel_sql::join_group_aggregate(sql_trimmed) {
         return render_join_group_aggregate(row_bytes, &jga, engine);
     }
+    // Shape 0.45 — SP-PG-SQL-PLAIN-GROUP-RENDER: a PLAIN (non-JOIN)
+    // group-aggregate (`SELECT category, COUNT(*) [AS n], SUM(price) FROM
+    // products GROUP BY category [HAVING …] [ORDER BY …] [LIMIT …]`). The
+    // engine's `Op::GroupAggregate` / `Op::GroupAggregateMulti` returns the
+    // SAME value-only group stream as the JOIN-agg path
+    // (`[u32 ngroups][u32 keylen][key][16B i128 × n_aggs]…`), so we decode it
+    // with the same machinery but type the group key from the FROM table
+    // schema and the aggregate OIDs from each aggregate's source column.
+    // `plain_group_aggregate` returns None for a JOIN group-agg (owned by the
+    // branch above) and for a single scalar aggregate with no GROUP BY (owned
+    // by `select_aggregate` below), so every existing render path is
+    // byte-untouched. Checked AFTER the JOIN-agg branch (a JOIN must not reach
+    // here) and BEFORE the single-scalar-agg branch.
+    if let Some(pga) = kessel_sql::plain_group_aggregate(sql_trimmed) {
+        return render_plain_group_aggregate(row_bytes, &pga, engine);
+    }
     // Shape 0 — SP-PG-SQL-AGG-ALIAS-RENDER: a single scalar-aggregate
     // SELECT over a FROM table (`SELECT COUNT(*) AS "__count" FROM "t"` —
     // Django's `.count()`). The engine's `Op::Aggregate` returns a
@@ -948,6 +964,142 @@ fn render_join_group_aggregate<E: EngineApply + ?Sized>(
                         SEVERITY_ERROR,
                         "XX000",
                         "join-agg: truncated aggregate value",
+                    )
+                }
+            };
+            p += 16;
+            cells.push(Some(v.to_string().into_bytes()));
+        }
+        let refs: Vec<Option<&[u8]>> = cells.iter().map(|c| c.as_deref()).collect();
+        out.extend_from_slice(&encode_data_row(&refs));
+        emitted += 1;
+    }
+    out.extend_from_slice(&encode_command_complete(&select_tag(emitted)));
+    out.extend_from_slice(&encode_ready_for_query(b'I'));
+    out
+}
+
+/// SP-PG-SQL-PLAIN-GROUP-RENDER — render a PLAIN (non-JOIN) group-aggregate
+/// SELECT result (`SELECT category, COUNT(*) [AS n], SUM(price) FROM products
+/// GROUP BY category …`). The engine's `Op::GroupAggregate` (single agg, no
+/// leading col) and `Op::GroupAggregateMulti` (≥2 aggs or a leading group col)
+/// BOTH return the value-only group stream
+/// `[u32 ngroups]([u32 keylen][key bytes][16B i128 LE × n_aggs])*` — identical
+/// to the JOIN-agg path — so this reuses the same decode loop. Differences vs
+/// `render_join_group_aggregate`:
+///   * the group key column is typed from the FROM **table** schema (not a
+///     join qualifier) and named by its bare column name;
+///   * the aggregate OIDs are typed per aggregate: COUNT/SUM → int8, AVG →
+///     numeric, MIN/MAX → the source column's OID (e.g. an int4 price column's
+///     MIN renders as int4). COUNT(*) and unresolved sources fall back to int8.
+/// The engine emits groups in ascending raw-key order and applies WHERE +
+/// HAVING; it does NOT apply the plain query's ORDER BY / LIMIT / OFFSET (those
+/// are not threaded into `Op::GroupAggregate*` in V1), so the render emits
+/// whatever group set the engine returns, in key order. Ends in
+/// `ReadyForQuery('I')`.
+fn render_plain_group_aggregate<E: EngineApply + ?Sized>(
+    row_bytes: &[u8],
+    proj: &kessel_sql::PlainGroupAggProj,
+    engine: &E,
+) -> Vec<u8> {
+    // Resolve the table schema (group key type + aggregate source types).
+    let tcols = match engine.describe_table(&proj.table) {
+        Some(c) => c,
+        None => {
+            return error_response_then_rfq(
+                SEVERITY_ERROR,
+                "42P01",
+                &format!("unknown table \"{}\"", proj.table),
+            )
+        }
+    };
+    // Group key FieldKind (used to decode + type the key column).
+    let gkind = match tcols
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(&proj.group_column))
+    {
+        Some(c) => c.kind,
+        None => {
+            return error_response_then_rfq(
+                SEVERITY_ERROR,
+                "42703",
+                &format!(
+                    "column \"{}\" does not exist in \"{}\"",
+                    proj.group_column, proj.table
+                ),
+            )
+        }
+    };
+    let gwidth = gkind.width() as usize;
+
+    // RowDescription: group column (its OID) + one OID-typed column per agg.
+    let mut fields: Vec<FieldMeta> = Vec::with_capacity(1 + proj.aggregates.len());
+    fields.push(FieldMeta {
+        name: proj.group_column.clone(),
+        type_oid: field_kind_to_oid(gkind),
+    });
+    for a in &proj.aggregates {
+        // COUNT / SUM → int8 (integral). AVG → numeric. MIN / MAX → the
+        // source column's OID (inherits the argument's type). COUNT(*) and
+        // an unresolved source default to int8.
+        let oid = match a.kind {
+            0 => crate::proto::PG_TYPE_INT8, // COUNT
+            1 => crate::proto::PG_TYPE_INT8, // SUM (of an integral column)
+            4 => crate::proto::PG_TYPE_NUMERIC, // AVG
+            2 | 3 => {
+                // MIN / MAX inherit the source column's OID when resolvable.
+                match a.source_column.as_ref().and_then(|sc| {
+                    tcols.iter().find(|c| c.name.eq_ignore_ascii_case(sc))
+                }) {
+                    Some(c) => field_kind_to_oid(c.kind),
+                    None => crate::proto::PG_TYPE_INT8,
+                }
+            }
+            _ => crate::proto::PG_TYPE_INT8,
+        };
+        fields.push(FieldMeta { name: a.out_name.clone(), type_oid: oid });
+    }
+
+    let n_aggs = proj.aggregates.len();
+    let mut out = Vec::new();
+    out.extend_from_slice(&encode_row_description(&fields));
+
+    // Decode `[u32 ngroups]` then per group `[u32 keylen][key][16B × n_aggs]`.
+    if row_bytes.len() < 4 {
+        return error_response_then_rfq(SEVERITY_ERROR, "XX000", "group-agg: truncated header");
+    }
+    let ngroups = u32::from_le_bytes(row_bytes[0..4].try_into().unwrap()) as usize;
+    let mut p = 4usize;
+    let mut emitted = 0u64;
+    for _ in 0..ngroups {
+        if p + 4 > row_bytes.len() {
+            return error_response_then_rfq(SEVERITY_ERROR, "XX000", "group-agg: truncated key len");
+        }
+        let klen = u32::from_le_bytes(row_bytes[p..p + 4].try_into().unwrap()) as usize;
+        p += 4;
+        let key = match row_bytes.get(p..p + klen) {
+            Some(k) => k,
+            None => {
+                return error_response_then_rfq(SEVERITY_ERROR, "XX000", "group-agg: truncated key")
+            }
+        };
+        p += klen;
+        // Decode the group key (raw fixed-width bytes) → Value → text.
+        let mut raw = key.to_vec();
+        raw.resize(gwidth, 0);
+        let gval = value_from_raw(gkind, &raw);
+        let gcell = render_pg_text(&gval, gkind);
+
+        let mut cells: Vec<Option<Vec<u8>>> = Vec::with_capacity(1 + n_aggs);
+        cells.push(Some(gcell));
+        for _ in 0..n_aggs {
+            let v = match row_bytes.get(p..p + 16) {
+                Some(b) => i128::from_le_bytes(b.try_into().unwrap()),
+                None => {
+                    return error_response_then_rfq(
+                        SEVERITY_ERROR,
+                        "XX000",
+                        "group-agg: truncated aggregate value",
                     )
                 }
             };
@@ -1965,6 +2117,92 @@ mod tests {
         let pc = bytes.iter().rposition(|&b| b == b'C').unwrap();
         let dcount = bytes[pt..pc].iter().filter(|&&b| b == b'D').count();
         assert!(dcount >= 2, "at least two DataRows between T and C");
+    }
+
+    /// SP-PG-SQL-PLAIN-GROUP-RENDER: a PLAIN (non-JOIN) group-aggregate SELECT
+    /// renders the value-only group stream as RowDescription([group, aggs…]) +
+    /// one DataRow per group. The CHAR(16) group key decodes to trimmed text;
+    /// the i128 aggregate values render to decimal.
+    #[test]
+    fn plain_group_agg_render_single_count() {
+        let cols = vec![
+            PgColumn { name: "id".into(), kind: FieldKind::U64, nullable: false },
+            PgColumn { name: "category".into(), kind: FieldKind::Char(16), nullable: false },
+            PgColumn { name: "price".into(), kind: FieldKind::I64, nullable: false },
+        ];
+        // Engine result: 2 groups (books 3, toys 5), one COUNT.
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&2u32.to_le_bytes());
+        for (cat, cnt) in [("books", 3i128), ("toys", 5i128)] {
+            let mut key = cat.as_bytes().to_vec();
+            key.resize(16, 0);
+            stream.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            stream.extend_from_slice(&key);
+            stream.extend_from_slice(&cnt.to_le_bytes());
+        }
+        let eng = CannedEngine {
+            cols,
+            row_bytes: stream,
+            result: std::sync::Mutex::new(None),
+            table_name: "products".into(),
+            no_schema: false,
+        };
+        let bytes = dispatch_query("SELECT category, COUNT(*) FROM products GROUP BY category", &eng);
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(bytes.contains(&b'T'), "RowDescription emitted");
+        assert!(s.contains("books"), "books group rendered");
+        assert!(s.contains("toys"), "toys group rendered");
+        assert!(s.contains("SELECT 2"), "CommandComplete SELECT 2");
+        // The default aggregate column name `count` appears in RowDescription.
+        assert!(s.contains("count"), "default `count` column name in RowDescription");
+        let pt = bytes.iter().position(|&b| b == b'T').unwrap();
+        let pc = bytes.iter().rposition(|&b| b == b'C').unwrap();
+        let dcount = bytes[pt..pc].iter().filter(|&&b| b == b'D').count();
+        assert!(dcount >= 2, "two DataRows between T and C");
+    }
+
+    /// SP-PG-SQL-PLAIN-GROUP-RENDER: multi-aggregate plain GROUP BY with an
+    /// alias + SUM/AVG/MIN/MAX over an INT group key. Verifies the int group
+    /// key renders to decimal text and every aggregate column appears.
+    #[test]
+    fn plain_group_agg_render_multi_int_key() {
+        let cols = vec![
+            PgColumn { name: "id".into(), kind: FieldKind::U64, nullable: false },
+            PgColumn { name: "bucket".into(), kind: FieldKind::I32, nullable: false },
+            PgColumn { name: "price".into(), kind: FieldKind::I64, nullable: false },
+        ];
+        // Engine result: 2 groups keyed by int (1, 2), 5 aggregates each:
+        // COUNT(*) AS n, SUM(price), AVG(price), MIN(price), MAX(price).
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&2u32.to_le_bytes());
+        for (bucket, vals) in [(1i32, [2i128, 30, 15, 10, 20]), (2i32, [1i128, 7, 7, 7, 7])] {
+            let key = bucket.to_le_bytes().to_vec(); // I32 raw 4-byte key
+            stream.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            stream.extend_from_slice(&key);
+            for v in vals {
+                stream.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        let eng = CannedEngine {
+            cols,
+            row_bytes: stream,
+            result: std::sync::Mutex::new(None),
+            table_name: "products".into(),
+            no_schema: false,
+        };
+        let bytes = dispatch_query(
+            "SELECT bucket, COUNT(*) AS n, SUM(price), AVG(price), MIN(price), MAX(price) \
+             FROM products GROUP BY bucket HAVING COUNT(*) > 0 ORDER BY n DESC LIMIT 10",
+            &eng,
+        );
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("SELECT 2"), "two groups rendered");
+        // The aliased + default aggregate names appear in RowDescription.
+        for name in ["bucket", "n", "sum", "avg", "min", "max"] {
+            assert!(s.contains(name), "column `{name}` in RowDescription");
+        }
+        // Int group keys 1 and 2 appear as decimal cells.
+        assert!(s.contains('1') && s.contains('2'), "int group keys rendered");
     }
 
     // ───────────────────────────────────────────────────────────────────

@@ -1265,6 +1265,203 @@ pub fn select_aggregate(sql: &str) -> Option<SelectAgg> {
     Some(SelectAgg { table, kind, field, alias })
 }
 
+/// SP-PG-SQL-PLAIN-GROUP-RENDER — one aggregate in a plain (non-JOIN)
+/// group-aggregate projection. Carries the kind code, the OUTPUT column
+/// name (alias or PG default like `count`), and the source argument column
+/// (`None` for `COUNT(*)`) so the gateway can type the RowDescription OID
+/// (MIN/MAX inherit the source column's type; AVG → numeric; COUNT/SUM →
+/// int8). The arg column is NOT needed to decode the engine's value stream
+/// (the engine returns the computed i128), only to assign the OID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainAggOut {
+    /// 0 COUNT / 1 SUM / 2 MIN / 3 MAX / 4 AVG.
+    pub kind: u8,
+    /// RowDescription column name (alias if given, else the PG default name).
+    pub out_name: String,
+    /// Source argument column, qualifier stripped (`None` for `COUNT(*)`).
+    pub source_column: Option<String>,
+}
+
+/// SP-PG-SQL-PLAIN-GROUP-RENDER — the gateway-facing description of a plain
+/// (non-JOIN) group-aggregate SELECT (`SELECT g, COUNT(*) [AS c], SUM(p) …
+/// FROM t GROUP BY g [HAVING …] [ORDER BY …] [LIMIT …] [OFFSET …]`). Carries
+/// the table + the GROUP BY column name (so the gateway can resolve the group
+/// key's FieldKind via the table schema and name the RowDescription column) +
+/// the ordered aggregate outputs. The engine result is value-only
+/// (`[u32 ngroups][u32 keylen][key][16B i128 × n_aggs]…`), so this recovers
+/// the output column shape (group col + agg names + types).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlainGroupAggProj {
+    /// FROM table name.
+    pub table: String,
+    /// GROUP BY column name (qualifier stripped).
+    pub group_column: String,
+    /// One per aggregate, in projection order.
+    pub aggregates: Vec<PlainAggOut>,
+}
+
+/// SP-PG-SQL-PLAIN-GROUP-RENDER — if `sql` is a PLAIN (non-JOIN)
+/// group-aggregate SELECT, return its `PlainGroupAggProj`. `None` for any
+/// other shape — crucially `None` for a JOIN group-aggregate (which has its
+/// own `join_group_aggregate` recognizer + render path) and `None` for a
+/// single scalar aggregate with no GROUP BY (`select_aggregate`). This keeps
+/// every existing render path byte-untouched; the gateway gates the plain
+/// group-aggregate render branch on `Some`.
+///
+/// Accepted shape (mirrors what the planner compiles to
+/// `Op::GroupAggregate` / `Op::GroupAggregateMulti`):
+/// ```text
+/// SELECT <group col> , <AGG>(<*|[t.]col>) [AS a] [, <AGG>(…) [AS a]]*
+///   FROM <table>
+///   [WHERE …]
+///   GROUP BY <group col>
+///   [HAVING …]            -- render ignores HAVING (the SM already filtered)
+///   [ORDER BY …]          -- engine emits ascending group-key order regardless
+///   [LIMIT n] [OFFSET n]  -- engine emits all groups regardless
+/// ```
+/// The leading group column may be bare (`category`) or qualified
+/// (`products.category` / `t.category`) — the qualifier is stripped. A JOIN
+/// in the FROM clause makes this return `None` (the JOIN path owns it).
+/// Lexer-backed; mirrors `select_aggregate` / `join_group_aggregate`.
+pub fn plain_group_aggregate(sql: &str) -> Option<PlainGroupAggProj> {
+    fn agg_code(w: &str) -> Option<u8> {
+        match w.to_ascii_uppercase().as_str() {
+            "COUNT" => Some(0),
+            "SUM" => Some(1),
+            "MIN" => Some(2),
+            "MAX" => Some(3),
+            "AVG" => Some(4),
+            _ => None,
+        }
+    }
+    let toks = lex(sql).ok()?;
+    let mut it = toks.iter().peekable();
+    match it.next()? {
+        Tok::Ident(k) if k.eq_ignore_ascii_case("SELECT") => {}
+        _ => return None,
+    }
+    // Leading group column — bare `c` or qualified `t.c` (qualifier stripped).
+    // It must NOT itself be an aggregate function call (`AGG(`), which is the
+    // single-scalar / no-leading-col shape `select_aggregate` owns.
+    let group_column = match it.next()? {
+        Tok::Ident(c) => {
+            // Reject `AGG(` as the leading token — that's the scalar-agg shape.
+            if agg_code(c).is_some() && matches!(it.peek(), Some(Tok::Punct('('))) {
+                return None;
+            }
+            let mut col = c.clone();
+            if matches!(it.peek(), Some(Tok::Punct('.'))) {
+                it.next(); // consume `.`
+                match it.next()? {
+                    Tok::Ident(real) => col = real.clone(),
+                    _ => return None,
+                }
+            }
+            col
+        }
+        _ => return None,
+    };
+    // Optional `AS <alias>` on the group column — accept-and-skip (rendered by
+    // its source name, like the projection paths).
+    if matches!(it.peek(), Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("AS")) {
+        it.next();
+        match it.next()? {
+            Tok::Ident(_) => {}
+            _ => return None,
+        }
+    }
+    // Then a comma + ≥1 aggregate (a plain group-agg projection has the
+    // group column first, then the aggregate(s)).
+    match it.next()? {
+        Tok::Punct(',') => {}
+        _ => return None,
+    }
+    let mut aggregates: Vec<PlainAggOut> = Vec::new();
+    loop {
+        let kind = match it.next()? {
+            Tok::Ident(w) => agg_code(w)?,
+            _ => return None,
+        };
+        match it.next()? {
+            Tok::Punct('(') => {}
+            _ => return None,
+        }
+        // arg: `*` | `[t.]col`
+        let source_column = match it.next()? {
+            Tok::Star => None,
+            Tok::Ident(c) => {
+                let mut col = c.clone();
+                if matches!(it.peek(), Some(Tok::Punct('.'))) {
+                    it.next();
+                    match it.next()? {
+                        Tok::Ident(real) => col = real.clone(),
+                        _ => return None,
+                    }
+                }
+                Some(col)
+            }
+            _ => return None,
+        };
+        match it.next()? {
+            Tok::Punct(')') => {}
+            _ => return None,
+        }
+        // optional `AS <alias>`
+        let out_name = if matches!(it.peek(), Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("AS")) {
+            it.next();
+            match it.next()? {
+                Tok::Ident(a) => a.clone(),
+                _ => return None,
+            }
+        } else {
+            agg_default_name(kind).to_string()
+        };
+        aggregates.push(PlainAggOut { kind, out_name, source_column });
+        match it.peek() {
+            Some(Tok::Punct(',')) => {
+                it.next();
+                continue;
+            }
+            _ => break,
+        }
+    }
+    if aggregates.is_empty() {
+        return None;
+    }
+    // `FROM <table>` — and the table must be a single bare table (no JOIN:
+    // the JOIN group-aggregate has its own recognizer + render path).
+    match it.next()? {
+        Tok::Ident(k) if k.eq_ignore_ascii_case("FROM") => {}
+        _ => return None,
+    }
+    let table = match it.next()? {
+        Tok::Ident(t) => t.clone(),
+        _ => return None,
+    };
+    // Scan the remaining tokens: a top-level GROUP BY MUST appear, and a
+    // JOIN keyword MUST NOT (a JOIN routes to `join_group_aggregate`). Other
+    // clauses (WHERE / HAVING / ORDER BY / LIMIT / OFFSET) are tolerated —
+    // the engine applies WHERE + HAVING; the render emits whatever group
+    // stream the engine returns.
+    let mut saw_group = false;
+    while let Some(t) = it.next() {
+        if let Tok::Ident(k) = t {
+            if k.eq_ignore_ascii_case("JOIN") {
+                return None; // a JOIN is the join-group-aggregate shape
+            }
+            if k.eq_ignore_ascii_case("GROUP") {
+                if matches!(it.peek(), Some(Tok::Ident(b)) if b.eq_ignore_ascii_case("BY")) {
+                    saw_group = true;
+                }
+            }
+        }
+    }
+    if !saw_group {
+        return None;
+    }
+    Some(PlainGroupAggProj { table, group_column, aggregates })
+}
+
 /// SP-PG-SQL-DML-GENERAL — if `sql` is an `UPDATE <table> … RETURNING
 /// <cols | *>` or `DELETE FROM <table> … RETURNING <cols | *>`, return
 /// `(table, [cols] | ["*"])` so the gateway can render the affected
@@ -7445,6 +7642,63 @@ mod tests {
         }
         // A GROUP BY column that doesn't match the leading projection col errors.
         assert!(compile("SELECT a.name, COUNT(b.id) FROM a JOIN b ON a.id=b.aid GROUP BY b.title", &cat).is_err());
+    }
+
+    /// SP-PG-SQL-PLAIN-GROUP-RENDER — the gateway recognizer accepts a plain
+    /// (non-JOIN) group-aggregate SELECT and recovers the output column shape.
+    #[test]
+    fn plain_group_aggregate_recognizer() {
+        // Single COUNT(*) — default name `count`, no source column.
+        let p = plain_group_aggregate(
+            "SELECT category, COUNT(*) FROM products GROUP BY category",
+        )
+        .expect("single COUNT(*) plain group-agg");
+        assert_eq!(p.table, "products");
+        assert_eq!(p.group_column, "category");
+        assert_eq!(p.aggregates.len(), 1);
+        assert_eq!(p.aggregates[0].kind, 0);
+        assert_eq!(p.aggregates[0].out_name, "count");
+        assert_eq!(p.aggregates[0].source_column, None);
+
+        // Multi-aggregate with aliases + HAVING + ORDER BY + LIMIT (all the
+        // trailing clauses are tolerated; the render ignores them).
+        let p = plain_group_aggregate(
+            "SELECT category, COUNT(*) AS n, SUM(price), AVG(price), MIN(price), MAX(price) \
+             FROM products GROUP BY category HAVING COUNT(*) > 1 ORDER BY n DESC LIMIT 5 OFFSET 2",
+        )
+        .expect("multi-agg plain group-agg with all clauses");
+        assert_eq!(p.group_column, "category");
+        let names: Vec<&str> = p.aggregates.iter().map(|a| a.out_name.as_str()).collect();
+        assert_eq!(names, vec!["n", "sum", "avg", "min", "max"]);
+        let kinds: Vec<u8> = p.aggregates.iter().map(|a| a.kind).collect();
+        assert_eq!(kinds, vec![0, 1, 4, 2, 3]);
+        // MIN/MAX/SUM/AVG carry their source column for OID typing.
+        assert_eq!(p.aggregates[1].source_column.as_deref(), Some("price"));
+        assert_eq!(p.aggregates[3].source_column.as_deref(), Some("price"));
+        assert_eq!(p.aggregates[5].source_column.as_deref(), Some("price"));
+
+        // Qualified group column + qualified aggregate arg — qualifier stripped.
+        let p = plain_group_aggregate(
+            "SELECT products.category, SUM(products.price) FROM products GROUP BY products.category",
+        )
+        .expect("qualified plain group-agg");
+        assert_eq!(p.group_column, "category");
+        assert_eq!(p.aggregates[0].source_column.as_deref(), Some("price"));
+
+        // None cases — the existing render paths own these shapes:
+        //   * a JOIN group-agg (owned by join_group_aggregate)
+        assert!(plain_group_aggregate(
+            "SELECT a.name, COUNT(b.id) FROM a JOIN b ON a.id=b.aid GROUP BY a.name"
+        )
+        .is_none());
+        //   * a single scalar aggregate, no GROUP BY (owned by select_aggregate)
+        assert!(plain_group_aggregate("SELECT COUNT(*) FROM products").is_none());
+        //   * a plain projection, no aggregate
+        assert!(plain_group_aggregate("SELECT category FROM products GROUP BY category").is_none());
+        //   * no GROUP BY at all
+        assert!(plain_group_aggregate("SELECT category, COUNT(*) FROM products").is_none());
+        //   * SELECT *
+        assert!(plain_group_aggregate("SELECT * FROM products").is_none());
     }
 
     /// SP-PG-SQL-JOIN-AGG end-to-end: COUNT(b.id) per author over the join,

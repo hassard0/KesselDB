@@ -482,6 +482,28 @@ pub enum Stmt {
         id: u128,
         sets: Vec<(u16, Value)>,
     },
+    /// SP-PG-SQL-DML-GENERAL — general-WHERE UPDATE (`UPDATE t SET … WHERE
+    /// <pred>`, multi-row). `program` is the kessel-expr predicate
+    /// (the SAME bytes `Op::Select`/`Op::QueryExpr` consume). The server
+    /// resolves the matching ids via `Op::QueryExpr`, then builds a
+    /// concrete `Op::Txn` of per-id `Op::UpdateSet` — the replicated
+    /// artifact is the concrete Txn (Path A; see the
+    /// SP-PG-SQL-DML-GENERAL design). `returning` is `None` (no clause),
+    /// `Some(["*"])` (star sentinel), or `Some([col, …])`.
+    UpdateWhere {
+        type_id: u32,
+        program: Vec<u8>,
+        sets: Vec<(u16, Value)>,
+        returning: Option<Vec<String>>,
+    },
+    /// SP-PG-SQL-DML-GENERAL — general-WHERE DELETE (`DELETE FROM t WHERE
+    /// <pred>`, multi-row). Same Path-A shape as `UpdateWhere` but the
+    /// inner ops are `Op::Delete`.
+    DeleteWhere {
+        type_id: u32,
+        program: Vec<u8>,
+        returning: Option<Vec<String>>,
+    },
     /// `EXPLAIN <stmt>` — a precomputed, human-readable query plan. The
     /// inner statement is *not* executed; the server just returns this
     /// text. Pure planner output (SP64).
@@ -689,6 +711,96 @@ pub fn insert_returning(sql: &str) -> Option<(String, Vec<String>)> {
     Some((table, cols))
 }
 
+/// SP-PG-SQL-DML-GENERAL — if `sql` is an `UPDATE <table> … RETURNING
+/// <cols | *>` or `DELETE FROM <table> … RETURNING <cols | *>`, return
+/// `(table, [cols] | ["*"])` so the gateway can render the affected
+/// rows. `None` for an UPDATE/DELETE without a RETURNING clause, or any
+/// non-UPDATE/DELETE statement. Mirrors `insert_returning`: lenient
+/// qualifier strip, `RETURNING *` → `["*"]` star sentinel, column
+/// aliases (`RETURNING t.id AS x`) accepted-and-skipped. The leading
+/// `UPDATE t` / `DELETE FROM t` shape gives the table; the RETURNING
+/// clause is located by a forward scan for the top-level keyword.
+pub fn dml_returning(sql: &str) -> Option<(String, Vec<String>)> {
+    let toks = lex(sql).ok()?;
+    let mut it = toks.iter().peekable();
+    let table = match it.next()? {
+        Tok::Ident(k) if k.eq_ignore_ascii_case("UPDATE") => {
+            // `UPDATE <table> …`
+            match it.next()? {
+                Tok::Ident(t) => t.clone(),
+                _ => return None,
+            }
+        }
+        Tok::Ident(k) if k.eq_ignore_ascii_case("DELETE") => {
+            // `DELETE FROM <table> …`
+            match it.next()? {
+                Tok::Ident(k2) if k2.eq_ignore_ascii_case("FROM") => {}
+                _ => return None,
+            }
+            match it.next()? {
+                Tok::Ident(t) => t.clone(),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    // Locate the top-level RETURNING keyword.
+    let mut found = false;
+    for t in it.by_ref() {
+        if let Tok::Ident(k) = t {
+            if k.eq_ignore_ascii_case("RETURNING") {
+                found = true;
+                break;
+            }
+        }
+    }
+    if !found {
+        return None;
+    }
+    // `RETURNING *` → star sentinel (whole clause, trailing `;` tolerated).
+    if matches!(it.peek(), Some(Tok::Star)) {
+        it.next();
+        match it.peek() {
+            None => return Some((table, vec!["*".to_string()])),
+            Some(Tok::Punct(';')) => return Some((table, vec!["*".to_string()])),
+            _ => return None,
+        }
+    }
+    let mut cols = Vec::new();
+    loop {
+        let mut col = match it.next()? {
+            Tok::Ident(c) => c.clone(),
+            _ => return None,
+        };
+        if matches!(it.peek(), Some(Tok::Punct('.'))) {
+            it.next();
+            match it.next()? {
+                Tok::Ident(real) => col = real.clone(),
+                _ => return None,
+            }
+        }
+        cols.push(col);
+        if matches!(it.peek(), Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("AS")) {
+            it.next();
+            match it.next() {
+                Some(Tok::Ident(_)) => {}
+                _ => return None,
+            }
+        }
+        match it.peek() {
+            Some(Tok::Punct(',')) => {
+                it.next();
+                continue;
+            }
+            _ => break,
+        }
+    }
+    if cols.is_empty() {
+        return None;
+    }
+    Some((table, cols))
+}
+
 /// Human-readable query plan for `EXPLAIN`. Describes how the compiled
 /// statement will actually run (index-narrowed vs full scan, which
 /// columns / composite index), so users can see the SP62/SP63 planner at
@@ -714,6 +826,14 @@ fn plan_string(stmt: &Stmt, cat: &Catalog) -> String {
         Stmt::Explain(_) => "EXPLAIN".to_string(),
         Stmt::Update { type_id, id, .. } => format!(
             "Read-Modify-Write on {} (id {id})",
+            tname(*type_id)
+        ),
+        Stmt::UpdateWhere { type_id, .. } => format!(
+            "Seq Scan on {} → filter → per-row Update (atomic Txn)",
+            tname(*type_id)
+        ),
+        Stmt::DeleteWhere { type_id, .. } => format!(
+            "Seq Scan on {} → filter → per-row Delete (atomic Txn)",
             tname(*type_id)
         ),
         Stmt::Op(op) => match op {
@@ -922,20 +1042,130 @@ fn compile_stmt_from_tokens(
                     _ => break,
                 }
             }
-            // Resolve the target id: legacy `ID <n>` already captured it;
-            // otherwise the standard shape requires `WHERE [t.]id = <n>`.
-            let id = match legacy_id {
-                Some(n) => n,
-                None => parse_where_id_eq(&mut p)?,
-            };
-            return Ok(Stmt::Update {
-                type_id: ot.type_id,
-                id,
-                sets,
-            });
+            // Resolve the target row(s):
+            //   - legacy `ID <n>` already captured a single id.
+            //   - else try the by-PK fast path `WHERE [t.]id = <n>` →
+            //     single-row `Stmt::Update`.
+            //   - SP-PG-SQL-DML-GENERAL: if the by-PK fast path rejects
+            //     (non-`id` column, non-`=` op, multi-predicate), restore
+            //     the cursor to the WHERE clause and compile the GENERAL
+            //     predicate → `Stmt::UpdateWhere` (server resolves the
+            //     matching ids + builds a concrete Txn).
+            if let Some(n) = legacy_id {
+                return Ok(Stmt::Update { type_id: ot.type_id, id: n, sets });
+            }
+            let where_start = p.i;
+            match parse_where_id_eq(&mut p) {
+                Ok(id) => {
+                    return Ok(Stmt::Update { type_id: ot.type_id, id, sets });
+                }
+                Err(_) => {
+                    // General WHERE: rewind to the WHERE keyword and
+                    // compile the predicate program (reuses the SELECT
+                    // `compile_where` grammar). The leading `WHERE` is
+                    // required (a SET with NO WHERE would update every
+                    // row — V1 rejects the unguarded form to avoid a
+                    // silent table-wide mutation footgun).
+                    p.i = where_start;
+                    if !p.kw("WHERE") {
+                        return Err(
+                            "UPDATE needs `WHERE <predicate>` (or the \
+                             legacy `ID <int>`); an unguarded table-wide \
+                             UPDATE is rejected in V1"
+                                .into(),
+                        );
+                    }
+                    let program = compile_where(&mut p, &ot)?;
+                    let returning = parse_returning(&mut p)?;
+                    return Ok(Stmt::UpdateWhere {
+                        type_id: ot.type_id,
+                        program,
+                        sets,
+                        returning,
+                    });
+                }
+            }
+        }
+    }
+    // SP-PG-SQL-DML-GENERAL — DELETE general-WHERE. The by-PK + legacy
+    // `ID <n>` DELETE shapes stay in `compile_from_tokens` (return
+    // `Op::Delete`); here we intercept ONLY the general-predicate case
+    // and produce `Stmt::DeleteWhere`. We peek the by-PK fast path; if
+    // it rejects, rewind and compile the general predicate + RETURNING.
+    {
+        let mut p = P { t: toks.clone(), i: 0, cat };
+        if p.kw("DELETE") {
+            p.expect_kw("FROM")?;
+            let tname = p.ident()?;
+            let ot = p.type_named(&tname)?.clone();
+            // Legacy `ID <n>` and by-PK `WHERE id = n` → fall through to
+            // the Op::Delete path in `compile_from_tokens`.
+            let is_legacy_id = matches!(p.peek(), Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("ID"));
+            if !is_legacy_id {
+                let where_start = p.i;
+                match parse_where_id_eq(&mut p) {
+                    Ok(_) => { /* by-PK: fall through below */ }
+                    Err(_) => {
+                        p.i = where_start;
+                        if !p.kw("WHERE") {
+                            return Err(
+                                "DELETE needs `WHERE <predicate>` (or the \
+                                 legacy `ID <int>`); an unguarded table-wide \
+                                 DELETE is rejected in V1"
+                                    .into(),
+                            );
+                        }
+                        let program = compile_where(&mut p, &ot)?;
+                        let returning = parse_returning(&mut p)?;
+                        return Ok(Stmt::DeleteWhere {
+                            type_id: ot.type_id,
+                            program,
+                            returning,
+                        });
+                    }
+                }
+            }
         }
     }
     Ok(Stmt::Op(compile_from_tokens(toks, cat)?))
+}
+
+/// SP-PG-SQL-DML-GENERAL — parse an optional trailing `RETURNING
+/// <cols | *>` clause inside the parser (after a general-WHERE
+/// UPDATE/DELETE predicate). Returns `None` (no clause), `Some(["*"])`
+/// (star sentinel — the gateway expands to every column via
+/// `describe_table`), or `Some([col, …])` (lenient qualifier strip,
+/// `col AS alias` accepted-and-skipped). Mirrors `dml_returning`'s
+/// clause grammar but operates on the live parser cursor.
+fn parse_returning(p: &mut P) -> Result<Option<Vec<String>>, SqlError> {
+    if !p.kw("RETURNING") {
+        return Ok(None);
+    }
+    // `RETURNING *`
+    if matches!(p.peek(), Some(Tok::Star)) {
+        p.i += 1;
+        return Ok(Some(vec!["*".to_string()]));
+    }
+    let mut cols = Vec::new();
+    loop {
+        let col = p.col_ident()?; // strips an optional `t.` qualifier
+        cols.push(col);
+        // accept-and-skip `col AS alias`
+        if p.kw("AS") {
+            let _alias = p.ident()?;
+        }
+        match p.peek() {
+            Some(Tok::Punct(',')) => {
+                p.i += 1;
+                continue;
+            }
+            _ => break,
+        }
+    }
+    if cols.is_empty() {
+        return Err("RETURNING needs ≥1 column (or `*`)".into());
+    }
+    Ok(Some(cols))
 }
 
 /// SP-PG-SQL-ORM-PARSE T2 — parse a `WHERE [table.]id = <int>` clause

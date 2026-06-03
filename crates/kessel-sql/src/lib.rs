@@ -6257,7 +6257,7 @@ mod tests {
         }
 
         // Helper: run a join SQL and count the combined KTR1 rows.
-        fn join_rows(sm: &mut StateMachine, seq: u64, sql: &str) -> usize {
+        fn join_rows(sm: &mut StateMachine<MemVfs>, seq: u64, sql: &str) -> usize {
             match run(sm, seq, sql) {
                 OpResult::Got(b) => {
                     assert_eq!(&b[..4], b"KTR1");

@@ -2488,6 +2488,34 @@ pub fn synthesize_helper_function(normalized: &str) -> Option<Vec<u8>> {
         let val = show_value_for(&name);
         return Some(single_text_row("current_setting", val));
     }
+    // `set_config('<name>', <value>, <is_local>)` → returns the new
+    // value as a single text row (column "set_config"), exactly as
+    // PostgreSQL's `set_config()` GUC-setter function does.
+    //
+    // Django's psycopg2/psycopg3 PostgreSQL backend issues
+    // `SELECT set_config('TimeZone', $1, false)` (or with the timezone
+    // name inlined as a literal) on EVERY connection-init, before any
+    // ORM operation runs. kessel-sql rejects this FROM-less scalar
+    // SELECT (`expected FROM`), which blocked the entire Django ORM
+    // path. We treat it as a no-op GUC set: KesselDB has no mutable
+    // session GUCs in V1, so accept-and-echo the requested value (the
+    // 2nd argument). When that argument is a bound `$N` placeholder
+    // (the Extended-Query form), echo the canned value for the named
+    // GUC instead — Django ignores the returned text, it only needs
+    // the statement to succeed so connection-init completes.
+    if let Some(rest) = s.strip_prefix("select pg_catalog.set_config(")
+        .or_else(|| s.strip_prefix("select set_config("))
+    {
+        // First arg: the GUC name (quoted literal).
+        let name = extract_quoted_arg(rest);
+        // Second arg: the requested value. Find the comma after the
+        // first quoted arg, then read the next token. If it is a
+        // quoted literal use it verbatim; otherwise (a `$N`
+        // placeholder, NULL, or a number) fall back to the canned GUC
+        // value for `name` (Django ignores this text).
+        let val = second_arg_value(rest, &name);
+        return Some(single_text_row("set_config", &val));
+    }
 
     // ── SHOW ALL (returns a 3-column projection with 0 rows in V1) ─
     // Checked BEFORE the SHOW prefix-strip so "show all" doesn't fall
@@ -2594,6 +2622,34 @@ fn extract_quoted_arg(s: &str) -> String {
         }
     }
     String::new()
+}
+
+/// Resolve the echoed value for a `set_config(name, value, is_local)`
+/// call. `rest` is the text immediately after the opening paren
+/// (`'<name>', <value>, <is_local>)`); `name` is the already-extracted
+/// first argument. If the second argument is a single-quoted literal,
+/// return it verbatim (PG echoes the value you set). Otherwise — a
+/// bound `$N` placeholder, a numeric, or NULL — return the canned GUC
+/// value for `name` (Django ignores the result text; it only needs
+/// the statement to succeed).
+fn second_arg_value(rest: &str, name: &str) -> String {
+    // Skip past the first quoted arg (the name).
+    if let Some(p1) = rest.find('\'') {
+        let after_open = &rest[p1 + 1..];
+        if let Some(close) = after_open.find('\'') {
+            let after_name = &after_open[close + 1..];
+            // Move past the comma separating arg1 and arg2.
+            if let Some(comma) = after_name.find(',') {
+                let arg2 = after_name[comma + 1..].trim_start();
+                if arg2.starts_with('\'') {
+                    // Quoted literal — echo it verbatim.
+                    return extract_quoted_arg(arg2);
+                }
+            }
+        }
+    }
+    // Placeholder / non-literal — fall back to the canned GUC value.
+    show_value_for(name).to_string()
 }
 
 /// Public wrapper for `parse_leading_u32` so the helper-function
@@ -3880,6 +3936,45 @@ mod tests {
         let bytes2 = synthesize_helper_function("select pg_catalog.pg_get_userbyid(42)")
             .expect("matches");
         assert!(bytes2.windows(b"kesseldb".len()).any(|w| w == b"kesseldb"));
+    }
+
+    /// **HEADLINE (SP-PG-ORM-DJANGO) — `set_config(...)` connection-init
+    /// GUC-setter is intercepted.** Django's PostgreSQL backend issues
+    /// `SELECT set_config('TimeZone', $1, false)` on EVERY connection
+    /// init (`_configure_timezone`). Without this intercept kessel-sql
+    /// rejects the FROM-less scalar SELECT with `expected FROM`, which
+    /// blocked the entire Django ORM path before any operation ran.
+    #[test]
+    fn django_set_config_intercepted() {
+        // Inlined-literal form (some drivers / the non-parameterized
+        // path) — PG's set_config echoes the value you set.
+        let bytes = synthesize_helper_function(
+            "select set_config('timezone', 'utc', false)",
+        )
+        .expect("set_config must be intercepted");
+        // Single-row result, column "set_config", echoes the value 'utc'.
+        assert!(bytes.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+        assert!(bytes.windows(b"set_config\0".len()).any(|w| w == b"set_config\0"));
+        assert!(bytes.windows(b"utc".len()).any(|w| w == b"utc"));
+
+        // Parameterized form (psycopg3 Extended-Query): the 2nd arg is a
+        // bound `$1` placeholder. We can't echo the bound value here, so
+        // we fall back to the canned GUC value for the named setting —
+        // Django ignores the text, it only needs the statement to
+        // succeed. Must still produce a well-framed single-row response.
+        let bytes_p = synthesize_helper_function(
+            "select set_config('timezone', $1, false)",
+        )
+        .expect("parameterized set_config must be intercepted");
+        assert!(bytes_p.windows(b"SELECT 1\0".len()).any(|w| w == b"SELECT 1\0"));
+        assert!(bytes_p.windows(b"set_config\0".len()).any(|w| w == b"set_config\0"));
+
+        // Qualified `pg_catalog.set_config(...)` form too.
+        let bytes_q = synthesize_helper_function(
+            "select pg_catalog.set_config('search_path', 'public', true)",
+        )
+        .expect("qualified set_config must be intercepted");
+        assert!(bytes_q.windows(b"public".len()).any(|w| w == b"public"));
     }
 
     /// **`pg_table_is_visible(N)` returns true for any OID.** V1

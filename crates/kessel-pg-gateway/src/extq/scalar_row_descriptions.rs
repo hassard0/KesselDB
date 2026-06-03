@@ -113,6 +113,18 @@ pub fn recognize_scalar_select(sql: &str) -> Option<(&'static str, u32)> {
         "select true" | "select false" => Some(("bool", PG_TYPE_BOOL)),
         "select null" => Some(("?column?", PG_TYPE_TEXT)),
         other => {
+            // `select set_config('<name>', <value>, <is_local>)` —
+            // Django's connection-init GUC setter (column "set_config",
+            // TEXT). Matches both the inlined-literal and bound-`$N`
+            // forms. Parity with the Simple-Query handler in
+            // `synthesize::synthesize_helper_function` so the Describe
+            // step agrees on the column shape (else the Extended-Query
+            // path would answer NoData and the DataRow would be orphaned).
+            if other.starts_with("select set_config(")
+                || other.starts_with("select pg_catalog.set_config(")
+            {
+                return Some(("set_config", PG_TYPE_TEXT));
+            }
             // `select '<literal>'` — bare single-quoted string literal,
             // no internal `'` allowed (V1 keeps the matcher narrow).
             if let Some(rest) = other.strip_prefix("select '") {

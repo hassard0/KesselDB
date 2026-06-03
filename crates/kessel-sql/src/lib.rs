@@ -2828,7 +2828,16 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
     // exists so the sibling `select_aggregate` text-helper can name the
     // gateway RowDescription column. The single-aggregate emit stays
     // byte-identical.
-    struct AggSpec { kind: u8, field: Option<String>, alias: Option<String> }
+    struct AggSpec {
+        kind: u8,
+        field: Option<String>,
+        // The alias is captured so `AGG(...) AS alias` parses without
+        // error; the gateway's `select_aggregate` text-helper (not this
+        // in-parser struct) reads it to name the RowDescription column, so
+        // the field is write-only here.
+        #[allow(dead_code)]
+        alias: Option<String>,
+    }
     enum Proj {
         Star,
         Cols(Vec<String>),

@@ -7588,16 +7588,18 @@ mod tests {
                    ON u.id = p.user_id JOIN comments c ON p.id = c.post_id";
         match compile(sql, &cat).unwrap() {
             Op::Join { left_field, right_field, extra_joins, group_aggregate, .. } => {
-                // Base ON: users.id (field 0) = posts.user_id (field 1).
-                assert_eq!(left_field, 0);
-                assert_eq!(right_field, 1);
+                // Catalog assigns field_ids starting at 1: users.id=1,
+                // posts.user_id=2. Base ON: users.id (1) = posts.user_id (2).
+                assert_eq!(left_field, 1);
+                assert_eq!(right_field, 2);
                 assert!(group_aggregate.is_none());
                 assert_eq!(extra_joins.len(), 1, "one chained step (3 tables)");
                 let step = &extra_joins[0];
-                // posts.id is combined field 2 (users.id=0, users.name=1,
-                // posts.id=2); comments.post_id is field 1 in comments.
+                // COMBINED schema reassigns ids 0..n: users.id=0, users.name=1,
+                // posts.id=2 ⇒ left_combined_field 2. comments.post_id is the
+                // catalog field 2 in comments.
                 assert_eq!(step.left_combined_field, 2, "posts.id combined id");
-                assert_eq!(step.right_field, 1, "comments.post_id field id");
+                assert_eq!(step.right_field, 2, "comments.post_id field id");
             }
             o => panic!("expected Op::Join, got {o:?}"),
         }

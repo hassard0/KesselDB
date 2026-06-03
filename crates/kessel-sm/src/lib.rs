@@ -12108,14 +12108,17 @@ mod tests {
         let mut sm = mj_setup();
         // users JOIN posts ON users.id = posts.user_id
         //       JOIN comments ON posts.id = comments.post_id
-        // Base ON: users.id (left_field 0) = posts.user_id (right_field 1).
-        // Step: combined posts.id (combined field 2) = comments.post_id (1).
+        // Catalog assigns field_ids starting at 1: users.id=1; posts.user_id=2;
+        // comments.post_id=2. Base ON: users.id (1) = posts.user_id (2).
+        // Step: combined posts.id (combined field index 2) = comments.post_id
+        // (catalog field 2). The COMBINED schema reassigns ids 0..n: users.id=0,
+        // users.name=1, posts.id=2 ⇒ left_combined_field 2.
         let r = match sm.apply(50, Op::Join {
-            left_type: 1, right_type: 2, left_field: 0, right_field: 1,
+            left_type: 1, right_type: 2, left_field: 1, right_field: 2,
             limit: 0, filter: vec![], join_type: kessel_proto::JoinType::Inner,
             order_by: None, limit_n: None, offset_n: None, group_aggregate: None,
             extra_joins: vec![kessel_proto::JoinStep {
-                right_type: 3, left_combined_field: 2, right_field: 1,
+                right_type: 3, left_combined_field: 2, right_field: 2,
             }],
         }) {
             OpResult::Got(b) => mj_read_triples(&b),
@@ -12144,12 +12147,12 @@ mod tests {
         // Simpler: assert the unfiltered chain count, then a filter via a
         // post-decode check would be redundant — instead verify ORDER BY.
         let r = match sm.apply(50, Op::Join {
-            left_type: 1, right_type: 2, left_field: 0, right_field: 1,
+            left_type: 1, right_type: 2, left_field: 1, right_field: 2,
             limit: 0, filter: vec![], join_type: kessel_proto::JoinType::Inner,
             order_by: Some((7, false)), limit_n: Some(2), offset_n: None,
             group_aggregate: None,
             extra_joins: vec![kessel_proto::JoinStep {
-                right_type: 3, left_combined_field: 2, right_field: 1,
+                right_type: 3, left_combined_field: 2, right_field: 2,
             }],
         }) {
             OpResult::Got(b) => mj_read_triples(&b),

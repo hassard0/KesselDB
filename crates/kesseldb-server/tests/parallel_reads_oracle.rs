@@ -452,6 +452,7 @@ fn gen_random_read_op(rng: &mut Rng) -> (&'static str, Op) {
                 right_field: 2,
                 limit: 1 + rng.below(4) as u32,
                 filter: vec![],
+                join_type: kessel_proto::JoinType::Inner,
             })
         }
     }
@@ -722,6 +723,7 @@ fn t3_smoke_join() {
         right_field: 2,
         limit: 1 + r.below(8) as u32,
         filter: vec![],
+        join_type: kessel_proto::JoinType::Inner,
     });
 }
 
@@ -978,6 +980,7 @@ fn txn_ro_smoke_all_txn_permitted_variants_one_txn_returns_ok() {
             right_field: 2,
             limit: 4,
             filter: vec![],
+            join_type: kessel_proto::JoinType::Inner,
         },
     ];
     // Bisect on divergence: run each inner op as a 1-op Txn on both

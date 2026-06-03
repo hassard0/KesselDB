@@ -32,6 +32,38 @@ pub struct Pred {
     pub value: Vec<u8>,
 }
 
+/// SP-PG-SQL-OUTER-JOIN: the join flavour carried by `Op::Join`. `Inner` is the
+/// default (equi-join: only left rows with a matching right row are emitted) and
+/// is wire-identical to the pre-arc bare/filtered join. `Left` is a LEFT [OUTER]
+/// JOIN: EVERY left row is emitted; a left row with no matching right row is
+/// emitted once with all right (`b.*`) fields NULL. The wire byte is appended
+/// only when non-`Inner`, so an older frame (or any inner join) decodes to
+/// `Inner` — byte-identical to before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum JoinType {
+    #[default]
+    Inner,
+    Left,
+}
+
+impl JoinType {
+    /// Stable wire tag (only emitted when non-`Inner`). RIGHT/FULL are named
+    /// follow-ups; reserve their tags here so a future arc stays compatible.
+    pub fn wire_tag(self) -> u8 {
+        match self {
+            JoinType::Inner => 0,
+            JoinType::Left => 1,
+        }
+    }
+    pub fn from_wire_tag(t: u8) -> Option<Self> {
+        match t {
+            0 => Some(JoinType::Inner),
+            1 => Some(JoinType::Left),
+            _ => None,
+        }
+    }
+}
+
 /// Operations applied by the deterministic state machine. Payloads are opaque
 /// bytes here so `kessel-proto` stays schema-agnostic; `kessel-catalog` /
 /// `kessel-codec` give them meaning.
@@ -266,6 +298,10 @@ pub enum Op {
         right_field: u16,
         limit: u32,
         filter: Vec<u8>,
+        /// SP-PG-SQL-OUTER-JOIN: `Inner` (default) or `Left`. Additive — see
+        /// `JoinType`. Encoded only when non-`Inner`; an older / inner frame
+        /// decodes to `Inner`, byte-identical to before.
+        join_type: JoinType,
     },
     /// Add a composite (multi-field) equality index (Sub-project 27);
     /// backfills existing rows.
@@ -975,18 +1011,34 @@ impl Op {
                 b.extend_from_slice(&field_id.to_le_bytes());
                 codec::put_bytes(&mut b, name.as_bytes());
             }
-            Op::Join { left_type, right_type, left_field, right_field, limit, filter } => {
+            Op::Join {
+                left_type,
+                right_type,
+                left_field,
+                right_field,
+                limit,
+                filter,
+                join_type,
+            } => {
                 codec::put_u32(&mut b, *left_type);
                 codec::put_u32(&mut b, *right_type);
                 b.extend_from_slice(&left_field.to_le_bytes());
                 b.extend_from_slice(&right_field.to_le_bytes());
                 codec::put_u32(&mut b, *limit);
-                // SP-PG-SQL-JOIN-WHERE: optional combined-schema filter
-                // appended last. Emitted only when present, so a bare join
-                // (no WHERE) is byte-identical to the pre-arc wire frame and
-                // an older frame decodes to an empty filter.
-                if !filter.is_empty() {
+                // SP-PG-SQL-JOIN-WHERE / -OUTER-JOIN: two OPTIONAL trailing
+                // fields. The combined-schema filter (length-prefixed) comes
+                // first, then a single join-type tag byte. BOTH are emitted
+                // only when they carry non-default information, so a bare
+                // INNER join (no filter) is byte-identical to the pre-arc
+                // frame. A LEFT join with no filter still needs the tag, so
+                // an empty filter is written (len-0) ahead of the tag to keep
+                // the decode unambiguous.
+                let non_inner = *join_type != JoinType::Inner;
+                if !filter.is_empty() || non_inner {
                     codec::put_bytes(&mut b, filter);
+                }
+                if non_inner {
+                    b.push(join_type.wire_tag());
                 }
             }
             Op::QueryRows { type_id, eq_preds, program, limit, range_preds } => {
@@ -1354,10 +1406,27 @@ impl Op {
                 let right_field = c.u16()?;
                 let limit = c.u32()?;
                 // SP-PG-SQL-JOIN-WHERE: optional trailing combined-schema
-                // filter. Absent (older / bare-join frame) ⇒ empty ⇒
-                // identical behaviour to before.
+                // filter (length-prefixed). Absent (older / bare-join frame)
+                // ⇒ empty ⇒ identical behaviour to before.
                 let filter = if c.remaining() > 0 { c.bytes()? } else { Vec::new() };
-                Op::Join { left_type, right_type, left_field, right_field, limit, filter }
+                // SP-PG-SQL-OUTER-JOIN: optional trailing join-type tag byte.
+                // Absent ⇒ Inner (every pre-arc / inner frame). Present and
+                // unknown ⇒ decode failure (forward-incompatible op rejected
+                // rather than silently mis-applied).
+                let join_type = if c.remaining() > 0 {
+                    JoinType::from_wire_tag(c.u8()?)?
+                } else {
+                    JoinType::Inner
+                };
+                Op::Join {
+                    left_type,
+                    right_type,
+                    left_field,
+                    right_field,
+                    limit,
+                    filter,
+                    join_type,
+                }
             }
             26 => {
                 let type_id = c.u32()?;
@@ -1716,10 +1785,16 @@ mod tests {
             Op::QueryRows { type_id: 4, eq_preds: vec![], program: vec![1], limit: 0, range_preds: vec![(2, 1, vec![7, 0]), (2, 3, vec![9, 0])] },
             Op::Describe { type_id: 4 },
             Op::DropType { type_id: 4 },
-            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9, filter: vec![] },
+            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9, filter: vec![], join_type: JoinType::Inner },
             // SP-PG-SQL-JOIN-WHERE: filtered join — non-empty filter program
             // round-trips through the new optional trailing wire suffix.
-            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9, filter: vec![1, 0, 0, 5, 42, 3] },
+            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9, filter: vec![1, 0, 0, 5, 42, 3], join_type: JoinType::Inner },
+            // SP-PG-SQL-OUTER-JOIN: LEFT join, no filter — the join-type tag
+            // round-trips with an empty filter ahead of it.
+            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9, filter: vec![], join_type: JoinType::Left },
+            // SP-PG-SQL-OUTER-JOIN: LEFT join WITH filter — both trailing
+            // fields present (filter then tag).
+            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9, filter: vec![1, 0, 0, 5, 42, 3], join_type: JoinType::Left },
             Op::Aggregate { type_id: 4, program: vec![1], kind: 1, field_id: 3, range_preds: vec![] },
             // SP-Analytic-Plan: aggregate w/ range hints — new wire suffix.
             Op::Aggregate { type_id: 4, program: vec![1], kind: 1, field_id: 3, range_preds: vec![(2, 1, vec![7, 0]), (2, 3, vec![9, 0])] },
@@ -1782,6 +1857,52 @@ mod tests {
             assert_eq!(op, dec);
             assert_eq!(op.kind(), enc[0]);
         }
+    }
+
+    /// SP-PG-SQL-OUTER-JOIN regression: an INNER bare join (no filter) must
+    /// encode byte-IDENTICALLY to the pre-arc frame — i.e. NO trailing
+    /// join-type tag byte is appended. This guarantees every existing inner
+    /// join is wire-unchanged and old logs replay identically.
+    #[test]
+    fn inner_join_no_filter_wire_byte_identical() {
+        let inner = Op::Join {
+            left_type: 4, right_type: 5, left_field: 1, right_field: 2,
+            limit: 9, filter: vec![], join_type: JoinType::Inner,
+        };
+        let enc = inner.encode();
+        // tag(28) + lt(u32) + rt(u32) + lf(u16) + rf(u16) + limit(u32)
+        // = 1 + 4 + 4 + 2 + 2 + 4 = 17 bytes, NO trailing suffix.
+        assert_eq!(enc.len(), 17, "inner bare join must have no trailing suffix");
+        assert_eq!(Op::decode(&enc).expect("decode"), inner);
+    }
+
+    /// SP-PG-SQL-OUTER-JOIN: a LEFT join with no filter appends an empty
+    /// filter (len-0, 4 bytes) followed by the join-type tag (1 byte), and
+    /// round-trips back to `JoinType::Left`.
+    #[test]
+    fn left_join_no_filter_carries_tag() {
+        let left = Op::Join {
+            left_type: 4, right_type: 5, left_field: 1, right_field: 2,
+            limit: 9, filter: vec![], join_type: JoinType::Left,
+        };
+        let enc = left.encode();
+        // 17 base + 4 (empty filter len) + 1 (tag) = 22.
+        assert_eq!(enc.len(), 22, "left join carries empty filter + tag");
+        assert_eq!(*enc.last().unwrap(), JoinType::Left.wire_tag());
+        assert_eq!(Op::decode(&enc).expect("decode"), left);
+    }
+
+    /// An unknown join-type tag is rejected at decode (forward-incompat op is
+    /// surfaced, not silently mis-applied as inner).
+    #[test]
+    fn unknown_join_type_tag_rejected() {
+        let left = Op::Join {
+            left_type: 4, right_type: 5, left_field: 1, right_field: 2,
+            limit: 9, filter: vec![], join_type: JoinType::Left,
+        };
+        let mut enc = left.encode();
+        *enc.last_mut().unwrap() = 0x7F; // bogus tag
+        assert!(Op::decode(&enc).is_none(), "unknown join-type tag must fail decode");
     }
 
     #[test]

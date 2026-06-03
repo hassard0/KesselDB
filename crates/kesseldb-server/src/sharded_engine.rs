@@ -1141,6 +1141,7 @@ mod tests {
             right_field: 1,
             limit: 10,
             filter: vec![],
+            join_type: kessel_proto::JoinType::Inner,
         };
         assert_eq!(route_op(&op, 4), ShardRoute::ShardZero, "{op:?}");
     }

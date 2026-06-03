@@ -622,9 +622,11 @@ pub fn select_star_table(sql: &str) -> Option<String> {
         Tok::Ident(t) => t.clone(),
         _ => return None,
     };
-    // A JOIN produces composite rows (different wire shape) — bail out.
+    // A JOIN (`JOIN` or `LEFT [OUTER] JOIN`) produces composite rows
+    // (different wire shape) — bail out. (SP-PG-SQL-OUTER-JOIN: `LEFT` is the
+    // first token after the table for a LEFT join, so check it too.)
     if let Some(Tok::Ident(k)) = it.next() {
-        if k.eq_ignore_ascii_case("JOIN") {
+        if k.eq_ignore_ascii_case("JOIN") || k.eq_ignore_ascii_case("LEFT") {
             return None;
         }
     }
@@ -698,8 +700,8 @@ pub fn select_columns(sql: &str) -> Option<(String, Vec<String>)> {
         _ => return None,
     };
     if let Some(Tok::Ident(k)) = it.next() {
-        if k.eq_ignore_ascii_case("JOIN") {
-            return None; // composite rows — different wire shape
+        if k.eq_ignore_ascii_case("JOIN") || k.eq_ignore_ascii_case("LEFT") {
+            return None; // composite rows (incl. LEFT JOIN) — different wire shape
         }
     }
     Some((table, cols))
@@ -787,12 +789,30 @@ pub fn join_projection(sql: &str) -> Option<(Vec<JoinProjCol>, bool)> {
             }
         }
     }
-    // FROM <table> JOIN — the JOIN keyword is what makes this a join shape.
+    // FROM <table> [LEFT [OUTER]] JOIN — the JOIN keyword (optionally preceded
+    // by `LEFT [OUTER]`, SP-PG-SQL-OUTER-JOIN) is what makes this a join shape.
     match it.next()? {
         Tok::Ident(_t) => {}
         _ => return None,
     }
-    match it.next() {
+    // Optional `LEFT [OUTER]` before `JOIN`. The render is identical for INNER
+    // and LEFT — the combined `KTR1` schema + NULL bitmap carry the difference,
+    // so this helper only needs to detect the join shape, not its flavour.
+    let next = it.next();
+    let after_left = match next {
+        Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("LEFT") => {
+            // skip optional OUTER
+            match it.peek() {
+                Some(Tok::Ident(o)) if o.eq_ignore_ascii_case("OUTER") => {
+                    it.next();
+                }
+                _ => {}
+            }
+            it.next()
+        }
+        other => other,
+    };
+    match after_left {
         Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("JOIN") => {}
         _ => return None, // single-table — not the JOIN shape
     }
@@ -3133,8 +3153,21 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
     p.expect_kw("FROM")?;
     let tname = p.ident()?;
     let ot = p.type_named(&tname)?.clone();
-    // Inner equi-join: `SELECT * FROM a JOIN b ON a.x = b.y [LIMIT n]`.
-    if p.kw("JOIN") {
+    // Equi-join: `SELECT * FROM a [LEFT [OUTER]] JOIN b ON a.x = b.y
+    // [WHERE …] [LIMIT n]`. A bare `JOIN` is INNER (only matching left rows);
+    // `LEFT [OUTER] JOIN` (SP-PG-SQL-OUTER-JOIN) emits EVERY left row, with
+    // NULL `b.*` fields for left rows that have no right match.
+    let join_type = if p.kw("LEFT") {
+        // `OUTER` is an optional noise word in `LEFT OUTER JOIN`.
+        let _ = p.kw("OUTER");
+        p.expect_kw("JOIN")?;
+        Some(kessel_proto::JoinType::Left)
+    } else if p.kw("JOIN") {
+        Some(kessel_proto::JoinType::Inner)
+    } else {
+        None // not a join shape — fall through to single-table paths below.
+    };
+    if let Some(join_type) = join_type {
         let rname = p.ident()?;
         let rt = p.type_named(&rname)?.clone();
         p.expect_kw("ON")?;
@@ -3193,6 +3226,7 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
             right_field: rfid,
             limit,
             filter,
+            join_type,
         });
     }
     // Primary-key fast path: `SELECT ... FROM t ID <n>` -> O(1) GetById
@@ -6383,6 +6417,122 @@ mod tests {
             compile("SELECT * FROM a JOIN b ON a.k = b.k WHERE a.tag = 1", &cat).unwrap(),
             kessel_proto::Op::Join { .. }
         ));
+    }
+
+    /// SP-PG-SQL-OUTER-JOIN — `LEFT [OUTER] JOIN` parses to
+    /// `Op::Join { join_type: Left }`; a bare `JOIN` stays `Inner` (regression).
+    #[test]
+    fn left_join_parses_to_left_join_type() {
+        use kessel_proto::{JoinType, Op};
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE usr (uid U32 NOT NULL)");
+        run(&mut sm, 2, "CREATE TABLE ord (owner U32 NOT NULL, amt U32 NOT NULL)");
+        let cat = sm.catalog().clone();
+
+        // LEFT JOIN → Left.
+        match compile("SELECT * FROM usr LEFT JOIN ord ON usr.uid = ord.owner", &cat).unwrap() {
+            Op::Join { join_type, .. } => assert_eq!(join_type, JoinType::Left),
+            o => panic!("expected Join, got {o:?}"),
+        }
+        // LEFT OUTER JOIN → Left (OUTER is a noise word).
+        match compile("SELECT * FROM usr LEFT OUTER JOIN ord ON usr.uid = ord.owner", &cat).unwrap() {
+            Op::Join { join_type, .. } => assert_eq!(join_type, JoinType::Left),
+            o => panic!("expected Join, got {o:?}"),
+        }
+        // bare JOIN stays Inner (regression).
+        match compile("SELECT * FROM usr JOIN ord ON usr.uid = ord.owner", &cat).unwrap() {
+            Op::Join { join_type, .. } => assert_eq!(join_type, JoinType::Inner),
+            o => panic!("expected Join, got {o:?}"),
+        }
+        // qualified-projection LEFT join also parses to Left.
+        match compile("SELECT usr.uid, ord.amt FROM usr LEFT JOIN ord ON usr.uid = ord.owner", &cat).unwrap() {
+            Op::Join { join_type, .. } => assert_eq!(join_type, JoinType::Left),
+            o => panic!("expected Join, got {o:?}"),
+        }
+        // join_projection() must recognise the LEFT/LEFT OUTER shapes so the
+        // gateway routes them to render_join_result.
+        assert!(join_projection("SELECT usr.uid, ord.amt FROM usr LEFT JOIN ord ON usr.uid = ord.owner").is_some());
+        assert!(join_projection("SELECT * FROM usr LEFT OUTER JOIN ord ON usr.uid = ord.owner").is_some());
+    }
+
+    /// SP-PG-SQL-OUTER-JOIN — engine semantics. When every left row matches,
+    /// LEFT == INNER. When a left row has NO match, it appears ONCE with NULL
+    /// right (`ord.*`) fields. LEFT + WHERE on a right column drops the
+    /// unmatched (NULL) rows (PostgreSQL semantics).
+    #[test]
+    fn left_join_emits_unmatched_left_with_null_right() {
+        use kessel_proto::Op;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE usr (uid U32 NOT NULL)");
+        run(&mut sm, 2, "CREATE TABLE ord (owner U32 NOT NULL, amt U32 NOT NULL)");
+        // usr 1 has 2 orders; usr 2 (orphan) has none.
+        run(&mut sm, 3, "INSERT INTO usr ID 1 (uid) VALUES (1)");
+        run(&mut sm, 4, "INSERT INTO usr ID 2 (uid) VALUES (2)");
+        run(&mut sm, 5, "INSERT INTO ord ID 10 (owner, amt) VALUES (1, 100)");
+        run(&mut sm, 6, "INSERT INTO ord ID 11 (owner, amt) VALUES (1, 200)");
+
+        // Decode the KTR1 result into (row_count, per_row null-bitmap of the
+        // combined record). Combined schema = usr.uid, ord.owner, ord.amt
+        // (3 fields: index 0 = left, indices 1,2 = right).
+        fn rows_and_nulls(sm: &mut StateMachine<MemVfs>, seq: u64, sql: &str)
+            -> Vec<[bool; 3]>
+        {
+            match run(sm, seq, sql) {
+                OpResult::Got(b) => {
+                    assert_eq!(&b[..4], b"KTR1");
+                    let dl = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
+                    let mut p = 8 + dl;
+                    let mut out = Vec::new();
+                    while p + 4 <= b.len() {
+                        let rl = u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize;
+                        let rec = &b[p + 4..p + 4 + rl];
+                        // null bitmap lives at record bytes 6..14.
+                        let bitmap = &rec[6..14];
+                        let null = |i: usize| bitmap[i / 8] & (1 << (i % 8)) != 0;
+                        out.push([null(0), null(1), null(2)]);
+                        p += 4 + rl;
+                    }
+                    assert_eq!(p, b.len(), "consumed exactly");
+                    out
+                }
+                o => panic!("{o:?}"),
+            }
+        }
+
+        // INNER: orphan usr 2 produces NO row → 2 rows (both for usr 1).
+        let inner = rows_and_nulls(&mut sm, 20,
+            "SELECT * FROM usr JOIN ord ON usr.uid = ord.owner");
+        assert_eq!(inner.len(), 2, "inner drops the orphan");
+        assert!(inner.iter().all(|n| n == &[false, false, false]),
+            "inner rows carry no NULLs");
+
+        // LEFT, all-match subset (only usr 1 exists): LEFT == INNER shape.
+        // (Validate via the full table below; here check the 3-row LEFT.)
+        let left = rows_and_nulls(&mut sm, 21,
+            "SELECT * FROM usr LEFT JOIN ord ON usr.uid = ord.owner");
+        assert_eq!(left.len(), 3, "LEFT emits the orphan too (2 matched + 1 orphan)");
+        // exactly one row (the orphan) has NULL right fields.
+        let orphan_rows: Vec<_> = left.iter().filter(|n| n[1] && n[2]).collect();
+        assert_eq!(orphan_rows.len(), 1, "exactly one orphan row");
+        // the orphan's LEFT field (usr.uid) is NOT null.
+        assert!(left.iter().any(|n| !n[0] && n[1] && n[2]),
+            "orphan keeps its left value, NULLs only on the right");
+        // the two matched rows have no NULLs.
+        assert_eq!(left.iter().filter(|n| n == &&[false, false, false]).count(), 2);
+
+        // LEFT + WHERE on a RIGHT column: the predicate on a NULL right column
+        // is false ⇒ the orphan row is dropped (PG semantics). amt=200 → 1 row,
+        // and it is a matched (non-NULL) row.
+        let filtered = rows_and_nulls(&mut sm, 22,
+            "SELECT * FROM usr LEFT JOIN ord ON usr.uid = ord.owner WHERE ord.amt = 200");
+        assert_eq!(filtered.len(), 1, "WHERE on a NULL right col drops the orphan");
+        assert_eq!(filtered[0], [false, false, false]);
+
+        // LEFT + WHERE on the LEFT column keeps the orphan when it matches.
+        let left_filter = rows_and_nulls(&mut sm, 23,
+            "SELECT * FROM usr LEFT JOIN ord ON usr.uid = ord.owner WHERE usr.uid = 2");
+        assert_eq!(left_filter.len(), 1, "orphan usr 2 survives a left-col filter");
+        assert!(left_filter[0][1] && left_filter[0][2], "and is still a NULL-right row");
     }
 
     #[test]

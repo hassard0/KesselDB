@@ -3232,7 +3232,7 @@ impl<V: Vfs> StateMachine<V> {
                 }
                 OpResult::Got(out.into())
             }
-            Op::Join { left_type, right_type, left_field, right_field, limit, filter } => {
+            Op::Join { left_type, right_type, left_field, right_field, limit, filter, join_type } => {
                 let lt = match self.catalog.get(left_type) {
                     Some(t) => t.clone(),
                     None => return OpResult::SchemaError(format!("no type {left_type}")),
@@ -3241,6 +3241,7 @@ impl<V: Vfs> StateMachine<V> {
                     Some(t) => t.clone(),
                     None => return OpResult::SchemaError(format!("no type {right_type}")),
                 };
+                let is_left = join_type == kessel_proto::JoinType::Left;
                 let pos = |ot: &kessel_catalog::ObjectType, fid: u16| {
                     ot.fields.iter().position(|f| f.field_id == fid).map(|i| {
                         (ot.compute_layout().offsets[i], ot.fields[i].kind.width() as usize)
@@ -3271,17 +3272,26 @@ impl<V: Vfs> StateMachine<V> {
                 let mut combined: Vec<kessel_catalog::Field> =
                     Vec::with_capacity(lt.fields.len() + rt.fields.len());
                 let mut fid: u16 = 0;
+                let n_left = lt.fields.len();
                 for (src, f) in lt
                     .fields
                     .iter()
                     .map(|f| (&lt.name, f))
                     .chain(rt.fields.iter().map(|f| (&rt.name, f)))
                 {
+                    // SP-PG-SQL-OUTER-JOIN: in LEFT mode the right (`b.*`)
+                    // fields must accept NULL (an unmatched left row emits a
+                    // combined record with every right field NULL), so the
+                    // synthetic combined type marks them nullable regardless
+                    // of the source column. INNER mode is byte-UNCHANGED
+                    // (right fields keep their declared nullability).
+                    let is_right = (fid as usize) >= n_left;
+                    let nullable = f.nullable || (is_left && is_right);
                     combined.push(kessel_catalog::Field {
                         field_id: fid,
                         name: format!("{src}.{}", f.name),
                         kind: f.kind,
-                        nullable: f.nullable,
+                        nullable,
                     });
                     fid += 1;
                 }
@@ -3304,43 +3314,83 @@ impl<V: Vfs> StateMachine<V> {
                         Some(k) => k,
                         None => continue,
                     };
-                    if let Some(rs) = map.get(k) {
-                        let lv = match kessel_codec::decode(&lt, &lr) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                return OpResult::SchemaError(format!(
-                                    "join decode left: {e:?}"
-                                ))
+                    let lv = match kessel_codec::decode(&lt, &lr) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return OpResult::SchemaError(format!(
+                                "join decode left: {e:?}"
+                            ))
+                        }
+                    };
+                    match map.get(k) {
+                        Some(rs) => {
+                            for rr in rs {
+                                if limit != 0 && n >= limit {
+                                    break 'outer;
+                                }
+                                let rv = match kessel_codec::decode(&rt, rr) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        return OpResult::SchemaError(format!(
+                                            "join decode right: {e:?}"
+                                        ))
+                                    }
+                                };
+                                let mut row = lv.clone();
+                                row.extend(rv);
+                                let rec = match kessel_codec::encode(&cot, &row) {
+                                    Ok(r) => r,
+                                    Err(e) => {
+                                        return OpResult::SchemaError(format!(
+                                            "join encode: {e:?}"
+                                        ))
+                                    }
+                                };
+                                // SP-PG-SQL-JOIN-WHERE: run the optional
+                                // combined-schema filter. Non-matching rows
+                                // drop (and do NOT count against `limit`).
+                                if !filter.is_empty() {
+                                    match kessel_expr::eval(&filter, &cot, &rec) {
+                                        Ok(true) => {}
+                                        Ok(false) => continue,
+                                        Err(e) => {
+                                            return OpResult::SchemaError(format!(
+                                                "join filter: {e:?}"
+                                            ))
+                                        }
+                                    }
+                                }
+                                out.extend_from_slice(
+                                    &(rec.len() as u32).to_le_bytes(),
+                                );
+                                out.extend_from_slice(&rec);
+                                n += 1;
                             }
-                        };
-                        for rr in rs {
+                        }
+                        // SP-PG-SQL-OUTER-JOIN: LEFT mode — a left row with NO
+                        // matching right row is emitted ONCE with every right
+                        // (`b.*`) field NULL. INNER mode skips it (no row).
+                        // The combined record's right fields are NULL via the
+                        // codec null-bitmap (the combined type marks them
+                        // nullable in LEFT mode). The WHERE filter still runs:
+                        // a predicate on a NULL right column evaluates false
+                        // and drops the unmatched row — matching PostgreSQL.
+                        None if is_left => {
                             if limit != 0 && n >= limit {
                                 break 'outer;
                             }
-                            let rv = match kessel_codec::decode(&rt, rr) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    return OpResult::SchemaError(format!(
-                                        "join decode right: {e:?}"
-                                    ))
-                                }
-                            };
                             let mut row = lv.clone();
-                            row.extend(rv);
+                            for _ in 0..rt.fields.len() {
+                                row.push(kessel_codec::Value::Null);
+                            }
                             let rec = match kessel_codec::encode(&cot, &row) {
                                 Ok(r) => r,
                                 Err(e) => {
                                     return OpResult::SchemaError(format!(
-                                        "join encode: {e:?}"
+                                        "join encode (left-null): {e:?}"
                                     ))
                                 }
                             };
-                            // SP-PG-SQL-JOIN-WHERE: run the optional combined-
-                            // schema filter on the encoded combined record.
-                            // Non-matching rows are dropped (and do NOT count
-                            // against `limit` — `limit` caps emitted rows, as
-                            // with a single-table WHERE scan). Pure function of
-                            // (combined record, predicate) ⇒ deterministic.
                             if !filter.is_empty() {
                                 match kessel_expr::eval(&filter, &cot, &rec) {
                                     Ok(true) => {}
@@ -3358,6 +3408,7 @@ impl<V: Vfs> StateMachine<V> {
                             out.extend_from_slice(&rec);
                             n += 1;
                         }
+                        None => {}
                     }
                 }
                 OpResult::Got(out.into())
@@ -4604,7 +4655,7 @@ impl<V: Vfs> StateMachine<V> {
             // Current body uses legacy 20-byte data-row keyspace (scan_range × 2);
             // T2.C rewrites against data_row_scan(type_id, u64::MAX) for both sides
             // per Decision 4 (composite read arm, per-statement auto-commit).
-            Op::Join { left_type, right_type, left_field, right_field, limit, filter } => {
+            Op::Join { left_type, right_type, left_field, right_field, limit, filter, join_type } => {
                 let lt = match self.catalog.get(left_type) {
                     Some(t) => t.clone(),
                     None => return OpResult::SchemaError(format!("no type {left_type}")),
@@ -4613,6 +4664,7 @@ impl<V: Vfs> StateMachine<V> {
                     Some(t) => t.clone(),
                     None => return OpResult::SchemaError(format!("no type {right_type}")),
                 };
+                let is_left = join_type == kessel_proto::JoinType::Left;
                 let pos = |ot: &kessel_catalog::ObjectType, fid: u16| {
                     ot.fields.iter().position(|f| f.field_id == fid).map(|i| {
                         (ot.compute_layout().offsets[i], ot.fields[i].kind.width() as usize)
@@ -4655,17 +4707,22 @@ impl<V: Vfs> StateMachine<V> {
                 let mut combined: Vec<kessel_catalog::Field> =
                     Vec::with_capacity(lt.fields.len() + rt.fields.len());
                 let mut fid: u16 = 0;
+                let n_left = lt.fields.len();
                 for (src, f) in lt
                     .fields
                     .iter()
                     .map(|f| (&lt.name, f))
                     .chain(rt.fields.iter().map(|f| (&rt.name, f)))
                 {
+                    // SP-PG-SQL-OUTER-JOIN: LEFT mode marks right fields
+                    // nullable so an unmatched left row can encode NULL b-*.
+                    let is_right = (fid as usize) >= n_left;
+                    let nullable = f.nullable || (is_left && is_right);
                     combined.push(kessel_catalog::Field {
                         field_id: fid,
                         name: format!("{src}.{}", f.name),
                         kind: f.kind,
-                        nullable: f.nullable,
+                        nullable,
                     });
                     fid += 1;
                 }
@@ -4693,40 +4750,80 @@ impl<V: Vfs> StateMachine<V> {
                         Some(k) => k,
                         None => continue,
                     };
-                    if let Some(rs) = map.get(k) {
-                        let lv = match kessel_codec::decode(&lt, &lr) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                return OpResult::SchemaError(format!(
-                                    "join decode left: {e:?}"
-                                ))
+                    let lv = match kessel_codec::decode(&lt, &lr) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return OpResult::SchemaError(format!(
+                                "join decode left: {e:?}"
+                            ))
+                        }
+                    };
+                    match map.get(k) {
+                        Some(rs) => {
+                            for rr in rs {
+                                if limit != 0 && n >= limit {
+                                    break 'outer;
+                                }
+                                let rv = match kessel_codec::decode(&rt, rr) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        return OpResult::SchemaError(format!(
+                                            "join decode right: {e:?}"
+                                        ))
+                                    }
+                                };
+                                let mut row = lv.clone();
+                                row.extend(rv);
+                                let rec = match kessel_codec::encode(&cot, &row) {
+                                    Ok(r) => r,
+                                    Err(e) => {
+                                        return OpResult::SchemaError(format!(
+                                            "join encode: {e:?}"
+                                        ))
+                                    }
+                                };
+                                // SP-PG-SQL-JOIN-WHERE: identical combined-
+                                // schema filter on the RO-Txn bypass path so a
+                                // join inside a read-only Txn filters exactly
+                                // like the main apply arm.
+                                if !filter.is_empty() {
+                                    match kessel_expr::eval(&filter, &cot, &rec) {
+                                        Ok(true) => {}
+                                        Ok(false) => continue,
+                                        Err(e) => {
+                                            return OpResult::SchemaError(format!(
+                                                "join filter: {e:?}"
+                                            ))
+                                        }
+                                    }
+                                }
+                                out.extend_from_slice(
+                                    &(rec.len() as u32).to_le_bytes(),
+                                );
+                                out.extend_from_slice(&rec);
+                                n += 1;
                             }
-                        };
-                        for rr in rs {
+                        }
+                        // SP-PG-SQL-OUTER-JOIN: LEFT mode unmatched-left row
+                        // with NULL right fields — IDENTICAL to the main apply
+                        // arm so a LEFT join inside a read-only Txn matches a
+                        // bare LEFT join exactly.
+                        None if is_left => {
                             if limit != 0 && n >= limit {
                                 break 'outer;
                             }
-                            let rv = match kessel_codec::decode(&rt, rr) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    return OpResult::SchemaError(format!(
-                                        "join decode right: {e:?}"
-                                    ))
-                                }
-                            };
                             let mut row = lv.clone();
-                            row.extend(rv);
+                            for _ in 0..rt.fields.len() {
+                                row.push(kessel_codec::Value::Null);
+                            }
                             let rec = match kessel_codec::encode(&cot, &row) {
                                 Ok(r) => r,
                                 Err(e) => {
                                     return OpResult::SchemaError(format!(
-                                        "join encode: {e:?}"
+                                        "join encode (left-null): {e:?}"
                                     ))
                                 }
                             };
-                            // SP-PG-SQL-JOIN-WHERE: identical combined-schema
-                            // filter on the RO-Txn bypass path so a join inside
-                            // a read-only Txn filters exactly like a bare join.
                             if !filter.is_empty() {
                                 match kessel_expr::eval(&filter, &cot, &rec) {
                                     Ok(true) => {}
@@ -4744,6 +4841,7 @@ impl<V: Vfs> StateMachine<V> {
                             out.extend_from_slice(&rec);
                             n += 1;
                         }
+                        None => {}
                     }
                 }
                 OpResult::Got(out.into())

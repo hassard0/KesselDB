@@ -849,6 +849,50 @@ impl<V: Vfs> StateMachine<V> {
         Ok(())
     }
 
+    /// SP-PG-SERIAL-RETURNING: patch the assigned autoincrement value
+    /// `seq` into the SERIAL primary-key column's fixed-width slot when
+    /// that column is a stored record field (`serial_field_id`). A no-op
+    /// (returns the record unchanged) when the serial PK has no backing
+    /// field, or when the record is not the canonical fixed-width shape
+    /// (an opaque/raw write — same opt-out as `check_not_null`). The
+    /// value is written as the field's integer width in little-endian,
+    /// matching `kessel_codec`'s encoding of `I64`/`I32`/`I16`/`U64`/etc.
+    fn patch_serial_field(
+        &self,
+        type_id: u32,
+        mut rec: Vec<u8>,
+        seq: u64,
+    ) -> Result<Vec<u8>, String> {
+        let ot = match self.catalog.get(type_id) {
+            Some(t) => t,
+            None => return Ok(rec),
+        };
+        let fid = match ot.serial_field_id {
+            Some(f) => f,
+            None => return Ok(rec), // pure-ObjectId serial PK, nothing to patch
+        };
+        // Only patch the canonical fixed-width record shape.
+        if rec.len() != ot.compute_layout().record_size {
+            return Ok(rec);
+        }
+        let (off, w) = match Self::idx_field_pos(ot, fid) {
+            Some(p) => p,
+            None => return Ok(rec),
+        };
+        let le = (seq as u128).to_le_bytes();
+        if w == 0 || w > 16 || off + w > rec.len() {
+            return Err(format!(
+                "serial field patch out of range (type {type_id}, field {fid})"
+            ));
+        }
+        rec[off..off + w].copy_from_slice(&le[..w]);
+        // NOTE: the SQL layer encodes the omitted serial column as a
+        // non-null `0` placeholder (the column is the NOT-NULL PK), so
+        // the null bitmap already marks it present; we only overwrite the
+        // value bytes here. No bitmap manipulation needed.
+        Ok(rec)
+    }
+
     /// True if some OTHER object already holds `v` for this unique field.
     fn unique_conflict(&self, ut: u32, fid: u16, v: &[u8], self_obj: [u8; 16]) -> bool {
         self.idx_lookup(ut, fid, v).iter().any(|id| *id != self_obj)
@@ -3755,6 +3799,9 @@ impl<V: Vfs> StateMachine<V> {
                     // `CREATE TABLE … BIGSERIAL PRIMARY KEY` from the SQL
                     // layer sets it so omitted-id INSERTs autoincrement.
                     serial_pk: kessel_catalog::decode_type_serial_pk(&def),
+                    serial_field_id: kessel_catalog::decode_type_serial_field(
+                        &def,
+                    ),
                 });
                 self.catalog.next_type_id += 1;
                 match self.persist_catalog(op_number) {
@@ -3875,6 +3922,22 @@ impl<V: Vfs> StateMachine<V> {
                 if let Err(e) = self.check_checks(type_id, &record) {
                     return OpResult::Constraint(e);
                 }
+                // SP-PG-SERIAL-RETURNING: when the serial PK is ALSO a
+                // stored record field (the `id BIGSERIAL PRIMARY KEY`
+                // shape stores `id` as field 1), patch the assigned
+                // counter value into that field's fixed-width slot so a
+                // later `SELECT id` reads back the engine-assigned id
+                // (not the sentinel / a placeholder). The patch is a pure
+                // deterministic byte write derived from the digest-covered
+                // counter — same on every replica.
+                let record = if let Some(seq) = assigned_serial {
+                    match self.patch_serial_field(type_id, record, seq) {
+                        Ok(r) => r,
+                        Err(e) => return OpResult::SchemaError(e),
+                    }
+                } else {
+                    record
+                };
                 let rec_idx = if need_idx { Some(record.clone()) } else { None };
                 let cached = self.cache.as_mut().map(|_| record.clone());
                 match self.storage.put(op_number, key.clone(), record) {
@@ -6519,34 +6582,53 @@ mod tests {
         )
     }
 
-    // SP-PG-SERIAL-RETURNING: a `serial_pk` type (the `id` is the
-    // ObjectId pseudo-PK, so the only real field is `name`). Built via
-    // `encode_type_def_full(.., serial_pk = true)` exactly as the SQL
-    // CREATE TABLE path does for `id BIGSERIAL PRIMARY KEY, name CHAR(8)`.
+    // SP-PG-SERIAL-RETURNING: a `serial_pk` type in the SQLAlchemy shape
+    // `id BIGSERIAL PRIMARY KEY, name CHAR(8)` — `id` is BOTH the
+    // ObjectId pseudo-PK AND a stored field (field 1, I64). Built via
+    // `encode_type_def_full(.., serial_pk = true, serial_field_id = 1)`
+    // exactly as the SQL CREATE TABLE path does.
     fn widget_serial_def() -> Vec<u8> {
         kessel_catalog::encode_type_def_full(
             "widgets",
-            &[Field { field_id: 0, name: "name".into(), kind: FieldKind::Char(8), nullable: true }],
+            &[
+                Field { field_id: 0, name: "id".into(), kind: FieldKind::I64, nullable: false },
+                Field { field_id: 0, name: "name".into(), kind: FieldKind::Char(8), nullable: true },
+            ],
             &[],
             true,
+            Some(1),
         )
     }
 
     // An autoincrement insert: the gateway omits the id, so the Create
-    // carries the SERIAL_SENTINEL. `name` is the single field record.
+    // carries the SERIAL_SENTINEL. The record encodes the `id` field as a
+    // 0 placeholder (the SM patches the assigned value) + `name`.
     fn serial_insert(name: &[u8; 8]) -> Op {
         Op::Create {
             type_id: 1,
             id: SERIAL_SENTINEL,
             record: {
-                // [schema_ver u32][field_count u16][null bitmap 8B][name 8B]
+                // [schema_ver u32][field_count u16][null bitmap 8B]
+                //   [id i64 8B = 0 placeholder][name 8B]
                 let mut r = Vec::new();
                 r.extend_from_slice(&1u32.to_le_bytes());
-                r.extend_from_slice(&1u16.to_le_bytes());
-                r.extend_from_slice(&[0u8; 8]); // null bitmap: name present
+                r.extend_from_slice(&2u16.to_le_bytes());
+                r.extend_from_slice(&[0u8; 8]); // null bitmap: both present
+                r.extend_from_slice(&0i64.to_le_bytes()); // id placeholder
                 r.extend_from_slice(name);
                 r
             },
+        }
+    }
+
+    // Read the stored `id` field (field 1, I64) of the row at ObjectId v.
+    fn read_id_field(sm: &mut StateMachine<MemVfs>, v: u128) -> Option<i64> {
+        match sm.apply(999, Op::GetById { type_id: 1, id: ObjectId::from_u128(v) }) {
+            OpResult::Got(rec) => {
+                // header = 14 bytes; id field at offset 14, width 8.
+                rec.get(14..22).map(|s| i64::from_le_bytes(s.try_into().unwrap()))
+            }
+            _ => None,
         }
     }
 
@@ -6583,6 +6665,11 @@ mod tests {
             sm.apply(6, Op::GetById { type_id: 1, id: SERIAL_SENTINEL }),
             OpResult::NotFound
         );
+        // The stored `id` FIELD was patched with the assigned value, so a
+        // `SELECT id` reads back 1/2/3 (not the 0 placeholder).
+        assert_eq!(read_id_field(&mut sm, 1), Some(1));
+        assert_eq!(read_id_field(&mut sm, 2), Some(2));
+        assert_eq!(read_id_field(&mut sm, 3), Some(3));
     }
 
     #[test]
@@ -7222,6 +7309,7 @@ mod tests {
             composite: vec![],
             defaults: vec![],
             serial_pk: false,
+            serial_field_id: None,
         };
         vec![0u8; t.compute_layout().record_size]
     }
@@ -7863,6 +7951,7 @@ mod tests {
             composite: vec![],
             defaults: vec![],
             serial_pk: false,
+            serial_field_id: None,
         };
         let mut b = vec![0u8; t.compute_layout().record_size];
         let o0 = t.compute_layout().offsets[0];
@@ -8329,6 +8418,7 @@ mod tests {
             composite: vec![],
             defaults: vec![],
             serial_pk: false,
+            serial_field_id: None,
         }
         .compute_layout()
     }
@@ -8583,6 +8673,7 @@ mod tests {
             indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![],
             defaults: vec![],
             serial_pk: false,
+            serial_field_id: None,
         };
         let l = ot.compute_layout();
         (l.offsets[0], l.offsets[1])
@@ -8891,6 +8982,7 @@ mod tests {
             indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![],
             defaults: vec![],
             serial_pk: false,
+            serial_field_id: None,
         };
         let l = ot.compute_layout();
         let mut b = vec![0u8; l.record_size];
@@ -9068,6 +9160,7 @@ mod tests {
             indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![],
             defaults: vec![],
             serial_pk: false,
+            serial_field_id: None,
         };
         let l = ot.compute_layout();
         (l.offsets[0], l.offsets[1])
@@ -9078,7 +9171,7 @@ mod tests {
             let ot = ObjectType { type_id:1,name:"rng".into(),schema_ver:1,fields:vec![
                 Field{field_id:1,name:"score".into(),kind:FieldKind::I32,nullable:false},
                 Field{field_id:2,name:"big".into(),kind:FieldKind::U64,nullable:false}],
-                indexes:vec![],unique:vec![],fks:vec![],checks:vec![],triggers:vec![],ordered:vec![],composite:vec![],defaults:vec![], serial_pk:false };
+                indexes:vec![],unique:vec![],fks:vec![],checks:vec![],triggers:vec![],ordered:vec![],composite:vec![],defaults:vec![], serial_pk:false, serial_field_id:None };
             ot.compute_layout().record_size
         }];
         b[o0..o0 + 4].copy_from_slice(&score.to_le_bytes());
@@ -10839,6 +10932,7 @@ mod tests {
             indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![],
             defaults: vec![],
             serial_pk: false,
+            serial_field_id: None,
         };
         let l = ot.compute_layout();
         (l.offsets[2], 4)

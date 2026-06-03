@@ -149,14 +149,24 @@ pub struct ObjectType {
     /// trailer ⇒ no defaults).
     pub defaults: Vec<(u16, Vec<u8>)>,
     /// SP-PG-SERIAL-RETURNING: this type's primary key (the `id`
-    /// pseudo-column / ObjectId) is a deterministic autoincrement
-    /// SERIAL. When `true`, an INSERT that omits the row id is assigned
-    /// the next per-type sequence value by the state machine (a counter
-    /// in the digest, advanced only on the apply thread). Serialized in
-    /// a second backward-compatible trailer of the type-def blob after
-    /// the SP86 defaults trailer; old blobs (and non-serial types) carry
-    /// no trailer ⇒ `false`.
+    /// pseudo-column / ObjectId) is a deterministic autoincrement SERIAL.
+    /// When `true`, an INSERT that omits the row id is assigned the next
+    /// per-type sequence value by the state machine (a counter in the
+    /// digest, advanced only on the apply thread): the value becomes the
+    /// row ObjectId AND, when `serial_field_id` names a stored field
+    /// (the `id` column is also a real record field in the SQLAlchemy
+    /// shape), is patched into that field so `SELECT id` reads it back.
+    /// Serialized in a second backward-compatible trailer of the type-def
+    /// blob after the SP86 defaults trailer; old blobs (and non-serial
+    /// types) carry no trailer ⇒ `false` / `None`.
     pub serial_pk: bool,
+    /// `field_id` of the SERIAL primary-key column when it is ALSO a
+    /// stored record field (the SQLAlchemy `id BIGSERIAL PRIMARY KEY`
+    /// shape stores `id` as field 1). `None` when `serial_pk` is set but
+    /// the PK is a pure ObjectId pseudo-column with no backing field.
+    /// Rides the same serial trailer (a `u16`, only written when
+    /// `serial_pk`).
+    pub serial_field_id: Option<u16>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -194,6 +204,7 @@ impl ObjectType {
             composite: vec![],
             defaults: vec![],
             serial_pk: false,
+            serial_field_id: None,
         }
     }
 
@@ -317,7 +328,7 @@ pub fn encode_type_def_with_defaults(
     fields: &[Field],
     defaults: &[(u16, Vec<u8>)],
 ) -> Vec<u8> {
-    encode_type_def_full(name, fields, defaults, false)
+    encode_type_def_full(name, fields, defaults, false, None)
 }
 
 /// SP-PG-SERIAL-RETURNING: like [`encode_type_def_with_defaults`] but
@@ -329,17 +340,20 @@ pub fn encode_type_def_with_defaults(
 /// to `encode_type_def`):
 ///   `name + [u16 fcount] + fields`                       (base)
 ///   `[u16 ndef] ndef×([u16 fid][u16 len][bytes])`        (SP86, if ndef>0 OR serial_pk)
-///   `[u8 serial_pk]`                                      (only if serial_pk)
+///   `[u8 1][u8 has_field][u16 field_id?]`                 (only if serial_pk)
 ///
 /// When `serial_pk` is set but there are no defaults we still write the
-/// `[u16 0]` defaults-count so the serial byte has a fixed offset; the
+/// `[u16 0]` defaults-count so the serial trailer has a fixed offset; the
 /// SP86 `decode_type_defaults` reads that 0 and returns an empty list —
-/// no defaults regression.
+/// no defaults regression. `has_field` = 1 followed by the serial
+/// column's `field_id` when it is a stored record field (the
+/// `id BIGSERIAL PRIMARY KEY` shape), else 0.
 pub fn encode_type_def_full(
     name: &str,
     fields: &[Field],
     defaults: &[(u16, Vec<u8>)],
     serial_pk: bool,
+    serial_field_id: Option<u16>,
 ) -> Vec<u8> {
     let mut b = encode_type_def(name, fields);
     if !defaults.is_empty() || serial_pk {
@@ -351,9 +365,42 @@ pub fn encode_type_def_full(
         }
     }
     if serial_pk {
-        b.push(1u8);
+        b.push(1u8); // serial flag present
+        match serial_field_id {
+            Some(fid) => {
+                b.push(1u8);
+                b.extend_from_slice(&fid.to_le_bytes());
+            }
+            None => b.push(0u8),
+        }
     }
     b
+}
+
+/// Position `p` just past the SP86 defaults trailer (the start of the
+/// serial trailer, if any). Returns `None` if there is no trailer region
+/// at all (old blob). Shared by the serial decoders.
+fn serial_trailer_offset(b: &[u8]) -> Option<usize> {
+    let mut p = 0usize;
+    let _ = get_str(b, &mut p)?; // name
+    let n = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
+    p += 2;
+    for _ in 0..n {
+        let fl = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
+        p += 2 + fl;
+    }
+    if p >= b.len() {
+        return None; // no trailer region
+    }
+    // Skip the SP86 defaults trailer to land on the serial byte.
+    let nd = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
+    p += 2;
+    for _ in 0..nd {
+        p += 2; // fid
+        let l = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
+        p += 2 + l;
+    }
+    Some(p)
 }
 
 /// SP-PG-SERIAL-RETURNING: parse the `serial_pk` flag from a type-def
@@ -361,34 +408,31 @@ pub fn encode_type_def_full(
 /// defaults-only trailer with nothing after it) and on any short read —
 /// the flag is metadata, never load-bearing for decode.
 pub fn decode_type_serial_pk(b: &[u8]) -> bool {
-    let parse = || -> Option<bool> {
-        let mut p = 0usize;
-        let _ = get_str(b, &mut p)?; // name
-        let n = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
-        p += 2;
-        for _ in 0..n {
-            let fl =
-                u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
-            p += 2 + fl;
-        }
-        // No defaults trailer at all ⇒ no serial trailer ⇒ false.
-        if p >= b.len() {
-            return Some(false);
-        }
-        // Skip the SP86 defaults trailer to land on the serial byte.
-        let nd = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
-        p += 2;
-        for _ in 0..nd {
-            let _fid = b.get(p..p + 2)?;
-            p += 2;
-            let l =
-                u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
-            p += 2 + l;
-        }
-        // The serial byte follows the defaults trailer when present.
-        Some(matches!(b.get(p), Some(1u8)))
+    let p = match serial_trailer_offset(b) {
+        Some(p) => p,
+        None => return false,
     };
-    parse().unwrap_or(false)
+    matches!(b.get(p), Some(1u8))
+}
+
+/// SP-PG-SERIAL-RETURNING: parse the SERIAL column's stored-field id
+/// from the type-def blob's serial trailer (the `[u8 has_field][u16
+/// fid]` after the serial flag). `None` when the serial PK is a pure
+/// ObjectId pseudo-column, the type is not serial, or on any short read.
+pub fn decode_type_serial_field(b: &[u8]) -> Option<u16> {
+    let parse = || -> Option<u16> {
+        let mut p = serial_trailer_offset(b)?;
+        if *b.get(p)? != 1u8 {
+            return None; // not serial
+        }
+        p += 1;
+        if *b.get(p)? != 1u8 {
+            return None; // serial flag present but no backing field
+        }
+        p += 1;
+        Some(u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?))
+    };
+    parse()
 }
 
 /// Parse the SP86 defaults trailer from a type-def blob (the bytes
@@ -501,6 +545,7 @@ impl Catalog {
                 &t.fields,
                 &t.defaults,
                 t.serial_pk,
+                t.serial_field_id,
             );
             b.extend_from_slice(&(def.len() as u32).to_le_bytes());
             b.extend_from_slice(&def);
@@ -658,6 +703,7 @@ impl Catalog {
             let (name, fields) = decode_type_def(def_slice)?;
             let defaults = decode_type_defaults(def_slice);
             let serial_pk = decode_type_serial_pk(def_slice);
+            let serial_field_id = decode_type_serial_field(def_slice);
             p += dl;
             let ni = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
             p += 2;
@@ -737,6 +783,7 @@ impl Catalog {
                 composite,
                 defaults,
                 serial_pk,
+                serial_field_id,
             });
         }
         // Optional Catalog-level external-recipe trailer. `p` is exactly
@@ -913,7 +960,7 @@ mod tests {
 
     #[test]
     fn layout_is_pure_and_deterministic() {
-        let t = ObjectType { type_id: 1, name: "transfer".into(), schema_ver: 1, fields: sample_fields(), indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![], defaults: vec![], serial_pk: false };
+        let t = ObjectType { type_id: 1, name: "transfer".into(), schema_ver: 1, fields: sample_fields(), indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![], defaults: vec![], serial_pk: false, serial_field_id: None };
         let a = t.compute_layout();
         let b = t.compute_layout();
         assert_eq!(a, b);
@@ -927,7 +974,7 @@ mod tests {
 
     #[test]
     fn appending_nullable_field_keeps_existing_offsets() {
-        let mut t = ObjectType { type_id: 1, name: "t".into(), schema_ver: 1, fields: sample_fields(), indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![], defaults: vec![], serial_pk: false };
+        let mut t = ObjectType { type_id: 1, name: "t".into(), schema_ver: 1, fields: sample_fields(), indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![], defaults: vec![], serial_pk: false, serial_field_id: None };
         let before = t.compute_layout();
         t.fields.push(Field { field_id: 5, name: "memo".into(), kind: FieldKind::Char(32), nullable: true });
         t.schema_ver += 1;
@@ -949,8 +996,8 @@ mod tests {
     fn catalog_roundtrip() {
         let mut c = Catalog::default();
         c.next_type_id = 3;
-        c.types.push(ObjectType { type_id: 1, name: "a".into(), schema_ver: 2, fields: sample_fields(), indexes: vec![3], unique: vec![3], fks: vec![(3, 9, 2)], checks: vec![vec![1, 2, 3]], triggers: vec![vec![7, 7]], ordered: vec![2], composite: vec![vec![1, 2]], defaults: vec![(1, vec![9, 0, 0, 0])], serial_pk: false });
-        c.types.push(ObjectType { type_id: 2, name: "b".into(), schema_ver: 1, fields: vec![], indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![], defaults: vec![], serial_pk: false });
+        c.types.push(ObjectType { type_id: 1, name: "a".into(), schema_ver: 2, fields: sample_fields(), indexes: vec![3], unique: vec![3], fks: vec![(3, 9, 2)], checks: vec![vec![1, 2, 3]], triggers: vec![vec![7, 7]], ordered: vec![2], composite: vec![vec![1, 2]], defaults: vec![(1, vec![9, 0, 0, 0])], serial_pk: false, serial_field_id: None });
+        c.types.push(ObjectType { type_id: 2, name: "b".into(), schema_ver: 1, fields: vec![], indexes: vec![], unique: vec![], fks: vec![], checks: vec![], triggers: vec![], ordered: vec![], composite: vec![], defaults: vec![], serial_pk: false, serial_field_id: None });
         let enc = c.encode();
         let dec = Catalog::decode(&enc).unwrap();
         assert_eq!(dec.next_type_id, 3);
@@ -981,9 +1028,10 @@ mod tests {
             kind: FieldKind::Char(8),
             nullable: true,
         }];
-        // serial_pk = true, no defaults.
-        let blob = encode_type_def_full("widgets", &fields, &[], true);
+        // serial_pk = true, serial field 1, no defaults.
+        let blob = encode_type_def_full("widgets", &fields, &[], true, Some(1));
         assert!(decode_type_serial_pk(&blob), "serial flag must decode true");
+        assert_eq!(decode_type_serial_field(&blob), Some(1), "serial field id decodes");
         assert!(decode_type_defaults(&blob).is_empty(), "no defaults regression");
         let (n, f) = decode_type_def(&blob).unwrap();
         assert_eq!(n, "widgets");
@@ -991,15 +1039,22 @@ mod tests {
 
         // serial_pk = true WITH a default → both trailers present.
         let defs = vec![(1u16, vec![0u8; 8])];
-        let blob2 = encode_type_def_full("w2", &fields, &defs, true);
+        let blob2 = encode_type_def_full("w2", &fields, &defs, true, Some(1));
         assert!(decode_type_serial_pk(&blob2));
+        assert_eq!(decode_type_serial_field(&blob2), Some(1));
         assert_eq!(decode_type_defaults(&blob2), defs);
+
+        // serial_pk = true with a pure-ObjectId PK (no backing field).
+        let blob3 = encode_type_def_full("w3", &fields, &[], true, None);
+        assert!(decode_type_serial_pk(&blob3));
+        assert_eq!(decode_type_serial_field(&blob3), None);
 
         // serial_pk = false, no defaults → BYTE-IDENTICAL to the plain
         // encoder (no trailer at all): preserves replicated digests.
-        let plain = encode_type_def_full("p", &fields, &[], false);
+        let plain = encode_type_def_full("p", &fields, &[], false, None);
         assert_eq!(plain, encode_type_def("p", &fields));
         assert!(!decode_type_serial_pk(&plain));
+        assert_eq!(decode_type_serial_field(&plain), None);
 
         // Full catalog roundtrip preserves the flag per-type.
         let mut c = Catalog::default();
@@ -1009,9 +1064,11 @@ mod tests {
             fields, indexes: vec![], unique: vec![], fks: vec![],
             checks: vec![], triggers: vec![], ordered: vec![],
             composite: vec![], defaults: vec![], serial_pk: true,
+            serial_field_id: Some(1),
         });
         let back = Catalog::decode(&c.encode()).unwrap();
         assert!(back.types[0].serial_pk, "serial_pk survives the catalog roundtrip");
+        assert_eq!(back.types[0].serial_field_id, Some(1), "serial_field_id survives roundtrip");
     }
 
     #[test]
@@ -1023,6 +1080,7 @@ mod tests {
             fks: vec![], checks: vec![], triggers: vec![], ordered: vec![],
             composite: vec![], defaults: vec![],
             serial_pk: false,
+            serial_field_id: None,
         });
         c.external.push(ExternalRecipe {
             type_id: 1, url: "http://x/y".into(), format: 0, key_field_id: 1,
@@ -1073,6 +1131,7 @@ mod tests {
             fks: vec![], checks: vec![], triggers: vec![], ordered: vec![],
             composite: vec![], defaults: vec![],
             serial_pk: false,
+            serial_field_id: None,
         });
         c.external.push(ExternalRecipe {
             type_id: 1, url: "http://x".into(), format: 2, key_field_id: 1,

@@ -91,7 +91,9 @@ enum Cont {
     /// replicated op. `sets = Some` ⇒ UPDATE, `None` ⇒ DELETE.
     DmlWhere {
         type_id: u32,
-        sets: Option<Vec<(u16, Value)>>,
+        /// Raw field bytes (already converted from `Value` against the
+        /// live catalog) for UPDATE; `None` ⇒ DELETE.
+        sets: Option<Vec<(u16, Vec<u8>)>>,
         reply: SyncSender<OpResult>,
     },
     /// SP-PG-SQL-DML-GENERAL — general-WHERE UPDATE/DELETE step 2: the
@@ -126,6 +128,48 @@ fn build_update(
     let record =
         kessel_codec::encode(&ot, &vals).map_err(|e| format!("update encode: {e:?}"))?;
     Ok(Op::Update { type_id, id: ObjectId::from_u128(id), record })
+}
+
+/// SP-PG-SQL-DML-GENERAL — convert a general-WHERE UPDATE's `Value` SET
+/// list to the raw field bytes `Op::UpdateSet` carries, against the live
+/// catalog. On any error (unknown type/field, or `SET col = NULL` which
+/// `raw_from_value` can't represent), send the error to `reply` and
+/// return `None` so the caller skips submission. `Some(raw)` on success.
+fn convert_sets(
+    cat: &kessel_catalog::Catalog,
+    type_id: u32,
+    sets: &[(u16, Value)],
+    reply: &SyncSender<OpResult>,
+) -> Option<Vec<(u16, Vec<u8>)>> {
+    let ot = match cat.get(type_id) {
+        Some(t) => t,
+        None => {
+            let _ = reply.send(OpResult::SchemaError(format!("update: no type {type_id}")));
+            return None;
+        }
+    };
+    let mut raw = Vec::with_capacity(sets.len());
+    for (fid, v) in sets {
+        let fk = match ot.fields.iter().find(|f| f.field_id == *fid) {
+            Some(f) => f.kind,
+            None => {
+                let _ = reply.send(OpResult::SchemaError(format!("update: no field {fid}")));
+                return None;
+            }
+        };
+        match kessel_codec::raw_from_value(fk, v) {
+            Some(r) => raw.push((*fid, r)),
+            None => {
+                let _ = reply.send(OpResult::Constraint(
+                    "UPDATE … SET col = NULL on a general-WHERE UPDATE is \
+                     not yet supported"
+                        .into(),
+                ));
+                return None;
+            }
+        }
+    }
+    Some(raw)
 }
 
 /// A running node. Holds the engine channel; `submit` linearizes an op
@@ -729,7 +773,9 @@ pub fn spawn_node(
                                          (SP-PG-SQL-DML-RETURNING-CLUSTER)"
                                             .into(),
                                     ));
-                                } else {
+                                } else if let Some(raw_sets) =
+                                    convert_sets(replica.catalog(), type_id, &sets, &reply)
+                                {
                                     let (out, key) = submit_internal(
                                         &mut replica,
                                         &mut pending,
@@ -737,7 +783,7 @@ pub fn spawn_node(
                                         Op::QueryExpr { type_id, program },
                                         Cont::DmlWhere {
                                             type_id,
-                                            sets: Some(sets),
+                                            sets: Some(raw_sets),
                                             reply,
                                         },
                                         Some(client),

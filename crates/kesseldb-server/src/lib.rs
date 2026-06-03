@@ -817,9 +817,48 @@ fn apply_dml_where(
         .collect();
     let affected = ids.len() as u32;
 
+    // Convert the UPDATE SET `Value`s to the raw field bytes
+    // `Op::UpdateSet` carries (mirrors the SP84 in-txn UPDATE path). Done
+    // once, before the per-id fan-out.
+    let raw_sets: Option<Vec<(u16, Vec<u8>)>> = match &sets {
+        None => None,
+        Some(vs) => {
+            let ot = match sm.catalog().get(type_id) {
+                Some(t) => t.clone(),
+                None => {
+                    return OpResult::SchemaError(format!(
+                        "dml-where: no type {type_id}"
+                    ))
+                }
+            };
+            let mut rs = Vec::with_capacity(vs.len());
+            for (fid, v) in vs {
+                let fk = match ot.fields.iter().find(|f| f.field_id == *fid) {
+                    Some(f) => f.kind,
+                    None => {
+                        return OpResult::SchemaError(format!(
+                            "dml-where: no field {fid}"
+                        ))
+                    }
+                };
+                match kessel_codec::raw_from_value(fk, v) {
+                    Some(r) => rs.push((*fid, r)),
+                    None => {
+                        return OpResult::Constraint(
+                            "UPDATE … SET col = NULL on a general-WHERE \
+                             UPDATE is not yet supported"
+                                .into(),
+                        )
+                    }
+                }
+            }
+            Some(rs)
+        }
+    };
+
     // 2. For DELETE RETURNING, capture the rows BEFORE they are removed.
     let mut returning_rows: Vec<Vec<u8>> = Vec::new();
-    let is_delete = sets.is_none();
+    let is_delete = raw_sets.is_none();
     if want_returning && is_delete {
         for id in &ids {
             match sm.apply(*n, Op::GetById { type_id, id: *id }) {
@@ -833,7 +872,7 @@ fn apply_dml_where(
     // 3. Build + apply the concrete Txn (the replicated artifact).
     let inner: Vec<Op> = ids
         .iter()
-        .map(|id| match &sets {
+        .map(|id| match &raw_sets {
             Some(s) => Op::UpdateSet { type_id, id: *id, sets: s.clone() },
             None => Op::Delete { type_id, id: *id },
         })

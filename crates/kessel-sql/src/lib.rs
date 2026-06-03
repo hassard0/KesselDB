@@ -437,6 +437,22 @@ fn kind_of(name: &str, arg: Option<i128>) -> Result<FieldKind, SqlError> {
         // unbounded `VARCHAR`/`TEXT` are NOT handled here (single-token,
         // `(n)`-required) — named follow-up `SP-PG-DDL-VARCHAR-UNBOUNDED`.
         "VARCHAR" => FieldKind::Char(arg.ok_or("VARCHAR needs (n)")? as u16),
+        // SP-PG-SQL-ORM-PARSE T5 — SERIAL-family DDL aliases. SQLAlchemy
+        // 2.0 renders a `BigInteger`/`Integer` PRIMARY KEY as
+        // `BIGSERIAL`/`SERIAL` (autoincrement) in `create_all`. KesselDB
+        // has no sequence/autoincrement engine yet, so these alias to the
+        // plain integer width: BIGSERIAL→I64, SERIAL→I32, SMALLSERIAL→I16.
+        // The row's `id` is the ObjectId pseudo-PK, which the ORM supplies
+        // EXPLICITLY for this model (`User(id=1, …)`), so dropping the
+        // auto-sequence is faithful for explicit-id inserts. Server-
+        // generated autoincrement + `INSERT … RETURNING id` is the named
+        // follow-up `SP-PG-SERIAL` / `SP-PG-RETURNING` (needed only when a
+        // model omits the PK and relies on the DB to assign it). Pure
+        // alias: same FieldKind / on-wire layout as the BIGINT/INTEGER
+        // names already mapped above.
+        "BIGSERIAL" | "SERIAL8" => FieldKind::I64,
+        "SERIAL" | "SERIAL4" => FieldKind::I32,
+        "SMALLSERIAL" | "SERIAL2" => FieldKind::I16,
         other => return Err(format!("unknown type `{other}`")),
     })
 }
@@ -6029,6 +6045,24 @@ mod tests {
             err.contains("primary key") || err.contains("row id"),
             "non-PK UPDATE WHERE must name the by-PK limitation, got: {err}"
         );
+    }
+
+    /// SP-PG-SQL-ORM-PARSE T5 — SERIAL-family DDL aliases (SQLAlchemy
+    /// renders a `BigInteger` PK as `BIGSERIAL`). Aliased to the plain
+    /// integer width (no sequence; explicit-id inserts are faithful).
+    #[test]
+    fn ormparse_serial_aliases() {
+        assert!(matches!(kind_of("BIGSERIAL", None), Ok(FieldKind::I64)));
+        assert!(matches!(kind_of("bigserial", None), Ok(FieldKind::I64)));
+        assert!(matches!(kind_of("SERIAL", None), Ok(FieldKind::I32)));
+        assert!(matches!(kind_of("SMALLSERIAL", None), Ok(FieldKind::I16)));
+        // A real CREATE TABLE with the ORM's exact BIGSERIAL PK compiles.
+        let cat = Catalog::default();
+        assert!(compile(
+            "CREATE TABLE orm_users (id BIGSERIAL NOT NULL, name VARCHAR(32))",
+            &cat
+        )
+        .is_ok());
     }
 
     /// SP-PG-SQL-ORM-PARSE T4 — `col = ANY (ARRAY[v1, v2, v3])` desugars

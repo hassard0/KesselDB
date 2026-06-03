@@ -7150,7 +7150,7 @@ mod tests {
     #[test]
     fn quoted_select_compiles_same_op_as_bare() {
         let mut sm = StateMachine::open(MemVfs::new()).unwrap();
-        run(&mut sm, 1, "CREATE TABLE users (id BIGINT NOT NULL, name TEXT NOT NULL)");
+        run(&mut sm, 1, "CREATE TABLE users (id BIGINT NOT NULL, name VARCHAR(32) NOT NULL)");
         let cat = sm.catalog();
         let bare = compile("SELECT * FROM users WHERE id = 1", cat).unwrap();
         let quoted = compile(r#"SELECT * FROM "users" WHERE "id" = 1"#, cat).unwrap();
@@ -7196,7 +7196,7 @@ mod tests {
         run(
             &mut sm,
             1,
-            r#"CREATE TABLE "t" ("id" BIGINT NOT NULL, "name" TEXT NOT NULL)"#,
+            r#"CREATE TABLE "t" ("id" BIGINT NOT NULL, "name" VARCHAR(32) NOT NULL)"#,
         );
         // The catalog stored the UNquoted spelling (quotes are delimiters,
         // not part of the name).
@@ -7227,7 +7227,7 @@ mod tests {
     #[test]
     fn quoted_and_bare_mix_compiles() {
         let mut sm = StateMachine::open(MemVfs::new()).unwrap();
-        run(&mut sm, 1, "CREATE TABLE t (id BIGINT NOT NULL, name TEXT NOT NULL)");
+        run(&mut sm, 1, "CREATE TABLE t (id BIGINT NOT NULL, name VARCHAR(32) NOT NULL)");
         let cat = sm.catalog();
         let all_bare = select_columns("SELECT id, name FROM t");
         let mixed = select_columns(r#"SELECT "id", name FROM t"#);

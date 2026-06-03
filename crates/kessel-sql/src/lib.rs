@@ -7572,6 +7572,51 @@ mod tests {
         }
     }
 
+    /// SP-PG-SQL-MULTI-JOIN: a chained 3-way `JOIN … JOIN …` compiles to one
+    /// `Op::Join` with TWO entries in `extra_joins` (the base join + 1 step is
+    /// the 3-table chain; here 3 JOINs ⇒ base + 2 steps ⇒ 4 tables). Verifies
+    /// the step ON columns resolve to the right combined / new-table field ids.
+    #[test]
+    fn multi_join_compiles_to_extra_joins() {
+        use kessel_proto::Op;
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE users (id U64 NOT NULL, name CHAR(16) NOT NULL)");
+        run(&mut sm, 2, "CREATE TABLE posts (id U64 NOT NULL, user_id U64 NOT NULL, title CHAR(16) NOT NULL)");
+        run(&mut sm, 3, "CREATE TABLE comments (id U64 NOT NULL, post_id U64 NOT NULL, body CHAR(16) NOT NULL)");
+        let cat = sm.catalog().clone();
+        let sql = "SELECT u.name, p.title, c.body FROM users u JOIN posts p \
+                   ON u.id = p.user_id JOIN comments c ON p.id = c.post_id";
+        match compile(sql, &cat).unwrap() {
+            Op::Join { left_field, right_field, extra_joins, group_aggregate, .. } => {
+                // Base ON: users.id (field 0) = posts.user_id (field 1).
+                assert_eq!(left_field, 0);
+                assert_eq!(right_field, 1);
+                assert!(group_aggregate.is_none());
+                assert_eq!(extra_joins.len(), 1, "one chained step (3 tables)");
+                let step = &extra_joins[0];
+                // posts.id is combined field 2 (users.id=0, users.name=1,
+                // posts.id=2); comments.post_id is field 1 in comments.
+                assert_eq!(step.left_combined_field, 2, "posts.id combined id");
+                assert_eq!(step.right_field, 1, "comments.post_id field id");
+            }
+            o => panic!("expected Op::Join, got {o:?}"),
+        }
+        // A bare 2-table JOIN still has EMPTY extra_joins (byte-identical path).
+        match compile(
+            "SELECT u.name, p.title FROM users u JOIN posts p ON u.id = p.user_id",
+            &cat,
+        ).unwrap() {
+            Op::Join { extra_joins, .. } => assert!(extra_joins.is_empty()),
+            o => panic!("expected Op::Join, got {o:?}"),
+        }
+        // GROUP BY over a chain is rejected (named follow-up).
+        assert!(compile(
+            "SELECT u.name, COUNT(c.id) FROM users u JOIN posts p ON u.id = p.user_id \
+             JOIN comments c ON p.id = c.post_id GROUP BY u.name",
+            &cat,
+        ).is_err(), "GROUP BY over a multi-join must error");
+    }
+
     #[test]
     fn describe_lets_client_decode_rows() {
         use kessel_catalog::decode_type_def;

@@ -2544,6 +2544,62 @@ mod tests {
         assert_eq!(Op::decode(&enc).expect("decode"), op);
     }
 
+    /// SP-PG-SQL-MULTI-JOIN: a join with NON-EMPTY `extra_joins` round-trips
+    /// exactly (chained steps preserved). The extra-joins block (marker 2)
+    /// force-writes the empty-filter + inner-tag + all-None page-block anchors.
+    #[test]
+    fn multi_join_round_trips() {
+        let op = Op::Join {
+            left_type: 1, right_type: 2, left_field: 0, right_field: 1,
+            limit: 0, filter: vec![], join_type: JoinType::Inner,
+            order_by: None, limit_n: None, offset_n: None, group_aggregate: None,
+            extra_joins: vec![
+                JoinStep { right_type: 3, left_combined_field: 2, right_field: 1 },
+                JoinStep { right_type: 4, left_combined_field: 5, right_field: 0 },
+            ],
+        };
+        let enc = op.encode();
+        assert_eq!(Op::decode(&enc).expect("decode"), op, "multi-join round-trip");
+        // Determinism: re-encoding the decoded op is byte-stable.
+        assert_eq!(Op::decode(&enc).unwrap().encode(), enc, "multi-join byte-stable");
+        // The extra-joins marker is `2` (distinct from the ga marker `1`): it
+        // sits after 17 base + 4 (empty filter) + 1 (inner tag) + 4 (page
+        // all-None) = index 26.
+        assert_eq!(enc[26], EXTRA_JOINS_MARKER, "extra-joins marker is 2");
+    }
+
+    /// SP-PG-SQL-MULTI-JOIN regression: an EMPTY `extra_joins` adds NO bytes —
+    /// a 2-table join is byte-identical to the pre-arc 17-byte frame.
+    #[test]
+    fn empty_extra_joins_wire_byte_identical() {
+        let inner = Op::Join {
+            left_type: 4, right_type: 5, left_field: 1, right_field: 2,
+            limit: 9, filter: vec![], join_type: JoinType::Inner,
+            order_by: None, limit_n: None, offset_n: None, group_aggregate: None,
+            extra_joins: vec![],
+        };
+        assert_eq!(inner.encode().len(), 17, "empty extra_joins ⇒ 17-byte frame");
+    }
+
+    /// SP-PG-SQL-MULTI-JOIN: a corrupt extra-joins count (0) is rejected at
+    /// decode — a malformed op is surfaced, not silently dropped.
+    #[test]
+    fn bad_extra_joins_count_rejected() {
+        let op = Op::Join {
+            left_type: 1, right_type: 2, left_field: 0, right_field: 1,
+            limit: 0, filter: vec![], join_type: JoinType::Inner,
+            order_by: None, limit_n: None, offset_n: None, group_aggregate: None,
+            extra_joins: vec![
+                JoinStep { right_type: 3, left_combined_field: 2, right_field: 1 },
+            ],
+        };
+        let mut enc = op.encode();
+        // marker(2) at 26, then u16 count at 27..29 → zero it.
+        enc[27] = 0;
+        enc[28] = 0;
+        assert!(Op::decode(&enc).is_none(), "extra-joins count==0 must fail decode");
+    }
+
     /// SP-PG-SQL-JOIN-AGG: a corrupt ga-block marker (non-1) is rejected at
     /// decode — a forward-incompatible op is surfaced, not silently dropped.
     #[test]

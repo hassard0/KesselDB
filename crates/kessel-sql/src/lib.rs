@@ -6493,21 +6493,148 @@ mod tests {
         assert!(matches!(ormstyle, Op::Delete { .. }));
     }
 
-    /// A non-PK WHERE in UPDATE/DELETE is a precise V1 error naming the
-    /// follow-up (not a silent wrong-row footgun).
+    // ---- SP-PG-SQL-DML-GENERAL (T3) — general-WHERE UPDATE/DELETE + RETURNING ----
+
+    /// A non-PK WHERE in UPDATE now compiles to `Stmt::UpdateWhere`
+    /// (general predicate), NOT the by-PK error. The carried `program`
+    /// is the SAME kessel-expr bytes the equivalent SELECT WHERE emits.
     #[test]
-    fn ormparse_update_where_nonpk_rejected() {
+    fn dmlgen_update_where_general_predicate() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (a I64 NOT NULL, b I64 NOT NULL)");
+        let cat = sm.catalog();
+        let stmt = compile_stmt(
+            "UPDATE t SET b = 0 WHERE a < 150",
+            cat,
+        )
+        .expect("general-WHERE UPDATE compiles");
+        match stmt {
+            Stmt::UpdateWhere { program, sets, returning, .. } => {
+                assert_eq!(sets.len(), 1, "one SET");
+                assert!(returning.is_none(), "no RETURNING");
+                // The predicate program equals the SELECT `a < 150` program.
+                let sel = compile("SELECT * FROM t WHERE a < 150", cat)
+                    .expect("select compiles");
+                match sel {
+                    Op::Select { program: p2, .. } => assert_eq!(
+                        program, p2,
+                        "UPDATE WHERE predicate must byte-match the SELECT \
+                         WHERE program (determinism contract)"
+                    ),
+                    o => panic!("expected Op::Select, got {:?}", o.kind()),
+                }
+            }
+            _ => panic!("expected Stmt::UpdateWhere"),
+        }
+    }
+
+    /// `DELETE FROM t WHERE <general pred>` → `Stmt::DeleteWhere`.
+    #[test]
+    fn dmlgen_delete_where_general_predicate() {
         let mut sm = StateMachine::open(MemVfs::new()).unwrap();
         run(&mut sm, 1, "CREATE TABLE t (a I64 NOT NULL)");
         let cat = sm.catalog();
-        let err = match compile_stmt("UPDATE t SET a = 1 WHERE a = 2", cat) {
-            Ok(_) => panic!("non-PK UPDATE WHERE must be rejected"),
-            Err(e) => e,
-        };
-        assert!(
-            err.contains("primary key") || err.contains("row id"),
-            "non-PK UPDATE WHERE must name the by-PK limitation, got: {err}"
+        let stmt = compile_stmt("DELETE FROM t WHERE a = 7", cat)
+            .expect("general-WHERE DELETE compiles");
+        assert!(matches!(stmt, Stmt::DeleteWhere { .. }));
+    }
+
+    /// String-predicate DELETE: `DELETE FROM t WHERE s = 'expired'`.
+    #[test]
+    fn dmlgen_delete_where_string() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (s CHAR(8) NOT NULL)");
+        let cat = sm.catalog();
+        assert!(matches!(
+            compile_stmt("DELETE FROM t WHERE s = 'expired'", cat)
+                .expect("string DELETE compiles"),
+            Stmt::DeleteWhere { .. }
+        ));
+    }
+
+    /// `UPDATE … WHERE <pred> RETURNING *` captures the star sentinel.
+    #[test]
+    fn dmlgen_update_where_returning_star() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (a I64 NOT NULL, b I64 NOT NULL)");
+        let cat = sm.catalog();
+        match compile_stmt("UPDATE t SET b = 1 WHERE a = 2 RETURNING *", cat)
+            .expect("UPDATE RETURNING * compiles")
+        {
+            Stmt::UpdateWhere { returning, .. } => {
+                assert_eq!(returning, Some(vec!["*".to_string()]));
+            }
+            _ => panic!("expected Stmt::UpdateWhere"),
+        }
+    }
+
+    /// `DELETE … RETURNING a, b` captures an explicit (qualifier-stripped)
+    /// column list.
+    #[test]
+    fn dmlgen_delete_where_returning_cols() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (a I64 NOT NULL, b I64 NOT NULL)");
+        let cat = sm.catalog();
+        match compile_stmt(
+            "DELETE FROM t WHERE a > 5 RETURNING t.a, b",
+            cat,
+        )
+        .expect("DELETE RETURNING cols compiles")
+        {
+            Stmt::DeleteWhere { returning, .. } => {
+                assert_eq!(
+                    returning,
+                    Some(vec!["a".to_string(), "b".to_string()])
+                );
+            }
+            _ => panic!("expected Stmt::DeleteWhere"),
+        }
+    }
+
+    /// By-PK `WHERE id = n` UPDATE/DELETE still take the single-row
+    /// fast path (regression): UPDATE → `Stmt::Update`, DELETE →
+    /// `Op::Delete` (NOT the general WHERE path).
+    #[test]
+    fn dmlgen_by_pk_fast_path_regression() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (a I64 NOT NULL)");
+        let cat = sm.catalog();
+        assert!(matches!(
+            compile_stmt("UPDATE t SET a = 1 WHERE id = 3", cat).unwrap(),
+            Stmt::Update { .. }
+        ));
+        assert!(matches!(
+            compile_stmt("DELETE FROM t WHERE id = 3", cat).unwrap(),
+            Stmt::Op(Op::Delete { .. })
+        ));
+    }
+
+    /// An unguarded table-wide UPDATE/DELETE (no WHERE) is rejected in V1
+    /// (footgun guard), naming neither a panic nor a silent full-table
+    /// mutation.
+    #[test]
+    fn dmlgen_unguarded_update_delete_rejected() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (a I64 NOT NULL)");
+        let cat = sm.catalog();
+        assert!(compile_stmt("UPDATE t SET a = 1", cat).is_err());
+        assert!(compile_stmt("DELETE FROM t", cat).is_err());
+    }
+
+    /// `dml_returning` (the gateway-side detector) parses UPDATE/DELETE
+    /// RETURNING and returns `None` for the no-RETURNING case.
+    #[test]
+    fn dmlgen_dml_returning_helper() {
+        assert_eq!(
+            dml_returning("UPDATE t SET a = 1 WHERE b = 2 RETURNING *"),
+            Some(("t".to_string(), vec!["*".to_string()]))
         );
+        assert_eq!(
+            dml_returning("DELETE FROM t WHERE b = 2 RETURNING t.a, b"),
+            Some(("t".to_string(), vec!["a".to_string(), "b".to_string()]))
+        );
+        assert_eq!(dml_returning("UPDATE t SET a = 1 WHERE b = 2"), None);
+        assert_eq!(dml_returning("SELECT * FROM t"), None);
     }
 
     /// SP-PG-SQL-ORM-PARSE T5 — SERIAL-family DDL aliases (SQLAlchemy

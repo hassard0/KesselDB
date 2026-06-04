@@ -797,6 +797,86 @@ pub fn select_projection_is_sorted(sql: &str) -> bool {
         .any(|t| matches!(t, Tok::Ident(k) if k.eq_ignore_ascii_case("ORDER")))
 }
 
+/// SP-PG-NULL-INT-RENDER — rewrite a single-table projection-list SELECT
+/// (`SELECT c1, c2 FROM t [WHERE …]`) into its `SELECT * FROM t [WHERE …]`
+/// equivalent, preserving everything from the FROM clause onward verbatim.
+///
+/// The gateway uses this to fetch the FULL record stream (`Op::Select`, which
+/// carries the on-disk null bitmap) for a non-sorted projection, then
+/// re-projects the requested columns in the gateway with NULL fidelity. The
+/// engine's narrow `Op::SelectFields` stream has NO null mask — an omitted /
+/// explicit-NULL field's stored zero bytes are indistinguishable from a real
+/// 0 at that layer (the root cause of SP-PG-NULL-INT-RENDER). By going through
+/// `SELECT *` + the bitmap-honoring `decode_record`, a projected NULL renders
+/// as a real PG NULL.
+///
+/// Returns `None` if `sql` is NOT a plain single-table projection list (the
+/// exact acceptance of `select_columns`): aggregates, JOINs, `SELECT *`, and
+/// any shape with a parenthesised/qualified-subquery projection are excluded,
+/// so the FROM keyword we splice on is unambiguously the top-level one (the
+/// projection list before it has no parens by construction). The match is
+/// case-insensitive and token-boundary aware (it won't fire on `FROM` inside a
+/// quoted string or an identifier like `from_date`). Used by the gateway's
+/// non-sorted projection render path ONLY; a no-op (None) for any other SQL so
+/// every prior dispatch path is byte-untouched.
+pub fn select_projection_to_star(sql: &str) -> Option<String> {
+    // Gate on the exact projection-list shape (no aggregate / JOIN / `*`).
+    select_columns(sql)?;
+    // Find the top-level FROM keyword as a case-insensitive token boundary,
+    // skipping any single/double-quoted spans (defensive — a projection list
+    // can't actually contain a string literal, but we stay quote-safe).
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+    // Skip leading whitespace + the SELECT keyword.
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if sql[i..].len() < 6 || !sql[i..i + 6].eq_ignore_ascii_case("SELECT") {
+        return None;
+    }
+    let from_rel = find_keyword_boundary(&sql[i..], "FROM")?;
+    let from_abs = i + from_rel;
+    Some(format!("SELECT * {}", &sql[from_abs..]))
+}
+
+/// Find the byte offset of a standalone keyword (case-insensitive, surrounded
+/// by token boundaries — start/whitespace/punct on each side), skipping any
+/// `'…'` / `"…"` quoted spans so a keyword inside a literal/identifier is not
+/// matched. Returns the offset of the keyword's first byte, or `None`.
+fn find_keyword_boundary(s: &str, kw: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let kwl = kw.len();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\'' || c == b'"' {
+            // Skip the quoted span (no escape handling needed — the projection
+            // list this runs on has no string literals; this is pure defense).
+            let q = c;
+            i += 1;
+            while i < bytes.len() && bytes[i] != q {
+                i += 1;
+            }
+            i += 1; // consume closing quote (or run off the end)
+            continue;
+        }
+        let is_boundary_before = i == 0 || !is_ident_byte(bytes[i - 1]);
+        if is_boundary_before
+            && i + kwl <= bytes.len()
+            && s[i..i + kwl].eq_ignore_ascii_case(kw)
+            && (i + kwl == bytes.len() || !is_ident_byte(bytes[i + kwl]))
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
 /// SP-PG-ORM-RELATIONSHIPS — a JOIN projection item: the (optional) table
 /// qualifier + the column name, preserved separately so the gateway can map
 /// it onto the JOIN's combined schema (whose columns are named
@@ -3271,6 +3351,11 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
                     // for `Value::Blob` bindings (non-UTF8 byte
                     // preservation through INSERT VALUES).
                     Some(Tok::Bytes(b)) => raw.push(Lit::Bytes(b)),
+                    // SP-PG-NULL-INT-RENDER — the bare `NULL` keyword (lexed
+                    // as an Ident) is an explicit SQL NULL value.
+                    Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("NULL") => {
+                        raw.push(Lit::Null)
+                    }
                     _ => return Err("expected value".into()),
                 }
                 for _ in 0..depth {
@@ -3325,6 +3410,14 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
                         .ok_or_else(|| {
                             "`id` must be an integer".to_string()
                         })?,
+                    // SP-PG-NULL-INT-RENDER — the `id` pseudo-PK can never be
+                    // NULL (it is the row's ObjectId).
+                    Lit::Null => {
+                        return Err(
+                            "`id` must not be NULL (it is the primary key)"
+                                .to_string(),
+                        )
+                    }
                 },
                 _ => unreachable!(),
             }
@@ -3334,7 +3427,27 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
             let mut values = Vec::with_capacity(ot.fields.len());
             for f in &ot.fields {
                 match cols.iter().position(|c| *c == f.name) {
-                    Some(idx) => values.push(lit_to_value(&raw[idx], f.kind)?),
+                    Some(idx) => {
+                        // SP-PG-NULL-INT-RENDER — an EXPLICIT `NULL` value
+                        // (`INSERT INTO t (id, c) VALUES (1, NULL)`) stores a
+                        // real SQL NULL (null-bitmap bit set) for a nullable
+                        // column; a NOT NULL column rejects it cleanly. This
+                        // mirrors the omitted-nullable-column path below so an
+                        // explicit NULL round-trips identically to an omission.
+                        if matches!(&raw[idx], Lit::Null) {
+                            if f.nullable {
+                                values.push(Value::Null);
+                            } else {
+                                return Err(format!(
+                                    "null value in column `{}` violates \
+                                     NOT NULL constraint",
+                                    f.name
+                                ));
+                            }
+                        } else {
+                            values.push(lit_to_value(&raw[idx], f.kind)?);
+                        }
+                    }
                     None => {
                         // SP-PG-SERIAL-RETURNING: the omitted SERIAL PK
                         // column gets a non-null `0` placeholder; the SM
@@ -3436,6 +3549,11 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
 enum Lit {
     Int(i128),
     Str(String),
+    /// SP-PG-NULL-INT-RENDER — the bare SQL `NULL` keyword in an INSERT
+    /// VALUES tuple. Resolves to `Value::Null` for a nullable target column
+    /// (sets the record's null bitmap bit) and a clean error for a NOT NULL
+    /// column or the `id` pseudo-PK.
+    Null,
     /// SP-PG-EXTQ-PARSED-BYTEA-TYPED T2 — raw bytes from a bound
     /// `Value::Blob` parameter. Threads non-UTF8 byte sequences
     /// through to `lit_to_value` without the UTF-8 round-trip that
@@ -10785,5 +10903,68 @@ mod tests {
         // A trailing lone quote still closes the string cleanly; an empty
         // string is empty.
         assert_eq!(lex("''").unwrap(), vec![Tok::Str("".into())]);
+    }
+
+    // ── SP-PG-NULL-INT-RENDER — projection→`SELECT *` rewrite ──────────────
+
+    #[test]
+    fn select_projection_to_star_basic() {
+        assert_eq!(
+            select_projection_to_star("SELECT a, b FROM t").as_deref(),
+            Some("SELECT * FROM t")
+        );
+    }
+
+    #[test]
+    fn select_projection_to_star_preserves_where() {
+        assert_eq!(
+            select_projection_to_star("SELECT id FROM child WHERE id = 12")
+                .as_deref(),
+            Some("SELECT * FROM child WHERE id = 12")
+        );
+    }
+
+    #[test]
+    fn select_projection_to_star_single_col_qualified() {
+        // Qualified projection `t.col` still rewrites to `SELECT *`.
+        assert_eq!(
+            select_projection_to_star("SELECT child.parent_id FROM child")
+                .as_deref(),
+            Some("SELECT * FROM child")
+        );
+    }
+
+    #[test]
+    fn select_projection_to_star_rejects_star_and_join_and_agg() {
+        // `SELECT *` is not a projection list → None (the caller already
+        // renders it via the full-record path).
+        assert_eq!(select_projection_to_star("SELECT * FROM t"), None);
+        // Aggregate → None.
+        assert_eq!(select_projection_to_star("SELECT COUNT(*) FROM t"), None);
+        // JOIN → None (different wire shape).
+        assert_eq!(
+            select_projection_to_star("SELECT a.x FROM a JOIN b ON a.id = b.id"),
+            None
+        );
+    }
+
+    #[test]
+    fn select_projection_to_star_keyword_boundary_not_in_ident() {
+        // A column named with an embedded `from` substring must NOT confuse
+        // the FROM-keyword finder (token boundary aware).
+        assert_eq!(
+            select_projection_to_star("SELECT from_date FROM events").as_deref(),
+            Some("SELECT * FROM events")
+        );
+    }
+
+    #[test]
+    fn find_keyword_boundary_skips_quoted_from() {
+        // A `FROM` inside a quoted span is not matched; the real keyword after
+        // the string is. (Defensive — projection lists have no literals.)
+        let s = "'a from b' FROM t";
+        let off = find_keyword_boundary(s, "FROM").unwrap();
+        assert_eq!(&s[off..off + 4], "FROM");
+        assert!(off > 9, "must skip the FROM inside the quoted span");
     }
 }

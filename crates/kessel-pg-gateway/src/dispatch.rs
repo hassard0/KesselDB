@@ -612,6 +612,10 @@ fn render_select_got<E: EngineApply + ?Sized>(
             })
             .collect();
         out.extend_from_slice(&encode_row_description(&fields));
+        // Mark the buffer position right after RowDescription so a fallback
+        // path (SP-PG-NULL-INT-RENDER full-record re-projection) can discard
+        // any partially-written DataRows before retrying the narrow decode.
+        let out_len_after_rowdesc = out.len();
         // SP-PG-ORM-REALAPP — a projection-list SELECT with an `ORDER BY`
         // (`SELECT title FROM posts ORDER BY title LIMIT n`) lowers to
         // `Op::SelectSorted`, which returns the FULL record stream (the sort
@@ -640,14 +644,65 @@ fn render_select_got<E: EngineApply + ?Sized>(
                 }
             }
         } else {
-            match emit_projected_rows(row_bytes, &proj_cols, &mut out) {
-                Ok(n) => n,
-                Err(msg) => {
-                    return error_response_then_rfq(
-                        SEVERITY_ERROR,
-                        "XX000",
-                        &format!("projected row decode failed: {msg}"),
-                    );
+            // SP-PG-NULL-INT-RENDER — a NON-sorted projection lowers to
+            // `Op::SelectFields`, whose NARROW projected-byte stream carries
+            // NO null bitmap: an omitted / explicit-NULL field's stored zero
+            // bytes are indistinguishable from a real 0 at that layer (e.g. a
+            // nullable `parent_id INT` omitted at INSERT read back as `0`
+            // instead of NULL — the root-cause bug). To render projected NULLs
+            // faithfully we re-issue the read as `SELECT *` (which returns FULL
+            // records via `Op::Select`, carrying the on-disk null bitmap) and
+            // re-project the requested columns in the gateway through the
+            // bitmap-honoring `decode_record`/`emit_projected_from_full_records`
+            // path (the same NULL-faithful machinery the sorted-projection
+            // branch already uses). This is a PURE render-layer fix — no
+            // storage/wire/Op format change, so the determinism oracles over
+            // the `SelectFields` stream are byte-untouched. If the rewrite or
+            // the re-issued read fails for any reason we fall back to the
+            // legacy narrow decode (renders the value, may show 0 for a NULL —
+            // never worse than V1).
+            match kessel_sql::select_projection_to_star(sql_trimmed)
+                .map(|star_sql| engine.apply_sql(&star_sql))
+            {
+                Some(OpResult::Got(full_bytes)) => {
+                    match emit_projected_from_full_records(
+                        &full_bytes,
+                        &table_cols,
+                        &proj_cols,
+                        &mut out,
+                    ) {
+                        Ok(n) => n,
+                        Err(_) => {
+                            // Full-record re-projection failed (unexpected
+                            // shape) — fall back to the narrow decode.
+                            out.truncate(out_len_after_rowdesc);
+                            match emit_projected_rows(row_bytes, &proj_cols, &mut out) {
+                                Ok(n) => n,
+                                Err(msg) => {
+                                    return error_response_then_rfq(
+                                        SEVERITY_ERROR,
+                                        "XX000",
+                                        &format!(
+                                            "projected row decode failed: {msg}"
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    // Could not re-issue as SELECT * — narrow decode fallback.
+                    match emit_projected_rows(row_bytes, &proj_cols, &mut out) {
+                        Ok(n) => n,
+                        Err(msg) => {
+                            return error_response_then_rfq(
+                                SEVERITY_ERROR,
+                                "XX000",
+                                &format!("projected row decode failed: {msg}"),
+                            );
+                        }
+                    }
                 }
             }
         };
@@ -1564,31 +1619,61 @@ fn emit_projected_from_full_records(
                 })
         })
         .collect::<Result<_, _>>()?;
+    let emit = |all_cells: &[Option<Vec<u8>>], out: &mut Vec<u8>| {
+        let projected: Vec<Option<&[u8]>> = proj_idx
+            .iter()
+            .map(|&i| all_cells.get(i).and_then(|c| c.as_deref()))
+            .collect();
+        out.extend_from_slice(&encode_data_row(&projected));
+    };
+    // Two row-stream shapes (mirroring `emit_data_rows`):
+    //   (a) length-prefixed list `[u32 LE len][full record]*` — what
+    //       `Op::SelectSorted` and `Op::Select` (a multi-row `SELECT *`)
+    //       emit.
+    //   (b) a single BARE record — what `Op::GetById` emits for a
+    //       `SELECT * FROM t WHERE id = N` fast path (SP-PG-NULL-INT-RENDER
+    //       re-issues projections as `SELECT *`, which CAN compile to GetById).
+    // Try (a) first; only if it consumes the whole buffer cleanly do we use it.
     let mut p = 0usize;
-    let mut n = 0u64;
+    let mut rows_a: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
+    let mut shape_a_ok = true;
     while p + 4 <= row_bytes.len() {
         let len =
             u32::from_le_bytes(row_bytes[p..p + 4].try_into().unwrap()) as usize;
         p += 4;
         if p + len > row_bytes.len() {
-            return Err("sorted record stream truncated".to_string());
+            shape_a_ok = false;
+            break;
         }
         let rec = &row_bytes[p..p + len];
         p += len;
-        let all_cells = decode_record(rec, table_cols, &layout)
-            .ok_or_else(|| "malformed sorted record".to_string())?;
-        // Project: pick the requested columns in projection order.
-        let projected: Vec<Option<&[u8]>> = proj_idx
-            .iter()
-            .map(|&i| all_cells[i].as_deref())
-            .collect();
-        out.extend_from_slice(&encode_data_row(&projected));
-        n += 1;
+        match decode_record(rec, table_cols, &layout) {
+            Some(cells) => rows_a.push(cells),
+            None => {
+                shape_a_ok = false;
+                break;
+            }
+        }
     }
-    if p != row_bytes.len() {
-        return Err("trailing bytes after sorted records".to_string());
+    if shape_a_ok && p == row_bytes.len() {
+        let mut n = 0u64;
+        for cells in &rows_a {
+            emit(cells, out);
+            n += 1;
+        }
+        return Ok(n);
     }
-    Ok(n)
+    // Shape (b) — entire blob is one bare full record.
+    if row_bytes.is_empty() {
+        return Ok(0);
+    }
+    match decode_record(row_bytes, table_cols, &layout) {
+        Some(cells) => {
+            emit(&cells, out);
+            Ok(1)
+        }
+        None => Err("malformed full record".to_string()),
+    }
 }
 
 /// SP-PG-SQL-ORM-PARSE T3 — resolve a projection list (`select_columns`

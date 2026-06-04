@@ -5428,7 +5428,7 @@ mod tests {
         let s0 = encode_groups(&[(b"A", 10), (b"C", 7)]);
         let s1 = encode_groups(&[(b"A", 5), (b"B", 3)]);
         let payloads: Vec<&[u8]> = vec![&s0, &s1];
-        let r = merge_group_aggregate(&payloads, 1); // SUM
+        let r = merge_group_aggregate(&payloads, 1, 0); // SUM
         match r {
             OpResult::Got(b) => {
                 // Expected: 3 groups, sorted by key: A=15, B=3, C=7.
@@ -5477,7 +5477,7 @@ mod tests {
         let s0 = encode_groups(&[(b"x", 50), (b"y", 5)]);
         let s1 = encode_groups(&[(b"x", 10), (b"y", 100)]);
         let payloads: Vec<&[u8]> = vec![&s0, &s1];
-        let r = merge_group_aggregate(&payloads, 2); // MIN
+        let r = merge_group_aggregate(&payloads, 2, 0); // MIN
         match r {
             OpResult::Got(b) => {
                 let n = u32::from_le_bytes(b[..4].try_into().unwrap()) as usize;
@@ -5526,7 +5526,7 @@ mod tests {
         let s1 = encode_groups(&[(b"A", vec![3, 5])]);
         let payloads: Vec<&[u8]> = vec![&s0, &s1];
         // kinds: [COUNT, SUM] = [0, 1]
-        let r = merge_group_aggregate_multi(&payloads, &[0u8, 1u8]);
+        let r = merge_group_aggregate_multi(&payloads, &[0u8, 1u8], 0);
         match r {
             OpResult::Got(b) => {
                 let n = u32::from_le_bytes(b[..4].try_into().unwrap()) as usize;
@@ -5565,7 +5565,7 @@ mod tests {
     #[test]
     fn shard_scan_group_agg_multi_merge_rejects_avg_slot() {
         let payloads: Vec<&[u8]> = vec![];
-        let r = merge_group_aggregate_multi(&payloads, &[0u8, 4u8]);
+        let r = merge_group_aggregate_multi(&payloads, &[0u8, 4u8], 0);
         match r {
             OpResult::SchemaError(msg) => {
                 assert!(msg.contains("AVG"), "msg: {msg}");

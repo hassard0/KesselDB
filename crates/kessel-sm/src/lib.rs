@@ -11006,6 +11006,7 @@ mod tests {
         match sm.apply(36, Op::GroupAggregate {
             type_id: 1, program: all, group_field: 1, kind: 0, agg_field: 0,
             range_preds: vec![],
+            extra_group_fields: vec![],
             having: Some(HavingPred { agg_index: 0, op: 0, value: 1000 }), sort: None,
         }) {
             OpResult::Got(b) => {

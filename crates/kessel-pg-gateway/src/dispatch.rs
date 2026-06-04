@@ -3291,13 +3291,17 @@ mod tests {
             PgColumn { name: "name".into(), kind: FieldKind::Char(8), nullable: true },
             PgColumn { name: "extra".into(), kind: FieldKind::I32, nullable: true },
         ];
-        // Projected `id, name`: i64 (8B LE) ++ char(8) padded.
-        let mut row1 = Vec::new();
-        row1.extend_from_slice(&7i64.to_le_bytes());
-        let mut nm = b"alice".to_vec();
-        nm.resize(8, 0);
-        row1.extend_from_slice(&nm);
-        let stream = build_projected_stream(&[row1]);
+        // SP-PG-NULL-INT-RENDER: a non-sorted projection now re-issues
+        // `SELECT *` and re-projects from FULL records (for NULL fidelity).
+        // The CannedEngine returns the same canned stream for both the
+        // initial projection apply and the re-issued `SELECT *`, so the
+        // canned stream must be a FULL-record stream (what a real engine
+        // returns for `SELECT *`). The gateway projects `id, name` from it.
+        let rec = build_record(
+            &table_cols,
+            &[Value::Int(7), Value::Blob(b"alice".to_vec()), Value::Int(0)],
+        );
+        let stream = build_row_stream(&[rec]);
         let eng = CannedEngine {
             cols: table_cols,
             row_bytes: stream,
@@ -3332,12 +3336,13 @@ mod tests {
             PgColumn { name: "id".into(), kind: FieldKind::I64, nullable: false },
             PgColumn { name: "name".into(), kind: FieldKind::Char(8), nullable: true },
         ];
-        let mut row1 = Vec::new();
-        row1.extend_from_slice(&3i64.to_le_bytes());
-        let mut nm = b"bob".to_vec();
-        nm.resize(8, 0);
-        row1.extend_from_slice(&nm);
-        let stream = build_projected_stream(&[row1]);
+        // SP-PG-NULL-INT-RENDER: full-record stream (the projection path now
+        // re-projects from `SELECT *` full records).
+        let rec = build_record(
+            &table_cols,
+            &[Value::Int(3), Value::Blob(b"bob".to_vec())],
+        );
+        let stream = build_row_stream(&[rec]);
         let mk = || CannedEngine {
             cols: table_cols.clone(),
             row_bytes: stream.clone(),
@@ -3351,6 +3356,9 @@ mod tests {
             bare, qual,
             "qualified projection must render byte-identically to bare"
         );
+        // The projected `bob` value must actually be present (proves the
+        // re-projection rendered real values, not all-NULL).
+        assert!(bare.windows(3).any(|w| w == b"bob"), "projected value present");
     }
 
     /// Projection column ORDER is preserved: `SELECT name, id FROM t`
@@ -3361,13 +3369,13 @@ mod tests {
             PgColumn { name: "id".into(), kind: FieldKind::I64, nullable: false },
             PgColumn { name: "name".into(), kind: FieldKind::Char(8), nullable: true },
         ];
-        // Projected `name, id`: char(8) ++ i64.
-        let mut row1 = Vec::new();
-        let mut nm = b"zoe".to_vec();
-        nm.resize(8, 0);
-        row1.extend_from_slice(&nm);
-        row1.extend_from_slice(&9i64.to_le_bytes());
-        let stream = build_projected_stream(&[row1]);
+        // SP-PG-NULL-INT-RENDER: full-record stream (what `SELECT *` returns);
+        // the gateway re-projects `name, id` from it preserving column order.
+        let rec = build_record(
+            &table_cols,
+            &[Value::Int(9), Value::Blob(b"zoe".to_vec())],
+        );
+        let stream = build_row_stream(&[rec]);
         let eng = CannedEngine {
             cols: table_cols,
             row_bytes: stream,

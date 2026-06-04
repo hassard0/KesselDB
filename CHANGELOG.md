@@ -5,6 +5,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning [Se
 
 ## [Unreleased]
 
+### Fixed
+
+- **Omitted / explicit-NULL nullable columns now render as SQL NULL over the
+  PG wire (SP-PG-NULL-INT-RENDER, 2026-06-03)** — a nullable column that was
+  omitted at INSERT (`INSERT INTO t (id, note) VALUES (1, 'x')` with a nullable
+  `n` left out), or set to an explicit `NULL`, now reads back as a real SQL
+  NULL (psycopg2 `None`) over the PG wire instead of `0` (int) / empty (text).
+  The bug was in the **non-sorted projection render path** (`SELECT col FROM t`):
+  the engine's narrow `Op::SelectFields` stream carries no null mask, so a
+  NULL field's stored zero bytes were rendered as a value. `SELECT *` was
+  already correct (it honors the on-disk null bitmap). The fix re-issues a
+  non-sorted projection as `SELECT *` (full records, which carry the bitmap)
+  and re-projects in the gateway — a **pure render-layer change, no storage /
+  wire / `Op` format change**, so the determinism oracles are byte-untouched.
+  Generic across column kinds (int + text/char + numeric). Also adds explicit
+  `NULL` literal support to `INSERT … VALUES (…, NULL)` (a NOT NULL column or
+  the `id` primary key rejects NULL cleanly). A NOT-NULL / PK column still
+  reads its real value.
+
 ### Added
 
 - **DDL FOREIGN KEY is now ENFORCED (SP-PG-DDL-FK-ENFORCE, 2026-06-03)** —

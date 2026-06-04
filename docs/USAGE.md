@@ -338,7 +338,19 @@ DELETE FROM <t> WHERE <expr> [RETURNING <c>,..|*]
                                                  --   atomically; RETURNING yields
                                                  --   the deleted rows
 UPDATE <t> ID <n> SET <col> = <val> [, ...]      -- legacy by-id read‑modify‑write
+INSERT INTO <t> (id, <c>) VALUES (<n>, NULL)     -- explicit SQL NULL for a
+                                                 --   nullable column
 ```
+
+**NULL semantics.** A nullable column that is OMITTED from an INSERT's column
+list, or given an explicit `NULL` value (`INSERT INTO t (id, c) VALUES (1,
+NULL)`), is stored as a true SQL NULL (the row's null-bitmap bit is set) and
+reads back as a real NULL over the PG wire — psycopg2 `None`, NOT `0` or an
+empty string — for BOTH `SELECT *` and a projection-list `SELECT c FROM t`.
+This holds for every column kind (integer, text/`CHAR`, numeric). Omitting a
+`NOT NULL` column with no `DEFAULT` is rejected; an explicit `NULL` on a
+`NOT NULL` column or on the `id` primary key is also rejected. A defaulted /
+`BIGSERIAL` PK column keeps its assigned value (it is never turned into NULL).
 
 **General-WHERE UPDATE/DELETE.** The `WHERE` clause accepts the SAME
 predicate grammar as `SELECT` (`=`, `!=`, `<`, `<=`, `>`, `>=`, `AND`/

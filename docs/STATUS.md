@@ -30,6 +30,20 @@ measurement and had drifted from the actual workspace count).
   under live sibling-agent load — reported honestly. SQLite not re-run
   (vulcan root fs was 100% full; KesselDB MemVfs + Postgres docker
   unaffected). Raw: `docs/benchmarks/finalbench-2026-06-02-*`.
+- **Nullable columns render as SQL NULL over the PG wire (SP-PG-NULL-INT-RENDER,
+  2026-06-03).** A nullable column omitted at INSERT, or set to an explicit
+  `NULL`, now reads back as a real PG NULL (psycopg2 `None`) for BOTH `SELECT *`
+  AND projection-list `SELECT col` — previously a projection rendered an omitted
+  nullable int as `0` (text as empty), a silent data-correctness bug. Root cause
+  was the engine's narrow `Op::SelectFields` projection stream carrying no null
+  mask; the fix re-issues a non-sorted projection as `SELECT *` (full records,
+  which carry the on-disk null bitmap) and re-projects in the gateway — a PURE
+  render-layer change, no storage/wire/`Op` format change, so the determinism
+  oracles stay byte-identical. Generic across kinds (int + text + numeric);
+  NOT-NULL / PK / `BIGSERIAL` columns keep their real values. Explicit `NULL`
+  literal support added to `INSERT … VALUES`. New psql smoke
+  `scripts/sppgnullintrender-smoke.py` (7/7 psycopg2 stages on vulcan); the
+  relationships (4/4), realapp (8/8), and fk-enforce (7/7) smokes stay green.
 - **DDL FOREIGN KEY now ENFORCED (SP-PG-DDL-FK-ENFORCE, 2026-06-03).** A
   `FOREIGN KEY (col) REFERENCES tbl [(col)] [ON DELETE …]` in `CREATE TABLE`
   (table-level or inline `col … REFERENCES tbl(col)`) ENFORCES referential

@@ -159,15 +159,16 @@ def run_stages():
 
     stage("bad_insert", _bad_insert)
 
-    # NULL FK is allowed.
+    # NULL FK is allowed. The FK column is OMITTED from the INSERT column
+    # list, so the nullable parent_id is stored NULL — and enforcement skips
+    # a NULL FK (SQL-like). (A bare `NULL` literal in VALUES is a separate
+    # parser feature; omission is the portable way to write a NULL here.)
     def _null_fk():
-        cur.execute(
-            "INSERT INTO child (id, parent_id, note) VALUES (12, NULL, 'orphan')"
-        )
+        cur.execute("INSERT INTO child (id, note) VALUES (12, 'orphan')")
         cur.execute("SELECT id, parent_id FROM child WHERE id = 12")
         row = cur.fetchone()
         assert row == (12, None), f"NULL-FK child not stored as NULL: {row}"
-        return f"child(12, NULL fk) inserted -> {row}"
+        return f"child(12, omitted fk -> NULL) inserted -> {row}"
 
     stage("null_fk", _null_fk)
 

@@ -36,7 +36,7 @@ pg-gateway,http-gateway`, so the PostgreSQL, HTTP/1.1, and WebSocket
 gateways are wired in.
 
 ```bash
-VER=v1.0.0   # see the releases page for the latest
+VER=v2.0.0   # see the releases page for the latest
 curl -L https://github.com/hassard0/KesselDB/releases/download/$VER/kesseldb-$VER-x86_64-unknown-linux-gnu \
   -o kesseldb && chmod +x kesseldb
 curl -L https://github.com/hassard0/KesselDB/releases/download/$VER/kessel-$VER-x86_64-unknown-linux-gnu \

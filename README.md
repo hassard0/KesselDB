@@ -166,7 +166,7 @@ all. Determinism is a feature, not an aspiration.
 
 ```bash
 # x86_64 Linux (glibc):
-VER=v1.0.0       # see https://github.com/hassard0/KesselDB/releases for the latest
+VER=v2.0.0       # see https://github.com/hassard0/KesselDB/releases for the latest
 curl -L https://github.com/hassard0/KesselDB/releases/download/$VER/kesseldb-$VER-x86_64-unknown-linux-gnu \
   -o kesseldb && chmod +x kesseldb
 curl -L https://github.com/hassard0/KesselDB/releases/download/$VER/kessel-$VER-x86_64-unknown-linux-gnu \

@@ -5,6 +5,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning [Se
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-06-04
+
+Major release: the **complete real-ORM relational SQL surface** over the
+PostgreSQL wire. Drives SQLAlchemy 2.0 and Django ORMs end-to-end — full CRUD +
+FK relationships, the entire join-type matrix (INNER / LEFT / RIGHT / FULL) with
+table aliases and 3+ table chains, the full aggregate surface (scalar, plain +
+multi-column `GROUP BY`, `HAVING`, `ORDER BY`/`LIMIT`/`OFFSET` over groups,
+group-aggregate over joins), `SELECT DISTINCT`, and non-correlated `WHERE`
+subqueries (`IN` / `NOT IN` / scalar) — plus NULL-render correctness. Every
+change is determinism-preserving (additive + marker-guarded wire formats; the
+seed-corpus / 3-replica byte-identity / sharded / read-pool oracles stay green).
+The read hot-path is unchanged: re-measured **63× faster than Postgres** on
+YCSB-C reads at N=16 (see `docs/BENCHMARKS.md` §"Re-measurement 2026-06-04").
+
+**Behavioral change (the major bump):** `FOREIGN KEY` constraints declared in
+`CREATE TABLE` are now **ENFORCED** — an `INSERT`/`UPDATE` with a non-NULL FK
+value that has no matching parent is rejected with SQLSTATE `23503`, and
+`ON DELETE RESTRICT`/`CASCADE` apply. Previously FK DDL was parsed and ignored
+(accept-and-skip), so workloads that relied on orphan rows being silently
+accepted will now see `23503`.
+
 ### Fixed
 
 - **Omitted / explicit-NULL nullable columns now render as SQL NULL over the

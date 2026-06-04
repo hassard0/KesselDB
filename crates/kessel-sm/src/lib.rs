@@ -1406,6 +1406,20 @@ impl<V: Vfs> StateMachine<V> {
                     "multi-join + GROUP BY is not supported in V1".into(),
                 );
             }
+            // SP-PG-SQL-RIGHT-FULL-JOIN V1: RIGHT/FULL on the base join of a 3+
+            // table CHAIN is a NAMED FOLLOW-UP (outer chains are their own
+            // complexity). LEFT chains were already a follow-up; INNER chains
+            // (the multi-join arc) keep working. Reject RIGHT/FULL chains
+            // defensively so they never silently degrade to an INNER chain.
+            if matches!(
+                join_type,
+                kessel_proto::JoinType::Right | kessel_proto::JoinType::Full
+            ) {
+                return OpResult::SchemaError(
+                    "RIGHT/FULL JOIN in a 3+ table chain is not supported in V1"
+                        .into(),
+                );
+            }
             return self.apply_multi_join(
                 left_type, right_type, left_field, right_field, limit, filter,
                 join_type, order_by, limit_n, offset_n, extra_joins,
@@ -1419,7 +1433,18 @@ impl<V: Vfs> StateMachine<V> {
             Some(t) => t.clone(),
             None => return OpResult::SchemaError(format!("no type {right_type}")),
         };
-        let is_left = join_type == kessel_proto::JoinType::Left;
+        // SP-PG-SQL-RIGHT-FULL-JOIN: the four flavours decompose into three
+        // independent row-set switches over the SAME `a ++ b` combined schema:
+        //   - matched pairs: emitted by ALL four (the inner core);
+        //   - unmatched-LEFT (a row, b NULL): LEFT and FULL;
+        //   - unmatched-RIGHT (b row, a NULL): RIGHT and FULL.
+        // Column ORDER stays `a.* ++ b.*` for every flavour (we switch which
+        // side's unmatched rows are emitted, NOT the output column order).
+        let is_left = matches!(join_type, kessel_proto::JoinType::Left);
+        let is_right = matches!(join_type, kessel_proto::JoinType::Right);
+        let is_full = matches!(join_type, kessel_proto::JoinType::Full);
+        let emit_unmatched_left = is_left || is_full;
+        let emit_unmatched_right = is_right || is_full;
         let pos = |ot: &kessel_catalog::ObjectType, fid: u16| {
             ot.fields.iter().position(|f| f.field_id == fid).map(|i| {
                 (ot.compute_layout().offsets[i], ot.fields[i].kind.width() as usize)
@@ -1446,8 +1471,10 @@ impl<V: Vfs> StateMachine<V> {
             }
         }
         // Combined `(a ++ b)` type: left fields `<lt>.<col>` ids `0..nL`,
-        // right fields `<rt>.<col>` ids `nL..nL+nR`. LEFT mode marks right
-        // fields nullable so an unmatched left row encodes NULL b-*.
+        // right fields `<rt>.<col>` ids `nL..nL+nR`. An outer flavour that can
+        // emit unmatched rows on a side marks the OTHER side's fields nullable:
+        // LEFT/FULL ⇒ right (`b.*`) nullable (unmatched-left row NULLs b);
+        // RIGHT/FULL ⇒ left (`a.*`) nullable (unmatched-right row NULLs a).
         let mut combined: Vec<kessel_catalog::Field> =
             Vec::with_capacity(lt.fields.len() + rt.fields.len());
         let mut fid: u16 = 0;
@@ -1458,8 +1485,10 @@ impl<V: Vfs> StateMachine<V> {
             .map(|f| (&lt.name, f))
             .chain(rt.fields.iter().map(|f| (&rt.name, f)))
         {
-            let is_right = (fid as usize) >= n_left;
-            let nullable = f.nullable || (is_left && is_right);
+            let is_right_field = (fid as usize) >= n_left;
+            let nullable = f.nullable
+                || (emit_unmatched_left && is_right_field)
+                || (emit_unmatched_right && !is_right_field);
             combined.push(kessel_catalog::Field {
                 field_id: fid,
                 name: format!("{src}.{}", f.name),
@@ -1548,8 +1577,23 @@ impl<V: Vfs> StateMachine<V> {
         // surviving combined-row set before producing output.
         let grouping = ga_spec.is_some();
         let sorting = sort_spec.is_some() || grouping;
+        // SP-PG-SQL-RIGHT-FULL-JOIN: RIGHT/FULL need the FULL matched-key set
+        // before they can decide which b-rows are unmatched, so they must
+        // collect (not stream) the matched pairs / unmatched-left rows just like
+        // the sorting path — then a second pass appends unmatched-right rows and
+        // a unified emit applies the (legacy `limit`) cap. INNER/LEFT keep
+        // streaming (byte-identical) when not sorting/grouping.
+        let collect_all = sorting || emit_unmatched_right;
         let mut collected: Vec<(Vec<kessel_codec::Value>, Vec<u8>)> = Vec::new();
 
+        // SP-PG-SQL-RIGHT-FULL-JOIN: for RIGHT/FULL we must also emit every b
+        // (right) row that NEVER matched any a (left) row, with a-columns NULL.
+        // A b-row is "matched" iff its join key appears among the left keys that
+        // found a non-empty match in `map`. Collect those left keys during the
+        // drive-over-a pass; then a second drive-over-b pass emits the unmatched
+        // b-rows. `matched_keys` is only populated/used when `emit_unmatched_right`.
+        let mut matched_keys: std::collections::HashSet<Vec<u8>> =
+            std::collections::HashSet::new();
         let llo = make_key(left_type, &[0u8; 16]);
         let lhi = make_key(left_type, &[0xFFu8; 16]);
         let mut n = 0u32;
@@ -1566,8 +1610,13 @@ impl<V: Vfs> StateMachine<V> {
             };
             match map.get(k) {
                 Some(rs) => {
+                    // RIGHT/FULL: this left key matched ⇒ its b-rows are NOT
+                    // unmatched-right (recorded so the second pass skips them).
+                    if emit_unmatched_right {
+                        matched_keys.insert(k.to_vec());
+                    }
                     for rr in rs {
-                        if !sorting && limit != 0 && n >= limit {
+                        if !collect_all && limit != 0 && n >= limit {
                             break 'outer;
                         }
                         let rv = match kessel_codec::decode(&rt, rr) {
@@ -1599,7 +1648,7 @@ impl<V: Vfs> StateMachine<V> {
                                 }
                             }
                         }
-                        if sorting {
+                        if collect_all {
                             collected.push((row, rec));
                         } else {
                             out.extend_from_slice(&(rec.len() as u32).to_le_bytes());
@@ -1608,8 +1657,8 @@ impl<V: Vfs> StateMachine<V> {
                         }
                     }
                 }
-                None if is_left => {
-                    if !sorting && limit != 0 && n >= limit {
+                None if emit_unmatched_left => {
+                    if !collect_all && limit != 0 && n >= limit {
                         break 'outer;
                     }
                     let mut row = lv.clone();
@@ -1635,7 +1684,7 @@ impl<V: Vfs> StateMachine<V> {
                             }
                         }
                     }
-                    if sorting {
+                    if collect_all {
                         collected.push((row, rec));
                     } else {
                         out.extend_from_slice(&(rec.len() as u32).to_le_bytes());
@@ -1644,6 +1693,76 @@ impl<V: Vfs> StateMachine<V> {
                     }
                 }
                 None => {}
+            }
+        }
+
+        // SP-PG-SQL-RIGHT-FULL-JOIN: second pass — emit every unmatched b
+        // (right) row with all a (left) columns NULL, preserving `a.* ++ b.*`
+        // column order. Deterministic: drive in the same right-table scan-range
+        // order used to build `map`, append AFTER the matched/unmatched-left
+        // rows. Only runs for RIGHT/FULL (`emit_unmatched_right`). These rows go
+        // into `collected` (RIGHT/FULL force `collect_all`), so the unified emit
+        // / sort / paginate below handles them like any other combined row.
+        if emit_unmatched_right {
+            for (_, rr) in self.storage.scan_range(&rlo, &rhi) {
+                let k = match rr.get(roff..roff + rw) {
+                    Some(k) => k,
+                    None => continue,
+                };
+                if matched_keys.contains(k) {
+                    continue; // this b-row matched at least one a-row already
+                }
+                let rv = match kessel_codec::decode(&rt, &rr) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return OpResult::SchemaError(format!(
+                            "join decode right (unmatched): {e:?}"
+                        ))
+                    }
+                };
+                // a.* columns NULL, then the real b.* values ⇒ a.* ++ b.*.
+                let mut row: Vec<kessel_codec::Value> =
+                    Vec::with_capacity(n_left + rv.len());
+                for _ in 0..n_left {
+                    row.push(kessel_codec::Value::Null);
+                }
+                row.extend(rv);
+                let rec = match kessel_codec::encode(&cot, &row) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return OpResult::SchemaError(format!(
+                            "join encode (right-null): {e:?}"
+                        ))
+                    }
+                };
+                if !filter.is_empty() {
+                    match kessel_expr::eval(filter, &cot, &rec) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(e) => {
+                            return OpResult::SchemaError(format!(
+                                "join filter: {e:?}"
+                            ))
+                        }
+                    }
+                }
+                collected.push((row, rec));
+            }
+        }
+
+        // SP-PG-SQL-RIGHT-FULL-JOIN: RIGHT/FULL with NO sort/group still
+        // collected (to compute unmatched-right). Emit the collected rows in
+        // deterministic order (matched/unmatched-left, then unmatched-right),
+        // applying the legacy `limit` cap. INNER/LEFT non-sorting streamed
+        // already (collected is empty there) so this is a no-op for them.
+        if collect_all && !sorting {
+            for (_, rec) in &collected {
+                if limit != 0 && n >= limit {
+                    break;
+                }
+                out.extend_from_slice(&(rec.len() as u32).to_le_bytes());
+                out.extend_from_slice(rec);
+                n += 1;
             }
         }
 
@@ -12073,7 +12192,59 @@ mod tests {
         put_b(&mut sm, &mut op, 1, 1, "lotr");
         put_b(&mut sm, &mut op, 2, 1, "hobbit");
         put_b(&mut sm, &mut op, 3, 1, "silmarillion");
+        // SP-PG-SQL-RIGHT-FULL-JOIN: an ORPHAN book whose author id (99) has no
+        // matching author row. Invisible to INNER/LEFT (both drive over
+        // authors), so existing tests are unaffected; appears in RIGHT/FULL with
+        // a.name NULL (unmatched-right row).
+        put_b(&mut sm, &mut op, 4, 99, "homeless");
         sm
+    }
+
+    // SP-PG-SQL-RIGHT-FULL-JOIN: decode a KTR1 join result into
+    // (Option<a.name>, Option<b.title>) — BOTH sides may be NULL now (a.name is
+    // NULL for an unmatched-RIGHT row; b.title is NULL for an unmatched-LEFT row).
+    fn jq_read_full(b: &[u8]) -> Vec<(Option<String>, Option<String>)> {
+        assert_eq!(&b[0..4], b"KTR1");
+        let deflen = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
+        let (jn, jf) = kessel_catalog::decode_type_def(&b[8..8 + deflen]).unwrap();
+        let cot = ObjectType::from_def(jn, jf);
+        let mut p = 8 + deflen;
+        let mut out = Vec::new();
+        let trim = |v: &[u8]| String::from_utf8_lossy(kessel_expr::right_trim_char_pad(v)).into_owned();
+        while p + 4 <= b.len() {
+            let l = u32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as usize;
+            p += 4;
+            let rec = &b[p..p + l];
+            p += l;
+            let vals = kessel_codec::decode(&cot, rec).unwrap();
+            // combined: a.id(0), a.name(1), b.id(2), b.aid(3), b.title(4)
+            let name = match &vals[1] {
+                kessel_codec::Value::Null => None,
+                kessel_codec::Value::Blob(v) => Some(trim(v)),
+                _ => None,
+            };
+            let title = match &vals[4] {
+                kessel_codec::Value::Null => None,
+                kessel_codec::Value::Blob(v) => Some(trim(v)),
+                _ => None,
+            };
+            out.push((name, title));
+        }
+        out
+    }
+
+    fn jq_join_full(
+        sm: &mut StateMachine<MemVfs>, op: u64, jt: kessel_proto::JoinType,
+    ) -> Vec<(Option<String>, Option<String>)> {
+        match sm.apply(op, Op::Join {
+            left_type: 1, right_type: 2, left_field: 1, right_field: 2,
+            limit: 0, filter: vec![], join_type: jt, order_by: None,
+            limit_n: None, offset_n: None, group_aggregate: None,
+            extra_joins: vec![],
+        }) {
+            OpResult::Got(b) => jq_read_full(&b),
+            o => panic!("join: {o:?}"),
+        }
     }
 
     // Decode a KTR1 join result into the (a.name, b.title) string pairs.
@@ -12315,10 +12486,102 @@ mod tests {
     fn jq_bare_join_no_order_unchanged() {
         let mut sm = jq_setup();
         // No order_by / limit_n / offset_n: INNER join emits in scan order,
-        // identical to a pre-arc bare join (3 tolkien rows, no orphan).
+        // identical to a pre-arc bare join (3 tolkien rows, no orphan; the
+        // orphan BOOK never appears because INNER drives over authors).
         let r = jq_join(&mut sm, 20, kessel_proto::JoinType::Inner, vec![], None, None, None);
         assert_eq!(r.len(), 3);
         assert!(r.iter().all(|(n, _)| n == "tolkien"));
+    }
+
+    // ---- SP-PG-SQL-RIGHT-FULL-JOIN: matrix-completing outer joins ----
+    // Setup recap (jq_setup): authors tolkien(1), orphan(2 — no books);
+    // books lotr/hobbit/silmarillion (aid=1=tolkien) + homeless (aid=99 — no
+    // author). Combined column order is ALWAYS a.name, b.title.
+
+    #[test]
+    fn jq_inner_only_matched_pairs() {
+        let mut sm = jq_setup();
+        // INNER ⇒ only the 3 matched tolkien books; NO orphan author, NO
+        // homeless book.
+        let r = jq_join_full(&mut sm, 20, kessel_proto::JoinType::Inner);
+        assert_eq!(r, vec![
+            (Some("tolkien".into()), Some("lotr".into())),
+            (Some("tolkien".into()), Some("hobbit".into())),
+            (Some("tolkien".into()), Some("silmarillion".into())),
+        ]);
+    }
+
+    #[test]
+    fn jq_left_matched_plus_unmatched_left() {
+        let mut sm = jq_setup();
+        // LEFT ⇒ matched pairs + the orphan AUTHOR (b.title NULL). The homeless
+        // book does NOT appear (LEFT drives over authors).
+        let r = jq_join_full(&mut sm, 20, kessel_proto::JoinType::Left);
+        assert_eq!(r, vec![
+            (Some("tolkien".into()), Some("lotr".into())),
+            (Some("tolkien".into()), Some("hobbit".into())),
+            (Some("tolkien".into()), Some("silmarillion".into())),
+            (Some("orphan".into()), None),
+        ]);
+    }
+
+    #[test]
+    fn jq_right_matched_plus_unmatched_right_a_null() {
+        let mut sm = jq_setup();
+        // RIGHT ⇒ matched pairs + the homeless BOOK with a.name NULL. The orphan
+        // AUTHOR does NOT appear. Column ORDER stays a.name, b.title (the NULL is
+        // on the a side, the title is real).
+        let r = jq_join_full(&mut sm, 20, kessel_proto::JoinType::Right);
+        assert_eq!(r, vec![
+            (Some("tolkien".into()), Some("lotr".into())),
+            (Some("tolkien".into()), Some("hobbit".into())),
+            (Some("tolkien".into()), Some("silmarillion".into())),
+            (None, Some("homeless".into())),
+        ], "RIGHT: matched pairs then unmatched-right (a.name NULL), order a.*,b.*");
+        // Determinism: re-run on a fresh identical SM ⇒ byte-identical row set.
+        let mut sm2 = jq_setup();
+        let r2 = jq_join_full(&mut sm2, 20, kessel_proto::JoinType::Right);
+        assert_eq!(r, r2, "RIGHT join row order is a deterministic fn of inputs");
+    }
+
+    #[test]
+    fn jq_full_matched_plus_both_unmatched_no_dup() {
+        let mut sm = jq_setup();
+        // FULL ⇒ matched pairs ONCE + unmatched-left (orphan author, b NULL) +
+        // unmatched-right (homeless book, a NULL). No duplicate of the matched
+        // pairs. Deterministic order: matched/unmatched-left (drive over a),
+        // THEN unmatched-right (drive over b).
+        let r = jq_join_full(&mut sm, 20, kessel_proto::JoinType::Full);
+        assert_eq!(r, vec![
+            (Some("tolkien".into()), Some("lotr".into())),
+            (Some("tolkien".into()), Some("hobbit".into())),
+            (Some("tolkien".into()), Some("silmarillion".into())),
+            (Some("orphan".into()), None),
+            (None, Some("homeless".into())),
+        ], "FULL: matched + unmatched-left + unmatched-right, no dup");
+        // No matched pair appears twice.
+        let dups = r.iter().filter(|p| **p == (Some("tolkien".into()), Some("lotr".into()))).count();
+        assert_eq!(dups, 1, "matched pair must appear exactly once in FULL");
+        let mut sm2 = jq_setup();
+        let r2 = jq_join_full(&mut sm2, 20, kessel_proto::JoinType::Full);
+        assert_eq!(r, r2, "FULL join row order is a deterministic fn of inputs");
+    }
+
+    #[test]
+    fn jq_right_full_chain_rejected_v1() {
+        // RIGHT/FULL on the base join of a 3+ table CHAIN is a named follow-up.
+        let mut sm = jq_setup();
+        for jt in [kessel_proto::JoinType::Right, kessel_proto::JoinType::Full] {
+            let r = sm.apply(30, Op::Join {
+                left_type: 1, right_type: 2, left_field: 1, right_field: 2,
+                limit: 0, filter: vec![], join_type: jt,
+                order_by: None, limit_n: None, offset_n: None, group_aggregate: None,
+                extra_joins: vec![kessel_proto::JoinStep {
+                    right_type: 2, left_combined_field: 2, right_field: 1,
+                }],
+            });
+            assert!(matches!(r, OpResult::SchemaError(_)), "RIGHT/FULL chain must be rejected in V1");
+        }
     }
 
     // SP-PG-SQL-JOIN-AGG: run a GROUP BY + aggregate over the jq_setup join and

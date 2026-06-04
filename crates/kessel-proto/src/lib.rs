@@ -32,33 +32,42 @@ pub struct Pred {
     pub value: Vec<u8>,
 }
 
-/// SP-PG-SQL-OUTER-JOIN: the join flavour carried by `Op::Join`. `Inner` is the
-/// default (equi-join: only left rows with a matching right row are emitted) and
-/// is wire-identical to the pre-arc bare/filtered join. `Left` is a LEFT [OUTER]
-/// JOIN: EVERY left row is emitted; a left row with no matching right row is
-/// emitted once with all right (`b.*`) fields NULL. The wire byte is appended
-/// only when non-`Inner`, so an older frame (or any inner join) decodes to
-/// `Inner` — byte-identical to before.
+/// SP-PG-SQL-OUTER-JOIN / SP-PG-SQL-RIGHT-FULL-JOIN: the join flavour carried by
+/// `Op::Join`. `Inner` is the default (equi-join: only left rows with a matching
+/// right row are emitted) and is wire-identical to the pre-arc bare/filtered
+/// join. `Left` is a LEFT [OUTER] JOIN: EVERY left row is emitted; a left row
+/// with no matching right row is emitted once with all right (`b.*`) fields NULL.
+/// `Right` is a RIGHT [OUTER] JOIN: EVERY right row is emitted; an unmatched
+/// right row is emitted once with all left (`a.*`) fields NULL (column ORDER stays
+/// `a.* ++ b.*`). `Full` is a FULL [OUTER] JOIN: matched pairs once, plus
+/// unmatched-left (b NULL), plus unmatched-right (a NULL). The wire byte is
+/// appended only when non-`Inner`, so an older frame (or any inner join) decodes
+/// to `Inner` — byte-identical to before.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum JoinType {
     #[default]
     Inner,
     Left,
+    Right,
+    Full,
 }
 
 impl JoinType {
-    /// Stable wire tag (only emitted when non-`Inner`). RIGHT/FULL are named
-    /// follow-ups; reserve their tags here so a future arc stays compatible.
+    /// Stable wire tag (only emitted when non-`Inner`).
     pub fn wire_tag(self) -> u8 {
         match self {
             JoinType::Inner => 0,
             JoinType::Left => 1,
+            JoinType::Right => 2,
+            JoinType::Full => 3,
         }
     }
     pub fn from_wire_tag(t: u8) -> Option<Self> {
         match t {
             0 => Some(JoinType::Inner),
             1 => Some(JoinType::Left),
+            2 => Some(JoinType::Right),
+            3 => Some(JoinType::Full),
             _ => None,
         }
     }
@@ -2319,6 +2328,12 @@ mod tests {
             // SP-PG-SQL-OUTER-JOIN: LEFT join WITH filter — both trailing
             // fields present (filter then tag).
             Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9, filter: vec![1, 0, 0, 5, 42, 3], join_type: JoinType::Left, order_by: None, limit_n: None, offset_n: None, group_aggregate: None, extra_joins: vec![] },
+            // SP-PG-SQL-RIGHT-FULL-JOIN: RIGHT join, no filter — tag byte 2
+            // round-trips with an empty filter ahead of it.
+            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 9, filter: vec![], join_type: JoinType::Right, order_by: None, limit_n: None, offset_n: None, group_aggregate: None, extra_joins: vec![] },
+            // SP-PG-SQL-RIGHT-FULL-JOIN: FULL join WITH filter + pagination —
+            // tag byte 3 with every trailing region present.
+            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 0, filter: vec![1, 0, 0, 5, 42, 3], join_type: JoinType::Full, order_by: Some((6, true)), limit_n: Some(5), offset_n: Some(2), group_aggregate: None, extra_joins: vec![] },
             // SP-PG-SQL-JOIN-QUERY: ORDER BY only (asc) — page block with just
             // the sort field, limit/offset absent.
             Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 0, filter: vec![], join_type: JoinType::Inner, order_by: Some((3, false)), limit_n: None, offset_n: None, group_aggregate: None, extra_joins: vec![] },

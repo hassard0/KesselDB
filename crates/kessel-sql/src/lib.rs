@@ -682,11 +682,16 @@ pub fn select_star_table(sql: &str) -> Option<String> {
         Tok::Ident(t) => t.clone(),
         _ => return None,
     };
-    // A JOIN (`JOIN` or `LEFT [OUTER] JOIN`) produces composite rows
-    // (different wire shape) — bail out. (SP-PG-SQL-OUTER-JOIN: `LEFT` is the
-    // first token after the table for a LEFT join, so check it too.)
+    // A JOIN (`JOIN`, `LEFT/RIGHT/FULL [OUTER] JOIN`) produces composite rows
+    // (different wire shape) — bail out. (SP-PG-SQL-OUTER-JOIN / RIGHT-FULL:
+    // the join-flavour keyword is the first token after the table.)
     if let Some(Tok::Ident(k)) = it.next() {
-        if k.eq_ignore_ascii_case("JOIN") || k.eq_ignore_ascii_case("LEFT") {
+        if k.eq_ignore_ascii_case("JOIN")
+            || k.eq_ignore_ascii_case("LEFT")
+            || k.eq_ignore_ascii_case("RIGHT")
+            || k.eq_ignore_ascii_case("FULL")
+            || k.eq_ignore_ascii_case("INNER")
+        {
             return None;
         }
     }
@@ -760,8 +765,13 @@ pub fn select_columns(sql: &str) -> Option<(String, Vec<String>)> {
         _ => return None,
     };
     if let Some(Tok::Ident(k)) = it.next() {
-        if k.eq_ignore_ascii_case("JOIN") || k.eq_ignore_ascii_case("LEFT") {
-            return None; // composite rows (incl. LEFT JOIN) — different wire shape
+        if k.eq_ignore_ascii_case("JOIN")
+            || k.eq_ignore_ascii_case("LEFT")
+            || k.eq_ignore_ascii_case("RIGHT")
+            || k.eq_ignore_ascii_case("FULL")
+            || k.eq_ignore_ascii_case("INNER")
+        {
+            return None; // composite rows (incl. outer JOINs) — different wire shape
         }
     }
     Some((table, cols))
@@ -1199,9 +1209,10 @@ where
     Some(None)
 }
 
-/// SP-PG-SQL-JOIN-ALIAS — consume an optional `LEFT [OUTER]` / `INNER` then a
+/// SP-PG-SQL-JOIN-ALIAS / RIGHT-FULL — consume an optional join flavour
+/// (`INNER` / `LEFT [OUTER]` / `RIGHT [OUTER]` / `FULL [OUTER]`) then a
 /// mandatory `JOIN`, returning `Some(true)` if a JOIN was consumed, `Some(false)`
-/// if the next token is not a join, `None` on a malformed `LEFT …`/`INNER …`.
+/// if the next token is not a join, `None` on a malformed flavour keyword.
 fn consume_join_kw<'a, I>(it: &mut std::iter::Peekable<I>) -> Option<bool>
 where
     I: Iterator<Item = &'a Tok>,
@@ -1218,7 +1229,11 @@ where
                 _ => None,
             }
         }
-        Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("LEFT") => {
+        Some(Tok::Ident(k))
+            if k.eq_ignore_ascii_case("LEFT")
+                || k.eq_ignore_ascii_case("RIGHT")
+                || k.eq_ignore_ascii_case("FULL") =>
+        {
             it.next();
             if matches!(it.peek(), Some(Tok::Ident(o)) if o.eq_ignore_ascii_case("OUTER")) {
                 it.next();
@@ -4132,10 +4147,13 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
     let left_alias: Option<String> = {
         let save = p.i;
         let a = parse_optional_alias(p)?;
-        // A join only if `[LEFT [OUTER]|INNER] JOIN` follows the (optional) alias.
+        // A join only if `[LEFT/RIGHT/FULL [OUTER]|INNER] JOIN` follows the
+        // (optional) alias.
         let join_follows = matches!(p.peek(), Some(Tok::Ident(k))
             if k.eq_ignore_ascii_case("JOIN")
                 || k.eq_ignore_ascii_case("LEFT")
+                || k.eq_ignore_ascii_case("RIGHT")
+                || k.eq_ignore_ascii_case("FULL")
                 || k.eq_ignore_ascii_case("INNER"));
         if join_follows {
             a
@@ -4144,15 +4162,28 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
             None
         }
     };
-    // Equi-join: `SELECT * FROM a [LEFT [OUTER]] JOIN b ON a.x = b.y
-    // [WHERE …] [LIMIT n]`. A bare `JOIN` is INNER (only matching left rows);
-    // `LEFT [OUTER] JOIN` (SP-PG-SQL-OUTER-JOIN) emits EVERY left row, with
-    // NULL `b.*` fields for left rows that have no right match.
+    // Equi-join: `SELECT * FROM a [LEFT/RIGHT/FULL [OUTER]] JOIN b ON a.x = b.y
+    // [WHERE …] [LIMIT n]`. A bare `JOIN`/`INNER JOIN` is INNER (only matching
+    // pairs); `LEFT [OUTER] JOIN` emits EVERY left row (NULL `b.*` for no
+    // match); `RIGHT [OUTER] JOIN` emits EVERY right row (NULL `a.*` for no
+    // match); `FULL [OUTER] JOIN` emits matched pairs + unmatched-left (b NULL)
+    // + unmatched-right (a NULL). Column order stays `a.* ++ b.*` for all.
     let join_type = if p.kw("LEFT") {
-        // `OUTER` is an optional noise word in `LEFT OUTER JOIN`.
+        // `OUTER` is an optional noise word in `LEFT/RIGHT/FULL OUTER JOIN`.
         let _ = p.kw("OUTER");
         p.expect_kw("JOIN")?;
         Some(kessel_proto::JoinType::Left)
+    } else if p.kw("RIGHT") {
+        let _ = p.kw("OUTER");
+        p.expect_kw("JOIN")?;
+        Some(kessel_proto::JoinType::Right)
+    } else if p.kw("FULL") {
+        let _ = p.kw("OUTER");
+        p.expect_kw("JOIN")?;
+        Some(kessel_proto::JoinType::Full)
+    } else if p.kw("INNER") {
+        p.expect_kw("JOIN")?;
+        Some(kessel_proto::JoinType::Inner)
     } else if p.kw("JOIN") {
         Some(kessel_proto::JoinType::Inner)
     } else {
@@ -8544,6 +8575,35 @@ mod tests {
         // gateway routes them to render_join_result.
         assert!(join_projection("SELECT usr.uid, ord.amt FROM usr LEFT JOIN ord ON usr.uid = ord.owner").is_some());
         assert!(join_projection("SELECT * FROM usr LEFT OUTER JOIN ord ON usr.uid = ord.owner").is_some());
+    }
+
+    /// SP-PG-SQL-RIGHT-FULL-JOIN — `RIGHT [OUTER] JOIN` → `JoinType::Right`,
+    /// `FULL [OUTER] JOIN` → `JoinType::Full`, `INNER JOIN` → `Inner`. LEFT and
+    /// bare JOIN unchanged (regression covered above).
+    #[test]
+    fn right_full_join_parse_to_join_type() {
+        use kessel_proto::{JoinType, Op};
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE usr (uid U32 NOT NULL)");
+        run(&mut sm, 2, "CREATE TABLE ord (owner U32 NOT NULL, amt U32 NOT NULL)");
+        let cat = sm.catalog().clone();
+        let jt = |sql: &str| match compile(sql, &cat).unwrap() {
+            Op::Join { join_type, .. } => join_type,
+            o => panic!("expected Join, got {o:?}"),
+        };
+        assert_eq!(jt("SELECT * FROM usr RIGHT JOIN ord ON usr.uid = ord.owner"), JoinType::Right);
+        assert_eq!(jt("SELECT * FROM usr RIGHT OUTER JOIN ord ON usr.uid = ord.owner"), JoinType::Right);
+        assert_eq!(jt("SELECT * FROM usr FULL JOIN ord ON usr.uid = ord.owner"), JoinType::Full);
+        assert_eq!(jt("SELECT * FROM usr FULL OUTER JOIN ord ON usr.uid = ord.owner"), JoinType::Full);
+        assert_eq!(jt("SELECT * FROM usr INNER JOIN ord ON usr.uid = ord.owner"), JoinType::Inner);
+        // Aliases keep working on RIGHT/FULL.
+        assert_eq!(jt("SELECT * FROM usr u RIGHT JOIN ord o ON u.uid = o.owner"), JoinType::Right);
+        assert_eq!(jt("SELECT x.amt FROM usr u FULL JOIN ord x ON u.uid = x.owner"), JoinType::Full);
+        // Qualified projection RIGHT/FULL parses too.
+        assert_eq!(jt("SELECT usr.uid, ord.amt FROM usr RIGHT JOIN ord ON usr.uid = ord.owner"), JoinType::Right);
+        // join_projection() recognises RIGHT/FULL so the gateway renders them.
+        assert!(join_projection("SELECT * FROM usr RIGHT JOIN ord ON usr.uid = ord.owner").is_some());
+        assert!(join_projection("SELECT usr.uid, ord.amt FROM usr FULL OUTER JOIN ord ON usr.uid = ord.owner").is_some());
     }
 
     /// SP-PG-SQL-JOIN-QUERY — `JOIN … [WHERE] ORDER BY / LIMIT / OFFSET` parses

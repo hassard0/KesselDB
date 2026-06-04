@@ -26,6 +26,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning [Se
 
 ### Added
 
+- **RIGHT + FULL outer joins complete the join-type matrix
+  (SP-PG-SQL-RIGHT-FULL-JOIN, 2026-06-03)** — `RIGHT [OUTER] JOIN` and
+  `FULL [OUTER] JOIN` join the existing `[INNER] JOIN` and `LEFT [OUTER] JOIN`
+  on a binary (two-table) equi-join, so the full INNER / LEFT / RIGHT / FULL
+  matrix is available over the PG wire. RIGHT returns matched pairs + every
+  unmatched RIGHT row with the LEFT (`a.*`) columns NULL; FULL returns matched
+  pairs + unmatched-left (`b.*` NULL) + unmatched-right (`a.*` NULL) with no
+  duplicate of the matched pairs. The combined column ORDER stays `a.* ++ b.*`
+  for every flavour (the JOIN drive direction is swapped, not the output
+  order), and NULL-filled columns read back as SQL NULL (psycopg2 `None`).
+  `JoinType` gained `Right` (wire tag 2) and `Full` (tag 3) — **purely
+  additive**: the tag byte is emitted only when non-Inner, so every INNER join
+  stays byte-identical to a pre-arc frame and LEFT (tag 1) is unchanged; no new
+  struct field, determinism oracles byte-untouched. Row order is a deterministic
+  function of the inputs (matched/unmatched-left in left-key scan order, then
+  unmatched-right in right-table scan order). RIGHT/FULL compose with WHERE /
+  ORDER BY / LIMIT / OFFSET / GROUP BY / table aliases exactly like LEFT, and
+  the pg-gateway JOIN renderer needed **no change** (same KTR1 combined-schema
+  stream shape). RIGHT/FULL mixed into a 3+ table CHAIN is a named follow-up
+  (rejected with a clear error); INNER chains keep working. Live vulcan psql
+  smoke (`scripts/sppgsqlrightfulljoin-smoke.py`): **9/9** stages PASS.
 - **DDL FOREIGN KEY is now ENFORCED (SP-PG-DDL-FK-ENFORCE, 2026-06-03)** —
   a `FOREIGN KEY (col) REFERENCES tbl [(col)] [ON DELETE …]` declared in
   `CREATE TABLE` (table-level or the inline `col … REFERENCES tbl(col)` form)

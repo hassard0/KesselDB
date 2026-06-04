@@ -57,6 +57,21 @@ measurement and had drifted from the actual workspace count).
   unknown column → clean DDL error, no half-created type. The ORM
   relationships + realapp smokes pass UNDER enforcement (dependency-ordered
   seeds satisfy it). Deferred: composite FKs, `ON UPDATE` actions.
+- **RIGHT + FULL outer joins — full join-type matrix (SP-PG-SQL-RIGHT-FULL-JOIN,
+  2026-06-03).** `RIGHT [OUTER] JOIN` and `FULL [OUTER] JOIN` complete the
+  INNER / LEFT / RIGHT / FULL matrix on a binary join. RIGHT = matched pairs +
+  unmatched-right rows (`a.*` NULL); FULL = LEFT results + unmatched-right rows.
+  Combined column order stays `a.* ++ b.*` for every flavour (the JOIN drive
+  direction is swapped, NOT the output order); NULL-filled columns read back as
+  SQL NULL (Python `None`). `JoinType` gained `Right` (wire tag 2) / `Full`
+  (tag 3) — purely additive (Inner byte-identical, Left = tag 1 unchanged), no
+  new struct field, determinism oracles green. Row order is deterministic
+  (matched/unmatched-left in scan order, then unmatched-right in right-table
+  scan order). RIGHT/FULL compose with WHERE/ORDER BY/LIMIT/OFFSET/GROUP BY/
+  aliases like LEFT; pg-gateway `render_join_result` needed NO change (same
+  KTR1 stream shape). RIGHT/FULL on a 3+ table CHAIN is the named follow-up
+  (rejected cleanly; INNER chains keep working). Live vulcan psql smoke:
+  **9/9** stages PASS.
 - **Table aliases in JOIN queries (SP-PG-SQL-JOIN-ALIAS, 2026-06-03).**
   `SELECT u.name, p.title FROM users u JOIN posts p ON u.id = p.user_id` (and the
   `AS` form) now resolve — the SQLAlchemy/Django/Rails form. An alias→table map
@@ -160,7 +175,26 @@ join byte-identical to the pre-arc frame; unknown tag rejected at decode).
 vulcan smoke: `LEFT JOIN` over `{tolkien, orphan}` × `{lotr→tolkien}` returns
 **2 rows** incl. `(orphan, NULL)`. Determinism preserved (VSR seed-7 + 3-replica
 oracle PASS — unmatched rows emit in left-key scan order). Named follow-ups:
-SP-PG-SQL-RIGHT-JOIN, SP-PG-SQL-FULL-JOIN, SP-PG-SQL-MULTI-JOIN.
+~~SP-PG-SQL-RIGHT-JOIN, SP-PG-SQL-FULL-JOIN~~ (DONE — see below), SP-PG-SQL-MULTI-JOIN.
+SP-PG-SQL-RIGHT-FULL-JOIN (2026-06-03, DONE) — `RIGHT [OUTER] JOIN` +
+`FULL [OUTER] JOIN` complete the INNER/LEFT/RIGHT/FULL matrix on a binary join.
+`JoinType` gained `Right` (wire tag 2) / `Full` (tag 3) — purely additive (Inner
+byte-identical, Left = tag 1 unchanged), no new struct field. RIGHT = the LEFT
+logic with the drive SWAPPED: every right row appears, an unmatched right row
+emits with `a.*` NULL — but the OUTPUT column order stays `a.* ++ b.*` (drive
+direction swapped, NOT column order). FULL = LEFT results + the unmatched-right
+rows (no duplicate of the matched pairs). Deterministic row order:
+matched/unmatched-left in left-key scan order, then unmatched-right in
+right-table scan order (locked by KATs). kessel-sql parses `RIGHT/FULL [OUTER]
+JOIN` (+ `INNER JOIN`) in the base join and every join-shape detector; aliases
+keep working. pg-gateway `render_join_result` UNCHANGED (same KTR1 stream
+shape; NULL `a.*`/`b.*` render as PG `i32 -1` → Python `None`). RIGHT/FULL
+compose with WHERE/ORDER BY/LIMIT/OFFSET/GROUP BY like LEFT. RIGHT/FULL on a
+3+ table CHAIN is rejected (named follow-up; INNER chains keep working).
+vulcan psql smoke **9/9**: INNER (matched only), LEFT (+orphan author NULL),
+RIGHT (+homeless book, `a.name` None, order a.*,b.*), FULL (both + no dup).
+Determinism oracles PASS. Named follow-up: SP-PG-SQL-OUTER-CHAIN (RIGHT/FULL in
+a 3+ table chain).
 SP-PG-SQL-JOIN-QUERY (2026-06-03, +11 KATs, DONE) — `ORDER BY / LIMIT / OFFSET`
 over join results (`SELECT a.name, b.title FROM a JOIN b ON a.id=b.aid [WHERE …]
 ORDER BY b.created LIMIT 20 OFFSET 40`), the ubiquitous paginated-list-view shape.

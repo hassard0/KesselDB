@@ -146,6 +146,8 @@ kessel "SELECT owner, bal FROM acct"      # projections render too
 kessel "SELECT * FROM a JOIN b ON a.x = b.y"   # JOINs render too (self-describing)
 kessel "SELECT a.n, b.t FROM a JOIN b ON a.id = b.aid WHERE b.t = 'x'"  # filtered joins (JOIN + WHERE)
 kessel "SELECT a.n, b.t FROM a LEFT JOIN b ON a.id = b.aid"  # LEFT [OUTER] JOIN — unmatched a-rows keep b.* = NULL
+kessel "SELECT a.n, b.t FROM a RIGHT JOIN b ON a.id = b.aid" # RIGHT [OUTER] JOIN — unmatched b-rows keep a.* = NULL (column order stays a.*,b.*)
+kessel "SELECT a.n, b.t FROM a FULL JOIN b ON a.id = b.aid"  # FULL [OUTER] JOIN — matched + unmatched on BOTH sides, no dup (SP-PG-SQL-RIGHT-FULL-JOIN)
 kessel "SELECT a.n, b.t FROM a JOIN b ON a.id = b.aid ORDER BY b.t LIMIT 20 OFFSET 40"  # paginated join (ORDER BY + LIMIT/OFFSET)
 kessel "SELECT a.n, COUNT(b.id) FROM a JOIN b ON a.id = b.aid GROUP BY a.n"  # grouped aggregate over a join (count related per parent)
 kessel "SELECT users.name, posts.title, comments.body FROM users JOIN posts ON users.id = posts.user_id JOIN comments ON posts.id = comments.post_id"  # chained 3-way INNER join (SP-PG-SQL-MULTI-JOIN)
@@ -398,21 +400,37 @@ SELECT <g>, <AGG>( * | <c> ) [AS alias] [, <AGG>(…) …] FROM <t> [WHERE …] 
        [HAVING <AGG>(...) <cmp> <literal>]              --   filter groups by an aggregate (SP-PG-SQL-HAVING)
        [ORDER BY <agg|alias|pos|g> [ASC|DESC]] [LIMIT n] [OFFSET n]  --   engine sorts + windows groups (SP-PG-SQL-GROUP-SORT-LIMIT)
 SELECT * FROM <t> [WHERE ...] ORDER BY <col> [DESC] [OFFSET n] [LIMIT n]
-SELECT <proj> FROM <a> [[AS] <a1>] [LEFT [OUTER]] JOIN <b> [[AS] <a2>] ON <a1.x> = <a2.y>  -- equi‑join (table aliases OK, SP-PG-SQL-JOIN-ALIAS)
+SELECT <proj> FROM <a> [[AS] <a1>] [INNER|LEFT|RIGHT|FULL [OUTER]] JOIN <b> [[AS] <a2>] ON <a1.x> = <a2.y>  -- equi‑join (table aliases OK, SP-PG-SQL-JOIN-ALIAS)
        [JOIN <c> [[AS] <a3>] ON <a1|a2.x> = <a3.y> [JOIN <d> ON …]]  --   chained N-way INNER joins, 3+ tables (SP-PG-SQL-MULTI-JOIN)
-       [WHERE <pred over any joined table's cols>]       --   INNER (default) or LEFT; filtered (qualified cols, AND/OR/…)
+       [WHERE <pred over any joined table's cols>]       --   INNER (default) / LEFT / RIGHT / FULL; filtered (qualified cols, AND/OR/…)
        [ORDER BY <t.c> [ASC|DESC]] [LIMIT n] [OFFSET m]  --   paginate the (sorted) join
 SELECT <a.g>, <AGG>( * | <a.c | b.c> ) [AS alias] [, <AGG>(…) …]  -- grouped aggregate over a join
-       FROM <a> [LEFT [OUTER]] JOIN <b> ON <a.x> = <b.y> [WHERE …]
+       FROM <a> [INNER|LEFT|RIGHT|FULL [OUTER]] JOIN <b> ON <a.x> = <b.y> [WHERE …]
        GROUP BY <a.g>                                   --   COUNT/SUM/MIN/MAX/AVG per group; one row per group
        [HAVING <AGG>(...) <cmp> <literal>]              --   filter groups after aggregation (SP-PG-SQL-HAVING)
 ```
 
-A bare `JOIN` is an INNER equi‑join. `LEFT [OUTER] JOIN` returns EVERY left
-row; left rows with no matching right row come back with the right (`b.*`)
-columns NULL (the ORM pattern for an optional relationship, e.g. SQLAlchemy
-`isouter=True`). A `WHERE` predicate on a right (`b.*`) column of a LEFT join
-drops the unmatched rows — standard PostgreSQL semantics.
+A bare `JOIN` (or `INNER JOIN`) is an INNER equi‑join. The full outer-join
+matrix is supported on a binary (two-table) join (SP-PG-SQL-OUTER-JOIN +
+SP-PG-SQL-RIGHT-FULL-JOIN):
+
+| flavour | rows returned |
+|---------|---------------|
+| `[INNER] JOIN` | only matched pairs |
+| `LEFT [OUTER] JOIN`  | EVERY left row; unmatched left rows have `b.*` NULL |
+| `RIGHT [OUTER] JOIN` | EVERY right row; unmatched right rows have `a.*` NULL |
+| `FULL [OUTER] JOIN`  | matched pairs + unmatched-left (`b.*` NULL) + unmatched-right (`a.*` NULL), no duplicates |
+
+The combined column ORDER is ALWAYS `a.*` then `b.*`, regardless of flavour
+(you wrote `FROM a … JOIN b`, so `SELECT a.x, b.y` keeps resolving) — a RIGHT
+join NULLs the `a.*` side, not the column order. NULL-filled columns read back
+as SQL NULL (Python `None` in psycopg2). A `WHERE` predicate on the
+NULL-filled side of an outer join drops the unmatched rows — standard
+PostgreSQL semantics. This is the ORM pattern for optional relationships
+(SQLAlchemy `isouter=True` / `full=True`). RIGHT/FULL on a binary join compose
+with WHERE / ORDER BY / LIMIT / OFFSET / GROUP BY / aliases exactly like LEFT.
+RIGHT/FULL mixed into a 3+ table CHAIN is a named follow-up (rejected with a
+clear error; INNER chains keep working).
 
 **Chained N-way joins** (SP-PG-SQL-MULTI-JOIN) — 3+ tables joined in one query,
 the everyday "row + its parent + its grandparent" shape:
@@ -1702,8 +1720,9 @@ the engine's embedded combined schema, recovers the projection from the SQL
 arc a JOIN hit the "only renders `SELECT *`" error even though the engine
 joined. **V1 out-of-scope** (named follow-ups): ~~`SP-PG-DDL-FK-ENFORCE`~~
 (DONE 2026-06-03 — DDL FK is now ENFORCED end-to-end, bad child INSERT → 23503),
-`SP-PG-SQL-OUTER-JOIN` (LEFT/RIGHT/FULL — `Op::Join` is inner-only),
-`SP-PG-SQL-JOIN-ALIAS`,
+~~`SP-PG-SQL-OUTER-JOIN`~~ (LEFT — DONE) + ~~`SP-PG-SQL-RIGHT-FULL-JOIN`~~
+(RIGHT/FULL — DONE 2026-06-03, the full INNER/LEFT/RIGHT/FULL matrix on a
+binary join), `SP-PG-SQL-JOIN-ALIAS`,
 `SP-PG-SQL-JOIN-AGG`. (`SP-PG-SQL-JOIN-WHERE` — filtered joins — shipped, see
 below; `SP-PG-SQL-MULTI-JOIN` — chained 3+ table INNER joins — SHIPPED
 2026-06-03.) Transcript:

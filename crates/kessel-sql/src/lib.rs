@@ -957,6 +957,222 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// SP-PG-SQL-SUBQUERY-WHERE — the operator a WHERE-clause subquery hangs off:
+/// `col IN (subquery)`, `col NOT IN (subquery)`, or a scalar comparison
+/// `col <op> (subquery)` for one of `= <> != < <= > >=`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubqueryOp {
+    /// `col IN (SELECT …)`.
+    In,
+    /// `col NOT IN (SELECT …)`.
+    NotIn,
+    /// Scalar `col <op> (SELECT …)`. The string is the canonical operator
+    /// spelling as it appeared in the SQL (`=`, `<>`, `!=`, `<`, `<=`,
+    /// `>`, `>=`).
+    Cmp(String),
+}
+
+/// SP-PG-SQL-SUBQUERY-WHERE — a detected non-correlated subquery in a WHERE
+/// clause. Byte offsets are into the ORIGINAL `sql` string.
+///
+/// - `op` — the operator the subquery hangs off (IN / NOT IN / scalar cmp).
+/// - `inner_sql` — the inner SELECT text (the parenthesis CONTENTS, trimmed),
+///   ready to run through the engine SQL path verbatim.
+/// - `paren_open` / `paren_close` — byte offsets of the `(` and `)` that
+///   wrap the subquery, so the gateway can splice a literal list in place of
+///   `(SELECT …)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhereSubquery {
+    pub op: SubqueryOp,
+    pub inner_sql: String,
+    pub paren_open: usize,
+    pub paren_close: usize,
+}
+
+/// SP-PG-SQL-SUBQUERY-WHERE — detect the FIRST non-correlated subquery in
+/// the WHERE clause of `sql`: a `(` immediately following `IN`, `NOT IN`, or
+/// a comparison operator, whose parenthesised contents start with `SELECT`.
+///
+/// The scan is a raw byte walk that SKIPS single-quoted string literals and
+/// double-quoted identifiers (so a `(` inside `'…'` is never treated as a
+/// subquery start) and BALANCES nested parens (so the returned `paren_close`
+/// matches the subquery's own `(`). It mirrors the cast_stripper / keyword
+/// scanners' quote-skipping discipline.
+///
+/// Returns `None` when there is no `<IN|NOT IN|cmp> ( SELECT …)` shape — in
+/// which case the gateway dispatches the SQL through its normal path
+/// untouched, so every prior SELECT/WHERE path is byte-identical.
+///
+/// **V1 scope:** ONE subquery per WHERE. The first matching `(SELECT …)` is
+/// returned; a second subquery in the same WHERE is a named follow-up.
+/// Correlation is NOT analysed here — the gateway runs the inner SELECT
+/// non-correlated; a genuinely correlated inner that references an outer
+/// column will surface as an `unknown column` error from the engine (clean
+/// error, never silently-wrong rows).
+pub fn find_where_subquery(sql: &str) -> Option<WhereSubquery> {
+    let bytes = sql.as_bytes();
+    let n = bytes.len();
+    let mut i = 0usize;
+    while i < n {
+        let c = bytes[i];
+        // Skip single-quoted string literals (PG `''` escape).
+        if c == b'\'' {
+            i += 1;
+            while i < n {
+                if bytes[i] == b'\'' {
+                    if i + 1 < n && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // Skip double-quoted identifiers.
+        if c == b'"' {
+            i += 1;
+            while i < n && bytes[i] != b'"' {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        // `(` — does an operator immediately precede it (skipping whitespace)?
+        if c == b'(' {
+            // Look back over whitespace to the operator token.
+            let mut j = i;
+            while j > 0 && bytes[j - 1].is_ascii_whitespace() {
+                j -= 1;
+            }
+            // Identify the operator ending at byte `j` (exclusive).
+            let op = detect_subquery_op(bytes, j);
+            if let Some(op) = op {
+                // Confirm the parenthesised contents start with `SELECT`.
+                let close = match balanced_close_paren(bytes, i) {
+                    Some(c) => c,
+                    None => {
+                        i += 1;
+                        continue;
+                    }
+                };
+                let inner = sql[i + 1..close].trim();
+                if inner.len() >= 6 && inner[..6].eq_ignore_ascii_case("SELECT") {
+                    return Some(WhereSubquery {
+                        op,
+                        inner_sql: inner.to_string(),
+                        paren_open: i,
+                        paren_close: close,
+                    });
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// SP-PG-SQL-SUBQUERY-WHERE — given the byte index `end` just past an
+/// operator token (whitespace before the subquery's `(` already skipped),
+/// classify it as IN / NOT IN / a comparison op, or `None` if the byte(s)
+/// before `end` are not a subquery-eligible operator.
+fn detect_subquery_op(bytes: &[u8], end: usize) -> Option<SubqueryOp> {
+    // Comparison operators (longest first): `<=` `>=` `<>` `!=` then `=` `<` `>`.
+    let two = |a: u8, b: u8| end >= 2 && bytes[end - 2] == a && bytes[end - 1] == b;
+    if two(b'<', b'=') {
+        return Some(SubqueryOp::Cmp("<=".into()));
+    }
+    if two(b'>', b'=') {
+        return Some(SubqueryOp::Cmp(">=".into()));
+    }
+    if two(b'<', b'>') {
+        return Some(SubqueryOp::Cmp("<>".into()));
+    }
+    if two(b'!', b'=') {
+        return Some(SubqueryOp::Cmp("!=".into()));
+    }
+    if end >= 1 {
+        match bytes[end - 1] {
+            b'=' => return Some(SubqueryOp::Cmp("=".into())),
+            // A `<`/`>` not part of `<=`/`>=`/`<>` handled above.
+            b'<' => return Some(SubqueryOp::Cmp("<".into())),
+            b'>' => return Some(SubqueryOp::Cmp(">".into())),
+            _ => {}
+        }
+    }
+    // Keyword operators: `IN` / `NOT IN`. The token ending at `end` must be
+    // the bare word `IN` (boundary on both sides). Then look further back for
+    // a preceding `NOT`.
+    if end >= 2
+        && bytes[end - 2].eq_ignore_ascii_case(&b'I')
+        && bytes[end - 1].eq_ignore_ascii_case(&b'N')
+        && (end == 2 || !is_ident_byte(bytes[end - 3]))
+    {
+        // Is there a `NOT` before the `IN` (whitespace-separated)?
+        let mut k = end - 2;
+        while k > 0 && bytes[k - 1].is_ascii_whitespace() {
+            k -= 1;
+        }
+        if k >= 3
+            && bytes[k - 3].eq_ignore_ascii_case(&b'N')
+            && bytes[k - 2].eq_ignore_ascii_case(&b'O')
+            && bytes[k - 1].eq_ignore_ascii_case(&b'T')
+            && (k == 3 || !is_ident_byte(bytes[k - 4]))
+        {
+            return Some(SubqueryOp::NotIn);
+        }
+        return Some(SubqueryOp::In);
+    }
+    None
+}
+
+/// SP-PG-SQL-SUBQUERY-WHERE — given `open` is the index of a `(`, return the
+/// index of its matching `)`, balancing nested parens and skipping quoted
+/// regions. Returns `None` if unbalanced.
+fn balanced_close_paren(bytes: &[u8], open: usize) -> Option<usize> {
+    let n = bytes.len();
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < n {
+        let c = bytes[i];
+        if c == b'\'' {
+            i += 1;
+            while i < n {
+                if bytes[i] == b'\'' {
+                    if i + 1 < n && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'"' {
+            i += 1;
+            while i < n && bytes[i] != b'"' {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'(' {
+            depth += 1;
+        } else if c == b')' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 /// SP-PG-ORM-RELATIONSHIPS — a JOIN projection item: the (optional) table
 /// qualifier + the column name, preserved separately so the gateway can map
 /// it onto the JOIN's combined schema (whose columns are named
@@ -11282,5 +11498,80 @@ mod tests {
         let off = find_keyword_boundary(s, "FROM").unwrap();
         assert_eq!(&s[off..off + 4], "FROM");
         assert!(off > 9, "must skip the FROM inside the quoted span");
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // SP-PG-SQL-SUBQUERY-WHERE — find_where_subquery detection KATs.
+    // ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn subquery_detect_in() {
+        let s = "SELECT name FROM users WHERE id IN (SELECT user_id FROM orders WHERE total > 100)";
+        let sq = find_where_subquery(s).expect("IN subquery detected");
+        assert_eq!(sq.op, SubqueryOp::In);
+        assert_eq!(sq.inner_sql, "SELECT user_id FROM orders WHERE total > 100");
+        assert_eq!(&s[sq.paren_open..=sq.paren_close], "(SELECT user_id FROM orders WHERE total > 100)");
+    }
+
+    #[test]
+    fn subquery_detect_not_in() {
+        let s = "SELECT name FROM users WHERE id NOT IN (SELECT user_id FROM banned)";
+        let sq = find_where_subquery(s).expect("NOT IN subquery detected");
+        assert_eq!(sq.op, SubqueryOp::NotIn);
+        assert_eq!(sq.inner_sql, "SELECT user_id FROM banned");
+    }
+
+    #[test]
+    fn subquery_detect_scalar_eq() {
+        let s = "SELECT name FROM products WHERE price = (SELECT MAX(price) FROM products)";
+        let sq = find_where_subquery(s).expect("scalar subquery detected");
+        assert_eq!(sq.op, SubqueryOp::Cmp("=".into()));
+        assert_eq!(sq.inner_sql, "SELECT MAX(price) FROM products");
+    }
+
+    #[test]
+    fn subquery_detect_scalar_all_ops() {
+        for (op, txt) in [
+            ("<>", "<>"), ("!=", "!="), ("<", "<"), ("<=", "<="),
+            (">", ">"), (">=", ">="),
+        ] {
+            let s = format!("SELECT a FROM t WHERE x {op} (SELECT MIN(y) FROM u)");
+            let sq = find_where_subquery(&s).unwrap_or_else(|| panic!("op {op}"));
+            assert_eq!(sq.op, SubqueryOp::Cmp(txt.into()), "op {op}");
+        }
+    }
+
+    #[test]
+    fn subquery_detect_nested_parens_balanced() {
+        // Inner subquery itself has a parenthesised expression — the close
+        // paren must balance, not stop at the first `)`.
+        let s = "SELECT a FROM t WHERE id IN (SELECT id FROM u WHERE (x > 1) AND (y < 2))";
+        let sq = find_where_subquery(s).expect("balanced nested parens");
+        assert_eq!(sq.inner_sql, "SELECT id FROM u WHERE (x > 1) AND (y < 2)");
+        assert_eq!(&s[sq.paren_close..=sq.paren_close], ")");
+    }
+
+    #[test]
+    fn subquery_detect_skips_string_literal_paren() {
+        // A `(SELECT` inside a string literal is NOT a subquery.
+        let s = "SELECT a FROM t WHERE note = '(SELECT hi)'";
+        assert_eq!(find_where_subquery(s), None);
+    }
+
+    #[test]
+    fn subquery_detect_plain_in_list_is_none() {
+        // A literal IN-list (no SELECT) is not a subquery.
+        let s = "SELECT a FROM t WHERE id IN (1, 2, 3)";
+        assert_eq!(find_where_subquery(s), None);
+        // Plain comparison too.
+        assert_eq!(find_where_subquery("SELECT a FROM t WHERE x = 5"), None);
+    }
+
+    #[test]
+    fn subquery_detect_in_not_matched_inside_ident() {
+        // A column named `min` ending in nothing IN-like; `IN` must be a whole
+        // token. `coin` ends in `in` but is an identifier → no false match.
+        let s = "SELECT a FROM t WHERE coin (SELECT 1)";
+        assert_eq!(find_where_subquery(s), None);
     }
 }

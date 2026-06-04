@@ -176,6 +176,18 @@ pub fn dispatch_query_with_params<E: EngineApply + ?Sized>(
         return bytes;
     }
     let sql_trimmed = sql.trim().trim_end_matches(';').trim();
+    // SP-PG-SQL-SUBQUERY-WHERE — handle a non-correlated WHERE subquery on the
+    // typed-param path too. The inner SELECT carries no outer `$N` params, so
+    // it runs through the param-less `dispatch_query`; the rewritten OUTER (
+    // which still references `$1..$N`) re-dispatches through THIS typed path so
+    // bound params keep their typed-value security closure.
+    match crate::subquery::rewrite_where_subquery(sql_trimmed, engine, dispatch_query) {
+        Ok(Some(rewritten)) => {
+            return dispatch_query_with_params(&rewritten, params, engine)
+        }
+        Ok(None) => {}
+        Err(error_bytes) => return error_bytes,
+    }
     let select_table = kessel_sql::select_star_table(sql_trimmed);
     // SP-PG-EXTQ-PARSED-DEFAULT T2 — engine call via the typed-param
     // path. NO SQL text rewrite; the bound values reach the engine
@@ -347,6 +359,19 @@ pub fn dispatch_query<E: EngineApply + ?Sized>(sql: &str, engine: &E) -> Vec<u8>
     // Strip a trailing `;` so the leading-keyword heuristic + the
     // SELECT * FROM table lookup don't trip over the terminator.
     let sql_trimmed = sql.trim().trim_end_matches(';').trim();
+
+    // SP-PG-SQL-SUBQUERY-WHERE — a non-correlated WHERE subquery
+    // (`col IN (SELECT …)`, `col NOT IN (SELECT …)`, scalar
+    // `col <op> (SELECT …)`). Two-phase: run the inner SELECT through THIS
+    // dispatcher, splice its single-column values into the outer query as a
+    // literal list / scalar, then re-dispatch the rewritten outer through the
+    // normal path. `rewrite_where_subquery` returns `Ok(None)` for any SQL
+    // with no WHERE subquery, so every prior dispatch path is byte-untouched.
+    match crate::subquery::rewrite_where_subquery(sql_trimmed, engine, dispatch_query) {
+        Ok(Some(rewritten)) => return dispatch_query(&rewritten, engine),
+        Ok(None) => {}
+        Err(error_bytes) => return error_bytes,
+    }
 
     // Is this a `SELECT * FROM <table>` that we can render with full
     // RowDescription? `kessel-sql::select_star_table` is the lexer-

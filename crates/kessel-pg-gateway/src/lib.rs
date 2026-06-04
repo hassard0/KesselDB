@@ -75,6 +75,7 @@ pub mod query;
 pub mod response;
 pub mod server;
 pub mod startup;
+pub mod subquery;
 pub mod types;
 
 pub use engine::{

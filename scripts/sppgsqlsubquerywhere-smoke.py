@@ -136,9 +136,9 @@ def run_stages():
     def _ddl():
         cur.execute("CREATE TABLE users (id BIGINT, name CHAR(16))")
         cur.execute("CREATE TABLE orders (id BIGINT, user_id BIGINT, total BIGINT)")
-        cur.execute("CREATE TABLE banned (user_id BIGINT)")
+        cur.execute("CREATE TABLE banned (id BIGINT, user_id BIGINT)")
         cur.execute("CREATE TABLE products (id BIGINT, name CHAR(16), price BIGINT, category CHAR(16))")
-        cur.execute("CREATE TABLE featured (cat CHAR(16))")
+        cur.execute("CREATE TABLE featured (id BIGINT, cat CHAR(16))")
         return "5 tables created"
 
     if not stage("ddl", _ddl) or not results[-1][1]:
@@ -150,14 +150,14 @@ def run_stages():
             cur.execute("INSERT INTO users (id, name) VALUES (%s, %s)", (uid, name))
         for oid, uid, total in [(10, 1, 150), (11, 2, 50), (12, 3, 200)]:
             cur.execute("INSERT INTO orders (id, user_id, total) VALUES (%s, %s, %s)", (oid, uid, total))
-        cur.execute("INSERT INTO banned (user_id) VALUES (%s)", (2,))
+        cur.execute("INSERT INTO banned (id, user_id) VALUES (%s, %s)", (1, 2))
         for pid, name, price, cat in [
             (1, "widget", 100, "tools"), (2, "gadget", 250, "tools"),
             (3, "gizmo", 250, "toys"), (4, "sprocket", 80, "tools"),
         ]:
             cur.execute("INSERT INTO products (id, name, price, category) VALUES (%s, %s, %s, %s)",
                         (pid, name, price, cat))
-        cur.execute("INSERT INTO featured (cat) VALUES (%s)", ("tools",))
+        cur.execute("INSERT INTO featured (id, cat) VALUES (%s, %s)", (1, "tools"))
         return "4 users, 3 orders, 1 banned, 4 products, 1 featured"
 
     stage("seed", _seed)

@@ -30,7 +30,8 @@ Stages:
   5. distinct_pair    — SELECT DISTINCT region, category → 4 unique pairs
   6. distinct_null    — NULL region appears EXACTLY once under DISTINCT
   7. distinct_star    — SELECT DISTINCT * → unique whole rows (7 here, all uniq)
-  8. distinct_dup_star— a real whole-row dup collapses under DISTINCT *
+  8. distinct_collapse— SELECT DISTINCT category collapses 7 rows → 2 values
+                        (non-distinct still returns all 7) — the real dedup-of-dups
 
 HEADLINE: `SELECT DISTINCT region FROM events` returns the 3 UNIQUE regions
 (count 3 < 7 total) while the non-distinct `SELECT region FROM events` still
@@ -241,23 +242,25 @@ def run_stages():
 
     stage("distinct_star", _distinct_star)
 
-    def _distinct_dup_star():
-        # Insert a TRUE whole-row duplicate of an existing row (same id+region+
-        # category) so DISTINCT * actually collapses it. Non-distinct sees 8;
-        # DISTINCT * sees 7.
-        cur.execute(
-            "INSERT INTO events (id, region, category) VALUES (%s, %s, %s)",
-            (1, "us", "click"),  # exact dup of row 1
+    def _distinct_collapse():
+        # A single-column DISTINCT collapses MANY duplicate values: the
+        # category column has 3 'click' and 4 'view' rows across the 7 rows;
+        # DISTINCT category collapses them to exactly 2 ('click', 'view'),
+        # while the non-distinct projection still returns all 7. This is the
+        # real "dedup collapses dups" demonstration (the `id` BIGINT is a
+        # unique primary key, so whole-row duplicates can't exist — DISTINCT *
+        # over distinct ids is always the full set, covered above).
+        nondistinct = fetch("SELECT category FROM events")
+        distinct_cat = fetch("SELECT DISTINCT category FROM events")
+        cats = sorted(norm(r[0]) for r in distinct_cat)
+        assert len(nondistinct) == 7, f"non-distinct category → {len(nondistinct)} (expected 7)"
+        assert len(distinct_cat) == 2, (
+            f"DISTINCT category should collapse to 2, got {len(distinct_cat)}: {cats}"
         )
-        total = fetch("SELECT * FROM events")
-        distinct_rows = fetch("SELECT DISTINCT * FROM events")
-        assert len(total) == 8, f"non-distinct now {len(total)} (expected 8)"
-        assert len(distinct_rows) == 7, (
-            f"DISTINCT * should collapse the dup to 7, got {len(distinct_rows)}"
-        )
-        return f"non-distinct={len(total)} distinct*={len(distinct_rows)} (dup collapsed)"
+        assert cats == ["click", "view"], cats
+        return f"non-distinct={len(nondistinct)} distinct={len(distinct_cat)} {cats} (dups collapsed)"
 
-    stage("distinct_dup_star", _distinct_dup_star)
+    stage("distinct_collapse", _distinct_collapse)
 
     cur.close()
     conn.close()

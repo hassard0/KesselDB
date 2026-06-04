@@ -390,14 +390,16 @@ pub fn route_op(op: &Op, k: usize) -> ShardRoute {
                 field_kind: FieldKind::U8,
             })
         }
-        Op::GroupAggregate { kind, .. } => {
+        Op::GroupAggregate { kind, extra_group_fields, .. } => {
             ShardRoute::Scatter(ScatterKind::GroupAggregateMerge {
                 kind: *kind,
+                n_extra: extra_group_fields.len() as u16,
             })
         }
-        Op::GroupAggregateMulti { aggregates, .. } => {
+        Op::GroupAggregateMulti { aggregates, extra_group_fields, .. } => {
             ShardRoute::Scatter(ScatterKind::GroupAggregateMultiMerge {
                 kinds: aggregates.iter().map(|(k, _)| *k).collect(),
+                n_extra: extra_group_fields.len() as u16,
             })
         }
         // Query / QueryExpr: K=1 baseline sort+dedups oid output;
@@ -1475,6 +1477,7 @@ mod tests {
                     kind: 0,
                     agg_field: 2,
                     range_preds: vec![],
+                    extra_group_fields: vec![],
                     having: None,
                     sort: None,
                 },
@@ -1487,6 +1490,7 @@ mod tests {
                     group_field: 1,
                     aggregates: vec![(0, 1), (1, 2)],
                     range_preds: vec![],
+                    extra_group_fields: vec![],
                     having: None,
                     sort: None,
                 },
@@ -2132,6 +2136,7 @@ mod tests {
             kind: 1,        // SUM
             agg_field: 1,   // v
             range_preds: vec![],
+            extra_group_fields: vec![],
             having: None,
             sort: None,
         };
@@ -2150,6 +2155,7 @@ mod tests {
             group_field: 2,
             aggregates: vec![(0u8, 1u16), (1u8, 1u16)], // COUNT and SUM on v
             range_preds: vec![],
+            extra_group_fields: vec![],
             having: None,
             sort: None,
         };
@@ -2355,6 +2361,7 @@ mod tests {
                 kind,
                 agg_field: 1,
                 range_preds: vec![],
+                extra_group_fields: vec![],
                 having: None,
                 sort: None,
             };

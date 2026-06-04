@@ -965,13 +965,47 @@ fn render_join_group_aggregate<E: EngineApply + ?Sized>(
         }
     };
     let gwidth = gkind.width() as usize;
+    // SP-PG-SQL-GROUP-MULTI-COL: resolve each EXTRA group column's kind via its
+    // qualifier's table schema (`(kind, width)` for decode + the column OID).
+    let mut extra_kinds: Vec<(kessel_catalog::FieldKind, usize)> =
+        Vec::with_capacity(proj.extra_group_columns.len());
+    for (q, c) in &proj.extra_group_columns {
+        let cols = match engine.describe_table(q) {
+            Some(cs) => cs,
+            None => {
+                return error_response_then_rfq(
+                    SEVERITY_ERROR,
+                    "42P01",
+                    &format!("unknown table \"{q}\""),
+                )
+            }
+        };
+        match cols.iter().find(|col| col.name.eq_ignore_ascii_case(c)) {
+            Some(col) => extra_kinds.push((col.kind, col.kind.width() as usize)),
+            None => {
+                return error_response_then_rfq(
+                    SEVERITY_ERROR,
+                    "42703",
+                    &format!("column \"{c}\" does not exist in \"{q}\""),
+                )
+            }
+        }
+    }
 
-    // RowDescription: group column (its OID) + one int8 column per aggregate.
-    let mut fields: Vec<FieldMeta> = Vec::with_capacity(1 + proj.aggregates.len());
+    // RowDescription: each group column (its OID) + one int8 col per aggregate.
+    let n_group = 1 + proj.extra_group_columns.len();
+    let mut fields: Vec<FieldMeta> =
+        Vec::with_capacity(n_group + proj.aggregates.len());
     fields.push(FieldMeta {
         name: format!("{}.{}", proj.group_qualifier, proj.group_column),
         type_oid: field_kind_to_oid(gkind),
     });
+    for (i, (q, c)) in proj.extra_group_columns.iter().enumerate() {
+        fields.push(FieldMeta {
+            name: format!("{q}.{c}"),
+            type_oid: field_kind_to_oid(extra_kinds[i].0),
+        });
+    }
     for a in &proj.aggregates {
         fields.push(FieldMeta {
             name: a.out_name.clone(),
@@ -1003,14 +1037,42 @@ fn render_join_group_aggregate<E: EngineApply + ?Sized>(
             }
         };
         p += klen;
-        // Decode the group key (raw fixed-width bytes) → Value → text.
+        // Decode the PRIMARY group key (raw fixed-width bytes) → Value → text.
         let mut raw = key.to_vec();
         raw.resize(gwidth, 0);
         let gval = value_from_raw(gkind, &raw);
         let gcell = render_pg_text(&gval, gkind);
 
-        let mut cells: Vec<Option<Vec<u8>>> = Vec::with_capacity(1 + n_aggs);
+        let mut cells: Vec<Option<Vec<u8>>> = Vec::with_capacity(n_group + n_aggs);
         cells.push(Some(gcell));
+        // SP-PG-SQL-GROUP-MULTI-COL: each EXTRA group column value follows the
+        // primary key as `[u32 len][value]`, decoded by its own kind.
+        for (ekind, ewidth) in &extra_kinds {
+            if p + 4 > row_bytes.len() {
+                return error_response_then_rfq(
+                    SEVERITY_ERROR,
+                    "XX000",
+                    "join-agg: truncated extra-col len",
+                );
+            }
+            let elen = u32::from_le_bytes(row_bytes[p..p + 4].try_into().unwrap()) as usize;
+            p += 4;
+            let ekey = match row_bytes.get(p..p + elen) {
+                Some(k) => k,
+                None => {
+                    return error_response_then_rfq(
+                        SEVERITY_ERROR,
+                        "XX000",
+                        "join-agg: truncated extra-col value",
+                    )
+                }
+            };
+            p += elen;
+            let mut eraw = ekey.to_vec();
+            eraw.resize(*ewidth, 0);
+            let eval = value_from_raw(*ekind, &eraw);
+            cells.push(Some(render_pg_text(&eval, *ekind)));
+        }
         for _ in 0..n_aggs {
             let v = match row_bytes.get(p..p + 16) {
                 Some(b) => i128::from_le_bytes(b.try_into().unwrap()),
@@ -1068,12 +1130,18 @@ fn render_plain_group_aggregate<E: EngineApply + ?Sized>(
             )
         }
     };
-    // Group key FieldKind (used to decode + type the key column).
-    let gkind = match tcols
-        .iter()
-        .find(|c| c.name.eq_ignore_ascii_case(&proj.group_column))
-    {
-        Some(c) => c.kind,
+    // Group key FieldKind (used to decode + type the key column). SP-PG-SQL-
+    // GROUP-MULTI-COL: resolve the PRIMARY group column then each EXTRA group
+    // column to its `(kind, width)` so the composite key stream can be decoded
+    // and each rendered as its own typed column.
+    let resolve_gcol = |name: &str| -> Option<kessel_catalog::FieldKind> {
+        tcols
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
+            .map(|c| c.kind)
+    };
+    let gkind = match resolve_gcol(&proj.group_column) {
+        Some(k) => k,
         None => {
             return error_response_then_rfq(
                 SEVERITY_ERROR,
@@ -1086,13 +1154,36 @@ fn render_plain_group_aggregate<E: EngineApply + ?Sized>(
         }
     };
     let gwidth = gkind.width() as usize;
+    // (kind, width) for each EXTRA group column, in order.
+    let mut extra_kinds: Vec<(kessel_catalog::FieldKind, usize)> =
+        Vec::with_capacity(proj.extra_group_columns.len());
+    for ec in &proj.extra_group_columns {
+        match resolve_gcol(ec) {
+            Some(k) => extra_kinds.push((k, k.width() as usize)),
+            None => {
+                return error_response_then_rfq(
+                    SEVERITY_ERROR,
+                    "42703",
+                    &format!("column \"{}\" does not exist in \"{}\"", ec, proj.table),
+                )
+            }
+        }
+    }
 
-    // RowDescription: group column (its OID) + one OID-typed column per agg.
-    let mut fields: Vec<FieldMeta> = Vec::with_capacity(1 + proj.aggregates.len());
+    // RowDescription: each group column (its OID) + one OID-typed col per agg.
+    let n_group = 1 + proj.extra_group_columns.len();
+    let mut fields: Vec<FieldMeta> =
+        Vec::with_capacity(n_group + proj.aggregates.len());
     fields.push(FieldMeta {
         name: proj.group_column.clone(),
         type_oid: field_kind_to_oid(gkind),
     });
+    for (i, ec) in proj.extra_group_columns.iter().enumerate() {
+        fields.push(FieldMeta {
+            name: ec.clone(),
+            type_oid: field_kind_to_oid(extra_kinds[i].0),
+        });
+    }
     for a in &proj.aggregates {
         // COUNT / SUM → int8 (integral). AVG → numeric. MIN / MAX → the
         // source column's OID (inherits the argument's type). COUNT(*) and
@@ -1139,14 +1230,42 @@ fn render_plain_group_aggregate<E: EngineApply + ?Sized>(
             }
         };
         p += klen;
-        // Decode the group key (raw fixed-width bytes) → Value → text.
+        // Decode the PRIMARY group key (raw fixed-width bytes) → Value → text.
         let mut raw = key.to_vec();
         raw.resize(gwidth, 0);
         let gval = value_from_raw(gkind, &raw);
         let gcell = render_pg_text(&gval, gkind);
 
-        let mut cells: Vec<Option<Vec<u8>>> = Vec::with_capacity(1 + n_aggs);
+        let mut cells: Vec<Option<Vec<u8>>> = Vec::with_capacity(n_group + n_aggs);
         cells.push(Some(gcell));
+        // SP-PG-SQL-GROUP-MULTI-COL: each EXTRA group column value follows the
+        // primary key as `[u32 len][value]`, decoded by its own kind.
+        for (ekind, ewidth) in &extra_kinds {
+            if p + 4 > row_bytes.len() {
+                return error_response_then_rfq(
+                    SEVERITY_ERROR,
+                    "XX000",
+                    "group-agg: truncated extra-col len",
+                );
+            }
+            let elen = u32::from_le_bytes(row_bytes[p..p + 4].try_into().unwrap()) as usize;
+            p += 4;
+            let ekey = match row_bytes.get(p..p + elen) {
+                Some(k) => k,
+                None => {
+                    return error_response_then_rfq(
+                        SEVERITY_ERROR,
+                        "XX000",
+                        "group-agg: truncated extra-col value",
+                    )
+                }
+            };
+            p += elen;
+            let mut eraw = ekey.to_vec();
+            eraw.resize(*ewidth, 0);
+            let eval = value_from_raw(*ekind, &eraw);
+            cells.push(Some(render_pg_text(&eval, *ekind)));
+        }
         for _ in 0..n_aggs {
             let v = match row_bytes.get(p..p + 16) {
                 Some(b) => i128::from_le_bytes(b.try_into().unwrap()),

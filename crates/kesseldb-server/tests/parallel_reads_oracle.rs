@@ -430,6 +430,7 @@ fn gen_random_read_op(rng: &mut Rng) -> (&'static str, Op) {
                 kind,
                 agg_field: 2,
                 range_preds: vec![],
+                extra_group_fields: vec![],
                 having: None,
                 sort: None,
             })
@@ -710,6 +711,7 @@ fn t3_smoke_group_aggregate() {
         kind: r.below(2) as u8,
         agg_field: 2,
         range_preds: vec![],
+        extra_group_fields: vec![],
         having: None,
         sort: None,
     });
@@ -986,6 +988,7 @@ fn txn_ro_smoke_all_txn_permitted_variants_one_txn_returns_ok() {
             kind: 0,
             agg_field: 2,
             range_preds: vec![],
+            extra_group_fields: vec![],
             having: None,
             sort: None,
         },

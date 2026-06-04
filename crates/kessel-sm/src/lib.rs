@@ -1524,7 +1524,17 @@ impl<V: Vfs> StateMachine<V> {
         // LEFT-join NULL b-column is a first-class `Value::Null` (COUNT(col) /
         // SUM / MIN / MAX / AVG skip it, COUNT(*) still counts the row).
         // `agg_spec[i]` = (kind, Option<combined idx>); None idx ⇒ COUNT(*).
-        let ga_spec: Option<(usize, kessel_catalog::FieldKind, usize, Vec<(u8, Option<usize>)>)> =
+        // SP-PG-SQL-GROUP-MULTI-COL: the join-group spec also carries the EXTRA
+        // group columns' `(combined idx, kind, width)` so the per-group key is
+        // the COMPOSITE tuple. EMPTY ⇒ single-column (byte-identical stream).
+        #[allow(clippy::type_complexity)]
+        let ga_spec: Option<(
+            usize,
+            kessel_catalog::FieldKind,
+            usize,
+            Vec<(usize, kessel_catalog::FieldKind, usize)>,
+            Vec<(u8, Option<usize>)>,
+        )> =
             match group_aggregate {
                 Some(ga) => {
                     let gidx = match combined.iter().position(|f| f.field_id == ga.group_field) {
@@ -1538,6 +1548,19 @@ impl<V: Vfs> StateMachine<V> {
                     };
                     let gkind = combined[gidx].kind;
                     let gwidth = combined[gidx].kind.width() as usize;
+                    // Resolve each EXTRA group column into the combined schema.
+                    let mut espec: Vec<(usize, kessel_catalog::FieldKind, usize)> =
+                        Vec::with_capacity(ga.extra_group_fields.len());
+                    for efid in &ga.extra_group_fields {
+                        match combined.iter().position(|f| f.field_id == *efid) {
+                            Some(i) => espec.push((i, combined[i].kind, combined[i].kind.width() as usize)),
+                            None => {
+                                return OpResult::SchemaError(format!(
+                                    "no join group field {efid}"
+                                ))
+                            }
+                        }
+                    }
                     let mut aspec: Vec<(u8, Option<usize>)> =
                         Vec::with_capacity(ga.aggregates.len());
                     for (kind, fid) in &ga.aggregates {
@@ -1559,7 +1582,7 @@ impl<V: Vfs> StateMachine<V> {
                             }
                         }
                     }
-                    Some((gidx, gkind, gwidth, aspec))
+                    Some((gidx, gkind, gwidth, espec, aspec))
                 }
                 None => None,
             };
@@ -1772,7 +1795,7 @@ impl<V: Vfs> StateMachine<V> {
         // and fold the aggregates per group over the decoded Values (NULL-aware).
         // Result encoding = the Op::GroupAggregateMulti shape:
         // [u32 ngroups] then per group [u32 keylen][key][16B i128 LE × n_aggs].
-        if let Some((gidx, gkind, gwidth, aspec)) = ga_spec {
+        if let Some((gidx, gkind, gwidth, espec, aspec)) = ga_spec {
             // Per-group accumulator, one (count, sum, min, max) per agg slot.
             type Acc = (i128, i128, Option<i128>, Option<i128>);
             let init: Vec<Acc> = (0..aspec.len()).map(|_| (0i128, 0, None, None)).collect();
@@ -1784,20 +1807,32 @@ impl<V: Vfs> StateMachine<V> {
                     _ => None, // Null / Blob ⇒ not a numeric aggregate value
                 }
             };
+            // SP-PG-SQL-GROUP-MULTI-COL: per-extra-column fixed-width widths, to
+            // split the composite BTreeMap key back into per-column values.
+            let extra_widths: Vec<usize> = espec.iter().map(|(_, _, w)| *w).collect();
             let mut groups: std::collections::BTreeMap<Vec<u8>, Vec<Acc>> =
                 std::collections::BTreeMap::new();
             for (row, _) in &collected {
-                // Group key = the group field Value's raw fixed-width bytes
-                // (zero-extended to the field width so the BTreeMap order is the
-                // declared fixed-width order). A NULL group key (rare; group col
-                // is normally a non-null parent col) folds to all-zero bytes.
-                let gkey: Vec<u8> = match kessel_codec::raw_from_value(gkind, &row[gidx]) {
+                // Group key = the primary group field Value's raw fixed-width
+                // bytes (zero-extended to the field width so the BTreeMap order
+                // is the declared fixed-width order). A NULL group key folds to
+                // all-zero bytes. SP-PG-SQL-GROUP-MULTI-COL: each EXTRA group
+                // column's fixed-width bytes are appended ⇒ COMPOSITE key.
+                let mut gkey: Vec<u8> = match kessel_codec::raw_from_value(gkind, &row[gidx]) {
                     Some(mut b) => {
                         b.resize(gwidth, 0);
                         b
                     }
                     None => vec![0u8; gwidth],
                 };
+                for (eidx, ekind, ewidth) in &espec {
+                    let mut eb: Vec<u8> = match kessel_codec::raw_from_value(*ekind, &row[*eidx]) {
+                        Some(b) => b,
+                        None => vec![0u8; *ewidth],
+                    };
+                    eb.resize(*ewidth, 0);
+                    gkey.extend_from_slice(&eb);
+                }
                 let entry = groups.entry(gkey).or_insert_with(|| init.clone());
                 for (i, (kind, aidx)) in aspec.iter().enumerate() {
                     match aidx {
@@ -1854,8 +1889,18 @@ impl<V: Vfs> StateMachine<V> {
             let mut gout = Vec::new();
             gout.extend_from_slice(&(kept.len() as u32).to_le_bytes());
             for (k, results) in kept {
-                gout.extend_from_slice(&(k.len() as u32).to_le_bytes());
-                gout.extend_from_slice(&k);
+                // SP-PG-SQL-GROUP-MULTI-COL: split the COMPOSITE key into the
+                // primary (gwidth) + each extra column (its width) and emit
+                // `[u32 keylen][primary]([u32 len][extra])*[16B × n_aggs]`.
+                // EMPTY extras ⇒ byte-identical single-column join-agg stream.
+                let (primary, extras) =
+                    Self::split_composite_key(&k, gwidth, &extra_widths);
+                gout.extend_from_slice(&(primary.len() as u32).to_le_bytes());
+                gout.extend_from_slice(&primary);
+                for extra in &extras {
+                    gout.extend_from_slice(&(extra.len() as u32).to_le_bytes());
+                    gout.extend_from_slice(extra);
+                }
                 for res in results {
                     gout.extend_from_slice(&res.to_le_bytes());
                 }
@@ -2909,6 +2954,7 @@ impl<V: Vfs> StateMachine<V> {
         group_field: u16,
         aggregates: &[(u8, u16)],
         range_preds: &[(u16, u8, Vec<u8>)],
+        extra_group_fields: &[u16],
         having: Option<&kessel_proto::HavingPred>,
         sort: Option<&kessel_proto::GroupSort>,
     ) -> OpResult {
@@ -2927,6 +2973,14 @@ impl<V: Vfs> StateMachine<V> {
             Some(i) => (layout.offsets[i], ot.fields[i].kind.width() as usize),
             None => return OpResult::SchemaError(format!("no group field {group_field}")),
         };
+        // SP-PG-SQL-GROUP-MULTI-COL: resolve EXTRA group columns. EMPTY ⇒
+        // single-column path (byte-identical). The composite key in `fold_one`
+        // appends each extra column's fixed-width bytes after the primary.
+        let epos = match Self::resolve_extra_group_pos(&ot, &layout, extra_group_fields) {
+            Ok(v) => v,
+            Err(e) => return OpResult::SchemaError(e),
+        };
+        let extra_widths: Vec<usize> = epos.iter().map(|(_, w)| *w).collect();
         // Per-aggregate: resolve (offset, width, signed) once. For COUNT
         // (kind=0) the field is ignored — None means "don't decode a value".
         let mut apos: Vec<Option<(usize, usize, bool)>> =
@@ -3016,10 +3070,19 @@ impl<V: Vfs> StateMachine<V> {
                     return Ok(());
                 }
             }
-            let gkey = match rec.get(gpos.0..gpos.0 + gpos.1) {
+            // SP-PG-SQL-GROUP-MULTI-COL: COMPOSITE key = primary bytes ++ each
+            // extra column's fixed-width bytes. EMPTY epos ⇒ primary only ⇒
+            // byte-identical single-column grouping.
+            let mut gkey = match rec.get(gpos.0..gpos.0 + gpos.1) {
                 Some(b) => b.to_vec(),
                 None => return Ok(()),
             };
+            for (off, w) in &epos {
+                match rec.get(*off..*off + *w) {
+                    Some(b) => gkey.extend_from_slice(b),
+                    None => return Ok(()),
+                }
+            }
             let entry = local.entry(gkey).or_insert_with(|| init.clone());
             for (i, slot) in apos.iter().enumerate() {
                 entry[i].0 += 1;
@@ -3250,7 +3313,7 @@ impl<V: Vfs> StateMachine<V> {
         // The result sequence is a pure function of the deterministic per-
         // group accumulator, so HAVING filtering is itself deterministic.
         // Encode: [u32 ngroups] per group [u32 keylen][key][16B × n_aggs].
-        let mut kept: Vec<(Vec<u8>, Vec<i128>)> = Vec::with_capacity(groups.len());
+        let mut kept: Vec<(Vec<u8>, Vec<Vec<u8>>, Vec<i128>)> = Vec::with_capacity(groups.len());
         for (k, accs) in groups {
             let mut results: Vec<i128> = Vec::with_capacity(accs.len());
             for (i, (cnt, sum, mn, mx)) in accs.iter().enumerate() {
@@ -3275,14 +3338,18 @@ impl<V: Vfs> StateMachine<V> {
                     continue;
                 }
             }
-            kept.push((k, results));
+            // SP-PG-SQL-GROUP-MULTI-COL: split the composite key back into
+            // (primary, extras) for the structured emit (empty extras ⇒
+            // byte-identical single-column stream).
+            let (primary, extras) = Self::split_composite_key(&k, gpos.1, &extra_widths);
+            kept.push((primary, extras, results));
         }
         // SP-PG-SQL-GROUP-SORT-LIMIT: post-aggregation ORDER BY / LIMIT /
         // OFFSET over the per-group results. `kept` is already in ascending
         // group-key order (the pre-arc emission order) ⇒ a STABLE sort makes
         // the tie-break deterministic (ascending key). `None` ⇒ byte-identical
         // emit to before this arc.
-        Self::emit_group_results(kept, sort)
+        Self::emit_group_results_composite(kept, sort)
     }
 
     /// SP-PG-SQL-GROUP-SORT-LIMIT: sort (optional), paginate (optional), then
@@ -3294,25 +3361,92 @@ impl<V: Vfs> StateMachine<V> {
     /// pre-arc emit. The sort key is the i128 aggregate value at
     /// `GroupSortTarget::Agg(i)` (defensive 0 if i is out of range) or the raw
     /// group-key bytes for `Key`; `desc` reverses; LIMIT/OFFSET apply AFTER.
+    /// SP-PG-SQL-GROUP-MULTI-COL: resolve each EXTRA group field to its
+    /// `(offset, width)` in the record layout. `Err` (schema error string) if
+    /// any field is absent. The PRIMARY group field is resolved separately by
+    /// the caller; this is only the additional composite-key columns.
+    fn resolve_extra_group_pos(
+        ot: &kessel_catalog::ObjectType,
+        layout: &kessel_catalog::Layout,
+        extra_group_fields: &[u16],
+    ) -> Result<Vec<(usize, usize)>, String> {
+        let mut v = Vec::with_capacity(extra_group_fields.len());
+        for fid in extra_group_fields {
+            match ot.fields.iter().position(|f| f.field_id == *fid) {
+                Some(i) => v.push((layout.offsets[i], ot.fields[i].kind.width() as usize)),
+                None => return Err(format!("no group field {fid}")),
+            }
+        }
+        Ok(v)
+    }
+
+    /// SP-PG-SQL-GROUP-MULTI-COL: slice a COMPOSITE group key (built by
+    /// concatenating the primary then each extra column's fixed-width raw
+    /// bytes) back into `(primary_bytes, extra_bytes_vec)` for emission. The
+    /// composite layout is `primary(gwidth) ++ extra0(w0) ++ extra1(w1) ++ …`.
+    fn split_composite_key(
+        key: &[u8],
+        gwidth: usize,
+        extra_widths: &[usize],
+    ) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let mut off = gwidth.min(key.len());
+        let primary = key.get(..off).unwrap_or(&[]).to_vec();
+        let mut extras = Vec::with_capacity(extra_widths.len());
+        for w in extra_widths {
+            let end = (off + *w).min(key.len());
+            extras.push(key.get(off..end).unwrap_or(&[]).to_vec());
+            off = end;
+        }
+        (primary, extras)
+    }
+
     fn emit_group_results(
-        mut kept: Vec<(Vec<u8>, Vec<i128>)>,
+        kept: Vec<(Vec<u8>, Vec<i128>)>,
         sort: Option<&kessel_proto::GroupSort>,
     ) -> OpResult {
+        // Single-column path: no extra group columns ⇒ delegate to the
+        // composite emitter with an empty extras vec per group, which writes a
+        // BYTE-IDENTICAL stream to the pre-multi-col `[u32 keylen][key][aggs]`.
+        let kept_c: Vec<(Vec<u8>, Vec<Vec<u8>>, Vec<i128>)> = kept
+            .into_iter()
+            .map(|(k, r)| (k, Vec::new(), r))
+            .collect();
+        Self::emit_group_results_composite(kept_c, sort)
+    }
+
+    /// SP-PG-SQL-GROUP-MULTI-COL: sort/paginate/encode a per-group result with
+    /// a COMPOSITE key. Each group is `(primary_key, extra_keys, results)`. The
+    /// stream is `[u32 ngroups]` then per group
+    /// `[u32 keylen][primary]([u32 len][extra])*[16B i128 LE × n_aggs]`. With
+    /// `extra_keys` EMPTY this is BYTE-IDENTICAL to the single-column stream.
+    /// The sort `Key` target orders by the FULL composite tuple (primary then
+    /// each extra, in order) so the tie-break is a deterministic total order.
+    fn emit_group_results_composite(
+        mut kept: Vec<(Vec<u8>, Vec<Vec<u8>>, Vec<i128>)>,
+        sort: Option<&kessel_proto::GroupSort>,
+    ) -> OpResult {
+        // Deterministic total order over the composite tuple: primary bytes
+        // then each extra in order (all fixed-width raw field bytes).
+        let composite_cmp = |a: &(Vec<u8>, Vec<Vec<u8>>, Vec<i128>),
+                             b: &(Vec<u8>, Vec<Vec<u8>>, Vec<i128>)| {
+            a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1))
+        };
         if let Some(s) = sort {
             match s.target {
                 kessel_proto::GroupSortTarget::Key => {
-                    kept.sort_by(|a, b| a.0.cmp(&b.0));
+                    kept.sort_by(composite_cmp);
                 }
                 kessel_proto::GroupSortTarget::Agg(i) => {
                     let idx = i as usize;
                     kept.sort_by(|a, b| {
-                        let av = a.1.get(idx).copied().unwrap_or(0);
-                        let bv = b.1.get(idx).copied().unwrap_or(0);
-                        // Primary: the aggregate value. Tie: ascending key
-                        // (kept's incoming order is already ascending key, so a
-                        // STABLE sort would suffice — but make it explicit so
-                        // the determinism does not depend on the caller's order).
-                        av.cmp(&bv).then_with(|| a.0.cmp(&b.0))
+                        let av = a.2.get(idx).copied().unwrap_or(0);
+                        let bv = b.2.get(idx).copied().unwrap_or(0);
+                        // Primary: the aggregate value. Tie: ascending
+                        // composite key (incoming order is already ascending
+                        // composite key, so a STABLE sort would suffice — but
+                        // make it explicit so determinism does not depend on
+                        // the caller's order).
+                        av.cmp(&bv).then_with(|| composite_cmp(a, b))
                     });
                 }
             }
@@ -3337,9 +3471,16 @@ impl<V: Vfs> StateMachine<V> {
         }
         let mut out = Vec::new();
         out.extend_from_slice(&(kept.len() as u32).to_le_bytes());
-        for (k, results) in kept {
-            out.extend_from_slice(&(k.len() as u32).to_le_bytes());
-            out.extend_from_slice(&k);
+        for (primary, extras, results) in kept {
+            out.extend_from_slice(&(primary.len() as u32).to_le_bytes());
+            out.extend_from_slice(&primary);
+            // SP-PG-SQL-GROUP-MULTI-COL: each extra group column value follows
+            // the primary key as `[u32 len][value]`, BEFORE the aggregates.
+            // EMPTY ⇒ nothing emitted ⇒ byte-identical single-column stream.
+            for extra in &extras {
+                out.extend_from_slice(&(extra.len() as u32).to_le_bytes());
+                out.extend_from_slice(extra);
+            }
             for res in results {
                 out.extend_from_slice(&res.to_le_bytes());
             }
@@ -4042,10 +4183,10 @@ impl<V: Vfs> StateMachine<V> {
             // SP-Analytic-Plan-MULTI: multi-aggregate single-scan GROUP BY
             // (read_only_op arm; mirrors the apply arm exactly via the
             // shared `group_aggregate_multi` helper — identical bytes).
-            Op::GroupAggregateMulti { type_id, program, group_field, aggregates, range_preds, having, sort } => {
-                self.group_aggregate_multi(type_id, &program, group_field, &aggregates, &range_preds, having.as_ref(), sort.as_ref())
+            Op::GroupAggregateMulti { type_id, program, group_field, aggregates, range_preds, extra_group_fields, having, sort } => {
+                self.group_aggregate_multi(type_id, &program, group_field, &aggregates, &range_preds, &extra_group_fields, having.as_ref(), sort.as_ref())
             }
-            Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds, having, sort } => {
+            Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds, extra_group_fields, having, sort } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
                     None => return OpResult::SchemaError(format!("no type {type_id}")),
@@ -4058,6 +4199,13 @@ impl<V: Vfs> StateMachine<V> {
                     Some(i) => (layout.offsets[i], ot.fields[i].kind.width() as usize),
                     None => return OpResult::SchemaError(format!("no group field {group_field}")),
                 };
+                // SP-PG-SQL-GROUP-MULTI-COL: resolve the EXTRA group columns'
+                // positions. EMPTY ⇒ single-column path (byte-identical).
+                let epos = match Self::resolve_extra_group_pos(&ot, &layout, &extra_group_fields) {
+                    Ok(v) => v,
+                    Err(e) => return OpResult::SchemaError(e),
+                };
+                let extra_widths: Vec<usize> = epos.iter().map(|(_, w)| *w).collect();
                 let apos = if kind == 0 {
                     None
                 } else {
@@ -4087,10 +4235,21 @@ impl<V: Vfs> StateMachine<V> {
                 let uncond = program
                     == kessel_expr::Program::new().push_int(1).bytes().as_slice();
                 let mut fold_rec = |rec: &[u8], groups: &mut std::collections::BTreeMap<Vec<u8>, (i128, i128, Option<i128>, Option<i128>)>| {
-                    let gkey = match rec.get(gpos.0..gpos.0 + gpos.1) {
+                    // SP-PG-SQL-GROUP-MULTI-COL: the COMPOSITE group key is the
+                    // primary field bytes concatenated with each extra field's
+                    // fixed-width bytes (in order). With no extra fields this is
+                    // exactly the primary bytes ⇒ byte-identical BTreeMap key
+                    // (so single-column emission is unchanged).
+                    let mut gkey = match rec.get(gpos.0..gpos.0 + gpos.1) {
                         Some(b) => b.to_vec(),
                         None => return,
                     };
+                    for (off, w) in &epos {
+                        match rec.get(*off..*off + *w) {
+                            Some(b) => gkey.extend_from_slice(b),
+                            None => return,
+                        }
+                    }
                     let e = groups.entry(gkey).or_insert((0, 0, None, None));
                     e.0 += 1;
                     if let Some((off, w, fk)) = apos {
@@ -4151,7 +4310,9 @@ impl<V: Vfs> StateMachine<V> {
                 // bytes to before this arc). SP-PG-SQL-GROUP-SORT-LIMIT: the
                 // per-group result is wrapped in a single-element Vec so the
                 // shared emit_group_results can sort/paginate uniformly.
-                let mut kept: Vec<(Vec<u8>, Vec<i128>)> = Vec::with_capacity(groups.len());
+                // SP-PG-SQL-GROUP-MULTI-COL: each composite key is split back
+                // into (primary, extras) for the structured emit.
+                let mut kept: Vec<(Vec<u8>, Vec<Vec<u8>>, Vec<i128>)> = Vec::with_capacity(groups.len());
                 for (k, (cnt, sum, mn, mx)) in groups {
                     let res: i128 = match kind {
                         0 => cnt,
@@ -4176,9 +4337,10 @@ impl<V: Vfs> StateMachine<V> {
                             continue;
                         }
                     }
-                    kept.push((k, vec![res]));
+                    let (primary, extras) = Self::split_composite_key(&k, gpos.1, &extra_widths);
+                    kept.push((primary, extras, vec![res]));
                 }
-                Self::emit_group_results(kept, sort.as_ref())
+                Self::emit_group_results_composite(kept, sort.as_ref())
             }
             Op::FindRange { type_id, field_id, lo, hi } => {
                 let ot = match self.catalog.get(type_id) {
@@ -6528,10 +6690,10 @@ impl<V: Vfs> StateMachine<V> {
             // Op::GroupAggregate calls — closes the SP-Analytic-Plan T4
             // Q1 gap. Equivalence vs the N-call shape is proven by an
             // SM-level KAT (byte-equal vs N sequential GroupAggregate).
-            Op::GroupAggregateMulti { type_id, program, group_field, aggregates, range_preds, having, sort } => {
-                self.group_aggregate_multi(type_id, &program, group_field, &aggregates, &range_preds, having.as_ref(), sort.as_ref())
+            Op::GroupAggregateMulti { type_id, program, group_field, aggregates, range_preds, extra_group_fields, having, sort } => {
+                self.group_aggregate_multi(type_id, &program, group_field, &aggregates, &range_preds, &extra_group_fields, having.as_ref(), sort.as_ref())
             }
-            Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds, having, sort } => {
+            Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds, extra_group_fields, having, sort } => {
                 let ot = match self.catalog.get(type_id) {
                     Some(t) => t.clone(),
                     None => return OpResult::SchemaError(format!("no type {type_id}")),
@@ -6544,6 +6706,13 @@ impl<V: Vfs> StateMachine<V> {
                     Some(i) => (layout.offsets[i], ot.fields[i].kind.width() as usize),
                     None => return OpResult::SchemaError(format!("no group field {group_field}")),
                 };
+                // SP-PG-SQL-GROUP-MULTI-COL: resolve EXTRA group columns
+                // (composite key). EMPTY ⇒ single-column (byte-identical).
+                let epos = match Self::resolve_extra_group_pos(&ot, &layout, &extra_group_fields) {
+                    Ok(v) => v,
+                    Err(e) => return OpResult::SchemaError(e),
+                };
+                let extra_widths: Vec<usize> = epos.iter().map(|(_, w)| *w).collect();
                 let apos = if kind == 0 {
                     None
                 } else {
@@ -6579,10 +6748,17 @@ impl<V: Vfs> StateMachine<V> {
                 let uncond = program
                     == kessel_expr::Program::new().push_int(1).bytes().as_slice();
                 let mut fold_rec = |rec: &[u8], groups: &mut std::collections::BTreeMap<Vec<u8>, (i128, i128, Option<i128>, Option<i128>)>| {
-                    let gkey = match rec.get(gpos.0..gpos.0 + gpos.1) {
+                    // SP-PG-SQL-GROUP-MULTI-COL: COMPOSITE key (primary ++ extras).
+                    let mut gkey = match rec.get(gpos.0..gpos.0 + gpos.1) {
                         Some(b) => b.to_vec(),
                         None => return,
                     };
+                    for (off, w) in &epos {
+                        match rec.get(*off..*off + *w) {
+                            Some(b) => gkey.extend_from_slice(b),
+                            None => return,
+                        }
+                    }
                     let e = groups.entry(gkey).or_insert((0, 0, None, None));
                     e.0 += 1;
                     if let Some((off, w, fk)) = apos {
@@ -6642,7 +6818,7 @@ impl<V: Vfs> StateMachine<V> {
                 // emitting groups. No HAVING ⇒ every group kept (identical
                 // bytes to before this arc). SP-PG-SQL-GROUP-SORT-LIMIT: wrap
                 // each result in a 1-elem Vec for the shared sort/paginate emit.
-                let mut kept: Vec<(Vec<u8>, Vec<i128>)> = Vec::with_capacity(groups.len());
+                let mut kept: Vec<(Vec<u8>, Vec<Vec<u8>>, Vec<i128>)> = Vec::with_capacity(groups.len());
                 for (k, (cnt, sum, mn, mx)) in groups {
                     let res: i128 = match kind {
                         0 => cnt,
@@ -6667,9 +6843,11 @@ impl<V: Vfs> StateMachine<V> {
                             continue;
                         }
                     }
-                    kept.push((k, vec![res]));
+                    // SP-PG-SQL-GROUP-MULTI-COL: split composite key for emit.
+                    let (primary, extras) = Self::split_composite_key(&k, gpos.1, &extra_widths);
+                    kept.push((primary, extras, vec![res]));
                 }
-                Self::emit_group_results(kept, sort.as_ref())
+                Self::emit_group_results_composite(kept, sort.as_ref())
             }
 
             Op::AddOrderedIndex { type_id, field_id } => {
@@ -10695,17 +10873,17 @@ mod tests {
         };
         let all = Program::new().push_int(1).bytes();
         // SUM(v) GROUP BY owner -> {1:30, 2:20, 3:100} ascending key order
-        match sm.apply(20, Op::GroupAggregate { type_id: 1, program: all.clone(), group_field: 1, kind: 1, agg_field: 3, range_preds: vec![], having: None, sort: None }) {
+        match sm.apply(20, Op::GroupAggregate { type_id: 1, program: all.clone(), group_field: 1, kind: 1, agg_field: 3, range_preds: vec![], extra_group_fields: vec![], having: None, sort: None }) {
             OpResult::Got(b) => assert_eq!(parse(&b), vec![(1, 30), (2, 20), (3, 100)]),
             o => panic!("{o:?}"),
         }
         // COUNT GROUP BY owner -> {1:2, 2:3, 3:1}
-        match sm.apply(21, Op::GroupAggregate { type_id: 1, program: all.clone(), group_field: 1, kind: 0, agg_field: 0, range_preds: vec![], having: None, sort: None }) {
+        match sm.apply(21, Op::GroupAggregate { type_id: 1, program: all.clone(), group_field: 1, kind: 0, agg_field: 0, range_preds: vec![], extra_group_fields: vec![], having: None, sort: None }) {
             OpResult::Got(b) => assert_eq!(parse(&b), vec![(1, 2), (2, 3), (3, 1)]),
             o => panic!("{o:?}"),
         }
         // MAX(v) GROUP BY owner -> {1:20, 2:8, 3:100}
-        match sm.apply(22, Op::GroupAggregate { type_id: 1, program: all, group_field: 1, kind: 3, agg_field: 3, range_preds: vec![], having: None, sort: None }) {
+        match sm.apply(22, Op::GroupAggregate { type_id: 1, program: all, group_field: 1, kind: 3, agg_field: 3, range_preds: vec![], extra_group_fields: vec![], having: None, sort: None }) {
             OpResult::Got(b) => assert_eq!(parse(&b), vec![(1, 20), (2, 8), (3, 100)]),
             o => panic!("{o:?}"),
         }
@@ -10768,6 +10946,7 @@ mod tests {
         match sm.apply(30, Op::GroupAggregate {
             type_id: 1, program: all.clone(), group_field: 1, kind: 0, agg_field: 0,
             range_preds: vec![],
+            extra_group_fields: vec![],
             having: Some(HavingPred { agg_index: 0, op: 1, value: 3 }), sort: None,
         }) {
             OpResult::Got(b) => assert_eq!(parse(&b), vec![(2, 3)], "only owner 2 has count>=3"),
@@ -10778,6 +10957,7 @@ mod tests {
         match sm.apply(31, Op::GroupAggregate {
             type_id: 1, program: all.clone(), group_field: 1, kind: 1, agg_field: 3,
             range_preds: vec![],
+            extra_group_fields: vec![],
             having: Some(HavingPred { agg_index: 0, op: 0, value: 25 }), sort: None,
         }) {
             OpResult::Got(b) => assert_eq!(parse(&b), vec![(1, 30), (3, 100)]),
@@ -10788,6 +10968,7 @@ mod tests {
         match sm.apply(32, Op::GroupAggregate {
             type_id: 1, program: all.clone(), group_field: 1, kind: 1, agg_field: 3,
             range_preds: vec![],
+            extra_group_fields: vec![],
             having: Some(HavingPred { agg_index: 0, op: 4, value: 100 }), sort: None,
         }) {
             OpResult::Got(b) => assert_eq!(parse(&b), vec![(3, 100)]),
@@ -10797,6 +10978,7 @@ mod tests {
         // No-HAVING result equals the pre-arc result (all groups).
         match sm.apply(33, Op::GroupAggregate {
             type_id: 1, program: all.clone(), group_field: 1, kind: 1, agg_field: 3,
+            extra_group_fields: vec![],
             range_preds: vec![], having: None, sort: None,
         }) {
             OpResult::Got(b) => assert_eq!(parse(&b), vec![(1, 30), (2, 20), (3, 100)]),
@@ -10808,6 +10990,7 @@ mod tests {
             type_id: 1, program: all.clone(), group_field: 1,
             aggregates: vec![(0, 0), (1, 3)],
             range_preds: vec![],
+            extra_group_fields: vec![],
             having: Some(HavingPred { agg_index: 1, op: 0, value: 25 }), sort: None,
         }) {
             OpResult::Got(b) => assert_eq!(
@@ -10823,6 +11006,7 @@ mod tests {
             type_id: 1, program: all.clone(), group_field: 1,
             aggregates: vec![(0, 0), (1, 3)],
             range_preds: vec![],
+            extra_group_fields: vec![],
             having: Some(HavingPred { agg_index: 0, op: 2, value: 3 }), sort: None,
         }) {
             OpResult::Got(b) => assert_eq!(
@@ -10905,6 +11089,7 @@ mod tests {
         // This is the headline: NOT ascending key order.
         let count_desc = Op::GroupAggregate {
             type_id: 1, program: all.clone(), group_field: 1, kind: 0, agg_field: 0,
+            extra_group_fields: vec![],
             range_preds: vec![], having: None,
             sort: Some(GroupSort { target: GroupSortTarget::Agg(0), desc: true, limit: None, offset: None }),
         };
@@ -10919,6 +11104,7 @@ mod tests {
         // ... ORDER BY COUNT(*) DESC LIMIT 2 ⇒ top 2 only: owner 2, owner 1.
         match sm.apply(42, Op::GroupAggregate {
             type_id: 1, program: all.clone(), group_field: 1, kind: 0, agg_field: 0,
+            extra_group_fields: vec![],
             range_preds: vec![], having: None,
             sort: Some(GroupSort { target: GroupSortTarget::Agg(0), desc: true, limit: Some(2), offset: None }),
         }) {
@@ -10929,6 +11115,7 @@ mod tests {
         // ... ORDER BY COUNT(*) DESC LIMIT 2 OFFSET 1 ⇒ window: owner 1, owner 3.
         match sm.apply(43, Op::GroupAggregate {
             type_id: 1, program: all.clone(), group_field: 1, kind: 0, agg_field: 0,
+            extra_group_fields: vec![],
             range_preds: vec![], having: None,
             sort: Some(GroupSort { target: GroupSortTarget::Agg(0), desc: true, limit: Some(2), offset: Some(1) }),
         }) {
@@ -10939,6 +11126,7 @@ mod tests {
         // ORDER BY key (group key) ASC is still ascending key order.
         match sm.apply(44, Op::GroupAggregate {
             type_id: 1, program: all.clone(), group_field: 1, kind: 0, agg_field: 0,
+            extra_group_fields: vec![],
             range_preds: vec![], having: None,
             sort: Some(GroupSort { target: GroupSortTarget::Key, desc: false, limit: None, offset: None }),
         }) {
@@ -10948,6 +11136,7 @@ mod tests {
         // ORDER BY key DESC reverses to descending key.
         match sm.apply(45, Op::GroupAggregate {
             type_id: 1, program: all.clone(), group_field: 1, kind: 0, agg_field: 0,
+            extra_group_fields: vec![],
             range_preds: vec![], having: None,
             sort: Some(GroupSort { target: GroupSortTarget::Key, desc: true, limit: None, offset: None }),
         }) {
@@ -10961,6 +11150,7 @@ mod tests {
         match sm.apply(46, Op::GroupAggregate {
             type_id: 1, program: all.clone(), group_field: 1, kind: 1, agg_field: 3,
             range_preds: vec![],
+            extra_group_fields: vec![],
             having: Some(kessel_proto::HavingPred { agg_index: 0, op: 0, value: 25 }),
             sort: Some(GroupSort { target: GroupSortTarget::Agg(0), desc: true, limit: Some(1), offset: None }),
         }) {
@@ -10973,6 +11163,7 @@ mod tests {
         let multi = Op::GroupAggregateMulti {
             type_id: 1, program: all.clone(), group_field: 1,
             aggregates: vec![(0, 0), (1, 3)],
+            extra_group_fields: vec![],
             range_preds: vec![], having: None,
             sort: Some(GroupSort { target: GroupSortTarget::Agg(1), desc: true, limit: Some(2), offset: None }),
         };
@@ -10990,6 +11181,7 @@ mod tests {
         // No-sort frame is byte-identical to the pre-arc ascending-key emit.
         let no_sort = Op::GroupAggregate {
             type_id: 1, program: all.clone(), group_field: 1, kind: 0, agg_field: 0,
+            extra_group_fields: vec![],
             range_preds: vec![], having: None, sort: None,
         };
         match sm.apply(49, no_sort) {
@@ -11078,6 +11270,7 @@ mod tests {
             group_field: 1,
             aggregates: aggs.clone(),
             range_preds: vec![],
+            extra_group_fields: vec![],
             having: None, sort: None,
         }) {
             OpResult::Got(b) => b.to_vec(),
@@ -11095,6 +11288,7 @@ mod tests {
                 kind: *k,
                 agg_field: *f,
                 range_preds: vec![],
+                extra_group_fields: vec![],
                 having: None, sort: None,
             }) {
                 OpResult::Got(b) => parse_single(&b),
@@ -11146,6 +11340,7 @@ mod tests {
                 group_field: 1,
                 aggregates: aggs.clone(),
                 range_preds: vec![],
+                extra_group_fields: vec![],
                 having: None, sort: None,
             },
         ) {
@@ -11158,6 +11353,7 @@ mod tests {
             group_field: 1,
             aggregates: aggs,
             range_preds: vec![],
+            extra_group_fields: vec![],
             having: None, sort: None,
         }) {
             OpResult::Got(b) => b.to_vec(),
@@ -11208,6 +11404,7 @@ mod tests {
             group_field: 1,
             aggregates: aggs.clone(),
             range_preds: vec![],
+            extra_group_fields: vec![],
             having: None, sort: None,
         }) {
             OpResult::Got(b) => b.to_vec(),
@@ -11224,6 +11421,7 @@ mod tests {
             group_field: 1,
             aggregates: aggs,
             range_preds: full_range,
+            extra_group_fields: vec![],
             having: None, sort: None,
         }) {
             OpResult::Got(b) => b.to_vec(),
@@ -11298,6 +11496,7 @@ mod tests {
                 group_field: 1,
                 aggregates: aggs.clone(),
                 range_preds: vec![],
+                extra_group_fields: vec![],
                 having: None, sort: None,
             }) {
                 OpResult::Got(b) => b.to_vec(),
@@ -11437,6 +11636,7 @@ mod tests {
                 group_field: 1,
                 aggregates: aggs.clone(),
                 range_preds: vec![],
+                extra_group_fields: vec![],
                 having: None, sort: None,
             },
         ) {
@@ -11449,6 +11649,7 @@ mod tests {
             group_field: 1,
             aggregates: aggs,
             range_preds: vec![],
+            extra_group_fields: vec![],
             having: None, sort: None,
         }) {
             OpResult::Got(b) => b.to_vec(),
@@ -11590,6 +11791,7 @@ mod tests {
                 group_field: 1,
                 aggregates: aggs.clone(),
                 range_preds: vec![],
+                extra_group_fields: vec![],
                 having: None, sort: None,
             }) {
                 OpResult::Got(b) => b.to_vec(),
@@ -11672,6 +11874,7 @@ mod tests {
                 group_field: 1,
                 aggregates: aggs.clone(),
                 range_preds: vec![],
+                extra_group_fields: vec![],
                 having: None, sort: None,
             },
         ) {
@@ -11684,6 +11887,7 @@ mod tests {
             group_field: 1,
             aggregates: aggs.clone(),
             range_preds: vec![],
+            extra_group_fields: vec![],
             having: None, sort: None,
         }) {
             OpResult::Got(b) => b.to_vec(),
@@ -11892,6 +12096,7 @@ mod tests {
             let r = match sm.apply(99, Op::GroupAggregate {
                 type_id: 1, program: Program::new().push_int(1).bytes(),
                 group_field: 1, kind: 1, agg_field: 3, range_preds: vec![],
+                extra_group_fields: vec![],
                 having: None, sort: None,
             }) {
                 OpResult::Got(b) => b,
@@ -12031,6 +12236,7 @@ mod tests {
             let oracle = match sm.apply(2000, Op::GroupAggregate {
                 type_id: 1, program: p.clone(), group_field: 1, kind: *k, agg_field: 3,
                 range_preds: vec![],
+                extra_group_fields: vec![],
                 having: None, sort: None,
             }) {
                 OpResult::Got(b) => b.to_vec(),
@@ -12042,6 +12248,7 @@ mod tests {
                     (3u16, 1u8, (*lo).to_le_bytes().to_vec()),
                     (3u16, 2u8, (*hi).to_le_bytes().to_vec()),
                 ],
+                extra_group_fields: vec![],
                 having: None, sort: None,
             }) {
                 OpResult::Got(b) => b.to_vec(),
@@ -12052,6 +12259,7 @@ mod tests {
             let oracle_ro = match sm.read_only_op(Op::GroupAggregate {
                 type_id: 1, program: p.clone(), group_field: 1, kind: *k, agg_field: 3,
                 range_preds: vec![],
+                extra_group_fields: vec![],
                 having: None, sort: None,
             }) {
                 OpResult::Got(b) => b.to_vec(),
@@ -12063,6 +12271,7 @@ mod tests {
                     (3u16, 1u8, (*lo).to_le_bytes().to_vec()),
                     (3u16, 2u8, (*hi).to_le_bytes().to_vec()),
                 ],
+                extra_group_fields: vec![],
                 having: None, sort: None,
             }) {
                 OpResult::Got(b) => b.to_vec(),
@@ -12597,7 +12806,7 @@ mod tests {
             left_type: 1, right_type: 2, left_field: 1, right_field: 2,
             limit: 0, filter: vec![], join_type: jt,
             order_by: None, limit_n: None, offset_n: None,
-            group_aggregate: Some(kessel_proto::JoinGroupAgg { group_field, aggregates, having: None }),
+            group_aggregate: Some(kessel_proto::JoinGroupAgg { group_field, aggregates, extra_group_fields: vec![], having: None }),
             extra_joins: vec![],
         }) {
             OpResult::Got(b) => b,
@@ -12682,6 +12891,7 @@ mod tests {
                 group_aggregate: Some(kessel_proto::JoinGroupAgg {
                     group_field: 1,
                     aggregates: vec![(0, 2), (0, kessel_proto::COUNT_STAR_FIELD), (1, 3)],
+                    extra_group_fields: vec![],
                     having: None,
                 }),
                 extra_joins: vec![],

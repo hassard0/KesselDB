@@ -425,6 +425,11 @@ pub enum ScatterKind {
     GroupAggregateMerge {
         /// 0=COUNT, 1=SUM, 2=MIN, 3=MAX, 4=AVG.
         kind: u8,
+        /// SP-PG-SQL-GROUP-MULTI-COL: number of EXTRA group columns (beyond the
+        /// primary key). Each appears as `[u32 len][value]` between the primary
+        /// key and the aggregate value(s) in the per-shard stream. 0 ⇒
+        /// single-column (byte-identical to the pre-multi-col merge).
+        n_extra: u16,
     },
     /// SP-Perf-A-SHARD-SCAN: multi-aggregate group merge for
     /// `Op::GroupAggregateMulti`. Per-shard reply is
@@ -435,6 +440,9 @@ pub enum ScatterKind {
         /// Per-slot kinds; same `aggregates` shape `Op::GroupAggregateMulti`
         /// carries (kind, field_id), but the merger only needs the kind.
         kinds: Vec<u8>,
+        /// SP-PG-SQL-GROUP-MULTI-COL: number of EXTRA group columns (see
+        /// `GroupAggregateMerge::n_extra`). 0 ⇒ single-column.
+        n_extra: u16,
     },
 }
 
@@ -516,11 +524,11 @@ pub fn merge_scan_results(
         ScatterKind::AggregateMerge { kind, field_kind } => {
             merge_aggregate(&payloads, *kind, *field_kind)
         }
-        ScatterKind::GroupAggregateMerge { kind } => {
-            merge_group_aggregate(&payloads, *kind)
+        ScatterKind::GroupAggregateMerge { kind, n_extra } => {
+            merge_group_aggregate(&payloads, *kind, *n_extra)
         }
-        ScatterKind::GroupAggregateMultiMerge { kinds } => {
-            merge_group_aggregate_multi(&payloads, kinds)
+        ScatterKind::GroupAggregateMultiMerge { kinds, n_extra } => {
+            merge_group_aggregate_multi(&payloads, kinds, *n_extra)
         }
     }
 }
@@ -769,7 +777,7 @@ fn merge_aggregate(
 ///   - 2 (MIN): min
 ///   - 3 (MAX): max
 ///   - 4 (AVG): SchemaError (same V1 gap as `merge_aggregate`)
-fn merge_group_aggregate(payloads: &[&[u8]], kind: u8) -> OpResult {
+fn merge_group_aggregate(payloads: &[&[u8]], kind: u8, n_extra: u16) -> OpResult {
     if kind == 4 {
         return OpResult::SchemaError(
             "scatter group-agg AVG (kind=4) not supported at K>=2: same \
@@ -782,6 +790,11 @@ fn merge_group_aggregate(payloads: &[&[u8]], kind: u8) -> OpResult {
             "scatter group-agg: unknown kind {kind}"
         ));
     }
+    // SP-PG-SQL-GROUP-MULTI-COL: the merge key is the COMPOSITE blob
+    // `[primary]([u32 len][extra])*` (everything before the aggregate
+    // value), re-emitted verbatim. Grouping on the full blob merges
+    // identical composite tuples across shards. n_extra=0 ⇒ the blob is
+    // exactly the primary key ⇒ byte-identical to the pre-multi-col merge.
     let mut acc: std::collections::BTreeMap<Vec<u8>, i128> =
         std::collections::BTreeMap::new();
     for (sid, p) in payloads.iter().enumerate() {
@@ -806,15 +819,40 @@ fn merge_group_aggregate(payloads: &[&[u8]], kind: u8) -> OpResult {
             }
             let keylen = u32::from_le_bytes(p[pos..pos + 4].try_into().unwrap())
                 as usize;
+            let blob_start = pos; // includes the primary keylen prefix
             pos += 4;
-            if pos + keylen + 16 > p.len() {
+            if pos + keylen > p.len() {
                 return OpResult::SchemaError(format!(
                     "scatter group-agg: shard {sid} group {g} truncated \
-                     key+value (keylen={keylen})"
+                     key (keylen={keylen})"
                 ));
             }
-            let key = p[pos..pos + keylen].to_vec();
             pos += keylen;
+            // Skip the n_extra `[u32 len][value]` blocks (part of the key blob).
+            for _ in 0..n_extra {
+                if pos + 4 > p.len() {
+                    return OpResult::SchemaError(format!(
+                        "scatter group-agg: shard {sid} group {g} truncated \
+                         extra-col len"
+                    ));
+                }
+                let elen = u32::from_le_bytes(p[pos..pos + 4].try_into().unwrap())
+                    as usize;
+                pos += 4;
+                if pos + elen > p.len() {
+                    return OpResult::SchemaError(format!(
+                        "scatter group-agg: shard {sid} group {g} truncated \
+                         extra-col value"
+                    ));
+                }
+                pos += elen;
+            }
+            let key = p[blob_start..pos].to_vec();
+            if pos + 16 > p.len() {
+                return OpResult::SchemaError(format!(
+                    "scatter group-agg: shard {sid} group {g} truncated value"
+                ));
+            }
             let mut le = [0u8; 16];
             le.copy_from_slice(&p[pos..pos + 16]);
             let v = i128::from_le_bytes(le);
@@ -831,11 +869,11 @@ fn merge_group_aggregate(payloads: &[&[u8]], kind: u8) -> OpResult {
                 .or_insert(v);
         }
     }
-    // Re-encode.
+    // Re-encode. The key blob already carries the primary keylen prefix + the
+    // extra `[len][value]` blocks, so it is written verbatim before the value.
     let mut out = Vec::new();
     out.extend_from_slice(&(acc.len() as u32).to_le_bytes());
     for (k, v) in acc {
-        out.extend_from_slice(&(k.len() as u32).to_le_bytes());
         out.extend_from_slice(&k);
         out.extend_from_slice(&v.to_le_bytes());
     }
@@ -851,7 +889,7 @@ fn merge_group_aggregate(payloads: &[&[u8]], kind: u8) -> OpResult {
 /// Each per-group payload has one `i128 LE` slot per aggregate; the
 /// merger combines per-slot using the `kinds[slot]` policy (sum for
 /// 0/1, min for 2, max for 3, SchemaError for 4).
-fn merge_group_aggregate_multi(payloads: &[&[u8]], kinds: &[u8]) -> OpResult {
+fn merge_group_aggregate_multi(payloads: &[&[u8]], kinds: &[u8], n_extra: u16) -> OpResult {
     if kinds.is_empty() {
         return OpResult::SchemaError(
             "scatter group-agg-multi merge: empty kinds vector".into(),
@@ -896,15 +934,43 @@ fn merge_group_aggregate_multi(payloads: &[&[u8]], kinds: &[u8]) -> OpResult {
             }
             let keylen = u32::from_le_bytes(p[pos..pos + 4].try_into().unwrap())
                 as usize;
+            // SP-PG-SQL-GROUP-MULTI-COL: the merge key is the COMPOSITE blob
+            // `[primary]([u32 len][extra])*` (everything before the slots),
+            // re-emitted verbatim. n_extra=0 ⇒ byte-identical single-column.
+            let blob_start = pos; // includes the primary keylen prefix
             pos += 4;
-            if pos + keylen + slot_bytes > p.len() {
+            if pos + keylen > p.len() {
                 return OpResult::SchemaError(format!(
                     "scatter group-agg-multi: shard {sid} group {g} \
-                     truncated key+slots"
+                     truncated key"
                 ));
             }
-            let key = p[pos..pos + keylen].to_vec();
             pos += keylen;
+            for _ in 0..n_extra {
+                if pos + 4 > p.len() {
+                    return OpResult::SchemaError(format!(
+                        "scatter group-agg-multi: shard {sid} group {g} \
+                         truncated extra-col len"
+                    ));
+                }
+                let elen = u32::from_le_bytes(p[pos..pos + 4].try_into().unwrap())
+                    as usize;
+                pos += 4;
+                if pos + elen > p.len() {
+                    return OpResult::SchemaError(format!(
+                        "scatter group-agg-multi: shard {sid} group {g} \
+                         truncated extra-col value"
+                    ));
+                }
+                pos += elen;
+            }
+            let key = p[blob_start..pos].to_vec();
+            if pos + slot_bytes > p.len() {
+                return OpResult::SchemaError(format!(
+                    "scatter group-agg-multi: shard {sid} group {g} \
+                     truncated slots"
+                ));
+            }
             let mut slot_vals: Vec<i128> = Vec::with_capacity(n_aggs);
             for _ in 0..n_aggs {
                 let mut le = [0u8; 16];
@@ -929,7 +995,8 @@ fn merge_group_aggregate_multi(payloads: &[&[u8]], kinds: &[u8]) -> OpResult {
     let mut out = Vec::new();
     out.extend_from_slice(&(acc.len() as u32).to_le_bytes());
     for (k, slots) in acc {
-        out.extend_from_slice(&(k.len() as u32).to_le_bytes());
+        // The key blob carries the primary keylen prefix + extra `[len][value]`
+        // blocks, so it is written verbatim before the slots.
         out.extend_from_slice(&k);
         for v in slots {
             out.extend_from_slice(&v.to_le_bytes());

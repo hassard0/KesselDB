@@ -146,6 +146,10 @@ fn read_extra_joins_body(c: &mut codec::Cursor) -> Result<Vec<JoinStep>, ()> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JoinGroupAgg {
     pub group_field: u16,
+    /// SP-PG-SQL-GROUP-MULTI-COL: ADDITIONAL combined-schema group columns
+    /// beyond the PRIMARY `group_field`, forming a COMPOSITE group key over
+    /// the join. EMPTY (default) ⇒ BYTE-IDENTICAL `Op` frame + result stream.
+    pub extra_group_fields: Vec<u16>,
     pub aggregates: Vec<(u8, u16)>,
     /// SP-PG-SQL-HAVING: optional post-aggregation group filter. `None`
     /// (default) ⇒ every group is emitted (byte-identical to a pre-HAVING
@@ -258,7 +262,16 @@ fn decode_having(c: &mut codec::Cursor) -> Result<Option<HavingPred>, ()> {
 ///     `[1][..]` when Some; we write a single `0` when None) FOLLOWED by the
 ///     group-sort block. The `0` anchor lets `decode_having` consume the
 ///     no-HAVING case and hand off to `decode_group_sort`.
-fn encode_group_trailer(b: &mut Vec<u8>, having: &Option<HavingPred>, sort: &Option<GroupSort>) {
+fn encode_group_trailer(
+    b: &mut Vec<u8>,
+    extra_group_fields: &[u16],
+    having: &Option<HavingPred>,
+    sort: &Option<GroupSort>,
+) {
+    // SP-PG-SQL-GROUP-MULTI-COL: the extra-group block (marker `2`) ALWAYS
+    // leads the trailer. Empty ⇒ nothing written ⇒ the HAVING/sort sub-trailer
+    // is byte-identical to the pre-multi-col frame.
+    encode_extra_group(b, extra_group_fields);
     match (having, sort) {
         (_, None) => encode_having(b, having),
         (Some(_), Some(_)) => {
@@ -377,6 +390,51 @@ fn decode_group_sort(c: &mut codec::Cursor) -> Result<Option<GroupSort>, ()> {
     }
 }
 
+/// SP-PG-SQL-GROUP-MULTI-COL: marker byte for the extra-group-fields trailer
+/// block. Distinct from the HAVING markers (`0`/`1`) and the group-sort marker
+/// (`1`), so the trailer decoder can place this block FIRST and unambiguously
+/// fall through to HAVING/sort when it is absent. (The `Op::Join` ga-block uses
+/// the same marker after its aggregate list.)
+const EXTRA_GROUP_MARKER: u8 = 2;
+
+/// SP-PG-SQL-GROUP-MULTI-COL: marker-guarded encode of the additional group
+/// columns. EMPTY ⇒ writes NOTHING (byte-identical to a single-column frame).
+/// NON-EMPTY ⇒ `[u8 2 marker][u16 count][u16 field_id]*`. Positioned FIRST in
+/// the group trailer (before HAVING + sort) so a non-multi frame is unchanged.
+fn encode_extra_group(b: &mut Vec<u8>, extra: &[u16]) {
+    if !extra.is_empty() {
+        b.push(EXTRA_GROUP_MARKER);
+        b.extend_from_slice(&(extra.len() as u16).to_le_bytes());
+        for f in extra {
+            b.extend_from_slice(&f.to_le_bytes());
+        }
+    }
+}
+
+/// SP-PG-SQL-GROUP-MULTI-COL: decode the optional leading extra-group block.
+/// Absent (no remaining bytes, or the next marker is NOT `2`) ⇒ `Ok(vec![])`
+/// WITHOUT consuming the cursor (so HAVING/sort decode their own markers).
+/// Marker `2` ⇒ consume + read the field list. A truncated block ⇒ `Err`.
+fn decode_extra_group(c: &mut codec::Cursor) -> Result<Vec<u16>, ()> {
+    if c.remaining() == 0 {
+        return Ok(Vec::new());
+    }
+    match c.peek_u8() {
+        Some(EXTRA_GROUP_MARKER) => {
+            c.u8().ok_or(())?; // consume the marker
+            let n = c.u16().ok_or(())? as usize;
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                v.push(c.u16().ok_or(())?);
+            }
+            Ok(v)
+        }
+        // Any other marker (0/1 HAVING anchor or HAVING/sort presence) ⇒ no
+        // extra-group block; leave the cursor for the next decoder.
+        _ => Ok(Vec::new()),
+    }
+}
+
 /// Operations applied by the deterministic state machine. Payloads are opaque
 /// bytes here so `kessel-proto` stays schema-agnostic; `kessel-catalog` /
 /// `kessel-codec` give them meaning.
@@ -490,6 +548,14 @@ pub enum Op {
         kind: u8,
         agg_field: u16,
         range_preds: Vec<(u16, u8, Vec<u8>)>,
+        /// SP-PG-SQL-GROUP-MULTI-COL: ADDITIONAL group-by columns beyond the
+        /// PRIMARY `group_field`, forming a COMPOSITE group key (the tuple
+        /// `(group_field, extra_group_fields…)`). EMPTY (default) ⇒ a single-
+        /// column GROUP BY ⇒ BYTE-IDENTICAL `Op` frame AND result stream to
+        /// before this arc (the marker-guarded extra block writes NOTHING when
+        /// empty). When non-empty, the SM groups by the tuple and emits each
+        /// extra column's value after the primary key in the result stream.
+        extra_group_fields: Vec<u16>,
         /// SP-PG-SQL-HAVING: optional post-aggregation group filter (agg_index
         /// is always 0 here — there is exactly one aggregate). `None` ⇒
         /// every group emitted (byte-identical to a pre-HAVING frame).
@@ -747,6 +813,10 @@ pub enum Op {
         group_field: u16,
         aggregates: Vec<(u8, u16)>,
         range_preds: Vec<(u16, u8, Vec<u8>)>,
+        /// SP-PG-SQL-GROUP-MULTI-COL: ADDITIONAL group-by columns beyond the
+        /// PRIMARY `group_field`, forming a COMPOSITE group key. EMPTY
+        /// (default) ⇒ BYTE-IDENTICAL `Op` frame AND result stream to before.
+        extra_group_fields: Vec<u16>,
         /// SP-PG-SQL-HAVING: optional post-aggregation group filter. `None` ⇒
         /// every group emitted (byte-identical to a pre-HAVING frame).
         having: Option<HavingPred>,
@@ -1474,6 +1544,11 @@ impl Op {
                         b.push(*kind);
                         b.extend_from_slice(&fid.to_le_bytes());
                     }
+                    // SP-PG-SQL-GROUP-MULTI-COL: marker-guarded extra-group block
+                    // (marker `2`) INSIDE the ga-block, after the aggregate list
+                    // and BEFORE the HAVING block. Empty ⇒ NOTHING written ⇒ a
+                    // single-column join-group-aggregate frame is byte-identical.
+                    encode_extra_group(&mut b, &ga.extra_group_fields);
                     // SP-PG-SQL-HAVING: marker-guarded HAVING block, INSIDE the
                     // ga-block (only reachable when group_aggregate is Some, so a
                     // plain/sorted/filtered join writes nothing here). Absent ⇒
@@ -1527,19 +1602,24 @@ impl Op {
                 }
                 codec::put_u32(&mut b, *limit);
             }
-            Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds, having, sort } => {
+            Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds, extra_group_fields, having, sort } => {
                 codec::put_u32(&mut b, *type_id);
                 codec::put_bytes(&mut b, program);
                 b.extend_from_slice(&group_field.to_le_bytes());
                 b.push(*kind);
                 b.extend_from_slice(&agg_field.to_le_bytes());
-                // SP-PG-SQL-HAVING / -GROUP-SORT-LIMIT: a HAVING clause OR a
-                // group-sort block forces the range-preds length prefix to be
-                // written even when empty (a `0u32`) so the trailing
-                // HAVING/sort blocks have a fixed offset to follow. A query
-                // with NO range hints AND NO HAVING AND NO sort still omits
-                // both ⇒ byte-identical to the pre-arc frame.
-                if !range_preds.is_empty() || having.is_some() || sort.is_some() {
+                // SP-PG-SQL-HAVING / -GROUP-SORT-LIMIT / -GROUP-MULTI-COL: a
+                // HAVING clause OR a group-sort block OR extra group columns
+                // forces the range-preds length prefix to be written even when
+                // empty (a `0u32`) so the trailing trailer blocks have a fixed
+                // offset to follow. A query with NO range hints AND NO HAVING
+                // AND NO sort AND NO extra group cols still omits both ⇒
+                // byte-identical to the pre-arc frame.
+                if !range_preds.is_empty()
+                    || having.is_some()
+                    || sort.is_some()
+                    || !extra_group_fields.is_empty()
+                {
                     codec::put_u32(&mut b, range_preds.len() as u32);
                     for (f, o, v) in range_preds {
                         b.extend_from_slice(&f.to_le_bytes());
@@ -1547,10 +1627,11 @@ impl Op {
                         codec::put_bytes(&mut b, v);
                     }
                 }
-                // SP-PG-SQL-HAVING + -GROUP-SORT-LIMIT: marker-guarded trailing
-                // HAVING block then group-sort block (see encode_group_trailer).
-                // Both absent ⇒ NOTHING written here ⇒ byte-identical to before.
-                encode_group_trailer(&mut b, having, sort);
+                // SP-PG-SQL-GROUP-MULTI-COL + -HAVING + -GROUP-SORT-LIMIT:
+                // marker-guarded trailing extra-group block then HAVING then
+                // group-sort block. All absent ⇒ NOTHING written here ⇒
+                // byte-identical to before.
+                encode_group_trailer(&mut b, extra_group_fields, having, sort);
             }
             // SP-Analytic-Plan-MULTI: wire tag 47.
             //   [u32 type_id]
@@ -1560,7 +1641,7 @@ impl Op {
             //   [u32 n_range_preds] { [u16 f][u8 op][u32 v_len][v] }*
             // n_range_preds is REQUIRED (no back-compat omission since
             // this variant is brand-new; reader symmetry is simpler).
-            Op::GroupAggregateMulti { type_id, program, group_field, aggregates, range_preds, having, sort } => {
+            Op::GroupAggregateMulti { type_id, program, group_field, aggregates, range_preds, extra_group_fields, having, sort } => {
                 codec::put_u32(&mut b, *type_id);
                 codec::put_bytes(&mut b, program);
                 b.extend_from_slice(&group_field.to_le_bytes());
@@ -1579,8 +1660,9 @@ impl Op {
                 // HAVING block then group-sort block. Tag 47's range_preds
                 // always carried an explicit length, so these simply follow;
                 // both absent ⇒ NOTHING written (byte-identical to a
-                // pre-HAVING/pre-sort tag-47 frame).
-                encode_group_trailer(&mut b, having, sort);
+                // pre-HAVING/pre-sort tag-47 frame). SP-PG-SQL-GROUP-MULTI-COL:
+                // the extra-group block (marker `2`) leads the trailer.
+                encode_group_trailer(&mut b, extra_group_fields, having, sort);
             }
             Op::AddCompositeIndex { type_id, fields }
             | Op::DropIndex { type_id, fields } => {
@@ -1919,10 +2001,14 @@ impl Op {
                                 let f = c.u16()?;
                                 aggregates.push((k, f));
                             }
+                            // SP-PG-SQL-GROUP-MULTI-COL: optional extra-group
+                            // block (marker `2`) INSIDE the ga-block, BEFORE the
+                            // HAVING block. Absent ⇒ empty (single-column).
+                            let extra_group_fields = decode_extra_group(&mut c).ok()?;
                             // SP-PG-SQL-HAVING: optional HAVING block INSIDE the
                             // ga-block. Absent ⇒ None.
                             let having = decode_having(&mut c).ok()?;
-                            group_aggregate = Some(JoinGroupAgg { group_field, aggregates, having });
+                            group_aggregate = Some(JoinGroupAgg { group_field, extra_group_fields, aggregates, having });
                         }
                         _ => return None,
                     }
@@ -2010,14 +2096,18 @@ impl Op {
                 } else {
                     Vec::new()
                 };
+                // SP-PG-SQL-GROUP-MULTI-COL: optional leading extra-group block
+                // (marker `2`). Absent ⇒ empty (single-column GROUP BY).
+                let extra_group_fields = decode_extra_group(&mut c).ok()?;
                 // SP-PG-SQL-HAVING: optional trailing HAVING block. Absent ⇒
                 // None (pre-arc frame). The range-preds prefix above is written
-                // (possibly as a `0`) whenever HAVING/sort is present, so any
-                // remaining bytes here ARE the HAVING then group-sort blocks.
+                // (possibly as a `0`) whenever HAVING/sort/extra-group is
+                // present, so any remaining bytes here ARE the extra-group then
+                // HAVING then group-sort blocks.
                 let having = decode_having(&mut c).ok()?;
                 // SP-PG-SQL-GROUP-SORT-LIMIT: optional trailing group-sort block.
                 let sort = decode_group_sort(&mut c).ok()?;
-                Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds, having, sort }
+                Op::GroupAggregate { type_id, program, group_field, kind, agg_field, range_preds, extra_group_fields, having, sort }
             }
             // SP-Analytic-Plan-MULTI: wire tag 47.
             47 => {
@@ -2041,13 +2131,17 @@ impl Op {
                 for _ in 0..m {
                     range_preds.push((c.u16()?, c.u8()?, c.bytes()?));
                 }
+                // SP-PG-SQL-GROUP-MULTI-COL: optional leading extra-group block
+                // (marker `2`). Absent ⇒ empty (single-column GROUP BY).
+                let extra_group_fields = decode_extra_group(&mut c).ok()?;
                 // SP-PG-SQL-HAVING: optional trailing HAVING block. Tag 47
                 // always wrote the range-preds length, so any remaining bytes
-                // are the HAVING then group-sort blocks. Absent ⇒ None.
+                // are the extra-group then HAVING then group-sort blocks.
+                // Absent ⇒ None.
                 let having = decode_having(&mut c).ok()?;
                 // SP-PG-SQL-GROUP-SORT-LIMIT: optional trailing group-sort block.
                 let sort = decode_group_sort(&mut c).ok()?;
-                Op::GroupAggregateMulti { type_id, program, group_field, aggregates, range_preds, having, sort }
+                Op::GroupAggregateMulti { type_id, program, group_field, aggregates, range_preds, extra_group_fields, having, sort }
             }
             24 => {
                 let type_id = c.u32()?;
@@ -2347,18 +2441,18 @@ mod tests {
             // aggregate (sentinel field id) over an INNER join, no filter — the
             // ga block force-writes the empty-filter + inner-tag + all-None page
             // block anchors, then the group/agg fields.
-            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 0, filter: vec![], join_type: JoinType::Inner, order_by: None, limit_n: None, offset_n: None, group_aggregate: Some(JoinGroupAgg { group_field: 0, aggregates: vec![(0, COUNT_STAR_FIELD)], having: None }), extra_joins: vec![] },
+            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 0, filter: vec![], join_type: JoinType::Inner, order_by: None, limit_n: None, offset_n: None, group_aggregate: Some(JoinGroupAgg { group_field: 0, aggregates: vec![(0, COUNT_STAR_FIELD)], extra_group_fields: vec![], having: None }), extra_joins: vec![] },
             // SP-PG-SQL-JOIN-AGG: GROUP BY field 1, TWO aggregates (COUNT(col 3)
             // + SUM(col 4)) over a LEFT join WITH filter — every trailing region
             // present at once (filter, tag, page block, ga block).
-            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 0, filter: vec![1, 0, 0, 5, 42, 3], join_type: JoinType::Left, order_by: None, limit_n: None, offset_n: None, group_aggregate: Some(JoinGroupAgg { group_field: 1, aggregates: vec![(0, 3), (1, 4)], having: None }), extra_joins: vec![] },
+            Op::Join { left_type: 4, right_type: 5, left_field: 1, right_field: 2, limit: 0, filter: vec![1, 0, 0, 5, 42, 3], join_type: JoinType::Left, order_by: None, limit_n: None, offset_n: None, group_aggregate: Some(JoinGroupAgg { group_field: 1, aggregates: vec![(0, 3), (1, 4)], extra_group_fields: vec![], having: None }), extra_joins: vec![] },
             Op::Aggregate { type_id: 4, program: vec![1], kind: 1, field_id: 3, range_preds: vec![] },
             // SP-Analytic-Plan: aggregate w/ range hints — new wire suffix.
             Op::Aggregate { type_id: 4, program: vec![1], kind: 1, field_id: 3, range_preds: vec![(2, 1, vec![7, 0]), (2, 3, vec![9, 0])] },
             Op::SelectFields { type_id: 4, program: vec![1], fields: vec![1, 3], limit: 5 },
-            Op::GroupAggregate { type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3, range_preds: vec![], having: None, sort: None },
+            Op::GroupAggregate { type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3, range_preds: vec![], extra_group_fields: vec![], having: None, sort: None },
             // SP-Analytic-Plan: group-agg w/ range hints — new wire suffix.
-            Op::GroupAggregate { type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3, range_preds: vec![(2, 1, vec![1, 0]), (2, 3, vec![5, 0])], having: None, sort: None },
+            Op::GroupAggregate { type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3, range_preds: vec![(2, 1, vec![1, 0]), (2, 3, vec![5, 0])], extra_group_fields: vec![], having: None, sort: None },
             Op::SelectSorted { type_id: 4, program: vec![1], sort_field: 3, desc: true, offset: 2, limit: 5 },
             Op::AddCompositeIndex { type_id: 4, fields: vec![1, 3] },
             Op::DropIndex { type_id: 4, fields: vec![1] },
@@ -2546,6 +2640,7 @@ mod tests {
             group_aggregate: Some(JoinGroupAgg {
                 group_field: 0,
                 aggregates: vec![(0, COUNT_STAR_FIELD), (1, 4)],
+                extra_group_fields: vec![],
                 having: None,
             }),
             extra_joins: vec![],
@@ -2626,6 +2721,7 @@ mod tests {
             group_aggregate: Some(JoinGroupAgg {
                 group_field: 0,
                 aggregates: vec![(0, COUNT_STAR_FIELD)],
+                extra_group_fields: vec![],
                 having: None,
             }),
             extra_joins: vec![],
@@ -3021,6 +3117,7 @@ mod tests {
             kind: 0,
             agg_field: 5,
             range_preds: vec![],
+            extra_group_fields: vec![],
             having: None, sort: None,
         };
         let enc_g = post_g.encode();
@@ -3050,6 +3147,7 @@ mod tests {
                 Op::GroupAggregate {
                     type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3,
                     range_preds: rp.clone(),
+                    extra_group_fields: vec![],
                     having: None, sort: None,
                 },
             ] {
@@ -3081,6 +3179,7 @@ mod tests {
                 group_field: 1,
                 aggregates: vec![(0, 0), (1, 3)],
                 range_preds: vec![],
+                extra_group_fields: vec![],
                 having: None, sort: None,
             },
             // 4 aggregates (Q1 shape: COUNT + 3 SUMs), one range_pred
@@ -3090,6 +3189,7 @@ mod tests {
                 group_field: 16,
                 aggregates: vec![(0, 0), (1, 4), (1, 5), (1, 6)],
                 range_preds: vec![(10, 3, vec![0x05, 0x35, 0x2F, 0x01])],
+                extra_group_fields: vec![],
                 having: None, sort: None,
             },
             // 5 aggregates incl. AVG (kind=4) + 2 range_preds
@@ -3099,6 +3199,7 @@ mod tests {
                 group_field: 0,
                 aggregates: vec![(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)],
                 range_preds: vec![(2, 1, vec![1, 0]), (2, 3, vec![9, 0])],
+                extra_group_fields: vec![],
                 having: None, sort: None,
             },
         ];
@@ -3141,6 +3242,7 @@ mod tests {
         let g = Op::GroupAggregate {
             type_id: 4, program: vec![9], group_field: 2, kind: 0, agg_field: 5,
             range_preds: vec![],
+            extra_group_fields: vec![],
             having: None, sort: None,
         };
         let g_enc = g.encode();
@@ -3169,6 +3271,7 @@ mod tests {
         let g = Op::GroupAggregate {
             type_id: 4, program: vec![9], group_field: 2, kind: 0, agg_field: 5,
             range_preds: vec![],
+            extra_group_fields: vec![],
             having: Some(HavingPred { agg_index: 0, op: 1, value: 3 }), sort: None,
         };
         let enc = g.encode();
@@ -3192,6 +3295,7 @@ mod tests {
         let g2 = Op::GroupAggregate {
             type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3,
             range_preds: vec![(2u16, 1u8, vec![1, 0])],
+            extra_group_fields: vec![],
             having: Some(HavingPred { agg_index: 0, op: 0, value: -5 }), sort: None,
         };
         assert_eq!(Op::decode(&g2.encode()).unwrap(), g2, "GA+rp+HAVING round-trip");
@@ -3201,6 +3305,7 @@ mod tests {
             type_id: 7, program: vec![1, 2], group_field: 1,
             aggregates: vec![(0, 0), (1, 3), (3, 4)],
             range_preds: vec![],
+            extra_group_fields: vec![],
             having: Some(HavingPred { agg_index: 2, op: 3, value: 100 }), sort: None,
         };
         assert_eq!(Op::decode(&m.encode()).unwrap(), m, "GroupAggregateMulti+HAVING round-trip");
@@ -3213,6 +3318,7 @@ mod tests {
             group_aggregate: Some(JoinGroupAgg {
                 group_field: 1,
                 aggregates: vec![(0, COUNT_STAR_FIELD)],
+                extra_group_fields: vec![],
                 having: Some(HavingPred { agg_index: 0, op: 5, value: 0 }),
             }),
             extra_joins: vec![],
@@ -3224,6 +3330,7 @@ mod tests {
         // HAVING-bearing frame above — no rp-len, no having block).
         let g_none = Op::GroupAggregate {
             type_id: 4, program: vec![9], group_field: 2, kind: 0, agg_field: 5,
+            extra_group_fields: vec![],
             range_preds: vec![], having: None, sort: None,
         };
         let mut hand_none = Vec::new();
@@ -3240,6 +3347,7 @@ mod tests {
             limit: 0, filter: vec![], join_type: JoinType::Inner,
             order_by: None, limit_n: None, offset_n: None,
             group_aggregate: Some(JoinGroupAgg {
+                extra_group_fields: vec![],
                 group_field: 1, aggregates: vec![(0, COUNT_STAR_FIELD)], having: None,
             }),
             extra_joins: vec![],
@@ -3273,6 +3381,7 @@ mod tests {
         let g = Op::GroupAggregate {
             type_id: 4, program: vec![9], group_field: 2, kind: 0, agg_field: 5,
             range_preds: vec![],
+            extra_group_fields: vec![],
             having: None,
             sort: Some(GroupSort {
                 target: GroupSortTarget::Agg(0),
@@ -3307,6 +3416,7 @@ mod tests {
         let g2 = Op::GroupAggregate {
             type_id: 4, program: vec![1], group_field: 1, kind: 1, agg_field: 3,
             range_preds: vec![(2u16, 1u8, vec![1, 0])],
+            extra_group_fields: vec![],
             having: Some(HavingPred { agg_index: 0, op: 0, value: -5 }),
             sort: Some(GroupSort {
                 target: GroupSortTarget::Key,
@@ -3322,6 +3432,7 @@ mod tests {
             type_id: 7, program: vec![1, 2], group_field: 1,
             aggregates: vec![(0, 0), (1, 3), (3, 4)],
             range_preds: vec![],
+            extra_group_fields: vec![],
             having: Some(HavingPred { agg_index: 2, op: 3, value: 100 }),
             sort: Some(GroupSort {
                 target: GroupSortTarget::Agg(2),
@@ -3337,6 +3448,7 @@ mod tests {
             type_id: 7, program: vec![1], group_field: 1,
             aggregates: vec![(0, 0)],
             range_preds: vec![],
+            extra_group_fields: vec![],
             having: None,
             sort: Some(GroupSort {
                 target: GroupSortTarget::Agg(0),
@@ -3351,6 +3463,7 @@ mod tests {
         // identical to the pre-arc frame (no rp-len, no anchor, no sort block).
         let g_none = Op::GroupAggregate {
             type_id: 4, program: vec![9], group_field: 2, kind: 0, agg_field: 5,
+            extra_group_fields: vec![],
             range_preds: vec![], having: None, sort: None,
         };
         let mut hand_none = Vec::new();

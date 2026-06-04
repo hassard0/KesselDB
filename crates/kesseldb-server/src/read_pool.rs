@@ -401,6 +401,7 @@ mod tests {
                 kind: 0,
                 agg_field: 0,
                 range_preds: vec![],
+                extra_group_fields: vec![],
                 having: None,
                 sort: None,
             },
@@ -473,6 +474,7 @@ mod tests {
                 group_field: 0,
                 aggregates: vec![(0, 0)],
                 range_preds: vec![],
+                extra_group_fields: vec![],
                 having: None,
                 sort: None,
             },
@@ -1245,6 +1247,7 @@ mod tests {
             Op::GroupAggregate {
                 type_id: 1, program: vec![], group_field: 0,
                 kind: 0, agg_field: 0, range_preds: vec![],
+                extra_group_fields: vec![],
                 having: None,
                 sort: None,
             },

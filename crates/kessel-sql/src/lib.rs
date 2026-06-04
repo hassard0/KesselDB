@@ -1271,6 +1271,10 @@ pub struct JoinGroupAggProj {
     pub group_qualifier: String,
     /// GROUP BY column name.
     pub group_column: String,
+    /// SP-PG-SQL-GROUP-MULTI-COL: ADDITIONAL group columns beyond the primary,
+    /// each `(qualifier, column)` (FULL table name resolved). EMPTY ⇒ a single-
+    /// column GROUP BY (the render emits exactly the primary group column).
+    pub extra_group_columns: Vec<(String, String)>,
     /// One per aggregate, in projection order.
     pub aggregates: Vec<JoinAggOut>,
 }
@@ -1302,33 +1306,50 @@ pub fn join_group_aggregate(sql: &str) -> Option<JoinGroupAggProj> {
         Tok::Ident(k) if k.eq_ignore_ascii_case("SELECT") => {}
         _ => return None,
     }
-    // Leading group column `t.c` (V1 requires a qualifier).
-    let group_qualifier = match it.next()? {
-        Tok::Ident(q) => q.clone(),
-        _ => return None,
-    };
-    match it.next()? {
-        Tok::Punct('.') => {}
-        _ => return None, // V1: the group column must be qualified
-    }
-    let group_column = match it.next()? {
-        Tok::Ident(c) => c.clone(),
-        _ => return None,
-    };
-    // Optional `AS <alias>` on the group column — accept-and-skip (rendered by
-    // its source name, like the projection paths).
-    if matches!(it.peek(), Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("AS")) {
-        it.next();
-        match it.next()? {
-            Tok::Ident(_) => {}
+    // SP-PG-SQL-GROUP-MULTI-COL: ONE OR MORE leading qualified group columns
+    // `t.c` (V1 requires a qualifier), each followed by a comma, STOPPING at
+    // the first aggregate call. The first is the primary group column; the
+    // rest are `extra_group_columns` (resolved to FULL table names below).
+    let mut raw_group_cols: Vec<(String, String)> = Vec::new(); // (qualifier, column)
+    loop {
+        // An aggregate call ends the leading-column list.
+        let is_agg = matches!(it.peek(), Some(Tok::Ident(w)) if agg_code(w).is_some())
+            && matches!({ let mut c = it.clone(); c.next(); c.peek().cloned() }, Some(Tok::Punct('(')));
+        if is_agg {
+            break;
+        }
+        let q = match it.next()? {
+            Tok::Ident(q) => q.clone(),
             _ => return None,
+        };
+        match it.next()? {
+            Tok::Punct('.') => {}
+            _ => return None, // V1: a group column must be qualified
+        }
+        let c = match it.next()? {
+            Tok::Ident(c) => c.clone(),
+            _ => return None,
+        };
+        // Optional `AS <alias>` — accept-and-skip.
+        if matches!(it.peek(), Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("AS")) {
+            it.next();
+            match it.next()? {
+                Tok::Ident(_) => {}
+                _ => return None,
+            }
+        }
+        raw_group_cols.push((q, c));
+        match it.next()? {
+            Tok::Punct(',') => {}
+            _ => return None, // a group col is followed by `,`
         }
     }
-    // Then a comma + ≥1 aggregate.
-    match it.next()? {
-        Tok::Punct(',') => {}
-        _ => return None, // a group-agg projection has the agg after the group col
+    if raw_group_cols.is_empty() {
+        return None;
     }
+    let group_qualifier = raw_group_cols[0].0.clone();
+    let group_column = raw_group_cols[0].1.clone();
+    let raw_extra_group_cols: Vec<(String, String)> = raw_group_cols[1..].to_vec();
     let mut aggregates: Vec<JoinAggOut> = Vec::new();
     loop {
         let kind = match it.next()? {
@@ -1412,6 +1433,16 @@ pub fn join_group_aggregate(sql: &str) -> Option<JoinGroupAggProj> {
         Ok(full) => full,
         Err(_) => return None,
     };
+    // SP-PG-SQL-GROUP-MULTI-COL: resolve each EXTRA group column's qualifier
+    // to the FULL table name too.
+    let mut extra_group_columns: Vec<(String, String)> =
+        Vec::with_capacity(raw_extra_group_cols.len());
+    for (q, c) in &raw_extra_group_cols {
+        match resolve_join_qualifier(&refs, q) {
+            Ok(full) => extra_group_columns.push((full, c.clone())),
+            Err(_) => return None,
+        }
+    }
     // Confirm a GROUP BY appears somewhere downstream (it must, for this to be a
     // group-aggregate; the engine compile requires it). Scan the remaining
     // tokens for a top-level `GROUP BY`.
@@ -1429,7 +1460,7 @@ pub fn join_group_aggregate(sql: &str) -> Option<JoinGroupAggProj> {
     if !saw_group {
         return None;
     }
-    Some(JoinGroupAggProj { group_qualifier, group_column, aggregates })
+    Some(JoinGroupAggProj { group_qualifier, group_column, extra_group_columns, aggregates })
 }
 
 /// SP-PG-SERIAL-RETURNING: if `sql` is an `INSERT INTO <table> … RETURNING
@@ -1674,6 +1705,10 @@ pub struct PlainGroupAggProj {
     pub table: String,
     /// GROUP BY column name (qualifier stripped).
     pub group_column: String,
+    /// SP-PG-SQL-GROUP-MULTI-COL: ADDITIONAL group column names (qualifier
+    /// stripped) beyond the primary, in projection order. EMPTY ⇒ a single-
+    /// column GROUP BY (the render emits exactly the primary group column).
+    pub extra_group_columns: Vec<String>,
     /// One per aggregate, in projection order.
     pub aggregates: Vec<PlainAggOut>,
 }
@@ -1719,42 +1754,54 @@ pub fn plain_group_aggregate(sql: &str) -> Option<PlainGroupAggProj> {
         Tok::Ident(k) if k.eq_ignore_ascii_case("SELECT") => {}
         _ => return None,
     }
-    // Leading group column — bare `c` or qualified `t.c` (qualifier stripped).
-    // It must NOT itself be an aggregate function call (`AGG(`), which is the
-    // single-scalar / no-leading-col shape `select_aggregate` owns.
-    let group_column = match it.next()? {
-        Tok::Ident(c) => {
-            // Reject `AGG(` as the leading token — that's the scalar-agg shape.
-            if agg_code(c).is_some() && matches!(it.peek(), Some(Tok::Punct('('))) {
-                return None;
-            }
-            let mut col = c.clone();
-            if matches!(it.peek(), Some(Tok::Punct('.'))) {
-                it.next(); // consume `.`
-                match it.next()? {
-                    Tok::Ident(real) => col = real.clone(),
-                    _ => return None,
-                }
-            }
-            col
+    // SP-PG-SQL-GROUP-MULTI-COL: parse ONE OR MORE leading group columns (bare
+    // `c` or qualified `t.c`, qualifier stripped), each followed by a comma,
+    // STOPPING at the first aggregate function call. The FIRST is the primary
+    // `group_column`; the rest are `extra_group_columns`. A leading aggregate
+    // (`AGG(`) is the single-scalar / no-leading-col shape `select_aggregate`
+    // owns ⇒ `None`.
+    let mut all_group_cols: Vec<String> = Vec::new();
+    loop {
+        // Peek: an aggregate function call ends the leading-column list.
+        let is_agg = matches!(it.peek(), Some(Tok::Ident(w)) if agg_code(w).is_some())
+            && matches!({ let mut c = it.clone(); c.next(); c.peek().cloned() }, Some(Tok::Punct('(')));
+        if is_agg {
+            break;
         }
-        _ => return None,
-    };
-    // Optional `AS <alias>` on the group column — accept-and-skip (rendered by
-    // its source name, like the projection paths).
-    if matches!(it.peek(), Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("AS")) {
-        it.next();
+        let col = match it.next()? {
+            Tok::Ident(c) => {
+                let mut col = c.clone();
+                if matches!(it.peek(), Some(Tok::Punct('.'))) {
+                    it.next(); // consume `.`
+                    match it.next()? {
+                        Tok::Ident(real) => col = real.clone(),
+                        _ => return None,
+                    }
+                }
+                col
+            }
+            _ => return None,
+        };
+        // Optional `AS <alias>` — accept-and-skip (rendered by source name).
+        if matches!(it.peek(), Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("AS")) {
+            it.next();
+            match it.next()? {
+                Tok::Ident(_) => {}
+                _ => return None,
+            }
+        }
+        all_group_cols.push(col);
+        // A comma must follow (then either another group col or the aggregate).
         match it.next()? {
-            Tok::Ident(_) => {}
+            Tok::Punct(',') => {}
             _ => return None,
         }
     }
-    // Then a comma + ≥1 aggregate (a plain group-agg projection has the
-    // group column first, then the aggregate(s)).
-    match it.next()? {
-        Tok::Punct(',') => {}
-        _ => return None,
+    if all_group_cols.is_empty() {
+        return None; // no leading group column ⇒ scalar-agg shape
     }
+    let group_column = all_group_cols[0].clone();
+    let extra_group_columns: Vec<String> = all_group_cols[1..].to_vec();
     let mut aggregates: Vec<PlainAggOut> = Vec::new();
     loop {
         let kind = match it.next()? {
@@ -1838,7 +1885,7 @@ pub fn plain_group_aggregate(sql: &str) -> Option<PlainGroupAggProj> {
     if !saw_group {
         return None;
     }
-    Some(PlainGroupAggProj { table, group_column, aggregates })
+    Some(PlainGroupAggProj { table, group_column, extra_group_columns, aggregates })
 }
 
 /// SP-PG-SQL-DML-GENERAL — if `sql` is an `UPDATE <table> … RETURNING
@@ -4420,11 +4467,26 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
             }
             p.expect_kw("BY")?;
             // qualified `a.c` (V1 requires a qualifier so the combined-schema
-            // resolution is unambiguous across the two tables).
-            let gqt = p.ident()?;
-            p.punct('.')?;
-            let gqc = p.ident()?;
-            let group_field = resolve_combined(&gqt, &gqc)?;
+            // resolution is unambiguous across the two tables). SP-PG-SQL-GROUP-
+            // MULTI-COL: a comma-separated list of qualified group columns.
+            let mut gcols: Vec<(String, String)> = Vec::new(); // (qualifier, column)
+            loop {
+                let gqt = p.ident()?;
+                p.punct('.')?;
+                let gqc = p.ident()?;
+                gcols.push((gqt, gqc));
+                if matches!(p.peek(), Some(Tok::Punct(','))) {
+                    p.i += 1;
+                    continue;
+                }
+                break;
+            }
+            // PRIMARY group field = the first column; the rest are extras.
+            let group_field = resolve_combined(&gcols[0].0, &gcols[0].1)?;
+            let mut extra_group_fields: Vec<u16> = Vec::with_capacity(gcols.len() - 1);
+            for (qt, qc) in &gcols[1..] {
+                extra_group_fields.push(resolve_combined(qt, qc)?);
+            }
             // The projection must be the aggregate shape. Pull the leading group
             // column(s) + aggregates out of `proj` (parsed up-front).
             let (leading_cols, aggs) = match &proj {
@@ -4437,21 +4499,15 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
                     )
                 }
             };
-            // V1: exactly one leading group column, and it must match the GROUP
-            // BY column (by its bare column name — `col_ident` already stripped
-            // the qualifier when the projection was parsed).
-            if leading_cols.len() != 1 {
-                return Err(
-                    "JOIN GROUP BY V1 supports exactly one leading group column \
-                     matching the GROUP BY column"
-                        .into(),
-                );
-            }
-            if leading_cols[0] != gqc {
+            // The leading group columns (bare names, qualifier stripped by
+            // `col_ident`) MUST equal the GROUP BY columns in order.
+            let want: Vec<String> = gcols.iter().map(|(_, c)| c.clone()).collect();
+            if leading_cols.len() != want.len()
+                || leading_cols.iter().zip(want.iter()).any(|(a, b)| a != b)
+            {
                 return Err(format!(
-                    "GROUP BY column `{gqc}` must match the leading projection \
-                     column `{}`",
-                    leading_cols[0]
+                    "JOIN GROUP BY leading projection columns {leading_cols:?} \
+                     must match the GROUP BY columns {want:?}"
                 ));
             }
             // Resolve each aggregate's argument to a combined field id. `COUNT(*)`
@@ -4608,7 +4664,7 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
                 None
             };
             group_aggregate =
-                Some(kessel_proto::JoinGroupAgg { group_field, aggregates, having });
+                Some(kessel_proto::JoinGroupAgg { group_field, extra_group_fields, aggregates, having });
         }
         // SP-PG-SQL-JOIN-QUERY: optional `ORDER BY <qualified col> [ASC|DESC]`
         // then `LIMIT n` / `OFFSET m`, composing with the optional WHERE above.
@@ -4745,6 +4801,10 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
     };
 
     let mut group: Option<String> = None;
+    // SP-PG-SQL-GROUP-MULTI-COL — additional GROUP BY columns beyond the
+    // primary (`GROUP BY region, category`). Empty ⇒ single-column GROUP BY
+    // (byte-identical). Each entry is the (qualifier-stripped) column name.
+    let mut extra_group: Vec<String> = Vec::new();
     let mut sort: Option<(String, bool)> = None;
     let mut limit: u32 = 0;
     let mut offset: u32 = 0;
@@ -4752,6 +4812,12 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
         p.expect_kw("BY")?;
         // SP-PG-SQL-ORM-PARSE T2 — GROUP BY column may be qualified.
         group = Some(p.col_ident()?);
+        // SP-PG-SQL-GROUP-MULTI-COL — a comma-separated list of further
+        // group columns (each bare or qualified `t.c`).
+        while matches!(p.peek(), Some(Tok::Punct(','))) {
+            p.i += 1;
+            extra_group.push(p.col_ident()?);
+        }
     }
     // SP-PG-SQL-HAVING — optional `HAVING <AGG>(arg) <cmp> <int>` after
     // GROUP BY, before ORDER BY. Parse the raw aggregate spec + comparison
@@ -4985,7 +5051,11 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
                 };
             // Single-aggregate back-compat path (byte-identical emit when no
             // HAVING; HAVING adds the marker-guarded trailing block only).
-            if aggs.len() == 1 && leading_cols.is_empty() {
+            // SP-PG-SQL-GROUP-MULTI-COL: the single-agg byte-identical path
+            // only applies to a SINGLE group column (no extra GROUP BY cols).
+            // A multi-column GROUP BY with one aggregate routes to the Multi
+            // path below (which carries `extra_group_fields`).
+            if aggs.len() == 1 && leading_cols.is_empty() && extra_group.is_empty() {
                 let (k, af) = resolve_agg(&aggs[0])?;
                 if let Some(g) = group {
                     let having = match &having_raw {
@@ -5001,6 +5071,7 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
                         kind: k,
                         agg_field: af,
                         range_preds: agg_range_preds,
+                        extra_group_fields: Vec::new(),
                         having,
                         sort: sort_spec,
                     });
@@ -5021,37 +5092,48 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
                     });
                 }
             }
-            // Multi-aggregate / leading-col path.
-            // Determine the single group field (V1: one column) + its NAME (so
-            // SP-PG-SQL-GROUP-SORT-LIMIT can resolve `ORDER BY g` to the key).
-            let (group_field, group_name): (u16, String) = match (group, leading_cols.as_slice()) {
-                (Some(g), []) => (fid(&g)?, g),
-                (None, [c]) => (fid(c)?, c.clone()),
-                (Some(g), [c]) => {
-                    if g != *c {
+            // Multi-aggregate / leading-col / multi-column-GROUP-BY path.
+            // SP-PG-SQL-GROUP-MULTI-COL — build the FULL ordered list of group
+            // columns (primary first, then extras). The group columns come from
+            // the GROUP BY clause (`group` + `extra_group`); if there is no
+            // explicit GROUP BY, the leading projection columns ARE the group
+            // columns (the implied-GROUP-BY shape `SELECT g1, g2, COUNT(*)`).
+            // The leading projection columns (non-aggregate SELECT cols) MUST
+            // equal the group columns (PostgreSQL semantics).
+            let group_cols: Vec<String> = match (&group, leading_cols.as_slice()) {
+                (Some(g), _) => {
+                    let mut v = vec![g.clone()];
+                    v.extend(extra_group.iter().cloned());
+                    // If there are leading projection cols, they must match the
+                    // GROUP BY columns exactly (in order).
+                    if !leading_cols.is_empty() && leading_cols.as_slice() != v.as_slice() {
                         return Err(format!(
-                            "GROUP BY column `{g}` must match leading projection `{c}`"
+                            "SELECT non-aggregate columns {leading_cols:?} must \
+                             match GROUP BY columns {v:?} (PostgreSQL requires \
+                             every non-aggregate SELECT column to appear in \
+                             GROUP BY)"
                         ));
                     }
-                    (fid(&g)?, g)
+                    v
                 }
                 (None, []) => {
                     // ≥2 aggs but no group field — there's no group key. V1
-                    // requires a GROUP BY (single-column) for the Multi op;
-                    // a "no GROUP BY" multi-aggregate (one row, N values)
-                    // is a follow-on shape (out of scope for V1).
+                    // requires a GROUP BY for the Multi op.
                     return Err(
                         "multi-aggregate SELECT requires GROUP BY (V1)".into(),
                     );
                 }
-                (_, _) => {
-                    return Err(
-                        "multi-column GROUP BY not supported in V1 (use one \
-                         leading group column)"
-                            .into(),
-                    );
-                }
+                (None, cols) => cols.to_vec(), // implied GROUP BY = leading cols
             };
+            // Resolve every group column to a field id; the FIRST is the
+            // PRIMARY `group_field`, the rest are `extra_group_fields`. The
+            // primary's NAME drives `ORDER BY g`/key resolution.
+            let group_field = fid(&group_cols[0])?;
+            let group_name = group_cols[0].clone();
+            let mut extra_group_fields: Vec<u16> = Vec::with_capacity(group_cols.len() - 1);
+            for c in &group_cols[1..] {
+                extra_group_fields.push(fid(c)?);
+            }
             let mut resolved: Vec<(u8, u16)> = Vec::with_capacity(aggs.len());
             for a in &aggs {
                 resolved.push(resolve_agg(a)?);
@@ -5069,6 +5151,7 @@ fn compile_select(p: &mut P) -> Result<Op, SqlError> {
                 group_field,
                 aggregates: resolved,
                 range_preds: agg_range_preds,
+                extra_group_fields,
                 having,
                 sort: sort_spec,
             })

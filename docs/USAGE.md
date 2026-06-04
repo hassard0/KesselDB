@@ -395,8 +395,8 @@ SELECT * FROM <t> [WHERE <expr>]                 -- =, !=, <, <=, >, >=, AND/OR/
                                                  --   col IS [NOT] NULL, col [NOT] LIKE 'pat%' (NOT IN / NOT BETWEEN too)
 SELECT <c1>, <c2> FROM <t> [WHERE ...]           -- projection
 SELECT COUNT(*) | SUM(c) | MIN(c) | MAX(c) | AVG(c) FROM <t> [WHERE ...]  -- single scalar aggregate (SP-PG-SQL-AGG-ALIAS-RENDER)
-SELECT <g>, <AGG>( * | <c> ) [AS alias] [, <AGG>(…) …] FROM <t> [WHERE …]  -- plain GROUP BY group-aggregate (SP-PG-SQL-PLAIN-GROUP-RENDER)
-       GROUP BY <g>                                     --   COUNT/SUM/MIN/MAX/AVG per group; one row per group
+SELECT <g1>[, <g2> …], <AGG>( * | <c> ) [AS alias] [, <AGG>(…) …] FROM <t> [WHERE …]  -- plain GROUP BY group-aggregate (SP-PG-SQL-PLAIN-GROUP-RENDER)
+       GROUP BY <g1>[, <g2> …]                          --   COUNT/SUM/MIN/MAX/AVG per group; one row per (g1[,g2,…]); multi-column (SP-PG-SQL-GROUP-MULTI-COL)
        [HAVING <AGG>(...) <cmp> <literal>]              --   filter groups by an aggregate (SP-PG-SQL-HAVING)
        [ORDER BY <agg|alias|pos|g> [ASC|DESC]] [LIMIT n] [OFFSET n]  --   engine sorts + windows groups (SP-PG-SQL-GROUP-SORT-LIMIT)
 SELECT * FROM <t> [WHERE ...] ORDER BY <col> [DESC] [OFFSET n] [LIMIT n]
@@ -404,9 +404,9 @@ SELECT <proj> FROM <a> [[AS] <a1>] [INNER|LEFT|RIGHT|FULL [OUTER]] JOIN <b> [[AS
        [JOIN <c> [[AS] <a3>] ON <a1|a2.x> = <a3.y> [JOIN <d> ON …]]  --   chained N-way INNER joins, 3+ tables (SP-PG-SQL-MULTI-JOIN)
        [WHERE <pred over any joined table's cols>]       --   INNER (default) / LEFT / RIGHT / FULL; filtered (qualified cols, AND/OR/…)
        [ORDER BY <t.c> [ASC|DESC]] [LIMIT n] [OFFSET m]  --   paginate the (sorted) join
-SELECT <a.g>, <AGG>( * | <a.c | b.c> ) [AS alias] [, <AGG>(…) …]  -- grouped aggregate over a join
+SELECT <a.g1>[, <b.g2> …], <AGG>( * | <a.c | b.c> ) [AS alias] [, <AGG>(…) …]  -- grouped aggregate over a join
        FROM <a> [INNER|LEFT|RIGHT|FULL [OUTER]] JOIN <b> ON <a.x> = <b.y> [WHERE …]
-       GROUP BY <a.g>                                   --   COUNT/SUM/MIN/MAX/AVG per group; one row per group
+       GROUP BY <a.g1>[, <b.g2> …]                      --   COUNT/SUM/MIN/MAX/AVG per group; one row per (g1[,g2,…]); multi-column (SP-PG-SQL-GROUP-MULTI-COL)
        [HAVING <AGG>(...) <cmp> <literal>]              --   filter groups after aggregation (SP-PG-SQL-HAVING)
 ```
 
@@ -507,6 +507,29 @@ produces byte-identical `Op` frames to before, so the determinism oracles are
 untouched. ORDER BY over a **JOIN** group-aggregate remains the separate
 follow-up `SP-PG-SQL-JOIN-AGG-ORDERBY-AGG`.
 
+**Multi-column `GROUP BY`** (SP-PG-SQL-GROUP-MULTI-COL) — group by SEVERAL
+columns to form a COMPOSITE group key, the bread-and-butter cross-tab analytics
+query:
+
+```sql
+SELECT region, category, COUNT(*), SUM(amount)
+  FROM sales GROUP BY region, category;
+```
+
+returns one row per DISTINCT `(region, category)` tuple with the per-group
+aggregates. Every non-aggregate column in the SELECT list must appear in
+`GROUP BY` (PostgreSQL semantics); a GROUP BY column that isn't in the table /
+combined schema is a clean error. Columns may be bare (`category`), qualified
+(`t.category`), or aliased (`u.category`, resolved via the join alias map). It
+composes with `HAVING` (filter composite groups), `ORDER BY` (by any aggregate
+or the FIRST group column) and `LIMIT`/`OFFSET` — so `GROUP BY region, category
+ORDER BY COUNT(*) DESC LIMIT 10` is top-N over composite groups. Works on a
+plain single-table GROUP BY AND over a binary join. The extra columns are
+additive + marker-guarded on the wire: a single-column GROUP BY produces
+byte-identical `Op` frames AND a byte-identical result stream to before, so the
+whole existing aggregate surface — and the determinism oracles — are untouched.
+Multi-column GROUP BY over a 3+ table chain is a named follow-up.
+
 `GROUP BY <a.g>` + one or more aggregates over a join is the dashboard /
 reporting query — "count (or sum / …) the related rows per parent":
 
@@ -521,8 +544,9 @@ values. For a `LEFT JOIN`, an unmatched parent (all `b.*` = NULL) makes
 `COUNT(b.id)` = 0 but `COUNT(*)` = 1 — the classic LEFT-JOIN-COUNT gotcha,
 matching PostgreSQL exactly. The group + aggregate columns may come from either
 table; qualify an aggregate arg (`COUNT(b.id)`) when the column name exists in
-both tables. (V1: one GROUP BY column; multi-column GROUP BY and 3+-table
-join-agg are named follow-ups.)
+both tables. Multi-column GROUP BY over a binary join is supported
+(`GROUP BY a.region, b.category`, SP-PG-SQL-GROUP-MULTI-COL); a 3+-table
+join-agg remains a named follow-up.
 
 `HAVING <AGG>(...) <cmp> <literal>` (SP-PG-SQL-HAVING) filters the GROUPS *after*
 aggregation — the "only show parents with more than N children" report:

@@ -26,6 +26,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning [Se
 
 ### Added
 
+- **Multi-column `GROUP BY` — composite group keys (SP-PG-SQL-GROUP-MULTI-COL,
+  2026-06-04)** — `SELECT region, category, COUNT(*), SUM(amount) FROM sales
+  GROUP BY region, category` now groups by the TUPLE of several columns, the
+  bread-and-butter cross-tab analytics query. Works on a plain single-table
+  GROUP BY AND over a binary join, and composes with `HAVING`, `ORDER BY`
+  (by an aggregate or the first group column) and `LIMIT`/`OFFSET`. Every
+  non-aggregate SELECT column must appear in `GROUP BY` (PostgreSQL semantics);
+  columns may be bare, qualified (`t.c`), or aliased (`u.c`). Implemented as a
+  marker-guarded, additive `extra_group_fields` on `Op::GroupAggregate`,
+  `Op::GroupAggregateMulti`, and the join `JoinGroupAgg`: the SM builds a
+  COMPOSITE group key (primary ++ each extra column's fixed-width bytes — a
+  deterministic total order) and emits each extra value as `[u32 len][value]`
+  after the primary key, before the aggregates. A SINGLE-column GROUP BY emits
+  BYTE-IDENTICAL `Op` frames AND a byte-identical result stream to before, so
+  the whole existing aggregate surface and the determinism oracles are
+  untouched. The scatter merge threads the extra-column count so K>=2 sharded
+  clusters merge composite groups correctly. Multi-column GROUP BY over a 3+
+  table chain is a named follow-up.
+
 - **RIGHT + FULL outer joins complete the join-type matrix
   (SP-PG-SQL-RIGHT-FULL-JOIN, 2026-06-03)** — `RIGHT [OUTER] JOIN` and
   `FULL [OUTER] JOIN` join the existing `[INNER] JOIN` and `LEFT [OUTER] JOIN`

@@ -57,6 +57,20 @@ measurement and had drifted from the actual workspace count).
   unknown column → clean DDL error, no half-created type. The ORM
   relationships + realapp smokes pass UNDER enforcement (dependency-ordered
   seeds satisfy it). Deferred: composite FKs, `ON UPDATE` actions.
+- **Multi-column `GROUP BY` — composite group keys (SP-PG-SQL-GROUP-MULTI-COL,
+  2026-06-04).** `SELECT region, category, COUNT(*), SUM(amount) FROM sales
+  GROUP BY region, category` groups by the TUPLE of N columns, the cross-tab
+  analytics query. Plain single-table AND binary-join; composes with HAVING /
+  ORDER BY (aggregate or first group col) / LIMIT / OFFSET. Marker-guarded
+  additive `extra_group_fields` on `Op::GroupAggregate` / `Op::GroupAggregate
+  Multi` / `JoinGroupAgg`; SM builds a COMPOSITE key (primary ++ each extra's
+  fixed-width bytes — deterministic total order) and emits each extra value as
+  `[u32 len][value]` after the primary key, before the aggregates. A SINGLE-
+  column GROUP BY is BYTE-IDENTICAL (Op frame + result stream) ⇒ determinism
+  oracles untouched. Scatter merge threads the extra-col count so K>=2 merges
+  composite groups. 3+ table multi-join GROUP BY is the named follow-up. Live
+  vulcan psql smoke: **7/7** stages PASS; the SP-PG-SQL-PLAIN-GROUP-RENDER +
+  SP-PG-SQL-GROUP-SORT-LIMIT single-column regression smokes stay green.
 - **RIGHT + FULL outer joins — full join-type matrix (SP-PG-SQL-RIGHT-FULL-JOIN,
   2026-06-03).** `RIGHT [OUTER] JOIN` and `FULL [OUTER] JOIN` complete the
   INNER / LEFT / RIGHT / FULL matrix on a binary join. RIGHT = matched pairs +

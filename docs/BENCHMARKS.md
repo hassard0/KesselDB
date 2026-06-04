@@ -58,6 +58,36 @@ columns are preserved as historical in §3–§3g. Raw per-trial JSONs:
 `/tmp/finalbench-*.json`); consolidated medians:
 `docs/benchmarks/finalbench-2026-06-02-summary.txt`.
 
+#### Re-measurement 2026-06-04 (HEAD `54bf969`) — numbers HELD after the SP-PG SQL/ORM arc series
+
+After the 2026-06-03/04 SQL-surface series (HAVING, plain/multi-column `GROUP
+BY` render, `GROUP BY … ORDER BY/LIMIT`, multi-table + RIGHT/FULL + aliased
+JOINs, FK enforcement, NULL render, `DISTINCT`, WHERE subqueries — all gateway /
+parser / render layer), the perf surface was re-measured on vulcan vs the same
+`bench-pg` Postgres 16 to confirm **no regression of the hot paths** (none of
+those arcs touch the read-pool apply path; the only engine-level change, the
+multi-column `GROUP BY` `extra_group_fields`, is additive + marker-guarded so a
+single-column group is byte-identical). 2 trials each, median:
+
+| Workload | KesselDB | Postgres | Ratio | vs 2026-06-02 |
+|---|---|---|---|---|
+| YCSB-C reads, N=1 | 1.18M ops/s (p50 0µs) | 5.3K (p50 191µs) | **221× faster** | held |
+| YCSB-C reads, N=8 | 4.45M ops/s | 66.5K | **67× faster** | held |
+| YCSB-C reads, N=16 | **5.0M ops/s** (p50 2µs, p99 6µs) | 79.3K (p50 191µs) | **63× faster** | held (was 63.75×) |
+| TPC-H Q1 (multi-agg GROUP BY), N=4 | 85.1 q/s (p50 47ms) | 184.6 q/s | LOSES 2.17× | held (was 2.16×) |
+| TPC-H Q6 (SUM + WHERE), N=4 | 555.7 q/s (p50 7.1ms) | 1,677 q/s | LOSES 3.02× | held (was 3.09×) |
+
+Single-node serial-apply (`kessel-bench`, batch=1): mem VFS CREATE 93.5K /
+GET 157K ops/s (p50 5–6µs); file VFS (real fsync) CREATE **247 ops/s** (p50
+3.8ms, one fsync per durable op) / GET 298K ops/s. The fsync-per-op write floor
+and the TPC-H aggregate-fold gap (the named `SP-JIT-Aggregate` follow-up) are the
+two standing residuals — unchanged. Raw JSONs on vulcan `/tmp/perf-{ycsbc,tpch-q1,tpch-q6}.json`.
+
+Build note: this re-measurement also fixed a build break in the out-of-workspace
+`tools/bench-compare` crate (`Op::GroupAggregateMulti` missing the new
+`extra_group_fields` field) — that crate has its own `[workspace]`, so
+`cargo test --workspace` does not compile it. Fixed in `54bf969`.
+
 KesselDB **wins 6 of 8 cross-DB workloads vs Postgres** (the SHARD-APPLY
 row is the internal sharded ceiling — see §13). Both transaction-bracket
 losses called out in the prior revisions are now closed:

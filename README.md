@@ -49,8 +49,10 @@ all. Determinism is a feature, not an aspiration.
   incl. `IN` / `BETWEEN` / `LIKE` / `IS [NOT] NULL` / `AND`/`OR`/`NOT`, `JOIN` (INNER/LEFT, chained 3+ table, table aliases `users u` / `users AS u`), `GROUP BY`, `HAVING`,
   `ORDER BY`, `LIMIT/OFFSET`), `UPDATE`, `DELETE`,
   `COUNT/SUM/MIN/MAX/AVG`, `CREATE [UNIQUE|RANGE] INDEX`, `DESCRIBE`, `EXPLAIN`.
-- **Constraints & logic** — `NOT NULL`, `UNIQUE`, foreign keys with
-  `ON DELETE RESTRICT/CASCADE/SET NULL`, `CHECK`, and deterministic triggers
+- **Constraints & logic** — `NOT NULL`, `UNIQUE`, foreign keys ENFORCED from
+  `CREATE TABLE … FOREIGN KEY` DDL (bad child INSERT → SQLSTATE 23503, NULL FK
+  allowed) with `ON DELETE NO ACTION/RESTRICT/CASCADE/SET NULL/SET DEFAULT`,
+  `CHECK`, and deterministic triggers
   (a gas‑bounded zero‑dep expression VM) — incl. zero‑dep, test‑vector‑verified
   **SHA‑256 / HMAC‑SHA256** usable in `CHECK`/triggers (pgcrypto‑subset).
 - **Atomic transactions** — SQL `BEGIN`/`COMMIT`/`ROLLBACK` (and op‑level

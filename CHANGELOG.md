@@ -7,6 +7,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning [Se
 
 ### Added
 
+- **DDL FOREIGN KEY is now ENFORCED (SP-PG-DDL-FK-ENFORCE, 2026-06-03)** —
+  a `FOREIGN KEY (col) REFERENCES tbl [(col)] [ON DELETE …]` declared in
+  `CREATE TABLE` (table-level or the inline `col … REFERENCES tbl(col)` form)
+  now ENFORCES referential integrity. Previously the FK was parsed and thrown
+  away. An INSERT/UPDATE of a child whose non-NULL FK value has no matching
+  parent row is rejected with PostgreSQL SQLSTATE **23503**
+  (`foreign_key_violation`); a NULL FK is allowed. `ON DELETE` actions
+  `NO ACTION` / `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT` are all
+  honored (RESTRICT blocks deleting a referenced parent with 23503; CASCADE
+  removes the children). This is a WIRING arc — the engine FK machinery
+  (Sub-projects 6 + 11) pre-existed; the DDL parser now captures the FK
+  descriptor BY NAME, threads it through the `CreateType` op in a
+  marker-guarded ADDITIVE trailer (a no-FK `CREATE TABLE` is byte-identical
+  to before — determinism preserved), and the engine resolves the names to
+  ids + registers the FK at apply time through the same path
+  `Op::AddForeignKey` uses. A forward reference (parent table not yet
+  created) or unknown column is a clean DDL error with NO half-created table.
+  Deferred: composite FKs (`SP-PG-DDL-COMPOSITE-FK`), `ON UPDATE` actions
+  (`SP-PG-DDL-FK-ON-UPDATE`).
 - **Table aliases in JOIN queries (SP-PG-SQL-JOIN-ALIAS, 2026-06-03)** —
   `SELECT u.name, p.title FROM users u JOIN posts p ON u.id = p.user_id`
   (and the `FROM users AS u` form) now resolve. Previously the parser accepted

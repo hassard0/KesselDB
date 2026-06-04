@@ -298,6 +298,13 @@ tested):
 
 ```sql
 CREATE TABLE <t> (<col> <TYPE> [NOT NULL], ...)
+CREATE TABLE <child> (..., <fkcol> <TYPE>,   -- FOREIGN KEY is ENFORCED:
+  FOREIGN KEY(<fkcol>) REFERENCES <parent>(id)  --  a non-NULL <fkcol> with no
+    [ON DELETE NO ACTION|RESTRICT|CASCADE|SET NULL|SET DEFAULT])  -- matching parent
+                                            --  row is rejected (SQLSTATE 23503);
+                                            --  NULL is allowed. Inline form
+                                            --  `<fkcol> <TYPE> REFERENCES <parent>(id)`
+                                            --  works too. Create the parent FIRST.
 ALTER TABLE <t> ADD [COLUMN] <c> <TYPE> [NOT NULL]  -- online, no lock; old rows: NULL
 DROP TABLE <t>                              -- removes rows, indexes & the type
                                             -- (refused if an FK still points at it)
@@ -528,8 +535,11 @@ PostgreSQL's default output naming. This is what Django's `.count()`,
   (add field) without downtime.
 - **Records** are fixed‑width per the schema; variable‑length values use an
   overflow store transparently.
-- **Constraints**: `NOT NULL`, `UNIQUE`, foreign keys
-  (`ON DELETE RESTRICT | CASCADE | SET NULL`), `CHECK` (a deterministic,
+- **Constraints**: `NOT NULL`, `UNIQUE`, foreign keys — ENFORCED whether
+  declared via `CREATE TABLE … FOREIGN KEY(col) REFERENCES …` DDL or
+  `ALTER`/engine op; a non-NULL FK with no matching parent row is rejected
+  (SQLSTATE 23503), a NULL FK is allowed, and `ON DELETE NO ACTION | RESTRICT
+  | CASCADE | SET NULL | SET DEFAULT` are honored. `CHECK` (a deterministic,
   gas‑bounded expression program).
 - **Triggers**: before‑write programs that may mutate or reject a row — same
   zero‑dep deterministic VM as `CHECK`.
@@ -1666,7 +1676,7 @@ on vulcan:
 
 | Relationship operation | Result | Notes |
 |---|---|---|
-| `create_all()` with a FK (2 tables) | **PASS** (new) | the child table's `FOREIGN KEY(author_id) REFERENCES authors (id)` table constraint (and the inline `REFERENCES …` form) now parse — accept-and-skip, byte-identical `CreateType` |
+| `create_all()` with a FK (2 tables) | **PASS** | the child table's `FOREIGN KEY(author_id) REFERENCES authors (id)` table constraint (and the inline `REFERENCES …` form) parse AND are now ENFORCED (SP-PG-DDL-FK-ENFORCE) — the FK descriptor is captured BY NAME and registered at apply time |
 | relationship cascade INSERT | **PASS** | `a.books = [Book, Book]; s.add(a); commit` → parent + children flush via `INSERT … RETURNING id`; the FK column is the parent's assigned id |
 | JOIN query `select(A.x, B.y).join(B, …)` | **PASS** (new) | `SELECT authors.name, books.title FROM authors JOIN books ON authors.id = books.author_id` → the gateway renders the engine's self-describing `Op::Join` (`KTR1`) result; `SELECT *` over a JOIN works too (columns labeled by qualified `authors.id` / `books.id`) |
 | **filtered JOIN** `…join(B, …).where(B.x == v)` | **PASS** (SP-PG-SQL-JOIN-WHERE) | `… JOIN books ON … WHERE books.title = $1` → `Op::Join` carries a `kessel-expr` filter over the COMBINED (a++b) schema; the engine filters joined rows in-place. Qualified cols from EITHER table (`authors.name`, `books.title`), `AND`/`OR`/`NOT`/`IN`/`BETWEEN`/`LIKE`, params, bare-col + ambiguity check |
@@ -1678,8 +1688,8 @@ The two keystone fixes: **(A)** kessel-sql now accept-and-skips FK DDL
 the engine's embedded combined schema, recovers the projection from the SQL
 (`kessel_sql::join_projection`), and emits the projected columns. Before this
 arc a JOIN hit the "only renders `SELECT *`" error even though the engine
-joined. **V1 out-of-scope** (named follow-ups): `SP-PG-DDL-FK-ENFORCE`
-(referential-integrity enforcement — FK is parse-and-skip today),
+joined. **V1 out-of-scope** (named follow-ups): ~~`SP-PG-DDL-FK-ENFORCE`~~
+(DONE 2026-06-03 — DDL FK is now ENFORCED end-to-end, bad child INSERT → 23503),
 `SP-PG-SQL-OUTER-JOIN` (LEFT/RIGHT/FULL — `Op::Join` is inner-only),
 `SP-PG-SQL-JOIN-ALIAS`,
 `SP-PG-SQL-JOIN-AGG`. (`SP-PG-SQL-JOIN-WHERE` — filtered joins — shipped, see
@@ -1697,7 +1707,7 @@ default) exercising the **full** query range a real app uses, back-to-back.
 
 | App operation | Result | Notes |
 |---|---|---|
-| `create_all()` — 3 tables, 2 FKs | **PASS** | FK table-constraints parse (SP-PG-ORM-RELATIONSHIPS) |
+| `create_all()` — 3 tables, 2 FKs | **PASS** | FK table-constraints parse AND are ENFORCED (SP-PG-DDL-FK-ENFORCE); the dependency-ordered ORM seed satisfies enforcement |
 | multi-level cascade INSERT (`user.posts=[…]`; `post.comments=[…]`) | **PASS** (new) | SQLAlchemy's `insertmanyvalues` batch + apostrophe data both flow; required the `''` string-escape fix |
 | Q1 list posts + author (JOIN) | **PASS** | inner equi-JOIN, qualified projection |
 | Q2 posts by author (filtered JOIN) | **PASS** | `JOIN … WHERE name = $1` (SP-PG-SQL-JOIN-WHERE) |

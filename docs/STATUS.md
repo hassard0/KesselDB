@@ -30,6 +30,19 @@ measurement and had drifted from the actual workspace count).
   under live sibling-agent load — reported honestly. SQLite not re-run
   (vulcan root fs was 100% full; KesselDB MemVfs + Postgres docker
   unaffected). Raw: `docs/benchmarks/finalbench-2026-06-02-*`.
+- **DDL FOREIGN KEY now ENFORCED (SP-PG-DDL-FK-ENFORCE, 2026-06-03).** A
+  `FOREIGN KEY (col) REFERENCES tbl [(col)] [ON DELETE …]` in `CREATE TABLE`
+  (table-level or inline `col … REFERENCES tbl(col)`) ENFORCES referential
+  integrity: a non-NULL child FK with no matching parent → SQLSTATE 23503;
+  NULL allowed; `ON DELETE NO ACTION/RESTRICT/CASCADE/SET NULL/SET DEFAULT`
+  honored. Wiring arc — the engine FK machinery (SP6 + SP11) pre-existed; the
+  DDL parser now captures the FK BY NAME, threads it through `CreateType` in a
+  marker-guarded ADDITIVE trailer (no-FK CREATE TABLE byte-identical →
+  determinism preserved), and the engine resolves names→ids + registers it at
+  apply through the same path `Op::AddForeignKey` uses. Forward reference /
+  unknown column → clean DDL error, no half-created type. The ORM
+  relationships + realapp smokes pass UNDER enforcement (dependency-ordered
+  seeds satisfy it). Deferred: composite FKs, `ON UPDATE` actions.
 - **Table aliases in JOIN queries (SP-PG-SQL-JOIN-ALIAS, 2026-06-03).**
   `SELECT u.name, p.title FROM users u JOIN posts p ON u.id = p.user_id` (and the
   `AS` form) now resolve — the SQLAlchemy/Django/Rails form. An alias→table map

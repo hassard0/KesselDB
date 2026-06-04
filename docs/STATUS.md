@@ -30,6 +30,17 @@ measurement and had drifted from the actual workspace count).
   under live sibling-agent load — reported honestly. SQLite not re-run
   (vulcan root fs was 100% full; KesselDB MemVfs + Postgres docker
   unaffected). Raw: `docs/benchmarks/finalbench-2026-06-02-*`.
+- **Table aliases in JOIN queries (SP-PG-SQL-JOIN-ALIAS, 2026-06-03).**
+  `SELECT u.name, p.title FROM users u JOIN posts p ON u.id = p.user_id` (and the
+  `AS` form) now resolve — the SQLAlchemy/Django/Rails form. An alias→table map
+  built from the FROM/JOIN clause resolves every qualifier (projection, ON,
+  WHERE, ORDER BY, GROUP BY) to the full table name, for binary AND multi-table
+  (3+) joins. Resolution is entirely in `kessel-sql`, so an aliased join compiles
+  to the IDENTICAL wire `Op` as its full-table-name twin (no determinism risk,
+  pg-gateway unchanged) and full-name qualifiers keep working (back-compat).
+  Duplicate/ambiguous alias, alias shadowing a table, and unknown qualifier are
+  clean errors; a self-join under two aliases of the SAME table is the named
+  follow-up `SP-PG-SQL-SELF-JOIN`. Live vulcan psql smoke: **8/8** stages PASS.
 - **Chained N-way joins (SP-PG-SQL-MULTI-JOIN, 2026-06-03).** 3+ table
   chained INNER equi-joins (`users JOIN posts JOIN comments`) work end-to-end
   over the PG wire — `Op::Join` gained an additive, marker-guarded
@@ -37,6 +48,7 @@ measurement and had drifted from the actual workspace count).
   `KTR1` row set; `WHERE`/`ORDER BY`/`LIMIT`/`OFFSET`/`SELECT *` apply over the
   full combined schema. Empty extra-joins ⇒ byte-identical to a binary join.
   INNER chains only (LEFT-in-chain + GROUP-BY-over-chain are named follow-ups).
+  Table aliases now resolve via SP-PG-SQL-JOIN-ALIAS (above).
 - **PostgreSQL ORM compatibility.** SP-PG-EXTQ V1 (Extended Query) +
   V2 hardening (SP-PG-EXTQ-BIN + SP-PG-EXTQ-BIN-RESULTS + SP-PG-EXTQ-CAST +
   SP-PG-EXTQ-DESCRIBE-VERSION + SP-PG-SQL-PAREN-VALUES + SP-CHAR-PAD-COMPARE)

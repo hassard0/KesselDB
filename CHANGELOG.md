@@ -7,6 +7,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning [Se
 
 ### Added
 
+- **Table aliases in JOIN queries (SP-PG-SQL-JOIN-ALIAS, 2026-06-03)** —
+  `SELECT u.name, p.title FROM users u JOIN posts p ON u.id = p.user_id`
+  (and the `FROM users AS u` form) now resolve. Previously the parser accepted
+  the alias but column qualifiers only resolved against the FULL table name, so
+  the universal SQLAlchemy/Django/Rails aliased-join form failed. An alias→table
+  map built from the FROM/JOIN clause resolves EVERY qualifier — projection, ON,
+  WHERE, ORDER BY, GROUP BY — to the full table name, for binary AND multi-table
+  (3+) INNER joins. A bare full-table-name qualifier (`users.name`) keeps
+  working (back-compat) and `SELECT *` is unchanged. A duplicate/ambiguous
+  alias, an alias that shadows another table's name, or an unknown qualifier is
+  a clean error rather than a silent mis-resolution; a self-join under two
+  aliases of the SAME table is the named follow-up `SP-PG-SQL-SELF-JOIN`
+  (rejected, since the combined `KTR1` schema would have duplicate
+  `<table>.<col>` names). **Determinism:** resolution is entirely in
+  `kessel-sql` — the alias is rewritten to the full table name during parse, so
+  an aliased join compiles to the **byte-identical** wire `Op` as its full-name
+  twin. No `Op`/proto change, no construction-site churn, no oracle literal
+  changes; `crates/kessel-pg-gateway` is unchanged. Live vulcan psql smoke
+  (`scripts/sppgsqljoinalias-smoke.py`): 8/8 stages PASS.
 - **Chained N-way (3+ table) INNER equi-joins (SP-PG-SQL-MULTI-JOIN,
   2026-06-03)** — `SELECT users.name, posts.title, comments.body FROM users
   JOIN posts ON users.id = posts.user_id JOIN comments ON posts.id =

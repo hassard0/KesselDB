@@ -149,6 +149,7 @@ kessel "SELECT a.n, b.t FROM a LEFT JOIN b ON a.id = b.aid"  # LEFT [OUTER] JOIN
 kessel "SELECT a.n, b.t FROM a JOIN b ON a.id = b.aid ORDER BY b.t LIMIT 20 OFFSET 40"  # paginated join (ORDER BY + LIMIT/OFFSET)
 kessel "SELECT a.n, COUNT(b.id) FROM a JOIN b ON a.id = b.aid GROUP BY a.n"  # grouped aggregate over a join (count related per parent)
 kessel "SELECT users.name, posts.title, comments.body FROM users JOIN posts ON users.id = posts.user_id JOIN comments ON posts.id = comments.post_id"  # chained 3-way INNER join (SP-PG-SQL-MULTI-JOIN)
+kessel "SELECT u.name, p.title FROM users u JOIN posts p ON u.id = p.user_id"  # table aliases resolve everywhere (SP-PG-SQL-JOIN-ALIAS) — the SQLAlchemy/Django form
 
 # pipe a .sql file (lines starting with # or -- are comments; blanks ignored)
 cat schema.sql | cargo run -q -p kessel-client --bin kessel
@@ -378,8 +379,8 @@ SELECT <g>, <AGG>( * | <c> ) [AS alias] [, <AGG>(…) …] FROM <t> [WHERE …] 
        [HAVING <AGG>(...) <cmp> <literal>]              --   filter groups by an aggregate (SP-PG-SQL-HAVING)
        [ORDER BY <agg|alias|pos|g> [ASC|DESC]] [LIMIT n] [OFFSET n]  --   engine sorts + windows groups (SP-PG-SQL-GROUP-SORT-LIMIT)
 SELECT * FROM <t> [WHERE ...] ORDER BY <col> [DESC] [OFFSET n] [LIMIT n]
-SELECT <proj> FROM <a> [LEFT [OUTER]] JOIN <b> ON <a.x> = <b.y>  -- equi‑join
-       [JOIN <c> ON <a|b.x> = <c.y> [JOIN <d> ON …]]     --   chained N-way INNER joins, 3+ tables (SP-PG-SQL-MULTI-JOIN)
+SELECT <proj> FROM <a> [[AS] <a1>] [LEFT [OUTER]] JOIN <b> [[AS] <a2>] ON <a1.x> = <a2.y>  -- equi‑join (table aliases OK, SP-PG-SQL-JOIN-ALIAS)
+       [JOIN <c> [[AS] <a3>] ON <a1|a2.x> = <a3.y> [JOIN <d> ON …]]  --   chained N-way INNER joins, 3+ tables (SP-PG-SQL-MULTI-JOIN)
        [WHERE <pred over any joined table's cols>]       --   INNER (default) or LEFT; filtered (qualified cols, AND/OR/…)
        [ORDER BY <t.c> [ASC|DESC]] [LIMIT n] [OFFSET m]  --   paginate the (sorted) join
 SELECT <a.g>, <AGG>( * | <a.c | b.c> ) [AS alias] [, <AGG>(…) …]  -- grouped aggregate over a join
@@ -408,10 +409,30 @@ Each additional `JOIN <table> ON <a.x> = <table.y>` segment INNER equi-joins the
 running combined row set against the next table; the combined schema widens by
 that table's columns each step (named `<table>.<col>`). `SELECT *` returns every
 column of every joined table; `WHERE` / `ORDER BY` / `LIMIT` / `OFFSET` apply
-over the full combined schema. Columns are qualified by the full table NAME (not
-an alias — `SP-PG-SQL-JOIN-ALIAS` is a follow-up, as for the binary join). V1 is
-INNER chains only — mixing `LEFT`/`RIGHT`/`FULL` into a chain, or `GROUP BY`
-over a chain, are named follow-ups (rejected with a clear error).
+over the full combined schema. V1 is INNER chains only — mixing
+`LEFT`/`RIGHT`/`FULL` into a chain, or `GROUP BY` over a chain, are named
+follow-ups (rejected with a clear error).
+
+**Table aliases** (SP-PG-SQL-JOIN-ALIAS) — each table in the FROM/JOIN clause
+may carry an optional `[AS] <alias>` (`FROM users u`, `FROM users AS u`), and the
+alias resolves in EVERY qualifier — projection, ON, WHERE, ORDER BY, GROUP BY —
+for both binary and multi-table joins:
+
+```sql
+SELECT u.name, p.title, c.body
+  FROM users u JOIN posts p ON u.id = p.user_id
+               JOIN comments c ON p.id = c.post_id
+  WHERE u.id = 1 ORDER BY p.title;
+```
+
+This is the form SQLAlchemy / Django / Rails emit. The alias is resolved to the
+full table name in the SQL layer, so an aliased join compiles to the IDENTICAL
+wire op as its full-table-name twin — full-name qualifiers (`users.name`) keep
+working unchanged (back-compat). A duplicate/ambiguous alias, an alias that
+shadows another table's name, or an unknown qualifier is a clean error. A
+self-join joining the SAME table under two aliases (`FROM users a JOIN users b`)
+is a named follow-up (`SP-PG-SQL-SELF-JOIN`), rejected to avoid same-name
+ambiguity in the combined schema.
 
 `ORDER BY <qualified col>` sorts the combined join rows by ONE column from
 either table (`ASC` default / `DESC`); `LIMIT` + `OFFSET` then paginate the

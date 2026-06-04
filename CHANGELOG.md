@@ -26,6 +26,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning [Se
 
 ### Added
 
+- **Non-correlated WHERE subqueries (SP-PG-SQL-SUBQUERY-WHERE, 2026-06-04)** —
+  a `WHERE` predicate may now compare a column against an inner `SELECT`:
+  `WHERE id IN (SELECT user_id FROM orders WHERE total > 100)`,
+  `WHERE id NOT IN (SELECT user_id FROM banned)`, and the scalar form
+  `WHERE price = (SELECT MAX(price) FROM products)` (operators `= <> != < <= >
+  >=`, inner yields one row/one column). Implemented two-phase at the gateway:
+  a quote-skipping, paren-balancing scan (`kessel_sql::find_where_subquery`)
+  detects the `<IN|NOT IN|cmp> (SELECT …)` shape, the inner SELECT runs FIRST
+  through the normal render path (so it may itself use WHERE / aggregates), its
+  single projected column's values are spliced into the outer query as a literal
+  list / scalar (typed from the inner RowDescription — ints bare, text
+  single-quoted with `'` doubled), and the rewritten outer re-dispatches through
+  the normal path. **No engine / `Op` / wire change**, so the determinism
+  oracles over the apply path are byte-untouched. Empty inner result: `IN (∅)`
+  returns no rows; `NOT IN (∅)` returns every non-NULL outer row. The inner
+  projecting ≠ 1 column (42601) or a scalar subquery returning > 1 row (21000)
+  is a clean error — never silently-wrong rows. NON-correlated + one-subquery-
+  per-WHERE V1; correlated / `EXISTS` / FROM-subquery / SELECT-list subquery /
+  multiple subqueries are named follow-ups. New psql smoke
+  `scripts/sppgsqlsubquerywhere-smoke.py`.
 - **`SELECT DISTINCT` row deduplication (SP-PG-SQL-DISTINCT, 2026-06-04)** —
   `SELECT DISTINCT region FROM t` (get the unique values of a column),
   `SELECT DISTINCT a, b FROM t` (unique tuples), and `SELECT DISTINCT * FROM t`

@@ -403,6 +403,9 @@ SELECT <g1>[, <g2> …], <AGG>( * | <c> ) [AS alias] [, <AGG>(…) …] FROM <t>
        [HAVING <AGG>(...) <cmp> <literal>]              --   filter groups by an aggregate (SP-PG-SQL-HAVING)
        [ORDER BY <agg|alias|pos|g> [ASC|DESC]] [LIMIT n] [OFFSET n]  --   engine sorts + windows groups (SP-PG-SQL-GROUP-SORT-LIMIT)
 SELECT * FROM <t> [WHERE ...] ORDER BY <col> [DESC] [OFFSET n] [LIMIT n]
+SELECT <c> FROM <t> WHERE <col> IN     (SELECT <c2> FROM <u> [WHERE …])  -- non-correlated WHERE subquery (SP-PG-SQL-SUBQUERY-WHERE)
+SELECT <c> FROM <t> WHERE <col> NOT IN (SELECT <c2> FROM <u> [WHERE …])  --   IN / NOT IN over a 1-column inner SELECT
+SELECT <c> FROM <t> WHERE <col> = (SELECT MAX(<c2>) FROM <u>)            --   scalar subquery: = <> < <= > >= over a 1-row/1-col inner
 SELECT <proj> FROM <a> [[AS] <a1>] [INNER|LEFT|RIGHT|FULL [OUTER]] JOIN <b> [[AS] <a2>] ON <a1.x> = <a2.y>  -- equi‑join (table aliases OK, SP-PG-SQL-JOIN-ALIAS)
        [JOIN <c> [[AS] <a3>] ON <a1|a2.x> = <a3.y> [JOIN <d> ON …]]  --   chained N-way INNER joins, 3+ tables (SP-PG-SQL-MULTI-JOIN)
        [WHERE <pred over any joined table's cols>]       --   INNER (default) / LEFT / RIGHT / FULL; filtered (qualified cols, AND/OR/…)
@@ -571,6 +574,35 @@ the group key, is a named follow-up.)
 `WHERE` supports `AND`/`OR`/`NOT`, all of `= != < <= > >=`, and `IN`/`BETWEEN` (incl. `NOT IN`/`NOT BETWEEN`). `SELECT *` returns
 length‑prefixed record blobs; use `DESCRIBE <t>` to decode them against the
 schema (the client decodes the wire schema for you).
+
+**Non-correlated WHERE subqueries** (SP-PG-SQL-SUBQUERY-WHERE) — a `WHERE`
+predicate may compare a column against the result of an inner `SELECT`:
+
+```sql
+SELECT name FROM users WHERE id IN (SELECT user_id FROM orders WHERE total > 100);
+SELECT name FROM users WHERE id NOT IN (SELECT user_id FROM banned);
+SELECT name FROM products WHERE price = (SELECT MAX(price) FROM products);  -- scalar
+```
+
+- `col IN (subquery)` / `col NOT IN (subquery)` — the inner SELECT must project
+  exactly ONE column; the outer row matches if its `col` is (not) among the
+  inner values.
+- Scalar `col <op> (subquery)` for `= <> != < <= > >=` — the inner must project
+  one column and yield AT MOST one row. Zero rows → the scalar is NULL → the
+  comparison is NULL → the outer returns no rows.
+
+The inner SELECT runs FIRST through the normal engine path, so it may itself use
+`WHERE` / aggregates (e.g. `MAX(price)`) — any SELECT shape that already works is
+a valid inner query. Spliced values are quoted by type (integers bare, text
+single-quoted with `'` doubled). **Empty inner result:** `IN (∅)` returns no
+rows; `NOT IN (∅)` returns every (non-NULL) outer row — note a NULL-valued
+`col` is NOT returned by `NOT IN (∅)` (a documented V1 edge vs PostgreSQL's
+NULL-row handling). The inner projecting ≠ 1 column, or a scalar subquery
+returning > 1 row, is a clean error (never silently-wrong rows). **V1 scope:**
+ONE subquery per WHERE, NON-correlated only. Correlated subqueries (inner
+references an outer column), `EXISTS`/`NOT EXISTS`, subqueries in `FROM`
+(derived tables), subqueries in the SELECT list, and multiple subqueries per
+WHERE are named follow-ups.
 
 Over the **PostgreSQL wire**, a single scalar aggregate
 `SELECT COUNT(*) | SUM(c) | MIN(c) | MAX(c) | AVG(c) [AS alias] FROM <t>`

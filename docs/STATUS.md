@@ -13,6 +13,22 @@ measurement and had drifted from the actual workspace count).
 
 **Coherent state of the union (2026-06-02):**
 
+- **Non-correlated WHERE subqueries (SP-PG-SQL-SUBQUERY-WHERE, 2026-06-04).**
+  `SELECT name FROM users WHERE id IN (SELECT user_id FROM orders WHERE total >
+  100)`, the `NOT IN` complement, and the scalar form `WHERE price = (SELECT
+  MAX(price) FROM products)` (`= <> != < <= > >=`, inner one-row/one-column) all
+  work over the PG wire. Two-phase at the gateway: a quote-skipping,
+  paren-balancing scan detects `<IN|NOT IN|cmp> (SELECT …)`; the inner SELECT
+  runs FIRST through the normal render path (so aggregates / WHERE inside the
+  inner work for free), its single column's values are spliced into the outer
+  query as a literal list / scalar (typed from the inner RowDescription — ints
+  bare, text single-quoted + escaped), and the rewritten outer re-dispatches
+  normally. NO `Op`/wire/storage change → determinism oracles byte-untouched.
+  Empty inner: `IN (∅)` → 0 rows, `NOT IN (∅)` → all non-NULL rows. Inner ≠ 1
+  column (42601) / scalar > 1 row (21000) error cleanly. NON-correlated,
+  one-subquery-per-WHERE V1; correlated / EXISTS / FROM-subquery / SELECT-list /
+  multiple subqueries are named follow-ups. New psql smoke
+  `scripts/sppgsqlsubquerywhere-smoke.py` (10/10 psycopg2 stages on vulcan).
 - **`SELECT DISTINCT` row deduplication (SP-PG-SQL-DISTINCT, 2026-06-04).**
   `SELECT DISTINCT region FROM t` (unique column values), `SELECT DISTINCT a, b
   FROM t` (unique tuples), and `SELECT DISTINCT * FROM t` (unique whole rows)

@@ -296,7 +296,13 @@ impl<'a> P<'a> {
     fn kw_peek_distinct(&self) -> bool {
         if let Some(Tok::Ident(s)) = self.t.get(self.i) {
             if s.eq_ignore_ascii_case("DISTINCT") {
-                return !matches!(self.t.get(self.i + 1), Some(Tok::Punct('(')));
+                // `DISTINCT ON (…)` — the `ON` keyword right after DISTINCT —
+                // is the Postgres extension (a named follow-up); do NOT consume
+                // it here so the projection parser rejects it cleanly.
+                return !matches!(
+                    self.t.get(self.i + 1),
+                    Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("ON")
+                );
             }
         }
         false
@@ -690,7 +696,7 @@ pub fn select_star_table(sql: &str) -> Option<String> {
     // named follow-up — a `(` right after DISTINCT bails out (returns None).
     if matches!(it.peek(), Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("DISTINCT")) {
         it.next();
-        if matches!(it.peek(), Some(Tok::Punct('('))) {
+        if matches!(it.peek(), Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("ON")) {
             return None; // DISTINCT ON (...) — follow-up, not handled here
         }
     }
@@ -741,7 +747,7 @@ pub fn select_columns(sql: &str) -> Option<(String, Vec<String>)> {
     // DISTINCT) is a named follow-up — bail out cleanly.
     if matches!(it.peek(), Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("DISTINCT")) {
         it.next();
-        if matches!(it.peek(), Some(Tok::Punct('('))) {
+        if matches!(it.peek(), Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("ON")) {
             return None; // DISTINCT ON (...) — follow-up
         }
     }
@@ -835,10 +841,10 @@ pub fn select_is_distinct(sql: &str) -> bool {
         Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("DISTINCT") => {}
         _ => return false,
     }
-    // `DISTINCT ON (…)` (Postgres extension) — a `(` right after DISTINCT —
-    // is a NAMED follow-up, not plain row-dedup. Report false so the gateway
-    // does not mis-render it as plain DISTINCT.
-    !matches!(it.peek(), Some(Tok::Punct('(')))
+    // `DISTINCT ON (…)` (Postgres extension) — the `ON` keyword right after
+    // DISTINCT — is a NAMED follow-up, not plain row-dedup. Report false so the
+    // gateway does not mis-render it as plain DISTINCT.
+    !matches!(it.peek(), Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("ON"))
 }
 
 /// SP-PG-ORM-REALAPP — does a single-table projection-list SELECT carry an

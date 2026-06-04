@@ -3400,20 +3400,6 @@ impl<V: Vfs> StateMachine<V> {
         (primary, extras)
     }
 
-    fn emit_group_results(
-        kept: Vec<(Vec<u8>, Vec<i128>)>,
-        sort: Option<&kessel_proto::GroupSort>,
-    ) -> OpResult {
-        // Single-column path: no extra group columns ⇒ delegate to the
-        // composite emitter with an empty extras vec per group, which writes a
-        // BYTE-IDENTICAL stream to the pre-multi-col `[u32 keylen][key][aggs]`.
-        let kept_c: Vec<(Vec<u8>, Vec<Vec<u8>>, Vec<i128>)> = kept
-            .into_iter()
-            .map(|(k, r)| (k, Vec::new(), r))
-            .collect();
-        Self::emit_group_results_composite(kept_c, sort)
-    }
-
     /// SP-PG-SQL-GROUP-MULTI-COL: sort/paginate/encode a per-group result with
     /// a COMPOSITE key. Each group is `(primary_key, extra_keys, results)`. The
     /// stream is `[u32 ngroups]` then per group
@@ -6747,7 +6733,7 @@ impl<V: Vfs> StateMachine<V> {
                 // still read by offset, result is identical.
                 let uncond = program
                     == kessel_expr::Program::new().push_int(1).bytes().as_slice();
-                let mut fold_rec = |rec: &[u8], groups: &mut std::collections::BTreeMap<Vec<u8>, (i128, i128, Option<i128>, Option<i128>)>| {
+                let fold_rec = |rec: &[u8], groups: &mut std::collections::BTreeMap<Vec<u8>, (i128, i128, Option<i128>, Option<i128>)>| {
                     // SP-PG-SQL-GROUP-MULTI-COL: COMPOSITE key (primary ++ extras).
                     let mut gkey = match rec.get(gpos.0..gpos.0 + gpos.1) {
                         Some(b) => b.to_vec(),

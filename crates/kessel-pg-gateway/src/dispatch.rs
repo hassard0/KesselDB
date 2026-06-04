@@ -502,6 +502,17 @@ fn render_select_got<E: EngineApply + ?Sized>(
     engine: &E,
 ) -> Vec<u8> {
     let mut out = Vec::new();
+    // SP-PG-SQL-DISTINCT — does this SELECT request row dedup? Computed once;
+    // applied ONLY in the two base-table render paths below (projection list
+    // and `SELECT *`). DISTINCT over JOIN / aggregate / GROUP BY / `DISTINCT
+    // ON (…)` are NAMED FOLLOW-UPS: those shapes never reach a base-table
+    // render path with `is_distinct` true, because `select_is_distinct`
+    // returns false for `DISTINCT ON (…)` and the JOIN/aggregate branches
+    // above own (and return before) the base-table paths. (A `SELECT DISTINCT`
+    // over a JOIN parses to neither `select_columns` nor `join_projection`
+    // here, so it falls through to the clean 0A000 "unsupported" error rather
+    // than silently returning duplicates.)
+    let is_distinct = kessel_sql::select_is_distinct(sql_trimmed);
     // Shape 0.4 — SP-PG-SQL-JOIN-AGG: a join-group-aggregate
     // (`SELECT a.name, COUNT(b.id) FROM a JOIN b ON … GROUP BY a.name`). The
     // engine's `Op::Join { group_aggregate: Some(..) }` returns the value-only
@@ -706,6 +717,28 @@ fn render_select_got<E: EngineApply + ?Sized>(
                 }
             }
         };
+        // SP-PG-SQL-DISTINCT — dedup the just-emitted projected DataRows
+        // (keeping first occurrence in scan order), then recompute the count
+        // so RowDescription order is preserved and `SELECT N` reports the
+        // DEDUPED row count. The DataRows occupy `out[out_len_after_rowdesc..]`;
+        // we splice them out, dedup, and write back. A `None` from
+        // `dedup_data_rows` (an unexpected non-'D' frame) leaves the rows
+        // untouched (defensive — never worse than the non-distinct render).
+        let row_count = if is_distinct {
+            let rows_slice = out.split_off(out_len_after_rowdesc);
+            match dedup_data_rows(&rows_slice) {
+                Some((deduped, n)) => {
+                    out.extend_from_slice(&deduped);
+                    n
+                }
+                None => {
+                    out.extend_from_slice(&rows_slice);
+                    row_count
+                }
+            }
+        } else {
+            row_count
+        };
         out.extend_from_slice(&encode_command_complete(&select_tag(row_count)));
         out.extend_from_slice(&encode_ready_for_query(b'I'));
         return out;
@@ -740,6 +773,9 @@ fn render_select_got<E: EngineApply + ?Sized>(
         })
         .collect();
     out.extend_from_slice(&encode_row_description(&fields));
+    // SP-PG-SQL-DISTINCT — mark where the whole-row DataRows begin so we can
+    // dedup them post-emit for `SELECT DISTINCT * FROM t`.
+    let out_len_after_rowdesc = out.len();
     let row_count = match emit_data_rows(row_bytes, &cols, &mut out) {
         Ok(n) => n,
         Err(msg) => {
@@ -749,6 +785,24 @@ fn render_select_got<E: EngineApply + ?Sized>(
                 &format!("row decode failed: {msg}"),
             );
         }
+    };
+    // SP-PG-SQL-DISTINCT — dedup whole-row DataRows (first occurrence in scan
+    // order), recompute the `SELECT N` count to the deduped total. NULLs dedup
+    // identically (each NULL cell is the same `-1` sentinel in the DataRow).
+    let row_count = if is_distinct {
+        let rows_slice = out.split_off(out_len_after_rowdesc);
+        match dedup_data_rows(&rows_slice) {
+            Some((deduped, n)) => {
+                out.extend_from_slice(&deduped);
+                n
+            }
+            None => {
+                out.extend_from_slice(&rows_slice);
+                row_count
+            }
+        }
+    } else {
+        row_count
     };
     out.extend_from_slice(&encode_command_complete(&select_tag(row_count)));
     out.extend_from_slice(&encode_ready_for_query(b'I'));
@@ -1570,6 +1624,55 @@ pub fn literal_cast_mismatch_response_then_rfq(
     error_response_then_rfq(SEVERITY_ERROR, "42846", &message)
 }
 
+/// SP-PG-SQL-DISTINCT — dedup a contiguous run of already-encoded `DataRow`
+/// ('D') messages, keeping the FIRST occurrence of each distinct row in scan
+/// order. The dedup key is the ENTIRE DataRow message body (the encoded
+/// projected cells: each cell is an i32 length followed by its bytes, with a
+/// `-1` length sentinel for NULL). Because that body is byte-identical for two
+/// rows iff they project to the same cell tuple — and NULL is encoded as the
+/// SAME `-1` sentinel for every NULL cell — this gives exact SQL DISTINCT
+/// semantics including "NULL is not distinct from NULL".
+///
+/// `rows_buf` MUST contain ONLY `DataRow` messages (the scratch buffer the
+/// distinct render path fills via the `emit_*` helpers). Returns the deduped
+/// DataRow bytes plus the deduped row count (what `CommandComplete` and the
+/// `SELECT N` tag must report). Any non-'D' leading byte aborts dedup and
+/// returns the input unchanged with a `None` count so the caller can fall back
+/// (defensive — the emit helpers only ever write 'D' frames here).
+fn dedup_data_rows(rows_buf: &[u8]) -> Option<(Vec<u8>, u64)> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<&[u8]> = HashSet::new();
+    let mut out = Vec::with_capacity(rows_buf.len());
+    let mut n = 0u64;
+    let mut p = 0usize;
+    while p < rows_buf.len() {
+        // Each message: 1-byte tag + 4-byte BE total_length (length counts
+        // itself but NOT the tag byte).
+        if rows_buf[p] != crate::proto::BE_DATA_ROW {
+            return None; // unexpected frame — bail to caller
+        }
+        if p + 5 > rows_buf.len() {
+            return None;
+        }
+        let total_len =
+            u32::from_be_bytes(rows_buf[p + 1..p + 5].try_into().unwrap()) as usize;
+        let msg_end = p + 1 + total_len;
+        if msg_end > rows_buf.len() {
+            return None;
+        }
+        // Dedup key = the message body (everything after the tag+length, i.e.
+        // the col_count + encoded cells). Two rows with the same projected
+        // cells produce identical bytes here.
+        let body = &rows_buf[p + 5..msg_end];
+        if seen.insert(body) {
+            out.extend_from_slice(&rows_buf[p..msg_end]);
+            n += 1;
+        }
+        p = msg_end;
+    }
+    Some((out, n))
+}
+
 /// Decode the row stream produced by `OpResult::Got` (which is
 /// `[u32 LE len][record]*` — see `kessel-sm::Op::Select`) and emit
 /// one `DataRow` per record into `out`. Returns the row count.
@@ -2215,6 +2318,58 @@ mod tests {
     use kessel_catalog::FieldKind;
     use kessel_codec::Value;
     use kessel_proto::OpResult;
+
+    /// SP-PG-SQL-DISTINCT — `dedup_data_rows` keeps the FIRST occurrence of
+    /// each distinct DataRow (by full message body), preserving scan order,
+    /// and treats two NULL cells as equal (same `-1` sentinel).
+    #[test]
+    fn dedup_data_rows_keeps_first_and_dedups_nulls() {
+        // Build a stream of DataRows: us, us(dup), eu, NULL, NULL(dup).
+        let mut buf = Vec::new();
+        let row_us = encode_data_row(&[Some(b"us")]);
+        let row_eu = encode_data_row(&[Some(b"eu")]);
+        let row_null: Vec<u8> = encode_data_row(&[None]);
+        buf.extend_from_slice(&row_us);
+        buf.extend_from_slice(&row_us); // dup
+        buf.extend_from_slice(&row_eu);
+        buf.extend_from_slice(&row_null);
+        buf.extend_from_slice(&row_null); // dup NULL — NULL not distinct from NULL
+
+        let (deduped, n) = dedup_data_rows(&buf).expect("dedup");
+        assert_eq!(n, 3, "us, eu, NULL → 3 distinct rows");
+        // First-occurrence order preserved: us, eu, NULL.
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&row_us);
+        expected.extend_from_slice(&row_eu);
+        expected.extend_from_slice(&row_null);
+        assert_eq!(deduped, expected);
+    }
+
+    /// Multi-cell dedup key: `(us, click)` repeated collapses; `(us, view)`
+    /// stays distinct.
+    #[test]
+    fn dedup_data_rows_multi_cell_tuples() {
+        let r_us_click = encode_data_row(&[Some(b"us"), Some(b"click")]);
+        let r_us_view = encode_data_row(&[Some(b"us"), Some(b"view")]);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&r_us_click);
+        buf.extend_from_slice(&r_us_view);
+        buf.extend_from_slice(&r_us_click); // dup tuple
+        let (deduped, n) = dedup_data_rows(&buf).expect("dedup");
+        assert_eq!(n, 2);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&r_us_click);
+        expected.extend_from_slice(&r_us_view);
+        assert_eq!(deduped, expected);
+    }
+
+    /// A non-'D' leading byte aborts cleanly (returns None) so the caller
+    /// falls back to the undeduped render.
+    #[test]
+    fn dedup_data_rows_rejects_non_datarow() {
+        let bogus = vec![b'C', 0, 0, 0, 4];
+        assert!(dedup_data_rows(&bogus).is_none());
+    }
 
     // A test engine that returns canned data. `Mutex` keeps the
     // trait's `Send + Sync` requirement without resorting to

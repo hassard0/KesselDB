@@ -288,6 +288,19 @@ impl<'a> P<'a> {
         }
         false
     }
+    /// SP-PG-SQL-DISTINCT — is the current token the `DISTINCT` keyword AND
+    /// is it *not* the start of the `DISTINCT ON (…)` Postgres extension (a
+    /// `(` follows)? Used to consume a plain row-dedup `DISTINCT` after SELECT
+    /// while leaving `DISTINCT ON (…)` for the parser to reject cleanly. Does
+    /// NOT advance the cursor.
+    fn kw_peek_distinct(&self) -> bool {
+        if let Some(Tok::Ident(s)) = self.t.get(self.i) {
+            if s.eq_ignore_ascii_case("DISTINCT") {
+                return !matches!(self.t.get(self.i + 1), Some(Tok::Punct('(')));
+            }
+        }
+        false
+    }
     fn expect_kw(&mut self, k: &str) -> Result<(), SqlError> {
         if self.kw(k) {
             Ok(())
@@ -665,10 +678,21 @@ pub enum Stmt {
 /// lexer — no string heuristics.
 pub fn select_star_table(sql: &str) -> Option<String> {
     let toks = lex(sql).ok()?;
-    let mut it = toks.iter();
+    let mut it = toks.iter().peekable();
     match it.next()? {
         Tok::Ident(k) if k.eq_ignore_ascii_case("SELECT") => {}
         _ => return None,
+    }
+    // SP-PG-SQL-DISTINCT — skip an optional `DISTINCT` immediately after
+    // SELECT so `SELECT DISTINCT * FROM t` parses its table exactly like the
+    // non-distinct `SELECT * FROM t` (the gateway dedups at render time;
+    // `select_is_distinct` reports whether to dedup). `DISTINCT ON (…)` is a
+    // named follow-up — a `(` right after DISTINCT bails out (returns None).
+    if matches!(it.peek(), Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("DISTINCT")) {
+        it.next();
+        if matches!(it.peek(), Some(Tok::Punct('('))) {
+            return None; // DISTINCT ON (...) — follow-up, not handled here
+        }
     }
     match it.next()? {
         Tok::Star => {}
@@ -709,6 +733,17 @@ pub fn select_columns(sql: &str) -> Option<(String, Vec<String>)> {
     match it.next()? {
         Tok::Ident(k) if k.eq_ignore_ascii_case("SELECT") => {}
         _ => return None,
+    }
+    // SP-PG-SQL-DISTINCT — skip an optional `DISTINCT` immediately after
+    // SELECT so `SELECT DISTINCT a, b FROM t` parses its projection as
+    // `[a, b]` and table as `t` exactly like the non-distinct form (the
+    // gateway dedups the rendered rows). `DISTINCT ON (…)` (a `(` right after
+    // DISTINCT) is a named follow-up — bail out cleanly.
+    if matches!(it.peek(), Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("DISTINCT")) {
+        it.next();
+        if matches!(it.peek(), Some(Tok::Punct('('))) {
+            return None; // DISTINCT ON (...) — follow-up
+        }
     }
     let mut cols = Vec::new();
     loop {
@@ -775,6 +810,35 @@ pub fn select_columns(sql: &str) -> Option<(String, Vec<String>)> {
         }
     }
     Some((table, cols))
+}
+
+/// SP-PG-SQL-DISTINCT — does this SELECT carry the `DISTINCT` row-dedup
+/// keyword immediately after `SELECT` (before the projection list / `*`)?
+/// Lenient + case-insensitive: skips a leading comment/whitespace span via
+/// the real lexer, then checks the first token is `SELECT` and the second is
+/// the `DISTINCT` keyword. Returns `false` for the Postgres `DISTINCT ON (…)`
+/// extension (a `(` follows DISTINCT) — that is a named follow-up the gateway
+/// must NOT silently treat as plain DISTINCT. The gateway calls this to decide
+/// whether to dedup the rendered DataRows; it is a pure render-time signal
+/// (no Op/wire/storage change). Uses the real lexer — no string heuristics.
+pub fn select_is_distinct(sql: &str) -> bool {
+    let toks = match lex(sql) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    let mut it = toks.iter().peekable();
+    match it.next() {
+        Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("SELECT") => {}
+        _ => return false,
+    }
+    match it.next() {
+        Some(Tok::Ident(k)) if k.eq_ignore_ascii_case("DISTINCT") => {}
+        _ => return false,
+    }
+    // `DISTINCT ON (…)` (Postgres extension) — a `(` right after DISTINCT —
+    // is a NAMED follow-up, not plain row-dedup. Report false so the gateway
+    // does not mis-render it as plain DISTINCT.
+    !matches!(it.peek(), Some(Tok::Punct('(')))
 }
 
 /// SP-PG-ORM-REALAPP — does a single-table projection-list SELECT carry an
@@ -3592,6 +3656,16 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
     }
 
     if p.kw("SELECT") {
+        // SP-PG-SQL-DISTINCT — consume an optional `DISTINCT` keyword right
+        // after SELECT so the engine compiles `SELECT DISTINCT … FROM t` to
+        // the SAME Op as the non-distinct form (it returns ALL rows; the
+        // gateway dedups at render time — pure render-layer feature, no Op
+        // change). `DISTINCT ON (…)` (a `(` follows DISTINCT) is a named
+        // follow-up: we do NOT consume it here, so it falls through to the
+        // projection parser which errors cleanly rather than mis-compiling.
+        if p.kw_peek_distinct() {
+            p.i += 1; // consume DISTINCT
+        }
         // Fast path: `SELECT * FROM t [WHERE c=v [AND c=v]*] [LIMIT n]`
         // compiles to Op::QueryRows so equality on indexed columns is
         // sub-linear. Anything outside this restricted grammar restores the
@@ -6057,6 +6131,99 @@ mod tests {
         assert_eq!(select_star_table("DESCRIBE acct"), None);
         assert_eq!(select_star_table("INSERT INTO t ID 1 (v) VALUES (1)"), None);
         assert_eq!(select_star_table("garbage ;;"), None);
+    }
+
+    /// SP-PG-SQL-DISTINCT — the `select_is_distinct` render-time signal and
+    /// the DISTINCT-aware projection/star recognizers.
+    #[test]
+    fn select_distinct_recognizers() {
+        // select_is_distinct: true only for a plain DISTINCT after SELECT.
+        assert!(select_is_distinct("SELECT DISTINCT region FROM t"));
+        assert!(select_is_distinct("select distinct a, b from t"));
+        assert!(select_is_distinct("SELECT DISTINCT * FROM t"));
+        assert!(select_is_distinct(
+            "SELECT DISTINCT region FROM t WHERE x = 1"
+        ));
+        // Non-distinct / not-our-shape ⇒ false.
+        assert!(!select_is_distinct("SELECT region FROM t"));
+        assert!(!select_is_distinct("SELECT * FROM t"));
+        assert!(!select_is_distinct("INSERT INTO t (v) VALUES (1)"));
+        assert!(!select_is_distinct("garbage"));
+        // `DISTINCT ON (…)` (Postgres extension) is a NAMED FOLLOW-UP — not
+        // plain row dedup, so the signal is false (the gateway must not
+        // mis-render it as plain DISTINCT).
+        assert!(!select_is_distinct("SELECT DISTINCT ON (region) region, id FROM t"));
+
+        // The projection recognizer skips a leading DISTINCT so the
+        // projection + table parse exactly like the non-distinct form.
+        assert_eq!(
+            select_columns("SELECT DISTINCT a, b FROM t"),
+            Some(("t".into(), vec!["a".into(), "b".into()]))
+        );
+        assert_eq!(
+            select_columns("SELECT a, b FROM t"),
+            Some(("t".into(), vec!["a".into(), "b".into()]))
+        );
+        assert_eq!(
+            select_columns("select distinct region from events where x = 1"),
+            Some(("events".into(), vec!["region".into()]))
+        );
+        // `DISTINCT ON (…)` is rejected by the column recognizer (follow-up).
+        assert_eq!(select_columns("SELECT DISTINCT ON (a) a FROM t"), None);
+
+        // The star recognizer skips a leading DISTINCT too.
+        assert_eq!(
+            select_star_table("SELECT DISTINCT * FROM events"),
+            Some("events".into())
+        );
+        assert_eq!(
+            select_star_table("SELECT DISTINCT * FROM t WHERE x = 1"),
+            Some("t".into())
+        );
+        assert_eq!(select_star_table("SELECT DISTINCT ON (a) * FROM t"), None);
+
+        // select_projection_to_star strips DISTINCT in the rewrite (it
+        // rebuilds from the FROM clause onward).
+        assert_eq!(
+            select_projection_to_star("SELECT DISTINCT a, b FROM t WHERE x = 1"),
+            Some("SELECT * FROM t WHERE x = 1".into())
+        );
+    }
+
+    /// SP-PG-SQL-DISTINCT — `SELECT DISTINCT …` compiles to the SAME `Op` as
+    /// the non-distinct form (the engine returns ALL rows; dedup is a pure
+    /// render-layer step in the gateway, so there is NO Op/wire/storage
+    /// change and the determinism oracles are byte-untouched).
+    #[test]
+    fn select_distinct_compiles_identically_to_nondistinct() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        run(&mut sm, 1, "CREATE TABLE t (region U32 NOT NULL, cat U32 NOT NULL)");
+        let cat = sm.catalog().clone();
+        // SELECT * — DISTINCT must produce the identical Op.
+        assert_eq!(
+            compile("SELECT DISTINCT * FROM t", &cat).unwrap(),
+            compile("SELECT * FROM t", &cat).unwrap(),
+            "DISTINCT * must compile to the same Op as plain *",
+        );
+        assert_eq!(
+            compile("SELECT DISTINCT * FROM t WHERE region = 1", &cat).unwrap(),
+            compile("SELECT * FROM t WHERE region = 1", &cat).unwrap(),
+        );
+        // Projection list — DISTINCT must produce the identical Op.
+        assert_eq!(
+            compile("SELECT DISTINCT region FROM t", &cat).unwrap(),
+            compile("SELECT region FROM t", &cat).unwrap(),
+        );
+        assert_eq!(
+            compile("SELECT DISTINCT region, cat FROM t", &cat).unwrap(),
+            compile("SELECT region, cat FROM t", &cat).unwrap(),
+        );
+        // `DISTINCT ON (…)` is a NAMED FOLLOW-UP — it must NOT silently
+        // compile to a plain SELECT; it errors cleanly.
+        assert!(
+            compile("SELECT DISTINCT ON (region) region FROM t", &cat).is_err(),
+            "DISTINCT ON (...) is a follow-up and must error, not mis-compile",
+        );
     }
 
     fn run(sm: &mut StateMachine<MemVfs>, op: u64, sql: &str) -> OpResult {

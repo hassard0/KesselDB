@@ -91,7 +91,12 @@ def launch_server(repo_root):
     if build.returncode != 0:
         print("BUILD FAILED", file=sys.stderr)
         sys.exit(2)
-    bin_path = os.path.join(repo_root, "target", "release", "kesseldb")
+    # Honor CARGO_TARGET_DIR (vulcan runs with a per-worktree isolated target
+    # dir); fall back to the in-tree target/ when it is unset.
+    target_dir = os.environ.get(
+        "CARGO_TARGET_DIR", os.path.join(repo_root, "target")
+    )
+    bin_path = os.path.join(target_dir, "release", "kesseldb")
     data_dir = tempfile.mkdtemp(prefix="kdb-di-data-")
     env = {**os.environ, "KESSELDB_PG_ADDR": PG_ADDR, "KESSELDB_TOKEN": "admin"}
     print(f"# launching {bin_path} {CLIENT_ADDR} {data_dir} on PG {PG_ADDR}…")

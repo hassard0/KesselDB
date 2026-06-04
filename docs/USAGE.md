@@ -394,6 +394,9 @@ SELECT * FROM <t> [WHERE <expr>]                 -- =, !=, <, <=, >, >=, AND/OR/
                                                  --   col IN (a,b,..), col BETWEEN lo AND hi
                                                  --   col IS [NOT] NULL, col [NOT] LIKE 'pat%' (NOT IN / NOT BETWEEN too)
 SELECT <c1>, <c2> FROM <t> [WHERE ...]           -- projection
+SELECT DISTINCT <c1>[, <c2> …] FROM <t> [WHERE ...] [ORDER BY …]  -- dedup result rows (SP-PG-SQL-DISTINCT)
+SELECT DISTINCT * FROM <t> [WHERE ...]           -- dedup whole rows; NULL is not distinct from NULL
+                                                 --   (DISTINCT ON (…), DISTINCT over JOIN/aggregate/GROUP BY are follow-ups)
 SELECT COUNT(*) | SUM(c) | MIN(c) | MAX(c) | AVG(c) FROM <t> [WHERE ...]  -- single scalar aggregate (SP-PG-SQL-AGG-ALIAS-RENDER)
 SELECT <g1>[, <g2> …], <AGG>( * | <c> ) [AS alias] [, <AGG>(…) …] FROM <t> [WHERE …]  -- plain GROUP BY group-aggregate (SP-PG-SQL-PLAIN-GROUP-RENDER)
        GROUP BY <g1>[, <g2> …]                          --   COUNT/SUM/MIN/MAX/AVG per group; one row per (g1[,g2,…]); multi-column (SP-PG-SQL-GROUP-MULTI-COL)

@@ -13,6 +13,20 @@ measurement and had drifted from the actual workspace count).
 
 **Coherent state of the union (2026-06-02):**
 
+- **`SELECT DISTINCT` row deduplication (SP-PG-SQL-DISTINCT, 2026-06-04).**
+  `SELECT DISTINCT region FROM t` (unique column values), `SELECT DISTINCT a, b
+  FROM t` (unique tuples), and `SELECT DISTINCT * FROM t` (unique whole rows)
+  dedup result rows over the PG wire; composes with `WHERE` and `ORDER BY`
+  (sorted scan order preserved post-dedup). NULL is NOT distinct from NULL. The
+  `SELECT N` tag reports the DEDUPED count. RENDER-LAYER arc: `SELECT DISTINCT …`
+  compiles to the SAME `Op` as the non-distinct form (engine returns all rows),
+  and the gateway dedups the emitted DataRows by their exact projected cell
+  tuple (first occurrence in scan order) — NO `Op`/wire/storage change, so the
+  determinism oracles are byte-untouched. Non-distinct SELECTs stay
+  byte-identical. `DISTINCT ON (…)`, DISTINCT over JOIN, and DISTINCT over
+  aggregate/GROUP BY are NAMED FOLLOW-UPS — cleanly errored, never returned with
+  duplicates. New psql smoke `scripts/sppgsqldistinct-smoke.py` (7/7 psycopg2
+  stages on vulcan).
 - **Performance (final sweep 2026-06-02, median of 3).** Sharded apply
   path (SP-Perf-A-SHARD-APPLY) delivers **14.71M ops/sec at K=8** (3.00×
   the 4.91M K=1 baseline, sub-µs p50; K=16 → 16.24M); scan-side companions

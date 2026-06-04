@@ -26,6 +26,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning [Se
 
 ### Added
 
+- **`SELECT DISTINCT` row deduplication (SP-PG-SQL-DISTINCT, 2026-06-04)** —
+  `SELECT DISTINCT region FROM t` (get the unique values of a column),
+  `SELECT DISTINCT a, b FROM t` (unique tuples), and `SELECT DISTINCT * FROM t`
+  (unique whole rows) now dedup result rows over the PG wire. Composes with
+  `WHERE` and `ORDER BY` (the sorted scan order is preserved post-dedup). NULL
+  is **not distinct from NULL** (a column's NULLs collapse to one row). The
+  `SELECT N` CommandComplete tag reports the DEDUPED row count. Implemented at
+  the **RENDER layer**: the engine compiles `SELECT DISTINCT …` to the SAME
+  `Op` as the non-distinct form (returns all rows) and the gateway dedups the
+  emitted DataRows by their exact projected cell tuple, keeping the first
+  occurrence in scan order. A **pure render-layer change — no `Op` / wire /
+  storage change**, so the determinism oracles are byte-untouched. The dedup
+  key is the PROJECTED columns (`SELECT DISTINCT region` dedups by region
+  only). Non-distinct SELECTs are byte-identical and still return all rows.
+  Named follow-ups (cleanly scoped out, NOT silently accepted): `DISTINCT ON
+  (…)` (Postgres extension), DISTINCT over JOIN, and DISTINCT over aggregate /
+  GROUP BY — those shapes error cleanly rather than returning duplicates.
+  Recognizer + compile-equivalence + dedup unit tests; psql smoke
+  `scripts/sppgsqldistinct-smoke.py`.
 - **Multi-column `GROUP BY` — composite group keys (SP-PG-SQL-GROUP-MULTI-COL,
   2026-06-04)** — `SELECT region, category, COUNT(*), SUM(amount) FROM sales
   GROUP BY region, category` now groups by the TUPLE of several columns, the

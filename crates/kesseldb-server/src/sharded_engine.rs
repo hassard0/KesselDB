@@ -1481,7 +1481,7 @@ mod tests {
                     having: None,
                     sort: None,
                 },
-                |k| matches!(k, ScatterKind::GroupAggregateMerge { kind: 0 }),
+                |k| matches!(k, ScatterKind::GroupAggregateMerge { kind: 0, .. }),
             ),
             (
                 Op::GroupAggregateMulti {

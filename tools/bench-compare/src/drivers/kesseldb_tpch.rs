@@ -273,6 +273,7 @@ pub fn run_tpch(
                         type_id: LINEITEM_TYPE_ID,
                         program: q1_prog.clone(),
                         group_field: fid::L_GROUPKEY,
+                        extra_group_fields: vec![], // single-column GROUP BY (SP-PG-SQL-GROUP-MULTI-COL)
                         aggregates: vec![
                             (0, 0),                    // COUNT(*)
                             (1, fid::L_QUANTITY),      // SUM(l_quantity)

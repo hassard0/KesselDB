@@ -1850,6 +1850,91 @@ impl<V: Vfs> StateMachine<V> {
         Ok(())
     }
 
+    /// Register one foreign key on the single deterministic apply thread.
+    /// Shared by `Op::AddForeignKey` AND the SP-PG-DDL-FK-ENFORCE CREATE
+    /// TABLE apply path (DDL-declared FKs are resolved to ids at apply time
+    /// and registered through THIS exact path). Validates existing rows
+    /// (rejects a dangling reference), backfills the reverse index for
+    /// RESTRICT/CASCADE, appends `(field_id, ref_type_id, on_delete)` to the
+    /// type's `fks`, and persists the catalog. Idempotent on a duplicate
+    /// `(field_id, ref_type_id)`.
+    fn add_foreign_key(
+        &mut self,
+        op_number: u64,
+        type_id: u32,
+        field_id: u16,
+        ref_type_id: u32,
+        on_delete: u8,
+    ) -> OpResult {
+        if on_delete > 4 {
+            return OpResult::SchemaError(
+                "on_delete must be 0|1|2|3|4 (0=NoAction 1=Restrict \
+                 2=Cascade 3=SetNull 4=SetDefault)"
+                    .into(),
+            );
+        }
+        let ot = match self.catalog.get(type_id) {
+            Some(t) => t.clone(),
+            None => return OpResult::SchemaError(format!("no type {type_id}")),
+        };
+        if self.catalog.get(ref_type_id).is_none() {
+            return OpResult::SchemaError(format!("no ref type {ref_type_id}"));
+        }
+        let i = match ot.fields.iter().position(|f| f.field_id == field_id) {
+            Some(i) => i,
+            None => return OpResult::SchemaError(format!("no field {field_id}")),
+        };
+        if matches!(ot.fields[i].kind, kessel_catalog::FieldKind::OverflowRef) {
+            return OpResult::SchemaError("cannot FK an OverflowRef field".into());
+        }
+        if ot.fks.iter().any(|(f, r, _)| *f == field_id && *r == ref_type_id) {
+            return OpResult::Ok; // idempotent
+        }
+        let layout = ot.compute_layout();
+        let off = layout.offsets[i];
+        let w = ot.fields[i].kind.width() as usize;
+        let lo = make_key(type_id, &[0u8; 16]);
+        let hi = make_key(type_id, &[0xFFu8; 16]);
+        // Validate existing rows (same scope as enforcement).
+        for (_, rec) in self.storage.scan_range(&lo, &hi) {
+            if !Self::is_codec_record(&ot, &rec) || Self::field_is_null(&rec, i) {
+                continue;
+            }
+            if let Some(fv) = rec.get(off..off + w) {
+                let mut id16 = [0u8; 16];
+                let n = fv.len().min(16);
+                id16[..n].copy_from_slice(&fv[..n]);
+                if self.storage.get(&make_key(ref_type_id, &id16)).is_none() {
+                    return OpResult::Constraint(
+                        "AddForeignKey: existing dangling reference".into(),
+                    );
+                }
+            }
+        }
+        // RESTRICT/CASCADE need a reverse lookup -> ensure an index
+        // on the FK field (build + backfill if absent).
+        if on_delete != 0 && !ot.indexes.contains(&field_id) {
+            if let Some(t) = self.catalog.get_mut(type_id) {
+                t.indexes.push(field_id);
+            }
+            if let OpResult::SchemaError(e) = self.persist_catalog(op_number) {
+                return OpResult::SchemaError(e);
+            }
+            for (k, rec) in self.storage.scan_range(&lo, &hi) {
+                if let Some(v) = rec.get(off..off + w) {
+                    let mut obj = [0u8; 16];
+                    obj.copy_from_slice(&k[4..20]);
+                    let v = v.to_vec();
+                    self.idx_add(op_number, type_id, field_id, &v, obj);
+                }
+            }
+        }
+        if let Some(t) = self.catalog.get_mut(type_id) {
+            t.fks.push((field_id, ref_type_id, on_delete));
+        }
+        self.persist_catalog(op_number)
+    }
+
     /// Run every before-write trigger of `type_id` in order. Each may mutate
     /// the record or reject the write. Deterministic (pure gas-bounded VM).
     fn run_triggers(&self, type_id: u32, mut rec: Vec<u8>) -> Result<Vec<u8>, String> {
@@ -4485,6 +4570,48 @@ impl<V: Vfs> StateMachine<V> {
                         ..f
                     })
                     .collect();
+                // SP-PG-DDL-FK-ENFORCE: PRE-VALIDATE the DDL-declared FKs
+                // (resolve each child column + referenced table to ids)
+                // BEFORE mutating the catalog, so a forward reference / bad
+                // column is a clean error that leaves NO half-created type
+                // behind (atomic create, matching PostgreSQL). The resolved
+                // triples are then registered below, after the type exists.
+                let fk_specs = kessel_catalog::decode_type_fks(&def);
+                let mut resolved_fks: Vec<(u16, u32, u8)> =
+                    Vec::with_capacity(fk_specs.len());
+                for fk in &fk_specs {
+                    let field_id = match fields
+                        .iter()
+                        .find(|f| f.name == fk.child_col)
+                        .map(|f| f.field_id)
+                    {
+                        Some(fid) => fid,
+                        None => {
+                            return OpResult::SchemaError(format!(
+                                "FOREIGN KEY references unknown column `{}` on \
+                                 table `{name}`",
+                                fk.child_col
+                            ))
+                        }
+                    };
+                    let ref_type_id = match self
+                        .catalog
+                        .types
+                        .iter()
+                        .find(|t| t.name == fk.ref_table)
+                        .map(|t| t.type_id)
+                    {
+                        Some(rt) => rt,
+                        None => {
+                            return OpResult::SchemaError(format!(
+                                "FOREIGN KEY references unknown table `{}` (create \
+                                 the parent table before the child)",
+                                fk.ref_table
+                            ))
+                        }
+                    };
+                    resolved_fks.push((field_id, ref_type_id, fk.on_delete));
+                }
                 self.catalog.types.push(ObjectType {
                     type_id,
                     name,
@@ -4512,10 +4639,33 @@ impl<V: Vfs> StateMachine<V> {
                     ),
                 });
                 self.catalog.next_type_id += 1;
-                match self.persist_catalog(op_number) {
-                    OpResult::Ok => OpResult::TypeCreated(type_id),
-                    e => e,
+                if let e @ OpResult::SchemaError(_) = self.persist_catalog(op_number) {
+                    return e;
                 }
+                // SP-PG-DDL-FK-ENFORCE: register the FOREIGN KEY(s) declared
+                // in the CREATE TABLE DDL, now that the child type exists.
+                // Names were resolved to ids ABOVE (pre-validation), so this
+                // can only fail on a real data problem (an existing dangling
+                // reference — impossible right after create, but the shared
+                // path handles it uniformly). Registration goes through the
+                // SAME path `Op::AddForeignKey` uses, so enforcement,
+                // dangling-ref validation, and ON DELETE actions all light up
+                // identically. A no-FK CREATE TABLE has an empty `resolved_fks`
+                // ⇒ this loop is a no-op and the op stays byte-identical to
+                // before this arc.
+                for (field_id, ref_type_id, on_delete) in resolved_fks {
+                    match self.add_foreign_key(
+                        op_number,
+                        type_id,
+                        field_id,
+                        ref_type_id,
+                        on_delete,
+                    ) {
+                        OpResult::Ok => {}
+                        other => return other,
+                    }
+                }
+                OpResult::TypeCreated(type_id)
             }
 
             Op::AlterTypeAddField { type_id, field } => {
@@ -5606,73 +5756,7 @@ impl<V: Vfs> StateMachine<V> {
             }
 
             Op::AddForeignKey { type_id, field_id, ref_type_id, on_delete } => {
-                if on_delete > 4 {
-                    return OpResult::SchemaError(
-                        "on_delete must be 0|1|2|3|4 (0=NoAction 1=Restrict \
-                         2=Cascade 3=SetNull 4=SetDefault)"
-                            .into(),
-                    );
-                }
-                let ot = match self.catalog.get(type_id) {
-                    Some(t) => t.clone(),
-                    None => return OpResult::SchemaError(format!("no type {type_id}")),
-                };
-                if self.catalog.get(ref_type_id).is_none() {
-                    return OpResult::SchemaError(format!("no ref type {ref_type_id}"));
-                }
-                let i = match ot.fields.iter().position(|f| f.field_id == field_id) {
-                    Some(i) => i,
-                    None => return OpResult::SchemaError(format!("no field {field_id}")),
-                };
-                if matches!(ot.fields[i].kind, kessel_catalog::FieldKind::OverflowRef) {
-                    return OpResult::SchemaError("cannot FK an OverflowRef field".into());
-                }
-                if ot.fks.iter().any(|(f, r, _)| *f == field_id && *r == ref_type_id) {
-                    return OpResult::Ok; // idempotent
-                }
-                let layout = ot.compute_layout();
-                let off = layout.offsets[i];
-                let w = ot.fields[i].kind.width() as usize;
-                let lo = make_key(type_id, &[0u8; 16]);
-                let hi = make_key(type_id, &[0xFFu8; 16]);
-                // Validate existing rows (same scope as enforcement).
-                for (_, rec) in self.storage.scan_range(&lo, &hi) {
-                    if !Self::is_codec_record(&ot, &rec) || Self::field_is_null(&rec, i) {
-                        continue;
-                    }
-                    if let Some(fv) = rec.get(off..off + w) {
-                        let mut id16 = [0u8; 16];
-                        let n = fv.len().min(16);
-                        id16[..n].copy_from_slice(&fv[..n]);
-                        if self.storage.get(&make_key(ref_type_id, &id16)).is_none() {
-                            return OpResult::Constraint(
-                                "AddForeignKey: existing dangling reference".into(),
-                            );
-                        }
-                    }
-                }
-                // RESTRICT/CASCADE need a reverse lookup -> ensure an index
-                // on the FK field (build + backfill if absent).
-                if on_delete != 0 && !ot.indexes.contains(&field_id) {
-                    if let Some(t) = self.catalog.get_mut(type_id) {
-                        t.indexes.push(field_id);
-                    }
-                    if let OpResult::SchemaError(e) = self.persist_catalog(op_number) {
-                        return OpResult::SchemaError(e);
-                    }
-                    for (k, rec) in self.storage.scan_range(&lo, &hi) {
-                        if let Some(v) = rec.get(off..off + w) {
-                            let mut obj = [0u8; 16];
-                            obj.copy_from_slice(&k[4..20]);
-                            let v = v.to_vec();
-                            self.idx_add(op_number, type_id, field_id, &v, obj);
-                        }
-                    }
-                }
-                if let Some(t) = self.catalog.get_mut(type_id) {
-                    t.fks.push((field_id, ref_type_id, on_delete));
-                }
-                self.persist_catalog(op_number)
+                self.add_foreign_key(op_number, type_id, field_id, ref_type_id, on_delete)
             }
 
             Op::AddCheck { type_id, program } => {
@@ -12452,6 +12536,102 @@ mod tests {
             sm.digest()
         };
         assert_eq!(build(), build(), "composite index must be deterministic");
+    }
+
+    // ---- SP-PG-DDL-FK-ENFORCE: DDL-declared FOREIGN KEY is enforced ----
+
+    /// A FOREIGN KEY declared in CREATE TABLE DDL (threaded BY NAME through
+    /// the type-def blob) is RESOLVED + REGISTERED at apply time, so INSERTs
+    /// are enforced identically to an explicit `Op::AddForeignKey`. Mirrors
+    /// the SP6 enforcement test but the FK arrives via the create, not a
+    /// separate op.
+    #[test]
+    fn ddl_declared_fk_is_registered_and_enforced_at_apply() {
+        use kessel_codec::{encode, Value};
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        // parent (id-keyed) created FIRST (the common ORM ordering).
+        sm.apply(1, Op::CreateType {
+            def: encode_type_def("parent", &[
+                Field { field_id: 0, name: "a".into(), kind: FieldKind::U64, nullable: false },
+            ]),
+        });
+        // child with a DDL FOREIGN KEY pref -> parent, captured by name and
+        // resolved at apply. pref is NULLABLE so the NULL-FK case is testable.
+        let child_def = kessel_catalog::encode_type_def_full_fk(
+            "child",
+            &[
+                Field { field_id: 0, name: "pref".into(), kind: FieldKind::U128, nullable: true },
+                Field { field_id: 0, name: "v".into(), kind: FieldKind::U32, nullable: false },
+            ],
+            &[],
+            false,
+            None,
+            &[kessel_catalog::FkSpec {
+                child_col: "pref".into(),
+                ref_table: "parent".into(),
+                ref_col: Some("id".into()),
+                on_delete: 1, // RESTRICT
+            }],
+        );
+        assert_eq!(sm.apply(2, Op::CreateType { def: child_def }), OpResult::TypeCreated(2));
+        // The FK must be registered on type 2 at apply time.
+        assert_eq!(
+            sm.catalog().get(2).unwrap().fks,
+            vec![(1u16, 1u32, 1u8)],
+            "DDL FK resolved to (field_id=1, ref_type=1, on_delete=RESTRICT)"
+        );
+
+        let cot = sm.catalog().get(2).unwrap().clone();
+        let child = |p: Option<u128>, v: u32| {
+            let pv = match p { Some(x) => Value::Uint(x), None => Value::Null };
+            encode(&cot, &[pv, Value::Uint(v as u128)]).unwrap()
+        };
+        // parent id=5 exists.
+        sm.apply(3, Op::Create { type_id: 1, id: ObjectId::from_u128(5), record: vec![1] });
+        // child -> existing parent 5: OK.
+        assert_eq!(
+            sm.apply(4, Op::Create { type_id: 2, id: ObjectId::from_u128(1), record: child(Some(5), 1) }),
+            OpResult::Ok
+        );
+        // child -> missing parent 999: rejected (this is the 23503 path).
+        assert!(matches!(
+            sm.apply(5, Op::Create { type_id: 2, id: ObjectId::from_u128(2), record: child(Some(999), 1) }),
+            OpResult::Constraint(_)
+        ));
+        // child with NULL fk: allowed.
+        assert_eq!(
+            sm.apply(6, Op::Create { type_id: 2, id: ObjectId::from_u128(3), record: child(None, 1) }),
+            OpResult::Ok
+        );
+        // ON DELETE RESTRICT: deleting referenced parent 5 is blocked.
+        assert!(matches!(
+            sm.apply(7, Op::Delete { type_id: 1, id: ObjectId::from_u128(5) }),
+            OpResult::Constraint(_)
+        ));
+    }
+
+    /// A forward reference (parent table not yet created) is a clean DDL
+    /// error, not a silent drop. (SQLAlchemy/Django create parents first.)
+    #[test]
+    fn ddl_fk_forward_reference_is_a_clean_error() {
+        let mut sm = StateMachine::open(MemVfs::new()).unwrap();
+        let child_def = kessel_catalog::encode_type_def_full_fk(
+            "child",
+            &[Field { field_id: 0, name: "pref".into(), kind: FieldKind::U128, nullable: true }],
+            &[],
+            false,
+            None,
+            &[kessel_catalog::FkSpec {
+                child_col: "pref".into(),
+                ref_table: "missing_parent".into(),
+                ref_col: None,
+                on_delete: 0,
+            }],
+        );
+        assert!(matches!(
+            sm.apply(1, Op::CreateType { def: child_def }),
+            OpResult::SchemaError(_)
+        ));
     }
 
     // ---- Sub-project 6: foreign keys ----

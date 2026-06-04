@@ -361,27 +361,56 @@ impl<'a> P<'a> {
     }
 }
 
-/// SP-PG-ORM-RELATIONSHIPS — consume trailing referential-action clauses on
-/// a `REFERENCES`/`FOREIGN KEY` constraint: `ON DELETE <action>` /
-/// `ON UPDATE <action>` where `<action>` is `CASCADE`, `RESTRICT`,
-/// `NO ACTION`, `SET NULL`, or `SET DEFAULT`. KesselDB does not enforce
-/// referential integrity at the SQL-DDL layer (named follow-up
-/// `SP-PG-DDL-FK-ENFORCE`), so the actions are parsed-and-ignored. Stops at
-/// the first token that is not part of an `ON DELETE/UPDATE` clause, leaving
-/// the cursor for the caller's `,`/`)` handling.
-fn skip_referential_actions(p: &mut P<'_>) {
+/// SP-PG-ORM-RELATIONSHIPS / SP-PG-DDL-FK-ENFORCE — consume trailing
+/// referential-action clauses on a `REFERENCES`/`FOREIGN KEY` constraint:
+/// `ON DELETE <action>` / `ON UPDATE <action>` where `<action>` is
+/// `CASCADE`, `RESTRICT`, `NO ACTION`, `SET NULL`, or `SET DEFAULT`.
+///
+/// Returns the engine `on_delete` action code parsed from the `ON DELETE`
+/// clause (the engine enforces referential integrity since
+/// SP-PG-DDL-FK-ENFORCE): `0=NO ACTION 1=RESTRICT 2=CASCADE 3=SET NULL
+/// 4=SET DEFAULT`. The default (no `ON DELETE` clause) is `0` (NO ACTION),
+/// matching PostgreSQL. `ON UPDATE` actions are still parsed-and-IGNORED
+/// (the engine does not yet enforce ON UPDATE — named follow-up
+/// `SP-PG-DDL-FK-ON-UPDATE`). Stops at the first token that is not part of
+/// an `ON DELETE/UPDATE` clause, leaving the cursor for the caller's
+/// `,`/`)` handling.
+fn parse_referential_actions(p: &mut P<'_>) -> u8 {
+    let mut on_delete: u8 = 0; // NO ACTION default (PostgreSQL semantics)
     while p.kw("ON") {
         // `DELETE` | `UPDATE`
-        let _ = p.kw("DELETE") || p.kw("UPDATE");
+        let is_delete = p.kw("DELETE");
+        if !is_delete {
+            let _ = p.kw("UPDATE");
+        }
         // `NO ACTION` | `SET NULL` | `SET DEFAULT` | `CASCADE` | `RESTRICT`
-        if p.kw("NO") {
+        let action: u8 = if p.kw("NO") {
             let _ = p.kw("ACTION");
+            0
         } else if p.kw("SET") {
-            let _ = p.kw("NULL") || p.kw("DEFAULT");
+            if p.kw("NULL") {
+                3
+            } else {
+                let _ = p.kw("DEFAULT");
+                4
+            }
+        } else if p.kw("CASCADE") {
+            2
+        } else if p.kw("RESTRICT") {
+            1
         } else {
-            let _ = p.kw("CASCADE") || p.kw("RESTRICT");
+            // No recognized action keyword followed `ON DELETE/UPDATE`;
+            // treat as NO ACTION (don't consume a non-action token — the
+            // caller's `,`/`)` handling needs it). Matches the pre-arc
+            // skip semantics for the common ORM-emitted clauses.
+            0
+        };
+        // Only ON DELETE drives the engine action; ON UPDATE is ignored.
+        if is_delete {
+            on_delete = action;
         }
     }
+    on_delete
 }
 
 /// Return the best near-match for `name` from `candidates`, or `None` if
@@ -2879,6 +2908,11 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
         // `id` pseudo-PK / ObjectId.
         let mut serial_col_names: Vec<String> = Vec::new();
         let mut pk_col_names: Vec<String> = Vec::new();
+        // SP-PG-DDL-FK-ENFORCE: FOREIGN KEY descriptors captured BY NAME
+        // during the DDL parse. The child type_id is only minted when the
+        // CreateType op APPLIES, so we thread these names through the
+        // type-def blob and resolve `ref_type_id`/`field_id` at apply time.
+        let mut fk_specs: Vec<kessel_catalog::FkSpec> = Vec::new();
         loop {
             // SP-PG-SQL-ORM-PARSE T5 — table-level `PRIMARY KEY (col, ...)`
             // constraint (SQLAlchemy's `create_all` emits a trailing
@@ -2924,8 +2958,14 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
             if p.kw("FOREIGN") {
                 p.expect_kw("KEY")?;
                 p.punct('(')?;
+                // SP-PG-DDL-FK-ENFORCE: capture the child column name(s).
+                // V1 enforces single-column FKs (every row is keyed by the
+                // `id` pseudo-PK); a composite FK captures only its FIRST
+                // column for enforcement (named follow-up
+                // `SP-PG-DDL-COMPOSITE-FK`).
+                let mut child_cols: Vec<String> = Vec::new();
                 loop {
-                    let _ = p.col_ident()?;
+                    child_cols.push(p.col_ident()?);
                     match p.next() {
                         Some(Tok::Punct(',')) => continue,
                         Some(Tok::Punct(')')) => break,
@@ -2933,12 +2973,13 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
                     }
                 }
                 p.expect_kw("REFERENCES")?;
-                let _ref_tbl = p.ident()?;
+                let ref_tbl = p.ident()?;
                 // Optional `( col [,col]* )` referenced-column list.
+                let mut ref_cols: Vec<String> = Vec::new();
                 if matches!(p.peek(), Some(Tok::Punct('('))) {
                     p.i += 1; // consume `(`
                     loop {
-                        let _ = p.col_ident()?;
+                        ref_cols.push(p.col_ident()?);
                         match p.next() {
                             Some(Tok::Punct(',')) => continue,
                             Some(Tok::Punct(')')) => break,
@@ -2951,7 +2992,15 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
                         }
                     }
                 }
-                skip_referential_actions(&mut p);
+                let on_delete = parse_referential_actions(&mut p);
+                if let Some(child_col) = child_cols.into_iter().next() {
+                    fk_specs.push(kessel_catalog::FkSpec {
+                        child_col,
+                        ref_table: ref_tbl,
+                        ref_col: ref_cols.into_iter().next(),
+                        on_delete,
+                    });
+                }
                 match p.next() {
                     Some(Tok::Punct(',')) => continue,
                     Some(Tok::Punct(')')) => break,
@@ -3070,11 +3119,12 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
                 // identically to the table-level FOREIGN KEY constraint; the
                 // column is still stored as its declared `kind`.
                 if p.kw("REFERENCES") {
-                    let _ref_tbl = p.ident()?;
+                    let ref_tbl = p.ident()?;
+                    let mut ref_cols: Vec<String> = Vec::new();
                     if matches!(p.peek(), Some(Tok::Punct('('))) {
                         p.i += 1; // consume `(`
                         loop {
-                            let _ = p.col_ident()?;
+                            ref_cols.push(p.col_ident()?);
                             match p.next() {
                                 Some(Tok::Punct(',')) => continue,
                                 Some(Tok::Punct(')')) => break,
@@ -3087,7 +3137,16 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
                             }
                         }
                     }
-                    skip_referential_actions(&mut p);
+                    let on_delete = parse_referential_actions(&mut p);
+                    // SP-PG-DDL-FK-ENFORCE: inline column FK → same descriptor
+                    // shape as the table-level FOREIGN KEY constraint, keyed by
+                    // THIS column name.
+                    fk_specs.push(kessel_catalog::FkSpec {
+                        child_col: cname.clone(),
+                        ref_table: ref_tbl,
+                        ref_col: ref_cols.into_iter().next(),
+                        on_delete,
+                    });
                     continue;
                 }
                 break;
@@ -3118,9 +3177,15 @@ fn compile_from_tokens(toks: Vec<Tok>, cat: &Catalog) -> Result<Op, SqlError> {
                 fields.iter().position(|f| &f.name == pk).map(|i| (i + 1) as u16)
             });
         let serial_pk = serial_field_id.is_some();
+        // SP-PG-DDL-FK-ENFORCE: thread captured FK descriptors (BY NAME)
+        // through the type-def blob. When `fk_specs` is empty this is
+        // BYTE-IDENTICAL to `encode_type_def_full` (no FK trailer emitted),
+        // so a no-FK CREATE TABLE produces the same op frame as before this
+        // arc. The engine resolves the names to ids and registers the FKs at
+        // apply time (the child type_id is only assigned then).
         return Ok(Op::CreateType {
-            def: kessel_catalog::encode_type_def_full(
-                &name, &fields, &defaults, serial_pk, serial_field_id,
+            def: kessel_catalog::encode_type_def_full_fk(
+                &name, &fields, &defaults, serial_pk, serial_field_id, &fk_specs,
             ),
         });
     }
@@ -8759,10 +8824,12 @@ mod tests {
     #[test]
     fn fk_table_constraint_ddl_parses() {
         use kessel_proto::Op;
-        // SP-PG-ORM-RELATIONSHIPS — SQLAlchemy `create_all` renders a child
+        // SP-PG-DDL-FK-ENFORCE — SQLAlchemy `create_all` renders a child
         // model's ForeignKey as a trailing table constraint. It must parse
-        // (accept-and-skip) and compile to the SAME CreateType as the table
-        // without the FK clause (determinism: the FK produces no field).
+        // AND now capture an FK descriptor (BY NAME) in the type-def blob, so
+        // the engine can resolve + enforce it at apply time. The base
+        // name+fields decode is UNCHANGED (the FK rides a trailer), and a
+        // table WITHOUT an FK is byte-identical to before this arc.
         let cat = Catalog::default();
         let with_fk = compile(
             "CREATE TABLE books (id I64 NOT NULL, title CHAR(64), author_id I64, \
@@ -8777,21 +8844,76 @@ mod tests {
         .unwrap();
         match (&with_fk, &without_fk) {
             (Op::CreateType { def: a }, Op::CreateType { def: b }) => {
-                assert_eq!(a, b, "FK clause must not change the encoded type def");
+                // The FK clause NOW changes the encoded def (it carries the FK
+                // descriptor), but the FK is the ONLY difference: base
+                // name+fields decode identically.
+                assert_ne!(a, b, "FK clause now carries a descriptor in the def");
+                let (na, fa) = kessel_catalog::decode_type_def(a).unwrap();
+                let (nb, fb) = kessel_catalog::decode_type_def(b).unwrap();
+                assert_eq!((na, fa), (nb, fb), "base name+fields unchanged");
+                // The captured FK descriptor: author_id -> authors(id), NO
+                // ACTION (no ON DELETE clause → default 0).
+                let fks = kessel_catalog::decode_type_fks(a);
+                assert_eq!(fks.len(), 1);
+                assert_eq!(fks[0].child_col, "author_id");
+                assert_eq!(fks[0].ref_table, "authors");
+                assert_eq!(fks[0].ref_col.as_deref(), Some("id"));
+                assert_eq!(fks[0].on_delete, 0, "NO ACTION default");
+                // The no-FK table carries NO FK trailer (byte-identical to
+                // the pre-arc shape).
+                assert!(kessel_catalog::decode_type_fks(b).is_empty());
             }
             o => panic!("expected CreateType pair, got {o:?}"),
         }
-        // FK + referential actions (ON DELETE CASCADE) still parse.
-        assert!(matches!(
-            compile(
+        // FK + ON DELETE CASCADE maps to on_delete=2.
+        match compile(
+            "CREATE TABLE books (id I64 NOT NULL, author_id I64, \
+             FOREIGN KEY(author_id) REFERENCES authors (id) ON DELETE CASCADE)",
+            &cat,
+        )
+        .unwrap()
+        {
+            Op::CreateType { def } => {
+                let fks = kessel_catalog::decode_type_fks(&def);
+                assert_eq!(fks.len(), 1);
+                assert_eq!(fks[0].on_delete, 2, "ON DELETE CASCADE → 2");
+            }
+            o => panic!("{o:?}"),
+        }
+        // ON DELETE RESTRICT → 1; ON DELETE SET NULL → 3; SET DEFAULT → 4.
+        for (clause, expect) in [
+            ("ON DELETE RESTRICT", 1u8),
+            ("ON DELETE SET NULL", 3),
+            ("ON DELETE SET DEFAULT", 4),
+            ("ON DELETE NO ACTION", 0),
+        ] {
+            let sql = format!(
                 "CREATE TABLE books (id I64 NOT NULL, author_id I64, \
-                 FOREIGN KEY(author_id) REFERENCES authors (id) ON DELETE CASCADE)",
-                &cat,
-            )
-            .unwrap(),
-            Op::CreateType { .. }
-        ));
-        // Inline column REFERENCES modifier parses too.
+                 FOREIGN KEY(author_id) REFERENCES authors (id) {clause})"
+            );
+            match compile(&sql, &cat).unwrap() {
+                Op::CreateType { def } => {
+                    let fks = kessel_catalog::decode_type_fks(&def);
+                    assert_eq!(fks[0].on_delete, expect, "{clause}");
+                }
+                o => panic!("{o:?}"),
+            }
+        }
+        // ON UPDATE actions are parsed but do NOT drive on_delete (still 0).
+        match compile(
+            "CREATE TABLE books (id I64 NOT NULL, author_id I64, \
+             FOREIGN KEY(author_id) REFERENCES authors (id) ON UPDATE CASCADE)",
+            &cat,
+        )
+        .unwrap()
+        {
+            Op::CreateType { def } => {
+                assert_eq!(kessel_catalog::decode_type_fks(&def)[0].on_delete, 0);
+            }
+            o => panic!("{o:?}"),
+        }
+        // Inline column REFERENCES modifier captures the FK too, keyed by the
+        // column it modifies; the FK col is still stored as a field.
         match compile(
             "CREATE TABLE books (id I64 NOT NULL, author_id I64 REFERENCES authors (id))",
             &cat,
@@ -8802,6 +8924,10 @@ mod tests {
                 let (_n, fields) = kessel_catalog::decode_type_def(&def).unwrap();
                 let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
                 assert_eq!(names, ["id", "author_id"], "FK col still stored");
+                let fks = kessel_catalog::decode_type_fks(&def);
+                assert_eq!(fks.len(), 1);
+                assert_eq!(fks[0].child_col, "author_id");
+                assert_eq!(fks[0].ref_table, "authors");
             }
             o => panic!("{o:?}"),
         }

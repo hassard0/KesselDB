@@ -377,6 +377,131 @@ pub fn encode_type_def_full(
     b
 }
 
+/// SP-PG-DDL-FK-ENFORCE — a single table-level / column-level FOREIGN KEY
+/// captured during CREATE TABLE DDL parse, carried BY NAME through the
+/// `CreateType` op's opaque type-def blob and resolved to engine ids at
+/// apply time (the child type_id is only minted when the create applies).
+///
+/// `on_delete` is the engine's `Op::AddForeignKey` action code:
+/// `0=NoAction 1=Restrict 2=Cascade 3=SetNull 4=SetDefault` (see
+/// `kessel-sm`). `ref_col` is the optional `REFERENCES tbl(col)` column;
+/// KesselDB keys every row by the `id` pseudo-PK (the ObjectId), so the
+/// referenced column is metadata in V1 (the engine FK always points at the
+/// parent's row id) — captured for fidelity/diagnostics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FkSpec {
+    pub child_col: String,
+    pub ref_table: String,
+    pub ref_col: Option<String>,
+    pub on_delete: u8,
+}
+
+/// SP-PG-DDL-FK-ENFORCE — magic marker byte that introduces the FK trailer
+/// in a type-def blob. Distinct from the serial-flag byte (`1`) and from
+/// the "no trailer" terminus, so the decoder can peek for it after the
+/// defaults+serial trailers WITHOUT a presence anchor. A CREATE TABLE with
+/// NO foreign keys never emits this byte ⇒ byte-identical to a pre-arc
+/// frame.
+const FK_TRAILER_MARKER: u8 = 0xFE;
+
+/// SP-PG-DDL-FK-ENFORCE — like [`encode_type_def_full`] but appends an FK
+/// trailer (only when `fks` is non-empty) AFTER the SP86 defaults trailer
+/// and the SERIAL trailer. Layout of the FK trailer:
+///   `[u8 0xFE marker][u16 count]  count×( fk_spec )`
+/// where each `fk_spec` is
+///   `[u16-len str child_col][u16-len str ref_table]`
+///   `[u8 has_ref_col][u16-len str ref_col?][u8 on_delete]`.
+/// When `fks` is empty this is byte-identical to `encode_type_def_full`.
+pub fn encode_type_def_full_fk(
+    name: &str,
+    fields: &[Field],
+    defaults: &[(u16, Vec<u8>)],
+    serial_pk: bool,
+    serial_field_id: Option<u16>,
+    fks: &[FkSpec],
+) -> Vec<u8> {
+    let mut b = encode_type_def_full(name, fields, defaults, serial_pk, serial_field_id);
+    if !fks.is_empty() {
+        // The FK trailer rides AFTER the defaults trailer (and the serial
+        // trailer, if any). `fk_trailer_offset` locates it by first skipping
+        // the defaults trailer via `serial_trailer_offset`, which only exists
+        // when SOMETHING was written after the base (defaults or serial). So
+        // when there are no defaults AND no serial PK, force an empty
+        // defaults-count `[u16 0]` so the trailer region (and thus the FK
+        // offset) is findable. `decode_type_defaults` reads that 0 → no
+        // defaults; `decode_type_serial_pk` reads the FK marker (0xFE ≠ 1) →
+        // not serial. Both stay correct.
+        if defaults.is_empty() && !serial_pk {
+            b.extend_from_slice(&0u16.to_le_bytes());
+        }
+        b.push(FK_TRAILER_MARKER);
+        b.extend_from_slice(&(fks.len() as u16).to_le_bytes());
+        for fk in fks {
+            put_str(&mut b, &fk.child_col);
+            put_str(&mut b, &fk.ref_table);
+            match &fk.ref_col {
+                Some(rc) => {
+                    b.push(1u8);
+                    put_str(&mut b, rc);
+                }
+                None => b.push(0u8),
+            }
+            b.push(fk.on_delete);
+        }
+    }
+    b
+}
+
+/// SP-PG-DDL-FK-ENFORCE — parse the FK trailer from a type-def blob.
+/// Returns an empty vec for old blobs / no-FK types (no marker present)
+/// or on any short read — FK specs are never load-bearing for the
+/// name+fields decode (the marker rides AFTER every other trailer).
+pub fn decode_type_fks(b: &[u8]) -> Vec<FkSpec> {
+    let parse = || -> Option<Vec<FkSpec>> {
+        let mut p = fk_trailer_offset(b)?;
+        if *b.get(p)? != FK_TRAILER_MARKER {
+            return Some(Vec::new());
+        }
+        p += 1;
+        let n = u16::from_le_bytes(b.get(p..p + 2)?.try_into().ok()?) as usize;
+        p += 2;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let child_col = get_str(b, &mut p)?;
+            let ref_table = get_str(b, &mut p)?;
+            let has_ref = *b.get(p)?;
+            p += 1;
+            let ref_col = if has_ref == 1 {
+                Some(get_str(b, &mut p)?)
+            } else {
+                None
+            };
+            let on_delete = *b.get(p)?;
+            p += 1;
+            out.push(FkSpec { child_col, ref_table, ref_col, on_delete });
+        }
+        Some(out)
+    };
+    parse().unwrap_or_default()
+}
+
+/// Position `p` just past the SP86 defaults trailer AND the SERIAL trailer
+/// (the start of the FK trailer, if any). Returns `None` if there is no
+/// trailer region at all. Shared by [`decode_type_fks`].
+fn fk_trailer_offset(b: &[u8]) -> Option<usize> {
+    let mut p = serial_trailer_offset(b)?;
+    // Skip the SERIAL trailer if present: `[u8 1][u8 has_field][u16 fid?]`.
+    if matches!(b.get(p), Some(1u8)) {
+        p += 1; // serial flag
+        let has_field = *b.get(p)?;
+        p += 1;
+        if has_field == 1 {
+            p += 2; // serial field_id
+        }
+    }
+    Some(p)
+}
+
 /// Position `p` just past the SP86 defaults trailer (the start of the
 /// serial trailer, if any). Returns `None` if there is no trailer region
 /// at all (old blob). Shared by the serial decoders.
@@ -1069,6 +1194,61 @@ mod tests {
         let back = Catalog::decode(&c.encode()).unwrap();
         assert!(back.types[0].serial_pk, "serial_pk survives the catalog roundtrip");
         assert_eq!(back.types[0].serial_field_id, Some(1), "serial_field_id survives roundtrip");
+    }
+
+    #[test]
+    fn fk_trailer_round_trips_and_is_byte_identical_when_empty() {
+        // SP-PG-DDL-FK-ENFORCE — the FK trailer rides AFTER the defaults +
+        // serial trailers and is only emitted when non-empty.
+        let fields = vec![
+            Field { field_id: 1, name: "id".into(), kind: FieldKind::I64, nullable: false },
+            Field { field_id: 2, name: "author_id".into(), kind: FieldKind::I64, nullable: true },
+        ];
+        let fks = vec![FkSpec {
+            child_col: "author_id".into(),
+            ref_table: "authors".into(),
+            ref_col: Some("id".into()),
+            on_delete: 2, // CASCADE
+        }];
+
+        // No defaults, no serial, WITH fks → trailer findable.
+        let blob = encode_type_def_full_fk("books", &fields, &[], false, None, &fks);
+        assert_eq!(decode_type_fks(&blob), fks, "fk specs round-trip");
+        // Base name+fields STILL decode through the FK trailer.
+        let (n, f) = decode_type_def(&blob).unwrap();
+        assert_eq!(n, "books");
+        assert_eq!(f, fields);
+        // The forced empty defaults count must NOT manifest as defaults, and
+        // the FK marker must NOT be misread as a serial flag.
+        assert!(decode_type_defaults(&blob).is_empty(), "no spurious defaults");
+        assert!(!decode_type_serial_pk(&blob), "FK marker is not a serial flag");
+        assert_eq!(decode_type_serial_field(&blob), None);
+
+        // FKs alongside serial PK + a default → all trailers coexist.
+        let defs = vec![(1u16, vec![0u8; 8])];
+        let blob2 =
+            encode_type_def_full_fk("books2", &fields, &defs, true, Some(1), &fks);
+        assert!(decode_type_serial_pk(&blob2));
+        assert_eq!(decode_type_serial_field(&blob2), Some(1));
+        assert_eq!(decode_type_defaults(&blob2), defs);
+        assert_eq!(decode_type_fks(&blob2), fks);
+
+        // EMPTY fks → BYTE-IDENTICAL to encode_type_def_full (determinism).
+        let plain_full = encode_type_def_full("p", &fields, &[], false, None);
+        let plain_fk = encode_type_def_full_fk("p", &fields, &[], false, None, &[]);
+        assert_eq!(plain_full, plain_fk, "no-FK blob is byte-identical");
+        assert!(decode_type_fks(&plain_fk).is_empty());
+
+        // ref_col = None branch.
+        let fks_no_col = vec![FkSpec {
+            child_col: "author_id".into(),
+            ref_table: "authors".into(),
+            ref_col: None,
+            on_delete: 0,
+        }];
+        let blob3 =
+            encode_type_def_full_fk("b3", &fields, &[], false, None, &fks_no_col);
+        assert_eq!(decode_type_fks(&blob3), fks_no_col);
     }
 
     #[test]

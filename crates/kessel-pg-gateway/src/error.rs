@@ -341,6 +341,14 @@ pub fn constraint_to_sqlstate(msg: &str) -> &'static str {
         SQLSTATE_UNIQUE_VIOLATION
     } else if lower.contains("foreign key")
         || lower.contains("referenced")
+        // SP-PG-DDL-FK-ENFORCE: the SM's INSERT/UPDATE enforcement message
+        // is "FOREIGN KEY violated …" (caught above); the ON DELETE RESTRICT
+        // block emits "ON DELETE RESTRICT: … still references type …", and
+        // AddForeignKey's existing-data check emits "… dangling reference".
+        // All of these are foreign_key_violation (23503).
+        || lower.contains("on delete")
+        || lower.contains("references type")
+        || lower.contains("dangling reference")
         || lower.contains(" fk ")
     {
         SQLSTATE_FOREIGN_KEY_VIOLATION
@@ -658,6 +666,31 @@ mod tests {
     fn t7_constraint_foreign_key_maps_to_23503() {
         let r = OpResult::Constraint(
             "DROP TABLE: type 7 is referenced by a foreign key".to_string(),
+        );
+        let (_, state, _) = op_result_to_sqlstate(&r).unwrap();
+        assert_eq!(state, "23503");
+    }
+
+    /// SP-PG-DDL-FK-ENFORCE: the SM's INSERT/UPDATE FK-enforcement message
+    /// "FOREIGN KEY violated on field 'x' -> type 2" → 23503 (the headline
+    /// path a bad child INSERT takes through the PG wire).
+    #[test]
+    fn sppgddlfkenforce_insert_violation_maps_to_23503() {
+        let r = OpResult::Constraint(
+            "FOREIGN KEY violated on field 'author_id' -> type 2".to_string(),
+        );
+        let (_, state, _) = op_result_to_sqlstate(&r).unwrap();
+        assert_eq!(state, "23503");
+    }
+
+    /// SP-PG-DDL-FK-ENFORCE: ON DELETE RESTRICT block on a referenced
+    /// parent → 23503 (the "still references type" message must map to FK
+    /// violation, not the 23000 default).
+    #[test]
+    fn sppgddlfkenforce_restrict_block_maps_to_23503() {
+        let r = OpResult::Constraint(
+            "ON DELETE RESTRICT: type 2 field 1 still references type 1"
+                .to_string(),
         );
         let (_, state, _) = op_result_to_sqlstate(&r).unwrap();
         assert_eq!(state, "23503");

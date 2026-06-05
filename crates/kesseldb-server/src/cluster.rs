@@ -1910,7 +1910,37 @@ mod tests {
             std::thread::spawn(move || serve_clients(cl, nn));
             arc_nodes.push(node);
         }
-        std::thread::sleep(Duration::from_millis(200));
+
+        // SP-CLUSTER-FLAKE — wait (bounded) for the cluster to elect a
+        // primary in Normal status BEFORE issuing client SQL. The earlier
+        // fixed `sleep(200ms)` was not enough on a loaded CI runner: with
+        // no primary yet, the follower-relay `ClusterClient::sql()` below
+        // would block indefinitely waiting for a not-yet-existent primary,
+        // hanging the test until the 30-minute CI job timeout. Same
+        // "slow runner, quorum not yet formed" signal `submit_with_retry`
+        // guards against — here we wait for an elected, Normal-status
+        // primary so the relay target exists. Bounded so a genuinely-stuck
+        // cluster fails fast with a clear message instead of timing out.
+        let primary_elected = {
+            let start = Instant::now();
+            loop {
+                let ready = arc_nodes.iter().any(|nd| {
+                    let (_view, is_primary, status) = nd.role_probe();
+                    is_primary && status == "Normal"
+                });
+                if ready {
+                    break true;
+                }
+                if start.elapsed() > Duration::from_secs(20) {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        assert!(
+            primary_elected,
+            "cluster did not elect a Normal-status primary within 20s"
+        );
 
         // ONLY the follower at idx 1 is in the address list — the
         // primary (idx 0) is unreachable client-side. ClusterClient's

@@ -766,6 +766,18 @@ impl ClusterClient {
             let a = &self.addrs[self.idx % self.addrs.len()];
             let mut s = TcpStream::connect(a)?;
             let _ = s.set_nodelay(true);
+            // A clustered client must never block forever on a single
+            // unresponsive node. If a contacted backup accepts the request
+            // but its server-side relay to the primary stalls (e.g. no
+            // primary elected yet), an un-timed `read_frame` would hang
+            // indefinitely — this is exactly what hung a cluster test for
+            // 25 min on a slow CI runner until the job timeout. Bound each
+            // attempt so a stall surfaces as a retryable I/O error and the
+            // caller rotates to the next address. Generous vs the server's
+            // own 5 s socket timeouts; the bounded retry loop provides the
+            // resilience, and reconnect-on-error preserves the session.
+            let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+            let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(10)));
             if let Some(tok) = &self.token {
                 do_auth(&mut s, tok)?;
             }

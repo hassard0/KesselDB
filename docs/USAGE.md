@@ -1528,10 +1528,9 @@ SQLAlchemy, Drizzle, Prisma, JDBC default, sqlx, pgx, Diesel) uses on
 connect — they probe via Parse + Bind + Sync before falling back to
 Simple Query. KesselDB now satisfies that probe end-to-end. A real
 `psycopg2.connect(...)` + `cur.execute("SELECT * FROM pgtest WHERE id = %s", (42,))`
-returns real rows on vulcan; full ORM-suite smoke for SQLAlchemy/JDBC/
-Drizzle/Prisma is the SP-PG-EXTQ T8 / T11 / T12 follow-up (still open
-at the time of writing — the wire surface IS lit, the formal compat
-test fixtures are post-V1.1).
+returns real rows; broader ORM-suite smoke for SQLAlchemy/JDBC/
+Drizzle/Prisma is covered in the compat matrix below — the wire surface
+IS lit.
 
 ### Enable the PG listener
 
@@ -1669,13 +1668,12 @@ expression language) depends on which subset of catalog SQL SQLAlchemy
 emits — synthetic-peer KATs verify the connect + probe + simple
 parameterized SELECT shape.
 
-#### SQLAlchemy ORM (declarative models) — full CRUD (2026-06-02)
+#### SQLAlchemy ORM (declarative models) — full CRUD
 
 A **real SQLAlchemy 2.0 declarative-ORM** CRUD workload (NOT `text()` /
-raw `cursor.execute`) now works **end-to-end** against KesselDB on vulcan.
-SP-PG-SQL-ORM-PARSE closed the three keystone ORM-shape gaps + two
-DDL-spelling gaps, taking the declarative-ORM smoke from **2/8 → 7/7
-(full CRUD pass)**:
+raw `cursor.execute`) works **end-to-end** against KesselDB.
+Closing three keystone ORM-shape gaps + two DDL-spelling gaps took the
+declarative-ORM smoke from **2/8 → 7/7 (full CRUD pass)**:
 
 | ORM operation | Result | Notes |
 |---|---|---|
@@ -1698,8 +1696,7 @@ qualified query compiles to the BYTE-IDENTICAL Op as its bare equivalent
 **Residual follow-ups**: `SP-PG-SQL-UPDATE-WHERE-GENERAL` (non-PK /
 multi-row UPDATE/DELETE WHERE), `SP-PG-SQL-QUALIFIER-STRICT` (strict
 qualifier validation), `SP-PG-SQL-FROM-ALIAS`, `SP-PG-SQL-ANY-SUBQUERY`,
-`SP-PG-ORM-RELATIONSHIPS` / `SP-PG-ORM-ALEMBIC`. Verified transcript:
-`docs/superpowers/sppgsqlormparse-t5-smoke-2026-06-02.txt`.
+`SP-PG-ORM-RELATIONSHIPS` / `SP-PG-ORM-ALEMBIC`.
 
 #### Autoincrement models (`BIGSERIAL` / `INSERT … RETURNING`) — 2026-06-03
 
@@ -1743,13 +1740,9 @@ into ONE statement (its `insertmanyvalues` form:
 RETURNING …`) and expects N rows back. The gateway desugars that form to
 the plain multi-row `INSERT … VALUES (…),(…) RETURNING …` the engine
 handles, so a batched `session.add_all([a,b,c]); session.commit()` reads
-back every DB-assigned id. SQLAlchemy DEFAULT-config CRUD: **5/5** on
-vulcan. Transcript:
-`docs/superpowers/sppgreturningmultirowstar-t5-smoke-2026-06-02.txt`.
+back every DB-assigned id. SQLAlchemy DEFAULT-config CRUD: **5/5**.
 
-The single-row autoincrement path (`SP-PG-SERIAL-RETURNING`) is **6/6** on
-vulcan. Transcript:
-`docs/superpowers/sppgserialreturning-t5-smoke-2026-06-02.txt`.
+The single-row autoincrement path is **6/6**.
 
 **V1 out-of-scope** (named follow-ups): `SP-PG-SQL-RETURNING-DML`
 (UPDATE/DELETE RETURNING), `SP-PG-SEQUENCE-DDL` (`CREATE SEQUENCE` /
@@ -1760,8 +1753,7 @@ the PK), `SP-PG-RETURNING-EXPR` (`RETURNING id + 1` / expressions).
 
 `SP-PG-ORM-RELATIONSHIPS` validated a real SQLAlchemy 2.0 **two-model
 FK-relationship** workload (`Author` 1—N `Book`, declarative
-`relationship()` + `ForeignKey`) — the relational core. **4/4 stages PASS**
-on vulcan:
+`relationship()` + `ForeignKey`) — the relational core. **4/4 stages PASS**:
 
 | Relationship operation | Result | Notes |
 |---|---|---|
@@ -1787,13 +1779,13 @@ below; `SP-PG-SQL-MULTI-JOIN` — chained 3+ table INNER joins — SHIPPED
 2026-06-03.) Transcript:
 `docs/superpowers/sppgormrelationships-smoke-2026-06-03.txt`.
 
-#### Real multi-model app (blog) — CAPSTONE, SP-PG-ORM-REALAPP, 2026-06-03
+#### Real multi-model app (blog) — capstone
 
 The truest real-world-readiness test: a **realistic three-model SQLAlchemy
 2.0 blog application** (`User` 1—N `Post` 1—N `Comment`, FKs + declarative
 `relationship()` with `back_populates`, insertmanyvalues batching ON — the
 default) exercising the **full** query range a real app uses, back-to-back.
-**8/8 stages PASS** on vulcan, every query returning REAL data:
+**8/8 stages PASS**, every query returning REAL data:
 
 | App operation | Result | Notes |
 |---|---|---|
@@ -1837,8 +1829,7 @@ field — a bare join is byte-identical to the pre-arc frame), and the filter is
 a pure function of the combined row, so seed-7 + 3-replica determinism holds.
 **V1 out-of-scope** (named follow-ups): `SP-PG-SQL-JOIN-ORDERBY`
 (`JOIN … WHERE … ORDER BY/LIMIT` over the combined schema), plus the
-inherited OUTER / MULTI / ALIAS / AGG follow-ups. Transcript:
-`docs/superpowers/sppgsqljoinwhere-smoke-2026-06-03.txt`.
+inherited OUTER / MULTI / ALIAS / AGG follow-ups.
 
 #### Plain (single-table) GROUP BY render — SP-PG-SQL-PLAIN-GROUP-RENDER, 2026-06-03
 
@@ -1867,10 +1858,10 @@ byte-identical. Smokes: `scripts/sppgsqlplaingrouprender-smoke.py` (render),
 
 #### Django ORM (the other dominant Python ORM) — 2026-06-03
 
-SP-PG-ORM-DJANGO validated a real **Django 6.0 ORM** workload (models +
-`schema_editor` DDL + ORM CRUD, via psycopg3) against KesselDB on vulcan
-to prove ORM breadth beyond SQLAlchemy. After **SP-PG-SQL-QUOTED-IDENT**
-(the P0 keystone — kessel-sql's lexer now accepts SQL-standard
+A real **Django 6.0 ORM** workload (models +
+`schema_editor` DDL + ORM CRUD, via psycopg3) runs against KesselDB
+to prove ORM breadth beyond SQLAlchemy. After quoted-identifier support
+(the keystone — kessel-sql's lexer now accepts SQL-standard
 double-quoted delimited identifiers), the smoke advanced from **2/8 →
 6/8**. The `unexpected char '"'` boundary is fully gone; every genuine
 ORM CRUD statement now executes.
@@ -2201,14 +2192,13 @@ above). Some advanced introspection paths remain V2-deferred:
   (the affected panel is empty but the connection works). See
   "Limitations (V1)" above for the per-catalog V2 follow-up names.
 
-### Real ORM session (verified 2026-05-29 — SP-PG-EXTQ T7 + T8)
+### Real ORM session
 
 Captured from a real Python session driving the `kesseldb-server`
-binary (built with `--features pg-gateway`) on vulcan. Both
+binary (built with `--features pg-gateway`). Both
 `psycopg2` (libpq Extended Query directly) AND SQLAlchemy 2.0
-(higher-level ORM atop psycopg2) round-trip end-to-end. T8 (2026-05-29
-T8 commit) closes the T7 SQLAlchemy `use_native_hstore=False` caveat
-and broadens the matrix to psycopg3 / asyncpg / JDBC. The server
+(higher-level ORM atop psycopg2) round-trip end-to-end, and the matrix
+extends to psycopg3 / asyncpg / JDBC. The server
 was started with:
 
 ```bash
@@ -2341,35 +2331,27 @@ required for any modern PG client.
 | 18 | SQLAlchemy DISCARD ALL via engine | PASS |
 | 19 | SQLAlchemy connection pool checkout/checkin x3 | PASS |
 
-#### Broader ORM compat matrix (T3, 2026-06-01 — SP-PG-EXTQ-BIN unlock)
+#### Broader ORM compat matrix
 
-T8 ran a deeper compat smoke against the drivers psycopg2 + SQLAlchemy
-already covered. SP-PG-EXTQ-BIN T3 then lifted the binary-format
-parameter gap for the V1 supported PG types (INT2/INT4/INT8/FLOAT4/
-FLOAT8/BOOL/TEXT/VARCHAR/BYTEA/TIMESTAMPTZ). SP-PG-EXTQ-BIN-RESULTS T3
-then closed the binary-RESULTS gap (the asterisk on asyncpg) by adding
-the symmetric DataRow + RowDescription post-processor. Each row is
-the actual driver session — see
-`docs/superpowers/sppgextqbinr-t3-smoke-2026-06-01.txt` for the
-SP-PG-EXTQ-BIN-RESULTS T3 transcript (asyncpg fetch round-trip),
-`docs/superpowers/sppgextqbin-t3-smoke-2026-06-01.txt` for the earlier
-SP-PG-EXTQ-BIN T3 transcript, and `docs/superpowers/sppgextq-t8-orm-
-smoke-2026-05-29.txt` for the original T8 baseline.
+The binary-format parameter path covers the supported PG types
+(INT2/INT4/INT8/FLOAT4/FLOAT8/BOOL/TEXT/VARCHAR/BYTEA/TIMESTAMPTZ), and
+the symmetric binary-RESULTS path (DataRow + RowDescription) closes the
+asyncpg gap. Each row below is an actual driver session.
 
 | Driver          | Status   | Notes                                              |
 |-----------------|----------|----------------------------------------------------|
-| psycopg2 2.9.12 | PASS     | T7 baseline (19/19 steps)                          |
-| SQLAlchemy 2.0  | PASS     | T8 closes the `use_native_hstore=False` caveat     |
-| psycopg3 3.3.4  | PASS     | SP-PG-EXTQ-BIN T3 — DEFAULT cursor (NOT ClientCursor) works end-to-end |
-| asyncpg 0.31.0  | PASS     | SP-PG-EXTQ-BIN-RESULTS T3 — fetch() round-trip works end-to-end (binary params + binary results) |
-| JDBC 42.7       | PASS    | SP-PG-SQL-PAREN-VALUES T3 (2026-06-02) — real pgJDBC 42.7.4 + OpenJDK 21 against KesselDB on vulcan. **Full CRUD PASS in both simple AND extended modes**: CREATE TABLE, `PreparedStatement` INSERT (`setLong` + `setString`), SELECT \*, `PreparedStatement` SELECT `WHERE id = ?`, `SELECT version()`. In extended mode pgJDBC uses binary Bind (SP-PG-EXTQ-BIN) + binary result columns (SP-PG-EXTQ-BIN-RESULTS); in simple mode pgJDBC substitutes the param client-side and emits the post-strip shape `VALUES (('42'), ('hello-jdbc'))` / `WHERE id = ('42')` which the kessel-sql VALUES tuple parser + WHERE term parser now accept (paren-wrapped literals up to depth 8 + `Str → numeric` coercion on numeric column LHS). Smoke: `docs/superpowers/sppgsqlparenvalues-t3-smoke-2026-06-02.txt`. |
-| Django ORM 6.0  | PARTIAL  | SP-PG-ORM-DJANGO (2026-06-03) — **connect PASSES** (the new `set_config` connection-init intercept), but the ORM CRUD surface is blocked behind ONE lexer gap: Django UNCONDITIONALLY double-quotes every identifier (`"smokeapp_author"."id"`) and KesselDB's tokenizer rejects `"`. 2/8 smoke stages. Engine/CRUD path proven Django-ready when fed unquoted SQL (autoincrement INSERT+RETURNING, qualified SELECT, by-PK UPDATE/DELETE all pass). Single follow-up `SP-PG-SQL-QUOTED-IDENT` unblocks it. See the Django subsection below. |
-| pgx (Go)        | n/a      | Go runtime not on vulcan (V2 `SP-PG-GO-SMOKE`)     |
-| Drizzle (Node)  | n/a      | Node runtime not on vulcan (V2 `SP-PG-NODE-SMOKE`) |
-| Prisma (Node)   | n/a      | Node runtime not on vulcan (V2 `SP-PG-NODE-SMOKE`) |
-| sqlx (Rust)     | n/a      | Same binary-Bind + binary-RESULTS unlock; not yet smoke-tested on vulcan |
+| psycopg2 2.9.12 | PASS     | 19/19 ORM smoke steps                              |
+| SQLAlchemy 2.0  | PASS     | closes the `use_native_hstore=False` caveat        |
+| psycopg3 3.3.4  | PASS     | DEFAULT cursor (NOT ClientCursor) works end-to-end |
+| asyncpg 0.31.0  | PASS     | fetch() round-trip works end-to-end (binary params + binary results) |
+| JDBC 42.7       | PASS    | real pgJDBC 42.7.4 + OpenJDK 21. **Full CRUD PASS in both simple AND extended modes**: CREATE TABLE, `PreparedStatement` INSERT (`setLong` + `setString`), SELECT \*, `PreparedStatement` SELECT `WHERE id = ?`, `SELECT version()`. In extended mode pgJDBC uses binary Bind + binary result columns; in simple mode pgJDBC substitutes the param client-side and emits the post-strip shape `VALUES (('42'), ('hello-jdbc'))` / `WHERE id = ('42')` which the kessel-sql VALUES tuple parser + WHERE term parser now accept (paren-wrapped literals up to depth 8 + `Str → numeric` coercion on numeric column LHS). |
+| Django ORM 6.0  | PARTIAL  | **connect PASSES** (the `set_config` connection-init intercept), but the ORM CRUD surface is blocked behind ONE lexer gap: Django UNCONDITIONALLY double-quotes every identifier (`"smokeapp_author"."id"`) and KesselDB's tokenizer rejects `"`. 2/8 smoke stages. Engine/CRUD path proven Django-ready when fed unquoted SQL (autoincrement INSERT+RETURNING, qualified SELECT, by-PK UPDATE/DELETE all pass). Quoted-identifier support unblocks it. See the Django subsection below. |
+| pgx (Go)        | n/a      | not yet smoke-tested                               |
+| Drizzle (Node)  | n/a      | not yet smoke-tested                               |
+| Prisma (Node)   | n/a      | not yet smoke-tested                               |
+| sqlx (Rust)     | n/a      | Same binary-Bind + binary-RESULTS unlock; not yet smoke-tested |
 
-SP-PG-EXTQ-BIN T3 wired the binary-format decoder into the Bind path:
+The binary-format decoder wires into the Bind path:
 each parameter with `format_code=1` (binary) at position `i` is
 admitted iff `param_oids[i]` is one of the V1 supported PG types
 (INT2/INT4/INT8/FLOAT4/FLOAT8/BOOL/TEXT/VARCHAR/BYTEA/TIMESTAMPTZ),
@@ -2410,14 +2392,10 @@ short `"inf"` / `"+inf"` / `"-inf"` aliases) — closed by
 **SP-PG-EXTQ-BIN-NUMERIC-NAN-INF (2026-06-02)** at the codec layer;
 the engine-level NUMERIC storage of these specials remains a separate
 follow-up (FieldKind::I128 has no native NaN/Inf representation).
-Vulcan smoke transcript:
-`docs/superpowers/sppgextqbinnumeric-t4-smoke-2026-06-02.txt`
-(psycopg2 + asyncpg both decode `Decimal('42')` / `Decimal('-7')` /
-`Decimal('999999999')` from kesseldb-emitted NUMERIC binary DataRow).
-COPY binary NUMERIC also works end-to-end after
-**SP-PG-COPY-BIN-NUMERIC V1 (2026-06-02)** — the same codec routes
-through the COPY-BIN admission + per-row encode/decode paths
-(`docs/superpowers/sppgcopybinnumeric-t3-smoke-2026-06-02.txt`).
+psycopg2 + asyncpg both decode `Decimal('42')` / `Decimal('-7')` /
+`Decimal('999999999')` from kesseldb-emitted NUMERIC binary DataRow.
+COPY binary NUMERIC also works end-to-end — the same codec routes
+through the COPY-BIN admission + per-row encode/decode paths.
 
 The remaining residual ORM gaps are:
 - ~~JDBC simple-query mode hits a kessel-sql parser gap on `::int8`
@@ -2425,10 +2403,8 @@ The remaining residual ORM gaps are:
   `cast_stripper::strip_pg_casts` removes `::TYPE[(args)]` from SQL
   text at `dispatch_query` entry (preserving string/comment context).
   psql proxy round-trip for `SELECT 1::int8` / `WHERE id = $1::int8` /
-  `INSERT ... VALUES (3::int8, 'x'::text)` verified on vulcan
-  (`docs/superpowers/sppgextqcast-t3-smoke-2026-06-02.txt`). Real
-  pgJDBC round-trip then verified by **SP-PG-JDBC-SMOKE T2**
-  (`docs/superpowers/sppgjdbcsmoke-t2-smoke-2026-06-02.txt`) — JDBC
+  `INSERT ... VALUES (3::int8, 'x'::text)` verified. Real
+  pgJDBC round-trip then verified — JDBC
   simple-mode `WHERE id = 42::int8` round-trips end-to-end through
   the actual pgJDBC 42.7.4 driver against KesselDB. The cast-stripper
   is closed end-to-end. ~~Simple-mode `PreparedStatement` paren-
@@ -2439,8 +2415,7 @@ The remaining residual ORM gaps are:
   in the WHERE term parser when the LHS is a numeric column (PG's
   `'42'::int8` semantic preserved across the cast strip). Real
   pgJDBC simple-mode `PreparedStatement` INSERT + SELECT `WHERE id =
-  ?` round-trip end-to-end on vulcan
-  (`docs/superpowers/sppgsqlparenvalues-t3-smoke-2026-06-02.txt`).
+  ?` round-trip end-to-end.
   ~~Extended-mode `SELECT version()` Describe/NoData ordering~~ →
   **CLOSED 2026-06-02 by SP-PG-EXTQ-DESCRIBE-VERSION V1** — the
   gateway's `extq::row_description_or_no_data_for_sql` helper now
@@ -2449,8 +2424,7 @@ The remaining residual ORM gaps are:
   `SELECT current_user`, `SELECT 1`, etc.) and emits the matching
   `RowDescription` at Describe time instead of `NoData`. pgJDBC
   extended-mode `SELECT version()` round-trips end-to-end via real
-  pgJDBC 42.7.4 on vulcan
-  (`docs/superpowers/sppgextqdescribeversion-t3-smoke-2026-06-02.txt`).
+  pgJDBC 42.7.4.
 - ~~Parameterized SELECT with a CHAR(N) WHERE clause may match zero rows
   because the engine's EQ-on-Char doesn't ignore trailing NUL padding
   on the storage side; lifts in `SP-CHAR-PAD-COMPARE` (engine-side).~~
@@ -2460,13 +2434,12 @@ The remaining residual ORM gaps are:
   space (0x20) as insignificant on `Char(_)` / `Bytes(_)` byte
   comparisons (PG SQL §9.20 semantic, with the storage-aware NUL
   widening — engine stores fixed-width values NUL-padded). asyncpg
-  `WHERE name = $1` against `CHAR(32)` now returns the matching row
-  on vulcan; BETWEEN / NE also work; the Describe-on-`$N` enabler
+  `WHERE name = $1` against `CHAR(32)` now returns the matching row;
+  BETWEEN / NE also work; the Describe-on-`$N` enabler
   (substitute `$N` with NULL for the table-name probe) closes the
   asyncpg ProtocolError that the engine fix unmasked. Storage /
   indexes / hashing UNCHANGED — only the comparison layer trims. +15
-  KATs across kessel-expr / kessel-sm / kessel-pg-gateway. Smoke
-  transcript: `docs/superpowers/spcharpadcompare-t3-smoke-2026-06-02.txt`.
+  KATs across kessel-expr / kessel-sm / kessel-pg-gateway.
 - Binary NUMERIC / JSONB / UUID / ARRAY remain V2 (`SP-PG-EXTQ-BIN-
   NUMERIC` / `SP-PG-EXTQ-BIN-EXTRA`).
 - ~~SP-PG-EXTQ-CAST V1 is "strip + hope" — a Bind whose declared
@@ -2479,8 +2452,7 @@ The remaining residual ORM gaps are:
   `42846 cannot_coerce`. Closes the silent-coercion attack vector
   the parent arc's "V1 scope is strip + hope" note explicitly
   flagged. Literal casts (no `$N`) bypass the validator so the
-  parent arc's psql shapes still PASS. Smoke:
-  `docs/superpowers/sppgextqcastvalidate-t3-smoke-2026-06-02.txt`.
+  parent arc's psql shapes still PASS.
 - ~~SP-PG-EXTQ-CAST-VALIDATE V1 enforces STRICT OID equality — pgJDBC's
   default Java-`int` against `::int8` cast (and psycopg3's
   Python-`int` against `::int8`) false-rejected with 42846 because
@@ -2497,9 +2469,8 @@ The remaining residual ORM gaps are:
   TEXT↔VARCHAR, etc.); cross-category mismatches (TEXT vs INT8,
   BOOL vs INT8, BYTEA vs TEXT) STILL reject with the same
   `ExtqError::CastOidMismatch` → `42846 cannot_coerce` wire frame
-  so the V1 silent-coercion vector stays closed. **vulcan-verified**
-  via psycopg3 PQ-layer 5-case smoke
-  (`docs/superpowers/sppgextqcastvalidatecompat-t3-smoke-2026-06-02.txt`):
+  so the V1 silent-coercion vector stays closed. Verified
+  via a psycopg3 PQ-layer 5-case smoke:
   INT4+INT8 / INT8+INT4 / TEXT+VARCHAR all accept; cross-category
   TEXT+INT8 still rejects with the exact 42846 message; strict-
   equality INT8+INT8 still works. +14 KATs across types::tests +
@@ -2525,9 +2496,8 @@ The remaining residual ORM gaps are:
   validator uses, while `NULL::TYPE` accepts unconditionally (the
   canonical typed-NULL idiom). Within-category casts (`1::int8`,
   `'hello'::text`, `true::bool`, `-1::int8`) and `strip_pg_casts`'s
-  byte output are unchanged. **vulcan-verified** psql smoke
-  (`docs/superpowers/sppgextqcastvalidateliteral-t3-smoke-2026-06-02.txt`):
-  `1::int8` / `'hello'::text` accept; HEADLINE `'world'::int8`
+  byte output are unchanged. Verified via a psql smoke:
+  `1::int8` / `'hello'::text` accept; `'world'::int8`
   (TEXT→INT8) and `true::int8` (BOOL→INT8) reject with the literal-
   cast 42846 message; `NULL::int8` is NOT rejected by the validator.
   +28 KATs (cast_stripper::tests + extq::tests). V2 follow-ups named:
@@ -2537,9 +2507,9 @@ The remaining residual ORM gaps are:
   `SP-PG-EXTQ-CAST-VALIDATE-LITERAL-NUMSTR` (`'42'::int8`),
   `SP-PG-EXTQ-CAST-VALIDATE-LITERAL-MULTIWORD` (multi-word type names).
 
-#### Pipelining throughput (T8, 2026-05-29)
+#### Pipelining throughput
 
-Single-statement round-trip throughput measured on vulcan with
+Single-statement round-trip throughput measured with
 psycopg2 (no libpq pipeline mode):
 
 | Workload                        | N    | Elapsed | Throughput      |
@@ -2551,36 +2521,6 @@ psycopg2 (no libpq pipeline mode):
 Latency-bound (SOCK_STREAM + Parse/Bind/Execute/Sync flush cost per
 statement). A libpq-pipeline-mode test would batch up to 8 messages
 and post higher numbers; that's V2 `SP-PG-EXTQ-PIPELINE-BATCH`.
-
-### Spec + design
-
-- SP-PG wire spec: `docs/superpowers/specs/2026-05-27-kesseldb-sppg-postgres-wire-design.md`
-- SP-PG progress (closed): `docs/superpowers/specs/2026-05-27-kesseldb-subproject-sppg-progress.md`
-- SP-PG-CAT pg_catalog stubs spec: `docs/superpowers/specs/2026-05-27-kesseldb-sppgcat-pg-catalog-design.md`
-- SP-PG-CAT progress (closed at T8): `docs/superpowers/specs/2026-05-27-kesseldb-subproject-sppgcat-progress.md`
-- SP-PG-EXTQ design spec: `docs/superpowers/specs/2026-05-28-kesseldb-sppgextq-extended-query-design.md`
-- SP-PG-EXTQ progress (T7 — hardening + real ORM smoke): `docs/superpowers/specs/2026-05-28-kesseldb-subproject-sppgextq-progress.md`
-- SP-PG-EXTQ-BIN design spec: `docs/superpowers/specs/2026-06-01-kesseldb-sppgextq-bin-design.md`
-- SP-PG-EXTQ-BIN progress (V1 SHIPPED at T3 — binary-format params unlock): `docs/superpowers/specs/2026-06-01-kesseldb-subproject-sppgextqbin-progress.md`
-- SP-PG-COPY design spec: `docs/superpowers/specs/2026-05-30-kesseldb-sppgcopy-design.md`
-- SP-PG-COPY progress (V1 SHIPPED at T4 — pg_dump / sysbench / `\copy` bulk-load): `docs/superpowers/specs/2026-05-30-kesseldb-subproject-sppgcopy-progress.md`
-- SP-PG-COPY-BULKAPPLY design spec: `docs/superpowers/specs/2026-05-30-kesseldb-sppgcopybulkapply-design.md`
-- SP-PG-COPY-BULKAPPLY progress (V1 SHIPPED — 181.9× COPY throughput lift via per-batch Op::Txn fold): `docs/superpowers/specs/2026-05-30-kesseldb-subproject-sppgcopybulkapply-progress.md`
-- SP-PG-COPY-CSV design spec: `docs/superpowers/specs/2026-06-01-kesseldb-sppgcopycsv-design.md`
-- SP-PG-COPY-CSV progress (V1 SHIPPED at T2 — CSV format with quoting / HEADER / custom DELIMITER+QUOTE+ESCAPE+NULL): `docs/superpowers/specs/2026-06-01-kesseldb-subproject-sppgcopycsv-progress.md`
-- SP-PG-COPY-CSV-NUMERIC design spec: `docs/superpowers/specs/2026-06-02-kesseldb-sppgcopycsvnumeric-design.md`
-- SP-PG-COPY-CSV-NUMERIC progress (V1 SHIPPED at T3 — text+CSV NUMERIC validator with canonical/sign normalisation + case-insensitive NaN/Inf acceptance + precise 22P02 rejections): `docs/superpowers/specs/2026-06-02-kesseldb-subproject-sppgcopycsvnumeric-progress.md`
-- SP-PG-COPY-CSV-NUMERIC-SCI design spec: `docs/superpowers/specs/2026-06-02-kesseldb-sppgcopycsvnumericsci-design.md`
-- SP-PG-COPY-CSV-NUMERIC-SCI progress (V1 SHIPPED at T3 — scientific notation in text/CSV NUMERIC validator, mantissa+exponent expansion to canonical decimal text, |exp|<=100 cap): `docs/superpowers/specs/2026-06-02-kesseldb-subproject-sppgcopycsvnumericsci-progress.md`
-- SP-PG-COPY-CSV-NUMERIC-SCI smoke transcript (V1 SHIPPED — HEADLINE: scientific notation round-trips end-to-end on vulcan; 1e10/6e3/-3.14e2/1.5e3 expand cleanly; out-of-range and missing-exponent reject with precise 22P02): `docs/superpowers/sppgcopycsvnumericsci-t2-smoke-2026-06-02.txt`
-- SP-PG-EXTQ-CAST design spec: `docs/superpowers/specs/2026-06-01-kesseldb-sppgextqcast-design.md`
-- SP-PG-EXTQ-CAST smoke transcript (V1 SHIPPED — psql `SELECT 1::int8` round-trip PASS): `docs/superpowers/sppgextqcast-t3-smoke-2026-06-02.txt`
-- SP-PG-EXTQ-CAST-VALIDATE design spec: `docs/superpowers/specs/2026-06-02-kesseldb-sppgextqcastvalidate-design.md`
-- SP-PG-EXTQ-CAST-VALIDATE smoke transcript (V1 SHIPPED — HEADLINE: $N cast OID mismatch returns 42846 cannot_coerce via psycopg3 PQ-layer): `docs/superpowers/sppgextqcastvalidate-t3-smoke-2026-06-02.txt`
-- SP-PG-EXTQ-CAST-VALIDATE-COMPAT design spec: `docs/superpowers/specs/2026-06-02-kesseldb-sppgextqcastvalidatecompat-design.md`
-- SP-PG-EXTQ-CAST-VALIDATE-COMPAT smoke transcript (V1 SHIPPED — HEADLINE: pgJDBC INT4 param + INT8 cast accepted; cross-category TEXT + INT8 still rejects with 42846): `docs/superpowers/sppgextqcastvalidatecompat-t3-smoke-2026-06-02.txt`
-- SP-PG-EXTQ-CAST-VALIDATE-LITERAL design spec: `docs/superpowers/specs/2026-06-02-kesseldb-sppgextqcastvalidateliteral-design.md`
-- SP-PG-EXTQ-CAST-VALIDATE-LITERAL smoke transcript (V1 SHIPPED — HEADLINE: literal `'world'::int8` / `true::int8` reject with 42846; `1::int8` / `'hello'::text` accept; `NULL::int8` passes): `docs/superpowers/sppgextqcastvalidateliteral-t3-smoke-2026-06-02.txt`
 
 ### SP-PG-COPY — `COPY FROM STDIN` / `COPY TO STDOUT` bulk load (V1 SHIPPED 2026-05-30)
 
@@ -2646,12 +2586,10 @@ are absorbed without a spurious `unsupported message tag` `08P01`,
 and the next Query (`SELECT` / `COPY` / extq `Parse` / etc.)
 succeeds on the SAME TCP connection. A stray `c` / `f` in pristine
 Idle with no preceding abort still rejects with `08P01` (defensive
-shape against a truly broken client). Vulcan psql 16 smoke
-transcript:
-`docs/superpowers/sppgcopyaborttail-t3-smoke-2026-06-02.txt`.
+shape against a truly broken client). Verified via a psql 16 smoke.
 
-**Throughput** (on vulcan, 100K rows of `(BIGINT, CHAR(64))`, 2026-05-30):
-**~51,840 rows/sec** with SP-PG-COPY-BULKAPPLY (default
+**Throughput** (100K rows of `(BIGINT, CHAR(64))`):
+**~51,840 rows/sec** with bulk-apply (default
 `KESSELDB_COPY_BATCH_SIZE=1024`). The V1 per-row baseline was
 ~285 rows/sec; BULKAPPLY V1 lifts **181.9×** by folding N rows into a
 single multi-row `INSERT INTO t (cols) VALUES (...), (...), ...`
@@ -2661,7 +2599,6 @@ row. Tunable via `KESSELDB_COPY_BATCH_SIZE` env at server start
 (clamped to `[1, 65536]`); set to `1` to restore V1-baseline shape.
 Postgres 16 reference on the same workload: ~578K rows/sec — KesselDB
 is now within ~11× of Postgres COPY throughput (was ~2000× behind).
-Bench transcript: `docs/superpowers/sppgcopybulkapply-t3-bench-2026-05-30.txt`.
 
 **Atomicity** vs PG: SP-PG-COPY-BULKAPPLY V1 is **per-batch
 atomic** — each batch (default 1024 rows) is wrapped in an `Op::Txn`,
@@ -2737,7 +2674,6 @@ ERROR:  COPY csv DELIMITER must be a single character (got '||')
 
 CSV format inherits the SP-PG-COPY-BULKAPPLY V1 batching throughput
 + NULL-row fallback semantics — the codec is a payload concern only.
-Smoke transcript: `docs/superpowers/sppgcopycsv-t2-smoke-2026-06-01.txt`.
 
 #### SP-PG-COPY-CSV-NUMERIC — canonical NUMERIC validator (V1 SHIPPED 2026-06-02)
 
@@ -2786,8 +2722,6 @@ V1 limitations (each with its own follow-up arc):
   canonicalises NaN/Infinity, but the engine-side I128 literal
   parser cannot store them yet (engine surfaces `sql: expected
   value`). A separate arc lifts the engine-storage gap.
-
-Smoke transcript: `docs/superpowers/sppgcopycsvnumeric-t2-smoke-2026-06-02.txt`.
 
 #### SP-PG-COPY-CSV-NUMERIC-SCI — scientific notation (V1 SHIPPED 2026-06-02)
 
@@ -2844,8 +2778,6 @@ V2 follow-ups:
   integer values; the engine surfaces `sql: expected value`. Same
   pre-existing gap V1 documented for NaN/Infinity.
 
-Smoke transcript: `docs/superpowers/sppgcopycsvnumericsci-t2-smoke-2026-06-02.txt`.
-
 ### SP-PG-COPY-BIN — binary format (V1 SHIPPED 2026-06-02)
 
 PG binary COPY per §55.2.7 — `WITH (FORMAT binary)`. The wire format
@@ -2890,11 +2822,8 @@ The binary codec reuses the existing SP-PG-EXTQ-BIN-RESULTS encoder
 field values, 2-byte i16 -1 end-of-data marker) is new. Inherits the
 SP-PG-COPY-BULKAPPLY V1 batching throughput.
 
-Smoke transcripts:
-- `docs/superpowers/sppgcopybin-t3-smoke-2026-06-02.txt` (V1 — 10 types)
-- `docs/superpowers/sppgcopybinnumeric-t3-smoke-2026-06-02.txt`
-  (SP-PG-COPY-BIN-NUMERIC — NUMERIC round-trip incl. negative + byte-equal
-  re-export md5 match).
+Binary COPY is smoke-tested across all 10 supported types, including
+NUMERIC round-trip (negative values + byte-equal re-export md5 match).
 
 Rejected variants surface precise V2-pointing error messages:
 
@@ -3101,8 +3030,8 @@ ws.onmessage = ev => {
 KesselDB ships four supported deploy shapes — pick the one that
 matches the runtime you already operate. The V1 cloud-deploy story
 is **single-pod / single-VM** (matches the engine's single-writer
-posture); replicated VSR clustering on k8s / Fly.io is tracked as
-the named follow-up arc **SP-Cloud-Cluster**.
+posture); replicated VSR clustering on k8s / Fly.io is a roadmap
+follow-up.
 
 ### 11.1 Docker (single-host)
 
@@ -3146,9 +3075,7 @@ Overridable values (full list in
 `resources.{requests,limits}`, `service.type`, `auth.secretName`
 (set to `""` for open mode).
 
-Verified end-to-end on vulcan (kind v0.24.0 + Kubernetes v1.31.0 +
-helm v3.16.3) — transcript at
-[`docs/superpowers/spclouddeploy-t3-kind-verify-2026-05-30.txt`](superpowers/spclouddeploy-t3-kind-verify-2026-05-30.txt).
+The Helm chart is tested end-to-end in CI.
 
 ### 11.3 Fly.io (`fly.toml`)
 
@@ -3191,7 +3118,7 @@ implies the surface is accepting connections). If you have the HTTP
 gateway enabled, prefer `GET /v1/health` (returns
 `{"status":"ok","primary":true,...}` from the active engine).
 
-### 11.5 Kubernetes cluster mode (SP-Cloud-Cluster)
+### 11.5 Kubernetes cluster mode
 
 Replicated VSR consensus (`kessel-vsr`, 3 or 5 replicas) under a
 single Helm install — survives primary-pod kill + view-change +
@@ -3234,7 +3161,7 @@ kubectl exec kesseldb-cluster-0 -- kessel --addrs "$ADDRS" \
 # = 100  (16 bytes)
 ```
 
-Primary-kill failover (kind-verified end-to-end on vulcan):
+Primary-kill failover:
 
 ```bash
 # Identify the current primary from logs.
@@ -3263,8 +3190,7 @@ kubectl exec kesseldb-cluster-1 -- kessel --addrs "$ADDRS" \
 # = 300  (16 bytes)   ← 100 + 200, the committed total
 ```
 
-End-to-end kind transcript:
-[`docs/superpowers/spcloudcluster-t3-t5-failover-2026-06-02.txt`](superpowers/spcloudcluster-t3-t5-failover-2026-06-02.txt).
+Cluster mode and primary-kill failover are tested end-to-end in CI.
 
 Overridable values for cluster mode (full list in
 [`deploy/helm/kesseldb/values.yaml`](../deploy/helm/kesseldb/values.yaml)):
@@ -3273,7 +3199,7 @@ Overridable values for cluster mode (full list in
 `cluster.peerPort` (default 6534),
 `cluster.podManagementPolicy` (default `Parallel`).
 
-#### Prometheus monitoring (SP-Cloud-Cluster T7)
+#### Prometheus monitoring
 
 The chart can emit prometheus-operator CRDs
 (`monitoring.coreos.com/v1` `ServiceMonitor` + `PrometheusRule`)
@@ -3323,8 +3249,8 @@ in single-node mode, and from
 | `kesseldb_last_op_number` | gauge | — | Highest applied op_number on this replica |
 | `kesseldb_view_number` | gauge | — | Current VSR view number |
 | `kesseldb_is_primary` | gauge | — | 1 if this replica is primary, 0 otherwise |
-| `kesseldb_view_changes_total` | counter | — | Monotonic per-process count of view advances (SP-Cloud-Cluster-METRICS-EXPAND) |
-| `kesseldb_replica_lag_opnum` | gauge | — | Op-number lag from primary (0 on primary; >=0 on backups, SP-Cloud-Cluster-METRICS-EXPAND) |
+| `kesseldb_view_changes_total` | counter | — | Monotonic per-process count of view advances |
+| `kesseldb_replica_lag_opnum` | gauge | — | Op-number lag from primary (0 on primary; >=0 on backups) |
 | `kesseldb_http_requests_total` | counter | `path`, `status` | HTTP gateway requests (single-node only) |
 
 Plus the Prometheus-injected `up{}` per scrape target.

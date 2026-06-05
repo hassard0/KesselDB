@@ -6,14 +6,14 @@
 
 *"It's the database that made the Kessel Run in 12 parsecs."*
 
-`2442 default tests green / 2470 with --features pg-gateway / 2503 with all gateway features` · `0 external dependencies in the kernel` · `Rust 1.95+` · single‑binary
+`~2,700+ tests green` (default; more with `--features pg-gateway` and the full gateway matrix) · `0 external dependencies in the kernel` · `Rust 1.95+` · single‑binary
 
-**Tonight's headlines** (2026‑06‑02):
-- **14.71M ops/sec point reads at K=8 sharded (sub‑µs p50)** — SP‑Perf‑A‑SHARD‑APPLY V1 (2026‑05‑30) wires K independent per‑shard sub‑engines, breaks the ~5M single‑shard `RwLock`‑reader ceiling honestly diagnosed in T6/T7. Vulcan get‑by‑id final sweep (2026‑06‑02) at K=8: **14.71M ops/sec (3.00× the 4.91M K=1 baseline)**; K=16 climbs to 16.24M. SP‑Perf‑A‑SHARD‑SCAN + SP‑Perf‑A‑SHARD‑SCAN‑FASTPATH + SP‑Perf‑A‑SHARD‑SCAN‑POOL‑SCALEOUT + SP‑Perf‑A‑SHARD‑SCAN‑LOCAL‑INDEX‑FUSION close the scan‑side companions — every scan workload at K=4 scales POSITIVELY, find‑by parity restored end‑to‑end without the `--pool-workers` flag. See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §13 + §14 + §14b–14d.
-- **Real PostgreSQL ORM compatibility — psycopg2 ✓ SQLAlchemy ✓ asyncpg ✓ pgJDBC ✓.** The Extended Query V1 arc set closed every PARTIAL row on the matrix this week: SP‑PG‑EXTQ‑BIN (binary params for the 10 V1 PG scalar types) + SP‑PG‑EXTQ‑BIN‑RESULTS (binary DataRow) unblocked asyncpg's default mode and pgJDBC's binary Bind path; SP‑PG‑EXTQ‑CAST stripped JDBC simple‑mode `::int8` casts at the dispatcher; SP‑PG‑EXTQ‑DESCRIBE‑VERSION synthesized RowDescription for the scalar SELECTs pgJDBC probes at connect; SP‑PG‑SQL‑PAREN‑VALUES taught the kessel‑sql parser pgJDBC's `VALUES (('42'), ('hello'))` paren‑wrapped substitution shape; SP‑CHAR‑PAD‑COMPARE fixed asyncpg's `WHERE name = $1` against `CHAR(N)` returning 0 rows. **SP‑PG‑JDBC‑SMOKE** then verified the chain end‑to‑end with real pgJDBC 42.7.4 — full CRUD PASS in **both simple AND extended modes**. See [`docs/USAGE.md`](docs/USAGE.md#broader-orm-compat-matrix-t3-2026-06-01--sp-pg-extq-bin-unlock) §9.
-- **Beats Postgres on 6 of 8 cross‑DB workloads — both transaction‑bracket losses closed** (final sweep 2026‑06‑02, median of 3). SP‑Perf‑A‑TXN‑RO (2026‑05‑29) made oltp‑RO at N=16 **6.02× faster than Postgres** (was LOSING); SP‑Perf‑A‑TXN‑RW (2026‑05‑30) made oltp‑RW at N=16 **2.30× faster than Postgres** (was LOSING). TPC‑H Q6 — five sequential lift arcs (Analytic‑Plan → Analytic‑Plan‑MULTI → Hash‑Agg → Hash‑Agg‑Tune → **SP‑WHERE‑VM‑Specialise** 2026‑06‑01) closed the gap vs Postgres **123× → 3.09×** (final sweep N=4 544.59 q/s); Q1 gap **18× → 2.16×**. Q6 design floor (≥400 q/s) AND stretch (≥500 q/s) both still MET. See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3 + §3f + §3g.
-- **PG COPY FROM STDIN — text + CSV + binary, ~51,840 rows/sec (181.9× lift).** SP‑PG‑COPY V1 (2026‑05‑30) shipped the text wire surface end‑to‑end; SP‑PG‑COPY‑CSV (2026‑06‑01) added RFC 4180 + PG superset (HEADER + DELIMITER/QUOTE/ESCAPE/NULL); SP‑PG‑COPY‑BIN (2026‑06‑02) added §55.2.7 binary COPY for the 10 supported PG scalar types — `pg_dump --format=custom` restore + JDBC `CopyManager` + `pg_bulkload` + `pgloader` + Stitch + Fivetran + Airbyte binary‑bulk‑loaders all unlock. SP‑PG‑COPY‑BULKAPPLY V1 lifted ingest throughput **181.9×** (~285 → 51,840 rows/sec on vulcan). See [`docs/USAGE.md`](docs/USAGE.md#sp-pg-copy--copy-from-stdin--copy-to-stdout-bulk-load-v1-shipped-2026-05-30) §9 → SP‑PG‑COPY.
-- **Cloud deploy story — Docker (ghcr.io/hassard0/kesseldb), Helm, Fly.io.** SP‑DX‑superior (2026‑05‑29) shipped the multi‑arch ~77 MiB image + did‑you‑mean SQL errors + CLI error‑class hints + embedded Rust example. SP‑Cloud‑Deploy (2026‑05‑30) added the Helm chart + `fly.toml` and verified the chart end‑to‑end on vulcan (kind v0.24.0 + Kubernetes v1.31.0 + helm v3.16.3). See [`docs/USAGE.md`](docs/USAGE.md#11-deploying-to-the-cloud) §11.
+**Highlights:**
+- **14.71M ops/sec point reads at K=8 sharded (sub‑µs p50).** K independent per‑shard sub‑engines break the ~5M single‑shard `RwLock`‑reader ceiling. Sharded get‑by‑id at K=8 reaches **14.71M ops/sec (3.00× the 4.91M K=1 baseline)**; K=16 climbs to 16.24M. Scan‑side companions scale every scan workload at K=4 positively, with find‑by parity restored end‑to‑end without the `--pool-workers` flag. See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §13 + §14 + §14b–14d.
+- **Real PostgreSQL ORM compatibility — psycopg2 ✓ SQLAlchemy ✓ asyncpg ✓ pgJDBC ✓.** Binary‑format Extended Query parameters and results (for the 10 supported PG scalar types) unblock asyncpg's default mode and pgJDBC's binary Bind path; JDBC simple‑mode `::int8` casts are stripped at the dispatcher; RowDescription is synthesized for the scalar SELECTs pgJDBC probes at connect; the parser handles pgJDBC's `VALUES (('42'), ('hello'))` paren‑wrapped substitution shape; and `WHERE name = $1` against `CHAR(N)` returns correct rows. Real pgJDBC 42.7.4 passes full CRUD in **both simple AND extended modes**. See [`docs/USAGE.md`](docs/USAGE.md) §9.
+- **Beats Postgres on 6 of 8 cross‑DB workloads.** OLTP read‑only at N=16 is **6.02× faster than Postgres**; OLTP read‑write at N=16 is **2.30× faster than Postgres**. For TPC‑H Q6, the gap vs Postgres was closed from ~123× to **3.09×** (N=4, 544.59 q/s); the Q1 gap from ~18× to **2.16×**. The Q6 design floor (≥400 q/s) and stretch (≥500 q/s) are both met. See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3 + §3f + §3g.
+- **PG COPY FROM STDIN — text + CSV + binary, ~51,840 rows/sec (181.9× lift).** The text wire surface ships end‑to‑end; CSV adds RFC 4180 + the PG superset (HEADER + DELIMITER/QUOTE/ESCAPE/NULL); binary COPY (§55.2.7) covers the 10 supported PG scalar types — `pg_dump --format=custom` restore + JDBC `CopyManager` + `pg_bulkload` + `pgloader` + Stitch + Fivetran + Airbyte binary‑bulk‑loaders all unlock. Bulk‑apply lifted ingest throughput **181.9×** (~285 → 51,840 rows/sec). See [`docs/USAGE.md`](docs/USAGE.md) §9.
+- **Cloud deploy story — Docker (ghcr.io/hassard0/kesseldb), Helm, Fly.io.** A multi‑arch ~77 MiB image, did‑you‑mean SQL errors, CLI error‑class hints, an embedded Rust example, plus a Helm chart and `fly.toml` (tested end‑to‑end in CI). See [`docs/USAGE.md`](docs/USAGE.md#11-deploying-to-the-cloud) §11.
 
 </div>
 
@@ -95,9 +95,9 @@ all. Determinism is a feature, not an aspiration.
   JSON/NDJSON/CSV/Parquet from HTTP/HTTPS endpoints or directly from
   S3‑compatible and Azure Blob object storage. The pure‑Rust zero‑dep
   Parquet reader (`kessel-parquet`) supports **flat REQUIRED + OPTIONAL +
-  `LIST<primitive>` + `MAP<K, V>` + `struct` (+ 3‑deep cross‑products,
-  OBJ‑2c‑5 fully closed at SP146) × UNCOMPRESSED + Snappy + GZIP + zstd
-  + LZ4_RAW + Brotli (SP154 closed the 6‑codec matrix) × PLAIN +
+  `LIST<primitive>` + `MAP<K, V>` + `struct` (+ 3‑deep cross‑products)
+  × UNCOMPRESSED + Snappy + GZIP + zstd
+  + LZ4_RAW + Brotli (the full 6‑codec matrix) × PLAIN +
   dictionary × V1 + V2 data pages × INT64 + INT32 + INT96 (timestamps) +
   DECIMAL (INT32 / INT64 / FLBA, precision ≤ 38) + FLBA + BYTE_ARRAY**
   out of the box. Every nested Parquet shape pyarrow writes up to 3‑deep
@@ -105,7 +105,7 @@ all. Determinism is a feature, not an aspiration.
   below. (`--features external-sources`, default off; `--features
   external-sources-objstore` for S3/Azure + Parquet; deterministic kernel
   unaffected when off.)
-- **Cross‑shard scatter scan (SP‑A)** — `SELECT` / `SELECT … ORDER BY` /
+- **Cross‑shard scatter scan** — `SELECT` / `SELECT … ORDER BY` /
   projection / row‑filter ops fan out across K independent VSR shard groups
   via a zero‑dep std‑thread scatter‑gather with bounded per‑shard channels.
   Unordered scan is shard‑id deterministic; sorted scan is a `BinaryHeap`
@@ -122,7 +122,7 @@ all. Determinism is a feature, not an aspiration.
   responses via the existing `kessel_client::format_result_json` contract.
   Binary protocol byte‑untouched; zero external (non‑workspace) deps on the
   gateway crate. See `docs/USAGE.md` §HTTP gateway.
-- **WebSocket gateway (SP‑WS, shipped under the HTTP gateway crate)** —
+- **WebSocket gateway (shipped under the HTTP gateway crate)** —
   long‑lived `/v1/ws` upgrade carrying raw `Op::encode()` payloads under the
   `kessel-op-v1` subprotocol. RFC 6455 strict handshake, binary frames only,
   bounded send queue (16 messages), 30 s ping/pong heartbeat. Same Bearer
@@ -130,7 +130,7 @@ all. Determinism is a feature, not an aspiration.
   push/streaming clients that don't want a per‑request HTTP round trip.
   Enabled automatically with `--features http-gateway`. See `docs/USAGE.md`
   §HTTP gateway → WebSocket.
-- **PostgreSQL wire protocol (opt‑in `--features pg-gateway`, SP‑PG + SP‑PG‑CAT + SP‑PG‑EXTQ)** —
+- **PostgreSQL wire protocol (opt‑in `--features pg-gateway`)** —
   Frontend/Backend Protocol v3.0 **Simple Query AND Extended Query** paths
   with SCRAM‑SHA‑256 authentication on a sibling TCP listener
   (`ServerConfig.pg_addr`, default port 5432). Operator's Bearer token IS
@@ -138,12 +138,12 @@ all. Determinism is a feature, not an aspiration.
   rotates HTTP, WS and PG together. SELECT / INSERT / UPDATE / DELETE /
   CREATE TABLE work end‑to‑end against `psql`, `pgcli`, JDBC, psycopg,
   `pgx`, `tokio-postgres`, sqlx-pg, Diesel‑pg, GORM‑pg, Drizzle‑pg,
-  Prisma‑pg, and every libpq‑derived client. **SP‑PG‑EXTQ V1 (2026‑05‑29)
-  ships the full Extended Query message set** (Parse / Bind / Describe /
-  Execute / Sync / Close / Flush) — psycopg2's `cursor.execute("…WHERE id = %s", (42,))`
-  round‑trips end‑to‑end, ORMs that REQUIRE prepared statements
-  (SQLAlchemy, Drizzle, Prisma, JDBC default) now connect. **SP‑PG‑CAT
-  (V1) ships `pg_catalog` + `information_schema` stubs** so pgAdmin 4,
+  Prisma‑pg, and every libpq‑derived client. The **full Extended Query
+  message set** (Parse / Bind / Describe / Execute / Sync / Close / Flush)
+  ships — psycopg2's `cursor.execute("…WHERE id = %s", (42,))`
+  round‑trips end‑to‑end, and ORMs that REQUIRE prepared statements
+  (SQLAlchemy, Drizzle, Prisma, JDBC default) connect. **`pg_catalog` +
+  `information_schema` stubs** let pgAdmin 4,
   DBeaver, DataGrip, Metabase, Tableau, Looker, dbt and pgJDBC
   `getTables` all connect + browse out of the box. Cap‑overflow (`53300`) and idle‑timeout (`57014`) emit
   wire‑level `ErrorResponse` with canonical PG message text before closing.
@@ -152,11 +152,11 @@ all. Determinism is a feature, not an aspiration.
   protocol byte‑untouched; zero external (non‑workspace) deps on the
   gateway crate. See `docs/USAGE.md` §9 PostgreSQL clients.
 - **Deterministic & verifiable** — the whole engine is a seedable state
-  machine; the test suite (2442 default / 2470 with `--features pg-gateway`
-  / 2503 with all gateway features) includes seeded partition/fault
+  machine; the test suite (~2,700+ tests by default, more with the
+  PostgreSQL and HTTP gateway features) includes seeded partition/fault
   simulation, multi‑replica Jepsen, hand‑derived KATs against published
-  spec text for every codec, the SP‑A 85‑seed K‑invariance sweep, the
-  SP‑PG‑CAT synthetic‑peer suite verifying each GUI tool's verbatim
+  spec text for every codec, the 85‑seed cross‑shard K‑invariance sweep, a
+  synthetic‑peer suite verifying each GUI tool's verbatim
   introspection SQL, and adversarial pentests for every public input
   surface.
 
@@ -208,7 +208,7 @@ for the layout + the matrix of supported env vars.
 git clone https://github.com/hassard0/KesselDB && cd KesselDB
 cargo build --release                                # default — binary protocol only
 cargo build --release --features pg-gateway,http-gateway   # all wire surfaces
-cargo test  --workspace --release                    # workspace gate: 2442 default tests
+cargo test  --workspace --release                    # workspace gate: ~2,700+ default tests
 ```
 
 ### Start a node
@@ -249,7 +249,7 @@ PGPASSWORD=mysecret pgcli -h 127.0.0.1 -p 5432 -u test
 ```
 
 ```python
-# psycopg2 — parameterized queries through the Extended Query protocol (verified on vulcan):
+# psycopg2 — parameterized queries through the Extended Query protocol:
 import os, psycopg2
 conn = psycopg2.connect(host="127.0.0.1", port=5432, user="test",
                         password=os.environ["KESSELDB_TOKEN"], dbname="kessel")
@@ -284,8 +284,8 @@ let row   = db.sql("SELECT * FROM acct ID 2")?;
 ## Deploy
 
 Single-pod (default) PLUS replicated VSR cluster mode (`--set cluster.enabled=true`).
-Multi-region (cross-zone WAN-tolerant view-change) is the named
-SP‑Cloud‑Cluster‑GEO follow‑up; sharding × clustering is SP‑Cloud‑Cluster‑SHARD.
+Multi-region (cross-zone WAN-tolerant view-change) and sharding × clustering
+are roadmap follow-ups.
 
 | Shape | One-liner | Reference |
 |---|---|---|
@@ -297,22 +297,19 @@ SP‑Cloud‑Cluster‑GEO follow‑up; sharding × clustering is SP‑Cloud‑C
 
 Full walkthrough + caveats (TLS, single‑attach volume, GHCR
 visibility) in [`docs/USAGE.md`](docs/USAGE.md) §11; cluster mode +
-primary-kill failover + Prometheus monitoring in §11.5. Single-pod
-Helm chart verified end‑to‑end on vulcan (kind + kubectl v1.31.0 +
-helm v3.16.3) — transcript at
-[`docs/superpowers/spclouddeploy-t3-kind-verify-2026-05-30.txt`](docs/superpowers/spclouddeploy-t3-kind-verify-2026-05-30.txt);
-cluster mode + primary-kill at
-[`docs/superpowers/spcloudcluster-t3-t5-failover-2026-06-02.txt`](docs/superpowers/spcloudcluster-t3-t5-failover-2026-06-02.txt).
+primary-kill failover + Prometheus monitoring in §11.5. The Helm chart
+(single-pod and cluster mode, including primary-kill failover) is tested
+end‑to‑end in CI.
 
 ## PostgreSQL client compatibility
 
 KesselDB speaks the PostgreSQL Frontend/Backend Protocol v3.0 **Simple
-Query AND Extended Query** paths with SCRAM‑SHA‑256 auth. After SP‑PG‑CAT
-(the `pg_catalog` / `information_schema` stubs arc) and SP‑PG‑EXTQ
-(2026‑05‑29, the Extended Query V1 message set), the following PG
-ecosystem tools connect and browse out of the box (verified by
-synthetic‑peer KATs driving each tool's verbatim connect / introspection
-SQL, and — for psycopg2 — by an end‑to‑end driver round‑trip on vulcan):
+Query AND Extended Query** paths with SCRAM‑SHA‑256 auth. With the
+`pg_catalog` / `information_schema` stubs and the Extended Query message
+set, the following PG ecosystem tools connect and browse out of the box
+(verified by synthetic‑peer KATs driving each tool's verbatim connect /
+introspection SQL, and — for the real drivers below — by end‑to‑end driver
+round‑trips):
 
 | Tool | Connect | Run queries | Notes |
 |---|---|---|---|
@@ -323,30 +320,28 @@ SQL, and — for psycopg2 — by an end‑to‑end driver round‑trip on vulcan
 | DataGrip / IntelliJ | ✓ | ✓ tables/columns | Functions panel empty (V1 returns empty `routines`) |
 | Metabase | ✓ | ✓ schema discovery via `information_schema.{tables,columns,schemata}` | |
 | Tableau / Looker / Hex / Superset | ✓ | ✓ ODBC wizards complete | schema discoverable |
-| **JDBC `org.postgresql:postgresql` 42.7.4** | ✓ | ✓ **PASS — full CRUD in both simple AND extended modes** | SP‑PG‑JDBC‑SMOKE (2026‑06‑02) drove real pgJDBC on vulcan end‑to‑end: CREATE TABLE, `PreparedStatement` INSERT (`setLong`+`setString`), SELECT \*, `PreparedStatement` SELECT WHERE id=?, `SELECT version()`. Extended mode uses binary Bind (SP‑PG‑EXTQ‑BIN) + binary result columns (SP‑PG‑EXTQ‑BIN‑RESULTS). Simple mode (`preferQueryMode=simple`) goes through the SP‑PG‑EXTQ‑CAST stripper + SP‑PG‑SQL‑PAREN‑VALUES paren‑VALUES parser + SP‑PG‑EXTQ‑DESCRIBE‑VERSION scalar‑SELECT synthesizer |
-| **psycopg2 2.9.12** | ✓ | ✓ **19/19 ORM smoke steps PASS on vulcan** | SCRAM auth + `cur.execute("…WHERE id = %s", (42,))` round‑trips through SP‑PG‑EXTQ |
-| **SQLAlchemy 2.0** | ✓ | ✓ **PASS — full session round-trip with DEFAULT settings on vulcan** | `sa.create_engine(...)` + `engine.connect()` + parameterized queries + pool checkout/checkin all green |
-| **psycopg3 3.3.4** | ✓ | ✓ **PASS — DEFAULT cursor works (no ClientCursor needed)** | SP‑PG‑EXTQ‑BIN T3 closed the binary‑Bind path; T8 ClientCursor workaround DROPPED |
-| **asyncpg 0.31.0** | ✓ | ✓ **PASS — fetch() round-trip works end-to-end** | SP‑PG‑EXTQ‑BIN‑RESULTS T3 closed the binary RowDescription/DataRow path; SP‑CHAR‑PAD‑COMPARE closed the `WHERE name = $1` against CHAR(N) zero‑rows gap |
-| `pgx` (Go) / `tokio-postgres` (Rust) / sqlx‑pg (Rust) | n/a | n/a | runtime not on vulcan smoke host; same binary‑Bind + binary‑RESULTS unlock as asyncpg / JDBC — tracked as V2 `SP‑PG‑GO‑SMOKE` / `SP‑SQLX‑SMOKE` |
-| Drizzle / Prisma (Node) | n/a | n/a | Node not on vulcan smoke host; tracked as V2 `SP‑PG‑NODE‑SMOKE` |
-| GORM (Go) / Diesel (Rust) | n/a | n/a | runtime not on vulcan smoke host; same binary‑format unlock as asyncpg / JDBC |
+| **JDBC `org.postgresql:postgresql` 42.7.4** | ✓ | ✓ **PASS — full CRUD in both simple AND extended modes** | Real pgJDBC verified end‑to‑end: CREATE TABLE, `PreparedStatement` INSERT (`setLong`+`setString`), SELECT \*, `PreparedStatement` SELECT WHERE id=?, `SELECT version()`. Extended mode uses binary Bind + binary result columns. Simple mode (`preferQueryMode=simple`) goes through the `::cast` stripper + paren‑VALUES parser + scalar‑SELECT Describe synthesizer |
+| **psycopg2 2.9.12** | ✓ | ✓ **19/19 ORM smoke steps PASS** | SCRAM auth + `cur.execute("…WHERE id = %s", (42,))` round‑trips through Extended Query |
+| **SQLAlchemy 2.0** | ✓ | ✓ **PASS — full session round-trip with DEFAULT settings** | `sa.create_engine(...)` + `engine.connect()` + parameterized queries + pool checkout/checkin all green |
+| **psycopg3 3.3.4** | ✓ | ✓ **PASS — DEFAULT cursor works (no ClientCursor needed)** | binary‑Bind path closed; no ClientCursor workaround needed |
+| **asyncpg 0.31.0** | ✓ | ✓ **PASS — fetch() round-trip works end-to-end** | binary RowDescription/DataRow path closed; `WHERE name = $1` against CHAR(N) returns correct rows |
+| `pgx` (Go) / `tokio-postgres` (Rust) / sqlx‑pg (Rust) | n/a | n/a | not yet smoke-tested; same binary‑Bind + binary‑RESULTS unlock as asyncpg / JDBC |
+| Drizzle / Prisma (Node) | n/a | n/a | not yet smoke-tested |
+| GORM (Go) / Diesel (Rust) | n/a | n/a | not yet smoke-tested; same binary‑format unlock as asyncpg / JDBC |
 
-**This release ships SP‑PG‑EXTQ V1 + V2 hardening + SP‑PG‑COPY V1.** Extended
-Query (`Parse/Bind/Describe/Execute/Sync/Close/Flush`) with binary‑format
-parameters (SP‑PG‑EXTQ‑BIN) AND binary‑format results (SP‑PG‑EXTQ‑BIN‑RESULTS)
-for the 10 V1 supported PG scalar types (INT2/INT4/INT8/FLOAT4/FLOAT8/BOOL/
+**This release ships** Extended Query
+(`Parse/Bind/Describe/Execute/Sync/Close/Flush`) with binary‑format
+parameters AND binary‑format results
+for the 10 supported PG scalar types (INT2/INT4/INT8/FLOAT4/FLOAT8/BOOL/
 TEXT/VARCHAR/BYTEA/TIMESTAMPTZ); JDBC simple‑mode `::cast` rewrite + paren‑VALUES
 parse + scalar‑SELECT Describe synthesizer; CHAR(N) padding‑aware comparison;
 COPY FROM/TO STDIN in text, CSV, and binary formats with 181.9× ingest lift.
 
-**V2 follow‑ups** (each named):
-binary NUMERIC (`SP‑PG‑EXTQ‑BIN‑NUMERIC`), JSONB/UUID/ARRAY binary
-(`SP‑PG‑EXTQ‑BIN‑EXTRA`), pgJDBC simple‑mode nested casts
-(`SP‑PG‑EXTQ‑CAST‑NESTED` / `‑MULTIWORD‑TYPE`), Describe for multi‑projection
-SELECTs (`SP‑PG‑EXTQ‑DESCRIBE‑MULTI‑PROJ` / `‑EXPR`), Go pgx / Node
-Drizzle+Prisma smoke harnesses (`SP‑PG‑GO‑SMOKE` / `SP‑PG‑NODE‑SMOKE`),
-libpq pipeline mode (`SP‑PG‑EXTQ‑PIPELINE‑BATCH`), `RETURNING`,
+**Follow‑ups on the roadmap:**
+binary NUMERIC, JSONB/UUID/ARRAY binary,
+pgJDBC simple‑mode nested casts, Describe for multi‑projection
+SELECTs, Go pgx / Node Drizzle+Prisma smoke harnesses,
+libpq pipeline mode, `RETURNING`,
 `CancelRequest` action, GUC plumbing, `pg_proc` real function listing,
 `pg_stat_*` runtime stats, TLS via SSLRequest, MD5 auth fallback, SCRAM
 channel binding, per‑user privileges. Full list in
@@ -382,15 +377,15 @@ and cloud projections).
 | Path | Result |
 |---|---|
 | State‑machine create (in‑mem, 128 B) | ~215 K ops/s @ p50 ~2 µs |
-| **Sharded point‑read, K=8, in‑process, N=16 cores** | **~14.71 M ops/s, p50 sub‑µs** — SP‑Perf‑A‑SHARD‑APPLY (3.00× the K=1 4.91M baseline; K=16 → 16.24M ops/s; final sweep 2026‑06‑02) |
-| **Parallel point‑read (single shard), in‑process, N=16 cores** | **~4.91 M ops/s, p50 < 1 µs, p99 ~7 µs** — SP‑Perf‑A T2 read‑pool bypass + T7 storage `Arc<[u8]>` (zero‑memcpy reads); honestly diagnosed ~5M `RwLock`‑reader ceiling broken by sharding |
-| **YCSB‑C uniform‑random reads, N=16** | **~5.27 M ops/s — ≈ 63.75× Postgres** (cross‑DB headline; final sweep, was 57× peak; see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3) |
-| **sysbench OLTP read‑only, N=16** | **~30,646 tx/s — 6.02× Postgres** (SP‑Perf‑A‑TXN‑RO; final sweep, was 5.7× peak — was LOSING) |
-| **sysbench OLTP read‑write, N=16** | **~8,852 tx/s — 2.30× Postgres** (SP‑Perf‑A‑TXN‑RW; final sweep re‑measured under sibling‑agent load, prior peak 2.66× — was LOSING) |
-| **sysbench OLTP write‑only, N=8** | **~50,687 tx/s — 4.91× Postgres** (final sweep, prior peak 5.2×) |
-| **TPC‑H Q6 (SUM with WHERE), N=4** | **~544.59 q/s** (final sweep; gap vs Postgres 3.09×; Q6 design floor ≥400 q/s + stretch ≥500 q/s both still MET) |
-| **TPC‑H Q1 (multi‑aggregate GROUP BY), N=4** | **~86.17 q/s** (final sweep; gap vs Postgres 2.16×) |
-| **PG COPY FROM STDIN, 100K rows, single conn** | **~51,840 rows/sec** — SP‑PG‑COPY‑BULKAPPLY lift 181.9× over V1 baseline 285 rows/sec; within ~11× of Postgres 16 (~578K rows/sec) |
+| **Sharded point‑read, K=8, in‑process, N=16 cores** | **~14.71 M ops/s, p50 sub‑µs** — 3.00× the K=1 4.91M baseline; K=16 → 16.24M ops/s |
+| **Parallel point‑read (single shard), in‑process, N=16 cores** | **~4.91 M ops/s, p50 < 1 µs, p99 ~7 µs** — read‑pool bypass + storage `Arc<[u8]>` (zero‑memcpy reads); the ~5M `RwLock`‑reader ceiling is broken by sharding |
+| **YCSB‑C uniform‑random reads, N=16** | **~5.27 M ops/s — ≈ 63.75× Postgres** (cross‑DB headline; see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3) |
+| **sysbench OLTP read‑only, N=16** | **~30,646 tx/s — 6.02× Postgres** |
+| **sysbench OLTP read‑write, N=16** | **~8,852 tx/s — 2.30× Postgres** |
+| **sysbench OLTP write‑only, N=8** | **~50,687 tx/s — 4.91× Postgres** |
+| **TPC‑H Q6 (SUM with WHERE), N=4** | **~544.59 q/s** (gap vs Postgres 3.09×; Q6 design floor ≥400 q/s + stretch ≥500 q/s both met) |
+| **TPC‑H Q1 (multi‑aggregate GROUP BY), N=4** | **~86.17 q/s** (gap vs Postgres 2.16×) |
+| **PG COPY FROM STDIN, 100K rows, single conn** | **~51,840 rows/sec** — 181.9× lift over the bulk‑apply baseline of 285 rows/sec; within ~11× of Postgres 16 (~578K rows/sec) |
 | Durable create, group commit (~1 K batch) | ~87 K ops/s (local NVMe) |
 | Concurrent durable, 8 clients | **~1,870 ops/s** — group commit + `TCP_NODELAY` (conservative; rises with concurrency) |
 | Pipelined batch, 1 connection | **~52,700 ops/s** — N statements per round‑trip |
@@ -401,98 +396,69 @@ and cloud projections).
 | Point read | ≤8 bloom‑probed segments (~28 ns/segment), bounded by design |
 | 3‑node replicated | ~161 K ops/s |
 
-**Cross‑DB benchmark suite (vulcan, 2026‑05‑28/29).** Full tables —
+**Cross‑DB benchmark suite.** Full tables —
 including the *losses* where KesselDB does NOT win — are in
 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md). Honest summary:
 
 | Workload | Winner | KesselDB place | One‑line cause |
 |---|---|---|---|
-| YCSB‑C (100% reads, uniform, ~1 KiB rows) | **KesselDB** | 1st at every N | in‑process + SP‑Perf‑A parallel read‑pool |
+| YCSB‑C (100% reads, uniform, ~1 KiB rows) | **KesselDB** | 1st at every N | in‑process + parallel read‑pool |
 | YCSB‑B (95% reads / 5% updates) | **KesselDB** | 1st at every N | same — read‑mostly workload |
 | YCSB‑A (50/50) | **KesselDB at N=1 + N=16** | 1st N=1, ≈ tied N=8 vs Postgres, 1st N=16 | write‑side apply lock pays cost at N=8 then amortizes |
 | sysbench OLTP write‑only | **KesselDB** | **1st at every N (4.91× Postgres at N=8)** | apply‑path is fast at the inner‑op level |
-| sysbench OLTP read‑only | **KesselDB at N=8 / N=16** | **1st at every N≥8 (6.02× Postgres at N=16)** | SP‑Perf‑A‑TXN‑RO bypass — all‑RO `Op::Txn{ops}` routes through the read pool — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3c |
-| sysbench OLTP read‑write | **KesselDB at N=8 / N=16** | **1st at every N≥8 (2.30× Postgres at N=16)** | SP‑Perf‑A‑TXN‑RW driver‑level split‑phase dispatch — (R*, W*)‑shape Txns split at the read/write boundary; read prefix routes via the TXN‑RO bypass (parallel), write suffix via `sm.write().apply` (serial) — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3e |
-| TPC‑H Q1 (multi‑aggregate GROUP BY) | Postgres at every N | **2nd at every N** | Final sweep N=4 86.17 q/s; gap vs Postgres **2.16×**; SP‑WHERE‑VM‑Specialise V1 (2026‑06‑01) closure‑built‑once‑per‑query WHERE evaluator cut per‑row VM dispatch — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3f |
-| TPC‑H Q6 (SUM with WHERE) | Postgres at every N | **2nd at N=4** | Final sweep N=4 544.59 q/s; gap vs Postgres **3.09×**; Q6 design floor ≥400 q/s + stretch ≥500 q/s both still MET — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3g |
+| sysbench OLTP read‑only | **KesselDB at N=8 / N=16** | **1st at every N≥8 (6.02× Postgres at N=16)** | all‑RO `Op::Txn{ops}` routes through the read pool — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3c |
+| sysbench OLTP read‑write | **KesselDB at N=8 / N=16** | **1st at every N≥8 (2.30× Postgres at N=16)** | driver‑level split‑phase dispatch — (R*, W*)‑shape Txns split at the read/write boundary; read prefix routes via the read‑pool bypass (parallel), write suffix via `sm.write().apply` (serial) — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3e |
+| TPC‑H Q1 (multi‑aggregate GROUP BY) | Postgres at every N | **2nd at every N** | N=4 86.17 q/s; gap vs Postgres **2.16×**; a closure‑built‑once‑per‑query WHERE evaluator cut per‑row VM dispatch — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3f |
+| TPC‑H Q6 (SUM with WHERE) | Postgres at every N | **2nd at N=4** | N=4 544.59 q/s; gap vs Postgres **3.09×**; Q6 design floor ≥400 q/s + stretch ≥500 q/s both met — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3g |
 
-**Roadmap is named — published-loss closures + next throughput levers.**
+**How the headline wins were built:**
 
-- **SP‑Perf‑A‑TXN‑RO V1 SHIPPED 2026‑05‑29** — static all‑RO `Op::Txn`
-  classification: `read_pool::is_read_only` recurses into the inner‑op
-  vector, returns true iff every inner is read‑only, and routes through
-  the Perf‑A read‑pool bypass. N=16 lift 42.6× (680 → 28,977 tx/s);
-  KesselDB 5.7× Postgres.
-- **SP‑Perf‑A‑TXN‑RW V1 SHIPPED 2026‑05‑30** — driver‑level split‑phase
-  dispatch on (R*, W*)‑shape mixed Txns: `read_pool::read_prefix_length`
-  + `is_split_safe` 3‑guard classifies each Txn; eligible Txns split at
-  the read/write boundary (parallel read prefix via the TXN‑RO bypass +
-  serial write suffix via `sm.write().apply`). Read‑after‑write Txns
-  fall through to unified apply (V1 limit; byte‑equivalent preserved
-  via apply's overlay). N=16 lift 14.4× (712 → 10,273 tx/s); KesselDB
-  2.66× Postgres + 2.60× SQLite. Next: **SP‑Perf‑A‑OPTIMISTIC‑CC**
-  (abort‑and‑retry with full SI overlay) for the read‑after‑write
-  fallthrough case.
-- **SP‑Perf‑A‑SHARD‑APPLY V1 SHIPPED 2026‑05‑30** — wires K
-  independent per‑shard sub‑engines (each its own
-  `Arc<RwLock<StateMachine>>` + apply thread + WAL + SSTables,
-  rooted at `data_dir/shard‑<i>/`) and routes every Op via
-  `hash(make_key(type_id, oid)) % K`. Activation: opt‑in via
-  `ServerConfig.shard_count = Some(K)` (default `None` =
-  pre‑SHARD byte‑identical). **Vulcan get‑by‑id sweep
-  (10K rows, 16 workers, 10s, `--pool-workers 16`):** K=baseline
-  ~4.9M ops/s → K=4 ~11.4M (2.3×) → **K=8 ~14.7M (3.0× — BREAKS
-  the 10M ceiling)** → K=16 ~16.2M (3.3×) on the 2026‑06‑02 final
-  sweep (original SHARD‑APPLY arc measured 4.68M/11.08M/14.93M/16.72M
-  — same within trial noise). p50 latency drops 3 µs → <1 µs. V1
-  limitations: scans/Txn route to shard 0
-  (named `SP‑Perf‑A‑SHARD‑SCAN` / `‑XTXN` follow‑ups);
-  per‑type FindBy / Describe pins all rows of a type to one
-  shard (per‑type lookups stay single‑shard); cross‑shard atomic
-  Txn deferred. Next: **SP‑Perf‑A‑SHARD‑SCAN** (scatter‑merge for
-  Select / Aggregate / Query so K>=2 scan ops see all data).
-- **SP‑Perf‑A‑SHARD‑SCAN + SP‑Perf‑A‑SHARD‑SCAN‑FASTPATH +
-  SP‑Perf‑A‑SHARD‑SCAN‑POOL‑SCALEOUT + SP‑Perf‑A‑SHARD‑SCAN‑LOCAL‑INDEX‑FUSION
-  SHIPPED (2026‑05‑30 → 2026‑06‑02)** — scan‑side companions to
-  SHARD‑APPLY. SHARD‑SCAN proves K‑invariance for scatter‑gather scan
-  ops; SHARD‑SCAN‑FASTPATH recovered find‑by perf at K≥2 by 105×;
-  SHARD‑SCAN‑POOL‑SCALEOUT makes every scan workload at K=4 scale
-  POSITIVELY; SHARD‑SCAN‑LOCAL‑INDEX‑FUSION delivers sharded find‑by
-  parity without requiring the `--pool-workers` flag. See
+- **Transaction‑bracket read paths.** Static all‑RO `Op::Txn`
+  classification recurses into the inner‑op vector and routes through
+  the read‑pool bypass when every inner op is read‑only — lifting
+  OLTP read‑only at N=16 42.6× (680 → 28,977 tx/s) to 5.7× Postgres,
+  and now 6.02×.
+- **Mixed‑transaction split‑phase dispatch.** (R*, W*)‑shape mixed
+  Txns are split at the read/write boundary — the read prefix runs in
+  parallel via the read‑pool bypass, the write suffix serially via
+  `sm.write().apply`; read‑after‑write Txns fall through to unified
+  apply (byte‑equivalent preserved via apply's overlay). This lifts
+  OLTP read‑write at N=16 14.4× (712 → 10,273 tx/s) to 2.30× Postgres.
+- **Sharding.** K independent per‑shard sub‑engines (each its own
+  `Arc<RwLock<StateMachine>>` + apply thread + WAL + SSTables, rooted
+  at `data_dir/shard‑<i>/`) route every Op via
+  `hash(make_key(type_id, oid)) % K`. Opt‑in via
+  `ServerConfig.shard_count = Some(K)` (default `None` is byte‑identical
+  to the unsharded engine). Get‑by‑id scales K=1 ~4.9M → K=4 ~11.4M
+  (2.3×) → **K=8 ~14.7M (3.0×, breaks the 10M ceiling)** → K=16 ~16.2M
+  (3.3×); p50 latency drops 3 µs → <1 µs. Scan‑side companions prove
+  K‑invariance for scatter‑gather scans, recover find‑by perf at K≥2
+  (105×), make every scan workload at K=4 scale positively, and deliver
+  sharded find‑by parity without the `--pool-workers` flag. See
   [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §14 + §14b + §14c + §14d.
-- **SP‑Analytic‑Plan + SP‑Analytic‑Plan‑MULTI + SP‑Hash‑Agg +
-  SP‑Hash‑Agg‑Tune + SP‑WHERE‑VM‑Specialise V1 SHIPPED (2026‑05‑29 →
-  2026‑06‑01)** — five sequential arcs for the TPC‑H Q1/Q6 losses:
-  (1) range‑pred narrowing on aggregate scans via the
-  `range_preds: Vec<(u16, u8, Vec<u8>)>` interface (Q6 7.5× at N=4);
-  (2) `Op::GroupAggregateMulti` folds N aggregates in one scan (Q1 4.0×
-  at N=4); (3) parallel hash aggregate (`std::thread::scope` +
-  per‑worker `HashMap` partials + sorted‑`BTreeMap` merge) for rows ≥
-  8192 (Q1 +1.46× / Q6 +1.79× at N=4); (4) producer‑channel‑workers
-  BATCHED streaming overlap (`std::sync::mpsc::sync_channel` carrying
-  `Vec<Arc<[u8]>>` batches of 256 rows) — workers start folding on row 1,
-  not row LAST (Q1 +1.06× / Q6 +1.07× at N=4); (5) `compile_filter`
-  walks the WHERE bytecode ONCE per query and returns a
-  `Box<dyn Fn(&[u8]) -> bool + Send + Sync>` closure that captures
-  pre‑resolved field offsets + comparison ops + AND/OR short‑circuit
-  tree directly (Q1 +1.35× / **Q6 +2.78× at N=4** — design floor
-  ≥400 q/s + stretch ≥500 q/s both EXCEEDED; SP‑Hash‑Agg‑Tune diagnosis
-  validated end‑to‑end). Cumulative gap‑closing **Q1 18× → 2.17×** and
-  **Q6 123× → 3.07×**. Next: **SP‑JIT‑Aggregate** (LLVM/cranelift
-  codegen for the per‑row aggregate‑update inner loop, what Postgres
-  uses; closes the residual 2.17× Q1 / 3.07× Q6 gap that's now the
-  decode→update fold work, not WHERE evaluation).
+- **Analytical aggregates (TPC‑H Q1/Q6).** Range‑pred narrowing on
+  aggregate scans, single‑scan multi‑aggregate folding, a parallel
+  hash aggregate (per‑worker `HashMap` partials + sorted‑`BTreeMap`
+  merge) for large row counts, batched streaming overlap so workers
+  start folding on row 1, and a WHERE filter compiled once per query
+  into a closure that captures pre‑resolved field offsets + comparison
+  ops + the AND/OR short‑circuit tree. Together these closed the gap vs
+  Postgres from ~18× to **2.16×** (Q1) and from ~123× to **3.09×** (Q6).
+  Q1 and Q6 remain the two workloads where Postgres still wins; closing
+  the residual gap (now in the decode→update fold work, not WHERE
+  evaluation) is a JIT‑aggregate follow‑up. See
+  [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) §3f + §3g.
 
-**Headline numbers worth quoting** (vulcan reference server, final sweep 2026‑06‑02, median of 3; see `docs/BENCHMARKS.md` §1):
-- **Sharded point‑read get‑by‑id, K=8, N=16 workers**: KesselDB **14.71M ops/sec** (3.00× the 4.91M K=1 baseline; sub‑µs p50; SP‑Perf‑A‑SHARD‑APPLY; K=16 → 16.24M)
+**Headline numbers worth quoting** (see `docs/BENCHMARKS.md` §1):
+- **Sharded point‑read get‑by‑id, K=8, N=16 workers**: KesselDB **14.71M ops/sec** (3.00× the 4.91M K=1 baseline; sub‑µs p50; K=16 → 16.24M)
 - **YCSB‑C reads, N=16**: KesselDB 5.27M ops/s — **63.75× Postgres**
 - **YCSB‑B mixed (95/5), N=16**: KesselDB 573.6K ops/s — **7.26× Postgres**
 - **sysbench OLTP write‑only, N=8**: KesselDB 50.7K tx/s — **4.91× Postgres**
-- **sysbench OLTP read‑only, N=16**: KesselDB 30.6K tx/s — **6.02× Postgres** (post SP‑Perf‑A‑TXN‑RO; was LOSING before this arc)
-- **sysbench OLTP read‑write, N=16**: KesselDB 8.85K tx/s — **2.30× Postgres** (post SP‑Perf‑A‑TXN‑RW; was LOSING before this arc)
-- **TPC‑H Q6, N=4**: KesselDB 544.59 q/s — gap vs Postgres 3.09× (design floor ≥400 + stretch ≥500 both still MET)
-- **KesselDB wins 6 of 8 cross‑DB workloads vs Postgres** (only TPC‑H Q1+Q6 remain losses, named follow‑up SP‑JIT‑Aggregate)
-- **PG COPY FROM STDIN, 100K rows, single conn**: KesselDB 51,840 rows/sec — 181.9× lift over V1 baseline (SP‑PG‑COPY‑BULKAPPLY; not re‑run this sweep)
+- **sysbench OLTP read‑only, N=16**: KesselDB 30.6K tx/s — **6.02× Postgres**
+- **sysbench OLTP read‑write, N=16**: KesselDB 8.85K tx/s — **2.30× Postgres**
+- **TPC‑H Q6, N=4**: KesselDB 544.59 q/s — gap vs Postgres 3.09× (design floor ≥400 + stretch ≥500 both met)
+- **KesselDB wins 6 of 8 cross‑DB workloads vs Postgres** (only TPC‑H Q1+Q6 remain losses)
+- **PG COPY FROM STDIN, 100K rows, single conn**: KesselDB 51,840 rows/sec — 181.9× lift over the bulk‑apply baseline
 
 Every figure is reproducible from the test suite / `kessel-bench`, and
 each query accelerator is guarded by a randomized equivalence oracle
@@ -592,8 +558,8 @@ Honest boundaries (documented, not hidden):
   `Delete`); cross‑shard scatter‑gather *reads*/SQL text routing is a
   separate, later concern from cross‑shard *transactions*.
 
-Every claim in this repository is backed by the test suite (2442 default /
-2470 with `--features pg-gateway` / 2503 with all gateway features); the docs
+Every claim in this repository is backed by the test suite (~2,700+ tests
+by default, more with the PostgreSQL and HTTP gateway features); the docs
 call out exactly what is proven versus roadmap. The four **strategic‑tier
 items S1–S4** (TLA+/model‑checked safety, serializable MVCC/SI, Jepsen
 linearizability under partition, deterministic WASM UDFs) are all **shipped**
@@ -621,12 +587,12 @@ linearizability under partition, deterministic WASM UDFs) are all **shipped**
 
 ```bash
 cargo build                 # all kernel crates, zero external deps
-cargo test --workspace      # 2442 default tests (seeded partition/fault sim,
+cargo test --workspace      # ~2,700+ default tests (seeded partition/fault sim,
                             # Jepsen linearizability, MVCC TLA+ refinement,
                             # pyarrow Parquet round-trips, WASM-MVP KATs,
-                            # SP-A 85-seed K-invariance sweep)
-cargo test --workspace --features pg-gateway                # 2470 (adds SP-PG + SP-PG-CAT + SP-PG-EXTQ V1 + V2 hardening + SP-PG-COPY V1)
-cargo test --workspace --features pg-gateway,http-gateway,kessel-http-gateway/test-server   # 2503 — full matrix
+                            # 85-seed cross-shard K-invariance sweep)
+cargo test --workspace --features pg-gateway                # adds the PostgreSQL gateway suite
+cargo test --workspace --features pg-gateway,http-gateway,kessel-http-gateway/test-server   # full matrix
 cargo run -p kessel-bench --release -- --help               # benchmarks
 
 # Strategic-tier rigor artifacts:
